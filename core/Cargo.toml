@@ -45,8 +45,18 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Concurrency (for the MCP server in later sessions)
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs"] }
+# Concurrency
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "net", "signal"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+
+# MCP server
+rmcp = { version = "1.7", default-features = false, features = [
+    "server",
+    "transport-streamable-http-server",
+] }
+axum = "0.7"
+sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 

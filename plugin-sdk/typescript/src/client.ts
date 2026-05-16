@@ -220,14 +220,30 @@ export class HestiaClient {
       // Hestia tools always return structured JSON in the first content block's text.
       const content = (result as { content?: Array<{ type: string; text?: string }> }).content;
       const structured = (result as { structuredContent?: unknown }).structuredContent;
-      if (structured !== undefined) return structured as T;
-      if (content && content[0]?.type === "text" && content[0].text) {
-        return JSON.parse(content[0].text) as T;
+
+      let payload: unknown;
+      if (structured !== undefined) {
+        payload = structured;
+      } else if (content && content[0]?.type === "text" && content[0].text) {
+        payload = JSON.parse(content[0].text);
+      } else {
+        throw new HestiaError(
+          "hestia.invalid_response",
+          `Tool ${toolName} returned no parseable content`,
+        );
       }
-      throw new HestiaError(
-        "hestia.invalid_response",
-        `Tool ${toolName} returned no parseable content`,
-      );
+
+      // Mechanism A: hestia tools embed typed errors in a `_hestia_error`
+      // envelope to survive MCP runtime normalization. Unwrap and throw.
+      if (
+        payload &&
+        typeof payload === "object" &&
+        "_hestia_error" in payload
+      ) {
+        const env = (payload as { _hestia_error: { code: string; message: string; data?: unknown } })._hestia_error;
+        throw mapHestiaError(env.code, env.message, env.data);
+      }
+      return payload as T;
     } catch (err) {
       // MCP errors arrive as McpError with a numeric JSON-RPC code and
       // hestia-specific code carried in `data.code` (since JSON-RPC error

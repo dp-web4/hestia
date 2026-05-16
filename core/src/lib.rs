@@ -8,6 +8,7 @@
 //! - **Society state**: Web4 society with witness chain + trust evolution (after that)
 
 pub mod error;
+pub mod server;
 pub mod vault;
 
 pub use error::{CoreError, Result};

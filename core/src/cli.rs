@@ -39,6 +39,13 @@ enum Command {
     /// Show hestia home + vault info
     Info,
 
+    /// Run the MCP server daemon
+    Serve {
+        /// Bind address (default 127.0.0.1:7711)
+        #[arg(long, default_value = "127.0.0.1:7711")]
+        bind: String,
+    },
+
     /// Vault subcommands
     #[command(subcommand)]
     Vault(VaultCmd),
@@ -88,6 +95,7 @@ pub fn run() -> AnyResult<()> {
     match cli.command {
         Command::Init { force } => cmd_init(&home, force),
         Command::Info => cmd_info(&home),
+        Command::Serve { bind } => cmd_serve(&home, &bind),
         Command::Vault(v) => match v {
             VaultCmd::List => cmd_vault_list(&home),
             VaultCmd::Get { name } => cmd_vault_get(&home, &name),
@@ -184,6 +192,37 @@ fn cmd_init(home: &std::path::Path, force: bool) -> AnyResult<()> {
         Vault::init(path.clone(), passphrase)?;
     }
     println!("✓ Empty vault created at {}", path.display());
+    Ok(())
+}
+
+fn cmd_serve(home: &std::path::Path, bind: &str) -> AnyResult<()> {
+    let path = hestia_core::vault::vault_path(home);
+    if !path.exists() {
+        anyhow::bail!(
+            "no vault at {} — run `hestia init` first",
+            path.display()
+        );
+    }
+    let passphrase = prompt_passphrase("Vault passphrase: ")?;
+    let vault = hestia_core::Vault::open(path, passphrase)?;
+    println!("Vault unlocked. Starting Hestia MCP server on {bind}...");
+
+    // Write endpoint discovery file so plugins can find us
+    let endpoint_file = home.join("endpoint");
+    let endpoint_url = format!("http://{}/mcp", bind);
+    if let Err(e) = std::fs::write(&endpoint_file, &endpoint_url) {
+        tracing::warn!("failed to write endpoint discovery file: {e}");
+    }
+
+    let state = hestia_core::server::build_state(vault);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+    runtime.block_on(hestia_core::server::serve(state, bind))?;
+
+    // Cleanup
+    let _ = std::fs::remove_file(&endpoint_file);
     Ok(())
 }
 
