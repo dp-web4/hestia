@@ -52,5 +52,5 @@ Candidates evaluated:
 - Repository: `dp-web4/hestia` (created 2026-05-15).
 - Public name: **Hestia** (capital H).
 - Tagline candidates: *"Tend your hearth. Your agents are guests."* / *"Web4 begins at home."* / *"Local-first trust for the agents you've chosen."*
-- Domain: `hestia.dev` (subject to availability — pending check); `hestia.web4.foundation` as redundant.
+- Domain: **`hestia.tools`** (registered 2026-05-15). The `.tools` TLD signals "this is tooling/infrastructure," which matches the layer-not-application positioning (see ADR-0002).
 - All package names use `hestia-` prefix.
