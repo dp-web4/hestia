@@ -214,7 +214,7 @@ fn cmd_serve(home: &std::path::Path, bind: &str) -> AnyResult<()> {
         tracing::warn!("failed to write endpoint discovery file: {e}");
     }
 
-    let state = hestia_core::server::build_state(vault);
+    let state = hestia_core::server::build_state(vault, home)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

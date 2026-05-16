@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use super::state::{InFlightAction, Session, SharedState};
 use crate::vault::VaultEntry;
+use web4_trust_core::EntityTrust;
 
 #[derive(Clone)]
 pub struct HestiaServer {
@@ -207,7 +208,7 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
             "soft_lct": soft_lct,
             "assigned_role": requested_role,
         }),
-    );
+    )?;
 
     Ok(json!({
         "sessionId": session_id,
@@ -220,16 +221,13 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
 async fn tool_begin_action(state: &SharedState, args: &Value) -> ToolResult {
     let tool_name = require_string(args, "tool_name")?;
     let target = optional_string(args, "target");
+    let session_id_arg = optional_string(args, "session_id");
 
     let mut s = state.lock().await;
     let action_id = Uuid::new_v4();
-    let chain_position = s.chain.len() as u64;
+    let chain_position = s.chain_len();
 
-    let session_id = s
-        .sessions
-        .values()
-        .max_by_key(|sess| sess.connected_at)
-        .map(|sess| sess.session_id)
+    let session_id = resolve_session_uuid(&s, session_id_arg.as_deref())
         .unwrap_or_else(Uuid::nil);
 
     let started_at = Utc::now();
@@ -292,13 +290,9 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
             "error": error,
             "plugin_id": plugin_id,
         }),
-    );
+    )?;
 
-    let trust_state = {
-        let trust = s.trust_mut(&plugin_id);
-        trust.apply_outcome(success, magnitude);
-        trust.clone()
-    };
+    let trust_state = s.apply_outcome(&plugin_id, success, magnitude)?;
 
     Ok(json!({
         "witnessEntryHash": entry.hash,
@@ -336,6 +330,7 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
                 .collect()
         })
         .unwrap_or_default();
+    let session_id_arg = optional_string(args, "session_id");
 
     let s = state.lock().await;
     let entry = match s.vault.get(&name) {
@@ -350,10 +345,7 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
     };
 
     let plugin_id = s
-        .sessions
-        .values()
-        .max_by_key(|sess| sess.connected_at)
-        .map(|sess| sess.plugin_id.clone())
+        .resolve_plugin_id(session_id_arg.as_deref())
         .unwrap_or_default();
 
     if !entry.allowed_consumers.is_empty() && !entry.allows(&plugin_id) {
@@ -418,6 +410,15 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
         .upsert(entry)
         .map_err(|e| anyhow::anyhow!("vault write: {}", e))?;
 
+    // Audit the mutation in the chain (the secret is never written; only the name).
+    let _ = s.append_chain(
+        "vault_set",
+        json!({
+            "name": name,
+            "entry_id": entry_id,
+        }),
+    );
+
     Ok(json!({"stored": true, "entryId": entry_id}))
 }
 
@@ -432,7 +433,7 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
 
     let s = state.lock().await;
     let mut entries = Vec::new();
-    for e in s.chain.iter().rev().take(limit) {
+    for e in s.recent_chain(limit as u64) {
         if let Some(tname) = tool_filter {
             let in_event = e
                 .event_data
@@ -460,8 +461,8 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
 async fn tool_request_witness(state: &SharedState, args: &Value) -> ToolResult {
     let event_type = require_string(args, "event_type")?;
     let event_data = args.get("event_data").cloned().unwrap_or(Value::Null);
-    let mut s = state.lock().await;
-    let entry = s.append_chain(&event_type, event_data);
+    let s = state.lock().await;
+    let entry = s.append_chain(&event_type, event_data)?;
     Ok(json!({"witnessEntryHash": entry.hash}))
 }
 
@@ -479,17 +480,15 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
         return Ok(serde_json::to_string(&json!({
             "sovereign_lct": s.sovereign_lct,
             "session_count": s.sessions.len(),
-            "chain_length": s.chain.len(),
-            "trust_states_known": s.trust_states.len(),
+            "chain_length": s.chain_len(),
+            "trust_states_known": s.trust_count(),
         }))
         .unwrap_or("{}".into()));
     }
     if uri == "hestia://witness/recent" {
         let recent: Vec<_> = s
-            .chain
-            .iter()
-            .rev()
-            .take(50)
+            .recent_chain(50)
+            .into_iter()
             .map(|e| {
                 json!({
                     "hash": e.hash,
@@ -532,22 +531,36 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
 // Helpers
 // =========================================================================
 
-fn trust_state_json(trust: &super::state::AgentTrust) -> Value {
+fn trust_state_json(trust: &EntityTrust) -> Value {
     json!({
+        "entityId": trust.entity_id,
         "t3": {
-            "talent": trust.t3_talent,
-            "training": trust.t3_training,
-            "temperament": trust.t3_temperament,
+            "talent": trust.t3.talent,
+            "training": trust.t3.training,
+            "temperament": trust.t3.temperament,
         },
         "v3": {
-            "valuation": trust.v3_valuation,
-            "veracity": trust.v3_veracity,
-            "validity": trust.v3_validity,
+            "valuation": trust.v3.valuation,
+            "veracity": trust.v3.veracity,
+            "validity": trust.v3.validity,
         },
-        "level": trust.level,
+        "level": trust.trust_level().as_str(),
         "actionCount": trust.action_count,
-        "daysSinceLast": trust.days_since_last(),
+        "successCount": trust.success_count,
+        "successRate": trust.success_rate(),
+        "daysSinceLast": trust.days_since_last_action(),
     })
+}
+
+fn resolve_session_uuid(state: &super::state::ServerState, session_id: Option<&str>) -> Option<Uuid> {
+    if let Some(sid) = session_id {
+        return Uuid::parse_str(sid).ok().filter(|u| state.sessions.contains_key(u));
+    }
+    state
+        .sessions
+        .values()
+        .max_by_key(|sess| sess.connected_at)
+        .map(|sess| sess.session_id)
 }
 
 fn hestia_error_envelope(code: &str, message: &str, data: Option<Value>) -> Value {

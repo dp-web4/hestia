@@ -275,7 +275,13 @@ class HestiaClient:
 
     async def _call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         session = self._require_session()
-        return await _invoke_tool(session, name, args)
+        # Stamp the session_id so the daemon can authoritatively resolve the
+        # caller. _call_tool_raw is used for hestia_connect (pre-session) and
+        # does NOT stamp.
+        stamped = dict(args)
+        if self._connect_result and "session_id" not in stamped:
+            stamped["session_id"] = self._connect_result.session_id
+        return await _invoke_tool(session, name, stamped)
 
     async def _read_resource(self, uri: str) -> dict[str, Any]:
         session = self._require_session()

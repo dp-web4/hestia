@@ -11,12 +11,16 @@ pub use handler::HestiaServer;
 pub use http::{serve, DEFAULT_BIND};
 pub use state::{ServerState, SharedState};
 
+use anyhow::Result;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::vault::Vault;
 
-/// Build the shared server state from an unlocked Vault.
-pub fn build_state(vault: Vault) -> SharedState {
-    Arc::new(Mutex::new(ServerState::new(vault)))
+/// Build the shared server state from an unlocked Vault. Opens the
+/// SQLite witness chain and the file-backed trust store rooted at `home`.
+pub fn build_state(vault: Vault, home: &Path) -> Result<SharedState> {
+    let state = ServerState::open(vault, home)?;
+    Ok(Arc::new(Mutex::new(state)))
 }

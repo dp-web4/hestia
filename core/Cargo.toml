@@ -60,5 +60,9 @@ sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# Web4 trust primitives + persistence
+web4-trust-core = { version = "0.2", features = ["file-store"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 [dev-dependencies]
 tempfile = "3"

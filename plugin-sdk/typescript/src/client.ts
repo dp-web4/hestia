@@ -214,8 +214,17 @@ export class HestiaClient {
     if (!this.mcpClient) {
       throw new NotConnectedError();
     }
+    // Stamp the session_id so the daemon can authoritatively resolve the
+    // caller. hestia_connect runs before a session exists; the daemon
+    // ignores session_id on that call.
+    const stampedArgs: Record<string, unknown> = {
+      ...args,
+      ...(this.session && !("session_id" in args)
+        ? { session_id: this.session.sessionId }
+        : {}),
+    };
     try {
-      const result = await this.mcpClient.callTool({ name: toolName, arguments: args });
+      const result = await this.mcpClient.callTool({ name: toolName, arguments: stampedArgs });
       // MCP tool results have either structuredContent or text content blocks.
       // Hestia tools always return structured JSON in the first content block's text.
       const content = (result as { content?: Array<{ type: string; text?: string }> }).content;

@@ -1,17 +1,25 @@
-//! Shared server state — vault, sessions, in-flight actions, witness chain.
+//! Shared server state — vault, sessions, in-flight actions, witness chain,
+//! and trust store.
 //!
-//! Persistent storage of the witness chain comes in Session 3; for now the
-//! chain lives in memory. The vault is loaded once at server start (passphrase
-//! prompted) and stays unlocked while the server runs.
+//! Persistence (Session 3):
+//! - witness chain → SQLite (`<HESTIA_HOME>/witness.db`)
+//! - trust         → JSON per entity under `<HESTIA_HOME>/trust/`
+//!
+//! Sessions and in-flight actions are intentionally RAM-only: a daemon
+//! restart should invalidate sessions, and plugins must reconnect.
 
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+use web4_trust_core::EntityTrust;
 
+use crate::storage::{ChainEntry, SqliteChainStore, TrustStore};
 use crate::vault::Vault;
 
 /// Active plugin session, created on `hestia_connect`.
@@ -38,117 +46,32 @@ pub struct InFlightAction {
     pub chain_position: u64,
 }
 
-/// Witness chain entry (in-memory; Session 3 adds persistence).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChainEntry {
-    pub hash: String,
-    pub prev_hash: String,
-    pub timestamp: DateTime<Utc>,
-    pub event_type: String,
-    pub event_data: serde_json::Value,
-    pub signer_lct: String,
-    pub chain_position: u64,
-}
-
-/// Per-agent trust state. Session 3 plugs in web4-trust-core; for now,
-/// this struct is enough to roll the SDK's TrustState contract.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentTrust {
-    pub t3_talent: f64,
-    pub t3_training: f64,
-    pub t3_temperament: f64,
-    pub v3_valuation: f64,
-    pub v3_veracity: f64,
-    pub v3_validity: f64,
-    pub level: String,
-    pub action_count: u64,
-    pub last_action_at: Option<DateTime<Utc>>,
-}
-
-impl Default for AgentTrust {
-    fn default() -> Self {
-        Self {
-            t3_talent: 0.5,
-            t3_training: 0.5,
-            t3_temperament: 0.5,
-            v3_valuation: 0.5,
-            v3_veracity: 0.5,
-            v3_validity: 0.5,
-            level: "medium".to_string(),
-            action_count: 0,
-            last_action_at: None,
-        }
-    }
-}
-
-impl AgentTrust {
-    /// Update T3/V3 from an outcome. Phase 1 placeholder math; Session 3 swaps
-    /// in the proper web4-trust-core evolution.
-    pub fn apply_outcome(&mut self, success: bool, magnitude: f64) {
-        let m = magnitude.clamp(0.0, 1.0);
-        let delta = m * 0.05 * if success { 1.0 } else { -1.0 };
-        self.t3_talent = (self.t3_talent + delta).clamp(0.0, 1.0);
-        self.t3_training = (self.t3_training + delta * 0.7).clamp(0.0, 1.0);
-        self.t3_temperament = (self.t3_temperament + delta * 0.5).clamp(0.0, 1.0);
-        self.v3_valuation = (self.v3_valuation + delta * 0.3).clamp(0.0, 1.0);
-        self.v3_veracity = (self.v3_veracity + delta * 0.4).clamp(0.0, 1.0);
-        self.v3_validity = (self.v3_validity + delta * 0.2).clamp(0.0, 1.0);
-        self.action_count += 1;
-        self.last_action_at = Some(Utc::now());
-        self.level = level_for((self.t3_talent + self.t3_training + self.t3_temperament) / 3.0);
-    }
-
-    pub fn days_since_last(&self) -> f64 {
-        match self.last_action_at {
-            None => 0.0,
-            Some(t) => {
-                let secs = (Utc::now() - t).num_seconds().max(0) as f64;
-                secs / 86_400.0
-            }
-        }
-    }
-}
-
-fn level_for(avg: f64) -> String {
-    if avg < 0.2 {
-        "low"
-    } else if avg < 0.4 {
-        "medium_low"
-    } else if avg < 0.6 {
-        "medium"
-    } else if avg < 0.8 {
-        "medium_high"
-    } else {
-        "high"
-    }
-    .to_string()
-}
-
 /// The mutable core state passed to every request handler.
 pub struct ServerState {
     pub vault: Vault,
     pub sessions: HashMap<Uuid, Session>,
     pub actions: HashMap<Uuid, InFlightAction>,
-    pub chain: Vec<ChainEntry>,
-    pub trust_states: HashMap<String, AgentTrust>, // keyed by plugin_id
+    pub chain_store: SqliteChainStore,
+    pub trust_store: TrustStore,
     pub sovereign_lct: String,
     pub shared_context: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ServerState {
-    pub fn new(vault: Vault) -> Self {
-        // For Phase 1, use a deterministic placeholder sovereign LCT. Session 3
-        // bootstraps a real Web4 society identity.
+    /// Open all persistent stores rooted at `home` and prepare server state.
+    pub fn open(vault: Vault, home: &Path) -> Result<Self> {
+        let chain_store = SqliteChainStore::open(home.join("witness.db"))?;
+        let trust_store = TrustStore::open(home.join("trust"))?;
         let sovereign_lct = "lct:web4:hestia:sovereign:phase1-placeholder".to_string();
-        Self {
+        Ok(Self {
             vault,
             sessions: HashMap::new(),
             actions: HashMap::new(),
-            chain: Vec::new(),
-            trust_states: HashMap::new(),
+            chain_store,
+            trust_store,
             sovereign_lct,
             shared_context: serde_json::Map::new(),
-        }
+        })
     }
 
     /// Issue a Soft LCT for a new session.
@@ -157,113 +80,103 @@ impl ServerState {
         hasher.update(session_id.as_bytes());
         hasher.update(self.sovereign_lct.as_bytes());
         let digest = hasher.finalize();
-        format!("lct:web4:session:{}", hex_short(&digest[..8]))
+        let hex: String = digest[..8].iter().map(|b| format!("{:02x}", b)).collect();
+        format!("lct:web4:session:{}", hex)
     }
 
-    /// Append a chain entry and return the entry's hash. Hash is over
-    /// prev_hash || timestamp_iso || event_type || event_data_json.
+    /// Append a chain entry under the sovereign LCT.
     pub fn append_chain(
-        &mut self,
+        &self,
         event_type: &str,
         event_data: serde_json::Value,
-    ) -> ChainEntry {
-        let prev_hash = self
-            .chain
-            .last()
-            .map(|e| e.hash.clone())
-            .unwrap_or_else(|| "0".repeat(64));
-        let timestamp = Utc::now();
-        let chain_position = self.chain.len() as u64;
-
-        let mut hasher = Sha256::new();
-        hasher.update(prev_hash.as_bytes());
-        hasher.update(timestamp.to_rfc3339().as_bytes());
-        hasher.update(event_type.as_bytes());
-        hasher.update(
-            serde_json::to_string(&event_data)
-                .unwrap_or_default()
-                .as_bytes(),
-        );
-        let hash = hex(&hasher.finalize()[..]);
-
-        let entry = ChainEntry {
-            hash,
-            prev_hash,
-            timestamp,
-            event_type: event_type.to_string(),
-            event_data,
-            signer_lct: self.sovereign_lct.clone(),
-            chain_position,
-        };
-        self.chain.push(entry.clone());
-        entry
+    ) -> Result<ChainEntry> {
+        self.chain_store
+            .append(event_type, event_data, &self.sovereign_lct)
     }
 
-    /// Get or initialize trust state for a plugin.
-    pub fn trust_mut(&mut self, plugin_id: &str) -> &mut AgentTrust {
-        self.trust_states
-            .entry(plugin_id.to_string())
-            .or_insert_with(AgentTrust::default)
+    pub fn chain_len(&self) -> u64 {
+        self.chain_store.len().unwrap_or(0)
     }
 
-    pub fn trust(&self, plugin_id: &str) -> AgentTrust {
-        self.trust_states
+    pub fn recent_chain(&self, limit: u64) -> Vec<ChainEntry> {
+        self.chain_store.read_recent(limit).unwrap_or_default()
+    }
+
+    /// Apply an outcome to the trust state for a plugin.
+    pub fn apply_outcome(
+        &self,
+        plugin_id: &str,
+        success: bool,
+        magnitude: f64,
+    ) -> Result<EntityTrust> {
+        self.trust_store.update(plugin_id, success, magnitude)
+    }
+
+    pub fn trust(&self, plugin_id: &str) -> EntityTrust {
+        self.trust_store
             .get(plugin_id)
-            .cloned()
-            .unwrap_or_default()
+            .unwrap_or_else(|_| EntityTrust::new(format!("plugin:{plugin_id}")))
+    }
+
+    pub fn trust_count(&self) -> usize {
+        self.trust_store.list().map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Resolve a plugin_id from a session_id provided in tool args.
+    /// Falls back to the most-recently-connected session if `session_id`
+    /// is absent (this fallback is the Session-2-era behavior and will
+    /// be removed once both SDKs reliably pass session_id in args).
+    pub fn resolve_plugin_id(&self, session_id: Option<&str>) -> Option<String> {
+        if let Some(sid) = session_id {
+            if let Ok(uuid) = Uuid::parse_str(sid) {
+                if let Some(s) = self.sessions.get(&uuid) {
+                    return Some(s.plugin_id.clone());
+                }
+            }
+            return None;
+        }
+        self.sessions
+            .values()
+            .max_by_key(|sess| sess.connected_at)
+            .map(|sess| sess.plugin_id.clone())
     }
 }
 
 pub type SharedState = Arc<Mutex<ServerState>>;
 
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
-}
-
-fn hex_short(bytes: &[u8]) -> String {
-    hex(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use crate::vault::Vault;
 
     fn make_state() -> (TempDir, ServerState) {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("v.enc");
-        let vault = Vault::init(path, "p".into()).unwrap();
-        (dir, ServerState::new(vault))
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = ServerState::open(vault, dir.path()).unwrap();
+        (dir, state)
     }
 
     #[test]
     fn chain_grows_with_hash_linkage() {
-        let (_dir, mut state) = make_state();
-        let e1 = state.append_chain("evt1", serde_json::json!({"a": 1}));
-        let e2 = state.append_chain("evt2", serde_json::json!({"b": 2}));
+        let (_dir, state) = make_state();
+        let e1 = state.append_chain("evt1", serde_json::json!({"a": 1})).unwrap();
+        let e2 = state.append_chain("evt2", serde_json::json!({"b": 2})).unwrap();
         assert_eq!(e1.prev_hash, "0".repeat(64));
         assert_eq!(e2.prev_hash, e1.hash);
         assert_eq!(e1.chain_position, 0);
         assert_eq!(e2.chain_position, 1);
-        assert_eq!(state.chain.len(), 2);
+        assert_eq!(state.chain_len(), 2);
     }
 
     #[test]
     fn trust_evolves_with_outcomes() {
-        let mut t = AgentTrust::default();
-        let initial = t.t3_talent;
-        t.apply_outcome(true, 0.8);
-        assert!(t.t3_talent > initial);
-        assert_eq!(t.action_count, 1);
-
-        let after_success = t.t3_talent;
-        t.apply_outcome(false, 0.8);
-        assert!(t.t3_talent < after_success);
+        let (_dir, state) = make_state();
+        let t1 = state.apply_outcome("plug-1", true, 0.8).unwrap();
+        assert_eq!(t1.action_count, 1);
+        assert_eq!(t1.success_count, 1);
+        let t2 = state.apply_outcome("plug-1", false, 0.8).unwrap();
+        assert_eq!(t2.action_count, 2);
+        assert_eq!(t2.success_count, 1);
     }
 
     #[test]
@@ -274,5 +187,47 @@ mod tests {
         let l2 = state.issue_soft_lct(sid);
         assert_eq!(l1, l2);
         assert!(l1.starts_with("lct:web4:session:"));
+    }
+
+    #[test]
+    fn resolve_plugin_id_uses_session_id_when_provided() {
+        let (_dir, mut state) = make_state();
+        let sid_a = Uuid::new_v4();
+        let sid_b = Uuid::new_v4();
+        state.sessions.insert(
+            sid_a,
+            Session {
+                session_id: sid_a,
+                plugin_id: "alice".into(),
+                plugin_version: None,
+                host_agent: "x".into(),
+                host_agent_version: None,
+                assigned_role: "citizen".into(),
+                soft_lct: "lct:test:a".into(),
+                connected_at: Utc::now(),
+            },
+        );
+        state.sessions.insert(
+            sid_b,
+            Session {
+                session_id: sid_b,
+                plugin_id: "bob".into(),
+                plugin_version: None,
+                host_agent: "x".into(),
+                host_agent_version: None,
+                assigned_role: "citizen".into(),
+                soft_lct: "lct:test:b".into(),
+                connected_at: Utc::now() + chrono::Duration::seconds(1),
+            },
+        );
+
+        assert_eq!(
+            state.resolve_plugin_id(Some(&sid_a.to_string())),
+            Some("alice".into())
+        );
+        // fallback to most-recent when session_id is absent
+        assert_eq!(state.resolve_plugin_id(None), Some("bob".into()));
+        // unknown session_id resolves to None (no fallback)
+        assert_eq!(state.resolve_plugin_id(Some("00000000-0000-0000-0000-000000000000")), None);
     }
 }
