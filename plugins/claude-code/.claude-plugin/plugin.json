@@ -1,0 +1,36 @@
+{
+  "name": "hestia",
+  "description": "Hestia — local-first Web4 trust layer. This plugin wires Claude Code into your local Hestia daemon: every tool call becomes a hash-linked witness entry, trust scores evolve from outcomes, and a credential vault keeps your scattered API keys in one encrypted place. No data leaves your machine.",
+  "version": "0.0.1",
+  "author": {
+    "name": "dp-web4",
+    "email": "dp@metalinxx.io"
+  },
+  "homepage": "https://hestia.tools",
+  "category": "productivity",
+  "keywords": [
+    "trust",
+    "audit",
+    "witness",
+    "web4",
+    "vault",
+    "T3V3",
+    "local-first",
+    "governance"
+  ],
+  "strict": true,
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/witness.py",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}
