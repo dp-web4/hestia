@@ -37,7 +37,7 @@ Candidates evaluated:
 ## Trade-offs accepted
 
 - **Namespace collision with Hestia Control Panel** (HestiaCP, 4.3K GitHub stars, MIT-licensed web hosting control panel). Different category (web hosting vs AI agent trust infrastructure); confusion risk is low. Search-engine confusion will be transient. Trade-dress separation is real.
-- **Package names will use `hestia-` prefix.** `hestia` on PyPI and npm is taken by unrelated projects. We ship as `hestia-sdk` (Python), `hestia-core` (Rust), `@hestia/plugin-sdk` (npm scope). Same pattern we navigated for `web4 → web4-sdk` on 2026-05-15.
+- **Package names will use `hestia-` prefix.** `hestia` on PyPI and npm is taken by unrelated projects. We ship as `hestia-sdk` (Python), `hestia-core` (Rust), `@hestia-tools/plugin-sdk` (npm scope). Same pattern we navigated for `web4 → web4-sdk` on 2026-05-15.
 - **Trademark filing deferred.** Phase 2 task after v1 launch validates the name is sticking.
 
 ## Alternatives rejected

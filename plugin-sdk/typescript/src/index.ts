@@ -1,11 +1,11 @@
 /**
- * @hestia/plugin-sdk — Plugin Authoring Kit for Hestia.
+ * @hestia-tools/plugin-sdk — Plugin Authoring Kit for Hestia.
  *
  * Public surface for plugin authors. Import what you need from this entry point.
  *
  * Quickstart:
  * ```ts
- * import { createHestiaClient } from '@hestia/plugin-sdk';
+ * import { createHestiaClient } from '@hestia-tools/plugin-sdk';
  *
  * const hestia = createHestiaClient({
  *   pluginId: 'my-agent-plugin',

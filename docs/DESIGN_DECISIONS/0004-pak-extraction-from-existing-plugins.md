@@ -99,10 +99,10 @@ AFTER (thin observer):
 ### OpenClaw (Phase 1 priority)
 
 - Strip `audit.ts`, `policy.ts`, `policy-entity.ts`, `policy-model.ts` (and friends), `session-state.ts`, `rate-limiter.ts`, `presets.ts`, `reporter.ts` from the plugin source tree.
-- Keep `r6.ts` (but import types from `@hestia/plugin-sdk` instead of defining them locally).
+- Keep `r6.ts` (but import types from `@hestia-tools/plugin-sdk` instead of defining them locally).
 - Keep `soft-lct.ts` only as a fallback for offline mode (Hestia issues the canonical Soft LCT).
 - Keep `matchers.ts` as a client-side utility if useful.
-- Rewrite `index.ts` to use `HestiaClient` from `@hestia/plugin-sdk`.
+- Rewrite `index.ts` to use `HestiaClient` from `@hestia-tools/plugin-sdk`.
 - Expected result: plugin shrinks from ~3500 lines to ~150-300 lines.
 
 ### Claude Code (Phase 1.5)

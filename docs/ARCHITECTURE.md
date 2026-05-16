@@ -214,7 +214,7 @@ Premium tier:
 The Plugin Authoring Kit (PAK) is the load-bearing deliverable. The PAK extracts the shared pattern from three independent existing Web4 governance plugins into a publishable SDK:
 
 ```
-@hestia/plugin-sdk      (npm)        TypeScript reference
+@hestia-tools/plugin-sdk      (npm)        TypeScript reference
 hestia-plugin-sdk       (PyPI)        Python parity
 hestia-plugin-sdk       (crates.io)   Rust parity
 ```

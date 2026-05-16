@@ -36,7 +36,7 @@ early access.
 
 ## See also
 
-- [`@hestia/plugin-sdk`](https://www.npmjs.com/package/@hestia/plugin-sdk)
+- [`@hestia-tools/plugin-sdk`](https://www.npmjs.com/package/@hestia-tools/plugin-sdk)
   — TS SDK for plugging an agent into the OSS Hestia daemon
 - [`hestia` Rust crate](https://crates.io/crates/hestia) — the daemon
   itself

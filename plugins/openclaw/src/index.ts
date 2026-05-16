@@ -3,7 +3,7 @@
  *
  * Refactor of `moltbot/extensions/web4-governance` (6,511 lines incl. tests)
  * into a thin observer (~140 lines incl. comments) that emits R6/R7 records
- * to the user's central Hestia instance via @hestia/plugin-sdk.
+ * to the user's central Hestia instance via @hestia-tools/plugin-sdk.
  *
  * What this plugin does:
  *   1. On OpenClaw startup, connect to the user's Hestia daemon.
@@ -27,7 +27,7 @@ import {
   PolicyDeniedError,
   type Outcome,
   type R6Action,
-} from "@hestia/plugin-sdk";
+} from "@hestia-tools/plugin-sdk";
 import type {
   AfterToolCallHandler,
   BeforeToolCallHandler,

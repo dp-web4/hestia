@@ -1,6 +1,6 @@
 # hestia-plugin-sdk (Python)
 
-Plugin Authoring Kit for Hestia — Python edition. Mirrors the [`@hestia/plugin-sdk`](../typescript) TypeScript reference. Use this to build Python plugins for AI agents (Aider, custom Python agents, scripts) that want to be Web4-compliant via Hestia.
+Plugin Authoring Kit for Hestia — Python edition. Mirrors the [`@hestia-tools/plugin-sdk`](../typescript) TypeScript reference. Use this to build Python plugins for AI agents (Aider, custom Python agents, scripts) that want to be Web4-compliant via Hestia.
 
 ## Status
 

@@ -20,7 +20,7 @@ import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { createHestiaClient } from "@hestia/plugin-sdk";
+import { createHestiaClient } from "@hestia-tools/plugin-sdk";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "../..");

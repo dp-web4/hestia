@@ -24,7 +24,7 @@ witness chain dump.
 ## Requirements
 
 - Built `hestia` binary: `cd core && cargo build`
-- Built `@hestia/plugin-sdk`: `cd plugin-sdk/typescript && npm install && npm run build`
+- Built `@hestia-tools/plugin-sdk`: `cd plugin-sdk/typescript && npm install && npm run build`
 - Node.js ≥ 20
 
 ## Running

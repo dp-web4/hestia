@@ -1,6 +1,6 @@
 # @hestia/plugin-openclaw
 
-Hestia plugin for [OpenClaw](https://github.com/getclawdbot/) (formerly Moltbot). A thin observer that emits R6/R7 records to the user's Hestia daemon via [`@hestia/plugin-sdk`](../../plugin-sdk/typescript).
+Hestia plugin for [OpenClaw](https://github.com/getclawdbot/) (formerly Moltbot). A thin observer that emits R6/R7 records to the user's Hestia daemon via [`@hestia-tools/plugin-sdk`](../../plugin-sdk/typescript).
 
 ## Status
 
@@ -52,7 +52,7 @@ This refactor strips all of that out. The plugin now delegates everything to the
 │  │  after_tool_call   │──────┤
 │  └────────────────────┘  │   │
 │                          │   │ HestiaClient
-│                          │   │ (via @hestia/plugin-sdk)
+│                          │   │ (via @hestia-tools/plugin-sdk)
 └──────────────────────────┘   │
                                ▼
                   ┌─────────────────────────┐
@@ -122,7 +122,7 @@ npm test
 The test suite (`test/integration.test.ts`) wires:
 
 ```
-mock OpenClaw host → this plugin → @hestia/plugin-sdk → mock Hestia server
+mock OpenClaw host → this plugin → @hestia-tools/plugin-sdk → mock Hestia server
 ```
 
 7 tests cover: plugin registration + Hestia connection, Bash tool call lifecycle, Read tool with lower magnitude, failure outcome recording, paired before/after via `callId`, graceful no-op when Hestia is unreachable, common target-extraction conventions.

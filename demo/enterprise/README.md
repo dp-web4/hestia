@@ -33,7 +33,7 @@ changes is what's signing the entries and where the keys live.
                    │  (Claude Code, OpenClaw, │
                    │   Cursor, custom...)     │
                    └────────────┬─────────────┘
-                                │  MCP / @hestia/plugin-sdk
+                                │  MCP / @hestia-tools/plugin-sdk
                                 ▼
        ┌─────────────────────────────────────────────────┐
        │              hestia-core daemon                 │ ← this repo

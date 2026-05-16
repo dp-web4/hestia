@@ -30,7 +30,7 @@ Three language editions of the same logical SDK:
 
 | Edition | Package | Use when |
 |---|---|---|
-| **TypeScript / JavaScript** | `@hestia/plugin-sdk` (npm) | Plugin is JS/TS — most modern agents (Claude Code, OpenClaw, Cursor, Cline, ruflo) |
+| **TypeScript / JavaScript** | `@hestia-tools/plugin-sdk` (npm) | Plugin is JS/TS — most modern agents (Claude Code, OpenClaw, Cursor, Cline, ruflo) |
 | **Python** | `hestia-plugin-sdk` (PyPI) | Plugin is Python (Aider, custom agents, scripts) |
 | **Rust** | `hestia-plugin-sdk` (crates.io) | Plugin embeds in a Rust host (or wants minimum overhead) |
 
@@ -38,7 +38,7 @@ All three editions expose the same logical interface:
 
 ```typescript
 // TypeScript reference (Python / Rust mirror this)
-import { HestiaClient } from '@hestia/plugin-sdk';
+import { HestiaClient } from '@hestia-tools/plugin-sdk';
 
 const hestia = new HestiaClient({
   pluginId: 'claude-code',          // identifies this plugin instance
@@ -122,7 +122,7 @@ To add a new agent: implement `PluginDiscoverer` for that agent. Submit as a PR.
 
 ## Versioning and compatibility
 
-- PAK editions follow semver (`@hestia/plugin-sdk@0.x.y` etc.)
+- PAK editions follow semver (`@hestia-tools/plugin-sdk@0.x.y` etc.)
 - The MCP protocol surface Hestia exposes is versioned (`hestia-mcp-protocol-version: 0`)
 - Plugins declare which protocol version they require at connect time
 - Hestia supports the current and one-prior protocol version
@@ -152,7 +152,7 @@ This is what makes Hestia a *cross-vendor* trust layer: the user is the integrat
 
 ```typescript
 // plugins/myagent/src/index.ts
-import { HestiaClient, R6Action } from '@hestia/plugin-sdk';
+import { HestiaClient, R6Action } from '@hestia-tools/plugin-sdk';
 
 const hestia = new HestiaClient({ pluginId: 'myagent' });
 await hestia.connect();

@@ -1,6 +1,6 @@
 # hestia-plugin-sdk (Rust)
 
-Plugin Authoring Kit for Hestia — Rust edition. Mirrors the [`@hestia/plugin-sdk`](../typescript) TypeScript and [`hestia-plugin-sdk`](../python) Python references.
+Plugin Authoring Kit for Hestia — Rust edition. Mirrors the [`@hestia-tools/plugin-sdk`](../typescript) TypeScript and [`hestia-plugin-sdk`](../python) Python references.
 
 Use this to build Rust plugins for AI agents and agent hosts that want to be Web4-compliant via Hestia. Built on the official `rmcp` crate.
 

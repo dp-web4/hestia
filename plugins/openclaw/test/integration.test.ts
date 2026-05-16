@@ -2,7 +2,7 @@
  * Integration test: end-to-end through the refactored OpenClaw plugin.
  *
  * Wires:
- *   mock OpenClaw host → refactored plugin → @hestia/plugin-sdk → mock Hestia
+ *   mock OpenClaw host → refactored plugin → @hestia-tools/plugin-sdk → mock Hestia
  *
  * Validates the architectural shift: the plugin (~140 lines) successfully
  * delegates all governance to Hestia via the SDK, with no embedded R6 chain,

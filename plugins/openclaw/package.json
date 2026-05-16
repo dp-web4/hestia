@@ -24,7 +24,7 @@
   },
   "author": "dp-web4 <dp@metalinxx.io>",
   "dependencies": {
-    "@hestia/plugin-sdk": "file:../../plugin-sdk/typescript"
+    "@hestia-tools/plugin-sdk": "file:../../plugin-sdk/typescript"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

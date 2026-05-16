@@ -32,7 +32,7 @@ That's the product, more or less. Your local Web4 society is the hearth. Your ag
 ```
 hestia/
 ├── plugin-sdk/           # The Plugin Authoring Kit (PAK)
-│   ├── typescript/       # @hestia/plugin-sdk on npm
+│   ├── typescript/       # @hestia-tools/plugin-sdk on npm
 │   ├── python/           # hestia-plugin-sdk on PyPI
 │   └── rust/             # hestia-plugin-sdk on crates.io
 ├── core/                 # Rust core (vault, MCP host, society state)

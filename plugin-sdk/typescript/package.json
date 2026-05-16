@@ -1,5 +1,5 @@
 {
-  "name": "@hestia/plugin-sdk",
+  "name": "@hestia-tools/plugin-sdk",
   "version": "0.0.2",
   "description": "Hestia Plugin Authoring Kit — author Hestia plugins for any AI agent client. Wraps R6/R7 record building, Soft LCT session identity, policy query, credential vault, and witness chain emission.",
   "type": "module",
