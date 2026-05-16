@@ -1,0 +1,54 @@
+[package]
+name = "hestia-core"
+version = "0.0.2"
+edition = "2021"
+authors = ["dp-web4 <dp@metalinxx.io>"]
+description = "Hestia — local-first Web4 trust layer for AI agents. The core daemon: credential vault, MCP server, society state, witness chain."
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/dp-web4/hestia"
+documentation = "https://github.com/dp-web4/hestia"
+keywords = ["hestia", "web4", "ai-agent", "vault", "mcp"]
+categories = ["cryptography", "authentication", "command-line-utilities"]
+rust-version = "1.80"
+
+[lib]
+name = "hestia_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hestia"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+rpassword = "7"
+
+# Crypto
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+zeroize = { version = "1.8", features = ["derive"] }
+
+# Serialization / storage
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# System
+dirs = "5"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Concurrency (for the MCP server in later sessions)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
