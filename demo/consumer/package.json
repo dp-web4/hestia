@@ -1,0 +1,17 @@
+{
+  "name": "@hestia/demo-consumer",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end consumer demo for the Hestia daemon + OpenClaw plugin path",
+  "scripts": {
+    "demo": "node run.mjs"
+  },
+  "dependencies": {
+    "@hestia/plugin-sdk": "file:../../plugin-sdk/typescript"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "AGPL-3.0-or-later"
+}

@@ -1,0 +1,71 @@
+
+━━━ Hestia consumer demo ━━━
+  HOME: /tmp/hestia-demo-dAlKwC
+  daemon: /mnt/c/exe/projects/ai-agents/hestia/core/target/debug/hestia
+
+▸ 1. Initialize Hestia (vault + identity)
+  ✓ Vault created at /tmp/hestia-demo-dAlKwC/vault.enc
+
+▸ 2. Seed credentials
+  ✓ Added anthropic_key (scope=[infer], consumer=[openclaw])
+  ✓ Added github_pat (scope=[git, publish], consumer=[openclaw])
+
+▸ 3. Start the Hestia daemon
+  ✓ Daemon listening on http://127.0.0.1:7714/mcp
+
+▸ 4. OpenClaw plugin connects to Hestia
+  ✓ session_id=1b119d4b-219e-4d1c-b091-e931816a22be
+  ✓ soft_lct=lct:web4:session:4e54ace083d9c0d1
+  ✓ role=citizen
+
+▸ 5. Run a realistic agent action sequence
+  · [Read /etc/hostname]  (low magnitude, read-only)
+  ✓ policy = allow (phase 1: default-allow (real policy engine in session 3))
+  · [vault_get anthropic_key]  (scoped to infer)
+  ✓ secret retrieved: sk-ant-d...
+  · [vault_get github_pat under infer scope]  (should be DENIED)
+  ✓ denied: code=hestia.vault_scope_mismatch (Credential 'github_pat' is not allowed under scope [] for this plugin.)
+  · [Bash 'echo hello']  (high magnitude)
+  ✓ policy = allow
+  · [Write /tmp/demo.txt]  (mutating, simulated failure)
+  ! recorded as FAILURE (trust takes a hit)
+  ✓ recorded 2 more Read successes
+
+▸ 6. Final state
+  witness chain: 6 entries
+  ──────────────────────────────────────────────────────────────────────────────
+  pos  event_type         detail                                   hash
+  ──────────────────────────────────────────────────────────────────────────────
+  0    session_started    plugin=openclaw role=citizen             353a00f41212...
+  1    outcome            Read → success                           07cc530b8c23...
+  2    outcome            Bash → success                           4f66ff372f3d...
+  3    outcome            Write → FAILURE                          f9c1cdc42cf4...
+  4    outcome            Read → success                           b164f10bb7ec...
+  5    outcome            Read → success                           506680106fdc...
+
+▸ 7. Trust state for the openclaw plugin
+  {
+    "actionCount": 5,
+    "daysSinceLast": 0,
+    "entityId": "plugin:openclaw",
+    "level": "medium",
+    "successCount": 4,
+    "successRate": 0.8,
+    "t3": {
+      "talent": 0.5010185273600001,
+      "temperament": 0.5016975456,
+      "training": 0.5033950912
+    },
+    "v3": {
+      "validity": 0.5,
+      "valuation": 0.55,
+      "veracity": 0.5
+    }
+  }
+
+▸ 8. Cross-agent shared context
+  {}
+
+✓ Demo complete
+  Persistent state at /tmp/hestia-demo-dAlKwC/
+  (witness.db is a vanilla sqlite file — open it with any sqlite tool)
