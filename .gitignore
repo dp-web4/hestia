@@ -1,0 +1,38 @@
+# Build artifacts
+target/
+node_modules/
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config
+.env
+.env.local
+*.local
+
+# Secrets (Hestia should manage these — never commit them here)
+*.pem
+*.key
+secrets/
+credentials/
+.pypirc
+.npmrc
+
+# Lockfiles for SDK packages — let consumers generate their own
+plugin-sdk/typescript/package-lock.json
+plugin-sdk/python/poetry.lock
+plugin-sdk/rust/Cargo.lock

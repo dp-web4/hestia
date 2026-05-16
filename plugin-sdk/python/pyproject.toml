@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hestia-plugin-sdk"
+version = "0.0.1"
+description = "Hestia Plugin Authoring Kit — author Hestia plugins for Python AI agents. Wraps R6/R7 record building, Soft LCT session identity, policy query, credential vault, and witness chain emission."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"
+authors = [{name = "dp-web4", email = "dp@metalinxx.io"}]
+keywords = ["hestia", "web4", "ai-agent", "plugin", "trust", "governance", "mcp"]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+]
+
+[project.urls]
+Homepage = "https://github.com/dp-web4/hestia"
+Documentation = "https://github.com/dp-web4/hestia/blob/main/docs/PLUGIN_AUTHORING_GUIDE.md"
+Repository = "https://github.com/dp-web4/hestia"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.5", "mypy>=1.10"]

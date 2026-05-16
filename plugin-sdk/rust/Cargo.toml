@@ -1,0 +1,22 @@
+[package]
+name = "hestia-plugin-sdk"
+version = "0.0.1"
+edition = "2021"
+authors = ["dp-web4 <dp@metalinxx.io>"]
+description = "Hestia Plugin Authoring Kit — author Hestia plugins for Rust AI agents. Wraps R6/R7 record building, Soft LCT session identity, policy query, credential vault, and witness chain emission."
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/dp-web4/hestia"
+documentation = "https://github.com/dp-web4/hestia/blob/main/docs/PLUGIN_AUTHORING_GUIDE.md"
+keywords = ["hestia", "web4", "ai-agent", "plugin", "mcp"]
+categories = ["api-bindings", "authentication"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+async-trait = "0.1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
