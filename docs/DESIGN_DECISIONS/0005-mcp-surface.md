@@ -271,7 +271,31 @@ Plugin                                Hestia
 
 ## Errors
 
-All Hestia tools return MCP-standard error responses (JSON-RPC error code + message + data). Hestia-specific error codes:
+Hestia tools surface errors via TWO mechanisms depending on the failure mode:
+
+### Mechanism A: typed-error envelope on the success path
+
+When a tool needs to signal a Hestia-specific error (vault miss, policy denial, action not found, etc.), it returns a JSON envelope of this shape on the success path of the call:
+
+```json
+{
+  "_hestia_error": {
+    "code": "hestia.vault_not_found",
+    "message": "Credential 'anthropic_api_key' not found",
+    "data": { "name": "anthropic_api_key" }
+  }
+}
+```
+
+The SDK detects `_hestia_error` in any tool result and raises the typed error class corresponding to `code`. This is the **primary error path** for tool-execution errors.
+
+**Why an envelope on the success path?** Both major MCP SDK implementations (TypeScript and Python) normalize tool exceptions into `isError=true` results when raised, dropping the `data` field that carries the typed error code. The envelope guarantees the code survives the wire, regardless of which language the server is implemented in.
+
+### Mechanism B: JSON-RPC protocol errors (rare for tools)
+
+Protocol-level failures (malformed requests, transport issues, auth failures) come back as standard JSON-RPC errors with a numeric code + optional `data`. If a JSON-RPC error happens to carry `data.code` starting with `hestia.`, the SDK maps it via the same code table. In practice this path is exercised mostly by initialize / capability negotiation issues.
+
+### Code table
 
 | Code | Meaning |
 |---|---|
@@ -283,6 +307,8 @@ All Hestia tools return MCP-standard error responses (JSON-RPC error code + mess
 | `hestia.vault_scope_mismatch` | Plugin not in allowed_consumers for this credential |
 | `hestia.action_not_found` | action_id doesn't reference a known action |
 | `hestia.invalid_role` | Requested role not available to plugins |
+| `hestia.invalid_response` | SDK couldn't parse a server response (defensive) |
+| `hestia.unknown_tool` | Server doesn't recognize the tool (version mismatch) |
 
 ## Transport
 
