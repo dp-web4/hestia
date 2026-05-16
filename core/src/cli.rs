@@ -46,6 +46,13 @@ enum Command {
         bind: String,
     },
 
+    /// Launch the terminal dashboard against a running daemon
+    Dashboard {
+        /// Daemon URL (default http://127.0.0.1:7711)
+        #[arg(long, default_value = "http://127.0.0.1:7711")]
+        endpoint: String,
+    },
+
     /// Vault subcommands
     #[command(subcommand)]
     Vault(VaultCmd),
@@ -96,6 +103,7 @@ pub fn run() -> AnyResult<()> {
         Command::Init { force } => cmd_init(&home, force),
         Command::Info => cmd_info(&home),
         Command::Serve { bind } => cmd_serve(&home, &bind),
+        Command::Dashboard { endpoint } => hestia_core::tui::run(&endpoint),
         Command::Vault(v) => match v {
             VaultCmd::List => cmd_vault_list(&home),
             VaultCmd::Get { name } => cmd_vault_get(&home, &name),

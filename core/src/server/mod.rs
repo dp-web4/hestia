@@ -3,10 +3,14 @@
 //! See `docs/DESIGN_DECISIONS/0005-mcp-surface.md` in the repo root for the
 //! tool / resource specification this server exposes.
 
+mod dashboard;
 mod handler;
 mod http;
 mod state;
 
+pub use dashboard::{
+    ActivityStats, DashboardSnapshot, RecentEntry, SocietyView, TrustView,
+};
 pub use handler::HestiaServer;
 pub use http::{serve, DEFAULT_BIND};
 pub use state::{ServerState, SharedState};

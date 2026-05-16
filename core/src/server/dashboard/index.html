@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Hestia</title>
+<style>
+  :root {
+    --bg: #0c0d10;
+    --bg-elev: #15171c;
+    --bg-elev-2: #1d2027;
+    --border: #2a2e38;
+    --fg: #e6e8ee;
+    --fg-dim: #9aa0ac;
+    --fg-faint: #5b6068;
+    --accent: #ff8b3d;       /* hearth-fire */
+    --accent-dim: #ff8b3d22;
+    --success: #4ade80;
+    --failure: #f87171;
+    --warning: #fbbf24;
+    --mono: ui-monospace, SF Mono, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+  }
+  body {
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    grid-template-areas: "header" "main" "footer";
+    gap: 0;
+  }
+
+  /* --- Header --- */
+  header {
+    grid-area: header;
+    padding: 1.25rem 2rem;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: linear-gradient(to bottom, var(--bg-elev), var(--bg));
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+  .brand h1 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+  .brand .flame {
+    display: inline-block;
+    width: 1.5rem;
+    height: 1.5rem;
+    background: var(--accent);
+    border-radius: 50%;
+    box-shadow: 0 0 24px var(--accent);
+    animation: flicker 3s ease-in-out infinite;
+  }
+  @keyframes flicker {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.85; transform: scale(0.95); }
+  }
+  .tagline {
+    color: var(--fg-dim);
+    font-size: 0.9rem;
+  }
+  .live {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+    color: var(--fg-dim);
+    font-variant-numeric: tabular-nums;
+  }
+  .live .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 8px var(--success);
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  /* --- Main --- */
+  main {
+    grid-area: main;
+    padding: 1.5rem 2rem;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+    max-width: 1400px;
+    margin: 0 auto;
+    width: 100%;
+  }
+  @media (min-width: 900px) {
+    main { grid-template-columns: 1fr 2fr; }
+    .stat-row { grid-column: 1 / -1; }
+  }
+
+  .stat-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 1rem;
+  }
+  .stat {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.25rem 1.5rem;
+  }
+  .stat .label {
+    font-size: 0.75rem;
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 0.5rem;
+  }
+  .stat .value {
+    font-family: var(--mono);
+    font-size: 2rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--fg);
+  }
+  .stat .delta {
+    font-size: 0.8rem;
+    color: var(--fg-dim);
+    margin-top: 0.25rem;
+  }
+  .stat.accent .value { color: var(--accent); }
+  .stat.success .value { color: var(--success); }
+
+  /* --- Cards --- */
+  .card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .card h2 {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--fg-dim);
+    padding: 1rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    font-weight: 600;
+  }
+  .card-body { padding: 1rem 1.25rem; }
+
+  /* --- Trust panel --- */
+  .trust-list { display: flex; flex-direction: column; gap: 1.25rem; }
+  .trust-item {
+    padding: 0.5rem 0;
+  }
+  .trust-item + .trust-item { border-top: 1px solid var(--border); padding-top: 1.25rem; }
+  .trust-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    margin-bottom: 0.75rem;
+  }
+  .trust-id {
+    font-family: var(--mono);
+    font-size: 1rem;
+    color: var(--fg);
+  }
+  .trust-level {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 0.2rem 0.6rem;
+    border-radius: 999px;
+    background: var(--accent-dim);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .tensor-row {
+    display: grid;
+    grid-template-columns: 4.5rem 1fr 3rem;
+    gap: 0.5rem;
+    align-items: center;
+    font-size: 0.8rem;
+    margin-bottom: 0.35rem;
+    font-family: var(--mono);
+  }
+  .tensor-row .name { color: var(--fg-dim); }
+  .tensor-row .val { color: var(--fg); text-align: right; font-variant-numeric: tabular-nums; }
+  .bar {
+    height: 6px;
+    background: var(--bg-elev-2);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .bar > div {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), #ffb070);
+    border-radius: 3px;
+    transition: width 600ms ease-out;
+  }
+  .trust-meta {
+    display: flex; gap: 1rem; margin-top: 0.5rem; font-size: 0.8rem; color: var(--fg-dim);
+  }
+  .trust-meta b { color: var(--fg); font-variant-numeric: tabular-nums; font-family: var(--mono); }
+
+  /* --- Chain feed --- */
+  .feed { max-height: 70vh; overflow-y: auto; }
+  .feed-row {
+    display: grid;
+    grid-template-columns: 4rem 7rem 1fr 4rem 9rem;
+    gap: 0.75rem;
+    align-items: center;
+    padding: 0.6rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    transition: background 200ms;
+  }
+  .feed-row:hover { background: var(--bg-elev-2); }
+  .feed-row.new { animation: flash-in 1200ms ease-out; }
+  @keyframes flash-in {
+    0% { background: var(--accent-dim); }
+    100% { background: transparent; }
+  }
+  .feed-pos { color: var(--fg-faint); font-variant-numeric: tabular-nums; }
+  .feed-event { color: var(--fg-dim); }
+  .feed-event.outcome { color: var(--fg); }
+  .feed-tool { color: var(--accent); font-weight: 500; }
+  .feed-detail { color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .feed-status {
+    text-align: center;
+    font-size: 0.75rem;
+    padding: 0.15rem 0;
+    border-radius: 4px;
+  }
+  .feed-status.ok { color: var(--success); }
+  .feed-status.fail { color: var(--failure); background: #f8717118; }
+  .feed-status.info { color: var(--fg-dim); }
+  .feed-hash { color: var(--fg-faint); font-size: 0.75rem; }
+
+  /* --- Right column composition --- */
+  .right-col { display: flex; flex-direction: column; gap: 1.5rem; }
+
+  /* --- Tool histogram --- */
+  .tool-list { display: flex; flex-direction: column; gap: 0.5rem; padding: 1rem 1.25rem; }
+  .tool-row {
+    display: grid;
+    grid-template-columns: 6rem 1fr 2.5rem;
+    gap: 0.75rem;
+    align-items: center;
+    font-family: var(--mono);
+    font-size: 0.85rem;
+  }
+  .tool-row .name { color: var(--fg-dim); }
+  .tool-row .bar > div { background: linear-gradient(90deg, var(--accent), #ffb070); }
+  .tool-row .count { text-align: right; font-variant-numeric: tabular-nums; }
+
+  /* --- Footer --- */
+  footer {
+    grid-area: footer;
+    padding: 0.75rem 2rem;
+    border-top: 1px solid var(--border);
+    color: var(--fg-faint);
+    font-size: 0.75rem;
+    font-family: var(--mono);
+    display: flex;
+    justify-content: space-between;
+    background: var(--bg-elev);
+  }
+  footer a { color: var(--accent); text-decoration: none; }
+
+  .empty {
+    padding: 2rem 1.25rem;
+    color: var(--fg-faint);
+    text-align: center;
+    font-size: 0.9rem;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="flame" aria-hidden="true"></span>
+      <h1>Hestia</h1>
+      <span class="tagline">local-first Web4 trust layer</span>
+    </div>
+    <div class="live">
+      <span class="dot"></span>
+      <span id="live-status">connecting…</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="stat-row" id="stats">
+      <div class="stat accent">
+        <div class="label">Witness chain</div>
+        <div class="value" id="stat-chain">—</div>
+        <div class="delta" id="stat-chain-delta">entries recorded</div>
+      </div>
+      <div class="stat">
+        <div class="label">Actions</div>
+        <div class="value" id="stat-actions">—</div>
+        <div class="delta" id="stat-actions-delta">tool calls witnessed</div>
+      </div>
+      <div class="stat success">
+        <div class="label">Success rate</div>
+        <div class="value" id="stat-rate">—</div>
+        <div class="delta" id="stat-rate-delta">across all plugins</div>
+      </div>
+      <div class="stat">
+        <div class="label">Last hour</div>
+        <div class="value" id="stat-hour">—</div>
+        <div class="delta">actions in trailing 60 min</div>
+      </div>
+    </section>
+
+    <section>
+      <div class="card">
+        <h2>Plugin trust</h2>
+        <div class="card-body">
+          <div class="trust-list" id="trust-list">
+            <div class="empty">No plugins recorded yet. Connect one to start building trust.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="right-col">
+      <div class="card">
+        <h2>Witness chain — live</h2>
+        <div class="feed" id="feed">
+          <div class="empty">Waiting for the first chain entry…</div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Tool histogram</h2>
+        <div class="tool-list" id="tool-list">
+          <div class="empty">No tool calls yet.</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div>
+      <span id="sov-lct">—</span>
+    </div>
+    <div>
+      <a href="https://github.com/dp-web4/hestia" target="_blank" rel="noopener">dp-web4/hestia</a>
+      ·
+      <span id="generated-at">—</span>
+    </div>
+  </footer>
+
+<script>
+(() => {
+  const REFRESH_MS = 2000;
+  const seen = new Set();
+  let first = true;
+
+  const fmt = {
+    int: n => (n ?? 0).toLocaleString(),
+    pct: f => (f * 100).toFixed(1) + '%',
+    bar: (f, clamp01 = true) => {
+      const v = clamp01 ? Math.max(0, Math.min(1, f)) : f;
+      return (v * 100).toFixed(1) + '%';
+    },
+    time: iso => {
+      if (!iso) return '—';
+      const t = new Date(iso);
+      return t.toLocaleTimeString();
+    },
+    short: s => (s ?? '').slice(0, 12),
+  };
+
+  const $ = id => document.getElementById(id);
+
+  function renderStats(s, society) {
+    $('stat-chain').textContent = fmt.int(society.chain_length);
+    $('stat-actions').textContent = fmt.int(s.total_actions);
+    $('stat-rate').textContent = s.total_actions === 0 ? '—' : fmt.pct(s.success_rate);
+    $('stat-rate-delta').textContent =
+      s.total_actions === 0
+        ? 'across all plugins'
+        : `${fmt.int(s.successful_actions)} ok · ${fmt.int(s.failed_actions)} fail`;
+    $('stat-hour').textContent = fmt.int(s.actions_last_hour);
+  }
+
+  function renderTrust(trust) {
+    const root = $('trust-list');
+    if (!trust.length) {
+      root.innerHTML = '<div class="empty">No plugins recorded yet. Connect one to start building trust.</div>';
+      return;
+    }
+    root.innerHTML = trust.map(t => `
+      <div class="trust-item">
+        <div class="trust-head">
+          <span class="trust-id">${escapeHtml(t.plugin_id)}</span>
+          <span class="trust-level">${escapeHtml(t.level)}</span>
+        </div>
+        ${tensorRow('Talent', t.t3_talent)}
+        ${tensorRow('Training', t.t3_training)}
+        ${tensorRow('Temper', t.t3_temperament)}
+        ${tensorRow('Veracity', t.v3_veracity)}
+        <div class="trust-meta">
+          <span>actions <b>${fmt.int(t.action_count)}</b></span>
+          <span>success <b>${t.action_count === 0 ? '—' : fmt.pct(t.success_rate)}</b></span>
+          <span>T3 avg <b>${(t.t3_average).toFixed(2)}</b></span>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  function tensorRow(name, value) {
+    return `
+      <div class="tensor-row">
+        <span class="name">${name}</span>
+        <div class="bar"><div style="width:${fmt.bar(value)}"></div></div>
+        <span class="val">${value.toFixed(2)}</span>
+      </div>
+    `;
+  }
+
+  function renderFeed(entries) {
+    const root = $('feed');
+    if (!entries.length) {
+      root.innerHTML = '<div class="empty">Waiting for the first chain entry…</div>';
+      return;
+    }
+    root.innerHTML = entries.map(e => {
+      const isNew = !seen.has(e.hash) && !first;
+      seen.add(e.hash);
+
+      let detail = '';
+      let status = '';
+      let statusClass = 'info';
+      let tool = '';
+
+      if (e.event_type === 'outcome') {
+        tool = e.tool_name || '?';
+        detail = e.target || '';
+        if (e.success === true) { status = 'ok'; statusClass = 'ok'; }
+        else if (e.success === false) { status = 'fail'; statusClass = 'fail'; }
+      } else if (e.event_type === 'session_started') {
+        tool = e.plugin_id || '';
+        detail = 'session_started';
+      } else if (e.event_type === 'vault_set') {
+        tool = 'vault';
+        detail = 'credential stored';
+      } else {
+        detail = e.event_type;
+      }
+
+      return `
+        <div class="feed-row${isNew ? ' new' : ''}">
+          <span class="feed-pos">#${e.chain_position}</span>
+          <span class="feed-event ${e.event_type}">${escapeHtml(e.event_type)}</span>
+          <span class="feed-detail" title="${escapeHtml(detail)}">
+            ${tool ? `<span class="feed-tool">${escapeHtml(tool)}</span> ` : ''}${escapeHtml(detail)}
+          </span>
+          <span class="feed-status ${statusClass}">${status}</span>
+          <span class="feed-hash">${fmt.short(e.hash)}…</span>
+        </div>
+      `;
+    }).join('');
+    first = false;
+  }
+
+  function renderHistogram(byTool, total) {
+    const root = $('tool-list');
+    if (!byTool.length) {
+      root.innerHTML = '<div class="empty">No tool calls yet.</div>';
+      return;
+    }
+    const max = byTool[0][1];
+    root.innerHTML = byTool.slice(0, 10).map(([name, count]) => `
+      <div class="tool-row">
+        <span class="name">${escapeHtml(name)}</span>
+        <div class="bar"><div style="width:${(count / max * 100).toFixed(1)}%"></div></div>
+        <span class="count">${count}</span>
+      </div>
+    `).join('');
+  }
+
+  function escapeHtml(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+  }
+
+  async function tick() {
+    try {
+      const res = await fetch('/api/dashboard', { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      renderStats(data.stats, data.society);
+      renderTrust(data.trust);
+      renderFeed(data.recent);
+      renderHistogram(data.stats.by_tool, data.stats.total_actions);
+      $('sov-lct').textContent = data.society.sovereign_lct;
+      $('generated-at').textContent = `updated ${fmt.time(data.generated_at)}`;
+      $('live-status').textContent = 'live';
+    } catch (err) {
+      $('live-status').textContent = `offline (${err.message})`;
+    }
+  }
+
+  tick();
+  setInterval(tick, REFRESH_MS);
+})();
+</script>
+</body>
+</html>

@@ -64,5 +64,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 web4-trust-core = { version = "0.2", features = ["file-store"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 
+# TUI dashboard
+ratatui = "0.28"
+crossterm = "0.28"
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+
 [dev-dependencies]
 tempfile = "3"

@@ -10,6 +10,7 @@
 pub mod error;
 pub mod server;
 pub mod storage;
+pub mod tui;
 pub mod vault;
 
 pub use error::{CoreError, Result};
