@@ -7,7 +7,7 @@ use anyhow::{Context, Result as AnyResult};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use hestia_core::vault::{default_hestia_home, vault_path, Vault, VaultEntry};
+use hestia::vault::{default_hestia_home, vault_path, Vault, VaultEntry};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -103,7 +103,7 @@ pub fn run() -> AnyResult<()> {
         Command::Init { force } => cmd_init(&home, force),
         Command::Info => cmd_info(&home),
         Command::Serve { bind } => cmd_serve(&home, &bind),
-        Command::Dashboard { endpoint } => hestia_core::tui::run(&endpoint),
+        Command::Dashboard { endpoint } => hestia::tui::run(&endpoint),
         Command::Vault(v) => match v {
             VaultCmd::List => cmd_vault_list(&home),
             VaultCmd::Get { name } => cmd_vault_get(&home, &name),
@@ -204,7 +204,7 @@ fn cmd_init(home: &std::path::Path, force: bool) -> AnyResult<()> {
 }
 
 fn cmd_serve(home: &std::path::Path, bind: &str) -> AnyResult<()> {
-    let path = hestia_core::vault::vault_path(home);
+    let path = hestia::vault::vault_path(home);
     if !path.exists() {
         anyhow::bail!(
             "no vault at {} — run `hestia init` first",
@@ -212,7 +212,7 @@ fn cmd_serve(home: &std::path::Path, bind: &str) -> AnyResult<()> {
         );
     }
     let passphrase = prompt_passphrase("Vault passphrase: ")?;
-    let vault = hestia_core::Vault::open(path, passphrase)?;
+    let vault = hestia::Vault::open(path, passphrase)?;
     println!("Vault unlocked. Starting Hestia MCP server on {bind}...");
 
     // Write endpoint discovery file so plugins can find us
@@ -222,12 +222,12 @@ fn cmd_serve(home: &std::path::Path, bind: &str) -> AnyResult<()> {
         tracing::warn!("failed to write endpoint discovery file: {e}");
     }
 
-    let state = hestia_core::server::build_state(vault, home)?;
+    let state = hestia::server::build_state(vault, home)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    runtime.block_on(hestia_core::server::serve(state, bind))?;
+    runtime.block_on(hestia::server::serve(state, bind))?;
 
     // Cleanup
     let _ = std::fs::remove_file(&endpoint_file);

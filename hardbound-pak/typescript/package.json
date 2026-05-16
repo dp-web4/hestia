@@ -1,0 +1,34 @@
+{
+  "name": "hardbound",
+  "version": "0.0.1",
+  "description": "Public interface surface for the hardware-bound enterprise trust tier of Web4. TypeScript interfaces an implementation must satisfy to anchor identity, vault, witness chain, and policy in TPM 2.0 / YubiKey / Secure Enclave hardware. The reference closed-source implementation lives at metalinxx.io; this package is the contract.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["trust", "tpm", "attestation", "web4", "hardbound"],
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dp-web4/hestia.git",
+    "directory": "hardbound-pak/typescript"
+  },
+  "homepage": "https://hestia.tools",
+  "author": "dp-web4 <dp@metalinxx.io>",
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

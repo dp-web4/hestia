@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hardbound"
+version = "0.0.1"
+description = "Public Protocol surface for the hardware-bound enterprise trust tier of Web4. Protocols an implementation must satisfy to anchor identity, vault, witness chain, and policy in TPM 2.0 / YubiKey / Secure Enclave hardware."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "dp-web4", email = "dp@metalinxx.io" }]
+keywords = ["trust", "tpm", "attestation", "web4", "hardbound"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://hestia.tools"
+Repository = "https://github.com/dp-web4/hestia"
+Documentation = "https://github.com/dp-web4/hestia/tree/main/hardbound-pak/python"
+
+[tool.setuptools.packages.find]
+include = ["hardbound*"]
+
+[tool.setuptools.package-data]
+hardbound = ["py.typed"]

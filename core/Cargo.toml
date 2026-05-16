@@ -1,5 +1,5 @@
 [package]
-name = "hestia-core"
+name = "hestia"
 version = "0.0.2"
 edition = "2021"
 authors = ["dp-web4 <dp@metalinxx.io>"]
@@ -12,7 +12,7 @@ categories = ["cryptography", "authentication", "command-line-utilities"]
 rust-version = "1.80"
 
 [lib]
-name = "hestia_core"
+name = "hestia"
 path = "src/lib.rs"
 
 [[bin]]

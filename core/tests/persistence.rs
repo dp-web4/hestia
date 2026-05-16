@@ -6,8 +6,8 @@
 use serde_json::json;
 use tempfile::TempDir;
 
-use hestia_core::server::ServerState;
-use hestia_core::Vault;
+use hestia::server::ServerState;
+use hestia::Vault;
 
 #[test]
 fn chain_and_trust_survive_daemon_restart() {
