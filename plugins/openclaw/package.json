@@ -1,0 +1,40 @@
+{
+  "name": "@hestia/plugin-openclaw",
+  "version": "0.0.1",
+  "description": "Hestia plugin for OpenClaw (formerly Moltbot). Thin observer that emits R6/R7 records to the user's Hestia instance.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": { "import": "./dist/index.js", "types": "./dist/index.d.ts" }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["hestia", "openclaw", "moltbot", "plugin", "web4"],
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dp-web4/hestia.git",
+    "directory": "plugins/openclaw"
+  },
+  "author": "dp-web4 <dp@metalinxx.io>",
+  "dependencies": {
+    "@hestia/plugin-sdk": "file:../../plugin-sdk/typescript"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "express": "^4.21.0",
+    "@types/express": "^4.17.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
