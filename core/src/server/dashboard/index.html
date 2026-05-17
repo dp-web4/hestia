@@ -207,6 +207,34 @@
     font-weight: 600;
   }
   .card-body { padding: 1rem 1.25rem; }
+  .card-head {
+    display: flex; justify-content: space-between; align-items: stretch;
+    border-bottom: 1px solid var(--border);
+  }
+  .card-head h2 { border-bottom: none; padding-right: 0.75rem; flex: 1; }
+  .feed-filter {
+    display: flex; gap: 0.25rem; align-items: center;
+    padding: 0.5rem 1rem;
+  }
+  .filter-btn {
+    background: transparent;
+    color: var(--fg-dim);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.25rem 0.75rem;
+    font-family: inherit;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    cursor: pointer;
+    transition: background 150ms, color 150ms, border-color 150ms;
+  }
+  .filter-btn:hover { color: var(--fg); border-color: var(--fg-dim); }
+  .filter-btn.selected {
+    background: var(--accent-dim);
+    color: var(--accent);
+    border-color: var(--accent);
+  }
 
   /* --- Trust panel --- */
   .trust-list { display: flex; flex-direction: column; gap: 1.25rem; }
@@ -402,7 +430,13 @@
 
     <section>
       <div class="card">
-        <h2 id="feed-title">Witness chain — live</h2>
+        <div class="card-head">
+          <h2 id="feed-title">Witness chain — live</h2>
+          <div class="feed-filter" role="group" aria-label="Filter chain entries">
+            <button type="button" class="filter-btn selected" data-filter="all">all</button>
+            <button type="button" class="filter-btn" data-filter="failed">failed</button>
+          </div>
+        </div>
         <div class="feed" id="feed">
           <div class="empty">Waiting for the first chain entry…</div>
         </div>
@@ -428,6 +462,7 @@
   let first = true;
   let selectedOrch = null; // currently-filtered orchestrator, or null = "all"
   let lastData = null;     // last snapshot, used to re-render on filter clicks without re-fetching
+  let feedFilter = 'all';  // 'all' | 'failed'
 
   const fmt = {
     int: n => (n ?? 0).toLocaleString(),
@@ -548,16 +583,27 @@
   function renderFeed(entries) {
     const root = $('feed');
     const title = $('feed-title');
-    const filtered = selectedOrch
+    let filtered = selectedOrch
       ? entries.filter(e => e.plugin_id === selectedOrch)
       : entries;
+    if (feedFilter === 'failed') {
+      // outcome rows with explicit success === false. Other event types
+      // don't carry success, so they're excluded from the failed view.
+      filtered = filtered.filter(e => e.event_type === 'outcome' && e.success === false);
+    }
     title.textContent = selectedOrch
       ? `Witness chain — live · ${selectedOrch}`
       : 'Witness chain — live';
     if (!filtered.length) {
-      root.innerHTML = selectedOrch
-        ? `<div class="empty">No recent chain entries for ${escapeHtml(selectedOrch)}.</div>`
-        : '<div class="empty">Waiting for the first chain entry…</div>';
+      const empty =
+        feedFilter === 'failed'
+          ? selectedOrch
+            ? `No failed entries for ${escapeHtml(selectedOrch)} in the recent window.`
+            : 'No failed entries in the recent window.'
+          : selectedOrch
+            ? `No recent chain entries for ${escapeHtml(selectedOrch)}.`
+            : 'Waiting for the first chain entry…';
+      root.innerHTML = `<div class="empty">${empty}</div>`;
       return;
     }
     root.innerHTML = filtered.map(e => {
@@ -670,6 +716,18 @@
       $('live-status').textContent = `offline (${err.message})`;
     }
   }
+
+  document.querySelectorAll('.feed-filter .filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const f = btn.dataset.filter;
+      if (f === feedFilter) return;
+      feedFilter = f;
+      document.querySelectorAll('.feed-filter .filter-btn').forEach(b => {
+        b.classList.toggle('selected', b.dataset.filter === feedFilter);
+      });
+      if (lastData) renderFeed(lastData.recent);
+    });
+  });
 
   tick();
   setInterval(tick, REFRESH_MS);
