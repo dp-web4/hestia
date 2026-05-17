@@ -1,0 +1,132 @@
+name: release
+
+# Builds prebuilt hestia binaries for the four primary targets and
+# attaches them to a GitHub Release. Trigger by pushing a tag matching
+# v*.*.* (e.g. v0.0.3). The dashboard HTML is baked into the binary
+# via include_str!, so the single executable is the entire artifact.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.0.3). Must already exist.'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build hestia
+        working-directory: core
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage artifacts (unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          STAGE="hestia-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/${STAGE}"
+          cp "core/target/${{ matrix.target }}/release/hestia" "dist/${STAGE}/"
+          cp README.md LICENSE "dist/${STAGE}/" 2>/dev/null || true
+          (cd dist && tar -czf "${STAGE}.tar.gz" "${STAGE}")
+          ls -la dist/
+
+      - name: Stage artifacts (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.inputs.tag || github.ref_name }}"
+          $stage = "hestia-$tag-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path "dist/$stage" | Out-Null
+          Copy-Item "core/target/${{ matrix.target }}/release/hestia.exe" "dist/$stage/"
+          if (Test-Path "README.md") { Copy-Item "README.md" "dist/$stage/" }
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" "dist/$stage/" }
+          Compress-Archive -Path "dist/$stage" -DestinationPath "dist/$stage.zip"
+          Get-ChildItem dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hestia-${{ matrix.target }}
+          path: |
+            dist/hestia-*.tar.gz
+            dist/hestia-*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          body: |
+            Prebuilt `hestia` daemon binaries for the four primary targets.
+
+            Install (Linux / macOS):
+            ```sh
+            curl -L https://github.com/dp-web4/hestia/releases/download/${{ github.event.inputs.tag || github.ref_name }}/hestia-${{ github.event.inputs.tag || github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz | tar -xz
+            ./hestia-${{ github.event.inputs.tag || github.ref_name }}-x86_64-unknown-linux-gnu/hestia --version
+            ```
+
+            The dashboard HTML is baked into the binary; nothing else is required to run.
+
+            Also available via `cargo install hestia` from crates.io.
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/hestia-*.tar.gz
+            dist/hestia-*.zip
