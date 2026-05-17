@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd user agent for the Hestia daemon on macOS.
+
+  Install: copy to ~/Library/LaunchAgents/io.hestia.tools.plist and
+  run `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.hestia.tools.plist`
+  (or just `launchctl load …` on older macOS).
+
+  The passphrase file lives at $HOME/.hestia/.passphrase (mode 600).
+  This is the consumer-tier security boundary; Hardbound replaces it
+  with Secure Enclave unsealing.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.hestia.tools</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>HESTIA_PASSPHRASE="$(cat $HOME/.hestia/.passphrase)" exec $HOME/.local/bin/hestia serve --bind 127.0.0.1:7711</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HESTIA_HOME</key>
+    <string>__HESTIA_HOME__</string>
+    <key>RUST_LOG</key>
+    <string>warn</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__HESTIA_HOME__/hestia.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HESTIA_HOME__/hestia.err</string>
+</dict>
+</plist>
