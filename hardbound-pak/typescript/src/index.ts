@@ -174,11 +174,33 @@ export interface PolicyAction {
   magnitude: number;
 }
 
-/** Policy verdict for a `PolicyAction`. */
+/**
+ * Policy verdict for a `PolicyAction`.
+ *
+ * As of presence-protocol v1, `deny`/`warn` carry both a stable `ruleId`
+ * (the canonical identifier) and a human-readable `ruleName`. The
+ * legacy `policyId` field is an alias of `ruleId` kept for v0 callers.
+ */
 export type PolicyDecision =
   | { kind: "allow" }
-  | { kind: "deny"; reason: string; policyId?: string }
-  | { kind: "warn"; reason: string; policyId?: string };
+  | {
+      kind: "deny";
+      reason: string;
+      ruleId?: string;
+      ruleName?: string;
+      /** v0 alias of `ruleId`. New code should read `ruleId`. */
+      policyId?: string;
+      /** Audit-trail constraint strings (`policy:`, `decision:`, `rule:`). */
+      constraints?: string[];
+    }
+  | {
+      kind: "warn";
+      reason: string;
+      ruleId?: string;
+      ruleName?: string;
+      policyId?: string;
+      constraints?: string[];
+    };
 
 /**
  * A policy engine. Implementations may be rule-based, model-based, or hybrid.

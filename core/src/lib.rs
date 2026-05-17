@@ -8,6 +8,7 @@
 //! - **Society state**: Web4 society with witness chain + trust evolution (after that)
 
 pub mod error;
+pub mod policy;
 pub mod server;
 pub mod storage;
 pub mod tui;

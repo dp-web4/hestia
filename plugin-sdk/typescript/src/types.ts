@@ -7,7 +7,7 @@
  */
 
 /** Protocol version this SDK targets. */
-export const HESTIA_PROTOCOL_VERSION = 0;
+export const HESTIA_PROTOCOL_VERSION = 1;
 
 /** Configuration when creating a Hestia client. */
 export interface HestiaClientConfig {
@@ -76,9 +76,16 @@ export type PolicyDecision = "allow" | "deny" | "warn";
 export interface PolicyResult {
   decision: PolicyDecision;
   reason: string;
+  /** Stable rule identifier (e.g. "deny-destructive-commands"). */
+  ruleId?: string;
+  /** Human-readable rule name. */
+  ruleName?: string;
+  /** v0 alias of `ruleId`. New code should read `ruleId`. */
   policyId?: string;
   /** False if Hestia is in dry-run mode (decision returned but not enforced). */
   enforced: boolean;
+  /** Audit-trail constraint strings (`policy:`, `decision:`, `rule:`). */
+  constraints?: string[];
 }
 
 /** Options for `hestia_vault_get`. */

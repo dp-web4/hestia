@@ -1,6 +1,6 @@
 [package]
 name = "hardbound"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 authors = ["dp-web4 <dp@metalinxx.io>"]
 description = "Hardbound — public trait surface for the enterprise hardware-bound trust tier of Web4. Implementations of these traits anchor identity, vault, witness chain, and policy in TPM 2.0 / YubiKey / Secure Enclave hardware. The reference closed-source implementation is at metalinxx.io; this crate is the contract any compatible implementation must satisfy."

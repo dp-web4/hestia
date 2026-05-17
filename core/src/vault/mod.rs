@@ -6,9 +6,11 @@
 
 pub mod crypto;
 pub mod entry;
+pub mod policy_state;
 pub mod storage;
 
 pub use entry::VaultEntry;
+pub use policy_state::{PolicyOverride, VaultPolicyState};
 pub use storage::{default_hestia_home, vault_path, VaultData};
 
 use std::path::PathBuf;
@@ -111,6 +113,27 @@ impl Vault {
 
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// Read the policy state stored inside the vault.
+    pub fn policy(&self) -> &VaultPolicyState {
+        &self.data.policy
+    }
+
+    /// Replace the vault's policy state and persist.
+    pub fn set_policy(&mut self, policy: VaultPolicyState) -> Result<()> {
+        self.data.policy = policy;
+        self.save()
+    }
+
+    /// Convenience: change just the active preset, keeping overrides + custom rules.
+    /// Returns `Err(CoreError::InvalidPreset)` if the preset isn't built-in.
+    pub fn set_active_preset(&mut self, preset_name: &str) -> Result<()> {
+        if !crate::policy::is_preset_name(preset_name) {
+            return Err(CoreError::InvalidPreset(preset_name.to_string()));
+        }
+        self.data.policy.active_preset = preset_name.to_string();
+        self.save()
     }
 }
 

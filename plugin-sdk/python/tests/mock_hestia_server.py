@@ -141,7 +141,7 @@ def _dispatch_tool(state: MockState, name: str, args: dict[str, Any]) -> dict[st
             "sessionId": sid,
             "softLct": soft_lct,
             "assignedRole": role,
-            "protocolVersion": 0,
+            "protocolVersion": 1,
         }
 
     if name == "hestia_begin_action":

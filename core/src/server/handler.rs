@@ -214,7 +214,7 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         "sessionId": session_id,
         "softLct": soft_lct,
         "assignedRole": requested_role,
-        "protocolVersion": 0,
+        "protocolVersion": 1,
     }))
 }
 
@@ -222,6 +222,7 @@ async fn tool_begin_action(state: &SharedState, args: &Value) -> ToolResult {
     let tool_name = require_string(args, "tool_name")?;
     let target = optional_string(args, "target");
     let session_id_arg = optional_string(args, "session_id");
+    let parameters = args.get("parameters").cloned();
 
     let mut s = state.lock().await;
     let action_id = Uuid::new_v4();
@@ -238,6 +239,7 @@ async fn tool_begin_action(state: &SharedState, args: &Value) -> ToolResult {
             session_id,
             tool_name: tool_name.clone(),
             target,
+            parameters,
             started_at,
             chain_position,
         },
@@ -305,17 +307,53 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     let action_id = Uuid::parse_str(&action_id_str)
         .map_err(|_| anyhow::anyhow!("invalid action_id"))?;
     let s = state.lock().await;
-    if !s.actions.contains_key(&action_id) {
-        return Ok(hestia_error_envelope(
-            "hestia.action_not_found",
-            &format!("Action {} not found", action_id),
-            Some(json!({"action_id": action_id_str})),
-        ));
-    }
+    let action = match s.actions.get(&action_id) {
+        Some(a) => a.clone(),
+        None => {
+            return Ok(hestia_error_envelope(
+                "hestia.action_not_found",
+                &format!("Action {} not found", action_id),
+                Some(json!({"action_id": action_id_str})),
+            ));
+        }
+    };
+
+    // Build a PolicyAction from the in-flight action + classify the tool.
+    // For Bash/Shell, the rule conventions (legacy safety preset) treat
+    // `target_patterns` like `rm\s+-` as full-command regexes. So for
+    // shell tools we substitute the full command as the target (if we
+    // have it) — keeping consistency with the Python reference's
+    // observed behavior. For other tools, `target` is the file/url/etc.
+    // captured at begin_action time.
+    let full_command_owned: Option<String> = action
+        .parameters
+        .as_ref()
+        .and_then(|p| p.get("command"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let full_command: Option<&str> = full_command_owned.as_deref();
+    let target: Option<&str> = if action.tool_name == "Bash" || action.tool_name == "Shell" {
+        full_command.or_else(|| action.target.as_deref())
+    } else {
+        action.target.as_deref()
+    };
+    let category = crate::policy::classify(&action.tool_name);
+    let pa = crate::policy::PolicyAction {
+        tool_name: &action.tool_name,
+        category,
+        target,
+        full_command,
+    };
+
+    let evaluation = s.policy_engine.evaluate(&pa);
     Ok(json!({
-        "decision": "allow",
-        "reason": "phase 1: default-allow (real policy engine in session 3)",
-        "enforced": true,
+        "decision": evaluation.decision.as_str(),
+        "reason": evaluation.reason,
+        "ruleId": evaluation.rule_id,
+        "ruleName": evaluation.rule_name,
+        "policyId": evaluation.rule_id, // alias kept for backward compat with v0 SDKs
+        "enforced": evaluation.enforced,
+        "constraints": evaluation.constraints,
     }))
 }
 

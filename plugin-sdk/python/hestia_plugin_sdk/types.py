@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 #: Protocol version this SDK targets.
-HESTIA_PROTOCOL_VERSION: int = 0
+HESTIA_PROTOCOL_VERSION: int = 1
 
 #: Policy decision returned by `query_policy`.
 PolicyDecision = Literal["allow", "deny", "warn"]
@@ -101,8 +101,12 @@ class OutcomeResult:
 class PolicyResult:
     decision: PolicyDecision
     reason: str
+    rule_id: str | None = None
+    rule_name: str | None = None
+    #: v0 alias of `rule_id`. New code should read `rule_id`.
     policy_id: str | None = None
     enforced: bool = True
+    constraints: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

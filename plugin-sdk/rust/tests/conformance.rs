@@ -207,6 +207,11 @@ async fn invoke_step(
             if let Some(s) = input.get("atp_stake").and_then(Value::as_f64) {
                 spec.atp_stake = Some(s);
             }
+            if let Some(params) = input.get("parameters").and_then(Value::as_object) {
+                for (k, v) in params {
+                    spec.parameters.insert(k.clone(), v.clone());
+                }
+            }
             let action = client.begin_action(spec).await.expect("begin_action");
             json!({
                 "actionId": action.action_id.to_string(),

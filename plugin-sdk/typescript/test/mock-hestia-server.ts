@@ -96,7 +96,7 @@ export async function startMockHestiaServer(port = 0): Promise<MockServerHandle>
         const pluginId = (args.plugin_id as string) ?? "unknown";
         const assignedRole = (args.requested_role as string) ?? "citizen";
         state.sessions.set(sessionId, { pluginId, assignedRole, softLct });
-        return respond({ sessionId, softLct, assignedRole, protocolVersion: 0 });
+        return respond({ sessionId, softLct, assignedRole, protocolVersion: 1 });
       }
 
       case "hestia_begin_action": {

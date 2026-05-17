@@ -22,6 +22,11 @@ pub struct PolicyAction {
 }
 
 /// Policy verdict for a [`PolicyAction`].
+///
+/// As of presence-protocol v1, `Deny` and `Warn` carry both a stable
+/// `rule_id` (the canonical identifier — e.g. `"deny-destructive-commands"`)
+/// AND a human-readable `rule_name`. The legacy `policy_id` field
+/// remains as an alias of `rule_id` for v0 callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyDecision {
     /// Caller should proceed.
@@ -32,9 +37,13 @@ pub enum PolicyDecision {
     Deny {
         /// Human-readable explanation.
         reason: String,
-        /// Stable identifier for the rule that fired, useful for
-        /// log/audit correlation.
-        policy_id: Option<String>,
+        /// Stable identifier for the rule that fired (e.g.
+        /// `"deny-destructive-commands"`).
+        rule_id: Option<String>,
+        /// Human-readable rule name (e.g. `"Block destructive shell commands"`).
+        rule_name: Option<String>,
+        /// Audit-trail constraint strings (`policy:`, `decision:`, `rule:`).
+        constraints: Vec<String>,
     },
 
     /// Caller may proceed but the user should see a warning first.
@@ -43,7 +52,11 @@ pub enum PolicyDecision {
         /// Human-readable explanation.
         reason: String,
         /// Stable identifier for the rule that fired.
-        policy_id: Option<String>,
+        rule_id: Option<String>,
+        /// Human-readable rule name.
+        rule_name: Option<String>,
+        /// Audit-trail constraint strings.
+        constraints: Vec<String>,
     },
 }
 

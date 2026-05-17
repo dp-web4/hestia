@@ -1,6 +1,6 @@
 [package]
 name = "hestia"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 authors = ["dp-web4 <dp@metalinxx.io>"]
 description = "Hestia — local-first Web4 trust layer for AI agents. The core daemon: credential vault, MCP server, society state, witness chain."
@@ -68,6 +68,11 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 ratatui = "0.28"
 crossterm = "0.28"
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+
+# Policy engine
+regex = "1"
+globset = "0.4"
+chrono-tz = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

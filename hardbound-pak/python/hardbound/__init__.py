@@ -23,12 +23,15 @@ from .protocols import (
     HardboundError,
     OversightPolicy,
     PolicyAction,
+    PolicyAllow,
     PolicyDecision,
+    PolicyDeny,
+    PolicyWarn,
     SealedVault,
     TrustedKeyProvider,
 )
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 __all__ = [
     "Attestation",
@@ -36,7 +39,10 @@ __all__ = [
     "HardboundError",
     "OversightPolicy",
     "PolicyAction",
+    "PolicyAllow",
     "PolicyDecision",
+    "PolicyDeny",
+    "PolicyWarn",
     "SealedVault",
     "TrustedKeyProvider",
     "__version__",

@@ -1,6 +1,6 @@
 {
   "name": "hardbound",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Public interface surface for the hardware-bound enterprise trust tier of Web4. TypeScript interfaces an implementation must satisfy to anchor identity, vault, witness chain, and policy in TPM 2.0 / YubiKey / Secure Enclave hardware. The reference closed-source implementation lives at metalinxx.io; this package is the contract.",
   "type": "module",
   "main": "dist/index.js",

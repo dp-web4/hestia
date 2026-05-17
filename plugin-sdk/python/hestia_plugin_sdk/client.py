@@ -190,8 +190,11 @@ class HestiaClient:
         return PolicyResult(
             decision=result["decision"],
             reason=result["reason"],
+            rule_id=result.get("ruleId") or result.get("policyId"),
+            rule_name=result.get("ruleName"),
             policy_id=result.get("policyId"),
             enforced=bool(result.get("enforced", True)),
+            constraints=list(result.get("constraints") or []),
         )
 
     # ----------------------------------------------------------- vault ----

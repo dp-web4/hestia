@@ -7,8 +7,8 @@ inherit from these classes explicitly.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal, Optional, Protocol, Union, runtime_checkable
+from dataclasses import dataclass, field
+from typing import List, Literal, Optional, Protocol, Union, runtime_checkable
 
 __all__ = [
     "Attestation",
@@ -155,10 +155,18 @@ class PolicyAllow:
 
 @dataclass(frozen=True)
 class PolicyDeny:
-    """Caller should NOT proceed."""
+    """Caller should NOT proceed.
+
+    As of presence-protocol v1, `rule_id` is the stable rule identifier
+    and `rule_name` the human-readable name. `policy_id` is an alias
+    of `rule_id` kept for v0 callers.
+    """
 
     reason: str
+    rule_id: Optional[str] = None
+    rule_name: Optional[str] = None
     policy_id: Optional[str] = None
+    constraints: List[str] = field(default_factory=list)
     kind: Literal["deny"] = "deny"
 
 
@@ -170,7 +178,10 @@ class PolicyWarn:
     """
 
     reason: str
+    rule_id: Optional[str] = None
+    rule_name: Optional[str] = None
     policy_id: Optional[str] = None
+    constraints: List[str] = field(default_factory=list)
     kind: Literal["warn"] = "warn"
 
 

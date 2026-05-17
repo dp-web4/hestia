@@ -122,4 +122,4 @@ async def test_full_lifecycle(hestia_url):
 
 async def test_protocol_version_constant():
     """Sanity: SDK exports the protocol version it targets."""
-    assert HESTIA_PROTOCOL_VERSION == 0
+    assert HESTIA_PROTOCOL_VERSION == 1

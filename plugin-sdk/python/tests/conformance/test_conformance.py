@@ -219,8 +219,11 @@ async def invoke_step(client, step, captures):
         return {
             "decision": result.decision,
             "reason": result.reason,
+            "ruleId": result.rule_id,
+            "ruleName": result.rule_name,
             "policyId": result.policy_id,
             "enforced": result.enforced,
+            "constraints": result.constraints,
         }
     if tool == "hestia_vault_get":
         try:

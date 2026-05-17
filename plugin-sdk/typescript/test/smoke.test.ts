@@ -43,7 +43,7 @@ describe("Hestia SDK — end-to-end against mock server", () => {
     expect(result.sessionId).toMatch(/[0-9a-f-]{36}/);
     expect(result.softLct).toMatch(/^lct:web4:session:/);
     expect(result.assignedRole).toBe("citizen");
-    expect(result.protocolVersion).toBe(0);
+    expect(result.protocolVersion).toBe(1);
   });
 
   it("begins an action and gets an action handle", async () => {

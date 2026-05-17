@@ -31,19 +31,29 @@ const VERSION: u8 = 1;
 const HEADER_LEN: usize = 4 + 1 + 16 + 12; // = 33
 
 /// The cleartext contents of the vault — serialized to JSON, then encrypted on disk.
+///
+/// **Schema versions**
+/// - v1: `{ version, created_at, entries }`
+/// - v2: adds `policy: VaultPolicyState`. The field is `#[serde(default)]`
+///   so v1 vaults deserialize transparently with a default policy
+///   (active_preset = "safety", no overrides, no custom rules). On
+///   the next save, the file is rewritten with v2 layout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultData {
     pub version: u32,
     pub created_at: DateTime<Utc>,
     pub entries: Vec<VaultEntry>,
+    #[serde(default)]
+    pub policy: super::policy_state::VaultPolicyState,
 }
 
 impl Default for VaultData {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             created_at: Utc::now(),
             entries: Vec::new(),
+            policy: super::policy_state::VaultPolicyState::default(),
         }
     }
 }

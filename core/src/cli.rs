@@ -56,6 +56,33 @@ enum Command {
     /// Vault subcommands
     #[command(subcommand)]
     Vault(VaultCmd),
+
+    /// Policy subcommands
+    #[command(subcommand)]
+    Policy(PolicyCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyCmd {
+    /// Show the active preset and its resolved rules
+    Show,
+
+    /// Change the active preset (writes to vault)
+    Set {
+        /// Preset name: permissive | safety | strict | audit-only
+        preset: String,
+    },
+
+    /// List all available built-in presets
+    List,
+
+    /// Dry-run evaluate a hypothetical action against the active preset
+    Test {
+        /// Tool name (e.g. "Bash", "Read", "Write")
+        tool: String,
+        /// Target (file path, URL, or for Bash, the full command)
+        target: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -114,6 +141,12 @@ pub fn run() -> AnyResult<()> {
                 allowed_consumers,
             } => cmd_vault_add(&home, &name, scope, tag, allowed_consumers),
             VaultCmd::Remove { name } => cmd_vault_remove(&home, &name),
+        },
+        Command::Policy(p) => match p {
+            PolicyCmd::Show => cmd_policy_show(&home),
+            PolicyCmd::List => cmd_policy_list(),
+            PolicyCmd::Set { preset } => cmd_policy_set(&home, &preset),
+            PolicyCmd::Test { tool, target } => cmd_policy_test(&home, &tool, &target),
         },
     }
 }
@@ -318,4 +351,129 @@ fn open_vault(home: &std::path::Path) -> AnyResult<Vault> {
     let passphrase = prompt_passphrase("Vault passphrase: ")?;
     let vault = Vault::open(path, passphrase)?;
     Ok(vault)
+}
+
+// ---- policy commands ------------------------------------------------------
+
+fn cmd_policy_show(home: &std::path::Path) -> AnyResult<()> {
+    let vault = open_vault(home)?;
+    let state = vault.policy();
+    println!("active preset: {}", state.active_preset);
+
+    if let Some(preset) = hestia::policy::get_preset(&state.active_preset) {
+        println!("description:   {}", preset.description);
+        println!(
+            "default:       {}  (enforce: {})",
+            preset.config.default_policy.as_str(),
+            preset.config.enforce
+        );
+    } else {
+        println!("(preset '{}' is unknown — daemon will fall back to safety)", state.active_preset);
+    }
+
+    let resolved = state.resolve().unwrap_or_else(|| {
+        hestia::policy::get_preset("safety").unwrap().config
+    });
+    println!("\nrules ({} total, after overrides):", resolved.rules.len());
+    let mut sorted = resolved.rules.clone();
+    sorted.sort_by_key(|r| r.priority);
+    for r in &sorted {
+        println!(
+            "  [{:>3}] {:6}  {:32}  {}",
+            r.priority,
+            r.decision.as_str(),
+            r.id,
+            r.name
+        );
+    }
+
+    if !state.overrides.is_empty() {
+        println!("\noverrides ({}):", state.overrides.len());
+        for (id, ov) in &state.overrides {
+            let mut bits = Vec::new();
+            if let Some(d) = ov.decision {
+                bits.push(format!("decision={}", d.as_str()));
+            }
+            if let Some(enabled) = ov.enabled {
+                bits.push(format!("enabled={enabled}"));
+            }
+            println!("  {} → {}", id, bits.join(", "));
+        }
+    }
+    if !state.custom_rules.is_empty() {
+        println!("\ncustom rules: {}", state.custom_rules.len());
+    }
+    Ok(())
+}
+
+fn cmd_policy_list() -> AnyResult<()> {
+    println!("Built-in presets:\n");
+    for p in hestia::policy::list_presets() {
+        println!(
+            "  {:12}  {}\n               {} rule(s), default={}, enforce={}",
+            p.name,
+            p.description,
+            p.config.rules.len(),
+            p.config.default_policy.as_str(),
+            p.config.enforce
+        );
+    }
+    Ok(())
+}
+
+fn cmd_policy_set(home: &std::path::Path, preset: &str) -> AnyResult<()> {
+    if !hestia::policy::is_preset_name(preset) {
+        anyhow::bail!(
+            "unknown preset: '{preset}' (expected one of: {})",
+            hestia::policy::PRESET_NAMES.join(", ")
+        );
+    }
+    let mut vault = open_vault(home)?;
+    vault.set_active_preset(preset)?;
+    println!("✓ active preset set to '{preset}'");
+    println!("  (a running daemon won't pick this up until restart)");
+    Ok(())
+}
+
+fn cmd_policy_test(
+    home: &std::path::Path,
+    tool: &str,
+    target: &str,
+) -> AnyResult<()> {
+    use hestia::policy::{PolicyAction, PolicyEngine};
+
+    let vault = open_vault(home)?;
+    let cfg = vault
+        .policy()
+        .resolve()
+        .unwrap_or_else(|| hestia::policy::get_preset("safety").unwrap().config);
+    let engine = PolicyEngine::new(cfg);
+
+    let category = hestia::policy::classify(tool);
+    // For Bash/Shell, the user-supplied "target" IS the full command.
+    // We pass the full command as both `target` (so target_patterns
+    // like `rm\s+-` match) and as `full_command` (so command_patterns
+    // match). For non-shell tools, target is the file path / URL.
+    let full_command: Option<&str> = if tool == "Bash" || tool == "Shell" {
+        Some(target)
+    } else {
+        None
+    };
+    let pa = PolicyAction {
+        tool_name: tool,
+        category,
+        target: Some(target),
+        full_command,
+    };
+    let v = engine.evaluate(&pa);
+    println!("decision:  {}", v.decision.as_str());
+    println!("reason:    {}", v.reason);
+    println!("ruleId:    {}", v.rule_id.as_deref().unwrap_or("(default)"));
+    println!("ruleName:  {}", v.rule_name.as_deref().unwrap_or("(default)"));
+    println!("enforced:  {}", v.enforced);
+    println!("constraints:");
+    for c in &v.constraints {
+        println!("  - {c}");
+    }
+    Ok(())
 }

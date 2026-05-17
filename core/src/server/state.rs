@@ -42,6 +42,10 @@ pub struct InFlightAction {
     pub session_id: Uuid,
     pub tool_name: String,
     pub target: Option<String>,
+    /// Raw tool input arguments captured at begin_action time. Used by
+    /// query_policy to match against `command_patterns` and similar
+    /// rules that need the full call context.
+    pub parameters: Option<serde_json::Value>,
     pub started_at: DateTime<Utc>,
     pub chain_position: u64,
 }
@@ -55,6 +59,7 @@ pub struct ServerState {
     pub trust_store: TrustStore,
     pub sovereign_lct: String,
     pub shared_context: serde_json::Map<String, serde_json::Value>,
+    pub policy_engine: crate::policy::PolicyEngine,
 }
 
 impl ServerState {
@@ -63,6 +68,13 @@ impl ServerState {
         let chain_store = SqliteChainStore::open(home.join("witness.db"))?;
         let trust_store = TrustStore::open(home.join("trust"))?;
         let sovereign_lct = "lct:web4:hestia:sovereign:phase1-placeholder".to_string();
+        // Resolve the active policy from the vault. Falls back to the
+        // safety preset if the vault's named preset isn't built-in.
+        let policy_config = vault
+            .policy()
+            .resolve()
+            .unwrap_or_else(|| crate::policy::get_preset("safety").unwrap().config);
+        let policy_engine = crate::policy::PolicyEngine::new(policy_config);
         Ok(Self {
             vault,
             sessions: HashMap::new(),
@@ -71,7 +83,19 @@ impl ServerState {
             trust_store,
             sovereign_lct,
             shared_context: serde_json::Map::new(),
+            policy_engine,
         })
+    }
+
+    /// Re-build the policy engine from the vault's current state. Call
+    /// after `vault.set_active_preset` or any policy mutation.
+    pub fn reload_policy(&mut self) {
+        let config = self
+            .vault
+            .policy()
+            .resolve()
+            .unwrap_or_else(|| crate::policy::get_preset("safety").unwrap().config);
+        self.policy_engine = crate::policy::PolicyEngine::new(config);
     }
 
     /// Issue a Soft LCT for a new session.

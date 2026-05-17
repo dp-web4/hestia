@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Protocol version this SDK targets.
-pub const HESTIA_PROTOCOL_VERSION: u32 = 0;
+pub const HESTIA_PROTOCOL_VERSION: u32 = 1;
 
 /// Configuration for a `HestiaClient`.
 #[derive(Debug, Clone)]
@@ -133,10 +133,25 @@ pub enum PolicyDecision {
 pub struct PolicyResult {
     pub decision: PolicyDecision,
     pub reason: String,
+    /// Stable identifier for the rule that fired (e.g.
+    /// `"deny-destructive-commands"`). `None` when no rule matched
+    /// and the default policy applied.
     #[serde(default)]
+    pub rule_id: Option<String>,
+    /// Human-readable rule name. `None` for default-policy decisions.
+    #[serde(default)]
+    pub rule_name: Option<String>,
+    /// Aliased view of `rule_id`. Kept for v0 SDK back-compat — new
+    /// code should read `rule_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_id: Option<String>,
+    /// `False` if Hestia is in dry-run mode (decision returned but not enforced).
     #[serde(default = "default_true")]
     pub enforced: bool,
+    /// Audit-trail constraint strings (`policy:`, `decision:`, `rule:`).
+    /// Always at least three entries when the field is present.
+    #[serde(default)]
+    pub constraints: Vec<String>,
 }
 
 fn default_true() -> bool {

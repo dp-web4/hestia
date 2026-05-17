@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hestia-plugin-sdk"
-version = "0.0.2"
+version = "0.0.3"
 description = "Hestia Plugin Authoring Kit (Python) — author Hestia plugins for Python AI agents. Wraps R6/R7 record building, Soft LCT session identity, policy query, credential vault, and witness chain emission."
 readme = "README.md"
 requires-python = ">=3.10"
