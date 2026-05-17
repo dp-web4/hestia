@@ -107,6 +107,18 @@ class HestiaClient:
             protocol_version=int(result["protocolVersion"]),
         )
         self._connect_result = connect_result
+
+        # Warn (don't fail) on protocol version mismatch — forward compat is
+        # preferred over hard failure. See presence-protocol.md §2.
+        if connect_result.protocol_version != HESTIA_PROTOCOL_VERSION:
+            import warnings
+
+            warnings.warn(
+                f"presence protocol version mismatch: SDK expects v{HESTIA_PROTOCOL_VERSION}, "
+                f"daemon reports v{connect_result.protocol_version}. Continuing anyway.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return connect_result
 
     async def disconnect(self) -> None:
@@ -153,6 +165,7 @@ class HestiaClient:
         )
         ts = result["updatedTrustState"]
         trust = TrustState(
+            entity_id=str(ts.get("entityId", "")),
             t3_talent=ts["t3"]["talent"],
             t3_training=ts["t3"]["training"],
             t3_temperament=ts["t3"]["temperament"],
@@ -161,6 +174,8 @@ class HestiaClient:
             v3_validity=ts["v3"]["validity"],
             level=ts["level"],
             action_count=int(ts["actionCount"]),
+            success_count=int(ts.get("successCount", 0)),
+            success_rate=float(ts.get("successRate", 0.0)),
             days_since_last=float(ts["daysSinceLast"]),
         )
         return OutcomeResult(witness_entry_hash=result["witnessEntryHash"], updated_trust_state=trust)
@@ -249,6 +264,7 @@ class HestiaClient:
             f"hestia://society/trust/{self.config.plugin_id}"
         )
         return TrustState(
+            entity_id=str(result.get("entityId", "")),
             t3_talent=result["t3"]["talent"],
             t3_training=result["t3"]["training"],
             t3_temperament=result["t3"]["temperament"],
@@ -257,6 +273,8 @@ class HestiaClient:
             v3_validity=result["v3"]["validity"],
             level=result["level"],
             action_count=int(result["actionCount"]),
+            success_count=int(result.get("successCount", 0)),
+            success_rate=float(result.get("successRate", 0.0)),
             days_since_last=float(result["daysSinceLast"]),
         )
 

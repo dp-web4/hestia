@@ -137,10 +137,13 @@ export async function startMockHestiaServer(port = 0): Promise<MockServerHandle>
         return respond({
           witnessEntryHash: hash,
           updatedTrustState: {
+            entityId: "plugin:smoke",
             t3: { talent: 0.55, training: 0.6, temperament: 0.5 },
             v3: { valuation: 0.5, veracity: 0.55, validity: 0.5 },
             level: "medium",
             actionCount: state.chain.length,
+            successCount: state.chain.length,
+            successRate: 1.0,
             daysSinceLast: 0,
           },
         });
@@ -225,16 +228,20 @@ export async function startMockHestiaServer(port = 0): Promise<MockServerHandle>
       };
     }
     if (uri.startsWith("hestia://society/trust/")) {
+      const pluginId = uri.split("/").pop() ?? "";
       return {
         contents: [
           {
             uri,
             mimeType: "application/json",
             text: JSON.stringify({
+              entityId: `plugin:${pluginId}`,
               t3: { talent: 0.5, training: 0.5, temperament: 0.5 },
               v3: { valuation: 0.5, veracity: 0.5, validity: 0.5 },
               level: "medium",
               actionCount: 0,
+              successCount: 0,
+              successRate: 0.5,
               daysSinceLast: 0,
             }),
           },

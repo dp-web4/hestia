@@ -180,10 +180,17 @@ pub struct V3Roots {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrustState {
+    /// Web4 entity id (e.g. "plugin:claude-code"). Carries the entity-type prefix.
+    #[serde(default)]
+    pub entity_id: String,
     pub t3: T3Roots,
     pub v3: V3Roots,
     pub level: String,
     pub action_count: u64,
+    #[serde(default)]
+    pub success_count: u64,
+    #[serde(default)]
+    pub success_rate: f64,
     pub days_since_last: f64,
 }
 

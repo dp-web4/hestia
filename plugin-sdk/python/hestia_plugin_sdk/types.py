@@ -71,6 +71,13 @@ class Outcome:
 
 @dataclass(frozen=True)
 class TrustState:
+    """Trust state for a single agent — flat-shape for Python ergonomics.
+
+    The wire format is nested (`{t3: {talent, training, temperament}, v3: ...}`,
+    see presence-protocol.md §5.5). The SDK flattens on deserialization.
+    """
+    # entity_id is `plugin:<id>` or similar — carries the Web4 entity-type prefix.
+    entity_id: str
     t3_talent: float
     t3_training: float
     t3_temperament: float
@@ -79,6 +86,8 @@ class TrustState:
     v3_validity: float
     level: str
     action_count: int
+    success_count: int
+    success_rate: float
     days_since_last: float
 
 

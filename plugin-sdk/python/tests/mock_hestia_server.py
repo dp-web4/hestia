@@ -102,12 +102,16 @@ def _make_server(state: MockState) -> Server:
         if uri_str == "hestia://context/shared":
             return json.dumps({"currentProject": "hestia-smoke-test"})
         if uri_str.startswith("hestia://society/trust/"):
+            plugin_id = uri_str.split("/")[-1]
             return json.dumps(
                 {
+                    "entityId": f"plugin:{plugin_id}",
                     "t3": {"talent": 0.5, "training": 0.5, "temperament": 0.5},
                     "v3": {"valuation": 0.5, "veracity": 0.5, "validity": 0.5},
                     "level": "medium",
                     "actionCount": 0,
+                    "successCount": 0,
+                    "successRate": 0.5,
                     "daysSinceLast": 0,
                 }
             )
@@ -165,10 +169,13 @@ def _dispatch_tool(state: MockState, name: str, args: dict[str, Any]) -> dict[st
         return {
             "witnessEntryHash": h,
             "updatedTrustState": {
+                "entityId": "plugin:smoke",
                 "t3": {"talent": 0.55, "training": 0.6, "temperament": 0.5},
                 "v3": {"valuation": 0.5, "veracity": 0.55, "validity": 0.5},
                 "level": "medium",
                 "actionCount": len(state.chain),
+                "successCount": len(state.chain) if args["success"] else max(0, len(state.chain) - 1),
+                "successRate": 1.0 if args["success"] else 0.5,
                 "daysSinceLast": 0,
             },
         }

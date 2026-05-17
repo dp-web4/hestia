@@ -83,6 +83,18 @@ export class HestiaClient {
       protocolVersion: result.protocolVersion,
     };
 
+    // Warn (don't fail) on protocol version mismatch — forward compat is
+    // preferred over hard failure. See web4-standard/core-spec/presence-protocol.md §2.
+    if (
+      typeof result.protocolVersion === "number" &&
+      result.protocolVersion !== HESTIA_PROTOCOL_VERSION
+    ) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[hestia-sdk] presence protocol version mismatch: SDK expects v${HESTIA_PROTOCOL_VERSION}, daemon reports v${result.protocolVersion}. Continuing anyway.`,
+      );
+    }
+
     return result;
   }
 

@@ -103,6 +103,8 @@ export interface VaultSetOptions {
 
 /** Trust state for a single agent (this plugin's own, or another's). */
 export interface TrustState {
+  /** Web4 entity id (e.g. "plugin:claude-code"). Carries the entity-type prefix. */
+  entityId: string;
   t3: {
     talent: number;
     training: number;
@@ -113,9 +115,11 @@ export interface TrustState {
     veracity: number;
     validity: number;
   };
-  /** Human-readable trust level ("low", "medium_low", "medium", "medium_high", "high"). */
+  /** Categorical T3 level ("low", "medium_low", "medium", "medium_high", "high"). */
   level: string;
   actionCount: number;
+  successCount: number;
+  successRate: number;
   daysSinceLast: number;
 }
 

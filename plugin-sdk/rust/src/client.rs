@@ -88,6 +88,15 @@ impl HestiaClient {
 
         let result = invoke_tool::<ConnectResult>(&service, "hestia_connect", args).await?;
 
+        // Warn (don't fail) on protocol-version mismatch. See
+        // web4-standard/core-spec/presence-protocol.md §2.
+        if result.protocol_version != HESTIA_PROTOCOL_VERSION {
+            eprintln!(
+                "[hestia-sdk] presence protocol version mismatch: SDK expects v{}, daemon reports v{}. Continuing anyway.",
+                HESTIA_PROTOCOL_VERSION, result.protocol_version
+            );
+        }
+
         let mut guard = self.state.lock().await;
         *guard = Some(ConnectedState {
             service,
