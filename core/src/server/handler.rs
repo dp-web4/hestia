@@ -352,6 +352,36 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     };
 
     let evaluation = s.policy_engine.evaluate(&pa);
+
+    // Witness the policy decision when the verdict is anything other
+    // than `allow`. Deny + warn + would-deny (audit-only) are all
+    // operationally interesting events — denies in particular block
+    // a tool call before it runs, so PostToolUse never fires and the
+    // outcome would otherwise never reach the chain. This is the
+    // structural place to capture them: any policy gate flow that
+    // calls query_policy gets witnessed automatically.
+    let plugin_id_for_chain = s
+        .sessions
+        .get(&action.session_id)
+        .map(|sess| sess.plugin_id.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    if evaluation.decision != crate::policy::PolicyDecision::Allow {
+        let _ = s.append_chain(
+            "policy_decision",
+            json!({
+                "action_id": action_id_str,
+                "tool_name": action.tool_name,
+                "target": target,
+                "plugin_id": plugin_id_for_chain,
+                "decision": evaluation.decision.as_str(),
+                "enforced": evaluation.enforced,
+                "rule_id": evaluation.rule_id,
+                "rule_name": evaluation.rule_name,
+                "reason": evaluation.reason,
+            }),
+        );
+    }
+
     Ok(json!({
         "decision": evaluation.decision.as_str(),
         "reason": evaluation.reason,

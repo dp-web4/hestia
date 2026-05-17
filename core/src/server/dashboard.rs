@@ -75,6 +75,15 @@ pub struct RecentEntry {
     pub magnitude: Option<f64>,
     pub plugin_id: Option<String>,
     pub error: Option<String>,
+    // Populated only for policy_decision entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enforced: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Flatten a `ChainEntry` into the UI-facing `RecentEntry` shape.
@@ -95,6 +104,13 @@ fn flatten_entry(e: crate::storage::ChainEntry) -> RecentEntry {
             .and_then(|v| v.as_str())
             .map(String::from),
         error: d.get("error").and_then(|v| v.as_str()).map(String::from),
+        decision: d.get("decision").and_then(|v| v.as_str()).map(String::from),
+        enforced: d.get("enforced").and_then(|v| v.as_bool()),
+        rule_name: d
+            .get("rule_name")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        reason: d.get("reason").and_then(|v| v.as_str()).map(String::from),
     }
 }
 

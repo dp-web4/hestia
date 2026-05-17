@@ -322,6 +322,7 @@
   }
   .feed-status.ok { color: var(--success); }
   .feed-status.fail { color: var(--failure); background: #f8717118; }
+  .feed-status.warn { color: #fbbf24; background: #fbbf2418; }
   .feed-status.info { color: var(--fg-dim); }
   .feed-hash { color: var(--fg-faint); font-size: 0.75rem; }
 
@@ -625,6 +626,14 @@
         detail = e.target || '';
         if (e.success === true) { status = 'ok'; statusClass = 'ok'; }
         else if (e.success === false) { status = 'fail'; statusClass = 'fail'; }
+      } else if (e.event_type === 'policy_decision') {
+        tool = e.tool_name || '?';
+        const verdict = e.decision || 'deny';
+        const enforced = e.enforced !== false;
+        const ruleLabel = e.rule_name ? ` [${e.rule_name}]` : '';
+        detail = `${e.target || ''}${ruleLabel}${e.reason ? ' — ' + e.reason : ''}`;
+        status = verdict === 'deny' ? (enforced ? 'deny' : 'would-deny') : verdict;
+        statusClass = verdict === 'deny' ? 'fail' : 'warn';
       } else if (e.event_type === 'session_started') {
         tool = e.plugin_id || '';
         detail = 'session_started';
