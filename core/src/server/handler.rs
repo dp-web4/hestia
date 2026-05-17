@@ -208,16 +208,13 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         s.mark_synthetic(&plugin_id);
     }
 
-    s.append_chain(
-        "session_started",
-        json!({
-            "session_id": session_id,
-            "plugin_id": plugin_id,
-            "soft_lct": soft_lct,
-            "assigned_role": requested_role,
-            "synthetic": synthetic,
-        }),
-    )?;
+    // session_started is intentionally NOT written to the witness chain.
+    // Sessions are RAM-only by design (transport artifacts); every hook
+    // invocation opens its own MCP connection, so writing one chain entry
+    // per connect would double the chain for no forensic value. Plugin
+    // identity is already captured on every outcome entry. If a presence
+    // signal is needed in the future, prefer a first-observation-per-day
+    // sentinel over per-connect.
 
     Ok(json!({
         "sessionId": session_id,

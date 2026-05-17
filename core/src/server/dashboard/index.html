@@ -265,7 +265,7 @@
   .feed { max-height: 70vh; overflow-y: auto; }
   .feed-row {
     display: grid;
-    grid-template-columns: 4rem 7rem 1fr 4rem 9rem;
+    grid-template-columns: 4rem 3.5rem 7rem 1fr 4rem 9rem;
     gap: 0.75rem;
     align-items: center;
     padding: 0.6rem 1.25rem;
@@ -281,6 +281,7 @@
     100% { background: transparent; }
   }
   .feed-pos { color: var(--fg-faint); font-variant-numeric: tabular-nums; }
+  .feed-time { color: var(--fg-faint); font-variant-numeric: tabular-nums; text-align: right; }
   .feed-event { color: var(--fg-dim); }
   .feed-event.outcome { color: var(--fg); }
   .feed-tool { color: var(--accent); font-weight: 500; }
@@ -440,6 +441,20 @@
       const t = new Date(iso);
       return t.toLocaleTimeString();
     },
+    relTime: iso => {
+      if (!iso) return '';
+      const then = new Date(iso).getTime();
+      const now = Date.now();
+      const s = Math.max(0, Math.floor((now - then) / 1000));
+      if (s < 5) return 'now';
+      if (s < 60) return s + 's';
+      const m = Math.floor(s / 60);
+      if (m < 60) return m + 'm';
+      const h = Math.floor(m / 60);
+      if (h < 24) return h + 'h';
+      const d = Math.floor(h / 24);
+      return d + 'd';
+    },
     short: s => (s ?? '').slice(0, 12),
   };
 
@@ -569,9 +584,11 @@
         detail = e.event_type;
       }
 
+      const absTime = e.timestamp ? new Date(e.timestamp).toLocaleString() : '';
       return `
         <div class="feed-row${isNew ? ' new' : ''}">
           <span class="feed-pos">#${e.chain_position}</span>
+          <span class="feed-time" title="${escapeHtml(absTime)}">${fmt.relTime(e.timestamp)}</span>
           <span class="feed-event ${e.event_type}">${escapeHtml(e.event_type)}</span>
           <span class="feed-detail" title="${escapeHtml(detail)}">
             ${tool ? `<span class="feed-tool">${escapeHtml(tool)}</span> ` : ''}${escapeHtml(detail)}

@@ -114,7 +114,12 @@ def extract_target(tool_input: Any) -> Optional[str]:
             return v
     cmd = tool_input.get("command")
     if isinstance(cmd, str) and cmd.strip():
-        return cmd.split()[0]
+        # Send the full command (truncated for chain-entry hygiene).
+        # The policy gate already sees the untruncated command via the
+        # PreToolUse hook's `parameters.command`; this `target` is for
+        # forensic readability in the chain feed.
+        s = cmd.strip()
+        return s if len(s) <= 240 else s[:237] + "..."
     return None
 
 

@@ -101,9 +101,10 @@ impl ServerState {
             std::collections::HashMap::new();
 
         for e in &stats_window {
-            // Track per-plugin last-seen for ANY event type (outcomes are
-            // the main signal, but session_started + vault_set also count
-            // as activity).
+            // Track per-plugin last-seen across any event that carries
+            // a plugin_id. Outcomes are the main signal now that
+            // session_started is no longer written; historical chains
+            // may still contain session_started entries with plugin_id.
             if let Some(pid) = e.event_data.get("plugin_id").and_then(|v| v.as_str()) {
                 let entry = last_seen_per_plugin
                     .entry(pid.to_string())
