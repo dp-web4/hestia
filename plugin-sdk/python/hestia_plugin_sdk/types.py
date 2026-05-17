@@ -107,6 +107,13 @@ class PolicyResult:
     policy_id: str | None = None
     enforced: bool = True
     constraints: list[str] = field(default_factory=list)
+    #: "decided" (default) = verdict is final.
+    #: "evaluating" = engine is still working; orchestrator should wait
+    #: `next_poll_ms` and re-query with the same action_id.
+    #: See spec §3.4.1.
+    status: Literal["decided", "evaluating"] = "decided"
+    #: Suggested wait (ms) before re-querying. Only set when status == "evaluating".
+    next_poll_ms: int | None = None
 
 
 @dataclass(frozen=True)

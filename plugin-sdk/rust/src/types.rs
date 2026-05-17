@@ -128,6 +128,22 @@ pub enum PolicyDecision {
     Warn,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyStatus {
+    /// Verdict is final; orchestrator can act on `decision`.
+    Decided,
+    /// Engine is still working (e.g. LLM-backed reviewer). Orchestrator
+    /// SHOULD wait `next_poll_ms` and re-query with the same action_id.
+    Evaluating,
+}
+
+impl Default for PolicyStatus {
+    fn default() -> Self {
+        Self::Decided
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PolicyResult {
@@ -152,6 +168,15 @@ pub struct PolicyResult {
     /// Always at least three entries when the field is present.
     #[serde(default)]
     pub constraints: Vec<String>,
+    /// "decided" (default) = verdict is final. "evaluating" = engine
+    /// still working; orchestrator should wait `next_poll_ms` and
+    /// re-query. See spec §3.4.1.
+    #[serde(default)]
+    pub status: PolicyStatus,
+    /// Suggested wait (ms) before re-querying. Only set when
+    /// `status == Evaluating`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_poll_ms: Option<u64>,
 }
 
 fn default_true() -> bool {

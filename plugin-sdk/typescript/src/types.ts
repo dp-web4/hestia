@@ -86,6 +86,15 @@ export interface PolicyResult {
   enforced: boolean;
   /** Audit-trail constraint strings (`policy:`, `decision:`, `rule:`). */
   constraints?: string[];
+  /**
+   * "decided" (default) = verdict is final.
+   * "evaluating" = engine is still working; orchestrator should wait
+   * `nextPollMs` and re-query with the same action_id.
+   * See spec §3.4.1.
+   */
+  status?: "decided" | "evaluating";
+  /** Suggested wait before re-querying. Only set when status == "evaluating". */
+  nextPollMs?: number | null;
 }
 
 /** Options for `hestia_vault_get`. */

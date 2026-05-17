@@ -354,6 +354,11 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         "policyId": evaluation.rule_id, // alias kept for backward compat with v0 SDKs
         "enforced": evaluation.enforced,
         "constraints": evaluation.constraints,
+        // v1 sync rule engine always settles in one shot. The "evaluating"
+        // status is reserved for future LLM-backed engines; orchestrators
+        // already handle both branches per spec §3.4.1.
+        "status": "decided",
+        "nextPollMs": serde_json::Value::Null,
     }))
 }
 

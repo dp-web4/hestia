@@ -195,6 +195,8 @@ class HestiaClient:
             policy_id=result.get("policyId"),
             enforced=bool(result.get("enforced", True)),
             constraints=list(result.get("constraints") or []),
+            status=result.get("status", "decided"),
+            next_poll_ms=result.get("nextPollMs"),
         )
 
     # ----------------------------------------------------------- vault ----
