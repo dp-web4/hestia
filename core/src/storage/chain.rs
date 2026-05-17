@@ -165,6 +165,28 @@ impl SqliteChainStore {
         Ok(out)
     }
 
+    /// Most-recent failed-outcome entries (descending). Scans the full
+    /// chain server-side via JSON extraction on `event_data.success`;
+    /// failures are rare so the result set is small even when the chain
+    /// is large.
+    pub fn read_failures(&self, limit: u64) -> Result<Vec<ChainEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+             FROM chain_entries
+             WHERE event_type = 'outcome'
+               AND json_extract(event_data, '$.success') = 0
+             ORDER BY chain_position DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], row_to_entry)?;
+        let mut out = Vec::with_capacity(limit as usize);
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
     /// Entries since (exclusive of) `chain_position`, ascending.
     pub fn read_since(&self, chain_position: u64, limit: u64) -> Result<Vec<ChainEntry>> {
         let conn = self.conn.lock().unwrap();

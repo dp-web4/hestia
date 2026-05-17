@@ -77,6 +77,27 @@ pub struct RecentEntry {
     pub error: Option<String>,
 }
 
+/// Flatten a `ChainEntry` into the UI-facing `RecentEntry` shape.
+fn flatten_entry(e: crate::storage::ChainEntry) -> RecentEntry {
+    let d = &e.event_data;
+    RecentEntry {
+        chain_position: e.chain_position,
+        event_type: e.event_type.clone(),
+        timestamp: e.timestamp,
+        hash: e.hash.clone(),
+        prev_hash: e.prev_hash.clone(),
+        tool_name: d.get("tool_name").and_then(|v| v.as_str()).map(String::from),
+        target: d.get("target").and_then(|v| v.as_str()).map(String::from),
+        success: d.get("success").and_then(|v| v.as_bool()),
+        magnitude: d.get("magnitude").and_then(|v| v.as_f64()),
+        plugin_id: d
+            .get("plugin_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        error: d.get("error").and_then(|v| v.as_str()).map(String::from),
+    }
+}
+
 impl ServerState {
     /// Build the dashboard snapshot. Reads up to `recent_limit` chain
     /// entries for the live feed; aggregates over the full chain for stats.
@@ -182,28 +203,7 @@ impl ServerState {
             .read_recent(recent_limit)
             .unwrap_or_default()
             .into_iter()
-            .map(|e| {
-                let d = &e.event_data;
-                RecentEntry {
-                    chain_position: e.chain_position,
-                    event_type: e.event_type.clone(),
-                    timestamp: e.timestamp,
-                    hash: e.hash.clone(),
-                    prev_hash: e.prev_hash.clone(),
-                    tool_name: d
-                        .get("tool_name")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    target: d.get("target").and_then(|v| v.as_str()).map(String::from),
-                    success: d.get("success").and_then(|v| v.as_bool()),
-                    magnitude: d.get("magnitude").and_then(|v| v.as_f64()),
-                    plugin_id: d
-                        .get("plugin_id")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    error: d.get("error").and_then(|v| v.as_str()).map(String::from),
-                }
-            })
+            .map(flatten_entry)
             .collect();
 
         DashboardSnapshot {
@@ -227,6 +227,30 @@ impl ServerState {
             generated_at: Utc::now(),
         }
     }
+
+    /// All-time failed outcomes (descending). Backs the `FAILED` filter
+    /// in the dashboard, which scrolls across the full chain rather
+    /// than just the recent window.
+    pub fn failures_snapshot(&self, limit: u64) -> FailuresSnapshot {
+        let entries: Vec<RecentEntry> = self
+            .chain_store
+            .read_failures(limit)
+            .unwrap_or_default()
+            .into_iter()
+            .map(flatten_entry)
+            .collect();
+        FailuresSnapshot {
+            entries,
+            generated_at: Utc::now(),
+        }
+    }
+}
+
+/// Response shape for `/api/failures`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailuresSnapshot {
+    pub entries: Vec<RecentEntry>,
+    pub generated_at: DateTime<Utc>,
 }
 
 #[cfg(test)]

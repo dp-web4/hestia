@@ -463,6 +463,7 @@
   let selectedOrch = null; // currently-filtered orchestrator, or null = "all"
   let lastData = null;     // last snapshot, used to re-render on filter clicks without re-fetching
   let feedFilter = 'all';  // 'all' | 'failed'
+  let failuresCache = null; // result of last /api/failures fetch, used while FAILED is selected
 
   const fmt = {
     int: n => (n ?? 0).toLocaleString(),
@@ -583,23 +584,27 @@
   function renderFeed(entries) {
     const root = $('feed');
     const title = $('feed-title');
-    let filtered = selectedOrch
-      ? entries.filter(e => e.plugin_id === selectedOrch)
-      : entries;
+    // In failed mode, source from the all-time failures cache instead
+    // of the live recent window. Falls back to the recent slice while
+    // the first /api/failures fetch is still in flight.
+    let source = entries;
     if (feedFilter === 'failed') {
-      // outcome rows with explicit success === false. Other event types
-      // don't carry success, so they're excluded from the failed view.
-      filtered = filtered.filter(e => e.event_type === 'outcome' && e.success === false);
+      source = failuresCache?.entries ?? entries.filter(
+        e => e.event_type === 'outcome' && e.success === false
+      );
     }
-    title.textContent = selectedOrch
-      ? `Witness chain — live · ${selectedOrch}`
-      : 'Witness chain — live';
+    let filtered = selectedOrch
+      ? source.filter(e => e.plugin_id === selectedOrch)
+      : source;
+    const baseTitle =
+      feedFilter === 'failed' ? 'Witness chain — failed (all time)' : 'Witness chain — live';
+    title.textContent = selectedOrch ? `${baseTitle} · ${selectedOrch}` : baseTitle;
     if (!filtered.length) {
       const empty =
         feedFilter === 'failed'
           ? selectedOrch
-            ? `No failed entries for ${escapeHtml(selectedOrch)} in the recent window.`
-            : 'No failed entries in the recent window.'
+            ? `No failures recorded for ${escapeHtml(selectedOrch)}.`
+            : 'No failures recorded.'
           : selectedOrch
             ? `No recent chain entries for ${escapeHtml(selectedOrch)}.`
             : 'Waiting for the first chain entry…';
@@ -704,12 +709,27 @@
     $('generated-at').textContent = `updated ${fmt.time(data.generated_at)}`;
   }
 
+  async function fetchFailures() {
+    try {
+      const res = await fetch('/api/failures', { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      failuresCache = await res.json();
+    } catch (err) {
+      // leave the previous cache in place on transient errors
+    }
+  }
+
   async function tick() {
     try {
       const res = await fetch('/api/dashboard', { cache: 'no-store' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       lastData = data;
+      // Refresh the failures cache in the background when the FAILED
+      // view is visible. Cheap (rare rows) and keeps the list current.
+      if (feedFilter === 'failed') {
+        await fetchFailures();
+      }
       rerender(data);
       $('live-status').textContent = 'live';
     } catch (err) {
@@ -718,13 +738,16 @@
   }
 
   document.querySelectorAll('.feed-filter .filter-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       const f = btn.dataset.filter;
       if (f === feedFilter) return;
       feedFilter = f;
       document.querySelectorAll('.feed-filter .filter-btn').forEach(b => {
         b.classList.toggle('selected', b.dataset.filter === feedFilter);
       });
+      if (feedFilter === 'failed') {
+        await fetchFailures();
+      }
       if (lastData) renderFeed(lastData.recent);
     });
   });

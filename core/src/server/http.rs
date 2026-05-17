@@ -49,6 +49,7 @@ pub async fn serve(state: SharedState, bind: &str) -> Result<()> {
     let app = axum::Router::new()
         .route("/", get(dashboard_html))
         .route("/api/dashboard", get(dashboard_json))
+        .route("/api/failures", get(failures_json))
         .with_state(state)
         .nest_service("/mcp", service);
 
@@ -86,6 +87,16 @@ async fn dashboard_html() -> impl IntoResponse {
 async fn dashboard_json(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.lock().await;
     let snapshot = s.dashboard_snapshot(50);
+    drop(s);
+    Json(snapshot)
+}
+
+async fn failures_json(State(state): State<SharedState>) -> impl IntoResponse {
+    let s = state.lock().await;
+    // Cap at 500 to keep the response sane even on chains with lots of
+    // historical failures. Operators who need more can read the chain
+    // directly.
+    let snapshot = s.failures_snapshot(500);
     drop(s);
     Json(snapshot)
 }
