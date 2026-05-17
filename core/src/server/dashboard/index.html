@@ -96,16 +96,65 @@
   main {
     grid-area: main;
     padding: 1.5rem 2rem;
-    display: grid;
-    grid-template-columns: 1fr;
+    display: flex;
+    flex-direction: column;
     gap: 1.5rem;
     max-width: 1400px;
     margin: 0 auto;
     width: 100%;
   }
-  @media (min-width: 900px) {
-    main { grid-template-columns: 1fr 2fr; }
-    .stat-row { grid-column: 1 / -1; }
+
+  /* --- Orchestrator selector bar --- */
+  .orch-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+    padding: 0.5rem 0;
+  }
+  .orch-bar-label {
+    font-size: 0.75rem;
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-right: 0.5rem;
+  }
+  .orch-chip {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.4rem 0.85rem;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    color: var(--fg);
+    cursor: pointer;
+    transition: background 200ms, border-color 200ms;
+    user-select: none;
+  }
+  .orch-chip:hover { background: var(--bg-elev-2); border-color: var(--fg-faint); }
+  .orch-chip.selected {
+    background: var(--accent-dim);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .orch-chip .level {
+    font-size: 0.7rem;
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .orch-chip.selected .level { color: var(--accent); opacity: 0.85; }
+  .orch-chip .count {
+    font-size: 0.75rem;
+    color: var(--fg-faint);
+  }
+  .orch-chip-empty {
+    color: var(--fg-faint);
+    font-size: 0.85rem;
+    font-style: italic;
   }
 
   .stat-row {
@@ -324,8 +373,15 @@
     </section>
 
     <section>
+      <div class="orch-bar" id="orch-bar">
+        <span class="orch-bar-label">Active orchestrators:</span>
+        <span class="orch-chip-empty">none active in the last hour</span>
+      </div>
+    </section>
+
+    <section>
       <div class="card">
-        <h2>Plugin trust</h2>
+        <h2 id="trust-title">Plugin trust</h2>
         <div class="card-body">
           <div class="trust-list" id="trust-list">
             <div class="empty">No plugins recorded yet. Connect one to start building trust.</div>
@@ -334,17 +390,20 @@
       </div>
     </section>
 
-    <section class="right-col">
+    <section>
       <div class="card">
-        <h2>Witness chain — live</h2>
-        <div class="feed" id="feed">
-          <div class="empty">Waiting for the first chain entry…</div>
-        </div>
-      </div>
-      <div class="card">
-        <h2>Tool histogram</h2>
+        <h2 id="histogram-title">Tool histogram</h2>
         <div class="tool-list" id="tool-list">
           <div class="empty">No tool calls yet.</div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="card">
+        <h2 id="feed-title">Witness chain — live</h2>
+        <div class="feed" id="feed">
+          <div class="empty">Waiting for the first chain entry…</div>
         </div>
       </div>
     </section>
@@ -366,6 +425,8 @@
   const REFRESH_MS = 2000;
   const seen = new Set();
   let first = true;
+  let selectedOrch = null; // currently-filtered orchestrator, or null = "all"
+  let lastData = null;     // last snapshot, used to re-render on filter clicks without re-fetching
 
   const fmt = {
     int: n => (n ?? 0).toLocaleString(),
@@ -395,13 +456,52 @@
     $('stat-hour').textContent = fmt.int(s.actions_last_hour);
   }
 
-  function renderTrust(trust) {
-    const root = $('trust-list');
+  function renderOrchBar(trust) {
+    const root = $('orch-bar');
+    const header = '<span class="orch-bar-label">Active orchestrators:</span>';
     if (!trust.length) {
-      root.innerHTML = '<div class="empty">No plugins recorded yet. Connect one to start building trust.</div>';
+      root.innerHTML = header + '<span class="orch-chip-empty">none active in the last hour</span>';
       return;
     }
-    root.innerHTML = trust.map(t => `
+    // If the currently-selected orchestrator is no longer active, clear the filter.
+    if (selectedOrch && !trust.some(t => t.plugin_id === selectedOrch)) {
+      selectedOrch = null;
+    }
+    const chips = trust.map(t => {
+      const sel = selectedOrch === t.plugin_id ? ' selected' : '';
+      return `<span class="orch-chip${sel}" data-pid="${escapeHtml(t.plugin_id)}">
+                <span>${escapeHtml(t.plugin_id)}</span>
+                <span class="level">${escapeHtml(t.level)}</span>
+                <span class="count">${fmt.int(t.action_count)}</span>
+              </span>`;
+    }).join('');
+    root.innerHTML = header + chips;
+    // Wire click → toggle filter
+    root.querySelectorAll('.orch-chip').forEach(el => {
+      el.addEventListener('click', () => {
+        const pid = el.getAttribute('data-pid');
+        selectedOrch = (selectedOrch === pid) ? null : pid;
+        if (lastData) rerender(lastData);
+      });
+    });
+  }
+
+  function renderTrust(trust) {
+    const root = $('trust-list');
+    const title = $('trust-title');
+    const filtered = selectedOrch
+      ? trust.filter(t => t.plugin_id === selectedOrch)
+      : trust;
+    title.textContent = selectedOrch
+      ? `Plugin trust — ${selectedOrch}`
+      : 'Plugin trust';
+    if (!filtered.length) {
+      root.innerHTML = selectedOrch
+        ? `<div class="empty">No trust data for ${escapeHtml(selectedOrch)}.</div>`
+        : '<div class="empty">No plugins active in the last hour.</div>';
+      return;
+    }
+    root.innerHTML = filtered.map(t => `
       <div class="trust-item">
         <div class="trust-head">
           <span class="trust-id">${escapeHtml(t.plugin_id)}</span>
@@ -432,11 +532,20 @@
 
   function renderFeed(entries) {
     const root = $('feed');
-    if (!entries.length) {
-      root.innerHTML = '<div class="empty">Waiting for the first chain entry…</div>';
+    const title = $('feed-title');
+    const filtered = selectedOrch
+      ? entries.filter(e => e.plugin_id === selectedOrch)
+      : entries;
+    title.textContent = selectedOrch
+      ? `Witness chain — live · ${selectedOrch}`
+      : 'Witness chain — live';
+    if (!filtered.length) {
+      root.innerHTML = selectedOrch
+        ? `<div class="empty">No recent chain entries for ${escapeHtml(selectedOrch)}.</div>`
+        : '<div class="empty">Waiting for the first chain entry…</div>';
       return;
     }
-    root.innerHTML = entries.map(e => {
+    root.innerHTML = filtered.map(e => {
       const isNew = !seen.has(e.hash) && !first;
       seen.add(e.hash);
 
@@ -475,10 +584,35 @@
     first = false;
   }
 
-  function renderHistogram(byTool, total) {
+  function renderHistogram(data) {
     const root = $('tool-list');
+    const title = $('histogram-title');
+    title.textContent = selectedOrch
+      ? `Tool histogram — ${selectedOrch}`
+      : 'Tool histogram';
+
+    // When filtering, recompute from the recent-feed window (windowed
+    // approximation — accurate for the last N entries, may underrepresent
+    // longer-tailed orchestrators). When unfiltered, use the server-side
+    // total histogram.
+    let byTool;
+    if (selectedOrch) {
+      const counts = {};
+      for (const e of data.recent) {
+        if (e.event_type !== 'outcome') continue;
+        if (e.plugin_id !== selectedOrch) continue;
+        if (!e.tool_name) continue;
+        counts[e.tool_name] = (counts[e.tool_name] || 0) + 1;
+      }
+      byTool = Object.entries(counts).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    } else {
+      byTool = data.stats.by_tool;
+    }
+
     if (!byTool.length) {
-      root.innerHTML = '<div class="empty">No tool calls yet.</div>';
+      root.innerHTML = selectedOrch
+        ? `<div class="empty">No tool calls for ${escapeHtml(selectedOrch)} in the recent window.</div>`
+        : '<div class="empty">No tool calls yet.</div>';
       return;
     }
     const max = byTool[0][1];
@@ -497,17 +631,23 @@
     }[c]));
   }
 
+  function rerender(data) {
+    renderStats(data.stats, data.society);
+    renderOrchBar(data.trust);
+    renderTrust(data.trust);
+    renderHistogram(data);
+    renderFeed(data.recent);
+    $('sov-lct').textContent = data.society.sovereign_lct;
+    $('generated-at').textContent = `updated ${fmt.time(data.generated_at)}`;
+  }
+
   async function tick() {
     try {
       const res = await fetch('/api/dashboard', { cache: 'no-store' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      renderStats(data.stats, data.society);
-      renderTrust(data.trust);
-      renderFeed(data.recent);
-      renderHistogram(data.stats.by_tool, data.stats.total_actions);
-      $('sov-lct').textContent = data.society.sovereign_lct;
-      $('generated-at').textContent = `updated ${fmt.time(data.generated_at)}`;
+      lastData = data;
+      rerender(data);
       $('live-status').textContent = 'live';
     } catch (err) {
       $('live-status').textContent = `offline (${err.message})`;

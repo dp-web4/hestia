@@ -81,33 +81,6 @@ impl ServerState {
     /// Build the dashboard snapshot. Reads up to `recent_limit` chain
     /// entries for the live feed; aggregates over the full chain for stats.
     pub fn dashboard_snapshot(&self, recent_limit: u64) -> DashboardSnapshot {
-        let known_plugins = self.trust_store.list().unwrap_or_default();
-        let trust: Vec<TrustView> = known_plugins
-            .iter()
-            .map(|pid| {
-                let t = self.trust(pid);
-                let t3_avg = t.t3_average();
-                let v3_avg = t.v3_average();
-                TrustView {
-                    plugin_id: pid.clone(),
-                    entity_id: t.entity_id.clone(),
-                    level: t.trust_level().as_str().to_string(),
-                    t3_talent: t.t3.talent,
-                    t3_training: t.t3.training,
-                    t3_temperament: t.t3.temperament,
-                    t3_average: t3_avg,
-                    v3_valuation: t.v3.valuation,
-                    v3_veracity: t.v3.veracity,
-                    v3_validity: t.v3.validity,
-                    v3_average: v3_avg,
-                    action_count: t.action_count,
-                    success_count: t.success_count,
-                    success_rate: t.success_rate(),
-                    days_since_last: t.days_since_last_action(),
-                }
-            })
-            .collect();
-
         // For activity stats, scan the recent window plus a wider sample.
         // The chain can be huge; cap the stats window at 10k entries which
         // is plenty for an "actions seen" picture without scanning forever.
@@ -122,8 +95,23 @@ impl ServerState {
         let mut by_tool: BTreeMap<String, u64> = BTreeMap::new();
         let one_hour_ago = Utc::now() - chrono::Duration::hours(1);
         let mut last_hour = 0u64;
+        // Per-plugin "last seen" timestamps, used to decide which
+        // orchestrators are "active" (= seen in the last hour).
+        let mut last_seen_per_plugin: std::collections::HashMap<String, chrono::DateTime<Utc>> =
+            std::collections::HashMap::new();
 
         for e in &stats_window {
+            // Track per-plugin last-seen for ANY event type (outcomes are
+            // the main signal, but session_started + vault_set also count
+            // as activity).
+            if let Some(pid) = e.event_data.get("plugin_id").and_then(|v| v.as_str()) {
+                let entry = last_seen_per_plugin
+                    .entry(pid.to_string())
+                    .or_insert(e.timestamp);
+                if e.timestamp > *entry {
+                    *entry = e.timestamp;
+                }
+            }
             if e.event_type != "outcome" {
                 continue;
             }
@@ -148,6 +136,42 @@ impl ServerState {
         let mut by_tool_vec: Vec<(String, u64)> = by_tool.into_iter().collect();
         by_tool_vec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let success_rate = if total == 0 { 0.0 } else { succ as f64 / total as f64 };
+
+        // Build the trust list, but only for plugins that have been active
+        // within the last hour. This drops stale orchestrators (cursor,
+        // openclaw seeds, old conformance-runner sessions) from the UI.
+        let known_plugins = self.trust_store.list().unwrap_or_default();
+        let trust: Vec<TrustView> = known_plugins
+            .iter()
+            .filter(|pid| {
+                last_seen_per_plugin
+                    .get(*pid)
+                    .map(|ts| *ts > one_hour_ago)
+                    .unwrap_or(false)
+            })
+            .map(|pid| {
+                let t = self.trust(pid);
+                let t3_avg = t.t3_average();
+                let v3_avg = t.v3_average();
+                TrustView {
+                    plugin_id: pid.clone(),
+                    entity_id: t.entity_id.clone(),
+                    level: t.trust_level().as_str().to_string(),
+                    t3_talent: t.t3.talent,
+                    t3_training: t.t3.training,
+                    t3_temperament: t.t3.temperament,
+                    t3_average: t3_avg,
+                    v3_valuation: t.v3.valuation,
+                    v3_veracity: t.v3.veracity,
+                    v3_validity: t.v3.validity,
+                    v3_average: v3_avg,
+                    action_count: t.action_count,
+                    success_count: t.success_count,
+                    success_rate: t.success_rate(),
+                    days_since_last: t.days_since_last_action(),
+                }
+            })
+            .collect();
 
         // Recent feed: flatten the outcome / session_started / etc. shape.
         let recent: Vec<RecentEntry> = self
