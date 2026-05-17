@@ -28,6 +28,13 @@ export interface HestiaClientConfig {
    * 3. `http://127.0.0.1:7711` (default)
    */
   hestiaEndpoint?: string;
+  /**
+   * Declare this client as a test harness, fuzzer, or other non-orchestrator
+   * workload. The daemon still witnesses every action, but excludes synthetic
+   * plugins from operator-facing aggregations (dashboards, trust roll-ups).
+   * See presence-protocol §3.1.
+   */
+  synthetic?: boolean;
 }
 
 /** Result of `hestia_connect`. */

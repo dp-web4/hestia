@@ -12,8 +12,9 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -60,6 +61,11 @@ pub struct ServerState {
     pub sovereign_lct: String,
     pub shared_context: serde_json::Map<String, serde_json::Value>,
     pub policy_engine: crate::policy::PolicyEngine,
+    /// Plugin IDs that self-declared as synthetic (test harnesses,
+    /// fuzzers, etc.). Excluded from operator-facing aggregations by
+    /// default. Persisted in `<HESTIA_HOME>/synthetic.json`.
+    pub synthetic_plugins: HashSet<String>,
+    synthetic_path: PathBuf,
 }
 
 impl ServerState {
@@ -75,6 +81,10 @@ impl ServerState {
             .resolve()
             .unwrap_or_else(|| crate::policy::get_preset("safety").unwrap().config);
         let policy_engine = crate::policy::PolicyEngine::new(policy_config);
+
+        let synthetic_path = home.join("synthetic.json");
+        let synthetic_plugins = load_synthetic_set(&synthetic_path);
+
         Ok(Self {
             vault,
             sessions: HashMap::new(),
@@ -84,7 +94,24 @@ impl ServerState {
             sovereign_lct,
             shared_context: serde_json::Map::new(),
             policy_engine,
+            synthetic_plugins,
+            synthetic_path,
         })
+    }
+
+    /// Mark a plugin_id as synthetic and persist. Idempotent; returns
+    /// `true` if this call added a new entry.
+    pub fn mark_synthetic(&mut self, plugin_id: &str) -> bool {
+        let added = self.synthetic_plugins.insert(plugin_id.to_string());
+        if added {
+            // Best-effort persist; we don't fail the request on disk errors.
+            let _ = save_synthetic_set(&self.synthetic_path, &self.synthetic_plugins);
+        }
+        added
+    }
+
+    pub fn is_synthetic(&self, plugin_id: &str) -> bool {
+        self.synthetic_plugins.contains(plugin_id)
     }
 
     /// Re-build the policy engine from the vault's current state. Call
@@ -168,6 +195,23 @@ impl ServerState {
 
 pub type SharedState = Arc<Mutex<ServerState>>;
 
+fn load_synthetic_set(path: &Path) -> HashSet<String> {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return HashSet::new(),
+    };
+    let ids: Vec<String> = serde_json::from_slice(&bytes).unwrap_or_default();
+    ids.into_iter().collect()
+}
+
+fn save_synthetic_set(path: &Path, set: &HashSet<String>) -> Result<()> {
+    let mut ids: Vec<&String> = set.iter().collect();
+    ids.sort();
+    let bytes = serde_json::to_vec_pretty(&ids)?;
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +255,31 @@ mod tests {
         let l2 = state.issue_soft_lct(sid);
         assert_eq!(l1, l2);
         assert!(l1.starts_with("lct:web4:session:"));
+    }
+
+    #[test]
+    fn synthetic_set_persists_across_reopen() {
+        let dir = TempDir::new().unwrap();
+        let vault_path = dir.path().join("v.enc");
+
+        {
+            let vault = Vault::init(vault_path.clone(), "p".into()).unwrap();
+            let mut state = ServerState::open(vault, dir.path()).unwrap();
+            assert!(state.mark_synthetic("conformance-runner"));
+            assert!(state.mark_synthetic("conformance-runner-py"));
+            // Re-marking the same id is a no-op.
+            assert!(!state.mark_synthetic("conformance-runner"));
+            assert!(state.is_synthetic("conformance-runner"));
+            assert!(!state.is_synthetic("claude-code"));
+        }
+
+        // Reopen with the same home — synthetic set is restored from disk.
+        let vault = Vault::open(vault_path.clone(), "p".into()).unwrap();
+        let state = ServerState::open(vault, dir.path()).unwrap();
+        assert!(state.is_synthetic("conformance-runner"));
+        assert!(state.is_synthetic("conformance-runner-py"));
+        assert!(!state.is_synthetic("claude-code"));
+        assert_eq!(state.synthetic_plugins.len(), 2);
     }
 
     #[test]

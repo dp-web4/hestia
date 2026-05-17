@@ -206,6 +206,7 @@ describe("Presence Protocol v0 conformance — TypeScript SDK", () => {
       hostAgent: "conformance-runner",
       hostAgentVersion: "0.0.1",
       hestiaEndpoint: ENDPOINT,
+      synthetic: true,
     });
   });
 

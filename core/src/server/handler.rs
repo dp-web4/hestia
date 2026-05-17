@@ -183,6 +183,10 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     let host_agent_version = optional_string(args, "host_agent_version");
     let requested_role =
         optional_string(args, "requested_role").unwrap_or_else(|| "citizen".to_string());
+    let synthetic = args
+        .get("synthetic")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let mut s = state.lock().await;
     let session_id = Uuid::new_v4();
@@ -200,6 +204,10 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     };
     s.sessions.insert(session_id, session);
 
+    if synthetic {
+        s.mark_synthetic(&plugin_id);
+    }
+
     s.append_chain(
         "session_started",
         json!({
@@ -207,6 +215,7 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
             "plugin_id": plugin_id,
             "soft_lct": soft_lct,
             "assigned_role": requested_role,
+            "synthetic": synthetic,
         }),
     )?;
 

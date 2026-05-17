@@ -33,6 +33,11 @@ class HestiaClientConfig:
     requested_role: str = "citizen"
     #: Override Hestia's MCP endpoint. If None, auto-discover.
     hestia_endpoint: str | None = None
+    #: Declare this client as a test harness or other non-orchestrator
+    #: workload. The daemon still witnesses every action, but excludes
+    #: synthetic plugins from operator-facing aggregations (dashboards,
+    #: trust roll-ups). See presence-protocol §3.1.
+    synthetic: bool = False
 
 
 @dataclass(frozen=True)

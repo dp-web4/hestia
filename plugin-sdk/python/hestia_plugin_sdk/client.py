@@ -97,6 +97,7 @@ class HestiaClient:
                 "host_agent_version": self.config.host_agent_version,
                 "requested_role": self.config.requested_role,
                 "protocol_version": HESTIA_PROTOCOL_VERSION,
+                "synthetic": self.config.synthetic,
             },
         )
 

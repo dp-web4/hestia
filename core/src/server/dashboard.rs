@@ -138,11 +138,13 @@ impl ServerState {
         let success_rate = if total == 0 { 0.0 } else { succ as f64 / total as f64 };
 
         // Build the trust list, but only for plugins that have been active
-        // within the last hour. This drops stale orchestrators (cursor,
-        // openclaw seeds, old conformance-runner sessions) from the UI.
+        // within the last hour AND are not flagged synthetic. Drops both
+        // stale orchestrators (cursor, openclaw seeds) and test harnesses
+        // (conformance-runner, fuzzers) from the operator-facing view.
         let known_plugins = self.trust_store.list().unwrap_or_default();
         let trust: Vec<TrustView> = known_plugins
             .iter()
+            .filter(|pid| !self.is_synthetic(pid))
             .filter(|pid| {
                 last_seen_per_plugin
                     .get(*pid)
@@ -287,5 +289,37 @@ mod tests {
         assert_eq!(s.recent[0].event_type, "outcome");
         assert_eq!(s.recent[0].tool_name.as_deref(), Some("Bash"));
         assert_eq!(s.recent[0].success, Some(false));
+    }
+
+    #[test]
+    fn synthetic_plugins_excluded_from_trust_list() {
+        let (_dir, mut state) = make_state();
+
+        // "real" plugin: active outcomes
+        state
+            .append_chain(
+                "outcome",
+                json!({"tool_name": "Read", "success": true, "magnitude": 0.2, "plugin_id": "real"}),
+            )
+            .unwrap();
+        state.apply_outcome("real", true, 0.5).unwrap();
+
+        // "harness" plugin: active outcomes, but flagged synthetic
+        state
+            .append_chain(
+                "outcome",
+                json!({"tool_name": "Read", "success": true, "magnitude": 0.2, "plugin_id": "harness"}),
+            )
+            .unwrap();
+        state.apply_outcome("harness", true, 0.5).unwrap();
+        assert!(state.mark_synthetic("harness"));
+
+        let s = state.dashboard_snapshot(20);
+        assert_eq!(s.trust.len(), 1, "harness should be excluded");
+        assert_eq!(s.trust[0].plugin_id, "real");
+
+        // Recent feed still includes both — the chain is authoritative,
+        // we only filter aggregations.
+        assert_eq!(s.recent.len(), 2);
     }
 }

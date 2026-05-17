@@ -74,6 +74,7 @@ export class HestiaClient {
       host_agent_version: this.config.hostAgentVersion,
       requested_role: this.config.requestedRole ?? "citizen",
       protocol_version: HESTIA_PROTOCOL_VERSION,
+      synthetic: this.config.synthetic ?? false,
     });
 
     this.session = {

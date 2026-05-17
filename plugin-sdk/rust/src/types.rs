@@ -26,6 +26,11 @@ pub struct HestiaClientConfig {
     pub requested_role: String,
     /// Override Hestia's MCP endpoint. If `None`, auto-discover.
     pub hestia_endpoint: Option<String>,
+    /// Declare this client as a test harness or other non-orchestrator
+    /// workload. The daemon still witnesses every action, but excludes
+    /// synthetic plugins from operator-facing aggregations (dashboards,
+    /// trust roll-ups). See presence-protocol §3.1.
+    pub synthetic: bool,
 }
 
 impl HestiaClientConfig {
@@ -38,6 +43,7 @@ impl HestiaClientConfig {
             host_agent_version: None,
             requested_role: "citizen".to_string(),
             hestia_endpoint: None,
+            synthetic: false,
         }
     }
 
@@ -48,6 +54,11 @@ impl HestiaClientConfig {
 
     pub fn with_role(mut self, role: impl Into<String>) -> Self {
         self.requested_role = role.into();
+        self
+    }
+
+    pub fn synthetic(mut self, synthetic: bool) -> Self {
+        self.synthetic = synthetic;
         self
     }
 }

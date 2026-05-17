@@ -298,6 +298,7 @@ async def test_conformance_scenarios(vectors):
             host_agent="conformance-runner-py",
             host_agent_version="0.0.1",
             hestia_endpoint=ENDPOINT,
+            synthetic=True,
         )
     )
     captures: dict[str, dict[str, Any]] = {}

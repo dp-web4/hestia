@@ -85,6 +85,7 @@ impl HestiaClient {
         if let Some(v) = &self.config.host_agent_version {
             args.insert("host_agent_version".into(), Value::String(v.clone()));
         }
+        args.insert("synthetic".into(), Value::Bool(self.config.synthetic));
 
         let result = invoke_tool::<ConnectResult>(&service, "hestia_connect", args).await?;
 

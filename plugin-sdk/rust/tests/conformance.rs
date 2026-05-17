@@ -358,7 +358,8 @@ async fn presence_protocol_v0_conformance() {
 
     let client = create_hestia_client(
         HestiaClientConfig::new("conformance-runner-rust", "conformance-runner-rust")
-            .with_endpoint(endpoint()),
+            .with_endpoint(endpoint())
+            .synthetic(true),
     );
     let session = client.connect().await.expect("connect");
     let mut captures: HashMap<String, HashMap<String, Value>> = HashMap::new();
