@@ -283,7 +283,13 @@ impl HestiaClient {
             .map_err(|e| HestiaError::InvalidResponse(format!("tool {name}: {e}")))
     }
 
-    async fn read_resource_raw(&self, uri: &str) -> Result<Value> {
+    /// Read an arbitrary `hestia://...` resource URI and return its JSON body.
+    ///
+    /// Most users want the typed wrappers (`get_shared_context`,
+    /// `get_own_trust_state`); this is the raw escape hatch for resources
+    /// the SDK doesn't expose typed accessors for (society/state,
+    /// witness/recent, vault/{name}, society/trust/{plugin_id}, etc.).
+    pub async fn read_resource_raw(&self, uri: &str) -> Result<Value> {
         let guard = self.state.lock().await;
         let state = guard.as_ref().ok_or(HestiaError::NotConnected)?;
         let result: ReadResourceResult = state
