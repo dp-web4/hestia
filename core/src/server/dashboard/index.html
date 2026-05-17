@@ -587,11 +587,14 @@
     const title = $('feed-title');
     // In failed mode, source from the all-time failures cache instead
     // of the live recent window. Falls back to the recent slice while
-    // the first /api/failures fetch is still in flight.
+    // the first /api/failures fetch is still in flight. "Failed" here
+    // covers anything that didn't succeed: failed outcomes AND policy
+    // denials (the gate blocked the call before it ran).
     let source = entries;
     if (feedFilter === 'failed') {
-      source = failuresCache?.entries ?? entries.filter(
-        e => e.event_type === 'outcome' && e.success === false
+      source = failuresCache?.entries ?? entries.filter(e =>
+        (e.event_type === 'outcome' && e.success === false) ||
+        (e.event_type === 'policy_decision' && e.decision === 'deny')
       );
     }
     let filtered = selectedOrch

@@ -165,17 +165,19 @@ impl SqliteChainStore {
         Ok(out)
     }
 
-    /// Most-recent failed-outcome entries (descending). Scans the full
-    /// chain server-side via JSON extraction on `event_data.success`;
-    /// failures are rare so the result set is small even when the chain
-    /// is large.
+    /// Most-recent "didn't succeed" entries (descending). Includes both
+    /// failed outcomes (`event_type='outcome'`, success=false) and
+    /// policy denials (`event_type='policy_decision'`, decision='deny').
+    /// From an operator's standpoint these are the same category — the
+    /// tool call didn't go through, whether because it ran and failed
+    /// or because the gate blocked it.
     pub fn read_failures(&self, limit: u64) -> Result<Vec<ChainEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
              FROM chain_entries
-             WHERE event_type = 'outcome'
-               AND json_extract(event_data, '$.success') = 0
+             WHERE (event_type = 'outcome' AND json_extract(event_data, '$.success') = 0)
+                OR (event_type = 'policy_decision' AND json_extract(event_data, '$.decision') = 'deny')
              ORDER BY chain_position DESC
              LIMIT ?1",
         )?;
