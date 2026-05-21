@@ -10,6 +10,40 @@ use super::types::{
 /// git-push-without-PAT warn.
 fn safety_rules() -> Vec<PolicyRule> {
     vec![
+        // Whitelist: allow `rm` (incl. -rf) when EVERY target is an absolute
+        // path under a whitelisted scratch root (/tmp). Priority 0 so it wins
+        // over the destructive-deny (priority 1) via first-match. Guards:
+        // the regex permits ONLY `/tmp/...` absolute args (no relative paths,
+        // no other roots), and `command_must_not_contain` rejects `..`
+        // (path escape) and shell metacharacters (command chaining) even if
+        // the regex were fooled. Relative `rm -rf foo`, `rm -rf /tmp/../etc`,
+        // `rm -rf /etc`, and `rm -rf /tmp/x; rm -rf /` all still hit the deny.
+        PolicyRule {
+            id: "allow-rm-whitelisted-scratch".into(),
+            name: "Allow rm in whitelisted scratch dirs (/tmp)".into(),
+            priority: 0,
+            decision: PolicyDecision::Allow,
+            reason: Some("rm confined to whitelisted scratch dir (/tmp) — permitted".into()),
+            r#match: PolicyMatch {
+                tools: Some(vec!["Bash".into()]),
+                command_patterns: Some(vec![
+                    // require >=1 flag (the `-rf` case); flagless `rm /tmp/x`
+                    // still falls through to the plain-rm warn rule.
+                    r"^\s*rm\s+(-{1,2}[A-Za-z]+\s+)+/tmp/[^\s;&|`$()]+(\s+/tmp/[^\s;&|`$()]+)*\s*$"
+                        .into(),
+                ]),
+                command_patterns_are_regex: true,
+                command_must_not_contain: Some(vec![
+                    "..".into(),
+                    ";".into(),
+                    "&".into(),
+                    "|".into(),
+                    "`".into(),
+                    "$(".into(),
+                ]),
+                ..Default::default()
+            },
+        },
         PolicyRule {
             id: "deny-destructive-commands".into(),
             name: "Block destructive shell commands".into(),

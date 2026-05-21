@@ -207,16 +207,53 @@ mod tests {
     #[test]
     fn safety_denies_destructive_bash() {
         let e = PolicyEngine::new(get_preset("safety").unwrap().config);
+        // non-whitelisted target — destructive deny still applies
         let action = PolicyAction {
             tool_name: "Bash",
             category: "command",
-            target: Some("rm -rf /tmp/foo"),
-            full_command: Some("rm -rf /tmp/foo"),
+            target: Some("rm -rf /home/user/data"),
+            full_command: Some("rm -rf /home/user/data"),
         };
         let v = e.evaluate(&action);
         assert_eq!(v.decision, PolicyDecision::Deny);
         assert_eq!(v.rule_id.as_deref(), Some("deny-destructive-commands"));
         assert!(v.enforced);
+    }
+
+    fn bash(cmd: &'static str) -> PolicyAction<'static> {
+        PolicyAction {
+            tool_name: "Bash",
+            category: "command",
+            target: Some(cmd),
+            full_command: Some(cmd),
+        }
+    }
+
+    #[test]
+    fn safety_allows_rm_rf_in_tmp() {
+        let e = PolicyEngine::new(get_preset("safety").unwrap().config);
+        for ok in ["rm -rf /tmp/foo", "rm -rf /tmp/a /tmp/b", "rm -r /tmp/x/y"] {
+            let v = e.evaluate(&bash(ok));
+            assert_eq!(v.decision, PolicyDecision::Allow, "expected allow for {ok:?}");
+            assert_eq!(v.rule_id.as_deref(), Some("allow-rm-whitelisted-scratch"));
+        }
+    }
+
+    #[test]
+    fn safety_still_denies_rm_rf_outside_tmp() {
+        let e = PolicyEngine::new(get_preset("safety").unwrap().config);
+        // relative path, non-tmp root, path-escape, and command-chaining all deny
+        for bad in [
+            "rm -rf v21out",
+            "rm -rf /etc",
+            "rm -rf /tmp/../etc",
+            "rm -rf /tmp/x; rm -rf /",
+            "rm -rf /tmp/x && rm -rf /home",
+        ] {
+            let v = e.evaluate(&bash(bad));
+            assert_eq!(v.decision, PolicyDecision::Deny, "expected deny for {bad:?}");
+            assert_eq!(v.rule_id.as_deref(), Some("deny-destructive-commands"));
+        }
     }
 
     #[test]
