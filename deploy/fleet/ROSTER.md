@@ -14,7 +14,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dp-web4/hestia/main/deploy/f
 | # | Machine    | OS / Arch              | Target binary                  | Daemon | Plugin | Dashboard | Notes |
 |---|------------|------------------------|--------------------------------|--------|--------|-----------|-------|
 | 1 | CBP        | Linux x86_64 (WSL2)    | x86_64-unknown-linux-gnu       | ✅      | ✅      | ✅         | First probe; reference deployment |
-| 2 | Sprout     | Linux aarch64 (Jetson) | aarch64-unknown-linux-gnu      | ⬜      | ⬜      | ⬜         | The constraint probe |
+| 2 | Sprout     | Linux aarch64 (Jetson) | aarch64-unknown-linux-gnu      | ✅      | ✅      | ✅         | Built from source (GLIBC 2.35 < 2.39 required by prebuilt); Rust 1.95, 5m12s build |
 | 3 | Thor       | Linux aarch64 (Jetson Thor) | aarch64-unknown-linux-gnu | ✅      | ✅      | ✅         | ARC-AGI workload dialect; Thor is aarch64 (corrected from x86_64). Daemon + plugin installed cleanly on Tegra L4T 2026-05-21 |
 | 4 | Legion     | Linux x86_64           | x86_64-unknown-linux-gnu       | ⬜      | ⬜      | ⬜         | GPU-bound autonomous tracks |
 | 5 | McNugget   | macOS aarch64 (M4)     | aarch64-apple-darwin           | ⬜      | ⬜      | ⬜         | launchd probe |
