@@ -17,7 +17,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dp-web4/hestia/main/deploy/f
 | 2 | Sprout     | Linux aarch64 (Jetson) | aarch64-unknown-linux-gnu      | ✅      | ✅      | ✅         | Built from source (GLIBC 2.35 < 2.39 required by prebuilt); Rust 1.95, 5m12s build |
 | 3 | Thor       | Linux aarch64 (Jetson Thor) | aarch64-unknown-linux-gnu | ✅      | ✅      | ✅         | ARC-AGI workload dialect; Thor is aarch64 (corrected from x86_64). Daemon + plugin installed cleanly on Tegra L4T 2026-05-21 |
 | 4 | Legion     | Linux x86_64           | x86_64-unknown-linux-gnu       | ✅      | ✅      | ✅         | Built from source (Rust 1.94, 41s); systemd user service; RTX 4090 GPU-bound autonomous tracks |
-| 5 | McNugget   | macOS aarch64 (M4)     | aarch64-apple-darwin           | ⬜      | ⬜      | ⬜         | launchd probe |
+| 5 | McNugget   | macOS aarch64 (M4)     | aarch64-apple-darwin           | ✅      | ✅      | ✅         | launchd ✓ (`com.web4.hestia.daemon`, pid alive on :7711); daemon v0.0.3; plugin hook (`post_tool_use.sh`) wired in `~/.claude/settings.json`; dashboard HTTP 200. macOS Tauri app (.app + .dmg, v0.1.0) built 2026-05-24. iOS pending full Xcode. |
 | 6 | Nomad      | Linux x86_64           | x86_64-unknown-linux-gnu       | ⬜      | ⬜      | ⬜         | Mobile oversight |
 
 **Legend:** ✅ installed · ⬜ pending · ❌ blocked (note in row)
