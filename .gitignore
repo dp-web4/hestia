@@ -36,3 +36,12 @@ credentials/
 plugin-sdk/typescript/package-lock.json
 plugin-sdk/python/poetry.lock
 plugin-sdk/rust/Cargo.lock
+
+# Tauri app
+app/node_modules/
+app/dist/
+app/src-tauri/target/
+app/src-tauri/gen/android/.gradle/
+app/src-tauri/gen/android/app/build/
+app/src-tauri/gen/android/buildSrc/build/
+app/src-tauri/gen/android/local.properties

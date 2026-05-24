@@ -1,0 +1,10 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicoverbruggen/tauri-vs-electron/refs/heads/main/capability-schema.json",
+  "identifier": "default",
+  "description": "Default permissions for the Hestia app",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open"
+  ]
+}
