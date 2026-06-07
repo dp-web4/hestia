@@ -1,116 +1,120 @@
 # Hestia
 
-> Make your existing AI agents Web4-compliant.
+> Universal Web4 presence — for humans and AI.
 
-Hestia is the open-source layer that adds **identity**, **trust**, and a **credential vault** to whatever AI agents you already use — Claude Code, OpenClaw, Cursor, Cline, ChatGPT desktop, ruflo, local LLMs. Plugin install. No workflow changes. Local-first.
+Hestia is the open-source local-first layer that gives any entity — human user, AI agent, autonomous service — a **cryptographic identity**, an **encrypted vault**, **delegation authority**, and a **trust record** in the Web4 ecosystem. Plugin install for AI agents. CLI for humans. No cloud required.
 
-> **Status:** Phase 0 (foundations). Not yet usable. This README describes the target.
+> **Status:** Phase 1 (functional core). Vault, policy engine, witness chain, delegation, plugin SDK, and CLI are built and working. Hub integration (Phase 2) in progress. See [Honest Status](#honest-status) below.
 
-## What Hestia is
+## What Hestia does
 
-Hestia is to agent ecosystems what TLS is to HTTP — a transparent layer that makes the thing you actually care about (your agent of choice) more trustworthy, without changing what you touch.
+### For humans
+- `hestia init` → encrypted vault + Web4 LCT identity on your machine
+- `hestia vault add` → store API keys, tokens, secrets (ChaCha20-Poly1305 + Argon2id)
+- `hestia delegate grant <agent-id> --role administrator --expires 24` → give an AI agent scoped authority, cryptographically signed, revocable
+- `hestia delegate list` / `hestia delegate revoke` → manage what your agents can do
+- `hestia connect-hub <url>` → join a Web4 hub (community, team, org) with your identity *(in progress)*
 
-You keep using Claude Code. You keep using OpenClaw. You keep using whatever IDE plugin or chat UI you've already chosen. Hestia runs alongside and:
+### For AI agents
+- Plugin SDK (Rust, TypeScript, Python) → connect to the local Hestia daemon
+- `beginAction()` / `recordOutcome()` → witnessed audit trail of every tool call
+- `vaultGet()` / `vaultSet()` → access credentials through controlled MCP interface
+- `queryPolicy()` → check what you're allowed to do before doing it
+- Delegated authority from human owner → act within scoped permissions
 
-- **Holds your credentials securely.** One vault for all the API keys and tokens that are currently scattered across `.pypirc`, `.cargo/credentials.toml`, `.npmrc`, `.env` files, IDE config, environment variables. Encrypted at rest. Exposed to your agents through a controlled MCP interface, with witness chain (audit trail) of every access.
-- **Gives each agent a cryptographic identity.** When Claude Code does work for you, it does so as a witnessed actor in your personal Web4 society. Same for OpenClaw, Cursor, anything you plug in.
-- **Tracks reputation that evolves from observed behavior.** T3/V3 trust tensors per agent, with decay. Over time you can answer: "which of my agents is most reliable on Python tasks?" — from real data, not vibes.
-- **Federates when you want it to.** Carry embers from your hearth to light another's: portable society state, inter-society protocol, teammate federation. (Phase 4.)
+### For the Web4 ecosystem
+- Each Hestia instance is a full Web4 presence: LCT identity, T3/V3 trust tensors, witness chain
+- Hub integration: present your identity to communities, sign requests, carry trust
+- Federation: portable society state between instances *(Phase 4)*
 
-What Hestia is **not**:
-- Not a replacement agent UI. Not a chat interface. Not an IDE. Not a workflow builder.
-- Not a vendor cloud. Your trust state, witness chain, and credentials live on your machine.
+## What Hestia is not
 
-## The metaphor (since the name asks for one)
+- Not a replacement agent UI, chat interface, IDE, or workflow builder
+- Not a vendor cloud — everything lives on your machine
+- Not just for AI agents — humans are first-class (the "universal" in universal presence)
 
-**Hestia** is the Greek goddess of hearth, home, family — and the state. Every Greek household and every Greek city-state had a public hearth dedicated to her. When colonies were founded, embers from the mother city's hearth were carried to the new one to ignite it.
+## The metaphor
 
-That's the product, more or less. Your local Web4 society is the hearth. Your agents are guests under your laws of hospitality (Greek *xenia*). You tend the trust state. When you federate with someone else, you carry embers.
+**Hestia** is the Greek goddess of hearth. Every household and city-state had a public hearth dedicated to her. When colonies were founded, embers from the mother city's hearth were carried to light the new one. That's the product: your local Web4 society is the hearth. Your agents are guests under your laws of hospitality. When you connect to a hub, you carry embers.
+
+## Honest status
+
+### Built and working (Phase 1)
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| **Vault** | Working | ChaCha20-Poly1305 + Argon2id, passphrase-first. CLI: init, add, get, list, remove. |
+| **Policy engine** | Working | 4 presets (permissive/safety/strict/audit-only), custom rules, rate limiting, glob+regex matchers. |
+| **Witness chain** | Working | SQLite-backed, hash-linked entries, integrated with web4-trust-core. |
+| **Trust evolution** | Working | T3/V3 per agent, fed from tool call outcomes. |
+| **Delegation** | Working | DelegatedAuthority (web4-core U2), scoped by role+action, signed, revocable. CLI: grant, list, revoke. |
+| **MCP server** | Working | 8 tools exposed via rmcp + Axum HTTP. |
+| **Plugin SDK** | Working | Rust, TypeScript, Python — identical interface. |
+| **Claude Code plugin** | Working | PostToolUse witness hook, policy gating. Deployed on 4 machines. |
+| **CLI** | Working | vault, policy, delegation, serve, dashboard, info, init. |
+| **TUI dashboard** | Working | ratatui terminal UI against running daemon. |
+| **Desktop app** | Scaffolded | Tauri 2 cross-platform. Framework ready, UI incomplete. |
+
+### Not yet built (Phase 2+)
+
+| Component | Status | Dependency |
+|-----------|--------|------------|
+| **Hub connection** (`connect-hub`, `list-hubs`, `sign-request`) | In progress | Hub API surface (Track B) |
+| **Multi-hub connector** | Not started | Hub connection |
+| **AI variant** (autonomous vault) | Design decision | Same code, different ownership model |
+| **PreToolUse policy gating** | Not started | Policy engine is ready; hook wiring needed |
+| **Vault credential injection** | Not started | Plugin SDK surface exists |
+| **Hardware binding** (TPM/YubiKey/SE) | Trait contracts only | Hardbound enterprise tier |
+| **Federation** | Not started | Phase 4 |
+
+### What changed from the original plan
+
+The original README (April 2026) described Hestia as an agent-tracking layer — "make your existing AI agents Web4-compliant." That's still true but undersells it. As of the V2 architecture work (June 2026), Hestia is the **universal Web4 presence primitive** for both humans and AI:
+
+- Humans use Hestia to manage their Web4 identity, join hubs, and delegate authority to agents
+- AI agents use Hestia to hold credentials, act under delegation, and build witnessed trust records
+- Hubs verify Hestia-signed requests for both humans and AI
+
+The vault + delegation + witness chain serve both roles. The "agent tracking" framing was Phase 0 thinking; the V2 architecture elevates Hestia to the presence substrate for the entire Web4 ecosystem.
 
 ## Repository layout
 
 ```
 hestia/
-├── plugin-sdk/           # The Plugin Authoring Kit (PAK)
-│   ├── typescript/       # @hestia-tools/plugin-sdk on npm
-│   ├── python/           # hestia-plugin-sdk on PyPI
-│   └── rust/             # hestia-plugin-sdk on crates.io
-├── core/                 # Rust core (vault, MCP host, society state)
-├── app/                  # Tauri desktop app (the inspection UI)
+├── core/                 # Rust core (vault, MCP host, delegation, policy, witness chain)
+├── plugin-sdk/           # Plugin Authoring Kit
+│   ├── rust/             # hestia-plugin-sdk (crates.io)
+│   ├── typescript/       # @hestia-tools/plugin-sdk (npm)
+│   └── python/           # hestia-plugin-sdk (PyPI)
 ├── plugins/              # First-party plugin implementations
-│   ├── claude-code/      # Hestia plugin for Claude Code
-│   ├── openclaw/         # Hestia plugin for OpenClaw
-│   ├── ruflo/            # Hestia plugin for ruflo (formerly claude-flow)
-│   └── ... more in Phase 2
-├── docs/                 # Public documentation
-│   ├── ARCHITECTURE.md
-│   ├── PLUGIN_AUTHORING_GUIDE.md
+│   ├── claude-code/      # Claude Code witness + policy hooks
+│   └── openclaw/         # OpenClaw integration
+├── hardbound-pak/        # Enterprise trait contracts (TPM/YubiKey/SE)
+├── app/                  # Tauri 2 desktop app (inspection UI)
+├── docs/                 # Architecture, plugin guide, ADRs
 │   └── DESIGN_DECISIONS/ # ADR-style decision records
-└── examples/             # Worked examples for users
+└── demo/                 # Worked examples (consumer + enterprise)
 ```
 
-## Where this fits in the Web4 ecosystem
-
-Hestia is built on the Web4 ontology:
+## Web4 foundation
 
 ```
 Web4 = MCP + RDF + LCT + T3/V3*MRH + ATP/ADP
 ```
 
-We use [`web4-core`](https://crates.io/crates/web4-core), [`web4-trust-core`](https://crates.io/crates/web4-trust-core), and [`web4-sdk`](https://pypi.org/project/web4-sdk/) (all currently at v0.2.0 / v0.27.0) for the underlying primitives. Hestia adds the local-first credential vault, the MCP plugin host, the inspection UI, and the user-sovereign packaging.
-
-Spec: [github.com/dp-web4/web4](https://github.com/dp-web4/web4)
-
-## Comparing Hestia to existing tools
-
-| | Hestia | Conductor | Claude Code Agent View | Microsoft AGT | OpenClaw / Cline / Cursor | 1Password / Bitwarden |
-|---|---|---|---|---|---|---|
-| **Replaces your agent UI** | No | Yes (Mac) | Yes (Claude only) | No | Themselves | No |
-| **Multi-vendor (cross-tool)** | ✓ | Coding only | Claude only | Enterprise-shaped | One tool each | No (humans only) |
-| **Local-first / sovereign** | ✓ | ✓ | ✓ | Partial | Mixed | ✓ |
-| **Credential vault** | ✓ | — | — | — | — | ✓ (human-only) |
-| **Cryptographic agent identity** | ✓ | — | — | ✓ DID | — | — |
-| **Evolving trust state** | ✓ T3/V3 | — | — | ✓ 0-1000 | — | — |
-| **Hardware binding (premium)** | ✓ | — | — | — | — | ✓ |
-| **Open source** | ✓ AGPL | Mac app | Anthropic's | ✓ MIT | Most | Bitwarden free / 1P paid |
-
-We don't compete with the agents (we make them Web4-compliant). We don't compete with dashboards (we're alongside, not instead). We complement password managers (we're for agents; they're for humans). Where we overlap with Microsoft's Agent Governance Toolkit, the difference is *who's in charge*: MAGT is enterprise governance imposed top-down; Hestia is user-sovereignty over agents you chose.
+Hestia uses [`web4-core`](https://github.com/dp-web4/web4/tree/main/web4-core) for LCT identity, delegation, role assignment, and crypto. Uses [`web4-trust-core`](https://github.com/dp-web4/web4/tree/main/web4-trust-core) for witness chain persistence and trust state.
 
 ## Tiers
 
-- **Open source (this repo) — Free, AGPL-3.0-or-later.** Everything except hardware binding + commercial license. Encrypted local-file vault, full Web4 society, plugins, MCP host, inspection UI. Use forever, no payment, no signup.
-- **Premium individual — TBD pricing.** Hardware binding to TPM / YubiKey + password recovery + cloud backup with envelope encryption.
-- **Commercial seat — TBD pricing.** Above + commercial license (escape AGPL for closed-source integration) + team admin console + audit log export.
-- **Enterprise — Custom.** On-prem central admin + SSO/SCIM + compliance attestation kit. (Hardbound integration.)
-
-The open-source tier is real and complete. Not crippleware.
-
-## Status — Phase 0
-
-This repository is being bootstrapped. The plan:
-
-- **Phase 0 (2-3 weeks):** Foundations + Plugin Authoring Kit extraction from the three existing Web4 governance plugins (`web4/claude-code-plugin`, `moltbot/extensions/web4-governance`, `claude-flow/v3/plugins/web4-governance` — now `ruvnet/ruflo`).
-- **Phase 1 (4-6 weeks):** Vault MVP + refactor first plugin (OpenClaw) against the PAK.
-- **Phase 2 (6-8 weeks):** New plugin adapters (Cursor, Cline, ChatGPT desktop) + inspection UI.
-- **Phase 3 (4 weeks):** Premium tier launch (hardware binding).
-- **Phase 4 (8-12 weeks):** Federation + commercial tier.
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/PLUGIN_AUTHORING_GUIDE.md](docs/PLUGIN_AUTHORING_GUIDE.md) for the technical shape.
+- **Open source (this repo) — Free, AGPL-3.0-or-later.** Vault, delegation, witness chain, trust evolution, policy engine, plugin SDK, CLI, TUI, MCP server. Complete and real.
+- **Premium individual — TBD.** Hardware binding (TPM/YubiKey/SE) + cloud backup with envelope encryption.
+- **Commercial seat — TBD.** Commercial license (escape AGPL) + team admin + audit export.
+- **Enterprise — Custom.** On-prem admin + SSO/SCIM + compliance attestation. (Hardbound integration.)
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Plugin authors: see [docs/PLUGIN_AUTHORING_GUIDE.md](docs/PLUGIN_AUTHORING_GUIDE.md). This is research-stage work; the API surface will change as we learn from design partners.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Plugin authors: see [docs/PLUGIN_AUTHORING_GUIDE.md](docs/PLUGIN_AUTHORING_GUIDE.md).
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE). Commercial license available for closed-source use — see the commercial tier above.
-
-## Acknowledgments
-
-Hestia stands on the existing Web4 governance plugins. Three independent implementations of the same core surface gave us the pattern that the Plugin Authoring Kit crystallizes:
-
-- [`web4/claude-code-plugin`](https://github.com/dp-web4/web4/tree/main/claude-code-plugin) (open PR [anthropics/claude-code#20448](https://github.com/anthropics/claude-code/pull/20448))
-- [`moltbot/extensions/web4-governance`](https://github.com/getclawdbot/moltbot/) (OpenClaw, formerly Moltbot — renamed after Anthropic trademark complaint)
-- [`claude-flow/v3/plugins/web4-governance`](https://github.com/ruvnet/ruflo/tree/main/v3/plugins/web4-governance) (ruflo, formerly claude-flow — rebranded by ruvnet per their ADR-046)
-
-All three credit-back to dp-web4 / dp@metalinxx.io.
+[AGPL-3.0-or-later](LICENSE). Commercial license available for closed-source use.
