@@ -7,6 +7,7 @@
 //! - **MCP server**: rmcp-backed server exposing the surface in ADR-0005 (next)
 //! - **Society state**: Web4 society with witness chain + trust evolution (after that)
 
+pub mod delegation;
 pub mod error;
 pub mod policy;
 pub mod server;
@@ -14,5 +15,6 @@ pub mod storage;
 pub mod tui;
 pub mod vault;
 
+pub use delegation::DelegationStore;
 pub use error::{CoreError, Result};
 pub use vault::{Vault, VaultEntry};

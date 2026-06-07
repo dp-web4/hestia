@@ -7,6 +7,7 @@ use anyhow::{Context, Result as AnyResult};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use hestia::delegation::{self, DelegationStore};
 use hestia::vault::{default_hestia_home, vault_path, Vault, VaultEntry};
 
 #[derive(Parser, Debug)]
@@ -60,6 +61,10 @@ enum Command {
     /// Policy subcommands
     #[command(subcommand)]
     Policy(PolicyCmd),
+
+    /// Delegation subcommands (Track H4 — delegate authority to agents)
+    #[command(subcommand)]
+    Delegate(DelegateCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -82,6 +87,37 @@ enum PolicyCmd {
         tool: String,
         /// Target (file path, URL, or for Bash, the full command)
         target: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DelegateCmd {
+    /// Grant authority to an agent
+    #[command(alias = "to")]
+    Grant {
+        /// Agent LCT ID (UUID)
+        agent: String,
+
+        /// Roles to grant (e.g. --role administrator --role archivist)
+        #[arg(long)]
+        role: Vec<String>,
+
+        /// Specific actions to permit (empty = all within granted roles)
+        #[arg(long)]
+        action: Vec<String>,
+
+        /// Expiration in hours (e.g. --expires 24)
+        #[arg(long)]
+        expires: Option<u64>,
+    },
+
+    /// List active delegations
+    List,
+
+    /// Revoke a delegation by ID
+    Revoke {
+        /// Delegation ID (UUID)
+        id: String,
     },
 }
 
@@ -147,6 +183,13 @@ pub fn run() -> AnyResult<()> {
             PolicyCmd::List => cmd_policy_list(),
             PolicyCmd::Set { preset } => cmd_policy_set(&home, &preset),
             PolicyCmd::Test { tool, target } => cmd_policy_test(&home, &tool, &target),
+        },
+        Command::Delegate(d) => match d {
+            DelegateCmd::Grant { agent, role, action, expires } => {
+                cmd_delegate_grant(&home, &agent, role, action, expires)
+            }
+            DelegateCmd::List => cmd_delegate_list(&home),
+            DelegateCmd::Revoke { id } => cmd_delegate_revoke(&home, &id),
         },
     }
 }
@@ -432,6 +475,86 @@ fn cmd_policy_set(home: &std::path::Path, preset: &str) -> AnyResult<()> {
     vault.set_active_preset(preset)?;
     println!("✓ active preset set to '{preset}'");
     println!("  (a running daemon won't pick this up until restart)");
+    Ok(())
+}
+
+// ---- delegation commands ----------------------------------------------------
+
+fn cmd_delegate_grant(
+    home: &std::path::Path,
+    agent: &str,
+    role_names: Vec<String>,
+    actions: Vec<String>,
+    expires: Option<u64>,
+) -> AnyResult<()> {
+    let agent_id = uuid::Uuid::parse_str(agent)
+        .with_context(|| format!("invalid agent UUID: {agent}"))?;
+
+    let roles: Vec<_> = role_names.iter()
+        .map(|r| delegation::parse_role(r))
+        .collect::<Result<_, _>>()?;
+
+    // For now, use a fresh keypair as the delegator.
+    // In production, this would come from the vault's LCT identity.
+    let delegator_kp = web4_core::crypto::KeyPair::generate();
+    let delegator_id = uuid::Uuid::new_v4();
+
+    let mut store = DelegationStore::load(home)?;
+    let deleg = store.create_delegation(
+        delegator_id,
+        agent_id,
+        roles,
+        actions,
+        expires,
+        &delegator_kp,
+    );
+
+    let id = deleg.id;
+    let exp = deleg.expires_at
+        .map(|e| e.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "never".into());
+
+    store.save(home)?;
+    println!("Delegation created:");
+    println!("  id:      {id}");
+    println!("  agent:   {agent_id}");
+    println!("  expires: {exp}");
+    Ok(())
+}
+
+fn cmd_delegate_list(home: &std::path::Path) -> AnyResult<()> {
+    let store = DelegationStore::load(home)?;
+    let active = store.active();
+
+    if active.is_empty() {
+        println!("(no active delegations)");
+        return Ok(());
+    }
+
+    for d in active {
+        let roles: Vec<String> = d.scope.roles.iter()
+            .map(|r| format!("{:?}", r))
+            .collect();
+        let role_str = if roles.is_empty() { "*".into() } else { roles.join(", ") };
+        let exp = d.expires_at
+            .map(|e| e.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "never".into());
+
+        println!("{} → agent={} roles=[{}] expires={}",
+            d.id, d.agent_lct_id, role_str, exp);
+    }
+    println!("\n{} active delegation(s), {} total", store.active().len(), store.delegations.len());
+    Ok(())
+}
+
+fn cmd_delegate_revoke(home: &std::path::Path, id: &str) -> AnyResult<()> {
+    let delegation_id = uuid::Uuid::parse_str(id)
+        .with_context(|| format!("invalid delegation UUID: {id}"))?;
+
+    let mut store = DelegationStore::load(home)?;
+    store.revoke(delegation_id)?;
+    store.save(home)?;
+    println!("Delegation {delegation_id} revoked");
     Ok(())
 }
 
