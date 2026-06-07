@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use hestia::delegation::{self, DelegationStore};
+use hestia::hub::{HubClient, HubStore};
 use hestia::vault::{default_hestia_home, vault_path, Vault, VaultEntry};
 
 #[derive(Parser, Debug)]
@@ -65,6 +66,34 @@ enum Command {
     /// Delegation subcommands (Track H4 — delegate authority to agents)
     #[command(subcommand)]
     Delegate(DelegateCmd),
+
+    /// Hub connection subcommands (Track H2/H3 — connect to Web4 hubs)
+    #[command(subcommand)]
+    Hub(HubCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum HubCmd {
+    /// Connect to a Web4 hub (discovers via .well-known/web4-hub.json)
+    Connect {
+        /// Hub base URL (e.g. https://hub.example.com)
+        url: String,
+    },
+
+    /// List connected hubs
+    List,
+
+    /// Show details of a specific hub connection
+    Show {
+        /// Hub URL or connection UUID
+        target: String,
+    },
+
+    /// Disconnect from a hub (removes local connection state)
+    Disconnect {
+        /// Hub URL or connection UUID
+        target: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -190,6 +219,12 @@ pub fn run() -> AnyResult<()> {
             }
             DelegateCmd::List => cmd_delegate_list(&home),
             DelegateCmd::Revoke { id } => cmd_delegate_revoke(&home, &id),
+        },
+        Command::Hub(h) => match h {
+            HubCmd::Connect { url } => cmd_hub_connect(&home, &url),
+            HubCmd::List => cmd_hub_list(&home),
+            HubCmd::Show { target } => cmd_hub_show(&home, &target),
+            HubCmd::Disconnect { target } => cmd_hub_disconnect(&home, &target),
         },
     }
 }
@@ -555,6 +590,120 @@ fn cmd_delegate_revoke(home: &std::path::Path, id: &str) -> AnyResult<()> {
     store.revoke(delegation_id)?;
     store.save(home)?;
     println!("Delegation {delegation_id} revoked");
+    Ok(())
+}
+
+// ---- hub commands -----------------------------------------------------------
+
+fn cmd_hub_connect(home: &std::path::Path, url: &str) -> AnyResult<()> {
+    let mut store = HubStore::load(home)?;
+
+    if store.find_by_url(url).is_some() {
+        anyhow::bail!("already connected to {url}");
+    }
+
+    println!("Discovering hub at {url}...");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all().build()?;
+
+    let client = HubClient::new();
+    let info = rt.block_on(client.discover(url))?;
+
+    println!("  hub LCT:      {}", info.hub_lct_id);
+    println!("  API versions: {:?}", info.api_versions);
+    println!("  REST:         {}", info.endpoints.rest);
+    println!("  chapters:     {} available", info.chapters.len());
+    for ch in &info.chapters {
+        println!("    - {} ({})", ch.name, if ch.public { "public" } else { "private" });
+    }
+
+    let our_lct_id = uuid::Uuid::new_v4();
+    let api_version = info.api_versions.first()
+        .cloned()
+        .unwrap_or_else(|| "v1".into());
+
+    let conn = hestia::hub::HubConnection {
+        id: uuid::Uuid::new_v4(),
+        url: url.to_string(),
+        hub_lct_id: info.hub_lct_id,
+        our_lct_id,
+        connected_at: chrono::Utc::now(),
+        last_seen: Some(chrono::Utc::now()),
+        api_version,
+        rest_endpoint: info.endpoints.rest,
+        chapters_joined: vec![],
+    };
+
+    store.connections.push(conn);
+    store.save(home)?;
+    println!("\nConnected to {url} (id: {our_lct_id})");
+    Ok(())
+}
+
+fn cmd_hub_list(home: &std::path::Path) -> AnyResult<()> {
+    let store = HubStore::load(home)?;
+
+    if store.connections.is_empty() {
+        println!("(no hub connections — use `hestia hub connect <url>` to connect)");
+        return Ok(());
+    }
+
+    for conn in &store.connections {
+        let age = chrono::Utc::now() - conn.connected_at;
+        let chapters = if conn.chapters_joined.is_empty() {
+            "none".into()
+        } else {
+            format!("{}", conn.chapters_joined.len())
+        };
+        println!("{} → {} (connected {}d ago, {} chapters joined)",
+            conn.id, conn.url, age.num_days(), chapters);
+    }
+    println!("\n{} connection(s)", store.connections.len());
+    Ok(())
+}
+
+fn cmd_hub_show(home: &std::path::Path, target: &str) -> AnyResult<()> {
+    let store = HubStore::load(home)?;
+
+    let conn = if let Ok(id) = uuid::Uuid::parse_str(target) {
+        store.find_by_id(id)
+    } else {
+        store.find_by_url(target)
+    };
+
+    let conn = conn.ok_or_else(|| anyhow::anyhow!("hub connection not found: {target}"))?;
+
+    println!("id:             {}", conn.id);
+    println!("url:            {}", conn.url);
+    println!("hub LCT:        {}", conn.hub_lct_id);
+    println!("our LCT:        {}", conn.our_lct_id);
+    println!("connected:      {}", conn.connected_at.format("%Y-%m-%d %H:%M UTC"));
+    println!("last seen:      {}", conn.last_seen
+        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "never".into()));
+    println!("API version:    {}", conn.api_version);
+    println!("REST endpoint:  {}", conn.rest_endpoint);
+    println!("chapters joined: {}", if conn.chapters_joined.is_empty() {
+        "none".into()
+    } else {
+        conn.chapters_joined.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")
+    });
+    Ok(())
+}
+
+fn cmd_hub_disconnect(home: &std::path::Path, target: &str) -> AnyResult<()> {
+    let mut store = HubStore::load(home)?;
+
+    let idx = if let Ok(id) = uuid::Uuid::parse_str(target) {
+        store.connections.iter().position(|c| c.id == id)
+    } else {
+        store.connections.iter().position(|c| c.url == target)
+    };
+
+    let idx = idx.ok_or_else(|| anyhow::anyhow!("hub connection not found: {target}"))?;
+    let removed = store.connections.remove(idx);
+    store.save(home)?;
+    println!("Disconnected from {} ({})", removed.url, removed.id);
     Ok(())
 }
 

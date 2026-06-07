@@ -9,6 +9,7 @@
 
 pub mod delegation;
 pub mod error;
+pub mod hub;
 pub mod policy;
 pub mod server;
 pub mod storage;
@@ -17,4 +18,5 @@ pub mod vault;
 
 pub use delegation::DelegationStore;
 pub use error::{CoreError, Result};
+pub use hub::{HubClient, HubStore};
 pub use vault::{Vault, VaultEntry};
