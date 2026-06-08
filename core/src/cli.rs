@@ -36,6 +36,12 @@ enum Command {
         /// Overwrite existing vault if present (DESTRUCTIVE)
         #[arg(long)]
         force: bool,
+
+        /// AI-autonomous mode — generate a keypair and store it in the vault
+        /// instead of prompting for human credentials. The AI agent owns this
+        /// identity directly (no delegation from a human).
+        #[arg(long)]
+        ai: bool,
     },
 
     /// Show hestia home + vault info
@@ -46,6 +52,11 @@ enum Command {
         /// Bind address (default 127.0.0.1:7711)
         #[arg(long, default_value = "127.0.0.1:7711")]
         bind: String,
+
+        /// Enable Sovereign callback server (hub signing requests).
+        /// Generates an ephemeral keypair; production should load from vault.
+        #[arg(long)]
+        callback: bool,
     },
 
     /// Launch the terminal dashboard against a running daemon
@@ -192,9 +203,9 @@ pub fn run() -> AnyResult<()> {
     let home = resolve_home(&cli)?;
 
     match cli.command {
-        Command::Init { force } => cmd_init(&home, force),
+        Command::Init { force, ai } => cmd_init(&home, force, ai),
         Command::Info => cmd_info(&home),
-        Command::Serve { bind } => cmd_serve(&home, &bind),
+        Command::Serve { bind, callback } => cmd_serve(&home, &bind, callback),
         Command::Dashboard { endpoint } => hestia::tui::run(&endpoint),
         Command::Vault(v) => match v {
             VaultCmd::List => cmd_vault_list(&home),
@@ -291,7 +302,7 @@ fn prompt_secret() -> AnyResult<String> {
 
 // ---- commands -------------------------------------------------------------
 
-fn cmd_init(home: &std::path::Path, force: bool) -> AnyResult<()> {
+fn cmd_init(home: &std::path::Path, force: bool, ai: bool) -> AnyResult<()> {
     std::fs::create_dir_all(home).with_context(|| format!("creating {}", home.display()))?;
     let path = vault_path(home);
     if path.exists() && !force {
@@ -302,7 +313,11 @@ fn cmd_init(home: &std::path::Path, force: bool) -> AnyResult<()> {
         );
     }
 
-    println!("Initializing Hestia at {}", home.display());
+    if ai {
+        println!("Initializing Hestia in AI-autonomous mode at {}", home.display());
+    } else {
+        println!("Initializing Hestia at {}", home.display());
+    }
     let passphrase = prompt_passphrase_with_confirmation()?;
 
     if force {
@@ -310,11 +325,36 @@ fn cmd_init(home: &std::path::Path, force: bool) -> AnyResult<()> {
     } else {
         Vault::init(path.clone(), passphrase)?;
     }
-    println!("✓ Empty vault created at {}", path.display());
+
+    if ai {
+        let mut vault = Vault::open(path.clone(), std::env::var("HESTIA_PASSPHRASE")
+            .unwrap_or_default())?;
+        let kp = web4_core::crypto::KeyPair::generate();
+        let lct_id = uuid::Uuid::new_v4();
+        let pub_hex = kp.verifying_key().to_hex();
+
+        vault.add(VaultEntry::new("ai_identity_lct_id", lct_id.to_string())
+            .with_tags(vec!["identity".into(), "ai".into()]))?;
+        vault.add(VaultEntry::new("ai_identity_pubkey", pub_hex.clone())
+            .with_tags(vec!["identity".into(), "ai".into()]))?;
+
+        // Store private key bytes hex-encoded
+        let secret_hex: String = kp.secret_key_bytes().iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        vault.add(VaultEntry::new("ai_identity_secret", secret_hex)
+            .with_tags(vec!["identity".into(), "ai".into(), "secret".into()]))?;
+
+        println!("✓ AI identity generated:");
+        println!("  LCT ID:     {lct_id}");
+        println!("  Public key:  {pub_hex}");
+    }
+
+    println!("✓ Vault created at {}", path.display());
     Ok(())
 }
 
-fn cmd_serve(home: &std::path::Path, bind: &str) -> AnyResult<()> {
+fn cmd_serve(home: &std::path::Path, bind: &str, callback: bool) -> AnyResult<()> {
     let path = hestia::vault::vault_path(home);
     if !path.exists() {
         anyhow::bail!(
@@ -333,12 +373,19 @@ fn cmd_serve(home: &std::path::Path, bind: &str) -> AnyResult<()> {
         tracing::warn!("failed to write endpoint discovery file: {e}");
     }
 
+    let callback_kp = if callback {
+        println!("Sovereign callback enabled at /callback");
+        Some(web4_core::crypto::KeyPair::generate())
+    } else {
+        None
+    };
+
     let state = hestia::server::build_state(vault, home)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    runtime.block_on(hestia::server::serve(state, bind))?;
+    runtime.block_on(hestia::server::serve_with_callback(state, bind, callback_kp))?;
 
     // Cleanup
     let _ = std::fs::remove_file(&endpoint_file);
@@ -612,8 +659,8 @@ fn cmd_hub_connect(home: &std::path::Path, url: &str) -> AnyResult<()> {
     println!("  hub LCT:      {}", info.hub_lct_id);
     println!("  API versions: {:?}", info.api_versions);
     println!("  REST:         {}", info.endpoints.rest);
-    println!("  chapters:     {} available", info.chapters.len());
-    for ch in &info.chapters {
+    println!("  hubs:         {} available", info.hubs.len());
+    for ch in &info.hubs {
         println!("    - {} ({})", ch.name, if ch.public { "public" } else { "private" });
     }
 
@@ -631,7 +678,7 @@ fn cmd_hub_connect(home: &std::path::Path, url: &str) -> AnyResult<()> {
         last_seen: Some(chrono::Utc::now()),
         api_version,
         rest_endpoint: info.endpoints.rest,
-        chapters_joined: vec![],
+        hubs_joined: vec![],
     };
 
     store.connections.push(conn);
@@ -650,13 +697,13 @@ fn cmd_hub_list(home: &std::path::Path) -> AnyResult<()> {
 
     for conn in &store.connections {
         let age = chrono::Utc::now() - conn.connected_at;
-        let chapters = if conn.chapters_joined.is_empty() {
+        let joined = if conn.hubs_joined.is_empty() {
             "none".into()
         } else {
-            format!("{}", conn.chapters_joined.len())
+            format!("{}", conn.hubs_joined.len())
         };
-        println!("{} → {} (connected {}d ago, {} chapters joined)",
-            conn.id, conn.url, age.num_days(), chapters);
+        println!("{} → {} (connected {}d ago, {} hubs joined)",
+            conn.id, conn.url, age.num_days(), joined);
     }
     println!("\n{} connection(s)", store.connections.len());
     Ok(())
@@ -683,10 +730,10 @@ fn cmd_hub_show(home: &std::path::Path, target: &str) -> AnyResult<()> {
         .unwrap_or_else(|| "never".into()));
     println!("API version:    {}", conn.api_version);
     println!("REST endpoint:  {}", conn.rest_endpoint);
-    println!("chapters joined: {}", if conn.chapters_joined.is_empty() {
+    println!("hubs joined: {}", if conn.hubs_joined.is_empty() {
         "none".into()
     } else {
-        conn.chapters_joined.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")
+        conn.hubs_joined.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")
     });
     Ok(())
 }
