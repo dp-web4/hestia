@@ -23,7 +23,7 @@ pub struct HubInfo {
     #[serde(default)]
     pub endpoints: HubEndpoints,
     #[serde(default)]
-    pub chapters: Vec<ChapterSummary>,
+    pub hubs: Vec<HubSummary>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -35,7 +35,7 @@ pub struct HubEndpoints {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChapterSummary {
+pub struct HubSummary {
     pub id: Uuid,
     pub name: String,
     #[serde(default)]
@@ -91,7 +91,7 @@ pub struct HubConnection {
     pub api_version: String,
     pub rest_endpoint: String,
     #[serde(default)]
-    pub chapters_joined: Vec<Uuid>,
+    pub hubs_joined: Vec<Uuid>,
 }
 
 /// Multi-hub connection store — persisted at `~/.hestia/hubs.json`.
@@ -199,10 +199,10 @@ impl HubClient {
     pub async fn register_delegation(
         &self,
         rest_endpoint: &str,
-        chapter_id: Uuid,
+        hub_id: Uuid,
         envelope: &SignedEnvelope,
     ) -> Result<()> {
-        let url = format!("{}/chapters/{}/delegations", rest_endpoint, chapter_id);
+        let url = format!("{}/hubs/{}/delegations", rest_endpoint, hub_id);
         let resp = self.http.post(&url)
             .json(&serde_json::json!({ "envelope": envelope }))
             .send().await
@@ -237,7 +237,7 @@ mod tests {
             last_seen: None,
             api_version: "v1".into(),
             rest_endpoint: "https://hub.example.com/v1".into(),
-            chapters_joined: vec![],
+            hubs_joined: vec![],
         });
 
         let json = serde_json::to_string(&store).unwrap();
@@ -250,7 +250,7 @@ mod tests {
     fn test_signed_envelope() {
         let kp = KeyPair::generate();
         let lct_id = Uuid::new_v4();
-        let payload = serde_json::json!({"action": "join", "chapter": "test"});
+        let payload = serde_json::json!({"action": "join", "hub": "test"});
 
         let envelope = SignedEnvelope::create(
             "nonce123".into(),
@@ -277,7 +277,7 @@ mod tests {
             last_seen: None,
             api_version: "v1".into(),
             rest_endpoint: "https://hub.example.com/v1".into(),
-            chapters_joined: vec![],
+            hubs_joined: vec![],
         });
 
         assert!(store.find_by_url("https://hub.example.com").is_some());
