@@ -23,12 +23,21 @@ use tokio_util::sync::CancellationToken;
 
 use super::handler::HestiaServer;
 use super::state::SharedState;
+use crate::callback::{CallbackState, callback_router};
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:7711";
 
 const DASHBOARD_HTML: &str = include_str!("dashboard/index.html");
 
 pub async fn serve(state: SharedState, bind: &str) -> Result<()> {
+    serve_with_callback(state, bind, None).await
+}
+
+pub async fn serve_with_callback(
+    state: SharedState,
+    bind: &str,
+    callback_keypair: Option<web4_core::crypto::KeyPair>,
+) -> Result<()> {
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("parsing bind address '{}'", bind))?;
@@ -46,12 +55,18 @@ pub async fn serve(state: SharedState, bind: &str) -> Result<()> {
         config,
     );
 
-    let app = axum::Router::new()
+    let mut app = axum::Router::new()
         .route("/", get(dashboard_html))
         .route("/api/dashboard", get(dashboard_json))
         .route("/api/failures", get(failures_json))
         .with_state(state)
         .nest_service("/mcp", service);
+
+    if let Some(kp) = callback_keypair {
+        let cb_state = Arc::new(tokio::sync::Mutex::new(CallbackState::new(kp)));
+        app = app.nest("/callback", callback_router(cb_state));
+        tracing::info!("Sovereign callback active at /callback");
+    }
 
     let listener = TcpListener::bind(&addr)
         .await

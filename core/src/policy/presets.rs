@@ -261,9 +261,9 @@ mod tests {
     }
 
     #[test]
-    fn safety_has_six_rules() {
+    fn safety_has_seven_rules() {
         let p = get_preset("safety").unwrap();
-        assert_eq!(p.config.rules.len(), 6);
+        assert_eq!(p.config.rules.len(), 7);
         assert!(p.config.enforce);
         assert_eq!(p.config.default_policy, PolicyDecision::Allow);
     }

@@ -92,7 +92,7 @@ mod tests {
         assert_eq!(s.active_preset, "safety");
         let cfg = s.resolve().unwrap();
         assert!(cfg.enforce);
-        assert_eq!(cfg.rules.len(), 6);
+        assert_eq!(cfg.rules.len(), 7);
     }
 
     #[test]
@@ -106,7 +106,7 @@ mod tests {
             },
         );
         let cfg = s.resolve().unwrap();
-        assert_eq!(cfg.rules.len(), 5);
+        assert_eq!(cfg.rules.len(), 6);
         assert!(cfg.rules.iter().all(|r| r.id != "warn-network"));
     }
 

@@ -12,7 +12,7 @@ pub use dashboard::{
     ActivityStats, DashboardSnapshot, RecentEntry, SocietyView, TrustView,
 };
 pub use handler::HestiaServer;
-pub use http::{serve, DEFAULT_BIND};
+pub use http::{serve, serve_with_callback, DEFAULT_BIND};
 pub use state::{ServerState, SharedState};
 
 use anyhow::Result;
