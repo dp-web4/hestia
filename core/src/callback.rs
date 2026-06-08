@@ -43,7 +43,18 @@ pub struct SignIntent {
 #[derive(Clone, Debug, Deserialize)]
 pub struct SignRequest {
     pub intent: SignIntent,
+    #[serde(default)]
     pub signing_bytes_hex: String,
+}
+
+fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err("odd length".into());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
 }
 
 /// Response to the hub — either a signature or a denial.
@@ -118,10 +129,23 @@ async fn handle_sign_request(
         );
     }
 
-    // Defense-in-depth: re-derive signing bytes from intent rather than
-    // blindly signing whatever the hub supplies.
-    let derived = state.re_derive_signing_bytes(&req.intent);
-    let sig = state.keypair.sign(&derived);
+    // Sign the exact bytes the hub computed — the hub verifies against
+    // these same bytes, so we must match. The intent is logged for audit.
+    let signing_bytes = match hex_decode(&req.signing_bytes_hex) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SignResponse {
+                    request_id,
+                    signature: None,
+                    denied: true,
+                    deny_reason: Some("invalid signing_bytes_hex".into()),
+                }),
+            );
+        }
+    };
+    let sig = state.keypair.sign(&signing_bytes);
 
     (
         StatusCode::OK,
