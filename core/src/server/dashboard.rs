@@ -14,6 +14,8 @@ pub struct DashboardSnapshot {
     pub stats: ActivityStats,
     pub trust: Vec<TrustView>,
     pub recent: Vec<RecentEntry>,
+    pub delegations: Vec<serde_json::Value>,
+    pub hub_connections: Vec<serde_json::Value>,
     pub generated_at: DateTime<Utc>,
 }
 
@@ -222,6 +224,20 @@ impl ServerState {
             .map(flatten_entry)
             .collect();
 
+        let delegations = crate::delegation::DelegationStore::load(&self.home)
+            .ok()
+            .map(|s| s.delegations.iter()
+                .map(|d| serde_json::to_value(d).unwrap_or_default())
+                .collect())
+            .unwrap_or_default();
+
+        let hub_connections = crate::hub::HubStore::load(&self.home)
+            .ok()
+            .map(|s| s.connections.iter()
+                .map(|c| serde_json::to_value(c).unwrap_or_default())
+                .collect())
+            .unwrap_or_default();
+
         DashboardSnapshot {
             society: SocietyView {
                 sovereign_lct: self.sovereign_lct.clone(),
@@ -240,6 +256,8 @@ impl ServerState {
             },
             trust,
             recent,
+            delegations,
+            hub_connections,
             generated_at: Utc::now(),
         }
     }

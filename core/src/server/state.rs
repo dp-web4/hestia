@@ -66,6 +66,7 @@ pub struct ServerState {
     /// default. Persisted in `<HESTIA_HOME>/synthetic.json`.
     pub synthetic_plugins: HashSet<String>,
     synthetic_path: PathBuf,
+    pub home: PathBuf,
 }
 
 impl ServerState {
@@ -96,6 +97,7 @@ impl ServerState {
             policy_engine,
             synthetic_plugins,
             synthetic_path,
+            home: home.to_path_buf(),
         })
     }
 
