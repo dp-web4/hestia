@@ -847,6 +847,76 @@ input::placeholder {
   }
 }
 
+/* --- Delegations page --- */
+.delegation-list { display: flex; flex-direction: column; gap: 12px; }
+.delegation-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+.delegation-card.revoked { opacity: 0.5; }
+.delegation-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.delegation-id { font-family: var(--font-mono); font-size: 13px; color: var(--text-muted); }
+.delegation-body { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.delegation-field { display: flex; flex-direction: column; gap: 2px; }
+
+/* --- Hubs page --- */
+.hub-list { display: flex; flex-direction: column; gap: 12px; }
+.hub-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+.hub-card-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.hub-url { font-weight: 600; font-size: 15px; }
+.hub-card-body { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.hub-field { display: flex; flex-direction: column; gap: 2px; }
+.hub-endpoint { font-size: 12px; word-break: break-all; }
+
+/* --- Shared: info cards, empty states, badges --- */
+.info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
+.info-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+.info-card h3 { margin: 0 0 8px 0; font-size: 15px; }
+.info-card p { margin: 0; font-size: 13px; color: var(--text-muted); line-height: 1.5; }
+.empty-state { text-align: center; padding: 32px; }
+.hint {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 8px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+}
+.section-description { color: var(--text-muted); font-size: 14px; margin-bottom: 16px; }
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.badge-success { background: var(--success-bg, #dcfce7); color: var(--success, #166534); }
+.badge-danger { background: var(--danger-bg, #fee2e2); color: var(--danger, #991b1b); }
+
 @media (max-width: 480px) {
   .sidebar {
     position: fixed;
