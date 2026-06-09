@@ -12,7 +12,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-use web4_core::crypto::{KeyPair, SignatureBytes};
+use web4_core::crypto::{KeyPair, PublicKey, SignatureBytes};
+use web4_core::pair_channel::{self, Sealed};
 
 /// Hub discovery metadata from `/.well-known/web4-hub.json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,6 +48,57 @@ pub struct HubSummary {
 pub struct ChallengeResponse {
     pub nonce: String,
     pub expires_at: DateTime<Utc>,
+}
+
+/// An established end-to-end encrypted channel to a hub (the member side).
+///
+/// Per the hub authz/confidentiality model, every citizen-tier+ request and
+/// response travels sealed over a member↔hub channel — never in the clear.
+/// This is the member's view of that channel: the `pair_id` agreed at open
+/// time and the hub's LCT public key. Sealing/opening uses `web4_core::
+/// pair_channel` (X25519 ECDH derived from the LCT identity keys →
+/// ChaCha20-Poly1305), the same primitive the hub uses, so the two ends
+/// interoperate by construction.
+///
+/// The member keeps its own `KeyPair` (held by Hestia's vault) and passes it
+/// in per call — this type never holds a secret.
+#[derive(Clone, Debug)]
+pub struct HubChannel {
+    /// The hub this channel is to (LCT id).
+    pub hub_lct_id: Uuid,
+    /// Pair id agreed with the hub at channel-open; salts the session key.
+    pub pair_id: Uuid,
+    /// The hub's LCT public key — the ECDH peer.
+    pub hub_pubkey: PublicKey,
+}
+
+impl HubChannel {
+    pub fn new(hub_lct_id: Uuid, pair_id: Uuid, hub_pubkey_hex: &str) -> Result<Self> {
+        let bytes = hex::decode(hub_pubkey_hex)
+            .context("decoding hub pubkey hex")?;
+        let arr: [u8; 32] = bytes.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("hub pubkey must be 32 bytes, got {}", bytes.len()))?;
+        let hub_pubkey = PublicKey::from_bytes(&arr).context("parsing hub pubkey")?;
+        Ok(Self { hub_lct_id, pair_id, hub_pubkey })
+    }
+
+    /// Seal a request for the hub. `my` is the member's LCT keypair (from the
+    /// vault). Returns base64 ready for JSON transport. The hub `open`s it with
+    /// its own keypair + the member's public key + this `pair_id`.
+    pub fn seal_request(&self, my: &KeyPair, request: &serde_json::Value) -> Result<String> {
+        let plaintext = serde_json::to_vec(request).context("serializing request")?;
+        let sealed = pair_channel::seal(my, &self.hub_pubkey, self.pair_id, &plaintext)
+            .context("sealing request to hub")?;
+        Ok(sealed.to_base64())
+    }
+
+    /// Open a sealed response from the hub.
+    pub fn open_response(&self, my: &KeyPair, sealed_b64: &str) -> Result<serde_json::Value> {
+        let sealed = Sealed::from_base64(sealed_b64).context("decoding sealed response")?;
+        let plaintext = pair_channel::open(my, &self.hub_pubkey, self.pair_id, &sealed)
+            .context("opening hub response (AEAD auth failed → tampered or wrong key)")?;
+        serde_json::from_slice(&plaintext).context("parsing decrypted response JSON")
+    }
 }
 
 /// A signed request envelope for hub API calls.
@@ -224,6 +276,54 @@ impl<T> Pipe for T {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_round_trips_member_to_hub_and_back() {
+        // Simulate the two ends: a member (Hestia) and the hub, each with an
+        // LCT keypair. They share only public info (each other's pubkey + a
+        // pair_id). This proves the member-side HubChannel interoperates with
+        // the hub-side `pair_channel` primitive in both directions.
+        let member = KeyPair::generate();
+        let hub = KeyPair::generate();
+        let pair_id = Uuid::new_v4();
+
+        let member_view = HubChannel {
+            hub_lct_id: Uuid::new_v4(),
+            pair_id,
+            hub_pubkey: hub.verifying_key(),
+        };
+
+        // Member seals a request → hub opens it.
+        let request = serde_json::json!({"tool": "find_members", "query": "rust async review"});
+        let sealed_b64 = member_view.seal_request(&member, &request).unwrap();
+        let opened = pair_channel::open(
+            &hub, &member.verifying_key(), pair_id,
+            &Sealed::from_base64(&sealed_b64).unwrap(),
+        ).unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&opened).unwrap(), request);
+
+        // Hub seals a response → member opens it.
+        let response = serde_json::json!({"members": [{"lct": "abc", "score": 0.82}]});
+        let resp_sealed = pair_channel::seal(
+            &hub, &member.verifying_key(), pair_id,
+            &serde_json::to_vec(&response).unwrap(),
+        ).unwrap();
+        let got = member_view.open_response(&member, &resp_sealed.to_base64()).unwrap();
+        assert_eq!(got, response);
+
+        // Wrong pair_id must fail to open (AEAD auth) — confirms the salt binds.
+        let wrong = HubChannel { pair_id: Uuid::new_v4(), ..member_view.clone() };
+        assert!(wrong.open_response(&member, &resp_sealed.to_base64()).is_err());
+    }
+
+    #[test]
+    fn hub_channel_new_parses_pubkey_hex() {
+        let hub = KeyPair::generate();
+        let hex = hub.verifying_key().to_hex();
+        let ch = HubChannel::new(Uuid::new_v4(), Uuid::new_v4(), &hex).unwrap();
+        assert_eq!(ch.hub_pubkey.to_hex(), hex);
+        assert!(HubChannel::new(Uuid::new_v4(), Uuid::new_v4(), "zz").is_err());
+    }
 
     #[test]
     fn test_hub_store_roundtrip() {
