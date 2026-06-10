@@ -89,7 +89,7 @@ pub struct RecentEntry {
 }
 
 /// Flatten a `ChainEntry` into the UI-facing `RecentEntry` shape.
-fn flatten_entry(e: crate::storage::ChainEntry) -> RecentEntry {
+pub fn flatten_entry(e: crate::storage::ChainEntry) -> RecentEntry {
     let d = &e.event_data;
     RecentEntry {
         chain_position: e.chain_position,

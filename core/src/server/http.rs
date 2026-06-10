@@ -7,10 +7,10 @@
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::State,
-    http::header,
+    extract::{Path, Query, State},
+    http::{header, StatusCode},
     response::{Html, IntoResponse, Json},
-    routing::get,
+    routing::{delete, get, post, put},
 };
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -59,6 +59,11 @@ pub async fn serve_with_callback(
         .route("/", get(dashboard_html))
         .route("/api/dashboard", get(dashboard_json))
         .route("/api/failures", get(failures_json))
+        .route("/api/vault", get(vault_list).post(vault_add))
+        .route("/api/vault/{name}", delete(vault_delete))
+        .route("/api/policy", get(policy_get))
+        .route("/api/policy/preset", put(policy_set_preset))
+        .route("/api/chain", get(chain_query))
         .with_state(state)
         .nest_service("/mcp", service);
 
@@ -108,10 +113,135 @@ async fn dashboard_json(State(state): State<SharedState>) -> impl IntoResponse {
 
 async fn failures_json(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.lock().await;
-    // Cap at 500 to keep the response sane even on chains with lots of
-    // historical failures. Operators who need more can read the chain
-    // directly.
     let snapshot = s.failures_snapshot(500);
     drop(s);
     Json(snapshot)
+}
+
+// --- Vault endpoints ---
+
+async fn vault_list(State(state): State<SharedState>) -> impl IntoResponse {
+    let s = state.lock().await;
+    let names = s.vault.list();
+    let entries: Vec<serde_json::Value> = names.iter().filter_map(|name| {
+        s.vault.get(name).map(|e| serde_json::json!({
+            "id": name,
+            "name": name,
+            "scope": e.scope,
+            "tags": e.tags,
+            "allowed_consumers": e.allowed_consumers,
+            "created_at": e.created_at,
+            "last_rotated": e.last_rotated,
+        }))
+    }).collect();
+    Json(serde_json::json!({ "entries": entries }))
+}
+
+async fn vault_add(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let value = body.get("value").and_then(|v| v.as_str()).unwrap_or("");
+    if name.is_empty() || value.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "name and value required"})));
+    }
+    let scope: Vec<String> = body.get("scope").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+    let tags: Vec<String> = body.get("tags").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+    let consumers: Vec<String> = body.get("allowed_consumers").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+
+    let entry = crate::vault::VaultEntry::new(name, value)
+        .with_scope(scope)
+        .with_tags(tags)
+        .with_consumers(consumers);
+
+    let mut s = state.lock().await;
+    match s.vault.add(entry) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+async fn vault_delete(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let mut s = state.lock().await;
+    match s.vault.remove(&name) {
+        Ok(_) => Json(serde_json::json!({"ok": true})),
+        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+// --- Policy endpoints ---
+
+async fn policy_get(State(state): State<SharedState>) -> impl IntoResponse {
+    let s = state.lock().await;
+    let policy_state = s.vault.policy();
+    let resolved = policy_state.resolve().unwrap_or_else(|| {
+        crate::policy::get_preset("safety").unwrap().config
+    });
+    Json(serde_json::json!({
+        "active_preset": policy_state.active_preset,
+        "enforce": resolved.enforce,
+        "default_policy": format!("{:?}", resolved.default_policy),
+        "rules": resolved.rules.iter().map(|r| serde_json::json!({
+            "id": r.id,
+            "name": r.name,
+            "priority": r.priority,
+            "decision": r.decision.as_str(),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+async fn policy_set_preset(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let preset = body.get("preset").and_then(|v| v.as_str()).unwrap_or("");
+    if !crate::policy::is_preset_name(preset) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("unknown preset: {preset}")})));
+    }
+    let mut s = state.lock().await;
+    match s.vault.set_active_preset(preset) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true, "preset": preset}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+// --- Chain endpoints ---
+
+#[derive(serde::Deserialize, Default)]
+struct ChainQuery {
+    limit: Option<u64>,
+    event_type: Option<String>,
+    tool: Option<String>,
+}
+
+async fn chain_query(
+    State(state): State<SharedState>,
+    Query(q): Query<ChainQuery>,
+) -> impl IntoResponse {
+    let s = state.lock().await;
+    let limit = q.limit.unwrap_or(50);
+    let entries: Vec<super::dashboard::RecentEntry> = s.chain_store
+        .read_recent(limit)
+        .unwrap_or_default()
+        .into_iter()
+        .map(super::dashboard::flatten_entry)
+        .filter(|e| {
+            if let Some(ref et) = q.event_type {
+                if e.event_type != *et { return false; }
+            }
+            if let Some(ref tf) = q.tool {
+                if let Some(ref tn) = e.tool_name {
+                    if !tn.contains(tf.as_str()) { return false; }
+                } else {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+    Json(serde_json::json!({ "entries": entries }))
 }
