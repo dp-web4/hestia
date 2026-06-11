@@ -16,6 +16,8 @@ pub struct DashboardSnapshot {
     pub recent: Vec<RecentEntry>,
     pub delegations: Vec<serde_json::Value>,
     pub hub_connections: Vec<serde_json::Value>,
+    pub profile: Option<serde_json::Value>,
+    pub constellation: Option<serde_json::Value>,
     pub generated_at: DateTime<Utc>,
 }
 
@@ -231,6 +233,14 @@ impl ServerState {
                 .collect())
             .unwrap_or_default();
 
+        let profile = crate::profile::ProfileStore::load(&self.home)
+            .ok()
+            .and_then(|s| serde_json::to_value(&s.present(&crate::profile::Visibility::Private)).ok());
+
+        let constellation = crate::constellation::ConstellationStore::load(&self.home)
+            .ok()
+            .and_then(|s| serde_json::to_value(&s.proof()).ok());
+
         let hub_connections = crate::hub::HubStore::load(&self.home)
             .ok()
             .map(|s| s.connections.iter()
@@ -258,6 +268,8 @@ impl ServerState {
             recent,
             delegations,
             hub_connections,
+            profile,
+            constellation,
             generated_at: Utc::now(),
         }
     }

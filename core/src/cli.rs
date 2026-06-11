@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use hestia::constellation::{ConstellationStore, DeviceType};
 use hestia::delegation::{self, DelegationStore};
+use hestia::profile::{self, ProfileLink, ProfileStore};
 use hestia::hub::{HubClient, HubStore};
 use hestia::vault::{default_hestia_home, vault_path, Vault, VaultEntry};
 
@@ -86,6 +87,60 @@ enum Command {
     /// Device constellation subcommands (mini-hub for your LCTs)
     #[command(subcommand)]
     Constellation(ConstellationCmd),
+
+    /// Profile / presence links (social, professional, contact)
+    #[command(subcommand)]
+    Profile(ProfileCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum ProfileCmd {
+    /// Set display name
+    Name {
+        name: String,
+    },
+
+    /// Set bio
+    Bio {
+        bio: String,
+    },
+
+    /// Add a link (platform: github, linkedin, twitter, bluesky, website, email, etc.)
+    #[command(alias = "add-link")]
+    Add {
+        /// Platform name
+        platform: String,
+        /// URL or handle
+        url: String,
+        /// Visibility: public | member | trusted | private
+        #[arg(long, default_value = "public")]
+        visibility: String,
+        /// Optional display label
+        #[arg(long)]
+        label: Option<String>,
+    },
+
+    /// List profile links
+    #[command(alias = "links")]
+    List {
+        /// Filter by visibility tier (show links visible at this tier)
+        #[arg(long)]
+        tier: Option<String>,
+    },
+
+    /// Remove a link by ID
+    #[command(alias = "rm")]
+    Remove {
+        /// Link ID (UUID)
+        id: String,
+    },
+
+    /// Show what a hub or peer would see at a given tier
+    Present {
+        /// Tier to present as: public | member | trusted | private
+        #[arg(default_value = "public")]
+        tier: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -271,6 +326,16 @@ pub fn run() -> AnyResult<()> {
             ConstellationCmd::List => cmd_constellation_list(&home),
             ConstellationCmd::Remove { id } => cmd_constellation_remove(&home, &id),
             ConstellationCmd::Proof => cmd_constellation_proof(&home),
+        },
+        Command::Profile(p) => match p {
+            ProfileCmd::Name { name } => cmd_profile_name(&home, &name),
+            ProfileCmd::Bio { bio } => cmd_profile_bio(&home, &bio),
+            ProfileCmd::Add { platform, url, visibility, label } => {
+                cmd_profile_add(&home, &platform, &url, &visibility, label.as_deref())
+            }
+            ProfileCmd::List { tier } => cmd_profile_list(&home, tier.as_deref()),
+            ProfileCmd::Remove { id } => cmd_profile_remove(&home, &id),
+            ProfileCmd::Present { tier } => cmd_profile_present(&home, &tier),
         },
     }
 }
@@ -592,6 +657,130 @@ fn cmd_policy_set(home: &std::path::Path, preset: &str) -> AnyResult<()> {
     vault.set_active_preset(preset)?;
     println!("✓ active preset set to '{preset}'");
     println!("  (a running daemon won't pick this up until restart)");
+    Ok(())
+}
+
+// ---- profile commands -------------------------------------------------------
+
+fn cmd_profile_name(home: &std::path::Path, name: &str) -> AnyResult<()> {
+    let mut store = ProfileStore::load(home)?;
+    store.display_name = Some(name.to_string());
+    store.save(home)?;
+    println!("Display name set to: {name}");
+    Ok(())
+}
+
+fn cmd_profile_bio(home: &std::path::Path, bio: &str) -> AnyResult<()> {
+    let mut store = ProfileStore::load(home)?;
+    store.bio = Some(bio.to_string());
+    store.save(home)?;
+    println!("Bio updated");
+    Ok(())
+}
+
+fn cmd_profile_add(
+    home: &std::path::Path,
+    platform: &str,
+    url: &str,
+    visibility: &str,
+    label: Option<&str>,
+) -> AnyResult<()> {
+    let plat = profile::parse_platform(platform);
+    let vis = profile::parse_visibility(visibility)?;
+
+    let mut link = ProfileLink::new(plat, url, vis);
+    if let Some(l) = label {
+        link = link.with_label(l);
+    }
+
+    let mut store = ProfileStore::load(home)?;
+    store.add_link(link.clone());
+    store.save(home)?;
+
+    println!("Link added:");
+    println!("  platform:   {platform}");
+    println!("  url:        {url}");
+    println!("  visibility: {visibility}");
+    if let Some(l) = label {
+        println!("  label:      {l}");
+    }
+    Ok(())
+}
+
+fn cmd_profile_list(home: &std::path::Path, tier: Option<&str>) -> AnyResult<()> {
+    let store = ProfileStore::load(home)?;
+
+    if let Some(name) = &store.display_name {
+        println!("{name}");
+    }
+    if let Some(bio) = &store.bio {
+        println!("{bio}");
+    }
+    if store.display_name.is_some() || store.bio.is_some() {
+        println!();
+    }
+
+    let links = if let Some(t) = tier {
+        let vis = profile::parse_visibility(t)?;
+        store.links_for_tier(&vis).into_iter().cloned().collect::<Vec<_>>()
+    } else {
+        store.links.clone()
+    };
+
+    if links.is_empty() {
+        println!("(no links — use `hestia profile add <platform> <url>`)");
+        return Ok(());
+    }
+
+    for l in &links {
+        let verified = match &l.verification {
+            profile::Verification::Claimed => "",
+            profile::Verification::SelfVerified => " [verified]",
+            profile::Verification::Attested { .. } => " [attested]",
+        };
+        let label = l.label.as_deref().map(|s| format!(" ({s})")).unwrap_or_default();
+        println!("  {} {} [{}]{}{}", l.platform.as_str(), l.url, l.visibility.as_str(), verified, label);
+        println!("    id: {}", l.id);
+    }
+    println!("\n{} link(s)", links.len());
+    Ok(())
+}
+
+fn cmd_profile_remove(home: &std::path::Path, id: &str) -> AnyResult<()> {
+    let link_id = uuid::Uuid::parse_str(id)
+        .with_context(|| format!("invalid UUID: {id}"))?;
+    let mut store = ProfileStore::load(home)?;
+    if store.remove_link(link_id) {
+        store.save(home)?;
+        println!("Link {link_id} removed");
+    } else {
+        anyhow::bail!("link {link_id} not found");
+    }
+    Ok(())
+}
+
+fn cmd_profile_present(home: &std::path::Path, tier: &str) -> AnyResult<()> {
+    let store = ProfileStore::load(home)?;
+    let vis = profile::parse_visibility(tier)?;
+    let pres = store.present(&vis);
+
+    println!("Profile presentation (tier: {tier}):\n");
+    if let Some(name) = &pres.display_name {
+        println!("  {name}");
+    }
+    if let Some(bio) = &pres.bio {
+        println!("  {bio}");
+    }
+    if pres.links.is_empty() {
+        println!("  (no links visible at this tier)");
+    } else {
+        println!();
+        for l in &pres.links {
+            let v = if l.verified { " [verified]" } else { "" };
+            let label = l.label.as_deref().map(|s| format!(" — {s}")).unwrap_or_default();
+            println!("  {} {}{}{}", l.platform, l.url, v, label);
+        }
+    }
     Ok(())
 }
 

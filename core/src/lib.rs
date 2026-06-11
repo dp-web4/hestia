@@ -14,6 +14,7 @@ pub mod error;
 pub mod hub;
 pub mod plugin;
 pub mod policy;
+pub mod profile;
 pub mod server;
 pub mod storage;
 pub mod tui;
@@ -21,6 +22,7 @@ pub mod vault;
 
 pub use constellation::ConstellationStore;
 pub use delegation::DelegationStore;
+pub use profile::ProfileStore;
 pub use error::{CoreError, Result};
 pub use hub::{HubClient, HubStore};
 pub use plugin::PluginRegistry;
