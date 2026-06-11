@@ -141,6 +141,12 @@ enum ProfileCmd {
         #[arg(default_value = "public")]
         tier: String,
     },
+
+    /// Push the member-tier profile to a connected hub (find_members discovery)
+    Push {
+        /// Hub URL or connection UUID (must be already connected)
+        target: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -336,6 +342,7 @@ pub fn run() -> AnyResult<()> {
             ProfileCmd::List { tier } => cmd_profile_list(&home, tier.as_deref()),
             ProfileCmd::Remove { id } => cmd_profile_remove(&home, &id),
             ProfileCmd::Present { tier } => cmd_profile_present(&home, &tier),
+            ProfileCmd::Push { target } => cmd_profile_push(&home, &target),
         },
     }
 }
@@ -782,6 +789,63 @@ fn cmd_profile_present(home: &std::path::Path, tier: &str) -> AnyResult<()> {
         }
     }
     Ok(())
+}
+
+fn cmd_profile_push(home: &std::path::Path, target: &str) -> AnyResult<()> {
+    // Resolve the hub connection.
+    let hubs = HubStore::load(home)?;
+    let conn = if let Ok(id) = uuid::Uuid::parse_str(target) {
+        hubs.find_by_id(id)
+    } else {
+        hubs.find_by_url(target)
+    }.ok_or_else(|| anyhow::anyhow!(
+        "not connected to {target} — run `hestia hub connect <url>` first"
+    ))?;
+
+    // Load the member identity key from the vault (created by `hestia init --ai`).
+    // The hub must have this pubkey pinned (via membership) for the act to verify.
+    let vault = open_vault(home)?;
+    let secret_hex = vault.get("ai_identity_secret").map(|e| e.secret.clone())
+        .ok_or_else(|| anyhow::anyhow!(
+            "no member identity key in vault — run `hestia init --ai`, or self-add to the hub \
+             so it pins your pubkey (Sovereign-seeded members can't push from here yet)"
+        ))?;
+    let secret_bytes: [u8; 32] = hex_to_32(&secret_hex)
+        .ok_or_else(|| anyhow::anyhow!("ai_identity_secret is not 32-byte hex"))?;
+    let keypair = web4_core::crypto::KeyPair::from_secret_bytes(&secret_bytes);
+
+    let profile = ProfileStore::load(home)?;
+    let fields = profile.hub_fields();
+    if fields.is_empty() {
+        anyhow::bail!("profile is empty — add a name/bio/links first (`hestia profile add ...`)");
+    }
+
+    let hub_id = conn.hub_lct_id;
+    let our_lct = conn.our_lct_id;
+    let rest = conn.rest_endpoint.clone();
+
+    println!("Pushing {} field(s) to {} ...", fields.len(), conn.url);
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let client = HubClient::new();
+    let resp = rt.block_on(client.push_profile(&rest, hub_id, our_lct, &keypair, fields))?;
+
+    println!("Profile pushed:");
+    if let Some(idx) = resp.get("entry_index") {
+        println!("  ledger entry: {idx}");
+    }
+    if let Some(kind) = resp.get("event_kind").and_then(|v| v.as_str()) {
+        println!("  event:        {kind}");
+    }
+    Ok(())
+}
+
+fn hex_to_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 { return None; }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&s[i*2..i*2+2], 16).ok()?;
+    }
+    Some(out)
 }
 
 // ---- constellation commands -------------------------------------------------

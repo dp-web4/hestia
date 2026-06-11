@@ -241,6 +241,57 @@ impl HubClient {
             .with_context(|| "parsing challenge response")
     }
 
+    /// Push the member-tier profile to a hub as a `MemberProfileUpdated` act.
+    ///
+    /// Full self-attested act flow: mint a challenge nonce, build the
+    /// `update_profile` payload (member-visible fields only — see
+    /// `ProfileStore::hub_fields`), sign with the member keypair, and POST the
+    /// signed envelope to `/v1/hubs/{hub_id}/events`. The hub merges the fields
+    /// into the member's profile for `find_members` discovery.
+    ///
+    /// Only public + member-visible links travel; trusted/private stay home.
+    pub async fn push_profile(
+        &self,
+        rest_endpoint: &str,
+        hub_id: Uuid,
+        member_lct_id: Uuid,
+        member_keypair: &KeyPair,
+        fields: std::collections::BTreeMap<String, String>,
+    ) -> Result<serde_json::Value> {
+        let rest = rest_endpoint.trim_end_matches('/');
+
+        // 1. Challenge nonce, bound to our LCT.
+        let challenge = self.challenge(rest, member_lct_id).await?;
+
+        // 2. Build the update_profile action payload.
+        let payload = serde_json::json!({
+            "action": "update_profile",
+            "member_lct_id": member_lct_id,
+            "fields": fields,
+        });
+
+        // 3. Sign (nonce ++ canonical(payload)) — matches the hub's
+        //    SignedEnvelope::signing_bytes exactly.
+        let envelope = SignedEnvelope::create(
+            challenge.nonce,
+            payload,
+            member_lct_id,
+            member_keypair,
+        );
+
+        // 4. POST the envelope directly to /events (not wrapped).
+        let url = format!("{rest}/hubs/{hub_id}/events");
+        let resp = self.http.post(&url).json(&envelope).send().await
+            .with_context(|| format!("posting profile act to {url}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("hub /events returned HTTP {status}: {text}");
+        }
+        serde_json::from_str(&text)
+            .with_context(|| "parsing /events response")
+    }
+
     /// Submit a signed envelope to a hub endpoint.
     pub async fn submit_signed(
         &self,

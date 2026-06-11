@@ -201,6 +201,28 @@ impl ProfileStore {
             .collect()
     }
 
+    /// Flatten the **member-tier** presentation into the hub's plain-language
+    /// `MemberProfileUpdated` field map (used by `find_members` discovery).
+    /// Only public + member-visible content goes — trusted/private stay home.
+    /// Keys are deliberately human-readable (`name`, `bio`, `github`, …) per
+    /// the hub's "not schematized" design. An empty map's fields clear nothing;
+    /// to clear a field, push it with an empty value (hub merge semantics).
+    pub fn hub_fields(&self) -> std::collections::BTreeMap<String, String> {
+        let pres = self.present(&Visibility::Member);
+        let mut fields = std::collections::BTreeMap::new();
+        if let Some(n) = pres.display_name {
+            fields.insert("name".to_string(), n);
+        }
+        if let Some(b) = pres.bio {
+            fields.insert("bio".to_string(), b);
+        }
+        // Platform as key; multiple links of one platform → last wins (rare).
+        for link in pres.links {
+            fields.insert(link.platform, link.url);
+        }
+        fields
+    }
+
     /// Build a presentation for a specific context — what to share with a hub or peer.
     pub fn present(&self, tier: &Visibility) -> ProfilePresentation {
         ProfilePresentation {
@@ -307,5 +329,28 @@ mod tests {
         let recovered: ProfileStore = serde_json::from_str(&json).unwrap();
         assert_eq!(recovered.links.len(), 1);
         assert_eq!(recovered.display_name.as_deref(), Some("Test"));
+    }
+
+    #[test]
+    fn test_hub_fields_member_tier_only() {
+        let mut store = ProfileStore {
+            display_name: Some("Dennis".into()),
+            bio: Some("Building Web4".into()),
+            links: vec![],
+        };
+        store.add_link(ProfileLink::new(Platform::GitHub, "https://github.com/dp-web4", Visibility::Public));
+        store.add_link(ProfileLink::new(Platform::LinkedIn, "https://linkedin.com/in/dp", Visibility::Member));
+        store.add_link(ProfileLink::new(Platform::Email, "dp@metalinxx.io", Visibility::Trusted));
+        store.add_link(ProfileLink::new(Platform::Phone, "+1-555-0100", Visibility::Private));
+
+        let f = store.hub_fields();
+        // name + bio + github + linkedin = 4. email/phone (trusted/private) excluded.
+        assert_eq!(f.len(), 4);
+        assert_eq!(f.get("name").map(String::as_str), Some("Dennis"));
+        assert_eq!(f.get("bio").map(String::as_str), Some("Building Web4"));
+        assert_eq!(f.get("github").map(String::as_str), Some("https://github.com/dp-web4"));
+        assert_eq!(f.get("linkedin").map(String::as_str), Some("https://linkedin.com/in/dp"));
+        assert!(!f.contains_key("email"));
+        assert!(!f.contains_key("phone"));
     }
 }
