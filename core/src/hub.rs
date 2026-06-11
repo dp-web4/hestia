@@ -326,6 +326,42 @@ impl HubClient {
             .with_context(|| "parsing sealed channel response")?;
         channel.open_response(my, &out.sealed)
     }
+
+    /// Present a constellation attestation over the channel for assurance-tier
+    /// resolution (MFA). Flow:
+    /// 1. `constellation_challenge` → hub returns a fresh nonce
+    /// 2. Build the attestation locally (owner signs, devices co-sign)
+    /// 3. `present_constellation` → hub verifies sigs, derives the assurance
+    ///    tier, binds it to this channel's pair_id
+    ///
+    /// Returns the hub's response (granted assurance tier + validity window).
+    pub async fn present_constellation(
+        &self,
+        rest_endpoint: &str,
+        channel: &HubChannel,
+        my: &KeyPair,
+        my_lct_id: Uuid,
+        build_attestation: impl FnOnce(&str) -> Result<crate::constellation::ConstellationAttestation>,
+    ) -> Result<serde_json::Value> {
+        // Step 1: get a challenge nonce from the hub (over the channel,
+        // so even the challenge exchange is sealed).
+        let challenge = self.channel_query(
+            rest_endpoint, channel, my, my_lct_id,
+            "constellation_challenge", serde_json::json!({}),
+        ).await?;
+        let nonce = challenge.get("nonce").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("hub challenge response missing nonce"))?;
+
+        // Step 2: caller builds + signs the attestation against that nonce.
+        let attestation = build_attestation(nonce)?;
+
+        // Step 3: present it.
+        self.channel_query(
+            rest_endpoint, channel, my, my_lct_id,
+            "present_constellation",
+            serde_json::to_value(&attestation)?,
+        ).await
+    }
 }
 
 /// Wire body for a channel request — matches the hub's `/v1/hubs/{id}/channel`.
