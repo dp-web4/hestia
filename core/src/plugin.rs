@@ -1,9 +1,9 @@
-//! Plugin seam — the same `ToolPlugin` / `PluginCtx` interface as the hub.
+//! Plugin seam — a generic `ToolPlugin` / `PluginCtx` registry.
 //!
-//! Hestia is a mini-hub for a person's device constellation. The plugin seam
-//! lets tools register into Hestia's MCP/channel surface the same way they
-//! register into the hub — core owns authn + gating + sealing, plugins own
-//! the handler.
+//! Lets tools register into Hestia's MCP/channel surface: core owns authn +
+//! gating + sealing, plugins own the handler. The interface mirrors the hub's
+//! generic seam so a plugin crate can implement `ToolPlugin` once and load on
+//! either side.
 //!
 //! The interface is deliberately identical to `hub-plugin` so a plugin crate
 //! can implement `ToolPlugin` once and be loaded on either side.

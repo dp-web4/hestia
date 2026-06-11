@@ -1,15 +1,13 @@
-//! Constellation manager — Hestia as a mini-hub for a person's devices.
+//! Constellation manager — a person's set of paired device LCTs.
 //!
 //! A constellation is a set of LCTs (devices, agents, identities) that belong
 //! to the same person. The manager:
 //! - Tracks paired devices with their capabilities and liveness
-//! - Responds to witness requests by polling constellation members
-//! - Provides constellation proofs (single-LCT vs verifiable multi-LCT)
-//!   for the hub's assurance tiers
-//!
-//! The key insight: a person's device-constellation manager and a society hub
-//! are the same thing at different scale. Both manage paired LCTs and answer
-//! witness queries. This is the Web4 fractal/synthon at work.
+//! - Produces a `ConstellationProof` (single-device / multi-device /
+//!   hardware-backed) summarizing the set
+//! - Produces a challenge-bound `ConstellationAttestation` — a standard
+//!   challenge-response multi-factor proof (owner + per-device co-signatures
+//!   over a verifier-supplied nonce) for assurance-tier resolution at a hub.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
