@@ -7,6 +7,7 @@ use anyhow::{Context, Result as AnyResult};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use hestia::constellation::{ConstellationStore, DeviceType};
 use hestia::delegation::{self, DelegationStore};
 use hestia::hub::{HubClient, HubStore};
 use hestia::vault::{default_hestia_home, vault_path, Vault, VaultEntry};
@@ -81,6 +82,34 @@ enum Command {
     /// Hub connection subcommands (Track H2/H3 — connect to Web4 hubs)
     #[command(subcommand)]
     Hub(HubCmd),
+
+    /// Device constellation subcommands (mini-hub for your LCTs)
+    #[command(subcommand)]
+    Constellation(ConstellationCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum ConstellationCmd {
+    /// Add a device to your constellation
+    Add {
+        /// Device name (e.g. "Legion Desktop", "Phone", "YubiKey")
+        name: String,
+        /// Device type: desktop | mobile | server | agent | hardware
+        #[arg(long, default_value = "desktop")]
+        device_type: String,
+    },
+
+    /// List devices in the constellation
+    List,
+
+    /// Remove a device by LCT ID
+    Remove {
+        /// Device LCT ID (UUID)
+        id: String,
+    },
+
+    /// Generate a constellation proof
+    Proof,
 }
 
 #[derive(Subcommand, Debug)]
@@ -236,6 +265,12 @@ pub fn run() -> AnyResult<()> {
             HubCmd::List => cmd_hub_list(&home),
             HubCmd::Show { target } => cmd_hub_show(&home, &target),
             HubCmd::Disconnect { target } => cmd_hub_disconnect(&home, &target),
+        },
+        Command::Constellation(c) => match c {
+            ConstellationCmd::Add { name, device_type } => cmd_constellation_add(&home, &name, &device_type),
+            ConstellationCmd::List => cmd_constellation_list(&home),
+            ConstellationCmd::Remove { id } => cmd_constellation_remove(&home, &id),
+            ConstellationCmd::Proof => cmd_constellation_proof(&home),
         },
     }
 }
@@ -557,6 +592,89 @@ fn cmd_policy_set(home: &std::path::Path, preset: &str) -> AnyResult<()> {
     vault.set_active_preset(preset)?;
     println!("✓ active preset set to '{preset}'");
     println!("  (a running daemon won't pick this up until restart)");
+    Ok(())
+}
+
+// ---- constellation commands -------------------------------------------------
+
+fn cmd_constellation_add(home: &std::path::Path, name: &str, device_type: &str) -> AnyResult<()> {
+    let dt = match device_type {
+        "desktop" => DeviceType::Desktop,
+        "mobile" => DeviceType::Mobile,
+        "server" => DeviceType::Server,
+        "agent" => DeviceType::Agent,
+        "hardware" => DeviceType::Hardware,
+        other => anyhow::bail!("unknown device type: {other} (expected: desktop, mobile, server, agent, hardware)"),
+    };
+
+    let kp = web4_core::crypto::KeyPair::generate();
+    let pubkey_hex = kp.verifying_key().to_hex();
+
+    let mut store = ConstellationStore::load(home)?;
+    if store.owner_lct_id.is_none() {
+        store.owner_lct_id = Some(uuid::Uuid::new_v4());
+    }
+    let member = store.add_device(name, dt, &pubkey_hex, vec![]);
+    let lct_id = member.lct_id;
+    store.save(home)?;
+
+    println!("Device added to constellation:");
+    println!("  name:    {name}");
+    println!("  type:    {device_type}");
+    println!("  LCT ID:  {lct_id}");
+    println!("  pubkey:  {}", &pubkey_hex[..16]);
+    Ok(())
+}
+
+fn cmd_constellation_list(home: &std::path::Path) -> AnyResult<()> {
+    let store = ConstellationStore::load(home)?;
+
+    if store.members.is_empty() {
+        println!("(no devices in constellation — use `hestia constellation add <name>`)");
+        return Ok(());
+    }
+
+    if let Some(owner) = store.owner_lct_id {
+        println!("Owner: {owner}");
+    }
+    println!();
+    for m in &store.members {
+        println!("{} — {} ({:?})", m.lct_id, m.name, m.device_type);
+        println!("  pubkey:    {}...", &m.pubkey_hex[..16]);
+        println!("  added:     {}", m.added_at.format("%Y-%m-%d %H:%M"));
+        if let Some(seen) = m.last_seen {
+            println!("  last seen: {}", seen.format("%Y-%m-%d %H:%M"));
+        }
+        println!();
+    }
+    println!("{} device(s)", store.members.len());
+    Ok(())
+}
+
+fn cmd_constellation_remove(home: &std::path::Path, id: &str) -> AnyResult<()> {
+    let lct_id = uuid::Uuid::parse_str(id)
+        .with_context(|| format!("invalid UUID: {id}"))?;
+    let mut store = ConstellationStore::load(home)?;
+    if store.remove_device(lct_id) {
+        store.save(home)?;
+        println!("Device {lct_id} removed from constellation");
+    } else {
+        anyhow::bail!("device {lct_id} not found in constellation");
+    }
+    Ok(())
+}
+
+fn cmd_constellation_proof(home: &std::path::Path) -> AnyResult<()> {
+    let store = ConstellationStore::load(home)?;
+    let proof = store.proof();
+    println!("Constellation proof:");
+    println!("  owner:      {}", proof.owner_lct_id);
+    println!("  members:    {}", proof.member_count);
+    println!("  assurance:  {:?}", proof.assurance_level);
+    println!("  issued:     {}", proof.issued_at.format("%Y-%m-%d %H:%M UTC"));
+    for id in &proof.members {
+        println!("    {id}");
+    }
     Ok(())
 }
 
