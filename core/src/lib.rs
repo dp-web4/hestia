@@ -8,16 +8,20 @@
 //! - **Society state**: Web4 society with witness chain + trust evolution (after that)
 
 pub mod callback;
+pub mod constellation;
 pub mod delegation;
 pub mod error;
 pub mod hub;
+pub mod plugin;
 pub mod policy;
 pub mod server;
 pub mod storage;
 pub mod tui;
 pub mod vault;
 
+pub use constellation::ConstellationStore;
 pub use delegation::DelegationStore;
 pub use error::{CoreError, Result};
 pub use hub::{HubClient, HubStore};
+pub use plugin::PluginRegistry;
 pub use vault::{Vault, VaultEntry};
