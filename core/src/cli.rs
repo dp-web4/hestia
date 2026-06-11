@@ -195,6 +195,16 @@ enum HubCmd {
         /// Hub URL or connection UUID
         target: String,
     },
+
+    /// Self-add as a member (V2-12): provision a member identity in the vault,
+    /// sign a join request, and submit it so the hub pins your pubkey.
+    Join {
+        /// Hub URL or connection UUID (must be already connected)
+        target: String,
+        /// Optional display name to register at join
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -326,6 +336,7 @@ pub fn run() -> AnyResult<()> {
             HubCmd::List => cmd_hub_list(&home),
             HubCmd::Show { target } => cmd_hub_show(&home, &target),
             HubCmd::Disconnect { target } => cmd_hub_disconnect(&home, &target),
+            HubCmd::Join { target, name } => cmd_hub_join(&home, &target, name),
         },
         Command::Constellation(c) => match c {
             ConstellationCmd::Add { name, device_type } => cmd_constellation_add(&home, &name, &device_type),
@@ -822,7 +833,7 @@ fn cmd_profile_push(home: &std::path::Path, target: &str) -> AnyResult<()> {
 
     let hub_id = conn.hub_lct_id;
     let our_lct = conn.our_lct_id;
-    let rest = conn.rest_endpoint.clone();
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
 
     println!("Pushing {} field(s) to {} ...", fields.len(), conn.url);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -837,6 +848,17 @@ fn cmd_profile_push(home: &std::path::Path, target: &str) -> AnyResult<()> {
         println!("  event:        {kind}");
     }
     Ok(())
+}
+
+/// Resolve a possibly-relative rest endpoint against the connection base URL.
+fn abs_rest(base_url: &str, rest: &str) -> String {
+    if rest.starts_with("http://") || rest.starts_with("https://") {
+        rest.to_string()
+    } else if rest.is_empty() {
+        format!("{}/v1", base_url.trim_end_matches('/'))
+    } else {
+        format!("{}{}", base_url.trim_end_matches('/'), rest)
+    }
 }
 
 fn hex_to_32(s: &str) -> Option<[u8; 32]> {
@@ -1048,7 +1070,9 @@ fn cmd_hub_connect(home: &std::path::Path, url: &str) -> AnyResult<()> {
         connected_at: chrono::Utc::now(),
         last_seen: Some(chrono::Utc::now()),
         api_version,
-        rest_endpoint: info.endpoints.rest,
+        // Discovery may advertise a relative rest path (e.g. "/v1"); store it
+        // absolute so request builders always have a base.
+        rest_endpoint: abs_rest(url, &info.endpoints.rest),
         hubs_joined: vec![],
     };
 
@@ -1122,6 +1146,83 @@ fn cmd_hub_disconnect(home: &std::path::Path, target: &str) -> AnyResult<()> {
     let removed = store.connections.remove(idx);
     store.save(home)?;
     println!("Disconnected from {} ({})", removed.url, removed.id);
+    Ok(())
+}
+
+/// Load the member identity (LCT + keypair) from the vault, creating and
+/// persisting one if absent. The pubkey of this key is what a hub pins at
+/// self-add, so the same identity must back both `join` and `push`.
+fn ensure_member_identity(
+    vault: &mut Vault,
+) -> AnyResult<(uuid::Uuid, web4_core::crypto::KeyPair)> {
+    if let (Some(lct_e), Some(sec_e)) = (vault.get("ai_identity_lct_id"), vault.get("ai_identity_secret")) {
+        let lct = uuid::Uuid::parse_str(&lct_e.secret)
+            .context("ai_identity_lct_id is not a UUID")?;
+        let bytes = hex_to_32(&sec_e.secret)
+            .ok_or_else(|| anyhow::anyhow!("ai_identity_secret is not 32-byte hex"))?;
+        return Ok((lct, web4_core::crypto::KeyPair::from_secret_bytes(&bytes)));
+    }
+
+    // Provision a fresh member identity.
+    let kp = web4_core::crypto::KeyPair::generate();
+    let lct = uuid::Uuid::new_v4();
+    let secret_hex: String = kp.secret_key_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    vault.add(VaultEntry::new("ai_identity_lct_id", lct.to_string())
+        .with_tags(vec!["identity".into()]))?;
+    vault.add(VaultEntry::new("ai_identity_pubkey", kp.verifying_key().to_hex())
+        .with_tags(vec!["identity".into()]))?;
+    vault.add(VaultEntry::new("ai_identity_secret", secret_hex)
+        .with_tags(vec!["identity".into(), "secret".into()]))?;
+    Ok((lct, kp))
+}
+
+fn cmd_hub_join(home: &std::path::Path, target: &str, name: Option<String>) -> AnyResult<()> {
+    let mut store = HubStore::load(home)?;
+    let (conn_idx, hub_id, rest, url) = {
+        let pos = if let Ok(id) = uuid::Uuid::parse_str(target) {
+            store.connections.iter().position(|c| c.id == id)
+        } else {
+            store.connections.iter().position(|c| c.url == target)
+        }.ok_or_else(|| anyhow::anyhow!(
+            "not connected to {target} — run `hestia hub connect <url>` first"
+        ))?;
+        let c = &store.connections[pos];
+        (pos, c.hub_lct_id, abs_rest(&c.url, &c.rest_endpoint), c.url.clone())
+    };
+
+    let mut vault = open_vault(home)?;
+    let (member_lct, keypair) = ensure_member_identity(&mut vault)?;
+
+    println!("Self-adding to {url} as {member_lct} ...");
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let client = HubClient::new();
+    let outcome = rt.block_on(client.join(&rest, hub_id, member_lct, &keypair, name))?;
+
+    // Point the connection at the joined identity so `push` uses the pinned key.
+    store.connections[conn_idx].our_lct_id = member_lct;
+    store.save(home)?;
+
+    match outcome {
+        hestia::hub::JoinOutcome::Admitted(resp) => {
+            println!("Admitted:");
+            if let Some(w) = resp.get("welcome").and_then(|v| v.as_str()) {
+                println!("  {w}");
+            }
+            if let Some(idx) = resp.get("entry_index") {
+                println!("  ledger entry: {idx}");
+            }
+            println!("  member LCT:   {member_lct}");
+            println!("\nProfile pushes will now verify. Try: hestia profile push {url}");
+        }
+        hestia::hub::JoinOutcome::Escalated { reason } => {
+            println!("Submitted — pending Sovereign approval (NOT yet a member):");
+            println!("  {reason}");
+            println!("  member LCT:   {member_lct} (identity saved to vault)");
+            println!("\nThis hub's law gates admission. A Sovereign must approve the");
+            println!("join before `profile push` will verify. Your identity is provisioned");
+            println!("and ready — re-run `hub join` is not needed once approved.");
+        }
+    }
     Ok(())
 }
 

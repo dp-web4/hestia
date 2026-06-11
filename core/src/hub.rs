@@ -48,6 +48,16 @@ pub struct HubSummary {
     pub public: bool,
 }
 
+/// Outcome of a self-add join attempt.
+#[derive(Clone, Debug)]
+pub enum JoinOutcome {
+    /// Admitted immediately — the member is pinned and acts will verify.
+    Admitted(serde_json::Value),
+    /// The hub verified the request but chapter law escalates admission to the
+    /// Sovereign. The member is NOT yet pinned; acts will 401 until approved.
+    Escalated { reason: String },
+}
+
 /// A challenge nonce from the hub.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChallengeResponse {
@@ -239,6 +249,56 @@ impl HubClient {
 
         resp.json::<ChallengeResponse>().await
             .with_context(|| "parsing challenge response")
+    }
+
+    /// Self-add as a member (V2-12). Signs a `member_join_request` envelope
+    /// with the member keypair and POSTs to `/v1/hubs/{id}/members/join`. The
+    /// hub bootstraps verification from the supplied pubkey and pins it via a
+    /// Sovereign-signed `MemberAdded`, so subsequent self-attested acts (e.g.
+    /// `push_profile`) verify against the resolver.
+    pub async fn join(
+        &self,
+        rest_endpoint: &str,
+        hub_id: Uuid,
+        member_lct_id: Uuid,
+        member_keypair: &KeyPair,
+        name: Option<String>,
+    ) -> Result<JoinOutcome> {
+        let rest = rest_endpoint.trim_end_matches('/');
+        let challenge = self.challenge(rest, member_lct_id).await?;
+
+        let mut payload = serde_json::json!({
+            "action": "member_join_request",
+            "member_lct_id": member_lct_id,
+            "member_pubkey_hex": member_keypair.verifying_key().to_hex(),
+        });
+        if let Some(n) = name {
+            payload["name"] = serde_json::Value::String(n);
+        }
+
+        let envelope = SignedEnvelope::create(
+            challenge.nonce, payload, member_lct_id, member_keypair,
+        );
+
+        let url = format!("{rest}/hubs/{hub_id}/members/join");
+        let resp = self.http.post(&url).json(&envelope).send().await
+            .with_context(|| format!("posting join to {url}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+
+        // 202 = the hub verified our request but chapter law escalates admission
+        // to the Sovereign (not auto-admitted). Distinct from a hard failure.
+        if status.as_u16() == 202 {
+            let reason = body.get("error").and_then(|v| v.as_str())
+                .or_else(|| body.get("reason").and_then(|v| v.as_str()))
+                .unwrap_or("admission escalated to Sovereign").to_string();
+            return Ok(JoinOutcome::Escalated { reason });
+        }
+        if !status.is_success() {
+            anyhow::bail!("hub /members/join returned HTTP {status}: {text}");
+        }
+        Ok(JoinOutcome::Admitted(body))
     }
 
     /// Push the member-tier profile to a hub as a `MemberProfileUpdated` act.
