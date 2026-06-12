@@ -15,7 +15,7 @@ export default function App() {
       <div className="app-layout">
         <nav className="sidebar">
           <div className="sidebar-brand">
-            <span className="flame">&#x1F525;</span>
+            <img className="brand-mark" src="/brand/hestia-mark-white-64.png" alt="" />
             <span className="brand-text">Hestia</span>
           </div>
           <div className="nav-links">

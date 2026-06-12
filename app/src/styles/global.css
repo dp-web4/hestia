@@ -1,18 +1,20 @@
 :root {
-  --hearth: #ff8b3d;
-  --hearth-dim: #cc6f30;
-  --hearth-glow: #ffa85c;
+  /* Metalinxx Web4 Tools brand palette (4-gov/source/brand/BRAND.md).
+     --hearth slots carry the brand sage accent; semantic colors stay local. */
+  --hearth: #509982;
+  --hearth-dim: #4d6664;
+  --hearth-glow: #5fb89a;
   --success: #4ade80;
   --fail: #f87171;
   --warn: #facc15;
-  --bg: #0f0f0f;
-  --bg-card: #1a1a1a;
-  --bg-surface: #242424;
-  --bg-hover: #2a2a2a;
-  --border: #333;
-  --text: #e4e4e7;
-  --text-dim: #a1a1aa;
-  --text-muted: #71717a;
+  --bg: #2d2d2d;
+  --bg-card: #383838;
+  --bg-surface: #424242;
+  --bg-hover: #4a4a4a;
+  --border: #565656;
+  --text: #e8e8e8;
+  --text-dim: #a8aeac;
+  --text-muted: #7b817f;
   --sidebar-width: 200px;
   --radius: 8px;
   --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
@@ -58,9 +60,10 @@ html, body, #root {
   gap: 8px;
 }
 
-.flame {
-  font-size: 24px;
-  filter: none;
+.brand-mark {
+  width: 24px;
+  height: 24px;
+  display: block;
 }
 
 .brand-text {
