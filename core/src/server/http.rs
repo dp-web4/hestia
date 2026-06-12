@@ -8,10 +8,13 @@
 use anyhow::{Context, Result};
 use axum::{
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Json},
     routing::{delete, get, post, put},
 };
+use base64::Engine as _;
+use web4_core::oid4vc::{verify_holder_proof, CredentialIssuerMetadata, CredentialRequest};
+use web4_core::sd_jwt_vc::SdJwtVc;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
@@ -64,6 +67,10 @@ pub async fn serve_with_callback(
         .route("/api/policy", get(policy_get))
         .route("/api/policy/preset", put(policy_set_preset))
         .route("/api/chain", get(chain_query))
+        // OID4VCI issuance (EUDI Phase 2) — hestia as person-scale issuer
+        .route("/.well-known/openid-credential-issuer", get(vci_metadata))
+        .route("/vci/nonce", post(vci_nonce))
+        .route("/vci/credential", post(vci_credential))
         .with_state(state)
         .nest_service("/mcp", service);
 
@@ -171,6 +178,113 @@ async fn vault_delete(
         Ok(_) => Json(serde_json::json!({"ok": true})),
         Err(e) => Json(serde_json::json!({"error": e.to_string()})),
     }
+}
+
+// --- OID4VCI issuance endpoints (EUDI Phase 2) ---
+
+/// Issuer base URL from the request Host header (the credential `iss`/audience).
+fn issuer_base(headers: &HeaderMap) -> String {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("127.0.0.1:7711");
+    format!("http://{host}")
+}
+
+async fn vci_metadata(headers: HeaderMap) -> impl IntoResponse {
+    let base = issuer_base(&headers);
+    Json(CredentialIssuerMetadata::for_vct(&base, "Web4Presence"))
+}
+
+async fn vci_nonce(State(state): State<SharedState>) -> impl IntoResponse {
+    // 128-bit random, hex. Single-use; consumed at the credential endpoint.
+    let nonce = web4_core::sha256_hex(uuid::Uuid::new_v4().as_bytes());
+    let mut s = state.lock().await;
+    s.vci_nonces.insert(nonce.clone());
+    Json(serde_json::json!({ "c_nonce": nonce }))
+}
+
+async fn vci_credential(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<CredentialRequest>,
+) -> impl IntoResponse {
+    let base = issuer_base(&headers);
+    let now = chrono::Utc::now().timestamp();
+
+    // Extract the c_nonce the wallet's proof was bound to (from the proof JWT
+    // payload) so we can check it's one we issued.
+    let proof_nonce = match proof_nonce(&req.proof_jwt) {
+        Some(n) => n,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"proof missing nonce"}))),
+    };
+
+    let mut s = state.lock().await;
+
+    // Single-use: must be a nonce we issued; consume it.
+    if !s.vci_nonces.remove(&proof_nonce) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"unknown or used c_nonce"})));
+    }
+
+    // Verify the holder key-possession proof (aud = us, fresh).
+    let holder_pk = match verify_holder_proof(&req.proof_jwt, &base, &proof_nonce, 300, now) {
+        Ok(pk) => pk,
+        Err(e) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": e}))),
+    };
+
+    // Load the daemon's issuer identity from the vault (init --ai).
+    let (issuer_lct, issuer_key) = match s.vault.get("ai_identity_secret").map(|e| e.secret.clone()) {
+        Some(hex) => {
+            let lct = s.vault.get("ai_identity_lct_id").map(|e| e.secret.clone()).unwrap_or_default();
+            match hex32(&hex) {
+                Some(b) => (lct, web4_core::crypto::KeyPair::from_secret_bytes(&b)),
+                None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"identity key malformed"}))),
+            }
+        }
+        None => return (StatusCode::CONFLICT, Json(serde_json::json!({"error":"no issuer identity — run `hestia init --ai`"}))),
+    };
+
+    // Assurance level from the local constellation (ties the credential to the
+    // device-constellation work); default single_device if none.
+    let assurance = crate::constellation::ConstellationStore::load(&s.home)
+        .ok()
+        .and_then(|st| serde_json::to_value(st.proof().assurance_level).ok())
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| "single_device".into());
+
+    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("127.0.0.1:7711");
+    let issuer_did = if issuer_lct.is_empty() {
+        format!("did:web:{host}")
+    } else {
+        format!("did:web4:{host}:{issuer_lct}")
+    };
+
+    let credential = SdJwtVc::new("Web4Presence", &issuer_did)
+        .iat(now)
+        .holder_binding(&holder_pk)
+        .sd_claim("assurance_level", serde_json::json!(assurance))
+        .sd_claim("issued_by", serde_json::json!("hestia"))
+        .issue(&issuer_key, &format!("{issuer_did}#key-0"));
+
+    (StatusCode::OK, Json(serde_json::json!({ "credential": credential, "format": "vc+sd-jwt" })))
+}
+
+/// Pull the `nonce` claim out of an OID4VCI proof JWT (no verification — just to
+/// look up which issued nonce it claims, before verifying).
+fn proof_nonce(proof_jwt: &str) -> Option<String> {
+    let payload_b64 = proof_jwt.split('.').nth(1)?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    v.get("nonce").and_then(|n| n.as_str()).map(String::from)
+}
+
+fn hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 { return None; }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 // --- Policy endpoints ---
