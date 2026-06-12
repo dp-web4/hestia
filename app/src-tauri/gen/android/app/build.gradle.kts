@@ -37,10 +37,16 @@ android {
             }
         }
         getByName("release") {
-            isMinifyEnabled = true
+            // Minify OFF: R8 with only the empty default proguard-rules.pro
+            // risks stripping Tauri's reflection-accessed Kotlin plugin
+            // classes. The APK bulk is the Rust .so files, which R8 never
+            // touches — so minify buys little here and removes a whole
+            // failure class. Revisit with proper tauri keep rules if size
+            // matters later.
+            isMinifyEnabled = false
             // Sideload signing: release builds are signed with the debug
             // keystore until a store-grade key lands (CI secret). Optimized
-            // Rust profile + minify keeps the APK ~20 MB vs ~535 MB for a
+            // Rust profile keeps the APK small vs ~535 MB for a
             // debug-buildType build (dev-profile .so × 4 ABIs — run
             // 27447945048). Replace with a real signingConfig for stores.
             signingConfig = signingConfigs.getByName("debug")
