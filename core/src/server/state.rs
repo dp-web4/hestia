@@ -67,6 +67,8 @@ pub struct ServerState {
     pub synthetic_plugins: HashSet<String>,
     synthetic_path: PathBuf,
     pub home: PathBuf,
+    /// Single-use OID4VCI `c_nonce`s issued but not yet redeemed.
+    pub vci_nonces: HashSet<String>,
 }
 
 impl ServerState {
@@ -98,6 +100,7 @@ impl ServerState {
             synthetic_plugins,
             synthetic_path,
             home: home.to_path_buf(),
+            vci_nonces: HashSet::new(),
         })
     }
 
