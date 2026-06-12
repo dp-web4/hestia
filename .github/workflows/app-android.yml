@@ -37,14 +37,8 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-
-      - name: Install NDK
-        run: sdkmanager "ndk;27.2.12479018"
-
-      - name: Set NDK env
-        run: |
-          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
+        # NDK: the runner image's preinstalled NDK is auto-detected by the
+        # tauri CLI (verified in run 27447314547 — compiled clean with it).
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -54,13 +48,22 @@ jobs:
         with:
           workspaces: app/src-tauri -> target
 
+      # The generated Gradle project (gen/android/buildSrc BuildTask.kt)
+      # hard-invokes `cargo tauri android android-studio-script`, so the
+      # RUST tauri-cli must exist as a cargo subcommand — the npm CLI is
+      # not enough. Pinned to match the tauri crate version in Cargo.toml.
+      - name: Install cargo tauri-cli (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2.11.2
+
       - name: npm ci
         working-directory: app
         run: npm ci
 
       - name: Build Android APK (debug-signed universal)
         working-directory: app
-        run: npx tauri android build --debug --apk
+        run: cargo tauri android build --debug --apk
 
       - name: Stage APK with versioned name
         run: |
