@@ -45,3 +45,8 @@ app/src-tauri/gen/android/.gradle/
 app/src-tauri/gen/android/app/build/
 app/src-tauri/gen/android/buildSrc/build/
 app/src-tauri/gen/android/local.properties
+
+# Hardbound private key (never commit)
+.hardbound/signing.key
+
+.hardbound/actors/claude/signing.key
