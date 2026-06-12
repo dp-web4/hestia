@@ -61,9 +61,9 @@ jobs:
         working-directory: app
         run: npm ci
 
-      - name: Build Android APK (debug-signed universal)
+      - name: Build Android APK (release profile, debug-keystore signed)
         working-directory: app
-        run: cargo tauri android build --debug --apk
+        run: cargo tauri android build --apk
 
       - name: Stage APK with versioned name
         run: |
@@ -71,7 +71,7 @@ jobs:
           test -n "$APK" || { echo "no APK produced"; exit 1; }
           REF="${GITHUB_REF_NAME:-dev}"
           mkdir -p dist
-          cp "$APK" "dist/hestia-${REF}-android-universal-debug.apk"
+          cp "$APK" "dist/hestia-${REF}-android-universal.apk"
           ls -la dist/
 
       - name: Upload artifact

@@ -38,6 +38,12 @@ android {
         }
         getByName("release") {
             isMinifyEnabled = true
+            // Sideload signing: release builds are signed with the debug
+            // keystore until a store-grade key lands (CI secret). Optimized
+            // Rust profile + minify keeps the APK ~20 MB vs ~535 MB for a
+            // debug-buildType build (dev-profile .so × 4 ABIs — run
+            // 27447945048). Replace with a real signingConfig for stores.
+            signingConfig = signingConfigs.getByName("debug")
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }
                     .plus(getDefaultProguardFile("proguard-android-optimize.txt"))
