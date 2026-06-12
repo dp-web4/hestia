@@ -69,6 +69,7 @@ same engine for terminal people:
 | **Constellation** | Working | Link devices into a verifying constellation; challenge-bound attestation in the hub handshake (multi-device proof as MFA). |
 | **Profile** | Working | Skills + social/professional presence links with tiered visibility. |
 | **Credential issuance** | Working | OID4VCI issuer endpoints, SD-JWT-VC — EUDI-wallet-compatible, person-scale. |
+| **PreToolUse policy gating** | Working | Synchronous policy gate in the Claude Code plugin — daemon-decided verdict (allow/warn/deny via exit code), wait protocol for slow policy entities, legacy-engine fallback, pairs with the PostToolUse witness. |
 | **AI variant** (autonomous vault) | Initial | `--ai` flag for agent-owned vaults; ownership model still maturing. |
 
 ### Not yet built (Phase 3+)
@@ -76,7 +77,6 @@ same engine for terminal people:
 | Component | Status | Dependency |
 |-----------|--------|------------|
 | **Multi-hub connector** | Not started | Single-hub connection (done) |
-| **PreToolUse policy gating** | Not started | Policy engine is ready; hook wiring needed |
 | **Vault credential injection** | Not started | Plugin SDK surface exists |
 | **Hardware binding** (TPM/YubiKey/SE) | Trait contracts only | Hardbound enterprise tier |
 | **Federation** | Not started | Phase 4 |
