@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { getConfig, setMode, getDaemonStatus } from "../lib/tauri";
+import { getConfig, setMode, setDaemonUrl, getDaemonStatus } from "../lib/tauri";
 import { StatusBadge } from "../components/StatusBadge";
 
 export function Settings() {
@@ -9,11 +9,13 @@ export function Settings() {
   } | null>(null);
   const [online, setOnline] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [urlDraft, setUrlDraft] = useState<string>("");
 
   const refresh = useCallback(async () => {
     try {
       const cfg = await getConfig();
       setConfig({ mode: cfg.mode, daemon_url: cfg.daemon_url });
+      setUrlDraft(cfg.daemon_url);
       const status = await getDaemonStatus();
       setOnline(status.online);
       setError(null);
@@ -25,6 +27,15 @@ export function Settings() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  const handleUrlSave = async () => {
+    try {
+      await setDaemonUrl(urlDraft);
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
 
   const handleMode = async (mode: string) => {
     try {
@@ -52,7 +63,33 @@ export function Settings() {
         {config && (
           <div className="settings-row">
             <span>URL</span>
-            <code>{config.daemon_url}</code>
+            <span style={{ display: "flex", gap: 8, alignItems: "center", flex: 1, justifyContent: "flex-end" }}>
+              <input
+                value={urlDraft}
+                onChange={(e) => setUrlDraft(e.target.value)}
+                placeholder="http://host:7711"
+                spellCheck={false}
+                autoCapitalize="none"
+                style={{
+                  flex: 1,
+                  maxWidth: 320,
+                  background: "var(--bg)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 6,
+                  color: "var(--text)",
+                  padding: "6px 10px",
+                  fontFamily: "var(--font-mono)",
+                  fontSize: 12,
+                }}
+              />
+              <button
+                className="btn"
+                onClick={handleUrlSave}
+                disabled={!urlDraft || urlDraft === config.daemon_url}
+              >
+                Save
+              </button>
+            </span>
           </div>
         )}
       </section>

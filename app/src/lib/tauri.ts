@@ -65,6 +65,10 @@ export async function setMode(mode: string): Promise<unknown> {
   return invoke("set_mode", { mode });
 }
 
+export async function setDaemonUrl(url: string): Promise<unknown> {
+  return invoke("set_daemon_url", { url });
+}
+
 export async function addRemote(name: string, url: string): Promise<unknown> {
   return invoke("add_remote", { remote: { name, url } });
 }

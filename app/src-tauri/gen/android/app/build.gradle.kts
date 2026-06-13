@@ -17,7 +17,11 @@ android {
     compileSdk = 36
     namespace = "com.web4.hestia"
     defaultConfig {
-        manifestPlaceholders["usesCleartextTraffic"] = "false"
+        // Cleartext ON: the app talks to hestia daemons over http:// —
+        // typically across a Tailscale tailnet, where transport is already
+        // WireGuard-encrypted. Without this, release builds silently block
+        // every daemon request. Revisit when the daemon serves TLS.
+        manifestPlaceholders["usesCleartextTraffic"] = "true"
         applicationId = "com.web4.hestia"
         minSdk = 24
         targetSdk = 36
