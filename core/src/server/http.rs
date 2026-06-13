@@ -12,7 +12,6 @@ use axum::{
     response::{Html, IntoResponse, Json},
     routing::{delete, get, post, put},
 };
-use base64::Engine as _;
 use web4_core::oid4vc::{verify_holder_proof, CredentialIssuerMetadata, CredentialRequest};
 use web4_core::sd_jwt_vc::SdJwtVc;
 use rmcp::transport::streamable_http_server::{
@@ -67,10 +66,12 @@ pub async fn serve_with_callback(
         .route("/api/policy", get(policy_get))
         .route("/api/policy/preset", put(policy_set_preset))
         .route("/api/chain", get(chain_query))
-        // OID4VCI issuance (EUDI Phase 2) — hestia as person-scale issuer
+        // OID4VCI issuance (EUDI Phase 2) — hestia as person-scale issuer.
+        // The credential route matches the `<issuer>/credential` that
+        // `CredentialIssuerMetadata::for_vct` advertises (issuer = http://host).
         .route("/.well-known/openid-credential-issuer", get(vci_metadata))
-        .route("/vci/nonce", post(vci_nonce))
-        .route("/vci/credential", post(vci_credential))
+        .route("/nonce", post(vci_nonce))
+        .route("/credential", post(vci_credential))
         .with_state(state)
         .nest_service("/mcp", service);
 
@@ -214,7 +215,7 @@ async fn vci_credential(
 
     // Extract the c_nonce the wallet's proof was bound to (from the proof JWT
     // payload) so we can check it's one we issued.
-    let proof_nonce = match proof_nonce(&req.proof_jwt) {
+    let proof_nonce = match web4_core::oid4vc::proof_nonce(&req.proof_jwt) {
         Some(n) => n,
         None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"proof missing nonce"}))),
     };
@@ -267,15 +268,6 @@ async fn vci_credential(
         .issue(&issuer_key, &format!("{issuer_did}#key-0"));
 
     (StatusCode::OK, Json(serde_json::json!({ "credential": credential, "format": "vc+sd-jwt" })))
-}
-
-/// Pull the `nonce` claim out of an OID4VCI proof JWT (no verification — just to
-/// look up which issued nonce it claims, before verifying).
-fn proof_nonce(proof_jwt: &str) -> Option<String> {
-    let payload_b64 = proof_jwt.split('.').nth(1)?;
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
-    v.get("nonce").and_then(|n| n.as_str()).map(String::from)
 }
 
 fn hex32(s: &str) -> Option<[u8; 32]> {
