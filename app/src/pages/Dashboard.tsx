@@ -1,4 +1,6 @@
+import { useState, useEffect } from "react";
 import { useDashboard } from "../hooks/useDashboard";
+import { getConfig, setDaemonUrl } from "../lib/tauri";
 import { StatusBadge } from "../components/StatusBadge";
 import { TrustCard } from "../components/TrustCard";
 import { ChainFeed } from "../components/ChainFeed";
@@ -6,6 +8,23 @@ import { ToolHistogram } from "../components/ToolHistogram";
 
 export function Dashboard() {
   const { data, online, error } = useDashboard(2000);
+  const [urlDraft, setUrlDraft] = useState<string>("");
+  const [saveMsg, setSaveMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    getConfig()
+      .then((cfg) => setUrlDraft(cfg.daemon_url))
+      .catch(() => {});
+  }, []);
+
+  const handleConnect = async () => {
+    try {
+      await setDaemonUrl(urlDraft);
+      setSaveMsg("Saved — connecting…");
+    } catch (e) {
+      setSaveMsg(String(e));
+    }
+  };
 
   if (error && !data) {
     return (
@@ -14,6 +33,26 @@ export function Dashboard() {
           <StatusBadge online={false} />
           <p>Cannot reach Hestia daemon</p>
           <code>{error}</code>
+          <div className="connect-form">
+            <label>Daemon URL</label>
+            <input
+              value={urlDraft}
+              onChange={(e) => setUrlDraft(e.target.value)}
+              placeholder="http://host:7711"
+              spellCheck={false}
+              autoCapitalize="none"
+              autoCorrect="off"
+              inputMode="url"
+            />
+            <button className="btn" onClick={handleConnect} disabled={!urlDraft}>
+              Connect
+            </button>
+            {saveMsg && <span className="connect-msg">{saveMsg}</span>}
+          </div>
+          <p className="connect-hint">
+            No daemon runs on this device yet — point Hestia at one you can
+            reach (e.g. a machine on your tailnet).
+          </p>
         </div>
       </div>
     );

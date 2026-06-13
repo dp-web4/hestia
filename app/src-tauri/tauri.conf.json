@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicoverbruggen/tauri-vs-electron/refs/heads/main/tauri.conf-v2-schema.json",
   "productName": "Hestia",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "identifier": "com.web4.hestia",
   "build": {
     "frontendDist": "../dist",
