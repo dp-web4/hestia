@@ -681,17 +681,19 @@ fn cmd_policy_set(home: &std::path::Path, preset: &str) -> AnyResult<()> {
 // ---- profile commands -------------------------------------------------------
 
 fn cmd_profile_name(home: &std::path::Path, name: &str) -> AnyResult<()> {
-    let mut store = ProfileStore::load(home)?;
+    let mut vault = open_vault(home)?;
+    let mut store = ProfileStore::load(&vault)?;
     store.display_name = Some(name.to_string());
-    store.save(home)?;
+    store.save(&mut vault)?;
     println!("Display name set to: {name}");
     Ok(())
 }
 
 fn cmd_profile_bio(home: &std::path::Path, bio: &str) -> AnyResult<()> {
-    let mut store = ProfileStore::load(home)?;
+    let mut vault = open_vault(home)?;
+    let mut store = ProfileStore::load(&vault)?;
     store.bio = Some(bio.to_string());
-    store.save(home)?;
+    store.save(&mut vault)?;
     println!("Bio updated");
     Ok(())
 }
@@ -711,9 +713,10 @@ fn cmd_profile_add(
         link = link.with_label(l);
     }
 
-    let mut store = ProfileStore::load(home)?;
+    let mut vault = open_vault(home)?;
+    let mut store = ProfileStore::load(&vault)?;
     store.add_link(link.clone());
-    store.save(home)?;
+    store.save(&mut vault)?;
 
     println!("Link added:");
     println!("  platform:   {platform}");
@@ -726,7 +729,8 @@ fn cmd_profile_add(
 }
 
 fn cmd_profile_list(home: &std::path::Path, tier: Option<&str>) -> AnyResult<()> {
-    let store = ProfileStore::load(home)?;
+    let vault = open_vault(home)?;
+    let store = ProfileStore::load(&vault)?;
 
     if let Some(name) = &store.display_name {
         println!("{name}");
@@ -767,9 +771,10 @@ fn cmd_profile_list(home: &std::path::Path, tier: Option<&str>) -> AnyResult<()>
 fn cmd_profile_remove(home: &std::path::Path, id: &str) -> AnyResult<()> {
     let link_id = uuid::Uuid::parse_str(id)
         .with_context(|| format!("invalid UUID: {id}"))?;
-    let mut store = ProfileStore::load(home)?;
+    let mut vault = open_vault(home)?;
+    let mut store = ProfileStore::load(&vault)?;
     if store.remove_link(link_id) {
-        store.save(home)?;
+        store.save(&mut vault)?;
         println!("Link {link_id} removed");
     } else {
         anyhow::bail!("link {link_id} not found");
@@ -778,7 +783,8 @@ fn cmd_profile_remove(home: &std::path::Path, id: &str) -> AnyResult<()> {
 }
 
 fn cmd_profile_present(home: &std::path::Path, tier: &str) -> AnyResult<()> {
-    let store = ProfileStore::load(home)?;
+    let vault = open_vault(home)?;
+    let store = ProfileStore::load(&vault)?;
     let vis = profile::parse_visibility(tier)?;
     let pres = store.present(&vis);
 
@@ -825,7 +831,7 @@ fn cmd_profile_push(home: &std::path::Path, target: &str) -> AnyResult<()> {
         .ok_or_else(|| anyhow::anyhow!("ai_identity_secret is not 32-byte hex"))?;
     let keypair = web4_core::crypto::KeyPair::from_secret_bytes(&secret_bytes);
 
-    let profile = ProfileStore::load(home)?;
+    let profile = ProfileStore::load(&vault)?;
     let fields = profile.hub_fields();
     if fields.is_empty() {
         anyhow::bail!("profile is empty — add a name/bio/links first (`hestia profile add ...`)");

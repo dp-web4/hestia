@@ -233,7 +233,7 @@ impl ServerState {
                 .collect())
             .unwrap_or_default();
 
-        let profile = crate::profile::ProfileStore::load(&self.home)
+        let profile = crate::profile::ProfileStore::load(&self.vault)
             .ok()
             .and_then(|s| serde_json::to_value(&s.present(&crate::profile::Visibility::Private)).ok());
 

@@ -11,10 +11,18 @@
 //! - `trusted` — entities above a T3 threshold
 //! - `private` — never shared automatically
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+use crate::vault::Vault;
+
+/// Vault namespace + name under which the profile is enclosed (vault doctrine —
+/// no plaintext sidecar).
+const PROFILE_NS: &str = "presence";
+const PROFILE_NAME: &str = "profile";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -159,23 +167,42 @@ pub struct ProfileStore {
 }
 
 impl ProfileStore {
-    pub fn path(hestia_home: &Path) -> PathBuf {
+    /// Legacy plaintext sidecar path (pre-doctrine). Retained only so the
+    /// migration in [`load`](Self::load)/[`save`](Self::save) can find + remove
+    /// it; the profile now lives in the vault, not here.
+    pub fn legacy_path(hestia_home: &Path) -> PathBuf {
         hestia_home.join("profile.json")
     }
 
-    pub fn load(hestia_home: &Path) -> anyhow::Result<Self> {
-        let path = Self::path(hestia_home);
-        if !path.exists() {
-            return Ok(Self::default());
+    /// Load the profile from the vault. Falls back to a legacy plaintext
+    /// `profile.json` (migrated into the vault on the next save) for older
+    /// installs. The vault must be unlocked — nothing is read pre-unlock.
+    pub fn load(vault: &Vault) -> anyhow::Result<Self> {
+        if let Some(bytes) = vault.get_document(PROFILE_NS, PROFILE_NAME) {
+            return serde_json::from_slice(bytes).context("parsing profile document");
         }
-        let data = std::fs::read_to_string(&path)?;
-        Ok(serde_json::from_str(&data)?)
+        if let Some(home) = vault.path().parent() {
+            let legacy = Self::legacy_path(home);
+            if legacy.exists() {
+                let data = std::fs::read(&legacy).context("reading legacy profile.json")?;
+                return serde_json::from_slice(&data).context("parsing legacy profile.json");
+            }
+        }
+        Ok(Self::default())
     }
 
-    pub fn save(&self, hestia_home: &Path) -> anyhow::Result<()> {
-        let path = Self::path(hestia_home);
-        let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, data)?;
+    /// Persist the profile as an encrypted vault document, and complete
+    /// migration by removing any legacy plaintext `profile.json`.
+    pub fn save(&self, vault: &mut Vault) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec_pretty(self).context("serializing profile")?;
+        vault
+            .put_document(PROFILE_NS, PROFILE_NAME, bytes)
+            .context("writing profile to vault")?;
+        if let Some(legacy) = vault.path().parent().map(Self::legacy_path) {
+            if legacy.exists() {
+                let _ = std::fs::remove_file(&legacy);
+            }
+        }
         Ok(())
     }
 
@@ -352,5 +379,47 @@ mod tests {
         assert_eq!(f.get("linkedin").map(String::as_str), Some("https://linkedin.com/in/dp"));
         assert!(!f.contains_key("email"));
         assert!(!f.contains_key("phone"));
+    }
+
+    #[test]
+    fn profile_round_trips_through_the_vault_no_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let vpath = dir.path().join("vault.enc");
+        let mut vault = Vault::init(vpath.clone(), "pw".into()).unwrap();
+
+        let mut store = ProfileStore::default();
+        store.display_name = Some("DP".into());
+        store.save(&mut vault).unwrap();
+
+        // No plaintext profile.json on disk — it's an encrypted vault document.
+        assert!(!dir.path().join("profile.json").exists());
+
+        // Round-trips through a fresh vault open.
+        let vault2 = Vault::open(vpath, "pw".into()).unwrap();
+        let loaded = ProfileStore::load(&vault2).unwrap();
+        assert_eq!(loaded.display_name.as_deref(), Some("DP"));
+    }
+
+    #[test]
+    fn profile_migrates_legacy_plaintext_then_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let vpath = dir.path().join("vault.enc");
+        let mut vault = Vault::init(vpath, "pw".into()).unwrap();
+
+        // A pre-doctrine plaintext profile.json next to the vault.
+        let legacy = dir.path().join("profile.json");
+        std::fs::write(
+            &legacy,
+            serde_json::to_vec(&serde_json::json!({"display_name":"Old","bio":null,"links":[]})).unwrap(),
+        )
+        .unwrap();
+
+        // load() reads the legacy file (migration source)...
+        let loaded = ProfileStore::load(&vault).unwrap();
+        assert_eq!(loaded.display_name.as_deref(), Some("Old"));
+        // ...and the first save() imports it to the vault + deletes the plaintext.
+        loaded.save(&mut vault).unwrap();
+        assert!(!legacy.exists(), "legacy plaintext should be removed after migration");
+        assert!(vault.get_document(PROFILE_NS, PROFILE_NAME).is_some());
     }
 }
