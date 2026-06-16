@@ -251,6 +251,72 @@ impl Vault {
         let sub: VaultData = serde_json::from_slice(&bytes)?;
         Ok(sub)
     }
+
+    /// Directory the vault file lives in (where legacy plaintext sidecars sit).
+    pub fn home_dir(&self) -> Option<&std::path::Path> {
+        self.path.parent()
+    }
+}
+
+/// Open the vault for a hestia `home` using `HESTIA_PASSPHRASE` (the daemon/CLI
+/// automation path). Errors if the passphrase isn't set — naivety: instance
+/// data is unreadable until unlock. For read-mostly callers (plugins) that
+/// don't hold the long-lived server vault handle.
+pub fn open_with_env(home: &std::path::Path) -> anyhow::Result<Vault> {
+    let pass = std::env::var("HESTIA_PASSPHRASE")
+        .map_err(|_| anyhow::anyhow!("HESTIA_PASSPHRASE not set — vault is locked"))?;
+    Vault::open(storage::vault_path(home), pass)
+        .map_err(|e| anyhow::anyhow!("opening vault at {}: {e}", home.display()))
+}
+
+/// Load a serde value from a master-tier vault document, migrating a legacy
+/// plaintext sidecar file if the document doesn't exist yet (older installs).
+/// Returns `T::default()` if neither is present. The vault doctrine in one
+/// helper: config/metadata/state lives in the vault, not in plaintext files.
+pub fn load_doc<T: serde::de::DeserializeOwned + Default>(
+    vault: &Vault,
+    namespace: &str,
+    name: &str,
+    legacy_filename: &str,
+) -> anyhow::Result<T> {
+    use anyhow::Context;
+    if let Some(bytes) = vault.get_document(namespace, name) {
+        return serde_json::from_slice(bytes)
+            .with_context(|| format!("parsing vault document {namespace}/{name}"));
+    }
+    if let Some(home) = vault.home_dir() {
+        let legacy = home.join(legacy_filename);
+        if legacy.exists() {
+            let data = std::fs::read(&legacy)
+                .with_context(|| format!("reading legacy {legacy_filename}"))?;
+            return serde_json::from_slice(&data)
+                .with_context(|| format!("parsing legacy {legacy_filename}"));
+        }
+    }
+    Ok(T::default())
+}
+
+/// Persist a serde value as an encrypted master-tier vault document, then remove
+/// any legacy plaintext sidecar (completing migration).
+pub fn save_doc<T: serde::Serialize>(
+    vault: &mut Vault,
+    namespace: &str,
+    name: &str,
+    legacy_filename: &str,
+    value: &T,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let bytes = serde_json::to_vec_pretty(value)
+        .with_context(|| format!("serializing {namespace}/{name}"))?;
+    vault
+        .put_document(namespace, name, bytes)
+        .with_context(|| format!("writing vault document {namespace}/{name}"))?;
+    if let Some(legacy) = vault.home_dir().map(|h| h.join(legacy_filename)) {
+        if legacy.exists() {
+            let _ = std::fs::remove_file(&legacy);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

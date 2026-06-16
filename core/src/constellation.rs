@@ -12,7 +12,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use uuid::Uuid;
 use web4_core::crypto::KeyPair;
 
@@ -246,24 +246,15 @@ pub struct ConstellationStore {
 }
 
 impl ConstellationStore {
-    pub fn path(hestia_home: &Path) -> PathBuf {
-        hestia_home.join("constellation.json")
+    /// Load the device constellation from the vault (migrating a legacy
+    /// `constellation.json` for older installs).
+    pub fn load(vault: &crate::vault::Vault) -> anyhow::Result<Self> {
+        crate::vault::load_doc(vault, "presence", "constellation", "constellation.json")
     }
 
-    pub fn load(hestia_home: &Path) -> anyhow::Result<Self> {
-        let path = Self::path(hestia_home);
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let data = std::fs::read_to_string(&path)?;
-        Ok(serde_json::from_str(&data)?)
-    }
-
-    pub fn save(&self, hestia_home: &Path) -> anyhow::Result<()> {
-        let path = Self::path(hestia_home);
-        let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, data)?;
-        Ok(())
+    /// Persist the constellation as an encrypted vault document.
+    pub fn save(&self, vault: &mut crate::vault::Vault) -> anyhow::Result<()> {
+        crate::vault::save_doc(vault, "presence", "constellation", "constellation.json", self)
     }
 
     pub fn add_device(
@@ -347,7 +338,9 @@ impl ToolPlugin for ConstellationPlugin {
     ) -> Result<serde_json::Value, PluginError> {
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("status");
 
-        let store = ConstellationStore::load(&self.home)
+        let vault = crate::vault::open_with_env(&self.home)
+            .map_err(|e| PluginError::Internal(e.to_string()))?;
+        let store = ConstellationStore::load(&vault)
             .map_err(|e| PluginError::Internal(e.to_string()))?;
 
         match action {

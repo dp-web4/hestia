@@ -226,7 +226,7 @@ impl ServerState {
             .map(flatten_entry)
             .collect();
 
-        let delegations = crate::delegation::DelegationStore::load(&self.home)
+        let delegations = crate::delegation::DelegationStore::load(&self.vault)
             .ok()
             .map(|s| s.delegations.iter()
                 .map(|d| serde_json::to_value(d).unwrap_or_default())
@@ -237,11 +237,11 @@ impl ServerState {
             .ok()
             .and_then(|s| serde_json::to_value(&s.present(&crate::profile::Visibility::Private)).ok());
 
-        let constellation = crate::constellation::ConstellationStore::load(&self.home)
+        let constellation = crate::constellation::ConstellationStore::load(&self.vault)
             .ok()
             .and_then(|s| serde_json::to_value(&s.proof()).ok());
 
-        let hub_connections = crate::hub::HubStore::load(&self.home)
+        let hub_connections = crate::hub::HubStore::load(&self.vault)
             .ok()
             .map(|s| s.connections.iter()
                 .map(|c| serde_json::to_value(c).unwrap_or_default())

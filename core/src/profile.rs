@@ -11,10 +11,8 @@
 //! - `trusted` — entities above a T3 threshold
 //! - `private` — never shared automatically
 
-use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::vault::Vault;
@@ -167,43 +165,16 @@ pub struct ProfileStore {
 }
 
 impl ProfileStore {
-    /// Legacy plaintext sidecar path (pre-doctrine). Retained only so the
-    /// migration in [`load`](Self::load)/[`save`](Self::save) can find + remove
-    /// it; the profile now lives in the vault, not here.
-    pub fn legacy_path(hestia_home: &Path) -> PathBuf {
-        hestia_home.join("profile.json")
-    }
-
-    /// Load the profile from the vault. Falls back to a legacy plaintext
-    /// `profile.json` (migrated into the vault on the next save) for older
-    /// installs. The vault must be unlocked — nothing is read pre-unlock.
+    /// Load the profile from the vault (migrating a legacy `profile.json` for
+    /// older installs). The vault must be unlocked — nothing is read pre-unlock.
     pub fn load(vault: &Vault) -> anyhow::Result<Self> {
-        if let Some(bytes) = vault.get_document(PROFILE_NS, PROFILE_NAME) {
-            return serde_json::from_slice(bytes).context("parsing profile document");
-        }
-        if let Some(home) = vault.path().parent() {
-            let legacy = Self::legacy_path(home);
-            if legacy.exists() {
-                let data = std::fs::read(&legacy).context("reading legacy profile.json")?;
-                return serde_json::from_slice(&data).context("parsing legacy profile.json");
-            }
-        }
-        Ok(Self::default())
+        crate::vault::load_doc(vault, PROFILE_NS, PROFILE_NAME, "profile.json")
     }
 
-    /// Persist the profile as an encrypted vault document, and complete
-    /// migration by removing any legacy plaintext `profile.json`.
+    /// Persist the profile as an encrypted vault document (and drop any legacy
+    /// plaintext `profile.json`).
     pub fn save(&self, vault: &mut Vault) -> anyhow::Result<()> {
-        let bytes = serde_json::to_vec_pretty(self).context("serializing profile")?;
-        vault
-            .put_document(PROFILE_NS, PROFILE_NAME, bytes)
-            .context("writing profile to vault")?;
-        if let Some(legacy) = vault.path().parent().map(Self::legacy_path) {
-            if legacy.exists() {
-                let _ = std::fs::remove_file(&legacy);
-            }
-        }
-        Ok(())
+        crate::vault::save_doc(vault, PROFILE_NS, PROFILE_NAME, "profile.json", self)
     }
 
     pub fn add_link(&mut self, link: ProfileLink) {

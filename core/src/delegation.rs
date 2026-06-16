@@ -6,7 +6,6 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 use web4_core::delegation::{DelegatedAuthority, DelegationScope};
 use web4_core::crypto::KeyPair;
 use web4_core::role::SocietyRole;
@@ -19,26 +18,14 @@ pub struct DelegationStore {
 }
 
 impl DelegationStore {
-    pub fn path(hestia_home: &Path) -> PathBuf {
-        hestia_home.join("delegations.json")
+    /// Load delegations from the vault (migrating a legacy `delegations.json`).
+    pub fn load(vault: &crate::vault::Vault) -> Result<Self> {
+        crate::vault::load_doc(vault, "presence", "delegations", "delegations.json")
     }
 
-    pub fn load(hestia_home: &Path) -> Result<Self> {
-        let path = Self::path(hestia_home);
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let data = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        serde_json::from_str(&data)
-            .with_context(|| format!("parsing {}", path.display()))
-    }
-
-    pub fn save(&self, hestia_home: &Path) -> Result<()> {
-        let path = Self::path(hestia_home);
-        let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, data)
-            .with_context(|| format!("writing {}", path.display()))
+    /// Persist delegations as an encrypted vault document.
+    pub fn save(&self, vault: &mut crate::vault::Vault) -> Result<()> {
+        crate::vault::save_doc(vault, "presence", "delegations", "delegations.json", self)
     }
 
     pub fn create_delegation(

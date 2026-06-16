@@ -809,8 +809,10 @@ fn cmd_profile_present(home: &std::path::Path, tier: &str) -> AnyResult<()> {
 }
 
 fn cmd_profile_push(home: &std::path::Path, target: &str) -> AnyResult<()> {
+    // One vault handle for the whole command (hub connections + identity key).
+    let vault = open_vault(home)?;
     // Resolve the hub connection.
-    let hubs = HubStore::load(home)?;
+    let hubs = HubStore::load(&vault)?;
     let conn = if let Ok(id) = uuid::Uuid::parse_str(target) {
         hubs.find_by_id(id)
     } else {
@@ -821,7 +823,6 @@ fn cmd_profile_push(home: &std::path::Path, target: &str) -> AnyResult<()> {
 
     // Load the member identity key from the vault (created by `hestia init --ai`).
     // The hub must have this pubkey pinned (via membership) for the act to verify.
-    let vault = open_vault(home)?;
     let secret_hex = vault.get("ai_identity_secret").map(|e| e.secret.clone())
         .ok_or_else(|| anyhow::anyhow!(
             "no member identity key in vault — run `hestia init --ai`, or self-add to the hub \
@@ -891,13 +892,14 @@ fn cmd_constellation_add(home: &std::path::Path, name: &str, device_type: &str) 
     let kp = web4_core::crypto::KeyPair::generate();
     let pubkey_hex = kp.verifying_key().to_hex();
 
-    let mut store = ConstellationStore::load(home)?;
+    let mut vault = open_vault(home)?;
+    let mut store = ConstellationStore::load(&vault)?;
     if store.owner_lct_id.is_none() {
         store.owner_lct_id = Some(uuid::Uuid::new_v4());
     }
     let member = store.add_device(name, dt, &pubkey_hex, vec![]);
     let lct_id = member.lct_id;
-    store.save(home)?;
+    store.save(&mut vault)?;
 
     println!("Device added to constellation:");
     println!("  name:    {name}");
@@ -908,7 +910,8 @@ fn cmd_constellation_add(home: &std::path::Path, name: &str, device_type: &str) 
 }
 
 fn cmd_constellation_list(home: &std::path::Path) -> AnyResult<()> {
-    let store = ConstellationStore::load(home)?;
+    let vault = open_vault(home)?;
+    let store = ConstellationStore::load(&vault)?;
 
     if store.members.is_empty() {
         println!("(no devices in constellation — use `hestia constellation add <name>`)");
@@ -935,9 +938,10 @@ fn cmd_constellation_list(home: &std::path::Path) -> AnyResult<()> {
 fn cmd_constellation_remove(home: &std::path::Path, id: &str) -> AnyResult<()> {
     let lct_id = uuid::Uuid::parse_str(id)
         .with_context(|| format!("invalid UUID: {id}"))?;
-    let mut store = ConstellationStore::load(home)?;
+    let mut vault = open_vault(home)?;
+    let mut store = ConstellationStore::load(&vault)?;
     if store.remove_device(lct_id) {
-        store.save(home)?;
+        store.save(&mut vault)?;
         println!("Device {lct_id} removed from constellation");
     } else {
         anyhow::bail!("device {lct_id} not found in constellation");
@@ -946,7 +950,8 @@ fn cmd_constellation_remove(home: &std::path::Path, id: &str) -> AnyResult<()> {
 }
 
 fn cmd_constellation_proof(home: &std::path::Path) -> AnyResult<()> {
-    let store = ConstellationStore::load(home)?;
+    let vault = open_vault(home)?;
+    let store = ConstellationStore::load(&vault)?;
     let proof = store.proof();
     println!("Constellation proof:");
     println!("  owner:      {}", proof.owner_lct_id);
@@ -980,7 +985,8 @@ fn cmd_delegate_grant(
     let delegator_kp = web4_core::crypto::KeyPair::generate();
     let delegator_id = uuid::Uuid::new_v4();
 
-    let mut store = DelegationStore::load(home)?;
+    let mut vault = open_vault(home)?;
+    let mut store = DelegationStore::load(&vault)?;
     let deleg = store.create_delegation(
         delegator_id,
         agent_id,
@@ -995,7 +1001,7 @@ fn cmd_delegate_grant(
         .map(|e| e.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_else(|| "never".into());
 
-    store.save(home)?;
+    store.save(&mut vault)?;
     println!("Delegation created:");
     println!("  id:      {id}");
     println!("  agent:   {agent_id}");
@@ -1004,7 +1010,8 @@ fn cmd_delegate_grant(
 }
 
 fn cmd_delegate_list(home: &std::path::Path) -> AnyResult<()> {
-    let store = DelegationStore::load(home)?;
+    let vault = open_vault(home)?;
+    let store = DelegationStore::load(&vault)?;
     let active = store.active();
 
     if active.is_empty() {
@@ -1032,9 +1039,10 @@ fn cmd_delegate_revoke(home: &std::path::Path, id: &str) -> AnyResult<()> {
     let delegation_id = uuid::Uuid::parse_str(id)
         .with_context(|| format!("invalid delegation UUID: {id}"))?;
 
-    let mut store = DelegationStore::load(home)?;
+    let mut vault = open_vault(home)?;
+    let mut store = DelegationStore::load(&vault)?;
     store.revoke(delegation_id)?;
-    store.save(home)?;
+    store.save(&mut vault)?;
     println!("Delegation {delegation_id} revoked");
     Ok(())
 }
@@ -1042,7 +1050,8 @@ fn cmd_delegate_revoke(home: &std::path::Path, id: &str) -> AnyResult<()> {
 // ---- hub commands -----------------------------------------------------------
 
 fn cmd_hub_connect(home: &std::path::Path, url: &str) -> AnyResult<()> {
-    let mut store = HubStore::load(home)?;
+    let mut vault = open_vault(home)?;
+    let mut store = HubStore::load(&vault)?;
 
     if store.find_by_url(url).is_some() {
         anyhow::bail!("already connected to {url}");
@@ -1083,13 +1092,14 @@ fn cmd_hub_connect(home: &std::path::Path, url: &str) -> AnyResult<()> {
     };
 
     store.connections.push(conn);
-    store.save(home)?;
+    store.save(&mut vault)?;
     println!("\nConnected to {url} (id: {our_lct_id})");
     Ok(())
 }
 
 fn cmd_hub_list(home: &std::path::Path) -> AnyResult<()> {
-    let store = HubStore::load(home)?;
+    let vault = open_vault(home)?;
+    let store = HubStore::load(&vault)?;
 
     if store.connections.is_empty() {
         println!("(no hub connections — use `hestia hub connect <url>` to connect)");
@@ -1111,7 +1121,8 @@ fn cmd_hub_list(home: &std::path::Path) -> AnyResult<()> {
 }
 
 fn cmd_hub_show(home: &std::path::Path, target: &str) -> AnyResult<()> {
-    let store = HubStore::load(home)?;
+    let vault = open_vault(home)?;
+    let store = HubStore::load(&vault)?;
 
     let conn = if let Ok(id) = uuid::Uuid::parse_str(target) {
         store.find_by_id(id)
@@ -1140,7 +1151,8 @@ fn cmd_hub_show(home: &std::path::Path, target: &str) -> AnyResult<()> {
 }
 
 fn cmd_hub_disconnect(home: &std::path::Path, target: &str) -> AnyResult<()> {
-    let mut store = HubStore::load(home)?;
+    let mut vault = open_vault(home)?;
+    let mut store = HubStore::load(&vault)?;
 
     let idx = if let Ok(id) = uuid::Uuid::parse_str(target) {
         store.connections.iter().position(|c| c.id == id)
@@ -1150,7 +1162,7 @@ fn cmd_hub_disconnect(home: &std::path::Path, target: &str) -> AnyResult<()> {
 
     let idx = idx.ok_or_else(|| anyhow::anyhow!("hub connection not found: {target}"))?;
     let removed = store.connections.remove(idx);
-    store.save(home)?;
+    store.save(&mut vault)?;
     println!("Disconnected from {} ({})", removed.url, removed.id);
     Ok(())
 }
@@ -1183,7 +1195,8 @@ fn ensure_member_identity(
 }
 
 fn cmd_hub_join(home: &std::path::Path, target: &str, name: Option<String>) -> AnyResult<()> {
-    let mut store = HubStore::load(home)?;
+    let mut vault = open_vault(home)?;
+    let mut store = HubStore::load(&vault)?;
     let (conn_idx, hub_id, rest, url) = {
         let pos = if let Ok(id) = uuid::Uuid::parse_str(target) {
             store.connections.iter().position(|c| c.id == id)
@@ -1196,7 +1209,6 @@ fn cmd_hub_join(home: &std::path::Path, target: &str, name: Option<String>) -> A
         (pos, c.hub_lct_id, abs_rest(&c.url, &c.rest_endpoint), c.url.clone())
     };
 
-    let mut vault = open_vault(home)?;
     let (member_lct, keypair) = ensure_member_identity(&mut vault)?;
 
     println!("Self-adding to {url} as {member_lct} ...");
@@ -1206,7 +1218,7 @@ fn cmd_hub_join(home: &std::path::Path, target: &str, name: Option<String>) -> A
 
     // Point the connection at the joined identity so `push` uses the pinned key.
     store.connections[conn_idx].our_lct_id = member_lct;
-    store.save(home)?;
+    store.save(&mut vault)?;
 
     match outcome {
         hestia::hub::JoinOutcome::Admitted(resp) => {

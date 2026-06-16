@@ -247,7 +247,7 @@ async fn vci_credential(
 
     // Assurance level from the local constellation (ties the credential to the
     // device-constellation work); default single_device if none.
-    let assurance = crate::constellation::ConstellationStore::load(&s.home)
+    let assurance = crate::constellation::ConstellationStore::load(&s.vault)
         .ok()
         .and_then(|st| serde_json::to_value(st.proof().assurance_level).ok())
         .and_then(|v| v.as_str().map(String::from))
