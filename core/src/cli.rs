@@ -481,7 +481,7 @@ fn cmd_serve(home: &std::path::Path, bind: &str, callback: bool) -> AnyResult<()
         );
     }
     let passphrase = prompt_passphrase("Vault passphrase: ")?;
-    let vault = hestia::Vault::open(path, passphrase)?;
+    let vault = hestia::Vault::open(path, passphrase.clone())?;
     println!("Vault unlocked. Starting Hestia MCP server on {bind}...");
 
     // Write endpoint discovery file so plugins can find us
@@ -498,7 +498,7 @@ fn cmd_serve(home: &std::path::Path, bind: &str, callback: bool) -> AnyResult<()
         None
     };
 
-    let state = hestia::server::build_state(vault, home)?;
+    let state = hestia::server::build_state(vault, home, &passphrase)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

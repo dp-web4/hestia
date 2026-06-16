@@ -1,9 +1,10 @@
 //! Shared server state — vault, sessions, in-flight actions, witness chain,
 //! and trust store.
 //!
-//! Persistence (Session 3):
-//! - witness chain → SQLite (`<HESTIA_HOME>/witness.db`)
-//! - trust         → JSON per entity under `<HESTIA_HOME>/trust/`
+//! Persistence (all encrypted at rest, vault doctrine):
+//! - witness chain → SQLCipher (`<HESTIA_HOME>/witness.db`)
+//! - trust         → per-entity, each sealed under `<HESTIA_HOME>/trust/`
+//! Both keyed by one storage key derived from the vault passphrase.
 //!
 //! Sessions and in-flight actions are intentionally RAM-only: a daemon
 //! restart should invalidate sessions, and plugins must reconnect.
@@ -71,9 +72,15 @@ pub struct ServerState {
 
 impl ServerState {
     /// Open all persistent stores rooted at `home` and prepare server state.
-    pub fn open(vault: Vault, home: &Path) -> Result<Self> {
-        let chain_store = SqliteChainStore::open(home.join("witness.db"))?;
-        let trust_store = TrustStore::open(home.join("trust"))?;
+    /// `passphrase` is the vault passphrase — used to derive the storage key
+    /// that seals the witness chain + trust files.
+    pub fn open(vault: Vault, home: &Path, passphrase: &str) -> Result<Self> {
+        // One stable storage key (Argon2 once) seals both the witness chain
+        // (SQLCipher) and the trust files.
+        let store_key = crate::storage::storage_key(home, passphrase)
+            .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
+        let chain_store = SqliteChainStore::open(home.join("witness.db"), store_key)?;
+        let trust_store = TrustStore::open(home.join("trust"), store_key)?;
         let sovereign_lct = "lct:web4:hestia:sovereign:phase1-placeholder".to_string();
         // Resolve the active policy from the vault. Falls back to the
         // safety preset if the vault's named preset isn't built-in.
@@ -217,7 +224,7 @@ mod tests {
     fn make_state() -> (TempDir, ServerState) {
         let dir = TempDir::new().unwrap();
         let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
-        let state = ServerState::open(vault, dir.path()).unwrap();
+        let state = ServerState::open(vault, dir.path(), "p").unwrap();
         (dir, state)
     }
 
@@ -261,7 +268,7 @@ mod tests {
 
         {
             let vault = Vault::init(vault_path.clone(), "p".into()).unwrap();
-            let mut state = ServerState::open(vault, dir.path()).unwrap();
+            let mut state = ServerState::open(vault, dir.path(), "p").unwrap();
             assert!(state.mark_synthetic("conformance-runner"));
             assert!(state.mark_synthetic("conformance-runner-py"));
             // Re-marking the same id is a no-op.
@@ -272,7 +279,7 @@ mod tests {
 
         // Reopen with the same home — synthetic set is restored from disk.
         let vault = Vault::open(vault_path.clone(), "p".into()).unwrap();
-        let state = ServerState::open(vault, dir.path()).unwrap();
+        let state = ServerState::open(vault, dir.path(), "p").unwrap();
         assert!(state.is_synthetic("conformance-runner"));
         assert!(state.is_synthetic("conformance-runner-py"));
         assert!(!state.is_synthetic("claude-code"));

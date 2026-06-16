@@ -64,7 +64,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Web4 primitives
 web4-core = { path = "../../web4/web4-core" }
 web4-trust-core = { version = "0.2", features = ["file-store"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
 
 # TUI dashboard
 ratatui = "0.28"

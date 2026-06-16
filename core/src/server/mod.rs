@@ -24,7 +24,7 @@ use crate::vault::Vault;
 
 /// Build the shared server state from an unlocked Vault. Opens the
 /// SQLite witness chain and the file-backed trust store rooted at `home`.
-pub fn build_state(vault: Vault, home: &Path) -> Result<SharedState> {
-    let state = ServerState::open(vault, home)?;
+pub fn build_state(vault: Vault, home: &Path, passphrase: &str) -> Result<SharedState> {
+    let state = ServerState::open(vault, home, passphrase)?;
     Ok(Arc::new(Mutex::new(state)))
 }

@@ -103,7 +103,7 @@ fn cmd_ensure_device(home: &std::path::Path, name: &str, dtype: &str) -> anyhow:
     let mut vault = open_vault(home)?;
     let (member_lct, _) = member_identity(&vault)?;
 
-    let mut store = ConstellationStore::load(home)?;
+    let mut store = ConstellationStore::load(&vault)?;
     // The attestation owner MUST be the hub-pinned member identity (hub
     // verify rule 3 binds owner pubkey to the resolver's pinned key) — a
     // random owner UUID here would 403 at presentation time.
@@ -111,14 +111,14 @@ fn cmd_ensure_device(home: &std::path::Path, name: &str, dtype: &str) -> anyhow:
 
     if let Some(existing) = store.members.iter().find(|m| m.name == name) {
         println!("device '{name}' already in constellation ({})", existing.lct_id);
-        store.save(home)?;
+        store.save(&mut vault)?;
         return Ok(());
     }
 
     let kp = KeyPair::generate();
     let pubkey_hex = kp.verifying_key().to_hex();
     let lct_id = store.add_device(name, dt, &pubkey_hex, vec![]).lct_id;
-    store.save(home)?;
+    store.save(&mut vault)?;
 
     let secret_hex: String = kp.secret_key_bytes().iter().map(|b| format!("{b:02x}")).collect();
     vault.upsert(
@@ -153,7 +153,7 @@ fn cmd_present(home: &std::path::Path, hub_url: &str) -> anyhow::Result<()> {
     let vault = open_vault(home)?;
     let (member_lct, owner_kp) = member_identity(&vault)?;
 
-    let store = ConstellationStore::load(home)?;
+    let store = ConstellationStore::load(&vault)?;
     anyhow::ensure!(
         store.owner_lct_id == Some(member_lct),
         "constellation owner ({:?}) != vault member identity ({member_lct}) — run ensure-device first",

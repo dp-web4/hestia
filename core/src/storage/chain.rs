@@ -35,16 +35,65 @@ pub struct SqliteChainStore {
 
 const GENESIS_PREV_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// Whether `path` is a legacy *plaintext* SQLite DB (header "SQLite format 3").
+/// An encrypted SQLCipher DB has a random-looking header instead.
+fn is_plaintext_sqlite(path: &Path) -> bool {
+    use std::io::Read;
+    let mut hdr = [0u8; 16];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut hdr))
+        .map(|_| &hdr == b"SQLite format 3\0")
+        .unwrap_or(false)
+}
+
+/// Migrate a plaintext SQLite witness DB to a SQLCipher-encrypted one in place,
+/// preserving every row (hashes + chain order intact). Uses SQLCipher's
+/// `sqlcipher_export` to copy the whole schema + data into a freshly-keyed DB,
+/// then atomically replaces the original. `key_hex` is the SQLCipher key.
+fn migrate_plaintext_to_encrypted(path: &Path, key_hex: &str) -> Result<()> {
+    let tmp = path.with_extension("db.enc-migrating");
+    let _ = std::fs::remove_file(&tmp);
+    // `key_hex` is [0-9a-f] only, so single-quoting it is safe; the temp path
+    // is one we control (no quotes).
+    {
+        let conn = Connection::open(path).context("opening plaintext witness DB for migration")?;
+        conn.execute_batch(&format!(
+            "ATTACH DATABASE '{}' AS enc KEY '{}'; \
+             SELECT sqlcipher_export('enc'); \
+             DETACH DATABASE enc;",
+            tmp.display(),
+            key_hex,
+        ))
+        .context("exporting plaintext witness chain into an encrypted copy")?;
+    }
+    std::fs::rename(&tmp, path).context("replacing plaintext witness DB with encrypted")?;
+    Ok(())
+}
+
 impl SqliteChainStore {
-    /// Open or create the witness chain database at the given path.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    /// Open or create the SQLCipher-encrypted witness chain. `key` is the stable
+    /// storage key (see [`crate::storage::storage_key`]); it's applied as the
+    /// SQLCipher key (hex), so the DB is encrypted at rest. A legacy plaintext
+    /// `witness.db` is migrated in place on first open (chain preserved).
+    pub fn open(path: impl AsRef<Path>, key: [u8; 32]) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating witness dir {}", parent.display()))?;
         }
+        let key_hex = hex::encode(key);
+
+        // One-time migration: re-encrypt a legacy plaintext DB.
+        if path.exists() && is_plaintext_sqlite(&path) {
+            migrate_plaintext_to_encrypted(&path, &key_hex)
+                .with_context(|| format!("migrating plaintext witness chain at {}", path.display()))?;
+        }
+
         let conn = Connection::open(&path)
             .with_context(|| format!("opening witness chain at {}", path.display()))?;
+        // SQLCipher: key the connection before any other access.
+        conn.pragma_update(None, "key", &key_hex)
+            .with_context(|| "applying SQLCipher key to witness chain")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chain_entries (
                 chain_position INTEGER PRIMARY KEY,
@@ -287,20 +336,59 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    const TEST_KEY: [u8; 32] = [7u8; 32];
+
     #[test]
     fn empty_store_reports_zero_and_genesis_tail() {
         let dir = TempDir::new().unwrap();
-        let store = SqliteChainStore::open(dir.path().join("w.db")).unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap();
         assert_eq!(store.len().unwrap(), 0);
         assert!(store.is_empty().unwrap());
         assert_eq!(store.tail_hash().unwrap(), GENESIS_PREV_HASH);
     }
 
     #[test]
+    fn legacy_plaintext_db_migrates_to_encrypted_preserving_rows() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("witness.db");
+        let signer = "lct:web4:hestia:sovereign:test";
+
+        // Build a legacy PLAINTEXT witness DB (no key) with two entries —
+        // exactly what an older install / the live daemon has on disk.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE chain_entries (
+                    chain_position INTEGER PRIMARY KEY, hash TEXT NOT NULL UNIQUE,
+                    prev_hash TEXT NOT NULL, event_type TEXT NOT NULL,
+                    event_data TEXT NOT NULL, signer_lct TEXT NOT NULL, timestamp TEXT NOT NULL);",
+            ).unwrap();
+            for i in 0..2u64 {
+                conn.execute(
+                    "INSERT INTO chain_entries VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params![i as i64, format!("h{i}"), format!("p{i}"), "evt",
+                        format!("{{\"n\":{i}}}"), signer, "2026-06-16T00:00:00Z"],
+                ).unwrap();
+            }
+        }
+        assert!(is_plaintext_sqlite(&path), "precondition: plaintext DB");
+
+        // Opening with a key migrates it in place, preserving the rows.
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        assert_eq!(store.len().unwrap(), 2);
+        assert!(!is_plaintext_sqlite(&path), "DB should now be encrypted");
+        drop(store);
+
+        // Reopen with the right key works; the wrong key fails.
+        assert_eq!(SqliteChainStore::open(&path, TEST_KEY).unwrap().len().unwrap(), 2);
+        assert!(SqliteChainStore::open(&path, [9u8; 32]).is_err(), "wrong key must fail");
+    }
+
+    #[test]
     fn append_and_read_round_trip() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("w.db");
-        let store = SqliteChainStore::open(&path).unwrap();
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
         let signer = "lct:web4:hestia:sovereign:test";
 
         let e1 = store.append("session_started", json!({"plugin": "a"}), signer).unwrap();
@@ -330,12 +418,12 @@ mod tests {
         let signer = "lct:web4:hestia:sovereign:test";
 
         {
-            let store = SqliteChainStore::open(&path).unwrap();
+            let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
             store.append("session_started", json!({"k": 1}), signer).unwrap();
             store.append("outcome", json!({"success": true}), signer).unwrap();
         }
         // Drop and reopen.
-        let store = SqliteChainStore::open(&path).unwrap();
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
         assert_eq!(store.len().unwrap(), 2);
         let entries = store.read_recent(10).unwrap();
         assert_eq!(entries[0].event_type, "outcome");
@@ -347,7 +435,7 @@ mod tests {
     #[test]
     fn verify_integrity_on_clean_chain_returns_length() {
         let dir = TempDir::new().unwrap();
-        let store = SqliteChainStore::open(dir.path().join("w.db")).unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap();
         let signer = "lct:web4:hestia:sovereign:test";
         for i in 0..5 {
             store.append("evt", json!({"i": i}), signer).unwrap();
@@ -361,12 +449,13 @@ mod tests {
         let path = dir.path().join("w.db");
         let signer = "lct:web4:hestia:sovereign:test";
         {
-            let store = SqliteChainStore::open(&path).unwrap();
+            let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
             store.append("evt", json!({"a": 1}), signer).unwrap();
             store.append("evt", json!({"a": 2}), signer).unwrap();
         }
         // Tamper with event_data at chain_position 0.
         let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "key", hex::encode(TEST_KEY)).unwrap();
         conn.execute(
             "UPDATE chain_entries SET event_data = ?1 WHERE chain_position = 0",
             params![r#"{"a": 99}"#],
@@ -374,7 +463,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let store = SqliteChainStore::open(&path).unwrap();
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
         let err = store.verify_integrity().unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("integrity broken"), "got: {msg}");

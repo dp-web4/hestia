@@ -309,7 +309,7 @@ mod tests {
     fn make_state() -> (TempDir, ServerState) {
         let dir = TempDir::new().unwrap();
         let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
-        let state = ServerState::open(vault, dir.path()).unwrap();
+        let state = ServerState::open(vault, dir.path(), "p").unwrap();
         (dir, state)
     }
 

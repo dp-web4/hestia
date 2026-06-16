@@ -17,7 +17,7 @@ fn chain_and_trust_survive_daemon_restart() {
 
     // --- First daemon lifetime ---
     let vault = Vault::init(vault_path.clone(), "p".into()).unwrap();
-    let s1 = ServerState::open(vault, home).unwrap();
+    let s1 = ServerState::open(vault, home, "p").unwrap();
 
     // Record several events + outcomes
     s1.append_chain("session_started", json!({"plugin_id": "claude"})).unwrap();
@@ -42,7 +42,7 @@ fn chain_and_trust_survive_daemon_restart() {
 
     // --- Second daemon lifetime ---
     let vault2 = Vault::open(vault_path, "p".into()).unwrap();
-    let s2 = ServerState::open(vault2, home).unwrap();
+    let s2 = ServerState::open(vault2, home, "p").unwrap();
 
     // Sessions and actions are RAM-only — must be empty.
     assert_eq!(s2.sessions.len(), 0);
