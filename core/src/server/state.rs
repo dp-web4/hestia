@@ -13,7 +13,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -63,9 +62,8 @@ pub struct ServerState {
     pub policy_engine: crate::policy::PolicyEngine,
     /// Plugin IDs that self-declared as synthetic (test harnesses,
     /// fuzzers, etc.). Excluded from operator-facing aggregations by
-    /// default. Persisted in `<HESTIA_HOME>/synthetic.json`.
+    /// default. Enclosed in the vault (document `presence`/`synthetic`).
     pub synthetic_plugins: HashSet<String>,
-    synthetic_path: PathBuf,
     pub home: PathBuf,
     /// Single-use OID4VCI `c_nonce`s issued but not yet redeemed.
     pub vci_nonces: HashSet<String>,
@@ -85,8 +83,11 @@ impl ServerState {
             .unwrap_or_else(|| crate::policy::get_preset("safety").unwrap().config);
         let policy_engine = crate::policy::PolicyEngine::new(policy_config);
 
-        let synthetic_path = home.join("synthetic.json");
-        let synthetic_plugins = load_synthetic_set(&synthetic_path);
+        // Synthetic-plugin set lives in the vault (migrating a legacy
+        // synthetic.json). Best-effort: an empty set on any read error.
+        let synthetic_plugins: HashSet<String> =
+            crate::vault::load_doc(&vault, "presence", "synthetic", "synthetic.json")
+                .unwrap_or_default();
 
         Ok(Self {
             vault,
@@ -98,7 +99,6 @@ impl ServerState {
             shared_context: serde_json::Map::new(),
             policy_engine,
             synthetic_plugins,
-            synthetic_path,
             home: home.to_path_buf(),
             vci_nonces: HashSet::new(),
         })
@@ -109,8 +109,15 @@ impl ServerState {
     pub fn mark_synthetic(&mut self, plugin_id: &str) -> bool {
         let added = self.synthetic_plugins.insert(plugin_id.to_string());
         if added {
-            // Best-effort persist; we don't fail the request on disk errors.
-            let _ = save_synthetic_set(&self.synthetic_path, &self.synthetic_plugins);
+            // Best-effort persist into the vault; don't fail the request on
+            // a disk/encrypt error.
+            let _ = crate::vault::save_doc(
+                &mut self.vault,
+                "presence",
+                "synthetic",
+                "synthetic.json",
+                &self.synthetic_plugins,
+            );
         }
         added
     }
@@ -200,22 +207,7 @@ impl ServerState {
 
 pub type SharedState = Arc<Mutex<ServerState>>;
 
-fn load_synthetic_set(path: &Path) -> HashSet<String> {
-    let bytes = match fs::read(path) {
-        Ok(b) => b,
-        Err(_) => return HashSet::new(),
-    };
-    let ids: Vec<String> = serde_json::from_slice(&bytes).unwrap_or_default();
-    ids.into_iter().collect()
-}
 
-fn save_synthetic_set(path: &Path, set: &HashSet<String>) -> Result<()> {
-    let mut ids: Vec<&String> = set.iter().collect();
-    ids.sort();
-    let bytes = serde_json::to_vec_pretty(&ids)?;
-    fs::write(path, bytes)?;
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
