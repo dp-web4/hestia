@@ -13,10 +13,20 @@ use hestia::profile::{self, ProfileLink, ProfileStore};
 use hestia::hub::{HubClient, HubStore};
 use hestia::vault::{default_hestia_home, vault_path, Vault, VaultEntry};
 
+/// Reported by `--version`: the semver plus the exact build provenance
+/// (`git describe`), baked at build time by `build.rs`. Can't go stale — it
+/// reflects the commit the binary was built from, not a hand-edited constant.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("HESTIA_GIT_VERSION"),
+    ")"
+);
+
 #[derive(Parser, Debug)]
 #[command(
     name = "hestia",
-    version,
+    version = VERSION,
     about = "Local-first Web4 trust layer for AI agents",
     long_about = "Hestia — local-first Web4 trust layer. Manages a credential vault, \
                   a Web4 society identity, a witness chain across all your AI agents, \
