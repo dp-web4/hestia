@@ -61,9 +61,17 @@ enum Command {
 
     /// Run the MCP server daemon
     Serve {
-        /// Bind address (default 127.0.0.1:7711)
+        /// Bind address (default 127.0.0.1:7711). Loopback-only unless
+        /// --allow-remote is passed — the REST surface is unauthenticated, so
+        /// off-device access should go through a paired sealed channel.
         #[arg(long, default_value = "127.0.0.1:7711")]
         bind: String,
+
+        /// Allow binding a NON-loopback address (e.g. 0.0.0.0 or a LAN/tailnet
+        /// IP). Required to override the default-refuse guard. NOT recommended:
+        /// it exposes the full vault/policy/chain REST surface with no auth.
+        #[arg(long)]
+        allow_remote: bool,
 
         /// Enable Sovereign callback server (hub signing requests).
         /// Generates an ephemeral keypair; production should load from vault.
@@ -315,7 +323,7 @@ pub fn run() -> AnyResult<()> {
     match cli.command {
         Command::Init { force, ai } => cmd_init(&home, force, ai),
         Command::Info => cmd_info(&home),
-        Command::Serve { bind, callback } => cmd_serve(&home, &bind, callback),
+        Command::Serve { bind, allow_remote, callback } => cmd_serve(&home, &bind, allow_remote, callback),
         Command::Dashboard { endpoint } => hestia::tui::run(&endpoint),
         Command::Vault(v) => match v {
             VaultCmd::List => cmd_vault_list(&home),
@@ -482,7 +490,43 @@ fn cmd_init(home: &std::path::Path, force: bool, ai: bool) -> AnyResult<()> {
     Ok(())
 }
 
-fn cmd_serve(home: &std::path::Path, bind: &str, callback: bool) -> AnyResult<()> {
+/// Whether `bind` targets a loopback interface (safe to serve without auth).
+/// Non-loopback binds (0.0.0.0, ::, LAN/tailnet IPs) expose the unauthenticated
+/// REST surface off-device and are refused unless explicitly allowed.
+fn bind_is_loopback(bind: &str) -> bool {
+    if let Ok(sa) = bind.parse::<std::net::SocketAddr>() {
+        return sa.ip().is_loopback();
+    }
+    // Non-literal host (e.g. "localhost:7711") — only "localhost" is loopback.
+    let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind);
+    host.trim_start_matches('[').trim_end_matches(']').eq_ignore_ascii_case("localhost")
+}
+
+fn cmd_serve(home: &std::path::Path, bind: &str, allow_remote: bool, callback: bool) -> AnyResult<()> {
+    // Default-refuse off-device binds: the daemon's REST surface
+    // (/api/vault, /api/policy, /api/chain, ...) is unauthenticated, so a
+    // non-loopback bind hands it to anything that can route to the port.
+    // Off-device access belongs on a paired, sealed channel — not an open bind.
+    if !allow_remote && !bind_is_loopback(bind) {
+        anyhow::bail!(
+            "refusing to bind a non-loopback address ({bind}).\n  \
+             The daemon's REST surface is unauthenticated; binding off-device \
+             exposes the full vault/policy/chain API to anything that can reach \
+             the port (tailnet membership is not authorization).\n  \
+             The phone/other devices should join your constellation and talk \
+             over a sealed channel, not dial an open REST port.\n  \
+             If you really mean it, pass --allow-remote (NOT recommended)."
+        );
+    }
+    if !bind_is_loopback(bind) {
+        // allow_remote was set — proceed, but make the exposure loud.
+        eprintln!(
+            "WARNING: serving the UNAUTHENTICATED REST surface on a non-loopback \
+             address ({bind}) via --allow-remote. Anything that can route to this \
+             port has full vault/policy/chain access."
+        );
+    }
+
     let path = hestia::vault::vault_path(home);
     if !path.exists() {
         anyhow::bail!(
@@ -1295,4 +1339,26 @@ fn cmd_policy_test(
         println!("  - {c}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod serve_guard_tests {
+    use super::bind_is_loopback;
+
+    #[test]
+    fn loopback_binds_are_allowed() {
+        assert!(bind_is_loopback("127.0.0.1:7711"));
+        assert!(bind_is_loopback("127.0.0.5:80"));
+        assert!(bind_is_loopback("[::1]:7711"));
+        assert!(bind_is_loopback("localhost:7711"));
+        assert!(bind_is_loopback("LocalHost:7711"));
+    }
+
+    #[test]
+    fn non_loopback_binds_are_refused() {
+        assert!(!bind_is_loopback("0.0.0.0:7711"));
+        assert!(!bind_is_loopback("[::]:7711"));
+        assert!(!bind_is_loopback("192.168.1.20:7711"));
+        assert!(!bind_is_loopback("100.75.141.17:7711")); // tailnet IP
+    }
 }
