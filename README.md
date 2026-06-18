@@ -110,6 +110,19 @@ hestia/
 └── demo/                 # Worked examples (consumer + enterprise)
 ```
 
+## Witnessed law
+
+Hestia is **policy-neutral**: it doesn't dictate how you run your own identity or
+device constellation — *you* set the rules (which devices belong, what each may
+do, what requires your presence, what your agents are delegated), and Hestia
+**enforces those rules and records adherence**. Every consequential act runs
+through your **policy engine** and is recorded in your local **witness chain**;
+delegations are scoped and revocable; nothing acts outside the authority you
+granted. This is the Web4 posture (web4's "Law is witnessed, not dictated") at
+*personal / constellation* scale — the same shape a hub has at society scale:
+the system doesn't mandate the policy, it insists that whatever your policy is,
+is followed verifiably. Convenience is your choice; the audit trail is not.
+
 ## Web4 foundation
 
 ```
