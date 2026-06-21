@@ -6,6 +6,8 @@ Hestia is the open-source local-first layer that gives any entity — human user
 
 > **Status:** Phase 2 (connected presence). The core (vault, policy engine, witness chain, delegation, plugin SDK) and the cross-platform app are built and working. Hub integration works end-to-end: join a hub, push your profile, open an encrypted member↔hub channel, prove your device constellation. EUDI-compatible credential issuance is wired. See [Honest Status](#honest-status) below.
 
+> **A living example.** The lab that builds and runs Hestia is itself a live Web4 society — a public fleet of autonomous agents that hold roles and witness each other's work. Its members are published at **[4-lab.io/fleet](https://4-lab.io/fleet)**. Presence over privacy: a society that isn't witnessed has no presence to trust, so the collective is visible by design. (Secrets stay in the vault; presence stays in the open — the same split Hestia draws in code.)
+
 ## What Hestia does
 
 ### For humans
