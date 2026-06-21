@@ -19,6 +19,7 @@ pub mod server;
 pub mod storage;
 pub mod tui;
 pub mod vault;
+pub mod witness_act;
 
 pub use constellation::ConstellationStore;
 pub use delegation::DelegationStore;

@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use web4_core::crypto::{KeyPair, PublicKey, SignatureBytes};
+use web4_core::crypto::{KeyPair, PublicKey};
 use web4_core::pair_channel::{self, Sealed};
 
 /// Hub discovery metadata from `/.well-known/web4-hub.json`.
@@ -123,6 +123,56 @@ impl HubChannel {
             .context("opening hub response (AEAD auth failed → tampered or wrong key)")?;
         serde_json::from_slice(&plaintext).context("parsing decrypted response JSON")
     }
+
+    /// Open a notification the hub **pushed** to us (the citizen side). A
+    /// notification is the member↔hub channel *reversed*: the hub seals to our
+    /// pinned pubkey, we open with our keypair. Same crypto as
+    /// [`open_response`](Self::open_response); named for the inbound direction
+    /// so the `notify` MCP method reads clearly. (HUB's `ReferencedAct{to:
+    /// Citizen, sealed_body}` — this opens the `sealed_body`.)
+    pub fn open_notification(&self, my: &KeyPair, sealed_b64: &str) -> Result<serde_json::Value> {
+        self.open_response(my, sealed_b64)
+    }
+
+    /// Seal an ACK back to the hub confirming receipt of a notification, so the
+    /// hub can mark it delivered and stop queuing it. Same sealing as a request.
+    pub fn seal_ack(&self, my: &KeyPair, ack: &NotificationAck) -> Result<String> {
+        let value = serde_json::to_value(ack).context("serializing notification ack")?;
+        self.seal_request(my, &value)
+    }
+}
+
+/// A notification the hub delivers to a citizen's LCT MCP, or that the citizen
+/// drains from its pending mailbox over the existing sealed channel (push and
+/// poll are the same mailbox — push is the optimization, poll is the floor).
+///
+/// This is the **citizen-side wire shape** for HUB's notification leg: it
+/// carries the `pair_id` (which channel to open it on) and the `sealed`
+/// `ReferencedAct.sealed_body`. The citizen opens `sealed` with its member
+/// keypair via [`HubChannel::open_notification`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Notification {
+    /// The channel the body was sealed on (selects the session key to open it).
+    pub pair_id: Uuid,
+    /// The act kind, in the clear so the citizen can route/filter without
+    /// opening the body (e.g. "notify:intro_accepted", "notify:pair_message").
+    pub kind: String,
+    /// The sealed `ReferencedAct.sealed_body` (base64); opened by the recipient.
+    pub sealed: String,
+    /// Optional clear pointer to off-channel substance (forum URL, /pairs/:id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer_uri: Option<String>,
+}
+
+/// The receipt the citizen returns after opening a [`Notification`] — sealed
+/// back to the hub so delivery is confirmed (un-acked notifications stay queued
+/// in the hub's per-citizen mailbox and are re-delivered or polled).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NotificationAck {
+    /// Echoes the act being acknowledged (from the opened body).
+    pub act_id: Uuid,
+    /// Receipt time (the citizen's clock; informational).
+    pub received_at: DateTime<Utc>,
 }
 
 /// A signed request envelope for hub API calls.
@@ -522,6 +572,55 @@ mod tests {
         // Wrong pair_id must fail to open (AEAD auth) — confirms the salt binds.
         let wrong = HubChannel { pair_id: Uuid::new_v4(), ..member_view.clone() };
         assert!(wrong.open_response(&member, &resp_sealed.to_base64()).is_err());
+    }
+
+    #[test]
+    fn hub_pushes_a_notification_citizen_opens_and_acks() {
+        // The notification leg: the hub→citizen direction. Same channel,
+        // reversed — the hub seals a notice to the citizen's pinned pubkey, the
+        // citizen opens it with its keypair and seals an ACK the hub can open.
+        let citizen = KeyPair::generate();
+        let hub = KeyPair::generate();
+        let pair_id = Uuid::new_v4();
+        let act_id = Uuid::new_v4();
+
+        let citizen_view = HubChannel {
+            hub_lct_id: Uuid::new_v4(),
+            pair_id,
+            hub_pubkey: hub.verifying_key(),
+        };
+
+        // Hub seals a notice body to the citizen and wraps it in a Notification.
+        let body = serde_json::json!({"act_id": act_id, "text": "intro from Nomad accepted"});
+        let sealed = pair_channel::seal(
+            &hub, &citizen.verifying_key(), pair_id,
+            &serde_json::to_vec(&body).unwrap(),
+        ).unwrap();
+        let notif = Notification {
+            pair_id,
+            kind: "notify:intro_accepted".into(),
+            sealed: sealed.to_base64(),
+            pointer_uri: Some("/v1/hubs/h/pairs/abc".into()),
+        };
+
+        // Citizen routes on the cleartext `kind`, then opens the sealed body.
+        assert!(notif.kind.starts_with("notify:"));
+        let opened = citizen_view.open_notification(&citizen, &notif.sealed).unwrap();
+        assert_eq!(opened, body);
+
+        // Citizen seals an ACK → the hub opens it to mark delivered.
+        let ack = NotificationAck { act_id, received_at: Utc::now() };
+        let ack_sealed = citizen_view.seal_ack(&citizen, &ack).unwrap();
+        let hub_got = pair_channel::open(
+            &hub, &citizen.verifying_key(), pair_id,
+            &Sealed::from_base64(&ack_sealed).unwrap(),
+        ).unwrap();
+        let hub_ack: NotificationAck = serde_json::from_slice(&hub_got).unwrap();
+        assert_eq!(hub_ack.act_id, act_id);
+
+        // A foreign keypair cannot open the notice (confidentiality holds).
+        let intruder = KeyPair::generate();
+        assert!(citizen_view.open_notification(&intruder, &notif.sealed).is_err());
     }
 
     #[test]
