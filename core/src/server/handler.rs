@@ -76,6 +76,7 @@ impl ServerHandler for HestiaServer {
             "hestia_vault_set" => tool_vault_set(&self.state, &args).await,
             "hestia_query_history" => tool_query_history(&self.state, &args).await,
             "hestia_request_witness" => tool_request_witness(&self.state, &args).await,
+            "hestia_notify" => tool_notify(&self.state, &args).await,
             _ => Ok(hestia_error_envelope(
                 "hestia.unknown_tool",
                 &format!("Unknown tool: {}", name),
@@ -162,6 +163,7 @@ fn hestia_tools() -> Vec<Tool> {
         t("hestia_vault_set", "Store a credential in the vault"),
         t("hestia_query_history", "Query the witness chain"),
         t("hestia_request_witness", "Append a custom witness chain event"),
+        t("hestia_notify", "Receive a hub->citizen notification: open the sealed body, record receipt, return a sealed ACK"),
     ]
 }
 
@@ -543,6 +545,80 @@ async fn tool_request_witness(state: &SharedState, args: &Value) -> ToolResult {
     let s = state.lock().await;
     let entry = s.append_chain(&event_type, event_data)?;
     Ok(json!({"witnessEntryHash": entry.hash}))
+}
+
+/// `hestia_notify` — the citizen side of HUB's hub→citizen notification leg.
+///
+/// A notification is the member↔hub sealed channel *reversed*: the hub sealed a
+/// body to this member's pinned pubkey. This tool opens it with the member
+/// identity keypair (loaded from the vault — the same identity that backs hub
+/// `join`/`push`), records receipt in the witness chain (encrypted at rest;
+/// auditable), and returns a sealed [`NotificationAck`](crate::hub::NotificationAck)
+/// the hub opens to mark the notice delivered. Args:
+/// `{ pair_id, hub_pubkey_hex, sealed, kind?, pointer_uri?, hub_lct_id? }`.
+async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
+    let pair_id = Uuid::parse_str(&require_string(args, "pair_id")?)
+        .map_err(|_| anyhow::anyhow!("pair_id is not a UUID"))?;
+    let hub_pubkey_hex = require_string(args, "hub_pubkey_hex")?;
+    let sealed = require_string(args, "sealed")?;
+    let kind = args.get("kind").and_then(Value::as_str).unwrap_or("notify").to_string();
+    let pointer_uri = args.get("pointer_uri").and_then(Value::as_str).map(str::to_string);
+    let hub_lct_id = args
+        .get("hub_lct_id")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or_else(Uuid::nil);
+
+    let s = state.lock().await;
+
+    // Load the member identity keypair from the vault — its pubkey is what the
+    // hub sealed to. (Same path as the hub-callback issuer identity.)
+    let secret_hex = s
+        .vault
+        .get("ai_identity_secret")
+        .map(|e| e.secret.clone())
+        .ok_or_else(|| anyhow::anyhow!("no member identity — run `hestia init --ai`"))?;
+    let secret = hex::decode(&secret_hex)
+        .map_err(|_| anyhow::anyhow!("identity secret is not valid hex"))?;
+    let arr: [u8; 32] = secret
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("identity secret must be 32 bytes"))?;
+    let keypair = web4_core::crypto::KeyPair::from_secret_bytes(&arr);
+
+    // Open the sealed body (member↔hub channel, reversed).
+    let channel = crate::hub::HubChannel::new(hub_lct_id, pair_id, &hub_pubkey_hex)?;
+    let body = channel.open_notification(&keypair, &sealed)?;
+
+    let act_id = body
+        .get("act_id")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or_else(Uuid::nil);
+
+    // Record receipt in the witness chain (so push and poll share one record).
+    let entry = s.append_chain(
+        "notify.received",
+        json!({
+            "kind": kind,
+            "pointer_uri": pointer_uri,
+            "act_id": act_id,
+            "from_hub": hub_lct_id,
+        }),
+    )?;
+
+    // Seal an ACK the hub opens to mark the notice delivered.
+    let ack = crate::hub::NotificationAck { act_id, received_at: Utc::now() };
+    let ack_sealed = channel.seal_ack(&keypair, &ack)?;
+
+    Ok(json!({
+        "opened": true,
+        "kind": kind,
+        "pointerUri": pointer_uri,
+        "body": body,
+        "ackSealed": ack_sealed,
+        "witnessEntryHash": entry.hash,
+    }))
 }
 
 // =========================================================================
