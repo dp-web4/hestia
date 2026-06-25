@@ -108,8 +108,31 @@ pub async fn serve_with_callback(
 async fn dashboard_html() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        Html(DASHBOARD_HTML),
+        Html(load_dashboard_html()),
     )
+}
+
+/// The dashboard HTML to serve. Normally the compiled-in copy. When
+/// `HESTIA_DASHBOARD_DEV=1` (or `HESTIA_DASHBOARD_PATH=<file>` for an explicit
+/// path) it is read **fresh from disk on every request**, so dashboard edits
+/// hot-reload on a browser refresh — no rebuild/restart needed. Falls back to
+/// the built-in copy if the file can't be read.
+fn load_dashboard_html() -> String {
+    let path = std::env::var("HESTIA_DASHBOARD_PATH").ok().or_else(|| {
+        match std::env::var("HESTIA_DASHBOARD_DEV") {
+            Ok(v) if !v.is_empty() && v != "0" => Some(
+                concat!(env!("CARGO_MANIFEST_DIR"), "/src/server/dashboard/index.html").to_string(),
+            ),
+            _ => None,
+        }
+    });
+    match path {
+        Some(p) => std::fs::read_to_string(&p).unwrap_or_else(|e| {
+            tracing::warn!("dashboard hot-reload: cannot read {p}: {e}; serving built-in copy");
+            DASHBOARD_HTML.to_string()
+        }),
+        None => DASHBOARD_HTML.to_string(),
+    }
 }
 
 async fn dashboard_json(State(state): State<SharedState>) -> impl IntoResponse {
