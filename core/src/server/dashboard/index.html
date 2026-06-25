@@ -398,6 +398,19 @@
   .pol-add-wrap { margin-top: 1rem; }
   .pol-add-wrap summary { cursor: pointer; color: var(--accent); font-size: 0.8rem; }
   .pol-add { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.75rem; }
+  /* policy trigger button in the witness-chain header */
+  .policy-btn { background: var(--accent-dim); color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 0.25rem 0.7rem; font: inherit; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; cursor: pointer; margin-right: 0.5rem; white-space: nowrap; }
+  .policy-btn:hover { background: var(--accent); color: var(--bg); }
+  /* modal */
+  .modal[hidden] { display: none; }
+  .modal { position: fixed; inset: 0; z-index: 50; display: flex; align-items: flex-start; justify-content: center; padding: 5vh 1rem; }
+  .modal-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,0.6); }
+  .modal-panel { position: relative; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; max-width: 760px; width: 100%; max-height: 88vh; overflow-y: auto; box-shadow: 0 12px 40px rgba(0,0,0,0.5); }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; padding: 0.9rem 1.25rem; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg-elev); }
+  .modal-head h2 { border: 0; padding: 0; }
+  .modal-close { background: transparent; border: 0; color: var(--fg-dim); font-size: 1.1rem; cursor: pointer; line-height: 1; }
+  .modal-close:hover { color: var(--fg); }
+  .modal-body { padding: 1rem 1.25rem; }
 </style>
 </head>
 <body>
@@ -445,30 +458,6 @@
     </section>
 
     <section>
-      <div class="card" id="policy-card">
-        <div class="card-head"><h2>Policy <span class="pol-mode" id="pol-mode"></span></h2></div>
-        <div class="card-body">
-          <div class="pol-presets" id="pol-presets"></div>
-          <div class="pol-section-label">Preset rules — change a decision, disable, or revert</div>
-          <div id="pol-rules"><div class="empty">Loading…</div></div>
-          <div class="pol-section-label">Custom rules</div>
-          <div id="pol-custom"><div class="empty">No custom rules.</div></div>
-          <details class="pol-add-wrap">
-            <summary>+ Add a rule (by category or specifically)</summary>
-            <div class="pol-add">
-              <input class="pol-input" id="pol-add-name" placeholder="rule name" size="16">
-              <select class="pol-select" id="pol-add-decision"><option value="deny">deny</option><option value="warn">warn</option><option value="allow">allow</option></select>
-              <select class="pol-select" id="pol-add-kind"><option value="category">category</option><option value="tool">tool</option><option value="command">command ~</option></select>
-              <input class="pol-input" id="pol-add-value" placeholder="value" list="pol-categories" size="18">
-              <datalist id="pol-categories"></datalist>
-              <button class="pol-btn" id="pol-add-btn">add</button>
-            </div>
-          </details>
-        </div>
-      </div>
-    </section>
-
-    <section>
       <div class="card">
         <h2 id="trust-title">Plugin trust</h2>
         <div class="card-body">
@@ -492,6 +481,7 @@
       <div class="card">
         <div class="card-head">
           <h2 id="feed-title">Witness chain — live</h2>
+          <button class="policy-btn" id="policy-btn" title="View / edit policy">policy</button>
           <div class="feed-filter" role="group" aria-label="Filter chain entries">
             <button type="button" class="filter-btn selected" data-filter="all">all</button>
             <button type="button" class="filter-btn" data-filter="warn">warn</button>
@@ -504,6 +494,34 @@
       </div>
     </section>
   </main>
+
+  <div class="modal" id="policy-modal" hidden>
+    <div class="modal-backdrop" data-close="1"></div>
+    <div class="modal-panel" id="policy-card">
+      <div class="modal-head">
+        <h2>Policy <span class="pol-mode" id="pol-mode"></span></h2>
+        <button class="modal-close" data-close="1" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="pol-presets" id="pol-presets"></div>
+        <div class="pol-section-label">Preset rules — change a decision, disable, or revert</div>
+        <div id="pol-rules"><div class="empty">Loading…</div></div>
+        <div class="pol-section-label">Custom rules</div>
+        <div id="pol-custom"><div class="empty">No custom rules.</div></div>
+        <details class="pol-add-wrap">
+          <summary>+ Add a rule (by category or specifically)</summary>
+          <div class="pol-add">
+            <input class="pol-input" id="pol-add-name" placeholder="rule name" size="16">
+            <select class="pol-select" id="pol-add-decision"><option value="deny">deny</option><option value="warn">warn</option><option value="allow">allow</option></select>
+            <select class="pol-select" id="pol-add-kind"><option value="category">category</option><option value="tool">tool</option><option value="command">command ~</option></select>
+            <input class="pol-input" id="pol-add-value" placeholder="value" list="pol-categories" size="18">
+            <datalist id="pol-categories"></datalist>
+            <button class="pol-btn" id="pol-add-btn">add</button>
+          </div>
+        </details>
+      </div>
+    </div>
+  </div>
 
   <footer>
     <div>
@@ -666,13 +684,16 @@
       ? source.filter(e => e.plugin_id === selectedOrch)
       : source;
     // Title carries the active policy setting (preset + enforce mode).
+    // The active policy is surfaced on the `policy` button (opens the editor),
+    // not inline in the title.
     const pol = lastData?.policy;
-    const polLabel = pol ? ` · policy: ${pol.preset}${pol.enforce ? '' : ' (audit)'}` : '';
+    const polBtn = $('policy-btn');
+    if (polBtn) polBtn.textContent = pol ? `policy: ${pol.preset}${pol.enforce ? '' : ' (audit)'}` : 'policy';
     const filterLabel =
       feedFilter === 'deny' ? 'denies' : feedFilter === 'warn' ? 'warnings' : 'live';
     let baseTitle = `Witness chain — ${filterLabel}`;
     if (selectedOrch) baseTitle += ` · ${selectedOrch}`;
-    title.textContent = baseTitle + polLabel;
+    title.textContent = baseTitle;
     if (!filtered.length) {
       const noun = feedFilter === 'deny' ? 'denies' : feedFilter === 'warn' ? 'warnings' : 'chain entries';
       const empty = selectedOrch
@@ -908,7 +929,14 @@
     });
   })();
 
-  fetchPolicy();
+  // policy modal: open from the witness-chain header button, refresh on open.
+  (function wirePolicyModal() {
+    const modal = $('policy-modal');
+    $('policy-btn').addEventListener('click', () => { modal.hidden = false; fetchPolicy(); });
+    modal.addEventListener('click', (e) => { if (e.target.dataset.close) modal.hidden = true; });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !modal.hidden) modal.hidden = true; });
+  })();
+
   tick();
   setInterval(tick, REFRESH_MS);
 })();
