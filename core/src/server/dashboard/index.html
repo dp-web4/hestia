@@ -8,10 +8,10 @@
   :root {
     /* Palette matches the Hestia app (app/src/styles/global.css): brand sage
        "hearth" accent on warm charcoal, not the old hearth-fire orange. */
-    --bg: #2d2d2d;
-    --bg-elev: #383838;
-    --bg-elev-2: #424242;
-    --border: #565656;
+    --bg: #1b1c1e;
+    --bg-elev: #26282a;
+    --bg-elev-2: #303335;
+    --border: #45484c;
     --fg: #e8e8e8;
     --fg-dim: #a8aeac;
     --fg-faint: #7b817f;
@@ -334,14 +334,21 @@
   .tool-list { display: flex; flex-direction: column; gap: 0.5rem; padding: 1rem 1.25rem; }
   .tool-row {
     display: grid;
-    grid-template-columns: 6rem 1fr 2.5rem;
+    /* Even split: tool name gets half, bar gets half (was 6rem name + long bar,
+       which truncated names and added no info past the bar). */
+    grid-template-columns: minmax(0, 1fr) 1fr 2.5rem;
     gap: 0.75rem;
     align-items: center;
     font-family: var(--mono);
     font-size: 0.85rem;
   }
-  .tool-row .name { color: var(--fg-dim); }
-  .tool-row .bar > div { background: linear-gradient(90deg, var(--accent), #ffb070); }
+  .tool-row .name {
+    color: var(--fg-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tool-row .bar > div { background: linear-gradient(90deg, var(--accent), var(--accent-glow)); }
   .tool-row .count { text-align: right; font-variant-numeric: tabular-nums; }
 
   /* --- Footer --- */
@@ -436,7 +443,8 @@
           <h2 id="feed-title">Witness chain — live</h2>
           <div class="feed-filter" role="group" aria-label="Filter chain entries">
             <button type="button" class="filter-btn selected" data-filter="all">all</button>
-            <button type="button" class="filter-btn" data-filter="failed">blocked &amp; failed</button>
+            <button type="button" class="filter-btn" data-filter="warn">warn</button>
+            <button type="button" class="filter-btn" data-filter="deny">deny</button>
           </div>
         </div>
         <div class="feed" id="feed">
@@ -464,7 +472,7 @@
   let first = true;
   let selectedOrch = null; // currently-filtered orchestrator, or null = "all"
   let lastData = null;     // last snapshot, used to re-render on filter clicks without re-fetching
-  let feedFilter = 'all';  // 'all' | 'failed'
+  let feedFilter = 'all';  // 'all' | 'warn' | 'deny'
   let failuresCache = null; // result of last /api/failures fetch, used while FAILED is selected
 
   const fmt = {
@@ -592,33 +600,30 @@
   function renderFeed(entries) {
     const root = $('feed');
     const title = $('feed-title');
-    // In failed mode, source from the all-time failures cache instead
-    // of the live recent window. Falls back to the recent slice while
-    // the first /api/failures fetch is still in flight. "Failed" here
-    // covers anything that didn't succeed: failed outcomes AND policy
-    // denials (the gate blocked the call before it ran).
+    // Filter the live witness-chain window by policy verdict (warn / deny),
+    // matching the policy engine's allow/warn/deny outcomes.
     let source = entries;
-    if (feedFilter === 'failed') {
-      source = failuresCache?.entries ?? entries.filter(e =>
-        (e.event_type === 'outcome' && e.success === false) ||
-        (e.event_type === 'policy_decision' && e.decision === 'deny')
+    if (feedFilter === 'warn' || feedFilter === 'deny') {
+      source = entries.filter(e =>
+        e.event_type === 'policy_decision' && e.decision === feedFilter
       );
     }
     let filtered = selectedOrch
       ? source.filter(e => e.plugin_id === selectedOrch)
       : source;
-    const baseTitle =
-      feedFilter === 'failed' ? 'Witness chain — blocked & failed (all time)' : 'Witness chain — live';
-    title.textContent = selectedOrch ? `${baseTitle} · ${selectedOrch}` : baseTitle;
+    // Title carries the active policy setting (preset + enforce mode).
+    const pol = lastData?.policy;
+    const polLabel = pol ? ` · policy: ${pol.preset}${pol.enforce ? '' : ' (audit)'}` : '';
+    const filterLabel =
+      feedFilter === 'deny' ? 'denies' : feedFilter === 'warn' ? 'warnings' : 'live';
+    let baseTitle = `Witness chain — ${filterLabel}`;
+    if (selectedOrch) baseTitle += ` · ${selectedOrch}`;
+    title.textContent = baseTitle + polLabel;
     if (!filtered.length) {
-      const empty =
-        feedFilter === 'failed'
-          ? selectedOrch
-            ? `Nothing blocked or failed for ${escapeHtml(selectedOrch)}.`
-            : 'Nothing blocked or failed.'
-          : selectedOrch
-            ? `No recent chain entries for ${escapeHtml(selectedOrch)}.`
-            : 'Waiting for the first chain entry…';
+      const noun = feedFilter === 'deny' ? 'denies' : feedFilter === 'warn' ? 'warnings' : 'chain entries';
+      const empty = selectedOrch
+        ? `No ${noun} for ${escapeHtml(selectedOrch)}.`
+        : (feedFilter === 'all' ? 'Waiting for the first chain entry…' : `No ${noun} in the recent window.`);
       root.innerHTML = `<div class="empty">${empty}</div>`;
       return;
     }
@@ -746,11 +751,6 @@
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       lastData = data;
-      // Refresh the failures cache in the background when the FAILED
-      // view is visible. Cheap (rare rows) and keeps the list current.
-      if (feedFilter === 'failed') {
-        await fetchFailures();
-      }
       rerender(data);
       $('live-status').textContent = 'live';
     } catch (err) {
@@ -766,9 +766,6 @@
       document.querySelectorAll('.feed-filter .filter-btn').forEach(b => {
         b.classList.toggle('selected', b.dataset.filter === feedFilter);
       });
-      if (feedFilter === 'failed') {
-        await fetchFailures();
-      }
       if (lastData) renderFeed(lastData.recent);
     });
   });

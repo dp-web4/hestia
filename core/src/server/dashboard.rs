@@ -7,11 +7,27 @@ use std::collections::BTreeMap;
 
 use super::state::ServerState;
 
-/// Top-level dashboard payload.
+/// The active policy setting, surfaced so the dashboard can show which gate is
+/// in force (e.g. "safety, enforcing" vs "audit-only, observing").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyView {
+    /// Active preset name (`permissive` | `safety` | `strict` | `audit-only`).
+    pub preset: String,
+    /// `true` = denies block; `false` = audit/observe mode (decisions logged,
+    /// not enforced).
+    pub enforce: bool,
+}
+
+fn default_policy_view() -> PolicyView {
+    PolicyView { preset: "safety".into(), enforce: true }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardSnapshot {
     pub society: SocietyView,
     pub stats: ActivityStats,
+    #[serde(default = "default_policy_view")]
+    pub policy: PolicyView,
     pub trust: Vec<TrustView>,
     pub recent: Vec<RecentEntry>,
     pub delegations: Vec<serde_json::Value>,
@@ -263,7 +279,16 @@ impl ServerState {
                 .collect())
             .unwrap_or_default();
 
+        let policy = {
+            let ps = self.vault.policy();
+            PolicyView {
+                preset: ps.active_preset.clone(),
+                enforce: ps.resolve().map(|c| c.enforce).unwrap_or(true),
+            }
+        };
+
         DashboardSnapshot {
+            policy,
             society: SocietyView {
                 sovereign_lct: self.sovereign_lct.clone(),
                 chain_length: self.chain_len(),
