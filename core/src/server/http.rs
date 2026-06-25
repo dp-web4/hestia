@@ -69,6 +69,7 @@ pub async fn serve_with_callback(
         .route("/api/policy/override/:rule_id", delete(policy_clear_override))
         .route("/api/policy/rule", put(policy_upsert_rule))
         .route("/api/policy/rule/:rule_id", delete(policy_delete_rule))
+        .route("/api/orchestrators/:id/connect", post(orchestrator_connect))
         .route("/api/chain", get(chain_query))
         // OID4VCI issuance (EUDI Phase 2) — hestia as person-scale issuer.
         // The credential route matches the `<issuer>/credential` that
@@ -487,6 +488,22 @@ async fn policy_delete_rule(
             (StatusCode::OK, Json(serde_json::json!({"ok": true, "removed": removed})))
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+/// `POST /api/orchestrators/{id}/connect` — connect a running-but-not-engaged
+/// orchestrator by installing its hestia plugin.
+async fn orchestrator_connect(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match crate::orchestrators::install(&id) {
+        Ok(msg) => {
+            let s = state.lock().await;
+            let _ = s.append_chain("orchestrator_connect", serde_json::json!({"id": id, "status": msg}));
+            (StatusCode::OK, Json(serde_json::json!({"ok": true, "message": msg})))
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))),
     }
 }
 

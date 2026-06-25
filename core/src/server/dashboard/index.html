@@ -411,6 +411,10 @@
   .modal-close { background: transparent; border: 0; color: var(--fg-dim); font-size: 1.1rem; cursor: pointer; line-height: 1; }
   .modal-close:hover { color: var(--fg); }
   .modal-body { padding: 1rem 1.25rem; }
+  /* orchestrator chips: idle (running, not connected) + connect affordance */
+  .orch-chip.idle { opacity: 0.55; }
+  .orch-connect { color: var(--accent); cursor: pointer; font-size: 0.7rem; margin-left: 0.35rem; }
+  .orch-connect[data-connectable="false"] { color: var(--fg-faint); cursor: default; }
 </style>
 </head>
 <body>
@@ -592,34 +596,61 @@
     $('stat-hour').textContent = fmt.int(s.actions_last_hour);
   }
 
-  function renderOrchBar(trust) {
+  function renderOrchBar(data) {
     const root = $('orch-bar');
-    const header = '<span class="orch-bar-label">Active orchestrators:</span>';
-    if (!trust.length) {
-      root.innerHTML = header + '<span class="orch-chip-empty">none active in the last hour</span>';
+    const orchs = data.orchestrators || [];
+    const trustById = Object.fromEntries((data.trust || []).map(t => [t.plugin_id, t]));
+    const header = '<span class="orch-bar-label">Orchestrators:</span>';
+    if (!orchs.length) {
+      root.innerHTML = header + '<span class="orch-chip-empty">none running or engaged</span>';
       return;
     }
-    // If the currently-selected orchestrator is no longer active, clear the filter.
-    if (selectedOrch && !trust.some(t => t.plugin_id === selectedOrch)) {
-      selectedOrch = null;
-    }
-    const chips = trust.map(t => {
-      const sel = selectedOrch === t.plugin_id ? ' selected' : '';
-      return `<span class="orch-chip${sel}" data-pid="${escapeHtml(t.plugin_id)}">
-                <span>${escapeHtml(t.plugin_id)}</span>
-                <span class="level">${escapeHtml(t.level)}</span>
-                <span class="count">${fmt.int(t.action_count)}</span>
+    // Drop the stats filter if the selected orchestrator is no longer engaged.
+    if (selectedOrch && !orchs.some(o => o.engaged && o.id === selectedOrch)) selectedOrch = null;
+
+    const chips = orchs.map(o => {
+      if (o.engaged) {
+        const t = trustById[o.id] || {};
+        const sel = selectedOrch === o.id ? ' selected' : '';
+        return `<span class="orch-chip${sel}" data-pid="${escapeHtml(o.id)}" title="engaged — click to filter stats">
+                  <span>${escapeHtml(o.name)}</span>
+                  ${t.level ? `<span class="level">${escapeHtml(t.level)}</span>` : ''}
+                  ${t.action_count != null ? `<span class="count">${fmt.int(t.action_count)}</span>` : ''}
+                </span>`;
+      }
+      // running but not engaged → offer to connect
+      const connectable = !!o.plugin_available;
+      return `<span class="orch-chip idle" title="${o.running ? 'running' : 'known'} · not connected">
+                <span>${escapeHtml(o.name)}</span>
+                <span class="orch-connect" data-connect="${escapeHtml(o.id)}" data-connectable="${connectable}">${connectable ? '+ connect' : 'no plugin'}</span>
               </span>`;
     }).join('');
     root.innerHTML = header + chips;
-    // Wire click → toggle filter
-    root.querySelectorAll('.orch-chip').forEach(el => {
-      el.addEventListener('click', () => {
-        const pid = el.getAttribute('data-pid');
-        selectedOrch = (selectedOrch === pid) ? null : pid;
-        if (lastData) rerender(lastData);
-      });
-    });
+
+    root.querySelectorAll('.orch-chip[data-pid]').forEach(el => el.addEventListener('click', () => {
+      const pid = el.getAttribute('data-pid');
+      selectedOrch = (selectedOrch === pid) ? null : pid;
+      if (lastData) rerender(lastData);
+    }));
+    root.querySelectorAll('.orch-connect').forEach(el => el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (el.getAttribute('data-connectable') !== 'true') return;
+      connectOrch(el.getAttribute('data-connect'), el);
+    }));
+  }
+
+  async function connectOrch(id, el) {
+    el.textContent = 'connecting…';
+    try {
+      const res = await fetch(`/api/orchestrators/${encodeURIComponent(id)}/connect`, { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || ('HTTP ' + res.status));
+      el.textContent = '✓ connected';
+      el.title = body.message || '';
+    } catch (e) {
+      el.textContent = '⚠ failed';
+      el.title = e.message;
+    }
   }
 
   function renderTrust(trust) {
@@ -806,7 +837,7 @@
 
   function rerender(data) {
     renderStats(data.stats, data.society);
-    renderOrchBar(data.trust);
+    renderOrchBar(data);
     renderTrust(data.trust);
     renderHistogram(data);
     renderFeed(data.recent);

@@ -34,6 +34,11 @@ pub struct DashboardSnapshot {
     /// warn/deny feed filters (the `recent` window may not include older denies).
     #[serde(default)]
     pub policy_decisions: Vec<RecentEntry>,
+    /// Compatible orchestrators that are running and/or engaged — backs the
+    /// orchestrator bar (engaged = highlighted/clickable; running-not-engaged =
+    /// offer to connect).
+    #[serde(default)]
+    pub orchestrators: Vec<serde_json::Value>,
     pub delegations: Vec<serde_json::Value>,
     pub hub_connections: Vec<serde_json::Value>,
     pub profile: Option<serde_json::Value>,
@@ -309,7 +314,38 @@ impl ServerState {
             }
         };
 
+        // Orchestrators: registry entries that are running and/or engaged, plus
+        // any engaged plugin not in the registry (custom orchestrators).
+        let running = crate::orchestrators::detect_running();
+        let engaged: std::collections::HashSet<&str> =
+            trust.iter().map(|t| t.plugin_id.as_str()).collect();
+        let mut orchestrators: Vec<serde_json::Value> = crate::orchestrators::REGISTRY
+            .iter()
+            .filter(|o| running.contains(o.id) || engaged.contains(o.id))
+            .map(|o| {
+                serde_json::json!({
+                    "id": o.id,
+                    "name": o.name,
+                    "running": running.contains(o.id),
+                    "engaged": engaged.contains(o.id),
+                    "plugin_available": o.plugin_available,
+                })
+            })
+            .collect();
+        for t in &trust {
+            if crate::orchestrators::lookup(&t.plugin_id).is_none() {
+                orchestrators.push(serde_json::json!({
+                    "id": t.plugin_id,
+                    "name": t.plugin_id,
+                    "running": true,
+                    "engaged": true,
+                    "plugin_available": false,
+                }));
+            }
+        }
+
         DashboardSnapshot {
+            orchestrators,
             policy,
             society: SocietyView {
                 sovereign_lct: self.sovereign_lct.clone(),

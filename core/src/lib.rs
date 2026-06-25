@@ -12,6 +12,7 @@ pub mod constellation;
 pub mod delegation;
 pub mod error;
 pub mod hub;
+pub mod orchestrators;
 pub mod plugin;
 pub mod policy;
 pub mod profile;
