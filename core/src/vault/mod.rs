@@ -140,6 +140,41 @@ impl Vault {
         self.save()
     }
 
+    /// Set (or replace) a per-rule override on a *preset* rule — change its
+    /// decision and/or enable/disable it. This is the "edit specifically" path
+    /// for the rules that ship with a preset. Sealed on success.
+    pub fn set_policy_override(&mut self, rule_id: &str, ov: PolicyOverride) -> Result<()> {
+        self.data.policy.overrides.insert(rule_id.to_string(), ov);
+        self.save()
+    }
+
+    /// Remove a per-rule override (revert that preset rule to its default).
+    pub fn clear_policy_override(&mut self, rule_id: &str) -> Result<()> {
+        self.data.policy.overrides.remove(rule_id);
+        self.save()
+    }
+
+    /// Add or replace (by `id`) a custom rule layered on top of the preset.
+    /// The "edit by category or specifically" path — the rule's `match` may be a
+    /// category match or a tool/pattern match. Sealed on success.
+    pub fn upsert_custom_rule(&mut self, rule: crate::policy::PolicyRule) -> Result<()> {
+        let rules = &mut self.data.policy.custom_rules;
+        match rules.iter_mut().find(|r| r.id == rule.id) {
+            Some(slot) => *slot = rule,
+            None => rules.push(rule),
+        }
+        self.save()
+    }
+
+    /// Remove a custom rule by id. Returns whether one was removed.
+    pub fn remove_custom_rule(&mut self, rule_id: &str) -> Result<bool> {
+        let before = self.data.policy.custom_rules.len();
+        self.data.policy.custom_rules.retain(|r| r.id != rule_id);
+        let removed = self.data.policy.custom_rules.len() != before;
+        self.save()?;
+        Ok(removed)
+    }
+
     // ---- Documents: config / metadata / state, enclosed in the vault ----
     //
     // The vault doctrine: every setting and piece of metadata lives here, not in
@@ -367,6 +402,58 @@ mod tests {
         // Persists across re-open
         let v2 = Vault::open(path, "p".into()).unwrap();
         assert_eq!(v2.list(), vec!["key2"]);
+    }
+
+    #[test]
+    fn policy_editing_persists_and_resolves() {
+        use crate::policy::{PolicyDecision, PolicyMatch, PolicyRule};
+        let (_dir, path) = temp_path();
+        let mut v = Vault::init(path.clone(), "p".into()).unwrap();
+
+        // Override a preset rule (warn-network: warn -> deny) — "specifically".
+        v.set_policy_override(
+            "warn-network",
+            PolicyOverride { decision: Some(PolicyDecision::Deny), enabled: None },
+        )
+        .unwrap();
+        // Add a custom rule matching a category — "by category".
+        v.upsert_custom_rule(PolicyRule {
+            id: "custom-deny-creds".into(),
+            name: "Deny credential access".into(),
+            priority: 5,
+            decision: PolicyDecision::Deny,
+            reason: Some("test".into()),
+            r#match: PolicyMatch {
+                categories: Some(vec!["credential_access".into()]),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+        // Sealed in the vault: reopen and confirm both edits survive + apply.
+        {
+            let v2 = Vault::open(path.clone(), "p".into()).unwrap();
+            let cfg = v2.policy().resolve().unwrap();
+            assert_eq!(
+                cfg.rules.iter().find(|r| r.id == "warn-network").unwrap().decision,
+                PolicyDecision::Deny,
+                "override persisted + applied",
+            );
+            assert!(cfg.rules.iter().any(|r| r.id == "custom-deny-creds"), "custom rule persisted");
+        }
+
+        // Clear the override + remove the custom rule; reopen confirms revert.
+        let mut v3 = Vault::open(path.clone(), "p".into()).unwrap();
+        assert!(v3.remove_custom_rule("custom-deny-creds").unwrap());
+        v3.clear_policy_override("warn-network").unwrap();
+        let v4 = Vault::open(path, "p".into()).unwrap();
+        let cfg = v4.policy().resolve().unwrap();
+        assert!(cfg.rules.iter().all(|r| r.id != "custom-deny-creds"));
+        assert_eq!(
+            cfg.rules.iter().find(|r| r.id == "warn-network").unwrap().decision,
+            PolicyDecision::Warn,
+            "override cleared -> back to preset default",
+        );
     }
 
     #[test]

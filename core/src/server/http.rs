@@ -62,9 +62,13 @@ pub async fn serve_with_callback(
         .route("/api/dashboard", get(dashboard_json))
         .route("/api/failures", get(failures_json))
         .route("/api/vault", get(vault_list).post(vault_add))
-        .route("/api/vault/{name}", delete(vault_delete))
+        .route("/api/vault/:name", delete(vault_delete))
         .route("/api/policy", get(policy_get))
         .route("/api/policy/preset", put(policy_set_preset))
+        .route("/api/policy/override", put(policy_set_override))
+        .route("/api/policy/override/:rule_id", delete(policy_clear_override))
+        .route("/api/policy/rule", put(policy_upsert_rule))
+        .route("/api/policy/rule/:rule_id", delete(policy_delete_rule))
         .route("/api/chain", get(chain_query))
         // OID4VCI issuance (EUDI Phase 2) — hestia as person-scale issuer.
         // The credential route matches the `<issuer>/credential` that
@@ -304,22 +308,75 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
 
 // --- Policy endpoints ---
 
+/// Tool categories the policy can match on (mirrors `policy::classify`).
+const POLICY_CATEGORIES: &[&str] =
+    &["command", "file_read", "file_write", "network", "credential_access", "task_management"];
+
+fn parse_decision(s: &str) -> Option<crate::policy::PolicyDecision> {
+    use crate::policy::PolicyDecision::*;
+    match s {
+        "allow" => Some(Allow),
+        "deny" => Some(Deny),
+        "warn" => Some(Warn),
+        _ => None,
+    }
+}
+
+/// A short human label for what a rule matches, for the editor list.
+fn match_summary(m: &crate::policy::PolicyMatch) -> String {
+    let mut parts = Vec::new();
+    let join = |v: &Vec<String>| v.join(", ");
+    if let Some(t) = m.tools.as_ref().filter(|v| !v.is_empty()) { parts.push(format!("tools: {}", join(t))); }
+    if let Some(c) = m.categories.as_ref().filter(|v| !v.is_empty()) { parts.push(format!("categories: {}", join(c))); }
+    if let Some(p) = m.target_patterns.as_ref().filter(|v| !v.is_empty()) { parts.push(format!("target ~ {}", join(p))); }
+    if let Some(p) = m.command_patterns.as_ref().filter(|v| !v.is_empty()) { parts.push(format!("command ~ {}", join(p))); }
+    if parts.is_empty() { "any".into() } else { parts.join(" · ") }
+}
+
+/// `GET /api/policy` — the full editable policy state for the dashboard editor:
+/// active preset, the preset's rules with their current override state, the
+/// custom rules, and the available presets / categories / decisions.
 async fn policy_get(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.lock().await;
-    let policy_state = s.vault.policy();
-    let resolved = policy_state.resolve().unwrap_or_else(|| {
-        crate::policy::get_preset("safety").unwrap().config
-    });
+    let ps = s.vault.policy();
+    let resolved = ps.resolve().unwrap_or_else(|| crate::policy::get_preset("safety").unwrap().config);
+
+    let preset_rules: Vec<_> = crate::policy::get_preset(&ps.active_preset)
+        .map(|p| p.config.rules)
+        .unwrap_or_default()
+        .iter()
+        .map(|r| {
+            let ov = ps.overrides.get(&r.id);
+            let decision = ov.and_then(|o| o.decision).unwrap_or(r.decision);
+            let enabled = ov.and_then(|o| o.enabled).unwrap_or(true);
+            serde_json::json!({
+                "id": r.id,
+                "name": r.name,
+                "priority": r.priority,
+                "default_decision": r.decision.as_str(),
+                "decision": decision.as_str(),
+                "enabled": enabled,
+                "overridden": ov.is_some(),
+                "match": match_summary(&r.r#match),
+                "reason": r.reason,
+            })
+        })
+        .collect();
+
+    let presets: Vec<_> = crate::policy::list_presets()
+        .iter()
+        .map(|p| serde_json::json!({"name": p.name, "description": p.description}))
+        .collect();
+
     Json(serde_json::json!({
-        "active_preset": policy_state.active_preset,
+        "active_preset": ps.active_preset,
         "enforce": resolved.enforce,
-        "default_policy": format!("{:?}", resolved.default_policy),
-        "rules": resolved.rules.iter().map(|r| serde_json::json!({
-            "id": r.id,
-            "name": r.name,
-            "priority": r.priority,
-            "decision": r.decision.as_str(),
-        })).collect::<Vec<_>>(),
+        "default_policy": resolved.default_policy.as_str(),
+        "presets": presets,
+        "categories": POLICY_CATEGORIES,
+        "decisions": ["allow", "warn", "deny"],
+        "preset_rules": preset_rules,
+        "custom_rules": ps.custom_rules,
     }))
 }
 
@@ -327,13 +384,108 @@ async fn policy_set_preset(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let preset = body.get("preset").and_then(|v| v.as_str()).unwrap_or("");
-    if !crate::policy::is_preset_name(preset) {
+    let preset = body.get("preset").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if !crate::policy::is_preset_name(&preset) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("unknown preset: {preset}")})));
     }
     let mut s = state.lock().await;
-    match s.vault.set_active_preset(preset) {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true, "preset": preset}))),
+    match s.vault.set_active_preset(&preset) {
+        Ok(()) => {
+            s.reload_policy();
+            let _ = s.append_chain("policy_edit", serde_json::json!({"change": "preset", "preset": preset}));
+            (StatusCode::OK, Json(serde_json::json!({"ok": true, "preset": preset})))
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct OverrideBody {
+    rule_id: String,
+    /// `"allow" | "warn" | "deny"`, or omit to leave the decision unchanged.
+    decision: Option<String>,
+    /// `false` disables the rule; omit to leave enabled-state unchanged.
+    enabled: Option<bool>,
+}
+
+/// `PUT /api/policy/override` — override a *preset* rule's decision / enabled
+/// state (the "edit specifically" path for built-in rules).
+async fn policy_set_override(
+    State(state): State<SharedState>,
+    Json(body): Json<OverrideBody>,
+) -> impl IntoResponse {
+    let decision = match body.decision.as_deref() {
+        None => None,
+        Some(d) => match parse_decision(d) {
+            Some(pd) => Some(pd),
+            None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("unknown decision: {d}")}))),
+        },
+    };
+    let ov = crate::vault::PolicyOverride { decision, enabled: body.enabled };
+    let mut s = state.lock().await;
+    match s.vault.set_policy_override(&body.rule_id, ov) {
+        Ok(()) => {
+            s.reload_policy();
+            let _ = s.append_chain("policy_edit", serde_json::json!({
+                "change": "override", "rule_id": body.rule_id,
+                "decision": body.decision, "enabled": body.enabled,
+            }));
+            (StatusCode::OK, Json(serde_json::json!({"ok": true, "rule_id": body.rule_id})))
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+/// `DELETE /api/policy/override/{rule_id}` — revert a preset rule to its default.
+async fn policy_clear_override(
+    State(state): State<SharedState>,
+    Path(rule_id): Path<String>,
+) -> impl IntoResponse {
+    let mut s = state.lock().await;
+    match s.vault.clear_policy_override(&rule_id) {
+        Ok(()) => {
+            s.reload_policy();
+            let _ = s.append_chain("policy_edit", serde_json::json!({"change": "clear_override", "rule_id": rule_id}));
+            (StatusCode::OK, Json(serde_json::json!({"ok": true, "rule_id": rule_id})))
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+/// `PUT /api/policy/rule` — add or replace (by `id`) a custom rule. The body is
+/// a full `PolicyRule`; its `match` may be by category or by tool/pattern (the
+/// "edit by category or specifically" path).
+async fn policy_upsert_rule(
+    State(state): State<SharedState>,
+    Json(rule): Json<crate::policy::PolicyRule>,
+) -> impl IntoResponse {
+    if rule.id.trim().is_empty() || rule.name.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "rule id and name are required"})));
+    }
+    let rule_id = rule.id.clone();
+    let mut s = state.lock().await;
+    match s.vault.upsert_custom_rule(rule) {
+        Ok(()) => {
+            s.reload_policy();
+            let _ = s.append_chain("policy_edit", serde_json::json!({"change": "upsert_rule", "rule_id": rule_id}));
+            (StatusCode::OK, Json(serde_json::json!({"ok": true, "rule_id": rule_id})))
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+/// `DELETE /api/policy/rule/{rule_id}` — remove a custom rule.
+async fn policy_delete_rule(
+    State(state): State<SharedState>,
+    Path(rule_id): Path<String>,
+) -> impl IntoResponse {
+    let mut s = state.lock().await;
+    match s.vault.remove_custom_rule(&rule_id) {
+        Ok(removed) => {
+            s.reload_policy();
+            let _ = s.append_chain("policy_edit", serde_json::json!({"change": "delete_rule", "rule_id": rule_id, "removed": removed}));
+            (StatusCode::OK, Json(serde_json::json!({"ok": true, "removed": removed})))
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
     }
 }
