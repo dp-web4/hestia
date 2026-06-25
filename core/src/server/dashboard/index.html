@@ -380,6 +380,24 @@
     text-align: center;
     font-size: 0.9rem;
   }
+  /* --- policy editor --- */
+  .pol-mode { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--fg-faint); margin-left: 0.5rem; }
+  .pol-presets { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+  .pol-section-label { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--fg-faint); margin: 1rem 0 0.4rem; }
+  .pol-rule { display: grid; grid-template-columns: 1fr auto auto auto; gap: 0.6rem; align-items: center; padding: 0.45rem 0; border-bottom: 1px solid var(--border); }
+  .pol-rule:last-child { border-bottom: 0; }
+  .pol-rule .rinfo { display: flex; flex-direction: column; min-width: 0; }
+  .pol-rule .rname { color: var(--fg); font-size: 0.85rem; }
+  .pol-rule .rmatch { color: var(--fg-faint); font-size: 0.72rem; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pol-select, .pol-input { background: var(--bg-elev-2); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 0.2rem 0.4rem; font: inherit; font-size: 0.78rem; }
+  .pol-select.allow { color: var(--success); } .pol-select.warn { color: var(--warning); } .pol-select.deny { color: var(--coral); }
+  .pol-enable { font-size: 0.72rem; color: var(--fg-dim); display: flex; align-items: center; gap: 0.25rem; cursor: pointer; }
+  .pol-btn { background: transparent; border: 1px solid var(--border); color: var(--fg-dim); border-radius: 4px; padding: 0.15rem 0.45rem; font: inherit; font-size: 0.72rem; cursor: pointer; }
+  .pol-btn:hover { color: var(--fg); border-color: var(--fg-dim); }
+  .pol-remove { color: var(--coral); border-color: transparent; font-size: 0.9rem; line-height: 1; }
+  .pol-add-wrap { margin-top: 1rem; }
+  .pol-add-wrap summary { cursor: pointer; color: var(--accent); font-size: 0.8rem; }
+  .pol-add { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.75rem; }
 </style>
 </head>
 <body>
@@ -423,6 +441,30 @@
       <div class="orch-bar" id="orch-bar">
         <span class="orch-bar-label">Active orchestrators:</span>
         <span class="orch-chip-empty">none active in the last hour</span>
+      </div>
+    </section>
+
+    <section>
+      <div class="card" id="policy-card">
+        <div class="card-head"><h2>Policy <span class="pol-mode" id="pol-mode"></span></h2></div>
+        <div class="card-body">
+          <div class="pol-presets" id="pol-presets"></div>
+          <div class="pol-section-label">Preset rules — change a decision, disable, or revert</div>
+          <div id="pol-rules"><div class="empty">Loading…</div></div>
+          <div class="pol-section-label">Custom rules</div>
+          <div id="pol-custom"><div class="empty">No custom rules.</div></div>
+          <details class="pol-add-wrap">
+            <summary>+ Add a rule (by category or specifically)</summary>
+            <div class="pol-add">
+              <input class="pol-input" id="pol-add-name" placeholder="rule name" size="16">
+              <select class="pol-select" id="pol-add-decision"><option value="deny">deny</option><option value="warn">warn</option><option value="allow">allow</option></select>
+              <select class="pol-select" id="pol-add-kind"><option value="category">category</option><option value="tool">tool</option><option value="command">command ~</option></select>
+              <input class="pol-input" id="pol-add-value" placeholder="value" list="pol-categories" size="18">
+              <datalist id="pol-categories"></datalist>
+              <button class="pol-btn" id="pol-add-btn">add</button>
+            </div>
+          </details>
+        </div>
       </div>
     </section>
 
@@ -786,6 +828,87 @@
     });
   });
 
+  // --- policy editor (fetched on load + after each edit, not every tick, so
+  // it doesn't clobber an in-progress edit) ---
+  function polMatchSummary(m) {
+    const p = [];
+    if (m.tools?.length) p.push('tools: ' + m.tools.join(', '));
+    if (m.categories?.length) p.push('categories: ' + m.categories.join(', '));
+    if (m.target_patterns?.length) p.push('target ~ ' + m.target_patterns.join(', '));
+    if (m.command_patterns?.length) p.push('command ~ ' + m.command_patterns.join(', '));
+    return p.join(' · ') || 'any';
+  }
+  const decOptions = sel => ['allow','warn','deny']
+    .map(d => `<option value="${d}"${d===sel?' selected':''}>${d}</option>`).join('');
+
+  function renderPolicy(p) {
+    $('pol-mode').textContent = `${p.active_preset} · ${p.enforce ? 'enforcing' : 'audit'}`;
+    $('pol-presets').innerHTML = p.presets.map(pr =>
+      `<button class="filter-btn${pr.name===p.active_preset?' selected':''}" data-preset="${escapeHtml(pr.name)}" title="${escapeHtml(pr.description)}">${escapeHtml(pr.name)}</button>`
+    ).join('');
+    $('pol-rules').innerHTML = p.preset_rules.map(r => `
+      <div class="pol-rule">
+        <div class="rinfo"><span class="rname">${escapeHtml(r.name)}</span><span class="rmatch">${escapeHtml(r.match)}</span></div>
+        <select class="pol-select ${r.decision}" data-override="${escapeHtml(r.id)}">${decOptions(r.decision)}</select>
+        <label class="pol-enable"><input type="checkbox" data-enable="${escapeHtml(r.id)}"${r.enabled?' checked':''}>on</label>
+        ${r.overridden ? `<button class="pol-btn pol-revert" data-revert="${escapeHtml(r.id)}">revert</button>` : '<span></span>'}
+      </div>`).join('');
+    $('pol-custom').innerHTML = p.custom_rules.length ? p.custom_rules.map(r => `
+      <div class="pol-rule">
+        <div class="rinfo"><span class="rname">${escapeHtml(r.name)}</span><span class="rmatch">${escapeHtml(polMatchSummary(r.match))} · ${escapeHtml(r.decision)}</span></div>
+        <span></span><span></span>
+        <button class="pol-btn pol-remove" data-remove="${escapeHtml(r.id)}" title="remove">✕</button>
+      </div>`).join('') : '<div class="empty">No custom rules.</div>';
+    $('pol-categories').innerHTML = p.categories.map(c => `<option value="${escapeHtml(c)}">`).join('');
+  }
+
+  async function fetchPolicy() {
+    try {
+      const res = await fetch('/api/policy', { cache: 'no-store' });
+      if (res.ok) renderPolicy(await res.json());
+    } catch (e) { /* leave previous render */ }
+  }
+
+  async function polSend(method, path, body) {
+    try {
+      const res = await fetch(path, {
+        method,
+        headers: body ? { 'content-type': 'application/json' } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
+      await fetchPolicy();
+    } catch (e) { $('pol-mode').textContent = '⚠ ' + e.message; }
+  }
+
+  (function wirePolicyEditor() {
+    const card = $('policy-card');
+    card.addEventListener('click', (e) => {
+      const t = e.target;
+      if (t.dataset.preset) polSend('PUT', '/api/policy/preset', { preset: t.dataset.preset });
+      else if (t.dataset.revert) polSend('DELETE', `/api/policy/override/${encodeURIComponent(t.dataset.revert)}`);
+      else if (t.dataset.remove) polSend('DELETE', `/api/policy/rule/${encodeURIComponent(t.dataset.remove)}`);
+      else if (t.id === 'pol-add-btn') {
+        const name = $('pol-add-name').value.trim();
+        const value = $('pol-add-value').value.trim();
+        if (!name || !value) { $('pol-mode').textContent = '⚠ name + value required'; return; }
+        const kind = $('pol-add-kind').value;
+        const m = kind === 'category' ? { categories: [value] }
+                : kind === 'tool' ? { tools: [value] }
+                : { command_patterns: [value] };
+        const id = 'custom-' + name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+        polSend('PUT', '/api/policy/rule', { id, name, priority: 50, decision: $('pol-add-decision').value, match: m });
+        $('pol-add-name').value = ''; $('pol-add-value').value = '';
+      }
+    });
+    card.addEventListener('change', (e) => {
+      const t = e.target;
+      if (t.dataset.override) polSend('PUT', '/api/policy/override', { rule_id: t.dataset.override, decision: t.value });
+      else if (t.dataset.enable) polSend('PUT', '/api/policy/override', { rule_id: t.dataset.enable, enabled: t.checked });
+    });
+  })();
+
+  fetchPolicy();
   tick();
   setInterval(tick, REFRESH_MS);
 })();
