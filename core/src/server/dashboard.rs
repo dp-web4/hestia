@@ -37,7 +37,14 @@ pub struct ActivityStats {
     pub total_actions: u64,
     pub successful_actions: u64,
     pub failed_actions: u64,
-    /// 0.0–1.0
+    /// Policy denials (`policy_decision`/`deny`). These never become an
+    /// `outcome` — the gate blocks the tool before it runs — so they are
+    /// **not** in `total_actions` and do **not** affect `success_rate`. A deny
+    /// is the trust layer succeeding at its job, not a tool failing; this is
+    /// surfaced separately so a wall of denies can't read as failures.
+    #[serde(default)]
+    pub denied_actions: u64,
+    /// 0.0–1.0 — execution reliability of *executed* tools only.
     pub success_rate: f64,
     /// Tool name → count, descending.
     pub by_tool: Vec<(String, u64)>,
@@ -133,6 +140,7 @@ impl ServerState {
         let mut total = 0u64;
         let mut succ = 0u64;
         let mut fail = 0u64;
+        let mut denied = 0u64;
         let mut by_tool: BTreeMap<String, u64> = BTreeMap::new();
         let one_hour_ago = Utc::now() - chrono::Duration::hours(1);
         let mut last_hour = 0u64;
@@ -153,6 +161,13 @@ impl ServerState {
                 if e.timestamp > *entry {
                     *entry = e.timestamp;
                 }
+            }
+            // A policy denial blocks the tool before it runs, so it never
+            // produces an `outcome`. Count it separately (not as a failure).
+            if e.event_type == "policy_decision"
+                && e.event_data.get("decision").and_then(|v| v.as_str()) == Some("deny")
+            {
+                denied += 1;
             }
             if e.event_type != "outcome" {
                 continue;
@@ -260,6 +275,7 @@ impl ServerState {
                 total_actions: total,
                 successful_actions: succ,
                 failed_actions: fail,
+                denied_actions: denied,
                 success_rate,
                 by_tool: by_tool_vec,
                 actions_last_hour: last_hour,
@@ -343,11 +359,23 @@ mod tests {
         state.apply_outcome("a", true, 0.5).unwrap();
         state.apply_outcome("a", false, 0.5).unwrap();
 
+        // Two policy denials: these must NOT enter the success-rate denominator
+        // (a deny is the gate working, not a tool failing) but MUST be counted.
+        for _ in 0..2 {
+            state
+                .append_chain(
+                    "policy_decision",
+                    json!({"tool_name": "Bash", "decision": "deny", "plugin_id": "a"}),
+                )
+                .unwrap();
+        }
+
         let s = state.dashboard_snapshot(20);
-        assert_eq!(s.stats.total_actions, 4);
+        assert_eq!(s.stats.total_actions, 4, "denies excluded from executed-tool total");
         assert_eq!(s.stats.successful_actions, 3);
         assert_eq!(s.stats.failed_actions, 1);
-        assert!((s.stats.success_rate - 0.75).abs() < 1e-9);
+        assert_eq!(s.stats.denied_actions, 2, "denies counted separately");
+        assert!((s.stats.success_rate - 0.75).abs() < 1e-9, "denies don't move success_rate");
         // Read=3, Bash=1
         assert_eq!(s.stats.by_tool[0], ("Read".into(), 3));
         assert_eq!(s.stats.by_tool[1], ("Bash".into(), 1));
@@ -356,10 +384,13 @@ mod tests {
         assert_eq!(s.trust[0].plugin_id, "a");
         assert_eq!(s.trust[0].action_count, 2);
 
-        assert_eq!(s.recent.len(), 4);
-        assert_eq!(s.recent[0].event_type, "outcome");
-        assert_eq!(s.recent[0].tool_name.as_deref(), Some("Bash"));
-        assert_eq!(s.recent[0].success, Some(false));
+        // 4 outcomes + 2 denies, descending (denies appended last).
+        assert_eq!(s.recent.len(), 6);
+        assert_eq!(s.recent[0].event_type, "policy_decision");
+        // The most recent outcome (Bash, failed) now sits behind the two denies.
+        assert_eq!(s.recent[2].event_type, "outcome");
+        assert_eq!(s.recent[2].tool_name.as_deref(), Some("Bash"));
+        assert_eq!(s.recent[2].success, Some(false));
     }
 
     #[test]
