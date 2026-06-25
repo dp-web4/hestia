@@ -30,6 +30,10 @@ pub struct DashboardSnapshot {
     pub policy: PolicyView,
     pub trust: Vec<TrustView>,
     pub recent: Vec<RecentEntry>,
+    /// Policy decisions (warn + deny) across the wider stats window — backs the
+    /// warn/deny feed filters (the `recent` window may not include older denies).
+    #[serde(default)]
+    pub policy_decisions: Vec<RecentEntry>,
     pub delegations: Vec<serde_json::Value>,
     pub hub_connections: Vec<serde_json::Value>,
     pub profile: Option<serde_json::Value>,
@@ -157,6 +161,9 @@ impl ServerState {
         let mut succ = 0u64;
         let mut fail = 0u64;
         let mut denied = 0u64;
+        let mut policy_decisions: Vec<RecentEntry> = Vec::new();
+        let mut deny_kept = 0usize;
+        let mut warn_kept = 0usize;
         let mut by_tool: BTreeMap<String, u64> = BTreeMap::new();
         let one_hour_ago = Utc::now() - chrono::Duration::hours(1);
         let mut last_hour = 0u64;
@@ -184,6 +191,21 @@ impl ServerState {
                 && e.event_data.get("decision").and_then(|v| v.as_str()) == Some("deny")
             {
                 denied += 1;
+            }
+            // Collect policy decisions for the warn/deny feed filters across the
+            // wider stats window (denies can be older than `recent_limit`). Cap
+            // warn and deny INDEPENDENTLY so frequent warns can't crowd out the
+            // rarer denies — a single shared cap made the deny list look empty.
+            if e.event_type == "policy_decision" {
+                let dec = e.event_data.get("decision").and_then(|v| v.as_str());
+                let keep = match dec {
+                    Some("deny") if deny_kept < 300 => { deny_kept += 1; true }
+                    Some("warn") if warn_kept < 300 => { warn_kept += 1; true }
+                    _ => false,
+                };
+                if keep {
+                    policy_decisions.push(flatten_entry(e.clone()));
+                }
             }
             if e.event_type != "outcome" {
                 continue;
@@ -307,6 +329,7 @@ impl ServerState {
             },
             trust,
             recent,
+            policy_decisions,
             delegations,
             hub_connections,
             profile,

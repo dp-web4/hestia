@@ -237,6 +237,13 @@
     color: var(--accent);
     border-color: var(--accent);
   }
+  /* warn/deny selected chips highlight in their own status hue, not green. */
+  .filter-btn[data-filter="warn"].selected {
+    background: #facc1518; color: var(--warning); border-color: var(--warning);
+  }
+  .filter-btn[data-filter="deny"].selected {
+    background: #ff7a6618; color: var(--coral); border-color: var(--coral);
+  }
 
   /* --- Trust panel --- */
   .trust-list { display: flex; flex-direction: column; gap: 1.25rem; }
@@ -606,7 +613,10 @@
     // matching the policy engine's allow/warn/deny outcomes.
     let source = entries;
     if (feedFilter === 'warn' || feedFilter === 'deny') {
-      source = entries.filter(e =>
+      // Source from the wider policy-decision window (the small recent feed may
+      // not contain older denies — the stats count does, so the list must too).
+      const pd = lastData?.policy_decisions ?? entries;
+      source = pd.filter(e =>
         e.event_type === 'policy_decision' && e.decision === feedFilter
       );
     }
