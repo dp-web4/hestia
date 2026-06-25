@@ -246,6 +246,52 @@ enum PolicyCmd {
         /// Target (file path, URL, or for Bash, the full command)
         target: String,
     },
+
+    /// Override a preset rule (change its decision / enable state) — "specifically"
+    Override {
+        /// The rule id (see `policy show`)
+        rule_id: String,
+        /// New decision: allow | warn | deny
+        #[arg(long)]
+        decision: Option<String>,
+        /// Disable the rule (it stops firing)
+        #[arg(long)]
+        disable: bool,
+        /// Re-enable a previously disabled rule
+        #[arg(long)]
+        enable: bool,
+        /// Remove the override entirely (revert to the preset default)
+        #[arg(long)]
+        clear: bool,
+    },
+
+    /// Add or replace a custom rule — by category or specifically
+    AddRule {
+        /// Human-readable name (the rule id is derived from it)
+        #[arg(long)]
+        name: String,
+        /// Decision: allow | warn | deny
+        #[arg(long)]
+        decision: String,
+        /// Match a tool category (e.g. credential_access, network, file_write)
+        #[arg(long)]
+        category: Option<String>,
+        /// Match a specific tool name (e.g. Bash)
+        #[arg(long)]
+        tool: Option<String>,
+        /// Match a command glob pattern (e.g. "*rm -rf*")
+        #[arg(long)]
+        command: Option<String>,
+        /// Priority (lower = evaluated first)
+        #[arg(long, default_value_t = 50)]
+        priority: i32,
+    },
+
+    /// Remove a custom rule by id
+    RmRule {
+        /// The custom rule id
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -341,6 +387,13 @@ pub fn run() -> AnyResult<()> {
             PolicyCmd::List => cmd_policy_list(),
             PolicyCmd::Set { preset } => cmd_policy_set(&home, &preset),
             PolicyCmd::Test { tool, target } => cmd_policy_test(&home, &tool, &target),
+            PolicyCmd::Override { rule_id, decision, disable, enable, clear } => {
+                cmd_policy_override(&home, &rule_id, decision, disable, enable, clear)
+            }
+            PolicyCmd::AddRule { name, decision, category, tool, command, priority } => {
+                cmd_policy_add_rule(&home, &name, &decision, category, tool, command, priority)
+            }
+            PolicyCmd::RmRule { id } => cmd_policy_rm_rule(&home, &id),
         },
         Command::Delegate(d) => match d {
             DelegateCmd::Grant { agent, role, action, expires } => {
@@ -728,6 +781,96 @@ fn cmd_policy_set(home: &std::path::Path, preset: &str) -> AnyResult<()> {
     let mut vault = open_vault(home)?;
     vault.set_active_preset(preset)?;
     println!("✓ active preset set to '{preset}'");
+    println!("  (a running daemon won't pick this up until restart)");
+    Ok(())
+}
+
+fn parse_decision_cli(s: &str) -> AnyResult<hestia::policy::PolicyDecision> {
+    use hestia::policy::PolicyDecision::*;
+    match s {
+        "allow" => Ok(Allow),
+        "warn" => Ok(Warn),
+        "deny" => Ok(Deny),
+        _ => anyhow::bail!("decision must be allow | warn | deny, got '{s}'"),
+    }
+}
+
+fn cmd_policy_override(
+    home: &std::path::Path,
+    rule_id: &str,
+    decision: Option<String>,
+    disable: bool,
+    enable: bool,
+    clear: bool,
+) -> AnyResult<()> {
+    let mut vault = open_vault(home)?;
+    if clear {
+        vault.clear_policy_override(rule_id)?;
+        println!("✓ override on '{rule_id}' cleared (reverted to preset default)");
+    } else {
+        let dec = match decision {
+            Some(d) => Some(parse_decision_cli(&d)?),
+            None => None,
+        };
+        let enabled = match (disable, enable) {
+            (true, true) => anyhow::bail!("--disable and --enable are mutually exclusive"),
+            (true, false) => Some(false),
+            (false, true) => Some(true),
+            (false, false) => None,
+        };
+        if dec.is_none() && enabled.is_none() {
+            anyhow::bail!("nothing to change: pass --decision, --disable, --enable, or --clear");
+        }
+        vault.set_policy_override(rule_id, hestia::vault::PolicyOverride { decision: dec, enabled })?;
+        println!("✓ override set on '{rule_id}'");
+    }
+    println!("  (a running daemon won't pick this up until restart)");
+    Ok(())
+}
+
+fn cmd_policy_add_rule(
+    home: &std::path::Path,
+    name: &str,
+    decision: &str,
+    category: Option<String>,
+    tool: Option<String>,
+    command: Option<String>,
+    priority: i32,
+) -> AnyResult<()> {
+    let dec = parse_decision_cli(decision)?;
+    let r#match = match (category, tool, command) {
+        (Some(c), None, None) => hestia::policy::PolicyMatch { categories: Some(vec![c]), ..Default::default() },
+        (None, Some(t), None) => hestia::policy::PolicyMatch { tools: Some(vec![t]), ..Default::default() },
+        (None, None, Some(cmd)) => hestia::policy::PolicyMatch { command_patterns: Some(vec![cmd]), ..Default::default() },
+        _ => anyhow::bail!("specify exactly one of --category, --tool, --command"),
+    };
+    let slug: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let id = format!("custom-{}", slug.trim_matches('-'));
+    let mut vault = open_vault(home)?;
+    vault.upsert_custom_rule(hestia::policy::PolicyRule {
+        id: id.clone(),
+        name: name.to_string(),
+        priority,
+        decision: dec,
+        reason: None,
+        r#match,
+    })?;
+    println!("✓ custom rule '{id}' added");
+    println!("  (a running daemon won't pick this up until restart)");
+    Ok(())
+}
+
+fn cmd_policy_rm_rule(home: &std::path::Path, id: &str) -> AnyResult<()> {
+    let mut vault = open_vault(home)?;
+    if vault.remove_custom_rule(id)? {
+        println!("✓ custom rule '{id}' removed");
+    } else {
+        println!("no custom rule with id '{id}'");
+    }
     println!("  (a running daemon won't pick this up until restart)");
     Ok(())
 }
