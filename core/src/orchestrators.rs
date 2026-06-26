@@ -34,8 +34,8 @@ pub struct KnownOrch {
 pub const REGISTRY: &[KnownOrch] = &[
     KnownOrch { id: "claude-code", name: "Claude Code", proc_patterns: &["claude"], plugin_available: true },
     KnownOrch { id: "openclaw", name: "OpenClaw", proc_patterns: &["openclaw"], plugin_available: true },
-    KnownOrch { id: "cursor", name: "Cursor", proc_patterns: &["cursor"], plugin_available: false },
-    KnownOrch { id: "codex", name: "Codex", proc_patterns: &["codex"], plugin_available: false },
+    KnownOrch { id: "cursor", name: "Cursor", proc_patterns: &["cursor"], plugin_available: true },
+    KnownOrch { id: "codex", name: "Codex", proc_patterns: &["codex"], plugin_available: true },
 ];
 
 pub fn lookup(id: &str) -> Option<&'static KnownOrch> {
@@ -79,23 +79,29 @@ fn home_dir() -> Result<PathBuf> {
 pub fn install(id: &str) -> Result<String> {
     match id {
         "claude-code" => install_claude_code(),
+        "codex" => install_codex(),
+        "cursor" => install_cursor(),
         other => anyhow::bail!("no installer available for '{other}' yet"),
     }
 }
 
-/// Path to the claude-code witness hook shipped in this repo (resolved from the
-/// build-time crate dir → repo root → plugins/…).
-fn claude_witness_hook() -> Result<PathBuf> {
-    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/claude-code/hooks/witness.py"))
-        .canonicalize()
-        .context("locating plugins/claude-code/hooks/witness.py")
+/// Path to an orchestrator's witness hook shipped in this repo (resolved from
+/// the build-time crate dir → repo root → plugins/…).
+fn repo_hook(orch: &str) -> Result<PathBuf> {
+    let p: &str = match orch {
+        "claude-code" => concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/claude-code/hooks/witness.py"),
+        "codex" => concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/codex/hooks/witness.py"),
+        "cursor" => concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/cursor/hooks/witness.py"),
+        other => anyhow::bail!("no witness hook for '{other}'"),
+    };
+    Path::new(p).canonicalize().with_context(|| format!("locating {p}"))
 }
 
 /// Merge hestia's PostToolUse witness hook into `~/.claude/settings.json`,
 /// idempotently. Needs write access to `~/.claude` (the daemon sandbox must
 /// allow it — see deploy notes).
 fn install_claude_code() -> Result<String> {
-    let witness = claude_witness_hook()?;
+    let witness = repo_hook("claude-code")?;
     let command = format!("python3 {}", witness.display());
     let claude_dir = home_dir()?.join(".claude");
     let settings_path = claude_dir.join("settings.json");
@@ -134,6 +140,70 @@ fn install_claude_code() -> Result<String> {
     Ok(format!("connected — added hestia PostToolUse hook to {}; restart Claude Code", settings_path.display()))
 }
 
+/// Merge hestia's witness into `~/.cursor/hooks.json` as afterShellExecution +
+/// afterFileEdit command hooks (Cursor's native hook schema), idempotently.
+fn install_cursor() -> Result<String> {
+    let witness = repo_hook("cursor")?;
+    let command = format!("python3 {}", witness.display());
+    let cursor_dir = home_dir()?.join(".cursor");
+    let hooks_path = cursor_dir.join("hooks.json");
+
+    let mut json: serde_json::Value = if hooks_path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&hooks_path)?)
+            .context("parsing ~/.cursor/hooks.json")?
+    } else {
+        serde_json::json!({ "version": 1, "hooks": {} })
+    };
+    if json.to_string().contains("witness.py") || json.to_string().contains("hestia") {
+        return Ok("already connected (hestia hook present)".into());
+    }
+
+    let obj = json.as_object_mut().context("~/.cursor/hooks.json is not a JSON object")?;
+    obj.entry("version").or_insert(serde_json::json!(1));
+    let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    let hooks_obj = hooks.as_object_mut().context("hooks.json `hooks` is not an object")?;
+    let entry = serde_json::json!({ "command": command, "timeout": 5 });
+    for event in ["afterShellExecution", "afterFileEdit"] {
+        let arr = hooks_obj.entry(event).or_insert_with(|| serde_json::json!([]));
+        arr.as_array_mut().with_context(|| format!("hooks.{event} is not an array"))?.push(entry.clone());
+    }
+
+    std::fs::create_dir_all(&cursor_dir).context("creating ~/.cursor")?;
+    std::fs::write(&hooks_path, serde_json::to_string_pretty(&json)?)
+        .with_context(|| format!("writing {} (does the daemon have write access?)", hooks_path.display()))?;
+    Ok(format!("connected — added hestia hooks to {}; restart Cursor", hooks_path.display()))
+}
+
+/// Append a hestia PostToolUse command hook to `~/.codex/config.toml` (Codex
+/// uses Claude Code's hook event schema), idempotently. We append the documented
+/// array-of-tables block rather than reparse the whole TOML.
+fn install_codex() -> Result<String> {
+    let witness = repo_hook("codex")?;
+    let command = format!("python3 {}", witness.display());
+    let codex_dir = home_dir()?.join(".codex");
+    let cfg_path = codex_dir.join("config.toml");
+
+    let existing = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+    if existing.contains("witness.py") || existing.contains("hestia") {
+        return Ok("already connected (hestia hook present)".into());
+    }
+
+    let block = format!(
+        "\n# hestia witness — added by dashboard connect\n\
+         [[hooks.PostToolUse]]\n\
+         [[hooks.PostToolUse.hooks]]\n\
+         type = \"command\"\n\
+         command = '{command}'\n\
+         timeout = 5\n"
+    );
+    std::fs::create_dir_all(&codex_dir).context("creating ~/.codex")?;
+    let mut new = existing;
+    new.push_str(&block);
+    std::fs::write(&cfg_path, new)
+        .with_context(|| format!("writing {} (does the daemon have write access?)", cfg_path.display()))?;
+    Ok(format!("connected — added hestia PostToolUse hook to {}; restart Codex", cfg_path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +218,8 @@ mod tests {
 
     #[test]
     fn install_unknown_orchestrator_errors() {
-        assert!(install("cursor").is_err());
+        // A genuinely unsupported id errors without touching the filesystem.
+        assert!(install("vim").is_err());
+        assert!(install("nope-xyz").is_err());
     }
 }
