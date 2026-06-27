@@ -57,18 +57,24 @@ impl TrustStore {
         DerivedKey::from_bytes(self.key)
     }
 
-    /// Read + decrypt one entity file. Sniffs a legacy plaintext JSON (`{`) vs a
-    /// sealed blob. `None` if the file is absent.
+    /// Read + decrypt one entity file. `None` if the file is absent.
+    ///
+    /// Sealed blobs are nonce-prefixed ChaCha20-Poly1305 with no magic header,
+    /// so their first byte is random. The old `first()=='{'` sniff therefore
+    /// misread ~1/256 sealed files (those whose nonce starts with 0x7b) as
+    /// plaintext, skipped decryption, and failed to parse the ciphertext.
+    /// Instead: decrypt first, and only fall back to legacy plaintext when AEAD
+    /// authentication fails — which it always does for genuine plaintext, so the
+    /// fallback is safe and unambiguous.
     fn load(&self, entity_id: &str) -> Result<Option<EntityTrust>> {
         let path = self.entity_file(entity_id);
         if !path.exists() {
             return Ok(None);
         }
         let raw = std::fs::read(&path).with_context(|| format!("reading trust {}", path.display()))?;
-        let json: Vec<u8> = if raw.first() == Some(&b'{') {
-            raw // legacy plaintext JSON
-        } else {
-            crypto::open(&self.dk(), &raw).context("decrypting trust file")?
+        let json: Vec<u8> = match crypto::open(&self.dk(), &raw) {
+            Ok(plain) => plain,
+            Err(_) => raw, // legacy plaintext JSON (predates at-rest encryption)
         };
         let trust: EntityTrust =
             serde_json::from_slice(&json).with_context(|| format!("parsing trust {}", path.display()))?;
@@ -119,13 +125,10 @@ impl TrustStore {
                 continue;
             }
             let Ok(raw) = std::fs::read(&path) else { continue };
-            let json = if raw.first() == Some(&b'{') {
-                raw
-            } else {
-                match crypto::open(&self.dk(), &raw) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                }
+            // Decrypt-first, fall back to legacy plaintext on AEAD failure (see load()).
+            let json = match crypto::open(&self.dk(), &raw) {
+                Ok(b) => b,
+                Err(_) => raw,
             };
             if let Ok(t) = serde_json::from_slice::<EntityTrust>(&json) {
                 out.push(t.entity_id.strip_prefix("plugin:").unwrap_or(&t.entity_id).to_string());
