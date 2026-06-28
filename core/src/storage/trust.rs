@@ -195,4 +195,39 @@ mod tests {
         store.update("legacy", true, 0.5).unwrap();
         assert_ne!(std::fs::read(&f).unwrap().first(), Some(&b'{'), "should be re-sealed after write");
     }
+
+    /// Regression for the first-byte sniff bug: a sealed blob is nonce-prefixed
+    /// with no magic header, so ~1/256 sealed files start with 0x7b ('{') by
+    /// chance. The old `raw.first()=='{'` heuristic misread those as plaintext,
+    /// skipped decryption, and failed to parse the ciphertext ("parsing trust").
+    /// Here we deterministically forge that exact condition — a real sealed blob
+    /// whose first byte is '{' — and assert it round-trips. Fails (panics in
+    /// get().unwrap()) against the old sniff; passes with decrypt-first.
+    #[test]
+    fn sealed_blob_starting_with_brace_byte_still_loads() {
+        let dir = TempDir::new().unwrap();
+        let store = TrustStore::open(dir.path(), KEY).unwrap();
+
+        // Non-default trust state so a successful load can't be confused with a
+        // freshly auto-created entity (which would have action_count == 0).
+        let mut t = EntityTrust::new("plugin:brace");
+        t.update_from_outcome(true, 0.8);
+        let json = serde_json::to_vec_pretty(&t).unwrap();
+
+        // Seal it by hand with a nonce whose first byte is '{', reproducing the
+        // collision. seal() == nonce(12) || encrypt(nonce, plaintext); open()
+        // reads it back regardless of that first byte.
+        let mut nonce = [0u8; 12];
+        nonce[0] = b'{';
+        let ct = crypto::encrypt(&store.dk(), &nonce, &json).unwrap();
+        let mut blob = nonce.to_vec();
+        blob.extend_from_slice(&ct);
+        assert_eq!(blob.first(), Some(&b'{'), "must reproduce the 0x7b-first condition");
+
+        std::fs::write(store.entity_file("plugin:brace"), &blob).unwrap();
+
+        let loaded = store.get("brace").unwrap();
+        assert_eq!(loaded.action_count, 1, "sealed trust must be decrypted, not parsed as plaintext");
+        assert_eq!(loaded.success_count, 1);
+    }
 }
