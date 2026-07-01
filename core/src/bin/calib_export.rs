@@ -41,6 +41,7 @@ use web4_trust_core::EntityTrust;
 fn main() -> Result<()> {
     let mut out_path: Option<PathBuf> = None;
     let mut mode = String::from("outcome");
+    let mut wire_risk = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -51,6 +52,13 @@ fn main() -> Result<()> {
             }
             "--mode" | "-m" => {
                 mode = args.next().context("--mode requires outcome|gate")?;
+            }
+            // Retrospective counterfactual: apply the daemon's warn/deny->trust
+            // penalty (deny 0.5, warn 0.2) DURING replay, so the reconstructed
+            // trust trajectory matches the deployed wiring. Falsifiable test of
+            // "does feeding the risk signal into trust make it discriminate?".
+            "--wire-risk" => {
+                wire_risk = true;
             }
             other => anyhow::bail!("unknown argument: {other}"),
         }
@@ -224,6 +232,19 @@ fn main() -> Result<()> {
                 "warn" => n_warn += 1,
                 "deny" => n_deny += 1,
                 _ => {}
+            }
+            // Counterfactual replay: mirror the deployed daemon — a gate decision
+            // lowers trust (asymmetric), deny stronger than warn. Applied AFTER the
+            // estimate for THIS event is captured, so it only affects later events.
+            if wire_risk {
+                let m = match decision {
+                    "deny" => 0.5,
+                    "warn" => 0.2,
+                    _ => 0.0,
+                };
+                if m > 0.0 {
+                    entry.update_from_outcome(false, m);
+                }
             }
         }
     }
