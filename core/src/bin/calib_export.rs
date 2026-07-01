@@ -1,11 +1,22 @@
 //! `calib_export` — trust-calibration exporter for the sealed witness chain.
 //!
 //! Emits calibration records `{estimate, outcome, ...}` from hestia's
-//! SQLCipher-sealed witness chain, one per `outcome` event. `estimate` is the
-//! plugin's trust scalar (T3 average) that existed *before* the outcome it is
-//! paired with — reconstructed by replaying `EntityTrust::update_from_outcome`
-//! in chain order, capturing the pre-update scalar. This is the
-//! `(trust-at-decision, outcome)` pair CBP's PRD-4 named.
+//! SQLCipher-sealed witness chain. `estimate` is the plugin's trust scalar (T3
+//! average) that existed *before* the paired event — reconstructed by replaying
+//! `EntityTrust::update_from_outcome` in chain order, capturing the pre-update
+//! scalar. This is the `(trust-at-decision, outcome)` pair CBP's PRD-4 named.
+//!
+//! Two modes (`--mode`):
+//!   • `outcome` (v1, default): one pair per `outcome` event; label = execution
+//!     success. The live outcome stream is all-success (the gate filters failures
+//!     upstream), so this axis is degenerate — a selection effect, not absence of
+//!     failure.
+//!   • `gate` (v2): recover the negatives the gate filters. Positives = outcome
+//!     events (cleared the gate → 1); negatives = `policy_decision` warn/deny (0).
+//!     The gate is rule-based and never reads trust, so calibrating trust against
+//!     the gate decision is non-circular. (`warn` proceeds → also an outcome pair;
+//!     that double-representation is tagged via `kind` — strict set = kind ∈
+//!     {executed, deny}.)
 //!
 //! CAUSAL HONESTY: the estimate is always the trust value that existed BEFORE
 //! the outcome — never post-update or final trust (that would postdate the
@@ -29,6 +40,7 @@ use web4_trust_core::EntityTrust;
 
 fn main() -> Result<()> {
     let mut out_path: Option<PathBuf> = None;
+    let mut mode = String::from("outcome");
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -37,10 +49,17 @@ fn main() -> Result<()> {
                     args.next().context("--out requires a path argument")?,
                 ));
             }
+            "--mode" | "-m" => {
+                mode = args.next().context("--mode requires outcome|gate")?;
+            }
             other => anyhow::bail!("unknown argument: {other}"),
         }
     }
     let out_path = out_path.context("missing required --out <path.jsonl>")?;
+    anyhow::ensure!(
+        mode == "outcome" || mode == "gate",
+        "unknown --mode {mode:?} (expected: outcome | gate)"
+    );
 
     // Resolve home (HESTIA_HOME or ~/.hestia) and the passphrase.
     let home = match std::env::var("HESTIA_HOME") {
@@ -95,10 +114,25 @@ fn main() -> Result<()> {
         .with_context(|| format!("creating output {}", out_path.display()))?;
     let mut w = std::io::BufWriter::new(&mut file);
 
+    // `outcome` mode (v1): one pair per outcome event, label = execution success.
+    // `gate` mode (v2): recover the negatives the gate filters upstream. Positives
+    // are the outcome events (the action cleared the gate and executed → label 1);
+    // negatives are the `policy_decision` events (warn/deny → label 0), which never
+    // become outcome events for a deny (blocked) — but a warn PROCEEDS, so a warned
+    // action is ALSO an outcome pair. That double-representation is disclosed and
+    // tagged via `kind` so a strict set (kind ∈ {executed, deny}) can drop it.
+    // The gate is rule-based (command-pattern) and never reads trust, so
+    // "does trust-at-decision predict gate-risk" is a non-circular test.
+    let gate = mode == "gate";
     let mut n_pairs = 0u64;
-    let mut n_success = 0u64;
+    let mut n_exec = 0u64; // outcome events (gate mode: label 1)
+    let mut n_success = 0u64; // of those, execution succeeded
+    let mut n_warn = 0u64;
+    let mut n_deny = 0u64;
     for e in &all {
-        if e.event_type != "outcome" {
+        let is_outcome = e.event_type == "outcome";
+        let is_decision = e.event_type == "policy_decision";
+        if !is_outcome && !(gate && is_decision) {
             continue;
         }
         let plugin_id = e
@@ -107,18 +141,6 @@ fn main() -> Result<()> {
             .and_then(|v| v.as_str())
             .unwrap_or("anonymous")
             .to_string();
-        // Match the daemon's default (handler.rs): success=false, magnitude=0.5
-        // when absent, so the reconstructed trajectory is byte-faithful.
-        let success = e
-            .event_data
-            .get("success")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let magnitude = e
-            .event_data
-            .get("magnitude")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.5);
         let tool = e
             .event_data
             .get("tool_name")
@@ -129,29 +151,80 @@ fn main() -> Result<()> {
             .entry(plugin_id.clone())
             .or_insert_with(|| EntityTrust::new(format!("plugin:{plugin_id}")));
 
-        // CAUSAL HONESTY: estimate is the PRE-update trust scalar.
+        // CAUSAL HONESTY: the estimate is the trust scalar as it exists BEFORE this
+        // event is processed — for outcome events, before update_from_outcome; for
+        // decision events, the trust as of this chain position (a decision never
+        // mutates trust, matching the daemon).
         let estimate = entry.t3_average();
         let v3_pre = entry.v3_average();
 
-        // Emit the projection (never the decrypted chain itself).
-        let rec = serde_json::json!({
-            "estimate": estimate,
-            "outcome": if success { 1 } else { 0 },
-            "plugin": plugin_id,
-            "magnitude": magnitude,
-            "tool": tool,
-            "ts": e.timestamp.to_rfc3339(),
-            "chain_position": e.chain_position,
-            "v3_pre": v3_pre,
-        });
-        writeln!(w, "{}", serde_json::to_string(&rec)?)?;
+        if is_outcome {
+            // Match the daemon's default (handler.rs): success=false, magnitude=0.5
+            // when absent, so the reconstructed trajectory is byte-faithful.
+            let success = e
+                .event_data
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let magnitude = e
+                .event_data
+                .get("magnitude")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.5);
+            let outcome = if gate {
+                1 // gate mode: the action cleared the gate and executed
+            } else if success {
+                1
+            } else {
+                0
+            };
+            let rec = serde_json::json!({
+                "estimate": estimate,
+                "outcome": outcome,
+                "kind": if gate { "executed" } else { "outcome" },
+                "success": success,
+                "plugin": plugin_id,
+                "magnitude": magnitude,
+                "tool": tool,
+                "ts": e.timestamp.to_rfc3339(),
+                "chain_position": e.chain_position,
+                "v3_pre": v3_pre,
+            });
+            writeln!(w, "{}", serde_json::to_string(&rec)?)?;
 
-        // THEN evolve trust — exactly as the daemon does.
-        entry.update_from_outcome(success, magnitude);
-
-        n_pairs += 1;
-        if success {
-            n_success += 1;
+            // THEN evolve trust — exactly as the daemon does.
+            entry.update_from_outcome(success, magnitude);
+            n_pairs += 1;
+            n_exec += 1;
+            if success {
+                n_success += 1;
+            }
+        } else {
+            // gate mode only: a policy_decision (warn|deny) = a recovered negative.
+            // estimate = trust-at-decision; label 0; trust is NOT updated (the
+            // daemon only evolves trust on outcome events).
+            let decision = e
+                .event_data
+                .get("decision")
+                .and_then(|v| v.as_str())
+                .unwrap_or("gated");
+            let rec = serde_json::json!({
+                "estimate": estimate,
+                "outcome": 0,
+                "kind": decision,
+                "plugin": plugin_id,
+                "tool": tool,
+                "ts": e.timestamp.to_rfc3339(),
+                "chain_position": e.chain_position,
+                "v3_pre": v3_pre,
+            });
+            writeln!(w, "{}", serde_json::to_string(&rec)?)?;
+            n_pairs += 1;
+            match decision {
+                "warn" => n_warn += 1,
+                "deny" => n_deny += 1,
+                _ => {}
+            }
         }
     }
     w.flush()?;
@@ -161,15 +234,21 @@ fn main() -> Result<()> {
     let _ = std::fs::remove_file(&copy_db);
     let _ = std::fs::remove_dir(&tmp_dir);
 
-    eprintln!(
-        "calib_export: {} chain entries, {} outcome pairs ({} success / {} fail) across {} plugins -> {}",
-        total_entries,
-        n_pairs,
-        n_success,
-        n_pairs - n_success,
-        trust.len(),
-        out_path.display()
-    );
+    if gate {
+        eprintln!(
+            "calib_export[gate]: {} entries -> {} pairs across {} plugins: {} executed (label 1, {} exec-success) + {} warn + {} deny (label 0) -> {}",
+            total_entries, n_pairs, trust.len(), n_exec, n_success, n_warn, n_deny, out_path.display()
+        );
+        eprintln!(
+            "  NOTE: warn PROCEEDS, so ~{} warned actions are ALSO 'executed' pairs (double-represented). For the no-double-count strict set filter kind in {{executed, deny}}.",
+            n_warn
+        );
+    } else {
+        eprintln!(
+            "calib_export[outcome]: {} entries, {} outcome pairs ({} success / {} fail) across {} plugins -> {}",
+            total_entries, n_pairs, n_success, n_pairs - n_success, trust.len(), out_path.display()
+        );
+    }
     Ok(())
 }
 
