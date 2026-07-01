@@ -415,6 +415,8 @@
   .orch-chip.idle { opacity: 0.55; }
   .orch-connect { color: var(--accent); cursor: pointer; font-size: 0.7rem; margin-left: 0.35rem; }
   .orch-connect[data-connectable="false"] { color: var(--fg-faint); cursor: default; }
+  /* connected but idle: live + wired, just no tool calls in the last hour */
+  .orch-idle { color: var(--fg-faint); font-size: 0.7rem; margin-left: 0.35rem; }
 </style>
 </head>
 <body>
@@ -605,22 +607,32 @@
       root.innerHTML = header + '<span class="orch-chip-empty">none running or engaged</span>';
       return;
     }
-    // Drop the stats filter if the selected orchestrator is no longer engaged.
+    // Drop the stats filter if the selected orchestrator is no longer active.
     if (selectedOrch && !orchs.some(o => o.engaged && o.id === selectedOrch)) selectedOrch = null;
 
     const chips = orchs.map(o => {
-      if (o.engaged) {
+      // `connected` = alive + wired (or acted in the last hour). `engaged` is the
+      // narrower "active in the last hour" signal used to filter stats. An idle
+      // but connected session stays connected — it does NOT flip to "disconnect".
+      if (o.connected) {
         const t = trustById[o.id] || {};
-        const sel = selectedOrch === o.id ? ' selected' : '';
-        return `<span class="orch-chip${sel}" data-pid="${escapeHtml(o.id)}" title="engaged — click to filter stats">
+        if (o.engaged) {
+          const sel = selectedOrch === o.id ? ' selected' : '';
+          return `<span class="orch-chip${sel}" data-pid="${escapeHtml(o.id)}" title="connected · active — click to filter stats">
+                    <span>${escapeHtml(o.name)}</span>
+                    ${t.level ? `<span class="level">${escapeHtml(t.level)}</span>` : ''}
+                    ${t.action_count != null ? `<span class="count">${fmt.int(t.action_count)}</span>` : ''}
+                  </span>`;
+        }
+        // connected but idle: running + wired, no tool calls in the last hour.
+        return `<span class="orch-chip" title="connected · idle — no tool calls in the last hour">
                   <span>${escapeHtml(o.name)}</span>
-                  ${t.level ? `<span class="level">${escapeHtml(t.level)}</span>` : ''}
-                  ${t.action_count != null ? `<span class="count">${fmt.int(t.action_count)}</span>` : ''}
+                  <span class="orch-idle">idle</span>
                 </span>`;
       }
-      // running but not engaged → offer to connect
+      // not connected → offer to install the plugin hooks (connect).
       const connectable = !!o.plugin_available;
-      return `<span class="orch-chip idle" title="${o.running ? 'running' : 'known'} · not connected">
+      return `<span class="orch-chip idle" title="${o.running ? 'running · hooks not installed' : 'known · not running'}">
                 <span>${escapeHtml(o.name)}</span>
                 <span class="orch-connect" data-connect="${escapeHtml(o.id)}" data-connectable="${connectable}">${connectable ? '+ connect' : 'no plugin'}</span>
               </span>`;
