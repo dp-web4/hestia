@@ -1435,7 +1435,12 @@ fn cmd_hub_join(home: &std::path::Path, target: &str, name: Option<String>) -> A
             println!("  member LCT:   {member_lct} (identity saved to vault)");
             println!("\nThis hub's law gates admission. A Sovereign must approve the");
             println!("join before `profile push` will verify. Your identity is provisioned");
-            println!("and ready — re-run `hub join` is not needed once approved.");
+            println!("and saved to the vault. Admission is async and the client is not");
+            println!("notified, so local state stays 'pending' until you reconcile:");
+            println!("  • after approval, re-run `hestia hub join {url}` (harmless to");
+            println!("    repeat) to resync local state, or");
+            println!("  • `hestia profile push {url}` — it fails until approved and");
+            println!("    succeeds once admitted, so it doubles as the admission probe.");
         }
     }
     Ok(())
