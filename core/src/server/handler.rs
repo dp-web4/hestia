@@ -382,6 +382,30 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 "reason": evaluation.reason,
             }),
         );
+
+        // Wire the gate's risk judgment into trust. Before this, trust evolved
+        // ONLY on execution outcomes (all success → it saturated at the ceiling)
+        // and NEVER on warn/deny, so trust was fully decoupled from gate-risk and
+        // could not predict it (calib_export --mode gate showed zero discrimination:
+        // warn/deny sat at the same trust as clean passes). A gated action is a
+        // real negative signal about the actor, so it feeds `EntityTrust` as one.
+        //
+        // ASYMMETRIC / fail-safe (CBP's governance rule): a gate decision only
+        // LOWERS trust (→ raises future scrutiny), never raises it. `deny` (the
+        // action was blocked) is a stronger negative than `warn` (flagged but
+        // allowed to proceed — it also gets an execution outcome later, so its
+        // weight is intentionally light to avoid over-penalising). Magnitudes are
+        // conservative first-cut defaults; tune if the reliability curve warrants.
+        let risk_magnitude = match evaluation.decision {
+            crate::policy::PolicyDecision::Deny => 0.5,
+            crate::policy::PolicyDecision::Warn => 0.2,
+            _ => 0.0,
+        };
+        if risk_magnitude > 0.0 {
+            let _ = s
+                .trust_store
+                .update(&plugin_id_for_chain, false, risk_magnitude);
+        }
     }
 
     Ok(json!({
