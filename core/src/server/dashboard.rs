@@ -35,8 +35,12 @@ pub struct DashboardSnapshot {
     #[serde(default)]
     pub policy_decisions: Vec<RecentEntry>,
     /// Compatible orchestrators that are running and/or engaged — backs the
-    /// orchestrator bar (engaged = highlighted/clickable; running-not-engaged =
-    /// offer to connect).
+    /// orchestrator bar. Each entry carries `running` (process alive),
+    /// `installed` (hooks wired into its config), `engaged` (acted in the last
+    /// hour → highlighted/clickable stat filter), and `connected` (alive+wired
+    /// OR recently active). The bar shows `connected` as connected and only
+    /// offers "connect" when not connected — so an idle-but-live session no
+    /// longer reads as disconnected after an hour of no tool calls.
     #[serde(default)]
     pub orchestrators: Vec<serde_json::Value>,
     pub delegations: Vec<serde_json::Value>,
@@ -317,17 +321,29 @@ impl ServerState {
         // Orchestrators: registry entries that are running and/or engaged, plus
         // any engaged plugin not in the registry (custom orchestrators).
         let running = crate::orchestrators::detect_running();
+        // `engaged` = acted in the last hour (drives the stats filter). It is NOT
+        // the same as "connected": an agent routinely goes >1h between witnessed
+        // tool calls (long reads, thinking, waiting on the human), and treating
+        // that idle gap as a disconnect is the bug this snapshot used to have.
+        // `connected` = the process is alive AND its hooks are wired, OR it acted
+        // recently. That way a live, wired-but-idle orchestrator reads connected,
+        // while a running-but-unwired one still gets offered a connect affordance.
         let engaged: std::collections::HashSet<&str> =
             trust.iter().map(|t| t.plugin_id.as_str()).collect();
         let mut orchestrators: Vec<serde_json::Value> = crate::orchestrators::REGISTRY
             .iter()
             .filter(|o| running.contains(o.id) || engaged.contains(o.id))
             .map(|o| {
+                let running_now = running.contains(o.id);
+                let active = engaged.contains(o.id);
+                let installed = crate::orchestrators::is_installed(o.id);
                 serde_json::json!({
                     "id": o.id,
                     "name": o.name,
-                    "running": running.contains(o.id),
-                    "engaged": engaged.contains(o.id),
+                    "running": running_now,
+                    "engaged": active,
+                    "installed": installed,
+                    "connected": active || (running_now && installed),
                     "plugin_available": o.plugin_available,
                 })
             })
@@ -339,6 +355,8 @@ impl ServerState {
                     "name": t.plugin_id,
                     "running": true,
                     "engaged": true,
+                    "installed": true,
+                    "connected": true,
                     "plugin_available": false,
                 }));
             }

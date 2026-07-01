@@ -85,6 +85,26 @@ pub fn install(id: &str) -> Result<String> {
     }
 }
 
+/// Whether an orchestrator already has hestia's witness hook wired into its
+/// config. Read-only mirror of the idempotency check in each `install_*`
+/// (scans the config for a hestia/witness marker). Lets the dashboard tell a
+/// running-but-unwired orchestrator apart from a running-and-connected one: it
+/// should offer to connect the former, and show the latter as connected even
+/// when it hasn't fired a tool call in the last hour.
+pub fn is_installed(id: &str) -> bool {
+    let Ok(home) = home_dir() else { return false };
+    let path = match id {
+        "claude-code" => home.join(".claude/settings.json"),
+        "codex" => home.join(".codex/config.toml"),
+        "cursor" => home.join(".cursor/hooks.json"),
+        _ => return false,
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(s) => s.contains("hestia") || s.contains("witness.py"),
+        Err(_) => false,
+    }
+}
+
 /// Path to an orchestrator's witness hook shipped in this repo (resolved from
 /// the build-time crate dir → repo root → plugins/…).
 fn repo_hook(orch: &str) -> Result<PathBuf> {
@@ -221,5 +241,13 @@ mod tests {
         // A genuinely unsupported id errors without touching the filesystem.
         assert!(install("vim").is_err());
         assert!(install("nope-xyz").is_err());
+    }
+
+    #[test]
+    fn is_installed_unknown_is_false_and_never_panics() {
+        // Unknown orchestrators are never "installed"; known ones just read a
+        // config file (absent → false) without panicking on this host.
+        assert!(!is_installed("nope-xyz"));
+        let _ = is_installed("claude-code");
     }
 }
