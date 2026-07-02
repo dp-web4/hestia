@@ -16,6 +16,7 @@ pub mod orchestrators;
 pub mod plugin;
 pub mod policy;
 pub mod profile;
+pub mod reputation;
 pub mod server;
 pub mod storage;
 pub mod tui;

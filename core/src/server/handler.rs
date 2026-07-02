@@ -302,7 +302,15 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
         }),
     )?;
 
-    let trust_state = s.apply_outcome(&plugin_id, success, magnitude)?;
+    let rep_action_id = action_id.to_string();
+    let rep_ctx = crate::reputation::RepContext {
+        role_lct: crate::reputation::V1_CONSTELLATION_ROLE,
+        action_type: "tool_execution",
+        action_target: &action.tool_name,
+        action_id: &rep_action_id,
+        reason: if success { "outcome:success" } else { "outcome:failure" },
+    };
+    let trust_state = s.apply_outcome_ctx(&plugin_id, success, magnitude, &rep_ctx)?;
 
     Ok(json!({
         "witnessEntryHash": entry.hash,
@@ -402,9 +410,17 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
             _ => 0.0,
         };
         if risk_magnitude > 0.0 {
-            let _ = s
-                .trust_store
-                .update(&plugin_id_for_chain, false, risk_magnitude);
+            // P3a: emit the gate's trust movement as a role-scoped ReputationDelta
+            // to the local bridge sink (the first source of hestia->hub reputation).
+            let reason = format!("gate:{}", evaluation.decision.as_str());
+            let rep_ctx = crate::reputation::RepContext {
+                role_lct: crate::reputation::V1_CONSTELLATION_ROLE,
+                action_type: "policy_gate",
+                action_target: &action.tool_name,
+                action_id: &action_id_str,
+                reason: &reason,
+            };
+            let _ = s.apply_outcome_ctx(&plugin_id_for_chain, false, risk_magnitude, &rep_ctx);
         }
     }
 

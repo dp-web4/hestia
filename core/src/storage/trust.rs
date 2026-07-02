@@ -105,10 +105,23 @@ impl TrustStore {
 
     /// Apply an outcome and persist. Returns the updated entity trust.
     pub fn update(&self, plugin_id: &str, success: bool, magnitude: f64) -> Result<EntityTrust> {
-        let mut t = self.get(plugin_id)?;
-        t.update_from_outcome(success, magnitude);
-        self.store(&t)?;
-        Ok(t)
+        Ok(self.update_returning_prior(plugin_id, success, magnitude)?.1)
+    }
+
+    /// Apply an outcome and persist, returning `(before, after)` so the caller can
+    /// diff the tensor movement into a `ReputationDelta` (the trust-tensor bridge,
+    /// P3a). One read + one write, same as `update`.
+    pub fn update_returning_prior(
+        &self,
+        plugin_id: &str,
+        success: bool,
+        magnitude: f64,
+    ) -> Result<(EntityTrust, EntityTrust)> {
+        let before = self.get(plugin_id)?;
+        let mut after = before.clone();
+        after.update_from_outcome(success, magnitude);
+        self.store(&after)?;
+        Ok((before, after))
     }
 
     /// List known plugin_ids (without the `plugin:` prefix when applicable).

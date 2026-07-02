@@ -179,7 +179,47 @@ impl ServerState {
         success: bool,
         magnitude: f64,
     ) -> Result<EntityTrust> {
-        self.trust_store.update(plugin_id, success, magnitude)
+        let ctx = crate::reputation::RepContext {
+            role_lct: crate::reputation::V1_CONSTELLATION_ROLE,
+            action_type: "outcome",
+            action_target: "",
+            action_id: "",
+            reason: if success { "outcome:success" } else { "outcome:failure" },
+        };
+        self.apply_outcome_ctx(plugin_id, success, magnitude, &ctx)
+    }
+
+    /// Apply an outcome AND emit the trust movement as a role-scoped
+    /// `web4_core::r6::ReputationDelta` to the local sink — the local half of the
+    /// trust-tensor bridge (P3a; `designs/2026-07-01-trust-tensor-bridge.md`).
+    /// The delta is the exact before/after diff, ready to emit to the hub §5.3
+    /// projection once a member-emit path exists.
+    pub fn apply_outcome_ctx(
+        &self,
+        plugin_id: &str,
+        success: bool,
+        magnitude: f64,
+        ctx: &crate::reputation::RepContext,
+    ) -> Result<EntityTrust> {
+        let (before, after) =
+            self.trust_store
+                .update_returning_prior(plugin_id, success, magnitude)?;
+        if let Some(delta) = crate::reputation::delta_from_change(
+            plugin_id,
+            ctx,
+            &before,
+            &after,
+            chrono::Utc::now(),
+        ) {
+            crate::reputation::log_delta(&self.reputation_sink(), &delta);
+        }
+        Ok(after)
+    }
+
+    /// Local sink for emitted reputation deltas — the ready-to-emit queue and a
+    /// `calib`-ready reputation stream (`<home>/reputation-deltas.jsonl`).
+    pub fn reputation_sink(&self) -> std::path::PathBuf {
+        self.home.join(crate::reputation::SINK_FILE)
     }
 
     pub fn trust(&self, plugin_id: &str) -> EntityTrust {
