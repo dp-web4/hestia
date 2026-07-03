@@ -66,7 +66,11 @@ web4-core = { path = "../../web4/web4-core" }
 # The generic plugin seam — shared with the hub (public open-core crate) instead
 # of maintaining a near-identical copy here. `crate::plugin` re-exports it.
 hub-plugin = { path = "../../web4/hub/hub-plugin" }
-web4-trust-core = { version = "0.2", features = ["file-store"] }
+# P3b: consume the sibling web4 checkout by path (matching web4-core / hub-plugin
+# above) so hestia builds in lockstep against the migrated EntityTrust, whose T3/V3
+# are now the canonical `web4_core::t3::T3` / `web4_core::v3::V3`. This unifies the
+# single web4-core source across the dependency graph (no duplicate tensor types).
+web4-trust-core = { path = "../../web4/web4-trust-core", features = ["file-store"] }
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
 
 # TUI dashboard

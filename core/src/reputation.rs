@@ -62,25 +62,29 @@ pub fn delta_from_change(
     after: &EntityTrust,
     ts: DateTime<Utc>,
 ) -> Option<ReputationDelta> {
+    // P3b: `EntityTrust` now holds the canonical `web4_core` tensors; read the
+    // root scores through the convenience getters (`talent()`, `valuation()`, …).
+    // The before/after deltas are numerically identical to the pre-migration
+    // fields, so the emitted `ReputationDelta` is unchanged.
     let mut t3_delta = HashMap::new();
-    if let Some(d) = dim_delta(before.t3.talent, after.t3.talent) {
+    if let Some(d) = dim_delta(before.talent(), after.talent()) {
         t3_delta.insert("talent".to_string(), d);
     }
-    if let Some(d) = dim_delta(before.t3.training, after.t3.training) {
+    if let Some(d) = dim_delta(before.training(), after.training()) {
         t3_delta.insert("training".to_string(), d);
     }
-    if let Some(d) = dim_delta(before.t3.temperament, after.t3.temperament) {
+    if let Some(d) = dim_delta(before.temperament(), after.temperament()) {
         t3_delta.insert("temperament".to_string(), d);
     }
 
     let mut v3_delta = HashMap::new();
-    if let Some(d) = dim_delta(before.v3.valuation, after.v3.valuation) {
+    if let Some(d) = dim_delta(before.valuation(), after.valuation()) {
         v3_delta.insert("valuation".to_string(), d);
     }
-    if let Some(d) = dim_delta(before.v3.veracity, after.v3.veracity) {
+    if let Some(d) = dim_delta(before.veracity(), after.veracity()) {
         v3_delta.insert("veracity".to_string(), d);
     }
-    if let Some(d) = dim_delta(before.v3.validity, after.v3.validity) {
+    if let Some(d) = dim_delta(before.validity(), after.validity()) {
         v3_delta.insert("validity".to_string(), d);
     }
 

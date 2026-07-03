@@ -730,14 +730,14 @@ fn trust_state_json(trust: &EntityTrust) -> Value {
     json!({
         "entityId": trust.entity_id,
         "t3": {
-            "talent": trust.t3.talent,
-            "training": trust.t3.training,
-            "temperament": trust.t3.temperament,
+            "talent": trust.talent(),
+            "training": trust.training(),
+            "temperament": trust.temperament(),
         },
         "v3": {
-            "valuation": trust.v3.valuation,
-            "veracity": trust.v3.veracity,
-            "validity": trust.v3.validity,
+            "valuation": trust.valuation(),
+            "veracity": trust.veracity(),
+            "validity": trust.validity(),
         },
         "level": trust.trust_level().as_str(),
         "actionCount": trust.action_count,

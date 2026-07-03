@@ -59,8 +59,9 @@ fn chain_and_trust_survive_daemon_restart() {
     assert_eq!(openclaw_after.success_count, openclaw_before.success_count);
 
     // T3/V3 values should match (within float tolerance — they're persisted).
-    assert!((claude_after.t3.training - claude_before.t3.training).abs() < 1e-9);
-    assert!((claude_after.v3.veracity - claude_before.v3.veracity).abs() < 1e-9);
+    // P3b: canonical tensors expose root scores via getters, not fields.
+    assert!((claude_after.training() - claude_before.training()).abs() < 1e-9);
+    assert!((claude_after.veracity() - claude_before.veracity()).abs() < 1e-9);
 
     // Most recent chain entry must hash-link to its predecessor.
     let recent = s2.recent_chain(10);

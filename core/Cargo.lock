@@ -2893,8 +2893,6 @@ dependencies = [
 [[package]]
 name = "web4-trust-core"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b61a940f5d909b29d060d218f90709a66c496f02ecc727717c58870794b7601a"
 dependencies = [
  "chrono",
  "serde",
@@ -2902,6 +2900,7 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "uuid",
+ "web4-core",
 ]
 
 [[package]]
