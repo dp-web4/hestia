@@ -231,6 +231,8 @@ async fn tool_begin_action(state: &SharedState, args: &Value) -> ToolResult {
     let target = optional_string(args, "target");
     let session_id_arg = optional_string(args, "session_id");
     let parameters = args.get("parameters").cloned();
+    // The accountability WHY — the actor's stated reason, captured at begin.
+    let intent = optional_string(args, "intent");
 
     let mut s = state.lock().await;
     let action_id = Uuid::new_v4();
@@ -248,6 +250,7 @@ async fn tool_begin_action(state: &SharedState, args: &Value) -> ToolResult {
             tool_name: tool_name.clone(),
             target,
             parameters,
+            intent,
             started_at,
             chain_position,
         },
@@ -288,6 +291,10 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
         .get(&action.session_id)
         .map(|sess| sess.plugin_id.clone())
         .unwrap_or_else(|| "anonymous".to_string());
+    // Accountability WHO: the durable per-instance LCT (trust grain) + the
+    // session_id (audit grain), so concurrent same-type sessions are attributed
+    // per-instance and distinguishable per-session — not smeared onto plugin_id.
+    let instance_lct = s.member_lct(&plugin_id);
 
     let entry = s.append_chain(
         "outcome",
@@ -299,6 +306,9 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
             "magnitude": magnitude,
             "error": error,
             "plugin_id": plugin_id,
+            "instance_lct": instance_lct,
+            "session_id": action.session_id,
+            "intent": action.intent,
         }),
     )?;
 
@@ -375,6 +385,10 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         .get(&action.session_id)
         .map(|sess| sess.plugin_id.clone())
         .unwrap_or_else(|| "unknown".to_string());
+    // A deny blocks before execution, so this is the ONLY witnessed record of a
+    // denied action — carry the full accountability WHO (instance + session) and
+    // WHY (actor intent) here, or they're lost for everything the gate blocks.
+    let instance_lct = s.member_lct(&plugin_id_for_chain);
     if evaluation.decision != crate::policy::PolicyDecision::Allow {
         let _ = s.append_chain(
             "policy_decision",
@@ -383,6 +397,9 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 "tool_name": action.tool_name,
                 "target": target,
                 "plugin_id": plugin_id_for_chain,
+                "instance_lct": instance_lct,
+                "session_id": action.session_id,
+                "intent": action.intent,
                 "decision": evaluation.decision.as_str(),
                 "enforced": evaluation.enforced,
                 "rule_id": evaluation.rule_id,
@@ -777,4 +794,91 @@ fn require_string(args: &Value, key: &str) -> Result<String, anyhow::Error> {
 
 fn optional_string(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(String::from)
+}
+
+#[cfg(test)]
+mod accountability_tests {
+    use super::*;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    /// The accountability contract: a completed action's witnessed `outcome`
+    /// event carries WHO (per-instance LCT + session_id) and WHY (actor intent),
+    /// so concurrent same-type sessions are attributed per-instance and
+    /// distinguishable per-session — not smeared onto `plugin_id`.
+    #[tokio::test]
+    async fn outcome_event_witnesses_who_and_why() {
+        let (_dir, state) = test_state().await;
+
+        let connect = tool_connect(
+            &state,
+            &json!({"plugin_id": "claude-code", "host_agent": "test"}),
+        )
+        .await
+        .unwrap();
+        let sid = connect["sessionId"].as_str().unwrap().to_string();
+
+        let begin = tool_begin_action(
+            &state,
+            &json!({
+                "tool_name": "Bash", "target": "ls", "session_id": sid,
+                "intent": "list files for the user"
+            }),
+        )
+        .await
+        .unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+
+        tool_record_outcome(
+            &state,
+            &json!({"action_id": aid, "success": true, "magnitude": 0.3}),
+        )
+        .await
+        .unwrap();
+
+        let s = state.lock().await;
+        let outcome = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "outcome")
+            .expect("outcome must be witnessed");
+        let d = &outcome.event_data;
+        // WHO — durable per-instance LCT (trust grain) + session_id (audit grain).
+        assert!(
+            d["instance_lct"].as_str().unwrap().starts_with("lct:web4:member:"),
+            "instance_lct must be the durable per-instance LCT, got {:?}",
+            d["instance_lct"]
+        );
+        assert_eq!(
+            d["session_id"].as_str().unwrap(),
+            sid,
+            "session_id must distinguish the concurrent session"
+        );
+        // WHY — the actor's stated intent, captured at begin, stamped on the outcome.
+        assert_eq!(d["intent"].as_str().unwrap(), "list files for the user");
+    }
+
+    /// Unstated intent is recorded as `null`, never fabricated (transparent-stub).
+    #[tokio::test]
+    async fn absent_intent_is_null_not_fabricated() {
+        let (_dir, state) = test_state().await;
+        let connect = tool_connect(&state, &json!({"plugin_id":"claude-code","host_agent":"test"}))
+            .await.unwrap();
+        let sid = connect["sessionId"].as_str().unwrap().to_string();
+        let begin = tool_begin_action(&state, &json!({"tool_name":"Read","session_id":sid}))
+            .await.unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        tool_record_outcome(&state, &json!({"action_id":aid,"success":true})).await.unwrap();
+        let s = state.lock().await;
+        let outcome = s.recent_chain(20).into_iter()
+            .find(|e| e.event_type == "outcome").unwrap();
+        assert!(outcome.event_data["intent"].is_null(), "unstated intent must be null");
+    }
 }

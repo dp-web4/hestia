@@ -47,6 +47,10 @@ pub struct InFlightAction {
     /// query_policy to match against `command_patterns` and similar
     /// rules that need the full call context.
     pub parameters: Option<serde_json::Value>,
+    /// The actor's stated reason for the action (the accountability WHY),
+    /// captured at `begin_action` and stamped onto the witnessed `outcome`.
+    /// `None` = unstated (honest — never fabricated).
+    pub intent: Option<String>,
     pub started_at: DateTime<Utc>,
     pub chain_position: u64,
 }
