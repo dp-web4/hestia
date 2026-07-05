@@ -385,11 +385,12 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         .get(&action.session_id)
         .map(|sess| sess.plugin_id.clone())
         .unwrap_or_else(|| "unknown".to_string());
-    // A deny blocks before execution, so this is the ONLY witnessed record of a
-    // denied action — carry the full accountability WHO (instance + session) and
-    // WHY (actor intent) here, or they're lost for everything the gate blocks.
-    let instance_lct = s.member_lct(&plugin_id_for_chain);
     if evaluation.decision != crate::policy::PolicyDecision::Allow {
+        // A deny blocks before execution, so this is the ONLY witnessed record of a
+        // denied action — carry the full accountability WHO (instance + session)
+        // and WHY (actor intent) here, or they're lost for everything the gate
+        // blocks. Computed inside the gate branch so Allow decisions skip it.
+        let instance_lct = s.member_lct(&plugin_id_for_chain);
         let _ = s.append_chain(
             "policy_decision",
             json!({
@@ -880,5 +881,77 @@ mod accountability_tests {
         let outcome = s.recent_chain(20).into_iter()
             .find(|e| e.event_type == "outcome").unwrap();
         assert!(outcome.event_data["intent"].is_null(), "unstated intent must be null");
+    }
+
+    /// The load-bearing case: a **denied** action is blocked *before* it runs,
+    /// so no `outcome` event ever fires — the `policy_decision` entry is the
+    /// ONLY witnessed record of the blocked act. It must still carry WHO
+    /// (per-instance LCT + session_id) and WHY (actor intent), or accountability
+    /// is lost for everything the gate stops.
+    #[tokio::test]
+    async fn denied_policy_decision_witnesses_who_and_why() {
+        let (_dir, state) = test_state().await;
+        // Pin the safety preset so the destructive-command rule denies
+        // deterministically, independent of the fresh vault's default policy.
+        {
+            let mut s = state.lock().await;
+            s.policy_engine = crate::policy::PolicyEngine::new(
+                crate::policy::get_preset("safety").unwrap().config,
+            );
+        }
+
+        let connect = tool_connect(
+            &state,
+            &json!({"plugin_id": "claude-code", "host_agent": "test"}),
+        )
+        .await
+        .unwrap();
+        let sid = connect["sessionId"].as_str().unwrap().to_string();
+
+        // A destructive Bash command outside the scratch whitelist → deny.
+        // For Bash the gate matches against the full command (from parameters).
+        let begin = tool_begin_action(
+            &state,
+            &json!({
+                "tool_name": "Bash",
+                "target": "rm -rf /home/user/data",
+                "parameters": {"command": "rm -rf /home/user/data"},
+                "session_id": sid,
+                "intent": "clean up the workspace"
+            }),
+        )
+        .await
+        .unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+
+        tool_query_policy(&state, &json!({"action_id": aid}))
+            .await
+            .unwrap();
+
+        let s = state.lock().await;
+        let pd = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "policy_decision")
+            .expect("a deny must be witnessed as a policy_decision");
+        let d = &pd.event_data;
+        assert_eq!(
+            d["decision"].as_str().unwrap(),
+            "deny",
+            "precondition: the action must actually be denied"
+        );
+        // WHO — durable per-instance LCT (trust grain) + session_id (audit grain).
+        assert!(
+            d["instance_lct"].as_str().unwrap().starts_with("lct:web4:member:"),
+            "instance_lct must be the durable per-instance LCT, got {:?}",
+            d["instance_lct"]
+        );
+        assert_eq!(
+            d["session_id"].as_str().unwrap(),
+            sid,
+            "session_id must distinguish the concurrent session"
+        );
+        // WHY — the actor's intent survives on the only record a blocked act leaves.
+        assert_eq!(d["intent"].as_str().unwrap(), "clean up the workspace");
     }
 }
