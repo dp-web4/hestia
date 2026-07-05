@@ -19,10 +19,41 @@ use chrono::{DateTime, Utc};
 use web4_core::r6::{ReputationDelta, TensorDelta};
 use web4_trust_core::EntityTrust;
 
-/// v1 single-role placeholder. Real per-role scoping (RFC #403) needs the
-/// constellation-role definition; until then every constellation entity acts in
-/// one role, giving valid-but-degenerate `(subject, role)` pairs. See the design.
+/// The fail-closed default constellation role. An instance whose declared role
+/// isn't in the published set normalizes to this (never mints a novel role).
+/// `== "role:constellation:member"`, matching the hub's published default.
 pub const V1_CONSTELLATION_ROLE: &str = "role:constellation:member";
+
+/// The canonical constellation-role vocabulary, **mirrored** from the hub's
+/// `KNOWN_CONSTELLATION_ROLES` (published in `hub-lib/src/law.rs`, web4 #457).
+///
+/// Kept as a local mirror (not a hub-lib dep) so hestia's connect path stays
+/// dep-light; the hub list is the source of truth and `roles_match_hub_published`
+/// guards drift. A constellation role scopes an instance's reputation to its
+/// *capacity* — a separate namespace from society `KNOWN_ROLES` (sovereign /
+/// administrator / …), which type ATP / admission authority. The two don't
+/// overlap. `member` is the fail-closed fallback ([`V1_CONSTELLATION_ROLE`]).
+pub const KNOWN_CONSTELLATION_ROLES: &[&str] = &[
+    "role:constellation:interactive-dev", // a human-driven session
+    "role:constellation:mesh-worker",     // a hub-mesh-fired autonomous session
+    "role:constellation:reviewer",        // a review/verify session
+    "role:constellation:autonomous-timer", // a scheduled/cron session
+    V1_CONSTELLATION_ROLE,                 // fail-closed default
+];
+
+/// Normalize a self-declared role to a published constellation role, **fail-closed**:
+/// returns the matching `&'static str` from [`KNOWN_CONSTELLATION_ROLES`] if `declared`
+/// is in the set, else [`V1_CONSTELLATION_ROLE`]. An unknown/garbage/misspelled role
+/// (`mesh_worker` vs `mesh-worker`) collapses to the default rather than fragmenting
+/// the hub's `(subject, role)` fold — the same defense the hub applies at its edge.
+/// Returns a `&'static str` so the result drops straight into `role_lct`.
+pub fn normalize_constellation_role(declared: &str) -> &'static str {
+    KNOWN_CONSTELLATION_ROLES
+        .iter()
+        .copied()
+        .find(|&r| r == declared)
+        .unwrap_or(V1_CONSTELLATION_ROLE)
+}
 
 /// The default sink filename under `<hestia_home>`.
 pub const SINK_FILE: &str = "reputation-deltas.jsonl";
@@ -165,5 +196,41 @@ mod tests {
         let before = EntityTrust::new("plugin:x");
         let after = before.clone(); // nothing moved
         assert!(delta_from_change("plugin:x", &ctx(), &before, &after, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn known_roles_pass_through_unknown_fails_closed() {
+        // Every published role normalizes to itself...
+        for &r in KNOWN_CONSTELLATION_ROLES {
+            assert_eq!(normalize_constellation_role(r), r);
+        }
+        // ...and anything else collapses to the fail-closed default — including the
+        // exact fragmentation cases (underscore/prefix drift) the hub flagged.
+        assert_eq!(normalize_constellation_role("mesh_worker"), V1_CONSTELLATION_ROLE);
+        assert_eq!(normalize_constellation_role("mesh-worker"), V1_CONSTELLATION_ROLE);
+        assert_eq!(normalize_constellation_role("reviewer"), V1_CONSTELLATION_ROLE);
+        assert_eq!(normalize_constellation_role(""), V1_CONSTELLATION_ROLE);
+    }
+
+    #[test]
+    fn vocab_matches_hub_published_set() {
+        // Drift guard: this local mirror must stay byte-identical to the hub's
+        // published `KNOWN_CONSTELLATION_ROLES` (web4 #457). If the hub changes the
+        // set, this fails until the mirror is updated — the point is to notice.
+        let expected = [
+            "role:constellation:interactive-dev",
+            "role:constellation:mesh-worker",
+            "role:constellation:reviewer",
+            "role:constellation:autonomous-timer",
+            "role:constellation:member",
+        ];
+        assert_eq!(KNOWN_CONSTELLATION_ROLES, &expected);
+        // The default is the last entry and the canonical `member` role.
+        assert_eq!(V1_CONSTELLATION_ROLE, "role:constellation:member");
+        assert!(KNOWN_CONSTELLATION_ROLES.contains(&V1_CONSTELLATION_ROLE));
+        // All entries share the constellation namespace (never a bare society role).
+        for &r in KNOWN_CONSTELLATION_ROLES {
+            assert!(r.starts_with("role:constellation:"), "non-namespaced role {r}");
+        }
     }
 }
