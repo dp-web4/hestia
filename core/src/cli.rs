@@ -1007,9 +1007,10 @@ fn cmd_profile_present(home: &std::path::Path, tier: &str) -> AnyResult<()> {
 
 fn cmd_profile_push(home: &std::path::Path, target: &str) -> AnyResult<()> {
     // One vault handle for the whole command (hub connections + identity key).
-    let vault = open_vault(home)?;
+    // Mutable: a successful push lets us reconcile the local joined-state below.
+    let mut vault = open_vault(home)?;
     // Resolve the hub connection.
-    let hubs = HubStore::load(&vault)?;
+    let mut hubs = HubStore::load(&vault)?;
     let conn = if let Ok(id) = uuid::Uuid::parse_str(target) {
         hubs.find_by_id(id)
     } else {
@@ -1037,9 +1038,10 @@ fn cmd_profile_push(home: &std::path::Path, target: &str) -> AnyResult<()> {
 
     let hub_id = conn.hub_lct_id;
     let our_lct = conn.our_lct_id;
+    let url = conn.url.clone();
     let rest = abs_rest(&conn.url, &conn.rest_endpoint);
 
-    println!("Pushing {} field(s) to {} ...", fields.len(), conn.url);
+    println!("Pushing {} field(s) to {} ...", fields.len(), url);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let client = HubClient::new();
     let resp = rt.block_on(client.push_profile(&rest, hub_id, our_lct, &keypair, fields))?;
@@ -1050,6 +1052,27 @@ fn cmd_profile_push(home: &std::path::Path, target: &str) -> AnyResult<()> {
     }
     if let Some(kind) = resp.get("event_kind").and_then(|v| v.as_str()) {
         println!("  event:        {kind}");
+    }
+
+    // Reconcile local joined-state from this successful member-tier act. The hub
+    // only accepts a signed profile update from an *admitted* member, so a
+    // successful push is proof of membership — even when we joined async and a
+    // Sovereign approved us out-of-band, which never notifies the client. Flip
+    // the local `hubs.json` flag so `hub list` / `hub show` stop reporting a
+    // stale `pending` / `none joined`. (Sprout report 2026-06-27: joined-state
+    // diverges permanently after async approval, with no local reconcile path.)
+    if let Some(pos) = hubs.connections.iter()
+        .position(|c| c.hub_lct_id == hub_id && c.our_lct_id == our_lct)
+    {
+        let was_stale = !hubs.connections[pos].hubs_joined.contains(&hub_id);
+        hubs.connections[pos].last_seen = Some(chrono::Utc::now());
+        if was_stale {
+            hubs.connections[pos].hubs_joined.push(hub_id);
+        }
+        hubs.save(&mut vault)?;
+        if was_stale {
+            println!("  local state: reconciled — marked hub joined (was stale)");
+        }
     }
     Ok(())
 }
