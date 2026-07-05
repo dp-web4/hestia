@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use web4_core::r6::{ReputationDelta, TensorDelta};
+use web4_core::r6::{ReputationDelta, SovereignStrength, TensorDelta};
 use web4_trust_core::EntityTrust;
 
 /// v1 single-role placeholder. Real per-role scoping (RFC #403) needs the
@@ -95,6 +95,10 @@ pub fn delta_from_change(
     Some(ReputationDelta {
         subject_lct: subject_lct.to_string(),
         role_lct: ctx.role_lct.to_string(),
+        // Hestia's citizen emit is placeholder-signed (sovereign:phase1-placeholder),
+        // not hardware-bound — so the honest, fail-closed strength is Placeholder.
+        // Never fabricate Hardware; the hub gates on this to verify (instance,role).
+        sovereign_strength: SovereignStrength::Placeholder,
         action_type: ctx.action_type.to_string(),
         action_target: ctx.action_target.to_string(),
         action_id: ctx.action_id.to_string(),
