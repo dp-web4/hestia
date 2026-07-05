@@ -154,6 +154,34 @@ impl ServerState {
         format!("lct:web4:session:{}", hex)
     }
 
+    /// Resolve a durable **member LCT** for a plugin, for use as `subject_lct`
+    /// on an emitted `ReputationDelta` (the `repemit-1` LCT-mapping). Fail-closed:
+    /// returns `None` for any plugin that must not have reputation reported to the
+    /// hub — synthetic/test plugins and malformed ids — so no un-mappable
+    /// `plugin:` string ever reaches the emit path.
+    ///
+    /// The LCT is derived deterministically from the **durable** `plugin_id`
+    /// bound to hestia's sovereign LCT — mirroring `issue_soft_lct`, but keyed on
+    /// the stable plugin identity rather than the ephemeral session, so a given
+    /// member has ONE member LCT across all its sessions. The plugin never
+    /// supplies its own LCT: hestia mints it, so a member cannot forge a foreign
+    /// `subject`. For v1 the hub trusts hestia's sovereign to attest its own
+    /// constellation's members; v2's constellation-publish makes membership
+    /// independently attestable and removes that residual trust.
+    pub fn member_lct(&self, plugin_id: &str) -> Option<String> {
+        let id = plugin_id.trim();
+        if id.is_empty() || self.is_synthetic(id) {
+            return None; // fail-closed: no emit for unmapped / synthetic members
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"web4:member:");
+        hasher.update(id.as_bytes());
+        hasher.update(self.sovereign_lct.as_bytes());
+        let digest = hasher.finalize();
+        let hex: String = digest[..12].iter().map(|b| format!("{:02x}", b)).collect();
+        Some(format!("lct:web4:member:{hex}"))
+    }
+
     /// Append a chain entry under the sovereign LCT.
     pub fn append_chain(
         &self,
@@ -204,14 +232,23 @@ impl ServerState {
         let (before, after) =
             self.trust_store
                 .update_returning_prior(plugin_id, success, magnitude)?;
-        if let Some(delta) = crate::reputation::delta_from_change(
-            plugin_id,
-            ctx,
-            &before,
-            &after,
-            chrono::Utc::now(),
-        ) {
-            crate::reputation::log_delta(&self.reputation_sink(), &delta);
+        // LCT-mapping (sequence head, `repemit-1`): resolve the durable member
+        // LCT for `plugin_id` before building the delta, so `subject_lct` is a
+        // ground-truth member identity minted under hestia's sovereign — never
+        // the raw `plugin:` string. Fail-closed: an unmapped plugin (synthetic
+        // or malformed) yields `None` and emits NO delta, so test harnesses
+        // never pollute the hub's reputation view and no un-mappable id reaches
+        // the emit path. Local trust bookkeeping above still runs for everyone.
+        if let Some(subject_lct) = self.member_lct(plugin_id) {
+            if let Some(delta) = crate::reputation::delta_from_change(
+                &subject_lct,
+                ctx,
+                &before,
+                &after,
+                chrono::Utc::now(),
+            ) {
+                crate::reputation::log_delta(&self.reputation_sink(), &delta);
+            }
         }
         Ok(after)
     }
@@ -299,6 +336,58 @@ mod tests {
         let l2 = state.issue_soft_lct(sid);
         assert_eq!(l1, l2);
         assert!(l1.starts_with("lct:web4:session:"));
+    }
+
+    #[test]
+    fn member_lct_is_stable_per_plugin_and_distinct_across_plugins() {
+        let (_dir, state) = make_state();
+        // Same plugin -> same member LCT (stable across sessions), well-formed.
+        let a1 = state.member_lct("alice").unwrap();
+        let a2 = state.member_lct("alice").unwrap();
+        assert_eq!(a1, a2);
+        assert!(a1.starts_with("lct:web4:member:"));
+        // Distinct plugins -> distinct member LCTs; neither leaks the raw id.
+        let b = state.member_lct("bob").unwrap();
+        assert_ne!(a1, b);
+        assert!(!a1.contains("alice") && !b.contains("bob"));
+    }
+
+    #[test]
+    fn member_lct_fails_closed_for_synthetic_and_empty() {
+        let (_dir, mut state) = make_state();
+        assert!(state.mark_synthetic("conformance-runner"));
+        // Synthetic plugins never map -> no delta will be emitted for them.
+        assert!(state.member_lct("conformance-runner").is_none());
+        // Malformed / empty ids also fail closed.
+        assert!(state.member_lct("").is_none());
+        assert!(state.member_lct("   ").is_none());
+        // A real member still maps.
+        assert!(state.member_lct("claude-code").is_some());
+    }
+
+    #[test]
+    fn emit_uses_member_lct_not_raw_plugin_id_and_skips_synthetic() {
+        use std::io::BufRead;
+        let (_dir, mut state) = make_state();
+        // A real member: a moving outcome emits a delta whose subject_lct is the
+        // mapped member LCT, not the raw plugin_id.
+        state.apply_outcome("real-plugin", false, 0.7).unwrap();
+        let sink = state.reputation_sink();
+        let expected = state.member_lct("real-plugin").unwrap();
+        let lines: Vec<String> = std::fs::File::open(&sink)
+            .map(|f| std::io::BufReader::new(f).lines().map_while(Result::ok).collect())
+            .unwrap_or_default();
+        assert_eq!(lines.len(), 1, "one delta emitted for a real member");
+        assert!(lines[0].contains(&expected), "subject_lct is the member LCT");
+        assert!(!lines[0].contains("real-plugin"), "raw plugin_id never leaks");
+
+        // A synthetic member: trust still updates locally, but NO delta is emitted.
+        state.mark_synthetic("synthetic-plugin");
+        state.apply_outcome("synthetic-plugin", false, 0.7).unwrap();
+        let after: Vec<String> = std::fs::File::open(&sink)
+            .map(|f| std::io::BufReader::new(f).lines().map_while(Result::ok).collect())
+            .unwrap_or_default();
+        assert_eq!(after.len(), 1, "synthetic plugin emits no delta (fail-closed)");
     }
 
     #[test]
