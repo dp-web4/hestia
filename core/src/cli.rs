@@ -223,6 +223,20 @@ enum HubCmd {
         #[arg(long)]
         name: Option<String>,
     },
+
+    /// Choose which key signs member-tier acts (`profile push`) to this hub.
+    /// Default is the sealed vault identity; point it at a raw 32-byte Ed25519
+    /// channel key file when the hub pinned your operational channel key (a
+    /// non-interactive mesh watcher can't open the sealed vault). Omit
+    /// `--channel-key` to reset to the vault identity.
+    SetMemberKey {
+        /// Hub URL or connection UUID
+        target: String,
+        /// Path to a raw 32-byte Ed25519 channel key file (e.g.
+        /// ~/.web4/<name>/channel_key.bin). Omit to reset to the vault identity.
+        #[arg(long)]
+        channel_key: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -408,6 +422,9 @@ pub fn run() -> AnyResult<()> {
             HubCmd::Show { target } => cmd_hub_show(&home, &target),
             HubCmd::Disconnect { target } => cmd_hub_disconnect(&home, &target),
             HubCmd::Join { target, name } => cmd_hub_join(&home, &target, name),
+            HubCmd::SetMemberKey { target, channel_key } => {
+                cmd_hub_set_member_key(&home, &target, channel_key)
+            }
         },
         Command::Constellation(c) => match c {
             ConstellationCmd::Add { name, device_type } => cmd_constellation_add(&home, &name, &device_type),
@@ -1019,16 +1036,13 @@ fn cmd_profile_push(home: &std::path::Path, target: &str) -> AnyResult<()> {
         "not connected to {target} — run `hestia hub connect <url>` first"
     ))?;
 
-    // Load the member identity key from the vault (created by `hestia init --ai`).
-    // The hub must have this pubkey pinned (via membership) for the act to verify.
-    let secret_hex = vault.get("ai_identity_secret").map(|e| e.secret.clone())
-        .ok_or_else(|| anyhow::anyhow!(
-            "no member identity key in vault — run `hestia init --ai`, or self-add to the hub \
-             so it pins your pubkey (Sovereign-seeded members can't push from here yet)"
-        ))?;
-    let secret_bytes: [u8; 32] = hex_to_32(&secret_hex)
-        .ok_or_else(|| anyhow::anyhow!("ai_identity_secret is not 32-byte hex"))?;
-    let keypair = web4_core::crypto::KeyPair::from_secret_bytes(&secret_bytes);
+    // Sign with the key the hub *pinned* for this member. Normally that's the
+    // vault identity (`hestia init --ai`); for a member whose non-interactive
+    // mesh watcher pinned a raw channel key, it's that key instead — signing
+    // with the sealed identity would 401 (BadSignature) against the pinned
+    // channel key. The per-connection `member_key_source` records which.
+    let key_source = conn.member_key_source.clone();
+    let keypair = member_signing_keypair(&vault, &key_source)?;
 
     let profile = ProfileStore::load(&vault)?;
     let fields = profile.hub_fields();
@@ -1088,6 +1102,48 @@ fn abs_rest(base_url: &str, rest: &str) -> String {
     }
 }
 
+fn cmd_hub_set_member_key(
+    home: &std::path::Path,
+    target: &str,
+    channel_key: Option<String>,
+) -> AnyResult<()> {
+    use hestia::hub::MemberKeySource;
+    let mut vault = open_vault(home)?;
+    let mut hubs = HubStore::load(&vault)?;
+    let pos = if let Ok(id) = uuid::Uuid::parse_str(target) {
+        hubs.connections.iter().position(|c| c.id == id || c.hub_lct_id == id)
+    } else {
+        hubs.connections.iter().position(|c| c.url == target)
+    }.ok_or_else(|| anyhow::anyhow!(
+        "not connected to {target} — run `hestia hub connect <url>` first"
+    ))?;
+
+    let source = match channel_key {
+        Some(path) => {
+            // Validate now: the file must be a readable 32-byte seed, so a later
+            // `profile push` doesn't fail on a stale/typo'd path. Show the pubkey
+            // so the operator can confirm it equals the hub's pinned key.
+            let src = MemberKeySource::ChannelKeyFile { path: path.clone() };
+            let kp = member_signing_keypair(&vault, &src)?;
+            println!("Channel key loads OK — pubkey {}", kp.verifying_key().to_hex());
+            src
+        }
+        None => MemberKeySource::VaultIdentity,
+    };
+
+    hubs.connections[pos].member_key_source = source.clone();
+    hubs.save(&mut vault)?;
+    let url = &hubs.connections[pos].url;
+    match &source {
+        MemberKeySource::VaultIdentity =>
+            println!("Member key source for {url} → vault identity (ai_identity_secret)."),
+        MemberKeySource::ChannelKeyFile { path } => println!(
+            "Member key source for {url} → channel key file {path}.\n\
+             `hestia profile push` will now sign with it (must equal the hub's pinned key)."),
+    }
+    Ok(())
+}
+
 fn hex_to_32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 { return None; }
     let mut out = [0u8; 32];
@@ -1095,6 +1151,54 @@ fn hex_to_32(s: &str) -> Option<[u8; 32]> {
         out[i] = u8::from_str_radix(&s[i*2..i*2+2], 16).ok()?;
     }
     Some(out)
+}
+
+/// Expand a leading `~/` (or bare `~`) to `$HOME`. Raw key-file paths are
+/// user-supplied and often written with a tilde; `std::fs` won't expand it.
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::Path::new(&home).join(rest);
+        }
+    } else if path == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home);
+        }
+    }
+    std::path::PathBuf::from(path)
+}
+
+/// Resolve the keypair that signs member-tier acts to a hub, per its
+/// `member_key_source`. `VaultIdentity` reads `ai_identity_secret` from the
+/// sealed vault (default); `ChannelKeyFile` reads a raw 32-byte Ed25519 seed —
+/// byte-for-byte the same format the mesh `channel_client` loads, so the CLI and
+/// the watcher present the *same* pinned key to the hub.
+fn member_signing_keypair(
+    vault: &hestia::vault::Vault,
+    source: &hestia::hub::MemberKeySource,
+) -> AnyResult<web4_core::crypto::KeyPair> {
+    use hestia::hub::MemberKeySource;
+    match source {
+        MemberKeySource::VaultIdentity => {
+            let secret_hex = vault.get("ai_identity_secret").map(|e| e.secret.clone())
+                .ok_or_else(|| anyhow::anyhow!(
+                    "no member identity key in vault — run `hestia init --ai`, or self-add to the hub \
+                     so it pins your pubkey (Sovereign-seeded members can't push from here yet)"
+                ))?;
+            let secret_bytes = hex_to_32(&secret_hex)
+                .ok_or_else(|| anyhow::anyhow!("ai_identity_secret is not 32-byte hex"))?;
+            Ok(web4_core::crypto::KeyPair::from_secret_bytes(&secret_bytes))
+        }
+        MemberKeySource::ChannelKeyFile { path } => {
+            let p = expand_tilde(path);
+            let raw = std::fs::read(&p)
+                .with_context(|| format!("reading channel key file {}", p.display()))?;
+            let seed: [u8; 32] = raw.as_slice().try_into().map_err(|_| anyhow::anyhow!(
+                "channel key file {} must be exactly 32 bytes (got {})", p.display(), raw.len()
+            ))?;
+            Ok(web4_core::crypto::KeyPair::from_secret_bytes(&seed))
+        }
+    }
 }
 
 // ---- constellation commands -------------------------------------------------
@@ -1309,6 +1413,7 @@ fn cmd_hub_connect(home: &std::path::Path, url: &str) -> AnyResult<()> {
         // absolute so request builders always have a base.
         rest_endpoint: abs_rest(url, &info.endpoints.rest),
         hubs_joined: vec![],
+        member_key_source: Default::default(),
     };
 
     store.connections.push(conn);
@@ -1531,5 +1636,73 @@ mod serve_guard_tests {
         assert!(!bind_is_loopback("[::]:7711"));
         assert!(!bind_is_loopback("192.168.1.20:7711"));
         assert!(!bind_is_loopback("100.75.141.17:7711")); // tailnet IP
+    }
+}
+
+#[cfg(test)]
+mod member_key_source_tests {
+    use super::{expand_tilde, member_signing_keypair};
+    use hestia::hub::MemberKeySource;
+    use hestia::vault::{Vault, VaultEntry};
+
+    // A fixed 32-byte Ed25519 seed → a deterministic pubkey we can assert on.
+    const SEED: [u8; 32] = [7u8; 32];
+
+    fn expected_pubkey() -> String {
+        web4_core::crypto::KeyPair::from_secret_bytes(&SEED).verifying_key().to_hex()
+    }
+
+    fn tmp_vault(dir: &std::path::Path) -> Vault {
+        Vault::init_force(dir.join("vault.enc"), "test-pass".into()).unwrap()
+    }
+
+    #[test]
+    fn channel_key_file_loads_same_pubkey_the_mesh_watcher_presents() {
+        // The mesh `channel_client` reads a raw 32-byte seed and does
+        // `KeyPair::from_secret_bytes`. hestia must derive the SAME pubkey, or
+        // `profile push` signs with a different key than the hub pinned → 401.
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("channel_key.bin");
+        std::fs::write(&key_path, SEED).unwrap();
+        let vault = tmp_vault(tmp.path());
+
+        let src = MemberKeySource::ChannelKeyFile { path: key_path.to_string_lossy().into() };
+        let kp = member_signing_keypair(&vault, &src).unwrap();
+        assert_eq!(kp.verifying_key().to_hex(), expected_pubkey());
+    }
+
+    #[test]
+    fn vault_identity_loads_from_ai_identity_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut vault = tmp_vault(tmp.path());
+        let seed_hex: String = SEED.iter().map(|b| format!("{b:02x}")).collect();
+        vault.upsert(VaultEntry::new("ai_identity_secret", seed_hex)).unwrap();
+
+        let kp = member_signing_keypair(&vault, &MemberKeySource::VaultIdentity).unwrap();
+        assert_eq!(kp.verifying_key().to_hex(), expected_pubkey());
+    }
+
+    #[test]
+    fn channel_key_file_wrong_size_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("short.bin");
+        std::fs::write(&key_path, [1u8; 16]).unwrap(); // not 32 bytes
+        let vault = tmp_vault(tmp.path());
+
+        let src = MemberKeySource::ChannelKeyFile { path: key_path.to_string_lossy().into() };
+        let err = match member_signing_keypair(&vault, &src) {
+            Ok(_) => panic!("expected a size error for a 16-byte key file"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("32 bytes"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn expand_tilde_expands_leading_home() {
+        std::env::set_var("HOME", "/home/tester");
+        assert_eq!(expand_tilde("~/.web4/x/channel_key.bin"),
+                   std::path::PathBuf::from("/home/tester/.web4/x/channel_key.bin"));
+        assert_eq!(expand_tilde("/abs/path"), std::path::PathBuf::from("/abs/path"));
+        assert_eq!(expand_tilde("~"), std::path::PathBuf::from("/home/tester"));
     }
 }
