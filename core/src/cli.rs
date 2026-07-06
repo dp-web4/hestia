@@ -1648,8 +1648,21 @@ mod member_key_source_tests {
     // A fixed 32-byte Ed25519 seed → a deterministic pubkey we can assert on.
     const SEED: [u8; 32] = [7u8; 32];
 
+    // Independently-computed golden vector: the RFC-8032 Ed25519 public key for
+    // `SEED`, produced OUTSIDE this crate (python `cryptography`:
+    // `Ed25519PrivateKey.from_private_bytes(bytes([7]*32)).public_key()...raw().hex()`).
+    // Asserting against this literal — not against `from_secret_bytes(SEED)` — is
+    // what makes the parity tests non-tautological: a divergence between
+    // web4_core's derivation and the mesh `channel_client`'s (the exact failure
+    // that would resurface the profile-push 401) is a divergence from the Ed25519
+    // standard, and this constant pins the standard. The real end-to-end proof is
+    // Sprout's live fixture (channel_key.bin → e367397c… == the hub's pinned key);
+    // its seed is secret, so this test uses a non-secret seed with the same math.
+    const EXPECTED_PUBKEY: &str =
+        "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c";
+
     fn expected_pubkey() -> String {
-        web4_core::crypto::KeyPair::from_secret_bytes(&SEED).verifying_key().to_hex()
+        EXPECTED_PUBKEY.to_string()
     }
 
     fn tmp_vault(dir: &std::path::Path) -> Vault {
