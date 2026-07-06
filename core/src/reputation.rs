@@ -19,10 +19,37 @@ use chrono::{DateTime, Utc};
 use web4_core::r6::{ReputationDelta, SovereignStrength, TensorDelta};
 use web4_trust_core::EntityTrust;
 
-/// v1 single-role placeholder. Real per-role scoping (RFC #403) needs the
-/// constellation-role definition; until then every constellation entity acts in
-/// one role, giving valid-but-degenerate `(subject, role)` pairs. See the design.
-pub const V1_CONSTELLATION_ROLE: &str = "role:constellation:member";
+/// Canonical constellation-role vocabulary (#403 capacity scoping). MUST stay
+/// byte-identical to hub-lib's `KNOWN_CONSTELLATION_ROLES` (web4 #457) — the fold
+/// keys reputation on `role_lct`, so a divergent string (`mesh-worker` vs
+/// `mesh_worker`) fragments the bucket exactly like `plugin_id` does one level up.
+/// The drift-guard test below pins this set; hub-lib pins the same from its side,
+/// so the seam stays observable — change one, both go red.
+pub const KNOWN_CONSTELLATION_ROLES: &[&str] = &[
+    "role:constellation:interactive-dev",
+    "role:constellation:mesh-worker",
+    "role:constellation:reviewer",
+    "role:constellation:autonomous-timer",
+    "role:constellation:member",
+];
+
+/// The fail-closed default capacity — an unknown/unstated role normalizes here
+/// rather than minting a novel role subject (matches hub-lib `DEFAULT_...`).
+pub const DEFAULT_CONSTELLATION_ROLE: &str = "role:constellation:member";
+
+/// Kept as an alias for the default (pre-#457 call sites).
+pub const V1_CONSTELLATION_ROLE: &str = DEFAULT_CONSTELLATION_ROLE;
+
+/// Map a declared role to the canonical published set, failing closed to
+/// [`DEFAULT_CONSTELLATION_ROLE`] on any unpublished value. Mirrors hub-lib's
+/// `normalize_constellation_role`; case-sensitive canonical lowercase.
+pub fn normalize_constellation_role(declared: &str) -> &'static str {
+    KNOWN_CONSTELLATION_ROLES
+        .iter()
+        .copied()
+        .find(|r| *r == declared)
+        .unwrap_or(DEFAULT_CONSTELLATION_ROLE)
+}
 
 /// The default sink filename under `<hestia_home>`.
 pub const SINK_FILE: &str = "reputation-deltas.jsonl";
@@ -104,11 +131,10 @@ pub fn delta_from_change(
         v3_delta,
         contributing_factors: Vec::new(),
         witnesses: Vec::new(),
-        // Stopgap so hestia compiles against web4-core after #457 added this field.
-        // `Placeholder` is the honest "not yet computed" value; the meaningful
-        // population (declared role → strength, via the connect-handshake threading)
-        // is the gated follow-up Legion scoped in hestia#11.
-        sovereign_strength: SovereignStrength::default(),
+        // Provenance: hestia's sovereign is a placeholder (§7 of the identity
+        // design), so the hub tags this bucket member-attested-not-hub-verified.
+        // Flips to Hardware when the TPM sovereign lands (P4).
+        sovereign_strength: SovereignStrength::Placeholder,
         timestamp: ts,
     })
 }
@@ -141,6 +167,48 @@ mod tests {
             action_id: "a1",
             reason: "gate:deny",
         }
+    }
+
+    /// Drift-guard: the constellation-role vocabulary MUST stay byte-identical to
+    /// hub-lib's `KNOWN_CONSTELLATION_ROLES` (web4 #457) — else the fold fragments
+    /// reputation by role. hub-lib pins the same list from its side; change either
+    /// and its test goes red, keeping the seam observable.
+    #[test]
+    fn constellation_role_vocabulary_matches_hub_lib_canonical_set() {
+        assert_eq!(
+            KNOWN_CONSTELLATION_ROLES,
+            &[
+                "role:constellation:interactive-dev",
+                "role:constellation:mesh-worker",
+                "role:constellation:reviewer",
+                "role:constellation:autonomous-timer",
+                "role:constellation:member",
+            ]
+        );
+        assert_eq!(DEFAULT_CONSTELLATION_ROLE, "role:constellation:member");
+    }
+
+    #[test]
+    fn normalize_role_passes_known_and_fails_closed_on_unknown() {
+        assert_eq!(
+            normalize_constellation_role("role:constellation:mesh-worker"),
+            "role:constellation:mesh-worker"
+        );
+        // underscore typo / novel string → fail closed to the default, never minted
+        assert_eq!(
+            normalize_constellation_role("role:constellation:mesh_worker"),
+            DEFAULT_CONSTELLATION_ROLE
+        );
+        assert_eq!(normalize_constellation_role(""), DEFAULT_CONSTELLATION_ROLE);
+    }
+
+    #[test]
+    fn delta_carries_placeholder_sovereign_strength() {
+        let before = EntityTrust::new("plugin:x");
+        let mut after = before.clone();
+        after.update_from_outcome(false, 0.5);
+        let d = delta_from_change("plugin:x", &ctx(), &before, &after, Utc::now()).unwrap();
+        assert_eq!(d.sovereign_strength, SovereignStrength::Placeholder);
     }
 
     #[test]

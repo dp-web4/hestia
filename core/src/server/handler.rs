@@ -185,6 +185,11 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     let host_agent_version = optional_string(args, "host_agent_version");
     let requested_role =
         optional_string(args, "requested_role").unwrap_or_else(|| "citizen".to_string());
+    // The #403 capacity — normalized fail-closed to the published constellation set.
+    let constellation_role = crate::reputation::normalize_constellation_role(
+        optional_string(args, "role").as_deref().unwrap_or(""),
+    )
+    .to_string();
     let synthetic = args
         .get("synthetic")
         .and_then(|v| v.as_bool())
@@ -201,6 +206,7 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         host_agent,
         host_agent_version,
         assigned_role: requested_role.clone(),
+        constellation_role,
         soft_lct: soft_lct.clone(),
         connected_at: Utc::now(),
     };
@@ -286,14 +292,20 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
         }
     };
 
-    let plugin_id = s
+    let (plugin_id, role_lct) = s
         .sessions
         .get(&action.session_id)
-        .map(|sess| sess.plugin_id.clone())
-        .unwrap_or_else(|| "anonymous".to_string());
-    // Accountability WHO: the durable per-instance LCT (trust grain) + the
-    // session_id (audit grain), so concurrent same-type sessions are attributed
-    // per-instance and distinguishable per-session — not smeared onto plugin_id.
+        .map(|sess| (sess.plugin_id.clone(), sess.constellation_role.clone()))
+        .unwrap_or_else(|| {
+            (
+                "anonymous".to_string(),
+                crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
+            )
+        });
+    // Accountability WHO: the durable per-instance LCT + the #403 capacity
+    // (role_lct) — the trust grain — plus session_id (audit grain), so concurrent
+    // same-type sessions are attributed per-(instance, role) and distinguishable
+    // per-session, not smeared onto plugin_id.
     let instance_lct = s.member_lct(&plugin_id);
 
     let entry = s.append_chain(
@@ -307,6 +319,7 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
             "error": error,
             "plugin_id": plugin_id,
             "instance_lct": instance_lct,
+            "role_lct": role_lct,
             "session_id": action.session_id,
             "intent": action.intent,
         }),
@@ -314,7 +327,7 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
 
     let rep_action_id = action_id.to_string();
     let rep_ctx = crate::reputation::RepContext {
-        role_lct: crate::reputation::V1_CONSTELLATION_ROLE,
+        role_lct: &role_lct,
         action_type: "tool_execution",
         action_target: &action.tool_name,
         action_id: &rep_action_id,
@@ -380,16 +393,21 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     // outcome would otherwise never reach the chain. This is the
     // structural place to capture them: any policy gate flow that
     // calls query_policy gets witnessed automatically.
-    let plugin_id_for_chain = s
+    let (plugin_id_for_chain, role_lct) = s
         .sessions
         .get(&action.session_id)
-        .map(|sess| sess.plugin_id.clone())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map(|sess| (sess.plugin_id.clone(), sess.constellation_role.clone()))
+        .unwrap_or_else(|| {
+            (
+                "unknown".to_string(),
+                crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
+            )
+        });
     if evaluation.decision != crate::policy::PolicyDecision::Allow {
         // A deny blocks before execution, so this is the ONLY witnessed record of a
-        // denied action — carry the full accountability WHO (instance + session)
-        // and WHY (actor intent) here, or they're lost for everything the gate
-        // blocks. Computed inside the gate branch so Allow decisions skip it.
+        // denied action — carry the full accountability WHO (instance + role +
+        // session) and WHY (actor intent) here, or they're lost for everything the
+        // gate blocks. Computed inside the gate branch so Allow decisions skip it.
         let instance_lct = s.member_lct(&plugin_id_for_chain);
         let _ = s.append_chain(
             "policy_decision",
@@ -399,6 +417,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 "target": target,
                 "plugin_id": plugin_id_for_chain,
                 "instance_lct": instance_lct,
+                "role_lct": role_lct,
                 "session_id": action.session_id,
                 "intent": action.intent,
                 "decision": evaluation.decision.as_str(),
@@ -432,7 +451,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
             // to the local bridge sink (the first source of hestia->hub reputation).
             let reason = format!("gate:{}", evaluation.decision.as_str());
             let rep_ctx = crate::reputation::RepContext {
-                role_lct: crate::reputation::V1_CONSTELLATION_ROLE,
+                role_lct: &role_lct,
                 action_type: "policy_gate",
                 action_target: &action.tool_name,
                 action_id: &action_id_str,
@@ -881,6 +900,27 @@ mod accountability_tests {
         let outcome = s.recent_chain(20).into_iter()
             .find(|e| e.event_type == "outcome").unwrap();
         assert!(outcome.event_data["intent"].is_null(), "unstated intent must be null");
+    }
+
+    /// A declared constellation role flows through `connect` (normalized) onto the
+    /// witnessed event's `role_lct` — trust + audit scoped per capacity (#403).
+    #[tokio::test]
+    async fn declared_role_flows_to_witnessed_event() {
+        let (_dir, state) = test_state().await;
+        let connect = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"test","role":"role:constellation:mesh-worker"}),
+        ).await.unwrap();
+        let sid = connect["sessionId"].as_str().unwrap().to_string();
+        let begin = tool_begin_action(&state, &json!({"tool_name":"Bash","session_id":sid}))
+            .await.unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        tool_record_outcome(&state, &json!({"action_id":aid,"success":true})).await.unwrap();
+        let s = state.lock().await;
+        let outcome = s.recent_chain(20).into_iter()
+            .find(|e| e.event_type == "outcome").unwrap();
+        assert_eq!(outcome.event_data["role_lct"], "role:constellation:mesh-worker");
+        // an unknown role would fail closed to the default (normalize covers that unit-side)
     }
 
     /// The load-bearing case: a **denied** action is blocked *before* it runs,

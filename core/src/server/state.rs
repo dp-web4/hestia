@@ -31,7 +31,12 @@ pub struct Session {
     pub plugin_version: Option<String>,
     pub host_agent: String,
     pub host_agent_version: Option<String>,
+    /// Trust *tier* (citizen/…) — distinct from the constellation role below.
     pub assigned_role: String,
+    /// The #403 *capacity* the session acts in (a canonical `role:constellation:*`
+    /// from the published set), used as `role_lct` on witnessed events + emitted
+    /// reputation deltas. Declared at `connect`, normalized fail-closed.
+    pub constellation_role: String,
     pub soft_lct: String,
     pub connected_at: DateTime<Utc>,
 }
@@ -433,6 +438,7 @@ mod tests {
                 host_agent: "x".into(),
                 host_agent_version: None,
                 assigned_role: "citizen".into(),
+                constellation_role: "role:constellation:member".into(),
                 soft_lct: "lct:test:a".into(),
                 connected_at: Utc::now(),
             },
@@ -446,6 +452,7 @@ mod tests {
                 host_agent: "x".into(),
                 host_agent_version: None,
                 assigned_role: "citizen".into(),
+                constellation_role: "role:constellation:member".into(),
                 soft_lct: "lct:test:b".into(),
                 connected_at: Utc::now() + chrono::Duration::seconds(1),
             },
