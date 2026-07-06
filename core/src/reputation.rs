@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use web4_core::r6::{ReputationDelta, TensorDelta};
+use web4_core::r6::{ReputationDelta, SovereignStrength, TensorDelta};
 use web4_trust_core::EntityTrust;
 
 /// v1 single-role placeholder. Real per-role scoping (RFC #403) needs the
@@ -102,6 +102,11 @@ pub fn delta_from_change(
         reason: ctx.reason.to_string(),
         t3_delta,
         v3_delta,
+        // web4 #457: interim `Placeholder` populate (the serde/fail-closed
+        // default). Threading a real per-emitter strength through `connect`
+        // (canonical `role_lct` + hardware attestation) is the larger queued
+        // C-series follow-up; this only unblocks the path-dep field addition.
+        sovereign_strength: SovereignStrength::default(),
         contributing_factors: Vec::new(),
         witnesses: Vec::new(),
         timestamp: ts,
