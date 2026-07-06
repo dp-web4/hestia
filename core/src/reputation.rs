@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use web4_core::r6::{ReputationDelta, TensorDelta};
+use web4_core::r6::{ReputationDelta, SovereignStrength, TensorDelta};
 use web4_trust_core::EntityTrust;
 
 /// v1 single-role placeholder. Real per-role scoping (RFC #403) needs the
@@ -104,6 +104,11 @@ pub fn delta_from_change(
         v3_delta,
         contributing_factors: Vec::new(),
         witnesses: Vec::new(),
+        // Stopgap so hestia compiles against web4-core after #457 added this field.
+        // `Placeholder` is the honest "not yet computed" value; the meaningful
+        // population (declared role → strength, via the connect-handshake threading)
+        // is the gated follow-up Legion scoped in hestia#11.
+        sovereign_strength: SovereignStrength::default(),
         timestamp: ts,
     })
 }
