@@ -205,6 +205,29 @@ impl SignedEnvelope {
     }
 }
 
+/// Which key signs member-tier acts (join, `profile push`) to a given hub.
+///
+/// The hub pins exactly **one** verifying key per member LCT, and every envelope
+/// that member signs verifies against it (`web4/hub` `MapResolver`: one `Lct`
+/// per `signer_lct_id`, `insert` overwrites). A member whose non-interactive mesh
+/// watcher must use a raw on-disk *channel* key — a systemd service can't open
+/// the passphrase-sealed vault — has that **channel key** pinned. So its
+/// interactive acts must sign with the *same* channel key, not the sealed vault
+/// identity, or the hub returns `BadSignature`/401. Defaulting to the vault
+/// identity keeps normal members (who pinned `ai_identity`) unchanged.
+/// See forum/legion-to-sprout-reconcile-decision-a-*-2026-07-05.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MemberKeySource {
+    /// Sign with `ai_identity_secret` from the sealed vault — the key
+    /// `hestia hub join` pins for a normal member. Default.
+    #[default]
+    VaultIdentity,
+    /// Sign with a raw 32-byte Ed25519 seed file — the operational channel key
+    /// pinned for a member running a non-interactive mesh watcher.
+    ChannelKeyFile { path: String },
+}
+
 /// A connected hub — persisted locally.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HubConnection {
@@ -218,6 +241,10 @@ pub struct HubConnection {
     pub rest_endpoint: String,
     #[serde(default)]
     pub hubs_joined: Vec<Uuid>,
+    /// Which key signs member-tier acts to this hub (defaults to the sealed
+    /// vault identity; backward-compatible for connections saved before this).
+    #[serde(default)]
+    pub member_key_source: MemberKeySource,
 }
 
 /// Multi-hub connection store — persisted at `~/.hestia/hubs.json`.
@@ -682,12 +709,14 @@ mod tests {
             api_version: "v1".into(),
             rest_endpoint: "https://hub.example.com/v1".into(),
             hubs_joined: vec![],
+            member_key_source: Default::default(),
         });
 
         let json = serde_json::to_string(&store).unwrap();
         let recovered: HubStore = serde_json::from_str(&json).unwrap();
         assert_eq!(recovered.connections.len(), 1);
         assert_eq!(recovered.connections[0].url, "https://hub.example.com");
+        assert_eq!(recovered.connections[0].member_key_source, MemberKeySource::VaultIdentity);
     }
 
     #[test]
@@ -722,6 +751,7 @@ mod tests {
             api_version: "v1".into(),
             rest_endpoint: "https://hub.example.com/v1".into(),
             hubs_joined: vec![],
+            member_key_source: Default::default(),
         });
 
         assert!(store.find_by_url("https://hub.example.com").is_some());

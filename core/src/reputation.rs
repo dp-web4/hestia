@@ -102,6 +102,11 @@ pub fn delta_from_change(
         reason: ctx.reason.to_string(),
         t3_delta,
         v3_delta,
+        // web4 #457: interim `Placeholder` populate (the serde/fail-closed
+        // default). Threading a real per-emitter strength through `connect`
+        // (canonical `role_lct` + hardware attestation) is the larger queued
+        // C-series follow-up; this only unblocks the path-dep field addition.
+        sovereign_strength: SovereignStrength::default(),
         contributing_factors: Vec::new(),
         witnesses: Vec::new(),
         // Stopgap so hestia compiles against web4-core after #457 added this field.
