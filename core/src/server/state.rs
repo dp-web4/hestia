@@ -265,9 +265,17 @@ impl ServerState {
         magnitude: f64,
         ctx: &crate::reputation::RepContext,
     ) -> Result<EntityTrust> {
+        // Trust accrues to the #403 (instance, role) grain, NOT the plugin type.
+        // Before this, a mesh-worker's failures and an interactive session's
+        // successes both landed on one `plugin:claude-code` entity — the deltas
+        // were role-scoped but the trust generating them was not. Keying the
+        // store on the (instance_lct, role_lct) pair closes that seam: a role's
+        // reputation is its own, and can't be diluted or poisoned by another
+        // capacity of the same instance.
+        let trust_key = self.trust_entity_key(plugin_id, ctx.role_lct);
         let (before, after) =
             self.trust_store
-                .update_returning_prior(plugin_id, success, magnitude)?;
+                .update_returning_prior(&trust_key, success, magnitude)?;
         // LCT-mapping (sequence head, `repemit-1`): resolve the durable member
         // LCT for `plugin_id` before building the delta, so `subject_lct` is a
         // ground-truth member identity minted under hestia's sovereign — never
@@ -295,10 +303,33 @@ impl ServerState {
         self.home.join(crate::reputation::SINK_FILE)
     }
 
-    pub fn trust(&self, plugin_id: &str) -> EntityTrust {
+    /// The durable trust-store key: the #403 `(instance_lct, role_lct)` grain.
+    /// A mapped plugin keys on `<instance_lct>#<role_lct>` — the (subject, role)
+    /// pair the hub fold also scopes on. An unmapped / synthetic plugin (no member
+    /// LCT — it never emits) still gets a role-scoped local key so bookkeeping
+    /// stays coherent. Old `plugin:<id>` trust blobs are legacy: they carried the
+    /// degenerate all-sessions-smeared-together grain, so role-scoped trust starts
+    /// fresh here rather than migrating that saturated history forward.
+    pub fn trust_entity_key(&self, plugin_id: &str, role_lct: &str) -> String {
+        match self.member_lct(plugin_id) {
+            Some(instance_lct) => format!("{instance_lct}#{role_lct}"),
+            None => format!("plugin:{plugin_id}#{role_lct}"),
+        }
+    }
+
+    /// Read the trust for a specific `(instance, role)` grain.
+    pub fn trust_for_role(&self, plugin_id: &str, role_lct: &str) -> EntityTrust {
+        let key = self.trust_entity_key(plugin_id, role_lct);
         self.trust_store
-            .get(plugin_id)
-            .unwrap_or_else(|_| EntityTrust::new(format!("plugin:{plugin_id}")))
+            .get(&key)
+            .unwrap_or_else(|_| EntityTrust::new(key))
+    }
+
+    /// Read trust for a plugin in the default (member) capacity. Retained for the
+    /// non-role-aware call sites (dashboard/tests); role-aware reads should use
+    /// [`trust_for_role`].
+    pub fn trust(&self, plugin_id: &str) -> EntityTrust {
+        self.trust_for_role(plugin_id, crate::reputation::DEFAULT_CONSTELLATION_ROLE)
     }
 
     pub fn trust_count(&self) -> usize {
@@ -339,6 +370,49 @@ mod tests {
         let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
         let state = ServerState::open(vault, dir.path(), "p").unwrap();
         (dir, state)
+    }
+
+    fn ctx_for(role: &'static str) -> crate::reputation::RepContext<'static> {
+        crate::reputation::RepContext {
+            role_lct: role,
+            action_type: "outcome",
+            action_target: "",
+            action_id: "",
+            reason: "outcome:failure",
+        }
+    }
+
+    /// The re-key: one instance acting in TWO roles accrues trust INDEPENDENTLY.
+    /// A mesh-worker's failures must not dilute the interactive-dev reputation of
+    /// the same plugin instance (the seam this closes).
+    #[test]
+    fn trust_is_scoped_per_instance_role_not_per_plugin() {
+        let (_dir, state) = make_state();
+        let mw = "role:constellation:mesh-worker";
+        let dev = "role:constellation:interactive-dev";
+        // Same plugin, mesh-worker role: two failures.
+        state.apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw)).unwrap();
+        let mw_trust = state.apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw)).unwrap();
+        // Same plugin, interactive-dev role: one success.
+        let dev_trust = state
+            .apply_outcome_ctx("claude-code", true, 0.8, &crate::reputation::RepContext {
+                reason: "outcome:success", ..ctx_for(dev)
+            })
+            .unwrap();
+        // Distinct entities: the two roles carry different entity_ids + scores.
+        assert_ne!(mw_trust.entity_id, dev_trust.entity_id);
+        assert!(mw_trust.entity_id.ends_with(mw), "got {}", mw_trust.entity_id);
+        assert!(dev_trust.entity_id.ends_with(dev), "got {}", dev_trust.entity_id);
+        // The mesh-worker's failures did not touch the dev role's trust.
+        assert!(dev_trust.talent() > mw_trust.talent(),
+            "dev(success) {} must outrank mesh-worker(2 failures) {}",
+            dev_trust.talent(), mw_trust.talent());
+        // Same instance underlies both (the shared member LCT prefix).
+        let inst = state.member_lct("claude-code").unwrap();
+        assert!(mw_trust.entity_id.starts_with(&inst));
+        assert!(dev_trust.entity_id.starts_with(&inst));
+        // Re-reading by role recovers the same accrued entity.
+        assert_eq!(state.trust_for_role("claude-code", mw).entity_id, mw_trust.entity_id);
     }
 
     #[test]

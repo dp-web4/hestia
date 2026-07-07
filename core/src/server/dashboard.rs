@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use super::state::ServerState;
+use web4_trust_core::EntityTrust;
 
 /// The active policy setting, surfaced so the dashboard can show which gate is
 /// in force (e.g. "safety, enforcing" vs "audit-only, observing").
@@ -178,20 +179,32 @@ impl ServerState {
         let mut last_hour = 0u64;
         // Per-plugin "last seen" timestamps, used to decide which
         // orchestrators are "active" (= seen in the last hour).
-        let mut last_seen_per_plugin: std::collections::HashMap<String, chrono::DateTime<Utc>> =
-            std::collections::HashMap::new();
+        // Active trust entities in the window, keyed by the trust-store composite
+        // `(instance, role)` key with the human plugin_id + role retained for
+        // display + the synthetic filter. The key is recomputed via
+        // `trust_entity_key` (not read from the event's `instance_lct`), so it
+        // matches storage exactly even for old events that predate that field.
+        let mut active_entities: std::collections::HashMap<
+            String,
+            (chrono::DateTime<Utc>, String, String),
+        > = std::collections::HashMap::new();
 
         for e in &stats_window {
-            // Track per-plugin last-seen across any event that carries
-            // a plugin_id. Outcomes are the main signal now that
-            // session_started is no longer written; historical chains
-            // may still contain session_started entries with plugin_id.
+            // Track per-(instance, role) last-seen across any event that carries a
+            // plugin_id. Outcomes are the main signal now that session_started is
+            // no longer written; historical chains may still contain older entries.
             if let Some(pid) = e.event_data.get("plugin_id").and_then(|v| v.as_str()) {
-                let entry = last_seen_per_plugin
-                    .entry(pid.to_string())
-                    .or_insert(e.timestamp);
-                if e.timestamp > *entry {
-                    *entry = e.timestamp;
+                let role = e
+                    .event_data
+                    .get("role_lct")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE);
+                let key = self.trust_entity_key(pid, role);
+                let entry = active_entities
+                    .entry(key)
+                    .or_insert((e.timestamp, pid.to_string(), role.to_string()));
+                if e.timestamp > entry.0 {
+                    entry.0 = e.timestamp;
                 }
             }
             // A policy denial blocks the tool before it runs, so it never
@@ -241,22 +254,24 @@ impl ServerState {
         by_tool_vec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let success_rate = if total == 0 { 0.0 } else { succ as f64 / total as f64 };
 
-        // Build the trust list, but only for plugins that have been active
-        // within the last hour AND are not flagged synthetic. Drops both
-        // stale orchestrators (cursor, openclaw seeds) and test harnesses
-        // (conformance-runner, fuzzers) from the operator-facing view.
-        let known_plugins = self.trust_store.list().unwrap_or_default();
-        let trust: Vec<TrustView> = known_plugins
-            .iter()
-            .filter(|pid| !self.is_synthetic(pid))
-            .filter(|pid| {
-                last_seen_per_plugin
-                    .get(*pid)
-                    .map(|ts| *ts > one_hour_ago)
-                    .unwrap_or(false)
-            })
-            .map(|pid| {
-                let t = self.trust(pid);
+        // Build the trust list per active (instance, role) entity — only those
+        // active within the last hour AND not flagged synthetic. Drops stale
+        // orchestrators and test harnesses from the operator-facing view. Sorted
+        // (plugin, role) for a stable snapshot.
+        let mut active_sorted: Vec<(&String, &(chrono::DateTime<Utc>, String, String))> =
+            active_entities
+                .iter()
+                .filter(|(_key, (_ts, pid, _role))| !self.is_synthetic(pid))
+                .filter(|(_key, (ts, _pid, _role))| *ts > one_hour_ago)
+                .collect();
+        active_sorted.sort_by(|a, b| (&a.1 .1, &a.1 .2).cmp(&(&b.1 .1, &b.1 .2)));
+        let trust: Vec<TrustView> = active_sorted
+            .into_iter()
+            .map(|(key, (_ts, pid, _role))| {
+                let t = self
+                    .trust_store
+                    .get(key)
+                    .unwrap_or_else(|_| EntityTrust::new(key.clone()));
                 let t3_avg = t.t3_average();
                 let v3_avg = t.v3_average();
                 TrustView {
@@ -370,7 +385,9 @@ impl ServerState {
                 chain_length: self.chain_len(),
                 active_sessions: self.sessions.len(),
                 vault_entries: self.vault.list().len(),
-                known_plugins: known_plugins.len(),
+                // Total known trust entities (all (instance, role) grains ever
+                // seen), independent of the last-hour active view above.
+                known_plugins: self.trust_store.list().map(|v| v.len()).unwrap_or(0),
             },
             stats: ActivityStats {
                 total_actions: total,
