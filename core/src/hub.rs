@@ -567,6 +567,10 @@ impl<T> Pipe for T {}
 /// Byte-compatible with the hub's `ChannelInner` (rest.rs) + the `channel_client`
 /// example. Fields are serde-optional on the hub, so this is Phase-1 backward-
 /// compatible; enforcement (Phase 2) lands only once every write-sender emits them.
+///
+/// INVARIANT: every sealed channel request MUST be built here. This is the single
+/// choke point where freshness fields are stamped — any future sealed path that
+/// bypasses this builder would be silently non-compliant under Phase-2 enforcement.
 fn channel_inner_request(tool: &str, args: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "tool": tool,
