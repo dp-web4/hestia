@@ -239,6 +239,8 @@ async fn tool_begin_action(state: &SharedState, args: &Value) -> ToolResult {
     let parameters = args.get("parameters").cloned();
     // The accountability WHY — the actor's stated reason, captured at begin.
     let intent = optional_string(args, "intent");
+    // The host agent's own stable session id (the real audit grain).
+    let host_session_id = optional_string(args, "host_session_id");
 
     let mut s = state.lock().await;
     let action_id = Uuid::new_v4();
@@ -257,6 +259,7 @@ async fn tool_begin_action(state: &SharedState, args: &Value) -> ToolResult {
             target,
             parameters,
             intent,
+            host_session_id,
             started_at,
             chain_position,
         },
@@ -321,6 +324,7 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
             "instance_lct": instance_lct,
             "role_lct": role_lct,
             "session_id": action.session_id,
+            "host_session_id": action.host_session_id,
             "intent": action.intent,
         }),
     )?;
@@ -384,7 +388,22 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         full_command,
     };
 
-    let evaluation = s.policy_engine.evaluate(&pa);
+    // Role-scoped law (#403): evaluate the base policy, then fold in the session's
+    // constellation-role overlay by STRICTEST verdict. A self-declared role can
+    // only ever tighten the base (Deny > Warn > Allow), never loosen it — so
+    // declaring a permissive role can't be used to escape the base floor.
+    let mut evaluation = s.policy_engine.evaluate(&pa);
+    let session_role = s
+        .sessions
+        .get(&action.session_id)
+        .map(|sess| sess.constellation_role.clone())
+        .unwrap_or_else(|| crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string());
+    if let Some(role_engine) = s.role_policy_engines.get(&session_role) {
+        let role_eval = role_engine.evaluate(&pa);
+        if role_eval.decision.severity() > evaluation.decision.severity() {
+            evaluation = role_eval;
+        }
+    }
 
     // Witness the policy decision when the verdict is anything other
     // than `allow`. Deny + warn + would-deny (audit-only) are all
@@ -419,6 +438,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 "instance_lct": instance_lct,
                 "role_lct": role_lct,
                 "session_id": action.session_id,
+                "host_session_id": action.host_session_id,
                 "intent": action.intent,
                 "decision": evaluation.decision.as_str(),
                 "enforced": evaluation.enforced,
@@ -993,5 +1013,70 @@ mod accountability_tests {
         );
         // WHY — the actor's intent survives on the only record a blocked act leaves.
         assert_eq!(d["intent"].as_str().unwrap(), "clean up the workspace");
+    }
+
+    /// The host agent's own stable session id is witnessed as the real audit grain.
+    #[tokio::test]
+    async fn host_session_id_is_witnessed_when_supplied() {
+        let (_dir, state) = test_state().await;
+        let connect = tool_connect(&state, &json!({"plugin_id":"claude-code","host_agent":"t"}))
+            .await.unwrap();
+        let sid = connect["sessionId"].as_str().unwrap().to_string();
+        let begin = tool_begin_action(&state, &json!({
+            "tool_name":"Read","session_id":sid,"host_session_id":"claude-sess-abc"
+        })).await.unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        tool_record_outcome(&state, &json!({"action_id":aid,"success":true})).await.unwrap();
+        let s = state.lock().await;
+        let outcome = s.recent_chain(20).into_iter()
+            .find(|e| e.event_type == "outcome").unwrap();
+        assert_eq!(outcome.event_data["host_session_id"], "claude-sess-abc");
+    }
+
+    /// Role-scoped law (#403): a role overlay can only TIGHTEN, and only for the
+    /// role that declared it. A permissive role can't escape the base floor, and a
+    /// restricted role's extra denies don't leak onto other roles.
+    #[tokio::test]
+    async fn role_overlay_tightens_law_only_for_the_declared_role() {
+        let (_dir, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            let rule = crate::policy::PolicyRule {
+                id: "mw-deny-testtool".into(),
+                name: "mesh-worker denies TestTool".into(),
+                priority: 0,
+                decision: crate::policy::PolicyDecision::Deny,
+                reason: Some("mesh-worker restricted".into()),
+                r#match: crate::policy::PolicyMatch {
+                    tools: Some(vec!["TestTool".into()]),
+                    ..Default::default()
+                },
+            };
+            let cfg = crate::policy::PolicyConfig {
+                default_policy: crate::policy::PolicyDecision::Allow,
+                enforce: true,
+                rules: vec![rule],
+            };
+            s.role_policy_engines.insert(
+                "role:constellation:mesh-worker".into(),
+                crate::policy::PolicyEngine::new(cfg),
+            );
+        }
+        // The role that declared the overlay → TestTool is denied (tightened).
+        assert_eq!(decision_for(&state, "role:constellation:mesh-worker").await, "deny");
+        // A different role has no overlay → base floor, not denied.
+        assert_ne!(decision_for(&state, "role:constellation:interactive-dev").await, "deny");
+    }
+
+    async fn decision_for(state: &SharedState, role: &str) -> String {
+        let connect = tool_connect(state, &json!({
+            "plugin_id":"claude-code","host_agent":"t","role":role
+        })).await.unwrap();
+        let sid = connect["sessionId"].as_str().unwrap().to_string();
+        let begin = tool_begin_action(state, &json!({"tool_name":"TestTool","session_id":sid}))
+            .await.unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        let q = tool_query_policy(state, &json!({"action_id":aid})).await.unwrap();
+        q["decision"].as_str().unwrap().to_string()
     }
 }

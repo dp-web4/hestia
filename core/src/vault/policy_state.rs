@@ -43,6 +43,16 @@ pub struct VaultPolicyState {
     /// alongside preset rules at evaluation time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_rules: Vec<PolicyRule>,
+
+    /// Per-constellation-role overlay rules (#403 role-scoped law), keyed by the
+    /// canonical `role:constellation:*`. Each role's rules are evaluated as a
+    /// SEPARATE policy (default `Allow`) and folded into the base by taking the
+    /// STRICTER verdict — so a self-declared role can only ever TIGHTEN law, never
+    /// loosen it (the base preset is always the floor). This is the safe design
+    /// for self-declared roles: declaring the least-restrictive role gets you the
+    /// base, never less. Empty = no role scoping (every session gets the base).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub role_overlays: HashMap<String, Vec<PolicyRule>>,
 }
 
 impl Default for VaultPolicyState {
@@ -51,6 +61,7 @@ impl Default for VaultPolicyState {
             active_preset: "safety".into(),
             overrides: HashMap::new(),
             custom_rules: Vec::new(),
+            role_overlays: HashMap::new(),
         }
     }
 }
@@ -78,6 +89,39 @@ impl VaultPolicyState {
         // Append custom rules
         cfg.rules.extend(self.custom_rules.iter().cloned());
         Some(cfg)
+    }
+
+    /// Build a per-role overlay `PolicyConfig` for each role that declares one.
+    /// Each defaults to `Allow` — a no-match means the role adds no restriction —
+    /// so folding it into the base by strictest-verdict can only tighten, never
+    /// loosen. `enforce` mirrors the resolved base so a role `Deny` enforces
+    /// identically. Empty map when no role overlays are configured.
+    pub fn role_configs(&self) -> HashMap<String, crate::policy::PolicyConfig> {
+        let enforce = self.resolve().map(|c| c.enforce).unwrap_or(true);
+        self.role_overlays
+            .iter()
+            .map(|(role, rules)| {
+                // Surface misconfig loudly: sessions normalize their declared role
+                // fail-closed to the published set, so an overlay keyed to an
+                // unpublished role can never be selected — it would be silently
+                // dead law. Still built (harmless), but warn so the operator sees it.
+                if !crate::reputation::KNOWN_CONSTELLATION_ROLES.contains(&role.as_str()) {
+                    eprintln!(
+                        "[policy] WARNING: role_overlays key '{role}' is not in the \
+                         published constellation-role set — no session can select this \
+                         overlay (declared roles normalize fail-closed to known roles)"
+                    );
+                }
+                (
+                    role.clone(),
+                    crate::policy::PolicyConfig {
+                        default_policy: crate::policy::PolicyDecision::Allow,
+                        enforce,
+                        rules: rules.clone(),
+                    },
+                )
+            })
+            .collect()
     }
 }
 
@@ -155,5 +199,36 @@ mod tests {
         // it should deserialize fine into a struct where policy defaults.
         let json = r#"{"version":1,"created_at":"2026-05-16T00:00:00Z","entries":[]}"#;
         let _: super::super::storage::VaultData = serde_json::from_str(json).unwrap();
+    }
+
+    #[test]
+    fn role_configs_are_allow_default_and_carry_only_declared_roles() {
+        use crate::policy::types::{PolicyMatch, PolicyRule};
+        let mut s = VaultPolicyState::default();
+        s.role_overlays.insert(
+            "role:constellation:mesh-worker".into(),
+            vec![PolicyRule {
+                id: "r".into(),
+                name: "n".into(),
+                priority: 0,
+                decision: PolicyDecision::Deny,
+                reason: None,
+                r#match: PolicyMatch {
+                    tools: Some(vec!["X".into()]),
+                    ..Default::default()
+                },
+            }],
+        );
+        let cfgs = s.role_configs();
+        let cfg = cfgs.get("role:constellation:mesh-worker").unwrap();
+        // Allow-default so a no-match adds nothing → the base decides via strictest.
+        assert_eq!(cfg.default_policy, PolicyDecision::Allow);
+        assert_eq!(cfg.rules.len(), 1);
+        assert_eq!(cfg.rules[0].decision, PolicyDecision::Deny);
+        // A role with no overlay isn't present → it falls through to the base engine.
+        assert!(!cfgs.contains_key("role:constellation:interactive-dev"));
+
+        // Default (no overlays) → empty map → every session gets the base.
+        assert!(VaultPolicyState::default().role_configs().is_empty());
     }
 }

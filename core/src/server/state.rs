@@ -56,6 +56,12 @@ pub struct InFlightAction {
     /// captured at `begin_action` and stamped onto the witnessed `outcome`.
     /// `None` = unstated (honest — never fabricated).
     pub intent: Option<String>,
+    /// The host agent's OWN stable session id (e.g. Claude Code's `session_id`),
+    /// passed through from the hook — the real per-session audit grain, since a
+    /// hestia session is minted per connect (per tool-call for the hook) and is
+    /// not itself a stable per-orchestrator-session identifier. `None` = the host
+    /// didn't supply one.
+    pub host_session_id: Option<String>,
     pub started_at: DateTime<Utc>,
     pub chain_position: u64,
 }
@@ -70,6 +76,11 @@ pub struct ServerState {
     pub sovereign_lct: String,
     pub shared_context: serde_json::Map<String, serde_json::Value>,
     pub policy_engine: crate::policy::PolicyEngine,
+    /// Per-constellation-role policy engines (#403 role-scoped law), built from
+    /// the vault's `role_overlays`. A session's declared role selects its engine;
+    /// its verdict is folded into `policy_engine` by strictest-wins in
+    /// `query_policy`, so a role can only tighten the base, never loosen it.
+    pub role_policy_engines: HashMap<String, crate::policy::PolicyEngine>,
     /// Plugin IDs that self-declared as synthetic (test harnesses,
     /// fuzzers, etc.). Excluded from operator-facing aggregations by
     /// default. Enclosed in the vault (document `presence`/`synthetic`).
@@ -98,6 +109,14 @@ impl ServerState {
             .resolve()
             .unwrap_or_else(|| crate::policy::get_preset("safety").unwrap().config);
         let policy_engine = crate::policy::PolicyEngine::new(policy_config);
+        // Per-role overlay engines (#403). Empty unless the vault declares
+        // `role_overlays`; each is folded strictest-wins into the base.
+        let role_policy_engines = vault
+            .policy()
+            .role_configs()
+            .into_iter()
+            .map(|(role, cfg)| (role, crate::policy::PolicyEngine::new(cfg)))
+            .collect();
 
         // Synthetic-plugin set lives in the vault (migrating a legacy
         // synthetic.json). Best-effort: an empty set on any read error.
@@ -114,6 +133,7 @@ impl ServerState {
             sovereign_lct,
             shared_context: serde_json::Map::new(),
             policy_engine,
+            role_policy_engines,
             synthetic_plugins,
             home: home.to_path_buf(),
             vci_nonces: HashSet::new(),
@@ -151,6 +171,13 @@ impl ServerState {
             .resolve()
             .unwrap_or_else(|| crate::policy::get_preset("safety").unwrap().config);
         self.policy_engine = crate::policy::PolicyEngine::new(config);
+        self.role_policy_engines = self
+            .vault
+            .policy()
+            .role_configs()
+            .into_iter()
+            .map(|(role, cfg)| (role, crate::policy::PolicyEngine::new(cfg)))
+            .collect();
     }
 
     /// Issue a Soft LCT for a new session.

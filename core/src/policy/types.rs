@@ -17,6 +17,17 @@ pub enum PolicyDecision {
 }
 
 impl PolicyDecision {
+    /// Strictness rank for combining policies — a stricter verdict wins.
+    /// `Allow` < `Warn` < `Deny`. Used to fold a role-overlay verdict into the
+    /// base so a self-declared role can only ever tighten law, never loosen it.
+    pub fn severity(&self) -> u8 {
+        match self {
+            Self::Allow => 0,
+            Self::Warn => 1,
+            Self::Deny => 2,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Allow => "allow",
@@ -151,4 +162,15 @@ pub struct PresetDefinition {
     pub name: String,
     pub description: String,
     pub config: PolicyConfig,
+}
+
+#[cfg(test)]
+mod severity_tests {
+    use super::*;
+
+    #[test]
+    fn severity_orders_allow_below_warn_below_deny() {
+        assert!(PolicyDecision::Allow.severity() < PolicyDecision::Warn.severity());
+        assert!(PolicyDecision::Warn.severity() < PolicyDecision::Deny.severity());
+    }
 }
