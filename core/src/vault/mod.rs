@@ -175,6 +175,40 @@ impl Vault {
         Ok(removed)
     }
 
+    /// Add or replace (by `id`) a rule in a constellation-role overlay (#403
+    /// role-scoped law). Overlay rules are folded into the base by strictest
+    /// verdict at query time, so they can only tighten. Sealed on success.
+    pub fn upsert_role_rule(&mut self, role: &str, rule: crate::policy::PolicyRule) -> Result<()> {
+        let rules = self
+            .data
+            .policy
+            .role_overlays
+            .entry(role.to_string())
+            .or_default();
+        match rules.iter_mut().find(|r| r.id == rule.id) {
+            Some(slot) => *slot = rule,
+            None => rules.push(rule),
+        }
+        self.save()
+    }
+
+    /// Remove a rule from a role overlay by id; drops the overlay entry when it
+    /// empties (so `role_configs` builds no engine for it). Returns whether a
+    /// rule was removed.
+    pub fn remove_role_rule(&mut self, role: &str, rule_id: &str) -> Result<bool> {
+        let mut removed = false;
+        if let Some(rules) = self.data.policy.role_overlays.get_mut(role) {
+            let before = rules.len();
+            rules.retain(|r| r.id != rule_id);
+            removed = rules.len() != before;
+            if rules.is_empty() {
+                self.data.policy.role_overlays.remove(role);
+            }
+        }
+        self.save()?;
+        Ok(removed)
+    }
+
     // ---- Documents: config / metadata / state, enclosed in the vault ----
     //
     // The vault doctrine: every setting and piece of metadata lives here, not in
@@ -473,6 +507,34 @@ mod tests {
         v.upsert(VaultEntry::new("key", "v2")).unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v.get("key").unwrap().secret, "v2");
+    }
+
+    #[test]
+    fn role_rule_upsert_remove_round_trip_and_reload() {
+        let (_dir, path) = temp_path();
+        let mut v = Vault::init(path.clone(), "p".into()).unwrap();
+        let rule = crate::policy::PolicyRule {
+            id: "custom-no-x".into(),
+            name: "no X".into(),
+            priority: 0,
+            decision: crate::policy::PolicyDecision::Deny,
+            reason: None,
+            r#match: crate::policy::PolicyMatch {
+                tools: Some(vec!["X".into()]),
+                ..Default::default()
+            },
+        };
+        v.upsert_role_rule("role:constellation:mesh-worker", rule.clone()).unwrap();
+        // Sealed round-trip: reopen and the overlay survives.
+        let v2 = Vault::open(path, "p".into()).unwrap();
+        let rules = v2.policy().role_overlays.get("role:constellation:mesh-worker").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, "custom-no-x");
+        // Upsert by id replaces, remove empties + drops the overlay key.
+        v.upsert_role_rule("role:constellation:mesh-worker", rule).unwrap();
+        assert_eq!(v.policy().role_overlays["role:constellation:mesh-worker"].len(), 1);
+        assert!(v.remove_role_rule("role:constellation:mesh-worker", "custom-no-x").unwrap());
+        assert!(v.policy().role_overlays.is_empty());
     }
 
     #[test]

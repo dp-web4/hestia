@@ -299,12 +299,22 @@ enum PolicyCmd {
         /// Priority (lower = evaluated first)
         #[arg(long, default_value_t = 50)]
         priority: i32,
+        /// Scope the rule to a constellation role (#403 role-scoped law), e.g.
+        /// role:constellation:mesh-worker. The rule then applies ONLY to sessions
+        /// in that role, folded strictest-wins on top of the base policy (it can
+        /// only tighten). Omit for a base custom rule that applies to everyone.
+        #[arg(long)]
+        role: Option<String>,
     },
 
     /// Remove a custom rule by id
     RmRule {
         /// The custom rule id
         id: String,
+        /// Remove from this constellation-role overlay instead of the base
+        /// custom rules.
+        #[arg(long)]
+        role: Option<String>,
     },
 }
 
@@ -404,10 +414,10 @@ pub fn run() -> AnyResult<()> {
             PolicyCmd::Override { rule_id, decision, disable, enable, clear } => {
                 cmd_policy_override(&home, &rule_id, decision, disable, enable, clear)
             }
-            PolicyCmd::AddRule { name, decision, category, tool, command, priority } => {
-                cmd_policy_add_rule(&home, &name, &decision, category, tool, command, priority)
+            PolicyCmd::AddRule { name, decision, category, tool, command, priority, role } => {
+                cmd_policy_add_rule(&home, &name, &decision, category, tool, command, priority, role)
             }
-            PolicyCmd::RmRule { id } => cmd_policy_rm_rule(&home, &id),
+            PolicyCmd::RmRule { id, role } => cmd_policy_rm_rule(&home, &id, role),
         },
         Command::Delegate(d) => match d {
             DelegateCmd::Grant { agent, role, action, expires } => {
@@ -770,6 +780,17 @@ fn cmd_policy_show(home: &std::path::Path) -> AnyResult<()> {
     if !state.custom_rules.is_empty() {
         println!("\ncustom rules: {}", state.custom_rules.len());
     }
+    if !state.role_overlays.is_empty() {
+        println!("\nrole overlays (#403 — folded strictest-wins onto the base):");
+        let mut roles: Vec<_> = state.role_overlays.iter().collect();
+        roles.sort_by(|a, b| a.0.cmp(b.0));
+        for (role, rules) in roles {
+            println!("  {role}:");
+            for r in rules {
+                println!("    {} → {} ({})", r.id, r.decision.as_str(), r.name);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -845,6 +866,21 @@ fn cmd_policy_override(
     Ok(())
 }
 
+/// Validate a `--role` against the published constellation set, fail-fast with
+/// the valid values. A typo'd role overlay would be silently dead law (sessions
+/// normalize fail-closed to known roles), so the CLI rejects it outright.
+fn validate_role_cli(role: &str) -> AnyResult<()> {
+    if hestia::reputation::KNOWN_CONSTELLATION_ROLES.contains(&role) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "'{role}' is not a published constellation role (no session could ever \
+         select it). Valid roles:\n  {}",
+        hestia::reputation::KNOWN_CONSTELLATION_ROLES.join("\n  ")
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_policy_add_rule(
     home: &std::path::Path,
     name: &str,
@@ -853,6 +889,7 @@ fn cmd_policy_add_rule(
     tool: Option<String>,
     command: Option<String>,
     priority: i32,
+    role: Option<String>,
 ) -> AnyResult<()> {
     let dec = parse_decision_cli(decision)?;
     let r#match = match (category, tool, command) {
@@ -867,26 +904,48 @@ fn cmd_policy_add_rule(
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     let id = format!("custom-{}", slug.trim_matches('-'));
-    let mut vault = open_vault(home)?;
-    vault.upsert_custom_rule(hestia::policy::PolicyRule {
+    let rule = hestia::policy::PolicyRule {
         id: id.clone(),
         name: name.to_string(),
         priority,
         decision: dec,
         reason: None,
         r#match,
-    })?;
-    println!("✓ custom rule '{id}' added");
+    };
+    let mut vault = open_vault(home)?;
+    match role {
+        Some(role) => {
+            validate_role_cli(&role)?;
+            vault.upsert_role_rule(&role, rule)?;
+            println!("✓ rule '{id}' added to role overlay '{role}'");
+            println!("  (applies ONLY to sessions in that role; folded strictest-wins onto the base)");
+        }
+        None => {
+            vault.upsert_custom_rule(rule)?;
+            println!("✓ custom rule '{id}' added");
+        }
+    }
     println!("  (a running daemon won't pick this up until restart)");
     Ok(())
 }
 
-fn cmd_policy_rm_rule(home: &std::path::Path, id: &str) -> AnyResult<()> {
+fn cmd_policy_rm_rule(home: &std::path::Path, id: &str, role: Option<String>) -> AnyResult<()> {
     let mut vault = open_vault(home)?;
-    if vault.remove_custom_rule(id)? {
-        println!("✓ custom rule '{id}' removed");
-    } else {
-        println!("no custom rule with id '{id}'");
+    match role {
+        Some(role) => {
+            if vault.remove_role_rule(&role, id)? {
+                println!("✓ rule '{id}' removed from role overlay '{role}'");
+            } else {
+                println!("no rule with id '{id}' in role overlay '{role}'");
+            }
+        }
+        None => {
+            if vault.remove_custom_rule(id)? {
+                println!("✓ custom rule '{id}' removed");
+            } else {
+                println!("no custom rule with id '{id}'");
+            }
+        }
     }
     println!("  (a running daemon won't pick this up until restart)");
     Ok(())
