@@ -94,10 +94,17 @@ impl VaultPolicyState {
     /// Build a per-role overlay `PolicyConfig` for each role that declares one.
     /// Each defaults to `Allow` — a no-match means the role adds no restriction —
     /// so folding it into the base by strictest-verdict can only tighten, never
-    /// loosen. `enforce` mirrors the resolved base so a role `Deny` enforces
-    /// identically. Empty map when no role overlays are configured.
+    /// loosen. Empty map when no role overlays are configured.
+    ///
+    /// Overlays ENFORCE unconditionally (`enforce: true`), independent of the
+    /// base preset's mode. Rationale (attendance-scaled law, ratified
+    /// 2026-07-06): the base preset's `enforce=false` (permissive/audit-only)
+    /// expresses the *observation phase* for attended sessions, while an overlay
+    /// rule is EXPLICIT operator-authored law for an unattended capacity — the
+    /// operator wrote `deny`, not `would-deny`. Inheriting the base's flag made
+    /// ratified unattended law silently observational on a permissive base.
     pub fn role_configs(&self) -> HashMap<String, crate::policy::PolicyConfig> {
-        let enforce = self.resolve().map(|c| c.enforce).unwrap_or(true);
+        let enforce = true;
         self.role_overlays
             .iter()
             .map(|(role, rules)| {
@@ -199,6 +206,36 @@ mod tests {
         // it should deserialize fine into a struct where policy defaults.
         let json = r#"{"version":1,"created_at":"2026-05-16T00:00:00Z","entries":[]}"#;
         let _: super::super::storage::VaultData = serde_json::from_str(json).unwrap();
+    }
+
+    /// Ratified attendance-scaled law: an overlay deny ENFORCES even when the
+    /// base preset is observational (permissive, enforce=false). Inheriting the
+    /// base flag turned ratified unattended law into silent would-deny audit —
+    /// caught live on 2026-07-06 (mesh-worker force-push exit=0).
+    #[test]
+    fn role_overlay_enforces_even_on_permissive_base() {
+        use crate::policy::types::{PolicyMatch, PolicyRule};
+        let mut s = VaultPolicyState {
+            active_preset: "permissive".into(),
+            ..Default::default()
+        };
+        assert!(!s.resolve().unwrap().enforce, "precondition: permissive base is audit-only");
+        s.role_overlays.insert(
+            "role:constellation:mesh-worker".into(),
+            vec![PolicyRule {
+                id: "r".into(),
+                name: "n".into(),
+                priority: 0,
+                decision: PolicyDecision::Deny,
+                reason: None,
+                r#match: PolicyMatch { tools: Some(vec!["X".into()]), ..Default::default() },
+            }],
+        );
+        let cfg = s.role_configs();
+        assert!(
+            cfg["role:constellation:mesh-worker"].enforce,
+            "operator-authored role law must enforce regardless of base mode"
+        );
     }
 
     #[test]
