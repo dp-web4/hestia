@@ -451,7 +451,17 @@ impl HubClient {
         tool: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let request = serde_json::json!({ "tool": tool, "args": args });
+        // H-007: carry freshness fields inside the sealed inner so the hub's
+        // ReplayGuard can key on the nonce and reject out-of-window requests —
+        // byte-compatible with the hub's `ChannelInner` (rest.rs) and with the
+        // `channel_client` example. Optional on the hub (serde-default) so this
+        // is backward-compatible; required once Phase 2 enforcement lands.
+        let request = serde_json::json!({
+            "tool": tool,
+            "args": args,
+            "nonce": Uuid::new_v4().to_string(),
+            "issued_at": Utc::now(),
+        });
         let sealed = channel.seal_request(my, &request)?;
         let url = format!(
             "{}/hubs/{}/channel",
