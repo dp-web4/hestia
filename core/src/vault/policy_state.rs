@@ -101,6 +101,17 @@ impl VaultPolicyState {
         self.role_overlays
             .iter()
             .map(|(role, rules)| {
+                // Surface misconfig loudly: sessions normalize their declared role
+                // fail-closed to the published set, so an overlay keyed to an
+                // unpublished role can never be selected — it would be silently
+                // dead law. Still built (harmless), but warn so the operator sees it.
+                if !crate::reputation::KNOWN_CONSTELLATION_ROLES.contains(&role.as_str()) {
+                    eprintln!(
+                        "[policy] WARNING: role_overlays key '{role}' is not in the \
+                         published constellation-role set — no session can select this \
+                         overlay (declared roles normalize fail-closed to known roles)"
+                    );
+                }
                 (
                     role.clone(),
                     crate::policy::PolicyConfig {
