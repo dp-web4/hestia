@@ -74,9 +74,13 @@ class HestiaClient:
         """Establish the MCP connection and the Hestia session.
 
         ``role`` — optional constellation role to declare for this session.
-        The daemon normalizes any string to a canonical ``role:constellation:*``
-        (fail-closed to ``role:constellation:member``). When ``None`` the key
-        is omitted and the daemon applies its default. Backward-compatible.
+        The value must be **byte-identical** to one of the daemon's published
+        roles — ``role:constellation:{interactive-dev, mesh-worker, reviewer,
+        autonomous-timer, member}``. The daemon does an exact-match lookup and
+        **fail-closes to ``role:constellation:member``** for anything else (it
+        does *not* canonicalize arbitrary strings — a bare ``reviewer`` or a
+        typo silently buckets as ``member``). When ``None`` the key is omitted
+        and the daemon applies its default. Backward-compatible.
         """
         endpoint = discover_hestia_endpoint(self.config.hestia_endpoint)
 

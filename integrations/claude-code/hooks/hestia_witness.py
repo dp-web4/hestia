@@ -50,7 +50,9 @@ ENDPOINT = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
 PLUGIN_ID = "claude-code"
 HOST_AGENT = "claude-code"
 # Optional constellation role for this session. Absent → omit → daemon
-# defaults to role:constellation:member. The daemon normalizes any string.
+# defaults to role:constellation:member. Must be byte-identical to a published
+# role:constellation:* (interactive-dev|mesh-worker|reviewer|autonomous-timer|
+# member); the daemon exact-matches and fail-closes to member otherwise.
 HESTIA_ROLE = os.environ.get("HESTIA_ROLE")
 
 

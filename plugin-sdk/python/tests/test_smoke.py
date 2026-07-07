@@ -128,12 +128,15 @@ async def test_connect_passes_role_when_set(hestia_url):
         hestia_endpoint=hestia_url.url,
     )
     client = HestiaClient(config)
-    await client.connect(role="constellation-sre")
+    # Use a byte-identical published role: the real daemon exact-matches this
+    # (anything else fail-closes to role:constellation:member), so the fixture
+    # documents the true pass-through contract, not a value that silently buckets.
+    await client.connect(role="role:constellation:reviewer")
     try:
         # Exactly one session should have been created, carrying our role.
         sessions = list(hestia_url.state.sessions.values())
         assert len(sessions) == 1
-        assert sessions[0]["role"] == "constellation-sre"
+        assert sessions[0]["role"] == "role:constellation:reviewer"
     finally:
         await client.disconnect()
 
