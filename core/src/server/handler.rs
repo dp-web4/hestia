@@ -7,13 +7,13 @@
 
 use chrono::Utc;
 use rmcp::{
-    ServerHandler,
     model::{
         CallToolRequestParams, CallToolResult, Content, ErrorData, ListResourcesResult,
         ListToolsResult, PaginatedRequestParams, RawResource, ReadResourceRequestParams,
         ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerInfo, Tool,
     },
     service::{RequestContext, RoleServer},
+    ServerHandler,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -246,8 +246,7 @@ async fn tool_begin_action(state: &SharedState, args: &Value) -> ToolResult {
     let action_id = Uuid::new_v4();
     let chain_position = s.chain_len();
 
-    let session_id = resolve_session_uuid(&s, session_id_arg.as_deref())
-        .unwrap_or_else(Uuid::nil);
+    let session_id = resolve_session_uuid(&s, session_id_arg.as_deref()).unwrap_or_else(Uuid::nil);
 
     let started_at = Utc::now();
     s.actions.insert(
@@ -335,7 +334,11 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
         action_type: "tool_execution",
         action_target: &action.tool_name,
         action_id: &rep_action_id,
-        reason: if success { "outcome:success" } else { "outcome:failure" },
+        reason: if success {
+            "outcome:success"
+        } else {
+            "outcome:failure"
+        },
     };
     let trust_state = s.apply_outcome_ctx(&plugin_id, success, magnitude, &rep_ctx)?;
 
@@ -347,8 +350,8 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
 
 async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     let action_id_str = require_string(args, "action_id")?;
-    let action_id = Uuid::parse_str(&action_id_str)
-        .map_err(|_| anyhow::anyhow!("invalid action_id"))?;
+    let action_id =
+        Uuid::parse_str(&action_id_str).map_err(|_| anyhow::anyhow!("invalid action_id"))?;
     let s = state.lock().await;
     let action = match s.actions.get(&action_id) {
         Some(a) => a.clone(),
@@ -392,6 +395,9 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     // constellation-role overlay by STRICTEST verdict. A self-declared role can
     // only ever tighten the base (Deny > Warn > Allow), never loosen it — so
     // declaring a permissive role can't be used to escape the base floor.
+    // Severity ties break in favor of `enforced`: a base audit-only deny must
+    // not shadow an enforced role deny, or the ratified law is silently
+    // defanged by the observation-phase flag (HUB post-hoc review, 2026-07-07).
     let mut evaluation = s.policy_engine.evaluate(&pa);
     let session_role = s
         .sessions
@@ -400,7 +406,9 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         .unwrap_or_else(|| crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string());
     if let Some(role_engine) = s.role_policy_engines.get(&session_role) {
         let role_eval = role_engine.evaluate(&pa);
-        if role_eval.decision.severity() > evaluation.decision.severity() {
+        if (role_eval.decision.severity(), role_eval.enforced)
+            > (evaluation.decision.severity(), evaluation.enforced)
+        {
             evaluation = role_eval;
         }
     }
@@ -536,7 +544,11 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
         let mut evaluation = s.policy_engine.evaluate(&pa);
         if let Some(role_engine) = s.role_policy_engines.get(&role_lct) {
             let role_eval = role_engine.evaluate(&pa);
-            if role_eval.decision.severity() > evaluation.decision.severity() {
+            // Same (severity, enforced) tie-break as the hook-path fold above —
+            // the two enforcement points must not drift semantically.
+            if (role_eval.decision.severity(), role_eval.enforced)
+                > (evaluation.decision.severity(), evaluation.enforced)
+            {
                 evaluation = role_eval;
             }
         }
@@ -712,8 +724,15 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
         .map_err(|_| anyhow::anyhow!("pair_id is not a UUID"))?;
     let hub_pubkey_hex = require_string(args, "hub_pubkey_hex")?;
     let sealed = require_string(args, "sealed")?;
-    let kind = args.get("kind").and_then(Value::as_str).unwrap_or("notify").to_string();
-    let pointer_uri = args.get("pointer_uri").and_then(Value::as_str).map(str::to_string);
+    let kind = args
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("notify")
+        .to_string();
+    let pointer_uri = args
+        .get("pointer_uri")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let hub_lct_id = args
         .get("hub_lct_id")
         .and_then(Value::as_str)
@@ -759,7 +778,10 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
     )?;
 
     // Seal an ACK the hub opens to mark the notice delivered.
-    let ack = crate::hub::NotificationAck { act_id, received_at: Utc::now() };
+    let ack = crate::hub::NotificationAck {
+        act_id,
+        received_at: Utc::now(),
+    };
     let ack_sealed = channel.seal_ack(&keypair, &ack)?;
 
     Ok(json!({
@@ -824,8 +846,9 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
     if let Some(name) = uri.strip_prefix("hestia://vault/") {
         match s.vault.get(name) {
             Some(e) => {
-                return Ok(serde_json::to_string(&json!({"value": e.secret}))
-                    .unwrap_or("{}".into()));
+                return Ok(
+                    serde_json::to_string(&json!({"value": e.secret})).unwrap_or("{}".into())
+                );
             }
             None => return Err(format!("vault: credential '{}' not found", name)),
         }
@@ -858,9 +881,14 @@ fn trust_state_json(trust: &EntityTrust) -> Value {
     })
 }
 
-fn resolve_session_uuid(state: &super::state::ServerState, session_id: Option<&str>) -> Option<Uuid> {
+fn resolve_session_uuid(
+    state: &super::state::ServerState,
+    session_id: Option<&str>,
+) -> Option<Uuid> {
     if let Some(sid) = session_id {
-        return Uuid::parse_str(sid).ok().filter(|u| state.sessions.contains_key(u));
+        return Uuid::parse_str(sid)
+            .ok()
+            .filter(|u| state.sessions.contains_key(u));
     }
     state
         .sessions
@@ -946,7 +974,10 @@ mod accountability_tests {
         let d = &outcome.event_data;
         // WHO — durable per-instance LCT (trust grain) + session_id (audit grain).
         assert!(
-            d["instance_lct"].as_str().unwrap().starts_with("lct:web4:member:"),
+            d["instance_lct"]
+                .as_str()
+                .unwrap()
+                .starts_with("lct:web4:member:"),
             "instance_lct must be the durable per-instance LCT, got {:?}",
             d["instance_lct"]
         );
@@ -963,17 +994,30 @@ mod accountability_tests {
     #[tokio::test]
     async fn absent_intent_is_null_not_fabricated() {
         let (_dir, state) = test_state().await;
-        let connect = tool_connect(&state, &json!({"plugin_id":"claude-code","host_agent":"test"}))
-            .await.unwrap();
+        let connect = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"test"}),
+        )
+        .await
+        .unwrap();
         let sid = connect["sessionId"].as_str().unwrap().to_string();
         let begin = tool_begin_action(&state, &json!({"tool_name":"Read","session_id":sid}))
-            .await.unwrap();
+            .await
+            .unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
-        tool_record_outcome(&state, &json!({"action_id":aid,"success":true})).await.unwrap();
+        tool_record_outcome(&state, &json!({"action_id":aid,"success":true}))
+            .await
+            .unwrap();
         let s = state.lock().await;
-        let outcome = s.recent_chain(20).into_iter()
-            .find(|e| e.event_type == "outcome").unwrap();
-        assert!(outcome.event_data["intent"].is_null(), "unstated intent must be null");
+        let outcome = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "outcome")
+            .unwrap();
+        assert!(
+            outcome.event_data["intent"].is_null(),
+            "unstated intent must be null"
+        );
     }
 
     /// The ratified unattended law has TEETH at the daemon: a mesh-worker session
@@ -1006,17 +1050,29 @@ mod accountability_tests {
             );
         }
         // mesh-worker → denied by the daemon, before the vault is even consulted.
-        let mw = tool_connect(&state, &json!({
-            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:mesh-worker"
-        })).await.unwrap();
-        let denied = tool_vault_get(&state, &json!({
-            "name":"github-pat","session_id": mw["sessionId"]
-        })).await.unwrap();
+        let mw = tool_connect(
+            &state,
+            &json!({
+                "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:mesh-worker"
+            }),
+        )
+        .await
+        .unwrap();
+        let denied = tool_vault_get(
+            &state,
+            &json!({
+                "name":"github-pat","session_id": mw["sessionId"]
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(denied["_hestia_error"]["code"], "hestia.policy_denied");
         // The refusal is witnessed with WHO.
         {
             let s = state.lock().await;
-            let pd = s.recent_chain(10).into_iter()
+            let pd = s
+                .recent_chain(10)
+                .into_iter()
                 .find(|e| e.event_type == "policy_decision")
                 .expect("vault deny must be witnessed");
             assert_eq!(pd.event_data["role_lct"], "role:constellation:mesh-worker");
@@ -1024,12 +1080,22 @@ mod accountability_tests {
             assert_eq!(pd.event_data["enforced"], true);
         }
         // member (attended) → NOT policy-blocked; falls through to not-found.
-        let m = tool_connect(&state, &json!({
-            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:member"
-        })).await.unwrap();
-        let ok = tool_vault_get(&state, &json!({
-            "name":"github-pat","session_id": m["sessionId"]
-        })).await.unwrap();
+        let m = tool_connect(
+            &state,
+            &json!({
+                "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:member"
+            }),
+        )
+        .await
+        .unwrap();
+        let ok = tool_vault_get(
+            &state,
+            &json!({
+                "name":"github-pat","session_id": m["sessionId"]
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(ok["_hestia_error"]["code"], "hestia.vault_not_found");
     }
 
@@ -1044,13 +1110,22 @@ mod accountability_tests {
         ).await.unwrap();
         let sid = connect["sessionId"].as_str().unwrap().to_string();
         let begin = tool_begin_action(&state, &json!({"tool_name":"Bash","session_id":sid}))
-            .await.unwrap();
+            .await
+            .unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
-        tool_record_outcome(&state, &json!({"action_id":aid,"success":true})).await.unwrap();
+        tool_record_outcome(&state, &json!({"action_id":aid,"success":true}))
+            .await
+            .unwrap();
         let s = state.lock().await;
-        let outcome = s.recent_chain(20).into_iter()
-            .find(|e| e.event_type == "outcome").unwrap();
-        assert_eq!(outcome.event_data["role_lct"], "role:constellation:mesh-worker");
+        let outcome = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "outcome")
+            .unwrap();
+        assert_eq!(
+            outcome.event_data["role_lct"],
+            "role:constellation:mesh-worker"
+        );
         // an unknown role would fail closed to the default (normalize covers that unit-side)
     }
 
@@ -1113,7 +1188,10 @@ mod accountability_tests {
         );
         // WHO — durable per-instance LCT (trust grain) + session_id (audit grain).
         assert!(
-            d["instance_lct"].as_str().unwrap().starts_with("lct:web4:member:"),
+            d["instance_lct"]
+                .as_str()
+                .unwrap()
+                .starts_with("lct:web4:member:"),
             "instance_lct must be the durable per-instance LCT, got {:?}",
             d["instance_lct"]
         );
@@ -1131,16 +1209,27 @@ mod accountability_tests {
     async fn host_session_id_is_witnessed_when_supplied() {
         let (_dir, state) = test_state().await;
         let connect = tool_connect(&state, &json!({"plugin_id":"claude-code","host_agent":"t"}))
-            .await.unwrap();
+            .await
+            .unwrap();
         let sid = connect["sessionId"].as_str().unwrap().to_string();
-        let begin = tool_begin_action(&state, &json!({
-            "tool_name":"Read","session_id":sid,"host_session_id":"claude-sess-abc"
-        })).await.unwrap();
+        let begin = tool_begin_action(
+            &state,
+            &json!({
+                "tool_name":"Read","session_id":sid,"host_session_id":"claude-sess-abc"
+            }),
+        )
+        .await
+        .unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
-        tool_record_outcome(&state, &json!({"action_id":aid,"success":true})).await.unwrap();
+        tool_record_outcome(&state, &json!({"action_id":aid,"success":true}))
+            .await
+            .unwrap();
         let s = state.lock().await;
-        let outcome = s.recent_chain(20).into_iter()
-            .find(|e| e.event_type == "outcome").unwrap();
+        let outcome = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "outcome")
+            .unwrap();
         assert_eq!(outcome.event_data["host_session_id"], "claude-sess-abc");
     }
 
@@ -1174,20 +1263,153 @@ mod accountability_tests {
             );
         }
         // The role that declared the overlay → TestTool is denied (tightened).
-        assert_eq!(decision_for(&state, "role:constellation:mesh-worker").await, "deny");
+        assert_eq!(
+            decision_for(&state, "role:constellation:mesh-worker").await,
+            "deny"
+        );
         // A different role has no overlay → base floor, not denied.
-        assert_ne!(decision_for(&state, "role:constellation:interactive-dev").await, "deny");
+        assert_ne!(
+            decision_for(&state, "role:constellation:interactive-dev").await,
+            "deny"
+        );
+    }
+
+    /// Strictest-wins tie-break (HUB post-hoc review, 2026-07-07): when the BASE
+    /// carries an audit-only deny on the same action the role overlay denies with
+    /// enforcement, the severities tie — and the fold must prefer the ENFORCED
+    /// eval. Otherwise the unenforced base eval wins and the ratified role deny
+    /// is silently defanged by the observation-phase flag (the fourth instance of
+    /// the "gate exists ≠ gate binds" defect class).
+    #[tokio::test]
+    async fn enforced_role_deny_beats_audit_only_base_deny_on_tie() {
+        let (_dir, state) = test_state().await;
+        let deny_rule = |id: &str| crate::policy::PolicyRule {
+            id: id.into(),
+            name: id.into(),
+            priority: 0,
+            decision: crate::policy::PolicyDecision::Deny,
+            reason: Some(id.to_string()),
+            r#match: crate::policy::PolicyMatch {
+                tools: Some(vec!["TestTool".into()]),
+                ..Default::default()
+            },
+        };
+        {
+            let mut s = state.lock().await;
+            // Base: observation phase — same deny, but audit-only (enforce=false).
+            s.policy_engine = crate::policy::PolicyEngine::new(crate::policy::PolicyConfig {
+                default_policy: crate::policy::PolicyDecision::Allow,
+                enforce: false,
+                rules: vec![deny_rule("base-audit-deny")],
+            });
+            // Role overlay: operator-authored law, enforced.
+            s.role_policy_engines.insert(
+                "role:constellation:mesh-worker".into(),
+                crate::policy::PolicyEngine::new(crate::policy::PolicyConfig {
+                    default_policy: crate::policy::PolicyDecision::Allow,
+                    enforce: true,
+                    rules: vec![deny_rule("role-enforced-deny")],
+                }),
+            );
+        }
+        let connect = tool_connect(
+            &state,
+            &json!({
+                "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:mesh-worker"
+            }),
+        )
+        .await
+        .unwrap();
+        let sid = connect["sessionId"].as_str().unwrap().to_string();
+        let begin = tool_begin_action(&state, &json!({"tool_name":"TestTool","session_id":sid}))
+            .await
+            .unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        let q = tool_query_policy(&state, &json!({"action_id":aid}))
+            .await
+            .unwrap();
+        assert_eq!(q["decision"], "deny");
+        // The pin: the fold must surface the ENFORCED role eval, not the tied
+        // audit-only base eval.
+        assert_eq!(
+            q["enforced"], true,
+            "severity tie must break toward enforced"
+        );
+        assert_eq!(q["ruleId"], "role-enforced-deny");
+    }
+
+    /// Same tie-break pin for the vault gate — the daemon-side credential_access
+    /// fold must also prefer the enforced role deny over a tied audit-only base
+    /// deny (the two enforcement points must not drift).
+    #[tokio::test]
+    async fn vault_gate_tie_breaks_toward_enforced_role_deny() {
+        let (_dir, state) = test_state().await;
+        let cred_deny = |id: &str| crate::policy::PolicyRule {
+            id: id.into(),
+            name: id.into(),
+            priority: 0,
+            decision: crate::policy::PolicyDecision::Deny,
+            reason: Some(id.to_string()),
+            r#match: crate::policy::PolicyMatch {
+                categories: Some(vec!["credential_access".into()]),
+                ..Default::default()
+            },
+        };
+        {
+            let mut s = state.lock().await;
+            s.policy_engine = crate::policy::PolicyEngine::new(crate::policy::PolicyConfig {
+                default_policy: crate::policy::PolicyDecision::Allow,
+                enforce: false,
+                rules: vec![cred_deny("base-audit-cred-deny")],
+            });
+            s.role_policy_engines.insert(
+                "role:constellation:mesh-worker".into(),
+                crate::policy::PolicyEngine::new(crate::policy::PolicyConfig {
+                    default_policy: crate::policy::PolicyDecision::Allow,
+                    enforce: true,
+                    rules: vec![cred_deny("role-enforced-cred-deny")],
+                }),
+            );
+        }
+        let mw = tool_connect(
+            &state,
+            &json!({
+                "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:mesh-worker"
+            }),
+        )
+        .await
+        .unwrap();
+        let denied = tool_vault_get(
+            &state,
+            &json!({
+                "name":"github-pat","session_id": mw["sessionId"]
+            }),
+        )
+        .await
+        .unwrap();
+        // Under the old severity-only fold the tied audit-only base eval won,
+        // `enforced` was false, and the credential was SERVED (vault_not_found
+        // here). The gate must refuse.
+        assert_eq!(denied["_hestia_error"]["code"], "hestia.policy_denied");
     }
 
     async fn decision_for(state: &SharedState, role: &str) -> String {
-        let connect = tool_connect(state, &json!({
-            "plugin_id":"claude-code","host_agent":"t","role":role
-        })).await.unwrap();
+        let connect = tool_connect(
+            state,
+            &json!({
+                "plugin_id":"claude-code","host_agent":"t","role":role
+            }),
+        )
+        .await
+        .unwrap();
         let sid = connect["sessionId"].as_str().unwrap().to_string();
         let begin = tool_begin_action(state, &json!({"tool_name":"TestTool","session_id":sid}))
-            .await.unwrap();
+            .await
+            .unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
-        let q = tool_query_policy(state, &json!({"action_id":aid})).await.unwrap();
+        let q = tool_query_policy(state, &json!({"action_id":aid}))
+            .await
+            .unwrap();
         q["decision"].as_str().unwrap().to_string()
     }
 }
