@@ -478,7 +478,10 @@ impl HubClient {
         tool: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let request = serde_json::json!({ "tool": tool, "args": args });
+        // H-007 (mesh-freshness): the request carries `nonce` + `issued_at`
+        // (see `channel_inner_request`) so the hub's ReplayGuard can dedup a
+        // re-sealed write and reject out-of-window requests.
+        let request = channel_inner_request(tool, args);
         let sealed = channel.seal_request(my, &request)?;
         let url = format!(
             "{}/hubs/{}/channel",
@@ -558,9 +561,41 @@ trait Pipe: Sized {
 }
 impl<T> Pipe for T {}
 
+/// Build the sealed `ChannelInner` request body for a hub tool call, stamped with
+/// the H-007 mesh-freshness fields (`nonce` + `issued_at`) so the hub's
+/// ReplayGuard can dedup a re-sealed write and reject out-of-window requests.
+/// Byte-compatible with the hub's `ChannelInner` (rest.rs) + the `channel_client`
+/// example. Fields are serde-optional on the hub, so this is Phase-1 backward-
+/// compatible; enforcement (Phase 2) lands only once every write-sender emits them.
+fn channel_inner_request(tool: &str, args: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "tool": tool,
+        "args": args,
+        "nonce": Uuid::new_v4().to_string(),
+        "issued_at": Utc::now().to_rfc3339(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H-007 regression guard: every sealed channel request must carry a fresh,
+    /// unique `nonce` + an `issued_at`, or the hub's replay defense is toothless.
+    #[test]
+    fn channel_inner_request_carries_fresh_h007_fields() {
+        let r = channel_inner_request("record_reputation", serde_json::json!({"x": 1}));
+        assert_eq!(r["tool"], "record_reputation");
+        assert_eq!(r["args"]["x"], 1);
+        assert!(
+            r.get("nonce").and_then(|n| n.as_str()).is_some_and(|s| !s.is_empty()),
+            "nonce must be present + non-empty"
+        );
+        assert!(r.get("issued_at").and_then(|t| t.as_str()).is_some(), "issued_at must be present");
+        // Distinct per call — a fixed nonce would BE the replay token it guards against.
+        let r2 = channel_inner_request("record_reputation", serde_json::json!({"x": 1}));
+        assert_ne!(r["nonce"], r2["nonce"], "each request must get a unique nonce");
+    }
 
     #[test]
     fn channel_round_trips_member_to_hub_and_back() {
