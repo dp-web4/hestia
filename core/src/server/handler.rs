@@ -510,7 +510,61 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
         .unwrap_or_default();
     let session_id_arg = optional_string(args, "session_id");
 
-    let s = state.lock().await;
+    let mut s = state.lock().await;
+    // Gate vault access at the DAEMON, not just the client hook — a direct MCP
+    // call must hit the same law. Evaluate base + the session's role overlay
+    // (strictest wins); an enforced deny refuses the credential and witnesses
+    // the decision (the only record of a blocked read). Ratified 2026-07-06:
+    // unattended roles (mesh-worker / autonomous-timer) deny credential_access.
+    {
+        let session_uuid = resolve_session_uuid(&s, session_id_arg.as_deref());
+        let (plugin_id, role_lct) = session_uuid
+            .and_then(|sid| s.sessions.get(&sid))
+            .map(|sess| (sess.plugin_id.clone(), sess.constellation_role.clone()))
+            .unwrap_or_else(|| {
+                (
+                    "unknown".to_string(),
+                    crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
+                )
+            });
+        let pa = crate::policy::PolicyAction {
+            tool_name: "hestia_vault_get",
+            category: "credential_access",
+            target: Some(&name),
+            full_command: None,
+        };
+        let mut evaluation = s.policy_engine.evaluate(&pa);
+        if let Some(role_engine) = s.role_policy_engines.get(&role_lct) {
+            let role_eval = role_engine.evaluate(&pa);
+            if role_eval.decision.severity() > evaluation.decision.severity() {
+                evaluation = role_eval;
+            }
+        }
+        if evaluation.decision == crate::policy::PolicyDecision::Deny && evaluation.enforced {
+            let instance_lct = s.member_lct(&plugin_id);
+            let _ = s.append_chain(
+                "policy_decision",
+                json!({
+                    "tool_name": "hestia_vault_get",
+                    "target": name,
+                    "plugin_id": plugin_id,
+                    "instance_lct": instance_lct,
+                    "role_lct": role_lct,
+                    "session_id": session_uuid,
+                    "decision": "deny",
+                    "enforced": true,
+                    "rule_id": evaluation.rule_id,
+                    "rule_name": evaluation.rule_name,
+                    "reason": evaluation.reason,
+                }),
+            );
+            return Ok(hestia_error_envelope(
+                "hestia.policy_denied",
+                &format!("Vault access denied by policy: {}", evaluation.reason),
+                Some(json!({"name": name, "rule_id": evaluation.rule_id})),
+            ));
+        }
+    }
     let entry = match s.vault.get(&name) {
         Some(e) => e.clone(),
         None => {
@@ -920,6 +974,63 @@ mod accountability_tests {
         let outcome = s.recent_chain(20).into_iter()
             .find(|e| e.event_type == "outcome").unwrap();
         assert!(outcome.event_data["intent"].is_null(), "unstated intent must be null");
+    }
+
+    /// The ratified unattended law has TEETH at the daemon: a mesh-worker session
+    /// with a credential_access overlay deny is refused by `vault_get` itself
+    /// (direct MCP calls can't bypass the client hook), and the deny is witnessed
+    /// with the full WHO. An attended (member) session is not blocked.
+    #[tokio::test]
+    async fn vault_get_denied_for_overlaid_role_and_witnessed() {
+        let (_dir, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            let rule = crate::policy::PolicyRule {
+                id: "unattended-no-vault".into(),
+                name: "unattended no vault reads".into(),
+                priority: 0,
+                decision: crate::policy::PolicyDecision::Deny,
+                reason: Some("unattended".into()),
+                r#match: crate::policy::PolicyMatch {
+                    categories: Some(vec!["credential_access".into()]),
+                    ..Default::default()
+                },
+            };
+            s.role_policy_engines.insert(
+                "role:constellation:mesh-worker".into(),
+                crate::policy::PolicyEngine::new(crate::policy::PolicyConfig {
+                    default_policy: crate::policy::PolicyDecision::Allow,
+                    enforce: true,
+                    rules: vec![rule],
+                }),
+            );
+        }
+        // mesh-worker → denied by the daemon, before the vault is even consulted.
+        let mw = tool_connect(&state, &json!({
+            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:mesh-worker"
+        })).await.unwrap();
+        let denied = tool_vault_get(&state, &json!({
+            "name":"github-pat","session_id": mw["sessionId"]
+        })).await.unwrap();
+        assert_eq!(denied["_hestia_error"]["code"], "hestia.policy_denied");
+        // The refusal is witnessed with WHO.
+        {
+            let s = state.lock().await;
+            let pd = s.recent_chain(10).into_iter()
+                .find(|e| e.event_type == "policy_decision")
+                .expect("vault deny must be witnessed");
+            assert_eq!(pd.event_data["role_lct"], "role:constellation:mesh-worker");
+            assert_eq!(pd.event_data["target"], "github-pat");
+            assert_eq!(pd.event_data["enforced"], true);
+        }
+        // member (attended) → NOT policy-blocked; falls through to not-found.
+        let m = tool_connect(&state, &json!({
+            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:member"
+        })).await.unwrap();
+        let ok = tool_vault_get(&state, &json!({
+            "name":"github-pat","session_id": m["sessionId"]
+        })).await.unwrap();
+        assert_eq!(ok["_hestia_error"]["code"], "hestia.vault_not_found");
     }
 
     /// A declared constellation role flows through `connect` (normalized) onto the

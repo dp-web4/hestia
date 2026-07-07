@@ -69,6 +69,13 @@ pub fn classify(tool_name: &str) -> &'static str {
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => "file_write",
         "WebFetch" | "WebSearch" => "network",
         "TodoWrite" => "task_management",
+        // Vault credential tools — until this, NOTHING classified as
+        // credential_access, so category rules on it were silently dead law
+        // (caught by the 2026-07-06 ratified-overlay live check). Suffix match
+        // covers host-agent prefixing (Claude Code: `mcp__hestia__hestia_vault_get`).
+        t if t.ends_with("hestia_vault_get") || t.ends_with("hestia_vault_set") => {
+            "credential_access"
+        }
         _ => "unknown",
     }
 }
