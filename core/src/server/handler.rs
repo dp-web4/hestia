@@ -399,10 +399,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         .map(|sess| sess.constellation_role.clone())
         .unwrap_or_else(|| crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string());
     if let Some(role_engine) = s.role_policy_engines.get(&session_role) {
-        let role_eval = role_engine.evaluate(&pa);
-        if role_eval.decision.severity() > evaluation.decision.severity() {
-            evaluation = role_eval;
-        }
+        evaluation = crate::policy::fold_strictest(evaluation, role_engine.evaluate(&pa));
     }
 
     // Witness the policy decision when the verdict is anything other
@@ -497,6 +494,79 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     }))
 }
 
+/// The WHO behind a direct tool call, resolved from an optional caller-supplied
+/// session id (falling back to the latest-connected session, then to the
+/// unattributed default — hestia's cooperative-attribution model).
+struct CallerWho {
+    session_uuid: Option<Uuid>,
+    plugin_id: String,
+    role_lct: String,
+}
+
+fn resolve_caller(s: &super::state::ServerState, session_id_arg: Option<&str>) -> CallerWho {
+    let session_uuid = resolve_session_uuid(s, session_id_arg);
+    let (plugin_id, role_lct) = session_uuid
+        .and_then(|sid| s.sessions.get(&sid))
+        .map(|sess| (sess.plugin_id.clone(), sess.constellation_role.clone()))
+        .unwrap_or_else(|| {
+            (
+                "unknown".to_string(),
+                crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
+            )
+        });
+    CallerWho { session_uuid, plugin_id, role_lct }
+}
+
+/// Daemon-side policy gate for the direct-call tool surfaces (vault get/set,
+/// witness append) — a direct MCP call must hit the same law as the client
+/// hook. Evaluates base + the caller's role overlay (strictest wins, enforced
+/// breaks ties); an enforced deny witnesses the refusal with full WHO (the
+/// only record of a blocked call) and returns the error envelope to send back.
+/// Ratified 2026-07-06: unattended roles deny credential_access.
+fn gate_direct_tool(
+    s: &mut super::state::ServerState,
+    who: &CallerWho,
+    tool_name: &str,
+    category: &'static str,
+    target: &str,
+) -> Option<Value> {
+    let pa = crate::policy::PolicyAction {
+        tool_name,
+        category,
+        target: Some(target),
+        full_command: None,
+    };
+    let mut evaluation = s.policy_engine.evaluate(&pa);
+    if let Some(role_engine) = s.role_policy_engines.get(&who.role_lct) {
+        evaluation = crate::policy::fold_strictest(evaluation, role_engine.evaluate(&pa));
+    }
+    if evaluation.decision == crate::policy::PolicyDecision::Deny && evaluation.enforced {
+        let instance_lct = s.member_lct(&who.plugin_id);
+        let _ = s.append_chain(
+            "policy_decision",
+            json!({
+                "tool_name": tool_name,
+                "target": target,
+                "plugin_id": who.plugin_id,
+                "instance_lct": instance_lct,
+                "role_lct": who.role_lct,
+                "session_id": who.session_uuid,
+                "decision": "deny",
+                "enforced": true,
+                "rule_id": evaluation.rule_id,
+                "rule_name": evaluation.rule_name,
+                "reason": evaluation.reason,
+            }),
+        );
+        return Some(hestia_error_envelope(
+            "hestia.policy_denied",
+            &format!("{} denied by policy: {}", tool_name, evaluation.reason),
+            Some(json!({"target": target, "rule_id": evaluation.rule_id})),
+        ));
+    }
+    None
+}
+
 async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
     let name = require_string(args, "name")?;
     let scope: Vec<String> = args
@@ -511,59 +581,10 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
     let session_id_arg = optional_string(args, "session_id");
 
     let mut s = state.lock().await;
-    // Gate vault access at the DAEMON, not just the client hook — a direct MCP
-    // call must hit the same law. Evaluate base + the session's role overlay
-    // (strictest wins); an enforced deny refuses the credential and witnesses
-    // the decision (the only record of a blocked read). Ratified 2026-07-06:
-    // unattended roles (mesh-worker / autonomous-timer) deny credential_access.
+    let who = resolve_caller(&s, session_id_arg.as_deref());
+    if let Some(denied) = gate_direct_tool(&mut s, &who, "hestia_vault_get", "credential_access", &name)
     {
-        let session_uuid = resolve_session_uuid(&s, session_id_arg.as_deref());
-        let (plugin_id, role_lct) = session_uuid
-            .and_then(|sid| s.sessions.get(&sid))
-            .map(|sess| (sess.plugin_id.clone(), sess.constellation_role.clone()))
-            .unwrap_or_else(|| {
-                (
-                    "unknown".to_string(),
-                    crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
-                )
-            });
-        let pa = crate::policy::PolicyAction {
-            tool_name: "hestia_vault_get",
-            category: "credential_access",
-            target: Some(&name),
-            full_command: None,
-        };
-        let mut evaluation = s.policy_engine.evaluate(&pa);
-        if let Some(role_engine) = s.role_policy_engines.get(&role_lct) {
-            let role_eval = role_engine.evaluate(&pa);
-            if role_eval.decision.severity() > evaluation.decision.severity() {
-                evaluation = role_eval;
-            }
-        }
-        if evaluation.decision == crate::policy::PolicyDecision::Deny && evaluation.enforced {
-            let instance_lct = s.member_lct(&plugin_id);
-            let _ = s.append_chain(
-                "policy_decision",
-                json!({
-                    "tool_name": "hestia_vault_get",
-                    "target": name,
-                    "plugin_id": plugin_id,
-                    "instance_lct": instance_lct,
-                    "role_lct": role_lct,
-                    "session_id": session_uuid,
-                    "decision": "deny",
-                    "enforced": true,
-                    "rule_id": evaluation.rule_id,
-                    "rule_name": evaluation.rule_name,
-                    "reason": evaluation.reason,
-                }),
-            );
-            return Ok(hestia_error_envelope(
-                "hestia.policy_denied",
-                &format!("Vault access denied by policy: {}", evaluation.reason),
-                Some(json!({"name": name, "rule_id": evaluation.rule_id})),
-            ));
-        }
+        return Ok(denied);
     }
     let entry = match s.vault.get(&name) {
         Some(e) => e.clone(),
@@ -631,7 +652,18 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
         })
         .unwrap_or_default();
 
+    let session_id_arg = optional_string(args, "session_id");
+
     let mut s = state.lock().await;
+    // Credential WRITES are the same tamper surface as reads (malicious
+    // replacement, persistence), so they hit the same daemon-side law —
+    // GPT 3rd-pass HST-002. classify() already maps hestia_vault_set to
+    // credential_access, so the ratified unattended-role deny binds here too.
+    let who = resolve_caller(&s, session_id_arg.as_deref());
+    if let Some(denied) = gate_direct_tool(&mut s, &who, "hestia_vault_set", "credential_access", &name)
+    {
+        return Ok(denied);
+    }
     let entry = VaultEntry::new(&name, value)
         .with_scope(scope)
         .with_tags(tags)
@@ -642,12 +674,16 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
         .upsert(entry)
         .map_err(|e| anyhow::anyhow!("vault write: {}", e))?;
 
-    // Audit the mutation in the chain (the secret is never written; only the name).
+    // Audit the mutation in the chain (the secret is never written; only the
+    // name), attributed to the writing WHO.
     let _ = s.append_chain(
         "vault_set",
         json!({
             "name": name,
             "entry_id": entry_id,
+            "plugin_id": who.plugin_id,
+            "role_lct": who.role_lct,
+            "session_id": who.session_uuid,
         }),
     );
 
@@ -690,11 +726,53 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
     Ok(json!({"entries": entries, "hasMore": false}))
 }
 
+/// Event types the daemon itself writes. `request_witness` must not be able to
+/// forge them — a caller-authored "policy_decision" or "outcome" entry would
+/// poison the audit semantics of the whole chain (GPT 3rd-pass HST-003).
+const RESERVED_EVENT_TYPES: &[&str] = &[
+    "outcome",
+    "policy_decision",
+    "policy_edit",
+    "vault_set",
+    "orchestrator_connect",
+    "notify.received",
+];
+
 async fn tool_request_witness(state: &SharedState, args: &Value) -> ToolResult {
     let event_type = require_string(args, "event_type")?;
     let event_data = args.get("event_data").cloned().unwrap_or(Value::Null);
-    let s = state.lock().await;
-    let entry = s.append_chain(&event_type, event_data)?;
+    let session_id_arg = optional_string(args, "session_id");
+
+    if RESERVED_EVENT_TYPES.contains(&event_type.as_str()) {
+        return Ok(hestia_error_envelope(
+            "hestia.witness_reserved_event",
+            &format!("event_type '{}' is reserved for daemon-authored events", event_type),
+            Some(json!({"event_type": event_type})),
+        ));
+    }
+
+    let mut s = state.lock().await;
+    // The chain is the audit surface, so appending to it is itself a gated,
+    // attributed act: law can deny it per role (category witness_append), and
+    // what lands on the chain carries the requesting WHO next to the caller's
+    // payload — never only caller-supplied data.
+    let who = resolve_caller(&s, session_id_arg.as_deref());
+    if let Some(denied) =
+        gate_direct_tool(&mut s, &who, "hestia_request_witness", "witness_append", &event_type)
+    {
+        return Ok(denied);
+    }
+    let entry = s.append_chain(
+        &event_type,
+        json!({
+            "requested_by": {
+                "plugin_id": who.plugin_id,
+                "role_lct": who.role_lct,
+                "session_id": who.session_uuid,
+            },
+            "data": event_data,
+        }),
+    )?;
     Ok(json!({"witnessEntryHash": entry.hash}))
 }
 
@@ -821,15 +899,10 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
         let trust = s.trust(plugin_id);
         return Ok(serde_json::to_string(&trust_state_json(&trust)).unwrap_or("{}".into()));
     }
-    if let Some(name) = uri.strip_prefix("hestia://vault/") {
-        match s.vault.get(name) {
-            Some(e) => {
-                return Ok(serde_json::to_string(&json!({"value": e.secret}))
-                    .unwrap_or("{}".into()));
-            }
-            None => return Err(format!("vault: credential '{}' not found", name)),
-        }
-    }
+    // NOTE deliberately NO `hestia://vault/{name}` resource: it served the raw
+    // secret with no policy, scope, allowed_consumers, or witness — a sibling
+    // path that made the hestia_vault_get gate decorative (GPT 3rd-pass
+    // HST-001). Credential reads go through hestia_vault_get, full stop.
     Err(format!("unknown resource: {}", uri))
 }
 
@@ -1031,6 +1104,134 @@ mod accountability_tests {
             "name":"github-pat","session_id": m["sessionId"]
         })).await.unwrap();
         assert_eq!(ok["_hestia_error"]["code"], "hestia.vault_not_found");
+    }
+
+    fn deny_overlay_for(categories: &[&str]) -> crate::policy::PolicyEngine {
+        crate::policy::PolicyEngine::new(crate::policy::PolicyConfig {
+            default_policy: crate::policy::PolicyDecision::Allow,
+            enforce: true,
+            rules: vec![crate::policy::PolicyRule {
+                id: "unattended-deny".into(),
+                name: "unattended deny".into(),
+                priority: 0,
+                decision: crate::policy::PolicyDecision::Deny,
+                reason: Some("unattended".into()),
+                r#match: crate::policy::PolicyMatch {
+                    categories: Some(categories.iter().map(|c| c.to_string()).collect()),
+                    ..Default::default()
+                },
+            }],
+        })
+    }
+
+    /// Regression pin for GPT 3rd-pass HST-001: the `hestia://vault/{name}`
+    /// resource path is GONE. It used to hand back the raw secret past every
+    /// gate `hestia_vault_get` enforces — a sibling seam that made the ratified
+    /// credential_access law decorative.
+    #[tokio::test]
+    async fn vault_uri_resource_no_longer_serves_secrets() {
+        let (_dir, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            s.vault.upsert(crate::vault::VaultEntry::new("github-pat", "s3cret")).unwrap();
+        }
+        let res = read_resource_body(&state, "hestia://vault/github-pat").await;
+        let err = res.expect_err("vault URI must no longer resolve");
+        assert!(err.contains("unknown resource"), "got: {err}");
+        assert!(!err.contains("s3cret"));
+    }
+
+    /// Regression pin for GPT 3rd-pass HST-002: credential WRITES hit the same
+    /// daemon-side law as reads. An overlaid unattended role is refused before
+    /// the vault is touched, the deny is witnessed with WHO, and nothing lands
+    /// in the vault. An attended (member) session still writes.
+    #[tokio::test]
+    async fn vault_set_denied_for_overlaid_role_and_witnessed() {
+        let (_dir, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            s.role_policy_engines.insert(
+                "role:constellation:mesh-worker".into(),
+                deny_overlay_for(&["credential_access"]),
+            );
+        }
+        let mw = tool_connect(&state, &json!({
+            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:mesh-worker"
+        })).await.unwrap();
+        let denied = tool_vault_set(&state, &json!({
+            "name":"github-pat","value":"evil","session_id": mw["sessionId"]
+        })).await.unwrap();
+        assert_eq!(denied["_hestia_error"]["code"], "hestia.policy_denied");
+        {
+            let s = state.lock().await;
+            assert!(s.vault.get("github-pat").is_none(), "denied write must not persist");
+            let pd = s.recent_chain(10).into_iter()
+                .find(|e| e.event_type == "policy_decision")
+                .expect("vault_set deny must be witnessed");
+            assert_eq!(pd.event_data["tool_name"], "hestia_vault_set");
+            assert_eq!(pd.event_data["role_lct"], "role:constellation:mesh-worker");
+            assert_eq!(pd.event_data["enforced"], true);
+        }
+        // member (attended) → the write goes through, attributed on the chain.
+        let m = tool_connect(&state, &json!({
+            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:member"
+        })).await.unwrap();
+        let ok = tool_vault_set(&state, &json!({
+            "name":"github-pat","value":"real","session_id": m["sessionId"]
+        })).await.unwrap();
+        assert_eq!(ok["stored"], true);
+        let s = state.lock().await;
+        assert!(s.vault.get("github-pat").is_some());
+        let vs = s.recent_chain(10).into_iter()
+            .find(|e| e.event_type == "vault_set")
+            .expect("vault_set must be audited");
+        assert_eq!(vs.event_data["role_lct"], "role:constellation:member");
+    }
+
+    /// Regression pin for GPT 3rd-pass HST-003: `request_witness` is a gated,
+    /// attributed act — reserved daemon event types can't be forged, an
+    /// overlaid role can be denied the append entirely, and an allowed append
+    /// carries the requesting WHO next to (never instead of) the caller data.
+    #[tokio::test]
+    async fn request_witness_gated_attributed_and_reserved() {
+        let (_dir, state) = test_state().await;
+        // Forging a daemon-authored event type is refused for anyone.
+        let forged = tool_request_witness(&state, &json!({
+            "event_type":"policy_decision","event_data":{"decision":"allow"}
+        })).await.unwrap();
+        assert_eq!(forged["_hestia_error"]["code"], "hestia.witness_reserved_event");
+
+        // An overlaid unattended role is denied the append by law.
+        {
+            let mut s = state.lock().await;
+            s.role_policy_engines.insert(
+                "role:constellation:mesh-worker".into(),
+                deny_overlay_for(&["witness_append"]),
+            );
+        }
+        let mw = tool_connect(&state, &json!({
+            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:mesh-worker"
+        })).await.unwrap();
+        let denied = tool_request_witness(&state, &json!({
+            "event_type":"custom.note","event_data":{"k":"v"},"session_id": mw["sessionId"]
+        })).await.unwrap();
+        assert_eq!(denied["_hestia_error"]["code"], "hestia.policy_denied");
+
+        // A member append lands, wrapped with the requesting WHO.
+        let m = tool_connect(&state, &json!({
+            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:member"
+        })).await.unwrap();
+        let ok = tool_request_witness(&state, &json!({
+            "event_type":"custom.note","event_data":{"k":"v"},"session_id": m["sessionId"]
+        })).await.unwrap();
+        assert!(ok["witnessEntryHash"].is_string());
+        let s = state.lock().await;
+        let e = s.recent_chain(10).into_iter()
+            .find(|e| e.event_type == "custom.note")
+            .expect("allowed append must land on the chain");
+        assert_eq!(e.event_data["data"]["k"], "v");
+        assert_eq!(e.event_data["requested_by"]["role_lct"], "role:constellation:member");
+        assert_eq!(e.event_data["requested_by"]["plugin_id"], "claude-code");
     }
 
     /// A declared constellation role flows through `connect` (normalized) onto the

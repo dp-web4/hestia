@@ -167,7 +167,6 @@ pub struct VaultEntry {
 
 | URI | Description |
 |---|---|
-| `hestia://vault/{name}` | Read a credential by name (gated by `allowed_consumers`) |
 | `hestia://society/state` | Read society state (members, roles, trust scores) |
 | `hestia://society/trust/{agent_id}` | Read trust state for a specific agent |
 | `hestia://witness/recent` | Read recent witness events |

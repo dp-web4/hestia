@@ -18,7 +18,7 @@ URIs use the `hestia://` scheme.
 
 | URI | Returns | Access control |
 |---|---|---|
-| `hestia://vault/{name}` | Credential value (string) | User approval per session or per request, depending on user setting; plugin must be in the credential's `allowed_consumers` |
+| ~~`hestia://vault/{name}`~~ | *Removed 2026-07-07* | The resource path returned the raw secret without the policy / scope / `allowed_consumers` / witness gates that `hestia_vault_get` enforces (GPT security review HST-001). Credential reads go through `hestia_vault_get` only. |
 | `hestia://society/state` | JSON snapshot of the user's society (members, roles, ATP treasury) | Plugin's own role determines depth: Citizens see public state only; Administrators see full state |
 | `hestia://society/trust/{agent_id}` | TrustState for the named agent (T3/V3 + level + action count + days-since-last) | Plugins see their own; cross-agent reads require user approval |
 | `hestia://witness/recent` | Last N witness chain entries (paginated, default 50) | Plugin sees entries it participated in; broader views require user approval |

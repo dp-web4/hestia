@@ -145,6 +145,26 @@ pub struct PolicyEvaluation {
     pub constraints: Vec<String>,
 }
 
+/// Fold a role-overlay evaluation into the base by STRICTEST verdict
+/// (`Allow` < `Warn` < `Deny`), so a self-declared role can only ever
+/// tighten the base, never loosen it.
+///
+/// Severity TIES break in favor of the ENFORCED evaluation: if the base
+/// carries an audit-only deny on a category the role also (enforced-)denies,
+/// a bare severity comparison would let the unenforced base eval win and
+/// `deny && enforced` fail — the ratified role law silently defanged by the
+/// fold itself (HUB post-hoc review note 1, 2026-07-07). On a full tie the
+/// base wins, keeping its attribution.
+pub fn fold_strictest(base: PolicyEvaluation, role: PolicyEvaluation) -> PolicyEvaluation {
+    let base_rank = (base.decision.severity(), base.enforced);
+    let role_rank = (role.decision.severity(), role.enforced);
+    if role_rank > base_rank {
+        role
+    } else {
+        base
+    }
+}
+
 /// The action being evaluated. Mirrors the orchestrator-side R6Action
 /// shape but locally-typed.
 #[derive(Debug, Clone)]
@@ -172,5 +192,44 @@ mod severity_tests {
     fn severity_orders_allow_below_warn_below_deny() {
         assert!(PolicyDecision::Allow.severity() < PolicyDecision::Warn.severity());
         assert!(PolicyDecision::Warn.severity() < PolicyDecision::Deny.severity());
+    }
+
+    fn eval(decision: PolicyDecision, enforced: bool, tag: &str) -> PolicyEvaluation {
+        PolicyEvaluation {
+            decision,
+            rule_id: Some(tag.into()),
+            rule_name: None,
+            reason: tag.into(),
+            enforced,
+            constraints: vec![],
+        }
+    }
+
+    /// Regression pin (HUB review note 1): an audit-only base deny must not
+    /// shadow an enforced role deny of equal severity — the fold breaks
+    /// severity ties in favor of `enforced`.
+    #[test]
+    fn fold_breaks_severity_tie_toward_enforced() {
+        let base = eval(PolicyDecision::Deny, false, "base-audit-only");
+        let role = eval(PolicyDecision::Deny, true, "role-ratified");
+        let folded = fold_strictest(base, role);
+        assert!(folded.enforced, "enforced role deny must win the tie");
+        assert_eq!(folded.rule_id.as_deref(), Some("role-ratified"));
+    }
+
+    #[test]
+    fn fold_still_prefers_stricter_verdict_and_base_on_full_tie() {
+        // Stricter verdict wins regardless of enforcement.
+        let folded = fold_strictest(
+            eval(PolicyDecision::Warn, true, "base"),
+            eval(PolicyDecision::Deny, false, "role"),
+        );
+        assert_eq!(folded.decision, PolicyDecision::Deny);
+        // Full tie → base wins, keeping its attribution.
+        let folded = fold_strictest(
+            eval(PolicyDecision::Deny, true, "base"),
+            eval(PolicyDecision::Deny, true, "role"),
+        );
+        assert_eq!(folded.rule_id.as_deref(), Some("base"));
     }
 }

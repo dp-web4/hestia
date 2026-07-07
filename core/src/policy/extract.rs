@@ -76,6 +76,10 @@ pub fn classify(tool_name: &str) -> &'static str {
         t if t.ends_with("hestia_vault_get") || t.ends_with("hestia_vault_set") => {
             "credential_access"
         }
+        // Witness-chain appends are their own gateable category: request_witness
+        // lets a caller write audit history, so law must be able to deny it for
+        // unattended roles the same way it denies credential_access.
+        t if t.ends_with("hestia_request_witness") => "witness_append",
         _ => "unknown",
     }
 }
@@ -122,5 +126,8 @@ mod tests {
         assert_eq!(classify("Write"), "file_write");
         assert_eq!(classify("WebFetch"), "network");
         assert_eq!(classify("Mystery"), "unknown");
+        assert_eq!(classify("hestia_vault_set"), "credential_access");
+        assert_eq!(classify("hestia_request_witness"), "witness_append");
+        assert_eq!(classify("mcp__hestia__hestia_request_witness"), "witness_append");
     }
 }

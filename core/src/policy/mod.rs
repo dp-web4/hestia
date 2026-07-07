@@ -26,6 +26,6 @@ pub use extract::{classify, extract_full_command, extract_target};
 pub use presets::{get_preset, is_preset_name, list_presets, PRESET_NAMES};
 pub use rate_limit::{RateLimitResult, RateLimiter};
 pub use types::{
-    PolicyAction, PolicyConfig, PolicyDecision, PolicyEvaluation, PolicyMatch, PolicyRule,
-    PresetDefinition, RateLimitSpec, TimeWindow,
+    fold_strictest, PolicyAction, PolicyConfig, PolicyDecision, PolicyEvaluation, PolicyMatch,
+    PolicyRule, PresetDefinition, RateLimitSpec, TimeWindow,
 };
