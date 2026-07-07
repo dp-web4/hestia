@@ -71,6 +71,7 @@ impl ServerHandler for HestiaServer {
             "hestia_connect" => tool_connect(&self.state, &args).await,
             "hestia_begin_action" => tool_begin_action(&self.state, &args).await,
             "hestia_record_outcome" => tool_record_outcome(&self.state, &args).await,
+            "hestia_record_reversal" => tool_record_reversal(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
             "hestia_vault_get" => tool_vault_get(&self.state, &args).await,
             "hestia_vault_set" => tool_vault_set(&self.state, &args).await,
@@ -158,6 +159,7 @@ fn hestia_tools() -> Vec<Tool> {
         t("hestia_connect", "Establish a plugin session and receive a Soft LCT"),
         t("hestia_begin_action", "Begin tracking an R6/R7 action"),
         t("hestia_record_outcome", "Submit the outcome of an action"),
+        t("hestia_record_reversal", "Record a reversal/override of a subject's work (judgment signal → trust)"),
         t("hestia_query_policy", "Query the user's policy for a decision"),
         t("hestia_vault_get", "Request a credential from the vault"),
         t("hestia_vault_set", "Store a credential in the vault"),
@@ -736,7 +738,90 @@ const RESERVED_EVENT_TYPES: &[&str] = &[
     "vault_set",
     "orchestrator_connect",
     "notify.received",
+    "reversal",
 ];
+
+/// Reversal kinds — a JUDGMENT signal about an actor's work, distinct from the
+/// execution `outcome` (did the tool run?) and the rule `policy_decision` (did a
+/// pattern match?). This is the signal the calibration analysis found missing:
+/// the rule-gate is trust-blind by construction, so trust can't predict it —
+/// but a reversal IS evidence about the actor's judgment, which trust should
+/// (falsifiably) predict. Instrumented 2026-07-07.
+const REVERSAL_KINDS: &[&str] = &["override", "rollback", "review_reject", "incident"];
+
+/// Record a reversal/override of a prior action — a delayed NEGATIVE judgment
+/// about the SUBJECT (instance, role), fed into trust and witnessed. The subject
+/// is passed explicitly (`subject_plugin_id` [+ `subject_role`]) because the
+/// reverted work is usually attributed after the subject's session has ended
+/// (e.g. a reviewer rejecting a worker's PR). The REPORTER (the caller) is also
+/// witnessed for accountability — a malicious reversal report is fully traceable.
+async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
+    let subject_plugin_id = require_string(args, "subject_plugin_id")?;
+    let subject_role = crate::reputation::normalize_constellation_role(
+        optional_string(args, "subject_role").as_deref().unwrap_or(""),
+    );
+    let kind = require_string(args, "kind")?;
+    if !REVERSAL_KINDS.contains(&kind.as_str()) {
+        return Ok(hestia_error_envelope(
+            "hestia.reversal_unknown_kind",
+            &format!("kind '{}' not in {:?}", kind, REVERSAL_KINDS),
+            Some(json!({"kind": kind})),
+        ));
+    }
+    let reason = optional_string(args, "reason");
+    // Severity of the reversal → trust penalty. Bounded [0,1]; default moderate.
+    let magnitude = args
+        .get("magnitude")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.4)
+        .clamp(0.0, 1.0);
+    let reference = optional_string(args, "ref");
+    let session_id_arg = optional_string(args, "session_id");
+
+    let mut s = state.lock().await;
+    let reporter = resolve_caller(&s, session_id_arg.as_deref());
+    let subject_instance_lct = s.member_lct(&subject_plugin_id);
+
+    // Witness the reversal — the subject's WHO + the reporter's WHO (accountability
+    // for who leveled the judgment) + the pointer to the reverted work.
+    let entry = s.append_chain(
+        "reversal",
+        json!({
+            "subject_plugin_id": subject_plugin_id,
+            "subject_instance_lct": subject_instance_lct,
+            "subject_role": subject_role,
+            "kind": kind,
+            "reason": reason,
+            "ref": reference,
+            "magnitude": magnitude,
+            "reported_by": {
+                "plugin_id": reporter.plugin_id,
+                "role_lct": reporter.role_lct,
+                "session_id": reporter.session_uuid,
+            },
+        }),
+    )?;
+
+    // Feed the SUBJECT's (instance, role) trust as a negative judgment outcome —
+    // a distinct `action_type` so the calibration can separate reversal-driven
+    // trust movement from execution outcomes.
+    let ref_target = reference.clone().unwrap_or_default();
+    let rev_reason = format!("reversal:{kind}");
+    let rep_ctx = crate::reputation::RepContext {
+        role_lct: subject_role,
+        action_type: "reversal",
+        action_target: &ref_target,
+        action_id: "",
+        reason: &rev_reason,
+    };
+    let trust_state = s.apply_outcome_ctx(&subject_plugin_id, false, magnitude, &rep_ctx)?;
+
+    Ok(json!({
+        "witnessEntryHash": entry.hash,
+        "subjectInstanceLct": subject_instance_lct,
+        "updatedTrustState": trust_state_json(&trust_state),
+    }))
+}
 
 async fn tool_request_witness(state: &SharedState, args: &Value) -> ToolResult {
     let event_type = require_string(args, "event_type")?;
@@ -1232,6 +1317,57 @@ mod accountability_tests {
         assert_eq!(e.event_data["data"]["k"], "v");
         assert_eq!(e.event_data["requested_by"]["role_lct"], "role:constellation:member");
         assert_eq!(e.event_data["requested_by"]["plugin_id"], "claude-code");
+    }
+
+    /// A reversal is a JUDGMENT signal: it witnesses the subject + reporter, feeds
+    /// the SUBJECT's (instance, role) trust negatively, and the event type is
+    /// reserved (a plugin can't forge one via request_witness).
+    #[tokio::test]
+    async fn reversal_witnesses_subject_and_reporter_and_feeds_trust() {
+        let (_dir, state) = test_state().await;
+        // A reviewer session reports a mesh-worker's PR was rejected.
+        let reviewer = tool_connect(&state, &json!({
+            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:reviewer"
+        })).await.unwrap();
+        // Baseline trust for the subject in the mesh-worker role.
+        let before = {
+            let s = state.lock().await;
+            s.trust_for_role("worker-agent", "role:constellation:mesh-worker").talent()
+        };
+        let out = tool_record_reversal(&state, &json!({
+            "subject_plugin_id":"worker-agent",
+            "subject_role":"role:constellation:mesh-worker",
+            "kind":"review_reject",
+            "reason":"unsafe force-push in the PR",
+            "ref":"PR#123",
+            "magnitude":0.5,
+            "session_id": reviewer["sessionId"],
+        })).await.unwrap();
+        assert!(out.get("_hestia_error").is_none(), "reversal should succeed: {out:?}");
+
+        let s = state.lock().await;
+        let ev = s.recent_chain(5).into_iter()
+            .find(|e| e.event_type == "reversal").expect("reversal witnessed");
+        let d = &ev.event_data;
+        assert_eq!(d["subject_plugin_id"], "worker-agent");
+        assert_eq!(d["subject_role"], "role:constellation:mesh-worker");
+        assert_eq!(d["kind"], "review_reject");
+        // reporter (the reviewer) is captured for accountability, distinct from subject
+        assert_eq!(d["reported_by"]["role_lct"], "role:constellation:reviewer");
+        // the SUBJECT's mesh-worker trust dropped (negative judgment)
+        let after = s.trust_for_role("worker-agent", "role:constellation:mesh-worker").talent();
+        assert!(after < before, "subject trust must drop: {after} !< {before}");
+        // an unknown reversal kind is rejected
+        drop(s);
+        let bad = tool_record_reversal(&state, &json!({
+            "subject_plugin_id":"worker-agent","kind":"vibes"
+        })).await.unwrap();
+        assert_eq!(bad["_hestia_error"]["code"], "hestia.reversal_unknown_kind");
+        // reversal is reserved from request_witness forgery
+        let forge = tool_request_witness(&state, &json!({
+            "event_type":"reversal","event_data":{"subject_plugin_id":"x"}
+        })).await.unwrap();
+        assert_eq!(forge["_hestia_error"]["code"], "hestia.witness_reserved_event");
     }
 
     /// A declared constellation role flows through `connect` (normalized) onto the
