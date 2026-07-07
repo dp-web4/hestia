@@ -296,6 +296,11 @@ enum PolicyCmd {
         /// Match a command glob pattern (e.g. "*rm -rf*")
         #[arg(long)]
         command: Option<String>,
+        /// Match a target glob pattern (file path / url), repeatable. Combinable
+        /// with the other specifiers — all given specifiers must match (AND), e.g.
+        /// `--category file_read --target "*/.ssh/*"` = reads of ssh key material.
+        #[arg(long = "target")]
+        targets: Vec<String>,
         /// Priority (lower = evaluated first)
         #[arg(long, default_value_t = 50)]
         priority: i32,
@@ -414,8 +419,8 @@ pub fn run() -> AnyResult<()> {
             PolicyCmd::Override { rule_id, decision, disable, enable, clear } => {
                 cmd_policy_override(&home, &rule_id, decision, disable, enable, clear)
             }
-            PolicyCmd::AddRule { name, decision, category, tool, command, priority, role } => {
-                cmd_policy_add_rule(&home, &name, &decision, category, tool, command, priority, role)
+            PolicyCmd::AddRule { name, decision, category, tool, command, targets, priority, role } => {
+                cmd_policy_add_rule(&home, &name, &decision, category, tool, command, targets, priority, role)
             }
             PolicyCmd::RmRule { id, role } => cmd_policy_rm_rule(&home, &id, role),
         },
@@ -894,16 +899,30 @@ fn cmd_policy_add_rule(
     category: Option<String>,
     tool: Option<String>,
     command: Option<String>,
+    targets: Vec<String>,
     priority: i32,
     role: Option<String>,
 ) -> AnyResult<()> {
     let dec = parse_decision_cli(decision)?;
-    let r#match = match (category, tool, command) {
-        (Some(c), None, None) => hestia::policy::PolicyMatch { categories: Some(vec![c]), ..Default::default() },
-        (None, Some(t), None) => hestia::policy::PolicyMatch { tools: Some(vec![t]), ..Default::default() },
-        (None, None, Some(cmd)) => hestia::policy::PolicyMatch { command_patterns: Some(vec![cmd]), ..Default::default() },
-        _ => anyhow::bail!("specify exactly one of --category, --tool, --command"),
-    };
+    // Specifiers are combinable: every one given must match (AND) — mirrors
+    // rule_matches, where each present field is a required condition. E.g.
+    // `--category file_read --target "*/.ssh/*"` = only reads of ssh key paths.
+    let mut r#match = hestia::policy::PolicyMatch::default();
+    if let Some(c) = category {
+        r#match.categories = Some(vec![c]);
+    }
+    if let Some(t) = tool {
+        r#match.tools = Some(vec![t]);
+    }
+    if let Some(cmd) = command {
+        r#match.command_patterns = Some(vec![cmd]);
+    }
+    if !targets.is_empty() {
+        r#match.target_patterns = Some(targets);
+    }
+    if r#match == hestia::policy::PolicyMatch::default() {
+        anyhow::bail!("specify at least one of --category, --tool, --command, --target");
+    }
     let slug: String = name
         .to_lowercase()
         .chars()

@@ -374,4 +374,50 @@ mod tests {
         let e2 = PolicyEngine::new(get_preset("strict").unwrap().config);
         assert_ne!(e1.entity_id(), e2.entity_id());
     }
+
+    /// Combined specifiers AND together: a category+target rule fires only when
+    /// BOTH match — the shape the ratified v1.1 key-material law uses
+    /// (`--category file_read --target "*/.ssh/*"`).
+    #[test]
+    fn category_and_target_patterns_are_anded() {
+        let cfg = PolicyConfig {
+            default_policy: PolicyDecision::Allow,
+            enforce: true,
+            rules: vec![PolicyRule {
+                id: "km".into(),
+                name: "no key material reads".into(),
+                priority: 0,
+                decision: PolicyDecision::Deny,
+                reason: None,
+                r#match: PolicyMatch {
+                    categories: Some(vec!["file_read".into()]),
+                    target_patterns: Some(vec!["*/.ssh/*".into(), "*/.hestia/.passphrase".into()]),
+                    ..Default::default()
+                },
+            }],
+        };
+        let e = PolicyEngine::new(cfg);
+        let read_key = PolicyAction {
+            tool_name: "Read", category: "file_read",
+            target: Some("/home/dp/.ssh/id_ed25519"), full_command: None,
+        };
+        assert_eq!(e.evaluate(&read_key).decision, PolicyDecision::Deny);
+        let read_passphrase = PolicyAction {
+            tool_name: "Read", category: "file_read",
+            target: Some("/home/dp/.hestia/.passphrase"), full_command: None,
+        };
+        assert_eq!(e.evaluate(&read_passphrase).decision, PolicyDecision::Deny);
+        // Same category, benign target → no match (target condition unmet).
+        let read_normal = PolicyAction {
+            tool_name: "Read", category: "file_read",
+            target: Some("/home/dp/project/src/main.rs"), full_command: None,
+        };
+        assert_eq!(e.evaluate(&read_normal).decision, PolicyDecision::Allow);
+        // Same target string but different category (e.g. Bash) → no match.
+        let bash_mention = PolicyAction {
+            tool_name: "Bash", category: "command",
+            target: Some("/home/dp/.ssh/id_ed25519"), full_command: None,
+        };
+        assert_eq!(e.evaluate(&bash_mention).decision, PolicyDecision::Allow);
+    }
 }
