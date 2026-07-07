@@ -787,7 +787,13 @@ fn cmd_policy_show(home: &std::path::Path) -> AnyResult<()> {
         for (role, rules) in roles {
             println!("  {role}:");
             for r in rules {
-                println!("    {} → {} ({})", r.id, r.decision.as_str(), r.name);
+                println!(
+                    "    [{:>3}] {:6}  {:32}  {}",
+                    r.priority,
+                    r.decision.as_str(),
+                    r.id,
+                    r.name
+                );
             }
         }
     }
@@ -912,10 +918,14 @@ fn cmd_policy_add_rule(
         reason: None,
         r#match,
     };
+    // Validate the role BEFORE prompting for the vault passphrase — the check
+    // needs no vault state, and a typo shouldn't cost the user an unlock.
+    if let Some(role) = role.as_deref() {
+        validate_role_cli(role)?;
+    }
     let mut vault = open_vault(home)?;
     match role {
         Some(role) => {
-            validate_role_cli(&role)?;
             vault.upsert_role_rule(&role, rule)?;
             println!("✓ rule '{id}' added to role overlay '{role}'");
             println!("  (applies ONLY to sessions in that role; folded strictest-wins onto the base)");
@@ -932,6 +942,9 @@ fn cmd_policy_add_rule(
 fn cmd_policy_rm_rule(home: &std::path::Path, id: &str, role: Option<String>) -> AnyResult<()> {
     let mut vault = open_vault(home)?;
     match role {
+        // Deliberately NO validate_role_cli here: rm-rule is the only way to
+        // clean up an overlay keyed to a stale/unknown role (e.g. hand-edited
+        // vault, or a role later removed from the published set).
         Some(role) => {
             if vault.remove_role_rule(&role, id)? {
                 println!("✓ rule '{id}' removed from role overlay '{role}'");
