@@ -213,6 +213,7 @@ def ask_daemon(
     tool_name: str,
     tool_input: Any,
     tool_use_id: str,
+    host_session_id: Optional[str] = None,
 ) -> Optional[Tuple[dict[str, Any], str]]:
     """Returns (decision_dict, action_id) on success, None on any failure
     or timeout. decision_dict has the shape from spec §3.4."""
@@ -238,14 +239,20 @@ def ask_daemon(
         client.initialized()
 
         # connect
-        connect_resp = client.call_tool("hestia_connect", {
+        connect_args: dict[str, Any] = {
             "plugin_id": PLUGIN_ID,
             "plugin_version": HOOK_VERSION,
             "host_agent": HOST_AGENT,
             "host_agent_version": "claude-code",
             "requested_role": "citizen",
             "protocol_version": PROTOCOL_VERSION,
-        })
+        }
+        # Optional constellation role. Absent env → omit → daemon defaults to
+        # role:constellation:member. (Distinct from the legacy requested_role.)
+        role = os.environ.get("HESTIA_ROLE")
+        if role:
+            connect_args["role"] = role
+        connect_resp = client.call_tool("hestia_connect", connect_args)
         connect = unwrap_tool_result(connect_resp)
         if "_hestia_error" in connect:
             debug_log(f"connect rejected: {connect['_hestia_error']}")
@@ -256,12 +263,17 @@ def ask_daemon(
         parameters: dict[str, Any] = {}
         if isinstance(tool_input, dict):
             parameters = dict(tool_input)
-        begin_resp = client.call_tool("hestia_begin_action", {
+        begin_args: dict[str, Any] = {
             "tool_name": tool_name,
             "target": target,
             "parameters": parameters,
             **({"session_id": session_id} if session_id else {}),
-        })
+        }
+        # Thread Claude Code's own session id as the audit grain. The daemon
+        # records it on the witnessed outcome/policy_decision events.
+        if host_session_id:
+            begin_args["host_session_id"] = host_session_id
+        begin_resp = client.call_tool("hestia_begin_action", begin_args)
         begin = unwrap_tool_result(begin_resp)
         if "_hestia_error" in begin:
             debug_log(f"begin_action rejected: {begin['_hestia_error']}")
@@ -399,11 +411,13 @@ def main() -> int:
         return 0
 
     tool_name = event.get("tool_name") or "?"
+    # Claude Code's own stable session id — the real per-session audit grain.
+    host_session_id = event.get("session_id")
     tool_use_id = event.get("tool_use_id") or event.get("session_id") or "no-id"
     tool_input = event.get("tool_input") or {}
 
     # Try the daemon first.
-    result = ask_daemon(tool_name, tool_input, tool_use_id)
+    result = ask_daemon(tool_name, tool_input, tool_use_id, host_session_id)
     if result is not None:
         decision, action_id = result
         cache_action(tool_use_id, action_id, tool_name)

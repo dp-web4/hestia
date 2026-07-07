@@ -136,7 +136,14 @@ def _dispatch_tool(state: MockState, name: str, args: dict[str, Any]) -> dict[st
         soft_lct = "lct:web4:session:" + hashlib.sha256(sid.encode()).hexdigest()[:16]
         plugin_id = args.get("plugin_id", "unknown")
         role = args.get("requested_role", "citizen")
-        state.sessions[sid] = {"pluginId": plugin_id, "assignedRole": role, "softLct": soft_lct}
+        state.sessions[sid] = {
+            "pluginId": plugin_id,
+            "assignedRole": role,
+            "softLct": soft_lct,
+            # Capture the new optional constellation role verbatim (None when
+            # the client omits it) so tests can assert pass-through.
+            "role": args.get("role"),
+        }
         return {
             "sessionId": sid,
             "softLct": soft_lct,
@@ -147,7 +154,13 @@ def _dispatch_tool(state: MockState, name: str, args: dict[str, Any]) -> dict[st
     if name == "hestia_begin_action":
         aid = str(uuid4())
         chain_pos = len(state.chain)
-        state.actions[aid] = {"toolName": args["tool_name"], "chainPosition": chain_pos}
+        state.actions[aid] = {
+            "toolName": args["tool_name"],
+            "chainPosition": chain_pos,
+            # Capture the host agent's own session id (None when omitted) so
+            # tests can assert pass-through as the audit grain.
+            "hostSessionId": args.get("host_session_id"),
+        }
         return {
             "actionId": aid,
             "startedAt": datetime.now(timezone.utc).isoformat(),
