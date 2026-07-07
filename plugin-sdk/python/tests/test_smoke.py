@@ -120,6 +120,71 @@ async def test_full_lifecycle(hestia_url):
         assert "witnessEntryHash" in wit
 
 
+async def test_connect_passes_role_when_set(hestia_url):
+    """connect(role=...) forwards `role` in the hestia_connect arguments."""
+    config = HestiaClientConfig(
+        plugin_id="role-test-plugin",
+        host_agent="claude-code",
+        hestia_endpoint=hestia_url.url,
+    )
+    client = HestiaClient(config)
+    await client.connect(role="constellation-sre")
+    try:
+        # Exactly one session should have been created, carrying our role.
+        sessions = list(hestia_url.state.sessions.values())
+        assert len(sessions) == 1
+        assert sessions[0]["role"] == "constellation-sre"
+    finally:
+        await client.disconnect()
+
+
+async def test_connect_omits_role_when_none(hestia_url):
+    """connect() without a role omits the `role` key (daemon defaults)."""
+    config = HestiaClientConfig(
+        plugin_id="no-role-test-plugin",
+        host_agent="claude-code",
+        hestia_endpoint=hestia_url.url,
+    )
+    client = HestiaClient(config)
+    await client.connect()
+    try:
+        sessions = list(hestia_url.state.sessions.values())
+        assert len(sessions) == 1
+        # Mock records args.get("role") → None when the client omits it.
+        assert sessions[0]["role"] is None
+    finally:
+        await client.disconnect()
+
+
+async def test_begin_action_passes_host_session_id_when_set(hestia_url):
+    """begin_action(host_session_id=...) forwards it as the audit grain."""
+    config = HestiaClientConfig(
+        plugin_id="hostsid-test-plugin",
+        host_agent="claude-code",
+        hestia_endpoint=hestia_url.url,
+    )
+    async with HestiaClient(config) as hestia:
+        action = await hestia.begin_action(
+            ToolCallSpec(tool_name="file_write", target="/tmp/x"),
+            host_session_id="cc-session-abc123",
+        )
+        recorded = hestia_url.state.actions[action.action_id]
+        assert recorded["hostSessionId"] == "cc-session-abc123"
+
+
+async def test_begin_action_omits_host_session_id_when_none(hestia_url):
+    """begin_action() without host_session_id omits the key."""
+    config = HestiaClientConfig(
+        plugin_id="no-hostsid-test-plugin",
+        host_agent="claude-code",
+        hestia_endpoint=hestia_url.url,
+    )
+    async with HestiaClient(config) as hestia:
+        action = await hestia.begin_action(ToolCallSpec(tool_name="noop"))
+        recorded = hestia_url.state.actions[action.action_id]
+        assert recorded["hostSessionId"] is None
+
+
 async def test_protocol_version_constant():
     """Sanity: SDK exports the protocol version it targets."""
     assert HESTIA_PROTOCOL_VERSION == 1

@@ -70,8 +70,14 @@ class HestiaClient:
 
     # ---------------------------------------------------------- lifecycle ----
 
-    async def connect(self) -> ConnectResult:
-        """Establish the MCP connection and the Hestia session."""
+    async def connect(self, role: str | None = None) -> ConnectResult:
+        """Establish the MCP connection and the Hestia session.
+
+        ``role`` — optional constellation role to declare for this session.
+        The daemon normalizes any string to a canonical ``role:constellation:*``
+        (fail-closed to ``role:constellation:member``). When ``None`` the key
+        is omitted and the daemon applies its default. Backward-compatible.
+        """
         endpoint = discover_hestia_endpoint(self.config.hestia_endpoint)
 
         stack = AsyncExitStack()
@@ -88,18 +94,18 @@ class HestiaClient:
         self._exit_stack = stack
         self._session = session
 
-        result = await self._call_tool_raw(
-            "hestia_connect",
-            {
-                "plugin_id": self.config.plugin_id,
-                "plugin_version": self.config.plugin_version,
-                "host_agent": self.config.host_agent,
-                "host_agent_version": self.config.host_agent_version,
-                "requested_role": self.config.requested_role,
-                "protocol_version": HESTIA_PROTOCOL_VERSION,
-                "synthetic": self.config.synthetic,
-            },
-        )
+        connect_args: dict[str, Any] = {
+            "plugin_id": self.config.plugin_id,
+            "plugin_version": self.config.plugin_version,
+            "host_agent": self.config.host_agent,
+            "host_agent_version": self.config.host_agent_version,
+            "requested_role": self.config.requested_role,
+            "protocol_version": HESTIA_PROTOCOL_VERSION,
+            "synthetic": self.config.synthetic,
+        }
+        if role is not None:
+            connect_args["role"] = role
+        result = await self._call_tool_raw("hestia_connect", connect_args)
 
         connect_result = ConnectResult(
             session_id=result["sessionId"],
@@ -136,16 +142,25 @@ class HestiaClient:
 
     # ----------------------------------------------------------- R6 flow ----
 
-    async def begin_action(self, spec: ToolCallSpec) -> R6Action:
-        result = await self._call_tool(
-            "hestia_begin_action",
-            {
-                "tool_name": spec.tool_name,
-                "target": spec.target,
-                "parameters": spec.parameters,
-                "atp_stake": spec.atp_stake,
-            },
-        )
+    async def begin_action(
+        self, spec: ToolCallSpec, host_session_id: str | None = None
+    ) -> R6Action:
+        """Begin an R6 action.
+
+        ``host_session_id`` — the host agent's own stable session id (e.g.
+        Claude Code's ``session_id``). When set, the daemon records it on the
+        witnessed outcome/policy_decision events as the audit grain. When
+        ``None`` the key is omitted. Backward-compatible.
+        """
+        begin_args: dict[str, Any] = {
+            "tool_name": spec.tool_name,
+            "target": spec.target,
+            "parameters": spec.parameters,
+            "atp_stake": spec.atp_stake,
+        }
+        if host_session_id is not None:
+            begin_args["host_session_id"] = host_session_id
+        result = await self._call_tool("hestia_begin_action", begin_args)
         return R6Action(
             action_id=result["actionId"],
             tool_name=spec.tool_name,

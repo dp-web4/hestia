@@ -49,6 +49,9 @@ ACTIONS_DIR.mkdir(exist_ok=True, parents=True)
 ENDPOINT = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
 PLUGIN_ID = "claude-code"
 HOST_AGENT = "claude-code"
+# Optional constellation role for this session. Absent → omit → daemon
+# defaults to role:constellation:member. The daemon normalizes any string.
+HESTIA_ROLE = os.environ.get("HESTIA_ROLE")
 
 
 def log(msg: str) -> None:
@@ -103,6 +106,8 @@ async def run() -> int:
 
     event_name = event.get("hook_event_name")
     tool_name = event.get("tool_name") or "?"
+    # Claude Code's own stable session id — the real per-session audit grain.
+    host_session_id = event.get("session_id")
     tool_use_id = event.get("tool_use_id") or event.get("session_id", "no-id")
     tool_input = event.get("tool_input") or {}
     tool_response = event.get("tool_response")
@@ -117,7 +122,7 @@ async def run() -> int:
     client = create_hestia_client(config)
 
     try:
-        await client.connect()
+        await client.connect(role=HESTIA_ROLE)
     except Exception as e:  # noqa: BLE001 — fail-open
         log(f"connect failed: {e}")
         return 0
@@ -127,7 +132,8 @@ async def run() -> int:
             target = extract_target(tool_name, tool_input)
             try:
                 action = await client.begin_action(
-                    ToolCallSpec(tool_name=tool_name, target=target)
+                    ToolCallSpec(tool_name=tool_name, target=target),
+                    host_session_id=host_session_id,
                 )
                 ACTIONS_DIR.joinpath(f"{tool_use_id}.json").write_text(
                     json.dumps(
@@ -173,7 +179,8 @@ async def run() -> int:
                         ToolCallSpec(
                             tool_name=tool_name_from_pre,
                             target=extract_target(tool_name_from_pre, tool_input),
-                        )
+                        ),
+                        host_session_id=host_session_id,
                     )
                     action_id = action.action_id
                     # Synthesize an R6Action for record_outcome.

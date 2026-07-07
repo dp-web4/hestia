@@ -256,6 +256,8 @@ def run() -> int:
     tool_name = event.get("tool_name") or "?"
     tool_input = event.get("tool_input") or {}
     tool_response = event.get("tool_response")
+    # Claude Code's own stable session id — the real per-session audit grain.
+    host_session_id = event.get("session_id")
 
     endpoint = discover_endpoint()
     if endpoint is None:
@@ -275,16 +277,19 @@ def run() -> int:
             return 0
         client.initialized()
 
-        connect_resp = client.call_tool(
-            "hestia_connect",
-            {
-                "plugin_id": PLUGIN_ID,
-                "plugin_version": HOOK_VERSION,
-                "host_agent": HOST_AGENT,
-                "host_agent_version": "claude-code",
-                "requested_role": "citizen",
-            },
-        )
+        connect_args: dict[str, Any] = {
+            "plugin_id": PLUGIN_ID,
+            "plugin_version": HOOK_VERSION,
+            "host_agent": HOST_AGENT,
+            "host_agent_version": "claude-code",
+            "requested_role": "citizen",
+        }
+        # Optional constellation role. Absent env → omit → daemon defaults to
+        # role:constellation:member. (Distinct from the legacy requested_role.)
+        role = os.environ.get("HESTIA_ROLE")
+        if role:
+            connect_args["role"] = role
+        connect_resp = client.call_tool("hestia_connect", connect_args)
         connect = unwrap_tool_result(connect_resp)
         if "_hestia_error" in connect:
             debug_log(f"connect rejected: {connect['_hestia_error']}")
@@ -297,6 +302,7 @@ def run() -> int:
                 "tool_name": tool_name,
                 "target": target,
                 **({"session_id": session_id} if session_id else {}),
+                **({"host_session_id": host_session_id} if host_session_id else {}),
             },
         )
         begin = unwrap_tool_result(begin_resp)
