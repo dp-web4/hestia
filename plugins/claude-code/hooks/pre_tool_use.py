@@ -422,6 +422,11 @@ def emit_decision(decision: dict[str, Any]) -> int:
 def main() -> int:
     raw = sys.stdin.read()
     if not raw.strip():
+        # Empty stdin = the harness sent no event. Not caller-controllable from
+        # inside a session, but under strict fail-closed semantics "no event" is
+        # still "no verdict" → no tool (CBP relay-verify micro-seam, 2026-07-07).
+        if fail_closed():
+            return deny_no_verdict("empty hook event")
         return 0
     try:
         event = json.loads(raw)
