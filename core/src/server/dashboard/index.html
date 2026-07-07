@@ -260,6 +260,12 @@
     font-size: 1rem;
     color: var(--fg);
   }
+  .trust-role {
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    color: var(--fg-dim);
+    margin-left: 0.5rem;
+  }
   .trust-level {
     font-size: 0.7rem;
     text-transform: uppercase;
@@ -598,10 +604,30 @@
     $('stat-hour').textContent = fmt.int(s.actions_last_hour);
   }
 
+  // Trust rows are one per (instance, role) grain, so a plugin can have several.
+  // The chip shows an explicit aggregate: the WORST grain's level (a strong grain
+  // must not mask a failing one) and total actions across grains — never whichever
+  // row happened to sort last.
+  const LEVEL_ORDER = ['minimal', 'low', 'medium', 'medium-high', 'high'];
+  function aggregateTrustByPlugin(trust) {
+    const byId = {};
+    for (const t of trust) {
+      const cur = byId[t.plugin_id];
+      if (!cur) {
+        byId[t.plugin_id] = { level: t.level, action_count: t.action_count, grains: 1 };
+      } else {
+        cur.action_count += t.action_count;
+        cur.grains += 1;
+        if (LEVEL_ORDER.indexOf(t.level) < LEVEL_ORDER.indexOf(cur.level)) cur.level = t.level;
+      }
+    }
+    return byId;
+  }
+
   function renderOrchBar(data) {
     const root = $('orch-bar');
     const orchs = data.orchestrators || [];
-    const trustById = Object.fromEntries((data.trust || []).map(t => [t.plugin_id, t]));
+    const trustById = aggregateTrustByPlugin(data.trust || []);
     const header = '<span class="orch-bar-label">Orchestrators:</span>';
     if (!orchs.length) {
       root.innerHTML = header + '<span class="orch-chip-empty">none running or engaged</span>';
@@ -618,7 +644,8 @@
         const t = trustById[o.id] || {};
         if (o.engaged) {
           const sel = selectedOrch === o.id ? ' selected' : '';
-          return `<span class="orch-chip${sel}" data-pid="${escapeHtml(o.id)}" title="connected · active — click to filter stats">
+          const grains = t.grains > 1 ? ` · ${t.grains} trust grains, level = worst` : '';
+          return `<span class="orch-chip${sel}" data-pid="${escapeHtml(o.id)}" title="connected · active${grains} — click to filter stats">
                     <span>${escapeHtml(o.name)}</span>
                     ${t.level ? `<span class="level">${escapeHtml(t.level)}</span>` : ''}
                     ${t.action_count != null ? `<span class="count">${fmt.int(t.action_count)}</span>` : ''}
@@ -665,6 +692,17 @@
     }
   }
 
+  // entity_id is trust_entity_key's `<instance-or-plugin>#<role_lct>`; the role
+  // suffix is what distinguishes rows sharing a plugin_id. shortRole drops the
+  // `role:constellation:` prefix for display (full LCT stays in the tooltip).
+  function trustRole(t) {
+    const i = (t.entity_id || '').indexOf('#');
+    return i < 0 ? '' : t.entity_id.slice(i + 1);
+  }
+  function shortRole(role) {
+    return role.split(':').pop();
+  }
+
   function renderTrust(trust) {
     const root = $('trust-list');
     const title = $('trust-title');
@@ -683,7 +721,7 @@
     root.innerHTML = filtered.map(t => `
       <div class="trust-item">
         <div class="trust-head">
-          <span class="trust-id">${escapeHtml(t.plugin_id)}</span>
+          <span class="trust-id">${escapeHtml(t.plugin_id)}${trustRole(t) ? `<span class="trust-role" title="${escapeHtml(trustRole(t))}">${escapeHtml(shortRole(trustRole(t)))}</span>` : ''}</span>
           <span class="trust-level">${escapeHtml(t.level)}</span>
         </div>
         ${tensorRow('Talent', t.t3_talent)}
