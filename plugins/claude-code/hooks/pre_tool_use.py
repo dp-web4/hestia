@@ -29,6 +29,12 @@ DESIGN
 
 ENV
   HESTIA_HOOK_DEBUG=1            log to ~/.hestia-claude/hook.log
+  HESTIA_PRE_FAIL_CLOSED=1       fail-CLOSED profile for governed roles:
+                                  any path that cannot get a daemon verdict
+                                  (daemon unreachable, budget exhausted,
+                                  unexpected error) DENIES the tool instead
+                                  of allowing. The legacy fallback is skipped
+                                  entirely — the daemon is the law.
   HESTIA_PRE_NO_FALLBACK=1       disable the legacy-engine fallback
                                   (deny-on-daemon-unreachable instead)
   HESTIA_PRE_TOTAL_BUDGET_MS     override TOTAL_BUDGET_MS
@@ -348,13 +354,26 @@ def cache_action(tool_use_id: str, action_id: str, tool_name: str) -> None:
 
 # ---- Legacy fallback --------------------------------------------------
 
+def fail_closed() -> bool:
+    return os.environ.get("HESTIA_PRE_FAIL_CLOSED") == "1"
+
+
+def deny_no_verdict(why: str) -> int:
+    """Fail-closed refusal: no daemon verdict → the tool does not run."""
+    sys.stderr.write(f"hestia: deny [fail-closed] — no policy verdict ({why})\n")
+    debug_log(f"fail-closed deny: {why}")
+    return 2
+
+
 def invoke_legacy_fallback(stdin_payload: str) -> int:
     """Spawn the legacy web4-governance pre_tool_use.py with the same
     stdin and return its exit code. Returns 0 if the legacy script
-    isn't available (fail-open)."""
+    isn't available (fail-open), unless HESTIA_PRE_NO_FALLBACK=1 asked
+    for deny-on-daemon-unreachable."""
     if os.environ.get("HESTIA_PRE_NO_FALLBACK") == "1":
-        debug_log("HESTIA_PRE_NO_FALLBACK=1; not invoking legacy")
-        return 2 if False else 0  # fail-open by default for now
+        # Used to fall OPEN here despite the documented deny semantics
+        # (GPT security review HST-004 / doc-code mismatch).
+        return deny_no_verdict("daemon unreachable, legacy fallback disabled")
     if not os.path.exists(LEGACY_FALLBACK):
         debug_log(f"legacy fallback not found at {LEGACY_FALLBACK}; allowing")
         return 0
@@ -407,6 +426,8 @@ def main() -> int:
     try:
         event = json.loads(raw)
     except json.JSONDecodeError as e:
+        if fail_closed():
+            return deny_no_verdict(f"unparseable hook event: {e}")
         debug_log(f"bad json: {e}; allowing")
         return 0
 
@@ -427,7 +448,11 @@ def main() -> int:
         )
         return emit_decision(decision)
 
-    # Daemon unavailable or didn't settle. Fall back to the legacy engine.
+    # Daemon unavailable or didn't settle. Under the fail-closed profile the
+    # daemon is the law: no verdict → no tool (GPT review HST-004; governed /
+    # unattended roles must not degrade to fail-open heuristics silently).
+    if fail_closed():
+        return deny_no_verdict(f"daemon path failed for {tool_name}")
     debug_log(f"daemon path failed; falling back to legacy for {tool_name}")
     return invoke_legacy_fallback(raw)
 
@@ -436,5 +461,7 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as e:  # noqa: BLE001
+        if fail_closed():
+            sys.exit(deny_no_verdict(f"hook crashed: {type(e).__name__}: {e}"))
         debug_log(f"top-level: {e}; allowing")
         sys.exit(0)
