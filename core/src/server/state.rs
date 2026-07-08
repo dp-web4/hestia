@@ -325,6 +325,57 @@ impl ServerState {
             .unwrap_or_else(|_| EntityTrust::new(key))
     }
 
+    /// The judgment-axis trust key: `<instance_lct>#<role_lct>#judgment`.
+    ///
+    /// Judgment outcomes (reversals/overrides) get their OWN trust entity, not a
+    /// share of the execution scalar. The calibration join (calibration-prd4)
+    /// measured why: execution outcomes arrive ~10³/day/machine and judgment
+    /// outcomes ~10⁰/day fleet-wide, so a reversal's dip in a shared `t3_average`
+    /// refills within minutes and the estimator stays a constant (pinned at the
+    /// 0.8 cap for the entire label era). Keying judgment on its own entity means
+    /// ONLY judgment events move it — its timescale is its own, and the estimator
+    /// can hold variance across a label window.
+    pub fn judgment_entity_key(&self, plugin_id: &str, role_lct: &str) -> String {
+        format!("{}#judgment", self.trust_entity_key(plugin_id, role_lct))
+    }
+
+    /// Read the judgment-axis trust for a `(instance, role)` grain.
+    pub fn judgment_for_role(&self, plugin_id: &str, role_lct: &str) -> EntityTrust {
+        let key = self.judgment_entity_key(plugin_id, role_lct);
+        self.trust_store
+            .get(&key)
+            .unwrap_or_else(|_| EntityTrust::new(key))
+    }
+
+    /// Apply a judgment outcome to the judgment-axis entity and emit the delta
+    /// (same bridge as [`apply_outcome_ctx`]). The delta's `action_type`
+    /// (`"reversal"`) is what separates this stream from execution deltas in the
+    /// sink — the role_lct stays canonical so the hub fold doesn't fragment.
+    pub fn apply_judgment_ctx(
+        &self,
+        plugin_id: &str,
+        success: bool,
+        magnitude: f64,
+        ctx: &crate::reputation::RepContext,
+    ) -> Result<EntityTrust> {
+        let key = self.judgment_entity_key(plugin_id, ctx.role_lct);
+        let (before, after) = self
+            .trust_store
+            .update_returning_prior(&key, success, magnitude)?;
+        if let Some(subject_lct) = self.member_lct(plugin_id) {
+            if let Some(delta) = crate::reputation::delta_from_change(
+                &subject_lct,
+                ctx,
+                &before,
+                &after,
+                chrono::Utc::now(),
+            ) {
+                crate::reputation::log_delta(&self.reputation_sink(), &delta);
+            }
+        }
+        Ok(after)
+    }
+
     /// Read trust for a plugin in the default (member) capacity. Retained for the
     /// non-role-aware call sites (dashboard/tests); role-aware reads should use
     /// [`trust_for_role`].
