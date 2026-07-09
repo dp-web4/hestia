@@ -149,6 +149,23 @@ fn main() -> Result<()> {
             .and_then(|v| v.as_str())
             .unwrap_or("anonymous")
             .to_string();
+        // Reconstruct the daemon's post-rekey (instance, role) trust grain. Events
+        // now witness `instance_lct` + `role_lct`, and the daemon keys trust on
+        // `<instance_lct>#<role_lct>` (or `plugin:<id>#<role>` when unmapped). Group
+        // the replay on the SAME key so the reconstructed estimate matches the live
+        // role-scoped trust — the point of the calibration pivot: a mesh-worker and
+        // an interactive-dev session of one instance become SEPARATE estimators
+        // instead of one smeared entity. Pre-rekey events lack the fields → fall
+        // back to member/plugin (honestly degraded, same as the daemon).
+        let role_lct = e
+            .event_data
+            .get("role_lct")
+            .and_then(|v| v.as_str())
+            .unwrap_or("role:constellation:member");
+        let entity_key = match e.event_data.get("instance_lct").and_then(|v| v.as_str()) {
+            Some(inst) => format!("{inst}#{role_lct}"),
+            None => format!("plugin:{plugin_id}#{role_lct}"),
+        };
         let tool = e
             .event_data
             .get("tool_name")
@@ -156,8 +173,8 @@ fn main() -> Result<()> {
             .unwrap_or("");
 
         let entry = trust
-            .entry(plugin_id.clone())
-            .or_insert_with(|| EntityTrust::new(format!("plugin:{plugin_id}")));
+            .entry(entity_key.clone())
+            .or_insert_with(|| EntityTrust::new(entity_key.clone()));
 
         // CAUSAL HONESTY: the estimate is the trust scalar as it exists BEFORE this
         // event is processed — for outcome events, before update_from_outcome; for
@@ -192,6 +209,8 @@ fn main() -> Result<()> {
                 "kind": if gate { "executed" } else { "outcome" },
                 "success": success,
                 "plugin": plugin_id,
+                "role": role_lct,
+                "entity": entity_key,
                 "magnitude": magnitude,
                 "tool": tool,
                 "ts": e.timestamp.to_rfc3339(),
@@ -221,6 +240,8 @@ fn main() -> Result<()> {
                 "outcome": 0,
                 "kind": decision,
                 "plugin": plugin_id,
+                "role": role_lct,
+                "entity": entity_key,
                 "tool": tool,
                 "ts": e.timestamp.to_rfc3339(),
                 "chain_position": e.chain_position,
