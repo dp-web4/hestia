@@ -59,6 +59,9 @@ pub struct SocietyView {
     pub active_sessions: usize,
     pub vault_entries: usize,
     pub known_plugins: usize,
+    /// Phase-1 mirror: published constellation roles held as `Role` LCT entities.
+    #[serde(default)]
+    pub role_entities: usize,
 }
 
 /// Aggregate counts across the witness chain.
@@ -388,6 +391,7 @@ impl ServerState {
                 // Total known trust entities (all (instance, role) grains ever
                 // seen), independent of the last-hour active view above.
                 known_plugins: self.trust_store.list().map(|v| v.len()).unwrap_or(0),
+                role_entities: self.role_registry.len(),
             },
             stats: ActivityStats {
                 total_actions: total,

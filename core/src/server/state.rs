@@ -74,6 +74,10 @@ pub struct ServerState {
     pub chain_store: SqliteChainStore,
     pub trust_store: TrustStore,
     pub sovereign_lct: String,
+    /// Phase-1 audit-first mirror: the published constellation roles as first-class
+    /// `web4_core::RoleEntity` LCT entities (additive + read-only — law evaluation
+    /// still uses the string-keyed `role_policy_engines` fold). See `role_registry`.
+    pub role_registry: web4_core::RoleRegistry,
     pub shared_context: serde_json::Map<String, serde_json::Value>,
     pub policy_engine: crate::policy::PolicyEngine,
     /// Per-constellation-role policy engines (#403 role-scoped law), built from
@@ -102,6 +106,8 @@ impl ServerState {
         let chain_store = SqliteChainStore::open(home.join("witness.db"), store_key)?;
         let trust_store = TrustStore::open(home.join("trust"), store_key)?;
         let sovereign_lct = "lct:web4:hestia:sovereign:phase1-placeholder".to_string();
+        // Phase-1 mirror: the constellation roles as Role LCT entities (read-only).
+        let role_registry = crate::role_registry::build_mirror_registry(&sovereign_lct);
         // Resolve the active policy from the vault. Falls back to the
         // safety preset if the vault's named preset isn't built-in.
         let policy_config = vault
@@ -131,6 +137,7 @@ impl ServerState {
             chain_store,
             trust_store,
             sovereign_lct,
+            role_registry,
             shared_context: serde_json::Map::new(),
             policy_engine,
             role_policy_engines,
