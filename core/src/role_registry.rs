@@ -39,14 +39,17 @@ fn sovereign_uuid(sovereign_lct: &str) -> Uuid {
 
 /// The mirror extension for a migrated string-role: unattributed (no authoring
 /// witness → `drift:unattributed` on any eval-time deny), folding under the
-/// constellation base. No affordances yet (see the module-level grant-vs-deny gap).
+/// constellation base. `default_verdict: Deny` — fail-closed: an unattributed role
+/// with no affordances grants nothing (CBP F1, 2026-07-08), which also accurately
+/// mirrors the DEPLOYED launchers (all HST-004 fail-closed). No affordances yet
+/// (see the module-level grant-vs-deny gap). `Scope::default()` = zero ATP budget.
 fn mirror_extension() -> RoleExtension {
     RoleExtension {
         bound_to_role_lct: Uuid::nil(), // overwritten authoritatively by issue()
         affordances: Vec::new(),
         responsibilities: Vec::new(),
-        scope: Scope::default(),
-        default_verdict: web4_core::ExtensionVerdict::Allow,
+        scope: Scope::default(), // ranges_over: [], atp_budget: Limited(0.0) — fail-closed
+        default_verdict: web4_core::ExtensionVerdict::Deny,
         folds_under: vec!["law:constellation".to_string()],
         authored_under: None, // pre-migration string-role → unattributed
         lint_verdict: None,
@@ -93,6 +96,10 @@ mod tests {
         let mw = reg.get("role:constellation:mesh-worker").unwrap();
         assert_eq!(mw.extension.drift_mark(), DriftMark::DriftUnattributed);
         assert!(mw.extension.authored_under.is_none());
+        // fail-closed: unattributed + no affordances → default deny, zero budget
+        assert_eq!(mw.extension.default_verdict, web4_core::ExtensionVerdict::Deny);
+        assert!(mw.extension.affordances.is_empty());
+        assert_eq!(mw.extension.scope.atp_budget, web4_core::AtpBudget::Limited(0.0));
     }
 
     #[test]
