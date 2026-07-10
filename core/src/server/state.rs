@@ -563,6 +563,25 @@ mod tests {
     }
 
     #[test]
+    fn member_lct_matches_web4core_legacy_derivation_byte_for_byte() {
+        // Lockstep contract (hestia-lct-concord 2026-07-10): the alias the hub
+        // registry verifies is computed by web4_core::LegacyDerivation::HestiaMember;
+        // it MUST reproduce this daemon's member_lct exactly, or a published member
+        // LCT's legacy alias fails ingest. Proven here against the live function, not
+        // a copy of the formula.
+        let (_dir, state) = make_state();
+        for plugin in ["alice", "claude-code", "supervisor-timer"] {
+            let native = state.member_lct(plugin).unwrap();
+            let via_web4core = web4_core::LegacyDerivation::HestiaMember {
+                plugin_id: plugin.to_string(),
+                sovereign: state.sovereign_lct.clone(),
+            }
+            .derive();
+            assert_eq!(native, via_web4core, "member_lct must equal the canonical derivation for {plugin}");
+        }
+    }
+
+    #[test]
     fn member_lct_fails_closed_for_synthetic_and_empty() {
         let (_dir, mut state) = make_state();
         assert!(state.mark_synthetic("conformance-runner", 3).unwrap());
