@@ -403,6 +403,12 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     if let Some(role_engine) = s.role_policy_engines.get(&session_role) {
         evaluation = crate::policy::fold_strictest(evaluation, role_engine.evaluate(&pa));
     }
+    // Third fold input (consolidation 2026-07-10): chapter law via the
+    // canonical web4-policy engine. Strictest-wins like the role overlay —
+    // law can only tighten, never loosen.
+    if let Some(gate) = &s.law_gate {
+        evaluation = crate::policy::fold_strictest(evaluation, gate.evaluate(&pa, &session_role));
+    }
 
     // Witness the policy decision when the verdict is anything other
     // than `allow`. Deny + warn + would-deny (audit-only) are all
@@ -541,6 +547,11 @@ fn gate_direct_tool(
     let mut evaluation = s.policy_engine.evaluate(&pa);
     if let Some(role_engine) = s.role_policy_engines.get(&who.role_lct) {
         evaluation = crate::policy::fold_strictest(evaluation, role_engine.evaluate(&pa));
+    }
+    // Chapter-law third input applies to the vault gate too — a norm that
+    // denies secret reads must bind here, not only on tool calls.
+    if let Some(gate) = &s.law_gate {
+        evaluation = crate::policy::fold_strictest(evaluation, gate.evaluate(&pa, &who.role_lct));
     }
     if evaluation.decision == crate::policy::PolicyDecision::Deny && evaluation.enforced {
         let instance_lct = s.member_lct(&who.plugin_id);

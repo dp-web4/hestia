@@ -71,6 +71,12 @@ hub-plugin = { path = "../../web4/hub/hub-plugin" }
 # are now the canonical `web4_core::t3::T3` / `web4_core::v3::V3`. This unifies the
 # single web4-core source across the dependency graph (no duplicate tensor types).
 web4-trust-core = { path = "../../web4/web4-trust-core", features = ["file-store"] }
+# Consolidation (2026-07-10, hestia-role-orchestration): chapter-law norms
+# evaluate in the ONE canonical crate the hub uses — closing the two-engines
+# drift seam CBP flagged. Same P3b by-path pattern as the deps above.
+web4-policy = { path = "../../web4/web4-policy" }
+# serde_yaml: the web4-policy law payload type (R6Request.payload)
+serde_yaml = "0.9"
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
 
 # TUI dashboard

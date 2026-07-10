@@ -85,6 +85,10 @@ pub struct ServerState {
     /// its verdict is folded into `policy_engine` by strictest-wins in
     /// `query_policy`, so a role can only tighten the base, never loosen it.
     pub role_policy_engines: HashMap<String, crate::policy::PolicyEngine>,
+    /// Chapter-law gate (consolidation, 2026-07-10): the third fold input.
+    /// `None` = no law file at `$HESTIA_HOME/law/chapter-law.yaml` (no-op);
+    /// `Some(Invalid)` fails closed. See `policy::law_gate`.
+    pub law_gate: Option<crate::policy::LawGate>,
     /// Plugin IDs that self-declared as synthetic (test harnesses,
     /// fuzzers, etc.). Excluded from operator-facing aggregations by
     /// default. Enclosed in the vault (document `presence`/`synthetic`).
@@ -124,6 +128,16 @@ impl ServerState {
             .map(|(role, cfg)| (role, crate::policy::PolicyEngine::new(cfg)))
             .collect();
 
+        // Chapter-law third input (machine-local copy; hub is the content
+        // authority). Absent file => None; invalid file => fail-closed gate.
+        let law_gate = crate::policy::LawGate::load(home);
+        if let Some(g) = &law_gate {
+            match g.law_sha256() {
+                Some(h) => eprintln!("[hestia] chapter law loaded (sha256 {h})"),
+                None => eprintln!("[hestia] WARNING: chapter law present but INVALID — failing closed"),
+            }
+        }
+
         // Synthetic-plugin set lives in the vault (migrating a legacy
         // synthetic.json). Best-effort: an empty set on any read error.
         let synthetic_plugins: HashSet<String> =
@@ -141,6 +155,7 @@ impl ServerState {
             shared_context: serde_json::Map::new(),
             policy_engine,
             role_policy_engines,
+            law_gate,
             synthetic_plugins,
             home: home.to_path_buf(),
             vci_nonces: HashSet::new(),
@@ -185,6 +200,9 @@ impl ServerState {
             .into_iter()
             .map(|(role, cfg)| (role, crate::policy::PolicyEngine::new(cfg)))
             .collect();
+        // Re-read the machine-local chapter law alongside vault policy so an
+        // operator law update lands without a daemon restart.
+        self.law_gate = crate::policy::LawGate::load(&self.home);
     }
 
     /// Issue a Soft LCT for a new session.

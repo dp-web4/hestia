@@ -16,12 +16,14 @@
 
 pub mod engine;
 pub mod extract;
+mod law_gate;
 pub mod matchers;
 pub mod presets;
 pub mod rate_limit;
 pub mod types;
 
 pub use engine::PolicyEngine;
+pub use law_gate::{LawGate, LAW_FILE};
 pub use extract::{classify, extract_full_command, extract_target};
 pub use presets::{get_preset, is_preset_name, list_presets, PRESET_NAMES};
 pub use rate_limit::{RateLimitResult, RateLimiter};
