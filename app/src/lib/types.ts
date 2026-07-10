@@ -19,14 +19,18 @@ export interface TrustView {
   plugin_id: string;
   entity_id: string;
   level: string;
-  t3_talent: number;
-  t3_training: number;
-  t3_temperament: number;
-  t3_average: number;
-  v3_valuation: number;
-  v3_veracity: number;
-  v3_validity: number;
-  v3_average: number;
+  // Canonical unmeasured-handling: a dimension with zero observations is null
+  // (honest unmeasured), never a fabricated 0.5 score.
+  t3_talent: number | null;
+  t3_training: number | null;
+  t3_temperament: number | null;
+  t3_average: number | null;
+  v3_valuation: number | null;
+  v3_veracity: number | null;
+  v3_validity: number | null;
+  v3_average: number | null;
+  t3_observation_counts: [number, number, number];
+  v3_observation_counts: [number, number, number];
   action_count: number;
   success_count: number;
   success_rate: number;
