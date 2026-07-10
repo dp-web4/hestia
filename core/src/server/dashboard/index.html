@@ -324,6 +324,7 @@
     100% { background: transparent; }
   }
   .feed-pos { color: var(--fg-faint); font-variant-numeric: tabular-nums; }
+  .feed-pid { display: block; font-size: 0.72em; color: var(--fg-dim, #8b93a7); opacity: 0.8; line-height: 1.1; }
   .feed-time { color: var(--fg-faint); font-variant-numeric: tabular-nums; text-align: right; }
   .feed-event { color: var(--fg-dim); }
   .feed-event.outcome { color: var(--fg); }
@@ -641,20 +642,20 @@
       // narrower "active in the last hour" signal used to filter stats. An idle
       // but connected session stays connected — it does NOT flip to "disconnect".
       if (o.connected) {
+        // ANY connected orchestrator is selectable — idle or active — so its history/policy stays
+        // viewable regardless of current activity (dp). Idle just shows an 'idle' badge; it still
+        // carries data-pid so the click handler attaches and filters to it.
         const t = trustById[o.id] || {};
-        if (o.engaged) {
-          const sel = selectedOrch === o.id ? ' selected' : '';
-          const grains = t.grains > 1 ? ` · ${t.grains} trust grains, level = worst` : '';
-          return `<span class="orch-chip${sel}" data-pid="${escapeHtml(o.id)}" title="connected · active${grains} — click to filter stats">
-                    <span>${escapeHtml(o.name)}</span>
-                    ${t.level ? `<span class="level">${escapeHtml(t.level)}</span>` : ''}
-                    ${t.action_count != null ? `<span class="count">${fmt.int(t.action_count)}</span>` : ''}
-                  </span>`;
-        }
-        // connected but idle: running + wired, no tool calls in the last hour.
-        return `<span class="orch-chip" title="connected · idle — no tool calls in the last hour">
+        const sel = selectedOrch === o.id ? ' selected' : '';
+        const grains = t.grains > 1 ? ` · ${t.grains} trust grains, level = worst` : '';
+        const state = o.engaged ? `active${grains}` : 'idle';
+        const badge = o.engaged
+          ? (t.action_count != null ? `<span class="count">${fmt.int(t.action_count)}</span>` : '')
+          : `<span class="orch-idle">idle</span>`;
+        return `<span class="orch-chip${sel}" data-pid="${escapeHtml(o.id)}" title="connected · ${state} — click to view its history/stats">
                   <span>${escapeHtml(o.name)}</span>
-                  <span class="orch-idle">idle</span>
+                  ${t.level ? `<span class="level">${escapeHtml(t.level)}</span>` : ''}
+                  ${badge}
                 </span>`;
       }
       // not connected → offer to install the plugin hooks (connect).
@@ -828,10 +829,21 @@
         detail = e.event_type;
       }
 
+      // WHO acted — plugin + capacity(role) + short session, so an interactive session is
+      // distinguishable from a mesh-worker / autonomous-timer cron at a glance (dp).
+      // WHO acted: show only the compact pid under the entry number; full role + session ride the
+      // number's hover title (same pattern as relative-time '3m' + hover for the absolute time).
+      const whoRole = e.role_lct ? shortRole(e.role_lct) : '';
+      const whoSess = e.host_session_id ? String(e.host_session_id).slice(0,8) : '';
+      // Compact display = the DISTINGUISHING identity (capacity + session), not the constant plugin.
+      // Full line (plugin + full role + full session) rides the hover.
+      const whoShort = [whoRole, whoSess].filter(Boolean).join('·') || (e.plugin_id || '');
+      const whoFull = [e.plugin_id || '', e.role_lct || '', e.host_session_id ? 'session '+e.host_session_id : ''].filter(Boolean).join(' · ');
+      const whoPid = whoShort ? `<span class="feed-pid">${escapeHtml(whoShort)}</span>` : '';
       const absTime = e.timestamp ? new Date(e.timestamp).toLocaleString() : '';
       return `
         <div class="feed-row${isNew ? ' new' : ''}">
-          <span class="feed-pos">#${e.chain_position}</span>
+          <span class="feed-pos" title="${escapeHtml(whoFull || (e.plugin_id||''))}">#${e.chain_position}${whoPid}</span>
           <span class="feed-time" title="${escapeHtml(absTime)}">${fmt.relTime(e.timestamp)}</span>
           <span class="feed-event ${e.event_type}">${escapeHtml(e.event_type)}</span>
           <span class="feed-detail" title="${escapeHtml(detail)}">

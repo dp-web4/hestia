@@ -212,11 +212,29 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         soft_lct: soft_lct.clone(),
         connected_at: Utc::now(),
     };
-    s.sessions.insert(session_id, session);
-
+    // Fail-closed synthetic declaration: a client that declares itself synthetic
+    // must have that exclusion durably PERSISTED before we admit it — otherwise a
+    // restart loses the exclusion and mints durable member labels for a test
+    // harness (the write-side mirror of the corrupt-doc load bug). Retry the
+    // persist up to a law-settable budget (vault policy, default 3); if every
+    // attempt fails, REFUSE the connect rather than admit an unpersisted
+    // synthetic member. Done BEFORE the session is inserted so a refusal leaves
+    // no half-open session behind.
     if synthetic {
-        s.mark_synthetic(&plugin_id);
+        let max_attempts = s.vault.policy().synthetic_persist_attempts();
+        if let Err(e) = s.mark_synthetic(&plugin_id, max_attempts) {
+            return Ok(hestia_error_envelope(
+                "hestia.internal_error",
+                &format!(
+                    "refusing connect: could not persist synthetic exclusion for '{plugin_id}' \
+                     after {max_attempts} attempt(s) (fail-closed): {e}"
+                ),
+                None,
+            ));
+        }
     }
+
+    s.sessions.insert(session_id, session);
 
     // session_started is intentionally NOT written to the witness chain.
     // Sessions are RAM-only by design (transport artifacts); every hook
@@ -489,6 +507,11 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     Ok(json!({
         "decision": evaluation.decision.as_str(),
         "reason": evaluation.reason,
+        // Steering text for the agent that was blocked (deny-as-redirect,
+        // thread hestia-lct-concord 2026-07-10). Null except on enforced deny.
+        // Clients surface it verbatim on their deny channel and never parse
+        // it; `reason`/`ruleName` stay the machine-readable fields.
+        "guidance": evaluation.guidance(),
         "ruleId": evaluation.rule_id,
         "ruleName": evaluation.rule_name,
         "policyId": evaluation.rule_id, // alias kept for backward compat with v0 SDKs
@@ -571,9 +594,15 @@ fn gate_direct_tool(
                 "reason": evaluation.reason,
             }),
         );
+        // The envelope message is what the calling agent reads — carry the
+        // steering text (guidance is Some here: enforced deny), not the bare
+        // reason, so a vault deny redirects the same way a gate deny does.
+        let message = evaluation.guidance().unwrap_or_else(|| {
+            format!("{} denied by policy: {}", tool_name, evaluation.reason)
+        });
         return Some(hestia_error_envelope(
             "hestia.policy_denied",
-            &format!("{} denied by policy: {}", tool_name, evaluation.reason),
+            &message,
             Some(json!({"target": target, "rule_id": evaluation.rule_id})),
         ));
     }
@@ -1633,6 +1662,60 @@ mod accountability_tests {
         );
         // WHY — the actor's intent survives on the only record a blocked act leaves.
         assert_eq!(d["intent"].as_str().unwrap(), "clean up the workspace");
+    }
+
+    /// Deny-as-redirect on the wire: an enforced deny carries the composed
+    /// `guidance` alongside the machine fields, and an allow carries null —
+    /// the client contract (GATE_PROFILE §1) is "surface if present, fall
+    /// back to reason".
+    #[tokio::test]
+    async fn query_policy_deny_carries_guidance_allow_does_not() {
+        let (_dir, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            s.policy_engine = crate::policy::PolicyEngine::new(
+                crate::policy::get_preset("safety").unwrap().config,
+            );
+        }
+        let connect = tool_connect(
+            &state,
+            &json!({"plugin_id": "claude-code", "host_agent": "test"}),
+        )
+        .await
+        .unwrap();
+        let sid = connect["sessionId"].as_str().unwrap().to_string();
+
+        let begin = tool_begin_action(
+            &state,
+            &json!({
+                "tool_name": "Bash",
+                "target": "rm -rf /home/user/data",
+                "parameters": {"command": "rm -rf /home/user/data"},
+                "session_id": sid,
+            }),
+        )
+        .await
+        .unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        let q = tool_query_policy(&state, &json!({"action_id": aid})).await.unwrap();
+        assert_eq!(q["decision"], "deny", "precondition: denied");
+        let g = q["guidance"].as_str().expect("enforced deny carries guidance");
+        assert!(g.contains("boundary, not a failure"));
+        assert!(
+            g.contains(q["reason"].as_str().unwrap()),
+            "guidance embeds the reason so the fallback loses no information"
+        );
+
+        let begin = tool_begin_action(
+            &state,
+            &json!({"tool_name": "Read", "target": "notes.md", "session_id": sid}),
+        )
+        .await
+        .unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        let q = tool_query_policy(&state, &json!({"action_id": aid})).await.unwrap();
+        assert_eq!(q["decision"], "allow", "precondition: allowed");
+        assert!(q["guidance"].is_null(), "allow must not carry steering text");
     }
 
     /// The host agent's own stable session id is witnessed as the real audit grain.

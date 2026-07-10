@@ -135,6 +135,13 @@ pub struct RecentEntry {
     pub success: Option<bool>,
     pub magnitude: Option<f64>,
     pub plugin_id: Option<String>,
+    /// WHICH session/capacity acted — so an operator can tell an interactive session from a
+    /// mesh-worker or autonomous-timer cron at a glance (the store already keys trust on this grain;
+    /// this surfaces it per-act in the feed/logs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role_lct: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_session_id: Option<String>,
     pub error: Option<String>,
     // Populated only for policy_decision entries.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -162,6 +169,11 @@ pub fn flatten_entry(e: crate::storage::ChainEntry) -> RecentEntry {
         magnitude: d.get("magnitude").and_then(|v| v.as_f64()),
         plugin_id: d
             .get("plugin_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        role_lct: d.get("role_lct").and_then(|v| v.as_str()).map(String::from),
+        host_session_id: d
+            .get("host_session_id")
             .and_then(|v| v.as_str())
             .map(String::from),
         error: d.get("error").and_then(|v| v.as_str()).map(String::from),
@@ -314,15 +326,15 @@ impl ServerState {
         by_tool_vec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let success_rate = if total == 0 { 0.0 } else { succ as f64 / total as f64 };
 
-        // Build the trust list per active (instance, role) entity — only those
-        // active within the last hour AND not flagged synthetic. Drops stale
-        // orchestrators and test harnesses from the operator-facing view. Sorted
-        // (plugin, role) for a stable snapshot.
+        // Build the trust list per (instance, role) entity seen in the window, minus synthetic
+        // test harnesses. NOTE: no last-hour filter — an idle-but-known orchestrator stays viewable
+        // (dp: always be able to select any visible orchestrator + view its history regardless of
+        // current activity). Staleness is conveyed by `days_since_last`, not by hiding the row.
+        // Sorted (plugin, role) for a stable snapshot.
         let mut active_sorted: Vec<(&String, &(chrono::DateTime<Utc>, String, String))> =
             active_entities
                 .iter()
                 .filter(|(_key, (_ts, pid, _role))| !self.is_synthetic(pid))
-                .filter(|(_key, (ts, _pid, _role))| *ts > one_hour_ago)
                 .collect();
         active_sorted.sort_by(|a, b| (&a.1 .1, &a.1 .2).cmp(&(&b.1 .1, &b.1 .2)));
         let trust: Vec<TrustView> = active_sorted
@@ -601,7 +613,7 @@ mod tests {
             )
             .unwrap();
         state.apply_outcome("harness", true, 0.5).unwrap();
-        assert!(state.mark_synthetic("harness"));
+        assert!(state.mark_synthetic("harness", 3).unwrap());
 
         let s = state.dashboard_snapshot(20);
         assert_eq!(s.trust.len(), 1, "harness should be excluded");
