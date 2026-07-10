@@ -32,8 +32,13 @@ The gate is the **running hestia daemon** — machine-local, loopback-only:
      client's action cache).
   2. `hestia_begin_action` — register the pending act (tool name, target, session).
   3. `hestia_query_policy` — get the verdict for the `action_id`.
-- **Verdict shape** (§3.4): `{ decision: "allow"|"warn"|"deny", reason, ruleId, enforced,
+- **Verdict shape** (§3.4): `{ decision: "allow"|"warn"|"deny", reason, guidance, ruleId, enforced,
   constraints[], status: "decided"|"evaluating", nextPollMs }`.
+- **`guidance` (optional string, null except on enforced deny)** — daemon-composed steering for the
+  blocked *agent*: why + "boundary, not a failure" + don't-re-run + what to do instead. Clients MUST
+  surface it verbatim on their deny channel when present (it replaces the bare `reason` line) and MUST
+  NOT parse it; `reason`/`ruleId`/`ruleName` remain the machine-readable fields. Absent/null `guidance`
+  ⇒ fall back to `reason`. A deny that only blocks trains retry-loops; this field is the redirect.
 - The daemon fold is in-process and synchronous (µs) — see `core/src/server/handler.rs` (base rules +
   role overlay via `fold_strictest`; the `web4-policy` law input is the third fold input arriving with
   the consolidation task). Transport, not evaluation, is the latency budget.
@@ -93,7 +98,7 @@ For any hook engine verified or suspected fail-open, the PreToolUse client MUST 
 |---|---|
 | `allow` (`status:"decided"`) | `trap - EXIT; exit 0`, silent |
 | `warn` | `exit 0`, one-line reason on stderr (surfacing in Kimi's UI is unverified — witness the warn regardless via the observe stream) |
-| `deny` | `exit 2`, one-line reason on stderr (becomes the engine's deny reason) |
+| `deny` | `exit 2`, `guidance` (fallback: one-line reason) on stderr (becomes the engine's deny reason) |
 | anything else / error / timeout | `exit 2` (§3 rules 1–6) |
 
 Rollout: Phase 1 starts in **WARN mode** (daemon policy maps would-be-denies to warn; the runbook's

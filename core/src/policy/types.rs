@@ -145,6 +145,34 @@ pub struct PolicyEvaluation {
     pub constraints: Vec<String>,
 }
 
+impl PolicyEvaluation {
+    /// Agent-facing steering for a blocked call: WHY (rule + reason), FRAME
+    /// (boundary, not a tool failure), DON'T (no blind retry), DO (adjust or
+    /// ask). Composed daemon-side so every client — the claude-code hook, the
+    /// Kimi adapter — surfaces the same text verbatim instead of each
+    /// inventing its own. `None` unless this is an enforced deny: warn already
+    /// lets the call proceed, and an audit-only would-deny must not tell the
+    /// agent to stop retrying a call that actually ran.
+    ///
+    /// The DO leg says "ask your operator" until the cooperative MCP channel
+    /// (`request_scope`, gate-shape note 2026-07-09) is registered — naming a
+    /// tool that doesn't exist yet would send agents into a tool-not-found
+    /// loop, the exact failure mode this text exists to prevent.
+    pub fn guidance(&self) -> Option<String> {
+        if self.decision != PolicyDecision::Deny || !self.enforced {
+            return None;
+        }
+        let rule = self.rule_name.as_deref().unwrap_or("policy");
+        Some(format!(
+            "hestia deny [rule: {rule}] — {reason}. This is a boundary, not a failure: do not \
+             re-run the same call. Either adjust your approach to stay in scope, or if you \
+             believe the action is legitimately needed, ask your operator and state your \
+             rationale — asking builds trust; reaching does not.",
+            reason = self.reason
+        ))
+    }
+}
+
 /// Fold a role-overlay evaluation into the base by STRICTEST verdict
 /// (`Allow` < `Warn` < `Deny`), so a self-declared role can only ever
 /// tighten the base, never loosen it.
@@ -231,5 +259,25 @@ mod severity_tests {
             eval(PolicyDecision::Deny, true, "role"),
         );
         assert_eq!(folded.rule_id.as_deref(), Some("base"));
+    }
+
+    /// Deny-as-redirect: guidance exists exactly for an enforced deny and
+    /// carries all four legs (why / frame / don't / do). Warn proceeds and
+    /// audit-only would-deny actually ran — steering "don't re-run" there
+    /// would be false, so both must stay None.
+    #[test]
+    fn guidance_only_on_enforced_deny_with_all_four_legs() {
+        let mut e = eval(PolicyDecision::Deny, true, "no destructive commands");
+        e.rule_name = Some("deny-destructive".into());
+        let g = e.guidance().expect("enforced deny must carry guidance");
+        assert!(g.contains("deny-destructive"), "WHY: rule name");
+        assert!(g.contains("no destructive commands"), "WHY: reason");
+        assert!(g.contains("boundary, not a failure"), "FRAME");
+        assert!(g.contains("do not re-run the same call"), "DON'T");
+        assert!(g.contains("ask your operator"), "DO");
+
+        assert_eq!(eval(PolicyDecision::Warn, true, "w").guidance(), None);
+        assert_eq!(eval(PolicyDecision::Deny, false, "audit").guidance(), None);
+        assert_eq!(eval(PolicyDecision::Allow, true, "a").guidance(), None);
     }
 }
