@@ -834,9 +834,12 @@
       // WHO acted: show only the compact pid under the entry number; full role + session ride the
       // number's hover title (same pattern as relative-time '3m' + hover for the absolute time).
       const whoRole = e.role_lct ? shortRole(e.role_lct) : '';
-      const whoSess = e.host_session_id ? String(e.host_session_id).slice(0,6) : '';
-      const whoFull = [e.role_lct || '', whoSess ? 'session '+whoSess : ''].filter(Boolean).join(' · ');
-      const whoPid = e.plugin_id ? `<span class="feed-pid">${escapeHtml(e.plugin_id)}</span>` : '';
+      const whoSess = e.host_session_id ? String(e.host_session_id).slice(0,8) : '';
+      // Compact display = the DISTINGUISHING identity (capacity + session), not the constant plugin.
+      // Full line (plugin + full role + full session) rides the hover.
+      const whoShort = [whoRole, whoSess].filter(Boolean).join('·') || (e.plugin_id || '');
+      const whoFull = [e.plugin_id || '', e.role_lct || '', e.host_session_id ? 'session '+e.host_session_id : ''].filter(Boolean).join(' · ');
+      const whoPid = whoShort ? `<span class="feed-pid">${escapeHtml(whoShort)}</span>` : '';
       const absTime = e.timestamp ? new Date(e.timestamp).toLocaleString() : '';
       return `
         <div class="feed-row${isNew ? ' new' : ''}">
