@@ -39,13 +39,21 @@ from typing import Any, Optional
 
 # ---- Configuration --------------------------------------------------------
 
-PLUGIN_ID = "claude-code"
-HOST_AGENT = "claude-code"
+# One witness for every orchestrator: the hook event schema (hook_event_name /
+# tool_name / tool_input) is shared across the Claude-Code lineage (Claude Code,
+# Kimi Code, Codex), so the SAME script witnesses any of them — set
+# HESTIA_PLUGIN_ID in the hook's environment to identify the member. All plugins
+# are treated identically; each accrues to its own (instance, role) trust grain.
+PLUGIN_ID = os.environ.get("HESTIA_PLUGIN_ID", "claude-code")
+HOST_AGENT = os.environ.get("HESTIA_HOST_AGENT", PLUGIN_ID)
 PROTOCOL_VERSION = "2024-11-05"
 TIMEOUT_S = 2.0
-HOOK_VERSION = "0.0.1"
+HOOK_VERSION = "0.0.2"
 
-STATE_DIR = Path.home() / ".hestia-claude"
+STATE_DIR = Path(
+    os.environ.get("HESTIA_STATE_DIR")
+    or str(Path.home() / (".hestia-claude" if PLUGIN_ID == "claude-code" else f".hestia-{PLUGIN_ID}"))
+)
 DEFAULT_HESTIA_HOME = Path.home() / ".hestia"
 DEFAULT_ENDPOINT = "http://127.0.0.1:7711/mcp"
 

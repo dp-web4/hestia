@@ -731,13 +731,24 @@
         <div class="trust-meta">
           <span>actions <b>${fmt.int(t.action_count)}</b></span>
           <span>success <b>${t.action_count === 0 ? '—' : fmt.pct(t.success_rate)}</b></span>
-          <span>T3 avg <b>${(t.t3_average).toFixed(2)}</b></span>
+          <span>T3 avg <b>${t.t3_average == null ? '—' : t.t3_average.toFixed(2)}</b></span>
         </div>
       </div>
     `).join('');
   }
 
   function tensorRow(name, value) {
+    // Canonical unmeasured-handling: null = zero observations on that dimension.
+    // Render it as unmeasured — never as a fabricated 0.5 score.
+    if (value == null) {
+      return `
+        <div class="tensor-row">
+          <span class="name">${name}</span>
+          <div class="bar"></div>
+          <span class="val" style="opacity:0.55">unmeasured</span>
+        </div>
+      `;
+    }
     return `
       <div class="tensor-row">
         <span class="name">${name}</span>

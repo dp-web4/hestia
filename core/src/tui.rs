@@ -330,6 +330,8 @@ fn draw_trust(f: &mut Frame, area: Rect, state: &AppState) {
                 height: 1,
             },
         );
+        // Canonical unmeasured-handling: None = zero observations on that
+        // dimension — render "unmeas" rather than a fabricated score.
         draw_gauge(f, area_t.x, area_t.y + 1, area_t.width, "Talent  ", t.t3_talent);
         draw_gauge(f, area_t.x, area_t.y + 2, area_t.width, "Training", t.t3_training);
         draw_gauge(f, area_t.x, area_t.y + 3, area_t.width, "Temper  ", t.t3_temperament);
@@ -342,7 +344,7 @@ fn draw_trust(f: &mut Frame, area: Rect, state: &AppState) {
     }
 }
 
-fn draw_gauge(f: &mut Frame, x: u16, y: u16, w: u16, label: &str, value: f64) {
+fn draw_gauge(f: &mut Frame, x: u16, y: u16, w: u16, label: &str, value: Option<f64>) {
     if w < 20 {
         return;
     }
@@ -357,6 +359,17 @@ fn draw_gauge(f: &mut Frame, x: u16, y: u16, w: u16, label: &str, value: f64) {
         Paragraph::new(Span::styled(label, Style::default().fg(FG_DIM))),
         label_area,
     );
+
+    // Unmeasured dimension (zero observations): empty bar + "unmeas", never a
+    // fabricated 0.5 score.
+    let Some(value) = value else {
+        f.render_widget(
+            Paragraph::new(Span::styled("unmeas ", Style::default().fg(FG_DIM)))
+                .alignment(Alignment::Right),
+            val_area,
+        );
+        return;
+    };
 
     let pct = (value.clamp(0.0, 1.0) * 100.0) as u16;
     let gauge = Gauge::default()

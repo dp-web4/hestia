@@ -86,19 +86,31 @@ pub struct ActivityStats {
 }
 
 /// One plugin's trust snapshot.
+///
+/// Canonical-web4 display contract: a dimension is shown ONLY if it has been
+/// measured (canonical per-dimension `observation_counts` > 0). An unmeasured
+/// dimension serializes as `null`, never as the 0.5 prior — 0.5-with-zero-
+/// observations is "honest unmeasured", and rendering it as a score fabricates
+/// confidence. Averages are shown only when at least one dimension of that
+/// tensor has been measured. No hestia-local trust terms; everything here is
+/// read straight off the canonical `web4_core` T3/V3 tensors as implemented.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustView {
     pub plugin_id: String,
     pub entity_id: String,
     pub level: String,
-    pub t3_talent: f64,
-    pub t3_training: f64,
-    pub t3_temperament: f64,
-    pub t3_average: f64,
-    pub v3_valuation: f64,
-    pub v3_veracity: f64,
-    pub v3_validity: f64,
-    pub v3_average: f64,
+    pub t3_talent: Option<f64>,
+    pub t3_training: Option<f64>,
+    pub t3_temperament: Option<f64>,
+    pub t3_average: Option<f64>,
+    pub v3_valuation: Option<f64>,
+    pub v3_veracity: Option<f64>,
+    pub v3_validity: Option<f64>,
+    pub v3_average: Option<f64>,
+    /// Canonical per-dimension observation counts [talent, training, temperament].
+    pub t3_observation_counts: [u64; 3],
+    /// Canonical per-dimension observation counts [valuation, veracity, validity].
+    pub v3_observation_counts: [u64; 3],
     pub action_count: u64,
     pub success_count: u64,
     pub success_rate: f64,
@@ -275,20 +287,26 @@ impl ServerState {
                     .trust_store
                     .get(key)
                     .unwrap_or_else(|_| EntityTrust::new(key.clone()));
-                let t3_avg = t.t3_average();
-                let v3_avg = t.v3_average();
+                // Canonical unmeasured-handling: read the tensors' own per-dim
+                // observation counts; a dim with 0 observations is null (not the
+                // 0.5 prior), and an average is null until something measured.
+                let t3c = *t.t3.observation_counts();
+                let v3c = *t.v3.observation_counts();
+                let dim = |v: f64, c: u64| if c > 0 { Some(v) } else { None };
                 TrustView {
                     plugin_id: pid.clone(),
                     entity_id: t.entity_id.clone(),
                     level: t.trust_level().as_str().to_string(),
-                    t3_talent: t.talent(),
-                    t3_training: t.training(),
-                    t3_temperament: t.temperament(),
-                    t3_average: t3_avg,
-                    v3_valuation: t.valuation(),
-                    v3_veracity: t.veracity(),
-                    v3_validity: t.validity(),
-                    v3_average: v3_avg,
+                    t3_talent: dim(t.talent(), t3c[0]),
+                    t3_training: dim(t.training(), t3c[1]),
+                    t3_temperament: dim(t.temperament(), t3c[2]),
+                    t3_average: dim(t.t3_average(), t3c.iter().sum()),
+                    v3_valuation: dim(t.valuation(), v3c[0]),
+                    v3_veracity: dim(t.veracity(), v3c[1]),
+                    v3_validity: dim(t.validity(), v3c[2]),
+                    v3_average: dim(t.v3_average(), v3c.iter().sum()),
+                    t3_observation_counts: t3c,
+                    v3_observation_counts: v3c,
                     action_count: t.action_count,
                     success_count: t.success_count,
                     success_rate: t.success_rate(),
