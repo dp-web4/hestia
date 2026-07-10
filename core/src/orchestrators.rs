@@ -36,6 +36,11 @@ pub const REGISTRY: &[KnownOrch] = &[
     KnownOrch { id: "openclaw", name: "OpenClaw", proc_patterns: &["openclaw"], plugin_available: true },
     KnownOrch { id: "cursor", name: "Cursor", proc_patterns: &["cursor"], plugin_available: true },
     KnownOrch { id: "codex", name: "Codex", proc_patterns: &["codex"], plugin_available: true },
+    // First foreign (non-family) orchestrator. Phase-0 adapter is observe-only and currently lives
+    // in shared-context/hestia/kimi-adapter-phase0/ (hand-installed into ~/.kimi-code/config.toml);
+    // plugin_available flips true when the adapter relocates into this repo at Phase 1 (HUB call)
+    // and install_kimi_code() ships with it. Detection + connected-status work today.
+    KnownOrch { id: "kimi-code", name: "Kimi Code", proc_patterns: &["kimi"], plugin_available: false },
 ];
 
 pub fn lookup(id: &str) -> Option<&'static KnownOrch> {
@@ -97,6 +102,7 @@ pub fn is_installed(id: &str) -> bool {
         "claude-code" => home.join(".claude/settings.json"),
         "codex" => home.join(".codex/config.toml"),
         "cursor" => home.join(".cursor/hooks.json"),
+        "kimi-code" => home.join(".kimi-code/config.toml"),
         _ => return false,
     };
     match std::fs::read_to_string(&path) {
