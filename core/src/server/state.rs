@@ -102,7 +102,7 @@ impl ServerState {
     /// Open all persistent stores rooted at `home` and prepare server state.
     /// `passphrase` is the vault passphrase — used to derive the storage key
     /// that seals the witness chain + trust files.
-    pub fn open(vault: Vault, home: &Path, passphrase: &str) -> Result<Self> {
+    pub fn open(mut vault: Vault, home: &Path, passphrase: &str) -> Result<Self> {
         // One stable storage key (Argon2 once) seals both the witness chain
         // (SQLCipher) and the trust files.
         let store_key = crate::storage::storage_key(home, passphrase)
@@ -110,8 +110,9 @@ impl ServerState {
         let chain_store = SqliteChainStore::open(home.join("witness.db"), store_key)?;
         let trust_store = TrustStore::open(home.join("trust"), store_key)?;
         let sovereign_lct = "lct:web4:hestia:sovereign:phase1-placeholder".to_string();
-        // Phase-1 mirror: the constellation roles as Role LCT entities (read-only).
-        let role_registry = crate::role_registry::build_mirror_registry(&sovereign_lct);
+        // Phase-1 mirror: the constellation roles as Role LCT entities, with
+        // VAULT-STABLE identities (same LCT across restarts; secrets sealed).
+        let role_registry = crate::role_registry::load_or_mint_registry(&mut vault, &sovereign_lct);
         // Resolve the active policy from the vault. Falls back to the
         // safety preset if the vault's named preset isn't built-in.
         let policy_config = vault

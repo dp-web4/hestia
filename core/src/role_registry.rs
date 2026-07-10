@@ -58,14 +58,79 @@ fn mirror_extension() -> RoleExtension {
 
 /// Build the Phase-1 audit-mirror registry: one `RoleEntity` per published
 /// constellation role, minted under this sovereign, each honestly unattributed.
-/// The role LCTs are minted fresh per call (in-memory Phase-1 visibility); stable
-/// vault-persisted identities are the immediate follow-up.
+/// The role LCTs are minted fresh per call — in-memory only; production uses
+/// [`load_or_mint_registry`] for vault-stable identities.
 pub fn build_mirror_registry(sovereign_lct: &str) -> RoleRegistry {
     let sovereign = sovereign_uuid(sovereign_lct);
     let mut registry = RoleRegistry::new();
     for label in crate::reputation::KNOWN_CONSTELLATION_ROLES {
         let (entity, _keypair) = RoleEntity::issue(*label, sovereign, mirror_extension());
         registry.register(entity);
+    }
+    registry
+}
+
+/// One persisted role: the LCT (durable identity), its label, its law extension,
+/// and the role's OWN keypair secret (hex). The secret lives here — inside the
+/// sealed vault, per the vault doctrine — so the role can later sign as itself
+/// (Phase 2: signed law extensions, launch acts). Without it a "stable" LCT would
+/// be hollow: a public key no one can ever answer for.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedRole {
+    label: String,
+    lct: web4_core::Lct,
+    extension: RoleExtension,
+    keypair_secret_hex: String,
+}
+
+const ROLES_NAMESPACE: &str = "roles";
+const ROLES_DOC: &str = "registry";
+const ROLES_LEGACY_FILE: &str = "roles.json";
+
+/// Load the role registry from the vault, minting (and persisting) any published
+/// constellation role not yet present. Role LCTs are therefore STABLE across
+/// daemon restarts — "the role has presence" requires a durable identity, not a
+/// fresh Uuid per boot. Additive: existing persisted roles are never re-minted or
+/// mutated here; a newly-published role is minted once and persists thereafter.
+/// Persistence failures degrade to the in-memory mirror (daemon must still start;
+/// the instability is logged, not hidden).
+pub fn load_or_mint_registry(vault: &mut crate::vault::Vault, sovereign_lct: &str) -> RoleRegistry {
+    let sovereign = sovereign_uuid(sovereign_lct);
+    let mut persisted: Vec<PersistedRole> =
+        crate::vault::load_doc(vault, ROLES_NAMESPACE, ROLES_DOC, ROLES_LEGACY_FILE)
+            .unwrap_or_default();
+
+    let mut registry = RoleRegistry::new();
+    for p in &persisted {
+        registry.register(RoleEntity {
+            lct: p.lct.clone(),
+            label: p.label.clone(),
+            extension: p.extension.clone(),
+        });
+    }
+
+    // Mint any published role not yet persisted (first boot, or a set upgrade).
+    let mut minted = false;
+    for label in crate::reputation::KNOWN_CONSTELLATION_ROLES {
+        if registry.get(label).is_some() {
+            continue;
+        }
+        let (entity, keypair) = RoleEntity::issue(*label, sovereign, mirror_extension());
+        persisted.push(PersistedRole {
+            label: entity.label.clone(),
+            lct: entity.lct.clone(),
+            extension: entity.extension.clone(),
+            keypair_secret_hex: hex::encode(keypair.secret_key_bytes()),
+        });
+        registry.register(entity);
+        minted = true;
+    }
+    if minted {
+        if let Err(e) = crate::vault::save_doc(vault, ROLES_NAMESPACE, ROLES_DOC, ROLES_LEGACY_FILE, &persisted) {
+            // Degrade honestly: the daemon runs with in-memory identities this
+            // boot; the next boot re-mints. Logged, never silently swallowed.
+            eprintln!("[roles] WARNING: persisting role registry failed ({e}) — role LCTs are unstable this boot");
+        }
     }
     registry
 }
@@ -100,6 +165,55 @@ mod tests {
         assert_eq!(mw.extension.default_verdict, web4_core::ExtensionVerdict::Deny);
         assert!(mw.extension.affordances.is_empty());
         assert_eq!(mw.extension.scope.atp_budget, web4_core::AtpBudget::Limited(0.0));
+    }
+
+    #[test]
+    fn role_lcts_are_stable_across_vault_reopens() {
+        // "The role has presence" — its LCT must survive a daemon restart, not be
+        // a fresh Uuid per boot. Two loads against the SAME vault = same identities.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("v.enc");
+        let mut vault = crate::vault::Vault::init(path.clone(), "p".into()).unwrap();
+        let first = load_or_mint_registry(&mut vault, "sov");
+        let ids1: Vec<_> = first
+            .labels()
+            .iter()
+            .map(|l| first.get(l).unwrap().lct.id)
+            .collect();
+        drop(vault);
+        // Reopen (the restart) and load again.
+        let mut vault2 = crate::vault::Vault::open(path, "p".into()).unwrap();
+        let second = load_or_mint_registry(&mut vault2, "sov");
+        let ids2: Vec<_> = second
+            .labels()
+            .iter()
+            .map(|l| second.get(l).unwrap().lct.id)
+            .collect();
+        assert_eq!(first.len(), crate::reputation::KNOWN_CONSTELLATION_ROLES.len());
+        assert_eq!(ids1, ids2, "role LCTs must be identical across restarts");
+    }
+
+    #[test]
+    fn persisted_keypair_answers_for_the_persisted_lct() {
+        // The sealed secret must reconstruct a keypair whose public key IS the
+        // persisted LCT's — otherwise the stable identity is hollow (a public key
+        // no one can sign for).
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("v.enc");
+        let mut vault = crate::vault::Vault::init(path, "p".into()).unwrap();
+        let reg = load_or_mint_registry(&mut vault, "sov");
+        let persisted: Vec<super::PersistedRole> =
+            crate::vault::load_doc(&vault, super::ROLES_NAMESPACE, super::ROLES_DOC, super::ROLES_LEGACY_FILE)
+                .unwrap();
+        assert_eq!(persisted.len(), reg.len());
+        for p in &persisted {
+            let bytes: [u8; 32] = hex::decode(&p.keypair_secret_hex).unwrap().try_into().unwrap();
+            let kp = web4_core::crypto::KeyPair::from_secret_bytes(&bytes);
+            assert_eq!(
+                kp.verifying_key(), p.lct.public_key,
+                "role {}: sealed secret must answer for the persisted LCT", p.label
+            );
+        }
     }
 
     #[test]
