@@ -587,7 +587,7 @@
 
   const $ = id => document.getElementById(id);
 
-  function renderStats(s, society) {
+  function renderStats(s, society, scope) {
     $('stat-chain').textContent = fmt.int(society.chain_length);
     $('stat-actions').textContent = fmt.int(s.total_actions);
     $('stat-rate').textContent = s.total_actions === 0 ? '—' : fmt.pct(s.success_rate);
@@ -599,8 +599,8 @@
       : '';
     $('stat-rate-delta').textContent =
       s.total_actions === 0
-        ? (s.denied_actions ? `${fmt.int(s.denied_actions)} blocked by policy` : 'across all plugins')
-        : `${fmt.int(s.successful_actions)} ok · ${fmt.int(s.failed_actions)} fail${blocked}`;
+        ? (s.denied_actions ? `${fmt.int(s.denied_actions)} blocked by policy` : (scope ? `for ${scope}` : 'across all plugins'))
+        : `${fmt.int(s.successful_actions)} ok · ${fmt.int(s.failed_actions)} fail${blocked}${scope ? ` · ${scope}` : ''}`;
     $('stat-hour').textContent = fmt.int(s.actions_last_hour);
   }
 
@@ -852,23 +852,12 @@
       ? `Tool histogram — ${selectedOrch}`
       : 'Tool histogram';
 
-    // When filtering, recompute from the recent-feed window (windowed
-    // approximation — accurate for the last N entries, may underrepresent
-    // longer-tailed orchestrators). When unfiltered, use the server-side
-    // total histogram.
-    let byTool;
-    if (selectedOrch) {
-      const counts = {};
-      for (const e of data.recent) {
-        if (e.event_type !== 'outcome') continue;
-        if (e.plugin_id !== selectedOrch) continue;
-        if (!e.tool_name) continue;
-        counts[e.tool_name] = (counts[e.tool_name] || 0) + 1;
-      }
-      byTool = Object.entries(counts).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-    } else {
-      byTool = data.stats.by_tool;
-    }
+    // When filtering, use the server-side per-plugin slice (same 10k-entry
+    // window as the aggregate — exact, not the old recent-feed approximation).
+    // When unfiltered, use the server-side total histogram.
+    const byTool = selectedOrch
+      ? (((data.stats_by_plugin || {})[selectedOrch] || {}).by_tool || [])
+      : data.stats.by_tool;
 
     if (!byTool.length) {
       root.innerHTML = selectedOrch
@@ -897,7 +886,14 @@
   }
 
   function rerender(data) {
-    renderStats(data.stats, data.society);
+    // Chip filter applies to the headline stats too: show the selected member's
+    // slice of the same window, not the society aggregate.
+    const statsEmpty = { total_actions: 0, successful_actions: 0, failed_actions: 0,
+                         denied_actions: 0, success_rate: 0, by_tool: [], actions_last_hour: 0 };
+    const s = selectedOrch
+      ? ((data.stats_by_plugin || {})[selectedOrch] || statsEmpty)
+      : data.stats;
+    renderStats(s, data.society, selectedOrch);
     renderOrchBar(data);
     renderTrust(data.trust);
     renderHistogram(data);

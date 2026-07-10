@@ -27,6 +27,11 @@ fn default_policy_view() -> PolicyView {
 pub struct DashboardSnapshot {
     pub society: SocietyView,
     pub stats: ActivityStats,
+    /// Per-plugin slices of `stats` over the same window — backs the
+    /// orchestrator-chip stat filter (selecting a member shows ITS activity,
+    /// not the society aggregate). Same field semantics as `stats`.
+    #[serde(default)]
+    pub stats_by_plugin: BTreeMap<String, ActivityStats>,
     #[serde(default = "default_policy_view")]
     pub policy: PolicyView,
     pub trust: Vec<TrustView>,
@@ -192,6 +197,11 @@ impl ServerState {
         let mut by_tool: BTreeMap<String, u64> = BTreeMap::new();
         let one_hour_ago = Utc::now() - chrono::Duration::hours(1);
         let mut last_hour = 0u64;
+        // Per-plugin slices of the same window, keyed by the human plugin_id:
+        // (total, succ, fail, denied, last_hour, by_tool). Backs the chip filter.
+        #[allow(clippy::type_complexity)]
+        let mut per_plugin: BTreeMap<String, (u64, u64, u64, u64, u64, BTreeMap<String, u64>)> =
+            BTreeMap::new();
         // Per-plugin "last seen" timestamps, used to decide which
         // orchestrators are "active" (= seen in the last hour).
         // Active trust entities in the window, keyed by the trust-store composite
@@ -228,6 +238,9 @@ impl ServerState {
                 && e.event_data.get("decision").and_then(|v| v.as_str()) == Some("deny")
             {
                 denied += 1;
+                if let Some(pid) = e.event_data.get("plugin_id").and_then(|v| v.as_str()) {
+                    per_plugin.entry(pid.to_string()).or_default().3 += 1;
+                }
             }
             // Collect policy decisions for the warn/deny feed filters across the
             // wider stats window (denies can be older than `recent_limit`). Cap
@@ -261,10 +274,42 @@ impl ServerState {
             } else {
                 fail += 1;
             }
-            if let Some(tname) = e.event_data.get("tool_name").and_then(|v| v.as_str()) {
+            let tname = e.event_data.get("tool_name").and_then(|v| v.as_str());
+            if let Some(tname) = tname {
                 *by_tool.entry(tname.to_string()).or_insert(0) += 1;
             }
+            // Same slice, per plugin.
+            if let Some(pid) = e.event_data.get("plugin_id").and_then(|v| v.as_str()) {
+                let p = per_plugin.entry(pid.to_string()).or_default();
+                p.0 += 1;
+                if success { p.1 += 1 } else { p.2 += 1 }
+                if e.timestamp > one_hour_ago {
+                    p.4 += 1;
+                }
+                if let Some(tname) = tname {
+                    *p.5.entry(tname.to_string()).or_insert(0) += 1;
+                }
+            }
         }
+        let stats_by_plugin: BTreeMap<String, ActivityStats> = per_plugin
+            .into_iter()
+            .map(|(pid, (t, s, f, d, lh, bt))| {
+                let mut btv: Vec<(String, u64)> = bt.into_iter().collect();
+                btv.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                (
+                    pid,
+                    ActivityStats {
+                        total_actions: t,
+                        successful_actions: s,
+                        failed_actions: f,
+                        denied_actions: d,
+                        success_rate: if t == 0 { 0.0 } else { s as f64 / t as f64 },
+                        by_tool: btv,
+                        actions_last_hour: lh,
+                    },
+                )
+            })
+            .collect();
         let mut by_tool_vec: Vec<(String, u64)> = by_tool.into_iter().collect();
         by_tool_vec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let success_rate = if total == 0 { 0.0 } else { succ as f64 / total as f64 };
@@ -420,6 +465,7 @@ impl ServerState {
                 by_tool: by_tool_vec,
                 actions_last_hour: last_hour,
             },
+            stats_by_plugin,
             trust,
             recent,
             policy_decisions,
