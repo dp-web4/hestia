@@ -423,6 +423,7 @@
   .orch-connect[data-connectable="false"] { color: var(--fg-faint); cursor: default; }
   /* connected but idle: live + wired, just no tool calls in the last hour */
   .orch-idle { color: var(--fg-faint); font-size: 0.7rem; margin-left: 0.35rem; }
+  .feed-who { color: var(--fg-dim, #8b93a7); font-size: 0.8em; opacity: 0.85; margin-right: 4px; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -641,20 +642,20 @@
       // narrower "active in the last hour" signal used to filter stats. An idle
       // but connected session stays connected — it does NOT flip to "disconnect".
       if (o.connected) {
+        // ANY connected orchestrator is selectable — idle or active — so its history/policy stays
+        // viewable regardless of current activity (dp). Idle just shows an 'idle' badge; it still
+        // carries data-pid so the click handler attaches and filters to it.
         const t = trustById[o.id] || {};
-        if (o.engaged) {
-          const sel = selectedOrch === o.id ? ' selected' : '';
-          const grains = t.grains > 1 ? ` · ${t.grains} trust grains, level = worst` : '';
-          return `<span class="orch-chip${sel}" data-pid="${escapeHtml(o.id)}" title="connected · active${grains} — click to filter stats">
-                    <span>${escapeHtml(o.name)}</span>
-                    ${t.level ? `<span class="level">${escapeHtml(t.level)}</span>` : ''}
-                    ${t.action_count != null ? `<span class="count">${fmt.int(t.action_count)}</span>` : ''}
-                  </span>`;
-        }
-        // connected but idle: running + wired, no tool calls in the last hour.
-        return `<span class="orch-chip" title="connected · idle — no tool calls in the last hour">
+        const sel = selectedOrch === o.id ? ' selected' : '';
+        const grains = t.grains > 1 ? ` · ${t.grains} trust grains, level = worst` : '';
+        const state = o.engaged ? `active${grains}` : 'idle';
+        const badge = o.engaged
+          ? (t.action_count != null ? `<span class="count">${fmt.int(t.action_count)}</span>` : '')
+          : `<span class="orch-idle">idle</span>`;
+        return `<span class="orch-chip${sel}" data-pid="${escapeHtml(o.id)}" title="connected · ${state} — click to view its history/stats">
                   <span>${escapeHtml(o.name)}</span>
-                  <span class="orch-idle">idle</span>
+                  ${t.level ? `<span class="level">${escapeHtml(t.level)}</span>` : ''}
+                  ${badge}
                 </span>`;
       }
       // not connected → offer to install the plugin hooks (connect).
@@ -828,12 +829,19 @@
         detail = e.event_type;
       }
 
+      // WHO acted — plugin + capacity(role) + short session, so an interactive session is
+      // distinguishable from a mesh-worker / autonomous-timer cron at a glance (dp).
+      const whoRole = e.role_lct ? shortRole(e.role_lct) : '';
+      const whoSess = e.host_session_id ? String(e.host_session_id).slice(0,6) : '';
+      const whoBits = [e.plugin_id, whoRole, whoSess ? 'sess:'+whoSess : ''].filter(Boolean);
+      const whoTag = whoBits.length ? `<span class="feed-who" title="${escapeHtml((e.role_lct||'')+' '+(e.host_session_id||''))}">${escapeHtml(whoBits.join(' · '))}</span>` : '';
       const absTime = e.timestamp ? new Date(e.timestamp).toLocaleString() : '';
       return `
         <div class="feed-row${isNew ? ' new' : ''}">
           <span class="feed-pos">#${e.chain_position}</span>
           <span class="feed-time" title="${escapeHtml(absTime)}">${fmt.relTime(e.timestamp)}</span>
           <span class="feed-event ${e.event_type}">${escapeHtml(e.event_type)}</span>
+          ${whoTag}
           <span class="feed-detail" title="${escapeHtml(detail)}">
             ${tool ? `<span class="feed-tool">${escapeHtml(tool)}</span> ` : ''}${escapeHtml(detail)}
           </span>
