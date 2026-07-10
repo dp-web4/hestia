@@ -139,10 +139,16 @@ impl ServerState {
         }
 
         // Synthetic-plugin set lives in the vault (migrating a legacy
-        // synthetic.json). Best-effort: an empty set on any read error.
-        let synthetic_plugins: HashSet<String> =
+        // synthetic.json). Absent doc = fresh install (empty set is correct);
+        // a present-but-unparseable doc must abort startup — collapsing it to
+        // an empty set would silently drop the synthetic exclusion in
+        // `member_lct` and mint durable, derivation-valid member LCTs for
+        // synthetic plugins.
+        let synthetic_plugins: HashSet<String> = {
+            use anyhow::Context;
             crate::vault::load_doc(&vault, "presence", "synthetic", "synthetic.json")
-                .unwrap_or_default();
+                .context("synthetic-plugin set unreadable — failing closed instead of treating it as empty")?
+        };
 
         Ok(Self {
             vault,
@@ -599,6 +605,32 @@ mod tests {
         assert!(state.is_synthetic("conformance-runner-py"));
         assert!(!state.is_synthetic("claude-code"));
         assert_eq!(state.synthetic_plugins.len(), 2);
+    }
+
+    #[test]
+    fn corrupt_synthetic_doc_fails_startup_not_open() {
+        // A present-but-unparseable synthetic set must abort startup: treating
+        // it as empty would drop the member_lct exclusion and mint durable
+        // member LCTs for synthetic plugins.
+        let dir = TempDir::new().unwrap();
+        let vault_path = dir.path().join("v.enc");
+        let mut vault = Vault::init(vault_path.clone(), "p".into()).unwrap();
+        vault
+            .put_document("presence", "synthetic", b"{ not valid json".to_vec())
+            .unwrap();
+        assert!(ServerState::open(vault, dir.path(), "p").is_err());
+
+        // Same for a corrupt legacy plaintext sidecar (no vault doc present).
+        let dir2 = TempDir::new().unwrap();
+        let vault2 = Vault::init(dir2.path().join("v.enc"), "p".into()).unwrap();
+        std::fs::write(dir2.path().join("synthetic.json"), "][").unwrap();
+        assert!(ServerState::open(vault2, dir2.path(), "p").is_err());
+
+        // Absent doc stays a fresh install: empty set, startup succeeds.
+        let dir3 = TempDir::new().unwrap();
+        let vault3 = Vault::init(dir3.path().join("v.enc"), "p".into()).unwrap();
+        let state = ServerState::open(vault3, dir3.path(), "p").unwrap();
+        assert!(state.synthetic_plugins.is_empty());
     }
 
     #[test]
