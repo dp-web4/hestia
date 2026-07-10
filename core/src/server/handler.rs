@@ -212,11 +212,29 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         soft_lct: soft_lct.clone(),
         connected_at: Utc::now(),
     };
-    s.sessions.insert(session_id, session);
-
+    // Fail-closed synthetic declaration: a client that declares itself synthetic
+    // must have that exclusion durably PERSISTED before we admit it — otherwise a
+    // restart loses the exclusion and mints durable member labels for a test
+    // harness (the write-side mirror of the corrupt-doc load bug). Retry the
+    // persist up to a law-settable budget (vault policy, default 3); if every
+    // attempt fails, REFUSE the connect rather than admit an unpersisted
+    // synthetic member. Done BEFORE the session is inserted so a refusal leaves
+    // no half-open session behind.
     if synthetic {
-        s.mark_synthetic(&plugin_id);
+        let max_attempts = s.vault.policy().synthetic_persist_attempts();
+        if let Err(e) = s.mark_synthetic(&plugin_id, max_attempts) {
+            return Ok(hestia_error_envelope(
+                "hestia.internal_error",
+                &format!(
+                    "refusing connect: could not persist synthetic exclusion for '{plugin_id}' \
+                     after {max_attempts} attempt(s) (fail-closed): {e}"
+                ),
+                None,
+            ));
+        }
     }
+
+    s.sessions.insert(session_id, session);
 
     // session_started is intentionally NOT written to the witness chain.
     // Sessions are RAM-only by design (transport artifacts); every hook

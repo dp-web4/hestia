@@ -53,7 +53,19 @@ pub struct VaultPolicyState {
     /// base, never less. Empty = no role scoping (every session gets the base).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub role_overlays: HashMap<String, Vec<PolicyRule>>,
+
+    /// Law-settable number of attempts to persist a synthetic-exclusion write
+    /// before `mark_synthetic` gives up and the connect is refused (fail-closed).
+    /// `None` ⇒ [`DEFAULT_SYNTHETIC_PERSIST_ATTEMPTS`] (3). An operator can raise
+    /// it for flaky storage or lower it to fail faster; it lives here (not a side
+    /// config) so it is inspectable and travels with the vault.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthetic_persist_max_attempts: Option<u32>,
 }
+
+/// Default persist attempts for a synthetic-exclusion write when the vault policy
+/// doc does not set one. Bounded retry, then fail-closed (refuse the connect).
+pub const DEFAULT_SYNTHETIC_PERSIST_ATTEMPTS: u32 = 3;
 
 impl Default for VaultPolicyState {
     fn default() -> Self {
@@ -62,7 +74,18 @@ impl Default for VaultPolicyState {
             overrides: HashMap::new(),
             custom_rules: Vec::new(),
             role_overlays: HashMap::new(),
+            synthetic_persist_max_attempts: None,
         }
+    }
+}
+
+impl VaultPolicyState {
+    /// Effective synthetic-persist attempt budget (>= 1), law-settable with a
+    /// default of [`DEFAULT_SYNTHETIC_PERSIST_ATTEMPTS`].
+    pub fn synthetic_persist_attempts(&self) -> u32 {
+        self.synthetic_persist_max_attempts
+            .unwrap_or(DEFAULT_SYNTHETIC_PERSIST_ATTEMPTS)
+            .max(1)
     }
 }
 
@@ -136,6 +159,34 @@ impl VaultPolicyState {
 mod tests {
     use super::*;
     use crate::policy::PolicyDecision;
+
+    #[test]
+    fn synthetic_persist_attempts_is_law_settable_default_three() {
+        // default (unset) => 3
+        let mut s = VaultPolicyState::default();
+        assert_eq!(s.synthetic_persist_max_attempts, None);
+        assert_eq!(s.synthetic_persist_attempts(), 3);
+        // operator-set value is honored
+        s.synthetic_persist_max_attempts = Some(5);
+        assert_eq!(s.synthetic_persist_attempts(), 5);
+        // floored at 1 — a 0 in the vault can never mean "never persist / never refuse"
+        s.synthetic_persist_max_attempts = Some(0);
+        assert_eq!(s.synthetic_persist_attempts(), 1);
+    }
+
+    #[test]
+    fn synthetic_attempts_survives_serde_roundtrip_and_back_compat() {
+        // absent field in an older vault doc deserializes to the default
+        let old = r#"{"active_preset":"safety"}"#;
+        let s: VaultPolicyState = serde_json::from_str(old).unwrap();
+        assert_eq!(s.synthetic_persist_attempts(), 3);
+        // an explicit value round-trips
+        let mut s2 = VaultPolicyState::default();
+        s2.synthetic_persist_max_attempts = Some(7);
+        let round: VaultPolicyState =
+            serde_json::from_str(&serde_json::to_string(&s2).unwrap()).unwrap();
+        assert_eq!(round.synthetic_persist_attempts(), 7);
+    }
 
     #[test]
     fn default_state_resolves_to_safety_preset() {

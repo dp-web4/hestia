@@ -613,7 +613,7 @@ mod tests {
             )
             .unwrap();
         state.apply_outcome("harness", true, 0.5).unwrap();
-        assert!(state.mark_synthetic("harness"));
+        assert!(state.mark_synthetic("harness", 3).unwrap());
 
         let s = state.dashboard_snapshot(20);
         assert_eq!(s.trust.len(), 1, "harness should be excluded");

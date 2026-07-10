@@ -168,22 +168,40 @@ impl ServerState {
         })
     }
 
-    /// Mark a plugin_id as synthetic and persist. Idempotent; returns
-    /// `true` if this call added a new entry.
-    pub fn mark_synthetic(&mut self, plugin_id: &str) -> bool {
+    /// Mark a plugin_id as synthetic and persist. Idempotent on membership;
+    /// `Ok(true)` if this call added a new entry.
+    ///
+    /// The persist is fail-closed and NOT guarded by novelty — the write-side
+    /// mirror of the corrupt-doc load rule. A best-effort save that failed
+    /// silently left the exclusion in memory only: durable member labels
+    /// would mint for this plugin after the next restart, and a novelty
+    /// guard meant no later re-join ever retried the write. The write is
+    /// retried up to `max_attempts` times (law-settable via the vault policy,
+    /// default 3 — see `VaultPolicyState::synthetic_persist_attempts`); if every
+    /// attempt fails the error reaches the caller (which must refuse the
+    /// request), the in-memory entry still stands so THIS run keeps the
+    /// exclusion, and the next declaring join retries the persist again.
+    pub fn mark_synthetic(&mut self, plugin_id: &str, max_attempts: u32) -> anyhow::Result<bool> {
         let added = self.synthetic_plugins.insert(plugin_id.to_string());
-        if added {
-            // Best-effort persist into the vault; don't fail the request on
-            // a disk/encrypt error.
-            let _ = crate::vault::save_doc(
+        let attempts = max_attempts.max(1);
+        let mut last_err = None;
+        for _ in 0..attempts {
+            match crate::vault::save_doc(
                 &mut self.vault,
                 "presence",
                 "synthetic",
                 "synthetic.json",
                 &self.synthetic_plugins,
-            );
+            ) {
+                Ok(()) => return Ok(added),
+                Err(e) => last_err = Some(e),
+            }
         }
-        added
+        Err(last_err
+            .expect("attempts >= 1 so the loop ran at least once")
+            .context(format!(
+                "failed to persist synthetic exclusion for '{plugin_id}' after {attempts} attempt(s)"
+            )))
     }
 
     pub fn is_synthetic(&self, plugin_id: &str) -> bool {
@@ -547,7 +565,7 @@ mod tests {
     #[test]
     fn member_lct_fails_closed_for_synthetic_and_empty() {
         let (_dir, mut state) = make_state();
-        assert!(state.mark_synthetic("conformance-runner"));
+        assert!(state.mark_synthetic("conformance-runner", 3).unwrap());
         // Synthetic plugins never map -> no delta will be emitted for them.
         assert!(state.member_lct("conformance-runner").is_none());
         // Malformed / empty ids also fail closed.
@@ -574,7 +592,7 @@ mod tests {
         assert!(!lines[0].contains("real-plugin"), "raw plugin_id never leaks");
 
         // A synthetic member: trust still updates locally, but NO delta is emitted.
-        state.mark_synthetic("synthetic-plugin");
+        state.mark_synthetic("synthetic-plugin", 3).unwrap();
         state.apply_outcome("synthetic-plugin", false, 0.7).unwrap();
         let after: Vec<String> = std::fs::File::open(&sink)
             .map(|f| std::io::BufReader::new(f).lines().map_while(Result::ok).collect())
@@ -590,10 +608,10 @@ mod tests {
         {
             let vault = Vault::init(vault_path.clone(), "p".into()).unwrap();
             let mut state = ServerState::open(vault, dir.path(), "p").unwrap();
-            assert!(state.mark_synthetic("conformance-runner"));
-            assert!(state.mark_synthetic("conformance-runner-py"));
+            assert!(state.mark_synthetic("conformance-runner", 3).unwrap());
+            assert!(state.mark_synthetic("conformance-runner-py", 3).unwrap());
             // Re-marking the same id is a no-op.
-            assert!(!state.mark_synthetic("conformance-runner"));
+            assert!(!state.mark_synthetic("conformance-runner", 3).unwrap());
             assert!(state.is_synthetic("conformance-runner"));
             assert!(!state.is_synthetic("claude-code"));
         }
