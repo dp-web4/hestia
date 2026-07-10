@@ -359,8 +359,18 @@ def fail_closed() -> bool:
 
 
 def deny_no_verdict(why: str) -> int:
-    """Fail-closed refusal: no daemon verdict → the tool does not run."""
-    sys.stderr.write(f"hestia: deny [fail-closed] — no policy verdict ({why})\n")
+    """Fail-closed refusal: no daemon verdict → the tool does not run.
+
+    Composed locally (the daemon is exactly what we couldn't reach), so this
+    carries its own static steering: without it, an agent facing a down daemon
+    reads every deny as a tool error and retry-loops — the highest-risk case
+    for the loop the daemon-side guidance exists to prevent."""
+    sys.stderr.write(
+        f"hestia: deny [fail-closed] — no policy verdict ({why}). This is a "
+        "boundary, not a tool failure: do not re-run the same call. The policy "
+        "daemon is unavailable, so no action can be approved — report this to "
+        "your operator and wait.\n"
+    )
     debug_log(f"fail-closed deny: {why}")
     return 2
 
@@ -407,7 +417,11 @@ def emit_decision(decision: dict[str, Any]) -> int:
     label = f" [{rule_name}]" if rule_name else ""
 
     if verdict == "deny" and enforced:
-        sys.stderr.write(f"hestia: deny{label} — {reason}\n")
+        # Prefer the daemon-composed steering text (deny-as-redirect): it is
+        # what the blocked agent actually reads, so it must say what to DO
+        # next, not just why. Fall back to the bare reason for old daemons.
+        guidance = decision.get("guidance")
+        sys.stderr.write((guidance or f"hestia: deny{label} — {reason}") + "\n")
         return 2
     if verdict == "warn":
         sys.stderr.write(f"hestia: warn{label} — {reason}\n")
