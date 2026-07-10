@@ -36,12 +36,22 @@ Rules:
   --channel-key` remains the only way to enter it, and status/CLI output must label the connection's
   tier wherever the key source is shown.
 
-### 1.2 Migration note (enum ordering)
+### 1.2 Migration note (enum ordering & rollout order)
 
 `AssuranceLevel` derives `Ord` and callers compare tiers. `Operational` must be inserted as the
 **first** variant so the ordering stays semantic (`Operational < SingleDevice < MultiDevice <
 HardwareBacked`). Serialized snake_case names are unaffected; any stored proofs/attestations
 deserialize unchanged.
+
+The enum lives in **two crates**: hestia `core/src/constellation.rs` and its mirror
+`web4/hub/hub-lib/src/constellation.rs:39` (also derived `Ord`, also snake_case on the wire).
+Insert the variant first in **both**, or every existing `<`/`>=` tier comparison silently inverts
+for it on the side that lags.
+
+**Rollout order: hubs before signers.** "Deserialize unchanged" holds for data at rest, not for
+the wire: an old hub-lib receiving `operational` in a live envelope fails deserialization of the
+whole envelope. Ship the enum to hub-lib/hub-daemon first; only after hubs are updated may hestia
+emit the new tier. (Per CBP's sanity check on the thread, 2026-07-10.)
 
 ---
 
@@ -178,6 +188,18 @@ Hubs gate act classes on tier (chapter law): e.g. high-consequence outward acts 
 the CBP mesh watcher's channel-key path grandfathered at `Operational` for everything it does
 today, or capped out of some current act?
 
+**CBP's input (sanity check, 2026-07-10):** the watcher's only write is `referenced_act`
+coordination notices, all carrying the default `ConsequenceClass::Reversible`
+(`web4-core/src/act.rs:125`) — nothing it does today exceeds `Reversible`, so no grandfathering
+carve-out is needed. CBP proposes keying the tier floor off the consequence axis that already
+exists, rather than per-act-class lists, making the decision structural:
+
+| `ConsequenceClass` | tier floor |
+|---|---|
+| `Reversible` | `Operational` |
+| `Costly` | `SingleDevice` |
+| `Irreversible` | `MultiDevice` + council (existing gate, `hub-lib/src/events.rs`) |
+
 The raw channel key is thereby **retired as an unstated workaround** and retained as an explicit,
 tier-capped exception — which is all a headless watcher needs.
 
@@ -185,7 +207,9 @@ tier-capped exception — which is all a headless watcher needs.
 
 ## 5. Implementation order
 
-1. `AssuranceLevel::Operational` + tier labeling in `hub status` / connection views (small, unblocks 4).
+1. `AssuranceLevel::Operational` in **`web4/hub/hub-lib/src/constellation.rs` first** (hub-track
+   counterpart PR; hubs must deserialize the tier before any signer emits it — §1.2), then the
+   hestia enum + tier labeling in `hub status` / connection views (small, unblocks 4).
 2. Witnessed enrollment + revocation ceremonies (§3.1–3.2) — `constellation.rs` + CLI.
 3. Revocation push to `HubConnection`s + hub-side pin (needs a hub-track counterpart PR).
 4. Per-device unlock policy doc + enforcement (§2.5), then per-item co-sign classes (§2.4).
