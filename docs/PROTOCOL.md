@@ -25,6 +25,7 @@ implementations:
 |---|---|---|
 | Dashboard HTML | `GET /` | Embedded HTML/CSS/JS dashboard. See [DASHBOARD.md](./DASHBOARD.md). |
 | Dashboard JSON | `GET /api/dashboard` | JSON snapshot consumed by both the web dashboard and the `hestia dashboard` TUI. See [DASHBOARD.md](./DASHBOARD.md). |
+| Gate profile (PreToolUse clients) | — | Normative client-construction contract for adapter gate hooks (fail-open engines): [GATE_PROFILE.md](./GATE_PROFILE.md). Wire protocol itself stays presence-protocol §3.4. |
 
 These are operator surfaces — for the user/operator to see what's
 happening in their own daemon. Orchestrators (Claude Code, etc.) do
