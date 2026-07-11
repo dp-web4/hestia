@@ -94,19 +94,46 @@ const ROLES_LEGACY_FILE: &str = "roles.json";
 /// mutated here; a newly-published role is minted once and persists thereafter.
 /// Persistence failures degrade to the in-memory mirror (daemon must still start;
 /// the instability is logged, not hidden).
-pub fn load_or_mint_registry(vault: &mut crate::vault::Vault, sovereign_lct: &str) -> RoleRegistry {
+///
+/// `sovereign_lct_id` is the sovereign's canonical (key-derived) LCT id; each
+/// role's `mrh.bound` gets a **derived** parent edge to it — the reachability
+/// statement "this role was issued under this sovereign" (canon §5). The edge is
+/// recomputed every boot (ts = the role's own `created_at`, so it is deterministic
+/// and never churns) and is NOT persisted: it is a projection of the issuance fact,
+/// not stored state. Empty `sovereign_lct_id` ⇒ no bound edge (fail-quiet).
+pub fn load_or_mint_registry(
+    vault: &mut crate::vault::Vault,
+    sovereign_lct: &str,
+    sovereign_lct_id: &str,
+) -> RoleRegistry {
     let sovereign = sovereign_uuid(sovereign_lct);
     let mut persisted: Vec<PersistedRole> =
         crate::vault::load_doc(vault, ROLES_NAMESPACE, ROLES_DOC, ROLES_LEGACY_FILE)
             .unwrap_or_default();
 
+    // Populate a role's MRH `bound` parent edge to the sovereign (canon §5:
+    // reachability is the edge, not metadata). Derived, deterministic (ts = the
+    // role's own created_at → never churns), applied before registration. Empty
+    // `sovereign_lct_id` ⇒ no edge (fail-quiet).
+    let with_bound_edge = |mut entity: RoleEntity| -> RoleEntity {
+        if !sovereign_lct_id.is_empty() {
+            let ts = entity.lct.created_at;
+            entity.lct.mrh.bound = vec![web4_core::MrhEdge {
+                lct_id: sovereign_lct_id.to_string(),
+                edge_type: "parent".to_string(),
+                ts,
+            }];
+        }
+        entity
+    };
+
     let mut registry = RoleRegistry::new();
     for p in &persisted {
-        registry.register(RoleEntity {
+        registry.register(with_bound_edge(RoleEntity {
             lct: p.lct.clone(),
             label: p.label.clone(),
             extension: p.extension.clone(),
-        });
+        }));
     }
 
     // Mint any published role not yet persisted (first boot, or a set upgrade).
@@ -122,7 +149,7 @@ pub fn load_or_mint_registry(vault: &mut crate::vault::Vault, sovereign_lct: &st
             extension: entity.extension.clone(),
             keypair_secret_hex: hex::encode(keypair.secret_key_bytes()),
         });
-        registry.register(entity);
+        registry.register(with_bound_edge(entity));
         minted = true;
     }
     if minted {
@@ -132,6 +159,7 @@ pub fn load_or_mint_registry(vault: &mut crate::vault::Vault, sovereign_lct: &st
             eprintln!("[roles] WARNING: persisting role registry failed ({e}) — role LCTs are unstable this boot");
         }
     }
+
     registry
 }
 
@@ -174,7 +202,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("v.enc");
         let mut vault = crate::vault::Vault::init(path.clone(), "p".into()).unwrap();
-        let first = load_or_mint_registry(&mut vault, "sov");
+        let first = load_or_mint_registry(&mut vault, "sov", "lct:web4:mb32:btestsovereign");
         let ids1: Vec<_> = first
             .labels()
             .iter()
@@ -183,7 +211,7 @@ mod tests {
         drop(vault);
         // Reopen (the restart) and load again.
         let mut vault2 = crate::vault::Vault::open(path, "p".into()).unwrap();
-        let second = load_or_mint_registry(&mut vault2, "sov");
+        let second = load_or_mint_registry(&mut vault2, "sov", "lct:web4:mb32:btestsovereign");
         let ids2: Vec<_> = second
             .labels()
             .iter()
@@ -201,7 +229,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("v.enc");
         let mut vault = crate::vault::Vault::init(path, "p".into()).unwrap();
-        let reg = load_or_mint_registry(&mut vault, "sov");
+        let reg = load_or_mint_registry(&mut vault, "sov", "lct:web4:mb32:btestsovereign");
         let persisted: Vec<super::PersistedRole> =
             crate::vault::load_doc(&vault, super::ROLES_NAMESPACE, super::ROLES_DOC, super::ROLES_LEGACY_FILE)
                 .unwrap();
@@ -214,6 +242,35 @@ mod tests {
                 "role {}: sealed secret must answer for the persisted LCT", p.label
             );
         }
+    }
+
+    #[test]
+    fn roles_carry_a_bound_parent_edge_to_the_sovereign() {
+        // Canon §5: reachability is the MRH edge. Every mirrored role must carry a
+        // `bound` parent edge to the sovereign's canonical LCT id — the "issued
+        // under this sovereign" statement, traversable.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut vault = crate::vault::Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let sov_id = "lct:web4:mb32:bexamplesovereignid";
+        let reg = load_or_mint_registry(&mut vault, "sov", sov_id);
+        for label in crate::reputation::KNOWN_CONSTELLATION_ROLES {
+            let role = reg.get(label).unwrap();
+            assert_eq!(role.lct.mrh.bound.len(), 1, "{label} has exactly one bound edge");
+            let edge = &role.lct.mrh.bound[0];
+            assert_eq!(edge.lct_id, sov_id, "bound edge targets the sovereign");
+            assert_eq!(edge.edge_type, "parent");
+            // deterministic: the edge ts is the role's own created_at (never churns)
+            assert_eq!(edge.ts, role.lct.created_at);
+        }
+    }
+
+    #[test]
+    fn empty_sovereign_id_leaves_bound_edges_absent_fail_quiet() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut vault = crate::vault::Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let reg = load_or_mint_registry(&mut vault, "sov", "");
+        let mw = reg.get("role:constellation:mesh-worker").unwrap();
+        assert!(mw.lct.mrh.bound.is_empty(), "no sovereign id ⇒ no bound edge");
     }
 
     #[test]

@@ -127,7 +127,7 @@ impl ServerState {
         );
         // Phase-1 mirror: the constellation roles as Role LCT entities, with
         // VAULT-STABLE identities (same LCT across restarts; secrets sealed).
-        let role_registry = crate::role_registry::load_or_mint_registry(&mut vault, &sovereign_lct);
+        let role_registry = crate::role_registry::load_or_mint_registry(&mut vault, &sovereign_lct, &sovereign.lct_id());
         // Resolve the active policy from the vault. Falls back to the
         // safety preset if the vault's named preset isn't built-in.
         let policy_config = vault
