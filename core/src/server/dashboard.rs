@@ -59,7 +59,12 @@ pub struct DashboardSnapshot {
 /// Identity + macro state of this Hestia society.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SocietyView {
+    /// The legacy sovereign anchor string (witness-chain authorship keys on this).
     pub sovereign_lct: String,
+    /// The sovereign's canonical, key-derived LCT id — its real presence as a
+    /// vault-persisted entity (distinct from the `sovereign_lct` anchor string).
+    #[serde(default)]
+    pub sovereign_lct_id: String,
     pub chain_length: u64,
     pub active_sessions: usize,
     pub vault_entries: usize,
@@ -460,6 +465,7 @@ impl ServerState {
             policy,
             society: SocietyView {
                 sovereign_lct: self.sovereign_lct.clone(),
+                sovereign_lct_id: self.sovereign.lct_id(),
                 chain_length: self.chain_len(),
                 active_sessions: self.sessions.len(),
                 vault_entries: self.vault.list().len(),
