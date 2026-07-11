@@ -73,7 +73,13 @@ pub struct ServerState {
     pub actions: HashMap<Uuid, InFlightAction>,
     pub chain_store: SqliteChainStore,
     pub trust_store: TrustStore,
+    /// The legacy sovereign anchor string — witness-chain authorship + member-label
+    /// derivation still key on this verbatim. See `sovereign` for the LCT identity.
     pub sovereign_lct: String,
+    /// The constellation sovereign as a first-class, vault-persisted LCT (durable
+    /// key-derived identity, sealed keypair). The society that mints the roles, with
+    /// presence of its own. `sovereign.lct_id()` is its canonical id. See `sovereign`.
+    pub sovereign: crate::sovereign::Sovereign,
     /// Phase-1 audit-first mirror: the published constellation roles as first-class
     /// `web4_core::RoleEntity` LCT entities (additive + read-only — law evaluation
     /// still uses the string-keyed `role_policy_engines` fold). See `role_registry`.
@@ -110,6 +116,15 @@ impl ServerState {
         let chain_store = SqliteChainStore::open(home.join("witness.db"), store_key)?;
         let trust_store = TrustStore::open(home.join("trust"), store_key)?;
         let sovereign_lct = "lct:web4:hestia:sovereign:phase1-placeholder".to_string();
+        // The sovereign as a first-class, vault-persisted LCT — the society that
+        // mints the roles now has durable presence of its own (id stable across
+        // restarts, keypair sealed). `anchor` stays the legacy string, so member
+        // labels + witness-chain authorship keyed on `sovereign_lct` are unchanged.
+        let sovereign = crate::sovereign::Sovereign::load_or_mint(&mut vault, &sovereign_lct);
+        eprintln!(
+            "[hestia] sovereign LCT {} (self-issued bootstrap, placeholder strength)",
+            sovereign.lct_id()
+        );
         // Phase-1 mirror: the constellation roles as Role LCT entities, with
         // VAULT-STABLE identities (same LCT across restarts; secrets sealed).
         let role_registry = crate::role_registry::load_or_mint_registry(&mut vault, &sovereign_lct);
@@ -158,6 +173,7 @@ impl ServerState {
             chain_store,
             trust_store,
             sovereign_lct,
+            sovereign,
             role_registry,
             shared_context: serde_json::Map::new(),
             policy_engine,
