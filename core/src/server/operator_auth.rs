@@ -21,9 +21,84 @@
 //! O (preflight) and the challenge/response + middleware that make this reachable
 //! live in the HTTP layer; this module is the pure, testable decision core.
 
+use std::collections::HashMap;
+
 use serde_json::json;
 
 use crate::vault::VaultPolicyState;
+
+/// Default lifetime of an operator challenge (seconds). Short — a challenge is
+/// signed and returned within one dashboard round-trip.
+pub const CHALLENGE_TTL_SECS: u64 = 120;
+
+/// Anti-replay store of issued, not-yet-consumed operator challenges. A challenge
+/// is single-use (consumed on the auth attempt) and time-bounded — a captured
+/// signature can't be replayed past its TTL or a second time. `now` is passed in
+/// (unix seconds) so the store is deterministic and testable.
+#[derive(Debug, Default)]
+pub struct ChallengeStore {
+    issued: HashMap<String, u64>,
+}
+
+impl ChallengeStore {
+    /// Mint a fresh, unpredictable challenge nonce (32 random bytes, hex) and
+    /// record its issue time. The operator signs this nonce with their LCT key.
+    pub fn issue(&mut self, now: u64) -> String {
+        use rand::RngCore;
+        let mut buf = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        let nonce = hex::encode(buf);
+        self.issued.insert(nonce.clone(), now);
+        nonce
+    }
+
+    /// Consume a challenge: valid iff it was issued, is unexpired, and hasn't been
+    /// used. Removes it either way (single-use — a replayed nonce fails the second
+    /// time, and an expired one is cleared).
+    pub fn consume(&mut self, nonce: &str, now: u64, ttl_secs: u64) -> bool {
+        match self.issued.remove(nonce) {
+            Some(issued_at) => now.saturating_sub(issued_at) <= ttl_secs,
+            None => false,
+        }
+    }
+
+    /// Drop expired challenges (call opportunistically to bound memory).
+    pub fn gc(&mut self, now: u64, ttl_secs: u64) {
+        self.issued
+            .retain(|_, issued_at| now.saturating_sub(*issued_at) <= ttl_secs);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.issued.len()
+    }
+}
+
+/// Verify one operator's signed challenge (RWOA clause W — the strong evidence).
+/// Returns the authorized operator's `lct_id` iff: the challenge was valid +
+/// unexpired + unused (consumed here, anti-replay), the signature hex is
+/// well-formed, and it verifies against an identity in `operator_access`.
+/// Fail-closed on every miss. `now`/`ttl` make the challenge lifetime explicit.
+pub fn authenticate_operator(
+    law: &VaultPolicyState,
+    store: &mut ChallengeStore,
+    lct_id: &str,
+    challenge: &str,
+    signature_hex: &str,
+    now: u64,
+    ttl_secs: u64,
+) -> Option<String> {
+    // Consume the challenge FIRST — even a bad attempt burns the nonce, so a
+    // captured challenge can't be reused to grind signatures.
+    if !store.consume(challenge, now, ttl_secs) {
+        return None;
+    }
+    let raw = hex::decode(signature_hex.trim()).ok()?;
+    let sig_bytes: [u8; 64] = raw.try_into().ok()?;
+    let sig = web4_core::crypto::SignatureBytes::from_bytes(sig_bytes);
+    law.authorize_operator(lct_id, challenge.as_bytes(), &sig)
+        .map(|op| op.lct_id.clone())
+}
 
 /// Consequence + reversibility of an operator act (clause S). The gradient:
 /// weaker evidence suffices lower down; the irreversible tail triggers V.
@@ -227,6 +302,64 @@ mod tests {
             authorize(&empty, Stakes::LowReversible, &["lct:web4:operator:0".into()]),
             AuthzOutcome::Denied { .. }
         ));
+    }
+
+    #[test]
+    fn challenge_store_is_single_use_and_time_bounded() {
+        let mut s = ChallengeStore::default();
+        let n = s.issue(1000);
+        assert_eq!(s.len(), 1);
+        // wrong nonce → no
+        assert!(!s.consume("deadbeef", 1000, CHALLENGE_TTL_SECS));
+        // valid within TTL → yes, and consumed (single-use)
+        assert!(s.consume(&n, 1030, CHALLENGE_TTL_SECS));
+        assert!(!s.consume(&n, 1030, CHALLENGE_TTL_SECS), "replay of a consumed nonce fails");
+        assert_eq!(s.len(), 0);
+        // expired → no (and cleared)
+        let n2 = s.issue(2000);
+        assert!(!s.consume(&n2, 2000 + CHALLENGE_TTL_SECS + 1, CHALLENGE_TTL_SECS));
+        assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn authenticate_operator_full_flow_fail_closed() {
+        use web4_core::crypto::KeyPair;
+        let kp = KeyPair::generate();
+        let mut law = VaultPolicyState::default();
+        law.operator_access.push(OperatorIdentity {
+            lct_id: "lct:web4:operator:dp".into(),
+            public_key_hex: hex::encode(kp.public_key_bytes()),
+            label: String::new(),
+        });
+        let mut store = ChallengeStore::default();
+
+        // happy path: issue → sign → authenticate
+        let ch = store.issue(1000);
+        let sig = kp.sign(ch.as_bytes());
+        let got = authenticate_operator(
+            &law, &mut store, "lct:web4:operator:dp", &ch, &sig.to_hex(), 1000, CHALLENGE_TTL_SECS,
+        );
+        assert_eq!(got.as_deref(), Some("lct:web4:operator:dp"));
+
+        // replay of the SAME challenge+sig → fail (nonce already consumed)
+        assert!(authenticate_operator(
+            &law, &mut store, "lct:web4:operator:dp", &ch, &sig.to_hex(), 1000, CHALLENGE_TTL_SECS,
+        ).is_none());
+
+        // wrong signer on a fresh challenge → fail (nonce still consumed)
+        let ch2 = store.issue(1000);
+        let attacker = KeyPair::generate();
+        let bad = attacker.sign(ch2.as_bytes());
+        assert!(authenticate_operator(
+            &law, &mut store, "lct:web4:operator:dp", &ch2, &bad.to_hex(), 1000, CHALLENGE_TTL_SECS,
+        ).is_none());
+
+        // expired challenge → fail
+        let ch3 = store.issue(1000);
+        let sig3 = kp.sign(ch3.as_bytes());
+        assert!(authenticate_operator(
+            &law, &mut store, "lct:web4:operator:dp", &ch3, &sig3.to_hex(), 9999, CHALLENGE_TTL_SECS,
+        ).is_none());
     }
 
     #[test]
