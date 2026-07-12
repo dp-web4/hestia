@@ -54,6 +54,16 @@ pub struct VaultPolicyState {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub role_overlays: HashMap<String, Vec<PolicyRule>>,
 
+    /// Per-`(instance, role)` overlay rules — the FINEST policy grain (stats and
+    /// trust already key on `(instance, role)`; this is the matching policy leg).
+    /// Nested `plugin_id → role → rules`, so a *specific* orchestrator in a role
+    /// (e.g. `kimi-code` as `role:constellation:foreign-kimi`) can carry policy
+    /// distinct from the generic role overlay. Folded strictest-wins AFTER the
+    /// role overlay — the most specific tightening, never a loosening (the base
+    /// preset and role overlay stay the floor). Empty = no per-instance scoping.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub instance_overlays: HashMap<String, HashMap<String, Vec<PolicyRule>>>,
+
     /// Law-settable number of attempts to persist a synthetic-exclusion write
     /// before `mark_synthetic` gives up and the connect is refused (fail-closed).
     /// `None` ⇒ [`DEFAULT_SYNTHETIC_PERSIST_ATTEMPTS`] (3). An operator can raise
@@ -74,6 +84,7 @@ impl Default for VaultPolicyState {
             overrides: HashMap::new(),
             custom_rules: Vec::new(),
             role_overlays: HashMap::new(),
+            instance_overlays: HashMap::new(),
             synthetic_persist_max_attempts: None,
         }
     }
@@ -153,12 +164,120 @@ impl VaultPolicyState {
             })
             .collect()
     }
+
+    /// Per-`(instance, role)` overlay engines, keyed by `(plugin_id, role)`. Each
+    /// is a default-`Allow` config folded strictest-wins into the base + role
+    /// overlay, so it can only tighten. Mirrors [`role_configs`] one grain finer.
+    pub fn instance_configs(
+        &self,
+    ) -> HashMap<(String, String), crate::policy::PolicyConfig> {
+        let mut out = HashMap::new();
+        for (plugin_id, by_role) in &self.instance_overlays {
+            for (role, rules) in by_role {
+                out.insert(
+                    (plugin_id.clone(), role.clone()),
+                    crate::policy::PolicyConfig {
+                        default_policy: crate::policy::PolicyDecision::Allow,
+                        enforce: true,
+                        rules: rules.clone(),
+                    },
+                );
+            }
+        }
+        out
+    }
+
+    /// The rules currently set for one `(plugin_id, role)` grain — for the
+    /// dashboard to display/seed the editor. `None` if none set.
+    pub fn instance_overlay(&self, plugin_id: &str, role: &str) -> Option<&Vec<PolicyRule>> {
+        self.instance_overlays.get(plugin_id).and_then(|m| m.get(role))
+    }
+
+    /// Set (replace) the overlay rules for one `(plugin_id, role)` grain. An empty
+    /// `rules` clears the grain — never leaves an empty map behind (so
+    /// `skip_serializing_if` keeps absent-stays-absent). Returns `true` if the
+    /// stored state changed.
+    pub fn set_instance_overlay(
+        &mut self,
+        plugin_id: &str,
+        role: &str,
+        rules: Vec<PolicyRule>,
+    ) -> bool {
+        if rules.is_empty() {
+            let changed = self
+                .instance_overlays
+                .get_mut(plugin_id)
+                .map(|m| m.remove(role).is_some())
+                .unwrap_or(false);
+            // prune an emptied plugin_id map so absence stays absence
+            if self.instance_overlays.get(plugin_id).is_some_and(HashMap::is_empty) {
+                self.instance_overlays.remove(plugin_id);
+            }
+            return changed;
+        }
+        let prev = self
+            .instance_overlays
+            .entry(plugin_id.to_string())
+            .or_default()
+            .insert(role.to_string(), rules.clone());
+        prev.as_ref() != Some(&rules)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::policy::PolicyDecision;
+
+    fn deny_rule(id: &str, tool: &str) -> PolicyRule {
+        use crate::policy::types::{PolicyMatch, PolicyRule};
+        PolicyRule {
+            id: id.into(),
+            name: id.into(),
+            priority: 0,
+            decision: PolicyDecision::Deny,
+            reason: None,
+            r#match: PolicyMatch { tools: Some(vec![tool.into()]), ..Default::default() },
+        }
+    }
+
+    #[test]
+    fn instance_overlay_set_get_clear_and_configs_keying() {
+        let mut s = VaultPolicyState::default();
+        let (pid, role) = ("kimi-code", "role:constellation:foreign-kimi");
+        assert!(s.instance_overlay(pid, role).is_none());
+
+        // set → present, and instance_configs keys on (plugin_id, role)
+        assert!(s.set_instance_overlay(pid, role, vec![deny_rule("no-bash", "Bash")]));
+        assert_eq!(s.instance_overlay(pid, role).map(Vec::len), Some(1));
+        let cfgs = s.instance_configs();
+        assert!(cfgs.contains_key(&(pid.to_string(), role.to_string())));
+        assert_eq!(cfgs[&(pid.to_string(), role.to_string())].rules.len(), 1);
+        // another instance in the SAME role is a distinct grain (unset)
+        assert!(!cfgs.contains_key(&("claude-code".to_string(), role.to_string())));
+
+        // idempotent set of the same rules reports no change
+        assert!(!s.set_instance_overlay(pid, role, vec![deny_rule("no-bash", "Bash")]));
+
+        // clear via empty rules → gone, and the plugin_id map is pruned (absence stays absent)
+        assert!(s.set_instance_overlay(pid, role, vec![]));
+        assert!(s.instance_overlay(pid, role).is_none());
+        assert!(s.instance_overlays.is_empty(), "emptied plugin map is pruned");
+    }
+
+    #[test]
+    fn instance_overlays_serde_back_compat() {
+        // older vault doc without the field → empty, no error
+        let old = r#"{"active_preset":"safety"}"#;
+        let s: VaultPolicyState = serde_json::from_str(old).unwrap();
+        assert!(s.instance_overlays.is_empty());
+        // round-trips when set
+        let mut s2 = VaultPolicyState::default();
+        s2.set_instance_overlay("kimi-code", "role:x", vec![deny_rule("d", "Bash")]);
+        let round: VaultPolicyState =
+            serde_json::from_str(&serde_json::to_string(&s2).unwrap()).unwrap();
+        assert_eq!(round.instance_overlay("kimi-code", "role:x").map(Vec::len), Some(1));
+    }
 
     #[test]
     fn synthetic_persist_attempts_is_law_settable_default_three() {

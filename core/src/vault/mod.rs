@@ -154,6 +154,21 @@ impl Vault {
         self.save()
     }
 
+    /// Set (replace) the per-`(instance, role)` policy overlay for one
+    /// orchestrator grain — the dashboard's "edit this orchestrator's policy"
+    /// path. Empty `rules` clears the grain. Sealed on success. Access to this
+    /// is gated by access to the dashboard/operator surface, not by the call
+    /// itself (dp: security is in gating the dashboard, not its functionality).
+    pub fn set_instance_overlay(
+        &mut self,
+        plugin_id: &str,
+        role: &str,
+        rules: Vec<crate::policy::PolicyRule>,
+    ) -> Result<()> {
+        self.data.policy.set_instance_overlay(plugin_id, role, rules);
+        self.save()
+    }
+
     /// Add or replace (by `id`) a custom rule layered on top of the preset.
     /// The "edit by category or specifically" path — the rule's `match` may be a
     /// category match or a tool/pattern match. Sealed on success.

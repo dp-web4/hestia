@@ -91,6 +91,12 @@ pub struct ServerState {
     /// its verdict is folded into `policy_engine` by strictest-wins in
     /// `query_policy`, so a role can only tighten the base, never loosen it.
     pub role_policy_engines: HashMap<String, crate::policy::PolicyEngine>,
+    /// Per-`(instance, role)` policy engines (the finest grain), keyed by
+    /// `(plugin_id, role)`. Selected AFTER the role engine and folded strictest-
+    /// wins in the gate, so a specific orchestrator can only tighten its role's
+    /// law, never loosen it. Built from the vault's `instance_overlays`.
+    pub instance_policy_engines:
+        HashMap<(String, String), crate::policy::PolicyEngine>,
     /// Hub-law gate (consolidation, 2026-07-10): the third fold input.
     /// `None` = no law file at `$HESTIA_HOME/law/hub-law.yaml` (no-op);
     /// `Some(Invalid)` fails closed. See `policy::law_gate`.
@@ -143,6 +149,12 @@ impl ServerState {
             .into_iter()
             .map(|(role, cfg)| (role, crate::policy::PolicyEngine::new(cfg)))
             .collect();
+        let instance_policy_engines = vault
+            .policy()
+            .instance_configs()
+            .into_iter()
+            .map(|(key, cfg)| (key, crate::policy::PolicyEngine::new(cfg)))
+            .collect();
 
         // Hub-law third input (machine-local copy; hub is the content
         // authority). Absent file => None; invalid file => fail-closed gate.
@@ -178,6 +190,7 @@ impl ServerState {
             shared_context: serde_json::Map::new(),
             policy_engine,
             role_policy_engines,
+            instance_policy_engines,
             law_gate,
             synthetic_plugins,
             home: home.to_path_buf(),
@@ -240,6 +253,13 @@ impl ServerState {
             .role_configs()
             .into_iter()
             .map(|(role, cfg)| (role, crate::policy::PolicyEngine::new(cfg)))
+            .collect();
+        self.instance_policy_engines = self
+            .vault
+            .policy()
+            .instance_configs()
+            .into_iter()
+            .map(|(key, cfg)| (key, crate::policy::PolicyEngine::new(cfg)))
             .collect();
         // Re-read the machine-local hub law alongside vault policy so an
         // operator law update lands without a daemon restart.

@@ -413,13 +413,26 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     // only ever tighten the base (Deny > Warn > Allow), never loosen it — so
     // declaring a permissive role can't be used to escape the base floor.
     let mut evaluation = s.policy_engine.evaluate(&pa);
-    let session_role = s
+    let (session_plugin_id, session_role) = s
         .sessions
         .get(&action.session_id)
-        .map(|sess| sess.constellation_role.clone())
-        .unwrap_or_else(|| crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string());
+        .map(|sess| (sess.plugin_id.clone(), sess.constellation_role.clone()))
+        .unwrap_or_else(|| {
+            (
+                "unknown".to_string(),
+                crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
+            )
+        });
     if let Some(role_engine) = s.role_policy_engines.get(&session_role) {
         evaluation = crate::policy::fold_strictest(evaluation, role_engine.evaluate(&pa));
+    }
+    // Finest grain: the per-(instance, role) overlay for THIS orchestrator, folded
+    // AFTER the role overlay so a specific instance can only tighten its role's law.
+    if let Some(inst_engine) = s
+        .instance_policy_engines
+        .get(&(session_plugin_id.clone(), session_role.clone()))
+    {
+        evaluation = crate::policy::fold_strictest(evaluation, inst_engine.evaluate(&pa));
     }
     // Third fold input (consolidation 2026-07-10): hub law via the
     // canonical web4-policy engine. Strictest-wins like the role overlay —
@@ -570,6 +583,14 @@ fn gate_direct_tool(
     let mut evaluation = s.policy_engine.evaluate(&pa);
     if let Some(role_engine) = s.role_policy_engines.get(&who.role_lct) {
         evaluation = crate::policy::fold_strictest(evaluation, role_engine.evaluate(&pa));
+    }
+    // Finest grain: the per-(instance, role) overlay for this caller, folded after
+    // the role overlay — the direct-call gate must honor the same instance law.
+    if let Some(inst_engine) = s
+        .instance_policy_engines
+        .get(&(who.plugin_id.clone(), who.role_lct.clone()))
+    {
+        evaluation = crate::policy::fold_strictest(evaluation, inst_engine.evaluate(&pa));
     }
     // Hub-law third input applies to the vault gate too — a norm that
     // denies secret reads must bind here, not only on tool calls.
