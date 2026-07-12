@@ -1,23 +1,23 @@
-//! LawGate — the third fold input: chapter law evaluated by the canonical engine.
+//! LawGate — the third fold input: hub law evaluated by the canonical engine.
 //!
 //! Consolidation (thread `hestia-role-orchestration`, 2026-07-10): hestia's gate
 //! and the hub daemon are "the same engine by design" (dp), but hestia/core
-//! historically ran only its own `PolicyEngine` while the hub evaluated chapter
+//! historically ran only its own `PolicyEngine` while the hub evaluated hub
 //! law with the canonical `web4-policy` crate — two implementations meant to
 //! agree, drifting apart is the seam an immune system can't afford (CBP's
 //! dup-flag, confirmed in `hub-to-cbp-two-engines-confirmed-…-2026-07-09.md`).
 //!
 //! This module closes the seam *structurally*: law semantics evaluate in the ONE
 //! canonical crate everywhere. hestia keeps what is genuinely machine-local
-//! (matchers, presets, rate limits — `PolicyEngine`); chapter-law norms evaluate
+//! (matchers, presets, rate limits — `PolicyEngine`); hub-law norms evaluate
 //! via `web4_policy::Law` and fold in as a third strictest-wins input:
 //!
 //! ```text
 //! fold_strictest(base_rules, role_overlay, law_eval)
 //! ```
 //!
-//! Law is chapter *content*, never a runtime dependency: the gate reads a LOCAL
-//! copy at `$HESTIA_HOME/law/chapter-law.yaml`, refreshed out-of-band (the hub is
+//! Law is hub-published *content*, never a runtime dependency: the gate reads a LOCAL
+//! copy at `$HESTIA_HOME/law/hub-law.yaml`, refreshed out-of-band (the hub is
 //! the authority for what the law *says*; the member machine holds the text it
 //! enforces). Absent file ⇒ no third input (exactly today's behavior). Present
 //! but INVALID file ⇒ fail-closed: every evaluation denies with a reason naming
@@ -35,10 +35,10 @@ use web4_policy::{Decision, Law, R6Request};
 
 use super::types::{PolicyAction, PolicyDecision, PolicyEvaluation};
 
-/// Filename (under `$HESTIA_HOME/law/`) for the machine-local chapter-law copy.
-pub const LAW_FILE: &str = "chapter-law.yaml";
+/// Filename (under `$HESTIA_HOME/law/`) for the machine-local hub-law copy.
+pub const LAW_FILE: &str = "hub-law.yaml";
 
-/// The chapter-law gate. Construct via [`LawGate::load`].
+/// The hub-law gate. Construct via [`LawGate::load`].
 #[derive(Debug)]
 pub enum LawGate {
     /// A valid law is loaded; evaluations run through `web4_policy::Law`.
@@ -49,7 +49,7 @@ pub enum LawGate {
 }
 
 impl LawGate {
-    /// Load the machine-local chapter law from `<home>/law/chapter-law.yaml`.
+    /// Load the machine-local hub law from `<home>/law/hub-law.yaml`.
     ///
     /// - No file → `None` (no third fold input; pre-consolidation behavior).
     /// - Valid file → `Some(Active)`.
@@ -88,7 +88,7 @@ impl LawGate {
         }
     }
 
-    /// Evaluate a tool action, in a role, against chapter law. Returns a
+    /// Evaluate a tool action, in a role, against hub law. Returns a
     /// `PolicyEvaluation` suitable for `fold_strictest` alongside the base and
     /// role-overlay evaluations.
     pub fn evaluate(&self, pa: &PolicyAction<'_>, role: &str) -> PolicyEvaluation {
@@ -96,8 +96,8 @@ impl LawGate {
             LawGate::Invalid { error } => (
                 PolicyDecision::Deny,
                 Some("law:invalid".to_string()),
-                Some("Chapter law unparseable".to_string()),
-                format!("chapter law present but invalid (fail-closed): {error}"),
+                Some("Hub law unparseable".to_string()),
+                format!("hub law present but invalid (fail-closed): {error}"),
             ),
             LawGate::Active { law, .. } => {
                 let req = R6Request {
@@ -112,7 +112,7 @@ impl LawGate {
                     Decision::Escalate => (
                         PolicyDecision::Deny,
                         format!(
-                            "escalation queued: chapter law escalates to '{}' (norm {})",
+                            "escalation queued: hub law escalates to '{}' (norm {})",
                             outcome.escalate_to.as_deref().unwrap_or("sovereign"),
                             norm.as_deref().unwrap_or("escalation-trigger"),
                         ),
@@ -121,10 +121,10 @@ impl LawGate {
                         let mapped = map_decision(d);
                         let reason = match (&mapped, &norm) {
                             (PolicyDecision::Allow, None) => {
-                                "chapter law: no norm objects".to_string()
+                                "hub law: no norm objects".to_string()
                             }
-                            (_, Some(id)) => format!("chapter law norm '{id}'"),
-                            (_, None) => "chapter law default".to_string(),
+                            (_, Some(id)) => format!("hub law norm '{id}'"),
+                            (_, None) => "hub law default".to_string(),
                         };
                         (mapped, reason)
                     }
@@ -132,13 +132,13 @@ impl LawGate {
                 (
                     decision,
                     norm.map(|id| format!("law:{id}")),
-                    Some("Chapter law".to_string()),
+                    Some("Hub law".to_string()),
                     reason,
                 )
             }
         };
         let constraints = vec![
-            "policy:chapter-law".to_string(),
+            "policy:hub-law".to_string(),
             format!("decision:{}", decision.as_str()),
             format!("rule:{}", rule_id.as_deref().unwrap_or("law:default")),
         ];

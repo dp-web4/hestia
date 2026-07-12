@@ -91,8 +91,8 @@ pub struct ServerState {
     /// its verdict is folded into `policy_engine` by strictest-wins in
     /// `query_policy`, so a role can only tighten the base, never loosen it.
     pub role_policy_engines: HashMap<String, crate::policy::PolicyEngine>,
-    /// Chapter-law gate (consolidation, 2026-07-10): the third fold input.
-    /// `None` = no law file at `$HESTIA_HOME/law/chapter-law.yaml` (no-op);
+    /// Hub-law gate (consolidation, 2026-07-10): the third fold input.
+    /// `None` = no law file at `$HESTIA_HOME/law/hub-law.yaml` (no-op);
     /// `Some(Invalid)` fails closed. See `policy::law_gate`.
     pub law_gate: Option<crate::policy::LawGate>,
     /// Plugin IDs that self-declared as synthetic (test harnesses,
@@ -144,13 +144,13 @@ impl ServerState {
             .map(|(role, cfg)| (role, crate::policy::PolicyEngine::new(cfg)))
             .collect();
 
-        // Chapter-law third input (machine-local copy; hub is the content
+        // Hub-law third input (machine-local copy; hub is the content
         // authority). Absent file => None; invalid file => fail-closed gate.
         let law_gate = crate::policy::LawGate::load(home);
         if let Some(g) = &law_gate {
             match g.law_sha256() {
-                Some(h) => eprintln!("[hestia] chapter law loaded (sha256 {h})"),
-                None => eprintln!("[hestia] WARNING: chapter law present but INVALID — failing closed"),
+                Some(h) => eprintln!("[hestia] hub law loaded (sha256 {h})"),
+                None => eprintln!("[hestia] WARNING: hub law present but INVALID — failing closed"),
             }
         }
 
@@ -241,7 +241,7 @@ impl ServerState {
             .into_iter()
             .map(|(role, cfg)| (role, crate::policy::PolicyEngine::new(cfg)))
             .collect();
-        // Re-read the machine-local chapter law alongside vault policy so an
+        // Re-read the machine-local hub law alongside vault policy so an
         // operator law update lands without a daemon restart.
         self.law_gate = crate::policy::LawGate::load(&self.home);
     }

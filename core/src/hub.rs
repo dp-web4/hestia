@@ -52,7 +52,7 @@ pub struct HubSummary {
 pub enum JoinOutcome {
     /// Admitted immediately — the member is pinned and acts will verify.
     Admitted(serde_json::Value),
-    /// The hub verified the request but chapter law escalates admission to the
+    /// The hub verified the request but hub law escalates admission to the
     /// Sovereign. The member is NOT yet pinned; acts will 401 until approved.
     Escalated { reason: String },
 }
@@ -351,7 +351,7 @@ impl HubClient {
         let text = resp.text().await.unwrap_or_default();
         let body: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
 
-        // 202 = the hub verified our request but chapter law escalates admission
+        // 202 = the hub verified our request but hub law escalates admission
         // to the Sovereign (not auto-admitted). Distinct from a hard failure.
         if status.as_u16() == 202 {
             let reason = body.get("error").and_then(|v| v.as_str())

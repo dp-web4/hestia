@@ -421,7 +421,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     if let Some(role_engine) = s.role_policy_engines.get(&session_role) {
         evaluation = crate::policy::fold_strictest(evaluation, role_engine.evaluate(&pa));
     }
-    // Third fold input (consolidation 2026-07-10): chapter law via the
+    // Third fold input (consolidation 2026-07-10): hub law via the
     // canonical web4-policy engine. Strictest-wins like the role overlay —
     // law can only tighten, never loosen.
     if let Some(gate) = &s.law_gate {
@@ -571,7 +571,7 @@ fn gate_direct_tool(
     if let Some(role_engine) = s.role_policy_engines.get(&who.role_lct) {
         evaluation = crate::policy::fold_strictest(evaluation, role_engine.evaluate(&pa));
     }
-    // Chapter-law third input applies to the vault gate too — a norm that
+    // Hub-law third input applies to the vault gate too — a norm that
     // denies secret reads must bind here, not only on tool calls.
     if let Some(gate) = &s.law_gate {
         evaluation = crate::policy::fold_strictest(evaluation, gate.evaluate(&pa, &who.role_lct));
