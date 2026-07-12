@@ -6,6 +6,7 @@
 mod dashboard;
 mod handler;
 mod http;
+pub mod operator_auth;
 mod state;
 
 pub use dashboard::{

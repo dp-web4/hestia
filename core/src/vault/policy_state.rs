@@ -112,6 +112,19 @@ pub struct VaultPolicyState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operator_access: Vec<OperatorIdentity>,
 
+    /// Law-settable quorum (number of distinct operator signatures) required for
+    /// an IRREVERSIBLE operator act — the clause-V escalation made concrete (RWOA
+    /// gradient, ratified 2026-07-12: irreversible acts pass a catastrophic-risk
+    /// check that can require multiple signatures by law). Reversible acts need a
+    /// single operator's strong evidence; irreversible ones (secret release — a
+    /// read has no undo — an irreversible law change, an operator-set change that
+    /// could lock out) require `operator_irreversible_quorum` distinct signatures.
+    /// `None` ⇒ default 2 (bounded below by the number of operators, and by 1
+    /// during the bootstrap window); `Some(1)` is a deliberate single-operator
+    /// waiver an operator must set in law explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_irreversible_quorum: Option<u32>,
+
     /// Law-settable number of attempts to persist a synthetic-exclusion write
     /// before `mark_synthetic` gives up and the connect is refused (fail-closed).
     /// `None` ⇒ [`DEFAULT_SYNTHETIC_PERSIST_ATTEMPTS`] (3). An operator can raise
@@ -134,6 +147,7 @@ impl Default for VaultPolicyState {
             role_overlays: HashMap::new(),
             instance_overlays: HashMap::new(),
             operator_access: Vec::new(),
+            operator_irreversible_quorum: None,
             synthetic_persist_max_attempts: None,
         }
     }
@@ -240,6 +254,14 @@ impl VaultPolicyState {
     /// dashboard to display/seed the editor. `None` if none set.
     pub fn instance_overlay(&self, plugin_id: &str, role: &str) -> Option<&Vec<PolicyRule>> {
         self.instance_overlays.get(plugin_id).and_then(|m| m.get(role))
+    }
+
+    /// Required distinct operator signatures for an irreversible act (clause V).
+    /// Law setting, default 2, floored at 1. If it exceeds the number of
+    /// authorized operators the act fails closed (needs more operators) — the
+    /// law deliberately forcing multi-party control over the irreversible tail.
+    pub fn irreversible_quorum(&self) -> u32 {
+        self.operator_irreversible_quorum.unwrap_or(2).max(1)
     }
 
     /// Is the operator surface bootstrapped (at least one authorized operator)?
