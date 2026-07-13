@@ -74,6 +74,70 @@ impl ChallengeStore {
     }
 }
 
+/// Default operator-session lifetime (seconds). A session is established by ONE
+/// strong-evidence event (an LCT-signed challenge) and continues *reversible* acts
+/// without re-signing. The irreversible tail is NOT covered by the session — it
+/// requires fresh per-act signatures (quorum), so the session token is never a
+/// bearer credential for consequential-irreversible acts (RWOA gradient: the
+/// strong evidence given at establishment is sufficient for the reversible
+/// majority; the irreversible tail always re-collects evidence).
+pub const SESSION_TTL_SECS: u64 = 3600;
+
+/// Established operator sessions: opaque token → (operator lct_id, issued_at).
+#[derive(Debug, Default)]
+pub struct SessionStore {
+    sessions: HashMap<String, (String, u64)>,
+}
+
+impl SessionStore {
+    /// Open a session for an already-authenticated operator; returns the opaque
+    /// bearer token (32 random bytes hex) the client presents on later requests.
+    pub fn open(&mut self, operator_lct: &str, now: u64) -> String {
+        use rand::RngCore;
+        let mut buf = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        let token = hex::encode(buf);
+        self.sessions.insert(token.clone(), (operator_lct.to_string(), now));
+        token
+    }
+
+    /// Resolve a session token to its operator lct_id iff present and unexpired.
+    pub fn operator(&self, token: &str, now: u64, ttl_secs: u64) -> Option<&str> {
+        self.sessions.get(token).and_then(|(op, issued)| {
+            (now.saturating_sub(*issued) <= ttl_secs).then_some(op.as_str())
+        })
+    }
+
+    /// Close a session (operator logout / revocation).
+    pub fn close(&mut self, token: &str) {
+        self.sessions.remove(token);
+    }
+
+    pub fn gc(&mut self, now: u64, ttl_secs: u64) {
+        self.sessions.retain(|_, (_, issued)| now.saturating_sub(*issued) <= ttl_secs);
+    }
+}
+
+/// Request-level gate (clause O, at the middleware). Given the operator resolved
+/// from the request's session (if any) and the act's stakes, decide. Reuses the
+/// gradient [`authorize`]: a session is exactly ONE signer, so reversible acts
+/// authorize and the irreversible tail returns `RequiresQuorum` — which the
+/// middleware surfaces as an escalation (collect fresh per-act operator
+/// signatures), never a silent pass.
+pub fn gate_session_request(
+    law: &VaultPolicyState,
+    session_operator: Option<&str>,
+    stakes: Stakes,
+) -> AuthzOutcome {
+    match session_operator {
+        None => AuthzOutcome::Denied {
+            stakes,
+            reason: "no operator session (present an LCT-signed challenge first)".into(),
+        },
+        Some(op) => authorize(law, stakes, std::slice::from_ref(&op.to_string())),
+    }
+}
+
 /// Verify one operator's signed challenge (RWOA clause W — the strong evidence).
 /// Returns the authorized operator's `lct_id` iff: the challenge was valid +
 /// unexpired + unused (consumed here, anti-replay), the signature hex is
@@ -302,6 +366,38 @@ mod tests {
             authorize(&empty, Stakes::LowReversible, &["lct:web4:operator:0".into()]),
             AuthzOutcome::Denied { .. }
         ));
+    }
+
+    #[test]
+    fn session_store_and_request_gate() {
+        let mut sessions = SessionStore::default();
+        let law = law_with_ops(3, Some(2));
+
+        // no session → every act denied (unauthenticated)
+        assert!(matches!(
+            gate_session_request(&law, None, Stakes::LowReversible),
+            AuthzOutcome::Denied { .. }
+        ));
+
+        // open a session for op0
+        let tok = sessions.open("lct:web4:operator:0", 1000);
+        assert_eq!(sessions.operator(&tok, 1500, SESSION_TTL_SECS), Some("lct:web4:operator:0"));
+        // expired token resolves to nothing
+        assert_eq!(sessions.operator(&tok, 1000 + SESSION_TTL_SECS + 1, SESSION_TTL_SECS), None);
+
+        let op = sessions.operator(&tok, 1500, SESSION_TTL_SECS);
+        // reversible acts pass on the session's single operator
+        assert!(gate_session_request(&law, op, Stakes::LowReversible).is_authorized());
+        assert!(gate_session_request(&law, op, Stakes::HighReversible).is_authorized());
+        // irreversible acts do NOT pass on the session alone → escalate (needs quorum)
+        assert!(matches!(
+            gate_session_request(&law, op, Stakes::Irreversible),
+            AuthzOutcome::RequiresQuorum { have: 1, need: 2, .. }
+        ));
+
+        // closed session → denied again
+        sessions.close(&tok);
+        assert_eq!(sessions.operator(&tok, 1500, SESSION_TTL_SECS), None);
     }
 
     #[test]

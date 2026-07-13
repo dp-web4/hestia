@@ -108,6 +108,18 @@ pub struct ServerState {
     pub home: PathBuf,
     /// Single-use OID4VCI `c_nonce`s issued but not yet redeemed.
     pub vci_nonces: HashSet<String>,
+    /// Operator-surface auth (RWOA W/O): issued challenges (anti-replay) and
+    /// established operator sessions. See `server::operator_auth`.
+    pub operator_challenges: crate::server::operator_auth::ChallengeStore,
+    pub operator_sessions: crate::server::operator_auth::SessionStore,
+}
+
+/// Unix seconds now — the single clock for operator challenge/session TTLs.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl ServerState {
@@ -195,6 +207,8 @@ impl ServerState {
             synthetic_plugins,
             home: home.to_path_buf(),
             vci_nonces: HashSet::new(),
+            operator_challenges: crate::server::operator_auth::ChallengeStore::default(),
+            operator_sessions: crate::server::operator_auth::SessionStore::default(),
         })
     }
 
@@ -236,6 +250,59 @@ impl ServerState {
 
     pub fn is_synthetic(&self, plugin_id: &str) -> bool {
         self.synthetic_plugins.contains(plugin_id)
+    }
+
+    /// Bounded, self-witnessing operator bootstrap (RWOA genesis window). If the
+    /// law's `operator_access` is EMPTY (genesis), mint one operator: generate a
+    /// keypair, write the private key 0600 to `<home>/operator.key` for the
+    /// operator to load into their client (browser/helper/TPM), seed the PUBLIC
+    /// key into the law, and witness the act AS a bootstrap (genesis evidence).
+    /// The window ratchets shut the moment `operator_access` is non-empty — this
+    /// no-ops on every subsequent start, so "claim you're still bootstrapping"
+    /// has no re-entry. Returns the new operator's lct_id if one was minted.
+    pub fn bootstrap_operator_if_genesis(&mut self) -> Result<Option<String>> {
+        if self.vault.policy().operator_access_bootstrapped() {
+            return Ok(None); // window shut — no re-entry
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let kp = web4_core::crypto::KeyPair::generate();
+        let lct_id = web4_core::lct::derive_lct_id(&kp.verifying_key());
+        let key_path = self.home.join("operator.key");
+        std::fs::write(&key_path, hex::encode(kp.secret_key_bytes()))
+            .map_err(|e| anyhow::anyhow!("writing operator.key: {e}"))?;
+        let mut perms = std::fs::metadata(&key_path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&key_path, perms)?;
+
+        let mut policy = self.vault.policy().clone();
+        policy.operator_access.push(crate::vault::OperatorIdentity {
+            lct_id: lct_id.clone(),
+            public_key_hex: hex::encode(kp.public_key_bytes()),
+            label: "genesis operator (bootstrap)".into(),
+        });
+        self.vault
+            .set_policy(policy)
+            .map_err(|e| anyhow::anyhow!("persisting bootstrapped operator: {e}"))?;
+
+        // Self-witnessing A: the genesis act is recorded AS a bootstrap act, with
+        // the evidence available at genesis (the sovereign process minting the
+        // first operator). The record makes the origin auditable, not silent.
+        let _ = self.append_chain(
+            "operator_bootstrap",
+            serde_json::json!({
+                "operator": lct_id,
+                "window": "genesis",
+                "evidence": "sovereign-process-minting-first-operator",
+                "note": "bounded self-terminating bootstrap; no re-entry once operator_access is non-empty",
+            }),
+        );
+        eprintln!(
+            "[hestia] OPERATOR BOOTSTRAP: minted genesis operator {lct_id}\n\
+             [hestia]   private key written to {} (0600) — load it into your operator client;\n\
+             [hestia]   the bootstrap window is now SHUT (add further operators via law).",
+            key_path.display()
+        );
+        Ok(Some(lct_id))
     }
 
     /// Re-build the policy engine from the vault's current state. Call
@@ -616,6 +683,25 @@ mod tests {
             .derive();
             assert_eq!(native, via_web4core, "member_lct must equal the canonical derivation for {plugin}");
         }
+    }
+
+    #[test]
+    fn operator_bootstrap_is_bounded_and_no_reentry() {
+        let (_dir, mut state) = make_state();
+        // genesis: empty operator_access → mints exactly one operator
+        assert!(!state.vault.policy().operator_access_bootstrapped());
+        let first = state.bootstrap_operator_if_genesis().unwrap();
+        assert!(first.is_some(), "genesis mints an operator");
+        assert!(state.vault.policy().operator_access_bootstrapped());
+        assert_eq!(state.vault.policy().operator_access.len(), 1);
+        // the private key was written 0600 for the operator to load
+        let key = state.home.join("operator.key");
+        assert!(key.exists());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+        // window shut: re-run is a no-op (no re-entry, no second operator)
+        assert!(state.bootstrap_operator_if_genesis().unwrap().is_none());
+        assert_eq!(state.vault.policy().operator_access.len(), 1);
     }
 
     #[test]
