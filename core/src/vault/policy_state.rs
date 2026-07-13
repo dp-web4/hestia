@@ -13,6 +13,44 @@ use std::collections::HashMap;
 
 use crate::policy::{PolicyDecision, PolicyRule};
 
+/// An identity authorized to reach the operator (dashboard) surface. The
+/// operator proves possession of the matching PRIVATE key by signing a
+/// server-issued challenge; hestia only ever holds the PUBLIC key. This is
+/// Web4 authenticating with Web4 — a witnessed, key-bound identity (RWOA clause
+/// W), not a shared secret. Keys are hardware-bindable (TPM/SE) in production.
+///
+/// The set of these lives in the *law* (`VaultPolicyState::operator_access`), so
+/// who may operate is law-gated and multi-identity by construction — not a single
+/// hardcoded credential. Adding an operator is a law amendment, not a code change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorIdentity {
+    /// The operator's LCT id (the witnessed identity this key belongs to).
+    pub lct_id: String,
+    /// Ed25519 public key, 64 lowercase hex chars (32 bytes). The private half
+    /// stays with the operator (browser/helper/TPM) and never enters the vault.
+    pub public_key_hex: String,
+    /// Human label for the operator UI (e.g. "dp — laptop TPM"). Non-authoritative.
+    #[serde(default)]
+    pub label: String,
+}
+
+impl OperatorIdentity {
+    /// Reconstruct the Ed25519 public key from the stored hex. `None` if the hex
+    /// is malformed (which then can never verify — fail-closed).
+    pub fn public_key(&self) -> Option<web4_core::crypto::PublicKey> {
+        let raw = hex::decode(self.public_key_hex.trim()).ok()?;
+        let arr: [u8; 32] = raw.try_into().ok()?;
+        web4_core::crypto::PublicKey::from_bytes(&arr).ok()
+    }
+
+    /// Verify `signature` over `challenge` against this operator's public key.
+    pub fn verify(&self, challenge: &[u8], signature: &web4_core::crypto::SignatureBytes) -> bool {
+        self.public_key()
+            .map(|pk| pk.verify(challenge, signature).is_ok())
+            .unwrap_or(false)
+    }
+}
+
 /// Per-rule overrides keyed by `rule_id`. Each entry can override the
 /// rule's `decision`, `enforced` flag, or completely disable it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +102,29 @@ pub struct VaultPolicyState {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub instance_overlays: HashMap<String, HashMap<String, Vec<PolicyRule>>>,
 
+    /// Identities authorized to reach the operator (dashboard) surface — the
+    /// law-gated access list (dp: dashboard access is the security boundary, and
+    /// it must itself be law-gated, not a single hardcoded credential). Empty on
+    /// a fresh vault; the daemon bootstraps exactly one operator on first run
+    /// (and refuses to serve the operator surface with an empty list — fail-
+    /// closed, no anonymous operator). Each entry is a key-bound witnessed
+    /// identity (RWOA clause W).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operator_access: Vec<OperatorIdentity>,
+
+    /// Law-settable quorum (number of distinct operator signatures) required for
+    /// an IRREVERSIBLE operator act — the clause-V escalation made concrete (RWOA
+    /// gradient, ratified 2026-07-12: irreversible acts pass a catastrophic-risk
+    /// check that can require multiple signatures by law). Reversible acts need a
+    /// single operator's strong evidence; irreversible ones (secret release — a
+    /// read has no undo — an irreversible law change, an operator-set change that
+    /// could lock out) require `operator_irreversible_quorum` distinct signatures.
+    /// `None` ⇒ default 2 (bounded below by the number of operators, and by 1
+    /// during the bootstrap window); `Some(1)` is a deliberate single-operator
+    /// waiver an operator must set in law explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_irreversible_quorum: Option<u32>,
+
     /// Law-settable number of attempts to persist a synthetic-exclusion write
     /// before `mark_synthetic` gives up and the connect is refused (fail-closed).
     /// `None` ⇒ [`DEFAULT_SYNTHETIC_PERSIST_ATTEMPTS`] (3). An operator can raise
@@ -85,6 +146,8 @@ impl Default for VaultPolicyState {
             custom_rules: Vec::new(),
             role_overlays: HashMap::new(),
             instance_overlays: HashMap::new(),
+            operator_access: Vec::new(),
+            operator_irreversible_quorum: None,
             synthetic_persist_max_attempts: None,
         }
     }
@@ -193,6 +256,38 @@ impl VaultPolicyState {
         self.instance_overlays.get(plugin_id).and_then(|m| m.get(role))
     }
 
+    /// Required distinct operator signatures for an irreversible act (clause V).
+    /// Law setting, default 2, floored at 1. If it exceeds the number of
+    /// authorized operators the act fails closed (needs more operators) — the
+    /// law deliberately forcing multi-party control over the irreversible tail.
+    pub fn irreversible_quorum(&self) -> u32 {
+        self.operator_irreversible_quorum.unwrap_or(2).max(1)
+    }
+
+    /// Is the operator surface bootstrapped (at least one authorized operator)?
+    /// An empty list means no one may operate — the surface fails closed until
+    /// first-run bootstrap seeds one, so there is never an anonymous operator.
+    pub fn operator_access_bootstrapped(&self) -> bool {
+        !self.operator_access.is_empty()
+    }
+
+    /// Verify a signed operator challenge against the law's authorized set.
+    /// Returns the authorized `OperatorIdentity` iff `lct_id` is in
+    /// `operator_access` AND `signature` is a valid signature over `challenge`
+    /// by that identity's key. Fail-closed: unknown id, bad key, or bad
+    /// signature all yield `None`. Reachability plays no part — only the
+    /// signature (RWOA: R excluded, W enforced).
+    pub fn authorize_operator(
+        &self,
+        lct_id: &str,
+        challenge: &[u8],
+        signature: &web4_core::crypto::SignatureBytes,
+    ) -> Option<&OperatorIdentity> {
+        self.operator_access
+            .iter()
+            .find(|op| op.lct_id == lct_id && op.verify(challenge, signature))
+    }
+
     /// Set (replace) the overlay rules for one `(plugin_id, role)` grain. An empty
     /// `rules` clears the grain — never leaves an empty map behind (so
     /// `skip_serializing_if` keeps absent-stays-absent). Returns `true` if the
@@ -239,6 +334,56 @@ mod tests {
             reason: None,
             r#match: PolicyMatch { tools: Some(vec![tool.into()]), ..Default::default() },
         }
+    }
+
+    #[test]
+    fn operator_auth_is_key_bound_and_fail_closed() {
+        use web4_core::crypto::KeyPair;
+
+        // an empty operator_access = no one may operate (fail-closed until bootstrap)
+        let mut s = VaultPolicyState::default();
+        assert!(!s.operator_access_bootstrapped());
+
+        // bootstrap one operator: hestia stores only the PUBLIC key
+        let kp = KeyPair::generate();
+        let op_lct = "lct:web4:operator:dp";
+        s.operator_access.push(OperatorIdentity {
+            lct_id: op_lct.into(),
+            public_key_hex: hex::encode(kp.public_key_bytes()),
+            label: "dp — test".into(),
+        });
+        assert!(s.operator_access_bootstrapped());
+
+        let challenge = b"hestia-operator-challenge:nonce-abc123";
+        let good_sig = kp.sign(challenge);
+
+        // the authorized operator's valid signature authorizes
+        assert!(s.authorize_operator(op_lct, challenge, &good_sig).is_some());
+
+        // wrong key (a different keypair signing) → refused
+        let attacker = KeyPair::generate();
+        let bad_sig = attacker.sign(challenge);
+        assert!(s.authorize_operator(op_lct, challenge, &bad_sig).is_none());
+
+        // right key but wrong challenge (replay of a signature over other bytes) → refused
+        let other_sig = kp.sign(b"a different challenge");
+        assert!(s.authorize_operator(op_lct, challenge, &other_sig).is_none());
+
+        // unknown lct_id, even with a valid signature by its own key → refused
+        assert!(s.authorize_operator("lct:web4:operator:stranger", challenge, &good_sig).is_none());
+
+        // malformed stored pubkey → fail-closed (can never verify)
+        s.operator_access[0].public_key_hex = "not-hex".into();
+        assert!(s.authorize_operator(op_lct, challenge, &good_sig).is_none());
+    }
+
+    #[test]
+    fn operator_access_serde_back_compat() {
+        // older vault doc without the field → empty (surface fails closed), no error
+        let old = r#"{"active_preset":"safety"}"#;
+        let s: VaultPolicyState = serde_json::from_str(old).unwrap();
+        assert!(s.operator_access.is_empty());
+        assert!(!s.operator_access_bootstrapped());
     }
 
     #[test]

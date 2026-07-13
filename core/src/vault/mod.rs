@@ -7,12 +7,12 @@
 pub mod crypto;
 pub mod document;
 pub mod entry;
-pub mod policy_state;
 pub mod storage;
 
 pub use document::{Document, ItemRef, Protection};
 pub use entry::VaultEntry;
-pub use policy_state::{PolicyOverride, VaultPolicyState};
+pub use policy_state::{OperatorIdentity, PolicyOverride, VaultPolicyState};
+pub mod policy_state;
 pub use storage::{default_hestia_home, vault_path, VaultData};
 
 use zeroize::Zeroizing;

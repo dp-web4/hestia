@@ -557,6 +557,81 @@
   let feedFilter = 'all';  // 'all' | 'warn' | 'deny'
   let failuresCache = null; // result of last /api/failures fetch, used while FAILED is selected
 
+  // ---- Operator authentication (RWOA W) — sign in with your LCT -------------
+  // Web4 authenticating with Web4: the operator loads their credential
+  // (lct_id + Ed25519 seed from $HESTIA_HOME/operator.key), SIGNS a server
+  // challenge, and a session token rides every /api/* call. No shared secret;
+  // the private key is imported non-extractable and never leaves the page.
+  // Software tier (WebCrypto Ed25519); the hardware (TPM/SE) path is a local
+  // signing helper — same wire flow, key never in the browser.
+  const auth = (() => {
+    let token = sessionStorage.getItem('hestia_op_token') || null;
+    let signKey = null, lctId = null;
+    // Fixed PKCS8 DER prefix for a raw 32-byte Ed25519 private seed.
+    const PKCS8 = Uint8Array.from([0x30,0x2e,0x02,0x01,0x00,0x30,0x05,0x06,0x03,0x2b,0x65,0x70,0x04,0x22,0x04,0x20]);
+    const hexToBytes = h => Uint8Array.from(h.trim().match(/.{1,2}/g).map(b => parseInt(b,16)));
+    const bytesToHex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2,'0')).join('');
+
+    async function loadCredential(text) {
+      const cred = JSON.parse(text);
+      lctId = cred.lct_id;
+      const seed = hexToBytes(cred.secret_key_hex);
+      if (seed.length !== 32) throw new Error('bad key length');
+      const pkcs8 = new Uint8Array(PKCS8.length + 32);
+      pkcs8.set(PKCS8); pkcs8.set(seed, PKCS8.length);
+      signKey = await crypto.subtle.importKey('pkcs8', pkcs8, {name:'Ed25519'}, false, ['sign']);
+    }
+    async function signIn() {
+      const ch = await (await fetch('/api/operator/challenge', {method:'POST'})).json();
+      const sig = await crypto.subtle.sign({name:'Ed25519'}, signKey, new TextEncoder().encode(ch.challenge));
+      const res = await fetch('/api/operator/session', {
+        method:'POST', headers:{'content-type':'application/json'},
+        body: JSON.stringify({lct_id: lctId, challenge: ch.challenge, signature: bytesToHex(sig)}),
+      });
+      if (!res.ok) throw new Error('sign-in rejected (' + res.status + ')');
+      token = (await res.json()).token;
+      sessionStorage.setItem('hestia_op_token', token);
+    }
+    // Lazy sign-in overlay: prompt the operator to load operator.key, import, sign.
+    function overlay() {
+      return new Promise((resolve, reject) => {
+        const o = document.createElement('div');
+        o.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:9999';
+        o.innerHTML = '<div style="background:#151a23;color:#e6edf3;padding:24px;border-radius:10px;max-width:440px;font:14px system-ui;box-shadow:0 8px 40px rgba(0,0,0,.5)">'
+          + '<h3 style="margin:0 0 8px">Operator sign-in</h3>'
+          + '<p style="margin:0 0 12px;color:#9aa7b4">Load your <code>operator.key</code> (from <code>$HESTIA_HOME</code>). It is signed locally; the key never leaves this page.</p>'
+          + '<input type="file" id="op-cred-file" accept=".key,.json,application/json" style="margin-bottom:10px">'
+          + '<div style="color:#f08a8a;font-size:12px;min-height:16px" id="op-cred-err"></div>'
+          + '<button id="op-cred-go" style="margin-top:8px;padding:8px 16px;background:#2d6cdf;color:#fff;border:0;border-radius:6px;cursor:pointer">Sign in</button></div>';
+        document.body.appendChild(o);
+        const err = m => o.querySelector('#op-cred-err').textContent = m;
+        o.querySelector('#op-cred-go').onclick = async () => {
+          try {
+            const f = o.querySelector('#op-cred-file').files[0];
+            if (!f) return err('choose your operator.key file');
+            await loadCredential(await f.text());
+            await signIn();
+            o.remove(); resolve();
+          } catch (e) { err(String(e.message || e)); }
+        };
+      });
+    }
+    // The wrapper every /api/* call goes through: attach bearer; on 401, sign in
+    // (once) and retry. A 202 (irreversible act needs quorum) is returned to the caller.
+    async function apiFetch(path, opts={}) {
+      const withTok = () => ({...opts, headers: {...(opts.headers||{}), ...(token ? {authorization:'Bearer '+token} : {})}});
+      let res = await fetch(path, withTok());
+      if (res.status === 401) {
+        if (!crypto.subtle || !window.isSecureContext) { /* Ed25519 needs a secure context */ }
+        await overlay();
+        res = await fetch(path, withTok());
+      }
+      return res;
+    }
+    return { apiFetch };
+  })();
+  const apiFetch = auth.apiFetch;
+
   const fmt = {
     int: n => (n ?? 0).toLocaleString(),
     pct: f => (f * 100).toFixed(1) + '%',
@@ -682,7 +757,7 @@
   async function connectOrch(id, el) {
     el.textContent = 'connecting…';
     try {
-      const res = await fetch(`/api/orchestrators/${encodeURIComponent(id)}/connect`, { method: 'POST' });
+      const res = await apiFetch(`/api/orchestrators/${encodeURIComponent(id)}/connect`, { method: 'POST' });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error || ('HTTP ' + res.status));
       el.textContent = '✓ connected';
@@ -916,7 +991,7 @@
 
   async function fetchFailures() {
     try {
-      const res = await fetch('/api/failures', { cache: 'no-store' });
+      const res = await apiFetch('/api/failures', { cache: 'no-store' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       failuresCache = await res.json();
     } catch (err) {
@@ -926,7 +1001,7 @@
 
   async function tick() {
     try {
-      const res = await fetch('/api/dashboard', { cache: 'no-store' });
+      const res = await apiFetch('/api/dashboard', { cache: 'no-store' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       lastData = data;
@@ -985,14 +1060,14 @@
 
   async function fetchPolicy() {
     try {
-      const res = await fetch('/api/policy', { cache: 'no-store' });
+      const res = await apiFetch('/api/policy', { cache: 'no-store' });
       if (res.ok) renderPolicy(await res.json());
     } catch (e) { /* leave previous render */ }
   }
 
   async function polSend(method, path, body) {
     try {
-      const res = await fetch(path, {
+      const res = await apiFetch(path, {
         method,
         headers: body ? { 'content-type': 'application/json' } : undefined,
         body: body ? JSON.stringify(body) : undefined,
