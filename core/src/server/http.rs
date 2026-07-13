@@ -196,10 +196,12 @@ pub async fn serve_with_callback(
         config,
     );
 
-    // The OPERATOR surface (/ + /api/*): every route behind the operator_gate
+    // The OPERATOR DATA surface (/api/*): every route behind the operator_gate
     // preflight (RWOA O). route_layer applies only to these routes, not fallbacks.
+    // NB: the dashboard HTML shell `GET /` is served UNAUTHENTICATED below — it
+    // carries no data (only the app skeleton + the sign-in JS), and it must load
+    // for the operator to sign in at all. All *data* lives behind the gate.
     let operator_surface = axum::Router::new()
-        .route("/", get(dashboard_html))
         .route("/api/dashboard", get(dashboard_json))
         .route("/api/failures", get(failures_json))
         .route("/api/vault", get(vault_list).post(vault_add))
@@ -216,6 +218,9 @@ pub async fn serve_with_callback(
 
     let mut app = axum::Router::new()
         .merge(operator_surface)
+        // The dashboard HTML shell — unauthenticated (app skeleton + sign-in JS,
+        // no data). The operator signs in from here; all /api/* data is gated.
+        .route("/", get(dashboard_html))
         // Operator auth bootstrap surface — UNauthenticated by design (this is how
         // an operator establishes a session; issuing a challenge grants nothing).
         .route("/api/operator/challenge", post(operator_challenge))

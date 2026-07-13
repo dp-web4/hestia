@@ -267,8 +267,16 @@ impl ServerState {
         use std::os::unix::fs::PermissionsExt;
         let kp = web4_core::crypto::KeyPair::generate();
         let lct_id = web4_core::lct::derive_lct_id(&kp.verifying_key());
+        // Self-contained credential the operator loads into their client: the
+        // lct_id (so the client knows WHICH operator it is) + the raw Ed25519 seed
+        // (hex) the client wraps + imports for signing. 0600, genesis handoff.
         let key_path = self.home.join("operator.key");
-        std::fs::write(&key_path, hex::encode(kp.secret_key_bytes()))
+        let cred = serde_json::json!({
+            "lct_id": lct_id,
+            "secret_key_hex": hex::encode(kp.secret_key_bytes()),
+            "note": "genesis operator credential — load into your dashboard client to sign in; keep private; rotate to a hardware key when able",
+        });
+        std::fs::write(&key_path, serde_json::to_vec_pretty(&cred).unwrap_or_default())
             .map_err(|e| anyhow::anyhow!("writing operator.key: {e}"))?;
         let mut perms = std::fs::metadata(&key_path)?.permissions();
         perms.set_mode(0o600);
@@ -694,11 +702,15 @@ mod tests {
         assert!(first.is_some(), "genesis mints an operator");
         assert!(state.vault.policy().operator_access_bootstrapped());
         assert_eq!(state.vault.policy().operator_access.len(), 1);
-        // the private key was written 0600 for the operator to load
+        // the credential was written 0600 for the operator to load, and is a
+        // valid {lct_id, secret_key_hex} the client can sign with
         let key = state.home.join("operator.key");
         assert!(key.exists());
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+        let cred: serde_json::Value = serde_json::from_slice(&std::fs::read(&key).unwrap()).unwrap();
+        assert_eq!(cred["lct_id"], first.clone().unwrap());
+        assert_eq!(cred["secret_key_hex"].as_str().unwrap().len(), 64); // 32-byte seed hex
         // window shut: re-run is a no-op (no re-entry, no second operator)
         assert!(state.bootstrap_operator_if_genesis().unwrap().is_none());
         assert_eq!(state.vault.policy().operator_access.len(), 1);
