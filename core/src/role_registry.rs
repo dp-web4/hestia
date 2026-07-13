@@ -111,6 +111,44 @@ pub fn load_or_mint_registry(
         crate::vault::load_doc(vault, ROLES_NAMESPACE, ROLES_DOC, ROLES_LEGACY_FILE)
             .unwrap_or_default();
 
+    // HEAL: roles persisted before binding signatures existed (pre web4 #499)
+    // carry no `binding_proof` — the publish path's ingest mirror would rightly
+    // refuse them. Their keypairs are sealed right here, so re-sign in place and
+    // persist. Idempotent (only fires on absent proofs); a sealed secret that no
+    // longer answers for its LCT is logged and left unsigned — an unpublishable
+    // role is a visible fact, never a forged signature.
+    let mut healed = false;
+    for p in &mut persisted {
+        if p.lct.binding_proof.is_none() {
+            match hex::decode(&p.keypair_secret_hex)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            {
+                Some(bytes) => {
+                    let kp = web4_core::crypto::KeyPair::from_secret_bytes(&bytes);
+                    if kp.verifying_key() == p.lct.public_key {
+                        p.lct.sign_binding(&kp);
+                        healed = true;
+                    } else {
+                        eprintln!(
+                            "[roles] WARNING: sealed secret for {} does not answer for its LCT — leaving binding unproven",
+                            p.label
+                        );
+                    }
+                }
+                None => eprintln!(
+                    "[roles] WARNING: sealed secret for {} is malformed — leaving binding unproven",
+                    p.label
+                ),
+            }
+        }
+    }
+    if healed {
+        if let Err(e) = crate::vault::save_doc(vault, ROLES_NAMESPACE, ROLES_DOC, ROLES_LEGACY_FILE, &persisted) {
+            eprintln!("[roles] WARNING: persisting healed binding proofs failed ({e}) — re-heals next boot");
+        }
+    }
+
     // Populate a role's MRH `bound` parent edge to the sovereign (canon §5:
     // reachability is the edge, not metadata). Derived, deterministic (ts = the
     // role's own created_at → never churns), applied before registration. Empty
@@ -242,6 +280,33 @@ mod tests {
                 "role {}: sealed secret must answer for the persisted LCT", p.label
             );
         }
+    }
+
+    #[test]
+    fn unsigned_persisted_roles_are_healed_with_their_sealed_keypairs() {
+        // Roles persisted pre-#499 have no binding_proof. On load, the sealed
+        // secret re-signs the binding in place and persists — so the publish
+        // path's ingest mirror accepts them without re-minting identity.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("v.enc");
+        let mut vault = crate::vault::Vault::init(path.clone(), "p".into()).unwrap();
+        let _ = load_or_mint_registry(&mut vault, "sov", "sid");
+        // Simulate the pre-#499 vault state: strip every proof and re-persist.
+        let mut persisted: Vec<super::PersistedRole> =
+            crate::vault::load_doc(&vault, super::ROLES_NAMESPACE, super::ROLES_DOC, super::ROLES_LEGACY_FILE).unwrap();
+        for p in &mut persisted { p.lct.binding_proof = None; }
+        crate::vault::save_doc(&mut vault, super::ROLES_NAMESPACE, super::ROLES_DOC, super::ROLES_LEGACY_FILE, &persisted).unwrap();
+        drop(vault);
+        // Reload (the healing boot): every role verifies again…
+        let mut vault2 = crate::vault::Vault::open(path.clone(), "p".into()).unwrap();
+        let reg = load_or_mint_registry(&mut vault2, "sov", "sid");
+        for label in crate::reputation::KNOWN_CONSTELLATION_ROLES {
+            assert!(reg.get(label).unwrap().lct.verify_binding(), "{label} healed");
+        }
+        // …and the heal PERSISTED (a third load starts from signed documents).
+        let healed: Vec<super::PersistedRole> =
+            crate::vault::load_doc(&vault2, super::ROLES_NAMESPACE, super::ROLES_DOC, super::ROLES_LEGACY_FILE).unwrap();
+        assert!(healed.iter().all(|p| p.lct.binding_proof.is_some()), "heal written back to the vault");
     }
 
     #[test]

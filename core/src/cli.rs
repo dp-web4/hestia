@@ -101,6 +101,9 @@ enum Command {
     /// Hub connection subcommands (Track H2/H3 — connect to Web4 hubs)
     #[command(subcommand)]
     Hub(HubCmd),
+    /// LCT publish subcommands (registry seam — canon genesis step 7)
+    #[command(subcommand)]
+    Lct(LctCmd),
 
     /// Device constellation subcommands (mini-hub for your LCTs)
     #[command(subcommand)]
@@ -431,6 +434,9 @@ pub fn run() -> AnyResult<()> {
             DelegateCmd::List => cmd_delegate_list(&home),
             DelegateCmd::Revoke { id } => cmd_delegate_revoke(&home, &id),
         },
+        Command::Lct(l) => match l {
+            LctCmd::Publish { dry_run } => cmd_lct_publish(&home, dry_run),
+        },
         Command::Hub(h) => match h {
             HubCmd::Connect { url } => cmd_hub_connect(&home, &url),
             HubCmd::List => cmd_hub_list(&home),
@@ -719,6 +725,60 @@ fn cmd_vault_remove(home: &std::path::Path, name: &str) -> AnyResult<()> {
     let mut vault = open_vault(home)?;
     vault.remove(name)?;
     println!("✓ Removed '{name}' from vault");
+    Ok(())
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum LctCmd {
+    /// Build the constellation's LctPublished payload set and print it —
+    /// sovereign first, then roles — WITHOUT sending. Every payload has passed
+    /// the producer-side mirror of the hub's fail-closed ingest; refusals are
+    /// listed with the named failing check. This dry-run IS the shape-
+    /// confirmation artifact for the hub's ingest implementation.
+    Publish {
+        /// Print payloads without sending (the only mode until the hub's
+        /// POST /v1/hubs/:hub_id/lcts/publish endpoint ships).
+        #[arg(long, default_value_t = true)]
+        dry_run: bool,
+    },
+}
+
+fn cmd_lct_publish(home: &std::path::Path, dry_run: bool) -> AnyResult<()> {
+    let mut vault = open_vault(home)?;
+    let anchor = "lct:web4:hestia:sovereign:phase1-placeholder";
+    let sovereign = hestia::sovereign::Sovereign::load_or_mint(&mut vault, anchor);
+    let registry =
+        hestia::role_registry::load_or_mint_registry(&mut vault, anchor, &sovereign.lct_id());
+    // published_by = our pinned hub member identity; nil + warning when the
+    // constellation hasn't joined a hub yet (dry-run remains useful).
+    let published_by = hestia::hub::HubStore::load(&vault)
+        .ok()
+        .and_then(|st| st.connections.first().map(|c| c.our_lct_id))
+        .unwrap_or_else(|| {
+            eprintln!("[lct publish] note: no hub connection — published_by is nil in this dry-run");
+            uuid::Uuid::nil()
+        });
+    let set = hestia::lct_publish::collect_publish_set(
+        &sovereign,
+        &registry,
+        published_by,
+        chrono::Utc::now(),
+    );
+    for (label, reason) in &set.refused {
+        eprintln!("[lct publish] REFUSED {label}: {reason}");
+    }
+    println!("{}", serde_json::to_string_pretty(&set.payloads)?);
+    if !dry_run {
+        eprintln!(
+            "[lct publish] send not yet wired — the hub's publish endpoint ships once this \
+             shape confirms (spec 2); payloads above are exactly what will be sent"
+        );
+    }
+    eprintln!(
+        "[lct publish] {} payload(s), {} refused (dry-run)",
+        set.payloads.len(),
+        set.refused.len()
+    );
     Ok(())
 }
 

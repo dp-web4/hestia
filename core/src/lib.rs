@@ -19,6 +19,7 @@ pub mod profile;
 pub mod reputation;
 pub mod role_registry;
 pub mod sovereign;
+pub mod lct_publish;
 pub mod server;
 pub mod storage;
 pub mod tui;
