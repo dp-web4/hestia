@@ -1,0 +1,20 @@
+{
+  "name": "hestia-observe",
+  "version": "0.1.0",
+  "description": "Hestia observe-only adapter for a foreign member (Kimi Code). Registers the session and streams acts to Hestia's observation log to grow a behavioral baseline. Installs standing law via AGENTS.md. NO blocking by default — it wires ZERO blocking-capable hooks in this manifest; blocking is the Phase-1 gate (hooks/pre_tool_use.py), wired separately.",
+  "author": "dp-web4 / Hestia",
+  "license": "AGPL-3.0",
+  "keywords": ["hestia", "web4", "onboarding", "immune-system", "observe-only", "kimi"],
+  "interface": {
+    "displayName": "Hestia (observe-only)",
+    "shortDescription": "Foreign-agent onboarding observer — no blocking, Phase 0",
+    "developerName": "dp-web4"
+  },
+  "hooks": [
+    { "event": "SessionStart",       "command": "./hooks/observe.sh", "timeout": 15 },
+    { "event": "PostToolUse",        "command": "./hooks/observe.sh", "timeout": 10 },
+    { "event": "PostToolUseFailure", "command": "./hooks/observe.sh", "timeout": 10 },
+    { "event": "SessionEnd",         "command": "./hooks/observe.sh", "timeout": 10 },
+    { "event": "SessionEnd",         "command": "./hooks/hydrate.sh", "timeout": 20 }
+  ]
+}

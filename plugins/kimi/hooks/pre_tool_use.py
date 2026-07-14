@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Hestia Phase-1 PreToolUse GATE for a foreign member (Kimi Code) — reference adapter.
+
+This is the membrane — the one hook a Kimi act must transit to have effect. It is FAIL-CLOSED BY
+CONSTRUCTION, because Kimi's hook engine fails OPEN on every failure mode (verified from the binary:
+timeout / spawn-fail / non-2 exit / exception all -> allow). So a blocking hook must default to
+`exit 2` and reach `exit 0` only on an explicit, confirmed allow — never rely on `set -e` or the
+engine's default. (This fail-open-on-error behavior is a property of the Claude-Code-lineage hook
+engines — Kimi, Codex, Cursor, etc. — and is the single most important fact for anyone writing a
+blocking hook for them: the gate itself must be the fail-closed party.)
+
+Two gates, in order:
+  1. SCOPE + EGRESS (local, per-entity, sourced from Kimi's MRH in identity.json). Out-of-scope
+     target, or a forbidden egress/secret path, -> deny. No daemon needed, so a down daemon never
+     bricks this boundary.
+  2. SOCIETY SAFETY (the governor): for write/exec-class tools, delegate to hestia's tested daemon
+     caller so the decision reaches the governor and is witnessed. Its deny (or fail-closed-on-
+     unreachable) is honored.
+
+A deny is STEERING, not just a block: the stderr reason says why + what to do (adjust in-scope, or
+ask via request_scope).
+
+Exit codes (Kimi engine contract): 2 = block (stderr = reason); 0 = allow. Default is 2.
+
+Config (all env-overridable; defaults suit a generic install):
+  HESTIA_WORKSPACE       root that contains the granted repos      (default: ~/ai-workspace)
+  HESTIA_SOCIETY_GATE    path to the society-safety gate caller     (default: $WORKSPACE/hestia/plugins/claude-code/hooks/pre_tool_use.py)
+  HESTIA_KIMI_IDENTITY   the member's live identity.json            (default: ~/.kimi-code/hestia-instance/identity.json)
+  HESTIA_KIMI_GATE_MODE  warn | enforce                             (default: warn)
+  HESTIA_FORBIDDEN_EXTRA comma-separated extra forbidden path tokens (e.g. your private repo names)
+"""
+import json
+import os
+import re
+import sys
+import subprocess
+
+WORKSPACE = os.environ.get("HESTIA_WORKSPACE", os.path.expanduser("~/ai-workspace"))
+IDENTITY = os.path.expanduser(
+    os.environ.get("HESTIA_KIMI_IDENTITY", "~/.kimi-code/hestia-instance/identity.json"))
+# Delegate the society-safety check to hestia's tested daemon caller (the safety preset is global, so
+# plugin_id doesn't change its verdict — we set it anyway for when it's parametrized).
+CLAUDE_PRE = os.environ.get(
+    "HESTIA_SOCIETY_GATE",
+    os.path.join(WORKSPACE, "hestia/plugins/claude-code/hooks/pre_tool_use.py"))
+
+# Innate egress/secret invariants — denied even inside a granted repo. Trust never relaxes these (S1).
+# Universal secret/credential patterns here; add your own private-repo names via HESTIA_FORBIDDEN_EXTRA.
+FORBIDDEN = ("/.ssh", ".env", "credentials", "id_rsa", "id_ed25519", "/.git/config", "secrets") + tuple(
+    t.strip() for t in os.environ.get("HESTIA_FORBIDDEN_EXTRA", "").split(",") if t.strip())
+READ_CLASS = {"Read", "Glob", "Grep", "TodoWrite", "TodoList", "GetGoal"}
+
+
+def load_in_scope():
+    """Kimi's granted MRH (repos it may touch), read from its identity — per-entity, role-sourced.
+    Scope grants become entries here. Default reflects an example grant."""
+    try:
+        mrh = json.load(open(IDENTITY, encoding="utf-8")).get("mrh", {})
+        scope = mrh.get("in_scope")
+        if isinstance(scope, list) and scope:
+            return [s.split(":", 1)[-1] for s in scope]  # "repo:web4" -> "web4"
+    except Exception:
+        pass
+    return ["web4"]
+
+
+def path_targets(tool_input):
+    out = []
+    if isinstance(tool_input, dict):
+        for k in ("path", "file_path", "notebook_path", "pattern"):
+            v = tool_input.get(k)
+            if isinstance(v, str):
+                out.append(v)
+    return out
+
+
+def command_of(tool_input):
+    if isinstance(tool_input, dict):
+        c = tool_input.get("command")
+        if isinstance(c, str):
+            return c
+    return None
+
+
+def _all_repos():
+    try:
+        return [d for d in os.listdir(WORKSPACE)
+                if os.path.isdir(os.path.join(WORKSPACE, d)) and not d.startswith(".")]
+    except Exception:
+        # If the workspace listing fails, degrade to root-glob detection only (no static inventory in
+        # the generic adapter — set HESTIA_WORKSPACE so the live listing works). deny-known-out is
+        # better than allow-all, but we don't ship a hardcoded repo list here.
+        return []
+
+
+def path_in_scope(path, scopes):
+    """A file path is in-scope if it's the agent's home, /tmp, or under a granted repo."""
+    p = path.replace("\\", "/")
+    low = p.lower()
+    if "~/.kimi-code" in low or low.startswith(os.path.expanduser("~/.kimi-code").lower()):
+        return True
+    if p.startswith(("/tmp", "/var/tmp")):
+        return True
+    if WORKSPACE in p:
+        rest = p.split(WORKSPACE, 1)[1].lstrip("/")
+    else:
+        rest = p.lstrip("./")
+    seg = rest.split("/", 1)[0] if rest else ""
+    if seg == "":
+        return False           # bare workspace root (the glob-the-root antipattern) -> out of scope
+    return seg in scopes
+
+
+def command_in_scope(cmd, scopes):
+    """A shell command is out of scope if it names an out-of-scope repo, or globs the workspace root
+    without narrowing to a granted repo."""
+    oos = [r for r in _all_repos() if r not in scopes]
+    for repo in oos:
+        if re.search(rf"""(^|[\s/=:"'(]){re.escape(repo)}(/|[\s"')]|$)""", cmd):
+            return False
+    # root-glob: references the workspace root but not immediately narrowed to a granted repo
+    if WORKSPACE in cmd:
+        after = cmd.split(WORKSPACE, 1)[1]
+        if not any(after.lstrip("/").startswith(s) for s in scopes):
+            return False
+    return True
+
+
+# Rollout mode: audit-first is the prudent path — wire the gate, run it in WARN so it surfaces
+# would-block verdicts + tests the plumbing without denying real work, THEN flip to enforce once
+# it's been watched not-false-deny. Default WARN. Flip with HESTIA_KIMI_GATE_MODE=enforce.
+MODE = os.environ.get("HESTIA_KIMI_GATE_MODE", "warn").lower()
+
+
+def deny(reason, what_to_do, innate=False):
+    """innate=True -> ALWAYS blocks (egress/secret is irreversible: a leaked read has no undo, so it
+    is enforced even in warn-rollout). Tunable scope/safety rules honor MODE: warn surfaces + allows,
+    enforce blocks."""
+    verb = "deny" if (innate or MODE == "enforce") else "warn"
+    sys.stderr.write(
+        f"hestia: {verb} [scope] — {reason}. This is a boundary, not a failure: don't re-run the same "
+        f"call. {what_to_do} Asking is a trust-building act; reaching is witnessed.\n")
+    if innate or MODE == "enforce":
+        sys.exit(2)
+    # warn mode, tunable rule: surfaced but allowed — return so evaluation continues to allow.
+
+
+def main():
+    # Fail-closed skeleton: any unexpected error -> deny (never fall through to allow).
+    try:
+        event = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        sys.stderr.write("hestia: deny [gate] — could not parse the tool event; failing closed.\n")
+        sys.exit(2)
+
+    if event.get("hook_event_name") != "PreToolUse":
+        sys.exit(0)  # not our event
+
+    tool = event.get("tool_name") or "?"
+    tinput = event.get("tool_input") or {}
+    scopes = load_in_scope()
+    paths = path_targets(tinput)
+    cmd = command_of(tinput)
+
+    # Gate 1a — egress/secret innate invariant (denied even inside a granted repo). ALWAYS enforced
+    # (innate): a leaked read is irreversible egress, so it is not subject to warn-rollout.
+    for blob in paths + ([cmd] if cmd else []):
+        if any(f in blob.lower() for f in FORBIDDEN):
+            deny(f"'{tool}' touches a forbidden path (secret/credential or out-of-MRH private repo)",
+                 "There is no in-scope way to do this; it is not yours to touch.", innate=True)
+
+    # Gate 1b — MRH scope (per-entity, from Kimi's identity). File paths use path-scope; shell
+    # commands use command-scope (out-of-scope repo tokens + root-glob).
+    for p in paths:
+        if not path_in_scope(p, scopes):
+            deny(f"'{tool}' targets '{p[:60]}' outside your granted scope ({'+'.join(scopes)})",
+                 "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
+    if cmd is not None and not command_in_scope(cmd, scopes):
+        deny(f"'{tool}' command reaches outside your granted scope ({'+'.join(scopes)})",
+             "Scope the command to a granted repo, or if legitimately needed, request it (request_scope).")
+
+    # Gate 2 — society safety (the governor). Read-class already fully covered by the local gates;
+    # only write/exec-class needs the daemon's destructive/secret verdict — and there we fail closed.
+    if tool not in READ_CLASS:
+        try:
+            env = dict(os.environ, HESTIA_PLUGIN_ID="kimi-code", HESTIA_PRE_FAIL_CLOSED="1")
+            r = subprocess.run([sys.executable, CLAUDE_PRE], input=json.dumps(event),
+                               capture_output=True, text=True, timeout=6, env=env)
+            if r.returncode != 0:  # daemon denied, or inconclusive -> fail-closed for a write/exec act
+                msg = (r.stderr.strip() if r.returncode == 2 and r.stderr.strip()
+                       else "hestia: deny [safety] — blocked/inconclusive at the society safety gate.")
+                if MODE == "enforce":
+                    sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
+                    sys.exit(2)
+                sys.stderr.write("hestia: warn [safety] — " + msg.split("— ", 1)[-1] +
+                                 " (warn-rollout: allowed; would block under enforce)\n")
+        except Exception:
+            if MODE == "enforce":
+                sys.stderr.write("hestia: deny [safety] — could not reach the governor; failing "
+                                 "closed on a consequential act.\n")
+                sys.exit(2)
+            sys.stderr.write("hestia: warn [safety] — governor unreachable (warn-rollout: allowed).\n")
+
+    sys.exit(0)  # the ONLY allow path — reached only after every gate explicitly passed
+
+
+if __name__ == "__main__":
+    main()
