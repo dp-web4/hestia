@@ -1,17 +1,20 @@
 //! Persistence backends for the Hestia daemon.
 //!
 //! - `chain` — SQLCipher-encrypted hash-linked witness chain
+//! - `inbox` — SQLCipher-encrypted durable inbound mailbox (accept-and-defer)
 //! - `trust` — per-entity T3/V3, each sealed at rest
 //!
-//! Both are encrypted at rest with a single stable storage key derived once
+//! All encrypted at rest with a single stable storage key derived once
 //! from `HESTIA_PASSPHRASE` (vault doctrine: no plaintext state). The key is
 //! cached across writes (Argon2 once), so high-frequency writes (trust updates,
 //! chain appends) don't re-derive per write.
 
 pub mod chain;
+pub mod inbox;
 pub mod trust;
 
 pub use chain::{ChainEntry, SqliteChainStore};
+pub use inbox::{InboxNotice, SqliteInboxStore};
 pub use trust::TrustStore;
 
 use std::path::Path;
