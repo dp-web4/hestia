@@ -540,6 +540,66 @@ impl HubClient {
             serde_json::to_value(&attestation)?,
         ).await
     }
+
+    /// Publish one LCT to the hub registry — the live half of the
+    /// `LctPublished` seam (`lct_publish.rs` builds and self-checks the
+    /// payload; this sends it). One challenge nonce and one [`SignedEnvelope`]
+    /// per payload (nonces are single-use), and the envelope is POSTed
+    /// DIRECTLY as the body — the hub's route takes `Json<SignedEnvelope>`,
+    /// not an `{"envelope": …}` wrapper.
+    ///
+    /// The hub binds `payload.published_by` to `envelope.signer_lct_id`
+    /// (hard 403 on mismatch), so callers must build the payload with the
+    /// SAME identity that signs here — see [`resolve_publish_identity`].
+    pub async fn publish_lct(
+        &self,
+        rest_endpoint: &str,
+        hub_id: Uuid,
+        signer_lct_id: Uuid,
+        keypair: &KeyPair,
+        payload: &crate::lct_publish::LctPublishPayload,
+    ) -> Result<LctPublishAccepted> {
+        let rest = rest_endpoint.trim_end_matches('/');
+        let challenge = self.challenge(rest, signer_lct_id).await?;
+        let envelope = SignedEnvelope::create(
+            challenge.nonce,
+            serde_json::to_value(payload)?,
+            signer_lct_id,
+            keypair,
+        );
+        let url = format!("{rest}/hubs/{hub_id}/lcts/publish");
+        let resp = self.http.post(&url).json(&envelope).send().await
+            .with_context(|| format!("posting lct publish to {url}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("hub /lcts/publish returned HTTP {status}: {text}");
+        }
+        serde_json::from_str(&text).with_context(|| "parsing /lcts/publish response")
+    }
+
+    /// List the hub registry (`GET /v1/hubs/{hub_id}/lcts`). Read-only —
+    /// used after a publish to verify what the registry actually serves,
+    /// rather than trusting the acceptance receipts alone.
+    pub async fn list_lcts(
+        &self,
+        rest_endpoint: &str,
+        hub_id: Uuid,
+    ) -> Result<serde_json::Value> {
+        let url = format!(
+            "{}/hubs/{}/lcts",
+            rest_endpoint.trim_end_matches('/'),
+            hub_id
+        );
+        let resp = self.http.get(&url).send().await
+            .with_context(|| format!("listing registry at {url}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("hub /lcts returned HTTP {status}: {text}");
+        }
+        serde_json::from_str(&text).with_context(|| "parsing /lcts response")
+    }
 }
 
 /// Wire body for a channel request — matches the hub's `/v1/hubs/{id}/channel`.
@@ -554,6 +614,49 @@ struct ChannelRequestBody {
 #[derive(Deserialize)]
 struct ChannelResponseBody {
     sealed: String,
+}
+
+/// The hub's acceptance receipt for one registry publish — mirrors the hub's
+/// `LctPublishAccepted` (web4 `hub-daemon` rest.rs) field-for-field.
+#[derive(Clone, Debug, Deserialize)]
+pub struct LctPublishAccepted {
+    pub lct_id: String,
+    /// The version this publish landed as (1 on first publish of a key;
+    /// republishing the same key overwrites in place and bumps this).
+    pub version: u32,
+    pub entry_index: u64,
+    pub entry_hash: String,
+}
+
+/// Decide which identity signs — and is named as `published_by` in — a
+/// registry publish through a connection, and whether the connection's cached
+/// `our_lct_id` needs repair.
+///
+/// The hub rejects `published_by != envelope.signer_lct_id` (403), so both
+/// must come from ONE source of truth:
+/// - [`MemberKeySource::VaultIdentity`]: the vault's `ai_identity_lct_id` is
+///   authoritative — that is the LCT whose key the hub pinned at join. A
+///   diverging `our_lct_id` is a stale cache (the 2026-07-13 live dry-run
+///   caught ours holding the HUB peer's member id) and is flagged for repair.
+/// - [`MemberKeySource::ChannelKeyFile`]: the pinned key is the channel key
+///   bound to `our_lct_id`; there is no vault-side authority to repair from.
+///
+/// Returns `(signer_lct_id, needs_repair)`. Pure, so the repair decision is
+/// testable without a vault.
+pub fn resolve_publish_identity(
+    conn_our_lct_id: Uuid,
+    source: &MemberKeySource,
+    vault_identity_lct_id: Option<Uuid>,
+) -> Result<(Uuid, bool)> {
+    match source {
+        MemberKeySource::VaultIdentity => {
+            let id = vault_identity_lct_id.ok_or_else(|| anyhow::anyhow!(
+                "vault has no ai_identity_lct_id — run `hestia init --ai` before publishing"
+            ))?;
+            Ok((id, id != conn_our_lct_id))
+        }
+        MemberKeySource::ChannelKeyFile { .. } => Ok((conn_our_lct_id, false)),
+    }
 }
 
 trait Pipe: Sized {
@@ -583,6 +686,89 @@ fn channel_inner_request(tool: &str, args: serde_json::Value) -> serde_json::Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The registry seam's identity rule: `published_by` == envelope signer
+    /// (hub 403s a mismatch), so a vault-identity member signs as the vault's
+    /// `ai_identity_lct_id` and a diverging store cache is REPAIRED — the
+    /// exact defect the 2026-07-13 live dry-run caught (store held the HUB
+    /// peer's member id).
+    #[test]
+    fn publish_identity_vault_source_repairs_a_stale_store_entry() {
+        let vault_id = Uuid::new_v4();
+        let stale = Uuid::new_v4(); // e.g. the peer hub's member id
+        let (signer, repair) =
+            resolve_publish_identity(stale, &MemberKeySource::VaultIdentity, Some(vault_id))
+                .unwrap();
+        assert_eq!(signer, vault_id, "the vault identity is authoritative");
+        assert!(repair, "a diverging cache must be flagged for repair");
+        // Idempotent: once repaired, a second resolve is a no-op.
+        let (signer2, repair2) =
+            resolve_publish_identity(vault_id, &MemberKeySource::VaultIdentity, Some(vault_id))
+                .unwrap();
+        assert_eq!(signer2, vault_id);
+        assert!(!repair2, "a matching cache needs no repair");
+    }
+
+    #[test]
+    fn publish_identity_channel_key_source_trusts_the_store() {
+        // A channel-key member's pinned key is bound to `our_lct_id`; the
+        // vault identity (even if present) is NOT the pinned identity here.
+        let ours = Uuid::new_v4();
+        let (signer, repair) = resolve_publish_identity(
+            ours,
+            &MemberKeySource::ChannelKeyFile { path: "/k".into() },
+            Some(Uuid::new_v4()),
+        )
+        .unwrap();
+        assert_eq!(signer, ours);
+        assert!(!repair);
+    }
+
+    #[test]
+    fn publish_identity_vault_source_without_identity_refuses() {
+        let err =
+            resolve_publish_identity(Uuid::new_v4(), &MemberKeySource::VaultIdentity, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("ai_identity_lct_id"));
+    }
+
+    /// Wire-shape lock for the send path: what `publish_lct` POSTs is the
+    /// BARE `SignedEnvelope` the hub's route deserializes — payload fields
+    /// verbatim at `.payload`, signer at `.signer_lct_id`, no `{"envelope":…}`
+    /// wrapper — and the hub's acceptance receipt parses field-for-field.
+    #[test]
+    fn publish_envelope_wire_shape_is_the_bare_signed_envelope() {
+        let (mut doc, kp) = web4_core::Lct::new(web4_core::EntityType::Role, None);
+        doc.sign_binding(&kp);
+        let signer = Uuid::new_v4();
+        let payload = crate::lct_publish::LctPublishPayload {
+            lct_id: doc.lct_id(),
+            document: doc,
+            published_by: signer,
+            provenance: crate::lct_publish::LctProvenance::SelfIssued,
+            published_at: Utc::now(),
+        };
+        let envelope = SignedEnvelope::create(
+            "nonce-1".into(),
+            serde_json::to_value(&payload).unwrap(),
+            signer,
+            &KeyPair::generate(),
+        );
+        let v = serde_json::to_value(&envelope).unwrap();
+        for key in ["challenge_nonce", "payload", "signature", "signer_lct_id"] {
+            assert!(v.get(key).is_some(), "envelope field `{key}` on the wire");
+        }
+        assert_eq!(v["payload"]["lct_id"], payload.lct_id);
+        assert_eq!(v["payload"]["published_by"], v["signer_lct_id"],
+            "published_by must equal the envelope signer or the hub 403s");
+
+        let receipt: LctPublishAccepted = serde_json::from_str(
+            r#"{"lct_id":"lct:web4:mb32:x","version":1,"entry_index":481,"entry_hash":"abc"}"#,
+        )
+        .unwrap();
+        assert_eq!(receipt.version, 1);
+        assert_eq!(receipt.entry_index, 481);
+    }
 
     /// H-007 regression guard: every sealed channel request must carry a fresh,
     /// unique `nonce` + an `issued_at`, or the hub's replay defense is toothless.

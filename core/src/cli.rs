@@ -435,7 +435,7 @@ pub fn run() -> AnyResult<()> {
             DelegateCmd::Revoke { id } => cmd_delegate_revoke(&home, &id),
         },
         Command::Lct(l) => match l {
-            LctCmd::Publish { dry_run } => cmd_lct_publish(&home, dry_run),
+            LctCmd::Publish { dry_run: _, send } => cmd_lct_publish(&home, send),
         },
         Command::Hub(h) => match h {
             HubCmd::Connect { url } => cmd_hub_connect(&home, &url),
@@ -730,34 +730,68 @@ fn cmd_vault_remove(home: &std::path::Path, name: &str) -> AnyResult<()> {
 
 #[derive(clap::Subcommand, Debug)]
 enum LctCmd {
-    /// Build the constellation's LctPublished payload set and print it —
-    /// sovereign first, then roles — WITHOUT sending. Every payload has passed
-    /// the producer-side mirror of the hub's fail-closed ingest; refusals are
-    /// listed with the named failing check. This dry-run IS the shape-
-    /// confirmation artifact for the hub's ingest implementation.
+    /// Build the constellation's LctPublished payload set — sovereign first,
+    /// then roles — and print it (default) or send it to the connected hub's
+    /// registry (`--send`). Every payload has passed the producer-side mirror
+    /// of the hub's fail-closed ingest; refusals are listed with the named
+    /// failing check, and any refusal blocks a send.
     Publish {
-        /// Print payloads without sending (the only mode until the hub's
-        /// POST /v1/hubs/:hub_id/lcts/publish endpoint ships).
-        #[arg(long, default_value_t = true)]
+        /// Print payloads without sending (the default mode; kept explicit so
+        /// scripts can say what they mean).
+        #[arg(long, default_value_t = true, conflicts_with = "send")]
         dry_run: bool,
+        /// Send the payload set to the connected hub's registry
+        /// (POST /v1/hubs/:hub_id/lcts/publish), sovereign first.
+        #[arg(long)]
+        send: bool,
     },
 }
 
-fn cmd_lct_publish(home: &std::path::Path, dry_run: bool) -> AnyResult<()> {
+fn cmd_lct_publish(home: &std::path::Path, send: bool) -> AnyResult<()> {
     let mut vault = open_vault(home)?;
     let anchor = "lct:web4:hestia:sovereign:phase1-placeholder";
     let sovereign = hestia::sovereign::Sovereign::load_or_mint(&mut vault, anchor);
     let registry =
         hestia::role_registry::load_or_mint_registry(&mut vault, anchor, &sovereign.lct_id());
-    // published_by = our pinned hub member identity; nil + warning when the
-    // constellation hasn't joined a hub yet (dry-run remains useful).
-    let published_by = hestia::hub::HubStore::load(&vault)
-        .ok()
-        .and_then(|st| st.connections.first().map(|c| c.our_lct_id))
-        .unwrap_or_else(|| {
+
+    // The hub binds `published_by` to the envelope signer (hard 403 on
+    // mismatch), so the publisher of record and the signing key must name ONE
+    // identity. For a vault-identity member that is the vault's
+    // `ai_identity_lct_id`; the HubStore's `our_lct_id` is only a cache of it
+    // and can go stale (the 2026-07-13 live dry-run caught it holding the HUB
+    // peer's member id) — a diverging entry is repaired here, loudly.
+    let mut hubs = hestia::hub::HubStore::load(&vault).unwrap_or_default();
+    let vault_identity: Option<uuid::Uuid> = vault
+        .get("ai_identity_lct_id")
+        .and_then(|e| e.secret.parse().ok());
+    let conn_snapshot = hubs.connections.first().cloned();
+    let published_by = match &conn_snapshot {
+        Some(conn) => {
+            let (signer, needs_repair) = hestia::hub::resolve_publish_identity(
+                conn.our_lct_id,
+                &conn.member_key_source,
+                vault_identity,
+            )?;
+            if needs_repair {
+                eprintln!(
+                    "[lct publish] REPAIR hubs store our_lct_id for {}: {} → {} \
+                     (stale cache; vault ai_identity_lct_id is authoritative)",
+                    conn.url, conn.our_lct_id, signer
+                );
+                hubs.connections[0].our_lct_id = signer;
+                hubs.save(&mut vault)?;
+            }
+            signer
+        }
+        None => {
+            if send {
+                anyhow::bail!("not connected to a hub — run `hestia hub connect <url>` first");
+            }
             eprintln!("[lct publish] note: no hub connection — published_by is nil in this dry-run");
             uuid::Uuid::nil()
-        });
+        }
+    };
+
     let set = hestia::lct_publish::collect_publish_set(
         &sovereign,
         &registry,
@@ -767,18 +801,64 @@ fn cmd_lct_publish(home: &std::path::Path, dry_run: bool) -> AnyResult<()> {
     for (label, reason) in &set.refused {
         eprintln!("[lct publish] REFUSED {label}: {reason}");
     }
-    println!("{}", serde_json::to_string_pretty(&set.payloads)?);
-    if !dry_run {
+
+    if !send {
+        println!("{}", serde_json::to_string_pretty(&set.payloads)?);
         eprintln!(
-            "[lct publish] send not yet wired — the hub's publish endpoint ships once this \
-             shape confirms (spec 2); payloads above are exactly what will be sent"
+            "[lct publish] {} payload(s), {} refused (dry-run — pass --send to publish)",
+            set.payloads.len(),
+            set.refused.len()
+        );
+        return Ok(());
+    }
+
+    // Fail-closed on the way out: a refusal means the local mirror of the
+    // hub's ingest found a defect. Sending around it (e.g. roles whose
+    // sovereign was refused) would land avoidable dangling edges.
+    if !set.refused.is_empty() {
+        anyhow::bail!(
+            "{} payload(s) refused by the local ingest mirror — repair before sending",
+            set.refused.len()
         );
     }
-    eprintln!(
-        "[lct publish] {} payload(s), {} refused (dry-run)",
+    let conn = conn_snapshot.expect("send path always has a connection");
+    let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let hub_id = conn.hub_lct_id;
+
+    println!(
+        "Publishing {} LCT(s) to {} (hub {hub_id}), sovereign first ...",
         set.payloads.len(),
-        set.refused.len()
+        conn.url
     );
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let client = HubClient::new();
+    for (i, payload) in set.payloads.iter().enumerate() {
+        let accepted = rt
+            .block_on(client.publish_lct(&rest, hub_id, published_by, &keypair, payload))
+            .with_context(|| {
+                format!(
+                    "publish {}/{} ({}) failed — {} already accepted and not rolled back \
+                     (republish overwrites in place: rerun --send once repaired)",
+                    i + 1,
+                    set.payloads.len(),
+                    payload.lct_id,
+                    i
+                )
+            })?;
+        println!(
+            "  ✓ {} v{} ledger#{} ({})",
+            accepted.lct_id, accepted.version, accepted.entry_index, accepted.entry_hash
+        );
+    }
+    // Read back what the registry now serves — verification, not trust.
+    match rt.block_on(client.list_lcts(&rest, hub_id)) {
+        Ok(list) => {
+            let n = list.as_array().map(|a| a.len()).unwrap_or(0);
+            println!("Registry now lists {n} entr{}.", if n == 1 { "y" } else { "ies" });
+        }
+        Err(e) => eprintln!("[lct publish] published, but registry read-back failed: {e:#}"),
+    }
     Ok(())
 }
 
