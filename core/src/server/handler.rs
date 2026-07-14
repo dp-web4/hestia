@@ -998,7 +998,7 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
         .and_then(|s| Uuid::parse_str(s).ok())
         .unwrap_or_else(Uuid::nil);
 
-    let s = state.lock().await;
+    let mut s = state.lock().await;
 
     // Load the member identity keypair from the vault — its pubkey is what the
     // hub sealed to. (Same path as the hub-callback issuer identity.)
@@ -1025,9 +1025,40 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
         .and_then(|s| Uuid::parse_str(s).ok())
         .unwrap_or_else(Uuid::nil);
 
-    let defer = args.get("defer").and_then(Value::as_bool).unwrap_or(false);
+    let defer_requested = args.get("defer").and_then(Value::as_bool).unwrap_or(false);
+
+    // Law gate on the BODY-RETURNING mode: returning the opened body to the
+    // caller is a secret release (`credential_access` — the same category the
+    // ratified law already denies for unattended roles). A DENIED open does not
+    // reject the notice: it AUTO-DEFERS — the still-sealed notice parks in the
+    // durable inbox for an authorized consumer, so failing closed on the
+    // release never loses the work item (accept-and-defer is exactly the safe
+    // downgrade). The transient in-process open above is not a release: the
+    // plaintext never leaves the daemon and never rests.
+    let mut denied_open: Option<Value> = None;
+    if !defer_requested {
+        let session_id_arg = optional_string(args, "session_id");
+        let who = resolve_caller(&s, session_id_arg.as_deref());
+        denied_open = gate_direct_tool(&mut s, &who, "hestia_notify", "credential_access", &kind);
+    }
+    let defer = defer_requested || denied_open.is_some();
+
+    // Accept-and-defer (entity-edge inbox): park the STILL-SEALED notice in the
+    // durable encrypted inbox BEFORE the receipt record and BEFORE sealing the
+    // ACK — the ACK tells the hub "delivered, stop queuing", so the park must
+    // be durable first (O: a failed park errors out here and the hub keeps its
+    // copy; an ACK-then-crash can no longer lose the work item). The body was
+    // opened only transiently above (the ACK needs `act_id`); the plaintext is
+    // never persisted.
+    if defer {
+        s.inbox_store
+            .enqueue(pair_id, hub_lct_id, &hub_pubkey_hex, &sealed, &kind, pointer_uri.as_deref())
+            .map_err(|e| anyhow::anyhow!("deferring notice to inbox (hub NOT acked): {e}"))?;
+    }
 
     // Record receipt in the witness chain (so push and poll share one record).
+    // AFTER the park: the record states `deferred` as a fact that is already
+    // durable, never as an intention that might have failed.
     let entry = s.append_chain(
         "notify.received",
         json!({
@@ -1036,20 +1067,9 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
             "act_id": act_id,
             "from_hub": hub_lct_id,
             "deferred": defer,
+            "deferred_by_law": denied_open.is_some(),
         }),
     )?;
-
-    // Accept-and-defer (entity-edge inbox): park the STILL-SEALED notice in the
-    // durable encrypted inbox BEFORE sealing the ACK — the ACK tells the hub
-    // "delivered, stop queuing", so the park must be durable first (O: a failed
-    // park errors out here and the hub keeps its copy; an ACK-then-crash can no
-    // longer lose the work item). The body was opened only transiently above
-    // (the ACK needs `act_id`); the plaintext is never persisted.
-    if defer {
-        s.inbox_store
-            .enqueue(pair_id, hub_lct_id, &hub_pubkey_hex, &sealed, &kind, pointer_uri.as_deref())
-            .map_err(|e| anyhow::anyhow!("deferring notice to inbox (hub NOT acked): {e}"))?;
-    }
 
     // Seal an ACK the hub opens to mark the notice delivered.
     let ack = crate::hub::NotificationAck { act_id, received_at: Utc::now() };
@@ -1059,6 +1079,9 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
         return Ok(json!({
             "accepted": true,
             "deferred": true,
+            // Present iff law denied the body-returning open — the caller sees
+            // WHY it got a deferral it didn't ask for (honest, not silent).
+            "deferredByLaw": denied_open.is_some(),
             "kind": kind,
             "pointerUri": pointer_uri,
             "queued": s.inbox_store.len().unwrap_or(0),
@@ -1083,8 +1106,22 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
 /// member identity keypair and returns the bodies, oldest first. A body that
 /// no longer opens (e.g. identity rotated since it was parked) is returned in
 /// its sealed form with an `error` — surfaced, never silently dropped.
-async fn tool_inbox(state: &SharedState, _args: &Value) -> ToolResult {
-    let s = state.lock().await;
+///
+/// **Law-gated as `credential_access`** (spec §7.8.2: deliver only to the
+/// authenticated LCT — the drain RELEASES bodies sealed to the member
+/// identity, so it is a secret-release surface, not a plain read). Under the
+/// ratified law this denies the unattended roles (mesh-worker,
+/// autonomous-timer) without any new rule. The gate runs BEFORE the drain
+/// (O: preflight dominates the consume — a denied caller must not consume the
+/// queue), and a deny leaves the mailbox bit-identical.
+async fn tool_inbox(state: &SharedState, args: &Value) -> ToolResult {
+    let session_id_arg = optional_string(args, "session_id");
+    let mut s = state.lock().await;
+    let who = resolve_caller(&s, session_id_arg.as_deref());
+    if let Some(denied) = gate_direct_tool(&mut s, &who, "hestia_inbox", "credential_access", "inbox")
+    {
+        return Ok(denied);
+    }
 
     let notices = s
         .inbox_store
@@ -2017,5 +2054,173 @@ mod inbox_tests {
 
         let s = state.lock().await;
         assert!(s.inbox_store.is_empty().unwrap(), "non-deferred notify must not queue");
+    }
+
+    /// A law-denied body-returning notify AUTO-DEFERS: fail closed on the
+    /// release without losing the work item — the still-sealed notice parks,
+    /// the hub gets its ACK, and the caller is told WHY (`deferredByLaw`).
+    #[tokio::test]
+    async fn notify_denied_open_auto_defers_instead_of_losing_the_notice() {
+        let (dir, member_kp) = seeded_home();
+        let hub_kp = KeyPair::generate();
+        let pair_id = Uuid::new_v4();
+        let sealed = hub_seal(&hub_kp, &member_kp, pair_id, &json!({"act_id": Uuid::new_v4()}));
+
+        let state = open_state(&dir);
+        let sid = Uuid::new_v4();
+        {
+            let mut s = state.lock().await;
+            // The ratified-law shape: unattended role's overlay denies
+            // credential_access (see server::handler::tests for the engine).
+            s.role_policy_engines.insert(
+                "role:constellation:mesh-worker".into(),
+                crate::server::handler::tests::deny_credential_access_engine(),
+            );
+            s.sessions.insert(
+                sid,
+                crate::server::state::Session {
+                    session_id: sid,
+                    plugin_id: "watcher".into(),
+                    plugin_version: None,
+                    host_agent: "test".into(),
+                    host_agent_version: None,
+                    assigned_role: "citizen".into(),
+                    constellation_role: "role:constellation:mesh-worker".into(),
+                    soft_lct: "lct:test".into(),
+                    connected_at: chrono::Utc::now(),
+                },
+            );
+        }
+
+        let resp = tool_notify(
+            &state,
+            &json!({
+                "pair_id": pair_id,
+                "hub_pubkey_hex": hex::encode(hub_kp.public_key_bytes()),
+                "sealed": sealed,
+                "session_id": sid.to_string()
+                // no "defer" — the caller ASKED for the body
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp["accepted"], json!(true));
+        assert_eq!(resp["deferred"], json!(true), "deny must downgrade to defer: {resp}");
+        assert_eq!(resp["deferredByLaw"], json!(true), "the caller is told why");
+        assert!(resp.get("body").is_none(), "denied open must NOT release the body");
+        assert!(resp.get("ackSealed").is_some(), "the hub still gets its delivery ACK");
+
+        let s = state.lock().await;
+        assert_eq!(s.inbox_store.len().unwrap(), 1, "the notice parked, not lost");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{PolicyConfig, PolicyDecision, PolicyEngine, PolicyMatch, PolicyRule};
+    use crate::vault::Vault;
+    use chrono::Utc;
+    use tempfile::TempDir;
+
+    fn make_shared_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        // The drain opens bodies with the member identity (as `hestia init --ai`
+        // leaves it) — seed one so the ALLOWED path exercises the full open.
+        vault
+            .add(crate::vault::VaultEntry::new(
+                "ai_identity_secret",
+                hex::encode(web4_core::crypto::KeyPair::generate().secret_key_bytes()),
+            ))
+            .unwrap();
+        let state = super::super::state::ServerState::open(vault, dir.path(), "p").unwrap();
+        (dir, std::sync::Arc::new(tokio::sync::Mutex::new(state)))
+    }
+
+    pub(super) fn deny_credential_access_engine() -> PolicyEngine {
+        PolicyEngine::new(PolicyConfig {
+            default_policy: PolicyDecision::Allow,
+            enforce: true,
+            rules: vec![PolicyRule {
+                id: "test-deny-cred".into(),
+                name: "deny credential_access (ratified-law shape)".into(),
+                priority: 0,
+                decision: PolicyDecision::Deny,
+                reason: Some("unattended role may not release secrets".into()),
+                r#match: PolicyMatch {
+                    tools: None,
+                    categories: Some(vec!["credential_access".into()]),
+                    target_patterns: None,
+                    target_patterns_are_regex: false,
+                    command_patterns: None,
+                    command_patterns_are_regex: false,
+                    command_must_not_contain: None,
+                    time_window: None,
+                    rate_limit: None,
+                },
+            }],
+        })
+    }
+
+    fn add_session(s: &mut super::super::state::ServerState, role: &str) -> Uuid {
+        let sid = Uuid::new_v4();
+        s.sessions.insert(
+            sid,
+            super::super::state::Session {
+                session_id: sid,
+                plugin_id: "test-plugin".into(),
+                plugin_version: None,
+                host_agent: "test".into(),
+                host_agent_version: None,
+                assigned_role: "citizen".into(),
+                constellation_role: role.into(),
+                soft_lct: "lct:test".into(),
+                connected_at: Utc::now(),
+            },
+        );
+        sid
+    }
+
+    /// Spec §7.8.2 "deliver only to that authenticated LCT" + RWOA O-clause:
+    /// a law-denied caller must NOT drain — and the deny leaves the mailbox
+    /// bit-identical (the gate dominates the consume).
+    #[tokio::test]
+    async fn inbox_drain_is_law_gated_and_deny_leaves_queue_intact() {
+        let (_dir, shared) = make_shared_state();
+        let (unattended, attended) = {
+            let mut s = shared.lock().await;
+            s.inbox_store
+                .enqueue(Uuid::new_v4(), Uuid::nil(), "ab", "sealed-x", "notify:k", None)
+                .unwrap();
+            // The ratified-law shape: the unattended role's overlay denies
+            // credential_access; the attended role has no overlay.
+            s.role_policy_engines.insert(
+                "role:constellation:mesh-worker".into(),
+                deny_credential_access_engine(),
+            );
+            (
+                add_session(&mut s, "role:constellation:mesh-worker"),
+                add_session(&mut s, "role:constellation:member"),
+            )
+        };
+
+        // Unattended: denied, and the queue is untouched.
+        let denied = tool_inbox(&shared, &json!({ "session_id": unattended.to_string() }))
+            .await
+            .unwrap();
+        assert!(
+            denied.get("_hestia_error").is_some(),
+            "mesh-worker drain must be denied by law: {denied}"
+        );
+        assert_eq!(shared.lock().await.inbox_store.len().unwrap(), 1, "deny must not consume");
+
+        // Attended: drains (consume-once).
+        let ok = tool_inbox(&shared, &json!({ "session_id": attended.to_string() }))
+            .await
+            .unwrap();
+        assert_eq!(ok["total"], 1, "member drain succeeds: {ok}");
+        assert_eq!(shared.lock().await.inbox_store.len().unwrap(), 0);
     }
 }
