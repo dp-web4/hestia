@@ -78,6 +78,7 @@ impl ServerHandler for HestiaServer {
             "hestia_query_history" => tool_query_history(&self.state, &args).await,
             "hestia_request_witness" => tool_request_witness(&self.state, &args).await,
             "hestia_notify" => tool_notify(&self.state, &args).await,
+            "hestia_inbox" => tool_inbox(&self.state, &args).await,
             _ => Ok(hestia_error_envelope(
                 "hestia.unknown_tool",
                 &format!("Unknown tool: {}", name),
@@ -165,7 +166,8 @@ fn hestia_tools() -> Vec<Tool> {
         t("hestia_vault_set", "Store a credential in the vault"),
         t("hestia_query_history", "Query the witness chain"),
         t("hestia_request_witness", "Append a custom witness chain event"),
-        t("hestia_notify", "Receive a hub->citizen notification: open the sealed body, record receipt, return a sealed ACK"),
+        t("hestia_notify", "Receive a hub->citizen notification: open the sealed body, record receipt, return a sealed ACK. Pass defer:true to park it (still sealed) in the durable encrypted inbox and ACK without returning the body"),
+        t("hestia_inbox", "Drain the durable inbound mailbox (consume-once): opens deferred notices with the member identity, oldest first"),
     ]
 }
 
@@ -1023,6 +1025,8 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
         .and_then(|s| Uuid::parse_str(s).ok())
         .unwrap_or_else(Uuid::nil);
 
+    let defer = args.get("defer").and_then(Value::as_bool).unwrap_or(false);
+
     // Record receipt in the witness chain (so push and poll share one record).
     let entry = s.append_chain(
         "notify.received",
@@ -1031,12 +1035,37 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
             "pointer_uri": pointer_uri,
             "act_id": act_id,
             "from_hub": hub_lct_id,
+            "deferred": defer,
         }),
     )?;
+
+    // Accept-and-defer (entity-edge inbox): park the STILL-SEALED notice in the
+    // durable encrypted inbox BEFORE sealing the ACK — the ACK tells the hub
+    // "delivered, stop queuing", so the park must be durable first (O: a failed
+    // park errors out here and the hub keeps its copy; an ACK-then-crash can no
+    // longer lose the work item). The body was opened only transiently above
+    // (the ACK needs `act_id`); the plaintext is never persisted.
+    if defer {
+        s.inbox_store
+            .enqueue(pair_id, hub_lct_id, &hub_pubkey_hex, &sealed, &kind, pointer_uri.as_deref())
+            .map_err(|e| anyhow::anyhow!("deferring notice to inbox (hub NOT acked): {e}"))?;
+    }
 
     // Seal an ACK the hub opens to mark the notice delivered.
     let ack = crate::hub::NotificationAck { act_id, received_at: Utc::now() };
     let ack_sealed = channel.seal_ack(&keypair, &ack)?;
+
+    if defer {
+        return Ok(json!({
+            "accepted": true,
+            "deferred": true,
+            "kind": kind,
+            "pointerUri": pointer_uri,
+            "queued": s.inbox_store.len().unwrap_or(0),
+            "ackSealed": ack_sealed,
+            "witnessEntryHash": entry.hash,
+        }));
+    }
 
     Ok(json!({
         "opened": true,
@@ -1046,6 +1075,63 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
         "ackSealed": ack_sealed,
         "witnessEntryHash": entry.hash,
     }))
+}
+
+/// `hestia_inbox` — drain the durable inbound mailbox (consume-once).
+///
+/// The consumer side of accept-and-defer: opens each parked notice with the
+/// member identity keypair and returns the bodies, oldest first. A body that
+/// no longer opens (e.g. identity rotated since it was parked) is returned in
+/// its sealed form with an `error` — surfaced, never silently dropped.
+async fn tool_inbox(state: &SharedState, _args: &Value) -> ToolResult {
+    let s = state.lock().await;
+
+    let notices = s
+        .inbox_store
+        .drain()
+        .map_err(|e| anyhow::anyhow!("draining inbox: {e}"))?;
+    if notices.is_empty() {
+        return Ok(json!({ "total": 0, "notices": [] }));
+    }
+
+    // Same identity-loading path as `tool_notify`.
+    let secret_hex = s
+        .vault
+        .get("ai_identity_secret")
+        .map(|e| e.secret.clone())
+        .ok_or_else(|| anyhow::anyhow!("no member identity — run `hestia init --ai`"))?;
+    let secret = hex::decode(&secret_hex)
+        .map_err(|_| anyhow::anyhow!("identity secret is not valid hex"))?;
+    let arr: [u8; 32] = secret
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("identity secret must be 32 bytes"))?;
+    let keypair = web4_core::crypto::KeyPair::from_secret_bytes(&arr);
+
+    let opened: Vec<Value> = notices
+        .into_iter()
+        .map(|n| {
+            let base = json!({
+                "kind": n.kind,
+                "pointerUri": n.pointer_uri,
+                "fromHub": n.from_hub,
+                "queuedAt": n.queued_at,
+            });
+            let mut v = base;
+            match crate::hub::HubChannel::new(n.from_hub, n.pair_id, &n.hub_pubkey_hex)
+                .and_then(|ch| ch.open_notification(&keypair, &n.sealed))
+            {
+                Ok(body) => v["body"] = body,
+                Err(e) => {
+                    v["sealed"] = json!(n.sealed);
+                    v["error"] = json!(format!("could not open: {e}"));
+                }
+            }
+            v
+        })
+        .collect();
+
+    Ok(json!({ "total": opened.len(), "notices": opened }))
 }
 
 // =========================================================================
@@ -1802,5 +1888,134 @@ mod accountability_tests {
         let aid = begin["actionId"].as_str().unwrap().to_string();
         let q = tool_query_policy(state, &json!({"action_id":aid})).await.unwrap();
         q["decision"].as_str().unwrap().to_string()
+    }
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::*;
+    use crate::vault::{Vault, VaultEntry};
+    use tempfile::TempDir;
+    use web4_core::crypto::{KeyPair, PublicKey};
+    use web4_core::pair_channel;
+
+    /// A state whose vault holds a member identity (as `hestia init --ai`
+    /// leaves it), plus that identity's keypair so tests can play the hub side.
+    fn seeded_home() -> (TempDir, KeyPair) {
+        let dir = TempDir::new().unwrap();
+        let member_kp = KeyPair::generate();
+        let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        vault
+            .add(VaultEntry::new("ai_identity_secret", hex::encode(member_kp.secret_key_bytes())))
+            .unwrap();
+        (dir, member_kp)
+    }
+
+    fn open_state(dir: &TempDir) -> SharedState {
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        crate::server::build_state(vault, dir.path(), "p").unwrap()
+    }
+
+    /// The hub side of the notify wire: seal a body to the member's pinned
+    /// pubkey (exactly what `queue_sealed_notice` does hub-side).
+    fn hub_seal(hub_kp: &KeyPair, member_kp: &KeyPair, pair_id: Uuid, body: &Value) -> String {
+        let member_pub = PublicKey::from_bytes(&member_kp.public_key_bytes()).unwrap();
+        pair_channel::seal(hub_kp, &member_pub, pair_id, &serde_json::to_vec(body).unwrap())
+            .unwrap()
+            .to_base64()
+    }
+
+    /// Accept-and-defer end to end: defer parks the still-sealed notice
+    /// durably and ACKs without the body; the parked notice survives a daemon
+    /// restart; `hestia_inbox` opens and consumes it exactly once.
+    #[tokio::test]
+    async fn notify_defer_survives_restart_and_inbox_drains_once() {
+        let (dir, member_kp) = seeded_home();
+        let hub_kp = KeyPair::generate();
+        let pair_id = Uuid::new_v4();
+        let hub_lct_id = Uuid::new_v4();
+        let act_id = Uuid::new_v4();
+        let body = json!({"act_id": act_id, "task": "review the fleet cartridge"});
+        let sealed = hub_seal(&hub_kp, &member_kp, pair_id, &body);
+
+        // --- defer: park before ACK, no body in the response ---
+        let state = open_state(&dir);
+        let resp = tool_notify(
+            &state,
+            &json!({
+                "pair_id": pair_id, "hub_lct_id": hub_lct_id,
+                "hub_pubkey_hex": hex::encode(hub_kp.public_key_bytes()),
+                "sealed": sealed, "kind": "notify:task",
+                "pointer_uri": "hub://act/1", "defer": true
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["accepted"], json!(true));
+        assert_eq!(resp["deferred"], json!(true));
+        assert_eq!(resp["queued"], json!(1));
+        assert!(resp.get("body").is_none(), "deferred notify must not return the body");
+
+        // The ACK still opens hub-side (the hub can mark it delivered).
+        let member_pub = PublicKey::from_bytes(&member_kp.public_key_bytes()).unwrap();
+        let ack_sealed = pair_channel::Sealed::from_base64(resp["ackSealed"].as_str().unwrap()).unwrap();
+        let ack_plain = pair_channel::open(&hub_kp, &member_pub, pair_id, &ack_sealed).unwrap();
+        let ack: Value = serde_json::from_slice(&ack_plain).unwrap();
+        assert_eq!(ack["act_id"], json!(act_id));
+
+        // Receipt was witnessed with the deferred marker.
+        {
+            let s = state.lock().await;
+            let rec = s.recent_chain(10).into_iter()
+                .find(|e| e.event_type == "notify.received")
+                .expect("receipt must be witnessed");
+            assert_eq!(rec.event_data["deferred"], json!(true));
+        }
+        drop(state); // daemon goes down with the notice still parked
+
+        // --- restart: the parked notice survived, drain opens + consumes it ---
+        let state2 = open_state(&dir);
+        let drained = tool_inbox(&state2, &json!({})).await.unwrap();
+        assert_eq!(drained["total"], json!(1));
+        let n = &drained["notices"][0];
+        assert_eq!(n["kind"], json!("notify:task"));
+        assert_eq!(n["pointerUri"], json!("hub://act/1"));
+        assert_eq!(n["body"]["task"], json!("review the fleet cartridge"));
+        assert_eq!(n["body"]["act_id"], json!(act_id));
+
+        // Consume-once: a second drain is empty.
+        let again = tool_inbox(&state2, &json!({})).await.unwrap();
+        assert_eq!(again["total"], json!(0));
+
+        // And the inbox file on disk is encrypted (not plaintext SQLite).
+        let hdr_path = dir.path().join("inbox.db");
+        let hdr = std::fs::read(&hdr_path).unwrap();
+        assert_ne!(&hdr[..16], b"SQLite format 3\0", "inbox must be encrypted at rest");
+    }
+
+    /// Without `defer`, the wire is unchanged: body returned, inbox untouched.
+    #[tokio::test]
+    async fn notify_without_defer_is_backward_compatible() {
+        let (dir, member_kp) = seeded_home();
+        let hub_kp = KeyPair::generate();
+        let pair_id = Uuid::new_v4();
+        let sealed = hub_seal(&hub_kp, &member_kp, pair_id, &json!({"act_id": Uuid::new_v4()}));
+
+        let state = open_state(&dir);
+        let resp = tool_notify(
+            &state,
+            &json!({
+                "pair_id": pair_id,
+                "hub_pubkey_hex": hex::encode(hub_kp.public_key_bytes()),
+                "sealed": sealed
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["opened"], json!(true));
+        assert!(resp.get("body").is_some(), "immediate notify still returns the body");
+
+        let s = state.lock().await;
+        assert!(s.inbox_store.is_empty().unwrap(), "non-deferred notify must not queue");
     }
 }

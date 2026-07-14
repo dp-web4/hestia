@@ -73,6 +73,11 @@ pub struct ServerState {
     pub actions: HashMap<Uuid, InFlightAction>,
     pub chain_store: SqliteChainStore,
     pub trust_store: TrustStore,
+    /// Durable inbound mailbox (entity-edge inbox): still-sealed notices parked
+    /// by `hestia_notify {defer: true}` before the hub is ACKed, drained by
+    /// `hestia_inbox`. Encrypted at rest under the same storage key as the
+    /// witness chain, in its own file (queue ≠ ledger — two persistences).
+    pub inbox_store: crate::storage::SqliteInboxStore,
     /// The legacy sovereign anchor string — witness-chain authorship + member-label
     /// derivation still key on this verbatim. See `sovereign` for the LCT identity.
     pub sovereign_lct: String,
@@ -133,6 +138,7 @@ impl ServerState {
             .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
         let chain_store = SqliteChainStore::open(home.join("witness.db"), store_key)?;
         let trust_store = TrustStore::open(home.join("trust"), store_key)?;
+        let inbox_store = crate::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
         let sovereign_lct = "lct:web4:hestia:sovereign:phase1-placeholder".to_string();
         // The sovereign as a first-class, vault-persisted LCT — the society that
         // mints the roles now has durable presence of its own (id stable across
@@ -196,6 +202,7 @@ impl ServerState {
             actions: HashMap::new(),
             chain_store,
             trust_store,
+            inbox_store,
             sovereign_lct,
             sovereign,
             role_registry,
