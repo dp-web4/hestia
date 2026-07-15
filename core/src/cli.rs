@@ -239,6 +239,13 @@ enum HubCmd {
         /// ~/.web4/<name>/channel_key.bin). Omit to reset to the vault identity.
         #[arg(long)]
         channel_key: Option<String>,
+        /// The member LCT id the hub pinned this key FOR (from your join /
+        /// mesh env `MY_LCT`). In channel-key mode this id IS the envelope
+        /// signer + registry `published_by`, so the connection must record the
+        /// pinned pairing, not a locally minted placeholder. Only meaningful
+        /// with --channel-key.
+        #[arg(long)]
+        member_lct: Option<uuid::Uuid>,
     },
 }
 
@@ -443,8 +450,8 @@ pub fn run() -> AnyResult<()> {
             HubCmd::Show { target } => cmd_hub_show(&home, &target),
             HubCmd::Disconnect { target } => cmd_hub_disconnect(&home, &target),
             HubCmd::Join { target, name } => cmd_hub_join(&home, &target, name),
-            HubCmd::SetMemberKey { target, channel_key } => {
-                cmd_hub_set_member_key(&home, &target, channel_key)
+            HubCmd::SetMemberKey { target, channel_key, member_lct } => {
+                cmd_hub_set_member_key(&home, &target, channel_key, member_lct)
             }
         },
         Command::Constellation(c) => match c {
@@ -1337,6 +1344,7 @@ fn cmd_hub_set_member_key(
     home: &std::path::Path,
     target: &str,
     channel_key: Option<String>,
+    member_lct: Option<uuid::Uuid>,
 ) -> AnyResult<()> {
     use hestia::hub::MemberKeySource;
     let mut vault = open_vault(home)?;
@@ -1363,6 +1371,17 @@ fn cmd_hub_set_member_key(
     };
 
     hubs.connections[pos].member_key_source = source.clone();
+    // In channel-key mode the connection's `our_lct_id` IS the envelope signer
+    // and the registry's `published_by` (resolve_publish_identity has no vault
+    // authority to repair from) — record the id the hub pinned the key FOR.
+    if let Some(id) = member_lct {
+        if matches!(source, MemberKeySource::VaultIdentity) {
+            anyhow::bail!("--member-lct only applies with --channel-key (vault identity is authoritative otherwise)");
+        }
+        let before = hubs.connections[pos].our_lct_id;
+        hubs.connections[pos].our_lct_id = id;
+        println!("our_lct_id: {before} → {id} (the member the hub pinned this key for)");
+    }
     hubs.save(&mut vault)?;
     let url = &hubs.connections[pos].url;
     match &source {
