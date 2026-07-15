@@ -89,6 +89,10 @@ pub struct ServerState {
     /// `web4_core::RoleEntity` LCT entities (additive + read-only — law evaluation
     /// still uses the string-keyed `role_policy_engines` fold). See `role_registry`.
     pub role_registry: web4_core::RoleRegistry,
+    /// Custodial member LCTs (the third registry consumer), `plugin_id → Lct`.
+    /// Minted on a member's first connect, vault-persisted, each carrying a
+    /// verifiable legacy alias to its `member_lct` label. See `member_registry`.
+    pub member_registry: crate::member_registry::MemberRegistry,
     pub shared_context: serde_json::Map<String, serde_json::Value>,
     pub policy_engine: crate::policy::PolicyEngine,
     /// Per-constellation-role policy engines (#403 role-scoped law), built from
@@ -152,6 +156,8 @@ impl ServerState {
         // Phase-1 mirror: the constellation roles as Role LCT entities, with
         // VAULT-STABLE identities (same LCT across restarts; secrets sealed).
         let role_registry = crate::role_registry::load_or_mint_registry(&mut vault, &sovereign_lct, &sovereign.lct_id());
+        // Custodial member LCTs, loaded from the vault (minted lazily on connect).
+        let member_registry = crate::member_registry::load_members(&vault);
         // Resolve the active policy from the vault. Falls back to the
         // safety preset if the vault's named preset isn't built-in.
         let policy_config = vault
@@ -206,6 +212,7 @@ impl ServerState {
             sovereign_lct,
             sovereign,
             role_registry,
+            member_registry,
             shared_context: serde_json::Map::new(),
             policy_engine,
             role_policy_engines,

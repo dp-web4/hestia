@@ -236,6 +236,29 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         }
     }
 
+    // First-observation member minting: a non-synthetic member that connects is
+    // a real member and gets durable presence (a custodial member LCT), minted
+    // once and cheap-looked-up thereafter. Fail-OPEN — a mint that can't persist
+    // just isn't published yet; it must never block a connect (presence is not a
+    // safety gate, unlike the synthetic exclusion above). Not per-connect work in
+    // steady state: the in-memory registry short-circuits an already-known member.
+    if !synthetic {
+        let sovereign_anchor = s.sovereign_lct.clone();
+        let sovereign_id = s.sovereign.lct_id();
+        let is_syn = s.is_synthetic(&plugin_id);
+        // Split the disjoint field borrows explicitly (the borrow checker can't
+        // see through a method call that takes &mut self).
+        let super::state::ServerState { vault, member_registry, .. } = &mut *s;
+        crate::member_registry::ensure_member(
+            vault,
+            member_registry,
+            &plugin_id,
+            is_syn,
+            &sovereign_id,
+            &sovereign_anchor,
+        );
+    }
+
     s.sessions.insert(session_id, session);
 
     // session_started is intentionally NOT written to the witness chain.
@@ -2181,6 +2204,32 @@ mod tests {
             },
         );
         sid
+    }
+
+    #[tokio::test]
+    async fn connect_mints_a_member_lct_on_first_sight_not_for_synthetic() {
+        let (_dir, shared) = make_shared_state();
+        // A real member connect → gets a custodial member LCT.
+        let r = tool_connect(&shared, &json!({
+            "plugin_id": "claude-code", "host_agent": "cc"
+        })).await.unwrap();
+        assert!(r.get("sessionId").is_some());
+        {
+            let s = shared.lock().await;
+            assert_eq!(s.member_registry.len(), 1, "first connect minted the member");
+            let lct = s.member_registry.get("claude-code").unwrap();
+            assert!(lct.verify_binding());
+            assert!(lct.legacy_alias.as_ref().unwrap().verify(), "carries its verifiable label alias");
+        }
+        // Reconnect → idempotent (still one member, no re-mint).
+        tool_connect(&shared, &json!({"plugin_id": "claude-code", "host_agent": "cc"}))
+            .await.unwrap();
+        assert_eq!(shared.lock().await.member_registry.len(), 1);
+        // A synthetic connect → NO member LCT (fail-closed domain).
+        tool_connect(&shared, &json!({
+            "plugin_id": "fuzz-runner", "host_agent": "cc", "synthetic": true
+        })).await.unwrap();
+        assert_eq!(shared.lock().await.member_registry.len(), 1, "synthetic gets no presence");
     }
 
     /// Spec §7.8.2 "deliver only to that authenticated LCT" + RWOA O-clause:

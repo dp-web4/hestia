@@ -72,6 +72,9 @@ pub struct SocietyView {
     /// Phase-1 mirror: published constellation roles held as `Role` LCT entities.
     #[serde(default)]
     pub role_entities: usize,
+    /// Custodial member LCTs minted for real (non-synthetic) members.
+    #[serde(default)]
+    pub member_entities: usize,
 }
 
 /// Aggregate counts across the witness chain.
@@ -473,6 +476,7 @@ impl ServerState {
                 // seen), independent of the last-hour active view above.
                 known_plugins: self.trust_store.list().map(|v| v.len()).unwrap_or(0),
                 role_entities: self.role_registry.len(),
+                member_entities: self.member_registry.len(),
             },
             stats: ActivityStats {
                 total_actions: total,

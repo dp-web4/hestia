@@ -760,6 +760,9 @@ fn cmd_lct_publish(home: &std::path::Path, send: bool) -> AnyResult<()> {
     let sovereign = hestia::sovereign::Sovereign::load_or_mint(&mut vault, anchor);
     let registry =
         hestia::role_registry::load_or_mint_registry(&mut vault, anchor, &sovereign.lct_id());
+    // Members are minted lazily on connect (the daemon's job); the CLI only
+    // publishes whatever the vault already holds — it never mints here.
+    let members = hestia::member_registry::load_members(&vault);
 
     // The hub binds `published_by` to the envelope signer (hard 403 on
     // mismatch), so the publisher of record and the signing key must name ONE
@@ -802,6 +805,7 @@ fn cmd_lct_publish(home: &std::path::Path, send: bool) -> AnyResult<()> {
     let set = hestia::lct_publish::collect_publish_set(
         &sovereign,
         &registry,
+        &members,
         published_by,
         chrono::Utc::now(),
     );

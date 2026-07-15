@@ -4,10 +4,9 @@
 //!
 //! Canon genesis step 7: the society publishes its LCTs to the registry so
 //! presence becomes *witnessed* presence. This module builds the publish
-//! payloads for everything this constellation can currently answer for —
-//! the sovereign and the constellation roles (member LCTs follow once the
-//! custodial minting build lands; today members are labels, and a label is
-//! not publishable presence).
+//! payloads for everything this constellation can answer for — the sovereign,
+//! the constellation roles, and the custodial member LCTs (each carrying a
+//! verifiable legacy alias to its old `member_lct` label).
 //!
 //! **Producer-side fail-closed:** [`self_check`] mirrors the hub's five-check
 //! ingest (§2, checks 2–5 — check 1, the envelope signature, is transport and
@@ -109,6 +108,7 @@ pub struct PublishSet {
 pub fn collect_publish_set(
     sovereign: &crate::sovereign::Sovereign,
     registry: &web4_core::RoleRegistry,
+    members: &crate::member_registry::MemberRegistry,
     published_by: Uuid,
     published_at: DateTime<Utc>,
 ) -> PublishSet {
@@ -129,16 +129,24 @@ pub fn collect_publish_set(
         }
     };
 
-    // Sovereign FIRST (HUB's ordering note — bound edges resolve on arrival).
+    // Sovereign FIRST (HUB's ordering note — bound edges resolve on arrival),
+    // then the constellation roles, then members. Every entity whose `mrh.bound`
+    // points at the sovereign is published after it, so no edge dangles on
+    // arrival (member and role bound-edges both target the sovereign).
     push_checked("sovereign", sovereign.lct.clone());
 
-    // Then the constellation roles, stable order for reproducible dry-runs.
     let mut labels = registry.labels();
     labels.sort_unstable();
     for label in labels {
         if let Some(role) = registry.get(label) {
             push_checked(label, role.lct.clone());
         }
+    }
+
+    // Members: custodial LCTs, each carrying a verifiable legacy alias to its
+    // label (ingest check 4 re-derives it). Sorted by plugin_id (reproducible).
+    for (plugin_id, lct) in members.iter_sorted() {
+        push_checked(&format!("member:{plugin_id}"), lct.clone());
     }
 
     PublishSet { payloads, refused }
@@ -149,19 +157,28 @@ mod tests {
     use super::*;
     use web4_core::{EntityType, LegacyAlias, LegacyDerivation};
 
-    fn test_sovereign_and_registry() -> (crate::sovereign::Sovereign, web4_core::RoleRegistry, tempfile::TempDir) {
+    fn test_fixture() -> (
+        crate::sovereign::Sovereign,
+        web4_core::RoleRegistry,
+        crate::member_registry::MemberRegistry,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::TempDir::new().unwrap();
         let mut vault = crate::vault::Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
         let sovereign = crate::sovereign::Sovereign::load_or_mint(&mut vault, "anchor");
         let registry =
             crate::role_registry::load_or_mint_registry(&mut vault, "anchor", &sovereign.lct_id());
-        (sovereign, registry, dir)
+        let mut members = crate::member_registry::MemberRegistry::default();
+        crate::member_registry::ensure_member(
+            &mut vault, &mut members, "claude-code", false, &sovereign.lct_id(), "anchor",
+        );
+        (sovereign, registry, members, dir)
     }
 
     #[test]
     fn publish_set_is_sovereign_first_then_all_roles_all_checked() {
-        let (sovereign, registry, _dir) = test_sovereign_and_registry();
-        let set = collect_publish_set(&sovereign, &registry, Uuid::new_v4(), Utc::now());
+        let (sovereign, registry, members, _dir) = test_fixture();
+        let set = collect_publish_set(&sovereign, &registry, &members, Uuid::new_v4(), Utc::now());
         assert!(
             set.refused.is_empty(),
             "freshly minted set must fully pass its own ingest mirror: {:?}",
@@ -169,9 +186,12 @@ mod tests {
         );
         assert_eq!(
             set.payloads.len(),
-            1 + crate::reputation::KNOWN_CONSTELLATION_ROLES.len(),
-            "sovereign + every published role"
+            1 + crate::reputation::KNOWN_CONSTELLATION_ROLES.len() + 1,
+            "sovereign + every published role + the one member"
         );
+        // the member payload carries its verifiable alias (ingest check 4)
+        let member = set.payloads.last().unwrap();
+        assert!(member.document.legacy_alias.as_ref().unwrap().verify());
         // sovereign first — the ordering the bound edges depend on
         assert_eq!(set.payloads[0].lct_id, sovereign.lct_id());
         // every payload independently re-verifies (what ingest will do)
@@ -231,7 +251,7 @@ mod tests {
     fn payload_wire_shape_matches_the_spec_field_names() {
         // The contract is the FIELD NAMES (HUB builds ingest against these).
         // Lock them so a rename here is a test failure, not a silent seam break.
-        let (sovereign, _reg, _dir) = test_sovereign_and_registry();
+        let (sovereign, _reg, _members, _dir) = test_fixture();
         let payload = LctPublishPayload {
             lct_id: sovereign.lct_id(),
             document: sovereign.lct.clone(),
