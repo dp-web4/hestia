@@ -403,6 +403,59 @@ impl ServerState {
             .append(event_type, event_data, &self.sovereign_lct)
     }
 
+    /// Confer citizenship on `subject_lct_id` — birth into THIS society's MRH —
+    /// by recording a birth certificate in this society's **ledger** (the witness
+    /// chain), the authoritative home per the citizenship-is-birth model (dp,
+    /// 2026-07-16). The issuing society is this constellation (its sovereign LCT
+    /// stands as the society identity until the Society-LCT restructure lands).
+    ///
+    /// **Fail-closed:** records nothing and returns `None` unless the attestations
+    /// meet the ≥3-distinct witness quorum, verified against `resolve_witness_pubkey`
+    /// (the registry is that resolver). The recorded event carries both the
+    /// certificate AND the backing attestations (the evidence), so any reader of
+    /// this ledger can re-verify the quorum — evidence, not a bare verdict.
+    ///
+    /// This is hestia's conferral lane (members/roles born into the constellation);
+    /// the sovereign's own citizenship is conferred by the hub's ledger (it is a
+    /// citizen of the hub, its parent society).
+    pub fn confer_citizenship<F>(
+        &self,
+        subject_lct_id: &str,
+        citizen_role: &str,
+        birth_context: Option<web4_core::BirthContext>,
+        attestations: &[web4_core::Attestation],
+        resolve_witness_pubkey: F,
+    ) -> Result<Option<web4_core::BirthCertificate>>
+    where
+        F: Fn(&str) -> Option<web4_core::PublicKey>,
+    {
+        let issuing_society = self.sovereign.lct_id();
+        let ts = Utc::now();
+        let Some((cert, evidence)) = crate::witness::build_birth_certificate(
+            subject_lct_id,
+            citizen_role,
+            &issuing_society,
+            birth_context,
+            attestations,
+            ts,
+            resolve_witness_pubkey,
+        ) else {
+            return Ok(None); // quorum not met — no birth (fail-closed)
+        };
+        self.append_chain(
+            "citizenship.conferred",
+            serde_json::json!({
+                "citizen": subject_lct_id,
+                "issuing_society": cert.issuing_society,
+                "citizen_role": cert.citizen_role,
+                "birth_witnesses": cert.birth_witnesses,
+                "birth_timestamp": cert.birth_timestamp,
+                "attestations": evidence,
+            }),
+        )?;
+        Ok(Some(cert))
+    }
+
     pub fn chain_len(&self) -> u64 {
         self.chain_store.len().unwrap_or(0)
     }
@@ -686,6 +739,36 @@ mod tests {
         let b = state.member_lct("bob").unwrap();
         assert_ne!(a1, b);
         assert!(!a1.contains("alice") && !b.contains("bob"));
+    }
+
+    #[test]
+    fn confer_citizenship_records_a_birth_cert_in_the_ledger_only_on_quorum() {
+        let (_dir, state) = make_state();
+        let subject = "lct:web4:mb32:bsubjectcitizen";
+        let w: Vec<web4_core::crypto::KeyPair> = (0..3).map(|_| web4_core::crypto::KeyPair::generate()).collect();
+        let wid: Vec<String> = (0..3).map(|i| format!("lct:web4:member:w{i}")).collect();
+        let resolver = {
+            let ks: Vec<_> = w.iter().map(|k| k.verifying_key()).collect();
+            let wid = wid.clone();
+            move |id: &str| wid.iter().position(|x| x == id).map(|i| ks[i].clone())
+        };
+        let ts = chrono::Utc::now();
+        let chain_before = state.chain_len();
+
+        // Below quorum → None, and NOTHING written to the ledger (fail-closed).
+        let two: Vec<_> = (0..2).map(|i| crate::witness::attest(subject, &wid[i], ts, &w[i])).collect();
+        assert!(state.confer_citizenship(subject, "lct:web4:role:citizen", None, &two, &resolver).unwrap().is_none());
+        assert_eq!(state.chain_len(), chain_before, "no birth on < 3 witnesses = no ledger write");
+
+        // Quorum → the birth cert is recorded in this society's ledger.
+        let three: Vec<_> = (0..3).map(|i| crate::witness::attest(subject, &wid[i], ts, &w[i])).collect();
+        let cert = state.confer_citizenship(subject, "lct:web4:role:citizen", None, &three, &resolver).unwrap().unwrap();
+        assert_eq!(cert.birth_witnesses.len(), 3);
+        assert_eq!(cert.issuing_society, state.sovereign.lct_id());
+        assert_eq!(state.chain_len(), chain_before + 1, "conferral wrote one ledger event");
+        let recent = state.recent_chain(1);
+        assert_eq!(recent[0].event_type, "citizenship.conferred");
+        assert_eq!(recent[0].event_data["citizen"], subject);
     }
 
     #[test]

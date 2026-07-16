@@ -16,13 +16,26 @@
 //!   is that resolver on the hub side), compute the verified quorum. Fail-closed,
 //!   reusing the web4-core `Attestation::verify` + the ≥3-DISTINCT-witness rule.
 //!
-//! What hestia does NOT do here: record the `birth_certificate` section or admit
-//! `society_conferred` at ingest — that is HUB's conferral-flow lane. This module
-//! produces and assembles the *evidence* (the attestation quorum) the conferral
-//! consumes. (Evidence, not verdict — the inspectable-evidence principle, LCT
-//! spec §1.2.)
+//! - **Confer** ([`build_birth_certificate`] + [`crate::server::state::ServerState::confer_citizenship`]):
+//!   for entities born into THIS society (its members and roles), hestia records
+//!   the birth certificate in its own **ledger** (the witness chain) once the
+//!   quorum is met. Per dp (2026-07-16), a birth certificate is held by the ledger
+//!   of the society the entity is born into, and *birth = coming to exist in that
+//!   society's MRH* (an external entity joining as a citizen is birthed into this
+//!   MRH — its citizenship certificate IS its birth certificate here). The
+//!   sovereign's own citizenship is conferred by the HUB's ledger (the sovereign
+//!   is a citizen of the hub, its parent society) — not here.
+//!
+//! What is NOT hestia's: the *relying party's* trust decision. A relying party
+//! traverses the witness tree to whatever depth its risk appetite wants (the
+//! IP-pending dev-hub traversal); web4/hestia give the tools (attestations,
+//! quorum, ledger record) — the relying party uses them (LCT spec §1.2). Some
+//! entities specialize as witnesses/notaries who traverse-and-cache or
+//! witness-on-request; that is a service, not a gate.
 
-use web4_core::{Attestation, AttestationType, PublicKey, BIRTH_WITNESS_QUORUM};
+use web4_core::{
+    Attestation, AttestationType, BirthCertificate, BirthContext, PublicKey, BIRTH_WITNESS_QUORUM,
+};
 
 /// Sign an `Existence` attestation over `subject_lct_id` as `witness_lct_id`,
 /// using this member's OPERATIONAL keypair (the channel key the registry
@@ -80,6 +93,44 @@ pub fn quorum_reached(valid_distinct: &[&Attestation]) -> bool {
     valid_distinct.len() >= BIRTH_WITNESS_QUORUM
 }
 
+/// Assemble a [`BirthCertificate`] for `subject_lct_id` **iff** the attestations
+/// meet the witness quorum. Returns the certificate paired with the exact
+/// valid-distinct attestations that back it (the evidence to record alongside),
+/// or `None` when the quorum is not met — **fail-closed**: a society does not
+/// birth a citizen on fewer than three distinct witnesses.
+///
+/// Birth = *coming to exist in this society's MRH* (dp, 2026-07-16): the same act
+/// whether the entity is minted here or an external entity joins as a citizen.
+/// The certificate's authoritative home is the issuing society's LEDGER, not the
+/// entity's LCT (see [`crate::server::state::ServerState::confer_citizenship`]).
+pub fn build_birth_certificate<F>(
+    subject_lct_id: &str,
+    citizen_role: &str,
+    issuing_society: &str,
+    birth_context: Option<BirthContext>,
+    attestations: &[Attestation],
+    birth_timestamp: chrono::DateTime<chrono::Utc>,
+    resolve_witness_pubkey: F,
+) -> Option<(BirthCertificate, Vec<Attestation>)>
+where
+    F: Fn(&str) -> Option<PublicKey>,
+{
+    let valid = valid_distinct_existence(subject_lct_id, attestations, resolve_witness_pubkey);
+    if !quorum_reached(&valid) {
+        return None;
+    }
+    let cert = BirthCertificate {
+        issuing_society: issuing_society.to_string(),
+        citizen_role: citizen_role.to_string(),
+        birth_witnesses: valid.iter().map(|a| a.witness.clone()).collect(),
+        birth_timestamp,
+        birth_context,
+        genesis_block_hash: None,
+    };
+    let evidence = valid.into_iter().cloned().collect();
+    Some((cert, evidence))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +177,29 @@ mod tests {
         let vd = valid_distinct_existence(subject, &atts, &resolver);
         assert_eq!(vd.len(), 3);
         assert!(quorum_reached(&vd));
+    }
+
+    #[test]
+    fn build_birth_certificate_is_quorum_gated() {
+        let subject = "lct:web4:mb32:bsubject";
+        let w: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
+        let wid: Vec<String> = (0..3).map(|i| format!("lct:web4:member:w{i}")).collect();
+        let resolver = {
+            let ks: Vec<_> = w.iter().map(|k| k.verifying_key()).collect();
+            let wid = wid.clone();
+            move |id: &str| wid.iter().position(|x| x == id).map(|i| ks[i].clone())
+        };
+        // Two witnesses → below quorum → None (no birth on < 3 witnesses).
+        let two = vec![attest(subject, &wid[0], now(), &w[0]), attest(subject, &wid[1], now(), &w[1])];
+        assert!(build_birth_certificate(subject, "lct:web4:role:citizen", "lct:web4:society:hestia", None, &two, now(), &resolver).is_none());
+        // Three distinct → Some(cert) naming exactly those witnesses.
+        let three: Vec<_> = (0..3).map(|i| attest(subject, &wid[i], now(), &w[i])).collect();
+        let (cert, evidence) = build_birth_certificate(subject, "lct:web4:role:citizen", "lct:web4:society:hestia", None, &three, now(), &resolver).unwrap();
+        assert_eq!(cert.birth_witnesses.len(), 3);
+        assert_eq!(cert.issuing_society, "lct:web4:society:hestia");
+        assert_eq!(cert.citizen_role, "lct:web4:role:citizen");
+        assert_eq!(evidence.len(), 3, "the backing attestations travel with the cert");
+        assert!(cert.quorum_structurally_ok());
     }
 
     #[test]
