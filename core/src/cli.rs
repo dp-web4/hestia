@@ -105,6 +105,10 @@ enum Command {
     #[command(subcommand)]
     Lct(LctCmd),
 
+    /// Witnessing subcommands (Phase-2 birth certificates — attest to an LCT)
+    #[command(subcommand)]
+    Witness(WitnessCmd),
+
     /// Device constellation subcommands (mini-hub for your LCTs)
     #[command(subcommand)]
     Constellation(ConstellationCmd),
@@ -441,6 +445,11 @@ pub fn run() -> AnyResult<()> {
             DelegateCmd::List => cmd_delegate_list(&home),
             DelegateCmd::Revoke { id } => cmd_delegate_revoke(&home, &id),
         },
+        Command::Witness(w) => match w {
+            WitnessCmd::Attest { subject_lct_id, target, out } => {
+                cmd_witness_attest(&home, &subject_lct_id, &target, out)
+            }
+        },
         Command::Lct(l) => match l {
             LctCmd::Publish { dry_run: _, send } => cmd_lct_publish(&home, send),
         },
@@ -732,6 +741,70 @@ fn cmd_vault_remove(home: &std::path::Path, name: &str) -> AnyResult<()> {
     let mut vault = open_vault(home)?;
     vault.remove(name)?;
     println!("✓ Removed '{name}' from vault");
+    Ok(())
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum WitnessCmd {
+    /// Sign an Existence attestation over a subject LCT, as this constellation's
+    /// pinned hub member, using the hub connection's OPERATIONAL signing key
+    /// (the registry-resolvable channel key — W1). Prints the attestation JSON
+    /// (or writes it to --out) for a conferral flow to collect toward a birth
+    /// quorum. This constellation is one of the >=3 witnesses.
+    Attest {
+        /// Canonical LCT id of the subject being witnessed (lct:web4:...).
+        subject_lct_id: String,
+        /// Hub URL or connection UUID whose pinned key signs (default: the sole
+        /// connection, or error if ambiguous).
+        #[arg(long, default_value = "")]
+        target: String,
+        /// Write the attestation JSON here instead of stdout.
+        #[arg(long)]
+        out: Option<String>,
+    },
+}
+
+fn cmd_witness_attest(
+    home: &std::path::Path,
+    subject_lct_id: &str,
+    target: &str,
+    out: Option<String>,
+) -> AnyResult<()> {
+    use hestia::hub::MemberKeySource;
+    let vault = open_vault(home)?;
+    let store = HubStore::load(&vault)?;
+    // Resolve which connection's pinned key witnesses (the operational key the
+    // registry resolves for this member — W1's autonomy constraint).
+    let conn = if target.is_empty() {
+        match store.connections.as_slice() {
+            [only] => only,
+            [] => anyhow::bail!("not connected to a hub — `hestia hub connect <url>` first"),
+            _ => anyhow::bail!("multiple hub connections — pass --target <url|uuid>"),
+        }
+    } else if let Ok(id) = uuid::Uuid::parse_str(target) {
+        store.connections.iter().find(|c| c.id == id || c.hub_lct_id == id)
+            .ok_or_else(|| anyhow::anyhow!("no connection matching {target}"))?
+    } else {
+        store.connections.iter().find(|c| c.url == target)
+            .ok_or_else(|| anyhow::anyhow!("not connected to {target}"))?
+    };
+    if matches!(conn.member_key_source, MemberKeySource::VaultIdentity) {
+        eprintln!(
+            "[witness] note: signing with the VAULT identity key. For autonomous witnessing the \
+             registry-resolvable key must be operational (a channel key) — see `hestia hub set-member-key`."
+        );
+    }
+    let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+    let witness_lct_id = format!("lct:web4:member:{}", conn.our_lct_id);
+    let att = hestia::witness::attest(subject_lct_id, &witness_lct_id, chrono::Utc::now(), &keypair);
+    let json = serde_json::to_string_pretty(&att)?;
+    match out {
+        Some(path) => {
+            std::fs::write(&path, &json).with_context(|| format!("writing attestation to {path}"))?;
+            eprintln!("[witness] Existence attestation over {subject_lct_id} by {witness_lct_id} -> {path}");
+        }
+        None => println!("{json}"),
+    }
     Ok(())
 }
 
