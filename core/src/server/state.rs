@@ -425,13 +425,13 @@ impl ServerState {
         birth_context: Option<web4_core::BirthContext>,
         attestations: &[web4_core::Attestation],
         resolve_witness_pubkey: F,
-    ) -> Result<Option<web4_core::BirthCertificate>>
+    ) -> Result<Option<web4_core::BirthCertificateRef>>
     where
         F: Fn(&str) -> Option<web4_core::PublicKey>,
     {
         let issuing_society = self.sovereign.lct_id();
         let ts = Utc::now();
-        let Some((cert, evidence)) = crate::witness::build_birth_certificate(
+        let Some((certificate, evidence)) = crate::witness::build_birth_certificate(
             subject_lct_id,
             citizen_role,
             &issuing_society,
@@ -442,18 +442,27 @@ impl ServerState {
         ) else {
             return Ok(None); // quorum not met — no birth (fail-closed)
         };
-        self.append_chain(
+        // The authoritative record: certificate + backing attestations. Its
+        // content hash binds the reference the subject LCT will carry.
+        let record = web4_core::CitizenshipRecord { certificate, attestations: evidence };
+        let entry_hash = record.content_hash();
+        // Record the record in THIS society's ledger (its witness chain) — the
+        // authoritative home. The event data IS the CitizenshipRecord, so a
+        // reader re-verifies quorum + re-hashes it against any presented reference.
+        let entry = self.append_chain(
             "citizenship.conferred",
             serde_json::json!({
                 "citizen": subject_lct_id,
-                "issuing_society": cert.issuing_society,
-                "citizen_role": cert.citizen_role,
-                "birth_witnesses": cert.birth_witnesses,
-                "birth_timestamp": cert.birth_timestamp,
-                "attestations": evidence,
+                "record": record,
             }),
         )?;
-        Ok(Some(cert))
+        // The tamper-evident reference the subject LCT carries in `citizenships`:
+        // society + ledger locator (chain position) + content hash.
+        Ok(Some(web4_core::BirthCertificateRef {
+            issuing_society,
+            entry_id: entry.chain_position.to_string(),
+            entry_hash,
+        }))
     }
 
     pub fn chain_len(&self) -> u64 {
@@ -762,13 +771,18 @@ mod tests {
 
         // Quorum → the birth cert is recorded in this society's ledger.
         let three: Vec<_> = (0..3).map(|i| crate::witness::attest(subject, &wid[i], ts, &w[i])).collect();
-        let cert = state.confer_citizenship(subject, "lct:web4:role:citizen", None, &three, &resolver).unwrap().unwrap();
-        assert_eq!(cert.birth_witnesses.len(), 3);
-        assert_eq!(cert.issuing_society, state.sovereign.lct_id());
+        let cref = state.confer_citizenship(subject, "lct:web4:role:citizen", None, &three, &resolver).unwrap().unwrap();
+        assert_eq!(cref.issuing_society, state.sovereign.lct_id());
+        assert!(!cref.entry_hash.is_empty(), "reference binds the record content hash");
         assert_eq!(state.chain_len(), chain_before + 1, "conferral wrote one ledger event");
         let recent = state.recent_chain(1);
         assert_eq!(recent[0].event_type, "citizenship.conferred");
         assert_eq!(recent[0].event_data["citizen"], subject);
+        // the reference's hash matches the recorded record (tamper-evident bind)
+        let record: web4_core::CitizenshipRecord =
+            serde_json::from_value(recent[0].event_data["record"].clone()).unwrap();
+        assert_eq!(record.content_hash(), cref.entry_hash);
+        assert!(record.verify_quorum(subject, &resolver), "recorded evidence re-verifies");
     }
 
     #[test]
