@@ -75,6 +75,15 @@ pub struct SocietyView {
     /// Custodial member LCTs minted for real (non-synthetic) members.
     #[serde(default)]
     pub member_entities: usize,
+    /// The society's entity type — now `society` (sovereign-as-role restructure).
+    #[serde(default)]
+    pub entity_type: String,
+    /// `role:sovereign` LCT id — the role the operator occupies (SAL §2.1).
+    #[serde(default)]
+    pub sovereign_role_id: String,
+    /// The society's provable ratchet level (0 = genesis L0; monotone).
+    #[serde(default)]
+    pub ratchet_level: u8,
 }
 
 /// Aggregate counts across the witness chain.
@@ -477,6 +486,10 @@ impl ServerState {
                 known_plugins: self.trust_store.list().map(|v| v.len()).unwrap_or(0),
                 role_entities: self.role_registry.len(),
                 member_entities: self.member_registry.len(),
+                entity_type: serde_json::to_string(&self.sovereign.lct.entity_type)
+                    .unwrap_or_default().trim_matches('"').to_string(),
+                sovereign_role_id: self.sovereign.sovereign_role_id(),
+                ratchet_level: self.sovereign.ratchet_level(),
             },
             stats: ActivityStats {
                 total_actions: total,
