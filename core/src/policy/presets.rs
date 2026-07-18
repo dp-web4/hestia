@@ -245,9 +245,11 @@ mod tests {
     }
 
     #[test]
-    fn safety_has_seven_rules() {
+    fn safety_has_six_rules() {
+        // Was seven; the stale `warn-git-push-no-pat` rule was removed 2026-07-18
+        // (PAT auth deprecated — SSH `git push` just works).
         let p = get_preset("safety").unwrap();
-        assert_eq!(p.config.rules.len(), 7);
+        assert_eq!(p.config.rules.len(), 6);
         assert!(p.config.enforce);
         assert_eq!(p.config.default_policy, PolicyDecision::Allow);
     }

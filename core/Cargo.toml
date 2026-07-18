@@ -60,6 +60,10 @@ axum = "0.7"
 sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+# Paired-channel client names the ephemeral X25519 pubkey type directly
+# (web4_core::pair_channel::{seal_fs,open_fs} take `&x25519_dalek::PublicKey`).
+# Version-matched to web4-core so the transitive type is the same.
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 
 # Web4 primitives
 web4-core = { path = "../../web4/web4-core" }

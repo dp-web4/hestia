@@ -929,6 +929,7 @@ dependencies = [
  "web4-core",
  "web4-policy",
  "web4-trust-core",
+ "x25519-dalek",
  "zeroize",
 ]
 

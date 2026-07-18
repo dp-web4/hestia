@@ -458,7 +458,7 @@ mod tests {
         assert_eq!(s.active_preset, "safety");
         let cfg = s.resolve().unwrap();
         assert!(cfg.enforce);
-        assert_eq!(cfg.rules.len(), 7);
+        assert_eq!(cfg.rules.len(), 6); // was 7; warn-git-push-no-pat removed 2026-07-18
     }
 
     #[test]
@@ -472,7 +472,7 @@ mod tests {
             },
         );
         let cfg = s.resolve().unwrap();
-        assert_eq!(cfg.rules.len(), 6);
+        assert_eq!(cfg.rules.len(), 5); // base 6 minus the disabled warn-network
         assert!(cfg.rules.iter().all(|r| r.id != "warn-network"));
     }
 

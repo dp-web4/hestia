@@ -333,33 +333,9 @@ mod tests {
         assert!(!v.enforced);
     }
 
-    #[test]
-    fn git_push_warn_only_when_no_pat() {
-        let e = PolicyEngine::new(get_preset("safety").unwrap().config);
-
-        // Without PAT — rule should fire (warn)
-        let no_pat = PolicyAction {
-            tool_name: "Bash",
-            category: "command",
-            target: Some("git"),
-            full_command: Some("git push origin main"),
-        };
-        let v = e.evaluate(&no_pat);
-        assert_eq!(v.decision, PolicyDecision::Warn);
-        assert_eq!(v.rule_id.as_deref(), Some("warn-git-push-no-pat"));
-
-        // With PAT — rule should NOT fire (default allow)
-        let with_pat = PolicyAction {
-            tool_name: "Bash",
-            category: "command",
-            target: Some("git"),
-            full_command: Some(
-                "git push https://u:$GITHUB_PAT@github.com/dp-web4/hestia.git main",
-            ),
-        };
-        let v = e.evaluate(&with_pat);
-        assert_eq!(v.decision, PolicyDecision::Allow);
-    }
+    // (removed 2026-07-18) `git_push_warn_only_when_no_pat` tested the
+    // `warn-git-push-no-pat` rule, which was deleted from the safety preset —
+    // PAT auth is deprecated; SSH `git push` just works, so there's nothing to warn.
 
     #[test]
     fn entity_id_is_stable_for_same_config() {

@@ -687,6 +687,156 @@ impl HubClient {
         let doc = v.get("document").cloned().unwrap_or(v);
         serde_json::from_value(doc).context("parsing resolved LCT document")
     }
+
+    // -----------------------------------------------------------------------
+    // Paired-channel broker client (CBP sprints A–F). The hub is the
+    // authentication controller: it admits the pairing under chapter law and
+    // establishes the sealed channel; these are the member-side calls that
+    // drive it. All mutating calls are challenge → SignedEnvelope → direct POST
+    // (the pair endpoints take `Json<SignedEnvelope>`). See `crate::pairing`.
+    // -----------------------------------------------------------------------
+
+    /// Sign a payload for a pair endpoint: fetch a fresh challenge for our
+    /// member uuid and wrap the payload in a `SignedEnvelope`.
+    async fn sign_pair_payload(
+        &self,
+        rest_endpoint: &str,
+        our_uuid: Uuid,
+        our_kp: &KeyPair,
+        payload: serde_json::Value,
+    ) -> Result<SignedEnvelope> {
+        let challenge = self.challenge(rest_endpoint, our_uuid).await?;
+        Ok(SignedEnvelope::create(challenge.nonce, payload, our_uuid, our_kp))
+    }
+
+    fn pairs_base(rest_endpoint: &str, hub_id: Uuid) -> String {
+        format!("{}/hubs/{}/pairs", rest_endpoint.trim_end_matches('/'), hub_id)
+    }
+
+    /// `POST /pairs/request` — propose a pairing (carrying our initiator
+    /// ephemeral pubkey). Returns the hub-assigned `pair_id`.
+    pub async fn pair_request(
+        &self,
+        rest_endpoint: &str,
+        hub_id: Uuid,
+        our_uuid: Uuid,
+        our_kp: &KeyPair,
+        payload: &crate::pairing::PairRequestPayload,
+    ) -> Result<Uuid> {
+        let env = self
+            .sign_pair_payload(rest_endpoint, our_uuid, our_kp, serde_json::to_value(payload)?)
+            .await?;
+        let url = format!("{}/request", Self::pairs_base(rest_endpoint, hub_id));
+        let resp = self.http.post(&url).json(&env).send().await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("pair_request failed: HTTP {status}: {text}");
+        }
+        let accepted: crate::pairing::PairAccepted =
+            serde_json::from_str(&text).context("parsing PairAccepted")?;
+        Ok(accepted.pair_id)
+    }
+
+    /// `POST /pairs/:id/confirm` — accept a pairing (carrying our counterparty
+    /// ephemeral pubkey). After this the channel is active for both sides.
+    pub async fn pair_confirm(
+        &self,
+        rest_endpoint: &str,
+        hub_id: Uuid,
+        our_uuid: Uuid,
+        our_kp: &KeyPair,
+        pair_id: Uuid,
+        payload: &crate::pairing::PairConfirmPayload,
+    ) -> Result<()> {
+        let env = self
+            .sign_pair_payload(rest_endpoint, our_uuid, our_kp, serde_json::to_value(payload)?)
+            .await?;
+        let url = format!("{}/{}/confirm", Self::pairs_base(rest_endpoint, hub_id), pair_id);
+        let resp = self.http.post(&url).json(&env).send().await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("pair_confirm failed: HTTP {status}: {text}");
+        }
+        Ok(())
+    }
+
+    /// `GET /pairs/:id` — the pair detail carrying both sides' ephemeral pubkeys
+    /// (the hub-brokered pairing keys) and the effective status.
+    pub async fn get_pair(
+        &self,
+        rest_endpoint: &str,
+        hub_id: Uuid,
+        pair_id: Uuid,
+    ) -> Result<crate::pairing::PairView> {
+        let url = format!("{}/{}", Self::pairs_base(rest_endpoint, hub_id), pair_id);
+        let resp = self.http.get(&url).send().await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("get_pair failed: HTTP {status}: {text}");
+        }
+        serde_json::from_str(&text).context("parsing PairView")
+    }
+
+    /// `POST /pairs/:id/messages` — relay a sealed body over the active channel.
+    /// The hub stores it opaque and witnesses only its `payload_hash`.
+    pub async fn post_pair_message(
+        &self,
+        rest_endpoint: &str,
+        hub_id: Uuid,
+        our_uuid: Uuid,
+        our_kp: &KeyPair,
+        pair_id: Uuid,
+        body_b64: String,
+    ) -> Result<()> {
+        let payload = crate::pairing::PairMessagePayload {
+            action: "pair_message",
+            pair_id,
+            body: body_b64,
+        };
+        let env = self
+            .sign_pair_payload(rest_endpoint, our_uuid, our_kp, serde_json::to_value(&payload)?)
+            .await?;
+        let url = format!("{}/{}/messages", Self::pairs_base(rest_endpoint, hub_id), pair_id);
+        let resp = self.http.post(&url).json(&env).send().await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("post_pair_message failed: HTTP {status}: {text}");
+        }
+        Ok(())
+    }
+
+    /// `GET /pairs/:id/messages?since=` — fetch relayed sealed bodies. Caller
+    /// opens each with `crate::pairing::open_over_pair`.
+    pub async fn get_pair_messages(
+        &self,
+        rest_endpoint: &str,
+        hub_id: Uuid,
+        pair_id: Uuid,
+        since: Option<u64>,
+    ) -> Result<Vec<crate::pairing::PairMessageView>> {
+        let mut url = format!("{}/{}/messages", Self::pairs_base(rest_endpoint, hub_id), pair_id);
+        if let Some(s) = since {
+            url.push_str(&format!("?since={s}"));
+        }
+        let resp = self.http.get(&url).send().await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("get_pair_messages failed: HTTP {status}: {text}");
+        }
+        let parsed: crate::pairing::PairMessagesResponse =
+            serde_json::from_str(&text).context("parsing PairMessagesResponse")?;
+        Ok(parsed.messages)
+    }
 }
 
 /// Wire body for a channel request — matches the hub's `/v1/hubs/{id}/channel`.
