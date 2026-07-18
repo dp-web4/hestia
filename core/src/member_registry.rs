@@ -122,6 +122,54 @@ pub fn attach_citizenship(
     true
 }
 
+/// Vouch a member's **operational witnessing key** on its LCT (concord ruling (B),
+/// 2026-07-18): the member's custodial BINDING key (held sealed here) signs a
+/// `#540 OperationalKey(purpose="witnessing")` over the given operational pubkey,
+/// so a verifier resolves the witness's signing key from the registry offline —
+/// one uniform resolver path for machines and agents alike, no hub roster.
+///
+/// A one-time, vault-attended act (the sealed binding key signs once); thereafter
+/// the member witnesses autonomously with the operational key. Located by
+/// `plugin_id`; re-persists. Returns `false` if the member is unknown or its
+/// sealed binding secret can't be recovered (fail-closed — never a forged vouch).
+pub fn vouch_witnessing_key(
+    vault: &mut crate::vault::Vault,
+    registry: &mut MemberRegistry,
+    plugin_id: &str,
+    operational_pubkey: web4_core::PublicKey,
+) -> bool {
+    let mut persisted: Vec<PersistedMember> =
+        crate::vault::load_doc(vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE)
+            .unwrap_or_default();
+    let Some(p) = persisted.iter_mut().find(|p| p.plugin_id == plugin_id) else {
+        return false;
+    };
+    // Recover the custodial binding keypair (sealed in the vault) to sign the vouch.
+    let Some(binding_kp) = hex::decode(&p.keypair_secret_hex)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .map(|bytes| web4_core::crypto::KeyPair::from_secret_bytes(&bytes))
+    else {
+        eprintln!("[members] WARNING: cannot recover binding key for '{plugin_id}' — vouch refused");
+        return false;
+    };
+    if binding_kp.verifying_key() != p.lct.public_key {
+        eprintln!("[members] WARNING: sealed key for '{plugin_id}' does not bind its LCT — vouch refused");
+        return false;
+    }
+    p.lct.authorize_operational_key("witnessing", operational_pubkey, &binding_kp);
+    if let Some(lct) = registry.members.get_mut(plugin_id) {
+        *lct = p.lct.clone();
+    }
+    if let Err(e) =
+        crate::vault::save_doc(vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE, &persisted)
+    {
+        eprintln!("[members] WARNING: persisting witnessing-key vouch for '{plugin_id}' failed ({e})");
+        return false;
+    }
+    true
+}
+
 /// Build the verifiable legacy alias tying a member LCT to its pre-LCT label.
 /// `sovereign_anchor` MUST be the exact string `member_lct` hashes over, so the
 /// alias re-derives to the label the trust grains already use.
@@ -283,6 +331,28 @@ mod tests {
         assert_eq!(reloaded.get("claude-code").unwrap().citizenships.len(), 2);
         // an unknown member → false, no panic
         assert!(!attach_citizenship(&mut vault, &mut reg, "ghost", cref));
+    }
+
+    #[test]
+    fn vouch_witnessing_key_publishes_the_resolvable_operational_key() {
+        // Ruling (B): the custodial binding key vouches the operational witnessing
+        // key, so a verifier resolves it from the LCT alone (uniform #540 path).
+        let (_dir, mut vault) = fresh_vault();
+        let mut reg = MemberRegistry::default();
+        ensure_member(&mut vault, &mut reg, "legion-witness", false, "sid", "anchor").unwrap();
+        let operational = web4_core::crypto::KeyPair::generate(); // the channel key
+        assert!(vouch_witnessing_key(&mut vault, &mut reg, "legion-witness", operational.verifying_key()));
+        // resolvable from the member LCT, no roster
+        let lct = reg.get("legion-witness").unwrap();
+        assert_eq!(lct.operational_key_for("witnessing"), Some(operational.verifying_key()));
+        // persisted: a reload still resolves it
+        let reloaded = load_members(&vault);
+        assert_eq!(
+            reloaded.get("legion-witness").unwrap().operational_key_for("witnessing"),
+            Some(operational.verifying_key())
+        );
+        // unknown member → false, no panic
+        assert!(!vouch_witnessing_key(&mut vault, &mut reg, "ghost", operational.verifying_key()));
     }
 
     #[test]
