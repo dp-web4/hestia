@@ -251,6 +251,25 @@ enum HubCmd {
         #[arg(long)]
         member_lct: Option<uuid::Uuid>,
     },
+    /// Send a small SECRET sealed END-TO-END to a peer member (dp/CBP PRD
+    /// 2026-07-18). The body is sealed to the RECIPIENT's key -- the hub relays it
+    /// opaquely, never sees plaintext, and the ledger carries a content-hash only.
+    /// Payload from --file or stdin (NEVER argv -> shell history). Fail-closed.
+    SendSecret {
+        /// Recipient member LCT id (the peer's pinned identity).
+        #[arg(long)]
+        to: uuid::Uuid,
+        /// Recipient's pinned identity pubkey (hex). Until the hub ships a
+        /// pubkey-resolver endpoint, provide it explicitly (from the pinned roster).
+        #[arg(long)]
+        recipient_pubkey: String,
+        /// Read the secret from this file instead of stdin.
+        #[arg(long)]
+        file: Option<String>,
+        /// Hub URL or connection UUID to send through (default: sole connection).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -464,6 +483,9 @@ pub fn run() -> AnyResult<()> {
             HubCmd::Join { target, name } => cmd_hub_join(&home, &target, name),
             HubCmd::SetMemberKey { target, channel_key, member_lct } => {
                 cmd_hub_set_member_key(&home, &target, channel_key, member_lct)
+            }
+            HubCmd::SendSecret { to, recipient_pubkey, file, target } => {
+                cmd_hub_send_secret(&home, to, &recipient_pubkey, file.as_deref(), &target)
             }
         },
         Command::Constellation(c) => match c {
@@ -1489,6 +1511,98 @@ fn abs_rest(base_url: &str, rest: &str) -> String {
     } else {
         format!("{}{}", base_url.trim_end_matches('/'), rest)
     }
+}
+
+fn cmd_hub_send_secret(
+    home: &std::path::Path,
+    to: uuid::Uuid,
+    recipient_pubkey_hex: &str,
+    file: Option<&str>,
+    target: &str,
+) -> AnyResult<()> {
+    use std::io::Read;
+    // Read the secret from a file or stdin -- NEVER argv (shell history leak).
+    let secret: Vec<u8> = match file {
+        Some(path) => std::fs::read(path).with_context(|| format!("reading secret file {path}"))?,
+        None => {
+            let mut buf = Vec::new();
+            std::io::stdin().read_to_end(&mut buf).context("reading secret from stdin")?;
+            buf
+        }
+    };
+    if secret.is_empty() {
+        anyhow::bail!("empty secret -- nothing to send");
+    }
+    if secret.len() > 8 * 1024 {
+        anyhow::bail!("secret too large ({} bytes) -- this channel is for small secrets (<=8 KB)", secret.len());
+    }
+    let recipient_pubkey = {
+        let bytes: [u8; 32] = hex::decode(recipient_pubkey_hex).ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| anyhow::anyhow!("--recipient-pubkey must be 32-byte hex"))?;
+        web4_core::crypto::PublicKey::from_bytes(&bytes).context("bad recipient pubkey")?
+    };
+
+    let vault = open_vault(home)?;
+    let store = HubStore::load(&vault)?;
+    let conn = if target.is_empty() {
+        match store.connections.as_slice() {
+            [only] => only.clone(),
+            [] => anyhow::bail!("not connected to a hub -- `hestia hub connect <url>` first"),
+            _ => anyhow::bail!("multiple hub connections -- pass --target <url|uuid>"),
+        }
+    } else if let Ok(id) = uuid::Uuid::parse_str(target) {
+        store.connections.iter().find(|c| c.id == id || c.hub_lct_id == id).cloned()
+            .ok_or_else(|| anyhow::anyhow!("no connection matching {target}"))?
+    } else {
+        store.connections.iter().find(|c| c.url == target).cloned()
+            .ok_or_else(|| anyhow::anyhow!("not connected to {target}"))?
+    };
+    let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+
+    // Seal END-TO-END to the recipient (the hub cannot open it).
+    let ss = hestia::hub::seal_secret_for_peer(&keypair, &recipient_pubkey, &secret)
+        .context("sealing the secret to the recipient")?;
+    drop(secret); // drop the plaintext the moment it is sealed (no echo, no log)
+
+    // Deliver as a `secret`-kind referenced_act carrying the sealed body. The hub
+    // relays the opaque body to the recipient's mailbox (never sees plaintext);
+    // the ledger binds to the CIPHERTEXT hash only.
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let client = HubClient::new();
+    let args = serde_json::json!({
+        "to": { "Citizen": to },
+        "kind": "secret",
+        "pointer_uri": format!("sealed://{}", to),
+        "content_hash": ss.ciphertext_hash,
+        "sealed_body": ss.sealed,
+        "sealed_from_pubkey": ss.from_pubkey_hex,
+        "sealed_pair_id": ss.pair_id,
+    });
+    let rt = tokio::runtime::Runtime::new()?;
+    let pair_id = uuid::Uuid::new_v4();
+    let channel = rt.block_on(client.open_channel(&conn.url, pair_id))?;
+    let resp = rt.block_on(client.channel_query(
+        &rest, &channel, &keypair, conn.our_lct_id, "referenced_act", args,
+    ));
+    match resp {
+        Ok(v) => {
+            println!("Sealed secret sent to {to}.");
+            println!("  ciphertext_hash (on the ledger, not the body): {}", ss.ciphertext_hash);
+            if let Some(idx) = v.get("entry_index").or_else(|| v.get("entryIndex")) {
+                println!("  ledger entry: {idx}");
+            }
+            println!("Recipient drains it via `hestia_inbox` from an ATTENDED session (spec 7.8.2).");
+        }
+        Err(e) => {
+            anyhow::bail!(
+                "send failed ({e}). If the hub rejected the sealed_body, it needs the opaque-carry \
+                 path (queue the sender-sealed body verbatim for kind=secret) -- HUB seam, PRD 2026-07-18. \
+                 The secret was NOT sent by any other means (no pointer fallback)."
+            );
+        }
+    }
+    Ok(())
 }
 
 fn cmd_hub_set_member_key(
