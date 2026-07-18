@@ -81,6 +81,47 @@ pub fn load_members(vault: &crate::vault::Vault) -> MemberRegistry {
     MemberRegistry { members }
 }
 
+/// Attach a citizenship reference to a member's LCT and re-persist, so the member
+/// now *carries* proof-of-citizenship (a tamper-evident pointer to the ledger
+/// record — the authoritative home stays the ledger). Located by `plugin_id`, not
+/// by lct_id, since that's the durable member key. Idempotent: a reference already
+/// present (same society + entry) is not duplicated. Returns `true` if the member
+/// exists and the reference is now attached (added or already present).
+///
+/// The subject's `citizenships` is plural (one per society), so this appends —
+/// it never overwrites another society's citizenship (the plurality reshape).
+pub fn attach_citizenship(
+    vault: &mut crate::vault::Vault,
+    registry: &mut MemberRegistry,
+    plugin_id: &str,
+    citizenship: web4_core::BirthCertificateRef,
+) -> bool {
+    let Some(lct) = registry.members.get_mut(plugin_id) else {
+        return false;
+    };
+    if !lct.citizenships.contains(&citizenship) {
+        lct.citizenships.push(citizenship);
+    }
+    // Re-persist the whole roster (the member's keypair secret is reloaded from
+    // the existing doc so the persisted record stays complete).
+    let mut persisted: Vec<PersistedMember> =
+        crate::vault::load_doc(vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE)
+            .unwrap_or_default();
+    if let Some(p) = persisted.iter_mut().find(|p| p.plugin_id == plugin_id) {
+        p.lct = lct.clone();
+        if let Err(e) = crate::vault::save_doc(
+            vault,
+            MEMBERS_NAMESPACE,
+            MEMBERS_DOC,
+            MEMBERS_LEGACY_FILE,
+            &persisted,
+        ) {
+            eprintln!("[members] WARNING: persisting citizenship for '{plugin_id}' failed ({e})");
+        }
+    }
+    true
+}
+
 /// Build the verifiable legacy alias tying a member LCT to its pre-LCT label.
 /// `sovereign_anchor` MUST be the exact string `member_lct` hashes over, so the
 /// alias re-derives to the label the trust grains already use.
@@ -212,6 +253,36 @@ mod tests {
         assert!(ensure_member(&mut vault, &mut reg, "runner", true, "sid", "anchor").is_none());
         assert!(ensure_member(&mut vault, &mut reg, "   ", false, "sid", "anchor").is_none());
         assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn attach_citizenship_makes_the_member_carry_the_reference_and_persists() {
+        let (_dir, mut vault) = fresh_vault();
+        let mut reg = MemberRegistry::default();
+        ensure_member(&mut vault, &mut reg, "claude-code", false, "sid", "anchor").unwrap();
+        let cref = web4_core::BirthCertificateRef {
+            issuing_society: "lct:web4:society:hestia".into(),
+            entry_id: "42".into(),
+            entry_hash: "deadbeef".into(),
+        };
+        assert!(attach_citizenship(&mut vault, &mut reg, "claude-code", cref.clone()));
+        assert_eq!(reg.get("claude-code").unwrap().citizenships, vec![cref.clone()]);
+        // idempotent: attaching the same ref again does not duplicate
+        attach_citizenship(&mut vault, &mut reg, "claude-code", cref.clone());
+        assert_eq!(reg.get("claude-code").unwrap().citizenships.len(), 1);
+        // a SECOND society's citizenship appends (plurality), never overwrites
+        let cref2 = web4_core::BirthCertificateRef {
+            issuing_society: "lct:web4:society:hub".into(),
+            entry_id: "7".into(),
+            entry_hash: "cafe".into(),
+        };
+        attach_citizenship(&mut vault, &mut reg, "claude-code", cref2.clone());
+        assert_eq!(reg.get("claude-code").unwrap().citizenships.len(), 2);
+        // persisted: a reload sees both citizenships
+        let reloaded = load_members(&vault);
+        assert_eq!(reloaded.get("claude-code").unwrap().citizenships.len(), 2);
+        // an unknown member → false, no panic
+        assert!(!attach_citizenship(&mut vault, &mut reg, "ghost", cref));
     }
 
     #[test]
