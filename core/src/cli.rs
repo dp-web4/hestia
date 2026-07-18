@@ -1560,10 +1560,20 @@ fn cmd_hub_send_secret(
     };
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
 
-    // Seal END-TO-END to the recipient (the hub cannot open it).
-    let ss = hestia::hub::seal_secret_for_peer(&keypair, &recipient_pubkey, &secret)
+    // Wrap in a JSON envelope so the recipient's existing sealed-notice open path
+    // (which parses JSON) handles it uniformly. `secret_hex` carries arbitrary
+    // bytes; `act_id` gives the receive side an id to ACK. Then seal END-TO-END to
+    // the recipient (the hub cannot open it).
+    let envelope = serde_json::json!({
+        "act_id": uuid::Uuid::new_v4(),
+        "kind": "secret",
+        "secret_hex": hex::encode(&secret),
+    });
+    let envelope_bytes = serde_json::to_vec(&envelope)?;
+    drop(secret); // drop the raw plaintext the moment it is enveloped (no echo, no log)
+    let ss = hestia::hub::seal_secret_for_peer(&keypair, &recipient_pubkey, &envelope_bytes)
         .context("sealing the secret to the recipient")?;
-    drop(secret); // drop the plaintext the moment it is sealed (no echo, no log)
+    drop(envelope_bytes);
 
     // Deliver as a `secret`-kind referenced_act carrying the sealed body. The hub
     // relays the opaque body to the recipient's mailbox (never sees plaintext);

@@ -999,24 +999,34 @@ async fn tool_request_witness(state: &SharedState, args: &Value) -> ToolResult {
     Ok(json!({"witnessEntryHash": entry.hash}))
 }
 
-/// `hestia_notify` — the citizen side of HUB's hub→citizen notification leg.
+/// `hestia_notify` — the citizen side of an inbound sealed notice.
 ///
-/// A notification is the member↔hub sealed channel *reversed*: the hub sealed a
-/// body to this member's pinned pubkey. This tool opens it with the member
-/// identity keypair (loaded from the vault — the same identity that backs hub
-/// `join`/`push`), records receipt in the witness chain (encrypted at rest;
-/// auditable), and returns a sealed [`NotificationAck`](crate::hub::NotificationAck)
-/// the hub opens to mark the notice delivered. Args:
-/// `{ pair_id, hub_pubkey_hex, sealed, kind?, pointer_uri?, hub_lct_id? }`.
+/// A notice is a sealed body addressed to this member: the **sealer** encrypted it
+/// to the member's pinned pubkey, and this tool opens it with the member identity
+/// keypair, records receipt in the witness chain, and returns a sealed
+/// [`NotificationAck`](crate::hub::NotificationAck). The sealer is EITHER the hub
+/// (a hub→citizen notification) OR a **sender peer** (a member→member sealed
+/// secret, PRD 2026-07-18) — the open is the same `pair_channel` ECDH against
+/// whoever sealed it, so the two are one code path. The sealer's pubkey + LCT are
+/// accepted under either name:
+/// `{ pair_id, (from_pubkey_hex|hub_pubkey_hex), sealed, kind?, pointer_uri?,
+///    (from_lct_id|hub_lct_id)? }`. A peer-sealed secret carries `from_pubkey_hex`.
 async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
     let pair_id = Uuid::parse_str(&require_string(args, "pair_id")?)
         .map_err(|_| anyhow::anyhow!("pair_id is not a UUID"))?;
-    let hub_pubkey_hex = require_string(args, "hub_pubkey_hex")?;
+    // The SEALER's pubkey — hub (hub_pubkey_hex) or sender peer (from_pubkey_hex).
+    let hub_pubkey_hex = optional_string(args, "from_pubkey_hex")
+        .or_else(|| optional_string(args, "hub_pubkey_hex"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("missing sealer pubkey (from_pubkey_hex for a peer, hub_pubkey_hex for the hub)")
+        })?;
     let sealed = require_string(args, "sealed")?;
     let kind = args.get("kind").and_then(Value::as_str).unwrap_or("notify").to_string();
     let pointer_uri = args.get("pointer_uri").and_then(Value::as_str).map(str::to_string);
+    // The SEALER's LCT — peer (from_lct_id) or hub (hub_lct_id).
     let hub_lct_id = args
-        .get("hub_lct_id")
+        .get("from_lct_id")
+        .or_else(|| args.get("hub_lct_id"))
         .and_then(Value::as_str)
         .and_then(|s| Uuid::parse_str(s).ok())
         .unwrap_or_else(Uuid::nil);
@@ -2204,6 +2214,66 @@ mod tests {
             },
         );
         sid
+    }
+
+    #[tokio::test]
+    async fn peer_sealed_notice_opens_via_from_pubkey_not_the_hub() {
+        // A sender PEER seals a JSON body to the member's identity key; tool_notify
+        // opens it using `from_pubkey_hex` (the sender), proving the receive path is
+        // sealer-generic — hub OR peer, one code path (the secret-send receive half).
+        let dir = TempDir::new().unwrap();
+        let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let member_kp = web4_core::crypto::KeyPair::generate();
+        vault
+            .add(crate::vault::VaultEntry::new(
+                "ai_identity_secret",
+                hex::encode(member_kp.secret_key_bytes()),
+            ))
+            .unwrap();
+        let state = super::super::state::ServerState::open(vault, dir.path(), "p").unwrap();
+        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(state));
+
+        // The sender seals the exact envelope the send verb produces.
+        let sender = web4_core::crypto::KeyPair::generate();
+        let pair_id = Uuid::new_v4();
+        let envelope = json!({"act_id": Uuid::new_v4(), "kind": "secret", "secret_hex": hex::encode(b"kaggle-DUMMY")});
+        let sealed = web4_core::pair_channel::seal(
+            &sender, &member_kp.verifying_key(), pair_id, &serde_json::to_vec(&envelope).unwrap(),
+        ).unwrap().to_base64();
+
+        let sender_lct = Uuid::new_v4();
+        let sender_pubkey_hex = hex::encode(sender.verifying_key().to_bytes());
+
+        // (1) Content proof: the peer-sealed body opens to the exact secret via the
+        // SAME sealer-generic path tool_inbox uses (HubChannel over the sender's key).
+        let opened = crate::hub::HubChannel::new(sender_lct, pair_id, &sender_pubkey_hex)
+            .unwrap()
+            .open_notification(&member_kp, &sealed)
+            .unwrap();
+        assert_eq!(hex::decode(opened["secret_hex"].as_str().unwrap()).unwrap(), b"kaggle-DUMMY");
+
+        // (2) tool_notify accepts the PEER sealer (from_pubkey_hex) and opens it. The
+        // unattended test caller auto-defers under §7.8.2 (deferredByLaw) — which
+        // PROVES the open succeeded (a failed open errors BEFORE the gate runs).
+        let resp = tool_notify(&shared, &json!({
+            "pair_id": pair_id.to_string(),
+            "from_pubkey_hex": sender_pubkey_hex,
+            "from_lct_id": sender_lct.to_string(),
+            "sealed": sealed,
+            "kind": "secret",
+        })).await.unwrap();
+        assert_eq!(resp["accepted"], json!(true), "peer sealer accepted + opened: {resp}");
+        assert_eq!(resp["deferredByLaw"], json!(true), "unattended caller auto-defers the release");
+
+        // (3) fail-closed: the WRONG sender pubkey cannot open it (AEAD binds the sealer)
+        let wrong = web4_core::crypto::KeyPair::generate();
+        let denied = tool_notify(&shared, &json!({
+            "pair_id": pair_id.to_string(),
+            "from_pubkey_hex": hex::encode(wrong.verifying_key().to_bytes()),
+            "sealed": web4_core::pair_channel::seal(&sender, &member_kp.verifying_key(), pair_id, b"{}").unwrap().to_base64(),
+            "kind": "secret",
+        })).await;
+        assert!(denied.is_err(), "opening against the wrong sealer must fail closed");
     }
 
     #[tokio::test]
