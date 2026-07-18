@@ -446,8 +446,11 @@ pub fn run() -> AnyResult<()> {
             DelegateCmd::Revoke { id } => cmd_delegate_revoke(&home, &id),
         },
         Command::Witness(w) => match w {
-            WitnessCmd::Attest { subject_lct_id, target, out } => {
-                cmd_witness_attest(&home, &subject_lct_id, &target, out)
+            WitnessCmd::Attest { subject_lct_id, r#as, target, out } => {
+                cmd_witness_attest(&home, &subject_lct_id, r#as.as_deref(), &target, out)
+            }
+            WitnessCmd::Onboard { plugin_id, target } => {
+                cmd_witness_onboard(&home, &plugin_id, &target)
             }
         },
         Command::Lct(l) => match l {
@@ -754,6 +757,12 @@ enum WitnessCmd {
     Attest {
         /// Canonical LCT id of the subject being witnessed (lct:web4:...).
         subject_lct_id: String,
+        /// Witness AS this member (its LCT's canonical mb32 id is recorded as the
+        /// witness id — concord ruling (B)). The member must have a vouched
+        /// witnessing key (`hestia witness onboard <plugin_id>`). Omit for the
+        /// legacy `lct:web4:member:{uuid}` form.
+        #[arg(long)]
+        r#as: Option<String>,
         /// Hub URL or connection UUID whose pinned key signs (default: the sole
         /// connection, or error if ambiguous).
         #[arg(long, default_value = "")]
@@ -762,11 +771,25 @@ enum WitnessCmd {
         #[arg(long)]
         out: Option<String>,
     },
+    /// One-time, vault-attended: vouch a member's OPERATIONAL witnessing key with
+    /// its custodial binding key (concord ruling (B), #540). Publishes the vouch on
+    /// the member LCT so a verifier resolves the witness's signing key from the
+    /// registry offline. Vouches the hub connection's channel key by default.
+    Onboard {
+        /// The member (plugin_id) to make a witness — its custodial LCT gets the
+        /// operational-key vouch.
+        plugin_id: String,
+        /// Hub URL or connection UUID whose channel key is the operational key
+        /// (default: the sole connection).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
 }
 
 fn cmd_witness_attest(
     home: &std::path::Path,
     subject_lct_id: &str,
+    as_member: Option<&str>,
     target: &str,
     out: Option<String>,
 ) -> AnyResult<()> {
@@ -795,7 +818,26 @@ fn cmd_witness_attest(
         );
     }
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let witness_lct_id = format!("lct:web4:member:{}", conn.our_lct_id);
+    // Ruling (B): the witness id is the member LCT's canonical mb32 id, and the
+    // member must have a vouched witnessing key so verifiers resolve the signing
+    // key from the registry. Legacy `lct:web4:member:{uuid}` when `--as` is omitted.
+    let witness_lct_id = match as_member {
+        Some(pid) => {
+            let reg = hestia::member_registry::load_members(&vault);
+            let lct = reg.get(pid).ok_or_else(|| anyhow::anyhow!(
+                "no member '{pid}' — mint it (a connect) then `hestia witness onboard {pid}`"))?;
+            if lct.operational_key_for("witnessing").map(|k| k != keypair.verifying_key()).unwrap_or(true) {
+                eprintln!("[witness] WARNING: '{pid}' has no vouched witnessing key matching this signer \
+                           — run `hestia witness onboard {pid}` first, or the attestation won't resolve");
+            }
+            lct.lct_id()
+        }
+        None => {
+            eprintln!("[witness] note: legacy witness-id form; ruling (B) uses `--as <plugin_id>` \
+                       for the canonical, registry-resolvable id");
+            format!("lct:web4:member:{}", conn.our_lct_id)
+        }
+    };
     let att = hestia::witness::attest(subject_lct_id, &witness_lct_id, chrono::Utc::now(), &keypair);
     let json = serde_json::to_string_pretty(&att)?;
     match out {
@@ -804,6 +846,38 @@ fn cmd_witness_attest(
             eprintln!("[witness] Existence attestation over {subject_lct_id} by {witness_lct_id} -> {path}");
         }
         None => println!("{json}"),
+    }
+    Ok(())
+}
+
+fn cmd_witness_onboard(home: &std::path::Path, plugin_id: &str, target: &str) -> AnyResult<()> {
+    let mut vault = open_vault(home)?;
+    let store = HubStore::load(&vault)?;
+    let conn = if target.is_empty() {
+        match store.connections.as_slice() {
+            [only] => only.clone(),
+            [] => anyhow::bail!("not connected to a hub — `hestia hub connect <url>` first"),
+            _ => anyhow::bail!("multiple hub connections — pass --target <url|uuid>"),
+        }
+    } else if let Ok(id) = uuid::Uuid::parse_str(target) {
+        store.connections.iter().find(|c| c.id == id || c.hub_lct_id == id).cloned()
+            .ok_or_else(|| anyhow::anyhow!("no connection matching {target}"))?
+    } else {
+        store.connections.iter().find(|c| c.url == target).cloned()
+            .ok_or_else(|| anyhow::anyhow!("not connected to {target}"))?
+    };
+    // The operational (witnessing) key = the connection's channel key.
+    let op_kp = member_signing_keypair(&vault, &conn.member_key_source)?;
+    let mut reg = hestia::member_registry::load_members(&vault);
+    if hestia::member_registry::vouch_witnessing_key(&mut vault, &mut reg, plugin_id, op_kp.verifying_key()) {
+        let id = reg.get(plugin_id).map(|l| l.lct_id()).unwrap_or_default();
+        println!("Vouched operational witnessing key for '{plugin_id}'.");
+        println!("  witness LCT id: {id}");
+        println!("  operational pubkey: {}", op_kp.verifying_key().to_hex());
+        println!("Witness AS this member with:  hestia witness attest <subject> --as {plugin_id}");
+        println!("Publish the vouch so verifiers resolve it:  hestia lct publish --send");
+    } else {
+        anyhow::bail!("could not vouch for '{plugin_id}' — is it a minted member? (mint via a connect first)");
     }
     Ok(())
 }
