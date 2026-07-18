@@ -999,6 +999,50 @@ async fn tool_request_witness(state: &SharedState, args: &Value) -> ToolResult {
     Ok(json!({"witnessEntryHash": entry.hash}))
 }
 
+/// Resolve a peer sender's OPERATIONAL public key (hex) from the registry, given
+/// its `sealed_by` LCT uuid (HUB #545). The published `#540` vouch is the authority
+/// (ruling B) — offline-verifiable, no hub-private roster. Fail-closed: an unknown
+/// sender, or one with no vouched operational key, is an error (never a guess).
+///
+/// `sealed_by` is a Uuid (the sender's member-LCT id), but the registry keys on the
+/// canonical mb32 id, so this matches by the document's `id` field. O(N) over the
+/// registry — fine at fleet scale; a direct id-index is a hub optimization to ask
+/// for if it grows.
+async fn resolve_sealer_operational_key(
+    s: &super::state::ServerState,
+    sealed_by: &str,
+) -> anyhow::Result<String> {
+    let sealer_uuid = Uuid::parse_str(sealed_by)
+        .map_err(|_| anyhow::anyhow!("sealed_by is not a UUID: {sealed_by}"))?;
+    let store = crate::hub::HubStore::load(&s.vault)?;
+    let conn = store
+        .connections
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no hub connection to resolve the sealer's key"))?;
+    let client = crate::hub::HubClient::new();
+    let list = client.list_lcts(&conn.rest_endpoint, conn.hub_lct_id).await?;
+    let ids: Vec<String> = list
+        .as_array()
+        .map(|a| a.iter().filter_map(|e| e.get("lct_id").and_then(Value::as_str).map(str::to_string)).collect())
+        .unwrap_or_default();
+    for lct_id in ids {
+        if let Ok(doc) = client.resolve_lct(&conn.rest_endpoint, conn.hub_lct_id, &lct_id).await {
+            if doc.id == sealer_uuid {
+                // Ruling B: the operational key the sender signs with. Try the
+                // channel/witnessing purposes (either is the operational level).
+                let opkey = doc
+                    .operational_key_for("channel")
+                    .or_else(|| doc.operational_key_for("witnessing"))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("sender {sealed_by} has no vouched operational key in the registry")
+                    })?;
+                return Ok(hex::encode(opkey.to_bytes()));
+            }
+        }
+    }
+    anyhow::bail!("sender {sealed_by} not found in the registry (has it published its member LCT?)")
+}
+
 /// `hestia_notify` — the citizen side of an inbound sealed notice.
 ///
 /// A notice is a sealed body addressed to this member: the **sealer** encrypted it
@@ -1014,24 +1058,42 @@ async fn tool_request_witness(state: &SharedState, args: &Value) -> ToolResult {
 async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
     let pair_id = Uuid::parse_str(&require_string(args, "pair_id")?)
         .map_err(|_| anyhow::anyhow!("pair_id is not a UUID"))?;
-    // The SEALER's pubkey — hub (hub_pubkey_hex) or sender peer (from_pubkey_hex).
-    let hub_pubkey_hex = optional_string(args, "from_pubkey_hex")
-        .or_else(|| optional_string(args, "hub_pubkey_hex"))
-        .ok_or_else(|| {
-            anyhow::anyhow!("missing sealer pubkey (from_pubkey_hex for a peer, hub_pubkey_hex for the hub)")
-        })?;
     let sealed = require_string(args, "sealed")?;
     let kind = args.get("kind").and_then(Value::as_str).unwrap_or("notify").to_string();
     let pointer_uri = args.get("pointer_uri").and_then(Value::as_str).map(str::to_string);
-    // The SEALER's LCT — peer (from_lct_id) or hub (hub_lct_id).
+    // The SEALER's LCT — a peer (`sealed_by`/`from_lct_id`) or the hub (`hub_lct_id`).
     let hub_lct_id = args
-        .get("from_lct_id")
+        .get("sealed_by")
+        .or_else(|| args.get("from_lct_id"))
         .or_else(|| args.get("hub_lct_id"))
         .and_then(Value::as_str)
         .and_then(|s| Uuid::parse_str(s).ok())
         .unwrap_or_else(Uuid::nil);
+    // `sealed_by` (HUB #545): a peer pre-sealed this — resolve the SENDER's
+    // operational key from the REGISTRY (ruling B / #540), the published vouch as
+    // authority (not a hub-private roster, not a carried pubkey). `from_pubkey_hex`
+    // is an explicit override (tests / already-resolved). Else the hub sealed it.
+    let sealed_by = args
+        .get("sealed_by")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     let mut s = state.lock().await;
+
+    // Resolve the sealer's pubkey. Peer path: resolve `sealed_by`'s operational key
+    // from the registry, fail-closed. Hub path / explicit override: the given hex.
+    let hub_pubkey_hex = match optional_string(args, "from_pubkey_hex")
+        .or_else(|| optional_string(args, "hub_pubkey_hex"))
+    {
+        Some(hex) => hex,
+        None => {
+            let sealed_by = sealed_by.clone().ok_or_else(|| {
+                anyhow::anyhow!("no sealer: need sealed_by (peer, registry-resolved), from_pubkey_hex, or hub_pubkey_hex")
+            })?;
+            resolve_sealer_operational_key(&s, &sealed_by).await?
+        }
+    };
 
     // Load the member identity keypair from the vault — its pubkey is what the
     // hub sealed to. (Same path as the hub-callback issuer identity.)

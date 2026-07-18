@@ -1580,20 +1580,24 @@ fn cmd_hub_send_secret(
     // the ledger binds to the CIPHERTEXT hash only.
     let rest = abs_rest(&conn.url, &conn.rest_endpoint);
     let client = HubClient::new();
+    // HUB's `send_secret` relay wire (#545): the hub carries the body opaquely
+    // (never re-seals), `to` = recipient LCT, `sealed`/`pair_id` are OUR seal to
+    // the recipient's operational key, `content_hash` is over the ciphertext. The
+    // recipient's inbox opens with the SENDER's operational key resolved from the
+    // registry (the notice's `sealed_by` = our authenticated LCT) — so we do NOT
+    // carry our pubkey here.
     let args = serde_json::json!({
-        "to": { "Citizen": to },
-        "kind": "secret",
+        "to": to,
+        "sealed": ss.sealed,
+        "pair_id": ss.pair_id,
         "pointer_uri": format!("sealed://{}", to),
         "content_hash": ss.ciphertext_hash,
-        "sealed_body": ss.sealed,
-        "sealed_from_pubkey": ss.from_pubkey_hex,
-        "sealed_pair_id": ss.pair_id,
     });
     let rt = tokio::runtime::Runtime::new()?;
     let pair_id = uuid::Uuid::new_v4();
     let channel = rt.block_on(client.open_channel(&conn.url, pair_id))?;
     let resp = rt.block_on(client.channel_query(
-        &rest, &channel, &keypair, conn.our_lct_id, "referenced_act", args,
+        &rest, &channel, &keypair, conn.our_lct_id, "send_secret", args,
     ));
     match resp {
         Ok(v) => {

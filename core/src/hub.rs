@@ -657,6 +657,36 @@ impl HubClient {
         }
         serde_json::from_str(&text).with_context(|| "parsing /lcts response")
     }
+
+    /// Resolve one LCT document from the registry by canonical id
+    /// (`GET /v1/hubs/:id/lcts/:lct_id`). The offline-verifiable path a recipient
+    /// uses to resolve a peer's OPERATIONAL key (ruling B / #540) for opening a
+    /// peer-sealed secret — no hub-private roster, the published vouch is the
+    /// authority.
+    pub async fn resolve_lct(
+        &self,
+        rest_endpoint: &str,
+        hub_id: Uuid,
+        lct_id: &str,
+    ) -> Result<web4_core::Lct> {
+        let url = format!(
+            "{}/hubs/{}/lcts/{}",
+            rest_endpoint.trim_end_matches('/'),
+            hub_id,
+            lct_id
+        );
+        let resp = self.http.get(&url).send().await
+            .with_context(|| format!("resolving LCT at {url}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("hub /lcts/:id returned HTTP {status}: {text}");
+        }
+        // The registry serves { lct_id, document, provenance, ... }.
+        let v: serde_json::Value = serde_json::from_str(&text).context("parsing /lcts/:id response")?;
+        let doc = v.get("document").cloned().unwrap_or(v);
+        serde_json::from_value(doc).context("parsing resolved LCT document")
+    }
 }
 
 /// Wire body for a channel request — matches the hub's `/v1/hubs/{id}/channel`.
