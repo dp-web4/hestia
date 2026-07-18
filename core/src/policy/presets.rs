@@ -132,26 +132,10 @@ fn safety_rules() -> Vec<PolicyRule> {
                 ..Default::default()
             },
         },
-        PolicyRule {
-            id: "warn-git-push-no-pat".into(),
-            name: "Warn on git push without PAT authentication".into(),
-            priority: 8,
-            decision: PolicyDecision::Warn,
-            reason: Some(
-                "git push without PAT will fail on WSL. Use: grep GITHUB_PAT ../.env | cut -d= -f2 | xargs -I {} git push https://user:{}@github.com/..."
-                    .into(),
-            ),
-            r#match: PolicyMatch {
-                tools: Some(vec!["Bash".into()]),
-                command_patterns: Some(vec![r"git\s+push".into()]),
-                command_patterns_are_regex: true,
-                command_must_not_contain: Some(vec![
-                    "GITHUB_PAT".into(),
-                    "@github.com".into(),
-                ]),
-                ..Default::default()
-            },
-        },
+        // (removed 2026-07-18) The `warn-git-push-no-pat` preset advised embedding a GITHUB_PAT in
+        // the push URL and claimed "git push without PAT will fail on WSL". Both are stale and wrong:
+        // PAT auth was deprecated long ago in favor of SSH remotes, over which a plain `git push`
+        // succeeds. The warn steered agents toward a deprecated, less-secure (secret-in-URL) method.
         PolicyRule {
             id: "warn-network".into(),
             name: "Warn on network access".into(),
