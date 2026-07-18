@@ -129,11 +129,12 @@ pub fn collect_publish_set(
         }
     };
 
-    // Sovereign FIRST (HUB's ordering note — bound edges resolve on arrival),
-    // then the constellation roles, then members. Every entity whose `mrh.bound`
-    // points at the sovereign is published after it, so no edge dangles on
-    // arrival (member and role bound-edges both target the sovereign).
+    // Sovereign (the Society) FIRST (HUB's ordering note — bound edges resolve on
+    // arrival), then role:sovereign (carrying the authority_ratchet, so the
+    // society's ratchet level is provable from the registry), then the
+    // constellation roles, then members.
     push_checked("sovereign", sovereign.lct.clone());
+    push_checked("role:sovereign", sovereign.sovereign_role.lct.clone());
 
     let mut labels = registry.labels();
     labels.sort_unstable();
@@ -186,9 +187,12 @@ mod tests {
         );
         assert_eq!(
             set.payloads.len(),
-            1 + crate::reputation::KNOWN_CONSTELLATION_ROLES.len() + 1,
-            "sovereign + every published role + the one member"
+            2 + crate::reputation::KNOWN_CONSTELLATION_ROLES.len() + 1,
+            "society + role:sovereign + every constellation role + the one member"
         );
+        // role:sovereign carries the provable ratchet level
+        let role_sov = set.payloads.iter().find(|p| p.document.authority_ratchet.is_some()).unwrap();
+        assert_eq!(role_sov.document.authority_ratchet.as_ref().unwrap().level(), 0, "genesis L0, provable");
         // the member payload carries its verifiable alias (ingest check 4)
         let member = set.payloads.last().unwrap();
         assert!(member.document.legacy_alias.as_ref().unwrap().verify());

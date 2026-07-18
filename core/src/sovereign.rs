@@ -145,6 +145,28 @@ impl Society {
                 p.ratchet = Some(ratchet.clone());
                 healed = true;
             }
+            // HEAL 3: the ratchet must ride ON role:sovereign's LCT (provable from
+            // the registry). A Society persisted before `authority_ratchet` existed
+            // lacks it — set it.
+            {
+                let role = p.sovereign_role.as_mut().unwrap();
+                if role.lct.authority_ratchet.as_ref() != Some(&ratchet) {
+                    role.lct.authority_ratchet = Some(ratchet.clone());
+                    healed = true;
+                }
+            }
+            // HEAL 4: the society PAIRS to its sovereign role, so a resolver can
+            // traverse society → role:sovereign → authority_ratchet.
+            let role_id = p.sovereign_role.as_ref().unwrap().lct.lct_id();
+            if !p.lct.mrh.paired.iter().any(|e| e.edge_type == "sovereign_role") {
+                let ts = p.lct.created_at;
+                p.lct.mrh.paired.push(MrhEdge {
+                    lct_id: role_id,
+                    edge_type: "sovereign_role".to_string(),
+                    ts,
+                });
+                healed = true;
+            }
             let sovereign_role = role_entity_from(p.sovereign_role.as_ref().unwrap());
             if healed {
                 let _ = crate::vault::save_doc(
@@ -156,10 +178,20 @@ impl Society {
 
         // First boot: mint the Society LCT (self-issued §3.2 bootstrap) + role:sovereign.
         let (mut lct, keypair) = LctBuilder::new(EntityType::Society).build();
-        lct.sign_binding(&keypair);
-        let (role_entity, role_kp) =
+        let (mut role_entity, role_kp) =
             RoleEntity::issue(SOVEREIGN_ROLE_LABEL, society_kp_uuid, sovereign_role_extension());
         let ratchet = RatchetRequirement::genesis();
+        // The ratchet rides ON role:sovereign's LCT (provable from the registry),
+        // and the society PAIRS to its sovereign role so a resolver can traverse
+        // society → role:sovereign → authority_ratchet. Both re-sign after mutation.
+        role_entity.lct.authority_ratchet = Some(ratchet.clone());
+        role_entity.lct.sign_binding(&role_kp);
+        lct.mrh.paired.push(MrhEdge {
+            lct_id: role_entity.lct.lct_id(),
+            edge_type: "sovereign_role".to_string(),
+            ts: lct.created_at,
+        });
+        lct.sign_binding(&keypair);
 
         let persisted = PersistedSociety {
             anchor: anchor.to_string(),
