@@ -12,7 +12,8 @@ use hestia::delegation::{self, DelegationStore};
 use hestia::profile::{self, ProfileLink, ProfileStore};
 use hestia::hub::{HubClient, HubConnection, HubStore};
 use hestia::pairing::{
-    Pairing, PairConfirmPayload, PairRequestPayload, PairingRole, PairingStore, SecretEnvelope,
+    Pairing, PairConfirmPayload, PairRequestPayload, PairRevokePayload, PairingRole, PairingStore,
+    SecretEnvelope,
 };
 use web4_core::pair_channel::EphemeralKeyPair;
 use hestia::vault::{default_hestia_home, vault_path, Vault, VaultEntry};
@@ -304,6 +305,21 @@ enum HubCmd {
     /// List the pairings we hold locally (id, peer, role, purpose).
     PairList,
 
+    /// Revoke a pairing (end the sealed channel) and WIPE our ephemeral secret --
+    /// this is what makes the forward-secrecy guarantee real: once wiped, a later
+    /// key compromise cannot decrypt past captured ciphertexts. Either party may
+    /// revoke. Voluntary by default.
+    PairRevoke {
+        /// The pair_id to revoke.
+        pair_id: uuid::Uuid,
+        /// Optional human reason recorded on the hub.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Hub URL or connection UUID (default: sole connection).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
+
     /// Drain and OPEN secrets sent to us over a confirmed pair (attended, §7.8.2
     /// -- the vault-authenticated operator IS the release recipient). Raw secret
     /// bytes go to stdout; metadata to stderr. Never logged.
@@ -538,6 +554,9 @@ pub fn run() -> AnyResult<()> {
                 cmd_hub_pair_confirm(&home, pair_id, &target)
             }
             HubCmd::PairList => cmd_hub_pair_list(&home),
+            HubCmd::PairRevoke { pair_id, reason, target } => {
+                cmd_hub_pair_revoke(&home, pair_id, reason, &target)
+            }
             HubCmd::RecvSecrets { pair_id, target } => {
                 cmd_hub_recv_secrets(&home, pair_id, &target)
             }
@@ -1696,6 +1715,50 @@ fn cmd_hub_pair_list(home: &std::path::Path) -> AnyResult<()> {
             PairingRole::Confirmer => "confirmer",
         };
         println!("{}  peer={}  role={}  purpose={}", p.pair_id, p.peer_uuid, role, p.purpose);
+    }
+    Ok(())
+}
+
+/// `hub pair-revoke` — end a pair on the hub, then WIPE our ephemeral secret.
+/// Order (RWOA-O): revoke the authoritative hub state FIRST, then local cleanup;
+/// a wipe failure after a successful revoke is surfaced loudly (the pair is dead
+/// but the FS material lingers until re-run) rather than silently swallowed.
+fn cmd_hub_pair_revoke(
+    home: &std::path::Path,
+    pair_id: uuid::Uuid,
+    reason: Option<String>,
+    target: &str,
+) -> AnyResult<()> {
+    let mut vault = open_vault(home)?;
+    let store = HubStore::load(&vault)?;
+    let conn = pick_connection(&store, target)?;
+    let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+
+    let payload = PairRevokePayload {
+        action: "pair_revoke",
+        pair_id,
+        revocation_kind: "voluntary",
+        reason,
+    };
+    rt.block_on(client.pair_revoke(
+        &rest, conn.hub_lct_id, conn.our_lct_id, &keypair, pair_id, &payload,
+    )).context("revoking the pair on the hub")?;
+
+    // Authoritative state is now revoked -- wipe the forward-secret material.
+    let mut pairings = PairingStore::load(&vault)?;
+    let wiped = pairings.wipe(&pair_id).is_some();
+    pairings.save(&mut vault)
+        .context("CRITICAL: pair revoked on hub but local ephemeral wipe FAILED to persist -- \
+                  re-run `hub pair-revoke` or clear presence/pairings to complete forward secrecy")?;
+
+    println!("Pair {pair_id} revoked.");
+    if wiped {
+        println!("  ephemeral secret wiped (forward secrecy: past ciphertexts stay unreadable).");
+    } else {
+        println!("  (no local pairing state was held for {pair_id} -- nothing to wipe.)");
     }
     Ok(())
 }

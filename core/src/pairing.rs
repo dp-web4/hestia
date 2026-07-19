@@ -239,6 +239,18 @@ pub struct PairConfirmPayload {
     pub counterparty_ephemeral_pub_hex: Option<String>,
 }
 
+/// `POST /pairs/:id/revoke` payload. `revocation_kind` serializes to the hub's
+/// snake_case `PairRevocationKind` ("voluntary" | "expired" | "hub_law" |
+/// "key_rotation"); the CLI defaults to "voluntary". Either party may revoke.
+#[derive(Serialize)]
+pub struct PairRevokePayload {
+    pub action: &'static str, // "pair_revoke"
+    pub pair_id: Uuid,
+    pub revocation_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// `POST /pairs/:id/messages` payload — `body` is base64 ciphertext (opaque to
 /// the hub, which witnesses only its `payload_hash`).
 #[derive(Serialize)]
@@ -432,6 +444,23 @@ mod tests {
         assert_eq!(recovered.kind, SecretEnvelope::KIND);
         assert_eq!(recovered.act_id, act_id, "act_id survives for the ACK");
         assert_eq!(recovered.secret_bytes().unwrap(), secret, "exact binary secret recovered");
+    }
+
+    #[test]
+    fn wipe_removes_the_forward_secret_material() {
+        let mut store = PairingStore::default();
+        let pid = Uuid::new_v4();
+        store.insert(Pairing {
+            pair_id: pid, peer_uuid: Uuid::new_v4(), role: PairingRole::Initiator,
+            purpose: "s".into(),
+            my_ephemeral_secret_hex: EphemeralKeyPair::generate().secret_hex(),
+            peer_lct_pubkey_hex: hex::encode(KeyPair::generate().verifying_key().to_bytes()),
+        });
+        assert!(store.get(&pid).is_some());
+        let wiped = store.wipe(&pid);
+        assert!(wiped.is_some(), "wipe returns the removed pairing");
+        assert!(store.get(&pid).is_none(), "ephemeral material is gone after wipe");
+        assert!(store.wipe(&pid).is_none(), "wiping again is a no-op");
     }
 
     #[test]

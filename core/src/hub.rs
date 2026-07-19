@@ -790,6 +790,32 @@ impl HubClient {
         Ok(())
     }
 
+    /// `POST /pairs/:id/revoke` — end the pair. Either party may revoke; after
+    /// this the channel is inactive and the caller should wipe its ephemeral
+    /// secret (forward secrecy). The hub records the revocation kind + reason.
+    pub async fn pair_revoke(
+        &self,
+        rest_endpoint: &str,
+        hub_id: Uuid,
+        our_uuid: Uuid,
+        our_kp: &KeyPair,
+        pair_id: Uuid,
+        payload: &crate::pairing::PairRevokePayload,
+    ) -> Result<()> {
+        let env = self
+            .sign_pair_payload(rest_endpoint, our_uuid, our_kp, serde_json::to_value(payload)?)
+            .await?;
+        let url = format!("{}/{}/revoke", Self::pairs_base(rest_endpoint, hub_id), pair_id);
+        let resp = self.http.post(&url).json(&env).send().await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("pair_revoke failed: HTTP {status}: {text}");
+        }
+        Ok(())
+    }
+
     /// `GET /pairs/:id` — the pair detail carrying both sides' ephemeral pubkeys
     /// (the hub-brokered pairing keys) and the effective status.
     pub async fn get_pair(
