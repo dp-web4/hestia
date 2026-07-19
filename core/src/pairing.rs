@@ -132,6 +132,11 @@ impl SecretEnvelope {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PairingStore {
     pub pairings: HashMap<Uuid, Pairing>,
+    /// Per-pair drain cursor: the highest pair_message `seq` already delivered to
+    /// an attended session. The daemon pulls `seq > cursor` so a secret is
+    /// delivered once. `#[serde(default)]` migrates pre-cursor stores.
+    #[serde(default)]
+    pub cursors: HashMap<Uuid, u64>,
 }
 
 impl PairingStore {
@@ -153,8 +158,26 @@ impl PairingStore {
 
     /// Wipe a pairing's forward-secret material on revoke/expiry (Sprint F: the
     /// FS guarantee holds only if endpoints destroy their ephemeral secrets).
+    /// Also drops the drain cursor — a revoked pair has no more to deliver.
     pub fn wipe(&mut self, pair_id: &Uuid) -> Option<Pairing> {
+        self.cursors.remove(pair_id);
         self.pairings.remove(pair_id)
+    }
+
+    /// The highest pair_message `seq` already delivered for this pair, or `None`
+    /// if never drained. Passed straight to `get_pair_messages(since)`, which
+    /// returns `seq > since`; `None` fetches everything (seq is 0-indexed, so a
+    /// `0` sentinel would wrongly skip the first message).
+    pub fn cursor(&self, pair_id: &Uuid) -> Option<u64> {
+        self.cursors.get(pair_id).copied()
+    }
+
+    /// Advance the drain cursor. Monotone — never moves backward.
+    pub fn set_cursor(&mut self, pair_id: Uuid, seq: u64) {
+        let e = self.cursors.entry(pair_id).or_insert(seq);
+        if seq > *e {
+            *e = seq;
+        }
     }
 }
 
@@ -444,6 +467,28 @@ mod tests {
         assert_eq!(recovered.kind, SecretEnvelope::KIND);
         assert_eq!(recovered.act_id, act_id, "act_id survives for the ACK");
         assert_eq!(recovered.secret_bytes().unwrap(), secret, "exact binary secret recovered");
+    }
+
+    #[test]
+    fn drain_cursor_is_none_then_monotone() {
+        let mut store = PairingStore::default();
+        let pid = Uuid::new_v4();
+        assert_eq!(store.cursor(&pid), None, "never drained → None (fetch all, incl. seq 0)");
+        store.set_cursor(pid, 3);
+        assert_eq!(store.cursor(&pid), Some(3));
+        store.set_cursor(pid, 1); // stale/out-of-order
+        assert_eq!(store.cursor(&pid), Some(3), "cursor never moves backward");
+        store.set_cursor(pid, 7);
+        assert_eq!(store.cursor(&pid), Some(7));
+        // wipe drops the cursor too.
+        store.insert(Pairing {
+            pair_id: pid, peer_uuid: Uuid::new_v4(), role: PairingRole::Initiator,
+            purpose: "s".into(),
+            my_ephemeral_secret_hex: EphemeralKeyPair::generate().secret_hex(),
+            peer_lct_pubkey_hex: hex::encode(KeyPair::generate().verifying_key().to_bytes()),
+        });
+        store.wipe(&pid);
+        assert_eq!(store.cursor(&pid), None, "revoke clears the cursor");
     }
 
     #[test]

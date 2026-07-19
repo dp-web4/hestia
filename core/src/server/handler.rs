@@ -79,6 +79,7 @@ impl ServerHandler for HestiaServer {
             "hestia_request_witness" => tool_request_witness(&self.state, &args).await,
             "hestia_notify" => tool_notify(&self.state, &args).await,
             "hestia_inbox" => tool_inbox(&self.state, &args).await,
+            "hestia_pair_inbox" => tool_pair_inbox(&self.state, &args).await,
             _ => Ok(hestia_error_envelope(
                 "hestia.unknown_tool",
                 &format!("Unknown tool: {}", name),
@@ -168,6 +169,7 @@ fn hestia_tools() -> Vec<Tool> {
         t("hestia_request_witness", "Append a custom witness chain event"),
         t("hestia_notify", "Receive a hub->citizen notification: open the sealed body, record receipt, return a sealed ACK. Pass defer:true to park it (still sealed) in the durable encrypted inbox and ACK without returning the body"),
         t("hestia_inbox", "Drain the durable inbound mailbox (consume-once): opens deferred notices with the member identity, oldest first"),
+        t("hestia_pair_inbox", "Drain SECRETS sent over confirmed paired channels (pull-side): opens each peer pair_message as a SecretEnvelope, advances a per-pair cursor so each is delivered once. Credential-access gated (§7.8.2) — an unattended caller is deferred and the secret waits for an attended drain"),
     ]
 }
 
@@ -1264,6 +1266,96 @@ async fn tool_inbox(state: &SharedState, args: &Value) -> ToolResult {
         .collect();
 
     Ok(json!({ "total": opened.len(), "notices": opened }))
+}
+
+/// `hestia_pair_inbox` — the pull-side sibling of `hestia_inbox` for the PAIRED
+/// channel (dp's authentication-controller model). Secrets ride confirmed pairs
+/// as `pair_message`s (not the pushed SealedNotice mailbox), so they must be
+/// PULLED (`GET /pairs/:id/messages`) and opened with the pair keys. Same §7.8.2
+/// credential_access gate as `hestia_inbox`: an unattended caller is DENIED and
+/// the secret stays on the hub for an ATTENDED drain (nothing is released, the
+/// cursor doesn't advance). An attended caller gets the opened `SecretEnvelope`s
+/// and the per-pair cursor advances so each secret is delivered once.
+async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
+    let session_id_arg = optional_string(args, "session_id");
+    let mut s = state.lock().await;
+    let who = resolve_caller(&s, session_id_arg.as_deref());
+    if let Some(denied) =
+        gate_direct_tool(&mut s, &who, "hestia_pair_inbox", "credential_access", "pair_inbox")
+    {
+        return Ok(denied); // §7.8.2: deferredByLaw — secret stays for an attended drain
+    }
+
+    let mut pairings = crate::pairing::PairingStore::load(&s.vault)?;
+    let hub_store = crate::hub::HubStore::load(&s.vault)?;
+    let Some(conn) = hub_store.connections.first().cloned() else {
+        return Ok(json!({ "total": 0, "secrets": [], "note": "no hub connection" }));
+    };
+
+    // Member identity keypair — same load path as tool_inbox.
+    let secret_hex = s
+        .vault
+        .get("ai_identity_secret")
+        .map(|e| e.secret.clone())
+        .ok_or_else(|| anyhow::anyhow!("no member identity — run `hestia init --ai`"))?;
+    let arr: [u8; 32] = hex::decode(&secret_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| anyhow::anyhow!("identity secret must be 32-byte hex"))?;
+    let keypair = web4_core::crypto::KeyPair::from_secret_bytes(&arr);
+    let client = crate::hub::HubClient::new();
+
+    let snapshot: Vec<crate::pairing::Pairing> = pairings.pairings.values().cloned().collect();
+    let mut opened: Vec<Value> = Vec::new();
+    let mut advanced = false;
+
+    for p in &snapshot {
+        // Need the (active) pair detail for the peer ephemeral; skip inactive pairs.
+        let detail = match client.get_pair(&conn.rest_endpoint, conn.hub_lct_id, p.pair_id).await {
+            Ok(d) if d.is_active() => d,
+            _ => continue,
+        };
+        let peer_lct = match p.peer_lct_pubkey() {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+        let since = pairings.cursor(&p.pair_id);
+        let msgs = match client
+            .get_pair_messages(&conn.rest_endpoint, conn.hub_lct_id, p.pair_id, since)
+            .await
+        {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        for m in &msgs {
+            if m.from == conn.our_lct_id {
+                // Our own sent message echoed back — advance past it, don't open.
+                pairings.set_cursor(p.pair_id, m.seq);
+                advanced = true;
+                continue;
+            }
+            let entry = match crate::pairing::open_over_pair(p, &detail, &keypair, &peer_lct, &m.payload)
+                .and_then(|plain| crate::pairing::SecretEnvelope::from_opened_bytes(&plain))
+            {
+                Ok(env) => json!({
+                    "pairId": p.pair_id, "seq": m.seq, "from": m.from,
+                    "actId": env.act_id, "secretHex": env.secret_hex,
+                }),
+                Err(e) => json!({
+                    "pairId": p.pair_id, "seq": m.seq, "from": m.from,
+                    "error": format!("could not open as a secret: {e}"),
+                }),
+            };
+            opened.push(entry);
+            pairings.set_cursor(p.pair_id, m.seq);
+            advanced = true;
+        }
+    }
+
+    if advanced {
+        pairings.save(&mut s.vault)?;
+    }
+    Ok(json!({ "total": opened.len(), "secrets": opened }))
 }
 
 // =========================================================================
@@ -2403,5 +2495,36 @@ mod tests {
             .unwrap();
         assert_eq!(ok["total"], 1, "member drain succeeds: {ok}");
         assert_eq!(shared.lock().await.inbox_store.len().unwrap(), 0);
+    }
+
+    /// §7.8.2 also gates the PAIRED-channel secret drain: an unattended caller is
+    /// denied (deferredByLaw), so the secret stays on the hub for an attended
+    /// drain. The attended path with no hub connection is a graceful empty result.
+    #[tokio::test]
+    async fn pair_inbox_is_law_gated() {
+        let (_dir, shared) = make_shared_state();
+        let (unattended, attended) = {
+            let mut s = shared.lock().await;
+            s.role_policy_engines.insert(
+                "role:constellation:mesh-worker".into(),
+                deny_credential_access_engine(),
+            );
+            (
+                add_session(&mut s, "role:constellation:mesh-worker"),
+                add_session(&mut s, "role:constellation:member"),
+            )
+        };
+        let denied = tool_pair_inbox(&shared, &json!({ "session_id": unattended.to_string() }))
+            .await
+            .unwrap();
+        assert!(
+            denied.get("_hestia_error").is_some(),
+            "unattended pair-secret drain must be denied by law: {denied}"
+        );
+        // Attended, no hub connection → graceful empty (the gate passed).
+        let ok = tool_pair_inbox(&shared, &json!({ "session_id": attended.to_string() }))
+            .await
+            .unwrap();
+        assert_eq!(ok["total"], 0, "attended drain with no connection is empty, not an error: {ok}");
     }
 }
