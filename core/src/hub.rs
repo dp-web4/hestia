@@ -688,6 +688,32 @@ impl HubClient {
         serde_json::from_value(doc).context("parsing resolved LCT document")
     }
 
+    /// Resolve a peer's LCT by their hub-member **uuid** (the pairing identity)
+    /// rather than canonical id. The registry list carries only canonical ids,
+    /// so this scans: list → resolve each → match `document.id == uuid`. O(N)
+    /// over the (small) registry; the result is persisted per-pair so it runs
+    /// once. Fail-closed: an unresolvable peer is an error, never a guess.
+    pub async fn resolve_lct_by_member_uuid(
+        &self,
+        rest_endpoint: &str,
+        hub_id: Uuid,
+        member_uuid: Uuid,
+    ) -> Result<web4_core::Lct> {
+        let list = self.list_lcts(rest_endpoint, hub_id).await?;
+        let summaries = list.as_array().ok_or_else(|| {
+            anyhow::anyhow!("registry list was not an array")
+        })?;
+        for s in summaries {
+            let Some(lct_id) = s.get("lct_id").and_then(|v| v.as_str()) else { continue };
+            if let Ok(doc) = self.resolve_lct(rest_endpoint, hub_id, lct_id).await {
+                if doc.id == member_uuid {
+                    return Ok(doc);
+                }
+            }
+        }
+        anyhow::bail!("no registry LCT has member uuid {member_uuid} — peer not published?")
+    }
+
     // -----------------------------------------------------------------------
     // Paired-channel broker client (CBP sprints A–F). The hub is the
     // authentication controller: it admits the pairing under chapter law and

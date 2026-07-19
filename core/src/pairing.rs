@@ -57,6 +57,11 @@ pub struct Pairing {
     /// Our per-session X25519 ephemeral SECRET (hex). Forward-secret material —
     /// never leaves the vault; wiped on revoke.
     pub my_ephemeral_secret_hex: String,
+    /// The peer's STATIC LCT public key (hex) — the authentication half of the
+    /// v2 key (`seal_fs` mixes static‖ephemeral). Resolved once from the hub
+    /// registry at establish/confirm time and persisted so send/recv need no
+    /// repeated O(N) uuid→LCT lookup.
+    pub peer_lct_pubkey_hex: String,
 }
 
 impl Pairing {
@@ -64,6 +69,61 @@ impl Pairing {
     pub fn my_ephemeral(&self) -> Result<EphemeralKeyPair> {
         EphemeralKeyPair::from_secret_hex(&self.my_ephemeral_secret_hex)
             .context("reconstructing our ephemeral keypair from vault")
+    }
+
+    /// Decode the peer's persisted static LCT public key.
+    pub fn peer_lct_pubkey(&self) -> Result<PublicKey> {
+        let bytes: [u8; 32] = hex::decode(&self.peer_lct_pubkey_hex)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| anyhow::anyhow!("peer_lct_pubkey_hex is not 32-byte hex"))?;
+        PublicKey::from_bytes(&bytes).context("decoding peer static LCT pubkey")
+    }
+}
+
+/// The inner envelope a `secret` rides inside the pair-channel seal. The hub
+/// relays the SEALED body opaquely, so this shape is an interop contract between
+/// the two *members* (hestia↔CBP), NOT a hub seam. `kind` lets the receive side
+/// route a secret to the §7.8.2 credential_access gate + interactive drain,
+/// distinct from ordinary coordination traffic. Bytes are hex (arbitrary
+/// binary secrets); `act_id` gives the receiver an id to ACK.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SecretEnvelope {
+    pub kind: String, // always "secret"
+    pub act_id: Uuid,
+    /// The secret bytes, hex-encoded (arbitrary binary; matches the prior
+    /// send_secret envelope's `secret_hex` so a receiver's parse is uniform).
+    pub secret_hex: String,
+}
+
+impl SecretEnvelope {
+    pub const KIND: &'static str = "secret";
+
+    pub fn new(secret: &[u8]) -> Self {
+        Self {
+            kind: Self::KIND.to_string(),
+            act_id: Uuid::new_v4(),
+            secret_hex: hex::encode(secret),
+        }
+    }
+
+    /// Serialize to the bytes that get sealed. Kept separate so the caller can
+    /// drop the plaintext immediately after enveloping.
+    pub fn to_sealed_bytes(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self).context("serializing SecretEnvelope")
+    }
+
+    pub fn from_opened_bytes(bytes: &[u8]) -> Result<Self> {
+        serde_json::from_slice(bytes).context("parsing opened SecretEnvelope")
+    }
+
+    /// Recover the raw secret bytes. Fail-closed on a wrong `kind` (a non-secret
+    /// message must not be treated as one).
+    pub fn secret_bytes(&self) -> Result<Vec<u8>> {
+        if self.kind != Self::KIND {
+            anyhow::bail!("envelope kind is '{}', not 'secret'", self.kind);
+        }
+        hex::decode(&self.secret_hex).context("decoding secret_hex")
     }
 }
 
@@ -201,6 +261,8 @@ pub struct PairView {
     pub initiator: Uuid,
     pub counterparty: Uuid,
     #[serde(default)]
+    pub purpose: String,
+    #[serde(default)]
     pub effective_status: String,
     #[serde(default)]
     pub initiator_ephemeral_pub_hex: Option<String>,
@@ -256,6 +318,7 @@ mod tests {
             role: PairingRole::Initiator,
             purpose: "secret-transport".into(),
             my_ephemeral_secret_hex: alice_eph.secret_hex(),
+            peer_lct_pubkey_hex: hex::encode(bob_lct.verifying_key().to_bytes()),
         };
         let bob_pairing = Pairing {
             pair_id,
@@ -263,6 +326,7 @@ mod tests {
             role: PairingRole::Confirmer,
             purpose: "secret-transport".into(),
             my_ephemeral_secret_hex: bob_eph.secret_hex(),
+            peer_lct_pubkey_hex: hex::encode(alice_lct.verifying_key().to_bytes()),
         };
 
         // The hub-brokered pair detail: initiator=alice's eph, counterparty=bob's.
@@ -270,6 +334,7 @@ mod tests {
             id: pair_id,
             initiator: alice_pairing.peer_uuid, // uuids irrelevant to the crypto
             counterparty: bob_pairing.peer_uuid,
+            purpose: "secret-transport".into(),
             effective_status: "active".into(),
             initiator_ephemeral_pub_hex: Some(alice_eph.public_hex()),
             counterparty_ephemeral_pub_hex: Some(bob_eph.public_hex()),
@@ -302,13 +367,16 @@ mod tests {
         let alice_pairing = Pairing {
             pair_id, peer_uuid: Uuid::new_v4(), role: PairingRole::Initiator,
             purpose: "x".into(), my_ephemeral_secret_hex: alice_eph.secret_hex(),
+            peer_lct_pubkey_hex: hex::encode(bob_lct.verifying_key().to_bytes()),
         };
         let bob_pairing = Pairing {
             pair_id, peer_uuid: Uuid::new_v4(), role: PairingRole::Confirmer,
             purpose: "x".into(), my_ephemeral_secret_hex: bob_eph.secret_hex(),
+            peer_lct_pubkey_hex: hex::encode(alice_lct.verifying_key().to_bytes()),
         };
         let detail = PairView {
             id: pair_id, initiator: Uuid::new_v4(), counterparty: Uuid::new_v4(),
+            purpose: "s".into(),
             effective_status: "active".into(),
             initiator_ephemeral_pub_hex: Some(alice_eph.public_hex()),
             counterparty_ephemeral_pub_hex: Some(bob_eph.public_hex()),
@@ -323,9 +391,61 @@ mod tests {
     }
 
     #[test]
+    fn secret_envelope_round_trips_through_the_pair_channel() {
+        // The full inner-contract path: wrap a secret in a SecretEnvelope, seal
+        // it over the pair, open on the other side, recover the exact bytes.
+        let alice_lct = KeyPair::generate();
+        let bob_lct = KeyPair::generate();
+        let pair_id = Uuid::new_v4();
+        let alice_eph = EphemeralKeyPair::generate();
+        let bob_eph = EphemeralKeyPair::generate();
+        let alice = Pairing {
+            pair_id, peer_uuid: Uuid::new_v4(), role: PairingRole::Initiator,
+            purpose: "s".into(), my_ephemeral_secret_hex: alice_eph.secret_hex(),
+            peer_lct_pubkey_hex: hex::encode(bob_lct.verifying_key().to_bytes()),
+        };
+        let bob = Pairing {
+            pair_id, peer_uuid: Uuid::new_v4(), role: PairingRole::Confirmer,
+            purpose: "s".into(), my_ephemeral_secret_hex: bob_eph.secret_hex(),
+            peer_lct_pubkey_hex: hex::encode(alice_lct.verifying_key().to_bytes()),
+        };
+        let detail = PairView {
+            id: pair_id, initiator: Uuid::new_v4(), counterparty: Uuid::new_v4(),
+            purpose: "s".into(),
+            effective_status: "active".into(),
+            initiator_ephemeral_pub_hex: Some(alice_eph.public_hex()),
+            counterparty_ephemeral_pub_hex: Some(bob_eph.public_hex()),
+        };
+
+        let secret = b"\x00\x01kaggle-token-BINARY\xff";
+        let env = SecretEnvelope::new(secret);
+        let act_id = env.act_id;
+        let body = seal_over_pair(
+            &alice, &detail, &alice_lct, &alice.peer_lct_pubkey().unwrap(),
+            &env.to_sealed_bytes().unwrap(),
+        ).unwrap();
+
+        let opened = open_over_pair(
+            &bob, &detail, &bob_lct, &bob.peer_lct_pubkey().unwrap(), &body,
+        ).unwrap();
+        let recovered = SecretEnvelope::from_opened_bytes(&opened).unwrap();
+        assert_eq!(recovered.kind, SecretEnvelope::KIND);
+        assert_eq!(recovered.act_id, act_id, "act_id survives for the ACK");
+        assert_eq!(recovered.secret_bytes().unwrap(), secret, "exact binary secret recovered");
+    }
+
+    #[test]
+    fn secret_envelope_wrong_kind_fails_closed() {
+        let mut env = SecretEnvelope::new(b"x");
+        env.kind = "coordination".into();
+        assert!(env.secret_bytes().is_err(), "a non-secret kind must not yield secret bytes");
+    }
+
+    #[test]
     fn unconfirmed_pair_has_no_peer_key() {
         let detail = PairView {
             id: Uuid::new_v4(), initiator: Uuid::new_v4(), counterparty: Uuid::new_v4(),
+            purpose: "s".into(),
             effective_status: "proposed".into(),
             initiator_ephemeral_pub_hex: Some(EphemeralKeyPair::generate().public_hex()),
             counterparty_ephemeral_pub_hex: None, // peer hasn't confirmed

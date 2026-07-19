@@ -10,7 +10,11 @@ use std::path::PathBuf;
 use hestia::constellation::{ConstellationStore, DeviceType};
 use hestia::delegation::{self, DelegationStore};
 use hestia::profile::{self, ProfileLink, ProfileStore};
-use hestia::hub::{HubClient, HubStore};
+use hestia::hub::{HubClient, HubConnection, HubStore};
+use hestia::pairing::{
+    Pairing, PairConfirmPayload, PairRequestPayload, PairingRole, PairingStore, SecretEnvelope,
+};
+use web4_core::pair_channel::EphemeralKeyPair;
 use hestia::vault::{default_hestia_home, vault_path, Vault, VaultEntry};
 
 /// Reported by `--version`: the semver plus the exact build provenance
@@ -251,22 +255,62 @@ enum HubCmd {
         #[arg(long)]
         member_lct: Option<uuid::Uuid>,
     },
-    /// Send a small SECRET sealed END-TO-END to a peer member (dp/CBP PRD
-    /// 2026-07-18). The body is sealed to the RECIPIENT's key -- the hub relays it
-    /// opaquely, never sees plaintext, and the ledger carries a content-hash only.
-    /// Payload from --file or stdin (NEVER argv -> shell history). Fail-closed.
+    /// Send a small SECRET over a CONFIRMED paired channel (dp 2026-07-18: the
+    /// hub is the authentication controller; a pairing IS the sealed channel).
+    /// The secret rides as a `pair_message`, sealed end-to-end with the pair's
+    /// keys -- the hub relays it opaquely, never sees plaintext, ledger carries a
+    /// content-hash only. Establish the pair first (`hub pair-request` +
+    /// peer `hub pair-confirm`). Payload from --file or stdin (NEVER argv).
     SendSecret {
-        /// Recipient member LCT id (the peer's pinned identity).
+        /// Recipient member LCT uuid (the peer you have a confirmed pair with).
         #[arg(long)]
         to: uuid::Uuid,
-        /// Recipient's pinned identity pubkey (hex). Until the hub ships a
-        /// pubkey-resolver endpoint, provide it explicitly (from the pinned roster).
+        /// Use a specific pair_id (default: the sole confirmed pair to `--to`).
         #[arg(long)]
-        recipient_pubkey: String,
+        pair: Option<uuid::Uuid>,
         /// Read the secret from this file instead of stdin.
         #[arg(long)]
         file: Option<String>,
         /// Hub URL or connection UUID to send through (default: sole connection).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
+
+    /// Propose a pairing with a peer member (the sealed-channel handshake). We
+    /// mint a per-session ephemeral key and publish it in the request; the peer
+    /// completes it with `hub pair-confirm`. Prints the new pair_id.
+    PairRequest {
+        /// Peer member LCT uuid to pair with.
+        #[arg(long)]
+        to: uuid::Uuid,
+        /// A human label for what the channel is for.
+        #[arg(long, default_value = "secret-transport")]
+        purpose: String,
+        /// Hub URL or connection UUID (default: sole connection).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
+
+    /// Confirm a pairing a peer requested with us (completes the sealed channel;
+    /// mints our ephemeral key and publishes it). After this the pair is active.
+    PairConfirm {
+        /// The pair_id from the peer's request (e.g. from the pair notice).
+        pair_id: uuid::Uuid,
+        /// Hub URL or connection UUID (default: sole connection).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
+
+    /// List the pairings we hold locally (id, peer, role, purpose).
+    PairList,
+
+    /// Drain and OPEN secrets sent to us over a confirmed pair (attended, §7.8.2
+    /// -- the vault-authenticated operator IS the release recipient). Raw secret
+    /// bytes go to stdout; metadata to stderr. Never logged.
+    RecvSecrets {
+        /// The pair_id to drain.
+        pair_id: uuid::Uuid,
+        /// Hub URL or connection UUID (default: sole connection).
         #[arg(long, default_value = "")]
         target: String,
     },
@@ -484,8 +528,18 @@ pub fn run() -> AnyResult<()> {
             HubCmd::SetMemberKey { target, channel_key, member_lct } => {
                 cmd_hub_set_member_key(&home, &target, channel_key, member_lct)
             }
-            HubCmd::SendSecret { to, recipient_pubkey, file, target } => {
-                cmd_hub_send_secret(&home, to, &recipient_pubkey, file.as_deref(), &target)
+            HubCmd::SendSecret { to, pair, file, target } => {
+                cmd_hub_send_secret(&home, to, pair, file.as_deref(), &target)
+            }
+            HubCmd::PairRequest { to, purpose, target } => {
+                cmd_hub_pair_request(&home, to, &purpose, &target)
+            }
+            HubCmd::PairConfirm { pair_id, target } => {
+                cmd_hub_pair_confirm(&home, pair_id, &target)
+            }
+            HubCmd::PairList => cmd_hub_pair_list(&home),
+            HubCmd::RecvSecrets { pair_id, target } => {
+                cmd_hub_recv_secrets(&home, pair_id, &target)
             }
         },
         Command::Constellation(c) => match c {
@@ -1513,10 +1567,146 @@ fn abs_rest(base_url: &str, rest: &str) -> String {
     }
 }
 
+/// Resolve the hub connection to operate on (sole connection, or by url/uuid).
+fn pick_connection(store: &HubStore, target: &str) -> AnyResult<HubConnection> {
+    if target.is_empty() {
+        match store.connections.as_slice() {
+            [only] => Ok(only.clone()),
+            [] => anyhow::bail!("not connected to a hub -- `hestia hub connect <url>` first"),
+            _ => anyhow::bail!("multiple hub connections -- pass --target <url|uuid>"),
+        }
+    } else if let Ok(id) = uuid::Uuid::parse_str(target) {
+        store.connections.iter().find(|c| c.id == id || c.hub_lct_id == id).cloned()
+            .ok_or_else(|| anyhow::anyhow!("no connection matching {target}"))
+    } else {
+        store.connections.iter().find(|c| c.url == target).cloned()
+            .ok_or_else(|| anyhow::anyhow!("not connected to {target}"))
+    }
+}
+
+/// `hub pair-request` — propose a pairing (the sealed-channel handshake). Mint a
+/// per-session ephemeral key, resolve + persist the peer's static LCT pubkey,
+/// publish our ephemeral in the request. The peer completes it with pair-confirm.
+fn cmd_hub_pair_request(
+    home: &std::path::Path,
+    to: uuid::Uuid,
+    purpose: &str,
+    target: &str,
+) -> AnyResult<()> {
+    let mut vault = open_vault(home)?;
+    let store = HubStore::load(&vault)?;
+    let conn = pick_connection(&store, target)?;
+    let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+
+    // Resolve the peer's static LCT pubkey ONCE (the v2-key auth half) and persist.
+    let peer_lct = rt.block_on(client.resolve_lct_by_member_uuid(&rest, conn.hub_lct_id, to))
+        .context("resolving peer LCT (is the peer published to the registry?)")?;
+    let peer_pubkey_hex = hex::encode(peer_lct.public_key.to_bytes());
+
+    let my_eph = EphemeralKeyPair::generate();
+    let payload = PairRequestPayload {
+        action: "pair_request",
+        counterparty_lct_id: to,
+        purpose: purpose.to_string(),
+        initiator_ephemeral_pub_hex: Some(my_eph.public_hex()),
+    };
+    let pair_id = rt.block_on(client.pair_request(
+        &rest, conn.hub_lct_id, conn.our_lct_id, &keypair, &payload,
+    ))?;
+
+    let mut pairings = PairingStore::load(&vault)?;
+    pairings.insert(Pairing {
+        pair_id,
+        peer_uuid: to,
+        role: PairingRole::Initiator,
+        purpose: purpose.to_string(),
+        my_ephemeral_secret_hex: my_eph.secret_hex(),
+        peer_lct_pubkey_hex: peer_pubkey_hex,
+    });
+    pairings.save(&mut vault)?;
+
+    println!("Pair requested: {pair_id}");
+    println!("  peer: {to}   purpose: {purpose}");
+    println!("Have the peer run:  hestia hub pair-confirm {pair_id}");
+    Ok(())
+}
+
+/// `hub pair-confirm` — accept a pairing the peer requested. Mint our ephemeral,
+/// resolve + persist the initiator's static pubkey, publish our ephemeral. Active after.
+fn cmd_hub_pair_confirm(
+    home: &std::path::Path,
+    pair_id: uuid::Uuid,
+    target: &str,
+) -> AnyResult<()> {
+    let mut vault = open_vault(home)?;
+    let store = HubStore::load(&vault)?;
+    let conn = pick_connection(&store, target)?;
+    let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+
+    let detail = rt.block_on(client.get_pair(&rest, conn.hub_lct_id, pair_id))?;
+    // The peer is the initiator (we are confirming).
+    let peer_uuid = detail.initiator;
+    let peer_lct = rt.block_on(client.resolve_lct_by_member_uuid(&rest, conn.hub_lct_id, peer_uuid))
+        .context("resolving initiator LCT")?;
+    let peer_pubkey_hex = hex::encode(peer_lct.public_key.to_bytes());
+
+    let my_eph = EphemeralKeyPair::generate();
+    let payload = PairConfirmPayload {
+        action: "pair_confirm",
+        pair_id,
+        counterparty_ephemeral_pub_hex: Some(my_eph.public_hex()),
+    };
+    rt.block_on(client.pair_confirm(
+        &rest, conn.hub_lct_id, conn.our_lct_id, &keypair, pair_id, &payload,
+    ))?;
+
+    let mut pairings = PairingStore::load(&vault)?;
+    pairings.insert(Pairing {
+        pair_id,
+        peer_uuid,
+        role: PairingRole::Confirmer,
+        purpose: detail.purpose.clone(),
+        my_ephemeral_secret_hex: my_eph.secret_hex(),
+        peer_lct_pubkey_hex: peer_pubkey_hex,
+    });
+    pairings.save(&mut vault)?;
+
+    println!("Pair confirmed: {pair_id} (channel active)");
+    println!("  peer: {peer_uuid}   purpose: {}", detail.purpose);
+    Ok(())
+}
+
+/// `hub pair-list` — the pairings we hold locally.
+fn cmd_hub_pair_list(home: &std::path::Path) -> AnyResult<()> {
+    let vault = open_vault(home)?;
+    let pairings = PairingStore::load(&vault)?;
+    if pairings.pairings.is_empty() {
+        println!("No pairings.");
+        return Ok(());
+    }
+    for p in pairings.pairings.values() {
+        let role = match p.role {
+            PairingRole::Initiator => "initiator",
+            PairingRole::Confirmer => "confirmer",
+        };
+        println!("{}  peer={}  role={}  purpose={}", p.pair_id, p.peer_uuid, role, p.purpose);
+    }
+    Ok(())
+}
+
+/// `hub send-secret` — seal a secret over a CONFIRMED pair and relay it as a
+/// `pair_message`. The hub carries the sealed body opaquely; the ledger witnesses
+/// only its content-hash. Fail-closed: no pointer fallback, plaintext never logged.
 fn cmd_hub_send_secret(
     home: &std::path::Path,
     to: uuid::Uuid,
-    recipient_pubkey_hex: &str,
+    pair: Option<uuid::Uuid>,
     file: Option<&str>,
     target: &str,
 ) -> AnyResult<()> {
@@ -1536,85 +1726,104 @@ fn cmd_hub_send_secret(
     if secret.len() > 8 * 1024 {
         anyhow::bail!("secret too large ({} bytes) -- this channel is for small secrets (<=8 KB)", secret.len());
     }
-    let recipient_pubkey = {
-        let bytes: [u8; 32] = hex::decode(recipient_pubkey_hex).ok()
-            .and_then(|b| b.try_into().ok())
-            .ok_or_else(|| anyhow::anyhow!("--recipient-pubkey must be 32-byte hex"))?;
-        web4_core::crypto::PublicKey::from_bytes(&bytes).context("bad recipient pubkey")?
-    };
 
     let vault = open_vault(home)?;
     let store = HubStore::load(&vault)?;
-    let conn = if target.is_empty() {
-        match store.connections.as_slice() {
-            [only] => only.clone(),
-            [] => anyhow::bail!("not connected to a hub -- `hestia hub connect <url>` first"),
-            _ => anyhow::bail!("multiple hub connections -- pass --target <url|uuid>"),
-        }
-    } else if let Ok(id) = uuid::Uuid::parse_str(target) {
-        store.connections.iter().find(|c| c.id == id || c.hub_lct_id == id).cloned()
-            .ok_or_else(|| anyhow::anyhow!("no connection matching {target}"))?
-    } else {
-        store.connections.iter().find(|c| c.url == target).cloned()
-            .ok_or_else(|| anyhow::anyhow!("not connected to {target}"))?
-    };
+    let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-
-    // Wrap in a JSON envelope so the recipient's existing sealed-notice open path
-    // (which parses JSON) handles it uniformly. `secret_hex` carries arbitrary
-    // bytes; `act_id` gives the receive side an id to ACK. Then seal END-TO-END to
-    // the recipient (the hub cannot open it).
-    let envelope = serde_json::json!({
-        "act_id": uuid::Uuid::new_v4(),
-        "kind": "secret",
-        "secret_hex": hex::encode(&secret),
-    });
-    let envelope_bytes = serde_json::to_vec(&envelope)?;
-    drop(secret); // drop the raw plaintext the moment it is enveloped (no echo, no log)
-    let ss = hestia::hub::seal_secret_for_peer(&keypair, &recipient_pubkey, &envelope_bytes)
-        .context("sealing the secret to the recipient")?;
-    drop(envelope_bytes);
-
-    // Deliver as a `secret`-kind referenced_act carrying the sealed body. The hub
-    // relays the opaque body to the recipient's mailbox (never sees plaintext);
-    // the ledger binds to the CIPHERTEXT hash only.
     let rest = abs_rest(&conn.url, &conn.rest_endpoint);
     let client = HubClient::new();
-    // HUB's `send_secret` relay wire (#545): the hub carries the body opaquely
-    // (never re-seals), `to` = recipient LCT, `sealed`/`pair_id` are OUR seal to
-    // the recipient's operational key, `content_hash` is over the ciphertext. The
-    // recipient's inbox opens with the SENDER's operational key resolved from the
-    // registry (the notice's `sealed_by` = our authenticated LCT) — so we do NOT
-    // carry our pubkey here.
-    let args = serde_json::json!({
-        "to": to,
-        "sealed": ss.sealed,
-        "pair_id": ss.pair_id,
-        "pointer_uri": format!("sealed://{}", to),
-        "content_hash": ss.ciphertext_hash,
-    });
     let rt = tokio::runtime::Runtime::new()?;
-    let pair_id = uuid::Uuid::new_v4();
-    let channel = rt.block_on(client.open_channel(&conn.url, pair_id))?;
-    let resp = rt.block_on(client.channel_query(
-        &rest, &channel, &keypair, conn.our_lct_id, "send_secret", args,
-    ));
-    match resp {
-        Ok(v) => {
-            println!("Sealed secret sent to {to}.");
-            println!("  ciphertext_hash (on the ledger, not the body): {}", ss.ciphertext_hash);
-            if let Some(idx) = v.get("entry_index").or_else(|| v.get("entryIndex")) {
-                println!("  ledger entry: {idx}");
+
+    // Select the pairing: by --pair, else the sole confirmed pair to `to`.
+    let pairings = PairingStore::load(&vault)?;
+    let pairing = match pair {
+        Some(pid) => pairings.get(&pid).cloned()
+            .ok_or_else(|| anyhow::anyhow!("no local pairing {pid} -- pair-request/confirm first"))?,
+        None => {
+            let matches: Vec<&Pairing> =
+                pairings.pairings.values().filter(|p| p.peer_uuid == to).collect();
+            match matches.as_slice() {
+                [only] => (*only).clone(),
+                [] => anyhow::bail!("no pairing with {to} -- `hestia hub pair-request --to {to}` first"),
+                _ => anyhow::bail!("multiple pairings with {to} -- pass --pair <pair_id>"),
             }
-            println!("Recipient drains it via `hestia_inbox` from an ATTENDED session (spec 7.8.2).");
         }
-        Err(e) => {
-            anyhow::bail!(
-                "send failed ({e}). If the hub rejected the sealed_body, it needs the opaque-carry \
-                 path (queue the sender-sealed body verbatim for kind=secret) -- HUB seam, PRD 2026-07-18. \
-                 The secret was NOT sent by any other means (no pointer fallback)."
-            );
+    };
+
+    // The pair MUST be active (peer has confirmed) -- fail-closed, no weak fallback.
+    let detail = rt.block_on(client.get_pair(&rest, conn.hub_lct_id, pairing.pair_id))?;
+    if !detail.is_active() {
+        anyhow::bail!(
+            "pair {} is '{}', not active -- the peer must `pair-confirm` before a secret can ride it",
+            pairing.pair_id, detail.effective_status
+        );
+    }
+    let peer_lct = pairing.peer_lct_pubkey()?;
+
+    // Envelope + seal end-to-end over the pair; drop plaintext immediately.
+    let env = SecretEnvelope::new(&secret);
+    let act_id = env.act_id;
+    drop(secret);
+    let sealed_bytes = env.to_sealed_bytes()?;
+    let body = hestia::pairing::seal_over_pair(&pairing, &detail, &keypair, &peer_lct, &sealed_bytes)
+        .context("sealing the secret over the pair channel")?;
+    drop(sealed_bytes);
+
+    rt.block_on(client.post_pair_message(
+        &rest, conn.hub_lct_id, conn.our_lct_id, &keypair, pairing.pair_id, body,
+    )).context("relaying the sealed pair_message (no pointer fallback for a secret)")?;
+
+    println!("Sealed secret sent over pair {} to {}.", pairing.pair_id, to);
+    println!("  act_id (for the peer's ACK): {act_id}");
+    println!("Peer drains it (attended, §7.8.2):  hestia hub recv-secrets {}", pairing.pair_id);
+    Ok(())
+}
+
+/// `hub recv-secrets` — drain + OPEN secrets on a confirmed pair. Attended: the
+/// vault-authenticated operator IS the §7.8.2 release recipient. Raw secret bytes
+/// to stdout (pipe to a file); metadata to stderr. Never logged.
+fn cmd_hub_recv_secrets(
+    home: &std::path::Path,
+    pair_id: uuid::Uuid,
+    target: &str,
+) -> AnyResult<()> {
+    use std::io::Write;
+    let vault = open_vault(home)?;
+    let store = HubStore::load(&vault)?;
+    let conn = pick_connection(&store, target)?;
+    let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+
+    let pairings = PairingStore::load(&vault)?;
+    let pairing = pairings.get(&pair_id).cloned()
+        .ok_or_else(|| anyhow::anyhow!("no local pairing {pair_id}"))?;
+    let detail = rt.block_on(client.get_pair(&rest, conn.hub_lct_id, pair_id))?;
+    if !detail.is_active() {
+        anyhow::bail!("pair {pair_id} is '{}', not active", detail.effective_status);
+    }
+    let peer_lct = pairing.peer_lct_pubkey()?;
+
+    let msgs = rt.block_on(client.get_pair_messages(&rest, conn.hub_lct_id, pair_id, None))?;
+    let mut opened = 0usize;
+    for m in &msgs {
+        // Only open the PEER's messages -- skip our own sent echoes.
+        if m.from != pairing.peer_uuid {
+            continue;
         }
+        let plain = hestia::pairing::open_over_pair(&pairing, &detail, &keypair, &peer_lct, &m.payload)
+            .with_context(|| format!("opening pair_message seq {}", m.seq))?;
+        let env = SecretEnvelope::from_opened_bytes(&plain)?;
+        let secret = env.secret_bytes()?;
+        // Metadata to stderr; raw secret to stdout (the operator's explicit release).
+        eprintln!("[secret] seq={} act_id={} bytes={}", m.seq, env.act_id, secret.len());
+        std::io::stdout().write_all(&secret).context("writing secret to stdout")?;
+        opened += 1;
+    }
+    if opened == 0 {
+        eprintln!("No secrets from the peer on pair {pair_id}.");
     }
     Ok(())
 }
