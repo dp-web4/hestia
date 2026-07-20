@@ -142,62 +142,12 @@ impl HubChannel {
     }
 }
 
-/// A secret sealed END-TO-END to a peer (dp/CBP PRD 2026-07-18, `hub-sendsecret`).
-/// The body is encrypted to the RECIPIENT's identity key — the hub relays it
-/// opaquely (it is NOT sealed to the hub, unlike a `HubChannel` request). The
-/// `ciphertext_hash` binds a ledger record to this exact sealed blob **without
-/// revealing the secret** (the ledger carries the hash only, never the body).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SealedSecret {
-    /// The channel salt the recipient needs to derive the session key.
-    pub pair_id: Uuid,
-    /// The sender's identity pubkey (hex) — the recipient opens against it.
-    pub from_pubkey_hex: String,
-    /// The sealed ciphertext, base64.
-    pub sealed: String,
-    /// `sha256(ciphertext)` — the witnessed content hash (NOT of the plaintext).
-    pub ciphertext_hash: String,
-}
-
-/// Seal `secret` end-to-end to `recipient_pubkey`, signed with `my` identity key.
-/// A fresh `pair_id` per send; the recipient opens with
-/// [`open_secret_from_peer`]. `pair_channel::seal` does the Ed25519→X25519 ECDH
-/// internally, so no separate sealing key is needed (the crypto de-risking, #625).
-pub fn seal_secret_for_peer(
-    my: &KeyPair,
-    recipient_pubkey: &PublicKey,
-    secret: &[u8],
-) -> Result<SealedSecret> {
-    let pair_id = Uuid::new_v4();
-    let sealed = pair_channel::seal(my, recipient_pubkey, pair_id, secret)
-        .context("sealing secret to peer")?;
-    let sealed_b64 = sealed.to_base64();
-    let ciphertext_hash = format!(
-        "sha256-content:{}",
-        web4_core::crypto::sha256_hex(sealed_b64.as_bytes())
-    );
-    Ok(SealedSecret {
-        pair_id,
-        from_pubkey_hex: hex::encode(my.verifying_key().to_bytes()),
-        sealed: sealed_b64,
-        ciphertext_hash,
-    })
-}
-
-/// Open a [`SealedSecret`] a peer sent us: derive the session key from OUR
-/// keypair + the SENDER's pubkey + the carried `pair_id`. **Fail-closed** — an
-/// AEAD failure (tampered, wrong key, or not actually sealed to us) is an error,
-/// never a partial read.
-pub fn open_secret_from_peer(my: &KeyPair, s: &SealedSecret) -> Result<Vec<u8>> {
-    let from_bytes: [u8; 32] = hex::decode(&s.from_pubkey_hex)
-        .ok()
-        .and_then(|b| b.try_into().ok())
-        .ok_or_else(|| anyhow::anyhow!("sender pubkey is not 32-byte hex"))?;
-    let from_pubkey = PublicKey::from_bytes(&from_bytes).context("bad sender pubkey")?;
-    let sealed = Sealed::from_base64(&s.sealed).context("decoding sealed secret")?;
-    pair_channel::open(my, &from_pubkey, s.pair_id, &sealed)
-        .context("opening sealed secret (AEAD auth failed → tampered, wrong key, or not sealed to us)")
-}
+// [retired 2026-07-20] `SealedSecret` / `seal_secret_for_peer` / `open_secret_from_peer`
+// were the member→member send_secret path (peer-sealed body relayed opaquely, the
+// receiver resolving the sender's operational key from the registry). Secrets now
+// ride confirmed paired channels as `pair_message`s (`crate::pairing`, v2 forward-
+// secret); the pairing keys make that per-send seal + registry-PKI resolution
+// unnecessary. Dogfooded CBP→Thor 2026-07-20. See `crate::pairing::seal_over_pair`.
 
 /// A notification the hub delivers to a citizen's LCT MCP, or that the citizen
 /// drains from its pending mailbox over the existing sealed channel (push and
@@ -999,29 +949,8 @@ mod tests {
     use super::*;
     use web4_core::crypto::KeyPair;
 
-    #[test]
-    fn sealed_secret_roundtrips_e2e_and_fails_closed() {
-        let sender = KeyPair::generate();
-        let recipient = KeyPair::generate();
-        let secret = b"kaggle-token-DUMMY-abc123";
-        let ss = seal_secret_for_peer(&sender, &recipient.verifying_key(), secret).unwrap();
-        // the recipient opens it with its own key + the sender pubkey it carries
-        assert_eq!(open_secret_from_peer(&recipient, &ss).unwrap(), secret);
-        // the hash is over the CIPHERTEXT, tagged, and the plaintext is not in the blob
-        assert!(ss.ciphertext_hash.starts_with("sha256-content:"));
-        assert!(!ss.sealed.contains("kaggle"), "ciphertext must not leak plaintext");
-        // fail-closed: a DIFFERENT recipient cannot open it (not sealed to them)
-        let stranger = KeyPair::generate();
-        assert!(open_secret_from_peer(&stranger, &ss).is_err());
-        // fail-closed: tampered ciphertext → AEAD failure
-        let mut tampered = ss.clone();
-        let mut b = tampered.sealed.clone();
-        let flip = if &b[8..9] == "A" { "B" } else { "A" };
-        b.replace_range(8..9, flip);
-        tampered.sealed = b;
-        assert!(open_secret_from_peer(&recipient, &tampered).is_err());
-    }
-
+    // [retired 2026-07-20] sealed_secret_roundtrips_e2e_and_fails_closed tested the
+    // send_secret primitives; superseded by `crate::pairing`'s pair-channel tests.
 
     /// The registry seam's identity rule: `published_by` == envelope signer
     /// (hub 403s a mismatch), so a vault-identity member signs as the vault's

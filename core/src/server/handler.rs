@@ -1001,101 +1001,36 @@ async fn tool_request_witness(state: &SharedState, args: &Value) -> ToolResult {
     Ok(json!({"witnessEntryHash": entry.hash}))
 }
 
-/// Resolve a peer sender's OPERATIONAL public key (hex) from the registry, given
-/// its `sealed_by` LCT uuid (HUB #545). The published `#540` vouch is the authority
-/// (ruling B) — offline-verifiable, no hub-private roster. Fail-closed: an unknown
-/// sender, or one with no vouched operational key, is an error (never a guess).
+/// `hestia_notify` — the citizen side of an inbound HUB→citizen sealed notice.
 ///
-/// `sealed_by` is a Uuid (the sender's member-LCT id), but the registry keys on the
-/// canonical mb32 id, so this matches by the document's `id` field. O(N) over the
-/// registry — fine at fleet scale; a direct id-index is a hub optimization to ask
-/// for if it grows.
-async fn resolve_sealer_operational_key(
-    s: &super::state::ServerState,
-    sealed_by: &str,
-) -> anyhow::Result<String> {
-    let sealer_uuid = Uuid::parse_str(sealed_by)
-        .map_err(|_| anyhow::anyhow!("sealed_by is not a UUID: {sealed_by}"))?;
-    let store = crate::hub::HubStore::load(&s.vault)?;
-    let conn = store
-        .connections
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("no hub connection to resolve the sealer's key"))?;
-    let client = crate::hub::HubClient::new();
-    let list = client.list_lcts(&conn.rest_endpoint, conn.hub_lct_id).await?;
-    let ids: Vec<String> = list
-        .as_array()
-        .map(|a| a.iter().filter_map(|e| e.get("lct_id").and_then(Value::as_str).map(str::to_string)).collect())
-        .unwrap_or_default();
-    for lct_id in ids {
-        if let Ok(doc) = client.resolve_lct(&conn.rest_endpoint, conn.hub_lct_id, &lct_id).await {
-            if doc.id == sealer_uuid {
-                // Ruling B: the operational key the sender signs with. Try the
-                // channel/witnessing purposes (either is the operational level).
-                let opkey = doc
-                    .operational_key_for("channel")
-                    .or_else(|| doc.operational_key_for("witnessing"))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("sender {sealed_by} has no vouched operational key in the registry")
-                    })?;
-                return Ok(hex::encode(opkey.to_bytes()));
-            }
-        }
-    }
-    anyhow::bail!("sender {sealed_by} not found in the registry (has it published its member LCT?)")
-}
-
-/// `hestia_notify` — the citizen side of an inbound sealed notice.
+/// A notice is a sealed body the **hub** encrypted to this member's pinned pubkey;
+/// this tool opens it with the member identity keypair, records receipt in the
+/// witness chain, and returns a sealed
+/// [`NotificationAck`](crate::hub::NotificationAck). Wire:
+/// `{ pair_id, hub_pubkey_hex, sealed, kind?, pointer_uri?, hub_lct_id? }`.
 ///
-/// A notice is a sealed body addressed to this member: the **sealer** encrypted it
-/// to the member's pinned pubkey, and this tool opens it with the member identity
-/// keypair, records receipt in the witness chain, and returns a sealed
-/// [`NotificationAck`](crate::hub::NotificationAck). The sealer is EITHER the hub
-/// (a hub→citizen notification) OR a **sender peer** (a member→member sealed
-/// secret, PRD 2026-07-18) — the open is the same `pair_channel` ECDH against
-/// whoever sealed it, so the two are one code path. The sealer's pubkey + LCT are
-/// accepted under either name:
-/// `{ pair_id, (from_pubkey_hex|hub_pubkey_hex), sealed, kind?, pointer_uri?,
-///    (from_lct_id|hub_lct_id)? }`. A peer-sealed secret carries `from_pubkey_hex`.
+/// **Member→member SECRETS do NOT come through here.** They ride confirmed paired
+/// channels as `pair_message`s and are drained by [`tool_pair_inbox`]
+/// (dp 2026-07-20). The old peer-sealed path — a peer pre-sealing a notice and the
+/// receiver resolving the sender's operational key from the registry (`sealed_by`,
+/// HUB #545 / ruling B) — was retired once the pairing dogfood landed; the pairing
+/// keys make that registry-PKI resolution unnecessary.
 async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
     let pair_id = Uuid::parse_str(&require_string(args, "pair_id")?)
         .map_err(|_| anyhow::anyhow!("pair_id is not a UUID"))?;
     let sealed = require_string(args, "sealed")?;
     let kind = args.get("kind").and_then(Value::as_str).unwrap_or("notify").to_string();
     let pointer_uri = args.get("pointer_uri").and_then(Value::as_str).map(str::to_string);
-    // The SEALER's LCT — a peer (`sealed_by`/`from_lct_id`) or the hub (`hub_lct_id`).
+    // The HUB is the sealer (hub→citizen notification).
     let hub_lct_id = args
-        .get("sealed_by")
-        .or_else(|| args.get("from_lct_id"))
-        .or_else(|| args.get("hub_lct_id"))
+        .get("hub_lct_id")
         .and_then(Value::as_str)
         .and_then(|s| Uuid::parse_str(s).ok())
         .unwrap_or_else(Uuid::nil);
-    // `sealed_by` (HUB #545): a peer pre-sealed this — resolve the SENDER's
-    // operational key from the REGISTRY (ruling B / #540), the published vouch as
-    // authority (not a hub-private roster, not a carried pubkey). `from_pubkey_hex`
-    // is an explicit override (tests / already-resolved). Else the hub sealed it.
-    let sealed_by = args
-        .get("sealed_by")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    let hub_pubkey_hex = optional_string(args, "hub_pubkey_hex")
+        .ok_or_else(|| anyhow::anyhow!("hub_pubkey_hex required (the hub's channel pubkey that sealed this notice)"))?;
 
     let mut s = state.lock().await;
-
-    // Resolve the sealer's pubkey. Peer path: resolve `sealed_by`'s operational key
-    // from the registry, fail-closed. Hub path / explicit override: the given hex.
-    let hub_pubkey_hex = match optional_string(args, "from_pubkey_hex")
-        .or_else(|| optional_string(args, "hub_pubkey_hex"))
-    {
-        Some(hex) => hex,
-        None => {
-            let sealed_by = sealed_by.clone().ok_or_else(|| {
-                anyhow::anyhow!("no sealer: need sealed_by (peer, registry-resolved), from_pubkey_hex, or hub_pubkey_hex")
-            })?;
-            resolve_sealer_operational_key(&s, &sealed_by).await?
-        }
-    };
 
     // Load the member identity keypair from the vault — its pubkey is what the
     // hub sealed to. (Same path as the hub-callback issuer identity.)
@@ -2368,66 +2303,6 @@ mod tests {
             },
         );
         sid
-    }
-
-    #[tokio::test]
-    async fn peer_sealed_notice_opens_via_from_pubkey_not_the_hub() {
-        // A sender PEER seals a JSON body to the member's identity key; tool_notify
-        // opens it using `from_pubkey_hex` (the sender), proving the receive path is
-        // sealer-generic — hub OR peer, one code path (the secret-send receive half).
-        let dir = TempDir::new().unwrap();
-        let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
-        let member_kp = web4_core::crypto::KeyPair::generate();
-        vault
-            .add(crate::vault::VaultEntry::new(
-                "ai_identity_secret",
-                hex::encode(member_kp.secret_key_bytes()),
-            ))
-            .unwrap();
-        let state = super::super::state::ServerState::open(vault, dir.path(), "p").unwrap();
-        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(state));
-
-        // The sender seals the exact envelope the send verb produces.
-        let sender = web4_core::crypto::KeyPair::generate();
-        let pair_id = Uuid::new_v4();
-        let envelope = json!({"act_id": Uuid::new_v4(), "kind": "secret", "secret_hex": hex::encode(b"kaggle-DUMMY")});
-        let sealed = web4_core::pair_channel::seal(
-            &sender, &member_kp.verifying_key(), pair_id, &serde_json::to_vec(&envelope).unwrap(),
-        ).unwrap().to_base64();
-
-        let sender_lct = Uuid::new_v4();
-        let sender_pubkey_hex = hex::encode(sender.verifying_key().to_bytes());
-
-        // (1) Content proof: the peer-sealed body opens to the exact secret via the
-        // SAME sealer-generic path tool_inbox uses (HubChannel over the sender's key).
-        let opened = crate::hub::HubChannel::new(sender_lct, pair_id, &sender_pubkey_hex)
-            .unwrap()
-            .open_notification(&member_kp, &sealed)
-            .unwrap();
-        assert_eq!(hex::decode(opened["secret_hex"].as_str().unwrap()).unwrap(), b"kaggle-DUMMY");
-
-        // (2) tool_notify accepts the PEER sealer (from_pubkey_hex) and opens it. The
-        // unattended test caller auto-defers under §7.8.2 (deferredByLaw) — which
-        // PROVES the open succeeded (a failed open errors BEFORE the gate runs).
-        let resp = tool_notify(&shared, &json!({
-            "pair_id": pair_id.to_string(),
-            "from_pubkey_hex": sender_pubkey_hex,
-            "from_lct_id": sender_lct.to_string(),
-            "sealed": sealed,
-            "kind": "secret",
-        })).await.unwrap();
-        assert_eq!(resp["accepted"], json!(true), "peer sealer accepted + opened: {resp}");
-        assert_eq!(resp["deferredByLaw"], json!(true), "unattended caller auto-defers the release");
-
-        // (3) fail-closed: the WRONG sender pubkey cannot open it (AEAD binds the sealer)
-        let wrong = web4_core::crypto::KeyPair::generate();
-        let denied = tool_notify(&shared, &json!({
-            "pair_id": pair_id.to_string(),
-            "from_pubkey_hex": hex::encode(wrong.verifying_key().to_bytes()),
-            "sealed": web4_core::pair_channel::seal(&sender, &member_kp.verifying_key(), pair_id, b"{}").unwrap().to_base64(),
-            "kind": "secret",
-        })).await;
-        assert!(denied.is_err(), "opening against the wrong sealer must fail closed");
     }
 
     #[tokio::test]
