@@ -4,7 +4,7 @@
 
 Hestia is the open-source local-first layer that gives any entity — human user, AI agent, autonomous service — a **cryptographic identity**, an **encrypted vault**, **delegation authority**, and a **trust record** in the Web4 ecosystem. A cross-platform app for humans. Plugin install for AI agents. CLI and TUI if you live in a terminal. No cloud required.
 
-> **Status:** Phase 2 (connected presence). The core (vault, policy engine, witness chain, delegation, plugin SDK) and the cross-platform app are built and working. Hub integration works end-to-end: join a hub, push your profile, open an encrypted member↔hub channel, prove your device constellation. EUDI-compatible credential issuance is wired. See [Honest Status](#honest-status) below.
+> **Status:** Phase 2 (connected presence). The core (vault, policy engine, witness chain, delegation, plugin SDK) and the cross-platform app are built and working. Hub integration works end-to-end: join a hub, push your profile, open an encrypted member↔hub channel, prove your device constellation, and exchange **end-to-end-sealed member↔member messages** through the hub with a **durable, crash-safe inbox** (accept-and-defer). EUDI-compatible credential issuance is wired. See [Honest Status](#honest-status) below.
 
 > **A living example.** The lab that builds and runs Hestia is itself a live Web4 society — a public fleet of autonomous agents that hold roles and witness each other's work. Its members are published at **[4-lab.io/fleet](https://4-lab.io/fleet)**. Presence over privacy: a society that isn't witnessed has no presence to trust, so the collective is visible by design. (Secrets stay in the vault; presence stays in the open — the same split Hestia draws in code.)
 
@@ -60,7 +60,7 @@ same engine for terminal people:
 | **Witness chain** | Working | SQLite-backed, hash-linked entries, integrated with web4-trust-core. |
 | **Trust evolution** | Working | T3/V3 per agent, fed from tool call outcomes. |
 | **Delegation** | Working | DelegatedAuthority (web4-core U2), scoped by role+action, signed, revocable. CLI: grant, list, revoke. |
-| **MCP server** | Working | 8 tools exposed via rmcp + Axum HTTP. |
+| **MCP server** | Working | 12 tools exposed via rmcp + Axum HTTP. |
 | **Plugin SDK** | Working | Rust, TypeScript, Python — identical interface. |
 | **Claude Code plugin** | Working | PostToolUse witness hook, policy gating. Deployed on 4 machines. |
 | **CLI** | Working | vault, policy, delegation, constellation, serve, dashboard, info, init. |
@@ -68,6 +68,8 @@ same engine for terminal people:
 | **Cross-platform app** | Working | Tauri 2. Dashboard, Vault, Chain, Delegations, Hubs, Policy, Fleet, Settings — served by the daemon's REST API. This is the primary human interface. |
 | **Hub connection** | Working | Join a hub (member self-add), push member-tier profile, signed callbacks. |
 | **Member↔hub channel** | Working | End-to-end encrypted (sealed channel) with HTTP transport — queries and acts off plaintext. |
+| **Paired member↔member channels** | Working | Request/confirm a pair and exchange end-to-end-sealed messages through the hub (X25519 + ChaCha20-Poly1305); the peer's static channel key is resolved from the hub's pinned-pubkey endpoint. The hub relays ciphertext content-blind. |
+| **Durable inbox (accept-and-defer)** | Working | SQLCipher-encrypted inbound mailbox (`inbox.db`): `hestia_notify --defer` parks a sealed notice, drained later by `hestia_inbox` / `hestia_pair_inbox` with consume-once, at-least-once semantics (mcp-protocol §7.8). Survives a daemon restart. |
 | **Constellation** | Working | Link devices into a verifying constellation; challenge-bound attestation in the hub handshake (multi-device proof as MFA). |
 | **Profile** | Working | Skills + social/professional presence links with tiered visibility. |
 | **Credential issuance** | Working | OID4VCI issuer endpoints, SD-JWT-VC — EUDI-wallet-compatible, person-scale. |
