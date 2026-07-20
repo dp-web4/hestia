@@ -182,6 +182,14 @@ pub struct VaultEntry {
 | `hestia_request_witness(event)` | Add a witness chain entry |
 | `hestia_query_policy(action, context)` | Query: allow / deny / warn |
 | `hestia_query_history(filter)` | Read prior actions from the witness chain |
+| `hestia_notify(sealed, defer?)` | Receive an inbound HUB→citizen sealed notice; `defer:true` parks it (still sealed) in the durable inbox and ACKs without opening (accept-and-defer, §7.8) |
+| `hestia_inbox()` | Drain the durable inbound mailbox (consume-once, at-least-once); `credential_access`-gated (§7.8.2) |
+| `hestia_pair_inbox()` | Drain secrets sent over confirmed paired channels (per-pair cursor, delivered-once); `credential_access`-gated (§7.8.2) |
+
+> This table is the Phase-0 sketch subset. The **connected-messaging protocols**
+> (paired member↔member channels and accept-and-defer durable inbox) are
+> implemented and documented in [PROTOCOL.md → *Connected messaging*](./PROTOCOL.md#connected-messaging-implemented);
+> the full 12-tool surface is the canonical presence-protocol tool set plus these.
 
 ### Prompts
 
@@ -202,6 +210,7 @@ Phase 0 baseline. Premium tier upgrades to hardware-bound key material.
 | Asymmetric signing (LCTs, witness chain) | **Ed25519** | Matches Web4 spec; matches MAGT's choice; matches existing web4-core |
 | Hash chain | **SHA-256** | Standard; matches existing plugins |
 | Random | OS CSPRNG via `getrandom` | Trivial; never hand-rolled |
+| Paired-channel key agreement | **X25519 ECDH** (static‖ephemeral) → **HKDF** → **ChaCha20-Poly1305** | Forward-secret member↔member sealing via `web4_core::pair_channel` (`seal_fs`/`open_fs`); hub relays ciphertext content-blind. See [PROTOCOL.md](./PROTOCOL.md#paired-membermember-channels) |
 
 Premium tier:
 - TPM 2.0 binding wraps the Argon2id-derived key, so unlock requires TPM presence
