@@ -1,0 +1,45 @@
+{
+  "bundle_id": "1af90f0f-0495-4c8e-8385-90b64c957804",
+  "timestamp": "2026-07-07T01:36:14.787Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "find plugin-sdk/python tests plugins -name '*.py' | xargs grep -l -i 'test\\|connect\\|begin_action' 2",
+    "parameters": {},
+    "result_hash": "sha256:78d8e160cebf7274010633c44bbafa3254cc8c2239ee4d58e09078c36bf64e7a",
+    "timestamp": "2026-07-07T01:36:14.787Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "13210449-f86f-4700-9fab-cfea6b6e5dca",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCIQCRarOf3/SrrymrBkSbqzPCJGHBtIpMACCBOIu/NXa3CAIgGr80CKIQoCCJ20Tkabbbo6Q3rSaL32+SO0XHGCez0cg=",
+        "timestamp": "2026-07-07T01:36:14.788Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: find plugin-sdk/python tests plugins -name '*.py' | xargs grep -l -i 'test\\|connect\\|begin_action' 2",
+  "outputs_hashes": [
+    "sha256:78d8e160cebf7274010633c44bbafa3254cc8c2239ee4d58e09078c36bf64e7a"
+  ]
+}

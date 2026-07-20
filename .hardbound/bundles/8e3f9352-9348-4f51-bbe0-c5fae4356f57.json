@@ -1,0 +1,45 @@
+{
+  "bundle_id": "8e3f9352-9348-4f51-bbe0-c5fae4356f57",
+  "timestamp": "2026-07-18T21:24:11.106Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\necho \"=== does the hestia CLI make sealed channel calls (POST) or sh",
+    "parameters": {},
+    "result_hash": "sha256:94f5ddd81d6e97799b1b746886f03556d92738dbb4e8344618eebc03f2d85994",
+    "timestamp": "2026-07-18T21:24:11.106Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "bbc1b0b2-e274-49a9-9c27-830575bc8165",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCIBOuUVA+xiL+GbT9Phw1zpHpSdlw3efI8QvyncvXQzwBAiEAhPR6Znwmzx6PJChhEuNYvNgivi3LxnlXUTiG2Ou/+EU=",
+        "timestamp": "2026-07-18T21:24:11.109Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\necho \"=== does the hestia CLI make sealed channel calls (POST) or sh",
+  "outputs_hashes": [
+    "sha256:94f5ddd81d6e97799b1b746886f03556d92738dbb4e8344618eebc03f2d85994"
+  ]
+}

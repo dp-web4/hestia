@@ -1,0 +1,45 @@
+{
+  "bundle_id": "6b134e19-2720-47b2-b868-6984658483c7",
+  "timestamp": "2026-07-07T01:37:15.798Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "ls plugin-sdk/python && echo \"---\" && cat plugin-sdk/python/pyproject.toml 2>/dev/null | head -60; e",
+    "parameters": {},
+    "result_hash": "sha256:2c1177cf46496d7600e3859c481c04568bc2aa3c61c3912dc2896670c6e96ac0",
+    "timestamp": "2026-07-07T01:37:15.798Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "c72dceac-73c4-45fd-b91b-53831e5b059b",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEYCIQDRh7uVDnn5M8QBw9/PxruXwdRuJwFO5Iye7Xexgkq+lwIhAOGT2k/783ThB9Tv882An4o/mf9ffa9by+opqBVra4jD",
+        "timestamp": "2026-07-07T01:37:15.799Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: ls plugin-sdk/python && echo \"---\" && cat plugin-sdk/python/pyproject.toml 2>/dev/null | head -60; e",
+  "outputs_hashes": [
+    "sha256:2c1177cf46496d7600e3859c481c04568bc2aa3c61c3912dc2896670c6e96ac0"
+  ]
+}

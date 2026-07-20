@@ -1,0 +1,45 @@
+{
+  "bundle_id": "496e8ef1-352b-4524-ab78-db3e74a553ba",
+  "timestamp": "2026-07-16T06:26:20.715Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "file_operation",
+    "target": "/home/dp/ai-workspace/shared-context/specs/hestia-role-orchestration/society-ratchet-model-2026-07-15.md",
+    "parameters": {},
+    "result_hash": "sha256:987f5767ccb4866737bf469f7797ccfe25f32b67ca11da92832b80f93c6790f5",
+    "timestamp": "2026-07-16T06:26:20.715Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "3ac46021-d6de-4d56-b84c-66b7bdb3eb90",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEQCIFPL24uqvLKYNTta90J3lAu6d8ZwuOdfHjlFP2CbxtLJAiAxQyDMABd4dk/ni/eUz9pA24W8n5y9eSE8TeLYndpQ8Q==",
+        "timestamp": "2026-07-16T06:26:20.716Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Write: /home/dp/ai-workspace/shared-context/specs/hestia-role-orchestration/society-ratchet-model-2026-07-15.md",
+  "outputs_hashes": [
+    "sha256:987f5767ccb4866737bf469f7797ccfe25f32b67ca11da92832b80f93c6790f5"
+  ]
+}

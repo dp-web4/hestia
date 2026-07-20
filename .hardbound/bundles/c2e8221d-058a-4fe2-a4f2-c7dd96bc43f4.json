@@ -1,0 +1,45 @@
+{
+  "bundle_id": "c2e8221d-058a-4fe2-a4f2-c7dd96bc43f4",
+  "timestamp": "2026-07-18T19:52:34.090Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "echo \"=== verify: the sovereign is now a SOCIETY in the registry ===\"\ncurl -s --max-time 8 \"http://h",
+    "parameters": {},
+    "result_hash": "sha256:6480c9b225cc46d1e0a9dc16c423c443581fbc9a5692df9f4f7d7e5d54544a39",
+    "timestamp": "2026-07-18T19:52:34.090Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "50df2d26-b63f-4581-9e7d-f8689c8f9112",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEQCIDva/UmqlhQUnDy1EhHqb4HXZUtzAZZM9akHlx6UcObaAiBMCK9zzDWG4kA2u0QHIb4CYxQwqxGHoi9AW53F1hVqxw==",
+        "timestamp": "2026-07-18T19:52:34.091Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: echo \"=== verify: the sovereign is now a SOCIETY in the registry ===\"\ncurl -s --max-time 8 \"http://h",
+  "outputs_hashes": [
+    "sha256:6480c9b225cc46d1e0a9dc16c423c443581fbc9a5692df9f4f7d7e5d54544a39"
+  ]
+}

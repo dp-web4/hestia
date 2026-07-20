@@ -1,0 +1,45 @@
+{
+  "bundle_id": "358cc681-8327-4844-a211-4684495b0959",
+  "timestamp": "2026-07-09T18:36:59.850Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace\necho \"=== autostash / uncommitted work across repos (nothing lost?) ===\"\nfo",
+    "parameters": {},
+    "result_hash": "sha256:0d8f9f7bfc13282743c5eb2b51b5e37400e5701de36b34445aff2782fc2c2fba",
+    "timestamp": "2026-07-09T18:36:59.850Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "ff574322-1037-4b00-828a-23bc27a46491",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEYCIQDLu94c150obuRHeIQ2Bw2UZ8+o7YnS5y08yi2oPGBJKQIhANCSPgMFJRxDoVmJRSpAoTG2Y3CJFwyLGIB3i7lQEUWe",
+        "timestamp": "2026-07-09T18:36:59.851Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace\necho \"=== autostash / uncommitted work across repos (nothing lost?) ===\"\nfo",
+  "outputs_hashes": [
+    "sha256:0d8f9f7bfc13282743c5eb2b51b5e37400e5701de36b34445aff2782fc2c2fba"
+  ]
+}

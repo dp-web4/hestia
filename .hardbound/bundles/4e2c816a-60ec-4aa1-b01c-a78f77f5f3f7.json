@@ -1,0 +1,45 @@
+{
+  "bundle_id": "4e2c816a-60ec-4aa1-b01c-a78f77f5f3f7",
+  "timestamp": "2026-07-18T21:14:07.570Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\necho \"=== the full PRD doc ===\"\nls docs/proposals/2026-07-18-PRD-sea",
+    "parameters": {},
+    "result_hash": "sha256:97c5430da0d03c7b309b81950a4a24017b4ebe7128536a2d128056526d1d057f",
+    "timestamp": "2026-07-18T21:14:07.570Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "8c8c925e-cb6d-4a2e-bf82-27739b1285e3",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEQCIFBFPjDjDbeIBXpYSp72Z48YmpAQhCJIOcOKL+AmHtS8AiAhc/4WWvUeYiKtF8FTCtozGaYiwwwVz/zA7X/sqX+y3Q==",
+        "timestamp": "2026-07-18T21:14:07.572Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\necho \"=== the full PRD doc ===\"\nls docs/proposals/2026-07-18-PRD-sea",
+  "outputs_hashes": [
+    "sha256:97c5430da0d03c7b309b81950a4a24017b4ebe7128536a2d128056526d1d057f"
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "bundle_id": "74f0f692-260b-4f40-9dcd-c2aa1c133af0",
+  "timestamp": "2026-07-18T22:33:45.781Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\necho \"=== pairing state: what keys does hestia hold per pair_id? ===",
+    "parameters": {},
+    "result_hash": "sha256:31c2758c116851fa313487e32ff245371b3c51167ba186334f5a5ad109884039",
+    "timestamp": "2026-07-18T22:33:45.781Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "e12e5f80-5b31-424d-9062-1f88c6b29147",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEQCIHJIFMTfIWKUDWJPN4VrQ63mTXHtil00dG9/TDVBwj1zAiBwxeG189Q4b1UQUg7eDXeWf5KLH6leduCo2qjxeuDXxQ==",
+        "timestamp": "2026-07-18T22:33:45.784Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\necho \"=== pairing state: what keys does hestia hold per pair_id? ===",
+  "outputs_hashes": [
+    "sha256:31c2758c116851fa313487e32ff245371b3c51167ba186334f5a5ad109884039"
+  ]
+}

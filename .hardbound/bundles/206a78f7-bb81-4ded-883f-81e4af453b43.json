@@ -1,0 +1,45 @@
+{
+  "bundle_id": "206a78f7-bb81-4ded-883f-81e4af453b43",
+  "timestamp": "2026-07-16T08:34:12.097Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "echo \"=== systemd user timers/services mentioning 4-life ===\"\nsystemctl --user list-timers --all 2>/",
+    "parameters": {},
+    "result_hash": "sha256:923bba6192a093b916a7c64040b143686ea0b13bd047612c65bb84260ffa2a46",
+    "timestamp": "2026-07-16T08:34:12.097Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "79c04632-87ef-49ad-9bfd-c43a7a23dffa",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCIQDBiTYkgGYVKjVSnOmS12aMm2F8Bz3Qlt7Vu8ZqVZJbmgIgfCL8Q7d6XCEn22k+i4PmRy6onE8+g4F8tCLJ7P5im08=",
+        "timestamp": "2026-07-16T08:34:12.100Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: echo \"=== systemd user timers/services mentioning 4-life ===\"\nsystemctl --user list-timers --all 2>/",
+  "outputs_hashes": [
+    "sha256:923bba6192a093b916a7c64040b143686ea0b13bd047612c65bb84260ffa2a46"
+  ]
+}

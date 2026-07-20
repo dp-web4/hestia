@@ -1,0 +1,45 @@
+{
+  "bundle_id": "53ab12f3-5bc2-45d5-9677-b01b0af2c540",
+  "timestamp": "2026-07-07T01:40:49.210Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "git commit -q -F - <<'EOF'\nfeat(hooks): declare constellation role + thread host session id\n\nWire th",
+    "parameters": {},
+    "result_hash": "sha256:c5874efe7131dee2555e598dc08bce76a7cc665d4b097ee6541d77a0cbf8b6fa",
+    "timestamp": "2026-07-07T01:40:49.210Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "f83665c0-b5ce-4cd9-80df-4cf75dc5e3dc",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCIFnZXudQl5mfqQzKTvhZuFac+46e+N1BgCx8cAPGd2BgAiEAsaTKN/GhK8HXPdAj9K9ySHE98pTgA9wGzH0Pa2GwPow=",
+        "timestamp": "2026-07-07T01:40:49.211Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: git commit -q -F - <<'EOF'\nfeat(hooks): declare constellation role + thread host session id\n\nWire th",
+  "outputs_hashes": [
+    "sha256:c5874efe7131dee2555e598dc08bce76a7cc665d4b097ee6541d77a0cbf8b6fa"
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "bundle_id": "0411d19c-f9c8-4719-8f48-cd3312c64ef5",
+  "timestamp": "2026-07-19T23:29:21.544Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\necho \"=== git diff stat (what's changed on disk) ===\"\ngit diff --sta",
+    "parameters": {},
+    "result_hash": "sha256:deeb269db15da5441f9caa3d4078f5e5c74015bae90d4240a3eec4458baddeee",
+    "timestamp": "2026-07-19T23:29:21.544Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "ae80b8a9-8507-4775-833d-3b2c5e3cd431",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEQCIFgWgGJIOslpsal/VSmcQIrxsb/3ix+3PmCc5/mg3orCAiAuNP3w4JApXw62P0puFkVoWHgYD9ymCgS9jAnLHz7BDw==",
+        "timestamp": "2026-07-19T23:29:21.546Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\necho \"=== git diff stat (what's changed on disk) ===\"\ngit diff --sta",
+  "outputs_hashes": [
+    "sha256:deeb269db15da5441f9caa3d4078f5e5c74015bae90d4240a3eec4458baddeee"
+  ]
+}

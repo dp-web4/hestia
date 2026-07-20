@@ -1,0 +1,45 @@
+{
+  "bundle_id": "99d9ca2b-0fa9-46dc-a132-d735fd38a2b6",
+  "timestamp": "2026-07-18T22:34:35.631Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\necho \"=== does the hub expose a pairing broker (create pairing betwe",
+    "parameters": {},
+    "result_hash": "sha256:e8a789ef2f46b387ba6495740cb64170696e804e6b4662cc4fa5090505d49dd6",
+    "timestamp": "2026-07-18T22:34:35.631Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "b97aea07-bfa2-4af6-bafc-d37c24d75063",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEYCIQCnZRAZzqw5ORCAgPzLN7rn81cGLvtXJDoBFvVerB6CegIhAM4BAF5WrUjZOKvfU8TK70UwlEP9GG3tsHsAjTxEu72O",
+        "timestamp": "2026-07-18T22:34:35.633Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\necho \"=== does the hub expose a pairing broker (create pairing betwe",
+  "outputs_hashes": [
+    "sha256:e8a789ef2f46b387ba6495740cb64170696e804e6b4662cc4fa5090505d49dd6"
+  ]
+}

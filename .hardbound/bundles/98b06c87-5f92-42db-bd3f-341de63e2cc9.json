@@ -1,0 +1,45 @@
+{
+  "bundle_id": "98b06c87-5f92-42db-bd3f-341de63e2cc9",
+  "timestamp": "2026-07-16T08:54:13.279Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\n# add a ledger-conferral test to state.rs tests (uses make_state)\npy",
+    "parameters": {},
+    "result_hash": "sha256:f0d4db1be17e05a34ba8ae71df6a1e5e1acf2fdb864d069600356de859fa3fa9",
+    "timestamp": "2026-07-16T08:54:13.279Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "34a74075-1474-477b-91ff-176a1271a6a7",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEQCICJxmTKVwOtlcoseKUE/h2NGVX+28v8AzDLVU3MW4EYTAiBy4Chhw4EpRF1tcoOMzswWcSyKvvdKwNqqvPELZ6l8AA==",
+        "timestamp": "2026-07-16T08:54:13.281Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\n# add a ledger-conferral test to state.rs tests (uses make_state)\npy",
+  "outputs_hashes": [
+    "sha256:f0d4db1be17e05a34ba8ae71df6a1e5e1acf2fdb864d069600356de859fa3fa9"
+  ]
+}

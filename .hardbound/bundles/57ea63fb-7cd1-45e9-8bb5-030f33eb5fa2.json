@@ -1,0 +1,45 @@
+{
+  "bundle_id": "57ea63fb-7cd1-45e9-8bb5-030f33eb5fa2",
+  "timestamp": "2026-07-07T06:56:39.961Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "EV='{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git push --force ori",
+    "parameters": {},
+    "result_hash": "sha256:6a7a840434ea1a275802d4dfa004b993f3d7dae50c134e3f9ae5e6915736d020",
+    "timestamp": "2026-07-07T06:56:39.961Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "b02249d0-67ac-4f82-83b5-2daa5763b6fb",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCIBtNSzMi5Z1VU5H4RpPD8Hy3q5MZFIEXQ7SHly+gWnY1AiEA1zbyf5kXmfL5f15JMmNV1MqYUpw0nncDBHWN6qGtYNA=",
+        "timestamp": "2026-07-07T06:56:39.962Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: EV='{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git push --force ori",
+  "outputs_hashes": [
+    "sha256:6a7a840434ea1a275802d4dfa004b993f3d7dae50c134e3f9ae5e6915736d020"
+  ]
+}

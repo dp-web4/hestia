@@ -1,0 +1,45 @@
+{
+  "bundle_id": "867705e3-16cf-454f-a534-f7b65affb11a",
+  "timestamp": "2026-07-11T05:29:05.794Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/private-context/hub-mesh\nbash hub-notify.sh hub note \"merging hestia sovere",
+    "parameters": {},
+    "result_hash": "sha256:5224ffd50ce491109d137c5600678432affbe27a979186a3aa3f47e762341cee",
+    "timestamp": "2026-07-11T05:29:05.794Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "af3ef430-9e3e-4c01-b22e-caa6e9259009",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEYCIQCdQgyR7UhtLWE4CLwhv/c/Cf+ozYtIXqGALLveJBtNjQIhANptAk7zG71sZtCX+BpR6cmrt7sTDEECJ73YmDB0qZv3",
+        "timestamp": "2026-07-11T05:29:05.795Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/private-context/hub-mesh\nbash hub-notify.sh hub note \"merging hestia sovere",
+  "outputs_hashes": [
+    "sha256:5224ffd50ce491109d137c5600678432affbe27a979186a3aa3f47e762341cee"
+  ]
+}

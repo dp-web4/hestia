@@ -1,0 +1,45 @@
+{
+  "bundle_id": "12c39954-eec5-4fb1-b721-ca65d67cb576",
+  "timestamp": "2026-07-09T01:45:34.159Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\necho \"=== does main have the reversal tool? (deployed live, but PR #",
+    "parameters": {},
+    "result_hash": "sha256:7a6b644fe7c876135a01251bb24161fc41e00140e5af22a2fb1d594f7c13e3dc",
+    "timestamp": "2026-07-09T01:45:34.159Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "9a41da71-eb06-4186-9d4a-7c6bfa4024c2",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEYCIQDQOeBGQ92czLxLTYG2eTlMMnzeogAlFhxUMDUkL9TawQIhAIrd88faNNl+w5A/QLNW+//AABje4NFP8MSWzIfja5xC",
+        "timestamp": "2026-07-09T01:45:34.162Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\necho \"=== does main have the reversal tool? (deployed live, but PR #",
+  "outputs_hashes": [
+    "sha256:7a6b644fe7c876135a01251bb24161fc41e00140e5af22a2fb1d594f7c13e3dc"
+  ]
+}

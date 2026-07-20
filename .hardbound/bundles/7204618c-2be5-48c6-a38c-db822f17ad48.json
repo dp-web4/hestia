@@ -1,0 +1,45 @@
+{
+  "bundle_id": "7204618c-2be5-48c6-a38c-db822f17ad48",
+  "timestamp": "2026-07-07T06:27:25.959Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\ngit checkout -q feat/role-scoped-law && git pull -q origin feat/role",
+    "parameters": {},
+    "result_hash": "sha256:4abb9080101ef422f59afa8c18f3c792f7ce7d7695b88298c7914a92495488d6",
+    "timestamp": "2026-07-07T06:27:25.959Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "ed8d48bc-6475-436b-85e7-de50ef4084f5",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEQCIEa0Rwdoy2Hea9E0UxDRxT4NhPlrejXBL9N0UKW3Duw2AiBT1NDBc7gBujbsTVjxomxQ11GyzObRHCamBJjKwDP0OA==",
+        "timestamp": "2026-07-07T06:27:25.961Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\ngit checkout -q feat/role-scoped-law && git pull -q origin feat/role",
+  "outputs_hashes": [
+    "sha256:4abb9080101ef422f59afa8c18f3c792f7ce7d7695b88298c7914a92495488d6"
+  ]
+}

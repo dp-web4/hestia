@@ -1,0 +1,45 @@
+{
+  "bundle_id": "4be8a1c0-dec4-4950-bfc2-c4f0205e8102",
+  "timestamp": "2026-07-13T19:25:53.852Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\nsource ~/.cargo/env 2>/dev/null\ntouch core/src/cli.rs\ncargo build --",
+    "parameters": {},
+    "result_hash": "sha256:c47f7185e818f065d98dac3e1b61f51109475e8955b3e51edeb0bc5c4b3bee22",
+    "timestamp": "2026-07-13T19:25:53.852Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "d311c669-6b28-4fef-99be-e8c7eaa95ab9",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEYCIQD7GOksj4wZLDuUcIlMK07QxNq06t6ORsfa9XXi4C0n7QIhAN8/nrxe7lrVkot3xT2leDJO/HhHdo7EVEOtFmAR/O0v",
+        "timestamp": "2026-07-13T19:25:53.853Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\nsource ~/.cargo/env 2>/dev/null\ntouch core/src/cli.rs\ncargo build --",
+  "outputs_hashes": [
+    "sha256:c47f7185e818f065d98dac3e1b61f51109475e8955b3e51edeb0bc5c4b3bee22"
+  ]
+}

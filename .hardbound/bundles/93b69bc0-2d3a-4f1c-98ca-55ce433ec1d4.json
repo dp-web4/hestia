@@ -1,0 +1,45 @@
+{
+  "bundle_id": "93b69bc0-2d3a-4f1c-98ca-55ce433ec1d4",
+  "timestamp": "2026-07-13T19:21:29.610Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\necho \"=== SignedEnvelope full shape + construction ===\"\nsed -n '178,",
+    "parameters": {},
+    "result_hash": "sha256:9e8be3b196889312cffbb7c8ad44156c97ebf2225f0af6815add104e0795a60b",
+    "timestamp": "2026-07-13T19:21:29.610Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "dc1e3a98-8eb4-4e88-a74d-c44a66223770",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEYCIQDkNBivAqGQZeCvh10tZaOnBRkOI2WYMF/nxRPJTcMgIwIhANyZ6PfbNwz+wFBXnSNRsgU3xpmB1y8v2tp34vCH0zdH",
+        "timestamp": "2026-07-13T19:21:29.611Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\necho \"=== SignedEnvelope full shape + construction ===\"\nsed -n '178,",
+  "outputs_hashes": [
+    "sha256:9e8be3b196889312cffbb7c8ad44156c97ebf2225f0af6815add104e0795a60b"
+  ]
+}

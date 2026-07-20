@@ -1,0 +1,45 @@
+{
+  "bundle_id": "3872349a-3849-44b7-ae0b-b86fdd31e200",
+  "timestamp": "2026-07-18T21:14:27.988Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "file_operation",
+    "target": "/home/dp/ai-workspace/hestia/docs/proposals/2026-07-18-PRD-sealed-secret-send-client-verb.md",
+    "parameters": {},
+    "result_hash": "sha256:57b4144dfed56c62a315a9972076be48b1458c7ea4f68e276f96dc7430df6347",
+    "timestamp": "2026-07-18T21:14:27.988Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "4e2c816a-60ec-4aa1-b01c-a78f77f5f3f7",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCIGTm46rj9vEd2J6bBYv+5r8pTguv8OiL4THNrR05vE+jAiEA9CsgH5ekHmaIfmZpr078xbQX0YYrS0J8oZT7fUXy7g8=",
+        "timestamp": "2026-07-18T21:14:27.991Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Read: /home/dp/ai-workspace/hestia/docs/proposals/2026-07-18-PRD-sealed-secret-send-client-verb.md",
+  "outputs_hashes": [
+    "sha256:57b4144dfed56c62a315a9972076be48b1458c7ea4f68e276f96dc7430df6347"
+  ]
+}

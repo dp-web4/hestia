@@ -688,30 +688,52 @@ impl HubClient {
         serde_json::from_value(doc).context("parsing resolved LCT document")
     }
 
-    /// Resolve a peer's LCT by their hub-member **uuid** (the pairing identity)
-    /// rather than canonical id. The registry list carries only canonical ids,
-    /// so this scans: list → resolve each → match `document.id == uuid`. O(N)
-    /// over the (small) registry; the result is persisted per-pair so it runs
-    /// once. Fail-closed: an unresolvable peer is an error, never a guess.
-    pub async fn resolve_lct_by_member_uuid(
+    /// Resolve a peer's pinned static pairing pubkey by their hub-member
+    /// **uuid** — the v2 sealed-channel authentication half. Single keyed lookup
+    /// against the hub pin map (`GET /v1/hubs/:id/members/:uuid/pubkey`), keyed
+    /// by the same member uuid the hub membership gate authorizes.
+    ///
+    /// Supersedes the old `resolve_lct_by_member_uuid` registry scan, which
+    /// matched `document.id == member_uuid` — structurally unsatisfiable, since a
+    /// member uuid only ever appears as a document's `published_by`, never as its
+    /// own `doc.id`. (Thor's repro, 2026-07-19.) The pin is also the unambiguous
+    /// source: a publisher's constellation carries many keys across its docs;
+    /// the pin is the one the hub actually verifies acts against.
+    ///
+    /// Fail-closed: a 404 (peer unpinned — sovereign, not yet admitted) is an
+    /// error, never a guess.
+    pub async fn resolve_member_pubkey(
         &self,
         rest_endpoint: &str,
         hub_id: Uuid,
         member_uuid: Uuid,
-    ) -> Result<web4_core::Lct> {
-        let list = self.list_lcts(rest_endpoint, hub_id).await?;
-        let summaries = list.as_array().ok_or_else(|| {
-            anyhow::anyhow!("registry list was not an array")
-        })?;
-        for s in summaries {
-            let Some(lct_id) = s.get("lct_id").and_then(|v| v.as_str()) else { continue };
-            if let Ok(doc) = self.resolve_lct(rest_endpoint, hub_id, lct_id).await {
-                if doc.id == member_uuid {
-                    return Ok(doc);
-                }
-            }
+    ) -> Result<PublicKey> {
+        let url = format!(
+            "{}/hubs/{}/members/{}/pubkey",
+            rest_endpoint.trim_end_matches('/'),
+            hub_id,
+            member_uuid
+        );
+        let resp = self.http.get(&url).send().await
+            .with_context(|| format!("resolving member pubkey at {url}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!(
+                "hub /members/:uuid/pubkey returned HTTP {status}: {text} \
+                 (peer not an admitted/pinned member?)"
+            );
         }
-        anyhow::bail!("no registry LCT has member uuid {member_uuid} — peer not published?")
+        let v: serde_json::Value =
+            serde_json::from_str(&text).context("parsing /members/:uuid/pubkey response")?;
+        let hex_str = v.get("pubkey_hex").and_then(|x| x.as_str()).ok_or_else(|| {
+            anyhow::anyhow!("member pubkey response missing pubkey_hex")
+        })?;
+        let bytes: [u8; 32] = hex::decode(hex_str)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| anyhow::anyhow!("member pubkey_hex is not 32-byte hex"))?;
+        PublicKey::from_bytes(&bytes).context("decoding member pinned pubkey")
     }
 
     // -----------------------------------------------------------------------

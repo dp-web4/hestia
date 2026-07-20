@@ -1,0 +1,45 @@
+{
+  "bundle_id": "95528860-2482-44d2-9194-a7c2913f1d8d",
+  "timestamp": "2026-07-07T06:33:40.452Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\necho \"=== is there a CLI/policy surface that can write role_overlays",
+    "parameters": {},
+    "result_hash": "sha256:477cbe216d5bbc320f2f373267678700282e9966e77bd504ed7995e60eea37cb",
+    "timestamp": "2026-07-07T06:33:40.452Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "64485588-c8eb-4aa7-8bc8-4a491724bfe8",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEQCIH5+exyGrJp7aH7Penhu0T1siRo1Yxhv1Ybi15wykZcVAiBSx3GIKZaUIObiaoLC75qnc8s9aM0AlUiugsP9K6Wwlg==",
+        "timestamp": "2026-07-07T06:33:40.455Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\necho \"=== is there a CLI/policy surface that can write role_overlays",
+  "outputs_hashes": [
+    "sha256:477cbe216d5bbc320f2f373267678700282e9966e77bd504ed7995e60eea37cb"
+  ]
+}

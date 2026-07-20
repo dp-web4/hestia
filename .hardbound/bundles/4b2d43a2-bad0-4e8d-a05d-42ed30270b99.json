@@ -1,0 +1,45 @@
+{
+  "bundle_id": "4b2d43a2-bad0-4e8d-a05d-42ed30270b99",
+  "timestamp": "2026-07-09T18:45:04.684Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/web4\nsed -i 's/pub use role_extension::{Affordance, DriftMark, ExtensionVer",
+    "parameters": {},
+    "result_hash": "sha256:e2792794da714a93ee1f793a42b57ec1bbf52e472875859be0b7892394399751",
+    "timestamp": "2026-07-09T18:45:04.684Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "03ad7dcf-6a37-486c-9a42-990cf25bd3b9",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCIA1qql7cJ5Lhr0c3MRGXhZSRO8IKwMdmDJiRBAcUMlDoAiEA9oudZjqvgbDGs8M1ROj1y89eAAgjuc3KaXkm0mwKI5A=",
+        "timestamp": "2026-07-09T18:45:04.685Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/web4\nsed -i 's/pub use role_extension::{Affordance, DriftMark, ExtensionVer",
+  "outputs_hashes": [
+    "sha256:e2792794da714a93ee1f793a42b57ec1bbf52e472875859be0b7892394399751"
+  ]
+}

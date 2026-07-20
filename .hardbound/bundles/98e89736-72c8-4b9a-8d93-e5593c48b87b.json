@@ -1,0 +1,45 @@
+{
+  "bundle_id": "98e89736-72c8-4b9a-8d93-e5593c48b87b",
+  "timestamp": "2026-07-17T23:22:53.284Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\n# update the confer test to the new return type (BirthCertificateRef",
+    "parameters": {},
+    "result_hash": "sha256:0f996cb4b429ee7417cd3615c0b5ebdcbf36aac76e3f3c0452129d5c68bd0222",
+    "timestamp": "2026-07-17T23:22:53.284Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "8831fa17-3f3b-4fbe-bec2-ee518daae4f1",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEQCIFZ2pqHCJKhrnIm9x6CMogf5aXDvr5cdd8LIkZfcud82AiB4jhoDsE/EUynFb8D9Akebn4N233j+POhBzOZHwpeGDA==",
+        "timestamp": "2026-07-17T23:22:53.287Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\n# update the confer test to the new return type (BirthCertificateRef",
+  "outputs_hashes": [
+    "sha256:0f996cb4b429ee7417cd3615c0b5ebdcbf36aac76e3f3c0452129d5c68bd0222"
+  ]
+}

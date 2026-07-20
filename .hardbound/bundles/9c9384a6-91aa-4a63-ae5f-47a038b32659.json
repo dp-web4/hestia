@@ -1,0 +1,45 @@
+{
+  "bundle_id": "9c9384a6-91aa-4a63-ae5f-47a038b32659",
+  "timestamp": "2026-07-07T06:31:55.585Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\necho \"=== 1. install new binary + restart daemon ===\"\ncp core/target",
+    "parameters": {},
+    "result_hash": "sha256:47742dd17ea9390b0a64d422c956f328adeb7239403e0b6b1b2b70db1f134b8a",
+    "timestamp": "2026-07-07T06:31:55.585Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "fba08be6-b6e8-4a04-8fae-99763aeb0cb9",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCIQDn3CWWnr7qIlZF+enbDY28rPlF2yVjEDbYZugrWr7oFwIgfkLZO9E2oU9El5oR3Qtwvl0NEQHICdiEWj7y1TVa8zA=",
+        "timestamp": "2026-07-07T06:31:55.587Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\necho \"=== 1. install new binary + restart daemon ===\"\ncp core/target",
+  "outputs_hashes": [
+    "sha256:47742dd17ea9390b0a64d422c956f328adeb7239403e0b6b1b2b70db1f134b8a"
+  ]
+}

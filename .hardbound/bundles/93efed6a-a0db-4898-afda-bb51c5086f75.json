@@ -1,0 +1,45 @@
+{
+  "bundle_id": "93efed6a-a0db-4898-afda-bb51c5086f75",
+  "timestamp": "2026-07-07T06:55:07.016Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "export HESTIA_PASSPHRASE=\"$(cat ~/.hestia/.passphrase)\"\nH=~/.local/bin/hestia\nfor ROLE in role:const",
+    "parameters": {},
+    "result_hash": "sha256:2ba096ca8ac44d4f6cf182f47fa35718d79a3ed30527b487f48e3d27c0c038ba",
+    "timestamp": "2026-07-07T06:55:07.016Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "60e92fc9-8b82-40ff-bcf8-7902084284df",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCIQDq8gRIDfa+SDM1mjGFjJu9fkP4DhazmHfd8p1wzBJD8gIgD8s4WHxdGMvZRgeeT5rrgCDXq49W+dEo+SoUhtMM8Vg=",
+        "timestamp": "2026-07-07T06:55:07.017Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: export HESTIA_PASSPHRASE=\"$(cat ~/.hestia/.passphrase)\"\nH=~/.local/bin/hestia\nfor ROLE in role:const",
+  "outputs_hashes": [
+    "sha256:2ba096ca8ac44d4f6cf182f47fa35718d79a3ed30527b487f48e3d27c0c038ba"
+  ]
+}

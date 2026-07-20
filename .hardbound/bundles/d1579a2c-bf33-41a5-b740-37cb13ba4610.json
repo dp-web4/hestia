@@ -1,0 +1,45 @@
+{
+  "bundle_id": "d1579a2c-bf33-41a5-b740-37cb13ba4610",
+  "timestamp": "2026-07-07T22:07:18.815Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/private-context/security\necho \"########## CBP verify note — what does it cl",
+    "parameters": {},
+    "result_hash": "sha256:9b9f8467c8547c1784284077587a7a1afb0828aa01a9cb271688d767b6bcaccd",
+    "timestamp": "2026-07-07T22:07:18.815Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "3a66dd76-6084-4e95-8813-707084600b5e",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCIQDsRHGYu6jnSe/PJ6rR02rMQxLVYR/dnf7NAg+/N4WAzQIgC7itx6t8zGxZ4pUY03r5bJ63+guzN3iSGwSp7JqCgOs=",
+        "timestamp": "2026-07-07T22:07:18.818Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/private-context/security\necho \"########## CBP verify note — what does it cl",
+  "outputs_hashes": [
+    "sha256:9b9f8467c8547c1784284077587a7a1afb0828aa01a9cb271688d767b6bcaccd"
+  ]
+}

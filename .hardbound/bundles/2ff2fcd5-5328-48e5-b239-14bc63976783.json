@@ -1,0 +1,45 @@
+{
+  "bundle_id": "2ff2fcd5-5328-48e5-b239-14bc63976783",
+  "timestamp": "2026-07-13T19:22:05.930Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\necho \"=== top-level Command enum ===\"\nsed -n '44,113p' core/src/cli.",
+    "parameters": {},
+    "result_hash": "sha256:1ce3b3117e3c25da45320d0bea179200e010975ca3b63bb4247203bf099f74fa",
+    "timestamp": "2026-07-13T19:22:05.930Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "f009c949-d100-4832-a8ab-57cc38acb03b",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCIEP1cVlk9CE17GJ75Gw6ghAfw4B5SURIhxtD+fTrj+K9AiEAvDCwi2tPMiUvT/KNZH03mqGrBGXCUNhJI/Q4/WBDrJ0=",
+        "timestamp": "2026-07-13T19:22:05.931Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\necho \"=== top-level Command enum ===\"\nsed -n '44,113p' core/src/cli.",
+  "outputs_hashes": [
+    "sha256:1ce3b3117e3c25da45320d0bea179200e010975ca3b63bb4247203bf099f74fa"
+  ]
+}

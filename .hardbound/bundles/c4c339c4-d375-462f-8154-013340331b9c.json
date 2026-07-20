@@ -1,0 +1,45 @@
+{
+  "bundle_id": "c4c339c4-d375-462f-8154-013340331b9c",
+  "timestamp": "2026-07-18T04:03:25.648Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/private-context/hub-mesh\nbash hub-notify.sh hub coordination \"merging hesti",
+    "parameters": {},
+    "result_hash": "sha256:de69ad13c88ff253f76a4e77fb95ba0c9a1fdfb1ef4b85d22963ef74fb01d290",
+    "timestamp": "2026-07-18T04:03:25.648Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "4eb8bcbc-7a39-48ea-ab00-60dbf81afd56",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEYCIQCcdiwlWfXOxS4bsLIzK/Xz6aqdUn9A8xMAxI+1wMrhGQIhALiENp7gA6DPasHa9kkOd/uTo7wM7lgxh1eos6QxhJRO",
+        "timestamp": "2026-07-18T04:03:25.650Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/private-context/hub-mesh\nbash hub-notify.sh hub coordination \"merging hesti",
+  "outputs_hashes": [
+    "sha256:de69ad13c88ff253f76a4e77fb95ba0c9a1fdfb1ef4b85d22963ef74fb01d290"
+  ]
+}

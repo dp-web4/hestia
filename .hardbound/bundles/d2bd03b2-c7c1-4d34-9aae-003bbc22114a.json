@@ -1,0 +1,45 @@
+{
+  "bundle_id": "d2bd03b2-c7c1-4d34-9aae-003bbc22114a",
+  "timestamp": "2026-07-07T01:37:31.257Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "git diff feat/h007-mesh-freshness -- plugin-sdk/python/hestia_plugin_sdk/client.py plugin-sdk/python",
+    "parameters": {},
+    "result_hash": "sha256:fb64df2c195179616f3a9f669cc81cecf0f2421a15e4484911db102d9dc5a0fa",
+    "timestamp": "2026-07-07T01:37:31.257Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "f57a69a9-2f04-4980-8042-0d45de942d1e",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEQCIETflPPT/+fjD4shopa3vLUtiZ3f0fj8pqyv/t7+kAVzAiBNISFVlEri/RLakUQDMUkUkDGX8518zH7+ajrel3mtig==",
+        "timestamp": "2026-07-07T01:37:31.258Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: git diff feat/h007-mesh-freshness -- plugin-sdk/python/hestia_plugin_sdk/client.py plugin-sdk/python",
+  "outputs_hashes": [
+    "sha256:fb64df2c195179616f3a9f669cc81cecf0f2421a15e4484911db102d9dc5a0fa"
+  ]
+}

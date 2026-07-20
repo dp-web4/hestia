@@ -1620,10 +1620,10 @@ fn cmd_hub_pair_request(
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
-    // Resolve the peer's static LCT pubkey ONCE (the v2-key auth half) and persist.
-    let peer_lct = rt.block_on(client.resolve_lct_by_member_uuid(&rest, conn.hub_lct_id, to))
-        .context("resolving peer LCT (is the peer published to the registry?)")?;
-    let peer_pubkey_hex = hex::encode(peer_lct.public_key.to_bytes());
+    // Resolve the peer's pinned static pubkey ONCE (the v2-key auth half) and persist.
+    let peer_pubkey = rt.block_on(client.resolve_member_pubkey(&rest, conn.hub_lct_id, to))
+        .context("resolving peer pinned pubkey (is the peer an admitted/pinned member?)")?;
+    let peer_pubkey_hex = hex::encode(peer_pubkey.to_bytes());
 
     let my_eph = EphemeralKeyPair::generate();
     let payload = PairRequestPayload {
@@ -1671,9 +1671,9 @@ fn cmd_hub_pair_confirm(
     let detail = rt.block_on(client.get_pair(&rest, conn.hub_lct_id, pair_id))?;
     // The peer is the initiator (we are confirming).
     let peer_uuid = detail.initiator;
-    let peer_lct = rt.block_on(client.resolve_lct_by_member_uuid(&rest, conn.hub_lct_id, peer_uuid))
-        .context("resolving initiator LCT")?;
-    let peer_pubkey_hex = hex::encode(peer_lct.public_key.to_bytes());
+    let peer_pubkey = rt.block_on(client.resolve_member_pubkey(&rest, conn.hub_lct_id, peer_uuid))
+        .context("resolving initiator pinned pubkey")?;
+    let peer_pubkey_hex = hex::encode(peer_pubkey.to_bytes());
 
     let my_eph = EphemeralKeyPair::generate();
     let payload = PairConfirmPayload {

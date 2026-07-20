@@ -1,0 +1,45 @@
+{
+  "bundle_id": "ef8b1774-a00f-4fb5-a355-0206c705fde8",
+  "timestamp": "2026-07-11T05:18:28.862Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/private-context/hub-mesh\n# Merge protocol step 1: announce before merging t",
+    "parameters": {},
+    "result_hash": "sha256:5e4e9dc99ca98f30a2edce933127b552100b39aa7da6cbad1efe8dc9d83c7c2c",
+    "timestamp": "2026-07-11T05:18:28.862Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "441c4c94-6426-4673-acca-55578efd1f30",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEYCIQCukKBTN6Nfm5Axlx6LoP0GIESvIdDI/uDYZUOeK2UCTAIhAPItQzYLZifaih2t1RuzwxBw2FOQvsPzLqGQv0MaUX2o",
+        "timestamp": "2026-07-11T05:18:28.863Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/private-context/hub-mesh\n# Merge protocol step 1: announce before merging t",
+  "outputs_hashes": [
+    "sha256:5e4e9dc99ca98f30a2edce933127b552100b39aa7da6cbad1efe8dc9d83c7c2c"
+  ]
+}

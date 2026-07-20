@@ -1,0 +1,45 @@
+{
+  "bundle_id": "ea827a37-605e-4cde-b19d-36058e6e19f7",
+  "timestamp": "2026-07-18T19:47:23.746Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "file_operation",
+    "target": "/home/dp/ai-workspace/hestia/core/src/sovereign.rs",
+    "parameters": {},
+    "result_hash": "sha256:b988825602c43e0136a390ef7e8f6032419f4822ec519767f41fa009c3ef3f2b",
+    "timestamp": "2026-07-18T19:47:23.746Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "6f7d3e70-8cf8-4214-9629-8d5df85bf7b8",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCIQCQQVdP0aWTg3i+kNwSsuy07va1LFK/3i8La4FSqImQ1gIgahHtMje6IZfW8lmz4IT3PZsUIFlZYu8A4A6AdMRDyj0=",
+        "timestamp": "2026-07-18T19:47:23.747Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Read: /home/dp/ai-workspace/hestia/core/src/sovereign.rs",
+  "outputs_hashes": [
+    "sha256:b988825602c43e0136a390ef7e8f6032419f4822ec519767f41fa009c3ef3f2b"
+  ]
+}

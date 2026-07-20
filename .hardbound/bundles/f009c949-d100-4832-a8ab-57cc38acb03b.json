@@ -1,0 +1,45 @@
+{
+  "bundle_id": "f009c949-d100-4832-a8ab-57cc38acb03b",
+  "timestamp": "2026-07-13T19:21:59.055Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\necho \"=== 1. do live persisted roles have binding_proof? (test via l",
+    "parameters": {},
+    "result_hash": "sha256:cb4e028a078644217e3260fb96a5a37c3855deeb406111f39d8e7571f3324ebe",
+    "timestamp": "2026-07-13T19:21:59.055Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "93b69bc0-2d3a-4f1c-98ca-55ce433ec1d4",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCIBJUxTmueiI2YQZ7m6PuY0exgW7baD00Hdj5+hR0mXv4AiEA42KDa2vSMtsX6LpYYafTHjAEjhyHiV7wWLdbSeAWIKs=",
+        "timestamp": "2026-07-13T19:21:59.056Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\necho \"=== 1. do live persisted roles have binding_proof? (test via l",
+  "outputs_hashes": [
+    "sha256:cb4e028a078644217e3260fb96a5a37c3855deeb406111f39d8e7571f3324ebe"
+  ]
+}

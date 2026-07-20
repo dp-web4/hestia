@@ -1,0 +1,45 @@
+{
+  "bundle_id": "7cb6f2d6-529a-47b9-943a-f88b0898b7b6",
+  "timestamp": "2026-07-18T21:22:25.544Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\n# add a round-trip + fail-closed test to hub.rs tests\ngrep -n \"mod t",
+    "parameters": {},
+    "result_hash": "sha256:5921dea4a646a5ebc103c7df94990168a5797002966f644d566e21705e913e18",
+    "timestamp": "2026-07-18T21:22:25.544Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "5f894e55-2a9b-4980-b8dd-e88b22b6b2ca",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCIQDs2FuolKyihm7LS5dvwcc8xhBHfVcpqONrOh9zY7+pfQIgJvaxnLRaJBnUeSSN3CnidO3nwhKq91j0kLbyiBg5YwA=",
+        "timestamp": "2026-07-18T21:22:25.547Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\n# add a round-trip + fail-closed test to hub.rs tests\ngrep -n \"mod t",
+  "outputs_hashes": [
+    "sha256:5921dea4a646a5ebc103c7df94990168a5797002966f644d566e21705e913e18"
+  ]
+}

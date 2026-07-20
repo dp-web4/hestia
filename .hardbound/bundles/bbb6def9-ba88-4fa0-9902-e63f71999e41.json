@@ -1,0 +1,45 @@
+{
+  "bundle_id": "bbb6def9-ba88-4fa0-9902-e63f71999e41",
+  "timestamp": "2026-07-07T01:40:33.425Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "git --no-pager diff core/src/server/handler.rs core/src/policy/types.rs | head -60",
+    "parameters": {},
+    "result_hash": "sha256:bfd9009836d31dadfb51f8a0ceb250a6491541e6ffb226a5dda809e35818637a",
+    "timestamp": "2026-07-07T01:40:33.425Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "7751ed49-e42e-4571-b8bf-1daf4d9bc2a8",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCID+GlKP3pvJCMEmzvGyPJH2hZFvgPFxwiq+prY05GS1QAiEA60hdMwz8C6TWasheNBZV0i0XWvmdy/TJjbFsudjrD9g=",
+        "timestamp": "2026-07-07T01:40:33.426Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: git --no-pager diff core/src/server/handler.rs core/src/policy/types.rs | head -60",
+  "outputs_hashes": [
+    "sha256:bfd9009836d31dadfb51f8a0ceb250a6491541e6ffb226a5dda809e35818637a"
+  ]
+}

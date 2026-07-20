@@ -1,0 +1,45 @@
+{
+  "bundle_id": "3b5cefa2-8a9e-4a52-8c20-930ff04afc54",
+  "timestamp": "2026-07-18T21:50:14.511Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "command_execution",
+    "target": "cd /home/dp/ai-workspace/hestia\n# add the receive-side peer-sealed test to the handler tests mod\npyt",
+    "parameters": {},
+    "result_hash": "sha256:94a7a151c920e4fa7b506fa029f622fc1cf6898e7acddbb4885409f9610fce01",
+    "timestamp": "2026-07-18T21:50:14.511Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "c8b72d6e-db45-444d-a575-7e9575ab79bc",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCIHNB6wHxCkO63p6YZHlERc77h8irRJQxYHJHSgTRYejCAiEA4N85OF3hJ6lXXtyauWKMGQstx5YYWbVuU/VB4KNet44=",
+        "timestamp": "2026-07-18T21:50:14.514Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Bash: cd /home/dp/ai-workspace/hestia\n# add the receive-side peer-sealed test to the handler tests mod\npyt",
+  "outputs_hashes": [
+    "sha256:94a7a151c920e4fa7b506fa029f622fc1cf6898e7acddbb4885409f9610fce01"
+  ]
+}

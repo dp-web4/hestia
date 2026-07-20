@@ -1,0 +1,45 @@
+{
+  "bundle_id": "af7bdcf3-904c-4962-b7f0-312a612fcdd6",
+  "timestamp": "2026-07-16T06:27:15.725Z",
+  "actor_id": "lct:web4:claude:opus-4",
+  "action": {
+    "type": "file_operation",
+    "target": "/home/dp/ai-workspace/web4/web4-core/src/ratchet.rs",
+    "parameters": {},
+    "result_hash": "sha256:a7c7a82b27a451f38e734f7ff1b013eb02d1ae89730f80ef4288a59c46fa9e15",
+    "timestamp": "2026-07-16T06:27:15.725Z"
+  },
+  "t3_tensor_snapshot": {
+    "talent": 0.3,
+    "training": 0.3,
+    "temperament": 0.3,
+    "context_weights": [
+      0.33,
+      0.33,
+      0.34
+    ]
+  },
+  "coherence_metrics": {
+    "score": 1,
+    "delta": 0
+  },
+  "provenance": {
+    "prev_bundle_id": "496e8ef1-352b-4524-ab78-db3e74a553ba",
+    "signatures": [
+      {
+        "signer": "lct:web4:claude:opus-4",
+        "algorithm": "ES256",
+        "signature": "MEUCIQDRrMiJiWzxftmfU2kitlobgcCjMUPJJ09XEO9y9sKdmAIgSTkv76vzMgeVO7w8fhCvtXpe0eg4FX9et8vVacAcFT4=",
+        "timestamp": "2026-07-16T06:27:15.726Z"
+      }
+    ],
+    "witness_signatures": []
+  },
+  "device_set": [
+    "lct:web4:claude:opus-4"
+  ],
+  "rationale_summary": "Write: /home/dp/ai-workspace/web4/web4-core/src/ratchet.rs",
+  "outputs_hashes": [
+    "sha256:a7c7a82b27a451f38e734f7ff1b013eb02d1ae89730f80ef4288a59c46fa9e15"
+  ]
+}
