@@ -92,10 +92,10 @@ pub enum AssuranceLevel {
 /// this attestation carries — `owner_pubkey_hex`, each `DeviceSignature`'s
 /// `pubkey_hex` and `device_type` — are the PRESENTER'S CLAIMS, never authority.
 /// A relying party MUST resolve every device fact (key, class, enrollment status)
-/// from committed state and recompute the tier via [`Self::verify_against_store`];
-/// [`Self::verify_internal_consistency`] proves only that the presented keys
-/// signed, and must not gate anything. Otherwise the owner-key holder can mint
-/// fresh keys, label them `Hardware`, and self-authenticate an inflated tier.
+/// from committed state and recompute the tier via [`Self::verify_against_store`].
+/// (The old presented-key verifier is retired to `#[cfg(test)]` — a production
+/// caller can't even name it.) Otherwise the owner-key holder can mint fresh keys,
+/// label them `Hardware`, and self-authenticate an inflated tier.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConstellationAttestation {
     pub owner_lct_id: Uuid,
@@ -203,6 +203,13 @@ impl ConstellationAttestation {
     ///
     /// Returns the consistency-derived tier purely as a diagnostic; treat it as
     /// "the presenter's claim", never as a resolved fact.
+    ///
+    /// **RETIRED from the API (2026-07-21): `#[cfg(test)]`-only.** It exists solely
+    /// to validate that `create()` produces well-formed, self-consistent
+    /// attestations. Every decision path uses [`Self::verify_against_store`]; a
+    /// production caller literally cannot compile against this, so it can never be
+    /// mistaken for authentication.
+    #[cfg(test)]
     pub fn verify_internal_consistency(
         &self,
         expected_nonce: &str,

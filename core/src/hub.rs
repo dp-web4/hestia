@@ -861,6 +861,98 @@ impl HubClient {
             serde_json::from_str(&text).context("parsing PairMessagesResponse")?;
         Ok(parsed.messages)
     }
+
+    // -----------------------------------------------------------------------
+    // Constellation device enrollment (GPT self-authentication fix, Phase 3).
+    // The owner (this member) commits a device's pubkey + class to the hub as
+    // AUTHORITATIVE state the constellation verifier resolves against — so a
+    // presented attestation can't self-authenticate its device facts. Self-
+    // attested: the envelope signer IS the owner.
+    // -----------------------------------------------------------------------
+
+    /// `POST /constellation/enroll` — enroll (or rotate) one of our devices.
+    /// Returns the hub-assigned enrollment version.
+    pub async fn enroll_device(
+        &self,
+        rest_endpoint: &str,
+        hub_id: Uuid,
+        our_uuid: Uuid,
+        our_kp: &KeyPair,
+        device_lct_id: Uuid,
+        device_pubkey_hex: &str,
+        device_class: &crate::constellation::DeviceType,
+    ) -> Result<u64> {
+        let payload = serde_json::json!({
+            "action": "device_enroll",
+            "device_lct_id": device_lct_id,
+            "device_pubkey_hex": device_pubkey_hex,
+            "device_class": device_class,
+        });
+        let env = self.sign_pair_payload(rest_endpoint, our_uuid, our_kp, payload).await?;
+        let url = format!(
+            "{}/hubs/{}/constellation/enroll",
+            rest_endpoint.trim_end_matches('/'), hub_id
+        );
+        let resp = self.http.post(&url).json(&env).send().await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("device_enroll failed: HTTP {status}: {text}");
+        }
+        let v: serde_json::Value = serde_json::from_str(&text).context("parsing enroll response")?;
+        Ok(v.get("enrollment_version").and_then(|x| x.as_u64()).unwrap_or(0))
+    }
+
+    /// `POST /constellation/revoke` — revoke one of our enrolled devices.
+    pub async fn revoke_device(
+        &self,
+        rest_endpoint: &str,
+        hub_id: Uuid,
+        our_uuid: Uuid,
+        our_kp: &KeyPair,
+        device_lct_id: Uuid,
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "action": "device_revoke",
+            "device_lct_id": device_lct_id,
+        });
+        let env = self.sign_pair_payload(rest_endpoint, our_uuid, our_kp, payload).await?;
+        let url = format!(
+            "{}/hubs/{}/constellation/revoke",
+            rest_endpoint.trim_end_matches('/'), hub_id
+        );
+        let resp = self.http.post(&url).json(&env).send().await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("device_revoke failed: HTTP {status}: {text}");
+        }
+        Ok(())
+    }
+
+    /// `GET /constellation/:owner/devices` — the owner's enrolled devices as the
+    /// hub holds them (the authoritative set the verifier resolves against).
+    pub async fn list_enrolled_devices(
+        &self,
+        rest_endpoint: &str,
+        hub_id: Uuid,
+        owner_uuid: Uuid,
+    ) -> Result<serde_json::Value> {
+        let url = format!(
+            "{}/hubs/{}/constellation/{}/devices",
+            rest_endpoint.trim_end_matches('/'), hub_id, owner_uuid
+        );
+        let resp = self.http.get(&url).send().await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("list enrolled devices failed: HTTP {status}: {text}");
+        }
+        serde_json::from_str(&text).context("parsing enrolled devices response")
+    }
 }
 
 /// Wire body for a channel request — matches the hub's `/v1/hubs/{id}/channel`.

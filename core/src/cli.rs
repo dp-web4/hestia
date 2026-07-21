@@ -201,6 +201,38 @@ enum ConstellationCmd {
 
     /// Generate a constellation proof
     Proof,
+
+    /// Enroll device(s) with the hub as AUTHORITATIVE constellation state — the
+    /// hub's assurance verifier resolves each device's key + class from here, not
+    /// from a presented attestation. Owner-signed (this member). Enroll before a
+    /// device can raise your assurance tier.
+    Enroll {
+        /// Device LCT ID to enroll (from `constellation list`). Omit with --all.
+        id: Option<String>,
+        /// Enroll every device in the local constellation.
+        #[arg(long)]
+        all: bool,
+        /// Hub URL or connection UUID (default: sole connection).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
+
+    /// Revoke an enrolled device on the hub — its key stops contributing
+    /// assurance immediately.
+    Revoke {
+        /// Device LCT ID to revoke.
+        id: String,
+        /// Hub URL or connection UUID (default: sole connection).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
+
+    /// List the devices the hub has enrolled for us (the authoritative set).
+    Enrolled {
+        /// Hub URL or connection UUID (default: sole connection).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -566,6 +598,13 @@ pub fn run() -> AnyResult<()> {
             ConstellationCmd::List => cmd_constellation_list(&home),
             ConstellationCmd::Remove { id } => cmd_constellation_remove(&home, &id),
             ConstellationCmd::Proof => cmd_constellation_proof(&home),
+            ConstellationCmd::Enroll { id, all, target } => {
+                cmd_constellation_enroll(&home, id.as_deref(), all, &target)
+            }
+            ConstellationCmd::Revoke { id, target } => {
+                cmd_constellation_revoke_device(&home, &id, &target)
+            }
+            ConstellationCmd::Enrolled { target } => cmd_constellation_enrolled(&home, &target),
         },
         Command::Profile(p) => match p {
             ProfileCmd::Name { name } => cmd_profile_name(&home, &name),
@@ -2085,6 +2124,95 @@ fn cmd_constellation_proof(home: &std::path::Path) -> AnyResult<()> {
     println!("  issued:     {}", proof.issued_at.format("%Y-%m-%d %H:%M UTC"));
     for id in &proof.members {
         println!("    {id}");
+    }
+    Ok(())
+}
+
+/// `constellation enroll` — commit local device(s) to the hub as authoritative
+/// enrollment (owner = this member). The hub's assurance verifier resolves each
+/// device's key + class from the enrolled record, not from a presented attestation.
+fn cmd_constellation_enroll(
+    home: &std::path::Path,
+    id: Option<&str>,
+    all: bool,
+    target: &str,
+) -> AnyResult<()> {
+    let vault = open_vault(home)?;
+    let store = ConstellationStore::load(&vault)?;
+    if store.members.is_empty() {
+        anyhow::bail!("no devices in the local constellation — `hestia constellation add <name>` first");
+    }
+    let selected: Vec<&hestia::constellation::ConstellationMember> = match (all, id) {
+        (true, _) => store.members.iter().collect(),
+        (false, Some(id)) => {
+            let lct = uuid::Uuid::parse_str(id).with_context(|| format!("invalid UUID: {id}"))?;
+            let m = store.members.iter().find(|m| m.lct_id == lct)
+                .ok_or_else(|| anyhow::anyhow!("device {id} not in the local constellation"))?;
+            vec![m]
+        }
+        (false, None) => anyhow::bail!("specify a device LCT id or --all"),
+    };
+
+    let hub_store = HubStore::load(&vault)?;
+    let conn = pick_connection(&hub_store, target)?;
+    let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+
+    for m in selected {
+        let version = rt.block_on(client.enroll_device(
+            &rest, conn.hub_lct_id, conn.our_lct_id, &keypair,
+            m.lct_id, &m.pubkey_hex, &m.device_type,
+        )).with_context(|| format!("enrolling device {} ({})", m.name, m.lct_id))?;
+        println!("Enrolled {} — {} ({:?})  v{version}", m.lct_id, m.name, m.device_type);
+    }
+    println!("Owner (this member): {}", conn.our_lct_id);
+    Ok(())
+}
+
+/// `constellation revoke <device>` — revoke an enrolled device on the hub.
+fn cmd_constellation_revoke_device(
+    home: &std::path::Path,
+    id: &str,
+    target: &str,
+) -> AnyResult<()> {
+    let device = uuid::Uuid::parse_str(id).with_context(|| format!("invalid UUID: {id}"))?;
+    let vault = open_vault(home)?;
+    let hub_store = HubStore::load(&vault)?;
+    let conn = pick_connection(&hub_store, target)?;
+    let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(client.revoke_device(&rest, conn.hub_lct_id, conn.our_lct_id, &keypair, device))
+        .context("revoking device on the hub")?;
+    println!("Revoked device {device} (no longer contributes assurance).");
+    Ok(())
+}
+
+/// `constellation enrolled` — the devices the hub holds enrolled for us.
+fn cmd_constellation_enrolled(home: &std::path::Path, target: &str) -> AnyResult<()> {
+    let vault = open_vault(home)?;
+    let hub_store = HubStore::load(&vault)?;
+    let conn = pick_connection(&hub_store, target)?;
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+    let resp = rt.block_on(client.list_enrolled_devices(&rest, conn.hub_lct_id, conn.our_lct_id))
+        .context("listing enrolled devices")?;
+    let devices = resp.get("devices").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+    if devices.is_empty() {
+        println!("(hub holds no enrolled devices for {})", conn.our_lct_id);
+        return Ok(());
+    }
+    println!("Enrolled devices for {} (hub-authoritative):", conn.our_lct_id);
+    for d in &devices {
+        let dev = d.get("device_lct_id").and_then(|x| x.as_str()).unwrap_or("?");
+        let class = d.get("device_class").and_then(|x| x.as_str()).unwrap_or("?");
+        let status = d.get("status").and_then(|x| x.as_str()).unwrap_or("?");
+        let ver = d.get("enrollment_version").and_then(|x| x.as_u64()).unwrap_or(0);
+        println!("  {dev}  class={class}  status={status}  v{ver}");
     }
     Ok(())
 }
