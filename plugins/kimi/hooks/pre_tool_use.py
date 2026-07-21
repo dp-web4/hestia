@@ -26,7 +26,7 @@ Config (all env-overridable; defaults suit a generic install):
   HESTIA_WORKSPACE       root that contains the granted repos      (default: ~/ai-workspace)
   HESTIA_SOCIETY_GATE    path to the society-safety gate caller     (default: $WORKSPACE/hestia/plugins/claude-code/hooks/pre_tool_use.py)
   HESTIA_KIMI_IDENTITY   the member's live identity.json            (default: ~/.kimi-code/hestia-instance/identity.json)
-  HESTIA_KIMI_GATE_MODE  warn | enforce                             (default: warn)
+  HESTIA_KIMI_GATE_MODE  warn | enforce   (default: enforce — deny-tight, relax as trust accrues)
   HESTIA_FORBIDDEN_EXTRA comma-separated extra forbidden path tokens (e.g. your private repo names)
 """
 import json
@@ -62,6 +62,18 @@ def load_in_scope():
     except Exception:
         pass
     return ["web4"]
+
+
+def launch_cwd_repo():
+    """The repo Kimi is launched in is always in scope (dp 2026-07-21: 'whatever cwd we launch it
+    in') — a per-launch dynamic grant on top of the static allowlist, so a task-specific launch dir
+    (even a private repo) is reachable for that session without widening the standing grant."""
+    cwd = (os.environ.get("HESTIA_KIMI_LAUNCH_CWD") or os.getcwd()).replace("\\", "/")
+    if WORKSPACE in cwd:
+        rest = cwd.split(WORKSPACE, 1)[1].lstrip("/")
+        seg = rest.split("/", 1)[0] if rest else ""
+        return [seg] if seg else []
+    return []
 
 
 def path_targets(tool_input):
@@ -126,10 +138,12 @@ def command_in_scope(cmd, scopes):
     return True
 
 
-# Rollout mode: audit-first is the prudent path — wire the gate, run it in WARN so it surfaces
-# would-block verdicts + tests the plumbing without denying real work, THEN flip to enforce once
-# it's been watched not-false-deny. Default WARN. Flip with HESTIA_KIMI_GATE_MODE=enforce.
-MODE = os.environ.get("HESTIA_KIMI_GATE_MODE", "warn").lower()
+# Rollout mode: DENY-TIGHT by default (dp 2026-07-21) — a foreign agent starts enforced and RELAXES
+# as role-scoped trust accrues (defensive trust: start at zero, earn the widening). `enforce` blocks
+# out-of-scope/unsafe acts; `warn` (opt-in, for a fresh integration's audit shakedown) surfaces the
+# verdict but allows. Egress/secret is `innate` — always blocks regardless of mode. Set warn via
+# HESTIA_KIMI_GATE_MODE=warn only while shaking down new plumbing.
+MODE = os.environ.get("HESTIA_KIMI_GATE_MODE", "enforce").lower()
 
 
 def deny(reason, what_to_do, innate=False):
@@ -158,7 +172,7 @@ def main():
 
     tool = event.get("tool_name") or "?"
     tinput = event.get("tool_input") or {}
-    scopes = load_in_scope()
+    scopes = load_in_scope() + launch_cwd_repo()
     paths = path_targets(tinput)
     cmd = command_of(tinput)
 
