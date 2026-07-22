@@ -43,7 +43,10 @@ this gate was wired in as gemini-cli 0.52.0's real BeforeTool hook and fired wit
 In-scope read allowed; out-of-scope read, ../ traversal, symlink escape, absolute oos, oos shell
 command, governor deny, and malformed JSON all denied exit 2 with the reason surfaced to the model.
 Confirmed live: read_file -> `file_path` (absolute), run_shell_command -> `command`. The pass also
-found the two holes closed here (ungated web_fetch egress; mcp_context unread by Gate-1).
+found the two holes closed here (ungated web_fetch egress; mcp_context unread by Gate-1). RE-FIRE
+(CBP, 2026-07-22, ...-LIVE-VERIFIED-re-fire-*): both verified live against 7e2d8f4; follow-on note
+folded in here - an HTTP/SSE MCP server's `url`/`cwd` (no command/args) is the same egress class,
+now swept by mcp_egress()/mcp_strings() and lifted into the governor handoff.
 Also live: gemini-cli natively confines FILE tools to the launch dir (+ --include-directories) and
 refuses .env - so for file paths this gate is layer 2. Shell, MCP and web egress have NO native
 layer, i.e. this gate is the ONLY thing between the model and them. That is the hardening priority.
@@ -194,7 +197,21 @@ def mcp_strings(mcp):
     """
     if not isinstance(mcp, dict):
         return []
-    return _strings(mcp.get("command")) + _strings(mcp.get("args"))
+    # `cwd` is the server's launch dir - a real local path, so it belongs to command/path scope
+    # alongside command+args. `url` does NOT: it's a network endpoint (see mcp_egress), scoping it
+    # against local repo names only mis-fires. LIVE-VERIFIED shape carries cwd/url on HTTP/SSE servers.
+    return _strings(mcp.get("command")) + _strings(mcp.get("args")) + _strings(mcp.get("cwd"))
+
+
+def mcp_egress(mcp):
+    """An HTTP/SSE MCP server is reached by `url` (extractMcpContext: `serverConfig.url ?? httpUrl`),
+    carrying NO command/args - a live egress surface with the same shape as web_fetch's url. A member
+    pointed at an out-of-scope HTTP MCP endpoint would otherwise sail past Gate-1 entirely (CBP note,
+    2026-07-22). Swept by Gate-1a for secrets and handed to the governor; NOT command-scoped, because
+    a URL is not a local path and repo-name matching on it only produces false denies."""
+    if not isinstance(mcp, dict):
+        return []
+    return _strings(mcp.get("url"))
 
 
 def dedupe(seq):
@@ -250,6 +267,10 @@ def to_claude_lineage(event, tool, tinput, mcp):
             m = re.search(r"https?://[^\s\"'<>)]+", str(tinput.get("prompt") or ""))
             if m:
                 ti["url"] = m.group(0)
+        # An HTTP/SSE MCP server has no command/args - its egress target is `mcp_context.url`. Lift it
+        # so the governor sees a real url instead of None (same fix as run_shell_command's target).
+        if "url" not in ti and mcp and isinstance(mcp.get("url"), str) and mcp["url"]:
+            ti["url"] = mcp["url"]
         out["tool_input"] = ti
     out["source_event"] = {"lineage": "gemini", "tool_name": tool, "tool_input": tinput,
                            "mcp_context": mcp}
@@ -332,8 +353,8 @@ def _gate():
     scopes = dedupe(load_in_scope() + launch_cwd_repo())
     paths = path_targets(tinput)
     cmd = command_of(tinput)
-    egress = egress_targets(tinput)      # url/prompt/query - swept, but never realpath-contained
-    mcp_args = mcp_strings(mcp)          # the MCP transport surface Gate-1 could not see
+    egress = egress_targets(tinput) + mcp_egress(mcp)  # url/prompt/query + HTTP-MCP url: Gate-1a only
+    mcp_args = mcp_strings(mcp)          # the MCP transport surface Gate-1 could not see (command+args+cwd)
 
     # Gate 1a - egress/secret innate invariant (denied even inside a granted repo). ALWAYS enforced.
     # The sweep covers every channel a secret can leave by: file paths, the shell command, the
