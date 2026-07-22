@@ -1,0 +1,39 @@
+{
+  "_comment": "Hestia governance hooks for the Google Gemini CLI occupant. Gemini reads hooks from the 'hooks' object in ~/.gemini/settings.json (user), <project>/.gemini/settings.json (project), or an extension-shipped hooks/hooks.json (Extensions priority). Merge this 'hooks' block into settings.json for a manual install, or ship this file inside a Gemini extension. The BeforeTool gate is FAIL-CLOSED (Gemini's engine fails open on unexpected failure); it covers run_shell_command + file-write/replace + MCP calls. Read-class tools pass the scope check but skip the society-safety governor. Commands bake HESTIA_WORKSPACE because the gate default (~/ai-workspace) is wrong on this host; adjust the absolute paths per install.",
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HESTIA_WORKSPACE=/mnt/c/projects/ai-agents python3 /mnt/c/projects/ai-agents/hestia/plugins/gemini/hooks/before_tool.py",
+            "timeout": 15000
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/mnt/c/projects/ai-agents/hestia/plugins/gemini/hooks/observe.sh", "timeout": 15000 }
+        ]
+      }
+    ],
+    "AfterTool": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "/mnt/c/projects/ai-agents/hestia/plugins/gemini/hooks/observe.sh", "timeout": 10000 }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "HESTIA_WORKSPACE=/mnt/c/projects/ai-agents /mnt/c/projects/ai-agents/hestia/plugins/gemini/hooks/hydrate.sh", "timeout": 20000 }
+        ]
+      }
+    ]
+  }
+}
