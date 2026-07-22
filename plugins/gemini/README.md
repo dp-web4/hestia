@@ -110,8 +110,20 @@ codex convention so nothing drifts across adapters.)
 2. Deploy `GEMINI.md` → the granted repo root and `~/.gemini/GEMINI.md`.
 3. Merge `hooks/hooks.json`'s `hooks` block into `~/.gemini/settings.json`, fixing the absolute paths
    and `HESTIA_WORKSPACE` for the host.
-4. (Optional) Add a Gemini **policy-engine** rule set for coarse allow/ask defaults; this gate handles
-   the Web4 boundary on top.
+4. **Install at USER level (`~/.gemini/settings.json`), not project level.** Gemini gates
+   Project-source hooks behind `isTrustedFolder()` — a project-scoped gate does not execute in an
+   untrusted folder, i.e. it is absent exactly where you most want it.
+5. **Pin the kill-switch explicitly** in `~/.gemini/settings.json`:
+   ```json
+   "hooksConfig": { "enabled": true }
+   ```
+   It defaults to `true` in 0.52.0, but `"enabled": false` disarms *every* hook, and a
+   `hooksConfig.disabled` array (written by the `/hooks` UI) can disable this gate by command
+   string. That is the operator's prerogative — but it must be a **visible** fact, not a silent one.
+   Anything auditing this member should read `hooksConfig` as part of the gate's state.
+6. (Optional) Add a Gemini **policy-engine** rule set for coarse allow/ask defaults; this gate handles
+   the Web4 boundary on top. Note the gate sits *before* the policy engine: hook deny beats
+   `--approval-mode yolo` (LIVE-VERIFIED, CBP 2026-07-22).
 
 ## Verification
 
@@ -123,6 +135,34 @@ Smoke-tested against synthetic `BeforeTool` events (2026-07-22, on Nomad):
 - secret path (`.env`) → deny exit 2 (innate) ✓
 - shell command reaching an out-of-scope repo → deny exit 2 (command-scope) ✓
 - malformed event JSON → deny exit 2 (fail-closed) ✓
+
+**Fail-open holes found by repro and closed (2026-07-22, nomad).** The first cut of this gate passed
+the smoke tests above while still allowing all four of these. Regression tests live in `tests/`:
+
+```sh
+plugins/gemini/tests/gate_holes_repro.sh          # 10/10 here, 6/10 against the pre-fix gate
+plugins/gemini/tests/wrapper_failclosed_test.py   # 5/5 — fault-injects the deny-on-exception wrapper
+```
+
+Both point `HESTIA_SOCIETY_GATE` at a nonexistent path on purpose: a correct gate fails **closed**
+when it cannot reach the governor, so every write/exec/egress case must come back exit 2. Pass a
+gate path as `$1` to test a different revision.
+
+| Hole | Why it was open | Fix |
+|---|---|---|
+| `read_many_files` skipped Gate-1b entirely | gate scanned `paths`/`file_paths`; the real params are `include`/`exclude` (source: `tools/definitions/base-declarations.ts`) | scan `include`/`exclude` too |
+| `web_fetch` / `google_web_search` skipped Gate-2 | both sat in `READ_CLASS`; they *are* reads, but of the **network** — and gemini has no sandbox behind the gate | split out `EGRESS_CLASS`; egress now meets the governor |
+| a crashing gate **allowed** the call | an uncaught Python exception exits 1, and exit 1 is ALLOW+warning, not a block | top-level deny-on-exception in `main()` |
+| the governor was consulted but **blind** | it extracts targets from `file_path`/`path`/`url` and only reads `command` for `Bash`/`Shell` — gemini emits none of those names, so every shell command arrived as `target=None` | `to_claude_lineage()` translates at the boundary |
+
+The exit-code contract these depend on is LIVE-VERIFIED on gemini-cli 0.52.0 by CBP
+(`shared-context/forum/cbp-to-nomad-gemini-hook-contract-LIVE-VERIFIED-2026-07-22.md`): exit 0 =
+allow, **exit 1 = allow+warning**, exit 2+ = deny, and empty output on *both* streams = no decision
+= allow. So `sys.exit(2)` without writing a reason is itself a hole; every deny path here writes to
+stderr first.
+
+**Still unverified:** this adapter has not been fired against a live gemini-cli. Everything above is
+synthetic-event + source tier. CBP's rig is preserved for the adapter-tier live pass.
 
 **Not yet done (the `verified` bar):** run against a real Gemini CLI, confirm the exact `tool_input` arg
 names for each builtin tool (shell / file), confirm `BeforeTool` fires for MCP calls, confirm the

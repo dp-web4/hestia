@@ -23,13 +23,22 @@ and, per Google's official hooks reference, near-identical in the fields this ga
     is simpler and used here.
 
 This gate is therefore FAIL-CLOSED BY CONSTRUCTION: it only ever exits 0 (explicit confirmed allow) or
-2 (deny, with text). It never exits 1, so it never emits an allow-with-warning by accident.
+2 (deny, with text). It never exits 1, so it never emits an allow-with-warning by accident. That last
+claim is only true because main() wraps the whole gate in a deny-on-exception - an uncaught Python
+exception exits 1, which the engine reads as ALLOW. See main().
 
 FIDELITY NOTE (2026-07-22): the exit-code/deny/fail-open contract above is SOURCE-verified (file+lines
-cited). The base/BeforeTool field names are from `docs/hooks/reference.md`; the exact per-tool
-`tool_input` arg names for Gemini's builtin tools (shell/file) are handled defensively below (a
-superset of likely keys) - because the gate is fail-closed, an unrecognized shape over-blocks (safe).
-Only LIVE FIRING is unverified; mark `verified` after a run against the real Gemini CLI (CBP's rig).
+cited) AND now LIVE-VERIFIED by CBP against an installed gemini-cli 0.52.0 with real model
+round-trips (forum/cbp-to-nomad-gemini-hook-contract-LIVE-VERIFIED-2026-07-22.md). Live additions:
+  - hook deny beats `--approval-mode yolo` - the hook layer sits before the policy engine;
+  - MCP calls fire BeforeTool as `mcp_<server>_<tool>` AND carry an `mcp_context` object
+    ({server_name, tool_name, command, args}) - use those fields, not string-parsing (see
+    to_claude_lineage);
+  - `hooksConfig.enabled` defaults true but is a one-line kill-switch: install docs must pin it.
+The per-tool `tool_input` arg names are source-read from `tools/definitions/base-declarations.ts`
+(notably read_many_files = `include`/`exclude`, NOT `paths`) plus a defensive superset - because the
+gate is fail-closed, an unrecognized shape over-blocks (safe).
+STILL UNVERIFIED: this adapter has not itself been fired live. CBP's rig is preserved for that pass.
 Gemini also has a NATIVE policy engine (docs/reference/policy-engine.md) + BeforeToolSelection/
 BeforeModel events; those are complementary (this gate is the BeforeTool scope+safety layer we own),
 not reinvented here.
@@ -69,9 +78,14 @@ CLAUDE_PRE = os.environ.get(
 FORBIDDEN = ("/.ssh", ".env", "credentials", "id_rsa", "id_ed25519", "/.git/config", "secrets") + tuple(
     t.strip() for t in os.environ.get("HESTIA_FORBIDDEN_EXTRA", "").split(",") if t.strip())
 
-# Gemini builtin read-class tools (no write/exec) - name-matched case-insensitively below.
-READ_CLASS = {"read_file", "read_many_files", "glob", "search_file_content", "list_directory",
-              "google_web_search", "web_fetch"}
+# Gemini builtin LOCAL read-class tools (no write, no exec, no network) - they may skip Gate-2.
+READ_CLASS = {"read_file", "read_many_files", "glob", "search_file_content", "list_directory"}
+
+# Egress tools. These READ, but they read the *network* - and egress is the irreversible direction
+# (a prompt-injected `web_fetch` is exfiltration). They were in READ_CLASS, which skipped Gate-2, so
+# on gemini - which has no sandbox behind the gate - egress never met the governor at all.
+# They are NOT writes to the filesystem, so Gate-1b must not treat them as such (see for_write below).
+EGRESS_CLASS = {"google_web_search", "web_fetch"}
 
 # The agent's own home is always in scope (state, identity, config).
 GEMINI_HOME = os.path.expanduser("~/.gemini")
@@ -109,10 +123,15 @@ def path_targets(tool_input):
             v = tool_input.get(k)
             if isinstance(v, str):
                 out.append(v)
-        # write_many_files / read_many_files pass a list of paths
-        for k in ("paths", "file_paths"):
+        # read_many_files takes `include`/`exclude` GLOBS, not `paths` (SOURCE-VERIFIED:
+        # tools/definitions/base-declarations.ts). Scanning only paths/file_paths skipped Gate-1b
+        # for this tool entirely - an out-of-scope `include:["../private-context/**"]` was ALLOWED.
+        # `paths`/`file_paths` stay as a defensive superset (other/future tools, harmless if absent).
+        for k in ("paths", "file_paths", "include", "exclude"):
             v = tool_input.get(k)
-            if isinstance(v, list):
+            if isinstance(v, str):
+                out.append(v)
+            elif isinstance(v, list):
                 out.extend(x for x in v if isinstance(x, str))
     return out
 
@@ -126,6 +145,53 @@ def command_of(tool_input):
         if isinstance(c, list):
             return " ".join(str(x) for x in c)
     return None
+
+
+# Gemini's event vocabulary -> the Claude-lineage names the society gate dispatches on. The governor
+# (plugins/claude-code/hooks/pre_tool_use.py) extracts its target from `file_path`/`path`/`url`/
+# `notebook_path`, and only reads `command` when tool_name is in {"Bash","Shell"}. Gemini emits none
+# of those names, so an UNTRANSLATED handoff gave the governor target=None for every shell command -
+# it was consulted, but blind. Translate at the boundary; the gate stays the lineage adapter.
+LINEAGE_TOOL = {"run_shell_command": "Shell", "write_file": "Write", "replace": "Edit",
+                "read_file": "Read", "read_many_files": "Read", "glob": "Glob",
+                "search_file_content": "Grep", "list_directory": "Read",
+                "web_fetch": "WebFetch", "google_web_search": "WebSearch"}
+LINEAGE_ARG = {"absolute_path": "file_path", "dir_path": "path"}
+
+
+def to_claude_lineage(event, tool, tinput, mcp):
+    """Re-shape a Gemini BeforeTool event into the Claude-lineage shape the governor understands.
+
+    Kept lossless: the original gemini fields ride along under `source_event` so the daemon can
+    witness what actually happened, and `mcp_context` (LIVE-VERIFIED present on gemini 0.52.0 MCP
+    calls, CBP 2026-07-22) is used for MCP naming instead of parsing `mcp_<server>_<tool>` - the
+    string form is ambiguous when a server or tool name itself contains an underscore.
+    """
+    out = dict(event)
+    if mcp and isinstance(mcp.get("server_name"), str):
+        out["tool_name"] = f"mcp__{mcp['server_name']}__{mcp.get('tool_name') or '?'}"
+        # command+args are the server's real egress surface - hand them to the governor explicitly.
+        out["mcp_server_command"] = " ".join(
+            [str(mcp.get("command") or "")] + [str(a) for a in (mcp.get("args") or [])]).strip()
+    else:
+        out["tool_name"] = LINEAGE_TOOL.get(tool.lower(), tool)
+    if isinstance(tinput, dict):
+        ti = {LINEAGE_ARG.get(k, k): v for k, v in tinput.items()}
+        # `include` is a glob LIST; the governor wants one string target.
+        if "file_path" not in ti and "path" not in ti:
+            inc = tinput.get("include")
+            if isinstance(inc, list) and inc and isinstance(inc[0], str):
+                ti["path"] = inc[0]
+        # web_fetch carries its URLs INSIDE the free-text `prompt`; lift the first one to `url` so the
+        # governor's egress check sees a real target instead of None. The prompt is preserved as-is.
+        if "url" not in ti:
+            m = re.search(r"https?://[^\s\"'<>)]+", str(tinput.get("prompt") or ""))
+            if m:
+                ti["url"] = m.group(0)
+        out["tool_input"] = ti
+    out["source_event"] = {"lineage": "gemini", "tool_name": tool, "tool_input": tinput,
+                           "mcp_context": mcp}
+    return out
 
 
 def _all_repos():
@@ -185,7 +251,7 @@ def deny(reason, what_to_do, innate=False):
     sys.stderr.write(f"hestia: warn [scope] - {reason} (warn-rollout: allowed; would block under enforce)\n")
 
 
-def main():
+def _gate():
     # Fail-closed skeleton: any unexpected error -> deny (never fall through to allow).
     try:
         event = json.loads(sys.stdin.read() or "{}")
@@ -196,8 +262,10 @@ def main():
     if event.get("hook_event_name") != "BeforeTool":
         sys.exit(0)  # not our event
 
-    tool = event.get("tool_name") or "?"
+    raw_tool = event.get("tool_name")
+    tool = raw_tool if isinstance(raw_tool, str) and raw_tool else "?"
     tinput = event.get("tool_input") or {}
+    mcp = event.get("mcp_context") if isinstance(event.get("mcp_context"), dict) else None
     cwd = event.get("cwd") or os.environ.get("HESTIA_GEMINI_LAUNCH_CWD") or os.getcwd()
     scopes = load_in_scope() + launch_cwd_repo()
     paths = path_targets(tinput)
@@ -215,7 +283,8 @@ def main():
             # Hardened realpath containment via the shared lib. Roots = granted repos + agent home +
             # tmp, all absolute. It denies ../ / symlink / absolute escapes that the string check can't.
             roots = [os.path.join(WORKSPACE, s) for s in scopes] + [GEMINI_HOME, "/tmp", "/var/tmp"]
-            res = _shared_check_paths(paths, roots, cwd, for_write=(tool.lower() not in READ_CLASS))
+            is_write = tool.lower() not in READ_CLASS and tool.lower() not in EGRESS_CLASS
+            res = _shared_check_paths(paths, roots, cwd, for_write=is_write)
             if not res.allowed:
                 deny(f"'{tool}': {res.reason}",
                      "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
@@ -228,11 +297,12 @@ def main():
         deny(f"'{tool}' command reaches outside your granted scope ({'+'.join(scopes)})",
              "Scope the command to a granted repo, or if legitimately needed, request it (request_scope).")
 
-    # Gate 2 - society safety (the governor). Only write/exec-class needs the daemon's verdict; fail closed.
+    # Gate 2 - society safety (the governor). Local-read-class skips it; write/exec AND EGRESS need
+    # the daemon's verdict; fail closed.
     if tool.lower() not in READ_CLASS:
         try:
             env = dict(os.environ, HESTIA_PLUGIN_ID="gemini-cli", HESTIA_PRE_FAIL_CLOSED="1")
-            r = subprocess.run([sys.executable, CLAUDE_PRE], input=json.dumps(event),
+            r = subprocess.run([sys.executable, CLAUDE_PRE], input=json.dumps(to_claude_lineage(event, tool, tinput, mcp)),
                                capture_output=True, text=True, timeout=6, env=env)
             if r.returncode != 0:  # daemon denied, or inconclusive -> fail-closed for a write/exec act
                 msg = (r.stderr.strip() if r.returncode == 2 and r.stderr.strip()
@@ -250,6 +320,25 @@ def main():
             sys.stderr.write("hestia: warn [safety] - governor unreachable (warn-rollout: allowed).\n")
 
     sys.exit(0)  # the ONLY allow path - reached only after every gate explicitly passed
+
+
+def main():
+    """Top-level deny-on-exception.
+
+    LIVE-VERIFIED (CBP, gemini-cli 0.52.0, 2026-07-22): exit 1 is ALLOW+warning, and an uncaught
+    Python exception exits 1. So without this wrapper a crashing fail-closed gate silently OPENS -
+    confirmed here by repro (`tool_name` non-string -> AttributeError -> exit 1 -> tool ran).
+    SystemExit must pass through untouched: it carries the gate's real 0/2 verdict.
+    """
+    try:
+        _gate()
+    except SystemExit:
+        raise                      # the gate's own verdict - never reinterpret it
+    except BaseException as exc:   # incl. KeyboardInterrupt/MemoryError: still a consequential act
+        sys.stderr.write(
+            f"hestia: deny [gate] - the gate crashed ({type(exc).__name__}: {str(exc)[:200]}) and "
+            f"cannot vouch for this call; failing closed. This is a boundary, not a failure.\n")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
