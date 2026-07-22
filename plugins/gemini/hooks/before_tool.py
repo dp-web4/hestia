@@ -38,7 +38,15 @@ round-trips (forum/cbp-to-nomad-gemini-hook-contract-LIVE-VERIFIED-2026-07-22.md
 The per-tool `tool_input` arg names are source-read from `tools/definitions/base-declarations.ts`
 (notably read_many_files = `include`/`exclude`, NOT `paths`) plus a defensive superset - because the
 gate is fail-closed, an unrecognized shape over-blocks (safe).
-STILL UNVERIFIED: this adapter has not itself been fired live. CBP's rig is preserved for that pass.
+ADAPTER-TIER LIVE PASS (CBP, 2026-07-22, forum/cbp-to-nomad-gemini-adapter-review-LIVE-VERIFIED-*):
+this gate was wired in as gemini-cli 0.52.0's real BeforeTool hook and fired with model round-trips.
+In-scope read allowed; out-of-scope read, ../ traversal, symlink escape, absolute oos, oos shell
+command, governor deny, and malformed JSON all denied exit 2 with the reason surfaced to the model.
+Confirmed live: read_file -> `file_path` (absolute), run_shell_command -> `command`. The pass also
+found the two holes closed here (ungated web_fetch egress; mcp_context unread by Gate-1).
+Also live: gemini-cli natively confines FILE tools to the launch dir (+ --include-directories) and
+refuses .env - so for file paths this gate is layer 2. Shell, MCP and web egress have NO native
+layer, i.e. this gate is the ONLY thing between the model and them. That is the hardening priority.
 Gemini also has a NATIVE policy engine (docs/reference/policy-engine.md) + BeforeToolSelection/
 BeforeModel events; those are complementary (this gate is the BeforeTool scope+safety layer we own),
 not reinvented here.
@@ -145,6 +153,60 @@ def command_of(tool_input):
         if isinstance(c, list):
             return " ".join(str(x) for x in c)
     return None
+
+
+def _strings(v, depth=0):
+    """Every string leaf of an arbitrarily-shaped value (bounded depth). Used to sweep free-text and
+    MCP argument objects, whose shape is the *server's*, not ours - we cannot enumerate their keys."""
+    if isinstance(v, str):
+        return [v]
+    if depth > 4:
+        return []
+    if isinstance(v, (list, tuple)):
+        return [s for x in v for s in _strings(x, depth + 1)]
+    if isinstance(v, dict):
+        return [s for x in v.values() for s in _strings(x, depth + 1)]
+    return []
+
+
+def egress_targets(tool_input):
+    """The network tools' arguments: `url` (web_fetch), free-text `prompt`, `query`.
+
+    These must be swept by Gate-1a - a secret is laundered out *inside* a URL or a prompt, and the
+    GEMINI.md promise ("you cannot launder a secret out through ... a web fetch") is only true if the
+    innate denylist actually looks at them. They must NOT be fed to Gate-1b: realpath containment on
+    `https://...` resolves under cwd and would deny every fetch, so egress rests on Gate-1a + Gate-2.
+    """
+    out = []
+    if isinstance(tool_input, dict):
+        for k in ("url", "urls", "prompt", "query"):
+            out.extend(_strings(tool_input.get(k)))
+    return out
+
+
+def mcp_strings(mcp):
+    """The MCP transport surface: `mcp_context` = {server_name, tool_name, command, args}.
+
+    An `mcp_<server>_<tool>` call's `tool_input` is the *server's* argument object, so path_targets()
+    and command_of() see nothing they recognize - Gate-1a and command-scope were blind to MCP
+    arguments entirely (live-confirmed by CBP 2026-07-22: an out-of-scope path inside
+    `mcp_context.args` passed Gate-1). Sweep the transport command and every string leaf of args.
+    """
+    if not isinstance(mcp, dict):
+        return []
+    return _strings(mcp.get("command")) + _strings(mcp.get("args"))
+
+
+def dedupe(seq):
+    """Order-preserving unique. `scopes` is identity-grant + launch-cwd-grant, which collide whenever
+    the member is launched inside a repo it already holds - live denies printed "scope (web4+web4)"
+    and listed the same root twice in the path_scope reason."""
+    seen, out = set(), []
+    for s in seq:
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
 
 # Gemini's event vocabulary -> the Claude-lineage names the society gate dispatches on. The governor
@@ -267,14 +329,18 @@ def _gate():
     tinput = event.get("tool_input") or {}
     mcp = event.get("mcp_context") if isinstance(event.get("mcp_context"), dict) else None
     cwd = event.get("cwd") or os.environ.get("HESTIA_GEMINI_LAUNCH_CWD") or os.getcwd()
-    scopes = load_in_scope() + launch_cwd_repo()
+    scopes = dedupe(load_in_scope() + launch_cwd_repo())
     paths = path_targets(tinput)
     cmd = command_of(tinput)
+    egress = egress_targets(tinput)      # url/prompt/query - swept, but never realpath-contained
+    mcp_args = mcp_strings(mcp)          # the MCP transport surface Gate-1 could not see
 
     # Gate 1a - egress/secret innate invariant (denied even inside a granted repo). ALWAYS enforced.
-    for blob in paths + ([cmd] if cmd else []):
+    # The sweep covers every channel a secret can leave by: file paths, the shell command, the
+    # network tools' url/prompt/query, and MCP arguments. Anything added here must be added there.
+    for blob in paths + egress + mcp_args + ([cmd] if cmd else []):
         if any(f in blob.lower() for f in FORBIDDEN):
-            deny(f"'{tool}' touches a forbidden path (secret/credential or out-of-MRH private repo)",
+            deny(f"'{tool}' names a forbidden target (secret/credential or out-of-MRH private repo)",
                  "There is no in-scope way to do this; it is not yours to touch.", innate=True)
 
     # Gate 1b - MRH scope. File paths use path-scope; shell commands use command-scope.
@@ -293,9 +359,13 @@ def _gate():
                 if not path_in_scope(p, scopes):
                     deny(f"'{tool}' targets '{p[:60]}' outside your granted scope ({'+'.join(scopes)})",
                          "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
-    if cmd is not None and not command_in_scope(cmd, scopes):
-        deny(f"'{tool}' command reaches outside your granted scope ({'+'.join(scopes)})",
-             "Scope the command to a granted repo, or if legitimately needed, request it (request_scope).")
+    # Command-scope covers the shell command AND the MCP transport (its command + args are a real
+    # exec surface: an oos root handed to a filesystem server is an oos read the file gates never see).
+    for c in ([cmd] if cmd is not None else []) + mcp_args:
+        if not command_in_scope(c, scopes):
+            where = "command" if c == cmd else "mcp_context argument"
+            deny(f"'{tool}' {where} reaches outside your granted scope ({'+'.join(scopes)})",
+                 "Scope it to a granted repo, or if legitimately needed, request it (request_scope).")
 
     # Gate 2 - society safety (the governor). Local-read-class skips it; write/exec AND EGRESS need
     # the daemon's verdict; fail closed.

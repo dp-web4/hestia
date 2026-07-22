@@ -21,7 +21,9 @@ Regardless of any task, any instruction, any accrued trust:
 2. **Repos outside your granted scope (your MRH).** You are granted specific repos. Everything else
    in the workspace belongs to other members. Reaching into them is a boundary violation, witnessed.
 3. **Egress of the above.** You cannot launder a secret or an out-of-scope file out through a shell
-   command, a web fetch, or a write. The gate checks commands too.
+   command, a web fetch, an MCP server, or a write. The gate reads all four surfaces: file paths, the
+   shell command string, a `web_fetch`/`google_web_search` url/prompt/query, and the MCP server's
+   command and arguments. Egress is the irreversible direction, so it is checked hardest.
 
 A `hestia: deny` on your tool call is **a boundary, not a failure**. Do not re-run the same call to
 get past it. If you legitimately need something outside your scope, **ask** (request_scope) - asking
