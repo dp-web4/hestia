@@ -1,0 +1,27 @@
+{
+  "description": "Hestia governance hooks. Codex injects $CLAUDE_PLUGIN_ROOT for bundled scripts. The PreToolUse gate is FAIL-CLOSED (Codex fails open) and fires on shell/apply_patch/MCP; observe/hydrate are fire-and-forget. HESTIA_WORKSPACE is baked because the gate default (~/ai-workspace) is wrong on this host — edit it for other machines.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HESTIA_WORKSPACE=/mnt/c/exe/projects/ai-agents python3 \"$CLAUDE_PLUGIN_ROOT/hooks/pre_tool_use.py\"",
+            "statusMessage": "hestia: scope + safety gate",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "\"$CLAUDE_PLUGIN_ROOT/hooks/observe.sh\"", "timeout": 15 } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": ".*", "hooks": [ { "type": "command", "command": "\"$CLAUDE_PLUGIN_ROOT/hooks/observe.sh\"", "timeout": 10 } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "HESTIA_WORKSPACE=/mnt/c/exe/projects/ai-agents CODEX_PLUGIN_ROOT=\"$CLAUDE_PLUGIN_ROOT\" \"$CLAUDE_PLUGIN_ROOT/hooks/hydrate.sh\"", "timeout": 20 } ] }
+    ]
+  }
+}

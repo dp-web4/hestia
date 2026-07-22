@@ -1,0 +1,7 @@
+{
+  "name": "hestia-codex",
+  "version": "0.1.0",
+  "description": "Hestia governance for a foreign Codex occupant: fail-closed scope + egress + society-safety gate (fires on shell/apply_patch/MCP), witness log, and identity continuity. Pair with sandbox_mode=workspace-write + network_access=false in config.toml — the sandbox is the write/egress boundary; this gate is the shell/edit gate. See hestia/plugins/codex/README.md.",
+  "keywords": ["hestia", "web4", "governance", "gate", "foreign-member"],
+  "hooks": "./hooks/hooks.json"
+}

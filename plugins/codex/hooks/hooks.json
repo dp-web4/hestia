@@ -1,0 +1,52 @@
+{
+  "_comment": "Hestia governance hooks for the Codex CLI occupant. Codex loads hooks from a hooks.json OR inline [[hooks.EVENT]] tables in ~/.codex/config.toml; both use this event structure. Requires [features] codex_hooks = true. The PreToolUse gate is FAIL-CLOSED (Codex fails open) and covers the SHELL tool ONLY — the filesystem boundary for out-of-scope repos is the sandbox (sandbox_mode = workspace-write). Commands bake HESTIA_WORKSPACE because the gate's default (~/ai-workspace) is wrong on this host; observe/hydrate default CODEX_HOME to ~/.codex.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HESTIA_WORKSPACE=/mnt/c/exe/projects/ai-agents python3 /mnt/c/exe/projects/ai-agents/hestia/plugins/codex/hooks/pre_tool_use.py",
+            "statusMessage": "hestia: scope + safety gate",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/mnt/c/exe/projects/ai-agents/hestia/plugins/codex/hooks/observe.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/mnt/c/exe/projects/ai-agents/hestia/plugins/codex/hooks/observe.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HESTIA_WORKSPACE=/mnt/c/exe/projects/ai-agents /mnt/c/exe/projects/ai-agents/hestia/plugins/codex/hooks/hydrate.sh",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

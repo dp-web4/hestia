@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Hestia Phase-1 PreToolUse GATE for a foreign member (OpenAI Codex CLI) — reference adapter.
+
+Adapted from the Kimi reference gate. Codex's hook engine is genuine Claude-Code lineage:
+same event names (PreToolUse/PostToolUse/SessionStart/SessionEnd/Stop/UserPromptSubmit/...),
+same event JSON on stdin (`hook_event_name`, `tool_name`, `tool_input`, `cwd`, `session_id`),
+same deny contract (exit code 2 + stderr reason, or a `permissionDecision: "deny"` JSON), and —
+verified from OpenAI's hooks docs — it **FAILS OPEN**: a hook that errors, times out, or exits
+non-zero "is marked failed... and the tool call continues." So this gate is FAIL-CLOSED BY
+CONSTRUCTION: default `exit 2`, reach `exit 0` only on an explicit, confirmed allow.
+
+CODEX-SPECIFIC DESIGN NOTE — READ THIS (verified 2026-07-22 from the codex-rs source).
+`PreToolUse` dispatches CENTRALLY and fires for every Function-payload tool: the **shell** tool
+(tool_name `"bash"`), **`apply_patch`** (file create/edit/delete), and **MCP** calls
+(`mcp__<server>__<tool>`). It does NOT fire for `tool_search`, custom/freeform-grammar tools, or a
+server-side `web_search`. So this gate sees shell commands AND file edits AND MCP calls.
+
+Defense-in-depth, because no single layer covers everything on Codex:
+  - WRITES to out-of-scope repos: the **sandbox** (`sandbox_mode = "workspace-write"`) structurally
+    confines writes to the launch workspace — the boundary string-parsing can't give. apply_patch
+    also fires this gate (belt + suspenders).
+  - NETWORK egress: the sandbox (`[sandbox_workspace_write] network_access = false`).
+  - READS of out-of-scope repos: the sandbox does NOT help (verified: under workspace-write the whole
+    FS is ro-bind readable). So read-scope rests on THIS gate's command-scope check for shell reads
+    (`cat`/`sed` go through the shell tool) — which catches explicit reaches but NOT relative-recursive
+    traversal (`grep -r .` from a broad cwd), the same string-parse limit as the Kimi gate. Mitigation
+    is operational: launch Codex in the specific task repo, not the workspace root. A bind-mount /
+    container that exposes only granted repos is the real read-confinement fix (future).
+This gate is the shell/edit/MCP-command layer: scope + egress + society-safety, fail-closed.
+
+Two gates, in order:
+  1. SCOPE + EGRESS (local, per-entity, from Codex's MRH in identity.json). Forbidden egress/secret
+     path or out-of-scope target -> deny. No daemon needed, so a down daemon never bricks this.
+  2. SOCIETY SAFETY (the governor): for exec-class tools, delegate to hestia's tested daemon caller
+     so the decision reaches the governor and is witnessed; its deny (or fail-closed-on-unreachable)
+     is honored.
+
+Config (all env-overridable; defaults suit a generic install):
+  HESTIA_WORKSPACE        root that contains the granted repos       (default: ~/ai-workspace)
+  HESTIA_SOCIETY_GATE     path to the society-safety gate caller      (default: $WORKSPACE/hestia/plugins/claude-code/hooks/pre_tool_use.py)
+  HESTIA_CODEX_IDENTITY   the member's live identity.json             (default: ~/.codex/hestia-instance/identity.json)
+  HESTIA_CODEX_GATE_MODE  warn | enforce   (default: enforce — deny-tight, relax as trust accrues)
+  HESTIA_CODEX_LAUNCH_CWD launch dir granted for the session          (default: os.getcwd())
+  HESTIA_FORBIDDEN_EXTRA  comma-separated extra forbidden path tokens (e.g. your private repo names)
+"""
+import json
+import os
+import re
+import sys
+import subprocess
+
+WORKSPACE = os.environ.get("HESTIA_WORKSPACE", os.path.expanduser("~/ai-workspace"))
+IDENTITY = os.path.expanduser(
+    os.environ.get("HESTIA_CODEX_IDENTITY", "~/.codex/hestia-instance/identity.json"))
+CLAUDE_PRE = os.environ.get(
+    "HESTIA_SOCIETY_GATE",
+    os.path.join(WORKSPACE, "hestia/plugins/claude-code/hooks/pre_tool_use.py"))
+
+# Innate egress/secret invariants — denied even inside a granted repo. Trust never relaxes these (S1).
+FORBIDDEN = ("/.ssh", ".env", "credentials", "id_rsa", "id_ed25519", "/.git/config", "secrets") + tuple(
+    t.strip() for t in os.environ.get("HESTIA_FORBIDDEN_EXTRA", "").split(",") if t.strip())
+READ_CLASS = {"Read", "Glob", "Grep", "TodoWrite", "TodoList", "GetGoal"}
+
+# The agent's own home is always in scope (state, identity, config).
+CODEX_HOME = os.path.expanduser("~/.codex")
+
+
+def load_in_scope():
+    """Codex's granted MRH (repos it may touch), read from its identity — per-entity, role-sourced."""
+    try:
+        mrh = json.load(open(IDENTITY, encoding="utf-8")).get("mrh", {})
+        scope = mrh.get("in_scope")
+        if isinstance(scope, list) and scope:
+            return [s.split(":", 1)[-1] for s in scope]  # "repo:web4" -> "web4"
+    except Exception:
+        pass
+    return ["web4"]
+
+
+def launch_cwd_repo():
+    """The repo Codex is launched in is always in scope — a per-launch dynamic grant on top of the
+    static allowlist, so a task-specific launch dir (even a private repo) is reachable for that
+    session without widening the standing grant."""
+    cwd = (os.environ.get("HESTIA_CODEX_LAUNCH_CWD") or os.getcwd()).replace("\\", "/")
+    if WORKSPACE in cwd:
+        rest = cwd.split(WORKSPACE, 1)[1].lstrip("/")
+        seg = rest.split("/", 1)[0] if rest else ""
+        return [seg] if seg else []
+    return []
+
+
+def path_targets(tool_input):
+    out = []
+    if isinstance(tool_input, dict):
+        for k in ("path", "file_path", "notebook_path", "pattern"):
+            v = tool_input.get(k)
+            if isinstance(v, str):
+                out.append(v)
+    return out
+
+
+def command_of(tool_input):
+    """Codex passes the shell command under tool_input.command (list or str depending on tool)."""
+    if isinstance(tool_input, dict):
+        c = tool_input.get("command")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):  # Codex shell tool may pass argv as a list
+            return " ".join(str(x) for x in c)
+    return None
+
+
+def _all_repos():
+    try:
+        return [d for d in os.listdir(WORKSPACE)
+                if os.path.isdir(os.path.join(WORKSPACE, d)) and not d.startswith(".")]
+    except Exception:
+        return []
+
+
+def path_in_scope(path, scopes):
+    """A file path is in-scope if it's the agent's home, /tmp, or under a granted repo."""
+    p = path.replace("\\", "/")
+    low = p.lower()
+    if CODEX_HOME.lower() in low or "~/.codex" in low:
+        return True
+    if p.startswith(("/tmp", "/var/tmp")):
+        return True
+    if WORKSPACE in p:
+        rest = p.split(WORKSPACE, 1)[1].lstrip("/")
+    else:
+        rest = p.lstrip("./")
+    seg = rest.split("/", 1)[0] if rest else ""
+    if seg == "":
+        return False           # bare workspace root (the glob-the-root antipattern) -> out of scope
+    return seg in scopes
+
+
+def command_in_scope(cmd, scopes):
+    """A shell command is out of scope if it names an out-of-scope repo, or globs the workspace root
+    without narrowing to a granted repo. (Note: relative-recursive traversal from a broad cwd escapes
+    string-parsing — that is exactly why Codex's sandbox, not this check, is the fs boundary.)"""
+    oos = [r for r in _all_repos() if r not in scopes]
+    for repo in oos:
+        if re.search(rf"""(^|[\s/=:"'(]){re.escape(repo)}(/|[\s"')]|$)""", cmd):
+            return False
+    if WORKSPACE in cmd:
+        after = cmd.split(WORKSPACE, 1)[1]
+        if not any(after.lstrip("/").startswith(s) for s in scopes):
+            return False
+    return True
+
+
+# Rollout mode: DENY-TIGHT by default — a foreign agent starts enforced and RELAXES as role-scoped
+# trust accrues (defensive trust: start at zero, earn the widening). Egress/secret is `innate` —
+# always blocks regardless of mode. Set warn via HESTIA_CODEX_GATE_MODE=warn only while shaking down.
+MODE = os.environ.get("HESTIA_CODEX_GATE_MODE", "enforce").lower()
+
+
+def deny(reason, what_to_do, innate=False):
+    """innate=True -> ALWAYS blocks (egress/secret is irreversible). Tunable rules honor MODE."""
+    verb = "deny" if (innate or MODE == "enforce") else "warn"
+    sys.stderr.write(
+        f"hestia: {verb} [scope] — {reason}. This is a boundary, not a failure: don't re-run the same "
+        f"call. {what_to_do} Asking is a trust-building act; reaching is witnessed.\n")
+    if innate or MODE == "enforce":
+        sys.exit(2)
+
+
+def main():
+    # Fail-closed skeleton: any unexpected error -> deny (never fall through to allow).
+    try:
+        event = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        sys.stderr.write("hestia: deny [gate] — could not parse the tool event; failing closed.\n")
+        sys.exit(2)
+
+    if event.get("hook_event_name") != "PreToolUse":
+        sys.exit(0)  # not our event
+
+    tool = event.get("tool_name") or "?"
+    tinput = event.get("tool_input") or {}
+    scopes = load_in_scope() + launch_cwd_repo()
+    paths = path_targets(tinput)
+    cmd = command_of(tinput)
+
+    # Gate 1a — egress/secret innate invariant (denied even inside a granted repo). ALWAYS enforced.
+    for blob in paths + ([cmd] if cmd else []):
+        if any(f in blob.lower() for f in FORBIDDEN):
+            deny(f"'{tool}' touches a forbidden path (secret/credential or out-of-MRH private repo)",
+                 "There is no in-scope way to do this; it is not yours to touch.", innate=True)
+
+    # Gate 1b — MRH scope. File paths use path-scope; shell commands use command-scope.
+    for p in paths:
+        if not path_in_scope(p, scopes):
+            deny(f"'{tool}' targets '{p[:60]}' outside your granted scope ({'+'.join(scopes)})",
+                 "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
+    if cmd is not None and not command_in_scope(cmd, scopes):
+        deny(f"'{tool}' command reaches outside your granted scope ({'+'.join(scopes)})",
+             "Scope the command to a granted repo, or if legitimately needed, request it (request_scope).")
+
+    # Gate 2 — society safety (the governor). Only write/exec-class needs the daemon's verdict; fail closed.
+    if tool not in READ_CLASS:
+        try:
+            env = dict(os.environ, HESTIA_PLUGIN_ID="codex-cli", HESTIA_PRE_FAIL_CLOSED="1")
+            r = subprocess.run([sys.executable, CLAUDE_PRE], input=json.dumps(event),
+                               capture_output=True, text=True, timeout=6, env=env)
+            if r.returncode != 0:  # daemon denied, or inconclusive -> fail-closed for a write/exec act
+                msg = (r.stderr.strip() if r.returncode == 2 and r.stderr.strip()
+                       else "hestia: deny [safety] — blocked/inconclusive at the society safety gate.")
+                if MODE == "enforce":
+                    sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
+                    sys.exit(2)
+                sys.stderr.write("hestia: warn [safety] — " + msg.split("— ", 1)[-1] +
+                                 " (warn-rollout: allowed; would block under enforce)\n")
+        except Exception:
+            if MODE == "enforce":
+                sys.stderr.write("hestia: deny [safety] — could not reach the governor; failing "
+                                 "closed on a consequential act.\n")
+                sys.exit(2)
+            sys.stderr.write("hestia: warn [safety] — governor unreachable (warn-rollout: allowed).\n")
+
+    sys.exit(0)  # the ONLY allow path — reached only after every gate explicitly passed
+
+
+if __name__ == "__main__":
+    main()

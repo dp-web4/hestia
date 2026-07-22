@@ -1,0 +1,11 @@
+{
+  "name": "hestia",
+  "description": "Hestia governance plugins for foreign fleet members on Codex CLI.",
+  "plugins": [
+    {
+      "name": "hestia-codex",
+      "source": { "source": "local", "path": "./plugins/hestia-codex" },
+      "category": "governance"
+    }
+  ]
+}
