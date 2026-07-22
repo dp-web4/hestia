@@ -640,6 +640,15 @@
       const withTok = () => ({...opts, headers: {...(opts.headers||{}), ...(token ? {authorization:'Bearer '+token} : {})}});
       let res = await fetch(path, withTok());
       if (res.status === 401) {
+        // A 401 means our token is missing OR expired/revoked server-side (the
+        // in-memory session lapsed on TTL or daemon restart). Clear the stale
+        // token FIRST so ensureSignedIn() actually re-launches the sign-in
+        // overlay — otherwise it short-circuits on `if (token)` and retries the
+        // same dead token forever, leaving the dashboard stuck "offline" with no
+        // way back except closing the tab (refresh reloads the same stale token
+        // from sessionStorage). This makes a timeout auto-prompt re-sign-in.
+        token = null;
+        sessionStorage.removeItem('hestia_op_token');
         await ensureSignedIn();
         res = await fetch(path, withTok());
       }
