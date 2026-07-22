@@ -7,20 +7,32 @@ and, per Google's official hooks reference, near-identical in the fields this ga
 
   - Base stdin JSON carries `session_id`, `transcript_path`, `cwd`, `hook_event_name`, `timestamp`.
   - `BeforeTool` adds `tool_name` (string) and `tool_input` (object, the raw model arguments).
-  - Block via **exit code 2** (stderr becomes the reason sent to the agent; the turn continues -
-    i.e. deny-as-steering, not halt) OR a stdout JSON `{"decision":"deny","reason":...}`.
-  - The engine **FAILS OPEN**: exit 2 is the *intentional* block; exit 0 is allow; any *other*
-    non-zero exit or a timeout is treated as a non-fatal warning and the tool call proceeds with the
-    original parameters. So this gate is FAIL-CLOSED BY CONSTRUCTION: default `exit 2`, reach
-    `exit 0` only on an explicit, confirmed allow.
+  - Exit-code contract (SOURCE-VERIFIED from packages/core/src/hooks/hookRunner.ts@main,
+    convertPlainTextToHookOutput L537-560 + close-handler L434-506; NOT just the docs):
+      * exit 0  -> {decision:'allow'}                         (allow)
+      * exit 1  (EXIT_CODE_NON_BLOCKING_ERROR) -> {decision:'allow', systemMessage:'Warning: '+text}
+                (a NON-blocking warning: the tool STILL RUNS - exit 1 is NOT a block)
+      * exit 2 or any other non-zero -> {decision:'deny', reason:text}   (BLOCK)
+      * timeout (default 60000ms, L36) or spawn error -> success:false, NO output -> FAIL OPEN
+    So the ONLY fail-open surface is a TIMEOUT or spawn error (hence CBP's ext4-not-/mnt/c note: a 9p
+    cold-load that exceeds the hook timeout fails open). A running gate that exits 2+ blocks.
+  - CRITICAL: a block requires EMITTED TEXT. The runner parses `stdout.trim() || stderr.trim()`
+    (L455); on exit 2 with EMPTY output, `output` is undefined and the call is NOT denied. So this
+    gate ALWAYS writes a reason to stderr before `exit 2` (see deny() and every exit-2 path). A stdout
+    JSON `{"decision":"deny","reason":...}` at exit 0 would also block (L459-467), but exit-2+stderr
+    is simpler and used here.
 
-FIDELITY NOTE (2026-07-22): the event/output contract above is verified from Google's
-`gemini-cli/docs/hooks/reference.md`. The exact per-tool `tool_input` arg names for Gemini's builtin
-tools (shell command, file paths) are handled defensively below (a superset of likely keys); because
-the gate is fail-closed, an unrecognized shape over-blocks (safe) rather than silently allowing.
-Mark this adapter `verified` only after a live run against the real Gemini CLI. Gemini also has a
-NATIVE policy engine (docs/reference/policy-engine.md) + BeforeToolSelection/BeforeModel events;
-those are complementary (this gate is the BeforeTool scope+safety layer), not reinvented here.
+This gate is therefore FAIL-CLOSED BY CONSTRUCTION: it only ever exits 0 (explicit confirmed allow) or
+2 (deny, with text). It never exits 1, so it never emits an allow-with-warning by accident.
+
+FIDELITY NOTE (2026-07-22): the exit-code/deny/fail-open contract above is SOURCE-verified (file+lines
+cited). The base/BeforeTool field names are from `docs/hooks/reference.md`; the exact per-tool
+`tool_input` arg names for Gemini's builtin tools (shell/file) are handled defensively below (a
+superset of likely keys) - because the gate is fail-closed, an unrecognized shape over-blocks (safe).
+Only LIVE FIRING is unverified; mark `verified` after a run against the real Gemini CLI (CBP's rig).
+Gemini also has a NATIVE policy engine (docs/reference/policy-engine.md) + BeforeToolSelection/
+BeforeModel events; those are complementary (this gate is the BeforeTool scope+safety layer we own),
+not reinvented here.
 
 Config (all env-overridable; defaults suit a generic install):
   HESTIA_WORKSPACE         root that contains the granted repos       (default: ~/ai-workspace)
