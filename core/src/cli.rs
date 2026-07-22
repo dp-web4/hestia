@@ -309,6 +309,26 @@ enum HubCmd {
         target: String,
     },
 
+    /// Notify a peer THROUGH the hub — emit a `referenced_act` into their mailbox,
+    /// which the peer's `hub-watch` drains into a work session (see
+    /// `private-context/hub-mesh`). Pointer-based: the body lives at the pointer (a
+    /// PR URL, a shared-context path, a thread). Signs with the **vault member key**,
+    /// so a hestia-led / AI-owned member participates in the mesh with its actual
+    /// pinned identity — no raw channel-key file needed. (The external mesh
+    /// `channel_client` can't open the sealed vault; the CLI can.)
+    Notify {
+        /// Peer name (resolved via the hub roster) or member LCT uuid.
+        peer: String,
+        /// Notice kind — must be in the receivers' KINDS gate: pr_review_request,
+        /// pr_changes, review_done, reply, plan, ack, handoff, forum, coordination.
+        kind: String,
+        /// Pointer URI: a PR URL, a shared-context file path, or a thread ref.
+        pointer: String,
+        /// Hub URL or connection UUID to send through (default: sole connection).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
+
     /// Propose a pairing with a peer member (the sealed-channel handshake). We
     /// mint a per-session ephemeral key and publish it in the request; the peer
     /// completes it with `hub pair-confirm`. Prints the new pair_id.
@@ -578,6 +598,9 @@ pub fn run() -> AnyResult<()> {
             }
             HubCmd::SendSecret { to, pair, file, target } => {
                 cmd_hub_send_secret(&home, to, pair, file.as_deref(), &target)
+            }
+            HubCmd::Notify { peer, kind, pointer, target } => {
+                cmd_hub_notify(&home, &peer, &kind, &pointer, &target)
             }
             HubCmd::PairRequest { to, purpose, target } => {
                 cmd_hub_pair_request(&home, to, &purpose, &target)
@@ -2039,6 +2062,106 @@ fn member_signing_keypair(
             Ok(web4_core::crypto::KeyPair::from_secret_bytes(&seed))
         }
     }
+}
+
+// ---- hub notify (mesh referenced_act, signed by the vault member key) --------
+
+/// `hub notify` — emit a `referenced_act` to a peer through the sealed member↔hub
+/// channel, signed with the vault member key. The hub queues it in the peer's
+/// mailbox; the peer's `hub-watch` drains it into a work session. This is the
+/// hestia-native equivalent of the mesh `hub-notify.sh` + `channel_client`, but it
+/// signs from the sealed vault instead of a raw key file — so an AI-owned /
+/// hestia-led member (whose pinned key lives in the vault, not `~/.web4/*.bin`) can
+/// participate in the event-driven mesh with its actual pinned identity.
+fn cmd_hub_notify(
+    home: &std::path::Path,
+    peer: &str,
+    kind: &str,
+    pointer: &str,
+    target: &str,
+) -> AnyResult<()> {
+    let vault = open_vault(home)?;
+    let store = HubStore::load(&vault)?;
+    let conn = pick_connection(&store, target)?;
+    let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+
+    // Peer: accept a raw LCT uuid, else resolve the display name via the hub roster.
+    let peer_lct: uuid::Uuid = match uuid::Uuid::parse_str(peer) {
+        Ok(u) => u,
+        Err(_) => rt
+            .block_on(client.resolve_member_by_name(&conn.url, peer))
+            .with_context(|| format!("resolving peer '{peer}' via hub roster"))?,
+    };
+
+    // H-008 content binding: tie the notice to a specific version of the pointed-at
+    // substance (git head SHA for a PR, sha256 for a file/opaque pointer).
+    let content_hash = compute_content_hash(pointer);
+    let args = serde_json::json!({
+        "to": { "to": "peer", "lct_id": peer_lct },
+        "kind": kind,
+        "pointer_uri": pointer,
+        "content_hash": content_hash,
+    });
+
+    // Seal {tool: referenced_act, args} on a fresh channel and POST. channel_query
+    // adds the nonce + issued_at freshness fields and opens the sealed response.
+    let channel = rt
+        .block_on(client.open_channel(&conn.url, uuid::Uuid::new_v4()))
+        .context("opening sealed channel to hub")?;
+    let out = rt
+        .block_on(client.channel_query(
+            &rest, &channel, &keypair, conn.our_lct_id, "referenced_act", args,
+        ))
+        .context("posting referenced_act to hub channel (is your member key pinned?)")?;
+
+    let idx = out
+        .get("entry_index")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".into());
+    println!("[hub notify] -> {peer} ({peer_lct}) kind={kind} ledger={idx} hash={content_hash}");
+    println!("  pointer: {pointer}");
+    Ok(())
+}
+
+/// Bind a notice to a specific version of the pointed-at substance via a
+/// self-describing, scheme-tagged content hash (mesh H-008, tag scheme agreed with
+/// Legion 2026-07-06). Mirrors `hub-mesh/hub-notify.sh`:
+///   `git-sha:<40hex>`       PR / git pointer — the head commit SHA is the version
+///   `sha256-content:<hex>`  local file — sha256 of the bytes (a real pin)
+///   `sha256-pointer:<hex>`  opaque / unresolvable — sha256 of the pointer string
+/// The `#thread=…` fragment is routing, not content, so it's stripped before hashing.
+fn compute_content_hash(pointer: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let bare = pointer.split('#').next().unwrap_or(pointer);
+    let sha_hex = |b: &[u8]| {
+        let mut h = Sha256::new();
+        h.update(b);
+        hex::encode(h.finalize())
+    };
+    // GitHub PR pointer → the head commit SHA (via `gh`, if available).
+    let pr_re = regex::Regex::new(r"github\.com/([^/]+/[^/]+)/pull/(\d+)").unwrap();
+    if let Some(caps) = pr_re.captures(bare) {
+        if let Ok(out) = std::process::Command::new("gh")
+            .args(["pr", "view", &caps[2], "--repo", &caps[1], "--json", "headRefOid", "-q", ".headRefOid"])
+            .output()
+        {
+            let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if oid.len() == 40 && oid.chars().all(|c| c.is_ascii_hexdigit()) {
+                return format!("git-sha:{oid}");
+            }
+        }
+        return format!("sha256-pointer:{}", sha_hex(bare.as_bytes()));
+    }
+    // Local file pointer → sha256 of the bytes.
+    if let Ok(bytes) = std::fs::read(bare) {
+        return format!("sha256-content:{}", sha_hex(&bytes));
+    }
+    // Opaque / unresolvable → honest weak binding on the pointer string.
+    format!("sha256-pointer:{}", sha_hex(bare.as_bytes()))
 }
 
 // ---- constellation commands -------------------------------------------------

@@ -476,6 +476,40 @@ impl HubClient {
     /// sealed to the hub, POSTed to `/v1/hubs/{hub_id}/channel`, and the sealed
     /// response is opened — nothing in the clear. `my` is the member's vault
     /// keypair; `my_lct_id` identifies which pinned pubkey the hub uses.
+    /// Resolve a member LCT by display name via the hub roster
+    /// (`GET {base}/tools/list_members`). Exact (case-insensitive) name match
+    /// first, then a unique prefix (`thor` → `thor-sage`); an ambiguous prefix
+    /// fails closed. Mirrors the mesh `hub-notify.sh` fallback so a peer name
+    /// resolves the same way whether the sender is the shell watcher or hestia.
+    pub async fn resolve_member_by_name(&self, base_url: &str, name: &str) -> Result<Uuid> {
+        let url = format!("{}/tools/list_members", base_url.trim_end_matches('/'));
+        let resp = self.http.get(&url).send().await
+            .with_context(|| format!("listing members at {url}"))?;
+        if !resp.status().is_success() {
+            anyhow::bail!("hub /tools/list_members returned HTTP {}", resp.status());
+        }
+        let body: serde_json::Value = resp.json().await
+            .context("parsing list_members response")?;
+        let members = body.get("members").and_then(|m| m.as_array())
+            .ok_or_else(|| anyhow::anyhow!("list_members response has no `members` array"))?;
+        let want = name.to_lowercase();
+        let name_of = |m: &serde_json::Value|
+            m.get("name").and_then(|n| n.as_str()).unwrap_or("").to_lowercase();
+        let lct_of = |m: &serde_json::Value|
+            m.get("lct_id").and_then(|l| l.as_str()).and_then(|s| Uuid::parse_str(s).ok());
+        if let Some(m) = members.iter().find(|m| name_of(m) == want) {
+            return lct_of(m).ok_or_else(|| anyhow::anyhow!("member '{name}' has no valid lct_id"));
+        }
+        let pref: Vec<&serde_json::Value> =
+            members.iter().filter(|m| name_of(m).starts_with(&want)).collect();
+        match pref.as_slice() {
+            [m] => lct_of(m).ok_or_else(|| anyhow::anyhow!("member '{name}' has no valid lct_id")),
+            [] => anyhow::bail!("no hub member matches name '{name}'"),
+            _ => anyhow::bail!(
+                "ambiguous member name '{name}' — matches {} members; use the LCT id", pref.len()),
+        }
+    }
+
     pub async fn channel_query(
         &self,
         rest_endpoint: &str,
