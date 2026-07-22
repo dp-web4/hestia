@@ -19,6 +19,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dp-web4/hestia/main/deploy/f
 | 4 | Legion     | Linux x86_64           | x86_64-unknown-linux-gnu       | ✅      | ✅      | ✅         | Built from source (Rust 1.94, 41s); systemd user service; RTX 4090 GPU-bound autonomous tracks |
 | 5 | McNugget   | macOS aarch64 (M4)     | aarch64-apple-darwin           | ✅      | ✅      | ✅         | launchd ✓ (`com.web4.hestia.daemon`, pid alive on :7711); daemon v0.0.3; plugin hook (`post_tool_use.sh`) wired in `~/.claude/settings.json`; dashboard HTTP 200. macOS Tauri app (.app + .dmg, v0.1.0) built 2026-05-24. iOS pending full Xcode. |
 | 6 | Nomad      | Linux x86_64           | x86_64-unknown-linux-gnu       | ⬜      | ⬜      | ⬜         | Mobile oversight |
+| 7 | HUB        | Linux x86_64 (WSL2)    | x86_64-unknown-linux-gnu       | ✅      | ✅      | ✅         | Hub-operator machine. Built from source (HEAD g9c150dc, 30s); systemd user service + linger; loopback :7711. **First agent-owned identity** (`hestia init --ai`, LCT fc378634…) — not human-delegated. Claude Code plugin wired (PreToolUse gate + PostToolUse witness) alongside existing snarc hooks; safety preset. Dashboard is operator-key-gated (`operator.key`); monitor-only credential is a flagged gap for agent-owned nodes. |
 
 **Legend:** ✅ installed · ⬜ pending · ❌ blocked (note in row)
 
