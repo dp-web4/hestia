@@ -616,14 +616,31 @@
         };
       });
     }
+    // Single-flight sign-in. Many /api/* calls (and every refresh tick) can 401
+    // at once; without a guard each spawns its own full-screen overlay and they
+    // stack, burying the one the operator is filling in — the "no file chosen"
+    // bug. All concurrent and subsequent 401s await the SAME overlay; once a
+    // token exists it's a no-op.
+    let signInFlight = null;
+    function ensureSignedIn() {
+      if (token) return Promise.resolve();
+      if (!window.isSecureContext || !crypto.subtle) {
+        return Promise.reject(new Error(
+          'Operator sign-in needs a secure context (WebCrypto Ed25519). Open the '
+          + 'dashboard via http://localhost:7711 or http://127.0.0.1:7711 — not a '
+          + 'hostname or LAN IP.'));
+      }
+      if (!signInFlight) signInFlight = overlay().finally(() => { signInFlight = null; });
+      return signInFlight;
+    }
     // The wrapper every /api/* call goes through: attach bearer; on 401, sign in
-    // (once) and retry. A 202 (irreversible act needs quorum) is returned to the caller.
+    // (once, single-flight) and retry. A 202 (irreversible act needs quorum) is
+    // returned to the caller.
     async function apiFetch(path, opts={}) {
       const withTok = () => ({...opts, headers: {...(opts.headers||{}), ...(token ? {authorization:'Bearer '+token} : {})}});
       let res = await fetch(path, withTok());
       if (res.status === 401) {
-        if (!crypto.subtle || !window.isSecureContext) { /* Ed25519 needs a secure context */ }
-        await overlay();
+        await ensureSignedIn();
         res = await fetch(path, withTok());
       }
       return res;
