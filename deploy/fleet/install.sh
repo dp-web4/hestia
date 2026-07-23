@@ -53,15 +53,31 @@ detect_target() {
 }
 
 step_download() {
-  local target="$1" tmpdir url filename
+  local target="$1" tmpdir url filename checksum_url
   tmpdir="$(mktemp -d)"
   filename="hestia-${VERSION}-${target}.tar.gz"
   url="https://github.com/${REPO}/releases/download/${VERSION}/${filename}"
+  checksum_url="${url}.sha256"
   c_hdr "downloading $filename"
   c_dim "$url"
   if ! curl -fsSL "$url" -o "$tmpdir/$filename"; then
     c_err "download failed; check that ${VERSION} has a release with ${filename}"
     exit 1
+  fi
+  # P0 (public-release): verify SHA-256 checksum. Signatures will be added in
+  # the next phase (minisign/cosign) — this step at least detects corruption
+  # or accidental mismatches and prepares the installer shape.
+  if curl -fsSL "$checksum_url" -o "$tmpdir/$filename.sha256" 2>/dev/null; then
+    (
+      cd "$tmpdir"
+      if ! sha256sum -c "$filename.sha256" >/dev/null 2>&1; then
+        c_err "SHA-256 checksum verification failed for $filename"
+        exit 1
+      fi
+      c_ok "SHA-256 checksum verified"
+    )
+  else
+    c_warn "no checksum file found at $checksum_url — proceeding without verification"
   fi
   tar -xzf "$tmpdir/$filename" -C "$tmpdir"
   mkdir -p "$BIN_DIR"

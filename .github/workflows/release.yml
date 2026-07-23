@@ -68,6 +68,7 @@ jobs:
           cp "core/target/${{ matrix.target }}/release/hestia" "dist/${STAGE}/"
           cp README.md LICENSE "dist/${STAGE}/" 2>/dev/null || true
           (cd dist && tar -czf "${STAGE}.tar.gz" "${STAGE}")
+          (cd dist && sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256")
           ls -la dist/
 
       - name: Stage artifacts (windows)
@@ -133,4 +134,5 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             dist/hestia-*.tar.gz
+            dist/hestia-*.tar.gz.sha256
             dist/hestia-*.zip
