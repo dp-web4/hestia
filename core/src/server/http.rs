@@ -294,9 +294,28 @@ fn load_dashboard_html() -> String {
     }
 }
 
-async fn dashboard_json(State(state): State<SharedState>) -> impl IntoResponse {
+#[derive(serde::Deserialize, Default)]
+struct DashboardQuery {
+    /// Calendar window for the feed + windowed stat: hour | day | week | all.
+    /// Calendar-filtered, not count-filtered — a count window silently evicts
+    /// a quiet plugin's entries when busier plugins churn (dp 2026-07-23).
+    range: Option<String>,
+}
+
+async fn dashboard_json(
+    State(state): State<SharedState>,
+    Query(q): Query<DashboardQuery>,
+) -> impl IntoResponse {
+    let now = chrono::Utc::now();
+    // Caps are transport safety only; the range does the filtering.
+    let (cutoff, cap, label) = match q.range.as_deref() {
+        Some("day") => (Some(now - chrono::Duration::days(1)), 5_000, "day"),
+        Some("week") => (Some(now - chrono::Duration::weeks(1)), 10_000, "week"),
+        Some("all") => (None, 10_000, "all"),
+        _ => (Some(now - chrono::Duration::hours(1)), 2_000, "hour"),
+    };
     let s = state.lock().await;
-    let snapshot = s.dashboard_snapshot(50);
+    let snapshot = s.dashboard_snapshot_window(cap, cutoff, label);
     drop(s);
     Json(snapshot)
 }
@@ -668,6 +687,11 @@ struct ChainQuery {
     limit: Option<u64>,
     event_type: Option<String>,
     tool: Option<String>,
+    /// Calendar window: hour | day | week | all. When set, entries are
+    /// selected by calendar time (capped) BEFORE the event/tool filters run —
+    /// a count-first window makes filtered views shrink as other signers
+    /// churn (the filtered-window illusion).
+    range: Option<String>,
 }
 
 async fn chain_query(
@@ -675,9 +699,18 @@ async fn chain_query(
     Query(q): Query<ChainQuery>,
 ) -> impl IntoResponse {
     let s = state.lock().await;
-    let limit = q.limit.unwrap_or(50);
+    let now = chrono::Utc::now();
+    let (cutoff, default_cap) = match q.range.as_deref() {
+        Some("hour") => (Some(now - chrono::Duration::hours(1)), 2_000),
+        Some("day") => (Some(now - chrono::Duration::days(1)), 5_000),
+        Some("week") => (Some(now - chrono::Duration::weeks(1)), 10_000),
+        Some("all") => (None, 10_000),
+        _ => (None, 50), // legacy: no range → old count-window behavior
+    };
+    let limit = q.limit.unwrap_or(default_cap);
+    let cutoff_str = cutoff.map(|c: chrono::DateTime<chrono::Utc>| c.to_rfc3339());
     let entries: Vec<super::dashboard::RecentEntry> = s.chain_store
-        .read_recent(limit)
+        .read_recent_window(cutoff_str.as_deref(), limit)
         .unwrap_or_default()
         .into_iter()
         .map(super::dashboard::flatten_entry)

@@ -53,6 +53,10 @@ pub struct DashboardSnapshot {
     pub hub_connections: Vec<serde_json::Value>,
     pub profile: Option<serde_json::Value>,
     pub constellation: Option<serde_json::Value>,
+    /// The calendar window this snapshot's feed + windowed stat cover
+    /// ("hour" | "day" | "week" | "all") — echoed so the UI labels honestly.
+    #[serde(default)]
+    pub window: String,
     pub generated_at: DateTime<Utc>,
 }
 
@@ -207,7 +211,32 @@ pub fn flatten_entry(e: crate::storage::ChainEntry) -> RecentEntry {
 impl ServerState {
     /// Build the dashboard snapshot. Reads up to `recent_limit` chain
     /// entries for the live feed; aggregates over the full chain for stats.
+    ///
+    /// Compat wrapper: trailing-hour window, the pre-range default.
     pub fn dashboard_snapshot(&self, recent_limit: u64) -> DashboardSnapshot {
+        self.dashboard_snapshot_window(
+            recent_limit,
+            Some(Utc::now() - chrono::Duration::hours(1)),
+            "hour",
+        )
+    }
+
+    /// Calendar-windowed snapshot. `window_cutoff = Some(t)` bounds the live
+    /// feed AND the windowed action stat by calendar time (capped at
+    /// `recent_cap` entries for transport safety); `None` = no calendar bound
+    /// ("all", count-capped only). `window_label` is echoed back so the UI
+    /// labels the stat truthfully.
+    ///
+    /// Why calendar, not count: a fixed "latest 50" global window silently
+    /// evicts a quiet plugin's entries whenever busier plugins churn — its
+    /// filtered log then reads as "emptied" while its chain is intact (the
+    /// filtered-window illusion, live-confirmed with kimi 2026-07-23).
+    pub fn dashboard_snapshot_window(
+        &self,
+        recent_cap: u64,
+        window_cutoff: Option<DateTime<Utc>>,
+        window_label: &str,
+    ) -> DashboardSnapshot {
         // For activity stats, scan the recent window plus a wider sample.
         // The chain can be huge; cap the stats window at 10k entries which
         // is plenty for an "actions seen" picture without scanning forever.
@@ -224,7 +253,11 @@ impl ServerState {
         let mut deny_kept = 0usize;
         let mut warn_kept = 0usize;
         let mut by_tool: BTreeMap<String, u64> = BTreeMap::new();
-        let one_hour_ago = Utc::now() - chrono::Duration::hours(1);
+        // Windowed action stat follows the SELECTED calendar window (None =
+        // count the whole stats sample, i.e. "all"). Liveness/selection of
+        // orchestrator chips is unaffected — "is it active now" is a
+        // different question than "what period am I looking at".
+        let stat_cutoff = window_cutoff;
         let mut last_hour = 0u64;
         // Per-plugin slices of the same window, keyed by the human plugin_id:
         // (total, succ, fail, denied, last_hour, by_tool). Backs the chip filter.
@@ -290,7 +323,7 @@ impl ServerState {
                 continue;
             }
             total += 1;
-            if e.timestamp > one_hour_ago {
+            if stat_cutoff.map_or(true, |c| e.timestamp > c) {
                 last_hour += 1;
             }
             let success = e
@@ -312,7 +345,7 @@ impl ServerState {
                 let p = per_plugin.entry(pid.to_string()).or_default();
                 p.0 += 1;
                 if success { p.1 += 1 } else { p.2 += 1 }
-                if e.timestamp > one_hour_ago {
+                if stat_cutoff.map_or(true, |c| e.timestamp > c) {
                     p.4 += 1;
                 }
                 if let Some(tname) = tname {
@@ -390,9 +423,11 @@ impl ServerState {
             .collect();
 
         // Recent feed: flatten the outcome / session_started / etc. shape.
+        // Calendar-windowed (count cap is transport safety, not the filter).
+        let cutoff_str = window_cutoff.map(|c| c.to_rfc3339());
         let recent: Vec<RecentEntry> = self
             .chain_store
-            .read_recent(recent_limit)
+            .read_recent_window(cutoff_str.as_deref(), recent_cap)
             .unwrap_or_default()
             .into_iter()
             .map(flatten_entry)
@@ -508,6 +543,7 @@ impl ServerState {
             hub_connections,
             profile,
             constellation,
+            window: window_label.to_string(),
             generated_at: Utc::now(),
         }
     }

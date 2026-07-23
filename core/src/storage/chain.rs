@@ -214,6 +214,41 @@ impl SqliteChainStore {
         Ok(out)
     }
 
+    /// Most recent entries at-or-after `cutoff_rfc3339` (a calendar window),
+    /// descending chain_position, capped at `limit`. `None` = no calendar
+    /// filter (plain `read_recent`).
+    ///
+    /// Why this exists: a count-limited window (`read_recent(50)`) silently
+    /// evicts a quiet signer's entries whenever busier signers churn — a
+    /// filtered view then reads as "emptied" while the chain is intact (the
+    /// filtered-window illusion). A calendar window keeps every signer's
+    /// entries for the period, so filters shrink only when time passes.
+    /// Timestamps are RFC3339 UTC text written by one code path, so the
+    /// lexicographic `>=` matches chronological order for this data.
+    pub fn read_recent_window(
+        &self,
+        cutoff_rfc3339: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ChainEntry>> {
+        let Some(cutoff) = cutoff_rfc3339 else {
+            return self.read_recent(limit);
+        };
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+             FROM chain_entries
+             WHERE timestamp >= ?1
+             ORDER BY chain_position DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![cutoff, limit as i64], row_to_entry)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
     /// Most-recent "didn't succeed" entries (descending). Includes both
     /// failed outcomes (`event_type='outcome'`, success=false) and
     /// policy denials (`event_type='policy_decision'`, decision='deny').

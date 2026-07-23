@@ -457,9 +457,14 @@
         <div class="delta" id="stat-rate-delta">across all plugins</div>
       </div>
       <div class="stat">
-        <div class="label">Last hour</div>
+        <div class="label"><select id="range-sel" style="background:transparent;border:none;color:inherit;font:inherit;cursor:pointer;padding:0">
+          <option value="hour" selected>Last hour</option>
+          <option value="day">Last day</option>
+          <option value="week">Last week</option>
+          <option value="all">All time</option>
+        </select></div>
         <div class="value" id="stat-hour">—</div>
-        <div class="delta">actions in trailing 60 min</div>
+        <div class="delta" id="stat-hour-delta">actions in trailing 60 min</div>
       </div>
     </section>
 
@@ -850,15 +855,11 @@
 
   function tensorRow(name, value) {
     // Canonical unmeasured-handling: null = zero observations on that dimension.
-    // Render it as unmeasured — never as a fabricated 0.5 score.
+    // An unmeasured dimension renders NOTHING (dp 2026-07-23): a permanent
+    // "unmeasured" row (Veracity, today) is noise, and rendering 0.5 would
+    // fabricate a score. The row reappears the day the dimension is measured.
     if (value == null) {
-      return `
-        <div class="tensor-row">
-          <span class="name">${name}</span>
-          <div class="bar"></div>
-          <span class="val" style="opacity:0.55">unmeasured</span>
-        </div>
-      `;
+      return '';
     }
     return `
       <div class="tensor-row">
@@ -901,7 +902,7 @@
       const noun = feedFilter === 'deny' ? 'denies' : feedFilter === 'warn' ? 'warnings' : 'chain entries';
       const empty = selectedOrch
         ? `No ${noun} for ${escapeHtml(selectedOrch)}.`
-        : (feedFilter === 'all' ? 'Waiting for the first chain entry…' : `No ${noun} in the recent window.`);
+        : (feedFilter === 'all' ? (rangeSel === 'all' ? 'Waiting for the first chain entry…' : 'No entries in this window — try a wider range.') : `No ${noun} in this window — try a wider range.`);
       root.innerHTML = `<div class="empty">${empty}</div>`;
       return;
     }
@@ -983,7 +984,7 @@
 
     if (!byTool.length) {
       root.innerHTML = selectedOrch
-        ? `<div class="empty">No tool calls for ${escapeHtml(selectedOrch)} in the recent window.</div>`
+        ? `<div class="empty">No tool calls for ${escapeHtml(selectedOrch)} in this window — try a wider range.</div>`
         : '<div class="empty">No tool calls yet.</div>';
       return;
     }
@@ -1034,9 +1035,25 @@
     }
   }
 
+  // Calendar window for the feed + windowed stat (hour/day/week/all). The
+  // server filters by calendar, not count — a count window silently evicted a
+  // quiet plugin's entries whenever busier plugins churned.
+  let rangeSel = 'hour';
+  const RANGE_DELTA = {
+    hour: 'actions in trailing 60 min',
+    day: 'actions in trailing 24 h',
+    week: 'actions in trailing 7 days',
+    all: 'actions across the whole chain',
+  };
+  document.getElementById('range-sel').addEventListener('change', e => {
+    rangeSel = e.target.value;
+    $('stat-hour-delta').textContent = RANGE_DELTA[rangeSel] || '';
+    tick();
+  });
+
   async function tick() {
     try {
-      const res = await apiFetch('/api/dashboard', { cache: 'no-store' });
+      const res = await apiFetch(`/api/dashboard?range=${rangeSel}`, { cache: 'no-store' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       lastData = data;
