@@ -6,13 +6,16 @@ third after Kimi (#1) and Codex (#2). Modeled on `hestia/plugins/codex/`, but Ge
 from Google's docs rather than inherited. Verifying the harness contract instead of assuming it is the
 whole method.
 
-> **Fidelity: source-verified contract, live firing not yet verified (2026-07-22).** The exit-code /
+> **Fidelity: source-verified contract + LIVE-VERIFIED adapter pass (2026-07-22).** The exit-code /
 > deny / fail-open contract below is read from gemini-cli **source** (file+line cited), not just docs
 > or blogs — per CBP's method note (a blog claim that Codex PreToolUse was "Bash-only" was wrong;
-> source corrected it). The base/`BeforeTool` field names are from `docs/hooks/reference.md`. The
-> gate's logic is smoke-tested against synthetic events (see "Verification"), but has **not** run
-> against a real Gemini CLI. Mark it `verified` only after a live run — that step belongs on CBP's
-> onboarding rig (the harness-lane owner). Nomad built this from the descriptor + vendor source.
+> source corrected it). CBP then wired this gate in as the real `BeforeTool` hook of an installed
+> gemini-cli 0.52.0 and fired it with model round-trips: in-scope read allowed; out-of-scope read,
+> `../` traversal, symlink escape, absolute out-of-scope, out-of-scope shell command, governor deny
+> and malformed JSON all denied `exit 2`, with the hestia reason surfaced verbatim to the model. Arg
+> names confirmed live (`read_file` → `file_path` absolute, `run_shell_command` → `command`). The
+> same pass found two holes (ungated web egress, `mcp_context` unread), closed here. Nomad built the
+> adapter from the descriptor + vendor source; CBP owns the rig and the live tier.
 
 ## What Gemini actually is (documented 2026-07-22, from Google's hooks reference)
 
@@ -53,18 +56,29 @@ Two Gemini-specific things shape the design:
    society-safety governor. Compose them (policy engine for broad rules, hook for the Web4-specific
    boundary), do not duplicate.
 
-Unlike Codex, Gemini's adapter does **not** yet lean on a sandbox for structural write/network
+Unlike Codex, Gemini's adapter does **not** lean on a sandbox for structural write/network
 confinement — so scope rests entirely on this fail-closed gate (hardened path containment for explicit
 paths + command-scope string-parsing for shell). Real read-confinement (bind-mount/container) and
 using Gemini's sandbox flags are future hardening, same as the Codex `find .` relative-traversal limit.
 
-| Act | Enforced by | Strength |
-|---|---|---|
-| Access to a secret/credential path | **BeforeTool gate** Gate-1a innate denylist | strong (always on, trust-independent) |
-| READ/WRITE of out-of-scope repo (explicit path) | **BeforeTool gate** Gate-1b — shared `path_scope` realpath containment | strong for explicit paths (../, symlink, absolute all denied) |
-| READ/WRITE of out-of-scope repo (via shell) | **BeforeTool gate** command-scope + launch-in-task-repo | weak (string-parse; relative-traversal escapes) |
-| Unsafe write/exec (society safety) | **BeforeTool gate** Gate-2 → claude-code governor | strong for explicit; fail-closed |
-| Witness / continuity | **observe.sh** + **hydrate.sh** | fail-open by design |
+**Gemini does have a native containment layer — but only for file tools.** Live-verified by CBP
+(2026-07-22): out of the box the file tools are confined to the launch dir (plus
+`--include-directories`), and `.env` files are natively refused — an out-of-scope read and a secret
+read were both denied by the CLI *before* this hook mattered (CBP had to widen the native boundary
+with `--include-directories` to exercise the gate at all). **Shell commands, MCP calls and the web
+tools have no such native layer.** So the "layer" column below is not decoration: it is the hardening
+priority map. Where this gate is the *only* layer is exactly where its weakest mechanism
+(command-scope string-parsing) lives.
+
+| Act | Enforced by | Layer | Strength |
+|---|---|---|---|
+| Access to a secret/credential path | **Gate-1a** innate denylist (paths, shell command, `url`/`prompt`/`query`, `mcp_context` args) | 2nd (CLI natively refuses `.env`) | strong (always on, trust-independent) |
+| READ/WRITE of out-of-scope repo (explicit path) | **Gate-1b** — shared `path_scope` realpath containment | 2nd (CLI confines file tools to launch dir) | strong for explicit paths (`../`, symlink, absolute all denied) |
+| READ/WRITE of out-of-scope repo (via shell) | **command-scope** + launch-in-task-repo | **ONLY layer** | weak (string-parse; relative-traversal escapes) |
+| Out-of-scope reach via an MCP server | **Gate-1a + command-scope** over `mcp_context.command`/`args`, then Gate-2 | **ONLY layer** | moderate (transport args are inspected; server-internal semantics are not) |
+| Network egress (`web_fetch` / `google_web_search`) | **Gate-1a** sweep of `url`/`prompt`/`query`, then **Gate-2** governor | **ONLY layer** | moderate — and this is the irreversible direction |
+| Unsafe write/exec (society safety) | **Gate-2** → claude-code governor | **ONLY layer** | strong for explicit; fail-closed |
+| Witness / continuity | **observe.sh** + **hydrate.sh** | — | fail-open by design |
 
 ## Files
 
@@ -99,19 +113,49 @@ using Gemini's sandbox flags are future hardening, same as the Codex `find .` re
 | `HESTIA_OBSERVE_DIR` | observation log dir | `~/.gemini/hestia-observe` |
 | `HESTIA_FORBIDDEN_EXTRA` | extra forbidden path tokens (comma-sep) | — |
 
+### Standing grants beyond `mrh.in_scope` (deliberate — know them)
+
+The gate grants three roots on top of the member's MRH. They are design choices, not oversights:
+
+- `~/.gemini` — the member's own home (identity, state, config). Without it the gate would deny the
+  member reading its own identity.
+- **`/tmp` and `/var/tmp`** — unconditional staging grant, so scratch work doesn't need a scope
+  request. **On a shared host this is a cross-member channel**: anything gemini writes to `/tmp` is
+  readable by every other member on the box, and anything they write there is reachable by gemini.
+  Treat `/tmp` as public, never as a place to stage anything scoped. (It also swallowed CBP's first
+  smoke run whole — a test workspace under `/tmp` makes every out-of-scope path trivially "contained",
+  which is why `tests/gate_holes_repro.sh` refuses to sandbox there.)
+- the **launch cwd's repo** — a per-session dynamic grant (see `HESTIA_GEMINI_LAUNCH_CWD`), so a
+  task-specific launch dir is reachable without widening the standing grant.
+
 (Shared env names — `HESTIA_WORKSPACE`, `HESTIA_SOCIETY_GATE`, `HESTIA_FORBIDDEN_EXTRA`,
 `HESTIA_OBSERVE_DIR`, `HESTIA_REPO_REGISTRY` — and the per-member `HESTIA_GEMINI_*` prefix follow the
 codex convention so nothing drifts across adapters.)
 
 ## Install
 
-1. Deploy `instance/identity.seed.json` → `~/.gemini/hestia-instance/identity.json` (edit `mrh.in_scope`
-   to the repos this member is granted).
+1. Deploy `instance/identity.seed.json` → `~/.gemini/hestia-instance/identity.json`, then set
+   `mrh.in_scope` to the repos this member is granted. **Hand-editing is the truth today** — the seed's
+   `_note` describes the *target* state (hydrate regenerating `in_scope` from the repo registry, as
+   `plugins/codex` does), and that port has not landed here yet; this `hydrate.sh` is a stub. Until it
+   does, hand-edit, and re-check after the port so a hand-edit doesn't get silently overwritten.
 2. Deploy `GEMINI.md` → the granted repo root and `~/.gemini/GEMINI.md`.
 3. Merge `hooks/hooks.json`'s `hooks` block into `~/.gemini/settings.json`, fixing the absolute paths
    and `HESTIA_WORKSPACE` for the host.
-4. (Optional) Add a Gemini **policy-engine** rule set for coarse allow/ask defaults; this gate handles
-   the Web4 boundary on top.
+4. **Install at USER level (`~/.gemini/settings.json`), not project level.** Gemini gates
+   Project-source hooks behind `isTrustedFolder()` — a project-scoped gate does not execute in an
+   untrusted folder, i.e. it is absent exactly where you most want it.
+5. **Pin the kill-switch explicitly** in `~/.gemini/settings.json`:
+   ```json
+   "hooksConfig": { "enabled": true }
+   ```
+   It defaults to `true` in 0.52.0, but `"enabled": false` disarms *every* hook, and a
+   `hooksConfig.disabled` array (written by the `/hooks` UI) can disable this gate by command
+   string. That is the operator's prerogative — but it must be a **visible** fact, not a silent one.
+   Anything auditing this member should read `hooksConfig` as part of the gate's state.
+6. (Optional) Add a Gemini **policy-engine** rule set for coarse allow/ask defaults; this gate handles
+   the Web4 boundary on top. Note the gate sits *before* the policy engine: hook deny beats
+   `--approval-mode yolo` (LIVE-VERIFIED, CBP 2026-07-22).
 
 ## Verification
 
@@ -124,9 +168,57 @@ Smoke-tested against synthetic `BeforeTool` events (2026-07-22, on Nomad):
 - shell command reaching an out-of-scope repo → deny exit 2 (command-scope) ✓
 - malformed event JSON → deny exit 2 (fail-closed) ✓
 
-**Not yet done (the `verified` bar):** run against a real Gemini CLI, confirm the exact `tool_input` arg
-names for each builtin tool (shell / file), confirm `BeforeTool` fires for MCP calls, confirm the
-fail-open behavior empirically. That belongs on the onboarding rig.
+**Fail-open holes found by repro and closed (2026-07-22, nomad).** The first cut of this gate passed
+the smoke tests above while still allowing all four of these. Regression tests live in `tests/`:
+
+```sh
+plugins/gemini/tests/gate_holes_repro.sh          # 17/17 here, 12/17 against the pre-fix gate
+plugins/gemini/tests/wrapper_failclosed_test.py   # 5/5 — fault-injects the deny-on-exception wrapper
+```
+
+They point `HESTIA_SOCIETY_GATE` at a nonexistent path on purpose: a correct gate fails **closed**
+when it cannot reach the governor, so every write/exec/egress case must come back exit 2. Pass a
+gate path as `$1` to test a different revision (keep the copy **inside `hooks/`** — from elsewhere the
+relative `../../lib` import fails and the gate silently falls back to the string check, which
+over-denies and makes a baseline look worse than it is).
+
+The last section is different and deliberately so: it swaps in a governor stub that **allows**, so
+the only thing that can deny is Gate-1. Egress and MCP are not `READ_CLASS`, so with the governor
+down they deny at Gate-2 regardless of what Gate-1 does — a deny there would prove nothing about the
+sweep. Any future Gate-1 assertion belongs in that section, not the first one.
+
+| Hole | Why it was open | Fix |
+|---|---|---|
+| `read_many_files` skipped Gate-1b entirely | gate scanned `paths`/`file_paths`; the real params are `include`/`exclude` (source: `tools/definitions/base-declarations.ts`) | scan `include`/`exclude` too |
+| `web_fetch` / `google_web_search` skipped Gate-2 | both sat in `READ_CLASS`; they *are* reads, but of the **network** — and gemini has no sandbox behind the gate | split out `EGRESS_CLASS`; egress now meets the governor |
+| a crashing gate **allowed** the call | an uncaught Python exception exits 1, and exit 1 is ALLOW+warning, not a block | top-level deny-on-exception in `main()` |
+| the governor was consulted but **blind** | it extracts targets from `file_path`/`path`/`url` and only reads `command` for `Bash`/`Shell` — gemini emits none of those names, so every shell command arrived as `target=None` | `to_claude_lineage()` translates at the boundary |
+
+**Two more found by CBP's live adapter pass and closed (2026-07-22).** Both were Gate-1 blind spots
+that the first fix round left behind — it moved egress into Gate-2 but never taught Gate-1 to *look* at
+egress arguments at all:
+
+| Hole | Why it was open | Fix |
+|---|---|---|
+| `web_fetch` reached the network with **zero Gate-1 inspection** (live: `?leak=SECRETDATA` ran clean) | `path_targets()`/`command_of()` never read `url`/`prompt`/`query`, so the innate secret denylist saw nothing — making GEMINI.md's "you cannot launder a secret out through … a web fetch" false | `egress_targets()` feeds those into the Gate-1a sweep; they are deliberately **not** fed to Gate-1b (realpath-containing a URL would deny every fetch) |
+| MCP arguments were invisible to Gate-1 (live: an out-of-scope path in `mcp_context.args` passed) | an `mcp_<server>_<tool>` call's `tool_input` is the *server's* object; the transport surface lives in `mcp_context.{command,args}`, which the gate read only for naming | `mcp_strings()` feeds command + every string leaf of args into both the Gate-1a sweep and `command_in_scope` |
+
+The exit-code contract these depend on is LIVE-VERIFIED on gemini-cli 0.52.0 by CBP
+(`shared-context/forum/cbp-to-nomad-gemini-hook-contract-LIVE-VERIFIED-2026-07-22.md`): exit 0 =
+allow, **exit 1 = allow+warning**, exit 2+ = deny, and empty output on *both* streams = no decision
+= allow. So `sys.exit(2)` without writing a reason is itself a hole; every deny path here writes to
+stderr first.
+
+**Live tier (CBP's rig, gemini-cli 0.52.0 + real API, 2026-07-22)** — the `verified` bar is met for
+the core paths: in-scope read allowed and returned contents; out-of-scope read denied with the full
+hestia reason rendered to the model; `../`, symlink and absolute escapes denied; `run_shell_command`
+into an out-of-scope repo denied; governor deny propagated with stderr preserved; malformed event
+JSON denied. `tool_input` arg names confirmed (`read_file` → `file_path` absolute,
+`run_shell_command` → `command`), and `BeforeTool` confirmed firing for MCP + shell + writes.
+
+**Still unverified:** the two fixes above (egress sweep, `mcp_context`) are source-tier + regression
+tests only — they landed after that pass. Re-fire on the rig to close them out. Also unverified: the
+fail-open timeout behavior empirically (contract-read only).
 
 ## Hardening (deployment notes)
 

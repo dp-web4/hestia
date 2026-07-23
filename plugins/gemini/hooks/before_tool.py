@@ -23,13 +23,33 @@ and, per Google's official hooks reference, near-identical in the fields this ga
     is simpler and used here.
 
 This gate is therefore FAIL-CLOSED BY CONSTRUCTION: it only ever exits 0 (explicit confirmed allow) or
-2 (deny, with text). It never exits 1, so it never emits an allow-with-warning by accident.
+2 (deny, with text). It never exits 1, so it never emits an allow-with-warning by accident. That last
+claim is only true because main() wraps the whole gate in a deny-on-exception - an uncaught Python
+exception exits 1, which the engine reads as ALLOW. See main().
 
 FIDELITY NOTE (2026-07-22): the exit-code/deny/fail-open contract above is SOURCE-verified (file+lines
-cited). The base/BeforeTool field names are from `docs/hooks/reference.md`; the exact per-tool
-`tool_input` arg names for Gemini's builtin tools (shell/file) are handled defensively below (a
-superset of likely keys) - because the gate is fail-closed, an unrecognized shape over-blocks (safe).
-Only LIVE FIRING is unverified; mark `verified` after a run against the real Gemini CLI (CBP's rig).
+cited) AND now LIVE-VERIFIED by CBP against an installed gemini-cli 0.52.0 with real model
+round-trips (forum/cbp-to-nomad-gemini-hook-contract-LIVE-VERIFIED-2026-07-22.md). Live additions:
+  - hook deny beats `--approval-mode yolo` - the hook layer sits before the policy engine;
+  - MCP calls fire BeforeTool as `mcp_<server>_<tool>` AND carry an `mcp_context` object
+    ({server_name, tool_name, command, args}) - use those fields, not string-parsing (see
+    to_claude_lineage);
+  - `hooksConfig.enabled` defaults true but is a one-line kill-switch: install docs must pin it.
+The per-tool `tool_input` arg names are source-read from `tools/definitions/base-declarations.ts`
+(notably read_many_files = `include`/`exclude`, NOT `paths`) plus a defensive superset - because the
+gate is fail-closed, an unrecognized shape over-blocks (safe).
+ADAPTER-TIER LIVE PASS (CBP, 2026-07-22, forum/cbp-to-nomad-gemini-adapter-review-LIVE-VERIFIED-*):
+this gate was wired in as gemini-cli 0.52.0's real BeforeTool hook and fired with model round-trips.
+In-scope read allowed; out-of-scope read, ../ traversal, symlink escape, absolute oos, oos shell
+command, governor deny, and malformed JSON all denied exit 2 with the reason surfaced to the model.
+Confirmed live: read_file -> `file_path` (absolute), run_shell_command -> `command`. The pass also
+found the two holes closed here (ungated web_fetch egress; mcp_context unread by Gate-1). RE-FIRE
+(CBP, 2026-07-22, ...-LIVE-VERIFIED-re-fire-*): both verified live against 7e2d8f4; follow-on note
+folded in here - an HTTP/SSE MCP server's `url`/`cwd` (no command/args) is the same egress class,
+now swept by mcp_egress()/mcp_strings() and lifted into the governor handoff.
+Also live: gemini-cli natively confines FILE tools to the launch dir (+ --include-directories) and
+refuses .env - so for file paths this gate is layer 2. Shell, MCP and web egress have NO native
+layer, i.e. this gate is the ONLY thing between the model and them. That is the hardening priority.
 Gemini also has a NATIVE policy engine (docs/reference/policy-engine.md) + BeforeToolSelection/
 BeforeModel events; those are complementary (this gate is the BeforeTool scope+safety layer we own),
 not reinvented here.
@@ -69,9 +89,14 @@ CLAUDE_PRE = os.environ.get(
 FORBIDDEN = ("/.ssh", ".env", "credentials", "id_rsa", "id_ed25519", "/.git/config", "secrets") + tuple(
     t.strip() for t in os.environ.get("HESTIA_FORBIDDEN_EXTRA", "").split(",") if t.strip())
 
-# Gemini builtin read-class tools (no write/exec) - name-matched case-insensitively below.
-READ_CLASS = {"read_file", "read_many_files", "glob", "search_file_content", "list_directory",
-              "google_web_search", "web_fetch"}
+# Gemini builtin LOCAL read-class tools (no write, no exec, no network) - they may skip Gate-2.
+READ_CLASS = {"read_file", "read_many_files", "glob", "search_file_content", "list_directory"}
+
+# Egress tools. These READ, but they read the *network* - and egress is the irreversible direction
+# (a prompt-injected `web_fetch` is exfiltration). They were in READ_CLASS, which skipped Gate-2, so
+# on gemini - which has no sandbox behind the gate - egress never met the governor at all.
+# They are NOT writes to the filesystem, so Gate-1b must not treat them as such (see for_write below).
+EGRESS_CLASS = {"google_web_search", "web_fetch"}
 
 # The agent's own home is always in scope (state, identity, config).
 GEMINI_HOME = os.path.expanduser("~/.gemini")
@@ -109,10 +134,15 @@ def path_targets(tool_input):
             v = tool_input.get(k)
             if isinstance(v, str):
                 out.append(v)
-        # write_many_files / read_many_files pass a list of paths
-        for k in ("paths", "file_paths"):
+        # read_many_files takes `include`/`exclude` GLOBS, not `paths` (SOURCE-VERIFIED:
+        # tools/definitions/base-declarations.ts). Scanning only paths/file_paths skipped Gate-1b
+        # for this tool entirely - an out-of-scope `include:["../private-context/**"]` was ALLOWED.
+        # `paths`/`file_paths` stay as a defensive superset (other/future tools, harmless if absent).
+        for k in ("paths", "file_paths", "include", "exclude"):
             v = tool_input.get(k)
-            if isinstance(v, list):
+            if isinstance(v, str):
+                out.append(v)
+            elif isinstance(v, list):
                 out.extend(x for x in v if isinstance(x, str))
     return out
 
@@ -126,6 +156,125 @@ def command_of(tool_input):
         if isinstance(c, list):
             return " ".join(str(x) for x in c)
     return None
+
+
+def _strings(v, depth=0):
+    """Every string leaf of an arbitrarily-shaped value (bounded depth). Used to sweep free-text and
+    MCP argument objects, whose shape is the *server's*, not ours - we cannot enumerate their keys."""
+    if isinstance(v, str):
+        return [v]
+    if depth > 4:
+        return []
+    if isinstance(v, (list, tuple)):
+        return [s for x in v for s in _strings(x, depth + 1)]
+    if isinstance(v, dict):
+        return [s for x in v.values() for s in _strings(x, depth + 1)]
+    return []
+
+
+def egress_targets(tool_input):
+    """The network tools' arguments: `url` (web_fetch), free-text `prompt`, `query`.
+
+    These must be swept by Gate-1a - a secret is laundered out *inside* a URL or a prompt, and the
+    GEMINI.md promise ("you cannot launder a secret out through ... a web fetch") is only true if the
+    innate denylist actually looks at them. They must NOT be fed to Gate-1b: realpath containment on
+    `https://...` resolves under cwd and would deny every fetch, so egress rests on Gate-1a + Gate-2.
+    """
+    out = []
+    if isinstance(tool_input, dict):
+        for k in ("url", "urls", "prompt", "query"):
+            out.extend(_strings(tool_input.get(k)))
+    return out
+
+
+def mcp_strings(mcp):
+    """The MCP transport surface: `mcp_context` = {server_name, tool_name, command, args}.
+
+    An `mcp_<server>_<tool>` call's `tool_input` is the *server's* argument object, so path_targets()
+    and command_of() see nothing they recognize - Gate-1a and command-scope were blind to MCP
+    arguments entirely (live-confirmed by CBP 2026-07-22: an out-of-scope path inside
+    `mcp_context.args` passed Gate-1). Sweep the transport command and every string leaf of args.
+    """
+    if not isinstance(mcp, dict):
+        return []
+    # `cwd` is the server's launch dir - a real local path, so it belongs to command/path scope
+    # alongside command+args. `url` does NOT: it's a network endpoint (see mcp_egress), scoping it
+    # against local repo names only mis-fires. LIVE-VERIFIED shape carries cwd/url on HTTP/SSE servers.
+    return _strings(mcp.get("command")) + _strings(mcp.get("args")) + _strings(mcp.get("cwd"))
+
+
+def mcp_egress(mcp):
+    """An HTTP/SSE MCP server is reached by `url` (extractMcpContext: `serverConfig.url ?? httpUrl`),
+    carrying NO command/args - a live egress surface with the same shape as web_fetch's url. A member
+    pointed at an out-of-scope HTTP MCP endpoint would otherwise sail past Gate-1 entirely (CBP note,
+    2026-07-22). Swept by Gate-1a for secrets and handed to the governor; NOT command-scoped, because
+    a URL is not a local path and repo-name matching on it only produces false denies."""
+    if not isinstance(mcp, dict):
+        return []
+    return _strings(mcp.get("url"))
+
+
+def dedupe(seq):
+    """Order-preserving unique. `scopes` is identity-grant + launch-cwd-grant, which collide whenever
+    the member is launched inside a repo it already holds - live denies printed "scope (web4+web4)"
+    and listed the same root twice in the path_scope reason."""
+    seen, out = set(), []
+    for s in seq:
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+# Gemini's event vocabulary -> the Claude-lineage names the society gate dispatches on. The governor
+# (plugins/claude-code/hooks/pre_tool_use.py) extracts its target from `file_path`/`path`/`url`/
+# `notebook_path`, and only reads `command` when tool_name is in {"Bash","Shell"}. Gemini emits none
+# of those names, so an UNTRANSLATED handoff gave the governor target=None for every shell command -
+# it was consulted, but blind. Translate at the boundary; the gate stays the lineage adapter.
+LINEAGE_TOOL = {"run_shell_command": "Shell", "write_file": "Write", "replace": "Edit",
+                "read_file": "Read", "read_many_files": "Read", "glob": "Glob",
+                "search_file_content": "Grep", "list_directory": "Read",
+                "web_fetch": "WebFetch", "google_web_search": "WebSearch"}
+LINEAGE_ARG = {"absolute_path": "file_path", "dir_path": "path"}
+
+
+def to_claude_lineage(event, tool, tinput, mcp):
+    """Re-shape a Gemini BeforeTool event into the Claude-lineage shape the governor understands.
+
+    Kept lossless: the original gemini fields ride along under `source_event` so the daemon can
+    witness what actually happened, and `mcp_context` (LIVE-VERIFIED present on gemini 0.52.0 MCP
+    calls, CBP 2026-07-22) is used for MCP naming instead of parsing `mcp_<server>_<tool>` - the
+    string form is ambiguous when a server or tool name itself contains an underscore.
+    """
+    out = dict(event)
+    if mcp and isinstance(mcp.get("server_name"), str):
+        out["tool_name"] = f"mcp__{mcp['server_name']}__{mcp.get('tool_name') or '?'}"
+        # command+args are the server's real egress surface - hand them to the governor explicitly.
+        out["mcp_server_command"] = " ".join(
+            [str(mcp.get("command") or "")] + [str(a) for a in (mcp.get("args") or [])]).strip()
+    else:
+        out["tool_name"] = LINEAGE_TOOL.get(tool.lower(), tool)
+    if isinstance(tinput, dict):
+        ti = {LINEAGE_ARG.get(k, k): v for k, v in tinput.items()}
+        # `include` is a glob LIST; the governor wants one string target.
+        if "file_path" not in ti and "path" not in ti:
+            inc = tinput.get("include")
+            if isinstance(inc, list) and inc and isinstance(inc[0], str):
+                ti["path"] = inc[0]
+        # web_fetch carries its URLs INSIDE the free-text `prompt`; lift the first one to `url` so the
+        # governor's egress check sees a real target instead of None. The prompt is preserved as-is.
+        if "url" not in ti:
+            m = re.search(r"https?://[^\s\"'<>)]+", str(tinput.get("prompt") or ""))
+            if m:
+                ti["url"] = m.group(0)
+        # An HTTP/SSE MCP server has no command/args - its egress target is `mcp_context.url`. Lift it
+        # so the governor sees a real url instead of None (same fix as run_shell_command's target).
+        if "url" not in ti and mcp and isinstance(mcp.get("url"), str) and mcp["url"]:
+            ti["url"] = mcp["url"]
+        out["tool_input"] = ti
+    out["source_event"] = {"lineage": "gemini", "tool_name": tool, "tool_input": tinput,
+                           "mcp_context": mcp}
+    return out
 
 
 def _all_repos():
@@ -185,7 +334,7 @@ def deny(reason, what_to_do, innate=False):
     sys.stderr.write(f"hestia: warn [scope] - {reason} (warn-rollout: allowed; would block under enforce)\n")
 
 
-def main():
+def _gate():
     # Fail-closed skeleton: any unexpected error -> deny (never fall through to allow).
     try:
         event = json.loads(sys.stdin.read() or "{}")
@@ -196,17 +345,23 @@ def main():
     if event.get("hook_event_name") != "BeforeTool":
         sys.exit(0)  # not our event
 
-    tool = event.get("tool_name") or "?"
+    raw_tool = event.get("tool_name")
+    tool = raw_tool if isinstance(raw_tool, str) and raw_tool else "?"
     tinput = event.get("tool_input") or {}
+    mcp = event.get("mcp_context") if isinstance(event.get("mcp_context"), dict) else None
     cwd = event.get("cwd") or os.environ.get("HESTIA_GEMINI_LAUNCH_CWD") or os.getcwd()
-    scopes = load_in_scope() + launch_cwd_repo()
+    scopes = dedupe(load_in_scope() + launch_cwd_repo())
     paths = path_targets(tinput)
     cmd = command_of(tinput)
+    egress = egress_targets(tinput) + mcp_egress(mcp)  # url/prompt/query + HTTP-MCP url: Gate-1a only
+    mcp_args = mcp_strings(mcp)          # the MCP transport surface Gate-1 could not see (command+args+cwd)
 
     # Gate 1a - egress/secret innate invariant (denied even inside a granted repo). ALWAYS enforced.
-    for blob in paths + ([cmd] if cmd else []):
+    # The sweep covers every channel a secret can leave by: file paths, the shell command, the
+    # network tools' url/prompt/query, and MCP arguments. Anything added here must be added there.
+    for blob in paths + egress + mcp_args + ([cmd] if cmd else []):
         if any(f in blob.lower() for f in FORBIDDEN):
-            deny(f"'{tool}' touches a forbidden path (secret/credential or out-of-MRH private repo)",
+            deny(f"'{tool}' names a forbidden target (secret/credential or out-of-MRH private repo)",
                  "There is no in-scope way to do this; it is not yours to touch.", innate=True)
 
     # Gate 1b - MRH scope. File paths use path-scope; shell commands use command-scope.
@@ -215,7 +370,8 @@ def main():
             # Hardened realpath containment via the shared lib. Roots = granted repos + agent home +
             # tmp, all absolute. It denies ../ / symlink / absolute escapes that the string check can't.
             roots = [os.path.join(WORKSPACE, s) for s in scopes] + [GEMINI_HOME, "/tmp", "/var/tmp"]
-            res = _shared_check_paths(paths, roots, cwd, for_write=(tool.lower() not in READ_CLASS))
+            is_write = tool.lower() not in READ_CLASS and tool.lower() not in EGRESS_CLASS
+            res = _shared_check_paths(paths, roots, cwd, for_write=is_write)
             if not res.allowed:
                 deny(f"'{tool}': {res.reason}",
                      "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
@@ -224,15 +380,20 @@ def main():
                 if not path_in_scope(p, scopes):
                     deny(f"'{tool}' targets '{p[:60]}' outside your granted scope ({'+'.join(scopes)})",
                          "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
-    if cmd is not None and not command_in_scope(cmd, scopes):
-        deny(f"'{tool}' command reaches outside your granted scope ({'+'.join(scopes)})",
-             "Scope the command to a granted repo, or if legitimately needed, request it (request_scope).")
+    # Command-scope covers the shell command AND the MCP transport (its command + args are a real
+    # exec surface: an oos root handed to a filesystem server is an oos read the file gates never see).
+    for c in ([cmd] if cmd is not None else []) + mcp_args:
+        if not command_in_scope(c, scopes):
+            where = "command" if c == cmd else "mcp_context argument"
+            deny(f"'{tool}' {where} reaches outside your granted scope ({'+'.join(scopes)})",
+                 "Scope it to a granted repo, or if legitimately needed, request it (request_scope).")
 
-    # Gate 2 - society safety (the governor). Only write/exec-class needs the daemon's verdict; fail closed.
+    # Gate 2 - society safety (the governor). Local-read-class skips it; write/exec AND EGRESS need
+    # the daemon's verdict; fail closed.
     if tool.lower() not in READ_CLASS:
         try:
             env = dict(os.environ, HESTIA_PLUGIN_ID="gemini-cli", HESTIA_PRE_FAIL_CLOSED="1")
-            r = subprocess.run([sys.executable, CLAUDE_PRE], input=json.dumps(event),
+            r = subprocess.run([sys.executable, CLAUDE_PRE], input=json.dumps(to_claude_lineage(event, tool, tinput, mcp)),
                                capture_output=True, text=True, timeout=6, env=env)
             if r.returncode != 0:  # daemon denied, or inconclusive -> fail-closed for a write/exec act
                 msg = (r.stderr.strip() if r.returncode == 2 and r.stderr.strip()
@@ -250,6 +411,25 @@ def main():
             sys.stderr.write("hestia: warn [safety] - governor unreachable (warn-rollout: allowed).\n")
 
     sys.exit(0)  # the ONLY allow path - reached only after every gate explicitly passed
+
+
+def main():
+    """Top-level deny-on-exception.
+
+    LIVE-VERIFIED (CBP, gemini-cli 0.52.0, 2026-07-22): exit 1 is ALLOW+warning, and an uncaught
+    Python exception exits 1. So without this wrapper a crashing fail-closed gate silently OPENS -
+    confirmed here by repro (`tool_name` non-string -> AttributeError -> exit 1 -> tool ran).
+    SystemExit must pass through untouched: it carries the gate's real 0/2 verdict.
+    """
+    try:
+        _gate()
+    except SystemExit:
+        raise                      # the gate's own verdict - never reinterpret it
+    except BaseException as exc:   # incl. KeyboardInterrupt/MemoryError: still a consequential act
+        sys.stderr.write(
+            f"hestia: deny [gate] - the gate crashed ({type(exc).__name__}: {str(exc)[:200]}) and "
+            f"cannot vouch for this call; failing closed. This is a boundary, not a failure.\n")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
