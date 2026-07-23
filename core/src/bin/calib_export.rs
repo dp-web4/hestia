@@ -65,8 +65,8 @@ fn main() -> Result<()> {
     }
     let out_path = out_path.context("missing required --out <path.jsonl>")?;
     anyhow::ensure!(
-        mode == "outcome" || mode == "gate",
-        "unknown --mode {mode:?} (expected: outcome | gate)"
+        mode == "outcome" || mode == "gate" || mode == "reversal",
+        "unknown --mode {mode:?} (expected: outcome | gate | reversal)"
     );
 
     // Resolve home (HESTIA_HOME or ~/.hestia) and the passphrase.
@@ -132,37 +132,50 @@ fn main() -> Result<()> {
     // The gate is rule-based (command-pattern) and never reads trust, so
     // "does trust-at-decision predict gate-risk" is a non-circular test.
     let gate = mode == "gate";
+    // `reversal` mode (v3): the JUDGMENT axis the gate calibration proved was
+    // orthogonal-by-construction. Positives = outcome events (label 1, not
+    // reversed); negatives = `reversal` events (label 0) — a delayed judgment that
+    // the SUBJECT's work was reverted/rejected. Trust is reconstructed from
+    // OUTCOMES ONLY (the reversal is NOT fed back), so the estimate is pure
+    // execution-reliability and the test is non-circular: "does execution
+    // reliability predict a judgment-reversal?" Unlike the rule-gate, judgment
+    // quality is a persistent per-actor trait, so this CAN be predictive.
+    let reversal = mode == "reversal";
     let mut n_pairs = 0u64;
     let mut n_exec = 0u64; // outcome events (gate mode: label 1)
     let mut n_success = 0u64; // of those, execution succeeded
     let mut n_warn = 0u64;
     let mut n_deny = 0u64;
+    let mut n_reversal = 0u64;
     for e in &all {
         let is_outcome = e.event_type == "outcome";
         let is_decision = e.event_type == "policy_decision";
-        if !is_outcome && !(gate && is_decision) {
+        let is_reversal = e.event_type == "reversal";
+        if !is_outcome && !(gate && is_decision) && !(reversal && is_reversal) {
             continue;
         }
+        // Reconstruct the daemon's post-rekey (instance, role) trust grain. Group
+        // the replay on the SAME key the daemon uses so the reconstructed estimate
+        // matches live role-scoped trust. A `reversal` event names the SUBJECT
+        // (whose work was reversed) with `subject_*` fields — attribute to THAT
+        // entity, not the reporter. outcome/decision events use the plain fields.
+        let (id_key, role_key, instance_key) = if is_reversal {
+            ("subject_plugin_id", "subject_role", "subject_instance_lct")
+        } else {
+            ("plugin_id", "role_lct", "instance_lct")
+        };
         let plugin_id = e
             .event_data
-            .get("plugin_id")
+            .get(id_key)
             .and_then(|v| v.as_str())
             .unwrap_or("anonymous")
             .to_string();
-        // Reconstruct the daemon's post-rekey (instance, role) trust grain. Events
-        // now witness `instance_lct` + `role_lct`, and the daemon keys trust on
-        // `<instance_lct>#<role_lct>` (or `plugin:<id>#<role>` when unmapped). Group
-        // the replay on the SAME key so the reconstructed estimate matches the live
-        // role-scoped trust — the point of the calibration pivot: a mesh-worker and
-        // an interactive-dev session of one instance become SEPARATE estimators
-        // instead of one smeared entity. Pre-rekey events lack the fields → fall
-        // back to member/plugin (honestly degraded, same as the daemon).
         let role_lct = e
             .event_data
-            .get("role_lct")
+            .get(role_key)
             .and_then(|v| v.as_str())
             .unwrap_or("role:constellation:member");
-        let entity_key = match e.event_data.get("instance_lct").and_then(|v| v.as_str()) {
+        let entity_key = match e.event_data.get(instance_key).and_then(|v| v.as_str()) {
             Some(inst) => format!("{inst}#{role_lct}"),
             None => format!("plugin:{plugin_id}#{role_lct}"),
         };
@@ -196,8 +209,8 @@ fn main() -> Result<()> {
                 .get("magnitude")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.5);
-            let outcome = if gate {
-                1 // gate mode: the action cleared the gate and executed
+            let outcome = if gate || reversal {
+                1 // gate: cleared the gate; reversal: this act was not (yet) reversed
             } else if success {
                 1
             } else {
@@ -206,7 +219,7 @@ fn main() -> Result<()> {
             let rec = serde_json::json!({
                 "estimate": estimate,
                 "outcome": outcome,
-                "kind": if gate { "executed" } else { "outcome" },
+                "kind": if gate || reversal { "executed" } else { "outcome" },
                 "success": success,
                 "plugin": plugin_id,
                 "role": role_lct,
@@ -226,6 +239,30 @@ fn main() -> Result<()> {
             if success {
                 n_success += 1;
             }
+        } else if is_reversal {
+            // reversal mode: a JUDGMENT negative about the subject. estimate = the
+            // subject's OUTCOMES-ONLY trust at this chain position (the reversal is
+            // deliberately NOT fed back into trust → non-circular; the estimate is
+            // pure execution-reliability). label 0; no trust update.
+            let kind = e
+                .event_data
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("reversal");
+            let rec = serde_json::json!({
+                "estimate": estimate,
+                "outcome": 0,
+                "kind": format!("reversal:{kind}"),
+                "plugin": plugin_id,
+                "role": role_lct,
+                "entity": entity_key,
+                "ts": e.timestamp.to_rfc3339(),
+                "chain_position": e.chain_position,
+                "v3_pre": v3_pre,
+            });
+            writeln!(w, "{}", serde_json::to_string(&rec)?)?;
+            n_pairs += 1;
+            n_reversal += 1;
         } else {
             // gate mode only: a policy_decision (warn|deny) = a recovered negative.
             // estimate = trust-at-decision; label 0; trust is NOT updated (the
@@ -284,6 +321,15 @@ fn main() -> Result<()> {
         eprintln!(
             "  NOTE: warn PROCEEDS, so ~{} warned actions are ALSO 'executed' pairs (double-represented). For the no-double-count strict set filter kind in {{executed, deny}}.",
             n_warn
+        );
+    } else if reversal {
+        eprintln!(
+            "calib_export[reversal]: {} entries -> {} pairs across {} entities: {} outcomes (label 1) + {} reversals (label 0, judgment negatives) -> {}",
+            total_entries, n_pairs, trust.len(), n_exec, n_reversal, out_path.display()
+        );
+        eprintln!(
+            "  NON-CIRCULAR: estimate = subject's OUTCOMES-ONLY trust (reversals NOT fed back). Test: does execution-reliability predict a judgment-reversal? N_reversal={} — treat below ~30 as directional only.",
+            n_reversal
         );
     } else {
         eprintln!(
