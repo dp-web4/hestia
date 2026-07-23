@@ -55,9 +55,9 @@ ident.setdefault("sessions", []).append(
 ident["sessions"] = ident["sessions"][-50:]  # bounded
 
 # Refresh the MRH base grant from the repo registry: base = ALL public repos + granted private
-# exceptions (shared-context), PLUS the launch cwd (handled live in the gate). PRESERVE accrued
+# exceptions (shared-context, memory, private-context), PLUS the launch cwd (handled live in the gate). PRESERVE accrued
 # private grants (trust-earned widening). Fail-soft: no readable registry -> leave in_scope untouched.
-PRIVATE_EXCEPTIONS = {"shared-context"}
+PRIVATE_EXCEPTIONS = {"shared-context", "memory", "private-context"}
 REGISTRY = os.environ.get("HESTIA_REPO_REGISTRY") or os.path.join(
     os.environ.get("HESTIA_WORKSPACE", os.path.expanduser("~/ai-workspace")),
     "private-context", "infrastructure", "repos.jsonl")

@@ -55,11 +55,11 @@ ident.setdefault("sessions", []).append(
 ident["sessions"] = ident["sessions"][-50:]  # bounded
 
 # Refresh the MRH base grant from the repo registry (dp 2026-07-21): base = ALL public repos +
-# the granted private exceptions (shared-context), PLUS the launch cwd (handled live in the gate).
+# the granted private exceptions (shared-context, memory, private-context), PLUS the launch cwd (handled live in the gate).
 # PRESERVE accrued private grants (trust-earned widening) — recompute the public base, keep anything
 # already granted into a private repo. Fail-soft: no readable registry -> leave in_scope untouched
 # (seed default or prior). This is what makes the scope self-update fleet-wide on each hydrate.
-PRIVATE_EXCEPTIONS = {"shared-context"}
+PRIVATE_EXCEPTIONS = {"shared-context", "memory", "private-context"}
 REGISTRY = os.environ.get("HESTIA_REPO_REGISTRY") or os.path.join(
     os.environ.get("HESTIA_WORKSPACE", os.path.expanduser("~/ai-workspace")),
     "private-context", "infrastructure", "repos.jsonl")
