@@ -638,6 +638,7 @@
     // returned to the caller.
     async function apiFetch(path, opts={}) {
       const withTok = () => ({...opts, headers: {...(opts.headers||{}), ...(token ? {authorization:'Bearer '+token} : {})}});
+      const usedTok = token;   // the token THIS request was dispatched with
       let res = await fetch(path, withTok());
       if (res.status === 401) {
         // A 401 means our token is missing OR expired/revoked server-side (the
@@ -647,8 +648,16 @@
         // same dead token forever, leaving the dashboard stuck "offline" with no
         // way back except closing the tab (refresh reloads the same stale token
         // from sessionStorage). This makes a timeout auto-prompt re-sign-in.
-        token = null;
-        sessionStorage.removeItem('hestia_op_token');
+        //
+        // Compare-and-swap (Legion review, PR #36): only clear if `token` is
+        // still the one THIS request used. A straggler — an old-token request
+        // whose 401 lands AFTER a concurrent request already re-signed-in — must
+        // not clobber the fresh token or pop a second overlay. If token already
+        // moved on, skip the clear and just retry with the current (fresh) token.
+        if (token === usedTok) {
+          token = null;
+          sessionStorage.removeItem('hestia_op_token');
+        }
         await ensureSignedIn();
         res = await fetch(path, withTok());
       }
