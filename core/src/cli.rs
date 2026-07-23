@@ -329,6 +329,18 @@ enum HubCmd {
         target: String,
     },
 
+    /// Drain this member's hub mailbox(es) over the sealed channel, signed with the
+    /// vault member key — the receiver half of the mesh (what `hub-watch` calls
+    /// instead of the raw-key `channel_client … notifications`). Multi-hub by
+    /// default: with no --target, drains EVERY joined hub and merges the notices.
+    /// CONSUME-ONCE — drained notices are removed from the hub, so whatever reads
+    /// the emitted `{"notifications":[…]}` owns delivery.
+    Notifications {
+        /// Hub URL or connection UUID to drain (default: ALL joined hubs).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
+
     /// Propose a pairing with a peer member (the sealed-channel handshake). We
     /// mint a per-session ephemeral key and publish it in the request; the peer
     /// completes it with `hub pair-confirm`. Prints the new pair_id.
@@ -602,6 +614,7 @@ pub fn run() -> AnyResult<()> {
             HubCmd::Notify { peer, kind, pointer, target } => {
                 cmd_hub_notify(&home, &peer, &kind, &pointer, &target)
             }
+            HubCmd::Notifications { target } => cmd_hub_notifications(&home, &target),
             HubCmd::PairRequest { to, purpose, target } => {
                 cmd_hub_pair_request(&home, to, &purpose, &target)
             }
@@ -2124,6 +2137,65 @@ fn cmd_hub_notify(
         .unwrap_or_else(|| "?".into());
     println!("[hub notify] -> {peer} ({peer_lct}) kind={kind} ledger={idx} hash={content_hash}");
     println!("  pointer: {pointer}");
+    Ok(())
+}
+
+/// `hub notifications` — drain this member's hub mailbox(es) over the sealed
+/// channel, signed with the vault member key. The receiver half of the mesh,
+/// symmetric to `hub notify`: `hub-watch` calls this instead of the raw-key
+/// `channel_client … notifications`, so a hestia-led / AI-owned member (vault-sealed
+/// key, no `~/.web4/*.bin`) can receive as well as send.
+///
+/// Multi-hub by default: with no `--target`, drains EVERY joined hub and merges the
+/// notices (each tagged with its source `hub` / `hub_url`). CONSUME-ONCE — the
+/// `notifications` channel tool removes what it returns, so the emitted output IS the
+/// delivery; the caller (hub-watch) must handle/dead-letter each notice. The
+/// `{"notifications":[…]}` JSON is the only thing on stdout (hub-watch-parser
+/// compatible); a per-hub drain failure goes to stderr and does not abort the rest.
+fn cmd_hub_notifications(home: &std::path::Path, target: &str) -> AnyResult<()> {
+    let vault = open_vault(home)?;
+    let store = HubStore::load(&vault)?;
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+
+    let conns: Vec<HubConnection> = if target.is_empty() {
+        store.connections.clone()
+    } else {
+        vec![pick_connection(&store, target)?]
+    };
+    if conns.is_empty() {
+        anyhow::bail!("not connected to any hub -- `hestia hub connect <url>` first");
+    }
+
+    let mut notices: Vec<serde_json::Value> = Vec::new();
+    for conn in &conns {
+        // Per-hub isolation: one unreachable hub must not drop the others' notices.
+        let drained = (|| -> AnyResult<serde_json::Value> {
+            let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+            let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+            let channel = rt.block_on(client.open_channel(&conn.url, uuid::Uuid::new_v4()))?;
+            rt.block_on(client.channel_query(
+                &rest, &channel, &keypair, conn.our_lct_id, "notifications", serde_json::json!({}),
+            ))
+        })();
+        match drained {
+            Ok(out) => {
+                if let Some(arr) = out.get("notifications").and_then(|n| n.as_array()) {
+                    for n in arr {
+                        let mut n = n.clone();
+                        if let Some(obj) = n.as_object_mut() {
+                            obj.insert("hub".into(), serde_json::json!(conn.hub_lct_id.to_string()));
+                            obj.insert("hub_url".into(), serde_json::json!(conn.url.clone()));
+                        }
+                        notices.push(n);
+                    }
+                }
+            }
+            Err(e) => eprintln!("[hub notifications] drain of {} failed: {e:#}", conn.url),
+        }
+    }
+
+    println!("{}", serde_json::to_string(&serde_json::json!({ "notifications": notices }))?);
     Ok(())
 }
 
