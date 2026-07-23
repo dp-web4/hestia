@@ -193,15 +193,24 @@ def witness_decision(verb, reason, innate):
     never sees them; this is the only record of a deny. Fail-safe: a log failure never changes the
     decision (the gate still exits 2)."""
     try:
-        import datetime
+        import datetime, hashlib
+        # REDACTED receipt — never copy the rejected payload into this (less-protected) log. A deny
+        # fires precisely because the target is sensitive/out-of-scope, so the raw tool_input is the
+        # LAST thing to persist here. Keep: the (already-bounded) reason, tool_name, decision, and a
+        # correlation hash of the payload — NOT the command/patch body. (Codex review, 2026-07-23.)
+        ti = _EVENT.get("tool_input")
+        ti_hash = None
+        if ti is not None:
+            ti_hash = hashlib.sha256(
+                json.dumps(ti, sort_keys=True, default=str).encode("utf-8", "replace")).hexdigest()[:16]
         rec = {
             "hook_event_name": "PreToolUse",
             "hestia_decision": verb,          # deny | warn
             "innate": bool(innate),
             "mode": MODE,
-            "reason": reason,
+            "reason": reason,                 # already bounded (no raw payload)
             "tool_name": _EVENT.get("tool_name"),
-            "tool_input": _EVENT.get("tool_input"),
+            "tool_input_sha256": ti_hash,     # correlate without persisting the (sensitive) payload
             "session_id": _EVENT.get("session_id"),
             "cwd": _EVENT.get("cwd"),
             "plugin": "codex",
