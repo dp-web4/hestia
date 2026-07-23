@@ -203,8 +203,12 @@ def main():
     if tool not in READ_CLASS:
         try:
             env = dict(os.environ, HESTIA_PLUGIN_ID="codex-cli", HESTIA_PRE_FAIL_CLOSED="1")
+            # Codex CLAMPS every hook to 3s. The whole gate must finish under that or Codex kills it
+            # and FAILS OPEN — so the society-safety subprocess gets 2s, not 6s: a slow/hung daemon
+            # then fails CLOSED here (enforce) at 2s instead of fail-open at the 3s clamp. (2026-07-23,
+            # from Codex's first live session: "clamping SessionEnd hook timeout to 3s".)
             r = subprocess.run([sys.executable, CLAUDE_PRE], input=json.dumps(event),
-                               capture_output=True, text=True, timeout=6, env=env)
+                               capture_output=True, text=True, timeout=2, env=env)
             if r.returncode != 0:  # daemon denied, or inconclusive -> fail-closed for a write/exec act
                 msg = (r.stderr.strip() if r.returncode == 2 and r.stderr.strip()
                        else "hestia: deny [safety] — blocked/inconclusive at the society safety gate.")
