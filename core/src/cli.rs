@@ -309,6 +309,40 @@ enum HubCmd {
         target: String,
     },
 
+    /// Notify a peer THROUGH the hub — emit a `referenced_act` into their mailbox,
+    /// which the peer's `hub-watch` drains into a work session (see
+    /// `private-context/hub-mesh`). Pointer-based: the body lives at the pointer (a
+    /// PR URL, a shared-context path, a thread). Signs with the **vault member key**,
+    /// so a hestia-led / AI-owned member participates in the mesh with its actual
+    /// pinned identity — no raw channel-key file needed. (The external mesh
+    /// `channel_client` can't open the sealed vault; the CLI can.)
+    Notify {
+        /// Peer name (resolved via the hub roster) or member LCT uuid.
+        peer: String,
+        /// Notice kind — must be in the receivers' KINDS gate (single source:
+        /// `private-context/hub-mesh/KINDS`; validated here, fails closed on a
+        /// miss). Current set: pr_review_request, pr_changes, review_done, reply,
+        /// plan, ack, handoff, forum, forum-note, coordination, secret.
+        kind: String,
+        /// Pointer URI: a PR URL, a shared-context file path, or a thread ref.
+        pointer: String,
+        /// Hub URL or connection UUID to send through (default: sole connection).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
+
+    /// Drain this member's hub mailbox(es) over the sealed channel, signed with the
+    /// vault member key — the receiver half of the mesh (what `hub-watch` calls
+    /// instead of the raw-key `channel_client … notifications`). Multi-hub by
+    /// default: with no --target, drains EVERY joined hub and merges the notices.
+    /// CONSUME-ONCE — drained notices are removed from the hub, so whatever reads
+    /// the emitted `{"notifications":[…]}` owns delivery.
+    Notifications {
+        /// Hub URL or connection UUID to drain (default: ALL joined hubs).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
+
     /// Propose a pairing with a peer member (the sealed-channel handshake). We
     /// mint a per-session ephemeral key and publish it in the request; the peer
     /// completes it with `hub pair-confirm`. Prints the new pair_id.
@@ -579,6 +613,10 @@ pub fn run() -> AnyResult<()> {
             HubCmd::SendSecret { to, pair, file, target } => {
                 cmd_hub_send_secret(&home, to, pair, file.as_deref(), &target)
             }
+            HubCmd::Notify { peer, kind, pointer, target } => {
+                cmd_hub_notify(&home, &peer, &kind, &pointer, &target)
+            }
+            HubCmd::Notifications { target } => cmd_hub_notifications(&home, &target),
             HubCmd::PairRequest { to, purpose, target } => {
                 cmd_hub_pair_request(&home, to, &purpose, &target)
             }
@@ -2041,6 +2079,235 @@ fn member_signing_keypair(
     }
 }
 
+// ---- hub notify (mesh referenced_act, signed by the vault member key) --------
+
+/// Canonical mesh kind vocabulary. The SINGLE source of record is
+/// `private-context/hub-mesh/KINDS`, read at runtime by BOTH shell ends — the
+/// sender (`hub-notify.sh`) and the receiver gate (`hub-watch.sh` `KIND_RE`) —
+/// so the two cannot drift. This compiled sender can't sit adjacent to that
+/// file, so it mirrors the list here AND, when the file is discoverable
+/// (`$HUB_MESH_DIR/KINDS`), reads it instead — letting an operator keep all
+/// three ends on one source. Keep this list in sync with that file.
+///
+/// Validation FAILS CLOSED on an unknown kind (see `validate_mesh_kind`): the
+/// hub drain is consume-once, so a kind a sender emits but receivers' gate
+/// doesn't accept is silently destroyed (2026-07-15 forum-note incident,
+/// thread `hub-mesh-forum-note-drop`). Dropping this check while positioning
+/// `hub notify` as the hestia-native `hub-notify.sh` would reintroduce exactly
+/// that hazard for every hestia-led member.
+const MESH_KINDS: &[&str] = &[
+    "pr_review_request", "pr_changes", "review_done", "reply", "plan", "ack",
+    "handoff", "forum", "forum-note", "coordination", "secret",
+];
+
+/// The active kind vocabulary: the single-source `$HUB_MESH_DIR/KINDS` file when
+/// present and non-empty (exact parity with the shell ends), else the embedded
+/// `MESH_KINDS` mirror. Never fails on a missing file — unlike the shell ends,
+/// this binary legitimately runs on hosts without `private-context` checked out,
+/// where the embedded mirror is the safe default.
+fn mesh_kinds() -> Vec<String> {
+    if let Ok(dir) = std::env::var("HUB_MESH_DIR") {
+        if let Ok(text) = std::fs::read_to_string(std::path::Path::new(&dir).join("KINDS")) {
+            // Mirror the shell's `grep -Ev '^[[:space:]]*(#|$)'`: drop blank and
+            // comment lines (kind lines carry no inline comments).
+            let kinds: Vec<String> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect();
+            if !kinds.is_empty() {
+                return kinds;
+            }
+        }
+    }
+    MESH_KINDS.iter().map(|s| s.to_string()).collect()
+}
+
+/// Fail closed BEFORE any side effect if `kind` is outside the receivers' gate —
+/// the port of the shell sender's `KIND_RE` check. Called first in
+/// `cmd_hub_notify`, so an unknown kind aborts before the vault opens or a
+/// channel is sealed (no dirty state, nothing emitted).
+fn validate_mesh_kind(kind: &str) -> AnyResult<()> {
+    let kinds = mesh_kinds();
+    if !kinds.iter().any(|k| k == kind) {
+        anyhow::bail!(
+            "unknown mesh kind '{kind}' — receivers' KINDS gate would silently drop \
+             (and consume) it. valid kinds: {}",
+            kinds.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// `hub notify` — emit a `referenced_act` to a peer through the sealed member↔hub
+/// channel, signed with the vault member key. The hub queues it in the peer's
+/// mailbox; the peer's `hub-watch` drains it into a work session. This is the
+/// hestia-native equivalent of the mesh `hub-notify.sh` + `channel_client`, but it
+/// signs from the sealed vault instead of a raw key file — so an AI-owned /
+/// hestia-led member (whose pinned key lives in the vault, not `~/.web4/*.bin`) can
+/// participate in the event-driven mesh with its actual pinned identity.
+fn cmd_hub_notify(
+    home: &std::path::Path,
+    peer: &str,
+    kind: &str,
+    pointer: &str,
+    target: &str,
+) -> AnyResult<()> {
+    // Preflight (O): reject a kind the receivers' gate would silently drop, BEFORE
+    // opening the vault or sealing a channel — no side effect precedes this check.
+    validate_mesh_kind(kind)?;
+
+    let vault = open_vault(home)?;
+    let store = HubStore::load(&vault)?;
+    let conn = pick_connection(&store, target)?;
+    let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+
+    // Peer: accept a raw LCT uuid, else resolve the display name via the hub roster.
+    let peer_lct: uuid::Uuid = match uuid::Uuid::parse_str(peer) {
+        Ok(u) => u,
+        Err(_) => rt
+            .block_on(client.resolve_member_by_name(&conn.url, peer))
+            .with_context(|| format!("resolving peer '{peer}' via hub roster"))?,
+    };
+
+    // H-008 content binding: tie the notice to a specific version of the pointed-at
+    // substance (git head SHA for a PR, sha256 for a file/opaque pointer).
+    let content_hash = compute_content_hash(pointer);
+    let args = serde_json::json!({
+        "to": { "to": "peer", "lct_id": peer_lct },
+        "kind": kind,
+        "pointer_uri": pointer,
+        "content_hash": content_hash,
+    });
+
+    // Seal {tool: referenced_act, args} on a fresh channel and POST. channel_query
+    // adds the nonce + issued_at freshness fields and opens the sealed response.
+    let channel = rt
+        .block_on(client.open_channel(&conn.url, uuid::Uuid::new_v4()))
+        .context("opening sealed channel to hub")?;
+    let out = rt
+        .block_on(client.channel_query(
+            &rest, &channel, &keypair, conn.our_lct_id, "referenced_act", args,
+        ))
+        .context("posting referenced_act to hub channel (is your member key pinned?)")?;
+
+    let idx = out
+        .get("entry_index")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".into());
+    println!("[hub notify] -> {peer} ({peer_lct}) kind={kind} ledger={idx} hash={content_hash}");
+    println!("  pointer: {pointer}");
+    Ok(())
+}
+
+/// `hub notifications` — drain this member's hub mailbox(es) over the sealed
+/// channel, signed with the vault member key. The receiver half of the mesh,
+/// symmetric to `hub notify`: `hub-watch` calls this instead of the raw-key
+/// `channel_client … notifications`, so a hestia-led / AI-owned member (vault-sealed
+/// key, no `~/.web4/*.bin`) can receive as well as send.
+///
+/// Multi-hub by default: with no `--target`, drains EVERY joined hub and merges the
+/// notices (each tagged with its source `hub` / `hub_url`). CONSUME-ONCE — the
+/// `notifications` channel tool removes what it returns, so the emitted output IS the
+/// delivery; the caller (hub-watch) must handle/dead-letter each notice. The
+/// `{"notifications":[…]}` JSON is the only thing on stdout (hub-watch-parser
+/// compatible); a per-hub drain failure goes to stderr and does not abort the rest.
+fn cmd_hub_notifications(home: &std::path::Path, target: &str) -> AnyResult<()> {
+    let vault = open_vault(home)?;
+    let store = HubStore::load(&vault)?;
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+
+    let conns: Vec<HubConnection> = if target.is_empty() {
+        store.connections.clone()
+    } else {
+        vec![pick_connection(&store, target)?]
+    };
+    if conns.is_empty() {
+        anyhow::bail!("not connected to any hub -- `hestia hub connect <url>` first");
+    }
+
+    let mut notices: Vec<serde_json::Value> = Vec::new();
+    for conn in &conns {
+        // Per-hub isolation: one unreachable hub must not drop the others' notices.
+        let drained = (|| -> AnyResult<serde_json::Value> {
+            let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+            let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+            let channel = rt.block_on(client.open_channel(&conn.url, uuid::Uuid::new_v4()))?;
+            rt.block_on(client.channel_query(
+                &rest, &channel, &keypair, conn.our_lct_id, "notifications", serde_json::json!({}),
+            ))
+        })();
+        match drained {
+            Ok(out) => {
+                if let Some(arr) = out.get("notifications").and_then(|n| n.as_array()) {
+                    for n in arr {
+                        let mut n = n.clone();
+                        if let Some(obj) = n.as_object_mut() {
+                            obj.insert("hub".into(), serde_json::json!(conn.hub_lct_id.to_string()));
+                            obj.insert("hub_url".into(), serde_json::json!(conn.url.clone()));
+                        }
+                        notices.push(n);
+                    }
+                }
+            }
+            Err(e) => eprintln!("[hub notifications] drain of {} failed: {e:#}", conn.url),
+        }
+    }
+
+    println!("{}", serde_json::to_string(&serde_json::json!({ "notifications": notices }))?);
+    Ok(())
+}
+
+/// Bind a notice to a specific version of the pointed-at substance via a
+/// self-describing, scheme-tagged content hash (mesh H-008, tag scheme agreed with
+/// Legion 2026-07-06). Mirrors `hub-mesh/hub-notify.sh`:
+///   `git-sha:<40hex>`       PR / git pointer — the head commit SHA is the version
+///   `sha256-content:<hex>`  local file — sha256 of the bytes (a real pin)
+///   `sha256-pointer:<hex>`  opaque / unresolvable — sha256 of the pointer string
+/// The `#thread=…` fragment is routing, not content, so it's stripped before hashing.
+fn compute_content_hash(pointer: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let bare = pointer.split('#').next().unwrap_or(pointer);
+    let sha_hex = |b: &[u8]| {
+        let mut h = Sha256::new();
+        h.update(b);
+        hex::encode(h.finalize())
+    };
+    // GitHub PR pointer → the head commit SHA (via `gh`, if available).
+    let pr_re = regex::Regex::new(r"github\.com/([^/]+/[^/]+)/pull/(\d+)").unwrap();
+    if let Some(caps) = pr_re.captures(bare) {
+        if let Ok(out) = std::process::Command::new("gh")
+            .args(["pr", "view", &caps[2], "--repo", &caps[1], "--json", "headRefOid", "-q", ".headRefOid"])
+            .output()
+        {
+            let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if oid.len() == 40 && oid.chars().all(|c| c.is_ascii_hexdigit()) {
+                return format!("git-sha:{oid}");
+            }
+        }
+        return format!("sha256-pointer:{}", sha_hex(bare.as_bytes()));
+    }
+    // Local file pointer → sha256 of the bytes. NOTE: intentionally narrower than
+    // the shell, which resolves a RELATIVE pointer against SHARED_CONTEXT_ROOT /
+    // ~/ai-workspace/private-context / ~/ai-workspace before hashing. Here a bare
+    // relative path that doesn't exist in cwd degrades to `sha256-pointer:` below —
+    // so a relative-path pointer can hash differently across senders. Absolute
+    // paths and PR URLs (the common mesh case) are byte-identical either way; the
+    // gap only bites bare relative file pointers. Mirror those roots here if that
+    // case ever matters.
+    if let Ok(bytes) = std::fs::read(bare) {
+        return format!("sha256-content:{}", sha_hex(&bytes));
+    }
+    // Opaque / unresolvable → honest weak binding on the pointer string.
+    format!("sha256-pointer:{}", sha_hex(bare.as_bytes()))
+}
+
 // ---- constellation commands -------------------------------------------------
 
 fn cmd_constellation_add(home: &std::path::Path, name: &str, device_type: &str) -> AnyResult<()> {
@@ -2637,6 +2904,36 @@ mod member_key_source_tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("32 bytes"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn mesh_kind_validation_fails_closed_on_unknown_kind() {
+        use super::validate_mesh_kind;
+        // Ensure no env override leaks in from the host so we exercise the mirror.
+        std::env::remove_var("HUB_MESH_DIR");
+        // Every embedded kind is accepted.
+        for k in super::MESH_KINDS {
+            assert!(validate_mesh_kind(k).is_ok(), "canonical kind rejected: {k}");
+        }
+        // An unknown kind is rejected loudly (the forum-note drop hazard).
+        let err = validate_mesh_kind("pr_reviewww").unwrap_err().to_string();
+        assert!(err.contains("unknown mesh kind"), "unexpected error: {err}");
+        assert!(err.contains("valid kinds"), "error should list valid kinds: {err}");
+    }
+
+    #[test]
+    fn mesh_kinds_reads_single_source_file_when_present() {
+        use super::mesh_kinds;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("KINDS"),
+            "# comment line\n\npr_review_request\n  ack  \n# trailing\nforum-note\n",
+        )
+        .unwrap();
+        std::env::set_var("HUB_MESH_DIR", tmp.path());
+        let kinds = mesh_kinds();
+        std::env::remove_var("HUB_MESH_DIR");
+        assert_eq!(kinds, vec!["pr_review_request", "ack", "forum-note"]);
     }
 
     #[test]
