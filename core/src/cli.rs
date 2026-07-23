@@ -319,8 +319,10 @@ enum HubCmd {
     Notify {
         /// Peer name (resolved via the hub roster) or member LCT uuid.
         peer: String,
-        /// Notice kind — must be in the receivers' KINDS gate: pr_review_request,
-        /// pr_changes, review_done, reply, plan, ack, handoff, forum, coordination.
+        /// Notice kind — must be in the receivers' KINDS gate (single source:
+        /// `private-context/hub-mesh/KINDS`; validated here, fails closed on a
+        /// miss). Current set: pr_review_request, pr_changes, review_done, reply,
+        /// plan, ack, handoff, forum, forum-note, coordination, secret.
         kind: String,
         /// Pointer URI: a PR URL, a shared-context file path, or a thread ref.
         pointer: String,
@@ -2079,6 +2081,65 @@ fn member_signing_keypair(
 
 // ---- hub notify (mesh referenced_act, signed by the vault member key) --------
 
+/// Canonical mesh kind vocabulary. The SINGLE source of record is
+/// `private-context/hub-mesh/KINDS`, read at runtime by BOTH shell ends — the
+/// sender (`hub-notify.sh`) and the receiver gate (`hub-watch.sh` `KIND_RE`) —
+/// so the two cannot drift. This compiled sender can't sit adjacent to that
+/// file, so it mirrors the list here AND, when the file is discoverable
+/// (`$HUB_MESH_DIR/KINDS`), reads it instead — letting an operator keep all
+/// three ends on one source. Keep this list in sync with that file.
+///
+/// Validation FAILS CLOSED on an unknown kind (see `validate_mesh_kind`): the
+/// hub drain is consume-once, so a kind a sender emits but receivers' gate
+/// doesn't accept is silently destroyed (2026-07-15 forum-note incident,
+/// thread `hub-mesh-forum-note-drop`). Dropping this check while positioning
+/// `hub notify` as the hestia-native `hub-notify.sh` would reintroduce exactly
+/// that hazard for every hestia-led member.
+const MESH_KINDS: &[&str] = &[
+    "pr_review_request", "pr_changes", "review_done", "reply", "plan", "ack",
+    "handoff", "forum", "forum-note", "coordination", "secret",
+];
+
+/// The active kind vocabulary: the single-source `$HUB_MESH_DIR/KINDS` file when
+/// present and non-empty (exact parity with the shell ends), else the embedded
+/// `MESH_KINDS` mirror. Never fails on a missing file — unlike the shell ends,
+/// this binary legitimately runs on hosts without `private-context` checked out,
+/// where the embedded mirror is the safe default.
+fn mesh_kinds() -> Vec<String> {
+    if let Ok(dir) = std::env::var("HUB_MESH_DIR") {
+        if let Ok(text) = std::fs::read_to_string(std::path::Path::new(&dir).join("KINDS")) {
+            // Mirror the shell's `grep -Ev '^[[:space:]]*(#|$)'`: drop blank and
+            // comment lines (kind lines carry no inline comments).
+            let kinds: Vec<String> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect();
+            if !kinds.is_empty() {
+                return kinds;
+            }
+        }
+    }
+    MESH_KINDS.iter().map(|s| s.to_string()).collect()
+}
+
+/// Fail closed BEFORE any side effect if `kind` is outside the receivers' gate —
+/// the port of the shell sender's `KIND_RE` check. Called first in
+/// `cmd_hub_notify`, so an unknown kind aborts before the vault opens or a
+/// channel is sealed (no dirty state, nothing emitted).
+fn validate_mesh_kind(kind: &str) -> AnyResult<()> {
+    let kinds = mesh_kinds();
+    if !kinds.iter().any(|k| k == kind) {
+        anyhow::bail!(
+            "unknown mesh kind '{kind}' — receivers' KINDS gate would silently drop \
+             (and consume) it. valid kinds: {}",
+            kinds.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// `hub notify` — emit a `referenced_act` to a peer through the sealed member↔hub
 /// channel, signed with the vault member key. The hub queues it in the peer's
 /// mailbox; the peer's `hub-watch` drains it into a work session. This is the
@@ -2093,6 +2154,10 @@ fn cmd_hub_notify(
     pointer: &str,
     target: &str,
 ) -> AnyResult<()> {
+    // Preflight (O): reject a kind the receivers' gate would silently drop, BEFORE
+    // opening the vault or sealing a channel — no side effect precedes this check.
+    validate_mesh_kind(kind)?;
+
     let vault = open_vault(home)?;
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
@@ -2228,7 +2293,14 @@ fn compute_content_hash(pointer: &str) -> String {
         }
         return format!("sha256-pointer:{}", sha_hex(bare.as_bytes()));
     }
-    // Local file pointer → sha256 of the bytes.
+    // Local file pointer → sha256 of the bytes. NOTE: intentionally narrower than
+    // the shell, which resolves a RELATIVE pointer against SHARED_CONTEXT_ROOT /
+    // ~/ai-workspace/private-context / ~/ai-workspace before hashing. Here a bare
+    // relative path that doesn't exist in cwd degrades to `sha256-pointer:` below —
+    // so a relative-path pointer can hash differently across senders. Absolute
+    // paths and PR URLs (the common mesh case) are byte-identical either way; the
+    // gap only bites bare relative file pointers. Mirror those roots here if that
+    // case ever matters.
     if let Ok(bytes) = std::fs::read(bare) {
         return format!("sha256-content:{}", sha_hex(&bytes));
     }
@@ -2832,6 +2904,36 @@ mod member_key_source_tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("32 bytes"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn mesh_kind_validation_fails_closed_on_unknown_kind() {
+        use super::validate_mesh_kind;
+        // Ensure no env override leaks in from the host so we exercise the mirror.
+        std::env::remove_var("HUB_MESH_DIR");
+        // Every embedded kind is accepted.
+        for k in super::MESH_KINDS {
+            assert!(validate_mesh_kind(k).is_ok(), "canonical kind rejected: {k}");
+        }
+        // An unknown kind is rejected loudly (the forum-note drop hazard).
+        let err = validate_mesh_kind("pr_reviewww").unwrap_err().to_string();
+        assert!(err.contains("unknown mesh kind"), "unexpected error: {err}");
+        assert!(err.contains("valid kinds"), "error should list valid kinds: {err}");
+    }
+
+    #[test]
+    fn mesh_kinds_reads_single_source_file_when_present() {
+        use super::mesh_kinds;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("KINDS"),
+            "# comment line\n\npr_review_request\n  ack  \n# trailing\nforum-note\n",
+        )
+        .unwrap();
+        std::env::set_var("HUB_MESH_DIR", tmp.path());
+        let kinds = mesh_kinds();
+        std::env::remove_var("HUB_MESH_DIR");
+        assert_eq!(kinds, vec!["pr_review_request", "ack", "forum-note"]);
     }
 
     #[test]
