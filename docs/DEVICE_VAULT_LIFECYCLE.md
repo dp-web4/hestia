@@ -28,8 +28,12 @@ path maps onto:
 | `HardwareBacked` | A `DeviceType::Hardware` member co-signed (TPM / Hardbound tier) | verified attestation incl. a hardware device |
 
 Rules:
-- The verifier **derives** the tier from verified signatures, never from a claim (already the
-  invariant in `ConstellationAttestation::verify`; it now covers `Operational` too).
+- The verifier **derives** the tier from verified signatures, never from a claim (the invariant in
+  `ConstellationAttestation::verify`). Note the scope: `verify`/`derive_assurance_refs` bottoms at
+  `SingleDevice` and can never *return* `Operational` — an attestation with no valid signatures
+  fails verification outright. `Operational` is derived one layer up, at the connection/act layer,
+  from the key source (`ChannelKeyFile`) or the absence of an attestation; an implementer should
+  not try to thread it through `derive_assurance`.
 - An auto-unlocked vault (passphrase file, §2.1) caps at `SingleDevice`. Convenience unlock is a
   legitimate consumer tier, but it can never masquerade as multi-device presence.
 - `Operational` is **explicit, never inferred as a default**. `hestia hub set-member-key
@@ -75,11 +79,18 @@ model: everything a daemon-auto-unlocked vault signs is at most `SingleDevice` (
 New CLI verb. Requirements:
 - Prompts for (or reads) the current passphrase, takes the new one interactively or via
   `HESTIA_PASSPHRASE_NEW`.
-- Re-keys **without downtime**: items are re-encrypted under the new Argon2id-derived key
-  item-by-item; the daemon holds both keys in memory during the pass and swaps atomically at the
-  end (per-item independent locking makes this incremental; no big-bang re-encrypt of a monolith).
-- Rewrites `~/.hestia/.passphrase` (mode 600) last, after the vault is fully re-keyed, so a crash
-  mid-rotation leaves a vault openable by the *old* file.
+- Re-keys in **one atomic step**, matching the real storage model: the vault is a *single*
+  ChaCha20-Poly1305 blob under one Argon2id-derived key (`core/src/vault/storage.rs`), not per-item
+  ciphertext. Rotation decrypts the whole `VaultData` with the old key, re-encrypts the whole blob
+  under the new key, and writes it via the existing temp-file-and-rename path. So there is no
+  dual-key window, no per-item key-epoch bookkeeping, and no incremental-vs-big-bang question — the
+  "monolith" *is* the vault. (Per-item "independent locking" is the `Protection::Master/Sealed`
+  *policy* grain in `core/src/vault/document.rs`, not a storage grain.) `Sealed` documents are
+  **rotation-invariant by construction**: their payload is independent ciphertext under its own
+  key, untouched by a master-passphrase rotation.
+- Rewrites `~/.hestia/.passphrase` (mode 600) **last**, after the atomic re-key rename has
+  committed, so a crash mid-rotation leaves the vault openable by the *old* passphrase file — the
+  rename either fully happened or it didn't, so there is no half-re-keyed vault to strand.
 - Emits a witnessed act (`witness_act`) recording that a rotation happened (not the material).
 
 ### 2.3 Recovery
