@@ -110,6 +110,30 @@ def command_of(tool_input):
     return None
 
 
+def apply_patch_targets(tool_input):
+    """Extract the TARGET file paths from an apply_patch payload (Codex '*** Add|Update|Delete File:
+    <path>' format). We scope/egress-check the TARGET path, NOT the patch body — an act that *touches*
+    a secret path is not the same as content that *mentions* '.env'/'credentials'. (2026-07-23: Codex's
+    hub/hestia security REVIEW was false-denied because the forbidden-token scan hit words in the report
+    body, which apply_patch delivers under tool_input.command.) Writing to a real secret path (e.g.
+    '*** Add File: ~/.ssh/authorized_keys') is still caught — the target path is what we check."""
+    out = []
+    if isinstance(tool_input, dict):
+        blob = ""
+        for k in ("input", "command", "patch"):
+            v = tool_input.get(k)
+            if isinstance(v, str):
+                blob = v
+                break
+        for m in re.finditer(r'^\*\*\*\s+(?:Add|Update|Delete)\s+File:\s*(.+?)\s*$', blob, re.MULTILINE):
+            out.append(m.group(1))
+        for k in ("path", "file_path"):        # explicit target keys, if present
+            v = tool_input.get(k)
+            if isinstance(v, str):
+                out.append(v)
+    return out
+
+
 def _all_repos():
     try:
         return [d for d in os.listdir(WORKSPACE)
@@ -156,10 +180,44 @@ def command_in_scope(cmd, scopes):
 # always blocks regardless of mode. Set warn via HESTIA_CODEX_GATE_MODE=warn only while shaking down.
 MODE = os.environ.get("HESTIA_CODEX_GATE_MODE", "enforce").lower()
 
+# Where to witness blocked reaches — the SAME observe log observe.sh appends to, so denies land in the
+# one witness stream alongside allows. Default matches observe.sh (~/.codex/hestia-observe).
+OBSERVE_DIR = os.path.expanduser(os.environ.get("HESTIA_OBSERVE_DIR", "~/.codex/hestia-observe"))
+_EVENT = {}  # set by main() so deny() can witness the reach it blocks
+
+
+def witness_decision(verb, reason, innate):
+    """Witness a blocked/warned reach to the observation log. 'Reaching is witnessed' has to INCLUDE
+    the reaches we deny — they are the boundary-tests the policy entity most needs (escalation
+    triggers, precedent, trust calibration). Denied calls never reach PostToolUse, so observe.sh
+    never sees them; this is the only record of a deny. Fail-safe: a log failure never changes the
+    decision (the gate still exits 2)."""
+    try:
+        import datetime
+        rec = {
+            "hook_event_name": "PreToolUse",
+            "hestia_decision": verb,          # deny | warn
+            "innate": bool(innate),
+            "mode": MODE,
+            "reason": reason,
+            "tool_name": _EVENT.get("tool_name"),
+            "tool_input": _EVENT.get("tool_input"),
+            "session_id": _EVENT.get("session_id"),
+            "cwd": _EVENT.get("cwd"),
+            "plugin": "codex",
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        }
+        os.makedirs(OBSERVE_DIR, exist_ok=True)
+        with open(os.path.join(OBSERVE_DIR, "observe.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass  # witnessing must never break the gate
+
 
 def deny(reason, what_to_do, innate=False):
     """innate=True -> ALWAYS blocks (egress/secret is irreversible). Tunable rules honor MODE."""
     verb = "deny" if (innate or MODE == "enforce") else "warn"
+    witness_decision(verb, reason, innate)   # a blocked reach is witnessed, not just shown to the agent
     sys.stderr.write(
         f"hestia: {verb} [scope] — {reason}. This is a boundary, not a failure: don't re-run the same "
         f"call. {what_to_do} Asking is a trust-building act; reaching is witnessed.\n")
@@ -178,11 +236,19 @@ def main():
     if event.get("hook_event_name") != "PreToolUse":
         sys.exit(0)  # not our event
 
+    _EVENT.clear(); _EVENT.update(event)   # so deny()/witness_decision can record the reach it blocks
     tool = event.get("tool_name") or "?"
     tinput = event.get("tool_input") or {}
     scopes = load_in_scope() + launch_cwd_repo()
-    paths = path_targets(tinput)
-    cmd = command_of(tinput)
+    if tool == "apply_patch":
+        # apply_patch's payload is FILE CONTENT, not a shell command. Check the TARGET paths for
+        # scope/egress; do NOT scan the patch body for forbidden tokens (else a security review that
+        # mentions '.env'/'credentials' is false-denied — Codex, 2026-07-23). Sandbox confines the write.
+        paths = apply_patch_targets(tinput)
+        cmd = None
+    else:
+        paths = path_targets(tinput)
+        cmd = command_of(tinput)
 
     # Gate 1a — egress/secret innate invariant (denied even inside a granted repo). ALWAYS enforced.
     for blob in paths + ([cmd] if cmd else []):
@@ -212,12 +278,16 @@ def main():
             if r.returncode != 0:  # daemon denied, or inconclusive -> fail-closed for a write/exec act
                 msg = (r.stderr.strip() if r.returncode == 2 and r.stderr.strip()
                        else "hestia: deny [safety] — blocked/inconclusive at the society safety gate.")
+                witness_decision("deny" if MODE == "enforce" else "warn",
+                                 "society-safety: " + msg.split("— ", 1)[-1].strip(), False)
                 if MODE == "enforce":
                     sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
                     sys.exit(2)
                 sys.stderr.write("hestia: warn [safety] — " + msg.split("— ", 1)[-1] +
                                  " (warn-rollout: allowed; would block under enforce)\n")
         except Exception:
+            witness_decision("deny" if MODE == "enforce" else "warn",
+                             "society-safety: governor unreachable, failing closed", False)
             if MODE == "enforce":
                 sys.stderr.write("hestia: deny [safety] — could not reach the governor; failing "
                                  "closed on a consequential act.\n")
