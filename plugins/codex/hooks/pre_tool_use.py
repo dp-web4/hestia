@@ -49,7 +49,31 @@ import re
 import sys
 import subprocess
 
-WORKSPACE = os.environ.get("HESTIA_WORKSPACE", os.path.expanduser("~/ai-workspace"))
+def _detect_workspace():
+    """WORKSPACE resolution that survives a wrong or absent env (2026-07-23, live: a session
+    launched before HESTIA_WORKSPACE landed in its hook config ran the gate against the
+    default ~/ai-workspace — every real-workspace path then read as 'outside the workspace'
+    (deny-everything) and the society-gate script resolved to a nonexistent file. A gate's
+    own config must not be able to poison its verdicts). Priority:
+      1. HESTIA_WORKSPACE env (explicit wins);
+      2. walk up from cwd to a dir that contains >=2 marker repos;
+      3. the historical default."""
+    env = os.environ.get("HESTIA_WORKSPACE")
+    if env and os.path.isdir(env):
+        return env
+    markers = ("hestia", "shared-context", "web4", "private-context")
+    d = os.getcwd()
+    for _ in range(8):
+        if sum(os.path.isdir(os.path.join(d, m)) for m in markers) >= 2:
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return os.path.expanduser("~/ai-workspace")
+
+
+WORKSPACE = _detect_workspace()
 IDENTITY = os.path.expanduser(
     os.environ.get("HESTIA_CODEX_IDENTITY", "~/.codex/hestia-instance/identity.json"))
 CLAUDE_PRE = os.environ.get(
@@ -92,7 +116,11 @@ def launch_cwd_repo():
 def path_targets(tool_input):
     out = []
     if isinstance(tool_input, dict):
-        for k in ("path", "file_path", "notebook_path", "pattern"):
+        # NOTE: "pattern" (Glob/Grep) is deliberately NOT here — it is a matcher
+        # ('*.md', a regex), not a filesystem reach; the "path" key carries the
+        # location. Checking the pattern as a path false-denied every Glob whose
+        # pattern didn't look like a granted repo (Kimi live, 2026-07-23).
+        for k in ("path", "file_path", "notebook_path"):
             v = tool_input.get(k)
             if isinstance(v, str):
                 out.append(v)
@@ -415,6 +443,10 @@ def main():
             # and FAILS OPEN — so the society-safety subprocess gets 2s, not 6s: a slow/hung daemon
             # then fails CLOSED here (enforce) at 2s instead of fail-open at the 3s clamp. (2026-07-23,
             # from Codex's first live session: "clamping SessionEnd hook timeout to 3s".)
+            if not os.path.isfile(CLAUDE_PRE):
+                raise FileNotFoundError(
+                    f"society gate script missing at {CLAUDE_PRE} — "
+                    "check HESTIA_WORKSPACE / workspace detection")
             r = subprocess.run([sys.executable, CLAUDE_PRE], input=json.dumps(event),
                                capture_output=True, text=True, timeout=2, env=env)
             if r.returncode != 0:  # daemon denied, or inconclusive -> fail-closed for a write/exec act
