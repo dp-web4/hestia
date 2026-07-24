@@ -72,6 +72,7 @@ impl ServerHandler for HestiaServer {
             "hestia_begin_action" => tool_begin_action(&self.state, &args).await,
             "hestia_record_outcome" => tool_record_outcome(&self.state, &args).await,
             "hestia_record_reversal" => tool_record_reversal(&self.state, &args).await,
+            "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
             "hestia_vault_get" => tool_vault_get(&self.state, &args).await,
             "hestia_vault_set" => tool_vault_set(&self.state, &args).await,
@@ -162,6 +163,7 @@ fn hestia_tools() -> Vec<Tool> {
         t("hestia_begin_action", "Begin tracking an R6/R7 action"),
         t("hestia_record_outcome", "Submit the outcome of an action"),
         t("hestia_record_reversal", "Record a reversal/override of a subject's work (judgment signal → trust)"),
+        t("hestia_witness_decision", "Witness an externally-adjudicated plugin-gate deny/warn (chain + gate-risk trust)"),
         t("hestia_query_policy", "Query the user's policy for a decision"),
         t("hestia_vault_get", "Request a credential from the vault"),
         t("hestia_vault_set", "Store a credential in the vault"),
@@ -960,6 +962,75 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
         "witnessEntryHash": entry.hash,
         "subjectInstanceLct": subject_instance_lct,
         "updatedJudgmentTrust": trust_state_json(&judgment_state),
+    }))
+}
+
+/// Externally-adjudicated gate decision: a plugin-side gate (the scope/egress
+/// membrane that runs INSIDE the member's hook engine, BEFORE the daemon is
+/// consulted) reporting a deny/warn it already enforced. Recorded as a
+/// `policy_decision` chain entry — the dashboard's warn/deny feed and denied
+/// counters consume these — with the adjudicator named, and fed to gate-risk
+/// trust with the daemon gate's own asymmetric weights (deny 0.5 / warn 0.2;
+/// a gate decision only LOWERS trust). Without this surface, local-gate denies
+/// were witnessed only in the plugin's own observe log: invisible to the
+/// dashboard, the policy feed, and trust (dp, 2026-07-23: "dashboard still
+/// does not show any of the denied calls for codex").
+///
+/// Trust note: this is loopback-/mcp-reachable like `hestia_record_outcome`,
+/// which can already push negative outcomes — no NEW poisoning class; the
+/// /mcp caller-auth work (public-release P0-3) gates both together.
+async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult {
+    let plugin_id = require_string(args, "plugin_id")?;
+    let decision = require_string(args, "decision")?;
+    if decision != "deny" && decision != "warn" {
+        return Ok(hestia_error_envelope(
+            "hestia.witness_decision_kind",
+            &format!("decision '{decision}' must be 'deny' or 'warn'"),
+            Some(json!({"decision": decision})),
+        ));
+    }
+    let adjudicator = require_string(args, "adjudicator")?;
+    let reason = optional_string(args, "reason").unwrap_or_default();
+    let tool_name = optional_string(args, "tool_name").unwrap_or_default();
+    let target = optional_string(args, "target").unwrap_or_default();
+    let session_id = optional_string(args, "session_id");
+    let payload_sha256 = optional_string(args, "payload_sha256");
+    let declared_role = optional_string(args, "role").unwrap_or_default();
+    let role_lct = crate::reputation::normalize_constellation_role(&declared_role);
+
+    let s = state.lock().await;
+    let instance_lct = s.member_lct(&plugin_id);
+    let entry = s.append_chain(
+        "policy_decision",
+        json!({
+            "tool_name": tool_name,
+            "target": target,
+            "plugin_id": plugin_id,
+            "instance_lct": instance_lct,
+            "role_lct": role_lct,
+            "session_id": session_id,
+            "decision": decision,
+            "enforced": true,
+            "adjudicator": adjudicator,
+            "reason": reason,
+            "payload_sha256": payload_sha256,
+        }),
+    )?;
+    // Same asymmetric gate-risk trust as the daemon's own gate decisions.
+    let risk_magnitude = if decision == "deny" { 0.5 } else { 0.2 };
+    let gate_reason = format!("gate:{decision} ({adjudicator})");
+    let rep_ctx = crate::reputation::RepContext {
+        role_lct,
+        action_type: "policy_gate",
+        action_target: &tool_name,
+        action_id: "",
+        reason: &gate_reason,
+    };
+    let trust_state = s.apply_outcome_ctx(&plugin_id, false, risk_magnitude, &rep_ctx)?;
+    Ok(json!({
+        "witnessEntryHash": entry.hash,
+        "decision": decision,
+        "updatedTrust": trust_state_json(&trust_state),
     }))
 }
 

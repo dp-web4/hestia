@@ -203,6 +203,47 @@ def command_in_scope(cmd, scopes, cwd=None):
 MODE = os.environ.get("HESTIA_KIMI_GATE_MODE", "enforce").lower()
 
 
+_EVENT = {}  # set by main() so deny() can witness the reach it blocks
+
+
+def _daemon_witness(verb, reason):
+    """Report an enforced deny/warn to the daemon's witness chain (hestia_witness_decision MCP
+    tool) so it shows on the dashboard's warn/deny feed and feeds gate-risk trust. Local-gate
+    denies were otherwise invisible to the dashboard (dp, 2026-07-23). Fire-and-forget: short
+    timeouts, every failure swallowed — a down daemon never changes the decision."""
+    import urllib.request, hashlib
+    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+    ti = _EVENT.get("tool_input")
+    ti_hash = None
+    if ti is not None:
+        ti_hash = hashlib.sha256(
+            json.dumps(ti, sort_keys=True, default=str).encode("utf-8", "replace")).hexdigest()[:16]
+
+    def post(payload, hdrs, timeout):
+        req = urllib.request.Request(
+            endpoint, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream", **hdrs})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read(), resp.headers.get("mcp-session-id")
+
+    _, sid = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                   "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                              "clientInfo": {"name": "hestia-kimi-gate", "version": "1"}}}, {}, 0.5)
+    h = {"mcp-session-id": sid} if sid else {}
+    post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, h, 0.4)
+    post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+          "params": {"name": "hestia_witness_decision",
+                     "arguments": {"plugin_id": "kimi-code",
+                                   "decision": verb,
+                                   "adjudicator": "plugin-gate:kimi(scope/egress)",
+                                   "reason": reason[:300],
+                                   "tool_name": _EVENT.get("tool_name") or "",
+                                   "session_id": _EVENT.get("session_id"),
+                                   "payload_sha256": ti_hash,
+                                   "role": "role:constellation:foreign-kimi"}}}, h, 0.8)
+
+
 def deny(reason, what_to_do, innate=False):
     """innate=True -> ALWAYS blocks (egress/secret is irreversible: a leaked read has no undo, so it
     is enforced even in warn-rollout). Tunable scope/safety rules honor MODE: warn surfaces + allows,
@@ -211,6 +252,10 @@ def deny(reason, what_to_do, innate=False):
     sys.stderr.write(
         f"hestia: {verb} [scope] — {reason}. This is a boundary, not a failure: don't re-run the same "
         f"call. {what_to_do} Asking is a trust-building act; reaching is witnessed.\n")
+    try:
+        _daemon_witness(verb, reason)
+    except Exception:
+        pass  # witnessing must never change the decision
     if innate or MODE == "enforce":
         sys.exit(2)
     # warn mode, tunable rule: surfaced but allowed — return so evaluation continues to allow.
@@ -227,6 +272,7 @@ def main():
     if event.get("hook_event_name") != "PreToolUse":
         sys.exit(0)  # not our event
 
+    _EVENT.clear(); _EVENT.update(event)
     tool = event.get("tool_name") or "?"
     tinput = event.get("tool_input") or {}
     scopes = load_in_scope() + launch_cwd_repo()

@@ -291,6 +291,64 @@ def witness_decision(verb, reason, innate):
             f.write(json.dumps(rec) + "\n")
     except Exception:
         pass  # witnessing must never break the gate
+    # ALSO report to the daemon's witness chain (hestia_witness_decision MCP tool) so the
+    # deny is visible on the dashboard's warn/deny feed and feeds gate-risk trust. The local
+    # observe log alone made local-gate denies invisible to the dashboard (dp, 2026-07-23).
+    # Fire-and-forget: short timeouts, every failure swallowed — the deny path already exits
+    # 2 regardless, and a down daemon must never change the decision.
+    try:
+        _daemon_witness(verb, reason)
+    except Exception:
+        pass
+
+
+def _daemon_witness(verb, reason):
+    """Single-shot MCP call: initialize -> tools/call hestia_witness_decision. ~1s worst case,
+    only ever runs on the deny/warn path (never on allows, so no hook-clamp pressure)."""
+    import urllib.request
+    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+    ti = _EVENT.get("tool_input")
+    ti_hash = None
+    if ti is not None:
+        import hashlib
+        ti_hash = hashlib.sha256(
+            json.dumps(ti, sort_keys=True, default=str).encode("utf-8", "replace")).hexdigest()[:16]
+
+    def post(payload, timeout):
+        req = urllib.request.Request(
+            endpoint, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            hdr = resp.headers.get("mcp-session-id")
+            return resp.read(), hdr
+
+    _, session_hdr = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"protocolVersion": "2024-11-05",
+                                      "capabilities": {},
+                                      "clientInfo": {"name": "hestia-codex-gate", "version": "1"}}},
+                          0.5)
+    def post_s(payload, timeout):
+        req = urllib.request.Request(
+            endpoint, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream",
+                     **({"mcp-session-id": session_hdr} if session_hdr else {})})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+
+    post_s({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, 0.4)
+    post_s({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "hestia_witness_decision",
+                       "arguments": {
+                           "plugin_id": "codex-cli",
+                           "decision": verb,
+                           "adjudicator": "plugin-gate:codex(scope/egress)",
+                           "reason": reason[:300],
+                           "tool_name": _EVENT.get("tool_name") or "",
+                           "session_id": _EVENT.get("session_id"),
+                           "payload_sha256": ti_hash,
+                           "role": "role:constellation:foreign-codex",
+                       }}}, 0.8)
 
 
 def deny(reason, what_to_do, innate=False):
