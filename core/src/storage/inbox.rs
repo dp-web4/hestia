@@ -15,7 +15,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -228,10 +228,24 @@ mod tests {
         let pair = Uuid::new_v4();
         let hub = Uuid::new_v4();
         store
-            .enqueue(pair, hub, "aa".repeat(32).as_str(), "sealed-1", "notify:x", Some("hub://act/1"))
+            .enqueue(
+                pair,
+                hub,
+                "aa".repeat(32).as_str(),
+                "sealed-1",
+                "notify:x",
+                Some("hub://act/1"),
+            )
             .unwrap();
         store
-            .enqueue(pair, hub, "aa".repeat(32).as_str(), "sealed-2", "notify:y", None)
+            .enqueue(
+                pair,
+                hub,
+                "aa".repeat(32).as_str(),
+                "sealed-2",
+                "notify:y",
+                None,
+            )
             .unwrap();
         assert_eq!(store.len().unwrap(), 2);
 
@@ -279,7 +293,14 @@ mod tests {
         let (_tmp, store) = fresh();
         for i in 0..(MAX_INBOX_NOTICES + 2) {
             store
-                .enqueue(Uuid::nil(), Uuid::nil(), "ab", &format!("sealed-{i}"), "k", None)
+                .enqueue(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    "ab",
+                    &format!("sealed-{i}"),
+                    "k",
+                    None,
+                )
                 .unwrap();
         }
         assert_eq!(store.len().unwrap(), MAX_INBOX_NOTICES);

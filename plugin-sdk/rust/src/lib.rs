@@ -29,11 +29,11 @@ mod errors;
 mod transport;
 mod types;
 
-pub use client::{create_hestia_client, HestiaClient};
+pub use client::{HestiaClient, create_hestia_client};
 pub use errors::{HestiaError, Result};
-pub use transport::{discover_hestia_endpoint, DEFAULT_HESTIA_ENDPOINT};
+pub use transport::{DEFAULT_HESTIA_ENDPOINT, discover_hestia_endpoint};
 pub use types::{
-    ConnectResult, HestiaClientConfig, HistoryFilter, HistoryResult, Outcome, OutcomeResult,
-    PolicyDecision, PolicyResult, R6Action, T3Roots, ToolCallSpec, TrustState, V3Roots,
-    VaultGetOptions, VaultSetOptions, VaultValue, WitnessEntry, HESTIA_PROTOCOL_VERSION,
+    ClosureClaim, ConnectResult, HESTIA_PROTOCOL_VERSION, HestiaClientConfig, HistoryFilter,
+    HistoryResult, Outcome, OutcomeResult, PolicyDecision, PolicyResult, R6Action, T3Roots,
+    ToolCallSpec, TrustState, V3Roots, VaultGetOptions, VaultSetOptions, VaultValue, WitnessEntry,
 };

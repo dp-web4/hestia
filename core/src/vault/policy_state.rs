@@ -231,9 +231,7 @@ impl VaultPolicyState {
     /// Per-`(instance, role)` overlay engines, keyed by `(plugin_id, role)`. Each
     /// is a default-`Allow` config folded strictest-wins into the base + role
     /// overlay, so it can only tighten. Mirrors [`role_configs`] one grain finer.
-    pub fn instance_configs(
-        &self,
-    ) -> HashMap<(String, String), crate::policy::PolicyConfig> {
+    pub fn instance_configs(&self) -> HashMap<(String, String), crate::policy::PolicyConfig> {
         let mut out = HashMap::new();
         for (plugin_id, by_role) in &self.instance_overlays {
             for (role, rules) in by_role {
@@ -253,7 +251,9 @@ impl VaultPolicyState {
     /// The rules currently set for one `(plugin_id, role)` grain — for the
     /// dashboard to display/seed the editor. `None` if none set.
     pub fn instance_overlay(&self, plugin_id: &str, role: &str) -> Option<&Vec<PolicyRule>> {
-        self.instance_overlays.get(plugin_id).and_then(|m| m.get(role))
+        self.instance_overlays
+            .get(plugin_id)
+            .and_then(|m| m.get(role))
     }
 
     /// Required distinct operator signatures for an irreversible act (clause V).
@@ -305,7 +305,11 @@ impl VaultPolicyState {
                 .map(|m| m.remove(role).is_some())
                 .unwrap_or(false);
             // prune an emptied plugin_id map so absence stays absence
-            if self.instance_overlays.get(plugin_id).is_some_and(HashMap::is_empty) {
+            if self
+                .instance_overlays
+                .get(plugin_id)
+                .is_some_and(HashMap::is_empty)
+            {
                 self.instance_overlays.remove(plugin_id);
             }
             return changed;
@@ -332,7 +336,10 @@ mod tests {
             priority: 0,
             decision: PolicyDecision::Deny,
             reason: None,
-            r#match: PolicyMatch { tools: Some(vec![tool.into()]), ..Default::default() },
+            r#match: PolicyMatch {
+                tools: Some(vec![tool.into()]),
+                ..Default::default()
+            },
         }
     }
 
@@ -367,10 +374,16 @@ mod tests {
 
         // right key but wrong challenge (replay of a signature over other bytes) → refused
         let other_sig = kp.sign(b"a different challenge");
-        assert!(s.authorize_operator(op_lct, challenge, &other_sig).is_none());
+        assert!(
+            s.authorize_operator(op_lct, challenge, &other_sig)
+                .is_none()
+        );
 
         // unknown lct_id, even with a valid signature by its own key → refused
-        assert!(s.authorize_operator("lct:web4:operator:stranger", challenge, &good_sig).is_none());
+        assert!(
+            s.authorize_operator("lct:web4:operator:stranger", challenge, &good_sig)
+                .is_none()
+        );
 
         // malformed stored pubkey → fail-closed (can never verify)
         s.operator_access[0].public_key_hex = "not-hex".into();
@@ -407,7 +420,10 @@ mod tests {
         // clear via empty rules → gone, and the plugin_id map is pruned (absence stays absent)
         assert!(s.set_instance_overlay(pid, role, vec![]));
         assert!(s.instance_overlay(pid, role).is_none());
-        assert!(s.instance_overlays.is_empty(), "emptied plugin map is pruned");
+        assert!(
+            s.instance_overlays.is_empty(),
+            "emptied plugin map is pruned"
+        );
     }
 
     #[test]
@@ -421,7 +437,10 @@ mod tests {
         s2.set_instance_overlay("kimi-code", "role:x", vec![deny_rule("d", "Bash")]);
         let round: VaultPolicyState =
             serde_json::from_str(&serde_json::to_string(&s2).unwrap()).unwrap();
-        assert_eq!(round.instance_overlay("kimi-code", "role:x").map(Vec::len), Some(1));
+        assert_eq!(
+            round.instance_overlay("kimi-code", "role:x").map(Vec::len),
+            Some(1)
+        );
     }
 
     #[test]
@@ -534,7 +553,10 @@ mod tests {
             active_preset: "permissive".into(),
             ..Default::default()
         };
-        assert!(!s.resolve().unwrap().enforce, "precondition: permissive base is audit-only");
+        assert!(
+            !s.resolve().unwrap().enforce,
+            "precondition: permissive base is audit-only"
+        );
         s.role_overlays.insert(
             "role:constellation:mesh-worker".into(),
             vec![PolicyRule {
@@ -543,7 +565,10 @@ mod tests {
                 priority: 0,
                 decision: PolicyDecision::Deny,
                 reason: None,
-                r#match: PolicyMatch { tools: Some(vec!["X".into()]), ..Default::default() },
+                r#match: PolicyMatch {
+                    tools: Some(vec!["X".into()]),
+                    ..Default::default()
+                },
             }],
         );
         let cfg = s.role_configs();

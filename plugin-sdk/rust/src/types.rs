@@ -103,12 +103,25 @@ pub struct R6Action {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClosureClaim {
+    pub claim_id: String,
+    pub statement: String,
+    pub scope: String,
+    pub confidence: f64,
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub known_limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Outcome {
     pub success: bool,
     /// Domain-specific magnitude in `[0..1]`.
     pub magnitude: f64,
     pub error: Option<String>,
     pub result: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub closure_claims: Vec<ClosureClaim>,
 }
 
 impl Outcome {
@@ -118,6 +131,7 @@ impl Outcome {
             magnitude,
             error: None,
             result: HashMap::new(),
+            closure_claims: Vec::new(),
         }
     }
 
@@ -127,7 +141,13 @@ impl Outcome {
             magnitude,
             error: Some(error.into()),
             result: HashMap::new(),
+            closure_claims: Vec::new(),
         }
+    }
+
+    pub fn with_closure_claim(mut self, claim: ClosureClaim) -> Self {
+        self.closure_claims.push(claim);
+        self
     }
 }
 

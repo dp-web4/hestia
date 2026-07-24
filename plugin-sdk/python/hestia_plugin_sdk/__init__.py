@@ -41,6 +41,7 @@ from .errors import (
 from .transport import DEFAULT_HESTIA_ENDPOINT, discover_hestia_endpoint
 from .types import (
     HESTIA_PROTOCOL_VERSION,
+    ClosureClaim,
     ConnectResult,
     HestiaClientConfig,
     HistoryFilter,
@@ -70,6 +71,7 @@ __all__ = [
     # R6 lifecycle
     "ToolCallSpec",
     "R6Action",
+    "ClosureClaim",
     "Outcome",
     "OutcomeResult",
     # Policy

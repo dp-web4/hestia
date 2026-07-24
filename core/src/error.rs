@@ -36,7 +36,9 @@ pub enum CoreError {
     #[error("credential '{0}' already exists in vault (use --force to overwrite)")]
     CredentialAlreadyExists(String),
 
-    #[error("policy preset '{0}' is not built-in (expected one of: permissive, safety, strict, audit-only)")]
+    #[error(
+        "policy preset '{0}' is not built-in (expected one of: permissive, safety, strict, audit-only)"
+    )]
     InvalidPreset(String),
 
     #[error("invalid passphrase: {0}")]

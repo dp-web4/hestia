@@ -65,10 +65,7 @@ pub fn command_lacks(full_command: &str, must_not_contain: &[String]) -> bool {
 ///
 /// Default behavior when both `allowed_hours` and `allowed_days` are
 /// `None`: `true` (the window doesn't gate at all).
-pub fn time_window_matches<Tz1: TimeZone>(
-    window: &TimeWindow,
-    now: DateTime<Tz1>,
-) -> bool {
+pub fn time_window_matches<Tz1: TimeZone>(window: &TimeWindow, now: DateTime<Tz1>) -> bool {
     // If both fields are None, the window is effectively open.
     if window.allowed_hours.is_none() && window.allowed_days.is_none() {
         return true;
@@ -140,8 +137,14 @@ mod tests {
     fn command_lacks_check() {
         let patterns = vec!["GITHUB_PAT".into(), "@github.com".into()];
         assert!(command_lacks("git push origin main", &patterns));
-        assert!(!command_lacks("git push https://x:$GITHUB_PAT@github.com/r.git", &patterns));
-        assert!(!command_lacks("git push https://x:tok@github.com/r.git", &patterns));
+        assert!(!command_lacks(
+            "git push https://x:$GITHUB_PAT@github.com/r.git",
+            &patterns
+        ));
+        assert!(!command_lacks(
+            "git push https://x:tok@github.com/r.git",
+            &patterns
+        ));
     }
 
     #[test]
@@ -154,7 +157,8 @@ mod tests {
         let mut win = TimeWindow::default();
         win.allowed_hours = Some((9, 17));
         // 12:00 noon
-        let now: DateTime<chrono::Utc> = chrono::Utc.with_ymd_and_hms(2026, 5, 16, 12, 0, 0).unwrap();
+        let now: DateTime<chrono::Utc> =
+            chrono::Utc.with_ymd_and_hms(2026, 5, 16, 12, 0, 0).unwrap();
         assert!(time_window_matches(&win, now));
         // 8am
         let too_early = chrono::Utc.with_ymd_and_hms(2026, 5, 16, 8, 0, 0).unwrap();

@@ -34,7 +34,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use hestia::storage::{storage_key, SqliteChainStore};
+use hestia::storage::{SqliteChainStore, storage_key};
 use hestia::vault::storage::default_hestia_home;
 use web4_trust_core::EntityTrust;
 
@@ -134,8 +134,10 @@ fn main() -> Result<()> {
     let gate = mode == "gate";
     // `reversal` mode (v3): the JUDGMENT axis the gate calibration proved was
     // orthogonal-by-construction. Positives = outcome events (label 1, not
-    // reversed); negatives = `reversal` events (label 0) — a delayed judgment that
-    // the SUBJECT's work was reverted/rejected. Trust is reconstructed from
+    // reversed); negatives = `reversal` events whose classified cause is
+    // `invalid-result` (label 0). Requirement changes, new evidence,
+    // corrected adjudications, self-corrections, obsolescence, and legacy
+    // unclassified events are not validity negatives and are excluded. Trust is reconstructed from
     // OUTCOMES ONLY (the reversal is NOT fed back), so the estimate is pure
     // execution-reliability and the test is non-circular: "does execution
     // reliability predict a judgment-reversal?" Unlike the rule-gate, judgment
@@ -147,11 +149,19 @@ fn main() -> Result<()> {
     let mut n_warn = 0u64;
     let mut n_deny = 0u64;
     let mut n_reversal = 0u64;
+    let mut n_non_refuting_reversal = 0u64;
     for e in &all {
         let is_outcome = e.event_type == "outcome";
         let is_decision = e.event_type == "policy_decision";
         let is_reversal = e.event_type == "reversal";
         if !is_outcome && !(gate && is_decision) && !(reversal && is_reversal) {
+            continue;
+        }
+        if reversal
+            && is_reversal
+            && e.event_data.get("cause").and_then(|value| value.as_str()) != Some("invalid-result")
+        {
+            n_non_refuting_reversal += 1;
             continue;
         }
         // Reconstruct the daemon's post-rekey (instance, role) trust grain. Group
@@ -316,7 +326,14 @@ fn main() -> Result<()> {
     if gate {
         eprintln!(
             "calib_export[gate]: {} entries -> {} pairs across {} plugins: {} executed (label 1, {} exec-success) + {} warn + {} deny (label 0) -> {}",
-            total_entries, n_pairs, trust.len(), n_exec, n_success, n_warn, n_deny, out_path.display()
+            total_entries,
+            n_pairs,
+            trust.len(),
+            n_exec,
+            n_success,
+            n_warn,
+            n_deny,
+            out_path.display()
         );
         eprintln!(
             "  NOTE: warn PROCEEDS, so ~{} warned actions are ALSO 'executed' pairs (double-represented). For the no-double-count strict set filter kind in {{executed, deny}}.",
@@ -324,8 +341,14 @@ fn main() -> Result<()> {
         );
     } else if reversal {
         eprintln!(
-            "calib_export[reversal]: {} entries -> {} pairs across {} entities: {} outcomes (label 1) + {} reversals (label 0, judgment negatives) -> {}",
-            total_entries, n_pairs, trust.len(), n_exec, n_reversal, out_path.display()
+            "calib_export[reversal]: {} entries -> {} pairs across {} entities: {} outcomes (label 1) + {} invalid-result reversals (label 0); {} non-refuting/unclassified reversals excluded -> {}",
+            total_entries,
+            n_pairs,
+            trust.len(),
+            n_exec,
+            n_reversal,
+            n_non_refuting_reversal,
+            out_path.display()
         );
         eprintln!(
             "  NON-CIRCULAR: estimate = subject's OUTCOMES-ONLY trust (reversals NOT fed back). Test: does execution-reliability predict a judgment-reversal? N_reversal={} — treat below ~30 as directional only.",
@@ -334,7 +357,12 @@ fn main() -> Result<()> {
     } else {
         eprintln!(
             "calib_export[outcome]: {} entries, {} outcome pairs ({} success / {} fail) across {} plugins -> {}",
-            total_entries, n_pairs, n_success, n_pairs - n_success, trust.len(), out_path.display()
+            total_entries,
+            n_pairs,
+            n_success,
+            n_pairs - n_success,
+            trust.len(),
+            out_path.display()
         );
     }
     Ok(())

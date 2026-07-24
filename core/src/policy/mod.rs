@@ -23,11 +23,11 @@ pub mod rate_limit;
 pub mod types;
 
 pub use engine::PolicyEngine;
-pub use law_gate::{LawGate, LAW_FILE};
 pub use extract::{classify, extract_full_command, extract_target};
-pub use presets::{get_preset, is_preset_name, list_presets, PRESET_NAMES};
+pub use law_gate::{LAW_FILE, LawGate};
+pub use presets::{PRESET_NAMES, get_preset, is_preset_name, list_presets};
 pub use rate_limit::{RateLimitResult, RateLimiter};
 pub use types::{
-    fold_strictest, PolicyAction, PolicyConfig, PolicyDecision, PolicyEvaluation, PolicyMatch,
-    PolicyRule, PresetDefinition, RateLimitSpec, TimeWindow,
+    PolicyAction, PolicyConfig, PolicyDecision, PolicyEvaluation, PolicyMatch, PolicyRule,
+    PresetDefinition, RateLimitSpec, TimeWindow, fold_strictest,
 };

@@ -139,6 +139,14 @@ export class HestiaClient {
       magnitude: outcome.magnitude,
       error: outcome.error,
       result: outcome.result,
+      closure_claims: outcome.closureClaims?.map((claim) => ({
+        claim_id: claim.claimId,
+        statement: claim.statement,
+        scope: claim.scope,
+        confidence: claim.confidence,
+        evidence: claim.evidence,
+        known_limitations: claim.knownLimitations ?? [],
+      })),
     });
   }
 

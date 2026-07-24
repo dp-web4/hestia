@@ -104,8 +104,7 @@ pub struct ServerState {
     /// `(plugin_id, role)`. Selected AFTER the role engine and folded strictest-
     /// wins in the gate, so a specific orchestrator can only tighten its role's
     /// law, never loosen it. Built from the vault's `instance_overlays`.
-    pub instance_policy_engines:
-        HashMap<(String, String), crate::policy::PolicyEngine>,
+    pub instance_policy_engines: HashMap<(String, String), crate::policy::PolicyEngine>,
     /// Hub-law gate (consolidation, 2026-07-10): the third fold input.
     /// `None` = no law file at `$HESTIA_HOME/law/hub-law.yaml` (no-op);
     /// `Some(Invalid)` fails closed. See `policy::law_gate`.
@@ -155,7 +154,11 @@ impl ServerState {
         );
         // Phase-1 mirror: the constellation roles as Role LCT entities, with
         // VAULT-STABLE identities (same LCT across restarts; secrets sealed).
-        let role_registry = crate::role_registry::load_or_mint_registry(&mut vault, &sovereign_lct, &sovereign.lct_id());
+        let role_registry = crate::role_registry::load_or_mint_registry(
+            &mut vault,
+            &sovereign_lct,
+            &sovereign.lct_id(),
+        );
         // Custodial member LCTs, loaded from the vault (minted lazily on connect).
         let member_registry = crate::member_registry::load_members(&vault);
         // Resolve the active policy from the vault. Falls back to the
@@ -198,8 +201,9 @@ impl ServerState {
         // synthetic plugins.
         let synthetic_plugins: HashSet<String> = {
             use anyhow::Context;
-            crate::vault::load_doc(&vault, "presence", "synthetic", "synthetic.json")
-                .context("synthetic-plugin set unreadable — failing closed instead of treating it as empty")?
+            crate::vault::load_doc(&vault, "presence", "synthetic", "synthetic.json").context(
+                "synthetic-plugin set unreadable — failing closed instead of treating it as empty",
+            )?
         };
 
         Ok(Self {
@@ -290,8 +294,11 @@ impl ServerState {
             "secret_key_hex": hex::encode(kp.secret_key_bytes()),
             "note": "genesis operator credential — load into your dashboard client to sign in; keep private; rotate to a hardware key when able",
         });
-        std::fs::write(&key_path, serde_json::to_vec_pretty(&cred).unwrap_or_default())
-            .map_err(|e| anyhow::anyhow!("writing operator.key: {e}"))?;
+        std::fs::write(
+            &key_path,
+            serde_json::to_vec_pretty(&cred).unwrap_or_default(),
+        )
+        .map_err(|e| anyhow::anyhow!("writing operator.key: {e}"))?;
         let mut perms = std::fs::metadata(&key_path)?.permissions();
         perms.set_mode(0o600);
         std::fs::set_permissions(&key_path, perms)?;
@@ -444,7 +451,10 @@ impl ServerState {
         };
         // The authoritative record: certificate + backing attestations. Its
         // content hash binds the reference the subject LCT will carry.
-        let record = web4_core::CitizenshipRecord { certificate, attestations: evidence };
+        let record = web4_core::CitizenshipRecord {
+            certificate,
+            attestations: evidence,
+        };
         let entry_hash = record.content_hash();
         // Record the record in THIS society's ledger (its witness chain) — the
         // authoritative home. The event data IS the CitizenshipRecord, so a
@@ -485,7 +495,11 @@ impl ServerState {
             action_type: "outcome",
             action_target: "",
             action_id: "",
-            reason: if success { "outcome:success" } else { "outcome:failure" },
+            reason: if success {
+                "outcome:success"
+            } else {
+                "outcome:failure"
+            },
         };
         self.apply_outcome_ctx(plugin_id, success, magnitude, &ctx)
     }
@@ -510,9 +524,9 @@ impl ServerState {
         // reputation is its own, and can't be diluted or poisoned by another
         // capacity of the same instance.
         let trust_key = self.trust_entity_key(plugin_id, ctx.role_lct);
-        let (before, after) =
-            self.trust_store
-                .update_returning_prior(&trust_key, success, magnitude)?;
+        let (before, after) = self
+            .trust_store
+            .update_returning_prior(&trust_key, success, magnitude)?;
         // LCT-mapping (sequence head, `repemit-1`): resolve the durable member
         // LCT for `plugin_id` before building the delta, so `subject_lct` is a
         // ground-truth member identity minted under hestia's sovereign — never
@@ -646,8 +660,6 @@ impl ServerState {
 
 pub type SharedState = Arc<Mutex<ServerState>>;
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,35 +691,63 @@ mod tests {
         let mw = "role:constellation:mesh-worker";
         let dev = "role:constellation:interactive-dev";
         // Same plugin, mesh-worker role: two failures.
-        state.apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw)).unwrap();
-        let mw_trust = state.apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw)).unwrap();
+        state
+            .apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw))
+            .unwrap();
+        let mw_trust = state
+            .apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw))
+            .unwrap();
         // Same plugin, interactive-dev role: one success.
         let dev_trust = state
-            .apply_outcome_ctx("claude-code", true, 0.8, &crate::reputation::RepContext {
-                reason: "outcome:success", ..ctx_for(dev)
-            })
+            .apply_outcome_ctx(
+                "claude-code",
+                true,
+                0.8,
+                &crate::reputation::RepContext {
+                    reason: "outcome:success",
+                    ..ctx_for(dev)
+                },
+            )
             .unwrap();
         // Distinct entities: the two roles carry different entity_ids + scores.
         assert_ne!(mw_trust.entity_id, dev_trust.entity_id);
-        assert!(mw_trust.entity_id.ends_with(mw), "got {}", mw_trust.entity_id);
-        assert!(dev_trust.entity_id.ends_with(dev), "got {}", dev_trust.entity_id);
+        assert!(
+            mw_trust.entity_id.ends_with(mw),
+            "got {}",
+            mw_trust.entity_id
+        );
+        assert!(
+            dev_trust.entity_id.ends_with(dev),
+            "got {}",
+            dev_trust.entity_id
+        );
         // The mesh-worker's failures did not touch the dev role's trust.
-        assert!(dev_trust.talent() > mw_trust.talent(),
+        assert!(
+            dev_trust.talent() > mw_trust.talent(),
             "dev(success) {} must outrank mesh-worker(2 failures) {}",
-            dev_trust.talent(), mw_trust.talent());
+            dev_trust.talent(),
+            mw_trust.talent()
+        );
         // Same instance underlies both (the shared member LCT prefix).
         let inst = state.member_lct("claude-code").unwrap();
         assert!(mw_trust.entity_id.starts_with(&inst));
         assert!(dev_trust.entity_id.starts_with(&inst));
         // Re-reading by role recovers the same accrued entity.
-        assert_eq!(state.trust_for_role("claude-code", mw).entity_id, mw_trust.entity_id);
+        assert_eq!(
+            state.trust_for_role("claude-code", mw).entity_id,
+            mw_trust.entity_id
+        );
     }
 
     #[test]
     fn chain_grows_with_hash_linkage() {
         let (_dir, state) = make_state();
-        let e1 = state.append_chain("evt1", serde_json::json!({"a": 1})).unwrap();
-        let e2 = state.append_chain("evt2", serde_json::json!({"b": 2})).unwrap();
+        let e1 = state
+            .append_chain("evt1", serde_json::json!({"a": 1}))
+            .unwrap();
+        let e2 = state
+            .append_chain("evt2", serde_json::json!({"b": 2}))
+            .unwrap();
         assert_eq!(e1.prev_hash, "0".repeat(64));
         assert_eq!(e2.prev_hash, e1.hash);
         assert_eq!(e1.chain_position, 0);
@@ -754,7 +794,9 @@ mod tests {
     fn confer_citizenship_records_a_birth_cert_in_the_ledger_only_on_quorum() {
         let (_dir, state) = make_state();
         let subject = "lct:web4:mb32:bsubjectcitizen";
-        let w: Vec<web4_core::crypto::KeyPair> = (0..3).map(|_| web4_core::crypto::KeyPair::generate()).collect();
+        let w: Vec<web4_core::crypto::KeyPair> = (0..3)
+            .map(|_| web4_core::crypto::KeyPair::generate())
+            .collect();
         let wid: Vec<String> = (0..3).map(|i| format!("lct:web4:member:w{i}")).collect();
         let resolver = {
             let ks: Vec<_> = w.iter().map(|k| k.verifying_key()).collect();
@@ -765,16 +807,39 @@ mod tests {
         let chain_before = state.chain_len();
 
         // Below quorum → None, and NOTHING written to the ledger (fail-closed).
-        let two: Vec<_> = (0..2).map(|i| crate::witness::attest(subject, &wid[i], ts, &w[i])).collect();
-        assert!(state.confer_citizenship(subject, "lct:web4:role:citizen", None, &two, &resolver).unwrap().is_none());
-        assert_eq!(state.chain_len(), chain_before, "no birth on < 3 witnesses = no ledger write");
+        let two: Vec<_> = (0..2)
+            .map(|i| crate::witness::attest(subject, &wid[i], ts, &w[i]))
+            .collect();
+        assert!(
+            state
+                .confer_citizenship(subject, "lct:web4:role:citizen", None, &two, &resolver)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            state.chain_len(),
+            chain_before,
+            "no birth on < 3 witnesses = no ledger write"
+        );
 
         // Quorum → the birth cert is recorded in this society's ledger.
-        let three: Vec<_> = (0..3).map(|i| crate::witness::attest(subject, &wid[i], ts, &w[i])).collect();
-        let cref = state.confer_citizenship(subject, "lct:web4:role:citizen", None, &three, &resolver).unwrap().unwrap();
+        let three: Vec<_> = (0..3)
+            .map(|i| crate::witness::attest(subject, &wid[i], ts, &w[i]))
+            .collect();
+        let cref = state
+            .confer_citizenship(subject, "lct:web4:role:citizen", None, &three, &resolver)
+            .unwrap()
+            .unwrap();
         assert_eq!(cref.issuing_society, state.sovereign.lct_id());
-        assert!(!cref.entry_hash.is_empty(), "reference binds the record content hash");
-        assert_eq!(state.chain_len(), chain_before + 1, "conferral wrote one ledger event");
+        assert!(
+            !cref.entry_hash.is_empty(),
+            "reference binds the record content hash"
+        );
+        assert_eq!(
+            state.chain_len(),
+            chain_before + 1,
+            "conferral wrote one ledger event"
+        );
         let recent = state.recent_chain(1);
         assert_eq!(recent[0].event_type, "citizenship.conferred");
         assert_eq!(recent[0].event_data["citizen"], subject);
@@ -782,7 +847,10 @@ mod tests {
         let record: web4_core::CitizenshipRecord =
             serde_json::from_value(recent[0].event_data["record"].clone()).unwrap();
         assert_eq!(record.content_hash(), cref.entry_hash);
-        assert!(record.verify_quorum(subject, &resolver), "recorded evidence re-verifies");
+        assert!(
+            record.verify_quorum(subject, &resolver),
+            "recorded evidence re-verifies"
+        );
     }
 
     #[test]
@@ -800,7 +868,10 @@ mod tests {
                 sovereign: state.sovereign_lct.clone(),
             }
             .derive();
-            assert_eq!(native, via_web4core, "member_lct must equal the canonical derivation for {plugin}");
+            assert_eq!(
+                native, via_web4core,
+                "member_lct must equal the canonical derivation for {plugin}"
+            );
         }
     }
 
@@ -818,8 +889,12 @@ mod tests {
         let key = state.home.join("operator.key");
         assert!(key.exists());
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
-        let cred: serde_json::Value = serde_json::from_slice(&std::fs::read(&key).unwrap()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let cred: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&key).unwrap()).unwrap();
         assert_eq!(cred["lct_id"], first.clone().unwrap());
         assert_eq!(cred["secret_key_hex"].as_str().unwrap().len(), 64); // 32-byte seed hex
         // window shut: re-run is a no-op (no re-entry, no second operator)
@@ -850,19 +925,39 @@ mod tests {
         let sink = state.reputation_sink();
         let expected = state.member_lct("real-plugin").unwrap();
         let lines: Vec<String> = std::fs::File::open(&sink)
-            .map(|f| std::io::BufReader::new(f).lines().map_while(Result::ok).collect())
+            .map(|f| {
+                std::io::BufReader::new(f)
+                    .lines()
+                    .map_while(Result::ok)
+                    .collect()
+            })
             .unwrap_or_default();
         assert_eq!(lines.len(), 1, "one delta emitted for a real member");
-        assert!(lines[0].contains(&expected), "subject_lct is the member LCT");
-        assert!(!lines[0].contains("real-plugin"), "raw plugin_id never leaks");
+        assert!(
+            lines[0].contains(&expected),
+            "subject_lct is the member LCT"
+        );
+        assert!(
+            !lines[0].contains("real-plugin"),
+            "raw plugin_id never leaks"
+        );
 
         // A synthetic member: trust still updates locally, but NO delta is emitted.
         state.mark_synthetic("synthetic-plugin", 3).unwrap();
         state.apply_outcome("synthetic-plugin", false, 0.7).unwrap();
         let after: Vec<String> = std::fs::File::open(&sink)
-            .map(|f| std::io::BufReader::new(f).lines().map_while(Result::ok).collect())
+            .map(|f| {
+                std::io::BufReader::new(f)
+                    .lines()
+                    .map_while(Result::ok)
+                    .collect()
+            })
             .unwrap_or_default();
-        assert_eq!(after.len(), 1, "synthetic plugin emits no delta (fail-closed)");
+        assert_eq!(
+            after.len(),
+            1,
+            "synthetic plugin emits no delta (fail-closed)"
+        );
     }
 
     #[test]
@@ -957,6 +1052,9 @@ mod tests {
         // fallback to most-recent when session_id is absent
         assert_eq!(state.resolve_plugin_id(None), Some("bob".into()));
         // unknown session_id resolves to None (no fallback)
-        assert_eq!(state.resolve_plugin_id(Some("00000000-0000-0000-0000-000000000000")), None);
+        assert_eq!(
+            state.resolve_plugin_id(Some("00000000-0000-0000-0000-000000000000")),
+            None
+        );
     }
 }

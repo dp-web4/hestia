@@ -225,7 +225,10 @@ mod tests {
         // (so the hub won't silently drop it).
         assert!(!d.t3_delta.is_empty());
         for k in d.t3_delta.keys() {
-            assert!(matches!(k.as_str(), "talent" | "training" | "temperament"), "unknown t3 key {k}");
+            assert!(
+                matches!(k.as_str(), "talent" | "training" | "temperament"),
+                "unknown t3 key {k}"
+            );
         }
         // The recorded change equals to - from, exactly what hestia applied.
         for td in d.t3_delta.values() {

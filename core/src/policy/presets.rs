@@ -1,9 +1,7 @@
 //! The four named policy presets. Ports the constants and
 //! `SAFETY_RULES` list from `presets.py`.
 
-use super::types::{
-    PolicyConfig, PolicyDecision, PolicyMatch, PolicyRule, PresetDefinition,
-};
+use super::types::{PolicyConfig, PolicyDecision, PolicyMatch, PolicyRule, PresetDefinition};
 
 /// Build the safety-preset rule list. Lifted verbatim from `presets.py`:
 /// destructive bash, secret-file reads, memory-file writes, network warns,
@@ -117,9 +115,7 @@ fn safety_rules() -> Vec<PolicyRule> {
             name: "Warn on agent memory file modifications".into(),
             priority: 4,
             decision: PolicyDecision::Warn,
-            reason: Some(
-                "Memory file modification flagged - potential memory poisoning".into(),
-            ),
+            reason: Some("Memory file modification flagged - potential memory poisoning".into()),
             r#match: PolicyMatch {
                 categories: Some(vec!["file_write".into()]),
                 target_patterns: Some(vec![
@@ -165,8 +161,7 @@ pub fn get_preset(name: &str) -> Option<PresetDefinition> {
         }),
         "safety" => Some(PresetDefinition {
             name: "safety".into(),
-            description:
-                "Deny destructive bash, deny secret file reads, warn on network".into(),
+            description: "Deny destructive bash, deny secret file reads, warn on network".into(),
             config: PolicyConfig {
                 default_policy: PolicyDecision::Allow,
                 enforce: true,

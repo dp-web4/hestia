@@ -33,6 +33,7 @@ export {
   type ConnectResult,
   type ToolCallSpec,
   type R6Action,
+  type ClosureClaim,
   type Outcome,
   type OutcomeResult,
   type PolicyDecision,

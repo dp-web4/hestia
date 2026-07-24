@@ -62,6 +62,18 @@ export interface R6Action {
   readonly chainPosition: number;
 }
 
+/** Explicit, scoped claim authored by the actor when closing an action. */
+export interface ClosureClaim {
+  claimId: string;
+  statement: string;
+  scope: string;
+  /** Calibrated confidence in [0..1]. */
+  confidence: number;
+  /** Inspectable evidence pointers (chain hash, commit, test artifact, etc.). */
+  evidence: string[];
+  knownLimitations?: string[];
+}
+
 /** Outcome of a completed action. */
 export interface Outcome {
   success: boolean;
@@ -69,6 +81,8 @@ export interface Outcome {
   magnitude: number;
   error?: string;
   result?: Record<string, unknown>;
+  /** Optional explicit claims; a generic result never becomes an implied claim. */
+  closureClaims?: ClosureClaim[];
 }
 
 /** Result of `hestia_record_outcome`. */

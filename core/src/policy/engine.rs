@@ -7,9 +7,7 @@
 
 use sha2::{Digest, Sha256};
 
-use super::matchers::{
-    command_lacks, command_matches, target_matches, time_window_matches_now,
-};
+use super::matchers::{command_lacks, command_matches, target_matches, time_window_matches_now};
 use super::rate_limit::RateLimiter;
 use super::types::{
     PolicyAction, PolicyConfig, PolicyDecision, PolicyEvaluation, PolicyMatch, PolicyRule,
@@ -99,8 +97,7 @@ impl PolicyEngine {
             rule_id: None,
             rule_name: None,
             reason: format!("Default policy: {}", self.config.default_policy.as_str()),
-            enforced: self.config.enforce
-                || self.config.default_policy != PolicyDecision::Deny,
+            enforced: self.config.enforce || self.config.default_policy != PolicyDecision::Deny,
             constraints: vec![
                 format!("policy:{}", self.entity_id()),
                 format!("decision:{}", self.config.default_policy.as_str()),
@@ -234,7 +231,11 @@ mod tests {
         let e = PolicyEngine::new(get_preset("safety").unwrap().config);
         for ok in ["rm -rf /tmp/foo", "rm -rf /tmp/a /tmp/b", "rm -r /tmp/x/y"] {
             let v = e.evaluate(&bash(ok));
-            assert_eq!(v.decision, PolicyDecision::Allow, "expected allow for {ok:?}");
+            assert_eq!(
+                v.decision,
+                PolicyDecision::Allow,
+                "expected allow for {ok:?}"
+            );
             assert_eq!(v.rule_id.as_deref(), Some("allow-rm-whitelisted-scratch"));
         }
     }
@@ -251,7 +252,11 @@ mod tests {
             "rm -rf /tmp/x && rm -rf /home",
         ] {
             let v = e.evaluate(&bash(bad));
-            assert_eq!(v.decision, PolicyDecision::Deny, "expected deny for {bad:?}");
+            assert_eq!(
+                v.decision,
+                PolicyDecision::Deny,
+                "expected deny for {bad:?}"
+            );
             assert_eq!(v.rule_id.as_deref(), Some("deny-destructive-commands"));
         }
     }
@@ -374,25 +379,33 @@ mod tests {
         };
         let e = PolicyEngine::new(cfg);
         let read_key = PolicyAction {
-            tool_name: "Read", category: "file_read",
-            target: Some("/home/dp/.ssh/id_ed25519"), full_command: None,
+            tool_name: "Read",
+            category: "file_read",
+            target: Some("/home/dp/.ssh/id_ed25519"),
+            full_command: None,
         };
         assert_eq!(e.evaluate(&read_key).decision, PolicyDecision::Deny);
         let read_passphrase = PolicyAction {
-            tool_name: "Read", category: "file_read",
-            target: Some("/home/dp/.hestia/.passphrase"), full_command: None,
+            tool_name: "Read",
+            category: "file_read",
+            target: Some("/home/dp/.hestia/.passphrase"),
+            full_command: None,
         };
         assert_eq!(e.evaluate(&read_passphrase).decision, PolicyDecision::Deny);
         // Same category, benign target → no match (target condition unmet).
         let read_normal = PolicyAction {
-            tool_name: "Read", category: "file_read",
-            target: Some("/home/dp/project/src/main.rs"), full_command: None,
+            tool_name: "Read",
+            category: "file_read",
+            target: Some("/home/dp/project/src/main.rs"),
+            full_command: None,
         };
         assert_eq!(e.evaluate(&read_normal).decision, PolicyDecision::Allow);
         // Same target string but different category (e.g. Bash) → no match.
         let bash_mention = PolicyAction {
-            tool_name: "Bash", category: "command",
-            target: Some("/home/dp/.ssh/id_ed25519"), full_command: None,
+            tool_name: "Bash",
+            category: "command",
+            target: Some("/home/dp/.ssh/id_ed25519"),
+            full_command: None,
         };
         assert_eq!(e.evaluate(&bash_mention).decision, PolicyDecision::Allow);
     }

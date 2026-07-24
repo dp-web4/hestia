@@ -19,10 +19,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use hestia_plugin_sdk::{
-    create_hestia_client, HestiaClientConfig, HistoryFilter, Outcome, R6Action, ToolCallSpec,
-    VaultGetOptions, VaultSetOptions,
+    HestiaClientConfig, HistoryFilter, Outcome, R6Action, ToolCallSpec, VaultGetOptions,
+    VaultSetOptions, create_hestia_client,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use url::Url;
 
 fn endpoint() -> String {
@@ -119,37 +119,68 @@ fn check_field(value: &Value, check: &Value, scenario_id: &str) {
     if let Some(pattern) = check.get("matchesPattern").and_then(Value::as_str) {
         let s = value.as_str().unwrap_or("");
         let re = regex::Regex::new(pattern).expect("valid regex");
-        assert!(re.is_match(s), "{ctx} doesn't match /{pattern}/ (got {s:?})");
+        assert!(
+            re.is_match(s),
+            "{ctx} doesn't match /{pattern}/ (got {s:?})"
+        );
     }
     if let Some(prefix) = check.get("startsWith").and_then(Value::as_str) {
         let s = value.as_str().unwrap_or("");
         assert!(s.starts_with(prefix), "{ctx} doesn't start with {prefix}");
     }
-    if check.get("isInteger").and_then(Value::as_bool).unwrap_or(false) {
+    if check
+        .get("isInteger")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         assert!(
             value.is_i64() || value.is_u64(),
             "{ctx} not integer (got {value})"
         );
     }
-    if check.get("isNumber").and_then(Value::as_bool).unwrap_or(false) {
+    if check
+        .get("isNumber")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         assert!(value.is_number(), "{ctx} not number");
     }
-    if check.get("isBoolean").and_then(Value::as_bool).unwrap_or(false) {
+    if check
+        .get("isBoolean")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         assert!(value.is_boolean(), "{ctx} not bool");
     }
-    if check.get("isString").and_then(Value::as_bool).unwrap_or(false) {
+    if check
+        .get("isString")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         assert!(value.is_string(), "{ctx} not string");
     }
-    if check.get("isNonEmptyString").and_then(Value::as_bool).unwrap_or(false) {
+    if check
+        .get("isNonEmptyString")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         assert!(
             value.as_str().map(|s| !s.is_empty()).unwrap_or(false),
             "{ctx} not non-empty string"
         );
     }
-    if check.get("isArray").and_then(Value::as_bool).unwrap_or(false) {
+    if check
+        .get("isArray")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         assert!(value.is_array(), "{ctx} not array");
     }
-    if check.get("isIso8601").and_then(Value::as_bool).unwrap_or(false) {
+    if check
+        .get("isIso8601")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         if let Some(s) = value.as_str() {
             assert!(
                 DateTime::parse_from_rfc3339(s).is_ok(),
@@ -181,7 +212,10 @@ async fn invoke_step(
     step: &Value,
     captures: &HashMap<String, HashMap<String, Value>>,
 ) -> Option<Value> {
-    let raw_input = step.get("input").cloned().unwrap_or(Value::Object(serde_json::Map::new()));
+    let raw_input = step
+        .get("input")
+        .cloned()
+        .unwrap_or(Value::Object(serde_json::Map::new()));
     let input = interpolate(&raw_input, captures);
 
     if let Some(resource) = step.get("resource").and_then(Value::as_str) {
@@ -232,8 +266,12 @@ async fn invoke_step(
                 magnitude: get("magnitude").as_f64().unwrap_or(0.5),
                 error: get_str("error"),
                 result: HashMap::new(),
+                closure_claims: Vec::new(),
             };
-            let r = client.record_outcome(&action, outcome).await.expect("record_outcome");
+            let r = client
+                .record_outcome(&action, outcome)
+                .await
+                .expect("record_outcome");
             serde_json::to_value(&r).unwrap()
         }
         "hestia_query_policy" => {
@@ -251,7 +289,11 @@ async fn invoke_step(
                 scope: input
                     .get("scope")
                     .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 reason: get_str("reason"),
             };
@@ -276,21 +318,37 @@ async fn invoke_step(
                 scope: input
                     .get("scope")
                     .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 tags: input
                     .get("tags")
                     .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 allowed_consumers: input
                     .get("allowed_consumers")
                     .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default(),
             };
             let _ = client
-                .vault_set(&get_str_or_default("name"), &get_str_or_default("value"), opts)
+                .vault_set(
+                    &get_str_or_default("name"),
+                    &get_str_or_default("value"),
+                    opts,
+                )
                 .await
                 .expect("vault_set");
             json!({"stored": true})
@@ -299,11 +357,23 @@ async fn invoke_step(
             let filt_v = input.get("filter").cloned().unwrap_or(Value::Null);
             let limit = filt_v.get("limit").and_then(Value::as_u64).unwrap_or(50) as u32;
             let filter = HistoryFilter {
-                tool_name: filt_v.get("tool_name").and_then(Value::as_str).map(String::from),
-                target_pattern: filt_v.get("target_pattern").and_then(Value::as_str).map(String::from),
-                since: filt_v.get("since").and_then(Value::as_str).map(String::from),
+                tool_name: filt_v
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                target_pattern: filt_v
+                    .get("target_pattern")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                since: filt_v
+                    .get("since")
+                    .and_then(Value::as_str)
+                    .map(String::from),
                 limit: Some(limit),
-                outcome: filt_v.get("outcome").and_then(Value::as_str).map(String::from),
+                outcome: filt_v
+                    .get("outcome")
+                    .and_then(Value::as_str)
+                    .map(String::from),
             };
             let r = client.query_history(filter).await.expect("query_history");
             serde_json::to_value(&r).unwrap()
@@ -316,7 +386,10 @@ async fn invoke_step(
                 .cloned()
                 .unwrap_or_default();
             // SDK returns the raw daemon response: {"witnessEntryHash": "<hex>"}
-            client.request_witness(&event_type, event_data).await.expect("request_witness")
+            client
+                .request_witness(&event_type, event_data)
+                .await
+                .expect("request_witness")
         }
         _ => panic!("unsupported tool: {tool}"),
     };
@@ -354,7 +427,8 @@ async fn presence_protocol_v0_conformance() {
         return;
     }
     let vectors: Value =
-        serde_json::from_slice(&std::fs::read(&vectors_file).expect("read vectors")).expect("parse vectors");
+        serde_json::from_slice(&std::fs::read(&vectors_file).expect("read vectors"))
+            .expect("parse vectors");
 
     let client = create_hestia_client(
         HestiaClientConfig::new("conformance-runner-rust", "conformance-runner-rust")
@@ -395,7 +469,11 @@ async fn presence_protocol_v0_conformance() {
                 }
             }
         }
-        let steps = scenario.get("steps").and_then(Value::as_array).unwrap_or(&Vec::new()).clone();
+        let steps = scenario
+            .get("steps")
+            .and_then(Value::as_array)
+            .unwrap_or(&Vec::new())
+            .clone();
         for step in &steps {
             let result = invoke_step(&client, step, &captures).await;
             // capture

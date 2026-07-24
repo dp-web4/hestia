@@ -179,7 +179,15 @@ impl HestiaClient {
                 Value::Object(outcome.result.into_iter().collect()),
             );
         }
-        self.call_tool::<OutcomeResult>("hestia_record_outcome", args).await
+        if !outcome.closure_claims.is_empty() {
+            args.insert(
+                "closure_claims".into(),
+                serde_json::to_value(outcome.closure_claims)
+                    .map_err(|error| HestiaError::InvalidResponse(error.to_string()))?,
+            );
+        }
+        self.call_tool::<OutcomeResult>("hestia_record_outcome", args)
+            .await
     }
 
     pub async fn query_policy(&self, action: &R6Action) -> Result<PolicyResult> {
@@ -188,7 +196,8 @@ impl HestiaClient {
             "action_id".into(),
             Value::String(action.action_id.to_string()),
         );
-        self.call_tool::<PolicyResult>("hestia_query_policy", args).await
+        self.call_tool::<PolicyResult>("hestia_query_policy", args)
+            .await
     }
 
     pub async fn vault_get(&self, name: &str, options: VaultGetOptions) -> Result<VaultValue> {
@@ -236,8 +245,12 @@ impl HestiaClient {
 
     pub async fn query_history(&self, filter: HistoryFilter) -> Result<HistoryResult> {
         let mut args = serde_json::Map::new();
-        args.insert("filter".into(), serde_json::to_value(filter).unwrap_or(Value::Null));
-        self.call_tool::<HistoryResult>("hestia_query_history", args).await
+        args.insert(
+            "filter".into(),
+            serde_json::to_value(filter).unwrap_or(Value::Null),
+        );
+        self.call_tool::<HistoryResult>("hestia_query_history", args)
+            .await
     }
 
     pub async fn request_witness(
@@ -309,7 +322,7 @@ impl HestiaClient {
             _ => {
                 return Err(HestiaError::InvalidResponse(format!(
                     "resource {uri} has no text content"
-                )))
+                )));
             }
         };
         serde_json::from_str(&text)
@@ -377,4 +390,3 @@ fn parse_or_envelope(value: Value) -> Result<Value> {
 pub fn create_hestia_client(config: HestiaClientConfig) -> HestiaClient {
     HestiaClient::new(config)
 }
-

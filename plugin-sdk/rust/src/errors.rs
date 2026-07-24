@@ -25,10 +25,7 @@ pub enum HestiaError {
     VaultNotFound { name: String },
 
     #[error("hestia: credential '{name}' not allowed under scope {scope:?} for this plugin")]
-    VaultScopeMismatch {
-        name: String,
-        scope: Vec<String>,
-    },
+    VaultScopeMismatch { name: String, scope: Vec<String> },
 
     #[error("hestia: action {action_id} not found (begin_action required first)")]
     ActionNotFound { action_id: String },

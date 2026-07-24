@@ -34,7 +34,7 @@
 //! witness-on-request; that is a service, not a gate.
 
 use web4_core::{
-    Attestation, AttestationType, BirthCertificate, BirthContext, PublicKey, BIRTH_WITNESS_QUORUM,
+    Attestation, AttestationType, BIRTH_WITNESS_QUORUM, BirthCertificate, BirthContext, PublicKey,
 };
 
 /// Sign an `Existence` attestation over `subject_lct_id` as `witness_lct_id`,
@@ -143,7 +143,12 @@ mod tests {
     #[test]
     fn attest_produces_a_verifiable_existence_attestation() {
         let kp = KeyPair::generate();
-        let a = attest("lct:web4:mb32:bsubject", "lct:web4:member:legion", now(), &kp);
+        let a = attest(
+            "lct:web4:mb32:bsubject",
+            "lct:web4:member:legion",
+            now(),
+            &kp,
+        );
         assert_eq!(a.attestation_type, AttestationType::Existence);
         assert_eq!(a.witness, "lct:web4:member:legion");
         assert!(a.verify("lct:web4:mb32:bsubject", &kp.verifying_key()));
@@ -166,7 +171,12 @@ mod tests {
         let mut atts = vec![
             attest(subject, &wid[0], now(), &w[0]),
             attest(subject, &wid[1], now(), &w[1]),
-            attest(subject, &wid[0], now() + chrono::Duration::seconds(5), &w[0]),
+            attest(
+                subject,
+                &wid[0],
+                now() + chrono::Duration::seconds(5),
+                &w[0],
+            ),
         ];
         let vd = valid_distinct_existence(subject, &atts, &resolver);
         assert_eq!(vd.len(), 2, "duplicate witness does not add to the quorum");
@@ -190,15 +200,44 @@ mod tests {
             move |id: &str| wid.iter().position(|x| x == id).map(|i| ks[i].clone())
         };
         // Two witnesses → below quorum → None (no birth on < 3 witnesses).
-        let two = vec![attest(subject, &wid[0], now(), &w[0]), attest(subject, &wid[1], now(), &w[1])];
-        assert!(build_birth_certificate(subject, "lct:web4:role:citizen", "lct:web4:society:hestia", None, &two, now(), &resolver).is_none());
+        let two = vec![
+            attest(subject, &wid[0], now(), &w[0]),
+            attest(subject, &wid[1], now(), &w[1]),
+        ];
+        assert!(
+            build_birth_certificate(
+                subject,
+                "lct:web4:role:citizen",
+                "lct:web4:society:hestia",
+                None,
+                &two,
+                now(),
+                &resolver
+            )
+            .is_none()
+        );
         // Three distinct → Some(cert) naming exactly those witnesses.
-        let three: Vec<_> = (0..3).map(|i| attest(subject, &wid[i], now(), &w[i])).collect();
-        let (cert, evidence) = build_birth_certificate(subject, "lct:web4:role:citizen", "lct:web4:society:hestia", None, &three, now(), &resolver).unwrap();
+        let three: Vec<_> = (0..3)
+            .map(|i| attest(subject, &wid[i], now(), &w[i]))
+            .collect();
+        let (cert, evidence) = build_birth_certificate(
+            subject,
+            "lct:web4:role:citizen",
+            "lct:web4:society:hestia",
+            None,
+            &three,
+            now(),
+            &resolver,
+        )
+        .unwrap();
         assert_eq!(cert.birth_witnesses.len(), 3);
         assert_eq!(cert.issuing_society, "lct:web4:society:hestia");
         assert_eq!(cert.citizen_role, "lct:web4:role:citizen");
-        assert_eq!(evidence.len(), 3, "the backing attestations travel with the cert");
+        assert_eq!(
+            evidence.len(),
+            3,
+            "the backing attestations travel with the cert"
+        );
         assert!(cert.quorum_structurally_ok());
     }
 
@@ -211,7 +250,13 @@ mod tests {
         let atts = vec![
             attest(subject, "lct:web4:member:good", now(), &good),
             // "forged": claims to be :good but signed by a different key
-            Attestation::sign(subject, "lct:web4:member:good2", AttestationType::Existence, now(), &forger),
+            Attestation::sign(
+                subject,
+                "lct:web4:member:good2",
+                AttestationType::Existence,
+                now(),
+                &forger,
+            ),
         ];
         // resolver returns good's key for :good, and nothing for :good2 (unknown)
         let resolver = |id: &str| (id == "lct:web4:member:good").then(|| good.verifying_key());

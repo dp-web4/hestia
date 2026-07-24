@@ -88,12 +88,17 @@ pub struct HubChannel {
 
 impl HubChannel {
     pub fn new(hub_lct_id: Uuid, pair_id: Uuid, hub_pubkey_hex: &str) -> Result<Self> {
-        let bytes = hex::decode(hub_pubkey_hex)
-            .context("decoding hub pubkey hex")?;
-        let arr: [u8; 32] = bytes.as_slice().try_into()
+        let bytes = hex::decode(hub_pubkey_hex).context("decoding hub pubkey hex")?;
+        let arr: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
             .map_err(|_| anyhow::anyhow!("hub pubkey must be 32 bytes, got {}", bytes.len()))?;
         let hub_pubkey = PublicKey::from_bytes(&arr).context("parsing hub pubkey")?;
-        Ok(Self { hub_lct_id, pair_id, hub_pubkey })
+        Ok(Self {
+            hub_lct_id,
+            pair_id,
+            hub_pubkey,
+        })
     }
 
     /// Build a channel from a discovery result + a freshly-minted `pair_id`.
@@ -294,31 +299,49 @@ impl HubClient {
 
     /// Discover hub metadata from well-known URL.
     pub async fn discover(&self, base_url: &str) -> Result<HubInfo> {
-        let url = format!("{}/.well-known/web4-hub.json", base_url.trim_end_matches('/'));
-        let resp = self.http.get(&url).send().await
+        let url = format!(
+            "{}/.well-known/web4-hub.json",
+            base_url.trim_end_matches('/')
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
             .with_context(|| format!("connecting to {url}"))?;
 
         if !resp.status().is_success() {
             anyhow::bail!("hub discovery failed: HTTP {}", resp.status());
         }
 
-        resp.json::<HubInfo>().await
+        resp.json::<HubInfo>()
+            .await
             .with_context(|| format!("parsing hub info from {url}"))
     }
 
     /// Request a challenge nonce from the hub.
-    pub async fn challenge(&self, rest_endpoint: &str, for_lct_id: Uuid) -> Result<ChallengeResponse> {
+    pub async fn challenge(
+        &self,
+        rest_endpoint: &str,
+        for_lct_id: Uuid,
+    ) -> Result<ChallengeResponse> {
         let url = format!("{}/auth/challenge", rest_endpoint);
         let body = serde_json::json!({ "for_lct_id": for_lct_id.to_string() });
 
-        let resp = self.http.post(&url).json(&body).send().await
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .with_context(|| format!("requesting challenge from {url}"))?;
 
         if !resp.status().is_success() {
             anyhow::bail!("challenge request failed: HTTP {}", resp.status());
         }
 
-        resp.json::<ChallengeResponse>().await
+        resp.json::<ChallengeResponse>()
+            .await
             .with_context(|| "parsing challenge response")
     }
 
@@ -347,23 +370,31 @@ impl HubClient {
             payload["name"] = serde_json::Value::String(n);
         }
 
-        let envelope = SignedEnvelope::create(
-            challenge.nonce, payload, member_lct_id, member_keypair,
-        );
+        let envelope =
+            SignedEnvelope::create(challenge.nonce, payload, member_lct_id, member_keypair);
 
         let url = format!("{rest}/hubs/{hub_id}/members/join");
-        let resp = self.http.post(&url).json(&envelope).send().await
+        let resp = self
+            .http
+            .post(&url)
+            .json(&envelope)
+            .send()
+            .await
             .with_context(|| format!("posting join to {url}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        let body: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        let body: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
 
         // 202 = the hub verified our request but hub law escalates admission
         // to the Sovereign (not auto-admitted). Distinct from a hard failure.
         if status.as_u16() == 202 {
-            let reason = body.get("error").and_then(|v| v.as_str())
+            let reason = body
+                .get("error")
+                .and_then(|v| v.as_str())
                 .or_else(|| body.get("reason").and_then(|v| v.as_str()))
-                .unwrap_or("admission escalated to Sovereign").to_string();
+                .unwrap_or("admission escalated to Sovereign")
+                .to_string();
             return Ok(JoinOutcome::Escalated { reason });
         }
         if !status.is_success() {
@@ -403,24 +434,24 @@ impl HubClient {
 
         // 3. Sign (nonce ++ canonical(payload)) — matches the hub's
         //    SignedEnvelope::signing_bytes exactly.
-        let envelope = SignedEnvelope::create(
-            challenge.nonce,
-            payload,
-            member_lct_id,
-            member_keypair,
-        );
+        let envelope =
+            SignedEnvelope::create(challenge.nonce, payload, member_lct_id, member_keypair);
 
         // 4. POST the envelope directly to /events (not wrapped).
         let url = format!("{rest}/hubs/{hub_id}/events");
-        let resp = self.http.post(&url).json(&envelope).send().await
+        let resp = self
+            .http
+            .post(&url)
+            .json(&envelope)
+            .send()
+            .await
             .with_context(|| format!("posting profile act to {url}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
             anyhow::bail!("hub /events returned HTTP {status}: {text}");
         }
-        serde_json::from_str(&text)
-            .with_context(|| "parsing /events response")
+        serde_json::from_str(&text).with_context(|| "parsing /events response")
     }
 
     /// Submit a signed envelope to a hub endpoint.
@@ -429,9 +460,12 @@ impl HubClient {
         url: &str,
         envelope: &SignedEnvelope,
     ) -> Result<serde_json::Value> {
-        let resp = self.http.post(url)
+        let resp = self
+            .http
+            .post(url)
             .json(&serde_json::json!({ "envelope": envelope }))
-            .send().await
+            .send()
+            .await
             .with_context(|| format!("submitting to {url}"))?;
 
         let status = resp.status();
@@ -441,7 +475,9 @@ impl HubClient {
             anyhow::bail!("hub returned HTTP {status}: {body}");
         }
 
-        serde_json::from_str(&body).unwrap_or(serde_json::Value::Null).pipe(Ok)
+        serde_json::from_str(&body)
+            .unwrap_or(serde_json::Value::Null)
+            .pipe(Ok)
     }
 
     /// Register a delegation with the hub so it can verify agent signatures.
@@ -452,9 +488,12 @@ impl HubClient {
         envelope: &SignedEnvelope,
     ) -> Result<()> {
         let url = format!("{}/hubs/{}/delegations", rest_endpoint, hub_id);
-        let resp = self.http.post(&url)
+        let resp = self
+            .http
+            .post(&url)
             .json(&serde_json::json!({ "envelope": envelope }))
-            .send().await
+            .send()
+            .await
             .with_context(|| format!("registering delegation at {url}"))?;
 
         if !resp.status().is_success() {
@@ -483,30 +522,46 @@ impl HubClient {
     /// resolves the same way whether the sender is the shell watcher or hestia.
     pub async fn resolve_member_by_name(&self, base_url: &str, name: &str) -> Result<Uuid> {
         let url = format!("{}/tools/list_members", base_url.trim_end_matches('/'));
-        let resp = self.http.get(&url).send().await
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
             .with_context(|| format!("listing members at {url}"))?;
         if !resp.status().is_success() {
             anyhow::bail!("hub /tools/list_members returned HTTP {}", resp.status());
         }
-        let body: serde_json::Value = resp.json().await
-            .context("parsing list_members response")?;
-        let members = body.get("members").and_then(|m| m.as_array())
+        let body: serde_json::Value = resp.json().await.context("parsing list_members response")?;
+        let members = body
+            .get("members")
+            .and_then(|m| m.as_array())
             .ok_or_else(|| anyhow::anyhow!("list_members response has no `members` array"))?;
         let want = name.to_lowercase();
-        let name_of = |m: &serde_json::Value|
-            m.get("name").and_then(|n| n.as_str()).unwrap_or("").to_lowercase();
-        let lct_of = |m: &serde_json::Value|
-            m.get("lct_id").and_then(|l| l.as_str()).and_then(|s| Uuid::parse_str(s).ok());
+        let name_of = |m: &serde_json::Value| {
+            m.get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_lowercase()
+        };
+        let lct_of = |m: &serde_json::Value| {
+            m.get("lct_id")
+                .and_then(|l| l.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+        };
         if let Some(m) = members.iter().find(|m| name_of(m) == want) {
             return lct_of(m).ok_or_else(|| anyhow::anyhow!("member '{name}' has no valid lct_id"));
         }
-        let pref: Vec<&serde_json::Value> =
-            members.iter().filter(|m| name_of(m).starts_with(&want)).collect();
+        let pref: Vec<&serde_json::Value> = members
+            .iter()
+            .filter(|m| name_of(m).starts_with(&want))
+            .collect();
         match pref.as_slice() {
             [m] => lct_of(m).ok_or_else(|| anyhow::anyhow!("member '{name}' has no valid lct_id")),
             [] => anyhow::bail!("no hub member matches name '{name}'"),
             _ => anyhow::bail!(
-                "ambiguous member name '{name}' — matches {} members; use the LCT id", pref.len()),
+                "ambiguous member name '{name}' — matches {} members; use the LCT id",
+                pref.len()
+            ),
         }
     }
 
@@ -534,15 +589,20 @@ impl HubClient {
             pair_id: channel.pair_id,
             sealed,
         };
-        let resp = self.http.post(&url).json(&body).send().await
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .with_context(|| format!("posting channel query to {url}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
             anyhow::bail!("hub channel returned HTTP {status}: {text}");
         }
-        let out: ChannelResponseBody = serde_json::from_str(&text)
-            .with_context(|| "parsing sealed channel response")?;
+        let out: ChannelResponseBody =
+            serde_json::from_str(&text).with_context(|| "parsing sealed channel response")?;
         channel.open_response(my, &out.sealed)
     }
 
@@ -564,11 +624,19 @@ impl HubClient {
     ) -> Result<serde_json::Value> {
         // Step 1: get a challenge nonce from the hub (over the channel,
         // so even the challenge exchange is sealed).
-        let challenge = self.channel_query(
-            rest_endpoint, channel, my, my_lct_id,
-            "constellation_challenge", serde_json::json!({}),
-        ).await?;
-        let nonce = challenge.get("nonce").and_then(|v| v.as_str())
+        let challenge = self
+            .channel_query(
+                rest_endpoint,
+                channel,
+                my,
+                my_lct_id,
+                "constellation_challenge",
+                serde_json::json!({}),
+            )
+            .await?;
+        let nonce = challenge
+            .get("nonce")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("hub challenge response missing nonce"))?;
 
         // Step 2: caller builds + signs the attestation against that nonce.
@@ -576,10 +644,14 @@ impl HubClient {
 
         // Step 3: present it.
         self.channel_query(
-            rest_endpoint, channel, my, my_lct_id,
+            rest_endpoint,
+            channel,
+            my,
+            my_lct_id,
             "present_constellation",
             serde_json::to_value(&attestation)?,
-        ).await
+        )
+        .await
     }
 
     /// Publish one LCT to the hub registry — the live half of the
@@ -609,7 +681,12 @@ impl HubClient {
             keypair,
         );
         let url = format!("{rest}/hubs/{hub_id}/lcts/publish");
-        let resp = self.http.post(&url).json(&envelope).send().await
+        let resp = self
+            .http
+            .post(&url)
+            .json(&envelope)
+            .send()
+            .await
             .with_context(|| format!("posting lct publish to {url}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -622,17 +699,17 @@ impl HubClient {
     /// List the hub registry (`GET /v1/hubs/{hub_id}/lcts`). Read-only —
     /// used after a publish to verify what the registry actually serves,
     /// rather than trusting the acceptance receipts alone.
-    pub async fn list_lcts(
-        &self,
-        rest_endpoint: &str,
-        hub_id: Uuid,
-    ) -> Result<serde_json::Value> {
+    pub async fn list_lcts(&self, rest_endpoint: &str, hub_id: Uuid) -> Result<serde_json::Value> {
         let url = format!(
             "{}/hubs/{}/lcts",
             rest_endpoint.trim_end_matches('/'),
             hub_id
         );
-        let resp = self.http.get(&url).send().await
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
             .with_context(|| format!("listing registry at {url}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -659,7 +736,11 @@ impl HubClient {
             hub_id,
             lct_id
         );
-        let resp = self.http.get(&url).send().await
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
             .with_context(|| format!("resolving LCT at {url}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -667,7 +748,8 @@ impl HubClient {
             anyhow::bail!("hub /lcts/:id returned HTTP {status}: {text}");
         }
         // The registry serves { lct_id, document, provenance, ... }.
-        let v: serde_json::Value = serde_json::from_str(&text).context("parsing /lcts/:id response")?;
+        let v: serde_json::Value =
+            serde_json::from_str(&text).context("parsing /lcts/:id response")?;
         let doc = v.get("document").cloned().unwrap_or(v);
         serde_json::from_value(doc).context("parsing resolved LCT document")
     }
@@ -698,7 +780,11 @@ impl HubClient {
             hub_id,
             member_uuid
         );
-        let resp = self.http.get(&url).send().await
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
             .with_context(|| format!("resolving member pubkey at {url}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -710,9 +796,10 @@ impl HubClient {
         }
         let v: serde_json::Value =
             serde_json::from_str(&text).context("parsing /members/:uuid/pubkey response")?;
-        let hex_str = v.get("pubkey_hex").and_then(|x| x.as_str()).ok_or_else(|| {
-            anyhow::anyhow!("member pubkey response missing pubkey_hex")
-        })?;
+        let hex_str = v
+            .get("pubkey_hex")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow::anyhow!("member pubkey response missing pubkey_hex"))?;
         let bytes: [u8; 32] = hex::decode(hex_str)
             .ok()
             .and_then(|b| b.try_into().ok())
@@ -738,11 +825,20 @@ impl HubClient {
         payload: serde_json::Value,
     ) -> Result<SignedEnvelope> {
         let challenge = self.challenge(rest_endpoint, our_uuid).await?;
-        Ok(SignedEnvelope::create(challenge.nonce, payload, our_uuid, our_kp))
+        Ok(SignedEnvelope::create(
+            challenge.nonce,
+            payload,
+            our_uuid,
+            our_kp,
+        ))
     }
 
     fn pairs_base(rest_endpoint: &str, hub_id: Uuid) -> String {
-        format!("{}/hubs/{}/pairs", rest_endpoint.trim_end_matches('/'), hub_id)
+        format!(
+            "{}/hubs/{}/pairs",
+            rest_endpoint.trim_end_matches('/'),
+            hub_id
+        )
     }
 
     /// `POST /pairs/request` — propose a pairing (carrying our initiator
@@ -756,10 +852,20 @@ impl HubClient {
         payload: &crate::pairing::PairRequestPayload,
     ) -> Result<Uuid> {
         let env = self
-            .sign_pair_payload(rest_endpoint, our_uuid, our_kp, serde_json::to_value(payload)?)
+            .sign_pair_payload(
+                rest_endpoint,
+                our_uuid,
+                our_kp,
+                serde_json::to_value(payload)?,
+            )
             .await?;
         let url = format!("{}/request", Self::pairs_base(rest_endpoint, hub_id));
-        let resp = self.http.post(&url).json(&env).send().await
+        let resp = self
+            .http
+            .post(&url)
+            .json(&env)
+            .send()
+            .await
             .with_context(|| format!("POST {url}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -783,10 +889,24 @@ impl HubClient {
         payload: &crate::pairing::PairConfirmPayload,
     ) -> Result<()> {
         let env = self
-            .sign_pair_payload(rest_endpoint, our_uuid, our_kp, serde_json::to_value(payload)?)
+            .sign_pair_payload(
+                rest_endpoint,
+                our_uuid,
+                our_kp,
+                serde_json::to_value(payload)?,
+            )
             .await?;
-        let url = format!("{}/{}/confirm", Self::pairs_base(rest_endpoint, hub_id), pair_id);
-        let resp = self.http.post(&url).json(&env).send().await
+        let url = format!(
+            "{}/{}/confirm",
+            Self::pairs_base(rest_endpoint, hub_id),
+            pair_id
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .json(&env)
+            .send()
+            .await
             .with_context(|| format!("POST {url}"))?;
         let status = resp.status();
         if !status.is_success() {
@@ -809,10 +929,24 @@ impl HubClient {
         payload: &crate::pairing::PairRevokePayload,
     ) -> Result<()> {
         let env = self
-            .sign_pair_payload(rest_endpoint, our_uuid, our_kp, serde_json::to_value(payload)?)
+            .sign_pair_payload(
+                rest_endpoint,
+                our_uuid,
+                our_kp,
+                serde_json::to_value(payload)?,
+            )
             .await?;
-        let url = format!("{}/{}/revoke", Self::pairs_base(rest_endpoint, hub_id), pair_id);
-        let resp = self.http.post(&url).json(&env).send().await
+        let url = format!(
+            "{}/{}/revoke",
+            Self::pairs_base(rest_endpoint, hub_id),
+            pair_id
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .json(&env)
+            .send()
+            .await
             .with_context(|| format!("POST {url}"))?;
         let status = resp.status();
         if !status.is_success() {
@@ -831,7 +965,11 @@ impl HubClient {
         pair_id: Uuid,
     ) -> Result<crate::pairing::PairView> {
         let url = format!("{}/{}", Self::pairs_base(rest_endpoint, hub_id), pair_id);
-        let resp = self.http.get(&url).send().await
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
             .with_context(|| format!("GET {url}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -858,10 +996,24 @@ impl HubClient {
             body: body_b64,
         };
         let env = self
-            .sign_pair_payload(rest_endpoint, our_uuid, our_kp, serde_json::to_value(&payload)?)
+            .sign_pair_payload(
+                rest_endpoint,
+                our_uuid,
+                our_kp,
+                serde_json::to_value(&payload)?,
+            )
             .await?;
-        let url = format!("{}/{}/messages", Self::pairs_base(rest_endpoint, hub_id), pair_id);
-        let resp = self.http.post(&url).json(&env).send().await
+        let url = format!(
+            "{}/{}/messages",
+            Self::pairs_base(rest_endpoint, hub_id),
+            pair_id
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .json(&env)
+            .send()
+            .await
             .with_context(|| format!("POST {url}"))?;
         let status = resp.status();
         if !status.is_success() {
@@ -880,11 +1032,19 @@ impl HubClient {
         pair_id: Uuid,
         since: Option<u64>,
     ) -> Result<Vec<crate::pairing::PairMessageView>> {
-        let mut url = format!("{}/{}/messages", Self::pairs_base(rest_endpoint, hub_id), pair_id);
+        let mut url = format!(
+            "{}/{}/messages",
+            Self::pairs_base(rest_endpoint, hub_id),
+            pair_id
+        );
         if let Some(s) = since {
             url.push_str(&format!("?since={s}"));
         }
-        let resp = self.http.get(&url).send().await
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
             .with_context(|| format!("GET {url}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -922,20 +1082,31 @@ impl HubClient {
             "device_pubkey_hex": device_pubkey_hex,
             "device_class": device_class,
         });
-        let env = self.sign_pair_payload(rest_endpoint, our_uuid, our_kp, payload).await?;
+        let env = self
+            .sign_pair_payload(rest_endpoint, our_uuid, our_kp, payload)
+            .await?;
         let url = format!(
             "{}/hubs/{}/constellation/enroll",
-            rest_endpoint.trim_end_matches('/'), hub_id
+            rest_endpoint.trim_end_matches('/'),
+            hub_id
         );
-        let resp = self.http.post(&url).json(&env).send().await
+        let resp = self
+            .http
+            .post(&url)
+            .json(&env)
+            .send()
+            .await
             .with_context(|| format!("POST {url}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
             anyhow::bail!("device_enroll failed: HTTP {status}: {text}");
         }
-        let v: serde_json::Value = serde_json::from_str(&text).context("parsing enroll response")?;
-        Ok(v.get("enrollment_version").and_then(|x| x.as_u64()).unwrap_or(0))
+        let v: serde_json::Value =
+            serde_json::from_str(&text).context("parsing enroll response")?;
+        Ok(v.get("enrollment_version")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0))
     }
 
     /// `POST /constellation/revoke` — revoke one of our enrolled devices.
@@ -951,12 +1122,20 @@ impl HubClient {
             "action": "device_revoke",
             "device_lct_id": device_lct_id,
         });
-        let env = self.sign_pair_payload(rest_endpoint, our_uuid, our_kp, payload).await?;
+        let env = self
+            .sign_pair_payload(rest_endpoint, our_uuid, our_kp, payload)
+            .await?;
         let url = format!(
             "{}/hubs/{}/constellation/revoke",
-            rest_endpoint.trim_end_matches('/'), hub_id
+            rest_endpoint.trim_end_matches('/'),
+            hub_id
         );
-        let resp = self.http.post(&url).json(&env).send().await
+        let resp = self
+            .http
+            .post(&url)
+            .json(&env)
+            .send()
+            .await
             .with_context(|| format!("POST {url}"))?;
         let status = resp.status();
         if !status.is_success() {
@@ -976,9 +1155,15 @@ impl HubClient {
     ) -> Result<serde_json::Value> {
         let url = format!(
             "{}/hubs/{}/constellation/{}/devices",
-            rest_endpoint.trim_end_matches('/'), hub_id, owner_uuid
+            rest_endpoint.trim_end_matches('/'),
+            hub_id,
+            owner_uuid
         );
-        let resp = self.http.get(&url).send().await
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
             .with_context(|| format!("GET {url}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -1037,9 +1222,11 @@ pub fn resolve_publish_identity(
 ) -> Result<(Uuid, bool)> {
     match source {
         MemberKeySource::VaultIdentity => {
-            let id = vault_identity_lct_id.ok_or_else(|| anyhow::anyhow!(
-                "vault has no ai_identity_lct_id — run `hestia init --ai` before publishing"
-            ))?;
+            let id = vault_identity_lct_id.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "vault has no ai_identity_lct_id — run `hestia init --ai` before publishing"
+                )
+            })?;
             Ok((id, id != conn_our_lct_id))
         }
         MemberKeySource::ChannelKeyFile { .. } => Ok((conn_our_lct_id, false)),
@@ -1047,7 +1234,12 @@ pub fn resolve_publish_identity(
 }
 
 trait Pipe: Sized {
-    fn pipe<F, R>(self, f: F) -> R where F: FnOnce(Self) -> R { f(self) }
+    fn pipe<F, R>(self, f: F) -> R
+    where
+        F: FnOnce(Self) -> R,
+    {
+        f(self)
+    }
 }
 impl<T> Pipe for T {}
 
@@ -1117,9 +1309,8 @@ mod tests {
 
     #[test]
     fn publish_identity_vault_source_without_identity_refuses() {
-        let err =
-            resolve_publish_identity(Uuid::new_v4(), &MemberKeySource::VaultIdentity, None)
-                .unwrap_err();
+        let err = resolve_publish_identity(Uuid::new_v4(), &MemberKeySource::VaultIdentity, None)
+            .unwrap_err();
         assert!(err.to_string().contains("ai_identity_lct_id"));
     }
 
@@ -1150,8 +1341,10 @@ mod tests {
             assert!(v.get(key).is_some(), "envelope field `{key}` on the wire");
         }
         assert_eq!(v["payload"]["lct_id"], payload.lct_id);
-        assert_eq!(v["payload"]["published_by"], v["signer_lct_id"],
-            "published_by must equal the envelope signer or the hub 403s");
+        assert_eq!(
+            v["payload"]["published_by"], v["signer_lct_id"],
+            "published_by must equal the envelope signer or the hub 403s"
+        );
 
         let receipt: LctPublishAccepted = serde_json::from_str(
             r#"{"lct_id":"lct:web4:mb32:x","version":1,"entry_index":481,"entry_hash":"abc"}"#,
@@ -1169,13 +1362,21 @@ mod tests {
         assert_eq!(r["tool"], "record_reputation");
         assert_eq!(r["args"]["x"], 1);
         assert!(
-            r.get("nonce").and_then(|n| n.as_str()).is_some_and(|s| !s.is_empty()),
+            r.get("nonce")
+                .and_then(|n| n.as_str())
+                .is_some_and(|s| !s.is_empty()),
             "nonce must be present + non-empty"
         );
-        assert!(r.get("issued_at").and_then(|t| t.as_str()).is_some(), "issued_at must be present");
+        assert!(
+            r.get("issued_at").and_then(|t| t.as_str()).is_some(),
+            "issued_at must be present"
+        );
         // Distinct per call — a fixed nonce would BE the replay token it guards against.
         let r2 = channel_inner_request("record_reputation", serde_json::json!({"x": 1}));
-        assert_ne!(r["nonce"], r2["nonce"], "each request must get a unique nonce");
+        assert_ne!(
+            r["nonce"], r2["nonce"],
+            "each request must get a unique nonce"
+        );
     }
 
     #[test]
@@ -1198,23 +1399,41 @@ mod tests {
         let request = serde_json::json!({"tool": "find_members", "query": "rust async review"});
         let sealed_b64 = member_view.seal_request(&member, &request).unwrap();
         let opened = pair_channel::open(
-            &hub, &member.verifying_key(), pair_id,
+            &hub,
+            &member.verifying_key(),
+            pair_id,
             &Sealed::from_base64(&sealed_b64).unwrap(),
-        ).unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&opened).unwrap(), request);
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&opened).unwrap(),
+            request
+        );
 
         // Hub seals a response → member opens it.
         let response = serde_json::json!({"members": [{"lct": "abc", "score": 0.82}]});
         let resp_sealed = pair_channel::seal(
-            &hub, &member.verifying_key(), pair_id,
+            &hub,
+            &member.verifying_key(),
+            pair_id,
             &serde_json::to_vec(&response).unwrap(),
-        ).unwrap();
-        let got = member_view.open_response(&member, &resp_sealed.to_base64()).unwrap();
+        )
+        .unwrap();
+        let got = member_view
+            .open_response(&member, &resp_sealed.to_base64())
+            .unwrap();
         assert_eq!(got, response);
 
         // Wrong pair_id must fail to open (AEAD auth) — confirms the salt binds.
-        let wrong = HubChannel { pair_id: Uuid::new_v4(), ..member_view.clone() };
-        assert!(wrong.open_response(&member, &resp_sealed.to_base64()).is_err());
+        let wrong = HubChannel {
+            pair_id: Uuid::new_v4(),
+            ..member_view.clone()
+        };
+        assert!(
+            wrong
+                .open_response(&member, &resp_sealed.to_base64())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1236,9 +1455,12 @@ mod tests {
         // Hub seals a notice body to the citizen and wraps it in a Notification.
         let body = serde_json::json!({"act_id": act_id, "text": "intro from Nomad accepted"});
         let sealed = pair_channel::seal(
-            &hub, &citizen.verifying_key(), pair_id,
+            &hub,
+            &citizen.verifying_key(),
+            pair_id,
             &serde_json::to_vec(&body).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         let notif = Notification {
             pair_id,
             kind: "notify:intro_accepted".into(),
@@ -1248,22 +1470,34 @@ mod tests {
 
         // Citizen routes on the cleartext `kind`, then opens the sealed body.
         assert!(notif.kind.starts_with("notify:"));
-        let opened = citizen_view.open_notification(&citizen, &notif.sealed).unwrap();
+        let opened = citizen_view
+            .open_notification(&citizen, &notif.sealed)
+            .unwrap();
         assert_eq!(opened, body);
 
         // Citizen seals an ACK → the hub opens it to mark delivered.
-        let ack = NotificationAck { act_id, received_at: Utc::now() };
+        let ack = NotificationAck {
+            act_id,
+            received_at: Utc::now(),
+        };
         let ack_sealed = citizen_view.seal_ack(&citizen, &ack).unwrap();
         let hub_got = pair_channel::open(
-            &hub, &citizen.verifying_key(), pair_id,
+            &hub,
+            &citizen.verifying_key(),
+            pair_id,
             &Sealed::from_base64(&ack_sealed).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         let hub_ack: NotificationAck = serde_json::from_slice(&hub_got).unwrap();
         assert_eq!(hub_ack.act_id, act_id);
 
         // A foreign keypair cannot open the notice (confidentiality holds).
         let intruder = KeyPair::generate();
-        assert!(citizen_view.open_notification(&intruder, &notif.sealed).is_err());
+        assert!(
+            citizen_view
+                .open_notification(&intruder, &notif.sealed)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1294,7 +1528,10 @@ mod tests {
         assert_eq!(ch.hub_pubkey.to_hex(), hub.verifying_key().to_hex());
 
         // Without one → a clear error (e.g. a Hestia-mode hub).
-        let info_no_key = HubInfo { hub_pubkey_hex: None, ..info };
+        let info_no_key = HubInfo {
+            hub_pubkey_hex: None,
+            ..info
+        };
         assert!(HubChannel::from_hub_info(&info_no_key, pair).is_err());
     }
 
@@ -1332,7 +1569,10 @@ mod tests {
         let recovered: HubStore = serde_json::from_str(&json).unwrap();
         assert_eq!(recovered.connections.len(), 1);
         assert_eq!(recovered.connections[0].url, "https://hub.example.com");
-        assert_eq!(recovered.connections[0].member_key_source, MemberKeySource::VaultIdentity);
+        assert_eq!(
+            recovered.connections[0].member_key_source,
+            MemberKeySource::VaultIdentity
+        );
     }
 
     #[test]
@@ -1341,12 +1581,7 @@ mod tests {
         let lct_id = Uuid::new_v4();
         let payload = serde_json::json!({"action": "join", "hub": "test"});
 
-        let envelope = SignedEnvelope::create(
-            "nonce123".into(),
-            payload.clone(),
-            lct_id,
-            &kp,
-        );
+        let envelope = SignedEnvelope::create("nonce123".into(), payload.clone(), lct_id, &kp);
 
         assert_eq!(envelope.challenge_nonce, "nonce123");
         assert_eq!(envelope.signer_lct_id, lct_id);

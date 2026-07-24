@@ -10,12 +10,12 @@
 //! the user's passphrase.
 
 use argon2::{
-    password_hash::{rand_core::OsRng, SaltString},
     Algorithm, Argon2, Params, Version,
+    password_hash::{SaltString, rand_core::OsRng},
 };
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
     ChaCha20Poly1305, Key, Nonce,
+    aead::{Aead, KeyInit},
 };
 use rand::RngCore;
 use zeroize::Zeroize;
