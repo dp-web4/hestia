@@ -917,7 +917,7 @@
         ${tensorRow('Adj. veracity', t.adjudicated_veracity)}
         ${tensorRow('Adj. valuation', t.adjudicated_valuation)}
         <div class="trust-meta" style="margin-top:2px">
-          <span style="opacity:0.6">derived v3-derived-v1 · ${nAdj} adjudication${nAdj===1?'':'s'} + ${nTemp} governance response${nTemp===1?'':'s'} · <a href="/api/trust/derivation?plugin_id=${encodeURIComponent(t.plugin_id)}&role=${encodeURIComponent(trustRole(t)||'')}" target="_blank" style="color:#7aa7e0">receipts</a></span>
+          <span style="opacity:0.6">derived v3-derived-v1 · ${nAdj} adjudication${nAdj===1?'':'s'} + ${nTemp} governance response${nTemp===1?'':'s'} · <a href="#" onclick="showReceipts('${escapeHtml(t.plugin_id)}','${escapeHtml(trustRole(t)||'')}');return false" style="color:#7aa7e0">receipts</a></span>
         </div>` : '';
       return `${adjBlock}
         ${tensorRow('Outcome record', t.t3_training)}
@@ -930,6 +930,38 @@
       ${tensorRow('Training', t.t3_training)}
       ${tensorRow('Temper', t.t3_temperament)}
       ${tensorRow('Veracity', t.v3_veracity)}`;
+  }
+
+  // In-page receipts drawer: score -> versioned formula -> evidence -> acts.
+  // Fetched with the operator session (a raw new-tab GET carries no bearer).
+  async function showReceipts(pluginId, role) {
+    let d;
+    try {
+      const res = await apiFetch(`/api/trust/derivation?plugin_id=${encodeURIComponent(pluginId)}&role=${encodeURIComponent(role)}`, {cache:'no-store'});
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      d = await res.json();
+    } catch (e) { alert('receipts fetch failed: ' + e.message); return; }
+    const o = document.createElement('div');
+    o.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:9999';
+    const dim = (name, x) => {
+      const score = x.score == null ? '<em style="opacity:.6">unmeasured</em>' : x.score.toFixed(3);
+      const ev = (x.evidence || []).map(e =>
+        `<li style="margin:2px 0"><code style="opacity:.55">#${e.chain_position}</code> ${escapeHtml(e.contribution)}` +
+        (e.reference ? ` — <span style="color:#7aa7e0">${escapeHtml(e.reference)}</span>` : '') + `</li>`).join('');
+      return `<details style="margin:8px 0" ${x.observations>0?'open':''}><summary style="cursor:pointer"><b>${name}</b>: ${score} <span style="opacity:.55">(${x.observations} obs)</span></summary>
+        <div style="font-size:12px;opacity:.7;margin:6px 0 4px">${escapeHtml(x.formula)}</div>
+        <ul style="margin:4px 0 4px 18px;padding:0;font-size:12px">${ev || '<li style="opacity:.5">no evidence</li>'}</ul></details>`;
+    };
+    o.innerHTML = `<div style="background:#151a23;color:#e6edf3;padding:20px 24px;border-radius:10px;max-width:640px;max-height:80vh;overflow:auto;font:14px system-ui;box-shadow:0 8px 40px rgba(0,0,0,.5)">
+      <div style="display:flex;justify-content:space-between;align-items:baseline">
+        <h3 style="margin:0 0 4px">Receipts — ${escapeHtml(pluginId)}</h3>
+        <button onclick="this.closest('div[style*=fixed]').remove()" style="background:none;border:0;color:#9aa7b4;font-size:18px;cursor:pointer">×</button>
+      </div>
+      <div style="font-size:12px;opacity:.6;margin-bottom:8px">${escapeHtml(role)} · ${escapeHtml(d.derivation_version)} · level <b>${escapeHtml(d.level)}</b> · every line is a chain-witnessed act</div>
+      ${dim('Temperament', d.temperament)}${dim('Validity', d.validity)}${dim('Veracity', d.veracity)}${dim('Valuation', d.valuation)}
+    </div>`;
+    o.onclick = (ev) => { if (ev.target === o) o.remove(); };
+    document.body.appendChild(o);
   }
 
   function tensorRow(name, value) {
