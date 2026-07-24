@@ -1,7 +1,7 @@
 {
   "_comment": "Seed identity for the Kimi role footprint \u2014 modeled on sage/instances/_seed/identity.json, adapted for a hosted-foreign occupant. Copied to $KIMI_CODE_HOME/hestia-instance/identity.json on first hydration; the live copy accumulates state. 'Model is weather, identity is organism': the reasoning substrate is Moonshot's cloud and does not persist; THIS FILE and the context it hydrates are the organism.",
   "entity": "kimi",
-  "role": "role:constellation:foreign-kimi",
+  "role": "role:constellation:interactive-dev",
   "substrate": {
     "kind": "hosted-foreign",
     "provider": "moonshot",
@@ -73,5 +73,25 @@
     "server_side_tools_note": "WebSearch/WebFetch execute in the provider's cloud, not locally \u2014 they are outside the local gate; use them knowingly"
   },
   "milestones": [],
-  "sessions": []
+  "sessions": [],
+  "role_note": "was 'role:constellation:foreign-kimi' \u2014 dp 2026-07-24: roles are always local; the foreign-* label was an occupancy attribute misfiled as a role (it normalized to 'member', eating the grain). 'reviewer' applies when running reviews.",
+  "occupancy": {
+    "_comment": "dp 2026-07-24: 'foreign' is MRH-relative and belongs HERE, not in the role. The role is always local; the occupant is decomposed by what assurances, auditability, and law it provides in filling the role. Relying parties weight by this profile, not by origin label.",
+    "substrate": "model",
+    "execution": "local",
+    "hosting": "remote",
+    "provider": "moonshot",
+    "assurances": [
+      "identity-file-continuity (this file; no cloud-side persistence observed)",
+      "member-keypair on the hub sealed channel"
+    ],
+    "auditability": [
+      "hestia observe log (all tool events)",
+      "witness-chain policy_decision entries for every gate deny/warn",
+      "kimi session transcripts; kimi-memory snarc capture"
+    ],
+    "law": [
+      "hestia PreToolUse gate, enforce mode (scope+egress+society-safety, fail-closed)"
+    ]
+  }
 }

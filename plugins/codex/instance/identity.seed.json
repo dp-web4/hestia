@@ -1,7 +1,7 @@
 {
   "_comment": "Seed identity for the Codex role footprint \u2014 modeled on the Kimi seed, adapted for a hosted-foreign OpenAI occupant. Copied to $CODEX_HOME/hestia-instance/identity.json on first hydration; the live copy accumulates state. 'Model is weather, identity is organism': the reasoning substrate is OpenAI's cloud and does not persist; THIS FILE and the context it hydrates are the organism.",
   "entity": "codex",
-  "role": "role:constellation:foreign-codex",
+  "role": "role:constellation:interactive-dev",
   "substrate": {
     "kind": "hosted-foreign",
     "provider": "openai",
@@ -77,5 +77,26 @@
     "sandbox_note": "WRITE boundary for out-of-scope repos = the sandbox (sandbox_mode=workspace-write confines writes to the launch workspace; network_access=false blocks egress). READ boundary = weak: the sandbox reads the whole FS, so a broad relative traversal (grep -r . from workspace root) can read private repos \u2014 the shell gate catches explicit reaches only. Launch Codex in the specific task repo, not the workspace root; a bind-mount that exposes only granted repos is the real read-confinement fix (future)."
   },
   "milestones": [],
-  "sessions": []
+  "sessions": [],
+  "role_note": "was 'role:constellation:foreign-codex' \u2014 dp 2026-07-24: roles are always local; the foreign-* label was an occupancy attribute misfiled as a role (it normalized to 'member', eating the grain). 'reviewer' applies when running reviews.",
+  "occupancy": {
+    "_comment": "dp 2026-07-24: 'foreign' is MRH-relative and belongs HERE, not in the role. The role is always local; the occupant is decomposed by what assurances, auditability, and law it provides in filling the role. Relying parties weight by this profile, not by origin label.",
+    "substrate": "model",
+    "execution": "local",
+    "hosting": "remote",
+    "provider": "openai",
+    "assurances": [
+      "identity-file-continuity (this file; no cloud-side persistence observed)",
+      "member-keypair on the hub sealed channel"
+    ],
+    "auditability": [
+      "hestia observe log (all tool events)",
+      "witness-chain policy_decision entries for every gate deny/warn",
+      "codex session rollouts under ~/.codex"
+    ],
+    "law": [
+      "hestia PreToolUse gate, enforce mode (scope+egress+society-safety, fail-closed)",
+      "codex sandbox: workspace-write + network_access=false"
+    ]
+  }
 }

@@ -88,6 +88,18 @@ def load_in_scope():
     return ["web4"]
 
 
+def _identity_role():
+    """The member's declared LOCAL role (dp 2026-07-24: roles are always local; occupancy
+    attributes carry the 'foreign' dimension). Falls back to the safe default."""
+    try:
+        r = json.load(open(IDENTITY, encoding="utf-8")).get("role")
+        if isinstance(r, str) and r.startswith("role:"):
+            return r
+    except Exception:
+        pass
+    return "role:constellation:member"
+
+
 def launch_cwd_repo():
     """The repo Kimi is launched in is always in scope (dp 2026-07-21: 'whatever cwd we launch it
     in') — a per-launch dynamic grant on top of the static allowlist, so a task-specific launch dir
@@ -269,7 +281,7 @@ def _daemon_witness(verb, reason):
                                    "tool_name": _EVENT.get("tool_name") or "",
                                    "session_id": _EVENT.get("session_id"),
                                    "payload_sha256": ti_hash,
-                                   "role": "role:constellation:foreign-kimi"}}}, h, 0.8)
+                                   "role": _identity_role()}}}, h, 0.8)
 
 
 def deny(reason, what_to_do, innate=False):
