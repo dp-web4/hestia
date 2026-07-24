@@ -15,6 +15,15 @@ PLUGIN="${1:?plugin_id}"; HOST_AGENT="${2:?host_agent}"; FIRE="${3:-}"
 EP="${HESTIA_ENDPOINT:-http://127.0.0.1:7711/mcp}"
 IVL="${WATCH_INTERVAL:-60}"
 
+# Kimi review 2026-07-24, Finding 4: single watcher per member (a second
+# instance would double-fire the same drain cadence), and primers in a private
+# 0700 state dir instead of world-writable /tmp — the fired CLI treats the
+# primer as its authoritative work list.
+STATE="${HESTIA_MESH_STATE:-$HOME/.local/state/hestia-mesh}"
+mkdir -p "$STATE/primers" && chmod 700 "$STATE" "$STATE/primers"
+exec 9>"$STATE/watch-$PLUGIN.lock"
+flock -n 9 || { echo "[hestia-watch] another watcher holds $STATE/watch-$PLUGIN.lock — exiting"; exit 1; }
+
 drain() {
 python3 - "$PLUGIN" "$HOST_AGENT" "$EP" <<'PY'
 import json, sys, urllib.request
@@ -42,11 +51,17 @@ while true; do
   OUT=$(drain || echo '{"total":0}')
   N=$(echo "$OUT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
   if [ "$N" -gt 0 ]; then
-    PRIMER=$(mktemp /tmp/hestia-notice-XXXXXX.json)
+    PRIMER=$(mktemp "$STATE/primers/notice-XXXXXX.json")
     echo "$OUT" > "$PRIMER"
     echo "[hestia-watch] $N notice(s) for $PLUGIN -> $PRIMER"
     if [ -n "$FIRE" ]; then
-      "$FIRE" "$PRIMER" || echo "[hestia-watch] fire command failed (notices preserved in $PRIMER)"
+      # Success: primer is spent, remove it. Failure: KEEP it — the drain was
+      # consume-once, so the primer is the only copy of the work list.
+      if "$FIRE" "$PRIMER"; then
+        rm -f "$PRIMER"
+      else
+        echo "[hestia-watch] fire command failed (notices preserved in $PRIMER)"
+      fi
     else
       python3 -c "import json;d=json.load(open('$PRIMER'));[print(f\"  {n['kind']} from {n['from_plugin']}: {n.get('pointer_uri','')}\") for n in d['notices']]"
     fi

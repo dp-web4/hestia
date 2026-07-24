@@ -114,6 +114,12 @@ pub struct ServerState {
     /// default. Enclosed in the vault (document `presence`/`synthetic`).
     pub synthetic_plugins: HashSet<String>,
     pub home: PathBuf,
+    /// Structural per-sender flood guard on the member mesh (Kimi review
+    /// 2026-07-24, Finding 2): `member_notify` is law-gateable but default-allow
+    /// on a permissive base, so the daemon itself bounds wake volume. This is
+    /// not trust law — it is plumbing that keeps a runaway sender from evicting
+    /// queued notices (drop-oldest cap) or spinning another member's auto-fire.
+    pub member_notify_limiter: crate::policy::RateLimiter,
     /// Single-use OID4VCI `c_nonce`s issued but not yet redeemed.
     pub vci_nonces: HashSet<String>,
     /// Operator-surface auth (RWOA W/O): issued challenges (anti-replay) and
@@ -224,6 +230,7 @@ impl ServerState {
             law_gate,
             synthetic_plugins,
             home: home.to_path_buf(),
+            member_notify_limiter: crate::policy::RateLimiter::new(),
             vci_nonces: HashSet::new(),
             operator_challenges: crate::server::operator_auth::ChallengeStore::default(),
             operator_sessions: crate::server::operator_auth::SessionStore::default(),
