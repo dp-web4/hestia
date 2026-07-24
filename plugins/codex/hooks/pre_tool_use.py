@@ -191,9 +191,21 @@ def command_in_scope(cmd, scopes, cwd=None):
         head = head.split("/", 1)[0]
         if head not in scopes:
             return False, (head or "<workspace root>")
-    # Pass 2 — relative tokens, resolved against cwd.
+    # Pass 2 — relative tokens. The event cwd is NOT reliable for these: Codex runs each
+    # command with a per-command workdir the hook event does not carry (observed live: event
+    # cwd = the session launch dir, e.g. the workspace root, while the command actually ran
+    # inside a granted repo — 'scripts'/'Research'/'simulations'/branch-prefix 'agent/' all
+    # false-denied, 2026-07-23). So a relative token is judged by its PLAUSIBLE
+    # interpretations — the event cwd plus every granted repo root — voting by what EXISTS:
+    #   * an existing in-scope interpretation -> pass (the work is plausibly granted);
+    #   * an existing out-of-scope interpretation with NO in-scope alternative -> deny;
+    #   * a token that exists nowhere -> not a reach (branch names, heredoc fragments).
+    # Residual (documented, accepted): a root-workdir command naming a dir that ALSO exists
+    # in a granted repo passes — the sandbox, not this string check, is the fs boundary.
     cwd = (cwd or os.getcwd()).replace("\\", "/")
+    bases = [cwd] + [f"{ws}/{s}" for s in scopes]
     oos_names = {r for r in _all_repos() if r not in scopes}
+    probes = 0
     for raw in re.split(r"""[\s;|&<>()'"`]+""", cmd):
         for tok in raw.split("="):
             tok = tok.strip()
@@ -204,13 +216,32 @@ def command_in_scope(cmd, scopes, cwd=None):
             first = tok.split("/", 1)[0]
             if "/" not in tok and first not in oos_names:
                 continue  # bare word that isn't a workspace-dir name
-            r = os.path.normpath(os.path.join(cwd, tok)).replace("\\", "/")
-            if r == ws:
-                return False, "<workspace root>"
-            if r.startswith(ws + "/"):
-                seg = r[len(ws) + 1:].split("/", 1)[0]
-                if seg not in scopes:
-                    return False, seg
+            if probes >= 40:
+                break     # bound fs probing under the engine's 3s hook clamp
+            probes += 1
+            # Probe = leading '..'s plus the first real component ('../synchronism-site',
+            # 'scripts', ...) — enough to know WHERE the token lands, cheap to exists-check.
+            comps = tok.split("/")
+            k = 0
+            while k < len(comps) and comps[k] == "..":
+                k += 1
+            probe = "/".join(comps[:k + 1]) if k < len(comps) else "/".join(comps)
+            in_scope_vote, oos_vote = False, None
+            for base in bases:
+                cand = os.path.normpath(os.path.join(base, probe)).replace("\\", "/")
+                if not os.path.exists(cand):
+                    continue
+                if cand == ws:
+                    oos_vote = oos_vote or "<workspace root>"
+                    continue
+                if cand.startswith(ws + "/"):
+                    seg = cand[len(ws) + 1:].split("/", 1)[0]
+                    if seg in scopes:
+                        in_scope_vote = True
+                        break
+                    oos_vote = seg
+            if not in_scope_vote and oos_vote:
+                return False, oos_vote
     return True, None
 
 
