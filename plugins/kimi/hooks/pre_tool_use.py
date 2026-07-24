@@ -124,18 +124,30 @@ def path_in_scope(path, scopes):
 
 
 def command_in_scope(cmd, scopes):
-    """A shell command is out of scope if it names an out-of-scope repo, or globs the workspace root
-    without narrowing to a granted repo."""
+    """Returns (ok, offending_token). A shell command is out of scope if any absolute workspace
+    reference lands outside a granted repo, or if it names an out-of-scope repo bare/relative.
+
+    The oos scan runs with the workspace-root string REMOVED first: a workspace directory named
+    like the root's own path component (e.g. an 'ai-agents' dir inside a workspace at
+    .../ai-agents) otherwise reads as an out-of-scope repo mention in EVERY absolute path and
+    false-denies fully in-scope commands (found live in the Codex gate, 2026-07-23; same matcher)."""
+    # 1) Every absolute workspace reference — ALL occurrences, not just the first — must land in
+    #    a granted repo. Bare root (glob-the-root antipattern) stays denied.
+    parts = cmd.split(WORKSPACE)
+    for after in parts[1:]:
+        head = after.lstrip("/")
+        head = re.split(r"""[\s"'`);&|<>]""", head, 1)[0]  # cut at shell metachars
+        head = head.split("/", 1)[0]
+        if head not in scopes:
+            return False, (head or "<workspace root>")
+    # 2) Out-of-scope repo mentions elsewhere (bare names, relative paths) — scanned on the
+    #    root-scrubbed command so the root's own name can't match.
+    scrubbed = " ".join(parts)
     oos = [r for r in _all_repos() if r not in scopes]
     for repo in oos:
-        if re.search(rf"""(^|[\s/=:"'(]){re.escape(repo)}(/|[\s"')]|$)""", cmd):
-            return False
-    # root-glob: references the workspace root but not immediately narrowed to a granted repo
-    if WORKSPACE in cmd:
-        after = cmd.split(WORKSPACE, 1)[1]
-        if not any(after.lstrip("/").startswith(s) for s in scopes):
-            return False
-    return True
+        if re.search(rf"""(^|[\s/=:"'(]){re.escape(repo)}(/|[\s"')]|$)""", scrubbed):
+            return False, repo
+    return True, None
 
 
 # Rollout mode: DENY-TIGHT by default (dp 2026-07-21) — a foreign agent starts enforced and RELAXES
@@ -189,9 +201,14 @@ def main():
         if not path_in_scope(p, scopes):
             deny(f"'{tool}' targets '{p[:60]}' outside your granted scope ({'+'.join(scopes)})",
                  "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
-    if cmd is not None and not command_in_scope(cmd, scopes):
-        deny(f"'{tool}' command reaches outside your granted scope ({'+'.join(scopes)})",
-             "Scope the command to a granted repo, or if legitimately needed, request it (request_scope).")
+    if cmd is not None:
+        ok, offending = command_in_scope(cmd, scopes)
+        if not ok:
+            # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
+            # debugging blind (Codex live session, 2026-07-23).
+            deny(f"'{tool}' command reaches outside your granted scope: '{offending}' is not granted "
+                 f"(granted: {'+'.join(scopes)})",
+                 "Scope the command to a granted repo, or if legitimately needed, request it (request_scope).")
 
     # Gate 2 — society safety (the governor). Read-class already fully covered by the local gates;
     # only write/exec-class needs the daemon's destructive/secret verdict — and there we fail closed.
