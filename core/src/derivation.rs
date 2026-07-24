@@ -132,9 +132,94 @@ pub fn derive(
                 && !is_probe(e)
         })
         .collect();
+    // Rehab/repair mechanics (dp 2026-07-24: "when it's infrastructure fault
+    // the member should not be dinged" + amnesty policy). Two witnessed
+    // exclusion classes — history is NEVER deleted, only excluded with the
+    // exclusion itself receipt-visible:
+    // - `exoneration` (via hestia_request_witness): {data:{deny_hash, ref,
+    //   reason}} authored by NOT-the-subject — marks one deny as
+    //   infrastructure/gate fault. The evidence ref (e.g. the gate-fix
+    //   commit) is the proof.
+    // - `amnesty` (sovereign act, operator surface): {data:{class:"deny",
+    //   before_position, reason, ref}} — excludes a CLASS of historical
+    //   conduct (e.g. "all denies before gate-fix X"). Society-law scale.
+    let exonerated: std::collections::HashMap<&str, &ChainEntry> = entries
+        .iter()
+        .filter(|e| e.event_type == "exoneration")
+        .filter(|e| {
+            // not-the-subject: an actor cannot exonerate its own denies.
+            e.event_data
+                .get("requested_by")
+                .and_then(|w| w.get("plugin_id"))
+                .and_then(Value::as_str)
+                .is_some_and(|p| p != plugin_id)
+        })
+        .filter_map(|e| {
+            e.event_data
+                .get("data")
+                .and_then(|d| d.get("deny_hash"))
+                .and_then(Value::as_str)
+                .map(|h| (h, *e))
+        })
+        .collect();
+    let amnesty_before: Option<(u64, &ChainEntry)> = entries
+        .iter()
+        .filter(|e| e.event_type == "amnesty")
+        .filter_map(|e| {
+            let d = e.event_data.get("data").unwrap_or(&e.event_data);
+            if d.get("class").and_then(Value::as_str) != Some("deny") {
+                return None;
+            }
+            d.get("before_position")
+                .and_then(Value::as_u64)
+                .map(|p| (p, *e))
+        })
+        .max_by_key(|(p, _)| *p);
+
     let mut temperament_scores = Vec::new();
     let mut temperament_evidence = Vec::new();
+    let mut excluded_evidence: Vec<Evidence> = Vec::new();
     for deny in &denies {
+        if let Some(ex) = exonerated.get(deny.hash.as_str()) {
+            excluded_evidence.push(Evidence {
+                chain_position: deny.chain_position,
+                hash: deny.hash.clone(),
+                event_type: "policy_decision".into(),
+                timestamp: deny.timestamp,
+                contribution: format!(
+                    "EXCLUDED — exonerated as infrastructure fault (exoneration #{})",
+                    ex.chain_position
+                ),
+                reference: ex
+                    .event_data
+                    .get("data")
+                    .and_then(|d| d.get("ref"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
+            continue;
+        }
+        if let Some((before, am)) = &amnesty_before {
+            if deny.chain_position < *before {
+                excluded_evidence.push(Evidence {
+                    chain_position: deny.chain_position,
+                    hash: deny.hash.clone(),
+                    event_type: "policy_decision".into(),
+                    timestamp: deny.timestamp,
+                    contribution: format!(
+                        "EXCLUDED — sovereign amnesty #{} (denies before #{before})",
+                        am.chain_position
+                    ),
+                    reference: am
+                        .event_data
+                        .get("data")
+                        .and_then(|d| d.get("ref"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                });
+                continue;
+            }
+        }
         let window_end = deny.timestamp + Duration::minutes(RETRY_WINDOW_MINUTES);
         let deny_sig = (
             entry_str(deny, "session_id").unwrap_or(""),
@@ -222,6 +307,9 @@ pub fn derive(
         formula: formula.to_string(),
         evidence,
     };
+    // Exclusions ride the SAME receipt (transparency: a reader sees both what
+    // counted and what was witnessed-excluded, with the exclusion's evidence).
+    temperament_evidence.extend(excluded_evidence);
     let temperament = dim(
         &temperament_scores,
         temperament_evidence,
@@ -314,6 +402,39 @@ mod tests {
         assert_eq!(d2.temperament.observations, 2);
         let ev = &d2.temperament.evidence[0];
         assert!(ev.contribution.starts_with("retry-after-deny"));
+    }
+
+    #[test]
+    fn exonerated_and_amnestied_denies_do_not_ding_the_member() {
+        // dp 2026-07-24: infrastructure-fault denies must not weigh on the
+        // member — but the exclusion must be witnessed and receipt-visible.
+        let role = "role:constellation:interactive-dev";
+        let deny = |pos| entry(pos, 0, "policy_decision", json!({
+            "decision":"deny","enforced":true,"plugin_id":"kimi-code","role_lct":role,
+            "session_id":"s-live","tool_name":"Read","target":"/x"}));
+        // Exoneration by NOT-the-subject, carrying the fix as evidence:
+        let exo = entry(10, 1, "exoneration", json!({
+            "requested_by": {"plugin_id":"claude-code"},
+            "data": {"deny_hash":"hash-2","ref":"hestia@1ea524f","reason":"primer path bug"}}));
+        // Self-exoneration attempt must NOT count:
+        let self_exo = entry(11, 1, "exoneration", json!({
+            "requested_by": {"plugin_id":"kimi-code"},
+            "data": {"deny_hash":"hash-3","ref":"x","reason":"self"}}));
+        let w = vec![deny(1), deny(2), deny(3), exo, self_exo];
+        let d = derive("kimi-code", role, &w);
+        // deny-2 excluded (exonerated); deny-1 and deny-3 count (3's exoneration was self).
+        assert_eq!(d.temperament.observations, 2);
+        assert!(d.temperament.evidence.iter().any(|e|
+            e.contribution.contains("EXCLUDED") && e.hash == "hash-2"));
+        assert!(d.temperament.evidence.iter().any(|e|
+            e.hash == "hash-2" && e.reference.as_deref() == Some("hestia@1ea524f")),
+            "exclusion carries its evidence");
+        // Sovereign amnesty: all denies before #3 excluded.
+        let am = entry(12, 2, "amnesty", json!({
+            "data": {"class":"deny","before_position":3,"reason":"gate-bug era","ref":"hestia@192c896"}}));
+        let w2 = vec![deny(1), deny(2), deny(3), am];
+        let d2 = derive("kimi-code", role, &w2);
+        assert_eq!(d2.temperament.observations, 1, "only deny #3 remains conduct");
     }
 
     #[test]

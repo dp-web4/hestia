@@ -226,6 +226,7 @@ pub async fn serve_with_callback(
         .route("/api/dashboard", get(dashboard_json))
         .route("/api/trust/derivation", get(trust_derivation_json))
         .route("/api/operator/adjudicate", post(operator_adjudicate))
+        .route("/api/operator/amnesty", post(operator_amnesty))
         .route("/api/failures", get(failures_json))
         .route("/api/vault", get(vault_list).post(vault_add))
         .route("/api/vault/:name", delete(vault_delete))
@@ -448,6 +449,56 @@ async fn operator_adjudicate(
         "axis": a.axis, "verdict": a.verdict, "score": score,
         "adjudicatedEntity": updated,
     })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct AmnestyRequest {
+    /// Currently only "deny" (conduct-class amnesty).
+    class: String,
+    /// Denies with chain_position strictly below this are excluded from conduct.
+    before_position: u64,
+    reason: String,
+    /// Evidence pointer (e.g. the fix commit that ended the era being amnestied).
+    #[serde(rename = "ref")]
+    evidence_ref: String,
+}
+
+/// Sovereign amnesty (dp 2026-07-24: rehab/repair policy). A SOCIETY-level act:
+/// excludes a class of historical conduct from derivation — history is never
+/// deleted; the amnesty is itself a witnessed act and every excluded item shows
+/// in receipts with the amnesty as its reason. Operator-session-gated (the
+/// /api operator_gate preflight authenticated the sovereign before this runs).
+async fn operator_amnesty(
+    State(state): State<SharedState>,
+    Json(a): Json<AmnestyRequest>,
+) -> impl IntoResponse {
+    if a.class != "deny" {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "only class 'deny' is amnestiable in v1"}))).into_response();
+    }
+    if a.reason.trim().is_empty() || a.evidence_ref.is_empty() || a.evidence_ref.len() > 512 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "amnesty requires a reason and a single-line evidence ref"}))).into_response();
+    }
+    let s = state.lock().await;
+    match s.append_chain("amnesty", serde_json::json!({
+        "data": {
+            "class": a.class,
+            "before_position": a.before_position,
+            "reason": a.reason,
+            "ref": a.evidence_ref,
+        },
+        "declared_by": {
+            "operator": true,
+            "sovereign_lct_id": s.sovereign.lct_id(),
+            "role_lct": s.sovereign.sovereign_role_id(),
+        },
+    })) {
+        Ok(e) => Json(serde_json::json!({"witnessEntryHash": e.hash,
+            "excludes": format!("denies before #{}", a.before_position)})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("witnessing: {e}")}))).into_response(),
+    }
 }
 
 async fn trust_derivation_json(
