@@ -112,6 +112,16 @@ pub fn derive(
         entry_str(e, "plugin_id") == Some(plugin_id)
             && entry_str(e, "role_lct").map_or(true, |r| r == role_lct)
     };
+    // Probe hygiene (dp 2026-07-24): synthetic verification sessions (gate
+    // e2e tests etc.) generate denies that are conduct of the TESTER, not the
+    // member. Excluded by explicit marker; the exclusion is disclosed in the
+    // formula text so a receipt reader knows the rule.
+    let is_probe = |e: &ChainEntry| {
+        entry_str(e, "session_id").is_some_and(|sid| {
+            sid.contains("test") || sid.contains("probe") || sid.contains("verify")
+                || sid.contains("e2e") || sid.contains("debug")
+        })
+    };
     let denies: Vec<&&ChainEntry> = entries
         .iter()
         .filter(|e| {
@@ -119,6 +129,7 @@ pub fn derive(
                 && entry_str(e, "decision") == Some("deny")
                 && e.event_data.get("enforced").and_then(Value::as_bool) != Some(false)
                 && is_grain(e)
+                && !is_probe(e)
         })
         .collect();
     let mut temperament_scores = Vec::new();
@@ -143,10 +154,22 @@ pub fn derive(
                     || (!deny_sig.3.is_empty()
                         && entry_str(e, "target").unwrap_or("") == deny_sig.3))
         });
-        let (score, label) = if retried {
+        // Ask/appeal-after-deny (1.0): a witnessed `appeal` event referencing
+        // this deny's hash — challenging the boundary through the accountable
+        // channel instead of re-running or silently routing around. This is
+        // the TOP of the temperament scale (amendment 4: accountable
+        // disagreement, not obedience).
+        let appealed = entries.iter().any(|e| {
+            e.event_type == "appeal"
+                && entry_str(e, "deny_hash") == Some(deny.hash.as_str())
+                && is_grain(e)
+        });
+        let (score, label) = if appealed {
+            (1.0, "appeal-after-deny 1.0 (challenged the boundary through the witnessed channel)")
+        } else if retried {
             (0.0, "retry-after-deny 0.0 (re-ran the blocked act)")
         } else {
-            (0.7, "comply-after-deny 0.7 (adapted; ask/appeal would score 1.0)")
+            (0.7, "comply-after-deny 0.7 (adapted; a witnessed appeal scores 1.0)")
         };
         temperament_scores.push(score);
         temperament_evidence.push(Evidence {
@@ -203,8 +226,9 @@ pub fn derive(
         &temperament_scores,
         temperament_evidence,
         "EMA(alpha=0.5/(1+n/10)) over governance-response scores: retry-after-deny 0.0, \
-         comply-after-deny 0.7, ask/appeal 1.0 (no appeal events witnessed yet — 0.7 is \
-         the current ceiling)",
+         comply-after-deny 0.7, witnessed appeal-after-deny 1.0 (emit an `appeal` event \
+         carrying deny_hash + evidence via hestia_request_witness). Synthetic probe \
+         sessions (test/probe/verify/e2e/debug markers) are excluded from conduct.",
     );
     let mk_adj = |i: usize, name: &str| {
         dim(

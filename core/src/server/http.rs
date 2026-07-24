@@ -225,6 +225,7 @@ pub async fn serve_with_callback(
     let operator_surface = axum::Router::new()
         .route("/api/dashboard", get(dashboard_json))
         .route("/api/trust/derivation", get(trust_derivation_json))
+        .route("/api/operator/adjudicate", post(operator_adjudicate))
         .route("/api/failures", get(failures_json))
         .route("/api/vault", get(vault_list).post(vault_add))
         .route("/api/vault/:name", delete(vault_delete))
@@ -344,6 +345,111 @@ struct DerivationQuery {
 /// The RECEIPTS endpoint (Stage 2): score -> versioned formula -> evidence
 /// pointers -> witnessed acts, computed at read time over the chain window.
 /// This is the auditable-trust contract made clickable.
+#[derive(serde::Deserialize)]
+struct OperatorAdjudication {
+    subject_plugin_id: String,
+    subject_role: String,
+    axis: String,    // validity | valuation (veracity stays daemon-computed via the plugin tool)
+    verdict: String, // upheld | partial | refuted | deferred
+    #[serde(rename = "ref")]
+    evidence_ref: String,
+    #[serde(default)]
+    score: Option<f64>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    method: Option<String>, // defaults to "review"
+}
+
+/// The HUMAN's adjudication surface (dp 2026-07-24: "i would rate you 1.0
+/// personally" — the most trusted witness in the system had no way to witness
+/// that). Operator-session-gated (the /api operator_gate preflight has already
+/// authenticated the sovereign's challenge-signed session before this runs);
+/// the adjudication is recorded with the SOVEREIGN as adjudicator. Temperament
+/// stays conduct-derived — a human rating enters as validity/valuation, never
+/// as a hand-set temperament (that would be prescribed trust again).
+async fn operator_adjudicate(
+    State(state): State<SharedState>,
+    Json(a): Json<OperatorAdjudication>,
+) -> impl IntoResponse {
+    if !matches!(a.axis.as_str(), "validity" | "valuation") {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "operator adjudications cover axis validity|valuation \
+                      (veracity is daemon-computed calibration; temperament is conduct-derived)"}))).into_response();
+    }
+    if !matches!(a.verdict.as_str(), "upheld" | "partial" | "refuted" | "deferred") {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "verdict must be upheld|partial|refuted|deferred"}))).into_response();
+    }
+    if a.evidence_ref.is_empty() || a.evidence_ref.len() > 512
+        || a.evidence_ref.chars().any(char::is_control)
+    {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "'ref' must be a single-line evidence pointer (<=512 bytes) — \
+                      no pointer, no adjudication"}))).into_response();
+    }
+    let role = crate::reputation::normalize_constellation_role(&a.subject_role);
+    let score = match a.verdict.as_str() {
+        "deferred" => None,
+        "upheld" => Some(a.score.unwrap_or(1.0).clamp(0.0, 1.0)),
+        "partial" => Some(a.score.unwrap_or(0.5).clamp(0.0, 1.0)),
+        _ => Some(a.score.unwrap_or(0.0).clamp(0.0, 1.0)),
+    };
+    let dimension = if a.axis == "validity" {
+        web4_core::v3::ValueDimension::Validity
+    } else {
+        web4_core::v3::ValueDimension::Valuation
+    };
+    let s = state.lock().await;
+    let subject_instance_lct = s.member_lct(&a.subject_plugin_id);
+    let entry = match s.append_chain("adjudication", serde_json::json!({
+        "subject_plugin_id": a.subject_plugin_id,
+        "subject_instance_lct": subject_instance_lct,
+        "subject_role": role,
+        "axis": a.axis,
+        "verdict": a.verdict,
+        "score": score,
+        "method": a.method.clone().unwrap_or_else(|| "review".to_string()),
+        "ref": a.evidence_ref,
+        "reason": a.reason,
+        "adjudicated_by": {
+            "operator": true,
+            "sovereign_lct_id": s.sovereign.lct_id(),
+            "role_lct": s.sovereign.sovereign_role_id(),
+        },
+    })) {
+        Ok(e) => e,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("witnessing: {e}")}))).into_response()
+        }
+    };
+    let mut updated = None;
+    if let Some(score) = score {
+        let adj_reason = format!("adjudication:{}:{}:operator", a.axis, a.verdict);
+        let rep_ctx = crate::reputation::RepContext {
+            role_lct: role,
+            action_type: "adjudication",
+            action_target: "operator",
+            action_id: "",
+            reason: &adj_reason,
+        };
+        match s.apply_adjudication_ctx(&a.subject_plugin_id, dimension, score, &rep_ctx) {
+            Ok(t) => updated = Some(t.entity_id),
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("applying: {e}"),
+                        "witnessEntryHash": entry.hash}))).into_response()
+            }
+        }
+    }
+    Json(serde_json::json!({
+        "witnessEntryHash": entry.hash,
+        "axis": a.axis, "verdict": a.verdict, "score": score,
+        "adjudicatedEntity": updated,
+    })).into_response()
+}
+
 async fn trust_derivation_json(
     State(state): State<SharedState>,
     Query(q): Query<DerivationQuery>,
