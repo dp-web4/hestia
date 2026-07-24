@@ -105,48 +105,64 @@ def _all_repos():
         return []
 
 
-def path_in_scope(path, scopes):
-    """A file path is in-scope if it's the agent's home, /tmp, or under a granted repo."""
+def path_in_scope(path, scopes, cwd=None):
+    """A file path is in-scope if it's the agent's home, /tmp, or under a granted repo.
+    Relative paths resolve against the event cwd — 'scripts/x' inside a granted repo is that
+    repo's subdir, not the workspace-root 'scripts' dir (same class as the command-scope
+    false-deny, 2026-07-23)."""
     p = path.replace("\\", "/")
     low = p.lower()
     if "~/.kimi-code" in low or low.startswith(os.path.expanduser("~/.kimi-code").lower()):
         return True
+    if not p.startswith("/") and not p.startswith("~"):
+        cwd = (cwd or os.getcwd()).replace("\\", "/")
+        p = os.path.normpath(os.path.join(cwd, p)).replace("\\", "/")
     if p.startswith(("/tmp", "/var/tmp")):
         return True
     if WORKSPACE in p:
         rest = p.split(WORKSPACE, 1)[1].lstrip("/")
-    else:
-        rest = p.lstrip("./")
-    seg = rest.split("/", 1)[0] if rest else ""
-    if seg == "":
-        return False           # bare workspace root (the glob-the-root antipattern) -> out of scope
-    return seg in scopes
+        seg = rest.split("/", 1)[0] if rest else ""
+        if seg == "":
+            return False       # bare workspace root (the glob-the-root antipattern) -> out of scope
+        return seg in scopes
+    # Absolute path outside the workspace (and not home/tmp): conservative deny, as before.
+    return False
 
 
-def command_in_scope(cmd, scopes):
-    """Returns (ok, offending_token). A shell command is out of scope if any absolute workspace
-    reference lands outside a granted repo, or if it names an out-of-scope repo bare/relative.
-
-    The oos scan runs with the workspace-root string REMOVED first: a workspace directory named
-    like the root's own path component (e.g. an 'ai-agents' dir inside a workspace at
-    .../ai-agents) otherwise reads as an out-of-scope repo mention in EVERY absolute path and
-    false-denies fully in-scope commands (found live in the Codex gate, 2026-07-23; same matcher)."""
-    # 1) Every absolute workspace reference — ALL occurrences, not just the first — must land in
-    #    a granted repo. Bare root (glob-the-root antipattern) stays denied.
+def command_in_scope(cmd, scopes, cwd=None):
+    """Returns (ok, offending_token). A reach is judged by WHERE IT RESOLVES, not what it
+    lexically mentions: (1) absolute workspace references (ALL occurrences) must land in a
+    granted repo (bare root denies); (2) relative path tokens resolve against the event cwd —
+    'scripts/foo.py' inside a granted repo is that repo's subdir, NOT the workspace-root
+    'scripts' dir. Lexical mention-scanning false-denied both classes (found live via the
+    Codex gate, 2026-07-23; same matcher). Relative traversal that never names a path
+    (`grep -r .`) still escapes string parsing — the engine sandbox is the fs boundary."""
+    ws = WORKSPACE.rstrip("/")
     parts = cmd.split(WORKSPACE)
     for after in parts[1:]:
         head = after.lstrip("/")
-        head = re.split(r"""[\s"'`);&|<>]""", head, 1)[0]  # cut at shell metachars
+        head = re.split(r"""[\s"'`);&|<>]""", head, 1)[0]
         head = head.split("/", 1)[0]
         if head not in scopes:
             return False, (head or "<workspace root>")
-    # 2) Out-of-scope repo mentions elsewhere (bare names, relative paths) — scanned on the
-    #    root-scrubbed command so the root's own name can't match.
-    scrubbed = " ".join(parts)
-    oos = [r for r in _all_repos() if r not in scopes]
-    for repo in oos:
-        if re.search(rf"""(^|[\s/=:"'(]){re.escape(repo)}(/|[\s"')]|$)""", scrubbed):
-            return False, repo
+    cwd = (cwd or os.getcwd()).replace("\\", "/")
+    oos_names = {r for r in _all_repos() if r not in scopes}
+    for raw in re.split(r"""[\s;|&<>()'"`]+""", cmd):
+        for tok in raw.split("="):
+            tok = tok.strip()
+            if (not tok or tok.startswith(("-", "/")) or ":" in tok
+                    or tok.strip(".") == ""):
+                continue
+            first = tok.split("/", 1)[0]
+            if "/" not in tok and first not in oos_names:
+                continue
+            r = os.path.normpath(os.path.join(cwd, tok)).replace("\\", "/")
+            if r == ws:
+                return False, "<workspace root>"
+            if r.startswith(ws + "/"):
+                seg = r[len(ws) + 1:].split("/", 1)[0]
+                if seg not in scopes:
+                    return False, seg
     return True, None
 
 
@@ -198,11 +214,11 @@ def main():
     # Gate 1b — MRH scope (per-entity, from Kimi's identity). File paths use path-scope; shell
     # commands use command-scope (out-of-scope repo tokens + root-glob).
     for p in paths:
-        if not path_in_scope(p, scopes):
+        if not path_in_scope(p, scopes, event.get("cwd")):
             deny(f"'{tool}' targets '{p[:60]}' outside your granted scope ({'+'.join(scopes)})",
                  "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
     if cmd is not None:
-        ok, offending = command_in_scope(cmd, scopes)
+        ok, offending = command_in_scope(cmd, scopes, event.get("cwd"))
         if not ok:
             # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
             # debugging blind (Codex live session, 2026-07-23).
