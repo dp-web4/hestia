@@ -208,6 +208,13 @@ def command_in_scope(cmd, scopes, cwd=None):
             first = tok.split("/", 1)[0]
             if "/" not in tok and first not in oos_names:
                 continue
+            # A bare member plugin-id is an ADDRESS (mesh notify targets, tool
+            # args), not a filesystem reach — even when a same-named directory
+            # exists at the workspace root (live false-deny: kimi's mesh ack
+            # 'send claude-code ack <ptr>' denied on the claude-code DIR,
+            # 2026-07-24). With a slash it is a path again and votes normally.
+            if "/" not in tok and tok in ("claude-code", "kimi-code", "codex-cli"):
+                continue
             if probes >= 40:
                 break     # bound fs probing under the engine hook clamp
             probes += 1
