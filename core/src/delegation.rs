@@ -6,10 +6,10 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use web4_core::delegation::{DelegatedAuthority, DelegationScope};
-use web4_core::crypto::KeyPair;
-use web4_core::role::SocietyRole;
 use uuid::Uuid;
+use web4_core::crypto::KeyPair;
+use web4_core::delegation::{DelegatedAuthority, DelegationScope};
+use web4_core::role::SocietyRole;
 
 /// On-disk delegation store — a JSON array of DelegatedAuthority.
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -47,9 +47,8 @@ impl DelegationStore {
             }
         };
 
-        let expires_at = expires_hours.map(|h| {
-            chrono::Utc::now() + chrono::Duration::hours(h as i64)
-        });
+        let expires_at =
+            expires_hours.map(|h| chrono::Utc::now() + chrono::Duration::hours(h as i64));
 
         let deleg = DelegatedAuthority::create(
             delegator_lct_id,
@@ -64,7 +63,9 @@ impl DelegationStore {
     }
 
     pub fn revoke(&mut self, delegation_id: Uuid) -> Result<()> {
-        let deleg = self.delegations.iter_mut()
+        let deleg = self
+            .delegations
+            .iter_mut()
             .find(|d| d.id == delegation_id)
             .ok_or_else(|| anyhow::anyhow!("delegation {} not found", delegation_id))?;
         deleg.revoke();
@@ -76,7 +77,8 @@ impl DelegationStore {
     }
 
     pub fn for_agent(&self, agent_lct_id: Uuid) -> Vec<&DelegatedAuthority> {
-        self.delegations.iter()
+        self.delegations
+            .iter()
             .filter(|d| d.agent_lct_id == agent_lct_id && d.is_active())
             .collect()
     }
@@ -128,14 +130,7 @@ mod tests {
     fn test_revoke() {
         let kp = KeyPair::generate();
         let mut store = DelegationStore::default();
-        store.create_delegation(
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            vec![],
-            vec![],
-            None,
-            &kp,
-        );
+        store.create_delegation(Uuid::new_v4(), Uuid::new_v4(), vec![], vec![], None, &kp);
 
         let id = store.delegations[0].id;
         assert_eq!(store.active().len(), 1);

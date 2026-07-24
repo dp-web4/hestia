@@ -144,8 +144,16 @@ pub fn load_or_mint_registry(
         }
     }
     if healed {
-        if let Err(e) = crate::vault::save_doc(vault, ROLES_NAMESPACE, ROLES_DOC, ROLES_LEGACY_FILE, &persisted) {
-            eprintln!("[roles] WARNING: persisting healed binding proofs failed ({e}) — re-heals next boot");
+        if let Err(e) = crate::vault::save_doc(
+            vault,
+            ROLES_NAMESPACE,
+            ROLES_DOC,
+            ROLES_LEGACY_FILE,
+            &persisted,
+        ) {
+            eprintln!(
+                "[roles] WARNING: persisting healed binding proofs failed ({e}) — re-heals next boot"
+            );
         }
     }
 
@@ -191,10 +199,18 @@ pub fn load_or_mint_registry(
         minted = true;
     }
     if minted {
-        if let Err(e) = crate::vault::save_doc(vault, ROLES_NAMESPACE, ROLES_DOC, ROLES_LEGACY_FILE, &persisted) {
+        if let Err(e) = crate::vault::save_doc(
+            vault,
+            ROLES_NAMESPACE,
+            ROLES_DOC,
+            ROLES_LEGACY_FILE,
+            &persisted,
+        ) {
             // Degrade honestly: the daemon runs with in-memory identities this
             // boot; the next boot re-mints. Logged, never silently swallowed.
-            eprintln!("[roles] WARNING: persisting role registry failed ({e}) — role LCTs are unstable this boot");
+            eprintln!(
+                "[roles] WARNING: persisting role registry failed ({e}) — role LCTs are unstable this boot"
+            );
         }
     }
 
@@ -209,7 +225,10 @@ mod tests {
     #[test]
     fn mirror_registry_holds_every_published_role_as_an_entity() {
         let reg = build_mirror_registry("lct:web4:hestia:sovereign:phase1-placeholder");
-        assert_eq!(reg.len(), crate::reputation::KNOWN_CONSTELLATION_ROLES.len());
+        assert_eq!(
+            reg.len(),
+            crate::reputation::KNOWN_CONSTELLATION_ROLES.len()
+        );
         for label in crate::reputation::KNOWN_CONSTELLATION_ROLES {
             let role = reg.get(label).expect("every published role is mirrored");
             // it's a real Role LCT entity, bound authoritatively
@@ -228,9 +247,15 @@ mod tests {
         assert_eq!(mw.extension.drift_mark(), DriftMark::DriftUnattributed);
         assert!(mw.extension.authored_under.is_none());
         // fail-closed: unattributed + no affordances → default deny, zero budget
-        assert_eq!(mw.extension.default_verdict, web4_core::ExtensionVerdict::Deny);
+        assert_eq!(
+            mw.extension.default_verdict,
+            web4_core::ExtensionVerdict::Deny
+        );
         assert!(mw.extension.affordances.is_empty());
-        assert_eq!(mw.extension.scope.atp_budget, web4_core::AtpBudget::Limited(0.0));
+        assert_eq!(
+            mw.extension.scope.atp_budget,
+            web4_core::AtpBudget::Limited(0.0)
+        );
     }
 
     #[test]
@@ -255,7 +280,10 @@ mod tests {
             .iter()
             .map(|l| second.get(l).unwrap().lct.id)
             .collect();
-        assert_eq!(first.len(), crate::reputation::KNOWN_CONSTELLATION_ROLES.len());
+        assert_eq!(
+            first.len(),
+            crate::reputation::KNOWN_CONSTELLATION_ROLES.len()
+        );
         assert_eq!(ids1, ids2, "role LCTs must be identical across restarts");
     }
 
@@ -268,16 +296,25 @@ mod tests {
         let path = dir.path().join("v.enc");
         let mut vault = crate::vault::Vault::init(path, "p".into()).unwrap();
         let reg = load_or_mint_registry(&mut vault, "sov", "lct:web4:mb32:btestsovereign");
-        let persisted: Vec<super::PersistedRole> =
-            crate::vault::load_doc(&vault, super::ROLES_NAMESPACE, super::ROLES_DOC, super::ROLES_LEGACY_FILE)
-                .unwrap();
+        let persisted: Vec<super::PersistedRole> = crate::vault::load_doc(
+            &vault,
+            super::ROLES_NAMESPACE,
+            super::ROLES_DOC,
+            super::ROLES_LEGACY_FILE,
+        )
+        .unwrap();
         assert_eq!(persisted.len(), reg.len());
         for p in &persisted {
-            let bytes: [u8; 32] = hex::decode(&p.keypair_secret_hex).unwrap().try_into().unwrap();
+            let bytes: [u8; 32] = hex::decode(&p.keypair_secret_hex)
+                .unwrap()
+                .try_into()
+                .unwrap();
             let kp = web4_core::crypto::KeyPair::from_secret_bytes(&bytes);
             assert_eq!(
-                kp.verifying_key(), p.lct.public_key,
-                "role {}: sealed secret must answer for the persisted LCT", p.label
+                kp.verifying_key(),
+                p.lct.public_key,
+                "role {}: sealed secret must answer for the persisted LCT",
+                p.label
             );
         }
     }
@@ -292,21 +329,46 @@ mod tests {
         let mut vault = crate::vault::Vault::init(path.clone(), "p".into()).unwrap();
         let _ = load_or_mint_registry(&mut vault, "sov", "sid");
         // Simulate the pre-#499 vault state: strip every proof and re-persist.
-        let mut persisted: Vec<super::PersistedRole> =
-            crate::vault::load_doc(&vault, super::ROLES_NAMESPACE, super::ROLES_DOC, super::ROLES_LEGACY_FILE).unwrap();
-        for p in &mut persisted { p.lct.binding_proof = None; }
-        crate::vault::save_doc(&mut vault, super::ROLES_NAMESPACE, super::ROLES_DOC, super::ROLES_LEGACY_FILE, &persisted).unwrap();
+        let mut persisted: Vec<super::PersistedRole> = crate::vault::load_doc(
+            &vault,
+            super::ROLES_NAMESPACE,
+            super::ROLES_DOC,
+            super::ROLES_LEGACY_FILE,
+        )
+        .unwrap();
+        for p in &mut persisted {
+            p.lct.binding_proof = None;
+        }
+        crate::vault::save_doc(
+            &mut vault,
+            super::ROLES_NAMESPACE,
+            super::ROLES_DOC,
+            super::ROLES_LEGACY_FILE,
+            &persisted,
+        )
+        .unwrap();
         drop(vault);
         // Reload (the healing boot): every role verifies again…
         let mut vault2 = crate::vault::Vault::open(path.clone(), "p".into()).unwrap();
         let reg = load_or_mint_registry(&mut vault2, "sov", "sid");
         for label in crate::reputation::KNOWN_CONSTELLATION_ROLES {
-            assert!(reg.get(label).unwrap().lct.verify_binding(), "{label} healed");
+            assert!(
+                reg.get(label).unwrap().lct.verify_binding(),
+                "{label} healed"
+            );
         }
         // …and the heal PERSISTED (a third load starts from signed documents).
-        let healed: Vec<super::PersistedRole> =
-            crate::vault::load_doc(&vault2, super::ROLES_NAMESPACE, super::ROLES_DOC, super::ROLES_LEGACY_FILE).unwrap();
-        assert!(healed.iter().all(|p| p.lct.binding_proof.is_some()), "heal written back to the vault");
+        let healed: Vec<super::PersistedRole> = crate::vault::load_doc(
+            &vault2,
+            super::ROLES_NAMESPACE,
+            super::ROLES_DOC,
+            super::ROLES_LEGACY_FILE,
+        )
+        .unwrap();
+        assert!(
+            healed.iter().all(|p| p.lct.binding_proof.is_some()),
+            "heal written back to the vault"
+        );
     }
 
     #[test]
@@ -320,7 +382,11 @@ mod tests {
         let reg = load_or_mint_registry(&mut vault, "sov", sov_id);
         for label in crate::reputation::KNOWN_CONSTELLATION_ROLES {
             let role = reg.get(label).unwrap();
-            assert_eq!(role.lct.mrh.bound.len(), 1, "{label} has exactly one bound edge");
+            assert_eq!(
+                role.lct.mrh.bound.len(),
+                1,
+                "{label} has exactly one bound edge"
+            );
             let edge = &role.lct.mrh.bound[0];
             assert_eq!(edge.lct_id, sov_id, "bound edge targets the sovereign");
             assert_eq!(edge.edge_type, "parent");
@@ -335,7 +401,10 @@ mod tests {
         let mut vault = crate::vault::Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
         let reg = load_or_mint_registry(&mut vault, "sov", "");
         let mw = reg.get("role:constellation:mesh-worker").unwrap();
-        assert!(mw.lct.mrh.bound.is_empty(), "no sovereign id ⇒ no bound edge");
+        assert!(
+            mw.lct.mrh.bound.is_empty(),
+            "no sovereign id ⇒ no bound edge"
+        );
     }
 
     #[test]

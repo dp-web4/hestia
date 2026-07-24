@@ -98,7 +98,10 @@ mod tests {
     #[test]
     fn extracts_url() {
         let input = json!({"url": "https://example.com/api"});
-        assert_eq!(extract_target("WebFetch", &input), Some("https://example.com/api".into()));
+        assert_eq!(
+            extract_target("WebFetch", &input),
+            Some("https://example.com/api".into())
+        );
     }
 
     #[test]
@@ -110,7 +113,10 @@ mod tests {
     #[test]
     fn bash_full_command_preserved() {
         let input = json!({"command": "rm -rf /tmp/foo"});
-        assert_eq!(extract_full_command("Bash", &input), Some("rm -rf /tmp/foo".into()));
+        assert_eq!(
+            extract_full_command("Bash", &input),
+            Some("rm -rf /tmp/foo".into())
+        );
     }
 
     #[test]
@@ -128,6 +134,9 @@ mod tests {
         assert_eq!(classify("Mystery"), "unknown");
         assert_eq!(classify("hestia_vault_set"), "credential_access");
         assert_eq!(classify("hestia_request_witness"), "witness_append");
-        assert_eq!(classify("mcp__hestia__hestia_request_witness"), "witness_append");
+        assert_eq!(
+            classify("mcp__hestia__hestia_request_witness"),
+            "witness_append"
+        );
     }
 }

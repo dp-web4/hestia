@@ -71,13 +71,14 @@ impl TrustStore {
         if !path.exists() {
             return Ok(None);
         }
-        let raw = std::fs::read(&path).with_context(|| format!("reading trust {}", path.display()))?;
+        let raw =
+            std::fs::read(&path).with_context(|| format!("reading trust {}", path.display()))?;
         let json: Vec<u8> = match crypto::open(&self.dk(), &raw) {
             Ok(plain) => plain,
             Err(_) => raw, // legacy plaintext JSON (predates at-rest encryption)
         };
-        let trust: EntityTrust =
-            serde_json::from_slice(&json).with_context(|| format!("parsing trust {}", path.display()))?;
+        let trust: EntityTrust = serde_json::from_slice(&json)
+            .with_context(|| format!("parsing trust {}", path.display()))?;
         Ok(Some(trust))
     }
 
@@ -86,7 +87,8 @@ impl TrustStore {
         let json = serde_json::to_vec_pretty(trust).context("serializing trust")?;
         let sealed = crypto::seal(&self.dk(), &json).context("sealing trust")?;
         let path = self.entity_file(&trust.entity_id);
-        std::fs::write(&path, sealed).with_context(|| format!("writing trust {}", path.display()))?;
+        std::fs::write(&path, sealed)
+            .with_context(|| format!("writing trust {}", path.display()))?;
         Ok(())
     }
 
@@ -105,7 +107,9 @@ impl TrustStore {
 
     /// Apply an outcome and persist. Returns the updated entity trust.
     pub fn update(&self, plugin_id: &str, success: bool, magnitude: f64) -> Result<EntityTrust> {
-        Ok(self.update_returning_prior(plugin_id, success, magnitude)?.1)
+        Ok(self
+            .update_returning_prior(plugin_id, success, magnitude)?
+            .1)
     }
 
     /// Apply an outcome and persist, returning `(before, after)` so the caller can
@@ -137,14 +141,21 @@ impl TrustStore {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(raw) = std::fs::read(&path) else { continue };
+            let Ok(raw) = std::fs::read(&path) else {
+                continue;
+            };
             // Decrypt-first, fall back to legacy plaintext on AEAD failure (see load()).
             let json = match crypto::open(&self.dk(), &raw) {
                 Ok(b) => b,
                 Err(_) => raw,
             };
             if let Ok(t) = serde_json::from_slice::<EntityTrust>(&json) {
-                out.push(t.entity_id.strip_prefix("plugin:").unwrap_or(&t.entity_id).to_string());
+                out.push(
+                    t.entity_id
+                        .strip_prefix("plugin:")
+                        .unwrap_or(&t.entity_id)
+                        .to_string(),
+                );
             }
         }
         out.sort();
@@ -172,7 +183,11 @@ mod tests {
         // On disk the file is sealed (not plaintext JSON).
         let f = store.entity_file(&TrustStore::entity_id("claude-code"));
         let raw = std::fs::read(&f).unwrap();
-        assert_ne!(raw.first(), Some(&b'{'), "trust file should be sealed, not plaintext JSON");
+        assert_ne!(
+            raw.first(),
+            Some(&b'{'),
+            "trust file should be sealed, not plaintext JSON"
+        );
 
         drop(store);
         let reopened = TrustStore::open(dir.path(), KEY).unwrap();
@@ -206,7 +221,11 @@ mod tests {
         // get() reads the plaintext; update() re-seals it.
         assert_eq!(store.get("legacy").unwrap().action_count, 0);
         store.update("legacy", true, 0.5).unwrap();
-        assert_ne!(std::fs::read(&f).unwrap().first(), Some(&b'{'), "should be re-sealed after write");
+        assert_ne!(
+            std::fs::read(&f).unwrap().first(),
+            Some(&b'{'),
+            "should be re-sealed after write"
+        );
     }
 
     /// Regression for the first-byte sniff bug: a sealed blob is nonce-prefixed
@@ -235,12 +254,19 @@ mod tests {
         let ct = crypto::encrypt(&store.dk(), &nonce, &json).unwrap();
         let mut blob = nonce.to_vec();
         blob.extend_from_slice(&ct);
-        assert_eq!(blob.first(), Some(&b'{'), "must reproduce the 0x7b-first condition");
+        assert_eq!(
+            blob.first(),
+            Some(&b'{'),
+            "must reproduce the 0x7b-first condition"
+        );
 
         std::fs::write(store.entity_file("plugin:brace"), &blob).unwrap();
 
         let loaded = store.get("brace").unwrap();
-        assert_eq!(loaded.action_count, 1, "sealed trust must be decrypted, not parsed as plaintext");
+        assert_eq!(
+            loaded.action_count, 1,
+            "sealed trust must be decrypted, not parsed as plaintext"
+        );
         assert_eq!(loaded.success_count, 1);
     }
 }

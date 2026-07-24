@@ -9,11 +9,9 @@ mod http;
 pub mod operator_auth;
 mod state;
 
-pub use dashboard::{
-    ActivityStats, DashboardSnapshot, RecentEntry, SocietyView, TrustView,
-};
+pub use dashboard::{ActivityStats, DashboardSnapshot, RecentEntry, SocietyView, TrustView};
 pub use handler::HestiaServer;
-pub use http::{serve, serve_with_callback, DEFAULT_BIND};
+pub use http::{DEFAULT_BIND, serve, serve_with_callback};
 pub use state::{ServerState, SharedState};
 
 use anyhow::Result;

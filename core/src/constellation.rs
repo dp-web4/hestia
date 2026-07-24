@@ -152,8 +152,9 @@ impl ConstellationAttestation {
         challenge_nonce: &str,
         device_keys: &[(Uuid, KeyPair)],
     ) -> anyhow::Result<Self> {
-        let owner = store.owner_lct_id
-            .ok_or_else(|| anyhow::anyhow!("constellation has no owner LCT — add a device first"))?;
+        let owner = store.owner_lct_id.ok_or_else(|| {
+            anyhow::anyhow!("constellation has no owner LCT — add a device first")
+        })?;
         let members: Vec<Uuid> = store.members.iter().map(|m| m.lct_id).collect();
         let issued_at = Utc::now();
 
@@ -229,7 +230,8 @@ impl ConstellationAttestation {
 
         let owner_pk = pubkey_from_hex(&self.owner_pubkey_hex)?;
         let owner_sig = sig_from_hex(&self.owner_signature)?;
-        owner_pk.verify(&payload, &owner_sig)
+        owner_pk
+            .verify(&payload, &owner_sig)
             .map_err(|_| anyhow::anyhow!("owner signature invalid"))?;
 
         let mut verified = Vec::new();
@@ -285,8 +287,11 @@ impl ConstellationAttestation {
 
         // Owner: verify against the TRUSTED key, not the presented one.
         let owner_sig = sig_from_hex(&self.owner_signature)?;
-        expected_owner_pubkey.verify(&payload, &owner_sig)
-            .map_err(|_| anyhow::anyhow!("owner signature invalid against the trusted owner key"))?;
+        expected_owner_pubkey
+            .verify(&payload, &owner_sig)
+            .map_err(|_| {
+                anyhow::anyhow!("owner signature invalid against the trusted owner key")
+            })?;
 
         // Devices: resolve each fact from the store; collapse duplicate lct_ids.
         let mut seen = std::collections::HashSet::new();
@@ -347,7 +352,10 @@ impl ConstellationAttestation {
     }
 
     fn derive_assurance_refs(verified: &[&DeviceSignature]) -> AssuranceLevel {
-        if verified.iter().any(|s| s.device_type == DeviceType::Hardware) {
+        if verified
+            .iter()
+            .any(|s| s.device_type == DeviceType::Hardware)
+        {
             AssuranceLevel::HardwareBacked
         } else if verified.len() >= 2 {
             AssuranceLevel::MultiDevice
@@ -359,14 +367,18 @@ impl ConstellationAttestation {
 
 fn pubkey_from_hex(hex_str: &str) -> anyhow::Result<web4_core::crypto::PublicKey> {
     let bytes = hex::decode(hex_str)?;
-    let arr: [u8; 32] = bytes.as_slice().try_into()
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
         .map_err(|_| anyhow::anyhow!("pubkey must be 32 bytes"))?;
     Ok(web4_core::crypto::PublicKey::from_bytes(&arr)?)
 }
 
 fn sig_from_hex(hex_str: &str) -> anyhow::Result<web4_core::crypto::SignatureBytes> {
     let bytes = hex::decode(hex_str)?;
-    let arr: [u8; 64] = bytes.as_slice().try_into()
+    let arr: [u8; 64] = bytes
+        .as_slice()
+        .try_into()
         .map_err(|_| anyhow::anyhow!("signature must be 64 bytes"))?;
     Ok(web4_core::crypto::SignatureBytes::from_bytes(arr))
 }
@@ -387,7 +399,13 @@ impl ConstellationStore {
 
     /// Persist the constellation as an encrypted vault document.
     pub fn save(&self, vault: &mut crate::vault::Vault) -> anyhow::Result<()> {
-        crate::vault::save_doc(vault, "presence", "constellation", "constellation.json", self)
+        crate::vault::save_doc(
+            vault,
+            "presence",
+            "constellation",
+            "constellation.json",
+            self,
+        )
     }
 
     pub fn add_device(
@@ -417,7 +435,10 @@ impl ConstellationStore {
     /// must never count). Returns false if the device isn't in the roster.
     pub fn set_device_status(&mut self, lct_id: Uuid, status: DeviceStatus) -> bool {
         match self.members.iter_mut().find(|m| m.lct_id == lct_id) {
-            Some(m) => { m.status = status; true }
+            Some(m) => {
+                m.status = status;
+                true
+            }
             None => false,
         }
     }
@@ -454,7 +475,10 @@ impl ConstellationStore {
 
     pub fn proof(&self) -> ConstellationProof {
         let member_ids: Vec<Uuid> = self.members.iter().map(|m| m.lct_id).collect();
-        let has_hardware = self.members.iter().any(|m| m.device_type == DeviceType::Hardware);
+        let has_hardware = self
+            .members
+            .iter()
+            .any(|m| m.device_type == DeviceType::Hardware);
         let assurance = if has_hardware {
             AssuranceLevel::HardwareBacked
         } else if self.members.len() > 1 {
@@ -504,33 +528,33 @@ impl ToolPlugin for ConstellationPlugin {
         _ctx: &dyn PluginCtx,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value, PluginError> {
-        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("status");
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("status");
 
         let vault = crate::vault::open_with_env(&self.home)
             .map_err(|e| PluginError::Internal(e.to_string()))?;
-        let store = ConstellationStore::load(&vault)
-            .map_err(|e| PluginError::Internal(e.to_string()))?;
+        let store =
+            ConstellationStore::load(&vault).map_err(|e| PluginError::Internal(e.to_string()))?;
 
         match action {
             "proof" => {
                 let proof = store.proof();
-                serde_json::to_value(&proof)
-                    .map_err(|e| PluginError::Internal(e.to_string()))
+                serde_json::to_value(&proof).map_err(|e| PluginError::Internal(e.to_string()))
             }
-            "status" => {
-                Ok(serde_json::json!({
-                    "owner_lct_id": store.owner_lct_id,
-                    "member_count": store.members.len(),
-                    "reachable": store.reachable_count(),
-                    "devices": store.members.iter().map(|m| serde_json::json!({
-                        "lct_id": m.lct_id,
-                        "name": m.name,
-                        "type": m.device_type,
-                        "reachable": m.reachable,
-                        "last_seen": m.last_seen,
-                    })).collect::<Vec<_>>(),
-                }))
-            }
+            "status" => Ok(serde_json::json!({
+                "owner_lct_id": store.owner_lct_id,
+                "member_count": store.members.len(),
+                "reachable": store.reachable_count(),
+                "devices": store.members.iter().map(|m| serde_json::json!({
+                    "lct_id": m.lct_id,
+                    "name": m.name,
+                    "type": m.device_type,
+                    "reachable": m.reachable,
+                    "last_seen": m.last_seen,
+                })).collect::<Vec<_>>(),
+            })),
             other => Err(PluginError::BadRequest(format!("unknown action: {other}"))),
         }
     }
@@ -546,8 +570,18 @@ mod tests {
         store.owner_lct_id = Some(Uuid::new_v4());
 
         let kp = KeyPair::generate();
-        store.add_device("Legion Desktop", DeviceType::Desktop, &kp.verifying_key().to_hex(), vec!["sign".into()]);
-        store.add_device("Phone", DeviceType::Mobile, &kp.verifying_key().to_hex(), vec!["approve".into()]);
+        store.add_device(
+            "Legion Desktop",
+            DeviceType::Desktop,
+            &kp.verifying_key().to_hex(),
+            vec!["sign".into()],
+        );
+        store.add_device(
+            "Phone",
+            DeviceType::Mobile,
+            &kp.verifying_key().to_hex(),
+            vec!["approve".into()],
+        );
 
         assert_eq!(store.members.len(), 2);
 
@@ -567,10 +601,23 @@ mod tests {
         store.owner_lct_id = Some(Uuid::new_v4());
 
         let kp = KeyPair::generate();
-        store.add_device("Desktop", DeviceType::Desktop, &kp.verifying_key().to_hex(), vec![]);
-        store.add_device("YubiKey", DeviceType::Hardware, &kp.verifying_key().to_hex(), vec!["attest".into()]);
+        store.add_device(
+            "Desktop",
+            DeviceType::Desktop,
+            &kp.verifying_key().to_hex(),
+            vec![],
+        );
+        store.add_device(
+            "YubiKey",
+            DeviceType::Hardware,
+            &kp.verifying_key().to_hex(),
+            vec!["attest".into()],
+        );
 
-        assert_eq!(store.proof().assurance_level, AssuranceLevel::HardwareBacked);
+        assert_eq!(
+            store.proof().assurance_level,
+            AssuranceLevel::HardwareBacked
+        );
     }
 
     #[test]
@@ -578,7 +625,12 @@ mod tests {
         let mut store = ConstellationStore::default();
         store.owner_lct_id = Some(Uuid::new_v4());
         let kp = KeyPair::generate();
-        store.add_device("Test", DeviceType::Server, &kp.verifying_key().to_hex(), vec!["api".into()]);
+        store.add_device(
+            "Test",
+            DeviceType::Server,
+            &kp.verifying_key().to_hex(),
+            vec!["api".into()],
+        );
 
         let json = serde_json::to_string(&store).unwrap();
         let recovered: ConstellationStore = serde_json::from_str(&json).unwrap();
@@ -600,7 +652,9 @@ mod tests {
         let mut keys = Vec::new();
         for (name, dt) in types {
             let kp = KeyPair::generate();
-            let id = store.add_device(name, dt.clone(), &kp.verifying_key().to_hex(), vec![]).lct_id;
+            let id = store
+                .add_device(name, dt.clone(), &kp.verifying_key().to_hex(), vec![])
+                .lct_id;
             keys.push((id, kp));
         }
         (store, keys)
@@ -614,10 +668,13 @@ mod tests {
         ]);
         let owner_kp = KeyPair::generate();
 
-        let att = ConstellationAttestation::create(&store, &owner_kp, "hub-nonce-123", &keys).unwrap();
+        let att =
+            ConstellationAttestation::create(&store, &owner_kp, "hub-nonce-123", &keys).unwrap();
         assert_eq!(att.claimed_assurance, AssuranceLevel::MultiDevice);
 
-        let level = att.verify_internal_consistency("hub-nonce-123", chrono::Duration::minutes(5)).unwrap();
+        let level = att
+            .verify_internal_consistency("hub-nonce-123", chrono::Duration::minutes(5))
+            .unwrap();
         assert_eq!(level, AssuranceLevel::MultiDevice);
     }
 
@@ -629,7 +686,9 @@ mod tests {
         ]);
         let owner_kp = KeyPair::generate();
         let att = ConstellationAttestation::create(&store, &owner_kp, "n", &keys).unwrap();
-        let level = att.verify_internal_consistency("n", chrono::Duration::minutes(5)).unwrap();
+        let level = att
+            .verify_internal_consistency("n", chrono::Duration::minutes(5))
+            .unwrap();
         assert_eq!(level, AssuranceLevel::HardwareBacked);
     }
 
@@ -638,7 +697,10 @@ mod tests {
         let (store, keys) = store_with_keys(&[("Desktop", DeviceType::Desktop)]);
         let owner_kp = KeyPair::generate();
         let att = ConstellationAttestation::create(&store, &owner_kp, "nonce-a", &keys).unwrap();
-        assert!(att.verify_internal_consistency("nonce-b", chrono::Duration::minutes(5)).is_err());
+        assert!(
+            att.verify_internal_consistency("nonce-b", chrono::Duration::minutes(5))
+                .is_err()
+        );
     }
 
     #[test]
@@ -650,7 +712,10 @@ mod tests {
         let owner_kp = KeyPair::generate();
         let mut att = ConstellationAttestation::create(&store, &owner_kp, "n", &keys).unwrap();
         att.member_lcts.push(Uuid::new_v4()); // inject a phantom device
-        assert!(att.verify_internal_consistency("n", chrono::Duration::minutes(5)).is_err());
+        assert!(
+            att.verify_internal_consistency("n", chrono::Duration::minutes(5))
+                .is_err()
+        );
     }
 
     #[test]
@@ -662,11 +727,16 @@ mod tests {
             ("Phone", DeviceType::Mobile),
         ]);
         let owner_kp = KeyPair::generate();
-        let one_key = vec![(keys[0].0, KeyPair::from_secret_bytes(&keys[0].1.secret_key_bytes()))];
+        let one_key = vec![(
+            keys[0].0,
+            KeyPair::from_secret_bytes(&keys[0].1.secret_key_bytes()),
+        )];
         let mut att = ConstellationAttestation::create(&store, &owner_kp, "n", &one_key).unwrap();
         att.claimed_assurance = AssuranceLevel::HardwareBacked; // lie
 
-        let level = att.verify_internal_consistency("n", chrono::Duration::minutes(5)).unwrap();
+        let level = att
+            .verify_internal_consistency("n", chrono::Duration::minutes(5))
+            .unwrap();
         assert_eq!(level, AssuranceLevel::SingleDevice);
     }
 
@@ -676,29 +746,38 @@ mod tests {
         let owner_kp = KeyPair::generate();
         let wrong_kp = KeyPair::generate();
         let device_id = store.members[0].lct_id;
-        let result = ConstellationAttestation::create(
-            &store, &owner_kp, "n", &[(device_id, wrong_kp)],
-        );
+        let result =
+            ConstellationAttestation::create(&store, &owner_kp, "n", &[(device_id, wrong_kp)]);
         assert!(result.is_err());
     }
 
     // ---- verify_against_store: GPT's exploit scenarios must now FAIL ----
 
     const SKEW: chrono::Duration = chrono::Duration::minutes(2);
-    fn max_age() -> chrono::Duration { chrono::Duration::minutes(5) }
+    fn max_age() -> chrono::Duration {
+        chrono::Duration::minutes(5)
+    }
 
     /// Baseline: a legit attestation verifies against the store, deriving the
     /// tier from STORED facts.
     #[test]
     fn store_verifier_accepts_a_legit_attestation() {
         let (store, keys) = store_with_keys(&[
-            ("Desktop", DeviceType::Desktop), ("Phone", DeviceType::Mobile),
+            ("Desktop", DeviceType::Desktop),
+            ("Phone", DeviceType::Mobile),
         ]);
         let owner_kp = KeyPair::generate();
         let att = ConstellationAttestation::create(&store, &owner_kp, "n", &keys).unwrap();
-        let level = att.verify_against_store(
-            store.owner_lct_id.unwrap(), &owner_kp.verifying_key(), "n", &store, max_age(), SKEW,
-        ).unwrap();
+        let level = att
+            .verify_against_store(
+                store.owner_lct_id.unwrap(),
+                &owner_kp.verifying_key(),
+                "n",
+                &store,
+                max_age(),
+                SKEW,
+            )
+            .unwrap();
         assert_eq!(level, AssuranceLevel::MultiDevice);
     }
 
@@ -715,7 +794,11 @@ mod tests {
         let phantom_id = Uuid::new_v4();
         let phantom_kp = KeyPair::generate();
         let payload = ConstellationAttestation::signing_payload(
-            att.owner_lct_id, &att.member_lcts, &att.challenge_nonce, &att.issued_at);
+            att.owner_lct_id,
+            &att.member_lcts,
+            &att.challenge_nonce,
+            &att.issued_at,
+        );
         att.member_lcts.push(phantom_id);
         att.device_signatures.push(DeviceSignature {
             lct_id: phantom_id,
@@ -725,12 +808,29 @@ mod tests {
         });
         // Re-sign the owner over the tampered roster so the owner check passes —
         // proving the DEFENSE is the store resolution, not the owner sig.
-        att.owner_signature = owner_kp.sign(&ConstellationAttestation::signing_payload(
-            att.owner_lct_id, &att.member_lcts, &att.challenge_nonce, &att.issued_at)).to_hex();
-        let level = att.verify_against_store(
-            store.owner_lct_id.unwrap(), &owner_kp.verifying_key(), "n", &store, max_age(), SKEW,
-        ).unwrap();
-        assert_eq!(level, AssuranceLevel::SingleDevice, "phantom Hardware must not count");
+        att.owner_signature = owner_kp
+            .sign(&ConstellationAttestation::signing_payload(
+                att.owner_lct_id,
+                &att.member_lcts,
+                &att.challenge_nonce,
+                &att.issued_at,
+            ))
+            .to_hex();
+        let level = att
+            .verify_against_store(
+                store.owner_lct_id.unwrap(),
+                &owner_kp.verifying_key(),
+                "n",
+                &store,
+                max_age(),
+                SKEW,
+            )
+            .unwrap();
+        assert_eq!(
+            level,
+            AssuranceLevel::SingleDevice,
+            "phantom Hardware must not count"
+        );
     }
 
     /// GPT #2: forged multi-device via a device id that isn't enrolled — ignored.
@@ -742,31 +842,55 @@ mod tests {
         let ghost = Uuid::new_v4();
         let ghost_kp = KeyPair::generate();
         let payload = ConstellationAttestation::signing_payload(
-            att.owner_lct_id, &att.member_lcts, &att.challenge_nonce, &att.issued_at);
+            att.owner_lct_id,
+            &att.member_lcts,
+            &att.challenge_nonce,
+            &att.issued_at,
+        );
         att.device_signatures.push(DeviceSignature {
-            lct_id: ghost, device_type: DeviceType::Desktop,
+            lct_id: ghost,
+            device_type: DeviceType::Desktop,
             pubkey_hex: ghost_kp.verifying_key().to_hex(),
             signature: ghost_kp.sign(&payload).to_hex(),
         });
-        let level = att.verify_against_store(
-            store.owner_lct_id.unwrap(), &owner_kp.verifying_key(), "n", &store, max_age(), SKEW,
-        ).unwrap();
-        assert_eq!(level, AssuranceLevel::SingleDevice, "unenrolled device adds nothing");
+        let level = att
+            .verify_against_store(
+                store.owner_lct_id.unwrap(),
+                &owner_kp.verifying_key(),
+                "n",
+                &store,
+                max_age(),
+                SKEW,
+            )
+            .unwrap();
+        assert_eq!(
+            level,
+            AssuranceLevel::SingleDevice,
+            "unenrolled device adds nothing"
+        );
     }
 
     /// A revoked device contributes no assurance even though its key still signs.
     #[test]
     fn store_verifier_excludes_revoked_device() {
         let (mut store, keys) = store_with_keys(&[
-            ("Desktop", DeviceType::Desktop), ("Phone", DeviceType::Mobile),
+            ("Desktop", DeviceType::Desktop),
+            ("Phone", DeviceType::Mobile),
         ]);
         let owner_kp = KeyPair::generate();
         let att = ConstellationAttestation::create(&store, &owner_kp, "n", &keys).unwrap();
         // Revoke the phone AFTER it co-signed — must drop to SingleDevice.
         assert!(store.set_device_status(keys[1].0, DeviceStatus::Revoked));
-        let level = att.verify_against_store(
-            store.owner_lct_id.unwrap(), &owner_kp.verifying_key(), "n", &store, max_age(), SKEW,
-        ).unwrap();
+        let level = att
+            .verify_against_store(
+                store.owner_lct_id.unwrap(),
+                &owner_kp.verifying_key(),
+                "n",
+                &store,
+                max_age(),
+                SKEW,
+            )
+            .unwrap();
         assert_eq!(level, AssuranceLevel::SingleDevice);
     }
 
@@ -774,21 +898,41 @@ mod tests {
     #[test]
     fn store_verifier_rejects_foreign_device_key() {
         let (store, keys) = store_with_keys(&[
-            ("Desktop", DeviceType::Desktop), ("Phone", DeviceType::Mobile),
+            ("Desktop", DeviceType::Desktop),
+            ("Phone", DeviceType::Mobile),
         ]);
         let owner_kp = KeyPair::generate();
         let mut att = ConstellationAttestation::create(&store, &owner_kp, "n", &keys).unwrap();
         // Re-sign the phone's entry with a foreign key (its lct stays enrolled).
         let foreign = KeyPair::generate();
         let payload = ConstellationAttestation::signing_payload(
-            att.owner_lct_id, &att.member_lcts, &att.challenge_nonce, &att.issued_at);
-        let phone = att.device_signatures.iter_mut().find(|d| d.lct_id == keys[1].0).unwrap();
+            att.owner_lct_id,
+            &att.member_lcts,
+            &att.challenge_nonce,
+            &att.issued_at,
+        );
+        let phone = att
+            .device_signatures
+            .iter_mut()
+            .find(|d| d.lct_id == keys[1].0)
+            .unwrap();
         phone.signature = foreign.sign(&payload).to_hex();
         phone.pubkey_hex = foreign.verifying_key().to_hex(); // even lying about the key
-        let level = att.verify_against_store(
-            store.owner_lct_id.unwrap(), &owner_kp.verifying_key(), "n", &store, max_age(), SKEW,
-        ).unwrap();
-        assert_eq!(level, AssuranceLevel::SingleDevice, "foreign key fails against the stored key");
+        let level = att
+            .verify_against_store(
+                store.owner_lct_id.unwrap(),
+                &owner_kp.verifying_key(),
+                "n",
+                &store,
+                max_age(),
+                SKEW,
+            )
+            .unwrap();
+        assert_eq!(
+            level,
+            AssuranceLevel::SingleDevice,
+            "foreign key fails against the stored key"
+        );
     }
 
     /// GPT #3: duplicate signature entries never inflate the count.
@@ -799,10 +943,21 @@ mod tests {
         let mut att = ConstellationAttestation::create(&store, &owner_kp, "n", &keys).unwrap();
         let dup = att.device_signatures[0].clone();
         att.device_signatures.push(dup); // same lct_id twice
-        let level = att.verify_against_store(
-            store.owner_lct_id.unwrap(), &owner_kp.verifying_key(), "n", &store, max_age(), SKEW,
-        ).unwrap();
-        assert_eq!(level, AssuranceLevel::SingleDevice, "one device, duplicated, is still one");
+        let level = att
+            .verify_against_store(
+                store.owner_lct_id.unwrap(),
+                &owner_kp.verifying_key(),
+                "n",
+                &store,
+                max_age(),
+                SKEW,
+            )
+            .unwrap();
+        assert_eq!(
+            level,
+            AssuranceLevel::SingleDevice,
+            "one device, duplicated, is still one"
+        );
     }
 
     /// GPT #4: the owner key must match the TRUSTED key, not the presented one.
@@ -812,9 +967,18 @@ mod tests {
         let owner_kp = KeyPair::generate();
         let att = ConstellationAttestation::create(&store, &owner_kp, "n", &keys).unwrap();
         let attacker = KeyPair::generate();
-        assert!(att.verify_against_store(
-            store.owner_lct_id.unwrap(), &attacker.verifying_key(), "n", &store, max_age(), SKEW,
-        ).is_err(), "a non-owner trusted key must reject");
+        assert!(
+            att.verify_against_store(
+                store.owner_lct_id.unwrap(),
+                &attacker.verifying_key(),
+                "n",
+                &store,
+                max_age(),
+                SKEW,
+            )
+            .is_err(),
+            "a non-owner trusted key must reject"
+        );
     }
 
     /// GPT #5: a future-dated attestation (negative age) is rejected.
@@ -825,25 +989,49 @@ mod tests {
         let mut att = ConstellationAttestation::create(&store, &owner_kp, "n", &keys).unwrap();
         att.issued_at = Utc::now() + chrono::Duration::hours(1);
         // Re-sign owner over the new issued_at so only the freshness gate can fire.
-        att.owner_signature = owner_kp.sign(&ConstellationAttestation::signing_payload(
-            att.owner_lct_id, &att.member_lcts, &att.challenge_nonce, &att.issued_at)).to_hex();
-        assert!(att.verify_against_store(
-            store.owner_lct_id.unwrap(), &owner_kp.verifying_key(), "n", &store, max_age(), SKEW,
-        ).is_err(), "future-dated beyond skew must reject");
+        att.owner_signature = owner_kp
+            .sign(&ConstellationAttestation::signing_payload(
+                att.owner_lct_id,
+                &att.member_lcts,
+                &att.challenge_nonce,
+                &att.issued_at,
+            ))
+            .to_hex();
+        assert!(
+            att.verify_against_store(
+                store.owner_lct_id.unwrap(),
+                &owner_kp.verifying_key(),
+                "n",
+                &store,
+                max_age(),
+                SKEW,
+            )
+            .is_err(),
+            "future-dated beyond skew must reject"
+        );
     }
 
     #[test]
     fn canonical_roster_hash_is_stable_and_excludes_liveness() {
         let (mut store, _keys) = store_with_keys(&[
-            ("Desktop", DeviceType::Desktop), ("Phone", DeviceType::Mobile),
+            ("Desktop", DeviceType::Desktop),
+            ("Phone", DeviceType::Mobile),
         ]);
         let h1 = store.canonical_roster_hash();
         // Mutating transient liveness must NOT change the roster identity.
         store.members[0].reachable = true;
         store.members[0].last_seen = Some(Utc::now());
-        assert_eq!(h1, store.canonical_roster_hash(), "liveness churn is excluded");
+        assert_eq!(
+            h1,
+            store.canonical_roster_hash(),
+            "liveness churn is excluded"
+        );
         // Revoking a device (authoritative status) MUST change it.
         store.members[0].status = DeviceStatus::Revoked;
-        assert_ne!(h1, store.canonical_roster_hash(), "status is part of identity");
+        assert_ne!(
+            h1,
+            store.canonical_roster_hash(),
+            "status is part of identity"
+        );
     }
 }

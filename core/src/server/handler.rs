@@ -15,11 +15,12 @@ use rmcp::{
     },
     service::{RequestContext, RoleServer},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
 
 use super::state::{InFlightAction, Session, SharedState};
+use crate::evidence::{CLOSURE_CLAIMS_SCHEMA_V1, ReversalCause, parse_closure_claims};
 use crate::vault::VaultEntry;
 use web4_trust_core::EntityTrust;
 
@@ -159,19 +160,46 @@ fn hestia_tools() -> Vec<Tool> {
     }
 
     vec![
-        t("hestia_connect", "Establish a plugin session and receive a Soft LCT"),
+        t(
+            "hestia_connect",
+            "Establish a plugin session and receive a Soft LCT",
+        ),
         t("hestia_begin_action", "Begin tracking an R6/R7 action"),
-        t("hestia_record_outcome", "Submit the outcome of an action"),
-        t("hestia_record_reversal", "Record a reversal/override of a subject's work (judgment signal → trust)"),
-        t("hestia_witness_decision", "Witness an externally-adjudicated plugin-gate deny/warn (chain + gate-risk trust)"),
-        t("hestia_query_policy", "Query the user's policy for a decision"),
+        t(
+            "hestia_record_outcome",
+            "Submit an action outcome with optional explicit closure claims",
+        ),
+        t(
+            "hestia_record_reversal",
+            "Record a reversal with a classified cause; only invalid-result refutes validity",
+        ),
+        t(
+            "hestia_witness_decision",
+            "Witness an externally-adjudicated plugin-gate deny/warn (chain + gate-risk trust)",
+        ),
+        t(
+            "hestia_query_policy",
+            "Query the user's policy for a decision",
+        ),
         t("hestia_vault_get", "Request a credential from the vault"),
         t("hestia_vault_set", "Store a credential in the vault"),
         t("hestia_query_history", "Query the witness chain"),
-        t("hestia_request_witness", "Append a custom witness chain event"),
-        t("hestia_notify", "Receive a hub->citizen notification: open the sealed body, record receipt, return a sealed ACK. Pass defer:true to park it (still sealed) in the durable encrypted inbox and ACK without returning the body"),
-        t("hestia_inbox", "Drain the durable inbound mailbox (consume-once): opens deferred notices with the member identity, oldest first"),
-        t("hestia_pair_inbox", "Drain SECRETS sent over confirmed paired channels (pull-side): opens each peer pair_message as a SecretEnvelope, advances a per-pair cursor so each is delivered once. Credential-access gated (§7.8.2) — an unattended caller is deferred and the secret waits for an attended drain"),
+        t(
+            "hestia_request_witness",
+            "Append a custom witness chain event",
+        ),
+        t(
+            "hestia_notify",
+            "Receive a hub->citizen notification: open the sealed body, record receipt, return a sealed ACK. Pass defer:true to park it (still sealed) in the durable encrypted inbox and ACK without returning the body",
+        ),
+        t(
+            "hestia_inbox",
+            "Drain the durable inbound mailbox (consume-once): opens deferred notices with the member identity, oldest first",
+        ),
+        t(
+            "hestia_pair_inbox",
+            "Drain SECRETS sent over confirmed paired channels (pull-side): opens each peer pair_message as a SecretEnvelope, advances a per-pair cursor so each is delivered once. Credential-access gated (§7.8.2) — an unattended caller is deferred and the secret waits for an attended drain",
+        ),
     ]
 }
 
@@ -252,7 +280,11 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         let is_syn = s.is_synthetic(&plugin_id);
         // Split the disjoint field borrows explicitly (the borrow checker can't
         // see through a method call that takes &mut self).
-        let super::state::ServerState { vault, member_registry, .. } = &mut *s;
+        let super::state::ServerState {
+            vault,
+            member_registry,
+            ..
+        } = &mut *s;
         crate::member_registry::ensure_member(
             vault,
             member_registry,
@@ -295,8 +327,7 @@ async fn tool_begin_action(state: &SharedState, args: &Value) -> ToolResult {
     let action_id = Uuid::new_v4();
     let chain_position = s.chain_len();
 
-    let session_id = resolve_session_uuid(&s, session_id_arg.as_deref())
-        .unwrap_or_else(Uuid::nil);
+    let session_id = resolve_session_uuid(&s, session_id_arg.as_deref()).unwrap_or_else(Uuid::nil);
 
     let started_at = Utc::now();
     s.actions.insert(
@@ -331,6 +362,16 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
         .unwrap_or(false);
     let magnitude = args.get("magnitude").and_then(Value::as_f64).unwrap_or(0.5);
     let error = optional_string(args, "error");
+    let closure_claims = match parse_closure_claims(args.get("closure_claims")) {
+        Ok(claims) => claims,
+        Err(message) => {
+            return Ok(hestia_error_envelope(
+                "hestia.invalid_closure_claims",
+                &message,
+                Some(json!({"schema": CLOSURE_CLAIMS_SCHEMA_V1})),
+            ));
+        }
+    };
 
     let mut s = state.lock().await;
     let action = match s.actions.remove(&action_id) {
@@ -375,6 +416,8 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
             "session_id": action.session_id,
             "host_session_id": action.host_session_id,
             "intent": action.intent,
+            "closure_claims_schema": CLOSURE_CLAIMS_SCHEMA_V1,
+            "closure_claims": closure_claims,
         }),
     )?;
 
@@ -384,7 +427,11 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
         action_type: "tool_execution",
         action_target: &action.tool_name,
         action_id: &rep_action_id,
-        reason: if success { "outcome:success" } else { "outcome:failure" },
+        reason: if success {
+            "outcome:success"
+        } else {
+            "outcome:failure"
+        },
     };
     let trust_state = s.apply_outcome_ctx(&plugin_id, success, magnitude, &rep_ctx)?;
 
@@ -396,8 +443,8 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
 
 async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     let action_id_str = require_string(args, "action_id")?;
-    let action_id = Uuid::parse_str(&action_id_str)
-        .map_err(|_| anyhow::anyhow!("invalid action_id"))?;
+    let action_id =
+        Uuid::parse_str(&action_id_str).map_err(|_| anyhow::anyhow!("invalid action_id"))?;
     let s = state.lock().await;
     let action = match s.actions.get(&action_id) {
         Some(a) => a.clone(),
@@ -587,7 +634,11 @@ fn resolve_caller(s: &super::state::ServerState, session_id_arg: Option<&str>) -
                 crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
             )
         });
-    CallerWho { session_uuid, plugin_id, role_lct }
+    CallerWho {
+        session_uuid,
+        plugin_id,
+        role_lct,
+    }
 }
 
 /// Daemon-side policy gate for the direct-call tool surfaces (vault get/set,
@@ -647,9 +698,9 @@ fn gate_direct_tool(
         // The envelope message is what the calling agent reads — carry the
         // steering text (guidance is Some here: enforced deny), not the bare
         // reason, so a vault deny redirects the same way a gate deny does.
-        let message = evaluation.guidance().unwrap_or_else(|| {
-            format!("{} denied by policy: {}", tool_name, evaluation.reason)
-        });
+        let message = evaluation
+            .guidance()
+            .unwrap_or_else(|| format!("{} denied by policy: {}", tool_name, evaluation.reason));
         return Some(hestia_error_envelope(
             "hestia.policy_denied",
             &message,
@@ -674,7 +725,8 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
 
     let mut s = state.lock().await;
     let who = resolve_caller(&s, session_id_arg.as_deref());
-    if let Some(denied) = gate_direct_tool(&mut s, &who, "hestia_vault_get", "credential_access", &name)
+    if let Some(denied) =
+        gate_direct_tool(&mut s, &who, "hestia_vault_get", "credential_access", &name)
     {
         return Ok(denied);
     }
@@ -752,7 +804,8 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
     // GPT 3rd-pass HST-002. classify() already maps hestia_vault_set to
     // credential_access, so the ratified unattended-role deny binds here too.
     let who = resolve_caller(&s, session_id_arg.as_deref());
-    if let Some(denied) = gate_direct_tool(&mut s, &who, "hestia_vault_set", "credential_access", &name)
+    if let Some(denied) =
+        gate_direct_tool(&mut s, &who, "hestia_vault_set", "credential_access", &name)
     {
         return Ok(denied);
     }
@@ -831,12 +884,10 @@ const RESERVED_EVENT_TYPES: &[&str] = &[
     "reversal",
 ];
 
-/// Reversal kinds — a JUDGMENT signal about an actor's work, distinct from the
+/// Reversal kinds — the operational shape of a reversal, distinct from the
 /// execution `outcome` (did the tool run?) and the rule `policy_decision` (did a
-/// pattern match?). This is the signal the calibration analysis found missing:
-/// the rule-gate is trust-blind by construction, so trust can't predict it —
-/// but a reversal IS evidence about the actor's judgment, which trust should
-/// (falsifiably) predict. Instrumented 2026-07-07.
+/// pattern match?). `cause` separately records why it happened; only an
+/// `invalid-result` cause supports a negative validity observation.
 ///
 /// There is deliberately NO `review_reject` kind. Under the judge-disjoint
 /// split (calibration-prd4, concurred 2026-07-07): dp's human-gate decisions
@@ -846,10 +897,11 @@ const RESERVED_EVENT_TYPES: &[&str] = &[
 /// through the side door. A human-gate rejection is an `override`.
 const REVERSAL_KINDS: &[&str] = &["override", "rollback", "incident"];
 
-/// Record a reversal/override of a prior action — a delayed NEGATIVE judgment
-/// about the SUBJECT (instance, role), fed into the subject's JUDGMENT-axis
-/// trust (never the execution scalar — see [`judgment_entity_key`]) and
-/// witnessed. The subject is passed explicitly (`subject_plugin_id`
+/// Record a witnessed reversal/override of a prior action. Only
+/// `cause=invalid-result` feeds the subject's legacy JUDGMENT-axis trust
+/// (never the execution scalar — see [`judgment_entity_key`]). Other causes
+/// remain append-only evidence without an automatic negative. The subject is
+/// passed explicitly (`subject_plugin_id`
 /// [+ `subject_role`]) because the reverted work is usually attributed after
 /// the subject's session has ended (e.g. dp reverting a worker's merged PR).
 /// The REPORTER (the caller) must be an attributable live session, is gated by
@@ -879,7 +931,7 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
                         "subject_role '{declared_role}' is not a published constellation role"
                     ),
                     Some(json!({"subject_role": declared_role})),
-                ))
+                ));
             }
         }
     };
@@ -891,6 +943,26 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
             Some(json!({"kind": kind})),
         ));
     }
+    let Some(cause_string) = optional_string(args, "cause") else {
+        return Ok(hestia_error_envelope(
+            "hestia.reversal_missing_cause",
+            "cause is required",
+            Some(json!({"allowed_causes": ReversalCause::ALL})),
+        ));
+    };
+    let cause = match cause_string.parse::<ReversalCause>() {
+        Ok(cause) => cause,
+        Err(message) => {
+            return Ok(hestia_error_envelope(
+                "hestia.reversal_unknown_cause",
+                &message,
+                Some(json!({
+                    "cause": cause_string,
+                    "allowed_causes": ReversalCause::ALL,
+                })),
+            ));
+        }
+    };
     let reason = optional_string(args, "reason");
     // Severity of the reversal → trust penalty. Bounded [0,1]; default moderate.
     let magnitude = args
@@ -903,8 +975,8 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
 
     let mut s = state.lock().await;
     let reporter = resolve_caller(&s, session_id_arg.as_deref());
-    // A negative judgment from an unattributable reporter must not feed trust:
-    // for a calibration instrument, poisoned data is worse than missing data.
+    // A cross-actor reversal from an unattributable reporter must not enter
+    // the evidence stream: poisoned attribution is worse than missing data.
     if reporter.session_uuid.is_none() {
         return Ok(hestia_error_envelope(
             "hestia.reversal_unattributed_reporter",
@@ -915,9 +987,13 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
     }
     // Same law as the other direct-call surfaces: role overlays can deny who
     // may report reversals, and an enforced deny is witnessed with full WHO.
-    if let Some(denied) =
-        gate_direct_tool(&mut s, &reporter, "hestia_record_reversal", "reversal_report", &kind)
-    {
+    if let Some(denied) = gate_direct_tool(
+        &mut s,
+        &reporter,
+        "hestia_record_reversal",
+        "reversal_report",
+        &kind,
+    ) {
         return Ok(denied);
     }
     let subject_instance_lct = s.member_lct(&subject_plugin_id);
@@ -931,6 +1007,12 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
             "subject_instance_lct": subject_instance_lct,
             "subject_role": subject_role,
             "kind": kind,
+            "cause": cause,
+            "validity_effect": if cause.refutes_validity() {
+                Value::String("refuted".into())
+            } else {
+                Value::Null
+            },
             "reason": reason,
             "ref": reference,
             "magnitude": magnitude,
@@ -942,13 +1024,12 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
         }),
     )?;
 
-    // Feed the SUBJECT's JUDGMENT-axis trust — a separate entity from the
-    // execution scalar, so the ~10³/day execution stream can't refill the dip
-    // (measured: a shared t3_average recovers a reversal within minutes and
-    // the estimator stays a constant). Distinct `action_type` separates the
-    // delta stream too.
+    // Only an invalid result is negative validity evidence. Other reversal
+    // causes remain witnessed history without silently penalizing the subject.
+    // Prompt/forthright self-correction can become positive Temperament
+    // evidence only after adjudication; the cause label alone does not prove it.
     let ref_target = reference.clone().unwrap_or_default();
-    let rev_reason = format!("reversal:{kind}");
+    let rev_reason = format!("reversal:{kind}:{cause}");
     let rep_ctx = crate::reputation::RepContext {
         role_lct: subject_role,
         action_type: "reversal",
@@ -956,11 +1037,19 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
         action_id: "",
         reason: &rev_reason,
     };
-    let judgment_state = s.apply_judgment_ctx(&subject_plugin_id, false, magnitude, &rep_ctx)?;
+    let judgment_mutated = cause.refutes_validity();
+    let judgment_state = if judgment_mutated {
+        s.apply_judgment_ctx(&subject_plugin_id, false, magnitude, &rep_ctx)?
+    } else {
+        s.judgment_for_role(&subject_plugin_id, subject_role)
+    };
 
     Ok(json!({
         "witnessEntryHash": entry.hash,
         "subjectInstanceLct": subject_instance_lct,
+        "cause": cause,
+        "validityEffect": if cause.refutes_validity() { Some("refuted") } else { None },
+        "judgmentMutated": judgment_mutated,
         "updatedJudgmentTrust": trust_state_json(&judgment_state),
     }))
 }
@@ -1042,7 +1131,10 @@ async fn tool_request_witness(state: &SharedState, args: &Value) -> ToolResult {
     if RESERVED_EVENT_TYPES.contains(&event_type.as_str()) {
         return Ok(hestia_error_envelope(
             "hestia.witness_reserved_event",
-            &format!("event_type '{}' is reserved for daemon-authored events", event_type),
+            &format!(
+                "event_type '{}' is reserved for daemon-authored events",
+                event_type
+            ),
             Some(json!({"event_type": event_type})),
         ));
     }
@@ -1053,9 +1145,13 @@ async fn tool_request_witness(state: &SharedState, args: &Value) -> ToolResult {
     // what lands on the chain carries the requesting WHO next to the caller's
     // payload — never only caller-supplied data.
     let who = resolve_caller(&s, session_id_arg.as_deref());
-    if let Some(denied) =
-        gate_direct_tool(&mut s, &who, "hestia_request_witness", "witness_append", &event_type)
-    {
+    if let Some(denied) = gate_direct_tool(
+        &mut s,
+        &who,
+        "hestia_request_witness",
+        "witness_append",
+        &event_type,
+    ) {
         return Ok(denied);
     }
     let entry = s.append_chain(
@@ -1090,16 +1186,26 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
     let pair_id = Uuid::parse_str(&require_string(args, "pair_id")?)
         .map_err(|_| anyhow::anyhow!("pair_id is not a UUID"))?;
     let sealed = require_string(args, "sealed")?;
-    let kind = args.get("kind").and_then(Value::as_str).unwrap_or("notify").to_string();
-    let pointer_uri = args.get("pointer_uri").and_then(Value::as_str).map(str::to_string);
+    let kind = args
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("notify")
+        .to_string();
+    let pointer_uri = args
+        .get("pointer_uri")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     // The HUB is the sealer (hub→citizen notification).
     let hub_lct_id = args
         .get("hub_lct_id")
         .and_then(Value::as_str)
         .and_then(|s| Uuid::parse_str(s).ok())
         .unwrap_or_else(Uuid::nil);
-    let hub_pubkey_hex = optional_string(args, "hub_pubkey_hex")
-        .ok_or_else(|| anyhow::anyhow!("hub_pubkey_hex required (the hub's channel pubkey that sealed this notice)"))?;
+    let hub_pubkey_hex = optional_string(args, "hub_pubkey_hex").ok_or_else(|| {
+        anyhow::anyhow!(
+            "hub_pubkey_hex required (the hub's channel pubkey that sealed this notice)"
+        )
+    })?;
 
     let mut s = state.lock().await;
 
@@ -1155,7 +1261,14 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
     // never persisted.
     if defer {
         s.inbox_store
-            .enqueue(pair_id, hub_lct_id, &hub_pubkey_hex, &sealed, &kind, pointer_uri.as_deref())
+            .enqueue(
+                pair_id,
+                hub_lct_id,
+                &hub_pubkey_hex,
+                &sealed,
+                &kind,
+                pointer_uri.as_deref(),
+            )
             .map_err(|e| anyhow::anyhow!("deferring notice to inbox (hub NOT acked): {e}"))?;
     }
 
@@ -1175,7 +1288,10 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
     )?;
 
     // Seal an ACK the hub opens to mark the notice delivered.
-    let ack = crate::hub::NotificationAck { act_id, received_at: Utc::now() };
+    let ack = crate::hub::NotificationAck {
+        act_id,
+        received_at: Utc::now(),
+    };
     let ack_sealed = channel.seal_ack(&keypair, &ack)?;
 
     if defer {
@@ -1221,7 +1337,8 @@ async fn tool_inbox(state: &SharedState, args: &Value) -> ToolResult {
     let session_id_arg = optional_string(args, "session_id");
     let mut s = state.lock().await;
     let who = resolve_caller(&s, session_id_arg.as_deref());
-    if let Some(denied) = gate_direct_tool(&mut s, &who, "hestia_inbox", "credential_access", "inbox")
+    if let Some(denied) =
+        gate_direct_tool(&mut s, &who, "hestia_inbox", "credential_access", "inbox")
     {
         return Ok(denied);
     }
@@ -1286,9 +1403,13 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
     let session_id_arg = optional_string(args, "session_id");
     let mut s = state.lock().await;
     let who = resolve_caller(&s, session_id_arg.as_deref());
-    if let Some(denied) =
-        gate_direct_tool(&mut s, &who, "hestia_pair_inbox", "credential_access", "pair_inbox")
-    {
+    if let Some(denied) = gate_direct_tool(
+        &mut s,
+        &who,
+        "hestia_pair_inbox",
+        "credential_access",
+        "pair_inbox",
+    ) {
         return Ok(denied); // §7.8.2: deferredByLaw — secret stays for an attended drain
     }
 
@@ -1317,7 +1438,10 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
 
     for p in &snapshot {
         // Need the (active) pair detail for the peer ephemeral; skip inactive pairs.
-        let detail = match client.get_pair(&conn.rest_endpoint, conn.hub_lct_id, p.pair_id).await {
+        let detail = match client
+            .get_pair(&conn.rest_endpoint, conn.hub_lct_id, p.pair_id)
+            .await
+        {
             Ok(d) if d.is_active() => d,
             _ => continue,
         };
@@ -1340,18 +1464,19 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
                 advanced = true;
                 continue;
             }
-            let entry = match crate::pairing::open_over_pair(p, &detail, &keypair, &peer_lct, &m.payload)
-                .and_then(|plain| crate::pairing::SecretEnvelope::from_opened_bytes(&plain))
-            {
-                Ok(env) => json!({
-                    "pairId": p.pair_id, "seq": m.seq, "from": m.from,
-                    "actId": env.act_id, "secretHex": env.secret_hex,
-                }),
-                Err(e) => json!({
-                    "pairId": p.pair_id, "seq": m.seq, "from": m.from,
-                    "error": format!("could not open as a secret: {e}"),
-                }),
-            };
+            let entry =
+                match crate::pairing::open_over_pair(p, &detail, &keypair, &peer_lct, &m.payload)
+                    .and_then(|plain| crate::pairing::SecretEnvelope::from_opened_bytes(&plain))
+                {
+                    Ok(env) => json!({
+                        "pairId": p.pair_id, "seq": m.seq, "from": m.from,
+                        "actId": env.act_id, "secretHex": env.secret_hex,
+                    }),
+                    Err(e) => json!({
+                        "pairId": p.pair_id, "seq": m.seq, "from": m.from,
+                        "error": format!("could not open as a secret: {e}"),
+                    }),
+                };
             opened.push(entry);
             pairings.set_cursor(p.pair_id, m.seq);
             advanced = true;
@@ -1445,9 +1570,14 @@ fn trust_state_json(trust: &EntityTrust) -> Value {
     })
 }
 
-fn resolve_session_uuid(state: &super::state::ServerState, session_id: Option<&str>) -> Option<Uuid> {
+fn resolve_session_uuid(
+    state: &super::state::ServerState,
+    session_id: Option<&str>,
+) -> Option<Uuid> {
     if let Some(sid) = session_id {
-        return Uuid::parse_str(sid).ok().filter(|u| state.sessions.contains_key(u));
+        return Uuid::parse_str(sid)
+            .ok()
+            .filter(|u| state.sessions.contains_key(u));
     }
     state
         .sessions
@@ -1533,7 +1663,10 @@ mod accountability_tests {
         let d = &outcome.event_data;
         // WHO — durable per-instance LCT (trust grain) + session_id (audit grain).
         assert!(
-            d["instance_lct"].as_str().unwrap().starts_with("lct:web4:member:"),
+            d["instance_lct"]
+                .as_str()
+                .unwrap()
+                .starts_with("lct:web4:member:"),
             "instance_lct must be the durable per-instance LCT, got {:?}",
             d["instance_lct"]
         );
@@ -1550,17 +1683,142 @@ mod accountability_tests {
     #[tokio::test]
     async fn absent_intent_is_null_not_fabricated() {
         let (_dir, state) = test_state().await;
-        let connect = tool_connect(&state, &json!({"plugin_id":"claude-code","host_agent":"test"}))
-            .await.unwrap();
+        let connect = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"test"}),
+        )
+        .await
+        .unwrap();
         let sid = connect["sessionId"].as_str().unwrap().to_string();
         let begin = tool_begin_action(&state, &json!({"tool_name":"Read","session_id":sid}))
-            .await.unwrap();
+            .await
+            .unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
-        tool_record_outcome(&state, &json!({"action_id":aid,"success":true})).await.unwrap();
+        tool_record_outcome(&state, &json!({"action_id":aid,"success":true}))
+            .await
+            .unwrap();
         let s = state.lock().await;
-        let outcome = s.recent_chain(20).into_iter()
-            .find(|e| e.event_type == "outcome").unwrap();
-        assert!(outcome.event_data["intent"].is_null(), "unstated intent must be null");
+        let outcome = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "outcome")
+            .unwrap();
+        assert!(
+            outcome.event_data["intent"].is_null(),
+            "unstated intent must be null"
+        );
+    }
+
+    /// Closure claims are actor-authored, explicit, and witnessed with their
+    /// schema. A generic tool result never becomes an implied claim.
+    #[tokio::test]
+    async fn outcome_witnesses_explicit_closure_claims_without_inference() {
+        let (_dir, state) = test_state().await;
+        let connected = tool_connect(&state, &json!({"plugin_id":"codex","host_agent":"test"}))
+            .await
+            .unwrap();
+        let sid = connected["sessionId"].as_str().unwrap();
+
+        let first = tool_begin_action(&state, &json!({"tool_name":"Bash","session_id":sid}))
+            .await
+            .unwrap();
+        let first_id = first["actionId"].as_str().unwrap();
+        let recorded = tool_record_outcome(
+            &state,
+            &json!({
+                "action_id": first_id,
+                "success": true,
+                "result": {"summary": "tests pass"},
+                "closure_claims": [{
+                    "claim_id": "focused-tests-pass",
+                    "statement": "The focused core tests pass.",
+                    "scope": "hestia-core at the current source tree",
+                    "confidence": 0.98,
+                    "evidence": ["test:cargo-test-evidence"],
+                    "known_limitations": ["The full workspace was not tested."]
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(recorded.get("_hestia_error").is_none());
+
+        let second = tool_begin_action(&state, &json!({"tool_name":"Read","session_id":sid}))
+            .await
+            .unwrap();
+        let second_id = second["actionId"].as_str().unwrap();
+        tool_record_outcome(
+            &state,
+            &json!({
+                "action_id": second_id,
+                "success": true,
+                "result": {"summary": "this is not a closure claim"}
+            }),
+        )
+        .await
+        .unwrap();
+
+        let s = state.lock().await;
+        let outcomes: Vec<_> = s
+            .recent_chain(20)
+            .into_iter()
+            .filter(|entry| entry.event_type == "outcome")
+            .collect();
+        assert_eq!(
+            outcomes[1].event_data["closure_claims_schema"],
+            CLOSURE_CLAIMS_SCHEMA_V1
+        );
+        assert_eq!(
+            outcomes[1].event_data["closure_claims"][0]["claim_id"],
+            "focused-tests-pass"
+        );
+        assert_eq!(
+            outcomes[1].event_data["closure_claims"][0]["confidence"],
+            0.98
+        );
+        assert_eq!(outcomes[0].event_data["closure_claims"], json!([]));
+    }
+
+    /// Invalid claim payloads are rejected before the in-flight action is
+    /// consumed, so the actor can correct and resubmit without losing the act.
+    #[tokio::test]
+    async fn invalid_closure_claim_does_not_consume_action() {
+        let (_dir, state) = test_state().await;
+        let connected = tool_connect(&state, &json!({"plugin_id":"codex","host_agent":"test"}))
+            .await
+            .unwrap();
+        let begin = tool_begin_action(
+            &state,
+            &json!({"tool_name":"Bash","session_id":connected["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        let action_id = begin["actionId"].as_str().unwrap();
+        let invalid = tool_record_outcome(
+            &state,
+            &json!({
+                "action_id": action_id,
+                "success": true,
+                "closure_claims": [{
+                    "claim_id": "unsupported",
+                    "statement": "Everything works.",
+                    "scope": "everything",
+                    "confidence": 1.0,
+                    "evidence": []
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            invalid["_hestia_error"]["code"],
+            "hestia.invalid_closure_claims"
+        );
+
+        let corrected = tool_record_outcome(&state, &json!({"action_id":action_id,"success":true}))
+            .await
+            .unwrap();
+        assert!(corrected.get("_hestia_error").is_none());
     }
 
     /// The ratified unattended law has TEETH at the daemon: a mesh-worker session
@@ -1593,17 +1851,29 @@ mod accountability_tests {
             );
         }
         // mesh-worker → denied by the daemon, before the vault is even consulted.
-        let mw = tool_connect(&state, &json!({
-            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:mesh-worker"
-        })).await.unwrap();
-        let denied = tool_vault_get(&state, &json!({
-            "name":"github-pat","session_id": mw["sessionId"]
-        })).await.unwrap();
+        let mw = tool_connect(
+            &state,
+            &json!({
+                "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:mesh-worker"
+            }),
+        )
+        .await
+        .unwrap();
+        let denied = tool_vault_get(
+            &state,
+            &json!({
+                "name":"github-pat","session_id": mw["sessionId"]
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(denied["_hestia_error"]["code"], "hestia.policy_denied");
         // The refusal is witnessed with WHO.
         {
             let s = state.lock().await;
-            let pd = s.recent_chain(10).into_iter()
+            let pd = s
+                .recent_chain(10)
+                .into_iter()
                 .find(|e| e.event_type == "policy_decision")
                 .expect("vault deny must be witnessed");
             assert_eq!(pd.event_data["role_lct"], "role:constellation:mesh-worker");
@@ -1611,12 +1881,22 @@ mod accountability_tests {
             assert_eq!(pd.event_data["enforced"], true);
         }
         // member (attended) → NOT policy-blocked; falls through to not-found.
-        let m = tool_connect(&state, &json!({
-            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:member"
-        })).await.unwrap();
-        let ok = tool_vault_get(&state, &json!({
-            "name":"github-pat","session_id": m["sessionId"]
-        })).await.unwrap();
+        let m = tool_connect(
+            &state,
+            &json!({
+                "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:member"
+            }),
+        )
+        .await
+        .unwrap();
+        let ok = tool_vault_get(
+            &state,
+            &json!({
+                "name":"github-pat","session_id": m["sessionId"]
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(ok["_hestia_error"]["code"], "hestia.vault_not_found");
     }
 
@@ -1647,7 +1927,9 @@ mod accountability_tests {
         let (_dir, state) = test_state().await;
         {
             let mut s = state.lock().await;
-            s.vault.upsert(crate::vault::VaultEntry::new("github-pat", "s3cret")).unwrap();
+            s.vault
+                .upsert(crate::vault::VaultEntry::new("github-pat", "s3cret"))
+                .unwrap();
         }
         let res = read_resource_body(&state, "hestia://vault/github-pat").await;
         let err = res.expect_err("vault URI must no longer resolve");
@@ -1669,17 +1951,32 @@ mod accountability_tests {
                 deny_overlay_for(&["credential_access"]),
             );
         }
-        let mw = tool_connect(&state, &json!({
-            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:mesh-worker"
-        })).await.unwrap();
-        let denied = tool_vault_set(&state, &json!({
-            "name":"github-pat","value":"evil","session_id": mw["sessionId"]
-        })).await.unwrap();
+        let mw = tool_connect(
+            &state,
+            &json!({
+                "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:mesh-worker"
+            }),
+        )
+        .await
+        .unwrap();
+        let denied = tool_vault_set(
+            &state,
+            &json!({
+                "name":"github-pat","value":"evil","session_id": mw["sessionId"]
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(denied["_hestia_error"]["code"], "hestia.policy_denied");
         {
             let s = state.lock().await;
-            assert!(s.vault.get("github-pat").is_none(), "denied write must not persist");
-            let pd = s.recent_chain(10).into_iter()
+            assert!(
+                s.vault.get("github-pat").is_none(),
+                "denied write must not persist"
+            );
+            let pd = s
+                .recent_chain(10)
+                .into_iter()
                 .find(|e| e.event_type == "policy_decision")
                 .expect("vault_set deny must be witnessed");
             assert_eq!(pd.event_data["tool_name"], "hestia_vault_set");
@@ -1687,16 +1984,28 @@ mod accountability_tests {
             assert_eq!(pd.event_data["enforced"], true);
         }
         // member (attended) → the write goes through, attributed on the chain.
-        let m = tool_connect(&state, &json!({
-            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:member"
-        })).await.unwrap();
-        let ok = tool_vault_set(&state, &json!({
-            "name":"github-pat","value":"real","session_id": m["sessionId"]
-        })).await.unwrap();
+        let m = tool_connect(
+            &state,
+            &json!({
+                "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:member"
+            }),
+        )
+        .await
+        .unwrap();
+        let ok = tool_vault_set(
+            &state,
+            &json!({
+                "name":"github-pat","value":"real","session_id": m["sessionId"]
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(ok["stored"], true);
         let s = state.lock().await;
         assert!(s.vault.get("github-pat").is_some());
-        let vs = s.recent_chain(10).into_iter()
+        let vs = s
+            .recent_chain(10)
+            .into_iter()
             .find(|e| e.event_type == "vault_set")
             .expect("vault_set must be audited");
         assert_eq!(vs.event_data["role_lct"], "role:constellation:member");
@@ -1710,10 +2019,18 @@ mod accountability_tests {
     async fn request_witness_gated_attributed_and_reserved() {
         let (_dir, state) = test_state().await;
         // Forging a daemon-authored event type is refused for anyone.
-        let forged = tool_request_witness(&state, &json!({
-            "event_type":"policy_decision","event_data":{"decision":"allow"}
-        })).await.unwrap();
-        assert_eq!(forged["_hestia_error"]["code"], "hestia.witness_reserved_event");
+        let forged = tool_request_witness(
+            &state,
+            &json!({
+                "event_type":"policy_decision","event_data":{"decision":"allow"}
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            forged["_hestia_error"]["code"],
+            "hestia.witness_reserved_event"
+        );
 
         // An overlaid unattended role is denied the append by law.
         {
@@ -1723,28 +2040,53 @@ mod accountability_tests {
                 deny_overlay_for(&["witness_append"]),
             );
         }
-        let mw = tool_connect(&state, &json!({
-            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:mesh-worker"
-        })).await.unwrap();
-        let denied = tool_request_witness(&state, &json!({
-            "event_type":"custom.note","event_data":{"k":"v"},"session_id": mw["sessionId"]
-        })).await.unwrap();
+        let mw = tool_connect(
+            &state,
+            &json!({
+                "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:mesh-worker"
+            }),
+        )
+        .await
+        .unwrap();
+        let denied = tool_request_witness(
+            &state,
+            &json!({
+                "event_type":"custom.note","event_data":{"k":"v"},"session_id": mw["sessionId"]
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(denied["_hestia_error"]["code"], "hestia.policy_denied");
 
         // A member append lands, wrapped with the requesting WHO.
-        let m = tool_connect(&state, &json!({
-            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:member"
-        })).await.unwrap();
-        let ok = tool_request_witness(&state, &json!({
-            "event_type":"custom.note","event_data":{"k":"v"},"session_id": m["sessionId"]
-        })).await.unwrap();
+        let m = tool_connect(
+            &state,
+            &json!({
+                "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:member"
+            }),
+        )
+        .await
+        .unwrap();
+        let ok = tool_request_witness(
+            &state,
+            &json!({
+                "event_type":"custom.note","event_data":{"k":"v"},"session_id": m["sessionId"]
+            }),
+        )
+        .await
+        .unwrap();
         assert!(ok["witnessEntryHash"].is_string());
         let s = state.lock().await;
-        let e = s.recent_chain(10).into_iter()
+        let e = s
+            .recent_chain(10)
+            .into_iter()
             .find(|e| e.event_type == "custom.note")
             .expect("allowed append must land on the chain");
         assert_eq!(e.event_data["data"]["k"], "v");
-        assert_eq!(e.event_data["requested_by"]["role_lct"], "role:constellation:member");
+        assert_eq!(
+            e.event_data["requested_by"]["role_lct"],
+            "role:constellation:member"
+        );
         assert_eq!(e.event_data["requested_by"]["plugin_id"], "claude-code");
     }
 
@@ -1769,45 +2111,159 @@ mod accountability_tests {
                 s.trust_for_role("worker-agent", mw).talent(),
             )
         };
-        let out = tool_record_reversal(&state, &json!({
-            "subject_plugin_id":"worker-agent",
-            "subject_role": mw,
-            "kind":"override",
-            "reason":"dp gate: reverted the merged PR",
-            "ref":"PR#123",
-            "magnitude":0.5,
-            "session_id": dev["sessionId"],
-        })).await.unwrap();
-        assert!(out.get("_hestia_error").is_none(), "reversal should succeed: {out:?}");
+        let out = tool_record_reversal(
+            &state,
+            &json!({
+                "subject_plugin_id":"worker-agent",
+                "subject_role": mw,
+                "kind":"override",
+                "cause":"invalid-result",
+                "reason":"dp gate: reverted the merged PR",
+                "ref":"PR#123",
+                "magnitude":0.5,
+                "session_id": dev["sessionId"],
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.get("_hestia_error").is_none(),
+            "reversal should succeed: {out:?}"
+        );
 
         let s = state.lock().await;
-        let ev = s.recent_chain(5).into_iter()
-            .find(|e| e.event_type == "reversal").expect("reversal witnessed");
+        let ev = s
+            .recent_chain(5)
+            .into_iter()
+            .find(|e| e.event_type == "reversal")
+            .expect("reversal witnessed");
         let d = &ev.event_data;
         assert_eq!(d["subject_plugin_id"], "worker-agent");
         assert_eq!(d["subject_role"], mw);
         assert_eq!(d["kind"], "override");
+        assert_eq!(d["cause"], "invalid-result");
+        assert_eq!(d["validity_effect"], "refuted");
         // reporter is captured for accountability, distinct from subject
-        assert_eq!(d["reported_by"]["role_lct"], "role:constellation:interactive-dev");
+        assert_eq!(
+            d["reported_by"]["role_lct"],
+            "role:constellation:interactive-dev"
+        );
         // the SUBJECT's judgment-axis trust dropped (negative judgment)...
         let judgment_after = s.judgment_for_role("worker-agent", mw).talent();
-        assert!(judgment_after < judgment_before,
-            "judgment trust must drop: {judgment_after} !< {judgment_before}");
+        assert!(
+            judgment_after < judgment_before,
+            "judgment trust must drop: {judgment_after} !< {judgment_before}"
+        );
         // ...and the execution-axis trust did NOT move (separate timescales).
         let exec_after = s.trust_for_role("worker-agent", mw).talent();
-        assert!((exec_after - exec_before).abs() < 1e-12,
-            "execution trust must be untouched by a judgment event");
+        assert!(
+            (exec_after - exec_before).abs() < 1e-12,
+            "execution trust must be untouched by a judgment event"
+        );
         // an unknown reversal kind is rejected
         drop(s);
-        let bad = tool_record_reversal(&state, &json!({
-            "subject_plugin_id":"worker-agent","kind":"vibes"
-        })).await.unwrap();
+        let bad = tool_record_reversal(
+            &state,
+            &json!({
+                "subject_plugin_id":"worker-agent","kind":"vibes"
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(bad["_hestia_error"]["code"], "hestia.reversal_unknown_kind");
         // reversal is reserved from request_witness forgery
-        let forge = tool_request_witness(&state, &json!({
-            "event_type":"reversal","event_data":{"subject_plugin_id":"x"}
-        })).await.unwrap();
-        assert_eq!(forge["_hestia_error"]["code"], "hestia.witness_reserved_event");
+        let forge = tool_request_witness(
+            &state,
+            &json!({
+                "event_type":"reversal","event_data":{"subject_plugin_id":"x"}
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            forge["_hestia_error"]["code"],
+            "hestia.witness_reserved_event"
+        );
+    }
+
+    /// Reversal cause, not operational kind, determines validity effect.
+    /// Requirement changes remain witnessed but do not punish the subject.
+    #[tokio::test]
+    async fn non_invalid_reversal_is_witnessed_without_negative_judgment() {
+        let (_dir, state) = test_state().await;
+        let reporter = tool_connect(
+            &state,
+            &json!({
+                "plugin_id":"claude-code",
+                "host_agent":"test",
+                "role":"role:constellation:interactive-dev"
+            }),
+        )
+        .await
+        .unwrap();
+        let role = "role:constellation:mesh-worker";
+        let before = {
+            let s = state.lock().await;
+            s.judgment_for_role("worker-agent", role).talent()
+        };
+
+        let out = tool_record_reversal(
+            &state,
+            &json!({
+                "subject_plugin_id":"worker-agent",
+                "subject_role":role,
+                "kind":"rollback",
+                "cause":"changed-requirements",
+                "reason":"requester changed the target after merge",
+                "ref":"PR#124",
+                "session_id":reporter["sessionId"]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["cause"], "changed-requirements");
+        assert!(out["validityEffect"].is_null());
+        assert_eq!(out["judgmentMutated"], false);
+
+        let s = state.lock().await;
+        let event = s
+            .recent_chain(5)
+            .into_iter()
+            .find(|entry| entry.event_type == "reversal")
+            .unwrap();
+        assert_eq!(event.event_data["cause"], "changed-requirements");
+        assert!(event.event_data["validity_effect"].is_null());
+        assert_eq!(s.judgment_for_role("worker-agent", role).talent(), before);
+    }
+
+    #[tokio::test]
+    async fn reversal_requires_a_known_cause() {
+        let (_dir, state) = test_state().await;
+        let missing = tool_record_reversal(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","kind":"override"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            missing["_hestia_error"]["code"],
+            "hestia.reversal_missing_cause"
+        );
+
+        let unknown = tool_record_reversal(
+            &state,
+            &json!({
+                "subject_plugin_id":"worker-agent",
+                "kind":"override",
+                "cause":"someone-was-unhappy"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unknown["_hestia_error"]["code"],
+            "hestia.reversal_unknown_cause"
+        );
     }
 
     /// Judge-disjoint split (CBP condition 1): peer review verdicts are the
@@ -1816,18 +2272,33 @@ mod accountability_tests {
     #[tokio::test]
     async fn reversal_rejects_review_reject_kind_judge_disjoint_split() {
         let (_dir, state) = test_state().await;
-        let rev = tool_connect(&state, &json!({
-            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:reviewer"
-        })).await.unwrap();
-        let out = tool_record_reversal(&state, &json!({
-            "subject_plugin_id":"worker-agent",
-            "kind":"review_reject",
-            "session_id": rev["sessionId"],
-        })).await.unwrap();
+        let rev = tool_connect(
+            &state,
+            &json!({
+                "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:reviewer"
+            }),
+        )
+        .await
+        .unwrap();
+        let out = tool_record_reversal(
+            &state,
+            &json!({
+                "subject_plugin_id":"worker-agent",
+                "kind":"review_reject",
+                "cause":"invalid-result",
+                "session_id": rev["sessionId"],
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(out["_hestia_error"]["code"], "hestia.reversal_unknown_kind");
         // and no judgment trust moved, no reversal was witnessed
         let s = state.lock().await;
-        assert!(s.recent_chain(5).into_iter().all(|e| e.event_type != "reversal"));
+        assert!(
+            s.recent_chain(5)
+                .into_iter()
+                .all(|e| e.event_type != "reversal")
+        );
     }
 
     /// Cross-actor trust injection is guarded: an unattributable reporter (no
@@ -1837,24 +2308,47 @@ mod accountability_tests {
     async fn reversal_rejects_unattributed_reporter_and_unknown_role() {
         let (_dir, state) = test_state().await;
         // No session connected → resolve_caller yields no session_uuid.
-        let out = tool_record_reversal(&state, &json!({
-            "subject_plugin_id":"worker-agent","kind":"override"
-        })).await.unwrap();
-        assert_eq!(out["_hestia_error"]["code"], "hestia.reversal_unattributed_reporter");
+        let out = tool_record_reversal(
+            &state,
+            &json!({
+                "subject_plugin_id":"worker-agent",
+                "kind":"override",
+                "cause":"invalid-result"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out["_hestia_error"]["code"],
+            "hestia.reversal_unattributed_reporter"
+        );
 
         let dev = tool_connect(&state, &json!({
             "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:interactive-dev"
         })).await.unwrap();
         // A typo'd role must not land the penalty on the default grain.
-        let bad_role = tool_record_reversal(&state, &json!({
-            "subject_plugin_id":"worker-agent",
-            "subject_role":"role:constellation:mesh_worker",
-            "kind":"override",
-            "session_id": dev["sessionId"],
-        })).await.unwrap();
-        assert_eq!(bad_role["_hestia_error"]["code"], "hestia.reversal_unknown_role");
+        let bad_role = tool_record_reversal(
+            &state,
+            &json!({
+                "subject_plugin_id":"worker-agent",
+                "subject_role":"role:constellation:mesh_worker",
+                "kind":"override",
+                "cause":"invalid-result",
+                "session_id": dev["sessionId"],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            bad_role["_hestia_error"]["code"],
+            "hestia.reversal_unknown_role"
+        );
         let s = state.lock().await;
-        assert!(s.recent_chain(5).into_iter().all(|e| e.event_type != "reversal"));
+        assert!(
+            s.recent_chain(5)
+                .into_iter()
+                .all(|e| e.event_type != "reversal")
+        );
     }
 
     /// The reversal surface hits the same law as the other direct-call tools:
@@ -1885,24 +2379,43 @@ mod accountability_tests {
                 }),
             );
         }
-        let mw = tool_connect(&state, &json!({
-            "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:mesh-worker"
-        })).await.unwrap();
-        let denied = tool_record_reversal(&state, &json!({
-            "subject_plugin_id":"worker-agent","kind":"override",
-            "session_id": mw["sessionId"],
-        })).await.unwrap();
+        let mw = tool_connect(
+            &state,
+            &json!({
+                "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:mesh-worker"
+            }),
+        )
+        .await
+        .unwrap();
+        let denied = tool_record_reversal(
+            &state,
+            &json!({
+                "subject_plugin_id":"worker-agent",
+                "kind":"override",
+                "cause":"invalid-result",
+                "session_id": mw["sessionId"],
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(denied["_hestia_error"]["code"], "hestia.policy_denied");
         let s = state.lock().await;
         // the refusal is witnessed with the reporter's WHO; no reversal event
-        let pd = s.recent_chain(10).into_iter()
+        let pd = s
+            .recent_chain(10)
+            .into_iter()
             .find(|e| e.event_type == "policy_decision")
             .expect("reversal deny must be witnessed");
         assert_eq!(pd.event_data["tool_name"], "hestia_record_reversal");
         assert_eq!(pd.event_data["role_lct"], "role:constellation:mesh-worker");
-        assert!(s.recent_chain(10).into_iter().all(|e| e.event_type != "reversal"));
+        assert!(
+            s.recent_chain(10)
+                .into_iter()
+                .all(|e| e.event_type != "reversal")
+        );
         assert_eq!(
-            s.judgment_for_role("worker-agent", "role:constellation:mesh-worker").talent(),
+            s.judgment_for_role("worker-agent", "role:constellation:mesh-worker")
+                .talent(),
             EntityTrust::new("x".to_string()).talent(),
             "no judgment trust may move on a denied report"
         );
@@ -1919,13 +2432,22 @@ mod accountability_tests {
         ).await.unwrap();
         let sid = connect["sessionId"].as_str().unwrap().to_string();
         let begin = tool_begin_action(&state, &json!({"tool_name":"Bash","session_id":sid}))
-            .await.unwrap();
+            .await
+            .unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
-        tool_record_outcome(&state, &json!({"action_id":aid,"success":true})).await.unwrap();
+        tool_record_outcome(&state, &json!({"action_id":aid,"success":true}))
+            .await
+            .unwrap();
         let s = state.lock().await;
-        let outcome = s.recent_chain(20).into_iter()
-            .find(|e| e.event_type == "outcome").unwrap();
-        assert_eq!(outcome.event_data["role_lct"], "role:constellation:mesh-worker");
+        let outcome = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "outcome")
+            .unwrap();
+        assert_eq!(
+            outcome.event_data["role_lct"],
+            "role:constellation:mesh-worker"
+        );
         // an unknown role would fail closed to the default (normalize covers that unit-side)
     }
 
@@ -1988,7 +2510,10 @@ mod accountability_tests {
         );
         // WHO — durable per-instance LCT (trust grain) + session_id (audit grain).
         assert!(
-            d["instance_lct"].as_str().unwrap().starts_with("lct:web4:member:"),
+            d["instance_lct"]
+                .as_str()
+                .unwrap()
+                .starts_with("lct:web4:member:"),
             "instance_lct must be the durable per-instance LCT, got {:?}",
             d["instance_lct"]
         );
@@ -2034,9 +2559,13 @@ mod accountability_tests {
         .await
         .unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
-        let q = tool_query_policy(&state, &json!({"action_id": aid})).await.unwrap();
+        let q = tool_query_policy(&state, &json!({"action_id": aid}))
+            .await
+            .unwrap();
         assert_eq!(q["decision"], "deny", "precondition: denied");
-        let g = q["guidance"].as_str().expect("enforced deny carries guidance");
+        let g = q["guidance"]
+            .as_str()
+            .expect("enforced deny carries guidance");
         assert!(g.contains("boundary, not a failure"));
         assert!(
             g.contains(q["reason"].as_str().unwrap()),
@@ -2050,9 +2579,14 @@ mod accountability_tests {
         .await
         .unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
-        let q = tool_query_policy(&state, &json!({"action_id": aid})).await.unwrap();
+        let q = tool_query_policy(&state, &json!({"action_id": aid}))
+            .await
+            .unwrap();
         assert_eq!(q["decision"], "allow", "precondition: allowed");
-        assert!(q["guidance"].is_null(), "allow must not carry steering text");
+        assert!(
+            q["guidance"].is_null(),
+            "allow must not carry steering text"
+        );
     }
 
     /// The host agent's own stable session id is witnessed as the real audit grain.
@@ -2060,16 +2594,27 @@ mod accountability_tests {
     async fn host_session_id_is_witnessed_when_supplied() {
         let (_dir, state) = test_state().await;
         let connect = tool_connect(&state, &json!({"plugin_id":"claude-code","host_agent":"t"}))
-            .await.unwrap();
+            .await
+            .unwrap();
         let sid = connect["sessionId"].as_str().unwrap().to_string();
-        let begin = tool_begin_action(&state, &json!({
-            "tool_name":"Read","session_id":sid,"host_session_id":"claude-sess-abc"
-        })).await.unwrap();
+        let begin = tool_begin_action(
+            &state,
+            &json!({
+                "tool_name":"Read","session_id":sid,"host_session_id":"claude-sess-abc"
+            }),
+        )
+        .await
+        .unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
-        tool_record_outcome(&state, &json!({"action_id":aid,"success":true})).await.unwrap();
+        tool_record_outcome(&state, &json!({"action_id":aid,"success":true}))
+            .await
+            .unwrap();
         let s = state.lock().await;
-        let outcome = s.recent_chain(20).into_iter()
-            .find(|e| e.event_type == "outcome").unwrap();
+        let outcome = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "outcome")
+            .unwrap();
         assert_eq!(outcome.event_data["host_session_id"], "claude-sess-abc");
     }
 
@@ -2103,20 +2648,34 @@ mod accountability_tests {
             );
         }
         // The role that declared the overlay → TestTool is denied (tightened).
-        assert_eq!(decision_for(&state, "role:constellation:mesh-worker").await, "deny");
+        assert_eq!(
+            decision_for(&state, "role:constellation:mesh-worker").await,
+            "deny"
+        );
         // A different role has no overlay → base floor, not denied.
-        assert_ne!(decision_for(&state, "role:constellation:interactive-dev").await, "deny");
+        assert_ne!(
+            decision_for(&state, "role:constellation:interactive-dev").await,
+            "deny"
+        );
     }
 
     async fn decision_for(state: &SharedState, role: &str) -> String {
-        let connect = tool_connect(state, &json!({
-            "plugin_id":"claude-code","host_agent":"t","role":role
-        })).await.unwrap();
+        let connect = tool_connect(
+            state,
+            &json!({
+                "plugin_id":"claude-code","host_agent":"t","role":role
+            }),
+        )
+        .await
+        .unwrap();
         let sid = connect["sessionId"].as_str().unwrap().to_string();
         let begin = tool_begin_action(state, &json!({"tool_name":"TestTool","session_id":sid}))
-            .await.unwrap();
+            .await
+            .unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
-        let q = tool_query_policy(state, &json!({"action_id":aid})).await.unwrap();
+        let q = tool_query_policy(state, &json!({"action_id":aid}))
+            .await
+            .unwrap();
         q["decision"].as_str().unwrap().to_string()
     }
 }
@@ -2136,7 +2695,10 @@ mod inbox_tests {
         let member_kp = KeyPair::generate();
         let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
         vault
-            .add(VaultEntry::new("ai_identity_secret", hex::encode(member_kp.secret_key_bytes())))
+            .add(VaultEntry::new(
+                "ai_identity_secret",
+                hex::encode(member_kp.secret_key_bytes()),
+            ))
             .unwrap();
         (dir, member_kp)
     }
@@ -2150,9 +2712,14 @@ mod inbox_tests {
     /// pubkey (exactly what `queue_sealed_notice` does hub-side).
     fn hub_seal(hub_kp: &KeyPair, member_kp: &KeyPair, pair_id: Uuid, body: &Value) -> String {
         let member_pub = PublicKey::from_bytes(&member_kp.public_key_bytes()).unwrap();
-        pair_channel::seal(hub_kp, &member_pub, pair_id, &serde_json::to_vec(body).unwrap())
-            .unwrap()
-            .to_base64()
+        pair_channel::seal(
+            hub_kp,
+            &member_pub,
+            pair_id,
+            &serde_json::to_vec(body).unwrap(),
+        )
+        .unwrap()
+        .to_base64()
     }
 
     /// Accept-and-defer end to end: defer parks the still-sealed notice
@@ -2184,11 +2751,15 @@ mod inbox_tests {
         assert_eq!(resp["accepted"], json!(true));
         assert_eq!(resp["deferred"], json!(true));
         assert_eq!(resp["queued"], json!(1));
-        assert!(resp.get("body").is_none(), "deferred notify must not return the body");
+        assert!(
+            resp.get("body").is_none(),
+            "deferred notify must not return the body"
+        );
 
         // The ACK still opens hub-side (the hub can mark it delivered).
         let member_pub = PublicKey::from_bytes(&member_kp.public_key_bytes()).unwrap();
-        let ack_sealed = pair_channel::Sealed::from_base64(resp["ackSealed"].as_str().unwrap()).unwrap();
+        let ack_sealed =
+            pair_channel::Sealed::from_base64(resp["ackSealed"].as_str().unwrap()).unwrap();
         let ack_plain = pair_channel::open(&hub_kp, &member_pub, pair_id, &ack_sealed).unwrap();
         let ack: Value = serde_json::from_slice(&ack_plain).unwrap();
         assert_eq!(ack["act_id"], json!(act_id));
@@ -2196,7 +2767,9 @@ mod inbox_tests {
         // Receipt was witnessed with the deferred marker.
         {
             let s = state.lock().await;
-            let rec = s.recent_chain(10).into_iter()
+            let rec = s
+                .recent_chain(10)
+                .into_iter()
                 .find(|e| e.event_type == "notify.received")
                 .expect("receipt must be witnessed");
             assert_eq!(rec.event_data["deferred"], json!(true));
@@ -2220,7 +2793,11 @@ mod inbox_tests {
         // And the inbox file on disk is encrypted (not plaintext SQLite).
         let hdr_path = dir.path().join("inbox.db");
         let hdr = std::fs::read(&hdr_path).unwrap();
-        assert_ne!(&hdr[..16], b"SQLite format 3\0", "inbox must be encrypted at rest");
+        assert_ne!(
+            &hdr[..16],
+            b"SQLite format 3\0",
+            "inbox must be encrypted at rest"
+        );
     }
 
     /// Without `defer`, the wire is unchanged: body returned, inbox untouched.
@@ -2229,7 +2806,12 @@ mod inbox_tests {
         let (dir, member_kp) = seeded_home();
         let hub_kp = KeyPair::generate();
         let pair_id = Uuid::new_v4();
-        let sealed = hub_seal(&hub_kp, &member_kp, pair_id, &json!({"act_id": Uuid::new_v4()}));
+        let sealed = hub_seal(
+            &hub_kp,
+            &member_kp,
+            pair_id,
+            &json!({"act_id": Uuid::new_v4()}),
+        );
 
         let state = open_state(&dir);
         let resp = tool_notify(
@@ -2243,10 +2825,16 @@ mod inbox_tests {
         .await
         .unwrap();
         assert_eq!(resp["opened"], json!(true));
-        assert!(resp.get("body").is_some(), "immediate notify still returns the body");
+        assert!(
+            resp.get("body").is_some(),
+            "immediate notify still returns the body"
+        );
 
         let s = state.lock().await;
-        assert!(s.inbox_store.is_empty().unwrap(), "non-deferred notify must not queue");
+        assert!(
+            s.inbox_store.is_empty().unwrap(),
+            "non-deferred notify must not queue"
+        );
     }
 
     /// A law-denied body-returning notify AUTO-DEFERS: fail closed on the
@@ -2257,7 +2845,12 @@ mod inbox_tests {
         let (dir, member_kp) = seeded_home();
         let hub_kp = KeyPair::generate();
         let pair_id = Uuid::new_v4();
-        let sealed = hub_seal(&hub_kp, &member_kp, pair_id, &json!({"act_id": Uuid::new_v4()}));
+        let sealed = hub_seal(
+            &hub_kp,
+            &member_kp,
+            pair_id,
+            &json!({"act_id": Uuid::new_v4()}),
+        );
 
         let state = open_state(&dir);
         let sid = Uuid::new_v4();
@@ -2299,13 +2892,27 @@ mod inbox_tests {
         .unwrap();
 
         assert_eq!(resp["accepted"], json!(true));
-        assert_eq!(resp["deferred"], json!(true), "deny must downgrade to defer: {resp}");
+        assert_eq!(
+            resp["deferred"],
+            json!(true),
+            "deny must downgrade to defer: {resp}"
+        );
         assert_eq!(resp["deferredByLaw"], json!(true), "the caller is told why");
-        assert!(resp.get("body").is_none(), "denied open must NOT release the body");
-        assert!(resp.get("ackSealed").is_some(), "the hub still gets its delivery ACK");
+        assert!(
+            resp.get("body").is_none(),
+            "denied open must NOT release the body"
+        );
+        assert!(
+            resp.get("ackSealed").is_some(),
+            "the hub still gets its delivery ACK"
+        );
 
         let s = state.lock().await;
-        assert_eq!(s.inbox_store.len().unwrap(), 1, "the notice parked, not lost");
+        assert_eq!(
+            s.inbox_store.len().unwrap(),
+            1,
+            "the notice parked, not lost"
+        );
     }
 }
 
@@ -2380,26 +2987,51 @@ mod tests {
     async fn connect_mints_a_member_lct_on_first_sight_not_for_synthetic() {
         let (_dir, shared) = make_shared_state();
         // A real member connect → gets a custodial member LCT.
-        let r = tool_connect(&shared, &json!({
-            "plugin_id": "claude-code", "host_agent": "cc"
-        })).await.unwrap();
+        let r = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code", "host_agent": "cc"
+            }),
+        )
+        .await
+        .unwrap();
         assert!(r.get("sessionId").is_some());
         {
             let s = shared.lock().await;
-            assert_eq!(s.member_registry.len(), 1, "first connect minted the member");
+            assert_eq!(
+                s.member_registry.len(),
+                1,
+                "first connect minted the member"
+            );
             let lct = s.member_registry.get("claude-code").unwrap();
             assert!(lct.verify_binding());
-            assert!(lct.legacy_alias.as_ref().unwrap().verify(), "carries its verifiable label alias");
+            assert!(
+                lct.legacy_alias.as_ref().unwrap().verify(),
+                "carries its verifiable label alias"
+            );
         }
         // Reconnect → idempotent (still one member, no re-mint).
-        tool_connect(&shared, &json!({"plugin_id": "claude-code", "host_agent": "cc"}))
-            .await.unwrap();
+        tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "cc"}),
+        )
+        .await
+        .unwrap();
         assert_eq!(shared.lock().await.member_registry.len(), 1);
         // A synthetic connect → NO member LCT (fail-closed domain).
-        tool_connect(&shared, &json!({
-            "plugin_id": "fuzz-runner", "host_agent": "cc", "synthetic": true
-        })).await.unwrap();
-        assert_eq!(shared.lock().await.member_registry.len(), 1, "synthetic gets no presence");
+        tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "fuzz-runner", "host_agent": "cc", "synthetic": true
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            shared.lock().await.member_registry.len(),
+            1,
+            "synthetic gets no presence"
+        );
     }
 
     /// Spec §7.8.2 "deliver only to that authenticated LCT" + RWOA O-clause:
@@ -2411,7 +3043,14 @@ mod tests {
         let (unattended, attended) = {
             let mut s = shared.lock().await;
             s.inbox_store
-                .enqueue(Uuid::new_v4(), Uuid::nil(), "ab", "sealed-x", "notify:k", None)
+                .enqueue(
+                    Uuid::new_v4(),
+                    Uuid::nil(),
+                    "ab",
+                    "sealed-x",
+                    "notify:k",
+                    None,
+                )
                 .unwrap();
             // The ratified-law shape: the unattended role's overlay denies
             // credential_access; the attended role has no overlay.
@@ -2433,7 +3072,11 @@ mod tests {
             denied.get("_hestia_error").is_some(),
             "mesh-worker drain must be denied by law: {denied}"
         );
-        assert_eq!(shared.lock().await.inbox_store.len().unwrap(), 1, "deny must not consume");
+        assert_eq!(
+            shared.lock().await.inbox_store.len().unwrap(),
+            1,
+            "deny must not consume"
+        );
 
         // Attended: drains (consume-once).
         let ok = tool_inbox(&shared, &json!({ "session_id": attended.to_string() }))
@@ -2471,6 +3114,9 @@ mod tests {
         let ok = tool_pair_inbox(&shared, &json!({ "session_id": attended.to_string() }))
             .await
             .unwrap();
-        assert_eq!(ok["total"], 0, "attended drain with no connection is empty, not an error: {ok}");
+        assert_eq!(
+            ok["total"], 0,
+            "attended drain with no connection is empty, not an error: {ok}"
+        );
     }
 }

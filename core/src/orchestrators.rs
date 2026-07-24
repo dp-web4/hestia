@@ -32,15 +32,40 @@ pub struct KnownOrch {
 }
 
 pub const REGISTRY: &[KnownOrch] = &[
-    KnownOrch { id: "claude-code", name: "Claude Code", proc_patterns: &["claude"], plugin_available: true },
-    KnownOrch { id: "openclaw", name: "OpenClaw", proc_patterns: &["openclaw"], plugin_available: true },
-    KnownOrch { id: "cursor", name: "Cursor", proc_patterns: &["cursor"], plugin_available: true },
-    KnownOrch { id: "codex", name: "Codex", proc_patterns: &["codex"], plugin_available: true },
+    KnownOrch {
+        id: "claude-code",
+        name: "Claude Code",
+        proc_patterns: &["claude"],
+        plugin_available: true,
+    },
+    KnownOrch {
+        id: "openclaw",
+        name: "OpenClaw",
+        proc_patterns: &["openclaw"],
+        plugin_available: true,
+    },
+    KnownOrch {
+        id: "cursor",
+        name: "Cursor",
+        proc_patterns: &["cursor"],
+        plugin_available: true,
+    },
+    KnownOrch {
+        id: "codex",
+        name: "Codex",
+        proc_patterns: &["codex"],
+        plugin_available: true,
+    },
     // First foreign (non-family) orchestrator. Phase-0 adapter is observe-only and currently lives
     // in shared-context/hestia/kimi-adapter-phase0/ (hand-installed into ~/.kimi-code/config.toml);
     // plugin_available flips true when the adapter relocates into this repo at Phase 1 (HUB call)
     // and install_kimi_code() ships with it. Detection + connected-status work today.
-    KnownOrch { id: "kimi-code", name: "Kimi Code", proc_patterns: &["kimi"], plugin_available: false },
+    KnownOrch {
+        id: "kimi-code",
+        name: "Kimi Code",
+        proc_patterns: &["kimi"],
+        plugin_available: false,
+    },
 ];
 
 pub fn lookup(id: &str) -> Option<&'static KnownOrch> {
@@ -50,7 +75,9 @@ pub fn lookup(id: &str) -> Option<&'static KnownOrch> {
 /// Ids of registry orchestrators with a process currently running (via `/proc`).
 pub fn detect_running() -> HashSet<String> {
     let mut found = HashSet::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else { return found };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
     for e in entries.flatten() {
         let pid = e.file_name();
         let Some(pid) = pid.to_str() else { continue };
@@ -75,7 +102,9 @@ pub fn detect_running() -> HashSet<String> {
 }
 
 fn home_dir() -> Result<PathBuf> {
-    std::env::var("HOME").map(PathBuf::from).context("HOME not set")
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .context("HOME not set")
 }
 
 /// Connect an orchestrator by installing its hestia plugin. Returns a short
@@ -115,12 +144,23 @@ pub fn is_installed(id: &str) -> bool {
 /// the build-time crate dir → repo root → plugins/…).
 fn repo_hook(orch: &str) -> Result<PathBuf> {
     let p: &str = match orch {
-        "claude-code" => concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/claude-code/hooks/witness.py"),
-        "codex" => concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/codex/hooks/witness.py"),
-        "cursor" => concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/cursor/hooks/witness.py"),
+        "claude-code" => concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../plugins/claude-code/hooks/witness.py"
+        ),
+        "codex" => concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../plugins/codex/hooks/witness.py"
+        ),
+        "cursor" => concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../plugins/cursor/hooks/witness.py"
+        ),
         other => anyhow::bail!("no witness hook for '{other}'"),
     };
-    Path::new(p).canonicalize().with_context(|| format!("locating {p}"))
+    Path::new(p)
+        .canonicalize()
+        .with_context(|| format!("locating {p}"))
 }
 
 /// Merge hestia's PostToolUse witness hook into `~/.claude/settings.json`,
@@ -139,17 +179,23 @@ fn install_claude_code() -> Result<String> {
         serde_json::json!({})
     };
 
-    let obj = json.as_object_mut().context("~/.claude/settings.json is not a JSON object")?;
+    let obj = json
+        .as_object_mut()
+        .context("~/.claude/settings.json is not a JSON object")?;
     let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
     let post = hooks
         .as_object_mut()
         .context("settings.hooks is not an object")?
         .entry("PostToolUse")
         .or_insert_with(|| serde_json::json!([]));
-    let arr = post.as_array_mut().context("settings.hooks.PostToolUse is not an array")?;
+    let arr = post
+        .as_array_mut()
+        .context("settings.hooks.PostToolUse is not an array")?;
 
     // Idempotent: bail out (success) if a hestia witness hook is already present.
-    let already = arr.iter().any(|e| e.to_string().contains("hestia") || e.to_string().contains("witness.py"));
+    let already = arr
+        .iter()
+        .any(|e| e.to_string().contains("hestia") || e.to_string().contains("witness.py"));
     if already {
         return Ok("already connected (hestia hook present)".into());
     }
@@ -160,10 +206,17 @@ fn install_claude_code() -> Result<String> {
     }));
 
     std::fs::create_dir_all(&claude_dir).context("creating ~/.claude")?;
-    std::fs::write(&settings_path, serde_json::to_string_pretty(&json)?)
-        .with_context(|| format!("writing {} (does the daemon have write access?)", settings_path.display()))?;
+    std::fs::write(&settings_path, serde_json::to_string_pretty(&json)?).with_context(|| {
+        format!(
+            "writing {} (does the daemon have write access?)",
+            settings_path.display()
+        )
+    })?;
 
-    Ok(format!("connected — added hestia PostToolUse hook to {}; restart Claude Code", settings_path.display()))
+    Ok(format!(
+        "connected — added hestia PostToolUse hook to {}; restart Claude Code",
+        settings_path.display()
+    ))
 }
 
 /// Merge hestia's witness into `~/.cursor/hooks.json` as afterShellExecution +
@@ -184,20 +237,35 @@ fn install_cursor() -> Result<String> {
         return Ok("already connected (hestia hook present)".into());
     }
 
-    let obj = json.as_object_mut().context("~/.cursor/hooks.json is not a JSON object")?;
+    let obj = json
+        .as_object_mut()
+        .context("~/.cursor/hooks.json is not a JSON object")?;
     obj.entry("version").or_insert(serde_json::json!(1));
     let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
-    let hooks_obj = hooks.as_object_mut().context("hooks.json `hooks` is not an object")?;
+    let hooks_obj = hooks
+        .as_object_mut()
+        .context("hooks.json `hooks` is not an object")?;
     let entry = serde_json::json!({ "command": command, "timeout": 5 });
     for event in ["afterShellExecution", "afterFileEdit"] {
-        let arr = hooks_obj.entry(event).or_insert_with(|| serde_json::json!([]));
-        arr.as_array_mut().with_context(|| format!("hooks.{event} is not an array"))?.push(entry.clone());
+        let arr = hooks_obj
+            .entry(event)
+            .or_insert_with(|| serde_json::json!([]));
+        arr.as_array_mut()
+            .with_context(|| format!("hooks.{event} is not an array"))?
+            .push(entry.clone());
     }
 
     std::fs::create_dir_all(&cursor_dir).context("creating ~/.cursor")?;
-    std::fs::write(&hooks_path, serde_json::to_string_pretty(&json)?)
-        .with_context(|| format!("writing {} (does the daemon have write access?)", hooks_path.display()))?;
-    Ok(format!("connected — added hestia hooks to {}; restart Cursor", hooks_path.display()))
+    std::fs::write(&hooks_path, serde_json::to_string_pretty(&json)?).with_context(|| {
+        format!(
+            "writing {} (does the daemon have write access?)",
+            hooks_path.display()
+        )
+    })?;
+    Ok(format!(
+        "connected — added hestia hooks to {}; restart Cursor",
+        hooks_path.display()
+    ))
 }
 
 /// Append a hestia PostToolUse command hook to `~/.codex/config.toml` (Codex
@@ -225,9 +293,16 @@ fn install_codex() -> Result<String> {
     std::fs::create_dir_all(&codex_dir).context("creating ~/.codex")?;
     let mut new = existing;
     new.push_str(&block);
-    std::fs::write(&cfg_path, new)
-        .with_context(|| format!("writing {} (does the daemon have write access?)", cfg_path.display()))?;
-    Ok(format!("connected — added hestia PostToolUse hook to {}; restart Codex", cfg_path.display()))
+    std::fs::write(&cfg_path, new).with_context(|| {
+        format!(
+            "writing {} (does the daemon have write access?)",
+            cfg_path.display()
+        )
+    })?;
+    Ok(format!(
+        "connected — added hestia PostToolUse hook to {}; restart Codex",
+        cfg_path.display()
+    ))
 }
 
 #[cfg(test)]

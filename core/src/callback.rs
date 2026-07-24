@@ -18,7 +18,7 @@
 //! ```
 
 use anyhow::Result;
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -103,7 +103,6 @@ impl CallbackState {
     fn should_approve(&self, event_kind: &str) -> bool {
         self.auto_approve || self.approved_events.iter().any(|e| e == event_kind)
     }
-
 }
 
 /// The event kind the hub uses for OID4VCI credential issuance.
@@ -360,7 +359,12 @@ mod tests {
         let (status, resp) = handle_sign_request(State(state), Json(req)).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(resp.0.denied);
-        assert!(resp.0.deny_reason.unwrap().contains("does not reference the signing actor"));
+        assert!(
+            resp.0
+                .deny_reason
+                .unwrap()
+                .contains("does not reference the signing actor")
+        );
     }
 
     #[tokio::test]

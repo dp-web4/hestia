@@ -13,7 +13,7 @@ pub use document::{Document, ItemRef, Protection};
 pub use entry::VaultEntry;
 pub use policy_state::{OperatorIdentity, PolicyOverride, VaultPolicyState};
 pub mod policy_state;
-pub use storage::{default_hestia_home, vault_path, VaultData};
+pub use storage::{VaultData, default_hestia_home, vault_path};
 
 use zeroize::Zeroizing;
 
@@ -165,7 +165,9 @@ impl Vault {
         role: &str,
         rules: Vec<crate::policy::PolicyRule>,
     ) -> Result<()> {
-        self.data.policy.set_instance_overlay(plugin_id, role, rules);
+        self.data
+            .policy
+            .set_instance_overlay(plugin_id, role, rules);
         self.save()
     }
 
@@ -247,12 +249,7 @@ impl Vault {
 
     /// Store a master-tier document (config / metadata / state). Plaintext is
     /// held inside the outer-encrypted vault. Upserts by (namespace, name).
-    pub fn put_document(
-        &mut self,
-        namespace: &str,
-        name: &str,
-        bytes: Vec<u8>,
-    ) -> Result<()> {
+    pub fn put_document(&mut self, namespace: &str, name: &str, bytes: Vec<u8>) -> Result<()> {
         let doc = Document::master(namespace, name, bytes);
         match self.doc_pos(namespace, name) {
             Some(i) => self.data.documents[i] = doc,
@@ -462,7 +459,10 @@ mod tests {
         // Override a preset rule (warn-network: warn -> deny) — "specifically".
         v.set_policy_override(
             "warn-network",
-            PolicyOverride { decision: Some(PolicyDecision::Deny), enabled: None },
+            PolicyOverride {
+                decision: Some(PolicyDecision::Deny),
+                enabled: None,
+            },
         )
         .unwrap();
         // Add a custom rule matching a category — "by category".
@@ -484,11 +484,18 @@ mod tests {
             let v2 = Vault::open(path.clone(), "p".into()).unwrap();
             let cfg = v2.policy().resolve().unwrap();
             assert_eq!(
-                cfg.rules.iter().find(|r| r.id == "warn-network").unwrap().decision,
+                cfg.rules
+                    .iter()
+                    .find(|r| r.id == "warn-network")
+                    .unwrap()
+                    .decision,
                 PolicyDecision::Deny,
                 "override persisted + applied",
             );
-            assert!(cfg.rules.iter().any(|r| r.id == "custom-deny-creds"), "custom rule persisted");
+            assert!(
+                cfg.rules.iter().any(|r| r.id == "custom-deny-creds"),
+                "custom rule persisted"
+            );
         }
 
         // Clear the override + remove the custom rule; reopen confirms revert.
@@ -499,7 +506,11 @@ mod tests {
         let cfg = v4.policy().resolve().unwrap();
         assert!(cfg.rules.iter().all(|r| r.id != "custom-deny-creds"));
         assert_eq!(
-            cfg.rules.iter().find(|r| r.id == "warn-network").unwrap().decision,
+            cfg.rules
+                .iter()
+                .find(|r| r.id == "warn-network")
+                .unwrap()
+                .decision,
             PolicyDecision::Warn,
             "override cleared -> back to preset default",
         );
@@ -539,16 +550,28 @@ mod tests {
                 ..Default::default()
             },
         };
-        v.upsert_role_rule("role:constellation:mesh-worker", rule.clone()).unwrap();
+        v.upsert_role_rule("role:constellation:mesh-worker", rule.clone())
+            .unwrap();
         // Sealed round-trip: reopen and the overlay survives.
         let v2 = Vault::open(path, "p".into()).unwrap();
-        let rules = v2.policy().role_overlays.get("role:constellation:mesh-worker").unwrap();
+        let rules = v2
+            .policy()
+            .role_overlays
+            .get("role:constellation:mesh-worker")
+            .unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].id, "custom-no-x");
         // Upsert by id replaces, remove empties + drops the overlay key.
-        v.upsert_role_rule("role:constellation:mesh-worker", rule).unwrap();
-        assert_eq!(v.policy().role_overlays["role:constellation:mesh-worker"].len(), 1);
-        assert!(v.remove_role_rule("role:constellation:mesh-worker", "custom-no-x").unwrap());
+        v.upsert_role_rule("role:constellation:mesh-worker", rule)
+            .unwrap();
+        assert_eq!(
+            v.policy().role_overlays["role:constellation:mesh-worker"].len(),
+            1
+        );
+        assert!(
+            v.remove_role_rule("role:constellation:mesh-worker", "custom-no-x")
+                .unwrap()
+        );
         assert!(v.policy().role_overlays.is_empty());
     }
 
@@ -566,8 +589,12 @@ mod tests {
     fn master_document_round_trips_through_the_vault() {
         let (_dir, path) = temp_path();
         let mut v = Vault::init(path.clone(), "master".into()).unwrap();
-        v.put_document("config", "daemon", b"{\"bind\":\"127.0.0.1:7711\"}".to_vec())
-            .unwrap();
+        v.put_document(
+            "config",
+            "daemon",
+            b"{\"bind\":\"127.0.0.1:7711\"}".to_vec(),
+        )
+        .unwrap();
 
         // Persists across re-open, readable with the outer unlock.
         let v2 = Vault::open(path, "master".into()).unwrap();
@@ -584,8 +611,13 @@ mod tests {
     fn sealed_document_needs_its_own_credential_not_just_the_master() {
         let (_dir, path) = temp_path();
         let mut v = Vault::init(path.clone(), "master".into()).unwrap();
-        v.seal_document("secrets", "high_tier_key", b"top-secret-bytes", "second-factor")
-            .unwrap();
+        v.seal_document(
+            "secrets",
+            "high_tier_key",
+            b"top-secret-bytes",
+            "second-factor",
+        )
+        .unwrap();
 
         let v2 = Vault::open(path, "master".into()).unwrap();
         // The outer unlock reveals the item EXISTS + that it's sealed...
@@ -595,7 +627,10 @@ mod tests {
         // ...but not its plaintext: get_document (master path) sees nothing.
         assert!(v2.get_document("secrets", "high_tier_key").is_none());
         // Opening with the master passphrase fails — needs the seal credential.
-        assert!(v2.open_document("secrets", "high_tier_key", "master").is_err());
+        assert!(
+            v2.open_document("secrets", "high_tier_key", "master")
+                .is_err()
+        );
         // The independent credential opens it, into memory.
         let opened = v2
             .open_document("secrets", "high_tier_key", "second-factor")
@@ -610,13 +645,20 @@ mod tests {
         let (_dir, path) = temp_path();
         let mut v = Vault::init(path.clone(), "master".into()).unwrap();
         v.put_document("config", "m", MASTER_MARK.to_vec()).unwrap();
-        v.seal_document("secrets", "s", SEALED_MARK, "second").unwrap();
+        v.seal_document("secrets", "s", SEALED_MARK, "second")
+            .unwrap();
 
         // The on-disk file must contain NEITHER plaintext — master docs are
         // outer-encrypted, sealed docs are double-encrypted.
         let raw = std::fs::read(&path).unwrap();
-        assert!(!contains(&raw, MASTER_MARK), "master plaintext leaked to disk");
-        assert!(!contains(&raw, SEALED_MARK), "sealed plaintext leaked to disk");
+        assert!(
+            !contains(&raw, MASTER_MARK),
+            "master plaintext leaked to disk"
+        );
+        assert!(
+            !contains(&raw, SEALED_MARK),
+            "sealed plaintext leaked to disk"
+        );
     }
 
     #[test]
@@ -626,8 +668,10 @@ mod tests {
 
         // Build a nested vault in memory and seal it under its own credential.
         let mut sub = VaultData::default();
-        sub.entries.push(VaultEntry::new("inner_key", "inner_secret"));
-        v.put_subvault("nested", "hub_state", &sub, "sub-cred").unwrap();
+        sub.entries
+            .push(VaultEntry::new("inner_key", "inner_secret"));
+        v.put_subvault("nested", "hub_state", &sub, "sub-cred")
+            .unwrap();
 
         let v2 = Vault::open(path, "master".into()).unwrap();
         // Wrong credential → no access to the sub-vault.

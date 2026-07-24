@@ -171,7 +171,12 @@ mod tests {
             crate::role_registry::load_or_mint_registry(&mut vault, "anchor", &sovereign.lct_id());
         let mut members = crate::member_registry::MemberRegistry::default();
         crate::member_registry::ensure_member(
-            &mut vault, &mut members, "claude-code", false, &sovereign.lct_id(), "anchor",
+            &mut vault,
+            &mut members,
+            "claude-code",
+            false,
+            &sovereign.lct_id(),
+            "anchor",
         );
         (sovereign, registry, members, dir)
     }
@@ -191,8 +196,21 @@ mod tests {
             "society + role:sovereign + every constellation role + the one member"
         );
         // role:sovereign carries the provable ratchet level
-        let role_sov = set.payloads.iter().find(|p| p.document.authority_ratchet.is_some()).unwrap();
-        assert_eq!(role_sov.document.authority_ratchet.as_ref().unwrap().level(), 0, "genesis L0, provable");
+        let role_sov = set
+            .payloads
+            .iter()
+            .find(|p| p.document.authority_ratchet.is_some())
+            .unwrap();
+        assert_eq!(
+            role_sov
+                .document
+                .authority_ratchet
+                .as_ref()
+                .unwrap()
+                .level(),
+            0,
+            "genesis L0, provable"
+        );
         // the member payload carries its verifiable alias (ingest check 4)
         let member = set.payloads.last().unwrap();
         assert!(member.document.legacy_alias.as_ref().unwrap().verify());
@@ -264,8 +282,17 @@ mod tests {
             published_at: Utc::now(),
         };
         let v: serde_json::Value = serde_json::to_value(&payload).unwrap();
-        for key in ["lct_id", "document", "published_by", "provenance", "published_at"] {
-            assert!(v.get(key).is_some(), "spec field `{key}` present on the wire");
+        for key in [
+            "lct_id",
+            "document",
+            "published_by",
+            "provenance",
+            "published_at",
+        ] {
+            assert!(
+                v.get(key).is_some(),
+                "spec field `{key}` present on the wire"
+            );
         }
         assert_eq!(v["provenance"], "self_issued", "snake_case provenance tag");
     }

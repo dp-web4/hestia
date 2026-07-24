@@ -13,21 +13,21 @@ use anyhow::{Context, Result};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     symbols::border,
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table, Wrap},
-    Frame, Terminal,
 };
 
 use crate::server::{DashboardSnapshot, RecentEntry, TrustView};
 
-const ACCENT: Color = Color::Rgb(255, 139, 61);   // hearth-fire
+const ACCENT: Color = Color::Rgb(255, 139, 61); // hearth-fire
 const ACCENT_DIM: Color = Color::Rgb(160, 90, 40);
 const FG: Color = Color::Rgb(230, 232, 238);
 const FG_DIM: Color = Color::Rgb(154, 160, 172);
@@ -120,8 +120,13 @@ fn run_loop(terminal: &mut Term, endpoint: &str) -> Result<()> {
 }
 
 fn fetch(client: &reqwest::blocking::Client, url: &str) -> Result<DashboardSnapshot> {
-    let res = client.get(url).send().with_context(|| format!("GET {url}"))?;
-    let snap = res.json::<DashboardSnapshot>().context("decoding snapshot")?;
+    let res = client
+        .get(url)
+        .send()
+        .with_context(|| format!("GET {url}"))?;
+    let snap = res
+        .json::<DashboardSnapshot>()
+        .context("decoding snapshot")?;
     Ok(snap)
 }
 
@@ -130,10 +135,10 @@ fn draw(f: &mut Frame, state: &AppState, url: &str) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // header
-            Constraint::Length(5),  // stat row
-            Constraint::Min(0),     // body
-            Constraint::Length(1),  // footer
+            Constraint::Length(3), // header
+            Constraint::Length(5), // stat row
+            Constraint::Min(0),    // body
+            Constraint::Length(1), // footer
         ])
         .split(area);
 
@@ -156,10 +161,7 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled("◉ ", Style::default().fg(ACCENT).bold()),
         Span::styled("Hestia", Style::default().fg(FG).bold()),
         Span::raw("  "),
-        Span::styled(
-            "local-first Web4 trust layer",
-            Style::default().fg(FG_DIM),
-        ),
+        Span::styled("local-first Web4 trust layer", Style::default().fg(FG_DIM)),
     ]);
     let right = Line::from(vec![
         status,
@@ -231,10 +233,7 @@ fn draw_stat(f: &mut Frame, area: Rect, label: &str, value: &str, value_color: C
             Style::default().fg(FG_DIM).add_modifier(Modifier::DIM),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            value,
-            Style::default().fg(value_color).bold(),
-        )),
+        Line::from(Span::styled(value, Style::default().fg(value_color).bold())),
     ];
     f.render_widget(
         Paragraph::new(text).alignment(Alignment::Left),
@@ -332,10 +331,38 @@ fn draw_trust(f: &mut Frame, area: Rect, state: &AppState) {
         );
         // Canonical unmeasured-handling: None = zero observations on that
         // dimension — render "unmeas" rather than a fabricated score.
-        draw_gauge(f, area_t.x, area_t.y + 1, area_t.width, "Talent  ", t.t3_talent);
-        draw_gauge(f, area_t.x, area_t.y + 2, area_t.width, "Training", t.t3_training);
-        draw_gauge(f, area_t.x, area_t.y + 3, area_t.width, "Temper  ", t.t3_temperament);
-        draw_gauge(f, area_t.x, area_t.y + 4, area_t.width, "Veracity", t.v3_veracity);
+        draw_gauge(
+            f,
+            area_t.x,
+            area_t.y + 1,
+            area_t.width,
+            "Talent  ",
+            t.t3_talent,
+        );
+        draw_gauge(
+            f,
+            area_t.x,
+            area_t.y + 2,
+            area_t.width,
+            "Training",
+            t.t3_training,
+        );
+        draw_gauge(
+            f,
+            area_t.x,
+            area_t.y + 3,
+            area_t.width,
+            "Temper  ",
+            t.t3_temperament,
+        );
+        draw_gauge(
+            f,
+            area_t.x,
+            area_t.y + 4,
+            area_t.width,
+            "Veracity",
+            t.v3_veracity,
+        );
 
         y += per_item;
         if y >= inner.y + inner.height {
@@ -351,9 +378,24 @@ fn draw_gauge(f: &mut Frame, x: u16, y: u16, w: u16, label: &str, value: Option<
     let label_w = 10;
     let val_w = 6;
     let bar_w = w.saturating_sub(label_w + val_w);
-    let label_area = Rect { x, y, width: label_w, height: 1 };
-    let bar_area = Rect { x: x + label_w, y, width: bar_w, height: 1 };
-    let val_area = Rect { x: x + label_w + bar_w, y, width: val_w, height: 1 };
+    let label_area = Rect {
+        x,
+        y,
+        width: label_w,
+        height: 1,
+    };
+    let bar_area = Rect {
+        x: x + label_w,
+        y,
+        width: bar_w,
+        height: 1,
+    };
+    let val_area = Rect {
+        x: x + label_w + bar_w,
+        y,
+        width: val_w,
+        height: 1,
+    };
 
     f.render_widget(
         Paragraph::new(Span::styled(label, Style::default().fg(FG_DIM))),
@@ -394,11 +436,7 @@ fn draw_feed(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(block, area);
 
     let empty: Vec<RecentEntry> = Vec::new();
-    let entries = state
-        .snapshot
-        .as_ref()
-        .map(|s| &s.recent)
-        .unwrap_or(&empty);
+    let entries = state.snapshot.as_ref().map(|s| &s.recent).unwrap_or(&empty);
     if entries.is_empty() {
         f.render_widget(
             Paragraph::new("Waiting for the first chain entry…")
@@ -417,8 +455,8 @@ fn draw_feed(f: &mut Frame, area: Rect, state: &AppState) {
         .iter()
         .take(inner.height as usize)
         .map(|e| {
-            let pos = Cell::from(format!("#{}", e.chain_position))
-                .style(Style::default().fg(FG_FAINT));
+            let pos =
+                Cell::from(format!("#{}", e.chain_position)).style(Style::default().fg(FG_FAINT));
             let typ_style = if e.event_type == "outcome" {
                 Style::default().fg(FG)
             } else {
@@ -438,16 +476,13 @@ fn draw_feed(f: &mut Frame, area: Rect, state: &AppState) {
             let detail_cell = Cell::from(detail).style(Style::default().fg(FG_DIM));
             let status = match e.success {
                 Some(true) => Cell::from("ok").style(Style::default().fg(SUCCESS)),
-                Some(false) => Cell::from("FAIL").style(
-                    Style::default()
-                        .fg(FAILURE)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Some(false) => Cell::from("FAIL")
+                    .style(Style::default().fg(FAILURE).add_modifier(Modifier::BOLD)),
                 None => Cell::from(""),
             };
             let hash_short: String = e.hash.chars().take(10).collect();
-            let hash_cell = Cell::from(format!("{}…", hash_short))
-                .style(Style::default().fg(FG_FAINT));
+            let hash_cell =
+                Cell::from(format!("{}…", hash_short)).style(Style::default().fg(FG_FAINT));
             Row::new(vec![pos, typ, tool_cell, detail_cell, status, hash_cell])
         })
         .collect();
@@ -496,8 +531,18 @@ fn draw_histogram(f: &mut Frame, area: Rect, state: &AppState) {
         if bar_w == 0 || inner.width < 24 {
             break;
         }
-        let label_area = Rect { x: inner.x + 1, y, width: label_w, height: 1 };
-        let bar_area = Rect { x: inner.x + 1 + label_w, y, width: bar_w, height: 1 };
+        let label_area = Rect {
+            x: inner.x + 1,
+            y,
+            width: label_w,
+            height: 1,
+        };
+        let bar_area = Rect {
+            x: inner.x + 1 + label_w,
+            y,
+            width: bar_w,
+            height: 1,
+        };
         let count_area = Rect {
             x: inner.x + 1 + label_w + bar_w,
             y,
@@ -542,7 +587,11 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, url: &str) {
         Span::styled(format!("→ {}", url), Style::default().fg(FG_FAINT)),
         Span::raw("   "),
         Span::styled(
-            if err.is_empty() { "q to quit" } else { err.as_str() },
+            if err.is_empty() {
+                "q to quit"
+            } else {
+                err.as_str()
+            },
             Style::default().fg(if err.is_empty() { FG_FAINT } else { FAILURE }),
         ),
     ]);

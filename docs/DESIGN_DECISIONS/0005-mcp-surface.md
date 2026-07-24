@@ -88,9 +88,21 @@ Submits the outcome of a previously-begun R6 action. Hestia updates trust state 
   "success": "boolean (required)",
   "magnitude": "number (required, 0..1)",
   "error": "string (optional)",
-  "result": "object (optional)"
+  "result": "object (optional)",
+  "closure_claims": [{
+    "claim_id": "stable explicit identifier",
+    "statement": "actor-authored claim",
+    "scope": "bounded context in which the claim applies",
+    "confidence": "number (required, 0..1)",
+    "evidence": ["one or more inspectable pointers"],
+    "known_limitations": ["optional explicit limitations"]
+  }]
 }
 ```
+
+`closure_claims` is optional and uses schema
+`hestia.closure-claims/v1`. A generic result or successful execution is never
+converted into an implied claim.
 
 **Returns:**
 ```json

@@ -108,13 +108,14 @@ impl Society {
     /// missing `role:sovereign`, and default the ratchet to genesis L0. Re-persists
     /// after a heal. Stable across restarts; the anchor is recorded verbatim.
     pub fn load_or_mint(vault: &mut crate::vault::Vault, anchor: &str) -> Self {
-        let existing: Option<PersistedSociety> = crate::vault::load_doc::<Option<PersistedSociety>>(
-            vault,
-            SOVEREIGN_NAMESPACE,
-            SOVEREIGN_DOC,
-            SOVEREIGN_LEGACY_FILE,
-        )
-        .unwrap_or(None);
+        let existing: Option<PersistedSociety> =
+            crate::vault::load_doc::<Option<PersistedSociety>>(
+                vault,
+                SOVEREIGN_NAMESPACE,
+                SOVEREIGN_DOC,
+                SOVEREIGN_LEGACY_FILE,
+            )
+            .unwrap_or(None);
 
         let society_kp_uuid = society_uuid(anchor);
 
@@ -130,8 +131,11 @@ impl Society {
             }
             // HEAL 2: mint the sovereign role if a legacy doc lacks it.
             if p.sovereign_role.is_none() {
-                let (role_lct, role_kp) =
-                    RoleEntity::issue(SOVEREIGN_ROLE_LABEL, society_kp_uuid, sovereign_role_extension());
+                let (role_lct, role_kp) = RoleEntity::issue(
+                    SOVEREIGN_ROLE_LABEL,
+                    society_kp_uuid,
+                    sovereign_role_extension(),
+                );
                 p.sovereign_role = Some(PersistedRole {
                     lct: role_lct.lct.clone(),
                     label: role_lct.label.clone(),
@@ -140,7 +144,10 @@ impl Society {
                 });
                 healed = true;
             }
-            let ratchet = p.ratchet.clone().unwrap_or_else(RatchetRequirement::genesis);
+            let ratchet = p
+                .ratchet
+                .clone()
+                .unwrap_or_else(RatchetRequirement::genesis);
             if p.ratchet.is_none() {
                 p.ratchet = Some(ratchet.clone());
                 healed = true;
@@ -158,7 +165,13 @@ impl Society {
             // HEAL 4: the society PAIRS to its sovereign role, so a resolver can
             // traverse society → role:sovereign → authority_ratchet.
             let role_id = p.sovereign_role.as_ref().unwrap().lct.lct_id();
-            if !p.lct.mrh.paired.iter().any(|e| e.edge_type == "sovereign_role") {
+            if !p
+                .lct
+                .mrh
+                .paired
+                .iter()
+                .any(|e| e.edge_type == "sovereign_role")
+            {
                 let ts = p.lct.created_at;
                 p.lct.mrh.paired.push(MrhEdge {
                     lct_id: role_id,
@@ -170,16 +183,28 @@ impl Society {
             let sovereign_role = role_entity_from(p.sovereign_role.as_ref().unwrap());
             if healed {
                 let _ = crate::vault::save_doc(
-                    vault, SOVEREIGN_NAMESPACE, SOVEREIGN_DOC, SOVEREIGN_LEGACY_FILE, &p,
+                    vault,
+                    SOVEREIGN_NAMESPACE,
+                    SOVEREIGN_DOC,
+                    SOVEREIGN_LEGACY_FILE,
+                    &p,
                 );
             }
-            return Society { lct: p.lct, anchor: p.anchor, sovereign_role, ratchet };
+            return Society {
+                lct: p.lct,
+                anchor: p.anchor,
+                sovereign_role,
+                ratchet,
+            };
         }
 
         // First boot: mint the Society LCT (self-issued §3.2 bootstrap) + role:sovereign.
         let (mut lct, keypair) = LctBuilder::new(EntityType::Society).build();
-        let (mut role_entity, role_kp) =
-            RoleEntity::issue(SOVEREIGN_ROLE_LABEL, society_kp_uuid, sovereign_role_extension());
+        let (mut role_entity, role_kp) = RoleEntity::issue(
+            SOVEREIGN_ROLE_LABEL,
+            society_kp_uuid,
+            sovereign_role_extension(),
+        );
         let ratchet = RatchetRequirement::genesis();
         // The ratchet rides ON role:sovereign's LCT (provable from the registry),
         // and the society PAIRS to its sovereign role so a resolver can traverse
@@ -206,14 +231,23 @@ impl Society {
             ratchet: Some(ratchet.clone()),
         };
         if let Err(e) = crate::vault::save_doc(
-            vault, SOVEREIGN_NAMESPACE, SOVEREIGN_DOC, SOVEREIGN_LEGACY_FILE, &persisted,
+            vault,
+            SOVEREIGN_NAMESPACE,
+            SOVEREIGN_DOC,
+            SOVEREIGN_LEGACY_FILE,
+            &persisted,
         ) {
             eprintln!(
                 "[society] WARNING: persisting society identity failed ({e}) — \
                  ephemeral this boot; re-mints next boot"
             );
         }
-        Society { lct, anchor: anchor.to_string(), sovereign_role: role_entity, ratchet }
+        Society {
+            lct,
+            anchor: anchor.to_string(),
+            sovereign_role: role_entity,
+            ratchet,
+        }
     }
 
     /// The society's canonical, key-derived LCT id (`lct:web4:mb32:…`).
@@ -241,7 +275,11 @@ fn recover_kp(secret_hex: &str, lct: &Lct) -> Option<web4_core::crypto::KeyPair>
 }
 
 fn role_entity_from(p: &PersistedRole) -> RoleEntity {
-    RoleEntity { lct: p.lct.clone(), label: p.label.clone(), extension: p.extension.clone() }
+    RoleEntity {
+        lct: p.lct.clone(),
+        label: p.label.clone(),
+        extension: p.extension.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -261,7 +299,11 @@ mod tests {
         let s1 = Society::load_or_mint(&mut v, "lct:web4:hestia:sovereign:phase1-placeholder");
         let id1 = s1.lct_id();
         let role1 = s1.sovereign_role_id();
-        assert_eq!(s1.lct.entity_type, EntityType::Society, "the entity is a Society");
+        assert_eq!(
+            s1.lct.entity_type,
+            EntityType::Society,
+            "the entity is a Society"
+        );
         assert!(s1.lct.verify_binding());
         assert_eq!(s1.sovereign_role.label, SOVEREIGN_ROLE_LABEL);
         assert_eq!(s1.ratchet_level(), 0, "genesis L0 at bootstrap");
@@ -269,7 +311,11 @@ mod tests {
         let mut v2 = crate::vault::Vault::open(path, "p".into()).unwrap();
         let s2 = Society::load_or_mint(&mut v2, "lct:web4:hestia:sovereign:phase1-placeholder");
         assert_eq!(id1, s2.lct_id(), "society id stable across restarts");
-        assert_eq!(role1, s2.sovereign_role_id(), "sovereign role id stable too");
+        assert_eq!(
+            role1,
+            s2.sovereign_role_id(),
+            "sovereign role id stable too"
+        );
         assert!(id1.starts_with("lct:web4:mb32:b"));
     }
 
@@ -278,9 +324,20 @@ mod tests {
         let (_dir, path) = fresh_vault();
         let mut v = crate::vault::Vault::init(path, "p".into()).unwrap();
         let s = Society::load_or_mint(&mut v, "anchor");
-        assert!(s.sovereign_role.lct.verify_binding(), "sovereign role signs its own binding");
-        assert_ne!(s.lct_id(), s.sovereign_role_id(), "the role is a distinct entity from the society");
-        assert_eq!(s.sovereign_role.extension.default_verdict, ExtensionVerdict::Deny, "fail-closed");
+        assert!(
+            s.sovereign_role.lct.verify_binding(),
+            "sovereign role signs its own binding"
+        );
+        assert_ne!(
+            s.lct_id(),
+            s.sovereign_role_id(),
+            "the role is a distinct entity from the society"
+        );
+        assert_eq!(
+            s.sovereign_role.extension.default_verdict,
+            ExtensionVerdict::Deny,
+            "fail-closed"
+        );
     }
 
     #[test]
@@ -308,14 +365,31 @@ mod tests {
             sovereign_role: None,
             ratchet: None,
         };
-        crate::vault::save_doc(&mut v, SOVEREIGN_NAMESPACE, SOVEREIGN_DOC, SOVEREIGN_LEGACY_FILE, &legacy).unwrap();
+        crate::vault::save_doc(
+            &mut v,
+            SOVEREIGN_NAMESPACE,
+            SOVEREIGN_DOC,
+            SOVEREIGN_LEGACY_FILE,
+            &legacy,
+        )
+        .unwrap();
 
         // Load → healed: retyped to Society (SAME id, pubkey-derived), role minted, genesis ratchet.
         let s = Society::load_or_mint(&mut v, "anchor");
         assert_eq!(s.lct.entity_type, EntityType::Society, "retyped to Society");
-        assert_eq!(s.lct_id(), old_id, "identity unchanged (id is pubkey-derived)");
-        assert!(s.lct.verify_binding(), "re-signed binding verifies after retype");
-        assert_eq!(s.sovereign_role.label, SOVEREIGN_ROLE_LABEL, "sovereign role minted on heal");
+        assert_eq!(
+            s.lct_id(),
+            old_id,
+            "identity unchanged (id is pubkey-derived)"
+        );
+        assert!(
+            s.lct.verify_binding(),
+            "re-signed binding verifies after retype"
+        );
+        assert_eq!(
+            s.sovereign_role.label, SOVEREIGN_ROLE_LABEL,
+            "sovereign role minted on heal"
+        );
         assert_eq!(s.ratchet_level(), 0);
         // and the heal persisted (a reload sees a Society, no re-heal churn)
         let s2 = Society::load_or_mint(&mut v, "anchor");

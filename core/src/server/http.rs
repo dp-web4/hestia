@@ -8,20 +8,20 @@
 use anyhow::{Context, Result};
 use axum::{
     extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Json},
     routing::{delete, get, post, put},
 };
-use web4_core::oid4vc::{verify_holder_proof, CredentialIssuerMetadata, CredentialRequest};
-use web4_core::sd_jwt_vc::SdJwtVc;
 use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+use web4_core::oid4vc::{CredentialIssuerMetadata, CredentialRequest, verify_holder_proof};
+use web4_core::sd_jwt_vc::SdJwtVc;
 
 use super::handler::HestiaServer;
 use super::state::SharedState;
@@ -43,8 +43,12 @@ async fn operator_challenge(State(state): State<SharedState>) -> impl IntoRespon
     let now = super::state::unix_now();
     let mut s = state.lock().await;
     let challenge = s.operator_challenges.issue(now);
-    s.operator_challenges.gc(now, super::operator_auth::CHALLENGE_TTL_SECS);
-    (StatusCode::OK, Json(serde_json::json!({ "challenge": challenge })))
+    s.operator_challenges
+        .gc(now, super::operator_auth::CHALLENGE_TTL_SECS);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "challenge": challenge })),
+    )
 }
 
 /// `POST /api/operator/session` {lct_id, challenge, signature} → open an operator
@@ -78,7 +82,10 @@ async fn operator_session(
                 "operator_session_opened",
                 serde_json::json!({ "operator": op, "evidence": "operator-lct-signature" }),
             );
-            (StatusCode::OK, Json(serde_json::json!({ "token": token, "operator": op })))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "token": token, "operator": op })),
+            )
         }
         None => (
             StatusCode::UNAUTHORIZED,
@@ -97,7 +104,7 @@ async fn operator_gate(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    use super::operator_auth::{gate_session_request, AuthzOutcome, Stakes};
+    use super::operator_auth::{AuthzOutcome, Stakes, gate_session_request};
 
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
@@ -105,8 +112,12 @@ async fn operator_gate(
 
     // Dev-only named override — the explicit unsafe escape hatch, refused in the
     // production profile, and loud + witnessed when used. Never the front door.
-    let dev_override = std::env::var("HESTIA_OPERATOR_DEV_TOKEN").ok().filter(|t| !t.is_empty());
-    let production = std::env::var("HESTIA_PROFILE").map(|p| p == "production").unwrap_or(false);
+    let dev_override = std::env::var("HESTIA_OPERATOR_DEV_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    let production = std::env::var("HESTIA_PROFILE")
+        .map(|p| p == "production")
+        .unwrap_or(false);
     let bearer = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -118,7 +129,9 @@ async fn operator_gate(
         if !production && bearer.as_deref() == Some(dev.as_str()) {
             let now = super::state::unix_now();
             let mut s = state.lock().await;
-            eprintln!("[hestia] WARNING: operator dev-override used on {method} {path} (dev-only, unsafe)");
+            eprintln!(
+                "[hestia] WARNING: operator dev-override used on {method} {path} (dev-only, unsafe)"
+            );
             let _ = s.append_chain(
                 "operator_gate",
                 serde_json::json!({ "act": format!("{method} {path}"), "verdict": "dev-override",
@@ -135,7 +148,10 @@ async fn operator_gate(
         let law = s.vault.policy();
         let operator = bearer
             .as_deref()
-            .and_then(|t| s.operator_sessions.operator(t, now, super::operator_auth::SESSION_TTL_SECS))
+            .and_then(|t| {
+                s.operator_sessions
+                    .operator(t, now, super::operator_auth::SESSION_TTL_SECS)
+            })
             .map(str::to_string);
         gate_session_request(law, operator.as_deref(), stakes)
     };
@@ -144,7 +160,10 @@ async fn operator_gate(
     // low-stakes read flood).
     if !matches!(stakes, Stakes::LowReversible) {
         let mut s = state.lock().await;
-        let _ = s.append_chain("operator_gate", outcome.evidence_record(&format!("{method} {path}")));
+        let _ = s.append_chain(
+            "operator_gate",
+            outcome.evidence_record(&format!("{method} {path}")),
+        );
     }
 
     match outcome {
@@ -157,9 +176,11 @@ async fn operator_gate(
             })),
         )
             .into_response(),
-        AuthzOutcome::Denied { reason, .. } => {
-            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": reason }))).into_response()
-        }
+        AuthzOutcome::Denied { reason, .. } => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response(),
     }
 }
 
@@ -209,12 +230,18 @@ pub async fn serve_with_callback(
         .route("/api/policy", get(policy_get))
         .route("/api/policy/preset", put(policy_set_preset))
         .route("/api/policy/override", put(policy_set_override))
-        .route("/api/policy/override/:rule_id", delete(policy_clear_override))
+        .route(
+            "/api/policy/override/:rule_id",
+            delete(policy_clear_override),
+        )
         .route("/api/policy/rule", put(policy_upsert_rule))
         .route("/api/policy/rule/:rule_id", delete(policy_delete_rule))
         .route("/api/orchestrators/:id/connect", post(orchestrator_connect))
         .route("/api/chain", get(chain_query))
-        .route_layer(axum::middleware::from_fn_with_state(state.clone(), operator_gate));
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            operator_gate,
+        ));
 
     let mut app = axum::Router::new()
         .merge(operator_surface)
@@ -280,7 +307,11 @@ fn load_dashboard_html() -> String {
     let path = std::env::var("HESTIA_DASHBOARD_PATH").ok().or_else(|| {
         match std::env::var("HESTIA_DASHBOARD_DEV") {
             Ok(v) if !v.is_empty() && v != "0" => Some(
-                concat!(env!("CARGO_MANIFEST_DIR"), "/src/server/dashboard/index.html").to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/src/server/dashboard/index.html"
+                )
+                .to_string(),
             ),
             _ => None,
         }
@@ -332,17 +363,22 @@ async fn failures_json(State(state): State<SharedState>) -> impl IntoResponse {
 async fn vault_list(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.lock().await;
     let names = s.vault.list();
-    let entries: Vec<serde_json::Value> = names.iter().filter_map(|name| {
-        s.vault.get(name).map(|e| serde_json::json!({
-            "id": name,
-            "name": name,
-            "scope": e.scope,
-            "tags": e.tags,
-            "allowed_consumers": e.allowed_consumers,
-            "created_at": e.created_at,
-            "last_rotated": e.last_rotated,
-        }))
-    }).collect();
+    let entries: Vec<serde_json::Value> = names
+        .iter()
+        .filter_map(|name| {
+            s.vault.get(name).map(|e| {
+                serde_json::json!({
+                    "id": name,
+                    "name": name,
+                    "scope": e.scope,
+                    "tags": e.tags,
+                    "allowed_consumers": e.allowed_consumers,
+                    "created_at": e.created_at,
+                    "last_rotated": e.last_rotated,
+                })
+            })
+        })
+        .collect();
     Json(serde_json::json!({ "entries": entries }))
 }
 
@@ -353,11 +389,23 @@ async fn vault_add(
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let value = body.get("value").and_then(|v| v.as_str()).unwrap_or("");
     if name.is_empty() || value.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "name and value required"})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "name and value required"})),
+        );
     }
-    let scope: Vec<String> = body.get("scope").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
-    let tags: Vec<String> = body.get("tags").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
-    let consumers: Vec<String> = body.get("allowed_consumers").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+    let scope: Vec<String> = body
+        .get("scope")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let tags: Vec<String> = body
+        .get("tags")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let consumers: Vec<String> = body
+        .get("allowed_consumers")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
 
     let entry = crate::vault::VaultEntry::new(name, value)
         .with_scope(scope)
@@ -367,7 +415,10 @@ async fn vault_add(
     let mut s = state.lock().await;
     match s.vault.add(entry) {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
     }
 }
 
@@ -418,32 +469,60 @@ async fn vci_credential(
     // payload) so we can check it's one we issued.
     let proof_nonce = match web4_core::oid4vc::proof_nonce(&req.proof_jwt) {
         Some(n) => n,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"proof missing nonce"}))),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"proof missing nonce"})),
+            );
+        }
     };
 
     let mut s = state.lock().await;
 
     // Single-use: must be a nonce we issued; consume it.
     if !s.vci_nonces.remove(&proof_nonce) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"unknown or used c_nonce"})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"unknown or used c_nonce"})),
+        );
     }
 
     // Verify the holder key-possession proof (aud = us, fresh).
     let holder_pk = match verify_holder_proof(&req.proof_jwt, &base, &proof_nonce, 300, now) {
         Ok(pk) => pk,
-        Err(e) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": e}))),
+        Err(e) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": e})),
+            );
+        }
     };
 
     // Load the daemon's issuer identity from the vault (init --ai).
-    let (issuer_lct, issuer_key) = match s.vault.get("ai_identity_secret").map(|e| e.secret.clone()) {
+    let (issuer_lct, issuer_key) = match s.vault.get("ai_identity_secret").map(|e| e.secret.clone())
+    {
         Some(hex) => {
-            let lct = s.vault.get("ai_identity_lct_id").map(|e| e.secret.clone()).unwrap_or_default();
+            let lct = s
+                .vault
+                .get("ai_identity_lct_id")
+                .map(|e| e.secret.clone())
+                .unwrap_or_default();
             match hex32(&hex) {
                 Some(b) => (lct, web4_core::crypto::KeyPair::from_secret_bytes(&b)),
-                None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"identity key malformed"}))),
+                None => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error":"identity key malformed"})),
+                    );
+                }
             }
         }
-        None => return (StatusCode::CONFLICT, Json(serde_json::json!({"error":"no issuer identity — run `hestia init --ai`"}))),
+        None => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error":"no issuer identity — run `hestia init --ai`"})),
+            );
+        }
     };
 
     // Assurance level from the local constellation (ties the credential to the
@@ -454,7 +533,10 @@ async fn vci_credential(
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| "single_device".into());
 
-    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("127.0.0.1:7711");
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("127.0.0.1:7711");
     let issuer_did = if issuer_lct.is_empty() {
         format!("did:web:{host}")
     } else {
@@ -468,11 +550,16 @@ async fn vci_credential(
         .sd_claim("issued_by", serde_json::json!("hestia"))
         .issue(&issuer_key, &format!("{issuer_did}#key-0"));
 
-    (StatusCode::OK, Json(serde_json::json!({ "credential": credential, "format": "vc+sd-jwt" })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "credential": credential, "format": "vc+sd-jwt" })),
+    )
 }
 
 fn hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 { return None; }
+    if s.len() != 64 {
+        return None;
+    }
     let mut out = [0u8; 32];
     for i in 0..32 {
         out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
@@ -483,8 +570,14 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
 // --- Policy endpoints ---
 
 /// Tool categories the policy can match on (mirrors `policy::classify`).
-const POLICY_CATEGORIES: &[&str] =
-    &["command", "file_read", "file_write", "network", "credential_access", "task_management"];
+const POLICY_CATEGORIES: &[&str] = &[
+    "command",
+    "file_read",
+    "file_write",
+    "network",
+    "credential_access",
+    "task_management",
+];
 
 fn parse_decision(s: &str) -> Option<crate::policy::PolicyDecision> {
     use crate::policy::PolicyDecision::*;
@@ -500,11 +593,23 @@ fn parse_decision(s: &str) -> Option<crate::policy::PolicyDecision> {
 fn match_summary(m: &crate::policy::PolicyMatch) -> String {
     let mut parts = Vec::new();
     let join = |v: &Vec<String>| v.join(", ");
-    if let Some(t) = m.tools.as_ref().filter(|v| !v.is_empty()) { parts.push(format!("tools: {}", join(t))); }
-    if let Some(c) = m.categories.as_ref().filter(|v| !v.is_empty()) { parts.push(format!("categories: {}", join(c))); }
-    if let Some(p) = m.target_patterns.as_ref().filter(|v| !v.is_empty()) { parts.push(format!("target ~ {}", join(p))); }
-    if let Some(p) = m.command_patterns.as_ref().filter(|v| !v.is_empty()) { parts.push(format!("command ~ {}", join(p))); }
-    if parts.is_empty() { "any".into() } else { parts.join(" · ") }
+    if let Some(t) = m.tools.as_ref().filter(|v| !v.is_empty()) {
+        parts.push(format!("tools: {}", join(t)));
+    }
+    if let Some(c) = m.categories.as_ref().filter(|v| !v.is_empty()) {
+        parts.push(format!("categories: {}", join(c)));
+    }
+    if let Some(p) = m.target_patterns.as_ref().filter(|v| !v.is_empty()) {
+        parts.push(format!("target ~ {}", join(p)));
+    }
+    if let Some(p) = m.command_patterns.as_ref().filter(|v| !v.is_empty()) {
+        parts.push(format!("command ~ {}", join(p)));
+    }
+    if parts.is_empty() {
+        "any".into()
+    } else {
+        parts.join(" · ")
+    }
 }
 
 /// `GET /api/policy` — the full editable policy state for the dashboard editor:
@@ -513,7 +618,9 @@ fn match_summary(m: &crate::policy::PolicyMatch) -> String {
 async fn policy_get(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.lock().await;
     let ps = s.vault.policy();
-    let resolved = ps.resolve().unwrap_or_else(|| crate::policy::get_preset("safety").unwrap().config);
+    let resolved = ps
+        .resolve()
+        .unwrap_or_else(|| crate::policy::get_preset("safety").unwrap().config);
 
     let preset_rules: Vec<_> = crate::policy::get_preset(&ps.active_preset)
         .map(|p| p.config.rules)
@@ -558,18 +665,34 @@ async fn policy_set_preset(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let preset = body.get("preset").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let preset = body
+        .get("preset")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     if !crate::policy::is_preset_name(&preset) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("unknown preset: {preset}")})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("unknown preset: {preset}")})),
+        );
     }
     let mut s = state.lock().await;
     match s.vault.set_active_preset(&preset) {
         Ok(()) => {
             s.reload_policy();
-            let _ = s.append_chain("policy_edit", serde_json::json!({"change": "preset", "preset": preset}));
-            (StatusCode::OK, Json(serde_json::json!({"ok": true, "preset": preset})))
+            let _ = s.append_chain(
+                "policy_edit",
+                serde_json::json!({"change": "preset", "preset": preset}),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "preset": preset})),
+            )
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
     }
 }
 
@@ -592,21 +715,38 @@ async fn policy_set_override(
         None => None,
         Some(d) => match parse_decision(d) {
             Some(pd) => Some(pd),
-            None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("unknown decision: {d}")}))),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("unknown decision: {d}")})),
+                );
+            }
         },
     };
-    let ov = crate::vault::PolicyOverride { decision, enabled: body.enabled };
+    let ov = crate::vault::PolicyOverride {
+        decision,
+        enabled: body.enabled,
+    };
     let mut s = state.lock().await;
     match s.vault.set_policy_override(&body.rule_id, ov) {
         Ok(()) => {
             s.reload_policy();
-            let _ = s.append_chain("policy_edit", serde_json::json!({
-                "change": "override", "rule_id": body.rule_id,
-                "decision": body.decision, "enabled": body.enabled,
-            }));
-            (StatusCode::OK, Json(serde_json::json!({"ok": true, "rule_id": body.rule_id})))
+            let _ = s.append_chain(
+                "policy_edit",
+                serde_json::json!({
+                    "change": "override", "rule_id": body.rule_id,
+                    "decision": body.decision, "enabled": body.enabled,
+                }),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "rule_id": body.rule_id})),
+            )
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
     }
 }
 
@@ -619,10 +759,19 @@ async fn policy_clear_override(
     match s.vault.clear_policy_override(&rule_id) {
         Ok(()) => {
             s.reload_policy();
-            let _ = s.append_chain("policy_edit", serde_json::json!({"change": "clear_override", "rule_id": rule_id}));
-            (StatusCode::OK, Json(serde_json::json!({"ok": true, "rule_id": rule_id})))
+            let _ = s.append_chain(
+                "policy_edit",
+                serde_json::json!({"change": "clear_override", "rule_id": rule_id}),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "rule_id": rule_id})),
+            )
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
     }
 }
 
@@ -634,17 +783,29 @@ async fn policy_upsert_rule(
     Json(rule): Json<crate::policy::PolicyRule>,
 ) -> impl IntoResponse {
     if rule.id.trim().is_empty() || rule.name.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "rule id and name are required"})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "rule id and name are required"})),
+        );
     }
     let rule_id = rule.id.clone();
     let mut s = state.lock().await;
     match s.vault.upsert_custom_rule(rule) {
         Ok(()) => {
             s.reload_policy();
-            let _ = s.append_chain("policy_edit", serde_json::json!({"change": "upsert_rule", "rule_id": rule_id}));
-            (StatusCode::OK, Json(serde_json::json!({"ok": true, "rule_id": rule_id})))
+            let _ = s.append_chain(
+                "policy_edit",
+                serde_json::json!({"change": "upsert_rule", "rule_id": rule_id}),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "rule_id": rule_id})),
+            )
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
     }
 }
 
@@ -658,9 +819,15 @@ async fn policy_delete_rule(
         Ok(removed) => {
             s.reload_policy();
             let _ = s.append_chain("policy_edit", serde_json::json!({"change": "delete_rule", "rule_id": rule_id, "removed": removed}));
-            (StatusCode::OK, Json(serde_json::json!({"ok": true, "removed": removed})))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "removed": removed})),
+            )
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
     }
 }
 
@@ -673,10 +840,19 @@ async fn orchestrator_connect(
     match crate::orchestrators::install(&id) {
         Ok(msg) => {
             let s = state.lock().await;
-            let _ = s.append_chain("orchestrator_connect", serde_json::json!({"id": id, "status": msg}));
-            (StatusCode::OK, Json(serde_json::json!({"ok": true, "message": msg})))
+            let _ = s.append_chain(
+                "orchestrator_connect",
+                serde_json::json!({"id": id, "status": msg}),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "message": msg})),
+            )
         }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
     }
 }
 
@@ -709,18 +885,23 @@ async fn chain_query(
     };
     let limit = q.limit.unwrap_or(default_cap);
     let cutoff_str = cutoff.map(|c: chrono::DateTime<chrono::Utc>| c.to_rfc3339());
-    let entries: Vec<super::dashboard::RecentEntry> = s.chain_store
+    let entries: Vec<super::dashboard::RecentEntry> = s
+        .chain_store
         .read_recent_window(cutoff_str.as_deref(), limit)
         .unwrap_or_default()
         .into_iter()
         .map(super::dashboard::flatten_entry)
         .filter(|e| {
             if let Some(ref et) = q.event_type {
-                if e.event_type != *et { return false; }
+                if e.event_type != *et {
+                    return false;
+                }
             }
             if let Some(ref tf) = q.tool {
                 if let Some(ref tn) = e.tool_name {
-                    if !tn.contains(tf.as_str()) { return false; }
+                    if !tn.contains(tf.as_str()) {
+                        return false;
+                    }
                 } else {
                     return false;
                 }

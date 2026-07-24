@@ -25,7 +25,7 @@
 //! synthetic exclusion, which is a safety gate).
 
 use std::collections::HashMap;
-use web4_core::{EntityType, LegacyAlias, LegacyDerivation, Lct, MrhEdge};
+use web4_core::{EntityType, Lct, LegacyAlias, LegacyDerivation, MrhEdge};
 
 const MEMBERS_NAMESPACE: &str = "members";
 const MEMBERS_DOC: &str = "registry";
@@ -150,21 +150,32 @@ pub fn vouch_witnessing_key(
         .and_then(|b| <[u8; 32]>::try_from(b).ok())
         .map(|bytes| web4_core::crypto::KeyPair::from_secret_bytes(&bytes))
     else {
-        eprintln!("[members] WARNING: cannot recover binding key for '{plugin_id}' — vouch refused");
+        eprintln!(
+            "[members] WARNING: cannot recover binding key for '{plugin_id}' — vouch refused"
+        );
         return false;
     };
     if binding_kp.verifying_key() != p.lct.public_key {
-        eprintln!("[members] WARNING: sealed key for '{plugin_id}' does not bind its LCT — vouch refused");
+        eprintln!(
+            "[members] WARNING: sealed key for '{plugin_id}' does not bind its LCT — vouch refused"
+        );
         return false;
     }
-    p.lct.authorize_operational_key("witnessing", operational_pubkey, &binding_kp);
+    p.lct
+        .authorize_operational_key("witnessing", operational_pubkey, &binding_kp);
     if let Some(lct) = registry.members.get_mut(plugin_id) {
         *lct = p.lct.clone();
     }
-    if let Err(e) =
-        crate::vault::save_doc(vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE, &persisted)
-    {
-        eprintln!("[members] WARNING: persisting witnessing-key vouch for '{plugin_id}' failed ({e})");
+    if let Err(e) = crate::vault::save_doc(
+        vault,
+        MEMBERS_NAMESPACE,
+        MEMBERS_DOC,
+        MEMBERS_LEGACY_FILE,
+        &persisted,
+    ) {
+        eprintln!(
+            "[members] WARNING: persisting witnessing-key vouch for '{plugin_id}' failed ({e})"
+        );
         return false;
     }
     true
@@ -262,8 +273,10 @@ mod tests {
     fn ensure_member_mints_persists_and_is_idempotent() {
         let (_dir, mut vault) = fresh_vault();
         let mut reg = MemberRegistry::default();
-        let a1 = ensure_member(&mut vault, &mut reg, "claude-code", false, "sid", "anchor").unwrap();
-        let a2 = ensure_member(&mut vault, &mut reg, "claude-code", false, "sid", "anchor").unwrap();
+        let a1 =
+            ensure_member(&mut vault, &mut reg, "claude-code", false, "sid", "anchor").unwrap();
+        let a2 =
+            ensure_member(&mut vault, &mut reg, "claude-code", false, "sid", "anchor").unwrap();
         assert_eq!(a1, a2, "second call returns the same LCT (no re-mint)");
         assert_eq!(reg.len(), 1);
         assert!(a1.starts_with("lct:web4:mb32:b"));
@@ -279,8 +292,14 @@ mod tests {
         let mut reg = MemberRegistry::default();
         ensure_member(&mut vault, &mut reg, "claude-code", false, "sid", "anchor").unwrap();
         let lct = reg.get("claude-code").unwrap();
-        let alias = lct.legacy_alias.as_ref().expect("member carries a legacy alias");
-        assert!(alias.verify(), "the alias re-derives (registry ingest check 4)");
+        let alias = lct
+            .legacy_alias
+            .as_ref()
+            .expect("member carries a legacy alias");
+        assert!(
+            alias.verify(),
+            "the alias re-derives (registry ingest check 4)"
+        );
         // and it targets the SAME label the trust grains key on
         let expected = LegacyDerivation::HestiaMember {
             plugin_id: "claude-code".into(),
@@ -313,8 +332,16 @@ mod tests {
             entry_id: "42".into(),
             entry_hash: "deadbeef".into(),
         };
-        assert!(attach_citizenship(&mut vault, &mut reg, "claude-code", cref.clone()));
-        assert_eq!(reg.get("claude-code").unwrap().citizenships, vec![cref.clone()]);
+        assert!(attach_citizenship(
+            &mut vault,
+            &mut reg,
+            "claude-code",
+            cref.clone()
+        ));
+        assert_eq!(
+            reg.get("claude-code").unwrap().citizenships,
+            vec![cref.clone()]
+        );
         // idempotent: attaching the same ref again does not duplicate
         attach_citizenship(&mut vault, &mut reg, "claude-code", cref.clone());
         assert_eq!(reg.get("claude-code").unwrap().citizenships.len(), 1);
@@ -339,27 +366,52 @@ mod tests {
         // key, so a verifier resolves it from the LCT alone (uniform #540 path).
         let (_dir, mut vault) = fresh_vault();
         let mut reg = MemberRegistry::default();
-        ensure_member(&mut vault, &mut reg, "legion-witness", false, "sid", "anchor").unwrap();
+        ensure_member(
+            &mut vault,
+            &mut reg,
+            "legion-witness",
+            false,
+            "sid",
+            "anchor",
+        )
+        .unwrap();
         let operational = web4_core::crypto::KeyPair::generate(); // the channel key
-        assert!(vouch_witnessing_key(&mut vault, &mut reg, "legion-witness", operational.verifying_key()));
+        assert!(vouch_witnessing_key(
+            &mut vault,
+            &mut reg,
+            "legion-witness",
+            operational.verifying_key()
+        ));
         // resolvable from the member LCT, no roster
         let lct = reg.get("legion-witness").unwrap();
-        assert_eq!(lct.operational_key_for("witnessing"), Some(operational.verifying_key()));
+        assert_eq!(
+            lct.operational_key_for("witnessing"),
+            Some(operational.verifying_key())
+        );
         // persisted: a reload still resolves it
         let reloaded = load_members(&vault);
         assert_eq!(
-            reloaded.get("legion-witness").unwrap().operational_key_for("witnessing"),
+            reloaded
+                .get("legion-witness")
+                .unwrap()
+                .operational_key_for("witnessing"),
             Some(operational.verifying_key())
         );
         // unknown member → false, no panic
-        assert!(!vouch_witnessing_key(&mut vault, &mut reg, "ghost", operational.verifying_key()));
+        assert!(!vouch_witnessing_key(
+            &mut vault,
+            &mut reg,
+            "ghost",
+            operational.verifying_key()
+        ));
     }
 
     #[test]
     fn members_survive_a_reload() {
         let (_dir, mut vault) = fresh_vault();
         let mut reg = MemberRegistry::default();
-        let minted = ensure_member(&mut vault, &mut reg, "claude-code", false, "sid", "anchor").unwrap();
+        let minted =
+            ensure_member(&mut vault, &mut reg, "claude-code", false, "sid", "anchor").unwrap();
         // Reload from the vault (a restart).
         let reloaded = load_members(&vault);
         assert_eq!(reloaded.len(), 1);

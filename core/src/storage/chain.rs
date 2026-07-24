@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -85,8 +85,9 @@ impl SqliteChainStore {
 
         // One-time migration: re-encrypt a legacy plaintext DB.
         if path.exists() && is_plaintext_sqlite(&path) {
-            migrate_plaintext_to_encrypted(&path, &key_hex)
-                .with_context(|| format!("migrating plaintext witness chain at {}", path.display()))?;
+            migrate_plaintext_to_encrypted(&path, &key_hex).with_context(|| {
+                format!("migrating plaintext witness chain at {}", path.display())
+            })?;
         }
 
         let conn = Connection::open(&path)
@@ -397,13 +398,22 @@ mod tests {
                     chain_position INTEGER PRIMARY KEY, hash TEXT NOT NULL UNIQUE,
                     prev_hash TEXT NOT NULL, event_type TEXT NOT NULL,
                     event_data TEXT NOT NULL, signer_lct TEXT NOT NULL, timestamp TEXT NOT NULL);",
-            ).unwrap();
+            )
+            .unwrap();
             for i in 0..2u64 {
                 conn.execute(
                     "INSERT INTO chain_entries VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                    params![i as i64, format!("h{i}"), format!("p{i}"), "evt",
-                        format!("{{\"n\":{i}}}"), signer, "2026-06-16T00:00:00Z"],
-                ).unwrap();
+                    params![
+                        i as i64,
+                        format!("h{i}"),
+                        format!("p{i}"),
+                        "evt",
+                        format!("{{\"n\":{i}}}"),
+                        signer,
+                        "2026-06-16T00:00:00Z"
+                    ],
+                )
+                .unwrap();
             }
         }
         assert!(is_plaintext_sqlite(&path), "precondition: plaintext DB");
@@ -415,8 +425,17 @@ mod tests {
         drop(store);
 
         // Reopen with the right key works; the wrong key fails.
-        assert_eq!(SqliteChainStore::open(&path, TEST_KEY).unwrap().len().unwrap(), 2);
-        assert!(SqliteChainStore::open(&path, [9u8; 32]).is_err(), "wrong key must fail");
+        assert_eq!(
+            SqliteChainStore::open(&path, TEST_KEY)
+                .unwrap()
+                .len()
+                .unwrap(),
+            2
+        );
+        assert!(
+            SqliteChainStore::open(&path, [9u8; 32]).is_err(),
+            "wrong key must fail"
+        );
     }
 
     #[test]
@@ -426,9 +445,15 @@ mod tests {
         let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
         let signer = "lct:web4:hestia:sovereign:test";
 
-        let e1 = store.append("session_started", json!({"plugin": "a"}), signer).unwrap();
-        let e2 = store.append("outcome", json!({"success": true}), signer).unwrap();
-        let e3 = store.append("outcome", json!({"success": false}), signer).unwrap();
+        let e1 = store
+            .append("session_started", json!({"plugin": "a"}), signer)
+            .unwrap();
+        let e2 = store
+            .append("outcome", json!({"success": true}), signer)
+            .unwrap();
+        let e3 = store
+            .append("outcome", json!({"success": false}), signer)
+            .unwrap();
 
         assert_eq!(e1.prev_hash, GENESIS_PREV_HASH);
         assert_eq!(e2.prev_hash, e1.hash);
@@ -454,8 +479,12 @@ mod tests {
 
         {
             let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
-            store.append("session_started", json!({"k": 1}), signer).unwrap();
-            store.append("outcome", json!({"success": true}), signer).unwrap();
+            store
+                .append("session_started", json!({"k": 1}), signer)
+                .unwrap();
+            store
+                .append("outcome", json!({"success": true}), signer)
+                .unwrap();
         }
         // Drop and reopen.
         let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
@@ -490,7 +519,8 @@ mod tests {
         }
         // Tamper with event_data at chain_position 0.
         let conn = Connection::open(&path).unwrap();
-        conn.pragma_update(None, "key", hex::encode(TEST_KEY)).unwrap();
+        conn.pragma_update(None, "key", hex::encode(TEST_KEY))
+            .unwrap();
         conn.execute(
             "UPDATE chain_entries SET event_data = ?1 WHERE chain_position = 0",
             params![r#"{"a": 99}"#],

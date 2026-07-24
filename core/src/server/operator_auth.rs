@@ -97,7 +97,8 @@ impl SessionStore {
         let mut buf = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut buf);
         let token = hex::encode(buf);
-        self.sessions.insert(token.clone(), (operator_lct.to_string(), now));
+        self.sessions
+            .insert(token.clone(), (operator_lct.to_string(), now));
         token
     }
 
@@ -114,7 +115,8 @@ impl SessionStore {
     }
 
     pub fn gc(&mut self, now: u64, ttl_secs: u64) {
-        self.sessions.retain(|_, (_, issued)| now.saturating_sub(*issued) <= ttl_secs);
+        self.sessions
+            .retain(|_, (_, issued)| now.saturating_sub(*issued) <= ttl_secs);
     }
 }
 
@@ -223,11 +225,18 @@ impl Stakes {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthzOutcome {
     /// Sufficient preponderance for the stakes — proceed.
-    Authorized { stakes: Stakes, signers: Vec<String> },
+    Authorized {
+        stakes: Stakes,
+        signers: Vec<String>,
+    },
     /// Clause V: an irreversible act without the law-required quorum. Block and
     /// escalate (collect more operator signatures, or a human gate). NOT a failure —
     /// a recorded, resumable "needs more evidence" state.
-    RequiresQuorum { have: u32, need: u32, signers: Vec<String> },
+    RequiresQuorum {
+        have: u32,
+        need: u32,
+        signers: Vec<String>,
+    },
     /// No admissible evidence for the act's stakes (e.g. a high-stakes act with no
     /// valid operator signature, or the surface not bootstrapped). Deny.
     Denied { stakes: Stakes, reason: String },
@@ -248,7 +257,11 @@ impl AuthzOutcome {
                 "stakes": stakes.as_str(), "evidence": "operator-lct-signature",
                 "signers": signers,
             }),
-            AuthzOutcome::RequiresQuorum { have, need, signers } => json!({
+            AuthzOutcome::RequiresQuorum {
+                have,
+                need,
+                signers,
+            } => json!({
                 "act": act, "verdict": "requires-quorum",
                 "stakes": "irreversible", "evidence": "operator-lct-signature",
                 "signers": signers, "have": have, "need": need,
@@ -288,13 +301,23 @@ pub fn authorize(law: &VaultPolicyState, stakes: Stakes, signers: &[String]) -> 
     if stakes.is_irreversible() {
         let need = law.irreversible_quorum();
         if n >= need {
-            AuthzOutcome::Authorized { stakes, signers: signers.to_vec() }
+            AuthzOutcome::Authorized {
+                stakes,
+                signers: signers.to_vec(),
+            }
         } else {
-            AuthzOutcome::RequiresQuorum { have: n, need, signers: signers.to_vec() }
+            AuthzOutcome::RequiresQuorum {
+                have: n,
+                need,
+                signers: signers.to_vec(),
+            }
         }
     } else {
         // low/high reversible: a single authorized operator's evidence suffices
-        AuthzOutcome::Authorized { stakes, signers: signers.to_vec() }
+        AuthzOutcome::Authorized {
+            stakes,
+            signers: signers.to_vec(),
+        }
     }
 }
 
@@ -318,15 +341,30 @@ mod tests {
 
     #[test]
     fn stakes_classification() {
-        assert_eq!(Stakes::classify("GET", "/api/dashboard"), Stakes::LowReversible);
+        assert_eq!(
+            Stakes::classify("GET", "/api/dashboard"),
+            Stakes::LowReversible
+        );
         assert_eq!(Stakes::classify("GET", "/api/chain"), Stakes::LowReversible);
         // releasing a secret's value is a read with no undo
-        assert_eq!(Stakes::classify("GET", "/api/vault/openai-key"), Stakes::Irreversible);
+        assert_eq!(
+            Stakes::classify("GET", "/api/vault/openai-key"),
+            Stakes::Irreversible
+        );
         // policy edits are high but reversible
-        assert_eq!(Stakes::classify("PUT", "/api/policy/rule"), Stakes::HighReversible);
-        assert_eq!(Stakes::classify("POST", "/api/policy/instance"), Stakes::HighReversible);
+        assert_eq!(
+            Stakes::classify("PUT", "/api/policy/rule"),
+            Stakes::HighReversible
+        );
+        assert_eq!(
+            Stakes::classify("POST", "/api/policy/instance"),
+            Stakes::HighReversible
+        );
         // operator-set changes risk lockout → irreversible tail
-        assert_eq!(Stakes::classify("DELETE", "/api/operator/lct:x"), Stakes::Irreversible);
+        assert_eq!(
+            Stakes::classify("DELETE", "/api/operator/lct:x"),
+            Stakes::Irreversible
+        );
     }
 
     #[test]
@@ -341,7 +379,10 @@ mod tests {
     fn irreversible_needs_quorum_else_escalates() {
         let law = law_with_ops(3, Some(2));
         let one = vec!["lct:web4:operator:0".to_string()];
-        let two = vec!["lct:web4:operator:0".to_string(), "lct:web4:operator:1".to_string()];
+        let two = vec![
+            "lct:web4:operator:0".to_string(),
+            "lct:web4:operator:1".to_string(),
+        ];
 
         // one signature on an irreversible act → RequiresQuorum (escalate), NOT authorized
         match authorize(&law, Stakes::Irreversible, &one) {
@@ -363,7 +404,11 @@ mod tests {
         ));
         let empty = law_with_ops(0, None);
         assert!(matches!(
-            authorize(&empty, Stakes::LowReversible, &["lct:web4:operator:0".into()]),
+            authorize(
+                &empty,
+                Stakes::LowReversible,
+                &["lct:web4:operator:0".into()]
+            ),
             AuthzOutcome::Denied { .. }
         ));
     }
@@ -381,9 +426,15 @@ mod tests {
 
         // open a session for op0
         let tok = sessions.open("lct:web4:operator:0", 1000);
-        assert_eq!(sessions.operator(&tok, 1500, SESSION_TTL_SECS), Some("lct:web4:operator:0"));
+        assert_eq!(
+            sessions.operator(&tok, 1500, SESSION_TTL_SECS),
+            Some("lct:web4:operator:0")
+        );
         // expired token resolves to nothing
-        assert_eq!(sessions.operator(&tok, 1000 + SESSION_TTL_SECS + 1, SESSION_TTL_SECS), None);
+        assert_eq!(
+            sessions.operator(&tok, 1000 + SESSION_TTL_SECS + 1, SESSION_TTL_SECS),
+            None
+        );
 
         let op = sessions.operator(&tok, 1500, SESSION_TTL_SECS);
         // reversible acts pass on the session's single operator
@@ -392,7 +443,11 @@ mod tests {
         // irreversible acts do NOT pass on the session alone → escalate (needs quorum)
         assert!(matches!(
             gate_session_request(&law, op, Stakes::Irreversible),
-            AuthzOutcome::RequiresQuorum { have: 1, need: 2, .. }
+            AuthzOutcome::RequiresQuorum {
+                have: 1,
+                need: 2,
+                ..
+            }
         ));
 
         // closed session → denied again
@@ -409,7 +464,10 @@ mod tests {
         assert!(!s.consume("deadbeef", 1000, CHALLENGE_TTL_SECS));
         // valid within TTL → yes, and consumed (single-use)
         assert!(s.consume(&n, 1030, CHALLENGE_TTL_SECS));
-        assert!(!s.consume(&n, 1030, CHALLENGE_TTL_SECS), "replay of a consumed nonce fails");
+        assert!(
+            !s.consume(&n, 1030, CHALLENGE_TTL_SECS),
+            "replay of a consumed nonce fails"
+        );
         assert_eq!(s.len(), 0);
         // expired → no (and cleared)
         let n2 = s.issue(2000);
@@ -433,36 +491,73 @@ mod tests {
         let ch = store.issue(1000);
         let sig = kp.sign(ch.as_bytes());
         let got = authenticate_operator(
-            &law, &mut store, "lct:web4:operator:dp", &ch, &sig.to_hex(), 1000, CHALLENGE_TTL_SECS,
+            &law,
+            &mut store,
+            "lct:web4:operator:dp",
+            &ch,
+            &sig.to_hex(),
+            1000,
+            CHALLENGE_TTL_SECS,
         );
         assert_eq!(got.as_deref(), Some("lct:web4:operator:dp"));
 
         // replay of the SAME challenge+sig → fail (nonce already consumed)
-        assert!(authenticate_operator(
-            &law, &mut store, "lct:web4:operator:dp", &ch, &sig.to_hex(), 1000, CHALLENGE_TTL_SECS,
-        ).is_none());
+        assert!(
+            authenticate_operator(
+                &law,
+                &mut store,
+                "lct:web4:operator:dp",
+                &ch,
+                &sig.to_hex(),
+                1000,
+                CHALLENGE_TTL_SECS,
+            )
+            .is_none()
+        );
 
         // wrong signer on a fresh challenge → fail (nonce still consumed)
         let ch2 = store.issue(1000);
         let attacker = KeyPair::generate();
         let bad = attacker.sign(ch2.as_bytes());
-        assert!(authenticate_operator(
-            &law, &mut store, "lct:web4:operator:dp", &ch2, &bad.to_hex(), 1000, CHALLENGE_TTL_SECS,
-        ).is_none());
+        assert!(
+            authenticate_operator(
+                &law,
+                &mut store,
+                "lct:web4:operator:dp",
+                &ch2,
+                &bad.to_hex(),
+                1000,
+                CHALLENGE_TTL_SECS,
+            )
+            .is_none()
+        );
 
         // expired challenge → fail
         let ch3 = store.issue(1000);
         let sig3 = kp.sign(ch3.as_bytes());
-        assert!(authenticate_operator(
-            &law, &mut store, "lct:web4:operator:dp", &ch3, &sig3.to_hex(), 9999, CHALLENGE_TTL_SECS,
-        ).is_none());
+        assert!(
+            authenticate_operator(
+                &law,
+                &mut store,
+                "lct:web4:operator:dp",
+                &ch3,
+                &sig3.to_hex(),
+                9999,
+                CHALLENGE_TTL_SECS,
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn evidence_record_is_self_witnessing() {
         let law = law_with_ops(2, Some(2));
-        let rec = authorize(&law, Stakes::HighReversible, &["lct:web4:operator:0".into()])
-            .evidence_record("PUT /api/policy/rule");
+        let rec = authorize(
+            &law,
+            Stakes::HighReversible,
+            &["lct:web4:operator:0".into()],
+        )
+        .evidence_record("PUT /api/policy/rule");
         assert_eq!(rec["verdict"], "authorized");
         assert_eq!(rec["stakes"], "high-reversible");
         assert_eq!(rec["evidence"], "operator-lct-signature");

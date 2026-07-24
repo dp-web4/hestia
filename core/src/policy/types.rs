@@ -186,11 +186,7 @@ impl PolicyEvaluation {
 pub fn fold_strictest(base: PolicyEvaluation, role: PolicyEvaluation) -> PolicyEvaluation {
     let base_rank = (base.decision.severity(), base.enforced);
     let role_rank = (role.decision.severity(), role.enforced);
-    if role_rank > base_rank {
-        role
-    } else {
-        base
-    }
+    if role_rank > base_rank { role } else { base }
 }
 
 /// The action being evaluated. Mirrors the orchestrator-side R6Action

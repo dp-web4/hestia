@@ -67,11 +67,24 @@ class R6Action:
 
 
 @dataclass(frozen=True)
+class ClosureClaim:
+    """Explicit, scoped claim authored when closing an action."""
+
+    claim_id: str
+    statement: str
+    scope: str
+    confidence: float
+    evidence: list[str]
+    known_limitations: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class Outcome:
     success: bool
     magnitude: float  # in [0..1]
     error: str | None = None
     result: dict[str, Any] = field(default_factory=dict)
+    closure_claims: list[ClosureClaim] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

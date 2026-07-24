@@ -40,7 +40,12 @@ pub fn act_digest(act: &Act) -> Result<String> {
 
 /// Sign an act as a witness — the pure crypto half (no chain side effect).
 /// `verdict` is the witness's judgment: `"verified"` or `"disputed"`.
-pub fn sign_act(act: &Act, my: &KeyPair, my_lct: Uuid, verdict: &str) -> Result<WitnessAttestation> {
+pub fn sign_act(
+    act: &Act,
+    my: &KeyPair,
+    my_lct: Uuid,
+    verdict: &str,
+) -> Result<WitnessAttestation> {
     let digest = act_digest(act)?;
     Ok(WitnessAttestation {
         lct: my_lct.to_string(),
@@ -79,13 +84,19 @@ pub fn witness_act(
 /// Verify a witness mark on an act: recompute the digest and check the mark's
 /// signature against the witness's public key. This is the verification the
 /// *recipient* of a handoff runs — the thing that replaces trust-on-faith.
-pub fn verify_witness(act: &Act, mark: &WitnessAttestation, witness_pubkey: &PublicKey) -> Result<bool> {
+pub fn verify_witness(
+    act: &Act,
+    mark: &WitnessAttestation,
+    witness_pubkey: &PublicKey,
+) -> Result<bool> {
     let digest = act_digest(act)?;
     let sig_bytes = hex::decode(&mark.signature).context("decoding witness signature hex")?;
-    let arr: [u8; 64] = sig_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("witness signature must be 64 bytes, got {}", sig_bytes.len()))?;
+    let arr: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "witness signature must be 64 bytes, got {}",
+            sig_bytes.len()
+        )
+    })?;
     let sig = SignatureBytes::from_bytes(arr);
     Ok(witness_pubkey.verify(digest.as_bytes(), &sig).is_ok())
 }

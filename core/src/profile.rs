@@ -58,7 +58,10 @@ impl Platform {
     }
 
     pub fn is_professional(&self) -> bool {
-        matches!(self, Platform::GitHub | Platform::LinkedIn | Platform::Website)
+        matches!(
+            self,
+            Platform::GitHub | Platform::LinkedIn | Platform::Website
+        )
     }
 }
 
@@ -115,7 +118,9 @@ pub fn parse_visibility(s: &str) -> anyhow::Result<Visibility> {
         "member" => Ok(Visibility::Member),
         "trusted" => Ok(Visibility::Trusted),
         "private" => Ok(Visibility::Private),
-        other => anyhow::bail!("unknown visibility: {other} (expected: public, member, trusted, private)"),
+        other => anyhow::bail!(
+            "unknown visibility: {other} (expected: public, member, trusted, private)"
+        ),
     }
 }
 
@@ -189,12 +194,16 @@ impl ProfileStore {
 
     /// Links visible at a given tier — returns everything the caller is allowed to see.
     pub fn links_for_tier(&self, tier: &Visibility) -> Vec<&ProfileLink> {
-        self.links.iter().filter(|l| l.visibility.permits(tier)).collect()
+        self.links
+            .iter()
+            .filter(|l| l.visibility.permits(tier))
+            .collect()
     }
 
     /// Professional links only (GitHub, LinkedIn, Website) at a given tier.
     pub fn professional_links(&self, tier: &Visibility) -> Vec<&ProfileLink> {
-        self.links.iter()
+        self.links
+            .iter()
             .filter(|l| l.platform.is_professional() && l.visibility.permits(tier))
             .collect()
     }
@@ -226,12 +235,16 @@ impl ProfileStore {
         ProfilePresentation {
             display_name: self.display_name.clone(),
             bio: self.bio.clone(),
-            links: self.links_for_tier(tier).into_iter().map(|l| PresentedLink {
-                platform: l.platform.as_str().to_string(),
-                url: l.url.clone(),
-                label: l.label.clone(),
-                verified: !matches!(l.verification, Verification::Claimed),
-            }).collect(),
+            links: self
+                .links_for_tier(tier)
+                .into_iter()
+                .map(|l| PresentedLink {
+                    platform: l.platform.as_str().to_string(),
+                    url: l.url.clone(),
+                    label: l.label.clone(),
+                    verified: !matches!(l.verification, Verification::Claimed),
+                })
+                .collect(),
         }
     }
 }
@@ -276,10 +289,26 @@ mod tests {
     #[test]
     fn test_links_for_tier() {
         let mut store = ProfileStore::default();
-        store.add_link(ProfileLink::new(Platform::GitHub, "https://github.com/dp-web4", Visibility::Public));
-        store.add_link(ProfileLink::new(Platform::LinkedIn, "https://linkedin.com/in/dp", Visibility::Member));
-        store.add_link(ProfileLink::new(Platform::Email, "dp@metalinxx.io", Visibility::Trusted));
-        store.add_link(ProfileLink::new(Platform::Phone, "+1-555-0100", Visibility::Private));
+        store.add_link(ProfileLink::new(
+            Platform::GitHub,
+            "https://github.com/dp-web4",
+            Visibility::Public,
+        ));
+        store.add_link(ProfileLink::new(
+            Platform::LinkedIn,
+            "https://linkedin.com/in/dp",
+            Visibility::Member,
+        ));
+        store.add_link(ProfileLink::new(
+            Platform::Email,
+            "dp@metalinxx.io",
+            Visibility::Trusted,
+        ));
+        store.add_link(ProfileLink::new(
+            Platform::Phone,
+            "+1-555-0100",
+            Visibility::Private,
+        ));
 
         assert_eq!(store.links_for_tier(&Visibility::Public).len(), 1);
         assert_eq!(store.links_for_tier(&Visibility::Member).len(), 2);
@@ -290,9 +319,21 @@ mod tests {
     #[test]
     fn test_professional_filter() {
         let mut store = ProfileStore::default();
-        store.add_link(ProfileLink::new(Platform::GitHub, "https://github.com/dp-web4", Visibility::Public));
-        store.add_link(ProfileLink::new(Platform::Twitter, "https://twitter.com/dp", Visibility::Public));
-        store.add_link(ProfileLink::new(Platform::LinkedIn, "https://linkedin.com/in/dp", Visibility::Member));
+        store.add_link(ProfileLink::new(
+            Platform::GitHub,
+            "https://github.com/dp-web4",
+            Visibility::Public,
+        ));
+        store.add_link(ProfileLink::new(
+            Platform::Twitter,
+            "https://twitter.com/dp",
+            Visibility::Public,
+        ));
+        store.add_link(ProfileLink::new(
+            Platform::LinkedIn,
+            "https://linkedin.com/in/dp",
+            Visibility::Member,
+        ));
 
         let pro = store.professional_links(&Visibility::Member);
         assert_eq!(pro.len(), 2); // GitHub + LinkedIn
@@ -306,8 +347,16 @@ mod tests {
             bio: Some("Building Web4".into()),
             links: vec![],
         };
-        store.add_link(ProfileLink::new(Platform::GitHub, "https://github.com/dp-web4", Visibility::Public));
-        store.add_link(ProfileLink::new(Platform::Phone, "+1-555-0100", Visibility::Private));
+        store.add_link(ProfileLink::new(
+            Platform::GitHub,
+            "https://github.com/dp-web4",
+            Visibility::Public,
+        ));
+        store.add_link(ProfileLink::new(
+            Platform::Phone,
+            "+1-555-0100",
+            Visibility::Private,
+        ));
 
         let public_view = store.present(&Visibility::Public);
         assert_eq!(public_view.links.len(), 1);
@@ -321,7 +370,11 @@ mod tests {
     fn test_serialization() {
         let mut store = ProfileStore::default();
         store.display_name = Some("Test".into());
-        store.add_link(ProfileLink::new(Platform::GitHub, "https://github.com/test", Visibility::Public));
+        store.add_link(ProfileLink::new(
+            Platform::GitHub,
+            "https://github.com/test",
+            Visibility::Public,
+        ));
 
         let json = serde_json::to_string(&store).unwrap();
         let recovered: ProfileStore = serde_json::from_str(&json).unwrap();
@@ -336,18 +389,40 @@ mod tests {
             bio: Some("Building Web4".into()),
             links: vec![],
         };
-        store.add_link(ProfileLink::new(Platform::GitHub, "https://github.com/dp-web4", Visibility::Public));
-        store.add_link(ProfileLink::new(Platform::LinkedIn, "https://linkedin.com/in/dp", Visibility::Member));
-        store.add_link(ProfileLink::new(Platform::Email, "dp@metalinxx.io", Visibility::Trusted));
-        store.add_link(ProfileLink::new(Platform::Phone, "+1-555-0100", Visibility::Private));
+        store.add_link(ProfileLink::new(
+            Platform::GitHub,
+            "https://github.com/dp-web4",
+            Visibility::Public,
+        ));
+        store.add_link(ProfileLink::new(
+            Platform::LinkedIn,
+            "https://linkedin.com/in/dp",
+            Visibility::Member,
+        ));
+        store.add_link(ProfileLink::new(
+            Platform::Email,
+            "dp@metalinxx.io",
+            Visibility::Trusted,
+        ));
+        store.add_link(ProfileLink::new(
+            Platform::Phone,
+            "+1-555-0100",
+            Visibility::Private,
+        ));
 
         let f = store.hub_fields();
         // name + bio + github + linkedin = 4. email/phone (trusted/private) excluded.
         assert_eq!(f.len(), 4);
         assert_eq!(f.get("name").map(String::as_str), Some("Dennis"));
         assert_eq!(f.get("bio").map(String::as_str), Some("Building Web4"));
-        assert_eq!(f.get("github").map(String::as_str), Some("https://github.com/dp-web4"));
-        assert_eq!(f.get("linkedin").map(String::as_str), Some("https://linkedin.com/in/dp"));
+        assert_eq!(
+            f.get("github").map(String::as_str),
+            Some("https://github.com/dp-web4")
+        );
+        assert_eq!(
+            f.get("linkedin").map(String::as_str),
+            Some("https://linkedin.com/in/dp")
+        );
         assert!(!f.contains_key("email"));
         assert!(!f.contains_key("phone"));
     }
@@ -381,7 +456,8 @@ mod tests {
         let legacy = dir.path().join("profile.json");
         std::fs::write(
             &legacy,
-            serde_json::to_vec(&serde_json::json!({"display_name":"Old","bio":null,"links":[]})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"display_name":"Old","bio":null,"links":[]}))
+                .unwrap(),
         )
         .unwrap();
 
@@ -390,7 +466,10 @@ mod tests {
         assert_eq!(loaded.display_name.as_deref(), Some("Old"));
         // ...and the first save() imports it to the vault + deletes the plaintext.
         loaded.save(&mut vault).unwrap();
-        assert!(!legacy.exists(), "legacy plaintext should be removed after migration");
+        assert!(
+            !legacy.exists(),
+            "legacy plaintext should be removed after migration"
+        );
         assert!(vault.get_document(PROFILE_NS, PROFILE_NAME).is_some());
     }
 }

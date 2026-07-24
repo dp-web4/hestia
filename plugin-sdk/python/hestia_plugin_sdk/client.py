@@ -181,6 +181,17 @@ class HestiaClient:
                 "magnitude": outcome.magnitude,
                 "error": outcome.error,
                 "result": outcome.result,
+                "closure_claims": [
+                    {
+                        "claim_id": claim.claim_id,
+                        "statement": claim.statement,
+                        "scope": claim.scope,
+                        "confidence": claim.confidence,
+                        "evidence": claim.evidence,
+                        "known_limitations": claim.known_limitations,
+                    }
+                    for claim in outcome.closure_claims
+                ],
             },
         )
         ts = result["updatedTrustState"]

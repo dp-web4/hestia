@@ -65,7 +65,7 @@ impl LawGate {
             Err(e) => {
                 return Some(LawGate::Invalid {
                     error: format!("unreadable law file {}: {e}", path.display()),
-                })
+                });
             }
         };
         match Law::parse_and_validate(&text) {
@@ -120,9 +120,7 @@ impl LawGate {
                     d => {
                         let mapped = map_decision(d);
                         let reason = match (&mapped, &norm) {
-                            (PolicyDecision::Allow, None) => {
-                                "hub law: no norm objects".to_string()
-                            }
+                            (PolicyDecision::Allow, None) => "hub law: no norm objects".to_string(),
                             (_, Some(id)) => format!("hub law norm '{id}'"),
                             (_, None) => "hub law default".to_string(),
                         };
