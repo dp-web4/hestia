@@ -597,25 +597,74 @@
       token = (await res.json()).token;
       sessionStorage.setItem('hestia_op_token', token);
     }
-    // Lazy sign-in overlay: prompt the operator to load operator.key, import, sign.
+    // Lazy sign-in overlay. One-click when a credential is remembered (dp
+    // 2026-07-24: "i'd rather just click login"); file picker for the first
+    // time or to switch keys. Threat-model note: the same credential already
+    // sits unencrypted at $HESTIA_HOME/operator.key for the same OS user, so a
+    // copy in this same user's browser profile (localStorage, loopback-only
+    // origin) widens nothing — 'forget' removes it, and a failed saved-key
+    // sign-in (e.g. rotated key) auto-clears back to the picker.
+    const CRED_STORE = 'hestia_op_cred';
     function overlay() {
       return new Promise((resolve, reject) => {
+        const saved = (() => {
+          try { return JSON.parse(localStorage.getItem(CRED_STORE) || 'null'); }
+          catch { return null; }
+        })();
         const o = document.createElement('div');
         o.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:9999';
+        const savedBlock = saved
+          ? '<button id="op-cred-saved" style="width:100%;padding:10px 16px;background:#2d6cdf;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:14px">Sign in as <code style="background:transparent">'
+            + String(saved.lct_id).slice(0, 8) + '…</code></button>'
+            + '<div style="margin:10px 0 4px;text-align:center"><a href="#" id="op-cred-other" style="color:#9aa7b4;font-size:12px">use a different key file…</a>'
+            + ' &nbsp;·&nbsp; <a href="#" id="op-cred-forget" style="color:#9aa7b4;font-size:12px">forget saved key</a></div>'
+            + '<div id="op-cred-picker" style="display:none">'
+          : '<div id="op-cred-picker">';
         o.innerHTML = '<div style="background:#151a23;color:#e6edf3;padding:24px;border-radius:10px;max-width:440px;font:14px system-ui;box-shadow:0 8px 40px rgba(0,0,0,.5)">'
           + '<h3 style="margin:0 0 8px">Operator sign-in</h3>'
-          + '<p style="margin:0 0 12px;color:#9aa7b4">Load your <code>operator.key</code> (from <code>$HESTIA_HOME</code>). It is signed locally; the key never leaves this page.</p>'
+          + '<p style="margin:0 0 12px;color:#9aa7b4">Signed locally; the key never leaves this page.</p>'
+          + savedBlock
           + '<input type="file" id="op-cred-file" accept=".key,.json,application/json" style="margin-bottom:10px">'
-          + '<div style="color:#f08a8a;font-size:12px;min-height:16px" id="op-cred-err"></div>'
-          + '<button id="op-cred-go" style="margin-top:8px;padding:8px 16px;background:#2d6cdf;color:#fff;border:0;border-radius:6px;cursor:pointer">Sign in</button></div>';
+          + '<label style="display:block;color:#9aa7b4;font-size:12px;margin-bottom:8px">'
+          + '<input type="checkbox" id="op-cred-remember" checked> remember on this device (one-click next time)</label>'
+          + '<button id="op-cred-go" style="padding:8px 16px;background:#2d6cdf;color:#fff;border:0;border-radius:6px;cursor:pointer">Sign in</button>'
+          + '</div>'
+          + '<div style="color:#f08a8a;font-size:12px;min-height:16px;margin-top:8px" id="op-cred-err"></div></div>';
         document.body.appendChild(o);
         const err = m => o.querySelector('#op-cred-err').textContent = m;
+        const showPicker = () => {
+          const p = o.querySelector('#op-cred-picker'); p.style.display = 'block';
+          const s = o.querySelector('#op-cred-saved'); if (s) s.style.display = 'none';
+        };
+        if (saved) {
+          o.querySelector('#op-cred-saved').onclick = async () => {
+            try {
+              await loadCredential(JSON.stringify(saved));
+              await signIn();
+              o.remove(); resolve();
+            } catch (e) {
+              // Saved key rejected (rotated/stale) — clear it, fall back to picker.
+              localStorage.removeItem(CRED_STORE);
+              showPicker();
+              err('saved key rejected (' + String(e.message || e) + ') — it was forgotten; pick the current key file');
+            }
+          };
+          o.querySelector('#op-cred-other').onclick = (ev) => { ev.preventDefault(); showPicker(); };
+          o.querySelector('#op-cred-forget').onclick = (ev) => {
+            ev.preventDefault(); localStorage.removeItem(CRED_STORE); showPicker();
+            err('saved key forgotten');
+          };
+        }
         o.querySelector('#op-cred-go').onclick = async () => {
           try {
             const f = o.querySelector('#op-cred-file').files[0];
             if (!f) return err('choose your operator.key file');
-            await loadCredential(await f.text());
+            const text = await f.text();
+            await loadCredential(text);
             await signIn();
+            if (o.querySelector('#op-cred-remember').checked) {
+              try { localStorage.setItem(CRED_STORE, JSON.stringify(JSON.parse(text))); } catch {}
+            }
             o.remove(); resolve();
           } catch (e) { err(String(e.message || e)); }
         };
