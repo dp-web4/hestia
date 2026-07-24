@@ -80,6 +80,8 @@ impl ServerHandler for HestiaServer {
             "hestia_query_history" => tool_query_history(&self.state, &args).await,
             "hestia_request_witness" => tool_request_witness(&self.state, &args).await,
             "hestia_notify" => tool_notify(&self.state, &args).await,
+            "hestia_member_notify" => tool_member_notify(&self.state, &args).await,
+            "hestia_member_inbox" => tool_member_inbox(&self.state, &args).await,
             "hestia_inbox" => tool_inbox(&self.state, &args).await,
             "hestia_pair_inbox" => tool_pair_inbox(&self.state, &args).await,
             _ => Ok(hestia_error_envelope(
@@ -191,6 +193,14 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_notify",
             "Receive a hub->citizen notification: open the sealed body, record receipt, return a sealed ACK. Pass defer:true to park it (still sealed) in the durable encrypted inbox and ACK without returning the body",
+        ),
+        t(
+            "hestia_member_notify",
+            "Send a witnessed, pointer-based wake notice to another LOCAL member (fractal mesh; kinds mirror hub-mesh)",
+        ),
+        t(
+            "hestia_member_inbox",
+            "Drain YOUR member notices (consume-once; recipient-scoped by resolved caller identity)",
         ),
         t(
             "hestia_inbox",
@@ -1333,6 +1343,119 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
 /// autonomous-timer) without any new rule. The gate runs BEFORE the drain
 /// (O: preflight dominates the consume — a denied caller must not consume the
 /// queue), and a deny leaves the mailbox bit-identical.
+/// Local member mesh — hestia as a fractal mini-fleet (dp 2026-07-24). The fleet
+/// coordinates through the HUB (message pass + event-driven wake, witnessed); this is
+/// the same pattern one MRH down: members of THIS constellation (claude-code, kimi,
+/// codex sessions) coordinate through THIS daemon. Pointer-based like hub-mesh — the
+/// notice is the wake signal, the content lives at the pointer (forum file, chain
+/// entry, PR). Every send is a witnessed `member_notice` chain event BEFORE it is
+/// queued (O: witness precedes delivery), carrying sender WHO + recipient + kind +
+/// pointer — never a payload.
+const MEMBER_NOTICE_KINDS: &[&str] = &[
+    "coordination",
+    "review_request",
+    "review_done",
+    "reply",
+    "handoff",
+    "forum-note",
+    "ack",
+];
+
+async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
+    let to_plugin = require_string(args, "to_plugin_id")?;
+    let kind = require_string(args, "kind")?;
+    if !MEMBER_NOTICE_KINDS.contains(&kind.as_str()) {
+        return Ok(hestia_error_envelope(
+            "hestia.member_notify_unknown_kind",
+            &format!("kind '{}' not in {:?}", kind, MEMBER_NOTICE_KINDS),
+            Some(json!({"kind": kind})),
+        ));
+    }
+    let pointer_uri = optional_string(args, "pointer_uri");
+    let session_id_arg = optional_string(args, "session_id");
+
+    let mut s = state.lock().await;
+    let sender = resolve_caller(&s, session_id_arg.as_deref());
+    // Same attribution law as reversal: an unattributable sender cannot inject
+    // wake signals into another member's loop.
+    if sender.session_uuid.is_none() {
+        return Ok(hestia_error_envelope(
+            "hestia.member_notify_unattributed",
+            "no live session resolves for the caller — connect first; an unattributable \
+             sender cannot notify another member",
+            None,
+        ));
+    }
+    if sender.plugin_id == to_plugin {
+        return Ok(hestia_error_envelope(
+            "hestia.member_notify_self",
+            "notifying yourself is a no-op — write to your own continuity surfaces instead",
+            None,
+        ));
+    }
+    // Law-gated: role overlays can deny who may wake whom.
+    if let Some(denied) =
+        gate_direct_tool(&mut s, &sender, "hestia_member_notify", "member_notify", &kind)
+    {
+        return Ok(denied);
+    }
+    // Witness FIRST (the act is the send; delivery is a consequence), then queue
+    // with the chain hash so every parked notice is anchored to its witnessed act.
+    let entry = s.append_chain(
+        "member_notice",
+        json!({
+            "to_plugin_id": to_plugin,
+            "from_plugin_id": sender.plugin_id,
+            "from_role_lct": sender.role_lct,
+            "from_session_id": sender.session_uuid,
+            "kind": kind,
+            "pointer_uri": pointer_uri,
+        }),
+    )?;
+    let queued_id = s
+        .inbox_store
+        .enqueue_member(
+            &to_plugin,
+            &sender.plugin_id,
+            &sender.role_lct,
+            &kind,
+            pointer_uri.as_deref(),
+            &entry.hash,
+        )
+        .map_err(|e| anyhow::anyhow!("queueing member notice: {e}"))?;
+    Ok(json!({
+        "queued_id": queued_id,
+        "witnessEntryHash": entry.hash,
+        "to_plugin_id": to_plugin,
+        "kind": kind,
+    }))
+}
+
+async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
+    let session_id_arg = optional_string(args, "session_id");
+    let mut s = state.lock().await;
+    let who = resolve_caller(&s, session_id_arg.as_deref());
+    // Recipient-scoped by construction: the drain key IS the caller's resolved
+    // plugin_id — a member can never drain another member's mail.
+    if who.session_uuid.is_none() {
+        return Ok(hestia_error_envelope(
+            "hestia.member_inbox_unattributed",
+            "no live session resolves for the caller — connect first",
+            None,
+        ));
+    }
+    if let Some(denied) =
+        gate_direct_tool(&mut s, &who, "hestia_member_inbox", "member_notify", "inbox")
+    {
+        return Ok(denied);
+    }
+    let notices = s
+        .inbox_store
+        .drain_member(&who.plugin_id)
+        .map_err(|e| anyhow::anyhow!("draining member inbox: {e}"))?;
+    Ok(json!({ "total": notices.len(), "notices": notices }))
+}
+
 async fn tool_inbox(state: &SharedState, args: &Value) -> ToolResult {
     let session_id_arg = optional_string(args, "session_id");
     let mut s = state.lock().await;

@@ -208,6 +208,160 @@ impl SqliteInboxStore {
         tx.commit().context("committing inbox drain")?;
         Ok(notices)
     }
+
+    // ---- Local member mesh (dp 2026-07-24: hestia is a fractal mini-fleet; ----
+    // ---- members coordinate through the daemon, witnessed, pointer-based) ----
+
+    /// Ensure the member_notices table exists (idempotent; called lazily so
+    /// pre-existing inbox DBs upgrade in place).
+    fn ensure_member_schema(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS member_notices (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                to_plugin    TEXT NOT NULL,
+                from_plugin  TEXT NOT NULL,
+                from_role    TEXT NOT NULL,
+                kind         TEXT NOT NULL,
+                pointer_uri  TEXT,
+                chain_hash   TEXT NOT NULL,
+                queued_at    TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_member_notices_to
+                 ON member_notices(to_plugin, queued_at);",
+        )
+        .context("initializing member_notices schema")?;
+        Ok(())
+    }
+
+    /// Park a member→member notice (pointer-based — the CONTENT lives at the
+    /// pointer; the notice is the wake signal, mirroring the fleet hub-mesh).
+    /// `chain_hash` is the witnessing `member_notice` chain entry — every
+    /// queued notice is anchored to its witnessed act.
+    pub fn enqueue_member(
+        &self,
+        to_plugin: &str,
+        from_plugin: &str,
+        from_role: &str,
+        kind: &str,
+        pointer_uri: Option<&str>,
+        chain_hash: &str,
+    ) -> Result<u64> {
+        let now = Utc::now();
+        let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        conn.execute(
+            "DELETE FROM member_notices WHERE queued_at < ?1",
+            params![cutoff],
+        )
+        .context("pruning expired member notices")?;
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM member_notices", [], |row| row.get(0))?;
+        if count as u64 >= MAX_INBOX_NOTICES {
+            conn.execute(
+                "DELETE FROM member_notices WHERE id = (SELECT MIN(id) FROM member_notices)",
+                [],
+            )
+            .context("dropping oldest member notice at cap")?;
+        }
+        conn.execute(
+            "INSERT INTO member_notices
+                 (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                to_plugin,
+                from_plugin,
+                from_role,
+                kind,
+                pointer_uri,
+                chain_hash,
+                now.to_rfc3339(),
+            ],
+        )
+        .context("enqueuing member notice")?;
+        Ok(conn.last_insert_rowid() as u64)
+    }
+
+    /// Consume-once drain of the notices addressed to `to_plugin` ONLY —
+    /// recipient-scoped (a member can never drain another member's mail).
+    /// Same at-least-once failure bias as the hub-notice drain.
+    pub fn drain_member(&self, to_plugin: &str) -> Result<Vec<MemberNotice>> {
+        let cutoff = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+        let mut conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting member drain")?;
+        let notices = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at
+                     FROM member_notices
+                     WHERE to_plugin = ?1 AND queued_at >= ?2 ORDER BY id ASC",
+                )
+                .context("preparing member drain SELECT")?;
+            let rows = stmt
+                .query_map(params![to_plugin, cutoff], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })
+                .context("querying member notices")?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at) =
+                    row.context("reading member notice row")?;
+                out.push(MemberNotice {
+                    id: id as u64,
+                    from_plugin,
+                    from_role,
+                    kind,
+                    pointer_uri,
+                    chain_hash,
+                    queued_at: DateTime::parse_from_rfc3339(&queued_at)
+                        .context("parsing member notice queued_at")?
+                        .with_timezone(&Utc),
+                });
+            }
+            out
+        };
+        tx.execute(
+            "DELETE FROM member_notices WHERE to_plugin = ?1",
+            params![to_plugin],
+        )
+        .context("consuming drained member notices")?;
+        tx.commit().context("committing member drain")?;
+        Ok(notices)
+    }
+
+    /// Count queued notices for a recipient without consuming (the watcher's
+    /// cheap poll — fire the member only when there is something to read).
+    pub fn member_pending(&self, to_plugin: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM member_notices WHERE to_plugin = ?1",
+            params![to_plugin],
+            |row| row.get(0),
+        )?;
+        Ok(n as u64)
+    }
+}
+
+/// One member→member notice (the local-mesh wake signal).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemberNotice {
+    pub id: u64,
+    pub from_plugin: String,
+    pub from_role: String,
+    pub kind: String,
+    pub pointer_uri: Option<String>,
+    pub chain_hash: String,
+    pub queued_at: DateTime<Utc>,
 }
 
 #[cfg(test)]
@@ -219,6 +373,31 @@ mod tests {
         let tmp = tempdir().unwrap();
         let store = SqliteInboxStore::open(tmp.path().join("inbox.db"), [7u8; 32]).unwrap();
         (tmp, store)
+    }
+
+    #[test]
+    fn member_notices_are_recipient_scoped_and_consume_once() {
+        let (_tmp, store) = fresh();
+        store
+            .enqueue_member("kimi-code", "claude-code", "role:constellation:interactive-dev",
+                            "coordination", Some("forum/x.md#thread=t"), "hash-a")
+            .unwrap();
+        store
+            .enqueue_member("codex-cli", "claude-code", "role:constellation:interactive-dev",
+                            "handoff", None, "hash-b")
+            .unwrap();
+        assert_eq!(store.member_pending("kimi-code").unwrap(), 1);
+        assert_eq!(store.member_pending("codex-cli").unwrap(), 1);
+        // kimi's drain returns ONLY kimi's mail and leaves codex's intact.
+        let kimi = store.drain_member("kimi-code").unwrap();
+        assert_eq!(kimi.len(), 1);
+        assert_eq!(kimi[0].from_plugin, "claude-code");
+        assert_eq!(kimi[0].kind, "coordination");
+        assert_eq!(kimi[0].chain_hash, "hash-a");
+        assert_eq!(store.member_pending("kimi-code").unwrap(), 0);
+        assert_eq!(store.member_pending("codex-cli").unwrap(), 1, "other member's mail untouched");
+        // consume-once: second drain empty.
+        assert!(store.drain_member("kimi-code").unwrap().is_empty());
     }
 
     #[test]
