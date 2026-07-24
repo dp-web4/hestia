@@ -934,6 +934,9 @@
 
   // In-page receipts drawer: score -> versioned formula -> evidence -> acts.
   // Fetched with the operator session (a raw new-tab GET carries no bearer).
+  // Exposed on window: the whole dashboard script is an IIFE, and the card's
+  // inline onclick resolves names globally.
+  window.showReceipts = showReceipts;
   async function showReceipts(pluginId, role) {
     let d;
     try {
