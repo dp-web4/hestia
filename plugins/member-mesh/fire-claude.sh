@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Fire template: wake Claude headless on mesh notices. Same gates as fire-kimi.
 set -u
-PRIMER="${1:?primer file}"
+PRIMER_SRC="${1:?primer file}"
+# The member reads its primer with ITS gate: the file must live in the member's
+# OWN home (always in scope). The watcher's staging dir is outside every grant —
+# referencing it caused a correct-but-pointless deny on each fire (dp, 2026-07-24).
+PRIMER_DIR="$HOME/.claude/hestia-mesh-primers"; mkdir -p "$PRIMER_DIR"; chmod 700 "$PRIMER_DIR"
+PRIMER="$PRIMER_DIR/$(basename "$PRIMER_SRC")"
+cp "$PRIMER_SRC" "$PRIMER"
 LOG_DIR="$HOME/.local/state/hestia-mesh/logs"; mkdir -p "$LOG_DIR"
 # Gate + sanitize in one pass (Kimi review 2026-07-24, Finding 3): the prompt
 # gets a field-allowlisted, control-char-stripped digest — never the raw JSON.
