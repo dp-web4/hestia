@@ -7,7 +7,7 @@ import { ChainFeed } from "../components/ChainFeed";
 import { ToolHistogram } from "../components/ToolHistogram";
 
 export function Dashboard() {
-  const { data, online, error } = useDashboard(2000);
+  const { data, online, signedIn, error } = useDashboard(2000);
   const [urlDraft, setUrlDraft] = useState<string>("");
   const [saveMsg, setSaveMsg] = useState<string | null>(null);
 
@@ -25,6 +25,24 @@ export function Dashboard() {
       setSaveMsg(String(e));
     }
   };
+
+  // Signed out but the daemon is up: a different problem with a different fix
+  // (sign in from the sidebar), so say so instead of showing "cannot reach".
+  if (!signedIn && online && !data) {
+    return (
+      <div className="page">
+        <div className="error-panel">
+          <StatusBadge online={true} />
+          <p>Daemon reachable — operator sign-in required</p>
+          <p className="connect-hint">
+            Every daemon API is behind the operator gate. Use <strong>Sign in</strong>{" "}
+            in the sidebar; it reads <code>~/.hestia/operator.key</code> and signs a
+            challenge. The key never leaves the app shell.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   if (error && !data) {
     return (

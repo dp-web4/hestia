@@ -7,6 +7,7 @@ import { Delegations } from "./pages/Delegations";
 import { Hubs } from "./pages/Hubs";
 import { Fleet } from "./pages/Fleet";
 import { Settings } from "./pages/Settings";
+import { OperatorBar } from "./components/OperatorBar";
 import "./styles/global.css";
 
 export default function App() {
@@ -29,7 +30,8 @@ export default function App() {
             <NavLink to="/settings">Settings</NavLink>
           </div>
           <div className="sidebar-footer">
-            <span className="version">v0.1.0</span>
+            <OperatorBar onChange={() => window.dispatchEvent(new Event("hestia:auth"))} />
+            <span className="version">v0.2.0</span>
           </div>
         </nav>
         <main className="main-content">

@@ -2,7 +2,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tauri::State;
 
-use crate::AppState;
+use crate::{daemon, AppState};
 
 #[derive(Deserialize)]
 pub struct VaultSetRequest {
@@ -15,46 +15,33 @@ pub struct VaultSetRequest {
 
 #[tauri::command]
 pub async fn vault_list(state: State<'_, AppState>) -> Result<Value, String> {
-    let url = format!("{}/api/vault", state.daemon_url());
-    reqwest::get(&url)
-        .await
-        .map_err(|e| format!("daemon unreachable: {e}"))?
-        .json::<Value>()
-        .await
-        .map_err(|e| format!("bad response: {e}"))
+    daemon::get(&state, "/api/vault").await
 }
 
 #[tauri::command]
 pub async fn vault_set(state: State<'_, AppState>, req: VaultSetRequest) -> Result<Value, String> {
-    let url = format!("{}/api/vault", state.daemon_url());
-    let client = reqwest::Client::new();
-    client
-        .post(&url)
-        .json(&serde_json::json!({
+    daemon::send(
+        &state,
+        reqwest::Method::POST,
+        "/api/vault",
+        Some(serde_json::json!({
             "name": req.name,
             "value": req.value,
             "scope": req.scope,
             "tags": req.tags,
             "allowed_consumers": req.allowed_consumers,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("daemon unreachable: {e}"))?
-        .json::<Value>()
-        .await
-        .map_err(|e| format!("bad response: {e}"))
+        })),
+    )
+    .await
 }
 
 #[tauri::command]
 pub async fn vault_delete(state: State<'_, AppState>, name: String) -> Result<Value, String> {
-    let url = format!("{}/api/vault/{name}", state.daemon_url());
-    let client = reqwest::Client::new();
-    client
-        .delete(&url)
-        .send()
-        .await
-        .map_err(|e| format!("daemon unreachable: {e}"))?
-        .json::<Value>()
-        .await
-        .map_err(|e| format!("bad response: {e}"))
+    daemon::send(
+        &state,
+        reqwest::Method::DELETE,
+        &format!("/api/vault/{name}"),
+        None,
+    )
+    .await
 }

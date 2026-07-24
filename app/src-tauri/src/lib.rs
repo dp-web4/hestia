@@ -1,4 +1,6 @@
 mod commands;
+mod daemon;
+pub mod operator;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -26,6 +28,9 @@ pub struct AppState {
     daemon_url: Mutex<String>,
     mode: Mutex<String>,
     remotes: Mutex<Vec<RemoteEntry>>,
+    /// The live operator session. Deliberately shell-side: neither the token
+    /// nor the signing key ever crosses the IPC boundary into the webview.
+    operator: Mutex<Option<operator::OperatorSession>>,
 }
 
 impl AppState {
@@ -34,6 +39,7 @@ impl AppState {
             daemon_url: Mutex::new("http://127.0.0.1:7711".to_string()),
             mode: Mutex::new("sovereign".to_string()),
             remotes: Mutex::new(Vec::new()),
+            operator: Mutex::new(None),
         }
     }
 
@@ -51,6 +57,46 @@ impl AppState {
 
     pub fn set_mode(&self, mode: &str) {
         *self.mode.lock().unwrap() = mode.to_string();
+    }
+
+    // ---- operator session (shell-side only) ----
+
+    pub fn operator_token(&self) -> Option<String> {
+        self.operator.lock().unwrap().as_ref().map(|o| o.token.clone())
+    }
+
+    pub fn operator_key_path(&self) -> Option<String> {
+        self.operator
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|o| o.key_path.clone())
+    }
+
+    pub fn set_operator(&self, session: operator::OperatorSession) {
+        *self.operator.lock().unwrap() = Some(session);
+    }
+
+    pub fn clear_operator(&self) {
+        *self.operator.lock().unwrap() = None;
+    }
+
+    /// What the UI may know: signed-in-ness and the LCT. Never the token.
+    pub fn operator_status(&self) -> operator::OperatorStatus {
+        let guard = self.operator.lock().unwrap();
+        match guard.as_ref() {
+            Some(o) => operator::OperatorStatus {
+                signed_in: true,
+                lct_id: Some(o.lct_id.clone()),
+                key_path: o.key_path.clone(),
+            },
+            None => operator::OperatorStatus {
+                signed_in: false,
+                lct_id: None,
+                key_path: operator::default_key_path()
+                    .map(|p| p.to_string_lossy().to_string()),
+            },
+        }
     }
 
     pub fn remotes(&self) -> Vec<RemoteEntry> {
@@ -112,6 +158,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::operator::operator_status,
+            commands::operator::operator_sign_in,
+            commands::operator::operator_sign_out,
+            commands::trust::get_derivation,
             commands::dashboard::get_dashboard,
             commands::dashboard::get_failures,
             commands::dashboard::get_daemon_status,

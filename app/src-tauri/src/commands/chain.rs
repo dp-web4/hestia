@@ -1,7 +1,7 @@
 use serde_json::Value;
 use tauri::State;
 
-use crate::AppState;
+use crate::{daemon, AppState};
 
 #[tauri::command]
 pub async fn query_chain(
@@ -10,28 +10,26 @@ pub async fn query_chain(
     event_type: Option<String>,
     tool_filter: Option<String>,
 ) -> Result<Value, String> {
-    let mut url = format!("{}/api/chain?limit={}", state.daemon_url(), limit.unwrap_or(50));
-    if let Some(et) = event_type {
-        url.push_str(&format!("&event_type={et}"));
+    let mut path = format!("/api/chain?limit={}", limit.unwrap_or(50));
+    if let Some(et) = event_type.filter(|s| !s.is_empty()) {
+        path.push_str(&format!("&event_type={et}"));
     }
-    if let Some(tf) = tool_filter {
-        url.push_str(&format!("&tool={tf}"));
+    if let Some(tf) = tool_filter.filter(|s| !s.is_empty()) {
+        path.push_str(&format!("&tool={tf}"));
     }
-    reqwest::get(&url)
-        .await
-        .map_err(|e| format!("daemon unreachable: {e}"))?
-        .json::<Value>()
-        .await
-        .map_err(|e| format!("bad response: {e}"))
+    daemon::get(&state, &path).await
 }
 
+/// Chain summary. The daemon has no `/api/chain/stats` route (the old app
+/// called one and always 404'd); the numbers live on the dashboard snapshot's
+/// `society` block, so read them from there.
 #[tauri::command]
 pub async fn chain_stats(state: State<'_, AppState>) -> Result<Value, String> {
-    let url = format!("{}/api/chain/stats", state.daemon_url());
-    reqwest::get(&url)
-        .await
-        .map_err(|e| format!("daemon unreachable: {e}"))?
-        .json::<Value>()
-        .await
-        .map_err(|e| format!("bad response: {e}"))
+    let snap = daemon::get(&state, "/api/dashboard").await?;
+    Ok(serde_json::json!({
+        "chain_length": snap.pointer("/society/chain_length").cloned().unwrap_or(Value::Null),
+        "active_sessions": snap.pointer("/society/active_sessions").cloned().unwrap_or(Value::Null),
+        "known_plugins": snap.pointer("/society/known_plugins").cloned().unwrap_or(Value::Null),
+        "vault_entries": snap.pointer("/society/vault_entries").cloned().unwrap_or(Value::Null),
+    }))
 }

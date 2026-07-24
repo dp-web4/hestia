@@ -35,6 +35,63 @@ export interface TrustView {
   success_count: number;
   success_rate: number;
   days_since_last: number;
+
+  // ---- T3-from-V3 arc (daemon >= 2026-07-24) ----
+  // The legacy scalar level, kept for audit and NEVER for display: the chip
+  // that called a well-adjudicated member "low" off this field was the
+  // footgun (dp 2026-07-24). `level` above is the derived one.
+  legacy_level?: string;
+  // Conduct-derived temperament: governance response, not self-report.
+  derived_temperament?: number | null;
+  derived_temperament_n?: number;
+  // The #adjudicated grain — V3 folded ONLY from witnessed not-the-actor
+  // adjudications. Null = zero adjudications (honest-unmeasured), never 0.5.
+  adjudicated_validity?: number | null;
+  adjudicated_veracity?: number | null;
+  adjudicated_valuation?: number | null;
+  // [valuation, veracity, validity]
+  adjudicated_counts?: [number, number, number];
+  // How the numbers were produced: "legacy-lockstep-v1" = one self-reported
+  // scalar smeared across three dims (must NOT be shown as three independent
+  // facts); "v3-derived-v1" = per-dimension from adjudicated evidence.
+  derivation?: string;
+}
+
+/// One evidence entry behind a derived score, as returned by
+/// GET /api/trust/derivation. Position + hash make it checkable against the
+/// chain; `contribution` says what it did to the score.
+export interface DerivationEvidence {
+  chain_position: number;
+  event_type: string;
+  hash: string;
+  timestamp: string;
+  contribution: string;
+  reference?: string;
+}
+
+export interface DerivedDimension {
+  score: number | null;
+  observations: number;
+  formula: string;
+  evidence: DerivationEvidence[];
+}
+
+export interface DerivationReceipt {
+  derivation_version: string;
+  generated_at: string;
+  level: string;
+  plugin_id: string;
+  role_lct: string;
+  temperament: DerivedDimension;
+  validity: DerivedDimension;
+  valuation: DerivedDimension;
+  veracity: DerivedDimension;
+}
+
+export interface OperatorStatus {
+  signed_in: boolean;
+  lct_id: string | null;
+  key_path: string | null;
 }
 
 export interface RecentEntry {
@@ -65,6 +122,9 @@ export interface DashboardSnapshot {
 
 export interface DaemonStatus {
   online: boolean;
+  /** Present since v0.2.0: distinguishes "daemon down" from "signed out". */
+  signed_in?: boolean;
+  operator_lct?: string | null;
   url: string;
 }
 

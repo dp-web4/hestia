@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DashboardSnapshot, DaemonStatus, AppConfig, RemoteEntry } from "./types";
+import type { DashboardSnapshot, DaemonStatus, AppConfig, RemoteEntry, DerivationReceipt, OperatorStatus } from "./types";
 
 export async function getDashboard(): Promise<DashboardSnapshot> {
   return invoke("get_dashboard");
@@ -83,4 +83,32 @@ export async function listRemotes(): Promise<{ remotes: RemoteEntry[] }> {
 
 export async function getRemoteDashboard(url: string): Promise<DashboardSnapshot> {
   return invoke("get_remote_dashboard", { url });
+}
+
+// ---- operator session (Sprint 2 prerequisite) ----
+// The key and bearer token live in the Rust shell; these calls only move
+// intent in and status out. The webview cannot read the credential — the
+// reason this app is a better operator surface than the web dashboard,
+// which must keep its cred in localStorage.
+
+export async function operatorStatus(): Promise<OperatorStatus> {
+  return invoke("operator_status");
+}
+
+/** Sign in. Omit keyPath to use ~/.hestia/operator.key (one-click). */
+export async function operatorSignIn(keyPath?: string): Promise<OperatorStatus> {
+  return invoke("operator_sign_in", { keyPath: keyPath ?? null });
+}
+
+export async function operatorSignOut(): Promise<OperatorStatus> {
+  return invoke("operator_sign_out");
+}
+
+// ---- trust derivation receipts ----
+
+export async function getDerivation(
+  pluginId: string,
+  role?: string,
+): Promise<DerivationReceipt> {
+  return invoke("get_derivation", { pluginId, role: role ?? null });
 }
