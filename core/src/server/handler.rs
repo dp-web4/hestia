@@ -73,6 +73,7 @@ impl ServerHandler for HestiaServer {
             "hestia_begin_action" => tool_begin_action(&self.state, &args).await,
             "hestia_record_outcome" => tool_record_outcome(&self.state, &args).await,
             "hestia_record_reversal" => tool_record_reversal(&self.state, &args).await,
+            "hestia_witness_adjudication" => tool_witness_adjudication(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
             "hestia_vault_get" => tool_vault_get(&self.state, &args).await,
@@ -174,6 +175,10 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_record_reversal",
             "Record a reversal with a classified cause; only invalid-result refutes validity",
+        ),
+        t(
+            "hestia_witness_adjudication",
+            "Adjudicate a witnessed Result on one V3 axis (not-the-actor; veracity = daemon-computed calibration over an explicit claim)",
         ),
         t(
             "hestia_witness_decision",
@@ -940,6 +945,243 @@ const REVERSAL_KINDS: &[&str] = &["override", "rollback", "incident"];
 /// malicious reversal report is traceable and deniable by law.
 ///
 /// [`judgment_entity_key`]: super::state::ServerState::judgment_entity_key
+/// Stage 1 of the T3-from-V3 arc: plural, append-only V3 adjudication events.
+/// An adjudicator who is NOT the actor assesses a witnessed Result on one V3
+/// axis. Disagreement between adjudicators is data (each event stands);
+/// supersession links, never erasure. Veracity is DAEMON-COMPUTED calibration
+/// over the actor's explicit closure claim (Kimi spec rev-1: S = 1-(c-o)^2,
+/// per-claim observe) — the adjudicator supplies the VERDICT on the claim,
+/// never the score. Specs: kimi calibration-veracity rev-1 +
+/// docs/V3_EVIDENCE_EVENTS.md; plan: t3-from-v3-synthesis-2026-07-24.md.
+const ADJUDICATION_AXES: [&str; 3] = ["validity", "veracity", "valuation"];
+const ADJUDICATION_VERDICTS: [&str; 4] = ["upheld", "partial", "refuted", "deferred"];
+const ADJUDICATION_METHODS: [&str; 6] = ["tests", "review", "reversal", "merge", "usage", "other"];
+
+fn axis_dimension(axis: &str) -> Option<web4_core::v3::ValueDimension> {
+    use web4_core::v3::ValueDimension as D;
+    match axis {
+        "validity" => Some(D::Validity),
+        "veracity" => Some(D::Veracity),
+        "valuation" => Some(D::Valuation),
+        _ => None,
+    }
+}
+
+async fn tool_witness_adjudication(state: &SharedState, args: &Value) -> ToolResult {
+    let subject_plugin_id = require_string(args, "subject_plugin_id")?;
+    let declared_role = optional_string(args, "subject_role").unwrap_or_default();
+    let subject_role = if declared_role.is_empty() {
+        crate::reputation::DEFAULT_CONSTELLATION_ROLE
+    } else {
+        match crate::reputation::KNOWN_CONSTELLATION_ROLES
+            .iter()
+            .copied()
+            .find(|r| *r == declared_role)
+        {
+            Some(r) => r,
+            None => {
+                return Ok(hestia_error_envelope(
+                    "hestia.adjudication_unknown_role",
+                    &format!("subject_role '{declared_role}' is not a published constellation role"),
+                    Some(json!({"subject_role": declared_role})),
+                ))
+            }
+        }
+    };
+    let axis = require_string(args, "axis")?;
+    let Some(dimension) = axis_dimension(&axis) else {
+        return Ok(hestia_error_envelope(
+            "hestia.adjudication_unknown_axis",
+            &format!("axis '{}' not in {:?}", axis, ADJUDICATION_AXES),
+            Some(json!({"axis": axis})),
+        ));
+    };
+    let verdict = require_string(args, "verdict")?;
+    if !ADJUDICATION_VERDICTS.contains(&verdict.as_str()) {
+        return Ok(hestia_error_envelope(
+            "hestia.adjudication_unknown_verdict",
+            &format!("verdict '{}' not in {:?}", verdict, ADJUDICATION_VERDICTS),
+            Some(json!({"verdict": verdict})),
+        ));
+    }
+    let method = require_string(args, "method")?;
+    if !ADJUDICATION_METHODS.contains(&method.as_str()) {
+        return Ok(hestia_error_envelope(
+            "hestia.adjudication_unknown_method",
+            &format!("method '{}' not in {:?}", method, ADJUDICATION_METHODS),
+            Some(json!({"method": method})),
+        ));
+    }
+    let evidence_ref = require_string(args, "ref")?;
+    if evidence_ref.len() > 512 || evidence_ref.chars().any(char::is_control) {
+        return Ok(hestia_error_envelope(
+            "hestia.adjudication_bad_ref",
+            "'ref' must be a single-line pointer (≤512 bytes, no control characters)",
+            None,
+        ));
+    }
+    let claim_ref = optional_string(args, "claim_ref");
+    let claim_id = optional_string(args, "claim_id");
+    let supersedes = optional_string(args, "supersedes");
+    let reason = optional_string(args, "reason");
+    let depends_on: Vec<String> = args
+        .get("depends_on")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let session_id_arg = optional_string(args, "session_id");
+
+    let mut s = state.lock().await;
+    let Some(adjudicator) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.adjudication_unattributed",
+            "no live session resolves for the caller — connect first (session_id required); \
+             an unattributable adjudicator cannot move another actor's trust",
+            None,
+        ));
+    };
+    let subject_instance_lct = s.member_lct(&subject_plugin_id);
+    let adjudicator_instance_lct = s.member_lct(&adjudicator.plugin_id);
+    if adjudicator.plugin_id == subject_plugin_id
+        || (subject_instance_lct.is_some() && subject_instance_lct == adjudicator_instance_lct)
+    {
+        return Ok(hestia_error_envelope(
+            "hestia.adjudication_self",
+            "adjudicator and subject resolve to the same entity — self-assessment is a \
+             closure CLAIM (record it at act closure), never an adjudication",
+            None,
+        ));
+    }
+    if let Some(denied) = gate_direct_tool(
+        &mut s,
+        &adjudicator,
+        "hestia_witness_adjudication",
+        "adjudication_report",
+        &axis,
+    ) {
+        return Ok(denied);
+    }
+
+    let mut computed_claim_confidence: Option<f64> = None;
+    let score: Option<f64> = if verdict == "deferred" {
+        None
+    } else if axis == "veracity" {
+        let (Some(cref), Some(cid)) = (&claim_ref, &claim_id) else {
+            return Ok(hestia_error_envelope(
+                "hestia.adjudication_veracity_needs_claim",
+                "veracity adjudication requires 'claim_ref' (chain hash of the outcome \
+                 entry) and 'claim_id' — veracity is calibration over an EXPLICIT claim; \
+                 unclaimed implications are validity findings, not veracity failures",
+                None,
+            ));
+        };
+        let outcome_value = match verdict.as_str() {
+            "upheld" => 1.0,
+            "refuted" => 0.0,
+            _ => {
+                return Ok(hestia_error_envelope(
+                    "hestia.adjudication_veracity_binary",
+                    "veracity outcomes are binary (upheld|refuted); a partial result is a \
+                     VALIDITY finding (Kimi spec §12)",
+                    None,
+                ))
+            }
+        };
+        let entry = s
+            .chain_store
+            .read_by_hash(cref)
+            .map_err(|e| anyhow::anyhow!("reading claim_ref entry: {e}"))?;
+        let Some(entry) = entry else {
+            return Ok(hestia_error_envelope(
+                "hestia.adjudication_claim_ref_not_found",
+                &format!("claim_ref '{cref}' does not resolve to a chain entry"),
+                None,
+            ));
+        };
+        let confidence = entry
+            .event_data
+            .get("closure_claims")
+            .and_then(Value::as_array)
+            .and_then(|claims| {
+                claims.iter().find(|c| {
+                    c.get("claim_id").and_then(Value::as_str) == Some(cid.as_str())
+                })
+            })
+            .and_then(|c| c.get("confidence"))
+            .and_then(Value::as_f64);
+        let Some(confidence) = confidence else {
+            return Ok(hestia_error_envelope(
+                "hestia.adjudication_claim_not_found",
+                &format!("claim_id '{cid}' not found in the closure_claims of entry '{cref}'"),
+                None,
+            ));
+        };
+        computed_claim_confidence = Some(confidence);
+        Some((1.0 - (confidence - outcome_value).powi(2)).clamp(0.0, 1.0))
+    } else {
+        let default = match verdict.as_str() {
+            "upheld" => 1.0,
+            "partial" => 0.5,
+            _ => 0.0,
+        };
+        Some(
+            args.get("score")
+                .and_then(Value::as_f64)
+                .unwrap_or(default)
+                .clamp(0.0, 1.0),
+        )
+    };
+
+    let entry = s.append_chain(
+        "adjudication",
+        json!({
+            "subject_plugin_id": subject_plugin_id,
+            "subject_instance_lct": subject_instance_lct,
+            "subject_role": subject_role,
+            "axis": axis,
+            "verdict": verdict,
+            "score": score,
+            "method": method,
+            "ref": evidence_ref,
+            "claim_ref": claim_ref,
+            "claim_id": claim_id,
+            "claim_confidence": computed_claim_confidence,
+            "reason": reason,
+            "supersedes": supersedes,
+            "depends_on": depends_on,
+            "adjudicated_by": {
+                "plugin_id": adjudicator.plugin_id,
+                "instance_lct": adjudicator_instance_lct,
+                "role_lct": adjudicator.role_lct,
+                "session_id": adjudicator.session_uuid,
+            },
+        }),
+    )?;
+
+    let mut adjudicated_state = None;
+    if let Some(score) = score {
+        let adj_reason = format!("adjudication:{axis}:{verdict}:{method}");
+        let rep_ctx = crate::reputation::RepContext {
+            role_lct: subject_role,
+            action_type: "adjudication",
+            action_target: &evidence_ref,
+            action_id: "",
+            reason: &adj_reason,
+        };
+        adjudicated_state =
+            Some(s.apply_adjudication_ctx(&subject_plugin_id, dimension, score, &rep_ctx)?);
+    }
+
+    Ok(json!({
+        "witnessEntryHash": entry.hash,
+        "axis": axis,
+        "verdict": verdict,
+        "score": score,
+        "claimConfidence": computed_claim_confidence,
+        "updatedAdjudicated": adjudicated_state.map(|t| trust_state_json(&t)),
+    }))
+}
+
 async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
     let subject_plugin_id = require_string(args, "subject_plugin_id")?;
     // A cross-actor judgment must land on a real trust grain: an unknown role
@@ -1005,17 +1247,17 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
     let session_id_arg = optional_string(args, "session_id");
 
     let mut s = state.lock().await;
-    let reporter = resolve_caller(&s, session_id_arg.as_deref());
-    // A cross-actor reversal from an unattributable reporter must not enter
-    // the evidence stream: poisoned attribution is worse than missing data.
-    if reporter.session_uuid.is_none() {
+    // Strict attribution (P0-1 closure, 2026-07-24): a cross-actor judgment must
+    // PROVE its session — the latest-session fallback would let an unattributed
+    // caller level judgments in the most recent member's name.
+    let Some(reporter) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
         return Ok(hestia_error_envelope(
             "hestia.reversal_unattributed_reporter",
-            "no live session resolves for the caller — connect first; \
+            "no live session resolves for the caller — connect first (session_id required); \
              an unattributable reporter cannot move another actor's trust",
             None,
         ));
-    }
+    };
     // Same law as the other direct-call surfaces: role overlays can deny who
     // may report reversals, and an enforced deny is witnessed with full WHO.
     if let Some(denied) = gate_direct_tool(
@@ -1075,6 +1317,51 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
         s.judgment_for_role(&subject_plugin_id, subject_role)
     };
 
+    // Stage 1 auto-emission (synthesis amendment 1 + V3_EVIDENCE_EVENTS): an
+    // invalid-result reversal IS a validity adjudication — emit it so every
+    // existing reversal caller gets V3 wiring for free. Other causes emit
+    // nothing here (changed-requirements is not a validity verdict; forthright
+    // self-correction is Temperament evidence, scored separately).
+    let mut adjudication_hash: Option<String> = None;
+    if cause.refutes_validity() {
+        let adj_ref = reference.clone().unwrap_or_default();
+        let adj_entry = s.append_chain(
+            "adjudication",
+            json!({
+                "subject_plugin_id": subject_plugin_id,
+                "subject_instance_lct": subject_instance_lct,
+                "subject_role": subject_role,
+                "axis": "validity",
+                "verdict": "refuted",
+                "score": 0.0,
+                "method": "reversal",
+                "ref": adj_ref,
+                "reason": format!("reversal:{kind}:{}", cause.as_str()),
+                "adjudicated_by": {
+                    "plugin_id": reporter.plugin_id,
+                    "role_lct": reporter.role_lct,
+                    "session_id": reporter.session_uuid,
+                },
+            }),
+        )?;
+        let adj_reason = format!("adjudication:validity:refuted:reversal:{}", cause.as_str());
+        let adj_target = reference.clone().unwrap_or_default();
+        let adj_ctx = crate::reputation::RepContext {
+            role_lct: subject_role,
+            action_type: "adjudication",
+            action_target: &adj_target,
+            action_id: "",
+            reason: &adj_reason,
+        };
+        let _ = s.apply_adjudication_ctx(
+            &subject_plugin_id,
+            web4_core::v3::ValueDimension::Validity,
+            0.0,
+            &adj_ctx,
+        )?;
+        adjudication_hash = Some(adj_entry.hash);
+    }
+
     Ok(json!({
         "witnessEntryHash": entry.hash,
         "subjectInstanceLct": subject_instance_lct,
@@ -1082,6 +1369,7 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
         "validityEffect": if cause.refutes_validity() { Some("refuted") } else { None },
         "judgmentMutated": judgment_mutated,
         "updatedJudgmentTrust": trust_state_json(&judgment_state),
+        "adjudicationEntryHash": adjudication_hash,
     }))
 }
 
@@ -2438,6 +2726,204 @@ mod accountability_tests {
         assert_eq!(event.event_data["cause"], "changed-requirements");
         assert!(event.event_data["validity_effect"].is_null());
         assert_eq!(s.judgment_for_role("worker-agent", role).talent(), before);
+    }
+
+    #[tokio::test]
+    async fn adjudication_strict_attribution_and_not_actor() {
+        let (_dir, state) = test_state().await;
+        // Unattributed (no session_id): must error — never fall back.
+        let out = tool_witness_adjudication(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","axis":"validity",
+                    "verdict":"upheld","method":"review","ref":"pr:web4#1"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["_hestia_error"]["code"], "hestia.adjudication_unattributed");
+
+        // Self-adjudication: rejected.
+        let me = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"t",
+                    "role":"role:constellation:interactive-dev"}),
+        )
+        .await
+        .unwrap();
+        let out = tool_witness_adjudication(
+            &state,
+            &json!({"subject_plugin_id":"claude-code","axis":"validity",
+                    "verdict":"upheld","method":"review","ref":"pr:web4#1",
+                    "session_id":me["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["_hestia_error"]["code"], "hestia.adjudication_self");
+    }
+
+    #[tokio::test]
+    async fn adjudication_moves_only_the_adjudicated_grain() {
+        let (_dir, state) = test_state().await;
+        let me = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"t",
+                    "role":"role:constellation:interactive-dev"}),
+        )
+        .await
+        .unwrap();
+        let role = "role:constellation:mesh-worker";
+        let (exec_before, adj_before) = {
+            let s = state.lock().await;
+            (
+                s.trust_for_role("worker-agent", role).validity(),
+                s.adjudicated_for_role("worker-agent", role).validity(),
+            )
+        };
+        let out = tool_witness_adjudication(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "axis":"validity","verdict":"upheld","method":"review",
+                    "ref":"pr:web4#99","session_id":me["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["verdict"], "upheld");
+        assert_eq!(out["score"], 1.0);
+        let s = state.lock().await;
+        let adj_after = s.adjudicated_for_role("worker-agent", role).validity();
+        assert!(adj_after > adj_before, "adjudicated grain must move up");
+        assert_eq!(
+            s.trust_for_role("worker-agent", role).validity(),
+            exec_before,
+            "execution entity's stored V3 must NOT move (saturating counter, never read)"
+        );
+        let event = s
+            .recent_chain(5)
+            .into_iter()
+            .find(|e| e.event_type == "adjudication")
+            .expect("adjudication witnessed");
+        assert_eq!(event.event_data["axis"], "validity");
+        assert_eq!(event.event_data["adjudicated_by"]["plugin_id"], "claude-code");
+    }
+
+    #[tokio::test]
+    async fn veracity_is_daemon_computed_calibration_over_the_explicit_claim() {
+        let (_dir, state) = test_state().await;
+        let me = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"t",
+                    "role":"role:constellation:interactive-dev"}),
+        )
+        .await
+        .unwrap();
+        // Fabricate a witnessed outcome entry carrying an explicit claim at c=0.8.
+        let claim_entry_hash = {
+            let s = state.lock().await;
+            s.append_chain(
+                "outcome",
+                json!({
+                    "plugin_id": "worker-agent",
+                    "success": true,
+                    "closure_claims": [
+                        {"claim_id":"tests-pass","statement":"the suite passes",
+                         "scope":"this change","confidence":0.8,
+                         "evidence":["ci:run:1"]}
+                    ],
+                }),
+            )
+            .unwrap()
+            .hash
+        };
+        // Veracity without claim_ref: rejected (no post-hoc implied claims).
+        let out = tool_witness_adjudication(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","axis":"veracity",
+                    "verdict":"upheld","method":"tests","ref":"ci:run:1",
+                    "session_id":me["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["_hestia_error"]["code"], "hestia.adjudication_veracity_needs_claim");
+
+        // Upheld at stated c=0.8 → Brier S = 1-(0.8-1.0)^2 = 0.96, daemon-computed.
+        let out = tool_witness_adjudication(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","axis":"veracity",
+                    "verdict":"upheld","method":"tests","ref":"ci:run:1",
+                    "claim_ref": claim_entry_hash, "claim_id":"tests-pass",
+                    "score": 0.123,  // caller-supplied score must be IGNORED
+                    "session_id":me["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["claimConfidence"], 0.8);
+        let s_val = out["score"].as_f64().unwrap();
+        assert!((s_val - 0.96).abs() < 1e-9, "S=1-(c-o)^2, not the caller's number");
+    }
+
+    #[tokio::test]
+    async fn deferred_verdict_witnesses_without_observation() {
+        let (_dir, state) = test_state().await;
+        let me = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"t",
+                    "role":"role:constellation:interactive-dev"}),
+        )
+        .await
+        .unwrap();
+        let role = "role:constellation:mesh-worker";
+        let before = {
+            let s = state.lock().await;
+            s.adjudicated_for_role("worker-agent", role).v3_average()
+        };
+        let out = tool_witness_adjudication(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "axis":"valuation","verdict":"deferred","method":"usage",
+                    "ref":"deploy:web4@abc","session_id":me["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert!(out["score"].is_null(), "deferred = right-censored, no score");
+        let s = state.lock().await;
+        assert_eq!(
+            s.adjudicated_for_role("worker-agent", role).v3_average(),
+            before,
+            "no observation folds until the follow-up adjudication"
+        );
+        assert!(s.recent_chain(3).iter().any(|e| e.event_type == "adjudication"),
+            "the deferred assessment IS witnessed");
+    }
+
+    #[tokio::test]
+    async fn invalid_result_reversal_auto_emits_validity_adjudication() {
+        let (_dir, state) = test_state().await;
+        let me = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"t",
+                    "role":"role:constellation:interactive-dev"}),
+        )
+        .await
+        .unwrap();
+        let role = "role:constellation:mesh-worker";
+        let out = tool_record_reversal(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "kind":"rollback","cause":"invalid-result",
+                    "reason":"result did not hold","ref":"PR#125",
+                    "session_id":me["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert!(out["adjudicationEntryHash"].is_string(),
+            "invalid-result reversal auto-emits an adjudication");
+        let s = state.lock().await;
+        let adj = s.recent_chain(5).into_iter()
+            .find(|e| e.event_type == "adjudication").expect("auto-emitted");
+        assert_eq!(adj.event_data["axis"], "validity");
+        assert_eq!(adj.event_data["verdict"], "refuted");
+        assert_eq!(adj.event_data["method"], "reversal");
+        assert!(s.adjudicated_for_role("worker-agent", role).validity() < 0.5,
+            "adjudicated validity moved DOWN off the prior");
     }
 
     #[tokio::test]

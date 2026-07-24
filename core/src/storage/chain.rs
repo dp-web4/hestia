@@ -256,6 +256,21 @@ impl SqliteChainStore {
     /// From an operator's standpoint these are the same category — the
     /// tool call didn't go through, whether because it ran and failed
     /// or because the gate blocked it.
+    /// Fetch one entry by its hash (the chain's stable public identifier —
+    /// receipts, claim_refs, and supersedes links all address entries this way).
+    pub fn read_by_hash(&self, hash: &str) -> Result<Option<ChainEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+             FROM chain_entries WHERE hash = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![hash], row_to_entry)?;
+        match rows.next() {
+            Some(r) => Ok(Some(r??)),
+            None => Ok(None),
+        }
+    }
+
     pub fn read_failures(&self, limit: u64) -> Result<Vec<ChainEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

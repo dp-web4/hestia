@@ -605,6 +605,51 @@ impl ServerState {
             .unwrap_or_else(|_| EntityTrust::new(key))
     }
 
+    /// The adjudicated-V3 grain for an `(instance, role)` pair — Stage 1 of the
+    /// T3-from-V3 arc. A DEDICATED entity for the same reason `#judgment`
+    /// exists: the ~10^3/day execution stream refills any shared scalar within
+    /// minutes, and the execution entity's stored V3 is a saturating action
+    /// counter (+0.01/outcome), not value. Only adjudications move this one.
+    pub fn adjudicated_entity_key(&self, plugin_id: &str, role_lct: &str) -> String {
+        format!("{}#adjudicated", self.trust_entity_key(plugin_id, role_lct))
+    }
+
+    /// Read the adjudicated-V3 trust for a grain (receipts + derivation read this).
+    pub fn adjudicated_for_role(&self, plugin_id: &str, role_lct: &str) -> EntityTrust {
+        let key = self.adjudicated_entity_key(plugin_id, role_lct);
+        self.trust_store
+            .get(&key)
+            .unwrap_or_else(|_| EntityTrust::new(key))
+    }
+
+    /// Apply one adjudicated V3 observation to the subject's `#adjudicated`
+    /// grain and emit the role-scoped delta (action_type `"adjudication"`
+    /// separates the stream in the bridge sink; Stage 4 drains it to the hub).
+    pub fn apply_adjudication_ctx(
+        &self,
+        subject_plugin_id: &str,
+        dimension: web4_core::v3::ValueDimension,
+        score: f64,
+        ctx: &crate::reputation::RepContext,
+    ) -> Result<EntityTrust> {
+        let key = self.adjudicated_entity_key(subject_plugin_id, ctx.role_lct);
+        let (before, after) = self
+            .trust_store
+            .update_v3_returning_prior(&key, dimension, score)?;
+        if let Some(subject_lct) = self.member_lct(subject_plugin_id) {
+            if let Some(delta) = crate::reputation::delta_from_change(
+                &subject_lct,
+                ctx,
+                &before,
+                &after,
+                chrono::Utc::now(),
+            ) {
+                crate::reputation::log_delta(&self.reputation_sink(), &delta);
+            }
+        }
+        Ok(after)
+    }
+
     /// Apply a judgment outcome to the judgment-axis entity and emit the delta
     /// (same bridge as [`apply_outcome_ctx`]). The delta's `action_type`
     /// (`"reversal"`) is what separates this stream from execution deltas in the

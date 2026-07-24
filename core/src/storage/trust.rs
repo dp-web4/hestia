@@ -128,6 +128,26 @@ impl TrustStore {
         Ok((before, after))
     }
 
+    /// Apply an adjudicated V3 observation to an entity (the T3-from-V3 arc's
+    /// `#adjudicated` grain — NEVER the execution entity, whose stored V3 is a
+    /// saturating action counter). Returns `(before, after)` for the delta
+    /// bridge, same shape as [`Self::update_returning_prior`].
+    pub fn update_v3_returning_prior(
+        &self,
+        plugin_id: &str,
+        dimension: web4_core::v3::ValueDimension,
+        score: f64,
+    ) -> Result<(EntityTrust, EntityTrust)> {
+        let before = self.get(plugin_id)?;
+        let mut after = before.clone();
+        after
+            .v3
+            .observe(dimension, score)
+            .map_err(|e| anyhow::anyhow!("v3 observe: {e}"))?;
+        self.store(&after)?;
+        Ok((before, after))
+    }
+
     /// List known plugin_ids (without the `plugin:` prefix when applicable).
     /// The filename is a hash, so we read each file to recover its entity id.
     pub fn list(&self) -> Result<Vec<String>> {
