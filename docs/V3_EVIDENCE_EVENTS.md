@@ -98,3 +98,19 @@ A: pass [construct: cause + subject + reporter + evidence pointer in append_chai
 V: n/a [construct: reversible projection; challenge/supersession stage remains required before consequential publication]
 verdict: PASS
 ```
+
+---
+
+## Post-review notes (CBP, 2026-07-24)
+
+- **BREAKING for out-of-tree callers:** `hestia_record_reversal` now REQUIRES `cause`
+  (one of the six taxonomy values); calls without it get a self-describing error envelope.
+  In-tree callers are updated; update any runbooks/operator habits.
+- Aggregate closure-claims payload is capped at 64 KB serialized per outcome
+  (`MAX_CLOSURE_CLAIMS_TOTAL_BYTES`) — large evidence goes behind pointers, not inline.
+- Reconciliation items for Codex's return (7/30), recorded in the plan errata:
+  (1) this spec's reading that `self-correction` earns Temperament only via adjudication
+  (not automatically) is accepted as anti-gaming but diverges from synthesis amendment 1's
+  letter — plan text to be aligned; (2) the per-cause adjudication-emission table
+  (supersedes/depends_on hooks for `corrected-adjudication` etc.) is still thin — CBP's
+  Stage-1 adjudication event will define it; Codex reviews on return.

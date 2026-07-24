@@ -85,12 +85,26 @@ impl ClosureClaim {
 ///
 /// Missing claims are represented as an empty vector. This preserves honest
 /// missingness: an execution result is not silently converted into a claim.
+/// Aggregate cap on the serialized claims payload per outcome. The per-field
+/// bounds alone admit a ~3.3 MB worst case (MAX_CLOSURE_CLAIMS × max field
+/// sizes) — an outlier against the chain's hash-not-payload norm. 64 KB is
+/// generous for structured claims; anything larger belongs behind an evidence
+/// POINTER, not inline (review 2026-07-24).
+pub const MAX_CLOSURE_CLAIMS_TOTAL_BYTES: usize = 64 * 1024;
+
 pub fn parse_closure_claims(
     value: Option<&serde_json::Value>,
 ) -> Result<Vec<ClosureClaim>, String> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
+    let serialized_len = value.to_string().len();
+    if serialized_len > MAX_CLOSURE_CLAIMS_TOTAL_BYTES {
+        return Err(format!(
+            "closure_claims serializes to {serialized_len} bytes; maximum is \
+             {MAX_CLOSURE_CLAIMS_TOTAL_BYTES} — put large evidence behind a pointer, not inline"
+        ));
+    }
     let claims: Vec<ClosureClaim> = serde_json::from_value(value.clone()).map_err(|error| {
         format!("closure_claims must match {CLOSURE_CLAIMS_SCHEMA_V1}: {error}")
     })?;

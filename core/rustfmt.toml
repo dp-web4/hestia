@@ -1,0 +1,3 @@
+# Pin the branch-wide 2024-style-edition formatting (Codex's fmt sweep, 2026-07-24)
+# so plain `cargo fmt` agrees with the tree instead of fighting it (review fix).
+style_edition = "2024"
