@@ -338,6 +338,42 @@ impl SqliteInboxStore {
         Ok(notices)
     }
 
+    /// Non-consuming list of a recipient's queued notices (oldest first) —
+    /// the SessionStart surface: a new session PEEKS so mail survives a session
+    /// that dies early; consume happens via drain when the member acts.
+    pub fn peek_member(&self, to_plugin: &str) -> Result<Vec<MemberNotice>> {
+        let cutoff = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at
+             FROM member_notices
+             WHERE to_plugin = ?1 AND queued_at >= ?2 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![to_plugin, cutoff], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at) = row?;
+            out.push(MemberNotice {
+                id: id as u64, from_plugin, from_role, kind, pointer_uri, chain_hash,
+                queued_at: DateTime::parse_from_rfc3339(&queued_at)
+                    .context("parsing member notice queued_at")?
+                    .with_timezone(&Utc),
+            });
+        }
+        Ok(out)
+    }
+
     /// Count queued notices for a recipient without consuming (the watcher's
     /// cheap poll — fire the member only when there is something to read).
     pub fn member_pending(&self, to_plugin: &str) -> Result<u64> {

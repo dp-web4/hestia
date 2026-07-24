@@ -1449,11 +1449,19 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
     {
         return Ok(denied);
     }
-    let notices = s
-        .inbox_store
-        .drain_member(&who.plugin_id)
-        .map_err(|e| anyhow::anyhow!("draining member inbox: {e}"))?;
-    Ok(json!({ "total": notices.len(), "notices": notices }))
+    // peek:true = non-consuming (the SessionStart surface — mail survives an
+    // early-dying session); default drain = consume-once.
+    let peek = args.get("peek").and_then(Value::as_bool).unwrap_or(false);
+    let notices = if peek {
+        s.inbox_store
+            .peek_member(&who.plugin_id)
+            .map_err(|e| anyhow::anyhow!("peeking member inbox: {e}"))?
+    } else {
+        s.inbox_store
+            .drain_member(&who.plugin_id)
+            .map_err(|e| anyhow::anyhow!("draining member inbox: {e}"))?
+    };
+    Ok(json!({ "total": notices.len(), "peeked": peek, "notices": notices }))
 }
 
 async fn tool_inbox(state: &SharedState, args: &Value) -> ToolResult {
