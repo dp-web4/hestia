@@ -1,0 +1,21 @@
+{
+  "_comment": "Hestia governance hooks for the AWS Kiro CLI occupant. Kiro CLI reads hooks from the 'hooks' field of a JSON AGENT CONFIG in .kiro/agents/<name>.json (project) or ~/.kiro/agents/<name>.json (global; local wins on name clash). Merge this 'hooks' block into the agent config you launch Kiro with. The IDE surface instead uses standalone JSON files in .kiro/hooks/ with fields version/name/trigger/matcher/action/timeout/enabled - see README for the IDE mapping. DOCUMENTED-tier: the exact entry schema (matcher/command/timeout key names) is from Kiro's hooks docs, not fired live; adjust per the installed CLI. The PreToolUse gate is FAIL-CLOSED (Kiro fails open, and exit 1 is a warning=ALLOW, so the gate carries a top-level deny-on-exception). It covers execute_bash + fs_write + use_aws + MCP calls; fs_read and other local reads pass scope but skip the governor. Commands bake HESTIA_WORKSPACE because the gate default (~/ai-workspace) is wrong on this host. HARDENING: install at GLOBAL/user level and put the scripts on ext4 (a 9p cold-load exceeding the 30s timeout fails OPEN); repoint the /mnt/c paths per install (a non-existent path spawn-errors into a fail-open).",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "command": "HESTIA_WORKSPACE=/mnt/c/projects/ai-agents python3 /mnt/c/projects/ai-agents/hestia/plugins/kiro_cli/hooks/pre_tool_use.py",
+        "timeout_ms": 15000
+      }
+    ],
+    "PostToolUse": [
+      { "matcher": ".*", "command": "/mnt/c/projects/ai-agents/hestia/plugins/kiro_cli/hooks/observe.sh", "timeout_ms": 10000 }
+    ],
+    "SessionStart": [
+      { "command": "/mnt/c/projects/ai-agents/hestia/plugins/kiro_cli/hooks/observe.sh", "timeout_ms": 10000 }
+    ],
+    "Stop": [
+      { "command": "HESTIA_WORKSPACE=/mnt/c/projects/ai-agents /mnt/c/projects/ai-agents/hestia/plugins/kiro_cli/hooks/hydrate.sh", "timeout_ms": 15000 }
+    ]
+  }
+}

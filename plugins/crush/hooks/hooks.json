@@ -1,0 +1,14 @@
+{
+  "_comment": "Hestia governance hooks for the Charm Crush occupant. Crush reads hooks from the 'hooks' map in crush.json (project working dir) or its data-dir config (~/.local/share/crush/; run `crush dirs`). Merge this 'hooks' block into crush.json. Each entry: command (required), optional matcher (regex over tool_name), name, timeout (SECONDS, default 30). SOURCE-VERIFIED (charmbracelet/crush@main): the PreToolUse gate is the ONLY blocking event Crush has today; exit 2 blocks with stderr as reason, exit 49 halts the turn, other non-zero + timeout FAIL OPEN. The gate is FAIL-CLOSED (it carries a top-level deny-on-exception because exit 1 is a non-blocking error = ALLOW). It covers bash + edit/write/multiedit + fetch/download (egress) + mcp__ calls; view/ls/glob/grep and other local reads pass scope but skip the governor. HARDENING: use ABSOLUTE paths in a global config (relative paths only resolve at project scope) and put the scripts on ext4 (a 9p cold-load exceeding the 30s timeout fails OPEN). Repoint the /mnt/c paths per install. WITNESS: Crush has no PostToolUse/Stop event, so passive observation must be read off the SQLite crush.db, not an event stream - there is intentionally no observe.sh here."
+  ,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "name": "hestia-gate",
+        "matcher": ".*",
+        "command": "HESTIA_WORKSPACE=/mnt/c/projects/ai-agents python3 /mnt/c/projects/ai-agents/hestia/plugins/crush/hooks/pre_tool_use.py",
+        "timeout": 15
+      }
+    ]
+  }
+}
