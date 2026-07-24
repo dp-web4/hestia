@@ -20,7 +20,10 @@ pub struct PolicyView {
 }
 
 fn default_policy_view() -> PolicyView {
-    PolicyView { preset: "safety".into(), enforce: true }
+    PolicyView {
+        preset: "safety".into(),
+        enforce: true,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +144,15 @@ pub struct TrustView {
     pub success_count: u64,
     pub success_rate: f64,
     pub days_since_last: f64,
+    /// How the numbers above were produced. `"legacy-lockstep-v1"` = the pre-arc
+    /// update_from_outcome path: ONE self-reported success scalar smeared across all
+    /// three T3 dims at fixed 1.0/0.5/0.3 coefficients, magnitudes caller-chosen. The
+    /// UI must NOT render that as three independent facts (Stage 0 of the T3-from-V3
+    /// arc, plans/t3-from-v3-synthesis-2026-07-24.md). `"v3-derived-v1"` (Stage 3)
+    /// re-enables per-dimension display for dimensions actually derived from
+    /// adjudicated evidence.
+    #[serde(default)]
+    pub derivation: String,
 }
 
 /// One recent chain entry, flattened for UI consumption.
@@ -184,7 +196,10 @@ pub fn flatten_entry(e: crate::storage::ChainEntry) -> RecentEntry {
         timestamp: e.timestamp,
         hash: e.hash.clone(),
         prev_hash: e.prev_hash.clone(),
-        tool_name: d.get("tool_name").and_then(|v| v.as_str()).map(String::from),
+        tool_name: d
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         target: d.get("target").and_then(|v| v.as_str()).map(String::from),
         success: d.get("success").and_then(|v| v.as_bool()),
         magnitude: d.get("magnitude").and_then(|v| v.as_f64()),
@@ -240,10 +255,7 @@ impl ServerState {
         // For activity stats, scan the recent window plus a wider sample.
         // The chain can be huge; cap the stats window at 10k entries which
         // is plenty for an "actions seen" picture without scanning forever.
-        let stats_window = self
-            .chain_store
-            .read_recent(10_000)
-            .unwrap_or_default();
+        let stats_window = self.chain_store.read_recent(10_000).unwrap_or_default();
 
         let mut total = 0u64;
         let mut succ = 0u64;
@@ -262,8 +274,10 @@ impl ServerState {
         // Per-plugin slices of the same window, keyed by the human plugin_id:
         // (total, succ, fail, denied, last_hour, by_tool). Backs the chip filter.
         #[allow(clippy::type_complexity)]
-        let mut per_plugin: BTreeMap<String, (u64, u64, u64, u64, u64, BTreeMap<String, u64>)> =
-            BTreeMap::new();
+        let mut per_plugin: BTreeMap<
+            String,
+            (u64, u64, u64, u64, u64, BTreeMap<String, u64>),
+        > = BTreeMap::new();
         // Per-plugin "last seen" timestamps, used to decide which
         // orchestrators are "active" (= seen in the last hour).
         // Active trust entities in the window, keyed by the trust-store composite
@@ -287,9 +301,11 @@ impl ServerState {
                     .and_then(|v| v.as_str())
                     .unwrap_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE);
                 let key = self.trust_entity_key(pid, role);
-                let entry = active_entities
-                    .entry(key)
-                    .or_insert((e.timestamp, pid.to_string(), role.to_string()));
+                let entry = active_entities.entry(key).or_insert((
+                    e.timestamp,
+                    pid.to_string(),
+                    role.to_string(),
+                ));
                 if e.timestamp > entry.0 {
                     entry.0 = e.timestamp;
                 }
@@ -311,8 +327,14 @@ impl ServerState {
             if e.event_type == "policy_decision" {
                 let dec = e.event_data.get("decision").and_then(|v| v.as_str());
                 let keep = match dec {
-                    Some("deny") if deny_kept < 300 => { deny_kept += 1; true }
-                    Some("warn") if warn_kept < 300 => { warn_kept += 1; true }
+                    Some("deny") if deny_kept < 300 => {
+                        deny_kept += 1;
+                        true
+                    }
+                    Some("warn") if warn_kept < 300 => {
+                        warn_kept += 1;
+                        true
+                    }
                     _ => false,
                 };
                 if keep {
@@ -344,7 +366,11 @@ impl ServerState {
             if let Some(pid) = e.event_data.get("plugin_id").and_then(|v| v.as_str()) {
                 let p = per_plugin.entry(pid.to_string()).or_default();
                 p.0 += 1;
-                if success { p.1 += 1 } else { p.2 += 1 }
+                if success {
+                    p.1 += 1
+                } else {
+                    p.2 += 1
+                }
                 if stat_cutoff.map_or(true, |c| e.timestamp > c) {
                     p.4 += 1;
                 }
@@ -374,7 +400,11 @@ impl ServerState {
             .collect();
         let mut by_tool_vec: Vec<(String, u64)> = by_tool.into_iter().collect();
         by_tool_vec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        let success_rate = if total == 0 { 0.0 } else { succ as f64 / total as f64 };
+        let success_rate = if total == 0 {
+            0.0
+        } else {
+            succ as f64 / total as f64
+        };
 
         // Build the trust list per (instance, role) entity seen in the window, minus synthetic
         // test harnesses. NOTE: no last-hour filter — an idle-but-known orchestrator stays viewable
@@ -386,7 +416,7 @@ impl ServerState {
                 .iter()
                 .filter(|(_key, (_ts, pid, _role))| !self.is_synthetic(pid))
                 .collect();
-        active_sorted.sort_by(|a, b| (&a.1 .1, &a.1 .2).cmp(&(&b.1 .1, &b.1 .2)));
+        active_sorted.sort_by(|a, b| (&a.1.1, &a.1.2).cmp(&(&b.1.1, &b.1.2)));
         let trust: Vec<TrustView> = active_sorted
             .into_iter()
             .map(|(key, (_ts, pid, _role))| {
@@ -418,6 +448,9 @@ impl ServerState {
                     success_count: t.success_count,
                     success_rate: t.success_rate(),
                     days_since_last: t.days_since_last_action(),
+                    // Everything in this view flows from update_from_outcome's
+                    // self-reported scalar until Stage 3 of the T3-from-V3 arc.
+                    derivation: "legacy-lockstep-v1".to_string(),
                 }
             })
             .collect();
@@ -435,14 +468,19 @@ impl ServerState {
 
         let delegations = crate::delegation::DelegationStore::load(&self.vault)
             .ok()
-            .map(|s| s.delegations.iter()
-                .map(|d| serde_json::to_value(d).unwrap_or_default())
-                .collect())
+            .map(|s| {
+                s.delegations
+                    .iter()
+                    .map(|d| serde_json::to_value(d).unwrap_or_default())
+                    .collect()
+            })
             .unwrap_or_default();
 
         let profile = crate::profile::ProfileStore::load(&self.vault)
             .ok()
-            .and_then(|s| serde_json::to_value(&s.present(&crate::profile::Visibility::Private)).ok());
+            .and_then(|s| {
+                serde_json::to_value(&s.present(&crate::profile::Visibility::Private)).ok()
+            });
 
         let constellation = crate::constellation::ConstellationStore::load(&self.vault)
             .ok()
@@ -450,9 +488,12 @@ impl ServerState {
 
         let hub_connections = crate::hub::HubStore::load(&self.vault)
             .ok()
-            .map(|s| s.connections.iter()
-                .map(|c| serde_json::to_value(c).unwrap_or_default())
-                .collect())
+            .map(|s| {
+                s.connections
+                    .iter()
+                    .map(|c| serde_json::to_value(c).unwrap_or_default())
+                    .collect()
+            })
             .unwrap_or_default();
 
         let policy = {
@@ -522,7 +563,9 @@ impl ServerState {
                 role_entities: self.role_registry.len(),
                 member_entities: self.member_registry.len(),
                 entity_type: serde_json::to_string(&self.sovereign.lct.entity_type)
-                    .unwrap_or_default().trim_matches('"').to_string(),
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .to_string(),
                 sovereign_role_id: self.sovereign.sovereign_role_id(),
                 ratchet_level: self.sovereign.ratchet_level(),
             },
@@ -629,11 +672,17 @@ mod tests {
         }
 
         let s = state.dashboard_snapshot(20);
-        assert_eq!(s.stats.total_actions, 4, "denies excluded from executed-tool total");
+        assert_eq!(
+            s.stats.total_actions, 4,
+            "denies excluded from executed-tool total"
+        );
         assert_eq!(s.stats.successful_actions, 3);
         assert_eq!(s.stats.failed_actions, 1);
         assert_eq!(s.stats.denied_actions, 2, "denies counted separately");
-        assert!((s.stats.success_rate - 0.75).abs() < 1e-9, "denies don't move success_rate");
+        assert!(
+            (s.stats.success_rate - 0.75).abs() < 1e-9,
+            "denies don't move success_rate"
+        );
         // Read=3, Bash=1
         assert_eq!(s.stats.by_tool[0], ("Read".into(), 3));
         assert_eq!(s.stats.by_tool[1], ("Bash".into(), 1));

@@ -840,17 +840,33 @@
           <span class="trust-id">${escapeHtml(t.plugin_id)}${trustRole(t) ? `<span class="trust-role" title="${escapeHtml(trustRole(t))}">${escapeHtml(shortRole(trustRole(t)))}</span>` : ''}</span>
           <span class="trust-level">${escapeHtml(t.level)}</span>
         </div>
-        ${tensorRow('Talent', t.t3_talent)}
-        ${tensorRow('Training', t.t3_training)}
-        ${tensorRow('Temper', t.t3_temperament)}
-        ${tensorRow('Veracity', t.v3_veracity)}
+        ${trustRows(t)}
         <div class="trust-meta">
           <span>actions <b>${fmt.int(t.action_count)}</b></span>
-          <span>success <b>${t.action_count === 0 ? '—' : fmt.pct(t.success_rate)}</b></span>
-          <span>T3 avg <b>${t.t3_average == null ? '—' : t.t3_average.toFixed(2)}</b></span>
+          <span>success <b>${t.action_count === 0 ? '—' : fmt.pct(t.success_rate)}</b>${t.derivation === 'legacy-lockstep-v1' ? ' <span style="opacity:0.55">(self-reported)</span>' : ''}</span>
         </div>
       </div>
     `).join('');
+  }
+
+  function trustRows(t) {
+    // Stage 0 of the T3-from-V3 arc (dp 2026-07-24): the legacy path computes ONE
+    // self-reported scalar and smears it across Talent/Training/Temper at fixed
+    // coefficients — rendering that as three independent facts fabricates precision.
+    // Until scores are derived from adjudicated evidence (derivation "v3-derived-v1"),
+    // show ONE honestly-labeled row; unmeasured dimensions render nothing (never zero).
+    if (t.derivation !== 'v3-derived-v1') {
+      return `
+        ${tensorRow('Outcome record', t.t3_training)}
+        <div class="trust-meta" style="margin-top:2px">
+          <span style="opacity:0.6">${fmt.int(t.action_count)} self-reported outcomes · magnitudes caller-chosen · not yet adjudicated</span>
+        </div>`;
+    }
+    return `
+      ${tensorRow('Talent', t.t3_talent)}
+      ${tensorRow('Training', t.t3_training)}
+      ${tensorRow('Temper', t.t3_temperament)}
+      ${tensorRow('Veracity', t.v3_veracity)}`;
   }
 
   function tensorRow(name, value) {
