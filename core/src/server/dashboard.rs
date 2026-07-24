@@ -144,6 +144,19 @@ pub struct TrustView {
     pub success_count: u64,
     pub success_rate: f64,
     pub days_since_last: f64,
+    /// The ADJUDICATED grain (Stage 1, T3-from-V3): V3 folded ONLY from
+    /// witnessed not-the-actor adjudications — the earned-trust record, next
+    /// to (never blended with) the self-reported outcome record. Null when
+    /// the dimension has zero adjudications (honest-unmeasured).
+    #[serde(default)]
+    pub adjudicated_validity: Option<f64>,
+    #[serde(default)]
+    pub adjudicated_veracity: Option<f64>,
+    #[serde(default)]
+    pub adjudicated_valuation: Option<f64>,
+    /// Per-dimension adjudication observation counts [valuation, veracity, validity].
+    #[serde(default)]
+    pub adjudicated_counts: [u64; 3],
     /// How the numbers above were produced. `"legacy-lockstep-v1"` = the pre-arc
     /// update_from_outcome path: ONE self-reported success scalar smeared across all
     /// three T3 dims at fixed 1.0/0.5/0.3 coefficients, magnitudes caller-chosen. The
@@ -430,6 +443,18 @@ impl ServerState {
                 let t3c = *t.t3.observation_counts();
                 let v3c = *t.v3.observation_counts();
                 let dim = |v: f64, c: u64| if c > 0 { Some(v) } else { None };
+                // The ADJUDICATED grain lives at `<grain>#adjudicated` — earned
+                // trust, folded only from witnessed adjudications (Stage 1).
+                let adj = self
+                    .trust_store
+                    .get(&format!("{key}#adjudicated"))
+                    .unwrap_or_else(|_| EntityTrust::new(format!("{key}#adjudicated")));
+                let adj_counts = *adj.v3.observation_counts();
+                let adj_dims = (
+                    dim(adj.validity(), adj_counts[2]),
+                    dim(adj.veracity(), adj_counts[1]),
+                    dim(adj.valuation(), adj_counts[0]),
+                );
                 TrustView {
                     plugin_id: pid.clone(),
                     entity_id: t.entity_id.clone(),
@@ -448,6 +473,10 @@ impl ServerState {
                     success_count: t.success_count,
                     success_rate: t.success_rate(),
                     days_since_last: t.days_since_last_action(),
+                    adjudicated_validity: adj_dims.0,
+                    adjudicated_veracity: adj_dims.1,
+                    adjudicated_valuation: adj_dims.2,
+                    adjudicated_counts: adj_counts,
                     // Everything in this view flows from update_from_outcome's
                     // self-reported scalar until Stage 3 of the T3-from-V3 arc.
                     derivation: "legacy-lockstep-v1".to_string(),

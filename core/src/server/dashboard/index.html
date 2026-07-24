@@ -905,10 +905,22 @@
     // Until scores are derived from adjudicated evidence (derivation "v3-derived-v1"),
     // show ONE honestly-labeled row; unmeasured dimensions render nothing (never zero).
     if (t.derivation !== 'v3-derived-v1') {
-      return `
+      // EARNED trust first, when it exists: the adjudicated grain — V3 folded
+      // only from witnessed not-the-actor adjudications. Never blended with
+      // the self-reported record below; both shown, each labeled (dp: the
+      // displayed scores must line up with earned trust).
+      const nAdj = (t.adjudicated_counts || [0,0,0]).reduce((a,b)=>a+b, 0);
+      const adjBlock = nAdj > 0 ? `
+        ${tensorRow('Adj. validity', t.adjudicated_validity)}
+        ${tensorRow('Adj. veracity', t.adjudicated_veracity)}
+        ${tensorRow('Adj. valuation', t.adjudicated_valuation)}
+        <div class="trust-meta" style="margin-top:2px">
+          <span style="opacity:0.6">${nAdj} witnessed adjudication${nAdj===1?'':'s'} · not-the-actor · evidence on chain</span>
+        </div>` : '';
+      return `${adjBlock}
         ${tensorRow('Outcome record', t.t3_training)}
         <div class="trust-meta" style="margin-top:2px">
-          <span style="opacity:0.6">${fmt.int(t.action_count)} self-reported outcomes · magnitudes caller-chosen · not yet adjudicated</span>
+          <span style="opacity:0.6">${fmt.int(t.action_count)} self-reported outcomes · magnitudes caller-chosen${nAdj>0?'':' · not yet adjudicated'}</span>
         </div>`;
     }
     return `
