@@ -224,6 +224,7 @@ pub async fn serve_with_callback(
     // for the operator to sign in at all. All *data* lives behind the gate.
     let operator_surface = axum::Router::new()
         .route("/api/dashboard", get(dashboard_json))
+        .route("/api/trust/derivation", get(trust_derivation_json))
         .route("/api/failures", get(failures_json))
         .route("/api/vault", get(vault_list).post(vault_add))
         .route("/api/vault/:name", delete(vault_delete))
@@ -331,6 +332,31 @@ struct DashboardQuery {
     /// Calendar-filtered, not count-filtered — a count window silently evicts
     /// a quiet plugin's entries when busier plugins churn (dp 2026-07-23).
     range: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct DerivationQuery {
+    plugin_id: String,
+    #[serde(default)]
+    role: Option<String>,
+}
+
+/// The RECEIPTS endpoint (Stage 2): score -> versioned formula -> evidence
+/// pointers -> witnessed acts, computed at read time over the chain window.
+/// This is the auditable-trust contract made clickable.
+async fn trust_derivation_json(
+    State(state): State<SharedState>,
+    Query(q): Query<DerivationQuery>,
+) -> impl IntoResponse {
+    let s = state.lock().await;
+    let role = q.role.unwrap_or_else(|| "role:constellation:interactive-dev".to_string());
+    let window = s
+        .chain_store
+        .read_recent(crate::derivation::DERIVATION_SCAN)
+        .unwrap_or_default();
+    let derived = crate::derivation::derive(&q.plugin_id, &role, &window);
+    drop(s);
+    Json(serde_json::to_value(derived).unwrap_or_default())
 }
 
 async fn dashboard_json(

@@ -910,12 +910,14 @@
       // the self-reported record below; both shown, each labeled (dp: the
       // displayed scores must line up with earned trust).
       const nAdj = (t.adjudicated_counts || [0,0,0]).reduce((a,b)=>a+b, 0);
-      const adjBlock = nAdj > 0 ? `
+      const nTemp = t.derived_temperament_n || 0;
+      const adjBlock = (nAdj > 0 || nTemp > 0) ? `
+        ${tensorRow('Temperament', t.derived_temperament)}
         ${tensorRow('Adj. validity', t.adjudicated_validity)}
         ${tensorRow('Adj. veracity', t.adjudicated_veracity)}
         ${tensorRow('Adj. valuation', t.adjudicated_valuation)}
         <div class="trust-meta" style="margin-top:2px">
-          <span style="opacity:0.6">${nAdj} witnessed adjudication${nAdj===1?'':'s'} · not-the-actor · evidence on chain</span>
+          <span style="opacity:0.6">derived v3-derived-v1 · ${nAdj} adjudication${nAdj===1?'':'s'} + ${nTemp} governance response${nTemp===1?'':'s'} · <a href="/api/trust/derivation?plugin_id=${encodeURIComponent(t.plugin_id)}&role=${encodeURIComponent(trustRole(t)||'')}" target="_blank" style="color:#7aa7e0">receipts</a></span>
         </div>` : '';
       return `${adjBlock}
         ${tensorRow('Outcome record', t.t3_training)}

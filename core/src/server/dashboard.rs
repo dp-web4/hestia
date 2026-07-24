@@ -144,6 +144,16 @@ pub struct TrustView {
     pub success_count: u64,
     pub success_rate: f64,
     pub days_since_last: f64,
+    /// Legacy level from the self-report scalar — kept for audit, NEVER for
+    /// display (the chip that called a well-adjudicated member "low" off this
+    /// field was the footgun — dp 2026-07-24).
+    #[serde(default)]
+    pub legacy_level: String,
+    /// Derived temperament (v3-derived-v1: governance-response conduct).
+    #[serde(default)]
+    pub derived_temperament: Option<f64>,
+    #[serde(default)]
+    pub derived_temperament_n: u64,
     /// The ADJUDICATED grain (Stage 1, T3-from-V3): V3 folded ONLY from
     /// witnessed not-the-actor adjudications — the earned-trust record, next
     /// to (never blended with) the self-reported outcome record. Null when
@@ -432,7 +442,8 @@ impl ServerState {
         active_sorted.sort_by(|a, b| (&a.1.1, &a.1.2).cmp(&(&b.1.1, &b.1.2)));
         let trust: Vec<TrustView> = active_sorted
             .into_iter()
-            .map(|(key, (_ts, pid, _role))| {
+            .map(|(key, (_ts, pid, _role_ts))| {
+                let _role = _role_ts.as_str();
                 let t = self
                     .trust_store
                     .get(key)
@@ -455,10 +466,17 @@ impl ServerState {
                     dim(adj.veracity(), adj_counts[1]),
                     dim(adj.valuation(), adj_counts[0]),
                 );
+                // v3-derived-v1: the DISPLAYED level comes from derived
+                // evidence (adjudications + governance conduct) — never from
+                // the self-report scalar. Unmeasured renders as unmeasured.
+                let derived = crate::derivation::derive(pid, _role, &stats_window);
                 TrustView {
                     plugin_id: pid.clone(),
                     entity_id: t.entity_id.clone(),
-                    level: t.trust_level().as_str().to_string(),
+                    level: derived.level.clone(),
+                    legacy_level: t.trust_level().as_str().to_string(),
+                    derived_temperament: derived.temperament.score,
+                    derived_temperament_n: derived.temperament.observations,
                     t3_talent: dim(t.talent(), t3c[0]),
                     t3_training: dim(t.training(), t3c[1]),
                     t3_temperament: dim(t.temperament(), t3c[2]),

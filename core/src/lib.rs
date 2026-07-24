@@ -10,6 +10,7 @@
 pub mod callback;
 pub mod constellation;
 pub mod delegation;
+pub mod derivation;
 pub mod error;
 pub mod evidence;
 pub mod hub;
