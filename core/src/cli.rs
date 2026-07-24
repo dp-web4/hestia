@@ -233,6 +233,23 @@ enum ConstellationCmd {
         #[arg(long, default_value = "")]
         target: String,
     },
+
+    /// Present a constellation attestation to the hub and print the resolved
+    /// assurance tier. Co-signs with the locally-held device keys (single-machine
+    /// TEST custody — see `add`), so this exercises the live enroll→present→
+    /// verify_enrolled loop. The tier is derived by the hub from ENROLLED devices,
+    /// so enroll the devices first; unenrolled co-signs add nothing.
+    Present {
+        /// Co-sign with all devices that have a local key (default). Or pass ids.
+        #[arg(long)]
+        all: bool,
+        /// Specific device LCT ids to co-sign with (repeatable).
+        #[arg(long = "device")]
+        devices: Vec<String>,
+        /// Hub URL or connection UUID (default: sole connection).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -643,6 +660,9 @@ pub fn run() -> AnyResult<()> {
                 cmd_constellation_revoke_device(&home, &id, &target)
             }
             ConstellationCmd::Enrolled { target } => cmd_constellation_enrolled(&home, &target),
+            ConstellationCmd::Present { all, devices, target } => {
+                cmd_constellation_present(&home, all, &devices, &target)
+            }
         },
         Command::Profile(p) => match p {
             ProfileCmd::Name { name } => cmd_profile_name(&home, &name),
@@ -2331,6 +2351,10 @@ fn cmd_constellation_add(home: &std::path::Path, name: &str, device_type: &str) 
     let member = store.add_device(name, dt, &pubkey_hex, vec![]);
     let lct_id = member.lct_id;
     store.save(&mut vault)?;
+    // Persist the device PRIVATE key (local custody) so it can co-sign
+    // attestations — the single-machine test harness for `constellation present`.
+    vault.upsert(VaultEntry::new(device_key_name(lct_id), hex::encode(kp.secret_key_bytes())))
+        .context("persisting the device signing key")?;
 
     println!("Device added to constellation:");
     println!("  name:    {name}");
@@ -2373,6 +2397,9 @@ fn cmd_constellation_remove(home: &std::path::Path, id: &str) -> AnyResult<()> {
     let mut store = ConstellationStore::load(&vault)?;
     if store.remove_device(lct_id) {
         store.save(&mut vault)?;
+        // Also drop its locally-held signing key (best-effort — may not exist for
+        // devices added before key persistence).
+        let _ = vault.remove(&device_key_name(lct_id));
         println!("Device {lct_id} removed from constellation");
     } else {
         anyhow::bail!("device {lct_id} not found in constellation");
@@ -2480,6 +2507,89 @@ fn cmd_constellation_enrolled(home: &std::path::Path, target: &str) -> AnyResult
         let status = d.get("status").and_then(|x| x.as_str()).unwrap_or("?");
         let ver = d.get("enrollment_version").and_then(|x| x.as_u64()).unwrap_or(0);
         println!("  {dev}  class={class}  status={status}  v{ver}");
+    }
+    Ok(())
+}
+
+/// Vault entry name for a device's PRIVATE key. **Local custody:** the key lives
+/// in THIS vault so hestia can co-sign as the device for a single-machine test of
+/// the assurance mechanism (the live enroll→present→verify_enrolled loop). This is
+/// a TEST HARNESS, not cross-device MFA — real multi-device assurance keeps each
+/// key on its own physical device; here one vault holds them all.
+fn device_key_name(lct: uuid::Uuid) -> String {
+    format!("constellation_device_key:{lct}")
+}
+
+fn load_device_key(vault: &Vault, lct: uuid::Uuid) -> Option<web4_core::crypto::KeyPair> {
+    let e = vault.get(&device_key_name(lct))?;
+    let bytes: [u8; 32] = hex::decode(e.secret.trim()).ok()?.as_slice().try_into().ok()?;
+    Some(web4_core::crypto::KeyPair::from_secret_bytes(&bytes))
+}
+
+/// `constellation present` — build + present a challenge-bound attestation to the
+/// hub and print the tier the hub resolves (from ENROLLED devices). Co-signs with
+/// the locally-held device keys; the owner is aligned to THIS member (the identity
+/// the hub pins + enrollment is under), signed with the member key.
+fn cmd_constellation_present(
+    home: &std::path::Path,
+    all: bool,
+    devices: &[String],
+    target: &str,
+) -> AnyResult<()> {
+    let mut vault = open_vault(home)?;
+    let mut store = ConstellationStore::load(&vault)?;
+    if store.members.is_empty() {
+        anyhow::bail!("no devices in the local constellation — `hestia constellation add <name>` first");
+    }
+    let hub_store = HubStore::load(&vault)?;
+    let conn = pick_connection(&hub_store, target)?;
+    let member_kp = member_signing_keypair(&vault, &conn.member_key_source)?;
+
+    // Align the attestation owner to THIS member: the hub verifies the owner key
+    // against the caller's pinned key and resolves enrollment under this uuid.
+    if store.owner_lct_id != Some(conn.our_lct_id) {
+        store.owner_lct_id = Some(conn.our_lct_id);
+        store.save(&mut vault)?;
+    }
+
+    // Select devices + load their local keys (only keyed devices can co-sign).
+    let selected: Vec<uuid::Uuid> = if all || devices.is_empty() {
+        store.members.iter().map(|m| m.lct_id).collect()
+    } else {
+        let mut v = Vec::new();
+        for id in devices {
+            v.push(uuid::Uuid::parse_str(id).with_context(|| format!("invalid UUID: {id}"))?);
+        }
+        v
+    };
+    let mut device_keys: Vec<(uuid::Uuid, web4_core::crypto::KeyPair)> = Vec::new();
+    for lct in &selected {
+        match load_device_key(&vault, *lct) {
+            Some(kp) => device_keys.push((*lct, kp)),
+            None => println!("  (no local key for {lct} — it won't co-sign; added pre-key-persistence?)"),
+        }
+    }
+
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+    let pair_id = uuid::Uuid::new_v4();
+    let channel = rt.block_on(client.open_channel(&conn.url, pair_id))
+        .context("opening the sealed channel to the hub")?;
+
+    let store_ref = &store;
+    let mkp = &member_kp;
+    let dks = &device_keys;
+    let resp = rt.block_on(client.present_constellation(
+        &rest, &channel, &member_kp, conn.our_lct_id,
+        |nonce| hestia::constellation::ConstellationAttestation::create(store_ref, mkp, nonce, dks),
+    )).context("presenting the constellation attestation")?;
+
+    let tier = resp.get("assurance").and_then(|v| v.as_str()).unwrap_or("?");
+    println!("Presented constellation ({} device co-sign(s)).", device_keys.len());
+    println!("  assurance tier (hub-resolved from ENROLLED devices): {tier}");
+    if let Some(vu) = resp.get("valid_until").and_then(|v| v.as_str()) {
+        println!("  valid_until: {vu}");
     }
     Ok(())
 }
