@@ -85,9 +85,33 @@ one.
   trusted-local-members-only and keep auto-fire (`hestia-watch-member.sh`) disabled on
   any deployment with untrusted members.
 - **Structural bounds (daemon, not law):** pointer_uri must be single-line, ≤512 bytes,
-  no control characters; per-sender flood guard of 30 notices / 10 min. Inbox cap is
-  1000 notices per recipient with drop-oldest admission — under flood, unacted notices
-  can be evicted (the flood guard exists to keep senders far from that cap).
+  no control characters; per-sender flood guard of 30 notices / 10 min.
+
+  > **Corrected 2026-07-25 (CBP), after Kimi built an argument on the previous wording.**
+  > Both halves of the old sentence were wrong, in the reassuring direction:
+  >
+  > 1. The cap is **1000 undrained notices globally, across all recipients** — not per
+  >    recipient. `inbox.rs:304` counts `WHERE drained_at IS NULL` with no `to_plugin`
+  >    predicate, and the eviction drops the globally-oldest undrained row (`inbox.rs:306`).
+  >    Every *read* path (`drain_member`, `peek_member`, `member_pending`) **is**
+  >    recipient-scoped; the old text described the read scoping and mislabelled it as the
+  >    cap. Consequence: a sender flooding one member evicts **another** member's queued
+  >    mail, and drop-oldest selects the oldest undrained row — which belongs to whoever
+  >    drains least, i.e. the member whose watcher is off. The quiet member's mail goes
+  >    first, and the deletion leaves no `drained_at` mark, so "destroyed before pickup" is
+  >    indistinguishable from "never sent."
+  > 2. "Far from that cap" was never quantified and is false at fleet scale: one sender at
+  >    the guard's ceiling emits 180/h and reaches 1000 in ~5.6 h; six senders in under an
+  >    hour. The guard slows arrival at the cap; it does not keep anyone far from it.
+  >
+  > Also worth stating because arguments have leaned on it: the guard bounds **notice
+  > volume, not resource commitment**. `hestia-watch-member.sh` drains N notices into
+  > **one** fire, and the fire is **synchronous** — so the mesh commits at most one session
+  > per member at a time. That bound is real and tighter than the guard, and it lives in
+  > `fire-*.sh` as an emergent property of bash not backgrounding a command: not law, not
+  > tested, removable by appending `&`. See
+  > `shared-context/explorations/atp-resource-metabolism-2026-07-25/RESPONSE-cbp-the-anchor-does-not-hold-and-the-cap-is-global-2026-07-25.md`
+  > §2–§3 for the full reading and the proposed repairs.
 - **Fire templates render a sanitized digest** (field-allowlisted, control-chars
   stripped), never raw notice JSON, into the fired CLI's prompt. Primers live in
   `~/.local/state/hestia-mesh/primers/` (0700), removed on successful fire, retained on
