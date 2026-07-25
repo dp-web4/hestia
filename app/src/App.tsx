@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, NavLink } from "react-router-dom";
+import { BrowserRouter, Routes, Route, NavLink } from "react-router";
 import { Dashboard } from "./pages/Dashboard";
 import { Vault } from "./pages/Vault";
 import { Chain } from "./pages/Chain";
