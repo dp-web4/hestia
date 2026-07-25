@@ -118,6 +118,10 @@ impl ServerHandler for HestiaServer {
             make_resource("hestia://society/state", "Society state"),
             make_resource("hestia://witness/recent", "Recent witness chain entries"),
             make_resource("hestia://session/own", "This plugin's session state"),
+            make_resource(
+                "hestia://session/siblings",
+                "All sessions connected locally (session-coordination read view)",
+            ),
         ];
         let mut result = ListResourcesResult::default();
         result.resources = resources;
@@ -2086,6 +2090,21 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
         };
         return Ok(serde_json::to_string(&resolved).unwrap_or("null".into()));
     }
+    if uri == "hestia://session/siblings" {
+        // The read side of LOCAL session coordination: every session currently connected on this
+        // machine, so a caller (or the hub-watch launcher via the CLI seam) can see what its siblings
+        // are before it acts — the manual "is another session live on this?" check, automated. This is
+        // the local plane only (HUB caution: never conflate with the fleet member-mesh). `host_agent`
+        // (+version) is the agent_family/model, so Claude / Kimi / a future local model are already
+        // distinguishable with no schema change. Read-only coordination metadata; no consequential act.
+        let mut siblings: Vec<_> = s.sessions.values().cloned().collect();
+        siblings.sort_by_key(|sess| sess.connected_at);
+        return Ok(serde_json::to_string(&json!({
+            "count": siblings.len(),
+            "sessions": siblings,
+        }))
+        .unwrap_or("{}".into()));
+    }
     if let Some(plugin_id) = uri.strip_prefix("hestia://society/trust/") {
         let trust = s.trust(plugin_id);
         return Ok(serde_json::to_string(&trust_state_json(&trust)).unwrap_or("{}".into()));
@@ -3925,6 +3944,29 @@ mod tests {
         assert!(
             body.contains(&a.to_string()) && !body.contains("ambiguous_caller"),
             "explicit session_id resolves the caller: {body}"
+        );
+    }
+
+    /// The read side of local coordination: siblings lists every connected session (heterogeneous by
+    /// host_agent), sorted by connect time — the primitive that automates the manual "is a sibling live
+    /// on this?" check that prevented a self-collision while building it.
+    #[tokio::test]
+    async fn session_siblings_lists_all_connected_sessions() {
+        let (_dir, shared) = make_shared_state();
+        let body = read_resource_body(&shared, "hestia://session/siblings").await.unwrap();
+        assert!(body.contains("\"count\":0"), "empty when no sessions: {body}");
+        let (a, b) = {
+            let mut s = shared.lock().await;
+            (
+                add_session(&mut s, "role:constellation:interactive"),
+                add_session(&mut s, "role:constellation:mesh-worker"),
+            )
+        };
+        let body = read_resource_body(&shared, "hestia://session/siblings").await.unwrap();
+        assert!(body.contains("\"count\":2"), "counts both: {body}");
+        assert!(
+            body.contains(&a.to_string()) && body.contains(&b.to_string()),
+            "lists both sessions: {body}"
         );
     }
 
