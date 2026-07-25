@@ -1897,10 +1897,16 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     // Structural flood guard (Kimi review 2026-07-24, Findings 2+5): the gate
     // above is law and default-allow on a permissive base; this bound is
     // plumbing and always on. Per-sender, sized far above legitimate
-    // coordination volume — it exists so a runaway sender can't evict queued
-    // notices (drop-oldest inbox cap) or spin a recipient's auto-fire loop.
-    // Deliberately NOT witnessed per-deny: under flood, per-deny chain writes
-    // would turn the guard itself into a chain-growth vector.
+    // coordination volume — it bounds notice VOLUME, so a runaway sender can't
+    // spin a recipient's auto-fire loop or fill that recipient's queue.
+    // It does NOT bound resource commitment, and (since the cap went
+    // per-recipient, `Inbox::enqueue_member`) it is no longer what stands
+    // between a compliant sender and a third member's mail — this comment
+    // previously claimed it was, which was false under the global cap and is
+    // now merely unnecessary. The guard is a compile-time const, not
+    // configuration. Denials are deliberately NOT witnessed per-deny: under
+    // flood, per-deny chain writes would turn the guard itself into a
+    // chain-growth vector.
     let flood = s.member_notify_limiter.check(
         &sender.plugin_id,
         MEMBER_NOTIFY_MAX_PER_WINDOW,
@@ -2046,7 +2052,25 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
             .drain_member(&who.plugin_id)
             .map_err(|e| anyhow::anyhow!("draining member inbox: {e}"))?
     };
-    Ok(json!({ "total": notices.len(), "peeked": peek, "notices": notices }))
+    // Silently-dropped mail, reported to the only party who can tell what is
+    // missing. The cap's evictions are unwitnessed DELETEs; without this the
+    // reader's mailbox looks complete whether or not it is. `evicted` counts
+    // only since the counter shipped (2026-07-25) — a 0 is "none since then",
+    // not "none ever", and the payload says so rather than leaving the reader
+    // to infer the stronger sentence. Reported, never gated on.
+    let evicted = s
+        .inbox_store
+        .member_evictions(&who.plugin_id)
+        .map_err(|e| anyhow::anyhow!("reading member queue evictions: {e}"))?;
+    let mut out = json!({ "total": notices.len(), "peeked": peek, "notices": notices,
+                          "evicted": evicted });
+    if evicted > 0 {
+        out["evicted_note"] = json!(format!(
+            "{evicted} notice(s) addressed to you were dropped by the queue cap and are \
+             unrecoverable; senders were not told. Counted since 2026-07-25 only."
+        ));
+    }
+    Ok(out)
 }
 
 /// "Which notices were queued and never answered?" — the query the mesh could

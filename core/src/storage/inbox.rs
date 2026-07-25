@@ -304,6 +304,36 @@ impl SqliteInboxStore {
         Ok(())
     }
 
+    /// Ensure the eviction-count table exists. Separate from the notices table
+    /// on purpose: the count must survive the rows it counts, which are gone.
+    fn ensure_eviction_schema(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS member_queue_evictions (
+                plugin_id      TEXT PRIMARY KEY,
+                evicted        INTEGER NOT NULL,
+                first_eviction TEXT NOT NULL,
+                last_eviction  TEXT NOT NULL
+             );",
+        )
+        .context("initializing member_queue_evictions schema")?;
+        Ok(())
+    }
+
+    /// How many notices addressed to `plugin_id` were silently dropped by the
+    /// queue cap. Zero is a real answer here and means "none since this
+    /// counter shipped" — it does NOT mean "none ever", because evictions
+    /// before it left no trace of any kind. Reported, never gated on.
+    pub fn member_evictions(&self, plugin_id: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_eviction_schema(&conn)?;
+        let n: i64 = conn.query_row(
+            "SELECT COALESCE((SELECT evicted FROM member_queue_evictions WHERE plugin_id = ?1), 0)",
+            params![plugin_id],
+            |row| row.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
     /// Record that `plugin_id` read its own mailbox, now. Idempotent-by-upsert;
     /// never fails a read (a heartbeat that could break a drain would be a
     /// control wearing a mark's coat).
@@ -380,18 +410,61 @@ impl SqliteInboxStore {
         // delivery record — drained rows are forensics, and evicting them to
         // admit a new notice would re-open the hole `drained_at` just closed.
         // They still age out on the TTL prune above.
+        //
+        // The cap is PER RECIPIENT (Kimi/CBP atp-metabolism amendment 2,
+        // 2026-07-25). It was global until this commit, which meant a sender at
+        // its own compliant ceiling could evict a third member's mail — a
+        // cross-member denial channel whose victims leave no mark, because the
+        // eviction is a silent DELETE and the drop is invisible to sender,
+        // recipient, and chain alike. Scoping admission and eviction to
+        // `to_plugin` removes that channel: a flood now only displaces mail
+        // inside the queue of the member the flooder is actually addressing.
+        //
+        // Two things this deliberately does NOT claim. (1) Storage is now
+        // bounded by MAX_INBOX_NOTICES × distinct recipients, not by
+        // MAX_INBOX_NOTICES — the previous global bound bought its fairness
+        // hole with a tighter storage bound, and this trade is the intended
+        // one at fleet scale (single-digit members, 7-day TTL). (2) Within one
+        // recipient's queue a flooding sender still displaces a quiet sender's
+        // mail to that same recipient. That residual channel is bounded by the
+        // flood guard and, unlike the one removed here, requires the attacker
+        // to be in a relationship with the victim's counterparty.
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM member_notices WHERE drained_at IS NULL",
-            [],
+            "SELECT COUNT(*) FROM member_notices WHERE to_plugin = ?1 AND drained_at IS NULL",
+            params![to_plugin],
             |row| row.get(0),
         )?;
         if count as u64 >= MAX_INBOX_NOTICES {
             conn.execute(
                 "DELETE FROM member_notices
-                 WHERE id = (SELECT MIN(id) FROM member_notices WHERE drained_at IS NULL)",
-                [],
+                 WHERE id = (SELECT MIN(id) FROM member_notices
+                             WHERE to_plugin = ?1 AND drained_at IS NULL)",
+                params![to_plugin],
             )
             .context("dropping oldest member notice at cap")?;
+            // An eviction is a silent DELETE: no error to the sender, no
+            // notice to the recipient, no chain entry. Until this counter the
+            // ONLY way to learn the cap had fired was to already know what
+            // should have been there. Counting it is what makes the residual
+            // (intra-recipient) channel observable at all, and the count is
+            // what a retrospective `SELECT COUNT(*)` fundamentally cannot
+            // recover — evicted rows are gone, and the id gaps they leave are
+            // indistinguishable from the TTL prune's.
+            //
+            // A mark, not a witness — same call as `drained_at` and the
+            // liveness touch: one chain entry per eviction, under exactly the
+            // flood where evictions happen, is a chain-growth vector.
+            Self::ensure_eviction_schema(&conn)?;
+            conn.execute(
+                "INSERT INTO member_queue_evictions
+                     (plugin_id, evicted, first_eviction, last_eviction)
+                 VALUES (?1, 1, ?2, ?2)
+                 ON CONFLICT(plugin_id) DO UPDATE SET
+                     evicted       = evicted + 1,
+                     last_eviction = ?2",
+                params![to_plugin, now.to_rfc3339()],
+            )
+            .context("recording member queue eviction")?;
         }
         conn.execute(
             "INSERT INTO member_notices
@@ -739,6 +812,58 @@ mod tests {
         assert_eq!(store.member_pending("codex-cli").unwrap(), 1, "other member's mail untouched");
         // consume-once: second drain empty.
         assert!(store.drain_member("kimi-code").unwrap().is_empty());
+    }
+
+    /// The queue cap must not be a cross-member denial channel: a sender
+    /// flooding member A's queue must not evict member B's mail, from a third
+    /// party, that B has never read. This is the falsifier for
+    /// atp-metabolism amendment 2 (Kimi/CBP 2026-07-25) — it FAILS against
+    /// the global cap this replaced, because there the globally-oldest
+    /// undrained row is exactly the quiet member's, and it goes first.
+    ///
+    /// The victim of the old policy left no mark: no error to the sender, no
+    /// notice to the recipient, no chain entry. This test is the only place
+    /// the channel is observable, which is the whole argument for it existing.
+    #[test]
+    fn a_flood_at_one_recipient_cannot_evict_a_third_members_mail() {
+        let (_tmp, store) = fresh();
+        // The quiet member's single unread notice, queued first — under the
+        // global cap it is the globally-oldest undrained row and therefore
+        // the first thing evicted.
+        store
+            .enqueue_member("codex-cli", "hub-supervisor", "role:r", "coordination",
+                            Some("forum/quiet.md#t"), "hash-quiet", None)
+            .unwrap();
+        // A sender fills a DIFFERENT recipient's queue to the cap and past it.
+        for i in 0..(MAX_INBOX_NOTICES + 5) {
+            store
+                .enqueue_member("kimi-code", "claude-code", "role:r", "coordination",
+                                Some(&format!("forum/flood{i}.md#t")), "hash-flood", None)
+                .unwrap();
+        }
+        assert_eq!(
+            store.member_pending("codex-cli").unwrap(),
+            1,
+            "the quiet member's mail was evicted by a flood addressed to someone else"
+        );
+        let quiet = store.drain_member("codex-cli").unwrap();
+        assert_eq!(quiet.len(), 1);
+        assert_eq!(quiet[0].chain_hash, "hash-quiet", "wrong notice survived");
+        // The cap still binds — on the flooded queue, where it belongs.
+        assert_eq!(
+            store.member_pending("kimi-code").unwrap(),
+            MAX_INBOX_NOTICES,
+            "the per-recipient cap must still bound the queue it applies to"
+        );
+        // And the drop is no longer silent: the member whose mail was dropped
+        // can learn that it was, which is the only way the residual channel is
+        // observable at all.
+        assert_eq!(store.member_evictions("kimi-code").unwrap(), 5, "evictions uncounted");
+        assert_eq!(
+            store.member_evictions("codex-cli").unwrap(),
+            0,
+            "the untouched member must not inherit another queue's eviction count"
+        );
     }
 
     /// The drain must stop returning a notice WITHOUT destroying the evidence
