@@ -166,6 +166,46 @@ because "it's evidence" violates the release rule; evidence withheld because "it
 secret" violates the presentation rule. Both are now *expressible* failures, which is
 what makes §9 criterion 2 testable.
 
+**What "collapsed" means, and what it does not.** Both failures named above are
+*classification* confusions — using an object's standing on one axis to decide the
+other. Neither says the release rule may not depend on properties of the *recipient*;
+`:146`'s "who may come to hold it" is already a statement about principals. The
+distinction matters at exactly one intersection, found by probing the shape for a
+residue (Sprout): **carriage × an object whose disclosure boundary runs through it** —
+`presence/profile` and its four tiers (`:130`), which is the motivating counterexample,
+not an exotic one. Carriage attests the recipient rather than assuming it (§7.2), so the
+full four-tier object cannot be handed to a courier on the expectation that it
+self-filters; what is released must be narrowed to the entitled subset as a function of
+the recipient's attestation. Under the *narrow* reading of this invariant that is not a
+collapse; under the *strong* reading — release may never be a function of
+presentation-context — it is. The wording above picks neither, and a reviewer applying
+the strong reading would read audience-narrowed carriage as a defect.
+
+**This resolves here, not in schema v2.** Sprout offers a fork: (a) admit the
+dependence — one schema row per object, the release column holding a predicate; or
+(b) hold orthogonality absolute and mint N objects, one per tier, each with a static
+release set — one row per (object, tier). Two corrections, and together they make the
+amendment independent of the schema call:
+
+- **A predicate is not enough for the case that motivates it.** `P(recipient) → bool`
+  answers *whether* a recipient may hold the object; carriage needs *which subset*. The
+  release rule must be a **projection**, `R(recipient) → released view`, of which the
+  all-or-nothing boolean — and a bearer's single-consumer set (`:148`) — are the
+  degenerate cases.
+- **(b) does not preserve orthogonality; it distributes the same dependence.** Each
+  per-tier object's release rule must still test the recipient's attested audience to
+  decide tier membership. `R(recipient) → subset` over a fixed finite tier lattice and
+  `{P_tier(recipient) → bool}` are the same function, curried. The fork is therefore
+  **representational, not semantic**: a real schema-row-granularity call, and dp's/HUB's
+  to make, but it does not decide this invariant either way.
+
+So, stated once: **the release rule is a projection fixed at issuance and evaluated at
+release**, and the invariant above forbids *classification* confusion between the two
+axes — not dependence of release on the recipient's attestation. Written here rather
+than deferred, because it holds under either horn. **Still owed and not ours:** the row
+granularity for schema v2 (§8), and — if (b) — the N-way issuance, revocation and
+custody cost stated as a consequence in §7.2.
+
 ### 7.2 Custody is not release
 
 The owner and their attested constellation **hold their own secrets**. Movement inside
@@ -224,7 +264,7 @@ same gap §11's last risk names, stated where the coverage claim is made.
 | # | Criterion | Demonstrated by |
 |---|---|---|
 | 1a | The crit-1 path exists *mechanically* — no config file, no key handling. | **RUN, AND IT FAILS — the first criterion in this table with a real artifact and a real verdict.** Legion ran it cold (fresh `HOME`, release binary only, 2026-07-24): step 0 acquire ✅; step 1 `init` ✅ with a pty (empty vault, no identity — §5.1); **step 2 join a hub ❌ no such command in the shipped binary**; step 3 add a device ❌ likewise; step 4 not reached. **The blocker is upstream of the persona entirely: a release gap (§8), not a build gap and not a usability gap.** The run stands as this rung's artifact and confirms its design: run by a **fleet peer who did not build hestia** — a builder cannot see what a non-builder trips over, and the runner's contamination is the variable this rung controls (PUB). Re-run per release candidate. It is not the persona test and must never be claimed as one. *Remaining human gate for the full walk: a disposable hub, or dp's go-ahead to join the live one as a throwaway member.* |
-| 1b | A non-technical user does it, one sitting. | A recorded cold-run on a **fresh machine** by someone **genuinely non-technical who has never seen the repo** (every fleet member and dp is contaminated). Pass bar: **zero questions that required a builder to answer** — questions answered by in-app text are the product working. The run ends when they finish **or when they would have quit**; a four-hour success still fails §6's "seamless." Re-run per release candidate; the ask-count is the metric and must be monotone decreasing. **The same metric applies in steady state, not only in the cold run:** once schema v2 lands (§8), **owner escalation prompts per day, monotone decreasing across release candidates** — that is the only instrument that would catch escalation fatigue before the owner does, and fatigue is how §7.1's safe default converts into a trained allow-all (kimi). **1a's blockers are burned down first** — a peer's goodwill renews, a first impression does not; each non-technical person is single-use as evidence, so spending one on a blocker 1a would have caught is a wasted rung (PUB), and 1a's run has now produced exactly such a blocker. **No artifact yet for either half — the largest evidential gap in this PRD** (and 1a now shows it is not the *nearest* one). |
+| 1b | A non-technical user does it, one sitting. | A recorded cold-run on a **fresh machine** by someone **genuinely non-technical who has never seen the repo** (every fleet member and dp is contaminated). Pass bar: **zero questions that required a builder to answer** — questions answered by in-app text are the product working. The run ends when they finish **or when they would have quit**; a four-hour success still fails §6's "seamless." Re-run per release candidate. **Run 1 is graded on the absolute bar, not a trend: it passes iff builder-answered asks = 0. If there are any, run 1 is not a pass, and every ask must resolve to a *filed, named product gap* before the next non-technical tester is spent.** This closes the deviation v4 carried on the record — a trend cannot grade the first run, and the first run is the one that matters when each subject is single-use (Sprout). It also makes the run-1 metric the right one: not *how many* asks, but *is every ask convertible* — an ask the product cannot articulate a fix for is the real run-1 failure, and a raw count hides it. From run 2 on — the first run where a trend exists — the ask-count is the metric and must be monotone decreasing. **The same metric applies in steady state, not only in the cold run:** once schema v2 lands (§8), **owner escalation prompts per day, monotone decreasing across release candidates** — that is the only instrument that would catch escalation fatigue before the owner does, and fatigue is how §7.1's safe default converts into a trained allow-all (kimi). **1a's blockers are burned down first** — a peer's goodwill renews, a first impression does not; each non-technical person is single-use as evidence, so spending one on a blocker 1a would have caught is a wasted rung (PUB), and 1a's run has now produced exactly such a blocker. **No artifact yet for either half — the largest evidential gap in this PRD** (and 1a now shows it is not the *nearest* one). |
 | 1c | The ratchet survives the owner's seat: they are *correctly denied an unearned rung* and it does not feel like a wall. | An owner-seat transcript of a correct deny. Without it, "climb, don't fake" is asserted but never demonstrated from the primary persona's seat. **No artifact yet.** |
 | 2 | No credential is served to a party not entitled to it under §7 — tested on **both axes and on custody**. | *Release:* a replay-attempt suite — a caller asks for a credential it does not consume, and for a peer's, from attested and unattested transports. *Presentation:* disclosure beyond the rules, presentation to an audience outside the permitted set, re-use of a single-use presentation — all fail closed. *Custody:* a cross-device transfer without co-sign fails; with co-sign succeeds and is witnessed. **Status: one tripwire test. The release suite's deny branch is *absent*, not merely uncovered (§5.5). The presentation suite is blocked on vault schema v2 and on naming the enforcing component (§8) — until those land, this half is an intention, and is marked as one.** |
 | 3 | No legitimate credential read is ever wrongly denied (fail-secure, not fragile). | A regression corpus built from *real* false-denies — the primer-path and scope-lag cases are the seed; the empty-`allowed_consumers` migration will generate more. Every new false-deny lands here as a case before it is fixed. **Rows 2 and 3 are one principle seen from both sides (§4.1) and are scheduled, funded, and passed together — splitting them is the decoupling §4.1 exists to prevent.** |
