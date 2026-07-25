@@ -449,7 +449,7 @@
       <div class="stat">
         <div class="label">Actions</div>
         <div class="value" id="stat-actions">—</div>
-        <div class="delta" id="stat-actions-delta">tool calls witnessed</div>
+        <div class="delta" id="stat-actions-delta">tool calls witnessed · trailing 60 min</div>
       </div>
       <div class="stat success">
         <div class="label">Success rate</div>
@@ -754,7 +754,10 @@
 
   function renderStats(s, society, scope) {
     $('stat-chain').textContent = fmt.int(society.chain_length);
-    $('stat-actions').textContent = fmt.int(s.total_actions);
+    // Headline = the live pulse (genuine trailing 60 min, independent of what range
+    // you happen to be browsing). The range-scoped total lives in the selector card
+    // below; before this, both cards rendered the same quantity.
+    $('stat-actions').textContent = fmt.int(s.actions_last_hour);
     $('stat-rate').textContent = s.total_actions === 0 ? '—' : fmt.pct(s.success_rate);
     // Denies never reach an `outcome` (the gate blocks before the tool runs),
     // so they're not in the success-rate math — surfaced here as gate activity,
@@ -766,7 +769,14 @@
       s.total_actions === 0
         ? (s.denied_actions ? `${fmt.int(s.denied_actions)} blocked by policy` : (scope ? `for ${scope}` : 'across all plugins'))
         : `${fmt.int(s.successful_actions)} ok · ${fmt.int(s.failed_actions)} fail${blocked}${scope ? ` · ${scope}` : ''}`;
-    $('stat-hour').textContent = fmt.int(s.actions_last_hour);
+    // The card whose label IS the range selector shows the SELECTED range's count.
+    // It was bound to `actions_last_hour`, which used to track the selection and now
+    // (correctly) means a real trailing hour — so the card read "last hour" under a
+    // label saying "trailing 7 days". Value and label must come from the same window.
+    $('stat-hour').textContent = fmt.int(s.total_actions);
+    // Keep the label in lockstep here rather than only in the change handler, so a
+    // reload or a programmatic range change can never leave them disagreeing again.
+    $('stat-hour-delta').textContent = RANGE_DELTA[rangeSel] || '';
   }
 
   // Trust rows are one per (instance, role) grain, so a plugin can have several.
