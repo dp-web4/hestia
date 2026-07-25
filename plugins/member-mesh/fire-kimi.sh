@@ -33,7 +33,9 @@ echo "[fire-kimi] firing kimi -p ($FIREWORTHY notice(s)) -> $LOG_DIR/kimi-$STAMP
 cd /mnt/c/exe/projects/ai-agents && timeout 1800 kimi -p "$PROMPT" > "$LOG_DIR/kimi-$STAMP.log" 2>&1
 # The fired CLI's rc IS this script's rc — see fire-claude.sh. The two
 # `timeout: failed to run command 'kimi'` fires of 2026-07-23 reported success
-# and their consume-once primers were deleted; those notices are unrecoverable.
+# and their consume-once primers were deleted, so which notices they carried is
+# no longer knowable. The CONTENT was never at risk: the mesh is pointer-based
+# and every pointer is committed. A dead fire costs attention, not data.
 RC=$?
 echo "[fire-kimi] done rc=$RC (log: $LOG_DIR/kimi-$STAMP.log)"
 exit "$RC"
