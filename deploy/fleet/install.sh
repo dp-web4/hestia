@@ -208,20 +208,56 @@ verify_service_linux() {
     c_ok "unit verifies clean"
   fi
 
-  # 2. Latent ordering cycle, detectable WITHOUT a reboot: if hestia is wanted by
-  #    default.target but absent from its After=, systemd's loop-avoidance already
-  #    fired, meaning a bridging unit can get its start job deleted at next boot.
-  #    Match whole space-delimited tokens: a bare `grep hestia.service` also hits
-  #    a unit merely named like it (myhestia.service).
+  # 2a. On-disk check: the dormant charge. Works with NO user bus at all, which
+  #     matters because this probe gets run from headless mesh sessions where
+  #     `systemctl --user` reaches nothing. This is the only honest witness there
+  #     (HUB and sprout both hit exactly that, 2026-07-24/25).
+  local unit_file="$HOME/.config/systemd/user/hestia.service"
+  local line_present=no
+  if [ -f "$unit_file" ] && grep -qE '^[[:space:]]*After=([^#]*[[:space:]])?default\.target([[:space:]]|$)' "$unit_file"; then
+    line_present=yes
+    c_warn "ORDERING-CYCLE LINE PRESENT on disk: $unit_file declares After=default.target"
+    c_warn "  Fix: sed -i '/^After=default\\.target\$/d' $unit_file && systemctl --user daemon-reload"
+  else
+    c_ok "no After=default.target on disk"
+  fi
+
+  # 2b. Is the charge ARMED? The line alone does not detonate -- it needs a third
+  #     unit bridging default.target -> watcher -> hestia -> default.target. A box
+  #     with the line but no bridge is dormant (sprout); a box with both is one
+  #     reboot from silently losing that watcher (cbp was).
+  local bridges
+  bridges=$(grep -lE '^[[:space:]]*After=([^#]*[[:space:]])?hestia\.service([[:space:]]|$)' \
+              "$HOME"/.config/systemd/user/*.service 2>/dev/null || true)
+  if [ "$line_present" = yes ]; then
+    if [ -n "$bridges" ]; then
+      c_warn "  ARMED: these units bridge the loop and can have their start job deleted at next boot:"
+      printf '    %s\n' $bridges
+    else
+      c_warn "  dormant: no unit currently declares After=hestia.service, so nothing closes the loop yet."
+      c_warn "  Still fix it -- adding any such watcher later arms it silently."
+    fi
+  fi
+
+  # 2c. Runtime fingerprint, via the live user manager: wanted-but-not-ordered
+  #     means loop-avoidance already fired. Corroborates 2a from the manager's
+  #     own graph -- but ONLY if the bus is actually reachable. With no user bus
+  #     `systemctl --user show` returns empty and the naive test reads "clean" on
+  #     a box that is in fact latent. Empty output is UNKNOWN, never CLEAN.
+  #     Match whole space-delimited tokens: a bare `grep hestia.service` also
+  #     hits a unit merely named like it (myhestia.service).
   local wants after
   wants=" $(systemctl --user show default.target -p Wants --value 2>/dev/null || true) "
   after=" $(systemctl --user show default.target -p After --value 2>/dev/null || true) "
-  if [ "${wants#* hestia.service }" != "$wants" ] && [ "${after#* hestia.service }" = "$after" ]; then
-    c_warn "LATENT ORDERING CYCLE: hestia.service is wanted by default.target but not ordered after it."
-    c_warn "  A unit with After=hestia.service can have its start job deleted at boot, silently."
-    c_warn "  Fix: remove any 'After=default.target' from ~/.config/systemd/user/hestia.service, then daemon-reload."
+  if [ -z "${wants// /}" ] && [ -z "${after// /}" ]; then
+    c_warn "runtime fingerprint UNKNOWN: no reachable user bus (empty systemctl output)."
+    c_warn "  Not a clean result -- the on-disk check above is the authoritative one here."
+    c_warn "  To query the real manager: export XDG_RUNTIME_DIR=/run/user/\$(id -u) and re-run."
+  elif [ "${wants#* hestia.service }" != "$wants" ] && [ "${after#* hestia.service }" = "$after" ]; then
+    c_warn "LATENT ORDERING CYCLE (runtime): hestia.service is wanted by default.target but not ordered after it."
+    c_warn "  systemd's loop-avoidance has already fired; a bridging unit can lose its start job at boot."
   else
-    c_ok "no latent ordering cycle"
+    c_ok "runtime fingerprint clean (bus reachable, ordering acyclic)"
   fi
 
   # 3. Cycles are logged against the target and the DELETED victim, never against
