@@ -2091,17 +2091,37 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
         return Ok(serde_json::to_string(&resolved).unwrap_or("null".into()));
     }
     if uri == "hestia://session/siblings" {
-        // The read side of LOCAL session coordination: every session currently connected on this
-        // machine, so a caller (or the hub-watch launcher via the CLI seam) can see what its siblings
-        // are before it acts — the manual "is another session live on this?" check, automated. This is
-        // the local plane only (HUB caution: never conflate with the fleet member-mesh). `host_agent`
-        // (+version) is the agent_family/model, so Claude / Kimi / a future local model are already
-        // distinguishable with no schema change. Read-only coordination metadata; no consequential act.
-        let mut siblings: Vec<_> = s.sessions.values().cloned().collect();
-        siblings.sort_by_key(|sess| sess.connected_at);
+        // The read side of LOCAL session coordination: every session connected on this machine, so a
+        // caller (or the hub-watch launcher via the CLI seam) can see its siblings before acting — the
+        // manual "is another session live on this?" check, automated. Local plane only (HUB caution:
+        // never the fleet member-mesh). `host_agent` (+version) is the agent_family/model, so Claude /
+        // Kimi / a future local model are distinguishable with no schema change.
+        //
+        // Coordination needs a NAME, not a CAPABILITY. The raw `session_id` (and `soft_lct`) is a bearer
+        // token in the vault path — `hestia_vault_get` scopes credential reads to a caller-supplied
+        // `?session_id=` — so enumerating them here would let any local plugin lift a peer's session_id
+        // and read creds scoped to it (Legion second-caller finding, 2026-07-24; my first-caller RWOA
+        // audit missed it — the two-caller discipline caught it). So siblings exposes ONLY
+        // coordination-safe metadata and REDACTS the bearer fields. `session/own` still returns the full
+        // session: you may hold your OWN capability, never a peer's.
+        let mut sessions: Vec<&Session> = s.sessions.values().collect();
+        sessions.sort_by_key(|sess| sess.connected_at);
+        let safe: Vec<Value> = sessions
+            .iter()
+            .map(|sess| {
+                json!({
+                    "host_agent": sess.host_agent,
+                    "host_agent_version": sess.host_agent_version,
+                    "role": sess.constellation_role,
+                    "connected_at": sess.connected_at,
+                    // session_id + soft_lct deliberately OMITTED (bearer tokens). A coordination-safe
+                    // per-session name arrives with the connect-idempotency fix (host_session_id).
+                })
+            })
+            .collect();
         return Ok(serde_json::to_string(&json!({
-            "count": siblings.len(),
-            "sessions": siblings,
+            "count": safe.len(),
+            "sessions": safe,
         }))
         .unwrap_or("{}".into()));
     }
@@ -3948,10 +3968,10 @@ mod tests {
     }
 
     /// The read side of local coordination: siblings lists every connected session (heterogeneous by
-    /// host_agent), sorted by connect time — the primitive that automates the manual "is a sibling live
-    /// on this?" check that prevented a self-collision while building it.
+    /// host_agent) but exposes a NAME, not a CAPABILITY — the bearer-bearing session_id/soft_lct are
+    /// redacted (Legion second-caller finding: session_id is a bearer token in the vault path).
     #[tokio::test]
-    async fn session_siblings_lists_all_connected_sessions() {
+    async fn session_siblings_lists_sessions_but_redacts_bearer_ids() {
         let (_dir, shared) = make_shared_state();
         let body = read_resource_body(&shared, "hestia://session/siblings").await.unwrap();
         assert!(body.contains("\"count\":0"), "empty when no sessions: {body}");
@@ -3964,10 +3984,18 @@ mod tests {
         };
         let body = read_resource_body(&shared, "hestia://session/siblings").await.unwrap();
         assert!(body.contains("\"count\":2"), "counts both: {body}");
+        // coordination-safe metadata IS present
         assert!(
-            body.contains(&a.to_string()) && body.contains(&b.to_string()),
-            "lists both sessions: {body}"
+            body.contains("role:constellation:interactive")
+                && body.contains("role:constellation:mesh-worker"),
+            "roles listed: {body}"
         );
+        // bearer tokens are REDACTED — the exact leak the second caller caught
+        assert!(
+            !body.contains(&a.to_string()) && !body.contains(&b.to_string()),
+            "session_id (a vault-path bearer token) must NOT be enumerated: {body}"
+        );
+        assert!(!body.contains("lct:test"), "soft_lct (bearer) must be redacted: {body}");
     }
 
     #[tokio::test]
