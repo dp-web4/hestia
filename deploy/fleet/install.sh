@@ -92,8 +92,21 @@ step_vault() {
   mkdir -p "$HESTIA_HOME"
   chmod 700 "$HESTIA_HOME"
   local pp="$HESTIA_HOME/.passphrase"
+  # Read the vault state BEFORE minting, so the mint can be honest about what it
+  # is about to do. The bad case: a vault sealed out-of-band (its passphrase held
+  # somewhere other than this file -- e.g. inline in a launchd plist, McNugget
+  # 2026-07-25) plus a missing .passphrase. We then mint a FRESH secret, find
+  # vault.enc already present, leave it alone, and hand the daemon a key that
+  # does not open it. Two green lines, an unopenable vault, nothing said so.
+  local vault_pre=no
+  [ -f "$HESTIA_HOME/vault.enc" ] && vault_pre=yes
   if [ -f "$pp" ] && [ -s "$pp" ]; then
     c_dim "passphrase exists; leaving alone"
+  elif [ "$vault_pre" = yes ]; then
+    c_warn "VAULT/PASSPHRASE MISMATCH: $HESTIA_HOME/vault.enc exists but $pp does not."
+    c_warn "  This vault was sealed with a secret held somewhere else. A generated one will NOT open it."
+    c_warn "  Recover the real passphrase first (check launchd plists / systemd units for an inline"
+    c_warn "  HESTIA_PASSPHRASE), write it to $pp mode 600, and re-run. Skipping generation."
   else
     if command -v openssl >/dev/null 2>&1; then
       openssl rand -base64 30 | tr -d '\n' > "$pp"
@@ -313,6 +326,124 @@ PLIST
   launchctl unload "$plist" 2>/dev/null || true
   launchctl load "$plist"
   c_ok "loaded $plist"
+
+  verify_service_macos "$plist" "io.hestia.tools"
+}
+
+# launchd's PID for a label, or empty. `launchctl list <label>` prints a plist-ish
+# dict and exits non-zero when the label is not loaded at all.
+macos_agent_pid() {
+  launchctl list "$1" 2>/dev/null | sed -n 's/.*"PID"[[:space:]]*=[[:space:]]*\([0-9]*\);.*/\1/p' | head -1 || true
+}
+
+# The macOS half of verify_service_linux. Same defect class, different platform,
+# and the platform is strictly worse at reporting it (mcnugget, forum 2026-07-25):
+#   - `launchctl load` succeeds on a syntactically valid plist and says NOTHING
+#     about whether the process runs. `c_ok "loaded"` above is not evidence.
+#   - there is no `failed` state to check. KeepAlive respawns forever by design;
+#     ThrottleInterval bounds the rate, not the count. So "is it enabled" is
+#     unanswerable-by-construction here -- the only honest probe is LIVENESS OVER
+#     TIME (same pid across two samples), which is what probe 4 does.
+#   - observed instance on the one Mac in the fleet: `com.dp-web4.supervisor`,
+#     loaded, no pid, LastExitStatus 78 (EX_CONFIG), silent about all of it.
+# Same style discipline as the Linux side: every probe `|| true`, capture first
+# and test the string second, warn but never gate.
+verify_service_macos() {
+  local plist="$1" label="$2"
+  c_hdr "post-install verification"
+
+  # 1. The plist as written must parse. Analogue of `systemd-analyze verify`:
+  #    launchctl will refuse a malformed file, but say so unhelpfully.
+  local lint
+  lint=$(plutil -lint "$plist" 2>&1 || true)
+  case "$lint" in
+    *OK*) c_ok "plist lints clean" ;;
+    *)    c_warn "plutil -lint reported:"; printf '%s\n' "$lint" ;;
+  esac
+
+  # 2. Label drift: is some OTHER agent already serving hestia under a different
+  #    label? The repo template is `io.hestia.tools`; McNugget has been running
+  #    `com.web4.hestia.daemon` since 2026-05-21 and ROSTER.md certifies THAT one.
+  #    Installing here does not replace it -- it adds a second agent contending for
+  #    the same port, and whichever loses is invisible in both.
+  #    Match FILE-scope, not line-scope: `hestia serve` is one line in our template
+  #    but two separate <string> elements in a hand-written plist (McNugget's is
+  #    /opt/homebrew/bin/hestia + serve as distinct array entries), and a
+  #    line-anchored regex reads CLEAN on precisely the drift it exists to catch.
+  #    Verified: a line-scoped version of this probe missed McNugget's shape.
+  local others=""
+  local cand
+  for cand in "$HOME"/Library/LaunchAgents/*.plist; do
+    [ -f "$cand" ] || continue
+    [ "$cand" = "$plist" ] && continue
+    grep -q 'hestia' "$cand" 2>/dev/null || continue
+    grep -q 'serve'  "$cand" 2>/dev/null || continue
+    others="${others:+$others
+}$cand"
+  done
+  if [ -n "$others" ]; then
+    c_warn "LABEL DRIFT: other LaunchAgents also run 'hestia serve':"
+    # read-loop, not `printf %s\\n $var`: macOS paths have spaces in them.
+    printf '%s\n' "$others" | while IFS= read -r f; do c_warn "    $f"; done
+    c_warn "  Two agents, one bind address. Unload the stale one before trusting this install:"
+    c_warn "    launchctl unload <plist>   # then confirm only one pid answers on ${HESTIA_BIND}"
+  else
+    c_ok "no competing hestia agent in ~/Library/LaunchAgents"
+  fi
+
+  # 3. Loaded WITH a pid, not merely loaded. This is the exit-78 shape.
+  local pid1
+  pid1=$(macos_agent_pid "$label")
+  if [ -z "$pid1" ]; then
+    local st
+    st=$(launchctl list "$label" 2>&1 | sed -n 's/.*"LastExitStatus"[[:space:]]*=[[:space:]]*\([0-9-]*\);.*/\1/p' | head -1 || true)
+    c_warn "$label is NOT running (no pid). LastExitStatus: ${st:-<label not loaded>}"
+    c_warn "  'loaded' alone does not mean it is running; see: tail ${HESTIA_HOME}/hestia.err"
+    [ "$st" = "78" ] && c_warn "  78 = EX_CONFIG: the plist loaded but the program rejected its configuration."
+    return 0
+  fi
+  c_ok "$label is running (pid $pid1)"
+
+  # 4. Liveness over time. A crash loop under KeepAlive presents as a HEALTHY
+  #    single sample -- there is always a pid, just never the same one. One extra
+  #    sample is the whole difference between "running" and "restarting forever".
+  sleep 4
+  local pid2
+  pid2=$(macos_agent_pid "$label")
+  if [ -z "$pid2" ]; then
+    c_warn "RESPAWN/EXIT: pid $pid1 is gone 4s later and nothing replaced it."
+  elif [ "$pid2" != "$pid1" ]; then
+    c_warn "CRASH LOOP: pid changed $pid1 -> $pid2 within 4s. launchd has no 'failed' state,"
+    c_warn "  so this can respawn indefinitely while every 'is it loaded' check reads green."
+    c_warn "  See: tail ${HESTIA_HOME}/hestia.err"
+  else
+    c_ok "stable across two samples (pid $pid1 held 4s)"
+  fi
+
+  # 5. Secret posture of the LaunchAgents dir. READ-ONLY -- reports, never edits:
+  #    relocating a vault passphrase is an operator action, not an installer one.
+  #    The template deliberately reads the secret from a 600 file and documents
+  #    that as the consumer-tier boundary; a plist carrying the literal inverts it,
+  #    because plists are world-readable by default and get copied around.
+  local inline
+  inline=$(grep -lE '<key>HESTIA_PASSPHRASE</key>' "$HOME"/Library/LaunchAgents/*.plist 2>/dev/null || true)
+  if [ -n "$inline" ]; then
+    c_warn "INLINE VAULT SECRET: these plists carry HESTIA_PASSPHRASE as a literal:"
+    printf '%s\n' "$inline" | while IFS= read -r f; do
+      c_warn "    $f (mode $(stat -f '%Lp' "$f" 2>/dev/null || echo '?'))"
+    done
+    c_warn "  The documented boundary is \$HOME/.hestia/.passphrase at mode 600. Operator call --"
+    c_warn "  moving it touches the key that opens the vault; do it deliberately, not from a script."
+  fi
+  local uncond
+  uncond=$(grep -lE '<key>KeepAlive</key>[[:space:]]*<true[[:space:]]*/>' \
+             "$HOME"/Library/LaunchAgents/*.plist 2>/dev/null || true)
+  if [ -n "$uncond" ]; then
+    c_warn "UNCONDITIONAL KeepAlive in:"
+    printf '%s\n' "$uncond" | while IFS= read -r f; do c_warn "    $f"; done
+    c_warn "  Respawns even after a clean exit, so a deliberate shutdown is indistinguishable"
+    c_warn "  from a crash loop. Prefer KeepAlive{SuccessfulExit:false}, as this template does."
+  fi
 }
 
 step_claude_hooks() {
