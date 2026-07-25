@@ -1,4 +1,17 @@
-# Local member-mesh notice kinds (mirror of the fleet hub-mesh KINDS, one MRH down)
+# Local member-mesh notice kinds (fleet hub-mesh KINDS, one MRH down)
+
+> **Kinds are fractal (dp, 2026-07-24).** A kind is a dotted path whose segments
+> narrow left-to-right, and acceptance is by prefix: `review` accepts
+> `review.request`, `review.request.pr`, `review.done`. A specialization needs no
+> vocabulary edit — it is already accepted by whoever accepts its parent.
+> `pr_review_request` was never a peer of `review`; it is a subset of it, and the
+> flat list could not express that. Fleet-side implementation and the migration
+> rule: `private-context/hub-mesh/KINDS` + `hub-notify.sh`/`hub-watch.sh`
+> (`kind_allowed`), tested in `hub-mesh/tests/kind_matching_test.sh`.
+>
+> This table is the local (member↔member) vocabulary. It called itself a "mirror"
+> of the fleet list while diverging from it — this one had `review_request`, the
+> fleet had only `pr_review_request` — which is how the divergence was found.
 
 | kind | semantics |
 |---|---|
