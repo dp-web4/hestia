@@ -1,0 +1,27 @@
+{
+  "_comment": "UPSTREAM TOOL INVENTORY for the AWS Kiro CLI (Amazon Q Developer CLI heritage). This file is a DRIFT TRIPWIRE, not configuration: tests/test_tool_inventory.py asserts every name here classifies to the stated class under the gate's VOCAB, and that none of them classify as 'unknown'. When upstream adds a tool, add it here with an explicit class; until then the gate treats it as UNKNOWN and gates it hardest, so the failure mode is over-block rather than a silent exfil channel (CBP review, thread harness-lane-split, 2026-07-24).",
+  "_provenance": "DOCUMENTED-tier throughout. Kiro is a closed AWS product; these names come from Kiro/Amazon-Q documentation, NOT from source and NOT from a live install. Live confirmation belongs on an onboarding rig with an installed kiro CLI. Because the gate is fail-closed, a wrong name here over-blocks rather than admitting a call.",
+  "_classes": "read = local read, may skip Gate-2 | write = mutates local files | exec = runs a command | egress = touches the network or a cloud API | mcp = MCP-family, argument shape is the server's",
+  "tools": [
+    { "name": "fs_read",             "class": "read",   "note": "Amazon Q's reader; tool_input key is `path`" },
+    { "name": "read",                "class": "read",   "note": "Claude-lineage superset - Kiro's Claude heritage may surface it" },
+    { "name": "read_file",           "class": "read",   "note": "Claude-lineage superset" },
+    { "name": "glob",                "class": "read" },
+    { "name": "grep",                "class": "read" },
+    { "name": "search_file_content", "class": "read" },
+    { "name": "list_directory",      "class": "read" },
+
+    { "name": "fs_write",            "class": "write",  "note": "Amazon Q's writer; tool_input key is `path`" },
+    { "name": "write",               "class": "write" },
+    { "name": "edit",                "class": "write" },
+
+    { "name": "execute_bash",        "class": "exec",   "note": "Amazon Q's shell; NOT Claude's Bash - an untranslated handoff gives the governor target=None" },
+    { "name": "execute_cmd",         "class": "exec" },
+
+    { "name": "use_aws",             "class": "egress", "note": "An AWS API call: cloud read OR write OR exfil. Its parameter set is NOT fully documented - `profile_name` was missing from the original key whitelist (CBP KIRO-4), which is why every string leaf is now swept instead of a guessed key list." },
+
+    { "name": "read_mcp_resource",   "class": "mcp" },
+    { "name": "list_mcp_resources",  "class": "mcp" }
+  ],
+  "_event_field": "Kiro's stdin event-name field is DOCUMENTED as `hook_event_name` and is UNVERIFIED. Crush is the existence proof that this varies between engines. gate_core.should_gate() accepts `hook_event_name` or `event`, and gates any envelope carrying a tool_name even when neither is present, because exiting 0 on an unrecognized envelope disarms the gate on every call (CBP KIRO-3)."
+}

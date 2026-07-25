@@ -5,7 +5,8 @@
       {
         "matcher": ".*",
         "command": "HESTIA_WORKSPACE=/mnt/c/projects/ai-agents python3 /mnt/c/projects/ai-agents/hestia/plugins/kiro_cli/hooks/pre_tool_use.py",
-        "timeout_ms": 15000
+        "_timeout_note": "MILLISECONDS, at the engine default/maximum of 30s. Do NOT lower this. Kiro fails open on a hook timeout (the tool RUNS), so a shorter timeout strictly increases fail-open exposure and buys no safety - and the 9p cold-load warned about above is exactly the case that blows it. This was 15000 and is now 30000.",
+        "timeout_ms": 30000
       }
     ],
     "PostToolUse": [

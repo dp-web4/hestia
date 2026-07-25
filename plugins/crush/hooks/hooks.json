@@ -7,7 +7,8 @@
         "name": "hestia-gate",
         "matcher": ".*",
         "command": "HESTIA_WORKSPACE=/mnt/c/projects/ai-agents python3 /mnt/c/projects/ai-agents/hestia/plugins/crush/hooks/pre_tool_use.py",
-        "timeout": 15
+        "_timeout_note": "SECONDS, at the engine default/maximum of 30. Do NOT lower this. Crush treats a hook timeout as DecisionNone = the tool RUNS, so a shorter timeout strictly increases fail-open exposure and buys no safety - and the 9p cold-load warned about above is exactly the case that blows it. This was 15 and is now 30.",
+        "timeout": 30
       }
     ]
   }

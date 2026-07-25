@@ -1,0 +1,39 @@
+{
+  "_comment": "UPSTREAM TOOL INVENTORY for charmbracelet/crush. This file is a DRIFT TRIPWIRE, not configuration: tests/test_tool_inventory.py asserts every name here classifies to the stated class under the gate's VOCAB, and that none of them classify as 'unknown'. A shared lib cannot catch a tool the adapter never heard of - that is how web_fetch, web_search, sourcegraph, read_mcp_resource and list_mcp_resources ended up registered upstream and swept by nothing (CBP review, thread harness-lane-split, 2026-07-24). When upstream adds a tool, add it here with an explicit class; until then the gate treats it as UNKNOWN and gates it hardest, so the failure mode is over-block rather than a silent exfil channel.",
+  "_provenance": "Names carrying a source reference are source-verified against charmbracelet/crush@main. Names without one are from the adapter's original documented-tier survey and are NOT source-verified - they are listed so their class is at least explicit. Live confirmation belongs on an onboarding rig with a real crush install.",
+  "_classes": "read = local read, may skip Gate-2 | write = mutates local files | exec = runs a command | egress = touches the network | mcp = MCP-family, argument shape is the server's",
+  "tools": [
+    { "name": "view",                 "class": "read",   "source": "internal/agent/tools/view.go" },
+    { "name": "ls",                   "class": "read",   "source": "internal/agent/tools/ls.go" },
+    { "name": "glob",                 "class": "read",   "source": "internal/agent/tools/glob.go" },
+    { "name": "grep",                 "class": "read",   "source": "internal/agent/tools/grep.go" },
+    { "name": "diagnostics",          "class": "read" },
+    { "name": "crush_info",           "class": "read" },
+    { "name": "crush_logs",           "class": "read" },
+    { "name": "job_output",           "class": "read" },
+    { "name": "lsp_diagnostics",      "class": "read" },
+    { "name": "lsp_references",       "class": "read" },
+    { "name": "lsp_hover",            "class": "read" },
+    { "name": "lsp_document_symbols", "class": "read" },
+    { "name": "lsp_workspace_symbols","class": "read" },
+    { "name": "lsp_definition",       "class": "read" },
+
+    { "name": "edit",                 "class": "write",  "source": "internal/agent/tools/edit.go" },
+    { "name": "write",                "class": "write",  "source": "internal/agent/tools/write.go" },
+    { "name": "multiedit",            "class": "write",  "source": "internal/agent/tools/multiedit.go" },
+    { "name": "lsp_rename",           "class": "write",  "note": "MUTATES source despite the lsp_ reader prefix (CBP CRUSH-4)" },
+    { "name": "lsp_replace_symbol",   "class": "write",  "note": "MUTATES source despite the lsp_ reader prefix (CBP CRUSH-4)" },
+
+    { "name": "bash",                 "class": "exec",   "source": "internal/agent/tools/bash.go" },
+
+    { "name": "fetch",                "class": "egress" },
+    { "name": "download",             "class": "egress" },
+    { "name": "web_fetch",            "class": "egress", "source": "internal/agent/tools/fetch_types.go:7  WebFetchToolName" },
+    { "name": "web_search",           "class": "egress", "source": "internal/agent/tools/fetch_types.go:10 WebSearchToolName" },
+    { "name": "sourcegraph",          "class": "egress", "source": "internal/agent/tools/sourcegraph.go" },
+
+    { "name": "read_mcp_resource",    "class": "mcp",    "note": "MCP-family but the name starts read_, so a bare mcp-prefix sweep missed it (CBP CRUSH-2)" },
+    { "name": "list_mcp_resources",   "class": "mcp",    "note": "MCP-family but the name starts list_, so a bare mcp-prefix sweep missed it (CBP CRUSH-2)" }
+  ],
+  "_mcp_naming": "Dynamic MCP tools are built as mcp_<server>_<tool> (SINGLE underscore) at internal/agent/tools/mcp-tools.go:59, NOT the Claude mcp__<server>__<tool>. gate_core.normalize_mcp_name() translates at the governor boundary (CBP CRUSH-3)."
+}

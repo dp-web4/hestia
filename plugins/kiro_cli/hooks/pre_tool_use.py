@@ -4,8 +4,7 @@
 Kiro is CLAUDE-CODE LINEAGE in its gate semantics (events PreToolUse/PostToolUse/UserPromptSubmit/
 Stop, `exit 2` blocks with stderr-as-reason, a `matcher` regex scopes a hook, engine FAILS OPEN) but
 carries AMAZON Q DEVELOPER CLI heritage in its tool vocabulary - the builtin tools are `fs_read`,
-`fs_write`, `execute_bash`, `use_aws`, NOT Claude's Read/Write/Bash. So this gate is closer to the
-codex/kimi PreToolUse gate than to gemini's, with ONE gemini-borrowed necessity: a tool-name
+`fs_write`, `execute_bash`, `use_aws`, NOT Claude's Read/Write/Bash. So the gate needs a tool-name
 translator, because the society-safety governor (plugins/claude-code) dispatches on Claude names.
 
 Contract (agent-atlas talk-to/kiro_cli, DOCUMENTED tier - Kiro is a closed AWS product, not yet fired
@@ -18,14 +17,30 @@ live by this registry; sources: kiro.dev/docs/hooks, /docs/cli/hooks, custom-age
   => FAIL-CLOSED BY CONSTRUCTION: only ever exit 0 (explicit confirmed allow) or 2 (deny, with text).
      Never exit on an odd code and never rely on a crash to deny - an uncaught Python exception exits 1,
      which is ALLOW here (the exact gemini live-repro that ran `rm -rf /`). main() wraps the gate in a
-     top-level deny-on-exception so a crash fails CLOSED. This is the load-bearing lesson from the
-     gemini adapter-tier pass, carried in from the start rather than found in review.
+     top-level deny-on-exception so a crash fails CLOSED.
+
+THE EVENT-FIELD NAME IS A GUESS, AND A WRONG GUESS DISARMS THE GATE ON EVERY CALL. Kiro's stdin
+contract is documented-tier and unverified, and Crush is the existence proof that this field name
+varies between engines (Crush uses `event`, not `hook_event_name`). The old code checked
+`hook_event_name` only and exited 0 when it did not match - so on an engine that names the field
+anything else, every tool call sailed through unexamined. gc.should_gate() now accepts either key,
+and - stronger - gates an envelope carrying a `tool_name` even when no recognized event key is
+present at all. Exiting 0 on an unrecognized envelope is the same class of fail-open as exiting 0 on
+an unrecognized tool. (CBP KIRO-3, thread `harness-lane-split`.)
+
+ENFORCEMENT LIVES IN `plugins/lib/gate_core.py`, not here. This file is the *vocabulary* plus Kiro's
+engine semantics. Gate-1a, command-scope and lineage translation are shared with every other adapter
+so a fix lands once - the review that prompted this found KIRO-1 and KIRO-2 to be holes the gemini
+adapter had ALREADY closed, re-introduced by copying the logic instead of importing it.
+
+UNKNOWN TOOLS ARE MAXIMALLY GATED. Anything absent from the tables below gets every string leaf swept
+for secrets, every non-URL leaf command-scoped, and the governor's verdict required. Kiro is a closed
+AWS product on a moving release train; drift is the expected case, and its failure mode is now
+over-block rather than a silent channel.
 
 FIDELITY: documented-tier, NOT live-verified. The verified pass belongs on CBP's onboarding rig (an
-installed `kiro` CLI). Because the gate is fail-closed, any wrong field-name/tool-name guess
-over-blocks (safe), never silently allows. Kiro also supports MCP; the MCP transport arg shape is not
-documented in the reviewed sources, so MCP args are swept as free-text string-leaves (Gate-1a) and the
-call is treated as consequential (Gate-2) - covered conservatively, flagged for live confirmation.
+installed `kiro` CLI). Because the gate is fail-closed, a wrong field-name/tool-name guess over-blocks
+(safe), never silently allows.
 
 Config (env-overridable):
   HESTIA_WORKSPACE       root holding the granted repos          (default: ~/ai-workspace)
@@ -37,18 +52,22 @@ Config (env-overridable):
 """
 import json
 import os
-import re
 import sys
 import subprocess
 
-# Shared realpath-containment lib - the one implementation of Gate-1b across every adapter (../,
-# symlink, absolute escapes that string-prefix logic cannot see). Falls back to the inline check if
-# the lib is absent (partial checkout), which still denies the bare-root case.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "lib"))
+# A missing lib must fail CLOSED. An ImportError at module scope raises BEFORE main()'s
+# deny-on-exception wrapper can catch it, and an uncaught exception exits 1 - which Kiro treats as a
+# non-fatal warning and RUNS THE TOOL. So the import is guarded here, at the only place it can be.
 try:
+    import gate_core as gc  # noqa: E402  the shared Gate-1 enforcement core
     from path_scope import check_paths as _shared_check_paths  # type: ignore
-except Exception:
-    _shared_check_paths = None
+except BaseException as _exc:  # pragma: no cover - exercised by tests/test_fail_closed.sh
+    sys.stderr.write(
+        f"hestia: deny [gate] - the shared gate library is unavailable "
+        f"({type(_exc).__name__}: {str(_exc)[:120]}); the gate cannot vouch for this call, "
+        f"failing closed.\n")
+    sys.exit(2)
 
 WORKSPACE = os.environ.get("HESTIA_WORKSPACE", os.path.expanduser("~/ai-workspace"))
 IDENTITY = os.path.expanduser(
@@ -57,19 +76,49 @@ CLAUDE_PRE = os.environ.get(
     "HESTIA_SOCIETY_GATE",
     os.path.join(WORKSPACE, "hestia/plugins/claude-code/hooks/pre_tool_use.py"))
 
-FORBIDDEN = ("/.ssh", ".env", "credentials", "id_rsa", "id_ed25519", "/.git/config", "secrets") + tuple(
+FORBIDDEN = gc.FORBIDDEN_DEFAULT + tuple(
     t.strip() for t in os.environ.get("HESTIA_FORBIDDEN_EXTRA", "").split(",") if t.strip())
 
-# Kiro/Amazon-Q LOCAL read-class tools (no write, no exec, no network/cloud) - may skip Gate-2.
-# `fs_read` is Amazon Q's reader; the Claude-lineage names ride along as a defensive superset since
-# Kiro's Claude heritage may surface them under some configs.
-READ_CLASS = {"fs_read", "read", "read_file", "glob", "grep", "search_file_content", "list_directory"}
-
-# Egress/cloud tools: `use_aws` makes an AWS API call - a cloud read OR write OR exfil channel, the
-# irreversible direction. It is NOT a local filesystem write, so Gate-1b must not realpath it; but it
-# MUST meet the governor (Gate-2) and have its arguments swept for secrets (Gate-1a).
-EGRESS_CLASS = {"use_aws"}
 KIRO_HOME = os.path.expanduser("~/.kiro")
+# `/tmp` and `/var/tmp` are blanket in-scope roots. DELIBERATE, not inherited: they are the scratch
+# space and the cross-member hand-off channel. Flagged in review; keeping it as a decision.
+TMP_ROOTS = ["/tmp", "/var/tmp"]
+
+# ---------------------------------------------------------------------------
+# VOCABULARY - the only per-engine part. Amazon Q Developer CLI builtin tools.
+# Anything NOT listed here classifies as UNKNOWN and is gated hardest.
+# ---------------------------------------------------------------------------
+VOCAB = gc.Vocabulary(
+    # LOCAL read-class (no write, no exec, no network/cloud) - the ONLY class that may skip Gate-2.
+    # `fs_read` is Amazon Q's reader; the Claude-lineage names ride along as a defensive superset
+    # since Kiro's Claude heritage may surface them under some configs.
+    read=("fs_read", "read", "read_file", "glob", "grep", "search_file_content", "list_directory"),
+    write=("fs_write", "write", "edit"),
+    exec_=("execute_bash", "execute_cmd"),
+    # `use_aws` makes an AWS API call - a cloud read OR write OR exfil channel, the irreversible
+    # direction. NOT a local filesystem write (Gate-1b must not realpath an ARN), but it MUST meet
+    # the governor and have EVERY argument leaf swept. The old key whitelist
+    # (service_name/operation_name/region/parameters/label) missed `profile_name`, a real use_aws
+    # parameter, so a secret there went unswept. Sweeping leaves rather than guessed keys removes
+    # the schema-guess dependency permanently. (CBP KIRO-4)
+    egress=("use_aws",),
+    mcp_prefixes=("mcp",),
+    mcp_tools=("read_mcp_resource", "list_mcp_resources"),
+    path_keys=("path", "file_path", "absolute_path", "notebook_path", "pattern", "dir_path"),
+    list_path_keys=("paths", "file_paths", "include", "exclude"),
+    uri_keys=("uri", "resource_uri"),
+    cmd_keys=("command",),
+    # Amazon-Q names -> the Claude-lineage names the governor dispatches on. The governor extracts
+    # its target from file_path/path/url/notebook_path and only reads `command` when tool_name is in
+    # {"Bash","Shell"} - Kiro emits `execute_bash`, so an UNTRANSLATED handoff gives the governor
+    # target=None for every command (the same blindness the gemini pass found).
+    lineage_tool={"fs_read": "Read", "fs_write": "Write", "execute_bash": "Shell",
+                  "execute_cmd": "Shell", "use_aws": "Shell", "read": "Read",
+                  "grep": "Grep", "glob": "Glob"},
+    lineage_arg={"absolute_path": "file_path", "dir_path": "path"},
+)
+
+MODE = os.environ.get("HESTIA_KIRO_GATE_MODE", "enforce").lower()
 
 
 def load_in_scope():
@@ -92,136 +141,6 @@ def launch_cwd_repo():
     return []
 
 
-def _strings(v, depth=0):
-    """Every string leaf of an arbitrarily-shaped value (bounded depth) - for use_aws.parameters and
-    MCP argument objects whose shape is the tool's/server's, not ours."""
-    if isinstance(v, str):
-        return [v]
-    if depth > 4:
-        return []
-    if isinstance(v, (list, tuple)):
-        return [s for x in v for s in _strings(x, depth + 1)]
-    if isinstance(v, dict):
-        return [s for x in v.values() for s in _strings(x, depth + 1)]
-    return []
-
-
-def path_targets(tool_input):
-    """File-path args. Amazon-Q: fs_read/fs_write take `path`; search takes `pattern`. Defensive
-    superset covers Claude-lineage names + list forms."""
-    out = []
-    if isinstance(tool_input, dict):
-        for k in ("path", "file_path", "absolute_path", "notebook_path", "pattern", "dir_path"):
-            v = tool_input.get(k)
-            if isinstance(v, str):
-                out.append(v)
-        for k in ("paths", "file_paths", "include", "exclude"):
-            v = tool_input.get(k)
-            if isinstance(v, str):
-                out.append(v)
-            elif isinstance(v, list):
-                out.extend(x for x in v if isinstance(x, str))
-    return out
-
-
-def command_of(tool_input):
-    """execute_bash passes the command string under `command`."""
-    if isinstance(tool_input, dict):
-        c = tool_input.get("command")
-        if isinstance(c, str):
-            return c
-        if isinstance(c, list):
-            return " ".join(str(x) for x in c)
-    return None
-
-
-def cloud_targets(tool, tool_input):
-    """use_aws arguments: service/operation/region/parameters. Swept by Gate-1a for secrets (an AWS
-    call can carry a credential in its parameters, or name a secret resource), NOT by Gate-1b (an AWS
-    ARN/service is not a local repo path). Only for the cloud/egress tool."""
-    if tool.lower() not in EGRESS_CLASS or not isinstance(tool_input, dict):
-        return []
-    out = []
-    for k in ("service_name", "operation_name", "region", "parameters", "label"):
-        out.extend(_strings(tool_input.get(k)))
-    return out
-
-
-def dedupe(seq):
-    seen, out = set(), []
-    for s in seq:
-        if s and s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
-
-
-# Amazon-Q tool names -> the Claude-lineage names the society governor dispatches on. The governor
-# extracts its target from file_path/path/url/notebook_path and only reads `command` when tool_name is
-# in {"Bash","Shell"} - Kiro emits `execute_bash`, so an UNTRANSLATED handoff gives the governor
-# target=None for every command (the same blindness the gemini pass found). Translate at the boundary.
-LINEAGE_TOOL = {"fs_read": "Read", "fs_write": "Write", "execute_bash": "Shell",
-                "use_aws": "Shell", "read": "Read", "grep": "Grep", "glob": "Glob"}
-LINEAGE_ARG = {"absolute_path": "file_path", "dir_path": "path"}
-
-
-def to_claude_lineage(event, tool, tinput):
-    """Re-shape a Kiro PreToolUse event into the Claude-lineage shape the governor understands, lossless
-    (original fields ride under `source_event`)."""
-    out = dict(event)
-    out["tool_name"] = LINEAGE_TOOL.get(tool.lower(), tool)
-    if isinstance(tinput, dict):
-        ti = {LINEAGE_ARG.get(k, k): v for k, v in tinput.items()}
-        # use_aws has no `command`; give the governor a synthetic one so its exec check sees a target
-        # instead of None, and preserve the structured call for witnessing.
-        if tool.lower() == "use_aws" and "command" not in ti:
-            ti["command"] = ("aws " + str(tinput.get("service_name") or "") + " " +
-                             str(tinput.get("operation_name") or "")).strip()
-        out["tool_input"] = ti
-    out["source_event"] = {"lineage": "kiro", "tool_name": tool, "tool_input": tinput}
-    return out
-
-
-def _all_repos():
-    try:
-        return [d for d in os.listdir(WORKSPACE)
-                if os.path.isdir(os.path.join(WORKSPACE, d)) and not d.startswith(".")]
-    except Exception:
-        return []
-
-
-def path_in_scope(path, scopes):
-    p = path.replace("\\", "/")
-    low = p.lower()
-    if KIRO_HOME.lower() in low or "~/.kiro" in low:
-        return True
-    if p.startswith(("/tmp", "/var/tmp")):
-        return True
-    if WORKSPACE in p:
-        rest = p.split(WORKSPACE, 1)[1].lstrip("/")
-    else:
-        rest = p.lstrip("./")
-    seg = rest.split("/", 1)[0] if rest else ""
-    if seg == "":
-        return False
-    return seg in scopes
-
-
-def command_in_scope(cmd, scopes):
-    oos = [r for r in _all_repos() if r not in scopes]
-    for repo in oos:
-        if re.search(rf"""(^|[\s/=:"'(]){re.escape(repo)}(/|[\s"')]|$)""", cmd):
-            return False
-    if WORKSPACE in cmd:
-        after = cmd.split(WORKSPACE, 1)[1]
-        if not any(after.lstrip("/").startswith(s) for s in scopes):
-            return False
-    return True
-
-
-MODE = os.environ.get("HESTIA_KIRO_GATE_MODE", "enforce").lower()
-
-
 def deny(reason, what_to_do, innate=False):
     if innate or MODE == "enforce":
         sys.stderr.write(
@@ -231,6 +150,18 @@ def deny(reason, what_to_do, innate=False):
     sys.stderr.write(f"hestia: warn [scope] - {reason} (warn-rollout: allowed; would block under enforce)\n")
 
 
+def to_lineage(event, tool, tinput):
+    """Kiro-specific addendum to the shared translation: `use_aws` has no `command`, so synthesise
+    one from the structured call - otherwise the governor's exec check sees target=None."""
+    out = gc.to_claude_lineage(event, tool, tinput, VOCAB, lineage_name="kiro")
+    if tool.lower() == "use_aws" and isinstance(out.get("tool_input"), dict) \
+            and "command" not in out["tool_input"]:
+        ti = tinput if isinstance(tinput, dict) else {}
+        out["tool_input"]["command"] = ("aws " + str(ti.get("service_name") or "") + " " +
+                                        str(ti.get("operation_name") or "")).strip()
+    return out
+
+
 def _gate():
     try:
         event = json.loads(sys.stdin.read() or "{}")
@@ -238,51 +169,56 @@ def _gate():
         sys.stderr.write("hestia: deny [gate] - could not parse the tool event; failing closed.\n")
         sys.exit(2)
 
-    if event.get("hook_event_name") != "PreToolUse":
-        sys.exit(0)  # not our event
+    # Accepts `hook_event_name` OR `event`, and gates an unrecognized envelope that still carries a
+    # tool_name rather than exiting 0 on it. See the module docstring - this is the one place the
+    # gate could silently disarm on every call.
+    if not gc.should_gate(event):
+        sys.exit(0)
 
     raw_tool = event.get("tool_name")
     tool = raw_tool if isinstance(raw_tool, str) and raw_tool else "?"
     tinput = event.get("tool_input") or {}
     cwd = event.get("cwd") or os.environ.get("HESTIA_KIRO_LAUNCH_CWD") or os.getcwd()
-    scopes = dedupe(load_in_scope() + launch_cwd_repo())
-    paths = path_targets(tinput)
-    cmd = command_of(tinput)
-    cloud = cloud_targets(tool, tinput)  # use_aws args: Gate-1a only
+    scopes = gc.dedupe(load_in_scope() + launch_cwd_repo())
 
-    # Gate 1a - egress/secret innate invariant. Sweeps every channel a secret can leave by: file paths,
-    # the shell command, use_aws arguments, and (conservatively) all string leaves for MCP-shaped calls.
-    mcp_like = [] if (paths or cmd or cloud) else _strings(tinput)  # unknown-shape call -> sweep it
-    for blob in paths + cloud + mcp_like + ([cmd] if cmd else []):
-        if any(f in blob.lower() for f in FORBIDDEN):
+    p = gc.plan(tool, tinput, VOCAB)
+
+    # Gate 1a - egress/secret innate invariant. Sweeps every channel a secret can leave by. For an
+    # MCP/unknown/egress call that is EVERY string leaf - the old code made this an else-branch
+    # (`[] if (paths or cmd or cloud) else _strings(...)`), so one recognized key disarmed the sweep
+    # for the whole rest of the object. It is a union, never an else. (CBP KIRO-1)
+    for blob in p.gate1a:
+        hit = gc.forbidden_hit(blob, FORBIDDEN)
+        if hit:
             deny(f"'{tool}' names a forbidden target (secret/credential or out-of-MRH private repo)",
                  "There is no in-scope way to do this; it is not yours to touch.", innate=True)
 
-    # Gate 1b - MRH scope. File paths -> path-scope; shell command -> command-scope. Cloud/egress args
-    # are NOT realpath-scoped (an AWS service is not a local path).
-    if paths:
-        if _shared_check_paths is not None:
-            roots = [os.path.join(WORKSPACE, s) for s in scopes] + [KIRO_HOME, "/tmp", "/var/tmp"]
-            is_write = tool.lower() not in READ_CLASS and tool.lower() not in EGRESS_CLASS
-            res = _shared_check_paths(paths, roots, cwd, for_write=is_write)
-            if not res.allowed:
-                deny(f"'{tool}': {res.reason}",
-                     "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
-        else:
-            for p in paths:
-                if not path_in_scope(p, scopes):
-                    deny(f"'{tool}' targets '{p[:60]}' outside your granted scope ({'+'.join(scopes)})",
-                         "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
-    if cmd is not None and not command_in_scope(cmd, scopes):
-        deny(f"'{tool}' command reaches outside your granted scope ({'+'.join(scopes)})",
-             "Scope the command to a granted repo, or if legitimately needed, request it (request_scope).")
+    # Gate 1b - MRH scope. Local paths -> realpath containment. Cloud/network endpoints are NOT
+    # realpath-scoped (an AWS ARN is not a local path); gc.as_local_path() has already dropped them.
+    if p.paths:
+        roots = [os.path.join(WORKSPACE, s) for s in scopes] + [KIRO_HOME] + TMP_ROOTS
+        res = _shared_check_paths(p.paths, roots, cwd, for_write=p.for_write)
+        if not res.allowed:
+            deny(f"'{tool}': {res.reason}",
+                 "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
+
+    # Command-scope: the shell command AND every non-URL argument leaf of an MCP/unknown/egress
+    # call. The old code checked `cmd` only, so an MCP argument naming an out-of-scope repo passed
+    # (crush already command-scoped its MCP args; this is the drift). (CBP KIRO-2)
+    for c in p.cmd_scope:
+        if not gc.command_in_scope(c, scopes, WORKSPACE):
+            where = "command" if c == (tinput.get("command") if isinstance(tinput, dict) else None) \
+                else f"{p.klass} argument"
+            deny(f"'{tool}' {where} reaches outside your granted scope ({'+'.join(scopes)})",
+                 "Scope it to a granted repo, or if legitimately needed, request it (request_scope).")
 
     # Gate 2 - society safety (the governor). Local-read-class skips it; write/exec AND cloud egress
-    # need the daemon's verdict; fail closed. The event is translated to the Claude lineage first.
-    if tool.lower() not in READ_CLASS:
+    # AND mcp AND every UNKNOWN tool need the daemon's verdict; fail closed.
+    if p.needs_gate2:
         try:
             env = dict(os.environ, HESTIA_PLUGIN_ID="kiro-cli", HESTIA_PRE_FAIL_CLOSED="1")
-            r = subprocess.run([sys.executable, CLAUDE_PRE], input=json.dumps(to_claude_lineage(event, tool, tinput)),
+            r = subprocess.run([sys.executable, CLAUDE_PRE],
+                               input=json.dumps(to_lineage(event, tool, tinput)),
                                capture_output=True, text=True, timeout=6, env=env)
             if r.returncode != 0:
                 msg = (r.stderr.strip() if r.returncode == 2 and r.stderr.strip()
