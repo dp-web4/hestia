@@ -24,6 +24,16 @@ mkdir -p "$STATE/primers" && chmod 700 "$STATE" "$STATE/primers"
 exec 9>"$STATE/watch-$PLUGIN.lock"
 flock -n 9 || { echo "[hestia-watch] another watcher holds $STATE/watch-$PLUGIN.lock — exiting"; exit 1; }
 
+# A retained primer is this mesh's ONLY record of an undelivered consume-once
+# notice, and until now nothing ever read the directory it lands in: two primers
+# sat unclaimed for 13h and 23h before anyone looked (CBP 2026-07-25). Say it out
+# loud at startup — an alarm no one reads is not an alarm.
+for stale in "$STATE"/primers/notice-*.json; do
+  [ -e "$stale" ] || break
+  echo "[hestia-watch] STALE PRIMER (undelivered notices from a failed fire): $stale"
+  python3 -c "import json,sys;d=json.load(open(sys.argv[1]));[print(f\"    id={n.get('id')} {n.get('kind')} from {n.get('from_plugin')} queued={n.get('queued_at','')}: {n.get('pointer_uri','')}\") for n in d.get('notices',[])]" "$stale" 2>/dev/null || true
+done
+
 drain() {
 python3 - "$PLUGIN" "$HOST_AGENT" "$EP" <<'PY'
 import json, sys, urllib.request
