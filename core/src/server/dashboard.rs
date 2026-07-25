@@ -293,6 +293,7 @@ impl ServerState {
         // orchestrator chips is unaffected — "is it active now" is a
         // different question than "what period am I looking at".
         let stat_cutoff = window_cutoff;
+        let trailing_hour = Utc::now() - chrono::Duration::hours(1);
         let mut last_hour = 0u64;
         // Per-plugin slices of the same window, keyed by the human plugin_id:
         // (total, succ, fail, denied, last_hour, by_tool). Backs the chip filter.
@@ -367,10 +368,20 @@ impl ServerState {
             if e.event_type != "outcome" {
                 continue;
             }
-            total += 1;
-            if stat_cutoff.map_or(true, |c| e.timestamp > c) {
+            // `actions_last_hour` means what it says: a genuine trailing hour,
+            // independent of the selected range. It previously tracked the SELECTED
+            // window, so at range=week the field labelled "last hour" reported a week.
+            if e.timestamp > trailing_hour {
                 last_hour += 1;
             }
+            // Everything below is the WINDOWED stat and must honour the selection.
+            // Previously only `last_hour` consulted the cutoff, so total/succ/fail/
+            // by_tool (and every per-plugin slice) silently reported the whole 10k
+            // sample at every range — the selector appeared to work and did not.
+            if !stat_cutoff.map_or(true, |c| e.timestamp > c) {
+                continue;
+            }
+            total += 1;
             let success = e
                 .event_data
                 .get("success")
@@ -394,7 +405,7 @@ impl ServerState {
                 } else {
                     p.2 += 1
                 }
-                if stat_cutoff.map_or(true, |c| e.timestamp > c) {
+                if e.timestamp > trailing_hour {
                     p.4 += 1;
                 }
                 if let Some(tname) = tname {

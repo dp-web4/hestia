@@ -799,7 +799,12 @@
       return;
     }
     // Drop the stats filter if the selected orchestrator is no longer active.
-    if (selectedOrch && !orchs.some(o => o.engaged && o.id === selectedOrch)) selectedOrch = null;
+    // Clear the selection only if the orchestrator is GONE — never merely because it
+    // went quiet. Gating this on `engaged` silently revoked an existing selection the
+    // moment a member idled past an hour, collapsing its history view; the chip stayed
+    // clickable (below), so the data was there and the selection had been thrown away.
+    // Same ruling dp already gave for trust rows: staleness is shown, not hidden.
+    if (selectedOrch && !orchs.some(o => o.connected && o.id === selectedOrch)) selectedOrch = null;
 
     const chips = orchs.map(o => {
       // `connected` = alive + wired (or acted in the last hour). `engaged` is the
