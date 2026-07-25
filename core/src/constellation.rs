@@ -560,6 +560,104 @@ impl ToolPlugin for ConstellationPlugin {
     }
 }
 
+// ===========================================================================
+// Cross-device co-signing (real multi-device MFA, 2026-07-24).
+//
+// A device in a person's constellation is a SEPARATE machine holding its OWN
+// key. To present a multi-device attestation the owner must collect a signature
+// over the challenge payload from each remote device. This is the device side:
+// asked to co-sign, a device signs EXACTLY the constellation-challenge payload
+// (never arbitrary bytes) with its member key and returns the signature. The
+// owner assembles these into the attestation it presents.
+// ===========================================================================
+
+/// A request the owner sends a remote device: "co-sign this constellation
+/// challenge." Carries exactly the inputs to `signing_payload` so the device can
+/// reconstruct the SAME bytes the owner will present — it never receives raw
+/// bytes to sign, only the structured challenge, which bounds what it will sign.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CosignRequest {
+    pub kind: String, // always "constellation_cosign_request"
+    /// The constellation owner (who is presenting). The device verifies it is a
+    /// device of THIS owner before signing.
+    pub owner_lct_id: Uuid,
+    /// The full device roster the owner will present (binds the co-sign to it).
+    pub roster: Vec<Uuid>,
+    /// The hub-issued challenge nonce this attestation answers.
+    pub challenge_nonce: String,
+    /// The attestation's `issued_at` — the device checks freshness before signing.
+    pub issued_at: DateTime<Utc>,
+    /// This device's own LCT id (so the device confirms it's being asked as itself).
+    pub device_lct_id: Uuid,
+}
+
+/// A device's answer: its signature over the challenge payload. The owner drops
+/// it into the attestation's `device_signatures`; the hub verifies it against the
+/// device's ENROLLED key (so a forged sig or unenrolled device still counts for
+/// nothing — the enrollment fix does the real gating).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CosignResponse {
+    pub kind: String, // always "constellation_cosign_response"
+    pub device_lct_id: Uuid,
+    /// The device's Ed25519 signature over `signing_payload(...)`, hex.
+    pub signature: String,
+    /// The device's public key (hex) — informational; the HUB resolves the real
+    /// key from enrollment and ignores this. Lets the owner sanity-check locally.
+    pub device_pubkey_hex: String,
+}
+
+impl CosignRequest {
+    pub const KIND: &'static str = "constellation_cosign_request";
+
+    pub fn new(owner_lct_id: Uuid, roster: Vec<Uuid>, challenge_nonce: String, issued_at: DateTime<Utc>, device_lct_id: Uuid) -> Self {
+        Self { kind: Self::KIND.to_string(), owner_lct_id, roster, challenge_nonce, issued_at, device_lct_id }
+    }
+
+    /// The device co-signs. Verifies the request is a well-formed constellation
+    /// challenge addressed to THIS device, checks freshness (never sign a stale or
+    /// future-dated challenge), then signs EXACTLY the `signing_payload` bytes with
+    /// `device_key`. Returns the response the owner assembles. Bounded surface: the
+    /// device only ever signs the deterministic challenge payload, not caller bytes.
+    pub fn cosign(
+        &self,
+        device_lct_id: Uuid,
+        device_key: &KeyPair,
+        max_age: chrono::Duration,
+        future_skew: chrono::Duration,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<CosignResponse> {
+        if self.kind != Self::KIND {
+            anyhow::bail!("not a cosign request (kind '{}')", self.kind);
+        }
+        if self.device_lct_id != device_lct_id {
+            anyhow::bail!("cosign request addressed to {}, not this device {}", self.device_lct_id, device_lct_id);
+        }
+        if !self.roster.contains(&device_lct_id) {
+            anyhow::bail!("this device is not in the presented roster — refusing to co-sign");
+        }
+        let age = now - self.issued_at;
+        if age > max_age {
+            anyhow::bail!("challenge is stale (age exceeds max_age) — refusing to co-sign");
+        }
+        if age < -future_skew {
+            anyhow::bail!("challenge is future-dated beyond skew — refusing to co-sign");
+        }
+        let payload = ConstellationAttestation::signing_payload(
+            self.owner_lct_id, &self.roster, &self.challenge_nonce, &self.issued_at,
+        );
+        Ok(CosignResponse {
+            kind: CosignResponse::KIND.to_string(),
+            device_lct_id,
+            signature: device_key.sign(&payload).to_hex(),
+            device_pubkey_hex: device_key.verifying_key().to_hex(),
+        })
+    }
+}
+
+impl CosignResponse {
+    pub const KIND: &'static str = "constellation_cosign_response";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1033,5 +1131,53 @@ mod tests {
             store.canonical_roster_hash(),
             "status is part of identity"
         );
+    }
+
+    // ---- cross-device co-signing ----
+
+    #[test]
+    fn remote_device_cosign_produces_a_valid_bound_signature() {
+        // The device side of cross-device MFA: a REMOTE device, asked to co-sign,
+        // signs EXACTLY the challenge payload with its own key. The signature
+        // verifies over that payload — and NOT over a different one (it's bound to
+        // the owner+roster+nonce). The owner drops it into device_signatures; the
+        // hub then resolves the key from enrollment (verify_enrolled, hub side).
+        let owner = Uuid::new_v4();
+        let remote_dev = Uuid::new_v4();
+        let remote_key = KeyPair::generate(); // lives on the remote machine
+        let nonce = "hub-nonce".to_string();
+        let issued_at = Utc::now();
+        let roster = vec![remote_dev, Uuid::new_v4()];
+
+        let req = CosignRequest::new(owner, roster.clone(), nonce.clone(), issued_at, remote_dev);
+        let resp = req.cosign(remote_dev, &remote_key, chrono::Duration::minutes(5), chrono::Duration::minutes(2), issued_at).unwrap();
+        assert_eq!(resp.kind, CosignResponse::KIND);
+        assert_eq!(resp.device_lct_id, remote_dev);
+
+        let payload = ConstellationAttestation::signing_payload(owner, &roster, &nonce, &issued_at);
+        let pk = pubkey_from_hex(&resp.device_pubkey_hex).unwrap();
+        let sig = sig_from_hex(&resp.signature).unwrap();
+        assert!(pk.verify(&payload, &sig).is_ok(), "co-sign is a valid signature over the challenge");
+        // Bound: a tampered roster produces a different payload the sig won't cover.
+        let tampered = ConstellationAttestation::signing_payload(owner, &[Uuid::new_v4()], &nonce, &issued_at);
+        assert!(pk.verify(&tampered, &sig).is_err(), "the co-sign is bound to the exact roster+nonce");
+    }
+
+    #[test]
+    fn device_refuses_to_cosign_wrong_target_or_stale() {
+        let dev = Uuid::new_v4();
+        let key = KeyPair::generate();
+        let now = Utc::now();
+        let mk = |device_lct: Uuid, issued: DateTime<Utc>| CosignRequest::new(
+            Uuid::new_v4(), vec![dev], "n".into(), issued, device_lct);
+        let ma = chrono::Duration::minutes(5); let sk = chrono::Duration::minutes(2);
+        // addressed to a different device
+        assert!(mk(Uuid::new_v4(), now).cosign(dev, &key, ma, sk, now).is_err());
+        // stale challenge
+        assert!(mk(dev, now - chrono::Duration::minutes(6)).cosign(dev, &key, ma, sk, now).is_err());
+        // future-dated
+        assert!(mk(dev, now + chrono::Duration::minutes(5)).cosign(dev, &key, ma, sk, now).is_err());
+        // valid
+        assert!(mk(dev, now).cosign(dev, &key, ma, sk, now).is_ok());
     }
 }

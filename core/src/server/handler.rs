@@ -85,6 +85,7 @@ impl ServerHandler for HestiaServer {
             "hestia_member_inbox" => tool_member_inbox(&self.state, &args).await,
             "hestia_inbox" => tool_inbox(&self.state, &args).await,
             "hestia_pair_inbox" => tool_pair_inbox(&self.state, &args).await,
+            "hestia_cosign" => tool_cosign(&self.state, &args).await,
             _ => Ok(hestia_error_envelope(
                 "hestia.unknown_tool",
                 &format!("Unknown tool: {}", name),
@@ -214,6 +215,10 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_pair_inbox",
             "Drain SECRETS sent over confirmed paired channels (pull-side): opens each peer pair_message as a SecretEnvelope, advances a per-pair cursor so each is delivered once. Credential-access gated (§7.8.2) — an unattended caller is deferred and the secret waits for an attended drain",
+        ),
+        t(
+            "hestia_cosign",
+            "Cross-device constellation MFA (device side): asked by the constellation owner, co-sign a challenge — sign EXACTLY the constellation-challenge payload with this device's member key and return the signature. Bounded: only a fresh, this-device-addressed, in-roster constellation challenge is ever signed, never arbitrary bytes",
         ),
     ]
 }
@@ -1979,6 +1984,33 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
         pairings.save(&mut s.vault)?;
     }
     Ok(json!({ "total": opened.len(), "secrets": opened }))
+}
+
+/// `hestia_cosign` — the DEVICE side of cross-device constellation MFA. The
+/// constellation owner (on another machine) asks this device to co-sign a
+/// challenge; this device signs EXACTLY the constellation-challenge payload with
+/// its member identity key and returns the signature. **Bounded surface:** it
+/// only ever signs a well-formed, fresh, THIS-device-addressed constellation
+/// challenge (`CosignRequest::cosign` enforces target/roster/freshness) — never
+/// arbitrary caller bytes. The owner drops the returned signature into the
+/// attestation; the hub then resolves this device's key from ENROLLMENT.
+async fn tool_cosign(state: &SharedState, args: &Value) -> ToolResult {
+    let req: crate::constellation::CosignRequest = serde_json::from_value(args.clone())
+        .map_err(|e| anyhow::anyhow!("not a valid cosign request: {e}"))?;
+    let s = state.lock().await;
+    // This device's identity — the member LCT id the owner enrolled + its key.
+    let my_lct = s.vault.get("ai_identity_lct_id")
+        .and_then(|e| Uuid::parse_str(e.secret.trim()).ok())
+        .ok_or_else(|| anyhow::anyhow!("no member identity — run `hestia init --ai`"))?;
+    let secret_hex = s.vault.get("ai_identity_secret").map(|e| e.secret.clone())
+        .ok_or_else(|| anyhow::anyhow!("no member identity secret"))?;
+    let arr: [u8; 32] = hex::decode(secret_hex.trim()).ok().and_then(|b| b.try_into().ok())
+        .ok_or_else(|| anyhow::anyhow!("identity secret must be 32-byte hex"))?;
+    let key = web4_core::crypto::KeyPair::from_secret_bytes(&arr);
+    let resp = req
+        .cosign(my_lct, &key, chrono::Duration::minutes(5), chrono::Duration::minutes(2), Utc::now())
+        .map_err(|e| anyhow::anyhow!("refusing to co-sign: {e}"))?;
+    Ok(serde_json::to_value(resp)?)
 }
 
 // =========================================================================
