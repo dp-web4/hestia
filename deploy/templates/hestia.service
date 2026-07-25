@@ -53,6 +53,11 @@ Documentation=https://github.com/dp-web4/hestia
 # NOTE: these are [Unit] keys, not [Service] — moved in systemd 229. Anywhere
 # else they are parsed, ignored, and reported green; install.sh probes 1b/1c
 # catch that without needing systemd-analyze or a user bus.
+#
+# Measured, not asserted (CBP, systemd 255.4/WSL2, two units identical but for
+# the window): 120 → `failed` at t=30s on the 5th start ("Start request repeated
+# too quickly"); 10 → 13 restarts at t=70s and still climbing. "Keep in sync"
+# is now enforced by install.sh probe 1d, not just stated here.
 StartLimitIntervalSec=120
 StartLimitBurst=5
 

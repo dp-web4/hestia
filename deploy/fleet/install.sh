@@ -165,6 +165,10 @@ Documentation=https://github.com/dp-web4/hestia
 # reproduce the forever-loop exactly. Keep this in sync with RestartSec below.
 # These are [Unit] keys, not [Service] -- they moved in systemd 229, and are
 # silently ignored anywhere else (verify_service_linux probes 1b/1c).
+# Measured, not asserted (CBP, systemd 255.4/WSL2, two units identical but for
+# the window): 120 -> failed at t=30s on the 5th start ("Start request repeated
+# too quickly"); 10 -> 13 restarts at t=70s and still climbing. Probe 1d now
+# enforces "keep in sync" instead of leaving it to this comment.
 StartLimitIntervalSec=120
 StartLimitBurst=5
 
@@ -305,6 +309,52 @@ verify_service_linux() {
       c_warn "  systemd did not take it. Check the section ([Unit], not [Service]) and daemon-reload."
     else
       c_ok "StartLimitIntervalSec=$written is in effect ($effective)"
+    fi
+  fi
+
+  # 1d. Reachability: CAN the start limit fire at all? Present-and-in-effect is
+  #     not the property that matters. systemd counts starts per window, so a
+  #     window <= burst x RestartSec can never be filled and the limit is decor.
+  #     This is not hypothetical -- it is the actual mechanism behind nomad's 289
+  #     restarts on 226/NAMESPACE: the unit declared neither key, inherited the
+  #     10s/5 default, and at RestartSec=5s only 2-3 attempts land per window.
+  #     Measured on CBP (systemd 255.4, WSL2), two units identical but for the
+  #     window: 120 -> failed at t=30s on the 5th start ("Start request repeated
+  #     too quickly"); 10 -> 13 restarts at t=70s, still climbing.
+  #     The template says "keep in sync with RestartSec"; a comment stating a
+  #     rule nothing enforces is the same class of defect as the rest of this
+  #     campaign. This probe enforces it.
+  #     NOTE: a unit stopped by the start limit keeps Result=exit-code -- it does
+  #     NOT become start-limit-hit (measured). Do not key a detector on Result;
+  #     ActiveState=failed and the journal line are the witnesses.
+  local restart_pol iv bu rs ivs rss need verdict
+  restart_pol=$(systemctl --user show hestia.service -p Restart --value 2>/dev/null || true)
+  if [ -z "$restart_pol" ]; then
+    c_warn "start-limit reachability UNKNOWN: no reachable user bus."
+  elif [ "$restart_pol" = no ]; then
+    c_ok "start-limit reachability n/a (Restart=no)"
+  else
+    iv=$(systemctl --user show hestia.service -p StartLimitIntervalUSec --value 2>/dev/null || true)
+    bu=$(systemctl --user show hestia.service -p StartLimitBurst --value 2>/dev/null || true)
+    rs=$(systemctl --user show hestia.service -p RestartUSec --value 2>/dev/null || true)
+    ivs=$(_timespan_secs "$iv"); rss=$(_timespan_secs "$rs")
+    if [ "$ivs" = infinity ]; then
+      c_ok "start-limit reachability ok (window is infinity)"
+    elif [ -z "$ivs" ] || [ -z "$rss" ] || [ "$rss" = infinity ] || [ -z "$bu" ]; then
+      c_warn "start-limit reachability UNKNOWN: window='$iv' burst='$bu' RestartSec='$rs'."
+    else
+      need=$(awk -v b="$bu" -v r="$rss" 'BEGIN{ printf "%g", b * r }' 2>/dev/null || true)
+      verdict=$(awk -v i="$ivs" -v n="$need" 'BEGIN{ print (i <= n) ? "bad" : "ok" }' 2>/dev/null || true)
+      if [ "$verdict" = bad ]; then
+        c_warn "START LIMIT UNREACHABLE: window $iv <= burst($bu) x RestartSec($rs) = ${need}s."
+        c_warn "  The limit is configured and can never fire; a persistent failure retries forever"
+        c_warn "  and the unit never enters 'failed'. This is nomad's 289-restart loop."
+        c_warn "  Fix: widen StartLimitIntervalSec past ${need}s (or lengthen RestartSec)."
+      elif [ "$verdict" = ok ]; then
+        c_ok "start-limit reachable (window $iv > burst($bu) x RestartSec($rs) = ${need}s)"
+      else
+        c_warn "start-limit reachability UNKNOWN: could not compare window='$iv' need='$need'."
+      fi
     fi
   fi
 
