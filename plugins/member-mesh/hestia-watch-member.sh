@@ -84,6 +84,8 @@ except Exception: raise SystemExit(0)
 for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me")):
     for n in d.get(key,[]) or []:
         seen = "delivered, unanswered" if n.get("drained_at") else "NEVER PICKED UP"
+        live = n.get("recipient_liveness")
+        if live and live != "live": seen += f", recipient {live}"
         print(f"[hestia-watch] UNANSWERED ({label}): id={n.get(\"id\")} {n.get(\"kind\")} "
               f"{n.get(\"from_plugin\")}->{n.get(\"to_plugin\")} [{seen}] queued={n.get(\"queued_at\",\"\")}: "
               f"{n.get(\"pointer_uri\",\"\")}")

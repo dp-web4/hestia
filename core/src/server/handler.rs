@@ -207,7 +207,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_member_notify",
-            "Send a witnessed, pointer-based wake notice to another LOCAL member (fractal mesh; kinds mirror hub-mesh). Pass in_reply_to:<notice id> to bind a disposition (reply/ack/review_done) to the notice it answers",
+            "Send a witnessed, pointer-based wake notice to another LOCAL member (fractal mesh; kinds mirror hub-mesh). Pass in_reply_to:<notice id> to bind a disposition (reply/ack/review_done) to the notice it answers. The receipt reports recipient_liveness (live/dormant/unknown) — 'unknown' means nothing on this mesh is known to deliver it, usually a fleet member addressed locally",
         ),
         t(
             "hestia_member_inbox",
@@ -1738,6 +1738,82 @@ const MEMBER_KINDS_AWAIT_RESPONSE: &[&str] = &["review_request", "reply"];
 /// Default staleness before an unbound notice is worth announcing.
 const MEMBER_UNANSWERED_DEFAULT_SECS: i64 = 6 * 3600;
 
+/// A member seen reading its mailbox within this window is reported `live`.
+/// Five minutes is five times `hestia-watch-member.sh`'s default
+/// `WATCH_INTERVAL` (60s) — a watcher must miss five consecutive polls before
+/// it stops looking live.
+///
+/// The daemon cannot see that config, so this constant is a *guess about
+/// another process's cadence*, and a caller running a slower watcher would be
+/// misclassified by it. That is why the raw `last_inbox_touch` and this window
+/// both ship in every response that carries a verdict: the classification is
+/// checkable against the evidence it was derived from, and a relying party at
+/// different stakes may draw the line elsewhere (hestia CLAUDE.md: inspectable
+/// evidence, not prescribed trust).
+const MEMBER_LIVE_WITHIN_SECS: i64 = 300;
+
+/// Recipient liveness as *recorded fact*: what the daemon has seen, never a
+/// permission. Three states, all derived from one kept sighting:
+///
+/// - `live` — mailbox read within [`MEMBER_LIVE_WITHIN_SECS`]. Watcher is up.
+/// - `dormant` — seen before, not lately. Watcher down, host asleep, member
+///   between sessions. This is the deferred-delivery case and queueing is
+///   exactly right for it.
+/// - `unknown` — never seen. No evidence any local watcher exists for that
+///   name. **This, and only this, is the dead-letter class.**
+///
+/// Returns (verdict, evidence). The evidence is `null` precisely when the
+/// verdict is `unknown`, which is the whole distinction: absence of a row is
+/// not a stale row.
+fn recipient_liveness(
+    store: &crate::storage::SqliteInboxStore,
+    plugin_id: &str,
+) -> (&'static str, Value) {
+    let now = Utc::now();
+    match store.inbox_touch(plugin_id) {
+        Ok(Some(t)) => (
+            t.liveness(now, MEMBER_LIVE_WITHIN_SECS),
+            json!({
+                "last_inbox_touch": t.last_touch.to_rfc3339(),
+                "first_seen": t.first_seen.to_rfc3339(),
+                "mailbox_reads": t.touches,
+                "live_within_secs": MEMBER_LIVE_WITHIN_SECS,
+            }),
+        ),
+        Ok(None) => ("unknown", Value::Null),
+        // A liveness read that fails must not fail the send it annotates —
+        // the mark is diagnostic and gates nothing. Say the read failed rather
+        // than reporting `unknown`, which would name a specific finding
+        // (never seen) on the strength of no evidence at all.
+        Err(e) => (
+            "unavailable",
+            json!({ "error": format!("liveness lookup failed: {e}") }),
+        ),
+    }
+}
+
+/// What a sender should do about each liveness state. `unknown` names the
+/// ROUTE, not just the gap: a sender who hits it picked the wrong mesh far
+/// more often than it is talking to nobody (CBP's id=54 went to `thor` on the
+/// local mesh at 18:36 and sat undelivered for 80 minutes — Thor is a fleet
+/// member, and the fix was relay, not abandonment).
+fn liveness_note(state: &str, to_plugin: &str) -> Option<String> {
+    match state {
+        "unknown" => Some(format!(
+            "'{to_plugin}' has never been seen reading a mailbox on this local mesh — \
+             the notice is queued and witnessed, but nothing here is known to deliver it. \
+             If this is a fleet member, the hub mesh is the route (hub-notify.sh); \
+             if its watcher has simply never run, start it and this becomes a normal \
+             deferred delivery."
+        )),
+        "dormant" => Some(format!(
+            "'{to_plugin}' has read its mailbox before but not recently — queued for \
+             deferred delivery, which is what dormant is for. Not an error."
+        )),
+        _ => None,
+    }
+}
+
 /// A pointer names a location — it never carries content. Anything longer
 /// than this (or multi-line) is payload smuggling, not a pointer.
 const MAX_POINTER_URI_BYTES: usize = 512;
@@ -1872,6 +1948,15 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         }
     }
     s.member_notify_limiter.record(&sender.plugin_id);
+    // What is known about the recipient's reachability, resolved BEFORE the
+    // witness so the chain entry carries it (an act's record must include the
+    // evidence relied upon — CLAUDE.md clause A). Same shape as
+    // `binding_verified`, deliberately: **accept always, record always, say
+    // what is known.** Never a deny — rejecting an unknown recipient would
+    // relocate the failure rather than remove it (a member setting up a new
+    // watcher would be silenced by the bookkeeping, which is the
+    // `unbound_notice` argument verbatim).
+    let (liveness, liveness_evidence) = recipient_liveness(&s.inbox_store, &to_plugin);
     // Witness FIRST (the act is the send; delivery is a consequence), then queue
     // with the chain hash so every parked notice is anchored to its witnessed act.
     let entry = s.append_chain(
@@ -1885,6 +1970,8 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             "pointer_uri": pointer_uri,
             "in_reply_to": in_reply_to,
             "binding_verified": binding_verified,
+            "recipient_liveness": liveness,
+            "recipient_liveness_evidence": liveness_evidence,
         }),
     )?;
     let queued_id = s
@@ -1906,7 +1993,15 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         "kind": kind,
         "in_reply_to": in_reply_to,
         "binding_verified": binding_verified,
+        // The send still succeeds and still returns a queued_id; it just stops
+        // reading like uniform success. `queued` never meant `delivered`, and
+        // until now nothing in the receipt said so.
+        "recipient_liveness": liveness,
+        "recipient_liveness_evidence": liveness_evidence,
     });
+    if let Some(note) = liveness_note(liveness, &to_plugin) {
+        out["recipient_note"] = json!(note);
+    }
     // Nudge, not a gate: for the two kinds whose disposition IS a response, an
     // unbound send is what leaves the sender's notice sitting "unanswered"
     // forever. Refusing it would be worse — a member with something to say and
@@ -2007,6 +2102,22 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
     let (mine, theirs): (Vec<_>, Vec<_>) = rows
         .into_iter()
         .partition(|n| n.to_plugin == who.plugin_id);
+    // Arm the strong asker (the fire primer) with the distinction that matters
+    // on THIS side of the ledger: "live and unanswered" is a member choosing
+    // not to reply; "never seen locally" is a misroute, and the two want
+    // opposite responses from the sender. Carried on `owed_to_me` only — on
+    // `i_owe` the recipient is the caller, who just proved its own liveness by
+    // asking, so the field would be a constant.
+    let theirs: Vec<Value> = theirs
+        .into_iter()
+        .map(|n| {
+            let (liveness, evidence) = recipient_liveness(&s.inbox_store, &n.to_plugin);
+            let mut row = serde_json::to_value(&n).unwrap_or_else(|_| json!({}));
+            row["recipient_liveness"] = json!(liveness);
+            row["recipient_liveness_evidence"] = evidence;
+            row
+        })
+        .collect();
     Ok(json!({
         "plugin_id": who.plugin_id,
         "older_than_secs": older_than_secs,
@@ -2017,6 +2128,11 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
         "owed_to_me": theirs,
         "scope": "unanswered = no notice binds in_reply_to to it; \
                   drained_at:null additionally means it was never picked up",
+        "recipient_liveness_scope": "liveness measures the DELIVERY PATH (did that member \
+                                     read its mailbox), not the member's ability to act — a \
+                                     watcher polling for a broken CLI reads as live. \
+                                     'unknown' means never seen on THIS mesh, which is the \
+                                     dead-letter class and usually a misroute",
         "still_unrepresentable": "a member that woke, ran, and did nothing (INERT) is \
                                   not visible here — this row measures responsiveness, \
                                   not action",
@@ -4068,6 +4184,112 @@ mod member_mesh_tests {
         .unwrap();
         assert!(out["queued_id"].is_number(), "unbound send must still deliver: {out}");
         assert!(out["unbound_notice"].is_string(), "and must say so: {out}");
+    }
+
+    /// The dead-letter class, reported and never gated (Kimi ↔ CBP,
+    /// 2026-07-25). CBP's id=54 went to `thor` — a FLEET member with no local
+    /// watcher — over the local mesh, and came back with a queued_id and a
+    /// witness hash: a success-shaped receipt for an undeliverable act. The fix
+    /// is the receipt, not a refusal: rejecting unknown recipients would
+    /// silence a member whose watcher merely has not started yet.
+    #[tokio::test]
+    async fn notify_reports_recipient_liveness_and_never_denies_on_it() {
+        let (_dir, state) = test_state().await;
+        let claude = connect(&state, "claude-code").await;
+
+        // `thor` has never read a mailbox here. The send still succeeds.
+        let dead = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "thor", "kind": "reply",
+                    "pointer_uri": "forum/x.md", "session_id": claude, "in_reply_to": 1}),
+        )
+        .await
+        .unwrap();
+        assert!(dead["queued_id"].is_number(), "unknown recipient must NOT be refused: {dead}");
+        assert_eq!(dead["recipient_liveness"], json!("unknown"), "{dead}");
+        assert!(dead["recipient_liveness_evidence"].is_null(), "unknown = no row, not a stale row");
+        // The nudge names the ROUTE, not just the gap: whoever hits this state
+        // picked the wrong mesh far more often than they are talking to nobody.
+        let note = dead["recipient_note"].as_str().unwrap_or_default();
+        assert!(note.contains("hub mesh"), "unknown must name the fleet route: {note}");
+
+        // ...and the witnessed act carries the evidence it was decided on.
+        {
+            let s = state.lock().await;
+            let ev = s
+                .recent_chain(10)
+                .into_iter()
+                .find(|e| e.event_type == "member_notice")
+                .expect("send is witnessed");
+            assert_eq!(
+                ev.event_data["recipient_liveness"],
+                json!("unknown"),
+                "{:?}",
+                ev.event_data
+            );
+        }
+
+        // Once a member reads its own mailbox — even an empty one — it is live,
+        // and a later send says so.
+        let kimi = connect(&state, "kimi-code").await;
+        tool_member_inbox(&state, &json!({"session_id": kimi})).await.unwrap();
+        let live = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "coordination",
+                    "pointer_uri": "forum/y.md", "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(live["recipient_liveness"], json!("live"), "{live}");
+        assert!(live["recipient_note"].is_null(), "live needs no nudge: {live}");
+        // The verdict ships with the evidence it was derived from, so a caller
+        // at different stakes can draw the line elsewhere.
+        assert!(live["recipient_liveness_evidence"]["last_inbox_touch"].is_string(), "{live}");
+        assert_eq!(
+            live["recipient_liveness_evidence"]["live_within_secs"],
+            json!(MEMBER_LIVE_WITHIN_SECS)
+        );
+    }
+
+    /// The row is only useful where the question gets asked. `owed_to_me` is
+    /// what the fire primer renders, so that is where "live and unanswered"
+    /// (a member choosing not to reply) must separate from "never seen here"
+    /// (a misroute) — they want opposite responses from the sender.
+    #[tokio::test]
+    async fn unanswered_owed_to_me_carries_recipient_liveness() {
+        let (_dir, state) = test_state().await;
+        let claude = connect(&state, "claude-code").await;
+        for to in ["thor", "kimi-code"] {
+            tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": to, "kind": "review_request",
+                        "pointer_uri": "pr/1", "session_id": claude}),
+            )
+            .await
+            .unwrap();
+        }
+        let kimi = connect(&state, "kimi-code").await;
+        tool_member_inbox(&state, &json!({"session_id": kimi})).await.unwrap();
+
+        let rows = tool_member_unanswered(
+            &state,
+            &json!({"session_id": claude, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let owed = rows["owed_to_me"].as_array().unwrap();
+        assert_eq!(owed.len(), 2, "{rows}");
+        let by_to = |p: &str| {
+            owed.iter()
+                .find(|r| r["to_plugin"] == json!(p))
+                .unwrap()["recipient_liveness"]
+                .clone()
+        };
+        assert_eq!(by_to("thor"), json!("unknown"), "{rows}");
+        assert_eq!(by_to("kimi-code"), json!("live"), "{rows}");
+        // Liveness is about the delivery path, not about acting — say so in
+        // the payload, where a reader cannot skip past it.
+        assert!(rows["recipient_liveness_scope"].is_string(), "{rows}");
     }
 
     /// Kimi review Finding 3: a pointer NAMES a location. Multi-line /

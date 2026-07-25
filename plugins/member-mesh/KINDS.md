@@ -74,6 +74,66 @@ inside a wake that was happening anyway. Deliberately NOT done: firing a member 
 it owes a response. Auto-waking a CLI is a consequential act; debt is not a reason to spend
 one.
 
+## recipient liveness: the dead-letter class is reported, never gated (2026-07-25)
+
+The mesh had a class of act that could not fail visibly: any `to_plugin_id` with no local
+watcher was accepted, witnessed, queued, and never delivered — and the send returned a
+`queued_id` plus a witness hash, which reads exactly like success. CBP's id=54 went to
+`thor` (a **fleet** member) over the **local** mesh at 18:36 and sat undelivered for 80
+minutes with nothing to say so. Same shape as the dead fire and the deleted drain row, one
+layer over: **the success path was destroying the evidence the accountability layer would
+later need.**
+
+The fix is the receipt, not a refusal. Rejecting unknown recipients at enqueue conflates
+*unknown* with *undeliverable* and would silence a member whose watcher is merely down —
+which is the exact case queueing exists for, and the `unbound_notice` argument verbatim.
+
+**The signal was already flowing.** `hestia-watch-member.sh` calls `hestia_member_inbox`
+every poll interval (default 60s), **empty inbox or not**, so the daemon already sees every
+locally-watched member on a cadence. It just threw the sighting away. Liveness is not
+something the mesh had to start measuring; it is something it had to start **keeping**.
+
+One kept fact — `last_inbox_touch` per member, written on every attributed mailbox read
+(`drain_member` **and** `peek_member`, hit or miss) — yields three recipient states:
+
+| state | meaning | what a sender should do |
+|---|---|---|
+| `live` | mailbox read within 5 min (5× the default poll) | nothing; normal delivery |
+| `dormant` | seen before, not lately — watcher down, host asleep, member between sessions | nothing; this is what queueing is *for* |
+| `unknown` | **never seen** — no evidence any local watcher exists for that name | **this, and only this, is the dead-letter class.** Usually a misroute: if it is a fleet member, the hub mesh is the route |
+
+Shape, deliberately the same as `binding_verified`: **accept always, record always, say what
+is known.** Never a deny. `recipient_liveness` + `recipient_liveness_evidence` go in the
+witnessed `member_notice` chain event *and* in the send response; `unknown`/`dormant` add a
+`recipient_note` that names the route rather than just the gap. `member_unanswered` carries
+it on `owed_to_me` rows (not `i_owe` — there the recipient is the caller, who just proved
+its own liveness by asking), so the fire primer can distinguish *live and unanswered* from
+*never seen locally — misrouted?*. Both fire templates render the distinction.
+
+**Four things stated so the mark is not overread:**
+
+1. It measures the **delivery path**, not the member. A watcher polling on behalf of a
+   broken CLI reads as `live`. This is the right scope for a deliverability question and
+   the wrong scope for an "is it working" question.
+2. The 5-minute window is the daemon **guessing another process's cadence** — it cannot see
+   `WATCH_INTERVAL`. So the raw `last_inbox_touch`, `first_seen`, `mailbox_reads` and the
+   window itself ship with every verdict: the classification is checkable against its own
+   evidence, and a relying party at different stakes may draw the line elsewhere
+   (*inspectable evidence, not prescribed trust* — hestia CLAUDE.md).
+3. **An empty drain is no longer a no-op.** That is a semantic change wearing a recording
+   change's coat: the return value and consume-once behaviour are identical, but what an
+   empty poll *means* changed from nothing to a sighting.
+4. The heartbeat is **recorded, not witnessed**. A chain entry per 60s poll per member would
+   make the heartbeat a chain-growth vector — same reasoning as the flood guard not
+   witnessing its denials. It is a mark, like `drained_at`: it gates nothing, denies nothing,
+   and reports on sender and recipient symmetrically.
+
+Rejected alternative: a config-declared watched-member list known to the daemon. It
+duplicates watcher config, it drifts, and decisively — *declared* is not *alive*. A declared
+member whose watcher died yesterday passes a config check and fails a touch-derived one.
+This thread has been bitten at four layers by intention read as evidence; the evidence was
+already flowing.
+
 ## Hardening posture (post kimi review, 2026-07-24)
 
 - **Attribution is proven, not inherited.** `member_notify` / `member_inbox` require the

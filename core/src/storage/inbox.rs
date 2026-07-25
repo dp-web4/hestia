@@ -264,7 +264,91 @@ impl SqliteInboxStore {
                  ON member_notices(in_reply_to);",
         )
         .context("indexing member_notices.in_reply_to")?;
+        Self::ensure_touch_schema(conn)?;
         Ok(())
+    }
+
+    /// The recipient-liveness record (Kimi ↔ CBP, 2026-07-25).
+    ///
+    /// The mesh had a dead-letter class: any `to_plugin` with no local watcher
+    /// was accepted, witnessed, queued and never delivered, and the send
+    /// returned a `queued_id` plus a witness hash — a success-shaped receipt
+    /// for an undeliverable act. The fix is NOT to reject unknown recipients:
+    /// that conflates *unknown* with *undeliverable* and would silence a member
+    /// whose watcher is merely down, which is exactly the case queueing exists
+    /// for.
+    ///
+    /// The signal was already flowing and was being thrown away.
+    /// `hestia-watch-member.sh` calls `hestia_member_inbox` every poll interval
+    /// (default 60s), empty inbox or not, so the daemon *sees* every
+    /// locally-watched member on a cadence. Liveness is not something the mesh
+    /// must start measuring — it is something it must start **keeping**.
+    ///
+    /// One row per member, updated on every attributed mailbox read
+    /// ([`Self::drain_member`], [`Self::peek_member`]), hit or miss. Both keys
+    /// are the caller's own resolved plugin_id, so a member cannot manufacture
+    /// another member's liveness. Deliberately NOT witnessed: one chain entry
+    /// per 60s poll per member would make the heartbeat a chain-growth vector,
+    /// the same reason the flood guard does not witness its denials. This is a
+    /// mark, like `drained_at` — it gates nothing and denies nothing.
+    fn ensure_touch_schema(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS member_inbox_touch (
+                plugin_id  TEXT PRIMARY KEY,
+                first_seen TEXT NOT NULL,
+                last_touch TEXT NOT NULL,
+                touches    INTEGER NOT NULL
+             );",
+        )
+        .context("initializing member_inbox_touch schema")?;
+        Ok(())
+    }
+
+    /// Record that `plugin_id` read its own mailbox, now. Idempotent-by-upsert;
+    /// never fails a read (a heartbeat that could break a drain would be a
+    /// control wearing a mark's coat).
+    fn touch_inbox(conn: &Connection, plugin_id: &str, now: &DateTime<Utc>) -> Result<()> {
+        let ts = now.to_rfc3339();
+        conn.execute(
+            "INSERT INTO member_inbox_touch (plugin_id, first_seen, last_touch, touches)
+             VALUES (?1, ?2, ?2, 1)
+             ON CONFLICT(plugin_id) DO UPDATE SET
+                 last_touch = ?2,
+                 touches    = touches + 1",
+            params![plugin_id, ts],
+        )
+        .context("recording member inbox touch")?;
+        Ok(())
+    }
+
+    /// What is on record about `plugin_id` ever having read its mailbox.
+    /// `None` = never seen: no evidence any local watcher exists for that name.
+    /// That is the dead-letter class, and *only* that is — a member seen before
+    /// but not lately is dormant, which is what queueing is for.
+    pub fn inbox_touch(&self, plugin_id: &str) -> Result<Option<InboxTouch>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT first_seen, last_touch, touches FROM member_inbox_touch WHERE plugin_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![plugin_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let (first_seen, last_touch, touches) = (
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        );
+        Ok(Some(InboxTouch {
+            first_seen: DateTime::parse_from_rfc3339(&first_seen)
+                .context("parsing inbox touch first_seen")?
+                .with_timezone(&Utc),
+            last_touch: DateTime::parse_from_rfc3339(&last_touch)
+                .context("parsing inbox touch last_touch")?
+                .with_timezone(&Utc),
+            touches: touches.max(0) as u64,
+        }))
     }
 
     /// Park a member→member notice (pointer-based — the CONTENT lives at the
@@ -351,6 +435,13 @@ impl SqliteInboxStore {
     /// Consume-once is a MARK (`drained_at`), not a DELETE: the notice never
     /// comes back from a second drain, but the fact that it was delivered
     /// survives, so "queued and never answered" stays askable after the wake.
+    ///
+    /// **An empty drain is no longer a no-op.** It records a sighting
+    /// ([`Self::ensure_touch_schema`]) — the watcher polls on a cadence whether
+    /// or not there is mail, so the empty drains are precisely where the
+    /// liveness evidence lives. This is a semantic change to what an empty
+    /// drain *means*, wearing a recording change's clothes; the return value
+    /// and consume-once behaviour are untouched.
     pub fn drain_member(&self, to_plugin: &str) -> Result<Vec<MemberNotice>> {
         let now = Utc::now();
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
@@ -414,6 +505,9 @@ impl SqliteInboxStore {
             params![to_plugin, now.to_rfc3339()],
         )
         .context("marking drained member notices")?;
+        // The heartbeat: recorded whether or not the drain returned anything,
+        // and in the same transaction as the delivery mark it accompanies.
+        Self::touch_inbox(&tx, to_plugin, &now)?;
         tx.commit().context("committing member drain")?;
         Ok(notices)
     }
@@ -421,10 +515,16 @@ impl SqliteInboxStore {
     /// Non-consuming list of a recipient's queued notices (oldest first) —
     /// the SessionStart surface: a new session PEEKS so mail survives a session
     /// that dies early; consume happens via drain when the member acts.
+    ///
+    /// Peeking counts as a sighting for the same reason draining does: the
+    /// member reached for its own mailbox. A member that only ever peeks is
+    /// still reachable.
     pub fn peek_member(&self, to_plugin: &str) -> Result<Vec<MemberNotice>> {
-        let cutoff = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+        let now = Utc::now();
+        let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
+        Self::touch_inbox(&conn, to_plugin, &now)?;
         let mut stmt = conn.prepare(
             "SELECT id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
                     in_reply_to
@@ -561,6 +661,35 @@ pub struct MemberNotice {
     pub in_reply_to: Option<u64>,
 }
 
+/// What the daemon has on record about a member reading its own mailbox.
+/// The evidence itself — never a verdict. Callers get the timestamps and the
+/// count and may classify with whatever window fits their stakes
+/// ([`Self::liveness`] is the default reading, not the only permitted one).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InboxTouch {
+    /// First time this member was ever seen reading its mailbox. Separates
+    /// "watcher started five minutes ago" from "watcher ran for a week".
+    pub first_seen: DateTime<Utc>,
+    pub last_touch: DateTime<Utc>,
+    /// How many mailbox reads are on record. A single touch is a one-shot
+    /// manual read; thousands is a polling watcher. Different evidence.
+    pub touches: u64,
+}
+
+impl InboxTouch {
+    /// `live` if seen within `live_within_secs`, else `dormant`. Never
+    /// `unknown` — that state is the *absence* of an `InboxTouch`, and keeping
+    /// it unrepresentable here is the point: unknown means no row, and a row
+    /// can only say how recently, never whether-at-all.
+    pub fn liveness(&self, now: DateTime<Utc>, live_within_secs: i64) -> &'static str {
+        if (now - self.last_touch).num_seconds() <= live_within_secs {
+            "live"
+        } else {
+            "dormant"
+        }
+    }
+}
+
 /// One notice with nothing bound to it — the row the mesh could not produce
 /// before 2026-07-25. `drained_at: None` means it was never even picked up;
 /// `Some(_)` means it was delivered and went unanswered, which is a different
@@ -685,6 +814,53 @@ mod tests {
         for row in claude.iter().chain(kimi.iter()) {
             assert_ne!(row.from_plugin, "thor", "no cross-thread visibility");
         }
+    }
+
+    /// The load-bearing case for the whole liveness notion: the watcher polls
+    /// on a cadence whether or not there is mail, so the sightings that prove a
+    /// member reachable are almost all EMPTY drains. If an empty drain stayed a
+    /// no-op, `dormant` and `unknown` would be indistinguishable for every
+    /// member that happens not to have mail waiting.
+    #[test]
+    fn an_empty_drain_is_a_sighting() {
+        let (_tmp, store) = fresh();
+        // Never seen: no row at all. This — and only this — is the dead-letter
+        // class. `thor` is the worked example: a fleet member with no local
+        // watcher, addressed on the local mesh by mistake.
+        assert!(store.inbox_touch("thor").unwrap().is_none());
+        assert!(store.inbox_touch("kimi-code").unwrap().is_none());
+
+        // An empty drain — the overwhelmingly common poll — is evidence.
+        assert!(store.drain_member("kimi-code").unwrap().is_empty());
+        let seen = store.inbox_touch("kimi-code").unwrap().expect("sighting kept");
+        assert_eq!(seen.touches, 1);
+        assert_eq!(seen.liveness(Utc::now(), 300), "live");
+        // The member with no watcher is still unknown: draining one member's
+        // mailbox says nothing about another's.
+        assert!(store.inbox_touch("thor").unwrap().is_none(), "no cross-member liveness");
+
+        // Peeking counts too, and sightings accumulate (one touch is a manual
+        // read; a thousand is a polling watcher — different evidence).
+        store.peek_member("kimi-code").unwrap();
+        let seen = store.inbox_touch("kimi-code").unwrap().unwrap();
+        assert_eq!(seen.touches, 2);
+        assert!(seen.first_seen <= seen.last_touch);
+    }
+
+    /// `dormant` is seen-before-not-lately, and it is NOT a failure: a watcher
+    /// that is down is exactly the case queueing exists for. The classifier
+    /// must separate it from `unknown` on evidence, not on recency alone.
+    #[test]
+    fn dormant_is_distinguishable_from_never_seen() {
+        let (_tmp, store) = fresh();
+        store.drain_member("kimi-code").unwrap();
+        let seen = store.inbox_touch("kimi-code").unwrap().unwrap();
+        // Same row, read with a window narrower than its age: dormant.
+        assert_eq!(seen.liveness(seen.last_touch + chrono::Duration::seconds(9), 5), "dormant");
+        assert_eq!(seen.liveness(seen.last_touch + chrono::Duration::seconds(9), 300), "live");
+        // A dormant member is still a member. `unknown` is the absence of the
+        // row, which no window can produce.
+        assert!(store.inbox_touch("codex-cli").unwrap().is_none());
     }
 
     /// A pre-id-binding inbox.db must upgrade in place, not fail to open.

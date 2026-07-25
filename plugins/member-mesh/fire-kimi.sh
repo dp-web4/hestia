@@ -35,9 +35,15 @@ u=json.load(open(sys.argv[1])).get("unanswered") or {}
 for label,key in (("you have not answered","i_owe"),("nobody has answered you","owed_to_me")):
     for x in u.get(key) or []:
         seen = "delivered" if x.get("drained_at") else "never picked up"
+        # Liveness of the recipient, on the sent side only: "live and unanswered"
+        # is a member choosing not to reply; "never seen on this mesh" is a
+        # misroute, and the two want opposite responses from you.
+        live = clean(x.get("recipient_liveness") or "")
+        hint = {"unknown": "; recipient NEVER SEEN on this mesh — likely misrouted, try the hub mesh",
+                "dormant": "; recipient dormant — queued, watcher not running"}.get(live, "")
         print(f"- id={clean(x.get('id',''))} {clean(x.get('kind',''))} "
               f"{clean(x.get('from_plugin',''))}->{clean(x.get('to_plugin',''))} "
-              f"({label}; {seen}) {clean(x.get('pointer_uri',''))}")
+              f"({label}; {seen}{hint}) {clean(x.get('pointer_uri',''))}")
 PY
 )
 DEBT_BLOCK=""
