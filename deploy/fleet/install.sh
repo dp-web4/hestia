@@ -153,10 +153,18 @@ Documentation=https://github.com/dp-web4/hestia
 # substitution and silently eat the text -- which is what happened to the
 # original of this comment.)
 
-# Bound the retry loop: without a start limit a persistent failure retries
-# forever and the unit NEVER enters failed, so nothing reports it broken
-# (nomad: 289 restarts against status=226/NAMESPACE under a WSL kernel).
-# These are [Unit] keys, not [Service] -- they moved in systemd 229.
+# Bound the retry loop. NOT because a start limit was missing: systemd already
+# applies StartLimitIntervalSec=10s / StartLimitBurst=5 by default (measured on
+# CBP's live unit, which declares neither and still reads 10s/5). The limit was
+# there and structurally could not fire -- at RestartSec=5s at most 2-3 attempts
+# land in any 10s window, so a burst of 5 is unreachable, the unit never enters
+# failed, and nothing reports it broken (nomad: 289 consecutive restarts against
+# status=226/NAMESPACE under a WSL kernel).
+# The fix is a window WIDER than burst x RestartSec, not the setting's presence:
+# 5 x 5s = 25s, so 120s trips. Writing StartLimitIntervalSec=10 here would
+# reproduce the forever-loop exactly. Keep this in sync with RestartSec below.
+# These are [Unit] keys, not [Service] -- they moved in systemd 229, and are
+# silently ignored anywhere else (verify_service_linux probes 1b/1c).
 StartLimitIntervalSec=120
 StartLimitBurst=5
 
@@ -178,6 +186,10 @@ StandardError=journal
 [Install]
 WantedBy=default.target
 UNIT
+  # `cat >` inherits the caller's umask, so a permissive umask writes a
+  # world-writable unit (nomad's live unit was mode 755, which systemd-analyze
+  # warns on). Pin it rather than depend on the environment.
+  chmod 644 "$unit"
   systemctl --user daemon-reload
   if systemctl --user is-active --quiet hestia.service; then
     systemctl --user restart hestia.service
@@ -193,6 +205,29 @@ UNIT
   fi
 
   verify_service_linux
+}
+
+# Normalise a systemd timespan to seconds: "120", "120s", "2min", "1min 30s",
+# "1h", "500ms", "infinity". Prints NOTHING when it cannot parse -- callers must
+# treat empty as UNKNOWN, never as a match. Needed because systemd echoes a
+# written 120 back as "2min", so comparing the rendered strings would report a
+# working setting as broken.
+_timespan_secs() {
+  awk -v s="$1" 'BEGIN{
+    if (s == "") exit
+    if (s == "infinity") { print "infinity"; exit }
+    if (s ~ /^[0-9]+$/)  { print s + 0; exit }
+    t = 0; ok = 0
+    while (match(s, /[0-9]+(us|ms|min|s|m|h|d)/)) {
+      tok = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+      v = tok + 0; u = tok; sub(/^[0-9]+/, "", u)
+      if (u == "us") v /= 1000000; else if (u == "ms") v /= 1000
+      else if (u == "min" || u == "m") v *= 60
+      else if (u == "h") v *= 3600; else if (u == "d") v *= 86400
+      t += v; ok = 1
+    }
+    if (ok) print t
+  }'
 }
 
 # Post-install verification. The recurring defect this guards is "install
@@ -211,21 +246,72 @@ verify_service_linux() {
   # report failure on exactly the runs where the pattern DID match. Capture
   # first, test the string second.
 
+  local unit_file="$HOME/.config/systemd/user/hestia.service"
+
   # 1. The unit as written must parse. Catches typo'd/misplaced keys -- e.g.
   #    StartLimit* in [Service] instead of [Unit], which systemd silently ignores.
+  #    It does NOT catch the ordering cycle, and must not be cited as evidence
+  #    that a unit is cycle-free. Measured on CBP (systemd 255.4): against a unit
+  #    carrying both After=default.target and WantedBy=default.target, verify
+  #    prints nothing and exits 0 -- equally clean before and after the repair.
+  #    It never builds a job transaction, so it cannot see a transaction-time
+  #    property. Probes 2a-2c are the cycle evidence; this one is "it parses".
   local vout
-  vout=$(systemd-analyze --user verify "$HOME/.config/systemd/user/hestia.service" 2>&1 || true)
+  vout=$(systemd-analyze --user verify "$unit_file" 2>&1 || true)
   if [ -n "$vout" ]; then
     c_warn "systemd-analyze verify reported:"; printf '%s\n' "$vout"
   else
     c_ok "unit verifies clean"
   fi
 
+  # 1b. Toolchain-free check of StartLimit* placement. Probe 1 does catch the
+  #     misplacement -- but only when systemd-analyze actually speaks. Measured:
+  #     a stub that exits 0 silently makes probe 1 print "verifies clean" on a
+  #     unit with StartLimit* in [Service]; the key is written, ignored by
+  #     systemd, and reported green. (A genuinely absent binary is fine: the
+  #     "command not found" lands in $vout and warns.) This check needs neither
+  #     the toolchain nor a bus.
+  local bad_section
+  bad_section=$(awk '
+    /^[[:space:]]*\[/            { sect = $0 }
+    /^[[:space:]]*StartLimit[A-Za-z]*=/ { if (sect != "[Unit]") print "    " sect "  " $0 }
+  ' "$unit_file" 2>/dev/null || true)
+  if [ -n "$bad_section" ]; then
+    c_warn "StartLimit* in the wrong section -- [Unit] keys since systemd 229, ignored where they are:"
+    printf '%s\n' "$bad_section"
+  else
+    c_ok "StartLimit* placement ok (or absent)"
+  fi
+
+  # 1c. Readback: did the written StartLimitIntervalSec actually take effect?
+  #     Independent of 1b -- catches "right section, still not live" (missing
+  #     daemon-reload, a drop-in override). Bus-gated: with no user bus
+  #     `systemctl --user show` prints nothing, and empty must read UNKNOWN,
+  #     never OK. That exact false-CLEAN is what c510b1e fixed in probe 2c; do
+  #     not reintroduce it here. Compare normalised seconds rather than the
+  #     rendered string -- systemd echoes 120 back as "2min".
+  local written effective ws es
+  written=$(awk -F= '/^[[:space:]]*StartLimitIntervalSec=/ {gsub(/[[:space:]]/,"",$2); v=$2} END{print v}' \
+              "$unit_file" 2>/dev/null || true)
+  if [ -n "$written" ]; then
+    effective=$(systemctl --user show hestia.service -p StartLimitIntervalUSec --value 2>/dev/null || true)
+    ws=$(_timespan_secs "$written"); es=$(_timespan_secs "$effective")
+    if [ -z "$effective" ]; then
+      c_warn "StartLimit readback UNKNOWN: no reachable user bus. Probe 1b above is the witness here."
+    elif [ -z "$ws" ] || [ -z "$es" ]; then
+      c_warn "StartLimit readback UNKNOWN: could not parse written='$written' effective='$effective'."
+    elif [ "$ws" != "$es" ]; then
+      c_warn "StartLimitIntervalSec=$written written but NOT in effect (live value: $effective)."
+      c_warn "  systemd did not take it. Check the section ([Unit], not [Service]) and daemon-reload."
+    else
+      c_ok "StartLimitIntervalSec=$written is in effect ($effective)"
+    fi
+  fi
+
   # 2a. On-disk check: the dormant charge. Works with NO user bus at all, which
   #     matters because this probe gets run from headless mesh sessions where
   #     `systemctl --user` reaches nothing. This is the only honest witness there
   #     (HUB and sprout both hit exactly that, 2026-07-24/25).
-  local unit_file="$HOME/.config/systemd/user/hestia.service"
   local line_present=no
   if [ -f "$unit_file" ] && grep -qE '^[[:space:]]*After=([^#]*[[:space:]])?default\.target([[:space:]]|$)' "$unit_file"; then
     line_present=yes

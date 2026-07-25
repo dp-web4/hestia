@@ -32,14 +32,27 @@ Documentation=https://github.com/dp-web4/hestia
 # Credit: pub (three-node model + detector), nomad (charge/detonator framing),
 # sprout (initial confirm).
 
-# Bound the retry loop. Without a start limit, a persistent failure retries
-# forever and the unit NEVER enters `failed` — so nothing reports it as broken.
-# Observed on nomad: 289 consecutive restarts against `status=226/NAMESPACE`
-# (the [Service] sandboxing below cannot set up mount namespacing under some WSL
-# kernels until the user manager is restarted). Same failure class as the
-# ordering cycle: enabled, no failure signal, not actually running. Prefer a
-# visible `failed` over a silent infinite retry.
-# NOTE: these are [Unit] keys, not [Service] — moved in systemd 229.
+# Bound the retry loop. NOT because a start limit was missing — systemd already
+# applies `StartLimitIntervalSec=10s` / `StartLimitBurst=5` by default. Measured
+# on CBP's live unit, which declares neither key and still reads 10s / 5.
+#
+# The limit was present and *structurally could not fire*: at `RestartSec=5s`
+# at most 2–3 attempts land in any 10s window, so a burst of 5 is unreachable.
+# The unit retries forever, never enters `failed`, and nothing reports it as
+# broken. Observed on nomad: 289 consecutive restarts against
+# `status=226/NAMESPACE` (the [Service] sandboxing below cannot set up mount
+# namespacing under some WSL kernels until the user manager is restarted).
+#
+# So the fix is a window WIDER than burst × RestartSec, not the presence of the
+# setting: 5 × 5s = 25s, so 120s trips it. `StartLimitIntervalSec=10` would
+# reproduce the forever-loop exactly — "add a start limit" is the wrong lesson
+# and invites precisely that. Keep this in sync with `RestartSec` below.
+#
+# Same failure class as the ordering cycle: enabled, no failure signal, not
+# actually running. Prefer a visible `failed` over a silent infinite retry.
+# NOTE: these are [Unit] keys, not [Service] — moved in systemd 229. Anywhere
+# else they are parsed, ignored, and reported green; install.sh probes 1b/1c
+# catch that without needing systemd-analyze or a user bus.
 StartLimitIntervalSec=120
 StartLimitBurst=5
 
