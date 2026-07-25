@@ -2050,13 +2050,41 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
             .collect();
         return Ok(serde_json::to_string(&json!({"entries": recent})).unwrap_or("{}".into()));
     }
-    if uri == "hestia://session/own" {
-        let session = s
-            .sessions
-            .values()
-            .max_by_key(|sess| sess.connected_at)
-            .cloned();
-        return Ok(serde_json::to_string(&session).unwrap_or("null".into()));
+    if let Some(rest) = uri.strip_prefix("hestia://session/own") {
+        // Attribution primitive. NEVER guess the caller under concurrency: `read_resource` carries no
+        // caller argument, so the old `max_by_key(connected_at)` returned the *most-recently-connected*
+        // session to *every* caller — meaning an older session reads a newer one's identity as its own.
+        // A claims layer built on that writes confident MISattribution — worse than no coordination,
+        // because the ledger then looks authoritative (Legion review §2, 2026-07-24). So: resolve the
+        // caller explicitly (`?session_id=<uuid>`, from `hestia session begin`), accept the single-session
+        // unambiguous case, and FAIL-CLOSED when multiple sessions are connected and no id is given —
+        // refusing to guess beats guessing wrong. Fixing the attribution substrate before building on it
+        // is reafference discipline applied to our own tooling.
+        let explicit = rest
+            .strip_prefix("?session_id=")
+            .and_then(|v| Uuid::parse_str(v.trim()).ok());
+        let resolved = match explicit {
+            Some(u) => s.sessions.get(&u).cloned(),
+            None => {
+                let mut it = s.sessions.values();
+                match (it.next(), it.next()) {
+                    (Some(only), None) => Some(only.clone()), // exactly one session: unambiguous
+                    (None, _) => None,                        // no sessions connected
+                    (Some(_), Some(_)) => {
+                        // multiple sessions + no caller id → do not guess the newest
+                        return Ok(serde_json::to_string(&hestia_error_envelope(
+                            "ambiguous_caller",
+                            "multiple sessions connected and no session_id given; call \
+                             hestia://session/own?session_id=<uuid> (obtained at session begin) — \
+                             refusing to guess the caller",
+                            None,
+                        ))
+                        .unwrap_or("{}".into()));
+                    }
+                }
+            }
+        };
+        return Ok(serde_json::to_string(&resolved).unwrap_or("null".into()));
     }
     if let Some(plugin_id) = uri.strip_prefix("hestia://society/trust/") {
         let trust = s.trust(plugin_id);
@@ -3863,6 +3891,41 @@ mod tests {
             },
         );
         sid
+    }
+
+    /// Attribution substrate (Legion review §2, 2026-07-24): `hestia://session/own` must never
+    /// GUESS the caller. Single session resolves unambiguously; a second concurrent session makes
+    /// an id-less read fail-closed (not "return the newest") so a claims layer can't be built on
+    /// confident misattribution; an explicit `?session_id=` resolves the true caller.
+    #[tokio::test]
+    async fn session_own_fails_closed_under_concurrency_never_guesses_the_newest() {
+        let (_dir, shared) = make_shared_state();
+        let a = {
+            let mut s = shared.lock().await;
+            add_session(&mut s, "role:constellation:mesh-worker")
+        };
+        // exactly one session → unambiguous
+        let body = read_resource_body(&shared, "hestia://session/own").await.unwrap();
+        assert!(body.contains(&a.to_string()), "single session resolves: {body}");
+
+        // a SECOND session connects — the exact concurrency this whole design manages
+        let b = {
+            let mut s = shared.lock().await;
+            add_session(&mut s, "role:constellation:interactive")
+        };
+        // id-less read MUST fail-closed, not hand the newest session to the older caller
+        let body = read_resource_body(&shared, "hestia://session/own").await.unwrap();
+        assert!(body.contains("ambiguous_caller"), "must fail-closed under ambiguity: {body}");
+        assert!(!body.contains(&b.to_string()), "must not leak the newest session as 'own': {body}");
+
+        // explicit caller id resolves the true caller, even amid concurrency
+        let body = read_resource_body(&shared, &format!("hestia://session/own?session_id={a}"))
+            .await
+            .unwrap();
+        assert!(
+            body.contains(&a.to_string()) && !body.contains("ambiguous_caller"),
+            "explicit session_id resolves the caller: {body}"
+        );
     }
 
     #[tokio::test]
