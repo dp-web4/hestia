@@ -131,6 +131,14 @@ Documentation=https://github.com/dp-web4/hestia
 # silently deleted both member-mesh watchers (`After=hestia.service`,
 # `WantedBy=default.target`) at every boot: the mesh was "enabled" and never ran.
 # Found 2026-07-25, the first reboot after the mesh was armed.
+#
+# StartLimit* belong in [Unit], NOT [Service] — systemd 255 silently ignores
+# them there and keeps the 10s default. And the default (5 starts / 10s) can
+# never trip at RestartSec=5s, so a permanently-broken unit restarts forever and
+# never enters \`failed\`: nothing reports it as broken (nomad: 289 restarts vs a
+# WSL 226/NAMESPACE failure). A 300s window makes a persistent failure fail.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -151,6 +159,8 @@ StandardError=journal
 [Install]
 WantedBy=default.target
 UNIT
+  # systemd-analyze warns on world-writable/executable unit files.
+  chmod 644 "$unit"
   systemctl --user daemon-reload
   if systemctl --user is-active --quiet hestia.service; then
     systemctl --user restart hestia.service
@@ -164,6 +174,89 @@ UNIT
     sudo loginctl enable-linger "$USER" 2>/dev/null || \
       c_warn "could not enable-linger (sudo may have prompted); service will stop on logout until you run: sudo loginctl enable-linger $USER"
   fi
+  verify_service_linux "$unit"
+}
+
+# Post-install verification. The bug class this exists for is "install reported
+# success, unit never ran, nothing said so" — which `step_smoketest` cannot
+# catch, because it tests the daemon that is running *now*, not the start job
+# systemd will schedule at the *next boot*. On CBP the smoke test passed green
+# while the ordering cycle was deleting both mesh watchers at every boot.
+#
+# NOTE: `systemd-analyze --user verify` does NOT catch the ordering cycle.
+# Measured on CBP 2026-07-25 against a unit carrying `After=default.target` +
+# `WantedBy=default.target`: no output, exit 0. Verifying default.target with a
+# synthetic unit tree is also clean. Cycle detection is a job-*transaction*
+# property and `verify` never builds a transaction, so it cannot see it. What
+# does see it is the manager's own loaded state after daemon-reload: the
+# effective `After=` list. That works with the unit merely present — not
+# enabled, not started, no reboot.
+verify_service_linux() {
+  c_hdr "verifying install"
+  local unit="$1" name; name="$(basename "$unit")"
+  local failed=0
+
+  # 1. Ordering cycle: is this unit ordered after a target that wants it?
+  local wanted_by after cyc=""
+  wanted_by="$(sed -n 's/^WantedBy=//p' "$unit" | tr ' ' '\n' | grep -v '^$' || true)"
+  after="$(systemctl --user show "$name" -p After --value | tr ' ' '\n')"
+  local t
+  for t in $wanted_by; do
+    if printf '%s\n' "$after" | grep -qx -- "$t"; then cyc="$cyc $t"; fi
+  done
+  if [ -n "$cyc" ]; then
+    c_err "ORDERING CYCLE:$cyc is in both After= and WantedBy= for $name."
+    c_err "  systemd breaks the cycle by DELETING a start job, and the victim may"
+    c_err "  be another unit (anything After=$name). Remove the After= line."
+    failed=1
+  else
+    c_ok "no ordering cycle (After= does not contain any WantedBy= target)"
+  fi
+
+  # 2. Actually running, not merely enabled. `enabled` is the trap: a deleted
+  #    start job leaves the unit enabled, inactive, and reporting no failure.
+  if systemctl --user is-active --quiet "$name"; then
+    c_ok "unit is active (not merely enabled)"
+  else
+    c_err "unit is NOT active: $(systemctl --user is-active "$name" 2>&1) / enabled=$(systemctl --user is-enabled "$name" 2>&1)"
+    failed=1
+  fi
+
+  # 3. Retrospective: did a *previous* boot lose a start job to a cycle? Only
+  #    meaningful after a reboot, so this is a warning, not a gate.
+  if journalctl --user -b --no-pager 2>/dev/null | grep -q 'ordering cycle'; then
+    c_warn "this boot's journal contains 'ordering cycle' — a start job was deleted:"
+    journalctl --user -b --no-pager 2>/dev/null | grep -m5 'ordering cycle\|deleted to break' | sed 's/^/    /'
+  fi
+
+  # 4. Restart-loop check. Distinguishes "up" from "up this second".
+  local n; n="$(systemctl --user show "$name" -p NRestarts --value 2>/dev/null || echo 0)"
+  if [ "${n:-0}" -gt 3 ]; then
+    c_warn "NRestarts=$n — unit is flapping; check: journalctl --user -u $name -b"
+  fi
+
+  # 4b. Did the start limit actually take effect? StartLimit* in [Service] is
+  #     silently ignored (systemd 255), leaving the 10s default — which can
+  #     never trip at RestartSec=5s. That is how a broken unit restarts forever
+  #     without ever entering `failed`. Assert the written value came back.
+  local sli; sli="$(systemctl --user show "$name" -p StartLimitIntervalUSec --value 2>/dev/null || true)"
+  if [ "$sli" = "10s" ] && grep -q '^StartLimitIntervalSec=' "$unit"; then
+    c_err "StartLimitIntervalSec was written but did not take effect (still $sli)."
+    c_err "  It must be in the [Unit] section, not [Service]."
+    failed=1
+  else
+    c_dim "  start limit: ${sli:-default} / burst $(systemctl --user show "$name" -p StartLimitBurst --value 2>/dev/null)"
+  fi
+
+  # 5. General unit lint (file mode, bad exec paths, unknown keys). This is
+  #    where a misplaced StartLimit* shows up as "Unknown key name". It does
+  #    NOT cover ordering cycles — see the note above.
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    systemd-analyze --user verify "$unit" 2>&1 | sed 's/^/    /' || true
+  fi
+
+  [ "$failed" -eq 0 ] || { c_err "post-install verification FAILED"; exit 1; }
+  c_ok "post-install verification passed"
 }
 
 step_service_macos() {

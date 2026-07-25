@@ -8,6 +8,19 @@ Documentation=https://github.com/dp-web4/hestia
 # silently deleted both member-mesh watchers (`After=hestia.service`,
 # `WantedBy=default.target`) at every boot: the mesh was "enabled" and never ran.
 # Found 2026-07-25, the first reboot after the mesh was armed.
+#
+# StartLimit* live in [Unit], NOT [Service]. systemd 255 silently ignores them
+# in [Service] ("Unknown key name ... ignoring") and leaves the default 10s
+# window in place — measured on CBP 2026-07-25. The default (5 starts / 10s) can
+# never trip at RestartSec=5s, since at most 2-3 attempts land in any 10s
+# window. So a *permanently* broken unit restarts forever and never enters
+# `failed` — nothing ever reports it as broken. Nomad hit exactly this: 289
+# restarts against a WSL mount-namespacing failure (status=226/NAMESPACE, from
+# the sandboxing block below) with no failure signal the whole time. A 300s
+# window makes a persistent failure actually fail. Recover with:
+#   systemctl --user reset-failed hestia.service && systemctl --user start hestia.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -28,6 +41,8 @@ PrivateTmp=true
 
 Restart=on-failure
 RestartSec=5s
+# NOTE: StartLimitIntervalSec/StartLimitBurst are in [Unit] above, not here —
+# systemd silently ignores them in this section.
 
 # Log to journal
 StandardOutput=journal
