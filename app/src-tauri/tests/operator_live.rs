@@ -49,6 +49,33 @@ async fn authenticate_opens_a_session_and_the_token_reads_the_gated_api() {
         "the operator gate should reject an unauthenticated read"
     );
 
+    // /credential fail-closed stopgap (PRD §5.6): OID4VCI issuance mints a presentation signed with the
+    // OWNER's identity key, so it is now behind the operator gate. An unauthenticated POST must be 401 —
+    // and 401 (not 400/422) also proves the gate preflights BEFORE body parsing (RWOA O). An empty body
+    // is deliberate: if it were 422, the gate would not be dominating the side effect.
+    let cred_unauthed = client
+        .post(format!("{DAEMON}/credential"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("daemon unreachable");
+    assert_eq!(
+        cred_unauthed.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "ungated /credential minted an owner-signed claim; it must be operator-gated now"
+    );
+    // ...but /nonce grants nothing and must stay open, or the stopgap over-gated (fail-fragile, §4.1).
+    let nonce_open = client
+        .post(format!("{DAEMON}/nonce"))
+        .send()
+        .await
+        .expect("daemon unreachable");
+    assert_ne!(
+        nonce_open.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "/nonce grants nothing and must stay open — the stopgap must not over-gate"
+    );
+
     let authed = client
         .get(format!("{DAEMON}/api/dashboard"))
         .bearer_auth(&session.token)

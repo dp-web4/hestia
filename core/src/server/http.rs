@@ -241,6 +241,14 @@ pub async fn serve_with_callback(
         .route("/api/policy/rule/:rule_id", delete(policy_delete_rule))
         .route("/api/orchestrators/:id/connect", post(orchestrator_connect))
         .route("/api/chain", get(chain_query))
+        // OID4VCI issuance MINTS a presentation SIGNED WITH THE OWNER'S IDENTITY KEY — a consequential
+        // act that must be owner-authorized. Fail-closed stopgap (PRD §5.6/§7.1; Nomad's finding, dp's
+        // §12 disposition): gate it behind the operator session like every other consequential surface,
+        // closing the ungated "any local caller mints an owner-signed claim" hole. `/metadata` + `/nonce`
+        // stay open below (discovery + a freshness nonce grant nothing). The full OID4VCI delegation authz
+        // — what a wallet flow should require — is a separate design (§8 item b); this only refuses
+        // unauthorized minting, it does not decide the wallet flow.
+        .route("/credential", post(vci_credential))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             operator_gate,
@@ -256,11 +264,12 @@ pub async fn serve_with_callback(
         .route("/api/operator/challenge", post(operator_challenge))
         .route("/api/operator/session", post(operator_session))
         // OID4VCI issuance (EUDI Phase 2) — hestia as person-scale issuer.
-        // The credential route matches the `<issuer>/credential` that
-        // `CredentialIssuerMetadata::for_vct` advertises (issuer = http://host).
+        // /metadata + /nonce are legitimately unauthenticated (discovery + a freshness
+        // nonce grant nothing). /credential — which mints an OWNER-SIGNED presentation —
+        // was moved behind the operator gate above (fail-closed stopgap, PRD §5.6) and is
+        // deliberately NOT mounted here anymore.
         .route("/.well-known/openid-credential-issuer", get(vci_metadata))
         .route("/nonce", post(vci_nonce))
-        .route("/credential", post(vci_credential))
         .with_state(state)
         .nest_service("/mcp", service);
 
@@ -733,6 +742,19 @@ async fn vci_credential(
         .sd_claim("issued_by", serde_json::json!("hestia"))
         .issue(&issuer_key, &format!("{issuer_did}#key-0"));
 
+    // Witness the issuance (RWOA A): minting a claim signed with the owner's key is a consequential act
+    // and must be on the chain, not just the write of a name. The operator gate (route_layer) did the
+    // R+W preflight; this records the act it authorized.
+    let _ = s.append_chain(
+        "credential_issued",
+        serde_json::json!({
+            "vct": "Web4Presence",
+            "issuer": issuer_did,
+            "holder": format!("{holder_pk:?}"),
+            "assurance_level": assurance,
+            "evidence": "operator-gated + holder-proof",
+        }),
+    );
     (
         StatusCode::OK,
         Json(serde_json::json!({ "credential": credential, "format": "vc+sd-jwt" })),
