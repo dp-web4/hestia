@@ -1,7 +1,13 @@
 [Unit]
 Description=Hestia local-first Web4 trust daemon
 Documentation=https://github.com/dp-web4/hestia
-After=default.target
+# NOT `After=default.target`: this unit is WantedBy=default.target, so ordering
+# it *after* the target that wants it forms a cycle (default.target -> hestia ->
+# default.target). systemd breaks such cycles by DELETING a start job — and the
+# victim is whichever unit closes the loop, not necessarily this one. On CBP it
+# silently deleted both member-mesh watchers (`After=hestia.service`,
+# `WantedBy=default.target`) at every boot: the mesh was "enabled" and never ran.
+# Found 2026-07-25, the first reboot after the mesh was armed.
 
 [Service]
 Type=simple
