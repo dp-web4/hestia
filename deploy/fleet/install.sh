@@ -488,6 +488,46 @@ macos_agent_pid() {
   launchctl list "$1" 2>/dev/null | sed -n 's/.*"PID"[[:space:]]*=[[:space:]]*\([0-9]*\);.*/\1/p' | head -1 || true
 }
 
+# Prints the path if this plist sets KeepAlive to the literal <true/>; silent otherwise.
+# The thing being asked is "what is KeepAlive's VALUE", and neither grep scope answers it:
+#   line-scope  -- `<key>KeepAlive</key>[[:space:]]*<true/>` only matches when key and
+#                  value share a line. That is the form the heredoc above writes; the
+#                  canonical form `plutil` emits, and what a hand-written plist looks
+#                  like, puts <true/> on the NEXT line. Measured (GNU grep 3.11): the
+#                  two-line and `<true />` forms both read CLEAN.
+#   file-scope  -- "<key>KeepAlive</key> somewhere AND <true/> somewhere", the shape
+#                  probe 2 uses for `hestia`+`serve`, WARNS ON OUR OWN PLIST: RunAtLoad
+#                  supplies the <true/> and KeepAlive is a dict. Measured: it flags the
+#                  repo template, the plist written above, and KeepAlive{Crashed:true}.
+#                  A probe that fires on its own known-good output is not the safe
+#                  direction -- it teaches the operator to skip the whole section.
+# So: adjacency, across lines, with comments removed first (a commented-out decoy must
+# not fire; a comment BETWEEN key and value must not hide it). Comments are stripped
+# with index(), not a regex, because an XML comment may legally contain ">". `[ \t]`
+# rather than [[:space:]] -- newlines are already folded to spaces, and character
+# classes are not safe on every awk this may meet. Verified identical on gawk 5.2.1,
+# mawk and nawk (BWK awk, macOS's).
+# Known limit: this reads text, not structure. `plutil -extract KeepAlive xml1 -o -`
+# is the right tool and plutil is already a hard dependency (probe 1) -- but this was
+# written on Linux and could not be executed against it. Shipping an unrun command is
+# the defect this file is about. Left for the Mac; see the PR thread.
+plist_uncond_keepalive() {
+  awk -v f="$1" '
+    { doc = doc $0 " " }
+    END {
+      while ((i = index(doc, "<!--")) > 0) {
+        keep = keep substr(doc, 1, i - 1)
+        rest = substr(doc, i + 4)
+        j = index(rest, "-->")
+        if (j == 0) { doc = ""; break }   # unterminated comment: drop the remainder
+        doc = substr(rest, j + 3)
+      }
+      doc = keep doc
+      if (doc ~ /<key>KeepAlive<\/key>[ \t]*<true[ \t]*\/>/) print f
+    }
+  ' "$1" 2>/dev/null || true
+}
+
 # The macOS half of verify_service_linux. Same defect class, different platform,
 # and the platform is strictly worse at reporting it (mcnugget, forum 2026-07-25):
 #   - `launchctl load` succeeds on a syntactically valid plist and says NOTHING
@@ -587,9 +627,25 @@ verify_service_macos() {
     c_warn "  The documented boundary is \$HOME/.hestia/.passphrase at mode 600. Operator call --"
     c_warn "  moving it touches the key that opens the vault; do it deliberately, not from a script."
   fi
-  local uncond
-  uncond=$(grep -lE '<key>KeepAlive</key>[[:space:]]*<true[[:space:]]*/>' \
-             "$HOME"/Library/LaunchAgents/*.plist 2>/dev/null || true)
+  # Unconditional KeepAlive. Same line-scope-vs-file-scope trap probe 2 documents,
+  # and BOTH scopes are wrong here -- see plist_uncond_keepalive above (HUB caught
+  # the line-anchored miss reviewing eed7254; its proposed two-grep fix flags this
+  # installer's own plist).
+  local uncond=""
+  local ka
+  for ka in "$HOME"/Library/LaunchAgents/*.plist; do
+    [ -f "$ka" ] || continue
+    # Found while exercising this loop: a plist we cannot read used to fall through
+    # to silence, i.e. "not inspected" rendered as "clean" -- the c510b1e rule, one
+    # more time. UNKNOWN is not a pass.
+    if [ ! -r "$ka" ]; then
+      c_warn "UNREADABLE: $ka -- KeepAlive posture UNKNOWN, not clean"
+      continue
+    fi
+    [ -n "$(plist_uncond_keepalive "$ka")" ] || continue
+    uncond="${uncond:+$uncond
+}$ka"
+  done
   if [ -n "$uncond" ]; then
     c_warn "UNCONDITIONAL KeepAlive in:"
     printf '%s\n' "$uncond" | while IFS= read -r f; do c_warn "    $f"; done
