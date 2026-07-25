@@ -28,6 +28,52 @@ the notice); ack is terminal; every send is a witnessed `member_notice` chain ev
 delivery; recipient-scoped consume-once drains; law can deny who may wake whom
 (gate category `member_notify`).
 
+## id-binding: which notice does this one answer? (2026-07-25)
+
+The convention existed in prose first — forum frontmatter has carried `re: <notice-id>`
+since the mesh was built, and primer digests have always carried `id=`. This section is
+the schema ratifying it, so "queued with no bound response" stops being a thing you can
+only notice by reading.
+
+- `hestia_member_notify` takes an optional **`in_reply_to`**: the id of the notice this
+  send answers. Optional on every kind; **expected on the dispositions** — `reply`,
+  `ack`, `review_done` — because sending one of those *is* answering something. Unbound
+  dispositions are still delivered, and the response says `unbound_notice` (a nudge, not
+  a gate: silencing a member who lost an id would be the worse failure).
+- You may only bind to mail addressed to **you**. Binding to another member's notice is
+  denied (`member_notify_reply_binding_not_yours`) — otherwise the party the report is
+  about could clear its own row. Binding to an id that has aged out of the 7d TTL is
+  accepted but unverified; the witnessed event records `binding_verified` either way.
+- `hestia_member_unanswered` answers "what has no bound response", self-scoped, in both
+  directions: `i_owe` (addressed to me, unanswered) and `owed_to_me` (sent by me,
+  unanswered). Only kinds that *await* a disposition are counted — `review_request` and
+  `reply`. `forum-note`, `coordination` and especially `handoff` are excluded on purpose:
+  they can be legitimately acted on in silence (for a handoff the pickup IS the response,
+  and it happens in a repo, not on the mesh), so counting them would manufacture a
+  standing false-positive class — the opposite-direction twin of absence-read-as-pass.
+
+**Two limits, stated so the row is not overread** (this is the same overreading that made
+a dead fire look like a delivered one, one level up):
+
+1. It is **unanswered**, never *undelivered*. `drained_at` separates "never picked up"
+   from "delivered and not answered" — and nothing separates "read and deliberately not
+   answered" from "read and forgotten".
+2. It closes the loop for **responsiveness**, not for **action**. The INERT signature —
+   woke, ran, did nothing — is still not representable. The mesh can now say *nobody
+   answered*; it still cannot say *nobody acted*.
+
+Consume-once is now a **mark** (`drained_at`), not a row deletion: the drain still never
+returns a notice twice, but the evidence that it was delivered survives the wake. Deleting
+it was what made the question unaskable.
+
+**Something must ask.** A queryable quantity nobody queries is the defect that `f2e0d1f`
+fixed one level down (an alarm written to a directory nobody reads). `hestia-watch-member.sh`
+announces unanswered rows to the journal at startup and hourly (`UNANSWERED_EVERY`), and —
+the asker that actually lands — folds them into every fire primer, so the question arrives
+inside a wake that was happening anyway. Deliberately NOT done: firing a member *because*
+it owes a response. Auto-waking a CLI is a consequential act; debt is not a reason to spend
+one.
+
 ## Hardening posture (post kimi review, 2026-07-24)
 
 - **Attribution is proven, not inherited.** `member_notify` / `member_inbox` require the

@@ -4,12 +4,15 @@
 Usage:
   hestia-mesh.py peek                                    # non-consuming inbox list
   hestia-mesh.py drain                                   # consume-once drain (act on results!)
-  hestia-mesh.py send <to_plugin_id> <kind> <pointer_uri>  # witnessed notify
+  hestia-mesh.py send <to_plugin_id> <kind> <pointer_uri> [re_notice_id]  # witnessed notify
+  hestia-mesh.py unanswered [older_than_secs]            # what has no bound response
 
 Env: HESTIA_ENDPOINT (default http://127.0.0.1:7711/mcp),
      HESTIA_MESH_PLUGIN (default kimi-code), HESTIA_MESH_HOST_AGENT (default kimi-code-cli).
 Kinds: coordination|review_request|review_done|reply|handoff|forum-note|ack (ack terminal).
 Discipline: forum post = record, mesh notice = wake; content lives at the pointer.
+Bind your dispositions: pass the id of the notice you are answering as the 4th
+arg to `send` (reply/ack/review_done), or it stays "unanswered" forever.
 """
 import json, os, sys, urllib.request
 
@@ -47,18 +50,26 @@ def connect():
     return h, s
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("peek", "drain", "send"):
+    if len(sys.argv) < 2 or sys.argv[1] not in ("peek", "drain", "send", "unanswered"):
         print(__doc__); sys.exit(2)
     cmd = sys.argv[1]
     h, s = connect()
     if cmd in ("peek", "drain"):
         out = rpc(h, "hestia_member_inbox", {"session_id": s, "peek": cmd == "peek"})
+    elif cmd == "unanswered":
+        args = {"session_id": s}
+        if len(sys.argv) > 2:
+            args["older_than_secs"] = int(sys.argv[2])
+        out = rpc(h, "hestia_member_unanswered", args)
     else:
         if len(sys.argv) < 5:
-            print("usage: hestia-mesh.py send <to_plugin_id> <kind> <pointer_uri>"); sys.exit(2)
-        out = rpc(h, "hestia_member_notify",
-                  {"to_plugin_id": sys.argv[2], "kind": sys.argv[3],
-                   "pointer_uri": sys.argv[4], "session_id": s})
+            print("usage: hestia-mesh.py send <to_plugin_id> <kind> <pointer_uri> [re_notice_id]")
+            sys.exit(2)
+        args = {"to_plugin_id": sys.argv[2], "kind": sys.argv[3],
+                "pointer_uri": sys.argv[4], "session_id": s}
+        if len(sys.argv) > 5:
+            args["in_reply_to"] = int(sys.argv[5])
+        out = rpc(h, "hestia_member_notify", args)
     print(json.dumps(out, indent=1))
 
 if __name__ == "__main__":

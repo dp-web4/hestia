@@ -214,6 +214,16 @@ impl SqliteInboxStore {
 
     /// Ensure the member_notices table exists (idempotent; called lazily so
     /// pre-existing inbox DBs upgrade in place).
+    ///
+    /// Two columns were added 2026-07-25 (Kimi ↔ CBP id-binding thread) and are
+    /// migrated in place on existing DBs:
+    /// - `in_reply_to` — the notice id this send answers. The convention
+    ///   (`re: <id>` in forum frontmatter) already existed; this is the schema
+    ///   ratifying it, so "queued with no bound response" becomes queryable.
+    /// - `drained_at` — consume-once is now expressed as a MARK, not a DELETE.
+    ///   Deleting the row destroyed the only evidence that a notice had ever
+    ///   been delivered, which is precisely what made "was this answered?"
+    ///   unaskable. Retention is unchanged (TTL prune still drops both).
     fn ensure_member_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS member_notices (
@@ -224,19 +234,45 @@ impl SqliteInboxStore {
                 kind         TEXT NOT NULL,
                 pointer_uri  TEXT,
                 chain_hash   TEXT NOT NULL,
-                queued_at    TEXT NOT NULL
+                queued_at    TEXT NOT NULL,
+                in_reply_to  INTEGER,
+                drained_at   TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_member_notices_to
                  ON member_notices(to_plugin, queued_at);",
         )
         .context("initializing member_notices schema")?;
+        // In-place upgrade for inboxes created before the id-binding columns.
+        let mut existing: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(member_notices)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            for r in rows {
+                existing.push(r?);
+            }
+        }
+        for (col, decl) in [("in_reply_to", "INTEGER"), ("drained_at", "TEXT")] {
+            if !existing.iter().any(|c| c == col) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE member_notices ADD COLUMN {col} {decl}"
+                ))
+                .with_context(|| format!("adding member_notices.{col}"))?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_member_notices_reply
+                 ON member_notices(in_reply_to);",
+        )
+        .context("indexing member_notices.in_reply_to")?;
         Ok(())
     }
 
     /// Park a member→member notice (pointer-based — the CONTENT lives at the
     /// pointer; the notice is the wake signal, mirroring the fleet hub-mesh).
     /// `chain_hash` is the witnessing `member_notice` chain entry — every
-    /// queued notice is anchored to its witnessed act.
+    /// queued notice is anchored to its witnessed act. `in_reply_to` binds this
+    /// send to the notice it answers (see [`Self::member_notice_recipient`] for
+    /// the check the caller runs first).
     pub fn enqueue_member(
         &self,
         to_plugin: &str,
@@ -245,6 +281,7 @@ impl SqliteInboxStore {
         kind: &str,
         pointer_uri: Option<&str>,
         chain_hash: &str,
+        in_reply_to: Option<u64>,
     ) -> Result<u64> {
         let now = Utc::now();
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
@@ -255,19 +292,28 @@ impl SqliteInboxStore {
             params![cutoff],
         )
         .context("pruning expired member notices")?;
-        let count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM member_notices", [], |row| row.get(0))?;
+        // The cap bounds the QUEUE (undelivered notices), not the retained
+        // delivery record — drained rows are forensics, and evicting them to
+        // admit a new notice would re-open the hole `drained_at` just closed.
+        // They still age out on the TTL prune above.
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM member_notices WHERE drained_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
         if count as u64 >= MAX_INBOX_NOTICES {
             conn.execute(
-                "DELETE FROM member_notices WHERE id = (SELECT MIN(id) FROM member_notices)",
+                "DELETE FROM member_notices
+                 WHERE id = (SELECT MIN(id) FROM member_notices WHERE drained_at IS NULL)",
                 [],
             )
             .context("dropping oldest member notice at cap")?;
         }
         conn.execute(
             "INSERT INTO member_notices
-                 (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
+                  in_reply_to)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 to_plugin,
                 from_plugin,
@@ -276,26 +322,49 @@ impl SqliteInboxStore {
                 pointer_uri,
                 chain_hash,
                 now.to_rfc3339(),
+                in_reply_to.map(|v| v as i64),
             ],
         )
         .context("enqueuing member notice")?;
         Ok(conn.last_insert_rowid() as u64)
     }
 
+    /// Who a notice was addressed to, if it is still on record. `None` means
+    /// "no such row" — which is NOT the same as "forged": notices age out on
+    /// the TTL, so an honest late binding to a pruned notice is unverifiable
+    /// rather than false. Callers must not read the two cases as one.
+    pub fn member_notice_recipient(&self, id: u64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let mut stmt = conn.prepare("SELECT to_plugin FROM member_notices WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id as i64])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(row.get::<_, String>(0)?),
+            None => None,
+        })
+    }
+
     /// Consume-once drain of the notices addressed to `to_plugin` ONLY —
     /// recipient-scoped (a member can never drain another member's mail).
     /// Same at-least-once failure bias as the hub-notice drain.
+    ///
+    /// Consume-once is a MARK (`drained_at`), not a DELETE: the notice never
+    /// comes back from a second drain, but the fact that it was delivered
+    /// survives, so "queued and never answered" stays askable after the wake.
     pub fn drain_member(&self, to_plugin: &str) -> Result<Vec<MemberNotice>> {
-        let cutoff = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+        let now = Utc::now();
+        let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
         let mut conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
         let tx = conn.transaction().context("starting member drain")?;
         let notices = {
             let mut stmt = tx
                 .prepare(
-                    "SELECT id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at
+                    "SELECT id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
+                            in_reply_to
                      FROM member_notices
-                     WHERE to_plugin = ?1 AND queued_at >= ?2 ORDER BY id ASC",
+                     WHERE to_plugin = ?1 AND queued_at >= ?2 AND drained_at IS NULL
+                     ORDER BY id ASC",
                 )
                 .context("preparing member drain SELECT")?;
             let rows = stmt
@@ -308,13 +377,22 @@ impl SqliteInboxStore {
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
                     ))
                 })
                 .context("querying member notices")?;
             let mut out = Vec::new();
             for row in rows {
-                let (id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at) =
-                    row.context("reading member notice row")?;
+                let (
+                    id,
+                    from_plugin,
+                    from_role,
+                    kind,
+                    pointer_uri,
+                    chain_hash,
+                    queued_at,
+                    in_reply_to,
+                ) = row.context("reading member notice row")?;
                 out.push(MemberNotice {
                     id: id as u64,
                     from_plugin,
@@ -325,15 +403,17 @@ impl SqliteInboxStore {
                     queued_at: DateTime::parse_from_rfc3339(&queued_at)
                         .context("parsing member notice queued_at")?
                         .with_timezone(&Utc),
+                    in_reply_to: in_reply_to.map(|v| v as u64),
                 });
             }
             out
         };
         tx.execute(
-            "DELETE FROM member_notices WHERE to_plugin = ?1",
-            params![to_plugin],
+            "UPDATE member_notices SET drained_at = ?2
+             WHERE to_plugin = ?1 AND drained_at IS NULL",
+            params![to_plugin, now.to_rfc3339()],
         )
-        .context("consuming drained member notices")?;
+        .context("marking drained member notices")?;
         tx.commit().context("committing member drain")?;
         Ok(notices)
     }
@@ -346,9 +426,10 @@ impl SqliteInboxStore {
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
         let mut stmt = conn.prepare(
-            "SELECT id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at
+            "SELECT id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
+                    in_reply_to
              FROM member_notices
-             WHERE to_plugin = ?1 AND queued_at >= ?2 ORDER BY id ASC",
+             WHERE to_plugin = ?1 AND queued_at >= ?2 AND drained_at IS NULL ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![to_plugin, cutoff], |row| {
             Ok((
@@ -359,16 +440,19 @@ impl SqliteInboxStore {
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, Option<i64>>(7)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at) = row?;
+            let (id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at, in_reply_to) =
+                row?;
             out.push(MemberNotice {
                 id: id as u64, from_plugin, from_role, kind, pointer_uri, chain_hash,
                 queued_at: DateTime::parse_from_rfc3339(&queued_at)
                     .context("parsing member notice queued_at")?
                     .with_timezone(&Utc),
+                in_reply_to: in_reply_to.map(|v| v as u64),
             });
         }
         Ok(out)
@@ -380,11 +464,86 @@ impl SqliteInboxStore {
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
         let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM member_notices WHERE to_plugin = ?1",
+            "SELECT COUNT(*) FROM member_notices WHERE to_plugin = ?1 AND drained_at IS NULL",
             params![to_plugin],
             |row| row.get(0),
         )?;
         Ok(n as u64)
+    }
+
+    /// Notices involving `plugin` that nothing has bound a response to, older
+    /// than `older_than_secs`, restricted to `kinds` (the kinds whose
+    /// disposition IS a response — see `MEMBER_KINDS_EXPECTING_RESPONSE`).
+    ///
+    /// The honest name is **unanswered**, never "undelivered": a notice that
+    /// was read and deliberately not answered is indistinguishable here from
+    /// one that was never read. This query closes the loop for RESPONSIVENESS,
+    /// not for ACTION — a member who woke, worked in a repo, and said nothing
+    /// still shows up. Lookback is bounded by the TTL prune (7d).
+    pub fn member_unanswered(
+        &self,
+        plugin: &str,
+        kinds: &[&str],
+        older_than_secs: i64,
+    ) -> Result<Vec<UnansweredNotice>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let before = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let placeholders = (0..kinds.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at
+             FROM member_notices n
+             WHERE (n.to_plugin = ?1 OR n.from_plugin = ?1)
+               AND n.queued_at < ?2
+               AND n.kind IN ({placeholders})
+               AND NOT EXISTS (SELECT 1 FROM member_notices r WHERE r.in_reply_to = n.id)
+             ORDER BY n.id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&plugin, &before];
+        for k in kinds {
+            binds.push(k);
+        }
+        let rows = stmt.query_map(binds.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at) = row?;
+            out.push(UnansweredNotice {
+                id: id as u64,
+                to_plugin,
+                from_plugin,
+                kind,
+                pointer_uri,
+                queued_at: DateTime::parse_from_rfc3339(&queued_at)
+                    .context("parsing unanswered queued_at")?
+                    .with_timezone(&Utc),
+                drained_at: match drained_at {
+                    Some(d) => Some(
+                        DateTime::parse_from_rfc3339(&d)
+                            .context("parsing unanswered drained_at")?
+                            .with_timezone(&Utc),
+                    ),
+                    None => None,
+                },
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -398,6 +557,23 @@ pub struct MemberNotice {
     pub pointer_uri: Option<String>,
     pub chain_hash: String,
     pub queued_at: DateTime<Utc>,
+    /// The notice id this one answers, when the sender bound it.
+    pub in_reply_to: Option<u64>,
+}
+
+/// One notice with nothing bound to it — the row the mesh could not produce
+/// before 2026-07-25. `drained_at: None` means it was never even picked up;
+/// `Some(_)` means it was delivered and went unanswered, which is a different
+/// finding and must not be collapsed into the first.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnansweredNotice {
+    pub id: u64,
+    pub to_plugin: String,
+    pub from_plugin: String,
+    pub kind: String,
+    pub pointer_uri: Option<String>,
+    pub queued_at: DateTime<Utc>,
+    pub drained_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]
@@ -416,11 +592,11 @@ mod tests {
         let (_tmp, store) = fresh();
         store
             .enqueue_member("kimi-code", "claude-code", "role:constellation:interactive-dev",
-                            "coordination", Some("forum/x.md#thread=t"), "hash-a")
+                            "coordination", Some("forum/x.md#thread=t"), "hash-a", None)
             .unwrap();
         store
             .enqueue_member("codex-cli", "claude-code", "role:constellation:interactive-dev",
-                            "handoff", None, "hash-b")
+                            "handoff", None, "hash-b", None)
             .unwrap();
         assert_eq!(store.member_pending("kimi-code").unwrap(), 1);
         assert_eq!(store.member_pending("codex-cli").unwrap(), 1);
@@ -434,6 +610,114 @@ mod tests {
         assert_eq!(store.member_pending("codex-cli").unwrap(), 1, "other member's mail untouched");
         // consume-once: second drain empty.
         assert!(store.drain_member("kimi-code").unwrap().is_empty());
+    }
+
+    /// The drain must stop returning a notice WITHOUT destroying the evidence
+    /// that it was ever delivered — that deletion is what made "was this
+    /// answered?" unaskable in the first place.
+    #[test]
+    fn drain_marks_rather_than_deletes_so_delivery_survives_the_wake() {
+        let (_tmp, store) = fresh();
+        let id = store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "reply",
+                            Some("forum/a.md#t"), "hash-a", None)
+            .unwrap();
+        assert!(!store.drain_member("kimi-code").unwrap().is_empty());
+        assert!(store.drain_member("kimi-code").unwrap().is_empty(), "consume-once holds");
+        assert_eq!(store.member_pending("kimi-code").unwrap(), 0);
+        // ...and the row is still there to be asked about.
+        assert_eq!(
+            store.member_notice_recipient(id).unwrap().as_deref(),
+            Some("kimi-code")
+        );
+        let un = store.member_unanswered("kimi-code", &["reply"], -1).unwrap();
+        assert_eq!(un.len(), 1);
+        assert!(un[0].drained_at.is_some(), "delivered, then unanswered");
+    }
+
+    /// Binding a response clears the debt; the per-kind filter keeps the
+    /// silently-actionable kinds out of the report entirely.
+    #[test]
+    fn unanswered_clears_on_binding_and_ignores_silent_kinds() {
+        let (_tmp, store) = fresh();
+        let asked = store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "review_request",
+                            Some("pr/1"), "h1", None)
+            .unwrap();
+        store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "handoff",
+                            Some("repo/state"), "h2", None)
+            .unwrap();
+        // handoff is legitimately silent — it must never appear.
+        let counted: &[&str] = &["review_request", "reply"];
+        let before = store.member_unanswered("kimi-code", counted, -1).unwrap();
+        assert_eq!(before.len(), 1, "handoff is not an unanswered-report row");
+        assert_eq!(before[0].id, asked);
+        assert!(before[0].drained_at.is_none(), "never picked up");
+        // Kimi answers it: the binding closes the row.
+        store
+            .enqueue_member("claude-code", "kimi-code", "role:r", "review_done",
+                            Some("forum/verdict.md"), "h3", Some(asked))
+            .unwrap();
+        assert!(
+            store.member_unanswered("kimi-code", counted, -1).unwrap().is_empty(),
+            "a bound response clears the notice it answers"
+        );
+    }
+
+    /// Both directions are visible to the party involved, and only that party.
+    #[test]
+    fn unanswered_is_self_scoped_in_both_directions() {
+        let (_tmp, store) = fresh();
+        store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "reply", None, "h1", None)
+            .unwrap();
+        store
+            .enqueue_member("codex-cli", "thor", "role:r", "reply", None, "h2", None)
+            .unwrap();
+        let counted: &[&str] = &["reply"];
+        let claude = store.member_unanswered("claude-code", counted, -1).unwrap();
+        assert_eq!(claude.len(), 1, "sender sees its own unanswered send");
+        assert_eq!(claude[0].to_plugin, "kimi-code");
+        let kimi = store.member_unanswered("kimi-code", counted, -1).unwrap();
+        assert_eq!(kimi.len(), 1, "recipient sees its own debt");
+        // Neither sees the thor -> codex thread.
+        for row in claude.iter().chain(kimi.iter()) {
+            assert_ne!(row.from_plugin, "thor", "no cross-thread visibility");
+        }
+    }
+
+    /// A pre-id-binding inbox.db must upgrade in place, not fail to open.
+    #[test]
+    fn member_schema_migrates_from_the_pre_binding_shape() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("inbox.db");
+        {
+            let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("DROP TABLE IF EXISTS member_notices").unwrap();
+            // The exact shape shipped before 2026-07-25.
+            conn.execute_batch(
+                "CREATE TABLE member_notices (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, to_plugin TEXT NOT NULL,
+                    from_plugin TEXT NOT NULL, from_role TEXT NOT NULL, kind TEXT NOT NULL,
+                    pointer_uri TEXT, chain_hash TEXT NOT NULL, queued_at TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO member_notices
+                    (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at)
+                 VALUES ('kimi-code','claude-code','role:r','reply','p','h',?1)",
+                params![Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        }
+        let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
+        // The legacy row is pending (drained_at NULL) and queryable under the new columns.
+        assert_eq!(store.member_pending("kimi-code").unwrap(), 1);
+        let drained = store.drain_member("kimi-code").unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].in_reply_to, None);
     }
 
     #[test]

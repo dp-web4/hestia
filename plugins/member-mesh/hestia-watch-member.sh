@@ -34,10 +34,21 @@ for stale in "$STATE"/primers/notice-*.json; do
   python3 -c "import json,sys;d=json.load(open(sys.argv[1]));[print(f\"    id={n.get('id')} {n.get('kind')} from {n.get('from_plugin')} queued={n.get('queued_at','')}: {n.get('pointer_uri','')}\") for n in d.get('notices',[])]" "$stale" 2>/dev/null || true
 done
 
-drain() {
-python3 - "$PLUGIN" "$HOST_AGENT" "$EP" <<'PY'
+# The unanswered row exists (daemon-side) only if something ASKS on a cadence —
+# a queryable quantity nobody queries is the same defect as an alarm written to
+# a directory nobody reads (Kimi, 2026-07-25). Two askers, deliberately weak-then-
+# strong: the journal announcement below (cheap, but only as good as who reads
+# journals), and the merge into every fire primer (guaranteed read, because it
+# lands in the woken session's own prompt). What is NOT done: firing a member
+# because it owes a response. Auto-waking a CLI is a consequential act; debt is
+# not a reason to spend one.
+UNANSWERED_EVERY="${UNANSWERED_EVERY:-3600}"   # journal cadence, seconds
+STALE_AFTER="${STALE_AFTER:-21600}"            # a notice is stale at 6h unbound
+
+mesh_rpc() {
+python3 - "$PLUGIN" "$HOST_AGENT" "$EP" "$1" "${2:-}" <<'PY'
 import json, sys, urllib.request
-plugin, host_agent, ep = sys.argv[1], sys.argv[2], sys.argv[3]
+plugin, host_agent, ep, tool, extra = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 def post(payload, hdrs={}):
     req = urllib.request.Request(ep, data=json.dumps(payload).encode(),
         headers={"Content-Type":"application/json","Accept":"application/json, text/event-stream",**hdrs})
@@ -53,16 +64,57 @@ post({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}, h)
 c = rpc(h, "hestia_connect", {"plugin_id": plugin, "host_agent": host_agent, "instance_name": f"watch-{plugin}"})
 s = c.get("sessionId") or c.get("session_id")
 if not s: print(json.dumps({"error": c})); raise SystemExit(1)
-print(json.dumps(rpc(h, "hestia_member_inbox", {"session_id": s})))
+args = {"session_id": s}
+if extra:
+    args.update(json.loads(extra))
+print(json.dumps(rpc(h, tool, args)))
 PY
 }
 
+drain() { mesh_rpc hestia_member_inbox; }
+unanswered() { mesh_rpc hestia_member_unanswered "{\"older_than_secs\": $STALE_AFTER}"; }
+
+# Render the unanswered rows for a human (journal) or for a fire primer.
+announce_unanswered() {
+  local OUT; OUT=$(unanswered 2>/dev/null) || return 0
+  printf '%s' "$OUT" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit(0)
+for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me")):
+    for n in d.get(key,[]) or []:
+        seen = "delivered, unanswered" if n.get("drained_at") else "NEVER PICKED UP"
+        print(f"[hestia-watch] UNANSWERED ({label}): id={n.get(\"id\")} {n.get(\"kind\")} "
+              f"{n.get(\"from_plugin\")}->{n.get(\"to_plugin\")} [{seen}] queued={n.get(\"queued_at\",\"\")}: "
+              f"{n.get(\"pointer_uri\",\"\")}")
+' || true
+}
+
+announce_unanswered
+LAST_ANNOUNCE=$(date +%s)
+
 while true; do
+  NOW=$(date +%s)
+  if [ $((NOW - LAST_ANNOUNCE)) -ge "$UNANSWERED_EVERY" ]; then
+    announce_unanswered
+    LAST_ANNOUNCE=$NOW
+  fi
   OUT=$(drain || echo '{"total":0}')
   N=$(echo "$OUT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
   if [ "$N" -gt 0 ]; then
     PRIMER=$(mktemp "$STATE/primers/notice-XXXXXX.json")
-    echo "$OUT" > "$PRIMER"
+    # The strong asker: fold the member's outstanding debt into the primer, so
+    # the question is asked where an answer is possible — inside the wake that
+    # is happening anyway. Costs one read; never causes a fire on its own.
+    UN=$(unanswered 2>/dev/null || echo '{}')
+    printf '%s' "$OUT" | UN="$UN" python3 -c '
+import json,os,sys
+d=json.load(sys.stdin)
+try: u=json.loads(os.environ.get("UN") or "{}")
+except Exception: u={}
+d["unanswered"]={k:u.get(k,[]) for k in ("i_owe","owed_to_me")}
+json.dump(d,sys.stdout)
+' > "$PRIMER" 2>/dev/null || echo "$OUT" > "$PRIMER"
     echo "[hestia-watch] $N notice(s) for $PLUGIN -> $PRIMER"
     if [ -n "$FIRE" ]; then
       # Success: primer is spent, remove it. Failure: KEEP it — the drain was

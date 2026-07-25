@@ -83,6 +83,7 @@ impl ServerHandler for HestiaServer {
             "hestia_notify" => tool_notify(&self.state, &args).await,
             "hestia_member_notify" => tool_member_notify(&self.state, &args).await,
             "hestia_member_inbox" => tool_member_inbox(&self.state, &args).await,
+            "hestia_member_unanswered" => tool_member_unanswered(&self.state, &args).await,
             "hestia_inbox" => tool_inbox(&self.state, &args).await,
             "hestia_pair_inbox" => tool_pair_inbox(&self.state, &args).await,
             "hestia_cosign" => tool_cosign(&self.state, &args).await,
@@ -206,11 +207,15 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_member_notify",
-            "Send a witnessed, pointer-based wake notice to another LOCAL member (fractal mesh; kinds mirror hub-mesh)",
+            "Send a witnessed, pointer-based wake notice to another LOCAL member (fractal mesh; kinds mirror hub-mesh). Pass in_reply_to:<notice id> to bind a disposition (reply/ack/review_done) to the notice it answers",
         ),
         t(
             "hestia_member_inbox",
             "Drain YOUR member notices (consume-once; recipient-scoped by resolved caller identity)",
+        ),
+        t(
+            "hestia_member_unanswered",
+            "Which of YOUR notices are queued with no bound response (older_than_secs, default 6h): i_owe = addressed to you and unanswered, owed_to_me = sent by you and unanswered. Measures responsiveness, not action",
         ),
         t(
             "hestia_inbox",
@@ -1709,6 +1714,30 @@ const MEMBER_NOTICE_KINDS: &[&str] = &[
     "ack",
 ];
 
+// ---- id-binding (Kimi ↔ CBP, 2026-07-25): two DIFFERENT per-kind sets ----
+//
+// The convention already existed in prose (`re: <notice-id>` in forum
+// frontmatter); these consts are the schema ratifying it. Keeping the sets
+// separate is the whole point — collapsing them is what would make the new row
+// as overreadable as the one it replaces.
+
+/// Kinds that ARE a disposition: sending one is answering something, so it
+/// should name what. Expected here, optional everywhere else — never enforced,
+/// only reported (see `unbound_notice`).
+const MEMBER_KINDS_ARE_DISPOSITIONS: &[&str] = &["reply", "ack", "review_done"];
+
+/// Kinds that AWAIT a disposition: one of these with nothing bound to it is
+/// genuinely unanswered. `forum-note`, `coordination` and especially `handoff`
+/// are deliberately absent — they can be legitimately acted on in silence (for
+/// a handoff the pickup IS the response, and it happens in a repo, not on the
+/// mesh), so counting them would manufacture a standing false-positive class:
+/// the opposite-direction twin of the absence-read-as-pass bug this row exists
+/// to fix. `ack` is terminal and closes what it binds to.
+const MEMBER_KINDS_AWAIT_RESPONSE: &[&str] = &["review_request", "reply"];
+
+/// Default staleness before an unbound notice is worth announcing.
+const MEMBER_UNANSWERED_DEFAULT_SECS: i64 = 6 * 3600;
+
 /// A pointer names a location — it never carries content. Anything longer
 /// than this (or multi-line) is payload smuggling, not a pointer.
 const MAX_POINTER_URI_BYTES: usize = 512;
@@ -1747,6 +1776,23 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         }
     }
     let session_id_arg = optional_string(args, "session_id");
+    // `in_reply_to` binds this send to the notice it answers. Optional on every
+    // kind, expected on reply/ack — a silent parse-failure would make a bound
+    // response look unbound, which is exactly the false negative this field
+    // exists to remove, so a present-but-malformed value is an error.
+    let in_reply_to = match args.get("in_reply_to") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(n) => Some(n),
+            None => {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_bad_reply_binding",
+                    "in_reply_to must be the integer id of a notice you received",
+                    Some(json!({"in_reply_to": v})),
+                ));
+            }
+        },
+    };
 
     let mut s = state.lock().await;
     // No latest-session fallback here — attribution must be proven, not
@@ -1797,6 +1843,34 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             Some(json!({"current": flood.current, "limit": flood.limit})),
         ));
     }
+    // You may only answer mail that was addressed to YOU. Without this, any
+    // member could mark another member's notice answered and the unanswered
+    // report would be steerable by the party it reports on.
+    // A binding to an id that is no longer on record is ACCEPTED, not rejected:
+    // notices age out on the TTL, so "not found" means unverifiable, not forged
+    // — and `binding_verified` in the witnessed event says which one it was.
+    let mut binding_verified = false;
+    if let Some(rid) = in_reply_to {
+        match s
+            .inbox_store
+            .member_notice_recipient(rid)
+            .map_err(|e| anyhow::anyhow!("resolving in_reply_to: {e}"))?
+        {
+            Some(addressee) if addressee == sender.plugin_id => binding_verified = true,
+            Some(addressee) => {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_reply_binding_not_yours",
+                    &format!(
+                        "notice {rid} was addressed to '{addressee}', not to '{}' — \
+                         a member can only answer its own mail",
+                        sender.plugin_id
+                    ),
+                    Some(json!({"in_reply_to": rid})),
+                ));
+            }
+            None => {}
+        }
+    }
     s.member_notify_limiter.record(&sender.plugin_id);
     // Witness FIRST (the act is the send; delivery is a consequence), then queue
     // with the chain hash so every parked notice is anchored to its witnessed act.
@@ -1809,6 +1883,8 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             "from_session_id": sender.session_uuid,
             "kind": kind,
             "pointer_uri": pointer_uri,
+            "in_reply_to": in_reply_to,
+            "binding_verified": binding_verified,
         }),
     )?;
     let queued_id = s
@@ -1820,14 +1896,28 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             &kind,
             pointer_uri.as_deref(),
             &entry.hash,
+            in_reply_to,
         )
         .map_err(|e| anyhow::anyhow!("queueing member notice: {e}"))?;
-    Ok(json!({
+    let mut out = json!({
         "queued_id": queued_id,
         "witnessEntryHash": entry.hash,
         "to_plugin_id": to_plugin,
         "kind": kind,
-    }))
+        "in_reply_to": in_reply_to,
+        "binding_verified": binding_verified,
+    });
+    // Nudge, not a gate: for the two kinds whose disposition IS a response, an
+    // unbound send is what leaves the sender's notice sitting "unanswered"
+    // forever. Refusing it would be worse — a member with something to say and
+    // a lost id would be silenced by the bookkeeping.
+    if in_reply_to.is_none() && MEMBER_KINDS_ARE_DISPOSITIONS.contains(&kind.as_str()) {
+        out["unbound_notice"] = json!(format!(
+            "kind '{kind}' is a disposition — pass in_reply_to:<notice id> so the notice \
+             it answers stops counting as unanswered"
+        ));
+    }
+    Ok(out)
 }
 
 async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
@@ -1862,6 +1952,75 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
             .map_err(|e| anyhow::anyhow!("draining member inbox: {e}"))?
     };
     Ok(json!({ "total": notices.len(), "peeked": peek, "notices": notices }))
+}
+
+/// "Which notices were queued and never answered?" — the query the mesh could
+/// not answer until 2026-07-25, and the reason `f2e0d1f`'s dead-fire class was
+/// invisible for 41 fires.
+///
+/// Two properties this surface must keep, both learned the hard way:
+///
+/// 1. It is **unanswered**, not undelivered. A notice read and deliberately
+///    not answered is forensically identical here to one nobody ever picked
+///    up (`drained_at` separates those two, and only those two). Named
+///    "undelivered" it would re-create absence-read-as-pass with better
+///    tooling.
+/// 2. It closes the loop for RESPONSIVENESS, not for ACTION. The INERT
+///    signature — woke, ran, did nothing — is still not representable. The
+///    mesh can now say "nobody answered"; it still cannot say "nobody acted".
+///    Both sentences ship in the response so a reader cannot take the first
+///    for the second.
+///
+/// Read-only and self-scoped: a caller sees only notices it sent or received.
+async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult {
+    let session_id_arg = optional_string(args, "session_id");
+    let older_than_secs = args
+        .get("older_than_secs")
+        .and_then(Value::as_i64)
+        .unwrap_or(MEMBER_UNANSWERED_DEFAULT_SECS)
+        .max(0);
+    let mut s = state.lock().await;
+    let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.member_unanswered_unattributed",
+            "member_unanswered requires the caller's own live session_id (from hestia_connect)",
+            None,
+        ));
+    };
+    if let Some(denied) = gate_direct_tool(
+        &mut s,
+        &who,
+        "hestia_member_unanswered",
+        "member_notify",
+        "unanswered",
+    ) {
+        return Ok(denied);
+    }
+    let rows = s
+        .inbox_store
+        .member_unanswered(
+            &who.plugin_id,
+            MEMBER_KINDS_AWAIT_RESPONSE,
+            older_than_secs,
+        )
+        .map_err(|e| anyhow::anyhow!("querying unanswered member notices: {e}"))?;
+    let (mine, theirs): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .partition(|n| n.to_plugin == who.plugin_id);
+    Ok(json!({
+        "plugin_id": who.plugin_id,
+        "older_than_secs": older_than_secs,
+        "kinds_counted": MEMBER_KINDS_AWAIT_RESPONSE,
+        // Notices addressed to me that I never answered: my own debt.
+        "i_owe": mine,
+        // Notices I sent that nobody answered: did my wake land?
+        "owed_to_me": theirs,
+        "scope": "unanswered = no notice binds in_reply_to to it; \
+                  drained_at:null additionally means it was never picked up",
+        "still_unrepresentable": "a member that woke, ran, and did nothing (INERT) is \
+                                  not visible here — this row measures responsiveness, \
+                                  not action",
+    }))
 }
 
 async fn tool_inbox(state: &SharedState, args: &Value) -> ToolResult {
@@ -3831,6 +3990,84 @@ mod member_mesh_tests {
             .unwrap();
         assert_eq!(kimi_mail["total"], json!(1));
         assert_eq!(kimi_mail["notices"][0]["from_plugin"], json!("claude-code"));
+    }
+
+    /// The unanswered report is only honest if the party it reports on cannot
+    /// steer it: answering is a right over YOUR OWN mail. And once a real
+    /// response is bound, the debt clears.
+    #[tokio::test]
+    async fn reply_binding_is_scoped_to_your_own_mail_and_clears_the_debt() {
+        let (_dir, state) = test_state().await;
+        let claude = connect(&state, "claude-code").await;
+        let kimi = connect(&state, "kimi-code").await;
+        let codex = connect(&state, "codex-cli").await;
+
+        let sent = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": "pr/1", "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        let nid = sent["queued_id"].as_u64().unwrap();
+
+        // A third member cannot mark someone else's notice answered.
+        let stolen = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "claude-code", "kind": "review_done",
+                    "pointer_uri": "forum/v.md", "session_id": codex, "in_reply_to": nid}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stolen["_hestia_error"]["code"],
+            json!("hestia.member_notify_reply_binding_not_yours"),
+            "{stolen}"
+        );
+
+        // Before any answer, the sender sees the notice as owed to them.
+        let pre = tool_member_unanswered(
+            &state,
+            &json!({"session_id": claude, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pre["owed_to_me"].as_array().unwrap().len(), 1, "{pre}");
+        assert_eq!(pre["i_owe"].as_array().unwrap().len(), 0);
+
+        // The addressee answers; the binding is verified and the debt clears.
+        let answer = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "claude-code", "kind": "review_done",
+                    "pointer_uri": "forum/v.md", "session_id": kimi, "in_reply_to": nid}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer["binding_verified"], json!(true), "{answer}");
+        let post = tool_member_unanswered(
+            &state,
+            &json!({"session_id": claude, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(post["owed_to_me"].as_array().unwrap().len(), 0, "{post}");
+    }
+
+    /// A disposition sent with no binding is nudged, never blocked — silencing
+    /// a member who lost an id would be a worse failure than an unbound send.
+    #[tokio::test]
+    async fn unbound_disposition_is_reported_not_refused() {
+        let (_dir, state) = test_state().await;
+        let claude = connect(&state, "claude-code").await;
+        let out = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "ack",
+                    "pointer_uri": "forum/x.md", "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        assert!(out["queued_id"].is_number(), "unbound send must still deliver: {out}");
+        assert!(out["unbound_notice"].is_string(), "and must say so: {out}");
     }
 
     /// Kimi review Finding 3: a pointer NAMES a location. Multi-line /
