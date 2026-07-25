@@ -169,6 +169,12 @@ Documentation=https://github.com/dp-web4/hestia
 # the window): 120 -> failed at t=30s on the 5th start ("Start request repeated
 # too quickly"); 10 -> 13 restarts at t=70s and still climbing. Probe 1d now
 # enforces "keep in sync" instead of leaving it to this comment.
+# Boundary, also measured (four units, only the window differing): 20 and 25
+# both climb past 15 restarts at t=80s without firing; 30 fails at 5. systemd
+# permits burst starts per window and refuses the burst+1-th, which lands at
+# burst x RestartSec -- so a window of (burst-1) x RestartSec never fires, and
+# window == burst x RestartSec is decided by sub-second jitter. Hence "wider
+# than", strictly.
 StartLimitIntervalSec=120
 StartLimitBurst=5
 
@@ -327,6 +333,16 @@ verify_service_linux() {
   #     NOTE: a unit stopped by the start limit keeps Result=exit-code -- it does
   #     NOT become start-limit-hit (measured). Do not key a detector on Result;
   #     ActiveState=failed and the journal line are the witnesses.
+  #     DO NOT TIGHTEN the "<=" below to "<", and do not re-derive the threshold
+  #     as (burst-1) x RestartSec. That derivation assumes the burst-th start is
+  #     the one refused; systemd permits burst starts per window and refuses the
+  #     burst+1-th, which lands at burst x RestartSec. Measured on CBP, four
+  #     units differing only in the window (burst=5, RestartSec=5s): 20 -> 15
+  #     restarts at t=80s and still climbing; 25 -> same, still climbing; 30 ->
+  #     failed at 5 starts. So (burst-1) x RestartSec = 20s does not fire, and
+  #     at window == burst x RestartSec the refusing start landed at t~=25.0s
+  #     against a 25s window -- sub-second jitter decides, and here it decided
+  #     against firing. Warning on "<=" is the boundary, not slack above it.
   local restart_pol iv bu rs ivs rss need verdict
   restart_pol=$(systemctl --user show hestia.service -p Restart --value 2>/dev/null || true)
   if [ -z "$restart_pol" ]; then

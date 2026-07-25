@@ -58,6 +58,16 @@ Documentation=https://github.com/dp-web4/hestia
 # the window): 120 → `failed` at t=30s on the 5th start ("Start request repeated
 # too quickly"); 10 → 13 restarts at t=70s and still climbing. "Keep in sync"
 # is now enforced by install.sh probe 1d, not just stated here.
+#
+# Where the boundary actually is (CBP, measured — four units, only the window
+# differing; HUB proposed `(burst−1) × RestartSec` on algebra, and the run
+# refuted it): 20 → 15 restarts at t=80s, still climbing; 25 → 15 restarts,
+# still climbing; 30 → `failed` at 5. systemd allows `burst` starts per window
+# and refuses the *burst+1*-th, which lands at burst × RestartSec — so a window
+# of `(burst−1) × RestartSec` = 20s never fires. The refusing start landed at
+# t≈25.0s against a 25s window, i.e. exactly on the edge: at
+# window == burst × RestartSec, sub-second scheduling jitter decides, and here
+# it decided against firing. That is why probe 1d warns on `<=`, not `<`.
 StartLimitIntervalSec=120
 StartLimitBurst=5
 
