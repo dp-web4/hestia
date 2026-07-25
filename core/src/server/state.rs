@@ -39,6 +39,12 @@ pub struct Session {
     pub constellation_role: String,
     pub soft_lct: String,
     pub connected_at: DateTime<Utc>,
+    /// The caller's stable host-session id (e.g. Claude Code's `session_id`), if supplied. A
+    /// DESCRIPTIVE reuse key ONLY — `tool_connect` reuses a live session with a matching value
+    /// instead of minting churn per tool call, so one host session = one stable hestia session.
+    /// Guard B (HUB ruling 2026-07-24): this is NEVER an authorization discriminator — no policy/authz
+    /// decision may key off it (nor off `soft_lct`). It names a session; it never confers capability.
+    pub host_session_id: Option<String>,
 }
 
 /// In-flight R6 action.
@@ -1080,6 +1086,7 @@ mod tests {
                 constellation_role: "role:constellation:member".into(),
                 soft_lct: "lct:test:a".into(),
                 connected_at: Utc::now(),
+                host_session_id: None,
             },
         );
         state.sessions.insert(
@@ -1094,6 +1101,7 @@ mod tests {
                 constellation_role: "role:constellation:member".into(),
                 soft_lct: "lct:test:b".into(),
                 connected_at: Utc::now() + chrono::Duration::seconds(1),
+                host_session_id: None,
             },
         );
 

@@ -258,6 +258,11 @@ def ask_daemon(
         role = os.environ.get("HESTIA_ROLE")
         if role:
             connect_args["role"] = role
+        # Stable host-session id → connect idempotency: one Claude session = one hestia session,
+        # instead of a fresh session minted per tool call. Descriptive reuse key only (Guard B —
+        # never an authz discriminator; the daemon reuse is liveness-only, Guard A).
+        if host_session_id:
+            connect_args["host_session_id"] = host_session_id
         connect_resp = client.call_tool("hestia_connect", connect_args)
         connect = unwrap_tool_result(connect_resp)
         if "_hestia_error" in connect:

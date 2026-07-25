@@ -243,6 +243,8 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     let host_agent = require_string(args, "host_agent")?;
     let plugin_version = optional_string(args, "plugin_version");
     let host_agent_version = optional_string(args, "host_agent_version");
+    // The caller's stable host-session id (Claude Code's session_id, etc.), for connect idempotency.
+    let host_session_id = optional_string(args, "host_session_id");
     let requested_role =
         optional_string(args, "requested_role").unwrap_or_else(|| "citizen".to_string());
     // The #403 capacity — normalized fail-closed to the published constellation set.
@@ -256,6 +258,33 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         .unwrap_or(false);
 
     let mut s = state.lock().await;
+
+    // Connect idempotency (HUB ruling 2026-07-24): the claude-code hook connects on EVERY tool call
+    // (fresh MCP connection per hook subprocess), so without this each tool call mints a distinct
+    // session — an interactive session becomes ephemeral churn invisible to coordination. If the caller
+    // supplies a stable `host_session_id` and a live session already carries it, REUSE that session so
+    // one host session = one stable hestia session.
+    //   Guard A — reuse is LIVENESS-ONLY and CAPABILITY-INVARIANT: bump `connected_at` and NOTHING else;
+    //     return the SAME `soft_lct`/role; never re-issue an LCT, change role, or adopt a new agent.
+    //   Not witnessed — local, RAM-only (host_session_id is already witnessed at begin_action grain).
+    //   Guard B (enforced by test): host_session_id is a descriptive reuse key, never an authz key.
+    if let Some(hsid) = host_session_id.as_deref() {
+        if let Some(existing) = s
+            .sessions
+            .values_mut()
+            .find(|sess| sess.host_session_id.as_deref() == Some(hsid))
+        {
+            existing.connected_at = Utc::now(); // Guard A: liveness only — no other field mutates
+            return Ok(json!({
+                "sessionId": existing.session_id,
+                "softLct": existing.soft_lct,
+                "assignedRole": existing.assigned_role,
+                "protocolVersion": 1,
+                "reused": true,
+            }));
+        }
+    }
+
     let session_id = Uuid::new_v4();
     let soft_lct = s.issue_soft_lct(session_id);
 
@@ -269,6 +298,7 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         constellation_role,
         soft_lct: soft_lct.clone(),
         connected_at: Utc::now(),
+        host_session_id,
     };
     // Fail-closed synthetic declaration: a client that declares itself synthetic
     // must have that exclusion durably PERSISTED before we admit it — otherwise a
@@ -2114,8 +2144,10 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
                     "host_agent_version": sess.host_agent_version,
                     "role": sess.constellation_role,
                     "connected_at": sess.connected_at,
-                    // session_id + soft_lct deliberately OMITTED (bearer tokens). A coordination-safe
-                    // per-session name arrives with the connect-idempotency fix (host_session_id).
+                    // The coordination-safe NAME: host_session_id NAMES a session (so a sibling/launcher
+                    // can say "session X holds this") without conferring capability (Guard B — never an
+                    // authz key). session_id + soft_lct remain OMITTED (bearer tokens in the vault path).
+                    "host_session_id": sess.host_session_id,
                 })
             })
             .collect();
@@ -3663,6 +3695,7 @@ mod inbox_tests {
                     constellation_role: "role:constellation:mesh-worker".into(),
                     soft_lct: "lct:test".into(),
                     connected_at: chrono::Utc::now(),
+                    host_session_id: None,
                 },
             );
         }
@@ -3927,6 +3960,7 @@ mod tests {
                 constellation_role: role.into(),
                 soft_lct: "lct:test".into(),
                 connected_at: Utc::now(),
+                host_session_id: None,
             },
         );
         sid
@@ -3996,6 +4030,70 @@ mod tests {
             "session_id (a vault-path bearer token) must NOT be enumerated: {body}"
         );
         assert!(!body.contains("lct:test"), "soft_lct (bearer) must be redacted: {body}");
+    }
+
+    /// Connect idempotency (HUB ruling): a stable host_session_id reuses the live session instead of
+    /// minting churn per tool call. Guard A: reuse is liveness-only + capability-invariant — same
+    /// session_id, same soft_lct; a distinct host_session_id is a distinct session.
+    #[tokio::test]
+    async fn connect_reuses_session_on_host_session_id_liveness_only() {
+        let (_dir, shared) = make_shared_state();
+        let a = tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "hs-1"}),
+        )
+        .await
+        .unwrap();
+        let sid1 = a.get("sessionId").unwrap().as_str().unwrap().to_string();
+        let lct1 = a.get("softLct").unwrap().as_str().unwrap().to_string();
+        assert_eq!(shared.lock().await.sessions.len(), 1);
+        // second connect, SAME host_session_id → reuse, not a new session
+        let b = tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "hs-1"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(b.get("reused").and_then(|v| v.as_bool()), Some(true), "reused: {b}");
+        assert_eq!(shared.lock().await.sessions.len(), 1, "no churn — still one session");
+        assert_eq!(b.get("sessionId").unwrap().as_str().unwrap(), sid1, "same session_id");
+        assert_eq!(b.get("softLct").unwrap().as_str().unwrap(), lct1, "Guard A: same soft_lct, no re-issue");
+        // a DIFFERENT host_session_id → a distinct session
+        tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "hs-2"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(shared.lock().await.sessions.len(), 2, "distinct host session → distinct hestia session");
+    }
+
+    /// Guard B (HUB ruling): host_session_id is a descriptive reuse key, NEVER an authz discriminator.
+    /// A reuse-connect asserting a different role must NOT change the session's role — the asserted id
+    /// cannot escalate. (The tripwire against a future "reuse convenience → auth-by-asserted-id" bleed.)
+    #[tokio::test]
+    async fn connect_reuse_cannot_change_role_host_session_id_is_not_an_authz_key() {
+        let (_dir, shared) = make_shared_state();
+        tool_connect(&shared, &json!({
+            "plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "hs-x",
+            "role": "role:constellation:member"
+        }))
+        .await
+        .unwrap();
+        // reuse-connect claiming a different role
+        tool_connect(&shared, &json!({
+            "plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "hs-x",
+            "role": "role:constellation:mesh-worker"
+        }))
+        .await
+        .unwrap();
+        let s = shared.lock().await;
+        assert_eq!(s.sessions.len(), 1, "still one session");
+        let sess = s.sessions.values().next().unwrap();
+        assert_eq!(
+            sess.constellation_role, "role:constellation:member",
+            "Guard B: an asserted host_session_id must not change role on reuse"
+        );
     }
 
     #[tokio::test]
