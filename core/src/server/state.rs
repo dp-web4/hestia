@@ -696,23 +696,14 @@ impl ServerState {
         self.trust_store.list().map(|v| v.len()).unwrap_or(0)
     }
 
-    /// Resolve a plugin_id from a session_id provided in tool args.
-    /// Falls back to the most-recently-connected session if `session_id`
-    /// is absent (this fallback is the Session-2-era behavior and will
-    /// be removed once both SDKs reliably pass session_id in args).
+    /// Resolve a plugin_id from a session_id provided in tool args. FAIL-CLOSED: an absent or
+    /// unresolvable session_id yields None (deny) — never the most-recently-connected session. That
+    /// former fallback was ambient authority and it races under exactly the concurrency the session
+    /// coordinator manages (same class as the session/own fix, dfe4c6f; §5.5 defect, McNugget). WHO on
+    /// the credential path must be an explicit, resolvable session, not whoever connected last.
     pub fn resolve_plugin_id(&self, session_id: Option<&str>) -> Option<String> {
-        if let Some(sid) = session_id {
-            if let Ok(uuid) = Uuid::parse_str(sid) {
-                if let Some(s) = self.sessions.get(&uuid) {
-                    return Some(s.plugin_id.clone());
-                }
-            }
-            return None;
-        }
-        self.sessions
-            .values()
-            .max_by_key(|sess| sess.connected_at)
-            .map(|sess| sess.plugin_id.clone())
+        let uuid = Uuid::parse_str(session_id?).ok()?;
+        self.sessions.get(&uuid).map(|s| s.plugin_id.clone())
     }
 }
 
@@ -1109,8 +1100,9 @@ mod tests {
             state.resolve_plugin_id(Some(&sid_a.to_string())),
             Some("alice".into())
         );
-        // fallback to most-recent when session_id is absent
-        assert_eq!(state.resolve_plugin_id(None), Some("bob".into()));
+        // FAIL-CLOSED: absent session_id resolves to None, NOT the most-recent session (the ambient-
+        // authority fallback was removed — §5.5; a caller that doesn't identify itself gets no identity).
+        assert_eq!(state.resolve_plugin_id(None), None);
         // unknown session_id resolves to None (no fallback)
         assert_eq!(
             state.resolve_plugin_id(Some("00000000-0000-0000-0000-000000000000")),
