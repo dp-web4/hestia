@@ -1,13 +1,47 @@
 [Unit]
 Description=Hestia local-first Web4 trust daemon
 Documentation=https://github.com/dp-web4/hestia
-# NOT `After=default.target`: this unit is WantedBy=default.target, so ordering
-# it *after* the target that wants it forms a cycle (default.target -> hestia ->
-# default.target). systemd breaks such cycles by DELETING a start job — and the
-# victim is whichever unit closes the loop, not necessarily this one. On CBP it
-# silently deleted both member-mesh watchers (`After=hestia.service`,
-# `WantedBy=default.target`) at every boot: the mesh was "enabled" and never ran.
+# NOT `After=default.target`. This unit is WantedBy=default.target; ordering it
+# *after* the target that wants it is the latent charge. It does NOT cycle on its
+# own — systemd refuses to build the two-node loop (a target skips its implicit
+# "order me after what I want" edge for any unit declaring a contradicting order;
+# the source comment is literally "Don't create loops"). The cycle needs a THIRD
+# unit to bridge it:
+#
+#   default.target --(implicit after)--> watcher      (WantedBy=default.target)
+#   watcher        --(explicit after)--> hestia       (After=hestia.service)
+#   hestia         --(explicit after)--> default.target   <-- the bad line
+#
+# systemd breaks that by DELETING a start job, and the victim is whichever unit
+# closes the loop — not necessarily this one. On CBP it silently deleted both
+# member-mesh watchers at every boot: the mesh was "enabled" and never ran.
 # Found 2026-07-25, the first reboot after the mesh was armed.
+#
+# Why it stayed hidden: the bad line is harmless until something orders itself
+# after hestia. "It starts fine on my box" is not evidence of absence. Detector
+# that needs no reboot (wanted-but-not-ordered == loop-avoidance already fired):
+#   systemctl --user show default.target -p Wants --value | tr ' ' '\n' \
+#     | grep -qx hestia.service &&
+#   ! systemctl --user show default.target -p After --value | tr ' ' '\n' \
+#     | grep -qx hestia.service &&
+#   echo "LATENT ORDERING CYCLE"
+# (-qx on tokenised lines, not a bare grep: `grep -q hestia.service` also
+# matches a unit merely *named* like it, e.g. myhestia.service.)
+# Packaged as install.sh:verify_service_linux — run it fleet-wide, and let it,
+# not deploy/fleet/ROSTER.md, define which machines are affected.
+# Credit: pub (three-node model + detector), nomad (charge/detonator framing),
+# sprout (initial confirm).
+
+# Bound the retry loop. Without a start limit, a persistent failure retries
+# forever and the unit NEVER enters `failed` — so nothing reports it as broken.
+# Observed on nomad: 289 consecutive restarts against `status=226/NAMESPACE`
+# (the [Service] sandboxing below cannot set up mount namespacing under some WSL
+# kernels until the user manager is restarted). Same failure class as the
+# ordering cycle: enabled, no failure signal, not actually running. Prefer a
+# visible `failed` over a silent infinite retry.
+# NOTE: these are [Unit] keys, not [Service] — moved in systemd 229.
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -21,7 +55,6 @@ Environment=RUST_LOG=warn
 # Sandboxing
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=%h/.hestia
 ProtectHome=read-only
 ReadWritePaths=%h/.hestia
 PrivateTmp=true

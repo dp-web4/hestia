@@ -124,13 +124,28 @@ step_service_linux() {
 [Unit]
 Description=Hestia local-first Web4 trust daemon
 Documentation=https://github.com/dp-web4/hestia
-# NOT `After=default.target`: this unit is WantedBy=default.target, so ordering
-# it *after* the target that wants it forms a cycle (default.target -> hestia ->
-# default.target). systemd breaks such cycles by DELETING a start job — and the
-# victim is whichever unit closes the loop, not necessarily this one. On CBP it
-# silently deleted both member-mesh watchers (`After=hestia.service`,
-# `WantedBy=default.target`) at every boot: the mesh was "enabled" and never ran.
+# NOT After=default.target. This unit is WantedBy=default.target; ordering it
+# *after* the target that wants it is the latent charge. It does NOT cycle on
+# its own -- systemd refuses to build the two-node loop ("Don't create loops"):
+# a target skips its implicit "order me after what I want" edge for any unit
+# that declares a contradicting order. The cycle needs a THIRD unit to bridge:
+#   default.target -> watcher (implicit) -> hestia (After=hestia.service)
+#                  -> default.target (the bad line)
+# systemd breaks that by DELETING a start job, and the victim is whichever unit
+# closes the loop -- not necessarily this one. On CBP it silently deleted both
+# member-mesh watchers at every boot: the mesh was "enabled" and never ran.
 # Found 2026-07-25, the first reboot after the mesh was armed.
+# Reboot-free detector: wanted-but-not-ordered == loop-avoidance already fired.
+# (No backticks in this heredoc: it is unquoted, so they would be command
+# substitution and silently eat the text -- which is what happened to the
+# original of this comment.)
+
+# Bound the retry loop: without a start limit a persistent failure retries
+# forever and the unit NEVER enters failed, so nothing reports it broken
+# (nomad: 289 restarts against status=226/NAMESPACE under a WSL kernel).
+# These are [Unit] keys, not [Service] -- they moved in systemd 229.
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -139,7 +154,6 @@ Environment=HESTIA_HOME=%h/.hestia
 Environment=RUST_LOG=warn
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=%h/.hestia
 ProtectHome=read-only
 ReadWritePaths=%h/.hestia
 PrivateTmp=true
@@ -163,6 +177,70 @@ UNIT
   if ! loginctl show-user "$USER" 2>/dev/null | grep -q 'Linger=yes'; then
     sudo loginctl enable-linger "$USER" 2>/dev/null || \
       c_warn "could not enable-linger (sudo may have prompted); service will stop on logout until you run: sudo loginctl enable-linger $USER"
+  fi
+
+  verify_service_linux
+}
+
+# Post-install verification. The recurring defect this guards is "install
+# reported success, unit never ran, nothing said so" -- an `enabled` unit reads
+# as "will come back" when it may not. Reports inspectable evidence and warns;
+# it does NOT fail the install, because the caller decides what the evidence is
+# worth. Two known instances: the default.target ordering cycle (2026-07-25) and
+# the unbounded 226/NAMESPACE restart loop on WSL (nomad, 289 retries).
+verify_service_linux() {
+  c_hdr "post-install verification"
+
+  # NOTE on style: this runs under `set -euo pipefail`, and verification must
+  # never abort an otherwise-good install. So every probe is `|| true`, and no
+  # probe puts a pipeline in an `if` condition -- `grep -q` exits early, which
+  # SIGPIPEs the upstream systemctl, and under pipefail the pipeline would then
+  # report failure on exactly the runs where the pattern DID match. Capture
+  # first, test the string second.
+
+  # 1. The unit as written must parse. Catches typo'd/misplaced keys -- e.g.
+  #    StartLimit* in [Service] instead of [Unit], which systemd silently ignores.
+  local vout
+  vout=$(systemd-analyze --user verify "$HOME/.config/systemd/user/hestia.service" 2>&1 || true)
+  if [ -n "$vout" ]; then
+    c_warn "systemd-analyze verify reported:"; printf '%s\n' "$vout"
+  else
+    c_ok "unit verifies clean"
+  fi
+
+  # 2. Latent ordering cycle, detectable WITHOUT a reboot: if hestia is wanted by
+  #    default.target but absent from its After=, systemd's loop-avoidance already
+  #    fired, meaning a bridging unit can get its start job deleted at next boot.
+  #    Match whole space-delimited tokens: a bare `grep hestia.service` also hits
+  #    a unit merely named like it (myhestia.service).
+  local wants after
+  wants=" $(systemctl --user show default.target -p Wants --value 2>/dev/null || true) "
+  after=" $(systemctl --user show default.target -p After --value 2>/dev/null || true) "
+  if [ "${wants#* hestia.service }" != "$wants" ] && [ "${after#* hestia.service }" = "$after" ]; then
+    c_warn "LATENT ORDERING CYCLE: hestia.service is wanted by default.target but not ordered after it."
+    c_warn "  A unit with After=hestia.service can have its start job deleted at boot, silently."
+    c_warn "  Fix: remove any 'After=default.target' from ~/.config/systemd/user/hestia.service, then daemon-reload."
+  else
+    c_ok "no latent ordering cycle"
+  fi
+
+  # 3. Cycles are logged against the target and the DELETED victim, never against
+  #    hestia.service -- so this must not filter by unit.
+  local cyc
+  cyc=$(journalctl --user -b 2>/dev/null | grep -i 'ordering cycle\|deleted to break' | tail -5 || true)
+  if [ -n "$cyc" ]; then
+    c_warn "this boot's journal contains ordering-cycle breakage:"
+    printf '%s\n' "$cyc"
+  fi
+
+  # 4. active, not merely enabled.
+  if systemctl --user is-active --quiet hestia.service; then
+    c_ok "hestia.service is active"
+  else
+    local state
+    state=$(systemctl --user is-active hestia.service 2>&1 || true)
+    c_warn "hestia.service is NOT active (state: $state)"
+    c_warn "  'enabled' alone does not mean it is running; see: journalctl --user -u hestia.service -b"
   fi
 }
 
