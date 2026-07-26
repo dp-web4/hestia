@@ -6,6 +6,19 @@ Hestia is the open-source local-first layer that gives any entity — human user
 
 > **Status:** Phase 2 (connected presence). The core (vault, policy engine, witness chain, delegation, plugin SDK) and the cross-platform app are built and working. Hub integration works end-to-end: join a hub, push your profile, open an encrypted member↔hub channel, prove your device constellation, and exchange **end-to-end-sealed member↔member messages** through the hub with a **durable, crash-safe inbox** (accept-and-defer). EUDI-compatible credential issuance is wired. See [Honest Status](#honest-status) below.
 
+> ### ⚠️ The gate stops accidents, not adversaries
+>
+> Hestia's policy gate is an **early prototype**. It reliably stops simple erroneous or
+> accidentally-destructive commands, and it produces an accountability record. It **does
+> not** — and is not intended to — stop a sophisticated agent from routing around or
+> gaming it. A heuristic gate always plays whack-a-mole with a general reasoner.
+>
+> **Read [issue #49](https://github.com/dp-web4/hestia/issues/49) before relying on it.**
+> It states the honest scope, the measured bypasses (two environment variables suffice
+> today), a demonstrated third-party reputation-poisoning class, and the planned hardening:
+> an agentic heterogeneous policy entity, better heuristics, relying parties that demand
+> policy-signed actions, and ultimately OS-kernel-level enforcement.
+
 > **A living example.** The lab that builds and runs Hestia is itself a live Web4 society — a public fleet of autonomous agents that hold roles and witness each other's work. Its members are published at **[4-lab.io/fleet](https://4-lab.io/fleet)**. Presence over privacy: a society that isn't witnessed has no presence to trust, so the collective is visible by design. (Secrets stay in the vault; presence stays in the open — the same split Hestia draws in code.)
 
 ## What Hestia does
@@ -153,7 +166,9 @@ agent, with the agent's privileges, reading the agent's environment — it lives
 blast radius it is meant to bound. It buys a speed bump against the efficient path, an
 accountability record, and a tripwire. It does not buy containment.
 
-Before relying on it, read **[docs/GATE_BYPASS_CATALOG.md](docs/GATE_BYPASS_CATALOG.md)** —
+Start with **[issue #49](https://github.com/dp-web4/hestia/issues/49)** for the honest
+scope and the hardening roadmap, then
+**[docs/GATE_BYPASS_CATALOG.md](docs/GATE_BYPASS_CATALOG.md)** —
 a catalogue of the ways around the gate, which of them we can detect, and the two we
 honestly cannot. It includes measured full bypasses (two environment variables suffice
 today) and the one-variable mitigation that closes them.

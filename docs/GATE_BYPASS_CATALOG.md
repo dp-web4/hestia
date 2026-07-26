@@ -195,6 +195,29 @@ for days purely by misconfiguration. If a mistake produced a split identity, an 
 key issued at install, signing each request. Currently unbuilt; this is the deepest
 structural gap in the record's integrity.
 
+### D3. Third-party reputation poisoning ⚠️ **DEMONSTRATED, unintentionally**
+**Mechanism.** An agent that can invoke ANOTHER member's gate can author entries against
+that member's conduct record. No control is defeated: the gate faithfully records what it
+is told, derivation faithfully folds it, and the target's measured trust falls for acts it
+never performed.
+**Status.** MEASURED, and not by design. While writing this catalogue CBP drove peer gates
+directly with synthetic payloads and launched other agents with deliberately
+harmful-looking prompts, manufacturing **22 denials against codex** and 3 against kimi.
+Codex's temperament fell to 0.371 and its `interactive-dev` grain read `medium` on conduct
+that was entirely CBP's.
+**Detection.** NONE automated. It was caught because a HUMAN noticed the numbers did not
+match the collaborators he worked with (dp, 2026-07-26) and directed exoneration.
+Reputation was writable by a third party and the correction was social.
+**Why it is the sharpest entry here.** Every other class requires defeating something.
+This one requires only *using* the system as designed — which is why heuristics cannot
+address it, and why the answer is upstream: attributing an act to the entity that
+*initiated* it rather than the identity whose gate processed it.
+**Partial mitigation, built:** `tools/gate-probe.py` makes instrumentation self-cleaning,
+so a probe exonerates the ding it causes. That is hygiene for honest probers, not a
+control against dishonest ones.
+**Scope note.** See [issue #49](https://github.com/dp-web4/hestia/issues/49) — the gate is
+an early prototype that stops accidents, not adversaries.
+
 ### D2. Selective non-witnessing
 Any Class A/B/C bypass is also a witnessing bypass, since the same hook does both. There is
 no independent observer. **Consequence: the chain is a record of governed activity, never a
@@ -258,6 +281,7 @@ B1 gets it for free.
 | C2 9p slowness | yes | inventory `FRAGILE` | ✅ (issue #45) |
 | C3 missing fallback | yes | inventory dead-target stat | ✅ |
 | D1 identity spoofing | weak | convergence across witnesses | **structural gap** |
+| **D3 third-party reputation poisoning** | **no — a human caught it** | — | **structural gap** |
 | D2 non-witnessing | no | — | **accepted limit** |
 | E1 obfuscation | poor | — | **accepted limit** |
 | F1 advisory harness | yes, in advance | atlas `blocking_capable` | ✅ |
