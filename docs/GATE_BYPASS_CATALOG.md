@@ -74,12 +74,20 @@ present but enforcement absent.
 `governed`. **Gap — the inventory checks that a gate exists, not that its matcher is
 total.** Worth fixing; it is a one-line comparison against `expects.json`.
 
-### A2. Sub-agents and spawned sessions
-**Status.** UNTESTED. Whether a `Task`/subagent inherits PreToolUse hooks is harness-
-specific and we have not measured it on any of the four.
-**Why it matters.** If subagents are ungated, "spawn a subagent to do it" is a one-step
-bypass requiring no cleverness at all.
-**Action.** Measure this next. It is the highest-value unknown in this document.
+### A2. Sub-agents and spawned sessions — **MEASURED CLOSED (claude)**
+**Result, 2026-07-26.** Subagents **do** inherit `PreToolUse`, and their calls **are**
+witnessed. A `general-purpose` subagent was given three Bash calls; the two benign ones ran
+and the third — an `echo` whose *text* trips the lexical matcher — was denied inside the
+subagent with the full `hestia deny [rule: Block destructive shell commands]`. The chain
+moved in step: **+14 entries, +5 actions, +1 denial**, including a `policy_decision
+status=deny` and its `outcome`. "Spawn a subagent to do it" is **not** a bypass on claude.
+**Still untested:** codex, kimi and gemini sub-session semantics. Recorded per harness in
+agent-atlas as `subagent_hooks_inherited` (`verified-inherited` for claude, `untested` for
+the other 44) — the registry, not this document, is the source of truth for it.
+**Residual — attribution, not enforcement.** Subagent activity is recorded under the
+PARENT's `plugin_id` (`claude-code`). Enforcement and witnessing are intact, but the chain
+cannot distinguish main-loop from subagent action, so a fleet of subagents is one actor in
+the record. That is an accountability-granularity gap worth closing separately.
 
 ### A3. Detached and deferred execution
 **Mechanism.** A gated call schedules work that runs later outside any hook: `at`, `cron`,
@@ -239,7 +247,9 @@ B1 gets it for free.
 | Class | Detectable? | By what | Built? |
 |---|---|---|---|
 | A1 matcher narrowed | partial | inventory vs `expects.json` | **gap** |
-| A2 subagents | unknown | — | **unmeasured** |
+| A2 subagents (claude) | **n/a — closed** | measured: gated + witnessed | ✅ |
+| A2 subagents (codex/kimi/gemini) | unknown | — | **unmeasured** |
+| A2 subagent attribution | no | recorded as the parent | **gap** |
 | A3 deferred execution | forensic only | chain holds the setup | n/a |
 | A4 config edit | yes, ≤1h lag | `agent-inventory` | ✅ |
 | **B1 endpoint redirect** | **not via chain** | `/proc/<pid>/environ` sweep | **gap** |
@@ -259,25 +269,62 @@ work inside this architecture removes them.
 
 ---
 
-## 9. Recommended, in value order
+## 9. The structural fix: consequential config belongs in the VAULT, not the environment
 
-1. **`HESTIA_PRE_FAIL_CLOSED=1` fleet-wide.** One variable; closes every measured bypass
-   here. Needs a society decision because the daemon becomes a hard dependency.
-2. **A live-environment sweep.** Read `/proc/<pid>/environ` and `cmdline` for every running
-   agent; flag `HESTIA_*` overrides, unexpected `PATH`, and `--dangerously-skip-permissions`.
-   Closes the entire measured-bypass class, which is currently chain-invisible. Natural home:
-   `agent-inventory`, which already enumerates running agents.
-3. **Measure A2 (subagent inheritance)** on all four harnesses. Cheap, and the answer could
-   be a one-step bypass.
-4. **Fix matcher totality** (A1) — compare declared coverage to `expects.json`.
-5. **Deny writes to gate-config paths** (A4) — turn an hourly detection into a prevention.
-6. **Per-plugin signing keys** (D1) — the only real fix for identity, and the largest job.
-7. **Resolution-based matching** (E1) — reduces false positives, which reduces the
+> **"All consequential config should live in the vault not in env."** — dp, 2026-07-26
+
+This reframes most of this document. Every measured bypass here (B1, B2, C1, C3) and the
+identity gap (D1) share one root: **the gate takes its own governing parameters from a
+channel the governed party can write.** Detection via `/proc` was my first recommendation
+and it is the wrong ambition — it *notices* a bypass that has already happened. Moving the
+parameters out of the environment *removes the class*.
+
+The seven env vars the hook currently trusts, and where each should come from:
+
+| variable | governs | belongs in |
+|---|---|---|
+| `HESTIA_ENDPOINT` | **which oracle is asked** | installed constant (see bootstrap below) |
+| `HESTIA_PRE_FAIL_CLOSED` | **posture on no-verdict** | vault, default **closed** |
+| `HESTIA_PRE_TOTAL_BUDGET_MS` | timeout before fail-open | vault |
+| `HESTIA_LEGACY_FALLBACK` | fallback path (missing ⇒ allow) | vault, or removed entirely |
+| `HESTIA_PRE_NO_FALLBACK` | deny-on-unreachable | vault |
+| `HESTIA_ROLE` / `HESTIA_PLUGIN_ID` | **who the actor claims to be** | per-plugin credential, never asserted |
+| `HESTIA_HOME` | where the vault is | installed constant |
+
+**The bootstrap caveat, stated because it is the interesting part.** `HESTIA_ENDPOINT`
+cannot itself come from the vault: reaching the vault requires knowing where the daemon is.
+That circularity is real and it does not dissolve — it has to be *terminated* rather than
+solved, by an installed constant the hook does not read from the environment at all. The
+honest framing is that we exchange "any env var can redirect the oracle" for "editing the
+installed hook can redirect the oracle" — a strictly smaller and far more visible surface,
+because the hook file's content is exactly what `agent-inventory` already reads.
+
+**Safe-default inversion.** Once posture lives in the vault, an *unreadable* vault must mean
+fail-**closed**. Today an absent signal means allow, which is why two missing values compose
+into a silent full bypass.
+
+## 10. Recommended, in value order
+
+1. **Move the posture flags into the vault** (§9), with fail-closed as the default when the
+   vault cannot be read. This eliminates B1/B2/C1/C3 rather than detecting them.
+2. **Pin `HESTIA_ENDPOINT` and `HESTIA_HOME` as installed constants**, not env reads.
+3. **`HESTIA_PRE_FAIL_CLOSED=1` fleet-wide *now*** as the interim. It closes every measured
+   bypass today with one variable, while 1–2 are built. Needs a society decision: the daemon
+   becomes a hard dependency.
+4. **Per-plugin signing keys** (D1) — identity must be proven, not asserted. Also closes the
+   subagent attribution gap if issued per session.
+5. **Live-environment sweep** (`/proc/<pid>/environ`, `cmdline`) — demoted from #2 to here.
+   Once 1–3 land it is defence in depth and a check on drift, not the primary control. Still
+   the only thing that would catch `--dangerously-skip-permissions`.
+6. **Fix matcher totality** (A1) — compare declared coverage against `expects.json`.
+7. **Deny writes to gate-config paths** (A4) — turn an hourly detection into a prevention.
+8. **Resolution-based matching** (E1) — reduces false positives, which reduces the
    disposition to route around. A precision fix *is* a security fix.
+9. **Measure A2 on codex, kimi, gemini.** Closed on claude (§2); unknown elsewhere.
 
 ---
 
-## 10. Standing acknowledgements — put these in front of anyone relying on hestia
+## 11. Standing acknowledgements — put these in front of anyone relying on hestia
 
 - The gate runs inside the blast radius; it is not containment.
 - The chain records **governed** activity, never **all** activity. Silence is not evidence
@@ -286,6 +333,8 @@ work inside this architecture removes them.
   daemon means an ungoverned agent.
 - Semantic evasion of the text matcher is unsolved and, in the current design, unsolvable.
 - Identity is **asserted**, not proven.
+- Consequential config read from the environment is config the governed party can write.
+  Until §9 lands, the gate's own posture is set on an agent-writable channel.
 - This catalogue is incomplete by construction. Its value is that it is honest about being
   incomplete; treat a mechanism absent from this list as *unexamined*, not as *safe*.
 
