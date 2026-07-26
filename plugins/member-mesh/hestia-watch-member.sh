@@ -28,10 +28,38 @@ flock -n 9 || { echo "[hestia-watch] another watcher holds $STATE/watch-$PLUGIN.
 # notice, and until now nothing ever read the directory it lands in: two primers
 # sat unclaimed for 13h and 23h before anyone looked (CBP 2026-07-25). Say it out
 # loud at startup — an alarm no one reads is not an alarm.
+# ...and then RETRY it. Announcing was only half the fix: for a day this loop said
+# STALE PRIMER on every restart and nothing ever re-fired, so a batch that failed once was
+# stranded permanently. Codex's first four notices — including Thor's answers to Codex's
+# own PR — sat that way (2026-07-26). The alarm existed and the recovery did not, which is
+# this corpus's recurring defect wearing recovery's clothes.
+#
+# Bounded, because a poison primer that fails forever must not fire forever: attempts are
+# counted in a sidecar, and on exhaustion the primer is SET ASIDE rather than deleted — it
+# is the only copy of a consume-once work list.
+STALE_MAX_ATTEMPTS="${STALE_MAX_ATTEMPTS:-3}"
 for stale in "$STATE"/primers/notice-*.json; do
   [ -e "$stale" ] || break
   echo "[hestia-watch] STALE PRIMER (undelivered notices from a failed fire): $stale"
   python3 -c "import json,sys;d=json.load(open(sys.argv[1]));[print(f\"    id={n.get('id')} {n.get('kind')} from {n.get('from_plugin')} queued={n.get('queued_at','')}: {n.get('pointer_uri','')}\") for n in d.get('notices',[])]" "$stale" 2>/dev/null || true
+  [ -n "$FIRE" ] || continue
+  attempts_file="$stale.attempts"
+  attempts="$(cat "$attempts_file" 2>/dev/null || echo 0)"
+  [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
+  if [ "$attempts" -ge "$STALE_MAX_ATTEMPTS" ]; then
+    echo "[hestia-watch] STALE PRIMER exhausted ($attempts/$STALE_MAX_ATTEMPTS) — set aside: $stale.exhausted"
+    mv -f "$stale" "$stale.exhausted" 2>/dev/null && rm -f "$attempts_file"
+    continue
+  fi
+  echo $((attempts + 1)) > "$attempts_file"
+  echo "[hestia-watch] RETRYING stale primer (attempt $((attempts + 1))/$STALE_MAX_ATTEMPTS): $stale"
+  if "$FIRE" "$stale"; then
+    rm -f "$stale" "$attempts_file"
+    echo "[hestia-watch] stale primer DELIVERED on retry: $stale"
+  else
+    rc=$?
+    echo "[hestia-watch] stale retry failed rc=$rc (preserved, will retry): $stale"
+  fi
 done
 
 # The unanswered row exists (daemon-side) only if something ASKS on a cadence —
