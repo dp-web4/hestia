@@ -80,6 +80,7 @@ pub fn classify(tool_name: &str) -> &'static str {
         // lets a caller write audit history, so law must be able to deny it for
         // unattended roles the same way it denies credential_access.
         t if t.ends_with("hestia_request_witness") => "witness_append",
+        t if t.ends_with("hestia_confirm_self_correction") => "conduct_confirmation",
         _ => "unknown",
     }
 }
@@ -137,6 +138,10 @@ mod tests {
         assert_eq!(
             classify("mcp__hestia__hestia_request_witness"),
             "witness_append"
+        );
+        assert_eq!(
+            classify("mcp__hestia__hestia_confirm_self_correction"),
+            "conduct_confirmation"
         );
     }
 }

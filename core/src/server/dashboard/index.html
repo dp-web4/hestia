@@ -917,9 +917,9 @@
     // Stage 0 of the T3-from-V3 arc (dp 2026-07-24): the legacy path computes ONE
     // self-reported scalar and smears it across Talent/Training/Temper at fixed
     // coefficients — rendering that as three independent facts fabricates precision.
-    // Until scores are derived from adjudicated evidence (derivation "v3-derived-v1"),
+    // Until scores are derived from adjudicated evidence (derivation "v3-derived-v2"),
     // show ONE honestly-labeled row; unmeasured dimensions render nothing (never zero).
-    if (t.derivation !== 'v3-derived-v1') {
+    if (t.derivation !== 'v3-derived-v2') {
       // EARNED trust first, when it exists: the adjudicated grain — V3 folded
       // only from witnessed not-the-actor adjudications. Never blended with
       // the self-reported record below; both shown, each labeled (dp: the
@@ -932,7 +932,7 @@
         ${tensorRow('Adj. veracity', t.adjudicated_veracity)}
         ${tensorRow('Adj. valuation', t.adjudicated_valuation)}
         <div class="trust-meta" style="margin-top:2px">
-          <span style="opacity:0.6">derived v3-derived-v1 · ${nAdj} adjudication${nAdj===1?'':'s'} + ${nTemp} governance response${nTemp===1?'':'s'} · <a href="#" onclick="showReceipts('${escapeHtml(t.plugin_id)}','${escapeHtml(trustRole(t)||'')}');return false" style="color:#7aa7e0">receipts</a></span>
+          <span style="opacity:0.6">derived v3-derived-v2 · ${nAdj} adjudication${nAdj===1?'':'s'} + ${nTemp} governance response${nTemp===1?'':'s'} · <a href="#" onclick="showReceipts('${escapeHtml(t.plugin_id)}','${escapeHtml(trustRole(t)||'')}');return false" style="color:#7aa7e0">receipts</a></span>
         </div>` : '';
       return `${adjBlock}
         ${tensorRow('Outcome record', t.t3_training)}

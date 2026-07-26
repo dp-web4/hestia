@@ -53,7 +53,7 @@ export interface TrustView {
   adjudicated_counts?: [number, number, number];
   // How the numbers were produced: "legacy-lockstep-v1" = one self-reported
   // scalar smeared across three dims (must NOT be shown as three independent
-  // facts); "v3-derived-v1" = per-dimension from adjudicated evidence.
+  // facts); "v3-derived-v2" = per-dimension from adjudicated + conduct evidence.
   derivation?: string;
 }
 

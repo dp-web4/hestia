@@ -149,7 +149,7 @@ pub struct TrustView {
     /// field was the footgun — dp 2026-07-24).
     #[serde(default)]
     pub legacy_level: String,
-    /// Derived temperament (v3-derived-v1: governance-response conduct).
+    /// Derived temperament (v3-derived-v2: governance-response conduct).
     #[serde(default)]
     pub derived_temperament: Option<f64>,
     #[serde(default)]
@@ -171,7 +171,7 @@ pub struct TrustView {
     /// update_from_outcome path: ONE self-reported success scalar smeared across all
     /// three T3 dims at fixed 1.0/0.5/0.3 coefficients, magnitudes caller-chosen. The
     /// UI must NOT render that as three independent facts (Stage 0 of the T3-from-V3
-    /// arc, plans/t3-from-v3-synthesis-2026-07-24.md). `"v3-derived-v1"` (Stage 3)
+    /// arc, plans/t3-from-v3-synthesis-2026-07-24.md). `"v3-derived-v2"` (Stage 3)
     /// re-enables per-dimension display for dimensions actually derived from
     /// adjudicated evidence.
     #[serde(default)]
@@ -465,7 +465,7 @@ impl ServerState {
                 let t3c = *t.t3.observation_counts();
                 let v3c = *t.v3.observation_counts();
                 let dim = |v: f64, c: u64| if c > 0 { Some(v) } else { None };
-                // v3-derived-v1: the DISPLAYED level comes from derived
+                // v3-derived-v2: the DISPLAYED level comes from derived
                 // evidence (adjudications + governance conduct) — never from
                 // the self-report scalar. Unmeasured renders as unmeasured.
                 let derived = crate::derivation::derive(pid, _role, &stats_window);

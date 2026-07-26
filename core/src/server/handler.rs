@@ -73,6 +73,9 @@ impl ServerHandler for HestiaServer {
             "hestia_begin_action" => tool_begin_action(&self.state, &args).await,
             "hestia_record_outcome" => tool_record_outcome(&self.state, &args).await,
             "hestia_record_reversal" => tool_record_reversal(&self.state, &args).await,
+            "hestia_confirm_self_correction" => {
+                tool_confirm_self_correction(&self.state, &args).await
+            }
             "hestia_witness_adjudication" => tool_witness_adjudication(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
@@ -182,6 +185,10 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_record_reversal",
             "Record a reversal with a classified cause; only invalid-result refutes validity",
+        ),
+        t(
+            "hestia_confirm_self_correction",
+            "Independently confirm a subject-reported self-correction using witnessed original and corrective outcomes",
         ),
         t(
             "hestia_witness_adjudication",
@@ -967,6 +974,7 @@ const RESERVED_EVENT_TYPES: &[&str] = &[
     "orchestrator_connect",
     "notify.received",
     "reversal",
+    "conduct_confirmation",
 ];
 
 /// Reversal kinds — the operational shape of a reversal, distinct from the
@@ -1524,6 +1532,201 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
         "judgmentMutated": judgment_mutated,
         "updatedJudgmentTrust": trust_state_json(&judgment_state),
         "adjudicationEntryHash": adjudication_hash,
+    }))
+}
+
+/// Confirm the conduct around a self-correction without letting the subject
+/// award itself Temperament. The subject must have reported a reversal naming
+/// its witnessed original outcome, a later successful corrective outcome must
+/// exist on the same role grain, and a different attributable witness must
+/// attest that the latter corrects the former. Derivation revalidates this
+/// graph and de-duplicates by reversal.
+async fn tool_confirm_self_correction(state: &SharedState, args: &Value) -> ToolResult {
+    let subject_plugin_id = require_string(args, "subject_plugin_id")?;
+    let declared_role = optional_string(args, "subject_role").unwrap_or_default();
+    let subject_role = if declared_role.is_empty() {
+        crate::reputation::DEFAULT_CONSTELLATION_ROLE
+    } else {
+        match crate::reputation::KNOWN_CONSTELLATION_ROLES
+            .iter()
+            .copied()
+            .find(|role| *role == declared_role)
+        {
+            Some(role) => role,
+            None => {
+                return Ok(hestia_error_envelope(
+                    "hestia.conduct_confirmation_unknown_role",
+                    &format!("subject_role '{declared_role}' is not a published constellation role"),
+                    Some(json!({"subject_role": declared_role})),
+                ))
+            }
+        }
+    };
+    let reversal_ref = require_string(args, "reversal_ref")?;
+    let correction_ref = require_string(args, "correction_ref")?;
+    let reason = require_string(args, "reason")?;
+    if reason.trim().is_empty()
+        || reason.len() > 2048
+        || reason.chars().any(char::is_control)
+    {
+        return Ok(hestia_error_envelope(
+            "hestia.conduct_confirmation_bad_reason",
+            "'reason' must be a non-empty single-line attestation \
+             (≤2048 bytes, no control characters)",
+            None,
+        ));
+    }
+    let reversal_hash = reversal_ref
+        .strip_prefix("chain:")
+        .unwrap_or(&reversal_ref);
+    let correction_hash = correction_ref
+        .strip_prefix("chain:")
+        .unwrap_or(&correction_ref);
+    let session_id_arg = optional_string(args, "session_id");
+
+    let mut s = state.lock().await;
+    let Some(confirmer) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.conduct_confirmation_unattributed",
+            "no live session resolves for the confirmer — connect first and pass session_id",
+            None,
+        ));
+    };
+    let subject_instance_lct = s.member_lct(&subject_plugin_id);
+    let confirmer_instance_lct = s.member_lct(&confirmer.plugin_id);
+    if confirmer.plugin_id == subject_plugin_id
+        || (subject_instance_lct.is_some() && subject_instance_lct == confirmer_instance_lct)
+    {
+        return Ok(hestia_error_envelope(
+            "hestia.conduct_confirmation_self",
+            "self-correction conduct must be confirmed by someone other than the subject",
+            None,
+        ));
+    }
+    if let Some(denied) = gate_direct_tool(
+        &mut s,
+        &confirmer,
+        "hestia_confirm_self_correction",
+        "conduct_confirmation",
+        &subject_plugin_id,
+    ) {
+        return Ok(denied);
+    }
+
+    // Evidence resolution follows attribution + law gating so unauthenticated
+    // callers cannot probe chain-hash existence through distinct errors.
+    let reversal = s
+        .chain_store
+        .read_by_hash(reversal_hash)
+        .map_err(|error| anyhow::anyhow!("reading self-correction reversal: {error}"))?;
+    let Some(reversal) = reversal else {
+        return Ok(hestia_error_envelope(
+            "hestia.conduct_confirmation_reversal_not_found",
+            &format!("reversal_ref '{reversal_ref}' does not resolve to a chain entry"),
+            None,
+        ));
+    };
+    let reversal_matches = reversal.event_type == "reversal"
+        && reversal.event_data.get("cause").and_then(Value::as_str) == Some("self-correction")
+        && reversal
+            .event_data
+            .get("subject_plugin_id")
+            .and_then(Value::as_str)
+            == Some(subject_plugin_id.as_str())
+        && reversal
+            .event_data
+            .get("subject_role")
+            .and_then(Value::as_str)
+            == Some(subject_role)
+        && reversal
+            .event_data
+            .get("reported_by")
+            .and_then(|reported_by| reported_by.get("plugin_id"))
+            .and_then(Value::as_str)
+            == Some(subject_plugin_id.as_str());
+    if !reversal_matches {
+        return Ok(hestia_error_envelope(
+            "hestia.conduct_confirmation_bad_reversal",
+            "reversal_ref must identify a self-reported self-correction reversal \
+             for the same subject and role",
+            Some(json!({"reversal_ref": reversal_ref})),
+        ));
+    }
+    let Some(target_hash) = reversal
+        .event_data
+        .get("ref")
+        .and_then(Value::as_str)
+        .map(|reference| reference.strip_prefix("chain:").unwrap_or(reference))
+    else {
+        return Ok(hestia_error_envelope(
+            "hestia.conduct_confirmation_unresolved_target",
+            "the self-correction reversal must ref a witnessed original outcome",
+            None,
+        ));
+    };
+    let target = s
+        .chain_store
+        .read_by_hash(target_hash)
+        .map_err(|error| anyhow::anyhow!("reading self-correction target: {error}"))?;
+    let correction = s
+        .chain_store
+        .read_by_hash(correction_hash)
+        .map_err(|error| anyhow::anyhow!("reading corrective outcome: {error}"))?;
+    let (Some(target), Some(correction)) = (target, correction) else {
+        return Ok(hestia_error_envelope(
+            "hestia.conduct_confirmation_outcome_not_found",
+            "both the reversal target and correction_ref must resolve to witnessed outcomes",
+            None,
+        ));
+    };
+    let is_subject_outcome = |candidate: &crate::storage::chain::ChainEntry| {
+        candidate.event_type == "outcome"
+            && candidate.event_data.get("plugin_id").and_then(Value::as_str)
+                == Some(subject_plugin_id.as_str())
+            && candidate.event_data.get("role_lct").and_then(Value::as_str) == Some(subject_role)
+    };
+    if !is_subject_outcome(&target)
+        || !is_subject_outcome(&correction)
+        || correction.event_data.get("success").and_then(Value::as_bool) != Some(true)
+        || target.chain_position >= reversal.chain_position
+        || target.chain_position >= correction.chain_position
+    {
+        return Ok(hestia_error_envelope(
+            "hestia.conduct_confirmation_bad_outcomes",
+            "original and corrective entries must be ordered outcomes on the same \
+             subject/role grain, and the corrective outcome must be successful",
+            None,
+        ));
+    }
+
+    let entry = s.append_chain(
+        "conduct_confirmation",
+        json!({
+            "schema": crate::derivation::CONDUCT_CONFIRMATION_SCHEMA_V1,
+            "conduct": "self-correction",
+            "subject_plugin_id": subject_plugin_id,
+            "subject_instance_lct": subject_instance_lct,
+            "subject_role": subject_role,
+            "reversal_hash": reversal.hash,
+            "target_hash": target.hash,
+            "correction_hash": correction.hash,
+            "score": crate::derivation::SELF_CORRECTION_SCORE,
+            "reason": reason,
+            "confirmed_by": {
+                "plugin_id": confirmer.plugin_id,
+                "instance_lct": confirmer_instance_lct,
+                "role_lct": confirmer.role_lct,
+                "session_id": confirmer.session_uuid,
+            },
+        }),
+    )?;
+    Ok(json!({
+        "witnessEntryHash": entry.hash,
+        "conduct": "self-correction",
+        "score": crate::derivation::SELF_CORRECTION_SCORE,
+        "reversalHash": reversal.hash,
+        "targetHash": target.hash,
+        "correctionHash": correction.hash,
     }))
 }
 
@@ -3138,6 +3341,19 @@ mod accountability_tests {
             forged["_hestia_error"]["code"],
             "hestia.witness_reserved_event"
         );
+        let forged_conduct = tool_request_witness(
+            &state,
+            &json!({
+                "event_type":"conduct_confirmation",
+                "event_data":{"conduct":"self-correction","score":1.0}
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            forged_conduct["_hestia_error"]["code"],
+            "hestia.witness_reserved_event"
+        );
 
         // An overlaid unattended role is denied the append by law.
         {
@@ -3700,6 +3916,168 @@ mod accountability_tests {
         let derived = crate::derivation::derive("worker-agent", role, &window);
         assert_eq!(derived.validity.observations, 0);
         assert!(derived.validity.score.is_none());
+    }
+
+    #[tokio::test]
+    async fn self_correction_conduct_requires_independent_witnessed_graph_and_deduplicates() {
+        let (_dir, state) = test_state().await;
+        let role = "role:constellation:mesh-worker";
+        let subject = tool_connect(
+            &state,
+            &json!({"plugin_id":"worker-agent","host_agent":"worker","role":role}),
+        )
+        .await
+        .unwrap();
+        let witness = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"reviewer",
+                    "role":"role:constellation:reviewer"}),
+        )
+        .await
+        .unwrap();
+        let original = {
+            let s = state.lock().await;
+            s.append_chain(
+                "outcome",
+                json!({"plugin_id":"worker-agent","role_lct":role,
+                       "success":true,"tool_name":"Edit","target":"artifact-v1"}),
+            )
+            .unwrap()
+        };
+        let reversal = tool_record_reversal(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "kind":"rollback","cause":"self-correction",
+                    "ref":format!("chain:{}", original.hash),
+                    "reason":"I found and withdrew an incorrect result",
+                    "session_id":subject["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        let failed_correction = {
+            let s = state.lock().await;
+            s.append_chain(
+                "outcome",
+                json!({"plugin_id":"worker-agent","role_lct":role,
+                       "success":false,"tool_name":"Edit","target":"artifact-v2"}),
+            )
+            .unwrap()
+        };
+
+        let unattributed = tool_confirm_self_correction(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "reversal_ref":"chain:not-a-real-hash",
+                    "correction_ref":"chain:not-a-real-hash",
+                    "reason":"probe"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unattributed["_hestia_error"]["code"],
+            "hestia.conduct_confirmation_unattributed"
+        );
+        let self_award = tool_confirm_self_correction(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "reversal_ref":reversal["witnessEntryHash"],
+                    "correction_ref":failed_correction.hash,
+                    "reason":"I confirm myself","session_id":subject["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            self_award["_hestia_error"]["code"],
+            "hestia.conduct_confirmation_self"
+        );
+        let failed = tool_confirm_self_correction(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "reversal_ref":reversal["witnessEntryHash"],
+                    "correction_ref":failed_correction.hash,
+                    "reason":"the attempted correction failed",
+                    "session_id":witness["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            failed["_hestia_error"]["code"],
+            "hestia.conduct_confirmation_bad_outcomes"
+        );
+
+        let correction = {
+            let s = state.lock().await;
+            s.append_chain(
+                "outcome",
+                json!({"plugin_id":"worker-agent","role_lct":role,
+                       "success":true,"tool_name":"Edit","target":"artifact-v3"}),
+            )
+            .unwrap()
+        };
+        {
+            let mut s = state.lock().await;
+            s.role_policy_engines.insert(
+                "role:constellation:reviewer".into(),
+                deny_overlay_for(&["conduct_confirmation"]),
+            );
+        }
+        let denied = tool_confirm_self_correction(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "reversal_ref":"chain:not-a-real-hash",
+                    "correction_ref":"chain:not-a-real-hash",
+                    "reason":"policy must run before hash resolution",
+                    "session_id":witness["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied["_hestia_error"]["code"], "hestia.policy_denied");
+        {
+            let mut s = state.lock().await;
+            s.role_policy_engines
+                .remove("role:constellation:reviewer");
+        }
+        let confirmed = tool_confirm_self_correction(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "reversal_ref":reversal["witnessEntryHash"],
+                    "correction_ref":format!("chain:{}", correction.hash),
+                    "reason":"reviewed artifact-v3; it corrects the withdrawn result",
+                    "session_id":witness["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(confirmed["conduct"], "self-correction");
+        assert_eq!(
+            confirmed["score"],
+            crate::derivation::SELF_CORRECTION_SCORE
+        );
+        // Heterogeneous confirmations remain useful receipts, but one act is
+        // one observation even if the same witness confirms it twice.
+        let duplicate = tool_confirm_self_correction(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "reversal_ref":reversal["witnessEntryHash"],
+                    "correction_ref":correction.hash,
+                    "reason":"second receipt for the same correction",
+                    "session_id":witness["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert!(duplicate["witnessEntryHash"].is_string());
+
+        let s = state.lock().await;
+        let derived = crate::derivation::derive(
+            "worker-agent",
+            role,
+            &s.recent_chain(s.chain_len()),
+        );
+        assert_eq!(derived.temperament.observations, 1);
+        assert_eq!(derived.temperament.score, Some(0.65));
+        assert!(derived.temperament.evidence.iter().any(|e| {
+            e.contribution
+                .contains("EXCLUDED — duplicate confirmation")
+        }));
     }
 
     #[tokio::test]
