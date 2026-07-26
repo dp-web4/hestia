@@ -465,22 +465,24 @@ impl ServerState {
                 let t3c = *t.t3.observation_counts();
                 let v3c = *t.v3.observation_counts();
                 let dim = |v: f64, c: u64| if c > 0 { Some(v) } else { None };
-                // The ADJUDICATED grain lives at `<grain>#adjudicated` — earned
-                // trust, folded only from witnessed adjudications (Stage 1).
-                let adj = self
-                    .trust_store
-                    .get(&format!("{key}#adjudicated"))
-                    .unwrap_or_else(|_| EntityTrust::new(format!("{key}#adjudicated")));
-                let adj_counts = *adj.v3.observation_counts();
-                let adj_dims = (
-                    dim(adj.validity(), adj_counts[2]),
-                    dim(adj.veracity(), adj_counts[1]),
-                    dim(adj.valuation(), adj_counts[0]),
-                );
                 // v3-derived-v1: the DISPLAYED level comes from derived
                 // evidence (adjudications + governance conduct) — never from
                 // the self-report scalar. Unmeasured renders as unmeasured.
                 let derived = crate::derivation::derive(pid, _role, &stats_window);
+                // Read-time derivation is also authoritative for the displayed
+                // adjudicated dimensions. The eager #adjudicated grain is an
+                // operational cache and cannot unwind immutable superseded
+                // observations; displaying it would smear corrected history.
+                let adj_dims = (
+                    derived.validity.score,
+                    derived.veracity.score,
+                    derived.valuation.score,
+                );
+                let adj_counts = [
+                    derived.valuation.observations,
+                    derived.veracity.observations,
+                    derived.validity.observations,
+                ];
                 TrustView {
                     plugin_id: pid.clone(),
                     entity_id: t.entity_id.clone(),
