@@ -226,6 +226,7 @@ pub async fn serve_with_callback(
         .route("/api/dashboard", get(dashboard_json))
         .route("/api/trust/derivation", get(trust_derivation_json))
         .route("/api/operator/adjudicate", post(operator_adjudicate))
+        .route("/api/operator/alias", post(operator_alias))
         .route("/api/operator/amnesty", post(operator_amnesty))
         .route("/api/failures", get(failures_json))
         .route("/api/vault", get(vault_list).post(vault_add))
@@ -356,6 +357,18 @@ struct DerivationQuery {
 /// pointers -> witnessed acts, computed at read time over the chain window.
 /// This is the auditable-trust contract made clickable.
 #[derive(serde::Deserialize)]
+struct OperatorIdentityAlias {
+    /// The identity that should OWN the evidence (the surviving member).
+    alias_of: String,
+    /// The identity whose evidence folds into it (the mis-reported one).
+    alias: String,
+    #[serde(rename = "ref")]
+    evidence_ref: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
 struct OperatorAdjudication {
     subject_plugin_id: String,
     subject_role: String,
@@ -378,6 +391,66 @@ struct OperatorAdjudication {
 /// the adjudication is recorded with the SOVEREIGN as adjudicator. Temperament
 /// stays conduct-derived — a human rating enters as validity/valuation, never
 /// as a hand-set temperament (that would be prescribed trust again).
+/// `POST /api/operator/alias` — record that two plugin_ids are the SAME member, so
+/// derivation folds their evidence together.
+///
+/// Consequential: it joins trust records, so it is operator-gated like adjudication and
+/// carries an evidence pointer. It is an APPEND, never a rewrite — history stays where it
+/// landed and `derivation::aliased_identities` follows the record at read time. Refuses a
+/// self-alias, and refuses without a pointer: no evidence, no join.
+///
+/// surface: operator identity-alias   act: join two identities' trust evidence
+/// S: high/reversible [construct: append-only; a later contradicting alias supersedes, nothing is edited]
+/// R: n/a [construct: no reachability-based authority]
+/// W: pass [construct: operator_gate — LCT-signed session, same bar as adjudicate]
+/// O: pass [construct: all validation precedes append_chain, the only side effect]
+/// A: pass [construct: single append_chain carrying alias, alias_of, ref and reason]
+/// V: n/a [construct: reversible — supersede by appending, no data destroyed]
+/// verdict: PASS
+async fn operator_alias(
+    State(state): State<SharedState>,
+    Json(a): Json<OperatorIdentityAlias>,
+) -> impl IntoResponse {
+    if a.alias.trim().is_empty() || a.alias_of.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "alias and alias_of are both required"}))).into_response();
+    }
+    if a.alias == a.alias_of {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "an identity cannot be an alias of itself"}))).into_response();
+    }
+    if a.evidence_ref.is_empty() || a.evidence_ref.len() > 512
+        || a.evidence_ref.chars().any(char::is_control)
+    {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "'ref' must be a single-line evidence pointer (<=512 bytes) — \
+                      joining two identities' evidence needs a stated basis"}))).into_response();
+    }
+    let mut s = state.lock().await;
+    let entry = match s.append_chain(
+        crate::derivation::IDENTITY_ALIAS_EVENT,
+        serde_json::json!({
+            "alias": a.alias,
+            "alias_of": a.alias_of,
+            "ref": a.evidence_ref,
+            "reason": a.reason,
+            "recorded_by": "operator",
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("witnessing: {e}")}))).into_response()
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!({
+        "alias": a.alias,
+        "alias_of": a.alias_of,
+        "witnessEntryHash": entry.hash,
+        "note": "evidence folds at READ time; nothing was rewritten"
+    }))).into_response()
+}
+
 async fn operator_adjudicate(
     State(state): State<SharedState>,
     Json(a): Json<OperatorAdjudication>,
