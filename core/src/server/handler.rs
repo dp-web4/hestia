@@ -86,6 +86,7 @@ impl ServerHandler for HestiaServer {
             "hestia_notify" => tool_notify(&self.state, &args).await,
             "hestia_member_notify" => tool_member_notify(&self.state, &args).await,
             "hestia_member_inbox" => tool_member_inbox(&self.state, &args).await,
+            "hestia_egress_pending" => tool_egress_pending(&self.state, &args).await,
             "hestia_member_unanswered" => tool_member_unanswered(&self.state, &args).await,
             "hestia_inbox" => tool_inbox(&self.state, &args).await,
             "hestia_pair_inbox" => tool_pair_inbox(&self.state, &args).await,
@@ -219,6 +220,10 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_member_inbox",
             "Drain YOUR member notices (consume-once; recipient-scoped by resolved caller identity)",
+        ),
+        t(
+            "hestia_egress_pending",
+            "Forwarding plane (r6-routing branch 2): list notices addressed `peer/member` awaiting hand-off to the fleet mesh, or `mark_forwarded: <id>` once the mesh accepted one. Accepted-by-mesh is NOT read-by-recipient",
         ),
         t(
             "hestia_member_unanswered",
@@ -2288,22 +2293,62 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             "recipient_liveness_evidence": liveness_evidence,
         }),
     )?;
-    let queued_id = s
-        .inbox_store
-        .enqueue_member(
-            &to_plugin,
-            &sender.plugin_id,
-            &sender.role_lct,
-            &kind,
-            pointer_uri.as_deref(),
-            &entry.hash,
-            in_reply_to,
-        )
-        .map_err(|e| anyhow::anyhow!("queueing member notice: {e}"))?;
+    // ---- r6-routing branch 2: is it for someone I know? then forward ------------
+    // `peer/member` addresses a member on ANOTHER machine. A bare id stays local,
+    // so no existing caller changes. Explicit rather than inferred: the sender
+    // states the scale it is crossing, and `/` is the fractal seam made syntactic.
+    //
+    // SPLIT-HORIZON, not TTL. Only a notice from a LOCAL sender is egressed, so a
+    // packet that arrived from outside can never be forwarded back outside. Thor
+    // refuted the per-packet hop counter this proposal originally carried — a bound
+    // the sender writes is not a bound. Sender identity here is
+    // transport-authenticated, so the loop bound contains no forgeable field.
+    // Cost: no third-party transit in v1. Deliberate.
+    let egress_peer = to_plugin.split_once('/').map(|(peer, _)| peer.to_string());
+    let queued_id = match &egress_peer {
+        Some(peer) => {
+            let remote_member = to_plugin.split_once('/').map(|(_, m)| m).unwrap_or("");
+            if peer.is_empty() || remote_member.is_empty() {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_bad_address",
+                    "a routed address is `peer/member`; both halves must be non-empty",
+                    Some(json!({ "to_plugin_id": to_plugin })),
+                ));
+            }
+            s.inbox_store
+                .enqueue_egress(
+                    peer,
+                    remote_member,
+                    &sender.plugin_id,
+                    &sender.role_lct,
+                    &kind,
+                    pointer_uri.as_deref(),
+                    &entry.hash,
+                )
+                .map_err(|e| anyhow::anyhow!("queueing egress notice: {e}"))?
+        }
+        None => s
+            .inbox_store
+            .enqueue_member(
+                &to_plugin,
+                &sender.plugin_id,
+                &sender.role_lct,
+                &kind,
+                pointer_uri.as_deref(),
+                &entry.hash,
+                in_reply_to,
+            )
+            .map_err(|e| anyhow::anyhow!("queueing member notice: {e}"))?,
+    };
     let mut out = json!({
         "queued_id": queued_id,
         "witnessEntryHash": entry.hash,
         "to_plugin_id": to_plugin,
+        // `forwarded_to` present => this left the machine (branch 2) and its
+        // `queued_id` is an EGRESS row, not a local inbox row. Absent => local.
+        // Naming which branch fired is the point: a receipt that cannot say how it
+        // was routed is the black hole with a success code.
+        "forwarded_to": egress_peer,
         "kind": kind,
         "in_reply_to": in_reply_to,
         "binding_verified": binding_verified,
@@ -2327,6 +2372,41 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         ));
     }
     Ok(out)
+}
+
+/// `hestia_egress_pending` — the forwarding plane's read side (r6-routing branch 2).
+///
+/// Returns notices addressed `peer/member` that have not yet been handed to the fleet
+/// mesh, and (with `mark`) records that a given row was accepted by it. Deliberately a
+/// READ + ACK pair rather than a consuming drain: "the fleet mesh took it" and "the far
+/// member read it" are different facts, and collapsing them is exactly the
+/// send-succeeded-means-delivered defect this thread exists to remove.
+///
+/// Placement note: Thor measured the watcher's fire loop blocked for a median 77s and up
+/// to 16 minutes, so an egress drain living *behind* the fire inherits that latency. This
+/// tool lets the drain be polled independently of the fire path until Thor's concurrency
+/// fix lands, at which point it can move into the watcher loop as originally proposed.
+async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
+    let s = state.lock().await;
+    if let Some(id) = args.get("mark_forwarded").and_then(|v| v.as_u64()) {
+        s.inbox_store
+            .mark_egress_forwarded(id)
+            .map_err(|e| anyhow::anyhow!("marking egress forwarded: {e}"))?;
+        return Ok(json!({ "marked": id }));
+    }
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
+    let rows = s
+        .inbox_store
+        .pending_egress(limit)
+        .map_err(|e| anyhow::anyhow!("reading egress queue: {e}"))?;
+    let pending: Vec<Value> = rows
+        .into_iter()
+        .map(|(id, peer, to_member, kind, ptr)| {
+            json!({ "id": id, "dest_peer": peer, "to_member": to_member,
+                    "kind": kind, "pointer_uri": ptr })
+        })
+        .collect();
+    Ok(json!({ "pending": pending, "total": pending.len() }))
 }
 
 async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
