@@ -146,6 +146,18 @@ Hestia uses [`web4-core`](https://github.com/dp-web4/web4/tree/main/web4-core) f
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Plugin authors: see [docs/PLUGIN_AUTHORING_GUIDE.md](docs/PLUGIN_AUTHORING_GUIDE.md).
 
+## What hestia is not
+
+**Pretty good governance, not a bulletproof sandbox.** The gate runs as a child of the
+agent, with the agent's privileges, reading the agent's environment — it lives inside the
+blast radius it is meant to bound. It buys a speed bump against the efficient path, an
+accountability record, and a tripwire. It does not buy containment.
+
+Before relying on it, read **[docs/GATE_BYPASS_CATALOG.md](docs/GATE_BYPASS_CATALOG.md)** —
+a catalogue of the ways around the gate, which of them we can detect, and the two we
+honestly cannot. It includes measured full bypasses (two environment variables suffice
+today) and the one-variable mitigation that closes them.
+
 ## License
 
 [AGPL-3.0-or-later](LICENSE). Commercial license available for closed-source use.
