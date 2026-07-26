@@ -291,23 +291,52 @@ The seven env vars the hook currently trusts, and where each should come from:
 | `HESTIA_ROLE` / `HESTIA_PLUGIN_ID` | **who the actor claims to be** | per-plugin credential, never asserted |
 | `HESTIA_HOME` | where the vault is | installed constant |
 
-**The bootstrap caveat, stated because it is the interesting part.** `HESTIA_ENDPOINT`
-cannot itself come from the vault: reaching the vault requires knowing where the daemon is.
-That circularity is real and it does not dissolve — it has to be *terminated* rather than
-solved, by an installed constant the hook does not read from the environment at all. The
-honest framing is that we exchange "any env var can redirect the oracle" for "editing the
-installed hook can redirect the oracle" — a strictly smaller and far more visible surface,
-because the hook file's content is exactly what `agent-inventory` already reads.
+**hub already solved this, and hestia should adopt its pattern rather than invent a
+parallel one** (dp, 2026-07-26). From `web4/hub`:
 
-**Safe-default inversion.** Once posture lives in the vault, an *unreadable* vault must mean
-fail-**closed**. Today an absent signal means allow, which is why two missing values compose
-into a silent full bypass.
+- The hub **starts LOCKED** when no passphrase is available: a *locked shell* serving a
+  "degraded no-LCT-tier surface, no signing" that can still answer generic discovery —
+  *what hub is this?* — and accept an unlock. Nothing else.
+- Unlocking swaps in the real signer at runtime; full functionality appears only then.
+- Security config lives in the vault **only**, decrypted **into memory only**.
+- Unlock attempts are rate-limited (`unlock_gate.rs`: 5 consecutive failures, 2 s minimum
+  interval, 5-minute lockout) against online guessing.
+- **A present-but-*wrong* passphrase is deliberately NOT treated as "locked"** — it
+  hard-errors. This is the sharpest part of the design and the one most worth copying: it
+  refuses to let a bad key degrade into the permissive-looking state. Exactly the failure
+  this catalogue keeps finding elsewhere.
+
+### What that changes for the gate
+
+**`LOCKED` is a positive, authenticated answer, not a missing one.** hestia's silent
+bypasses all come from the hook treating *no verdict* as *allow*. Under the hub pattern the
+daemon, when locked, still answers — with "I cannot authorize anything." The hook must map
+that to **deny**, and it is now distinguishable from unreachable, which it never was before.
+
+**Authenticate the oracle, do not merely address it.** This retires my earlier framing that
+an installed-constant endpoint was the best available fix. It is not, because it still
+trusts *whatever answers at that address*. The hub signs; if the hook verifies that a
+verdict is signed by the expected sovereign LCT, then B1 collapses — an attacker may
+redirect `HESTIA_ENDPOINT` wherever they like, but a fake daemon cannot produce a valid
+signature, and an unsigned or wrongly-signed verdict is a deny. **Endpoint poisoning stops
+being a bypass and becomes a denial of service**, which is the correct downgrade: loud
+instead of silent. The address may stay a constant for convenience; it stops being the
+thing that is trusted.
+
+**Safe-default inversion.** An unreadable vault must mean fail-**closed**. Today an absent
+signal means allow, which is exactly why two *missing* values compose into a silent full
+bypass.
 
 ## 10. Recommended, in value order
 
-1. **Move the posture flags into the vault** (§9), with fail-closed as the default when the
-   vault cannot be read. This eliminates B1/B2/C1/C3 rather than detecting them.
-2. **Pin `HESTIA_ENDPOINT` and `HESTIA_HOME` as installed constants**, not env reads.
+1. **Adopt hub's locked-shell pattern** (§9): security config in the vault, decrypted to
+   memory only; a locked daemon serves unlock + discovery and nothing else; `LOCKED` is an
+   answer meaning deny, not a missing verdict; a wrong key hard-errors instead of degrading.
+   This eliminates B1/B2/C1/C3 rather than detecting them.
+2. **Verify the verdict's signature** against the expected sovereign LCT. This is what
+   actually closes B1 — it downgrades endpoint poisoning from a silent bypass to a loud
+   denial of service. Supersedes "pin the endpoint as a constant", which only ever moved
+   the trust, never removed it.
 3. **`HESTIA_PRE_FAIL_CLOSED=1` fleet-wide *now*** as the interim. It closes every measured
    bypass today with one variable, while 1–2 are built. Needs a society decision: the daemon
    becomes a hard dependency.
