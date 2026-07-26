@@ -5300,21 +5300,30 @@ mod member_mesh_tests {
 
         // Fill the egress plane to its bound directly — this test is about what the
         // refusal RECORDS, not about where the bound sits (that is pinned in inbox.rs).
+        // Post-S1 there are two bounds; the per-peer one is the cheaper to provoke and
+        // it produces the same refusal envelope, which is what is under test here.
         {
             let s = state.lock().await;
-            for i in 0..crate::storage::inbox::MAX_EGRESS_QUEUE {
+            for i in 0..crate::storage::inbox::MAX_EGRESS_QUEUE_PER_PEER {
                 s.inbox_store
-                    .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r",
-                                    "reply", Some("forum/x.md#thread=t"),
+                    .enqueue_egress("thor-sage", "lct:thor-sage", "claude-code", "codex-cli",
+                                    "role:r", "reply", Some("forum/x.md#thread=t"),
                                     &format!("h{i}"))
                     .unwrap();
             }
         }
 
+        // `thor-sage`, not `thor`. Thor's branch wrote this test against a router that
+        // resolved peer names loosely; the WIP's `addressing::resolve_peer` matches the
+        // peer table EXACTLY and never by prefix, so `thor/...` is refused with
+        // `member_notify_no_route` before admission is ever consulted — and the test
+        // would have asserted the bound fired while nothing had reached the bound.
+        // The two branches disagreed about what a peer name is, and only the graft
+        // puts them in the same process to find out.
         let refused = tool_member_notify(
             &state,
             &json!({
-                "to_plugin_id": "thor/claude-code", "kind": "review_done",
+                "to_plugin_id": "thor-sage/claude-code", "kind": "review_done",
                 "pointer_uri": "shared-context/forum/x.md#thread=t", "session_id": alice
             }),
         )
@@ -5338,7 +5347,7 @@ mod member_mesh_tests {
         // refusal voids, without trusting the sender's copy of the reply.
         assert_eq!(e.event_data["witnessed_entry"], json!(witness));
         assert_eq!(e.event_data["reason"], json!("egress_queue_full"));
-        assert_eq!(e.event_data["dest_peer"], json!("thor"));
+        assert_eq!(e.event_data["dest_peer"], json!("thor-sage"));
         // And the accepted-looking witness is still there — the pair is the record,
         // not the refusal alone.
         assert!(chain.iter().any(|e| e.event_type == "member_notice"),
@@ -6017,14 +6026,21 @@ mod member_mesh_tests {
         )
         .await
         .unwrap();
+        // The local row has to come from a DIFFERENT member: `alice` is
+        // `claude-code`, and `claude-code` -> `claude-code` is refused as
+        // `hestia.member_notify_self`, so this returned an error envelope with no
+        // `queued_id` and the test panicked on the unwrap. The recipient name is
+        // what this test needs held constant across the two planes, not the sender.
+        let bob = connect(&state, "codex-cli").await;
         let local = tool_member_notify(
             &state,
             &json!({"to_plugin_id": "claude-code", "kind": "reply",
-                    "pointer_uri": "forum/y.md", "session_id": alice}),
+                    "pointer_uri": "forum/y.md", "session_id": bob}),
         )
         .await
         .unwrap();
-        let local_id = local["queued_id"].as_u64().unwrap();
+        let local_id = local["queued_id"].as_u64()
+            .unwrap_or_else(|| panic!("setup: the local send was refused: {local}"));
 
         let s = state.lock().await;
         // Everything is younger than an hour, so nothing is expired yet…

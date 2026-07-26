@@ -40,6 +40,30 @@ const MAX_INBOX_NOTICES: u64 = 1000;
 /// arbitrary.
 pub(crate) const MAX_EGRESS_QUEUE: u64 = 200;
 
+/// Per-destination egress cap (S1, CBP 2026-07-26). [`MAX_EGRESS_QUEUE`] above is
+/// a RESOURCE bound and is correctly plane-wide. It was also, until this constant,
+/// the only bound — so it was doing a second job it cannot do: STALL ISOLATION.
+///
+/// Those are different questions. "Is this box holding too much undelivered mail?"
+/// is about the box, and every parked forward counts. "Is one peer's stall eating
+/// everyone else's capacity?" is about a peer, and only that peer's rows count.
+/// One predicate answered the first and was read as answering the second, so a
+/// single wedged peer accumulating 200 parked forwards refused admission for EVERY
+/// peer — a fleet-wide coordination outage sourced from one dead link. (Local
+/// member-to-member mail is untouched: that is [`MAX_INBOX_NOTICES`], a separate
+/// count on a separate predicate. The failure is "the mesh is down", not "the boxes
+/// stop" — McNugget's scope refinement, and the reason the local plane remains a
+/// working channel through which to report the egress refusal.)
+///
+/// Set well below the plane-wide bound on purpose: at 50, a peer that is wedged
+/// solid consumes at most a quarter of the plane, so three more peers can wedge
+/// before the resource bound is even in play. The retirement seam
+/// (`MAX_EGRESS_ATTEMPTS` → retire → report home) then reclaims the stalled rows,
+/// which is what downgrades this from terminal to transient — but a bound that
+/// only releases on retirement still needs to not take the whole plane hostage in
+/// the meantime.
+pub(crate) const MAX_EGRESS_QUEUE_PER_PEER: u64 = 50;
+
 /// One deferred inbound notice, exactly as it arrived: `sealed` is still the
 /// hub-sealed ciphertext; `pair_id` + `hub_pubkey_hex` are the channel context
 /// needed to open it at drain time.
@@ -471,6 +495,31 @@ impl SqliteInboxStore {
                  refusing admission rather than evicting a queued forward"
             );
         }
+        // S1. The count above is the RESOURCE bound and is right to be plane-wide.
+        // This one is the STALL bound and has to name the peer, because the two
+        // questions have different answers: one wedged peer holding 200 parked
+        // forwards is not a reason to refuse mail to a peer that is answering
+        // fine. Without this clause it was — every forward to every peer, refused
+        // by one dead link, with the refusal correctly reporting a full plane and
+        // saying nothing about which peer filled it.
+        let queued_peer: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM member_notices
+              WHERE dest_peer = ?1 AND drained_at IS NULL",
+            params![dest_peer],
+            |row| row.get(0),
+        )?;
+        if queued_peer as u64 >= MAX_EGRESS_QUEUE_PER_PEER {
+            // Names the peer, so the receipt distinguishes "this box is full" from
+            // "this one peer is not draining" — the distinction the single bound
+            // could not express, and the one an operator acts on.
+            anyhow::bail!(
+                "egress queue full for peer '{dest_peer}' \
+                 ({queued_peer}/{MAX_EGRESS_QUEUE_PER_PEER} undrained forwards to that \
+                 peer; the plane as a whole is at {queued}/{MAX_EGRESS_QUEUE}) — \
+                 refusing admission for this destination only. Forwards to other peers \
+                 are unaffected: this is one stalled link, not a full forwarding plane."
+            );
+        }
         conn.execute(
             "INSERT INTO member_notices
                 (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
@@ -490,6 +539,20 @@ impl SqliteInboxStore {
     /// Plane-wide on purpose: this is the resource bound's view. The per-peer
     /// stall question is [`Self::egress_queued_for`] (S1) — two different
     /// questions that were one predicate before the graft.
+    pub fn egress_queued_for(&self, dest_peer: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM member_notices
+              WHERE dest_peer = ?1 AND drained_at IS NULL",
+            params![dest_peer],
+            |row| row.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    /// Undrained forwards parked on the egress plane as a whole — see
+    /// [`Self::egress_queued_for`] for the per-peer count the stall bound tests.
     pub fn egress_queued(&self) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
@@ -1654,19 +1717,25 @@ mod tests {
         );
     }
 
-    /// T1, pinned as a KNOWN GAP rather than left implicit. Nothing in the tree can
-    /// remove a PARKED forward: both `DELETE`s carry `dest_peer IS NULL`, and the
-    /// egress plane's own bound refuses rather than evicts. This test documents that
-    /// and will fail the moment a retirement path exists — at which point it should be
-    /// replaced by the assertion that the path works, NOT deleted.
+    /// T1, CONVERTED. Thor pinned this on `2b70394` as a known gap whose doc said:
+    /// "will fail the moment a retirement path exists — at which point it should be
+    /// replaced by the assertion that the path works, NOT deleted." The graft is that
+    /// moment, so this is that replacement, and it now asserts the joint end to end.
     ///
-    /// Widening the prune to cover parked forwards would be the wrong fix: an
-    /// age-based DELETE of an undelivered forward is the silent loss B1 was about.
-    /// Retiring one honestly needs the report path (attempts → dead-letter → report
-    /// home), which is CBP's WIP, and building it here a fourth time is the waste this
-    /// exploration is currently about.
+    /// The half that must NOT change: no age-based `DELETE` may reach a parked
+    /// forward. That was B1, and widening the prune is still the wrong fix — an
+    /// age-based DELETE of an undelivered forward is exactly the silent loss this
+    /// exploration exists to remove.
+    ///
+    /// The half that is new: a parked forward is no longer immortal either. It is
+    /// reclaimed through a path that OWES A REPORT at every step — `expired_egress`
+    /// hands the id to a caller who must report home, `retire_egress` then sets
+    /// `drained_at`, and only then does Thor's T2 prune (`local OR already-drained`)
+    /// reclaim the storage. Neither branch could do this alone: the WIP supplies the
+    /// retirement seam, Thor supplies the predicate that reclaims what it retires,
+    /// and `drained_at` is the field neither author coordinated on.
     #[test]
-    fn known_gap_t1_a_parked_forward_has_no_expiry_on_this_branch() {
+    fn t1_a_parked_forward_is_reclaimed_only_through_the_reporting_path() {
         let (_tmp, store) = fresh();
         let egress = store
             .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "reply",
@@ -1680,6 +1749,9 @@ mod tests {
             .execute("UPDATE member_notices SET queued_at = ?1 WHERE id = ?2",
                      params![ancient, egress as i64])
             .unwrap();
+
+        // 1. Still no silent expiry. Local sends run the prune; the parked forward
+        //    survives all of them, however old it is. This is B1, still fixed.
         for i in 0..3 {
             store
                 .enqueue_member("codex-cli", "kimi-code", "role:r", "coordination",
@@ -1688,8 +1760,37 @@ mod tests {
         }
         assert!(
             row_exists(&store, egress),
-            "a retirement path now exists — replace this test with one asserting it \
-             reports home, do not simply delete it"
+            "an unrelated local send silently deleted a parked forward — B1 has regressed"
+        );
+
+        // 2. But it IS visible to the path that owes a report. This is what closes
+        //    T1: the row surfaces to a caller, not to a DELETE.
+        let expired = store.expired_egress(60, 25).unwrap();
+        assert!(expired.contains(&egress),
+                "the reporting path cannot see the row it is supposed to retire — T1 is open");
+
+        // 3. Retirement marks it drained. The row leaves the admission count
+        //    IMMEDIATELY, which is what downgrades S1's stall from terminal to
+        //    transient.
+        let before = store.egress_queued_for("thor").unwrap();
+        store.retire_egress(egress).unwrap();
+        assert_eq!(store.egress_queued_for("thor").unwrap(), before - 1,
+                   "a retired row still occupies its peer's admission budget");
+        assert_eq!(store.egress_queued().unwrap(), 0,
+                   "a retired row still occupies the plane's admission budget");
+
+        // 4. …and only NOW may storage be reclaimed, by Thor's T2 predicate. The
+        //    same local send that was harmless in step 1 collects it in step 4.
+        //    That difference is the joint: `drained_at` is what makes the delete
+        //    legitimate, and it is set by the seam that reported home.
+        store
+            .enqueue_member("codex-cli", "kimi-code", "role:r", "coordination",
+                            Some("forum/unrelated.md#t"), "hash-final", None)
+            .unwrap();
+        assert!(
+            !row_exists(&store, egress),
+            "a RETIRED forward aged past the TTL was never reclaimed — member_notices \
+             grows without bound on a forwarding node (Thor T2)"
         );
     }
 
@@ -1751,19 +1852,29 @@ mod tests {
     #[test]
     fn the_egress_plane_carries_its_own_bound_and_it_refuses_rather_than_evicts() {
         let (_tmp, store) = fresh();
-        let first = store
-            .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "reply",
-                            Some("forum/first.md#t"), "hash-first")
-            .unwrap();
-        for i in 1..MAX_EGRESS_QUEUE {
-            store
-                .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "reply",
-                                Some(&format!("forum/f{i}.md#t")), "hash-e")
-                .unwrap();
+        // Fill the plane to its RESOURCE bound without tripping the per-peer STALL
+        // bound (S1). That takes several peers now; before S1 one peer could fill
+        // the whole plane alone, which was exactly the defect.
+        let peers = MAX_EGRESS_QUEUE / MAX_EGRESS_QUEUE_PER_PEER;
+        let mut first = 0u64;
+        for p in 0..peers {
+            let peer = format!("peer{p}");
+            for i in 0..MAX_EGRESS_QUEUE_PER_PEER {
+                let id = store
+                    .enqueue_egress(&peer, &format!("lct:{peer}"), "claude-code", "codex-cli",
+                                    "role:r", "reply", Some(&format!("forum/f{p}-{i}.md#t")),
+                                    "hash-e")
+                    .unwrap();
+                if p == 0 && i == 0 {
+                    first = id;
+                }
+            }
         }
         assert_eq!(store.egress_queued().unwrap(), MAX_EGRESS_QUEUE);
-        let refused = store.enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r",
-                                           "reply", Some("forum/over.md#t"), "hash-o");
+        // A peer with NOTHING queued is still refused — the plane-wide bound is a
+        // statement about this box's capacity, not about that peer.
+        let refused = store.enqueue_egress("fresh-peer", "lct:fresh", "claude-code", "codex-cli",
+                                           "role:r", "reply", Some("forum/over.md#t"), "hash-o");
         assert!(refused.is_err(), "the egress plane admitted past its cap");
         // The oldest forward is still queued: at the bound we tell the newest sender
         // no, we do not silently destroy the oldest sender's packet.
@@ -1776,6 +1887,42 @@ mod tests {
                             Some("forum/local.md#t"), "hash-l", None)
             .unwrap();
         assert_eq!(store.member_pending("claude-code").unwrap(), 1);
+    }
+
+    /// S1 (CBP, 2026-07-26). The admission bound was plane-wide only, so it did
+    /// resource protection correctly and stall isolation not at all: one peer that
+    /// stopped draining accumulated parked forwards until the WHOLE plane was at
+    /// its cap, and from then on every send to every OTHER peer was refused. One
+    /// dead link, fleet-wide coordination outage.
+    ///
+    /// Falsifier for the per-peer clause specifically: wedge one peer solid, then
+    /// send to a different one. Pre-S1 the second send fails; it must not.
+    #[test]
+    fn one_wedged_peer_does_not_refuse_admission_for_every_other_peer() {
+        let (_tmp, store) = fresh();
+        for i in 0..MAX_EGRESS_QUEUE_PER_PEER {
+            store
+                .enqueue_egress("wedged", "lct:wedged", "claude-code", "codex-cli", "role:r",
+                                "reply", Some(&format!("forum/w{i}.md#t")), "hash-w")
+                .unwrap();
+        }
+        assert_eq!(store.egress_queued_for("wedged").unwrap(), MAX_EGRESS_QUEUE_PER_PEER);
+        // That peer is now refused, and the refusal names it rather than the plane.
+        let refused = store.enqueue_egress("wedged", "lct:wedged", "claude-code", "codex-cli",
+                                           "role:r", "reply", Some("forum/w-over.md#t"), "hash-wo");
+        let msg = refused.unwrap_err().to_string();
+        assert!(msg.contains("wedged"),
+                "the refusal must name the stalled peer, not just report a full plane: {msg}");
+        // …and a healthy peer is completely unaffected. This is the assertion that
+        // fails without the `dest_peer = ?1` clause.
+        store
+            .enqueue_egress("healthy", "lct:healthy", "claude-code", "codex-cli", "role:r",
+                            "reply", Some("forum/h.md#t"), "hash-h")
+            .expect("one stalled peer refused admission to an unrelated, draining peer");
+        assert_eq!(store.egress_queued_for("healthy").unwrap(), 1);
+        // The plane-wide bound is untouched by all this: it is still the resource
+        // question, and the plane is nowhere near full.
+        assert!(store.egress_queued().unwrap() < MAX_EGRESS_QUEUE);
     }
 
     #[test]
