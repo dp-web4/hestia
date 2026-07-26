@@ -5304,7 +5304,7 @@ mod member_mesh_tests {
             let s = state.lock().await;
             for i in 0..crate::storage::inbox::MAX_EGRESS_QUEUE {
                 s.inbox_store
-                    .enqueue_egress("thor", "claude-code", "codex-cli", "role:r",
+                    .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r",
                                     "reply", Some("forum/x.md#thread=t"),
                                     &format!("h{i}"))
                     .unwrap();

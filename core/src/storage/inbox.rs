@@ -1509,7 +1509,7 @@ mod tests {
     fn a_forward_is_not_local_mail_for_the_member_that_shares_its_name() {
         let (_tmp, store) = fresh();
         let egress = store
-            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+            .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "reply",
                             Some("forum/for-thor.md#thread=t"), "hash-egress")
             .unwrap();
         let local = store
@@ -1528,8 +1528,8 @@ mod tests {
         // ...and the forward is still there, still pending, still going to Thor.
         let pending = store.pending_egress(25).unwrap();
         assert_eq!(pending.len(), 1, "the local drain cancelled the forward");
-        assert_eq!(pending[0].0, egress);
-        assert_eq!(pending[0].1, "thor");
+        assert_eq!(pending[0].id, egress);
+        assert_eq!(pending[0].dest_peer, "thor");
     }
 
     /// `drain_member`'s UPDATE is broader than its SELECT (no `queued_at` cutoff),
@@ -1542,7 +1542,7 @@ mod tests {
         let (_tmp, store) = fresh();
         for peer in ["thor", "mcnugget", "legion"] {
             store
-                .enqueue_egress(peer, "kimi-code", "claude-code", "role:r", "review_done",
+                .enqueue_egress(peer, &format!("lct:{peer}"), "kimi-code", "claude-code", "role:r", "review_done",
                                 Some("forum/x.md#thread=t"), "hash-e")
                 .unwrap();
         }
@@ -1560,7 +1560,7 @@ mod tests {
     fn a_local_send_cannot_delete_a_parked_forward() {
         let (_tmp, store) = fresh();
         let egress = store
-            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+            .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "reply",
                             Some("forum/for-thor.md#thread=t"), "hash-egress")
             .unwrap();
         // Path 1 — the cap. Local `claude-code` is flooded past MAX_INBOX_NOTICES by
@@ -1573,7 +1573,7 @@ mod tests {
         }
         assert_eq!(store.pending_egress(25).unwrap().len(), 1,
                    "a flood at the local member of the same name deleted the forward");
-        assert_eq!(store.pending_egress(25).unwrap()[0].0, egress);
+        assert_eq!(store.pending_egress(25).unwrap()[0].id, egress);
         // The eviction ledger must not book the loss under the local id either: the
         // count is the only trace an eviction leaves, and 3 evictions of local mail
         // is a different fact from 4 with a forward among them.
@@ -1592,7 +1592,7 @@ mod tests {
     fn an_aged_forward_survives_the_local_ttl_prune() {
         let (_tmp, store) = fresh();
         let egress = store
-            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+            .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "reply",
                             Some("forum/for-thor.md#thread=t"), "hash-egress")
             .unwrap();
         let stale = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS + 3600)).to_rfc3339();
@@ -1612,7 +1612,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.pending_egress(25).unwrap().len(), 1,
                    "an unrelated local send deleted the aged forward");
-        assert_eq!(store.pending_egress(25).unwrap()[0].0, egress);
+        assert_eq!(store.pending_egress(25).unwrap()[0].id, egress);
     }
 
     /// The counterpart to the test above, and the reason the prune's predicate is
@@ -1628,7 +1628,7 @@ mod tests {
     fn an_aged_delivered_forward_is_reclaimed_by_the_ttl_prune() {
         let (_tmp, store) = fresh();
         let egress = store
-            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+            .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "reply",
                             Some("forum/for-thor.md#thread=t"), "hash-egress")
             .unwrap();
         // Delivered, unlike the sibling test: this is the whole difference.
@@ -1669,7 +1669,7 @@ mod tests {
     fn known_gap_t1_a_parked_forward_has_no_expiry_on_this_branch() {
         let (_tmp, store) = fresh();
         let egress = store
-            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+            .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "reply",
                             Some("forum/for-thor.md#thread=t"), "hash-egress")
             .unwrap();
         let ancient = (Utc::now() - chrono::Duration::days(400)).to_rfc3339();
@@ -1704,7 +1704,7 @@ mod tests {
     fn a_forwards_reply_binding_names_the_routed_addressee() {
         let (_tmp, store) = fresh();
         let egress = store
-            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+            .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "reply",
                             Some("forum/x.md#thread=t"), "hash-e")
             .unwrap();
         assert_eq!(
@@ -1729,7 +1729,7 @@ mod tests {
     fn a_forward_cannot_poison_its_senders_unanswered_report() {
         let (_tmp, store) = fresh();
         store
-            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "review_done",
+            .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "review_done",
                             Some("forum/x.md#thread=t"), "hash-e")
             .unwrap();
         // `-1` = "older than one second in the future", i.e. include everything.
@@ -1752,22 +1752,22 @@ mod tests {
     fn the_egress_plane_carries_its_own_bound_and_it_refuses_rather_than_evicts() {
         let (_tmp, store) = fresh();
         let first = store
-            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+            .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "reply",
                             Some("forum/first.md#t"), "hash-first")
             .unwrap();
         for i in 1..MAX_EGRESS_QUEUE {
             store
-                .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+                .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "reply",
                                 Some(&format!("forum/f{i}.md#t")), "hash-e")
                 .unwrap();
         }
         assert_eq!(store.egress_queued().unwrap(), MAX_EGRESS_QUEUE);
-        let refused = store.enqueue_egress("thor", "claude-code", "codex-cli", "role:r",
+        let refused = store.enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r",
                                            "reply", Some("forum/over.md#t"), "hash-o");
         assert!(refused.is_err(), "the egress plane admitted past its cap");
         // The oldest forward is still queued: at the bound we tell the newest sender
         // no, we do not silently destroy the oldest sender's packet.
-        assert_eq!(store.pending_egress(1).unwrap()[0].0, first);
+        assert_eq!(store.pending_egress(1).unwrap()[0].id, first);
         assert_eq!(store.egress_queued().unwrap(), MAX_EGRESS_QUEUE);
         // And the bound is the EGRESS plane's: local mail is unaffected by a full
         // egress queue, which is the same seam this whole block is about.
