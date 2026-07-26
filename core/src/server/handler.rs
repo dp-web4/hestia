@@ -6700,6 +6700,105 @@ mod member_mesh_tests {
         );
     }
 
+    /// G9 (Thor, hop 5) — G7 closed the double-report by making the settled row
+    /// silent, and the two-store seam is what that silence lands on.
+    ///
+    /// `retire_and_report_egress` writes to two stores in sequence: the inbox
+    /// row's `drained_at`, then the chain witness, then the sender's report.
+    /// Nothing spans them. A crash after the first write leaves a row that is
+    /// SETTLED and has PAID NOTHING — no `member_notice_unreachable`, no report
+    /// home — and this is the state reconstructed below.
+    ///
+    /// Before G7 that state was recoverable by accident: `record_egress_failure`
+    /// re-read `attempts` (still at the maximum), the arm fell through to
+    /// retire-and-report, `retire_egress` no-opped silently, and the witness and
+    /// the report were written on the retry. The debt was paid late.
+    ///
+    /// After G7 the same retry returns `noop`, and the packet is undelivered mail
+    /// recorded as delivered with nothing anywhere that says so — the class this
+    /// whole thread is named for, now with no path back. The two rules the thread
+    /// has been running on point in opposite directions here: "an honest witness
+    /// feeding a dishonest tally is worse than a missing one" (G7) and "a queue
+    /// may drop things, but it may not drop them quietly" (G1). G7 is right about
+    /// its own case; this is the bill.
+    ///
+    /// This test ASSERTS THE HOLE, on CBP's own G4-auth precedent, because the
+    /// hole cannot be closed from here: `mark_egress_forwarded` and
+    /// `retire_egress` write the identical column under the identical predicate,
+    /// so "settled but unpaid" is not expressible — see
+    /// `storage::inbox::tests::forwarded_and_retired_leave_the_same_row_so_an_unpaid_debt_is_unfindable`.
+    /// If this test ever goes RED, the seam was closed and the record here should
+    /// be replaced by the invariant, not amended away.
+    #[tokio::test]
+    async fn a_crash_between_the_two_stores_leaves_a_settled_row_that_paid_nothing() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        let row_id = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "thor-sage/claude-code", "kind": "reply",
+                    "pointer_uri": "shared-context/alices-mail.md", "session_id": alice}),
+        )
+        .await
+        .unwrap()["queued_id"]
+            .as_u64()
+            .unwrap();
+
+        // Four real failures. The fifth is the one that retires.
+        for _ in 0..MAX_EGRESS_ATTEMPTS - 1 {
+            tool_egress_pending(
+                &state,
+                &json!({"session_id": alice, "mark_failed": row_id, "reason": "timeout"}),
+            )
+            .await
+            .unwrap();
+        }
+
+        // The fifth call, interrupted: both of `retire_and_report_egress`'s inbox
+        // writes commit and the process dies before `append_chain`. Exactly the
+        // two statements the real arm runs, in the real order, and then nothing.
+        {
+            let s = state.lock().await;
+            let attempts = s.inbox_store.record_egress_failure(row_id, "timeout").unwrap();
+            assert_eq!(attempts, Some(MAX_EGRESS_ATTEMPTS), "setup did not exhaust");
+            assert!(s.inbox_store.retire_egress(row_id).unwrap(), "setup did not retire");
+        }
+
+        // Restart. The drain still holds the id and reports the hand-off it never
+        // heard back about.
+        let again = tool_egress_pending(
+            &state,
+            &json!({"session_id": alice, "mark_failed": row_id, "reason": "timeout"}),
+        )
+        .await
+        .unwrap();
+
+        let s = state.lock().await;
+        let unreachable = s
+            .recent_chain(50)
+            .into_iter()
+            .filter(|e| e.event_type == "member_notice_unreachable")
+            .count();
+        drop(s);
+        let inbox = tool_member_inbox(&state, &json!({"session_id": alice}))
+            .await
+            .unwrap();
+        assert_eq!(
+            again["disposition"], "noop",
+            "the retry was answered by something other than the G7 gate: {again}"
+        );
+        assert_eq!(
+            unreachable, 0,
+            "THE HOLE: a settled row that owes a witness has none, and `noop` \
+             means nothing will ever write one"
+        );
+        assert_eq!(
+            inbox["total"], 0,
+            "THE HOLE: the packet is dead, the row says delivered, and the sender \
+             is never told: {inbox}"
+        );
+    }
+
     /// The bound that answers G4-auth's blast-radius question with a predicate
     /// instead of prose.
     ///

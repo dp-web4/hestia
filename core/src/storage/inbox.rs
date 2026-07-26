@@ -1314,6 +1314,25 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// The forward margin every store-level `member_unanswered` call passes
+    /// (G10, r6-routing hop 5) — the handler's `MARGIN_SECS`, at the sites the
+    /// handler's own correction did not reach.
+    ///
+    /// `-1` was the value the handler tests were held against when they were
+    /// found at `0`, and CBP's hop-5 measurement then refuted the standard as
+    /// well as the deviation: on the box where this suite actually flakes,
+    /// `CLOCK_REALTIME` steps backward 1.67-1.74s every ~30s, and a backward step
+    /// of Δ is arithmetically identical to passing `older_than_secs + Δ`. `-1`
+    /// buys one second of headroom against a measured 1.7-second step, i.e. none.
+    /// Verified by running these seven call sites at `-1 + 2` — the same
+    /// simulation the handler's margin test uses — which turns four of them red.
+    ///
+    /// An hour is safe here for the same reason it is safe there: the tests that
+    /// use it assert PRESENCE, or pair an absence with a positive control (see
+    /// `a_forward_cannot_poison_its_senders_unanswered_report`, which had one
+    /// before the handler did).
+    const MARGIN_SECS: i64 = 3600;
+
     fn fresh() -> (tempfile::TempDir, SqliteInboxStore) {
         let tmp = tempdir().unwrap();
         let store = SqliteInboxStore::open(tmp.path().join("inbox.db"), [7u8; 32]).unwrap();
@@ -1438,7 +1457,7 @@ mod tests {
             store.member_notice_recipient(id).unwrap().as_deref(),
             Some("kimi-code")
         );
-        let un = store.member_unanswered("kimi-code", &["reply"], -1).unwrap();
+        let un = store.member_unanswered("kimi-code", &["reply"], -MARGIN_SECS).unwrap();
         assert_eq!(un.len(), 1);
         assert!(un[0].drained_at.is_some(), "delivered, then unanswered");
     }
@@ -1458,7 +1477,7 @@ mod tests {
             .unwrap();
         // handoff is legitimately silent — it must never appear.
         let counted: &[&str] = &["review_request", "reply"];
-        let before = store.member_unanswered("kimi-code", counted, -1).unwrap();
+        let before = store.member_unanswered("kimi-code", counted, -MARGIN_SECS).unwrap();
         assert_eq!(before.len(), 1, "handoff is not an unanswered-report row");
         assert_eq!(before[0].id, asked);
         assert!(before[0].drained_at.is_none(), "never picked up");
@@ -1468,7 +1487,7 @@ mod tests {
                             Some("forum/verdict.md"), "h3", Some(asked))
             .unwrap();
         assert!(
-            store.member_unanswered("kimi-code", counted, -1).unwrap().is_empty(),
+            store.member_unanswered("kimi-code", counted, -MARGIN_SECS).unwrap().is_empty(),
             "a bound response clears the notice it answers"
         );
     }
@@ -1484,10 +1503,10 @@ mod tests {
             .enqueue_member("codex-cli", "thor", "role:r", "reply", None, "h2", None)
             .unwrap();
         let counted: &[&str] = &["reply"];
-        let claude = store.member_unanswered("claude-code", counted, -1).unwrap();
+        let claude = store.member_unanswered("claude-code", counted, -MARGIN_SECS).unwrap();
         assert_eq!(claude.len(), 1, "sender sees its own unanswered send");
         assert_eq!(claude[0].to_plugin, "kimi-code");
-        let kimi = store.member_unanswered("kimi-code", counted, -1).unwrap();
+        let kimi = store.member_unanswered("kimi-code", counted, -MARGIN_SECS).unwrap();
         assert_eq!(kimi.len(), 1, "recipient sees its own debt");
         // Neither sees the thor -> codex thread.
         for row in claude.iter().chain(kimi.iter()) {
@@ -2002,6 +2021,67 @@ mod tests {
                    Some("claude-code"), "local rows keep the bare id");
     }
 
+    /// G9, second half (Thor, hop 5) — why the crash seam cannot be closed from
+    /// the row, and why the obvious remedy would re-open G1.
+    ///
+    /// `mark_egress_forwarded` and `retire_egress` run the SAME UPDATE, on the
+    /// same column, under the same predicate, one function apart. Two terminal
+    /// states with OPPOSITE obligations share one marker: a forwarded row owes
+    /// nothing (the peer took the hand-off), a retired row owes a witness and a
+    /// report home. Nothing on the row records which one happened.
+    ///
+    /// So a recovery predicate of the shape "settled, and no report bound to it —
+    /// pay the debt", which is what would close the crash seam G7 opened, fires
+    /// on the forwarded row too and manufactures `member_notice_unreachable`
+    /// about a peer that DID accept the packet. That is G1's class, in the arm
+    /// hardened against it.
+    ///
+    /// `attempts` does not rescue the predicate. It discriminates only for the
+    /// exhaustion path; the age sweep and the G1 undeliverable sweep both retire
+    /// at ZERO attempts, which is the state asserted here — indistinguishable
+    /// from a forward that never had to retry. Closing the seam needs a terminal
+    /// state the row can carry (a `retired_at` distinct from `drained_at`, or a
+    /// disposition column), or the one transaction across the inbox and chain
+    /// stores that CBP has already named. It is not a predicate away.
+    #[test]
+    fn forwarded_and_retired_leave_the_same_row_so_an_unpaid_debt_is_unfindable() {
+        let (_tmp, store) = fresh();
+        let fwd = store
+            .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/a.md#t"), "hash-f")
+            .unwrap();
+        let ret = store
+            .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/b.md#t"), "hash-r")
+            .unwrap();
+        assert!(store.mark_egress_forwarded(fwd).unwrap(), "the forward did not transition");
+        // What the age sweep and the undeliverable sweep do: retire at zero
+        // attempts. Both then owe the sender a report.
+        assert!(store.retire_egress(ret).unwrap(), "the retirement did not transition");
+
+        // Every column either transition can touch, read back raw.
+        let conn = store.conn.lock().unwrap();
+        let read = |id: u64| -> (Option<String>, i64, Option<String>) {
+            conn.query_row(
+                "SELECT drained_at, COALESCE(attempts, 0), last_error
+                   FROM member_notices WHERE id = ?1",
+                params![id as i64],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        let (f_drained, f_attempts, f_error) = read(fwd);
+        let (r_drained, r_attempts, r_error) = read(ret);
+        assert!(f_drained.is_some() && r_drained.is_some(), "both are settled");
+        assert_eq!(f_attempts, r_attempts, "attempts cannot tell them apart");
+        assert_eq!(f_error, r_error, "last_error cannot tell them apart");
+        assert_eq!(f_attempts, 0, "the sweeps retire at zero, like a clean forward");
+        // `drained_at` itself is deliberately NOT asserted to differ. It holds a
+        // timestamp, so it says WHEN and never WHICH — and an assertion that two
+        // adjacent `Utc::now()` reads are distinct is precisely the clock
+        // dependency G8 spent two hops removing from this file.
+    }
+
     /// `member_unanswered`'s clearing condition — some row binds
     /// `in_reply_to = n.id` — is unsatisfiable for a forward: the answering party is
     /// on another machine, `enqueue_egress` has no `in_reply_to` column, and the
@@ -2014,15 +2094,16 @@ mod tests {
             .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "review_done",
                             Some("forum/x.md#thread=t"), "hash-e")
             .unwrap();
-        // `-1` = "older than one second in the future", i.e. include everything.
-        let owed = store.member_unanswered("codex-cli", &["review_done"], -1).unwrap();
+        // `-MARGIN_SECS` = "older than an hour in the future", i.e. include
+        // everything, and keep including it across a host clock correction.
+        let owed = store.member_unanswered("codex-cli", &["review_done"], -MARGIN_SECS).unwrap();
         assert!(owed.is_empty(), "the forward entered owed_to_me and can never leave");
         // The local plane still reports, or the filter would have bought silence.
         store
             .enqueue_member("kimi-code", "codex-cli", "role:r", "review_done",
                             Some("forum/y.md#t"), "hash-l", None)
             .unwrap();
-        assert_eq!(store.member_unanswered("codex-cli", &["review_done"], -1).unwrap().len(), 1);
+        assert_eq!(store.member_unanswered("codex-cli", &["review_done"], -MARGIN_SECS).unwrap().len(), 1);
     }
 
     /// Removing the local plane's (wrong) bound from the egress plane leaves the
