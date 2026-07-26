@@ -22,10 +22,16 @@ separately rather than as one "governed: n/m":
 
 | gap | meaning | remedy |
 |---|---|---|
-| `miswired` | wired, but the hook target does not exist | **worst state** — reads as covered while failing open. Fix now. |
+| `miswired` | a **gate** event is wired to a target that does not exist | **worst state** — reads as covered while failing open. Fix now. |
+| `partial` | observation wired, **enforcement absent** | the state a machine sits in while it *looks* covered. Wire the gate. |
 | `ungoverned` | installed, plugin exists, not wired | run that plugin's `install.sh` — cheapest fix |
 | `ungovernable` | installed, no plugin exists | someone must build the adapter |
 | `dormant_plugin` | plugin exists, harness not installed | nothing. Ready if it ever lands — a plugin built on nomad governs CBP the moment the CLI arrives. |
+| `unknown` | a scope could not be established | **read `scope` in the report.** Not a clean result. |
+
+`DEAD_HOOK` is `miswired`'s non-gate sibling: a hook that resolves to nothing on a
+non-gate event. It loses evidence rather than opening a door, so it is reported without
+changing status.
 
 `FRAGILE` is orthogonal: governed, but the wiring is on `/tmp` (cleared by reboot) or on
 the `/mnt/c` 9p mount (cold reads can outlast a hook timeout, and these hooks fail OPEN).
@@ -45,6 +51,41 @@ Re-run `install.sh` after editing `inventory.py`.
 Every run witnesses to the chain as `agent_inventory`, **including clean results**: a
 record that only ever holds failures cannot distinguish "checked, fine" from "never
 checked".
+
+## Scope is the finding
+
+Thor reviewed the first cut (`209e154`) and found it reporting `OK` on a machine with two
+configured, enabled, **dead** `PreToolUse` gates. Re-running that review on CBP found the
+same two dead gates here. Five blind spots, one error: **the check treated "where I
+looked" as "where it is"** — and every one of them failed in the *reassuring* direction.
+
+| it looked | the truth lived | consequence |
+|---|---|---|
+| `$HOME/.claude` | project + local scope too | on both machines the enforcement half lives *entirely* in the last two |
+| the working tree | `origin/main` | a feature-branch checkout flips the remedy from `install.sh` to "build an adapter" |
+| a compiled-in default path | `$HESTIA_WORKSPACE` | correct on CBP, `UNKNOWN` everywhere else |
+| the substring `hestia` | real gates never say it | deleting codex's live gate still reported `OK` |
+| `$PATH` | `~/.nvm`, `~/.pyenv`, … | `1 installed` from a hook, `3 installed` from a shell, same machine, same minute |
+
+So the check now **reports the scope it achieved** — `scope` in the JSON carries the
+workspace, whether it came from the environment, every executable search root, every
+config file read, and the ref `plugins_available` was resolved from. And **any scope it
+could not establish degrades to `UNKNOWN`, never to `OK`.**
+
+Two consequences worth stating plainly:
+
+- **Dead-target detection is not hestia-scoped.** A gate that resolves to nothing fails
+  open no matter who wrote it (missing command → exit 127 → `GATE_PROFILE.md` §3 rule 2
+  → ALLOW), so every hook target is stat'd regardless of owner.
+- **Witnessing is not gating.** Post-hoc observation *cannot* fail closed. Plugins declare
+  which events they must occupy in `plugins/<name>/expects.json`
+  (`{"gate": ["PreToolUse"], "observe": ["PostToolUse"]}`) and a machine with observation
+  but no enforcement reads `partial`, not `governed`.
+
+Ownership is decided by **reading the target**, not by its path: hestia deploys its own
+gate to `~/.codex/hooks/pre_tool_use.py`, which says "hestia" nowhere in its name and 36
+times in its text. Judging by the path is the same judge-by-name error as `command -v`
+matching shell builtins, one level up.
 
 ## Three things it refuses to get wrong
 
@@ -68,8 +109,29 @@ does the full MCP handshake with an attributed identity and reports success only
 returned chain hash. An inventory of who is governed is itself an act; an unattributed
 act is the thing this file exists to find.
 
+## Three things it refuses to get wrong — and a fourth
+
+4. **A check must report the scope it achieved.** A governance check whose blind spots all
+   read as clean manufactures exactly the confidence it exists to withhold. See
+   *Scope is the finding* above. This is rule 3 (`empty is not clean`) generalised from
+   the registry to every dimension the check reads.
+
 ## Status on CBP (2026-07-26)
 
-`OK` — 4 installed (claude, codex, gemini, kimi_code_cli), 6 plugins available, 4
-governed. 2 dormant (cursor, openclaw). 3 FRAGILE: claude, codex and kimi hooks all
-resolve onto `/mnt/c`.
+**`MISWIRED`** — 4 installed (claude, codex, gemini, kimi_code_cli), 6 plugins available,
+3 governed, 0 unknown. `claude` is miswired: three enabled `PreToolUse` gates resolve to
+nothing.
+
+```
+private-context/.claude/settings.local.json  PreToolUse -> web4/claude-code-plugin/hooks/pre_tool_use.py  (gone)
+Synchronism/.claude/settings.local.json      PreToolUse -> web4/claude-code-plugin/hooks/pre_tool_use.py  (gone)
+ruvector/.claude/settings.json               PreToolUse -> /workspaces/ruvector/...  (devcontainer path)
+```
+
+The first two are the same defect Thor reported on Thor, on the machine that wrote the
+check. CBP's **user**-scope gate is live and fail-closed — verified incidentally during
+this work, when it refused an `rm -rf` from this session. The dead ones are one scope down,
+which is precisely why the first cut could not see them.
+
+Prior reading at `209e154`, same machine, same hour: `OK — 1 installed, 1 governed`.
+Every difference is a blind spot, not a change on disk.
