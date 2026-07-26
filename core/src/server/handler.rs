@@ -5458,6 +5458,27 @@ mod inbox_tests {
 #[cfg(test)]
 mod member_mesh_tests {
     use super::*;
+
+    /// The forward margin every handler-level `member_unanswered` call passes as
+    /// `older_than_secs: -MARGIN_SECS` (G8, r6-routing hops 4-5).
+    ///
+    /// `member_unanswered` filters `queued_at < (now - older_than_secs)`. A
+    /// backward step of Δ in `CLOCK_REALTIME` between the enqueue and the query
+    /// is ARITHMETICALLY IDENTICAL to calling it with `older_than_secs + Δ`, so
+    /// this constant IS the headroom, in seconds, against a clock that moves
+    /// under the test. Thor's fix took it from `0` (zero-width — any backward
+    /// step at all empties the window) to `1`. On CBP, the box where this test
+    /// has actually been flaking, the measured step is ~1.7s, so `1` does not
+    /// survive it; see
+    /// `the_unanswered_margin_must_survive_a_backward_clock_step`.
+    ///
+    /// An hour is not a guess at the worst step — it is "large enough that no
+    /// clock correction of the kind a host applies can reach it", and it is only
+    /// SAFE to be that large because the tests that use it now carry positive
+    /// controls (G8's other half). A margin this wide makes the window
+    /// effectively unbounded, so a test asserting only an ABSENCE would pass
+    /// vacuously; the controls are what turn an empty window red.
+    const MARGIN_SECS: i64 = 3600;
     use crate::vault::Vault;
     use tempfile::TempDir;
 
@@ -5625,7 +5646,7 @@ mod member_mesh_tests {
     /// steer it: answering is a right over YOUR OWN mail. And once a real
     /// response is bound, the debt clears.
     ///
-    /// `older_than_secs: -1`, not `0` — G8, r6-routing hop 4, and this is the
+    /// A forward margin, not `0` — G8, r6-routing hop 4 (Thor), and this is the
     /// test that has been carried as "intermittent" since 2026-07-26 hop 1.
     /// `member_unanswered` filters `queued_at < (now - older_than_secs)`, so `0`
     /// is a ZERO-WIDTH window: the row this test asserts is visible only if
@@ -5634,8 +5655,15 @@ mod member_mesh_tests {
     /// store-level test already passes `-1`; all four handler-level ones passed
     /// `0`. Eight green samples on aarch64 were never evidence about this test —
     /// 207M adjacent `CLOCK_REALTIME` reads on that box showed zero equal and
-    /// zero backward steps, so the window there cannot lose. A one-second forward
-    /// margin removes the dependency on the clock entirely.
+    /// zero backward steps, so the window there cannot lose.
+    ///
+    /// It loses HERE. Measured on CBP at hop 5 — the box where this test has
+    /// actually been flaking — `CLOCK_REALTIME` steps backward ~1.7s every ~30s.
+    /// That confirms Thor's mechanism and refutes the size he drew from it: a
+    /// one-second margin does not remove the dependency on the clock, it survives
+    /// steps under 1s, and this machine has none of those. The margin is
+    /// `MARGIN_SECS`, and it is a measurement — see
+    /// `the_unanswered_margin_must_survive_a_backward_clock_step`.
     #[tokio::test]
     async fn reply_binding_is_scoped_to_your_own_mail_and_clears_the_debt() {
         let (_dir, state) = test_state().await;
@@ -5669,7 +5697,7 @@ mod member_mesh_tests {
         // Before any answer, the sender sees the notice as owed to them.
         let pre = tool_member_unanswered(
             &state,
-            &json!({"session_id": claude, "older_than_secs": -1}),
+            &json!({"session_id": claude, "older_than_secs": -MARGIN_SECS}),
         )
         .await
         .unwrap();
@@ -5687,11 +5715,74 @@ mod member_mesh_tests {
         assert_eq!(answer["binding_verified"], json!(true), "{answer}");
         let post = tool_member_unanswered(
             &state,
-            &json!({"session_id": claude, "older_than_secs": -1}),
+            &json!({"session_id": claude, "older_than_secs": -MARGIN_SECS}),
         )
         .await
         .unwrap();
         assert_eq!(post["owed_to_me"].as_array().unwrap().len(), 0, "{post}");
+    }
+
+    /// G8 continued (CBP, hop 5) — Thor's margin is the right SHAPE and the
+    /// wrong SIZE, and the size is a measurement rather than a preference.
+    ///
+    /// The mechanism is confirmed and it is his: `member_unanswered` filters
+    /// `queued_at < (now - older_than_secs)`, and a backward step of Δ between
+    /// the enqueue and the query is arithmetically identical to passing
+    /// `older_than_secs + Δ`. That equivalence is what makes this testable
+    /// WITHOUT a clock that misbehaves on demand — to simulate a step of Δ,
+    /// hand the query the margin the step would have left behind.
+    ///
+    /// The size is where the two boxes disagree, and neither of us could have
+    /// settled it alone. On Thor's aarch64: 207M adjacent `CLOCK_REALTIME`
+    /// reads, zero equal and zero backward — the window cannot lose there, which
+    /// is why 8 green samples were never evidence. On CBP (WSL2), the box where
+    /// this test has actually been flaking: 5 backward steps in 150s, each
+    /// 1.68-1.74s, every ~30.5s, with `CLOCK_MONOTONIC` advancing 0.5us across
+    /// the same interval — a periodic host-timesync step, not granularity
+    /// (`equal == 0` here too).
+    ///
+    /// So a 1-second margin does not survive a 1.7-second step, and on this
+    /// machine EVERY observed step exceeds it. Thor's fix is not merely tight
+    /// here; against the measured mechanism it changes nothing.
+    #[tokio::test]
+    async fn the_unanswered_margin_must_survive_a_backward_clock_step() {
+        let (_dir, state) = test_state().await;
+        let claude = connect(&state, "claude-code").await;
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": "pr/1", "session_id": claude}),
+        )
+        .await
+        .unwrap();
+
+        // A 2-second backward step against a 1-second margin: `-1 + 2 == 1`.
+        // The row every assertion in this file depends on VANISHES — and note
+        // what that does to a test asserting an absence: it passes.
+        let lost = tool_member_unanswered(
+            &state,
+            &json!({"session_id": claude, "older_than_secs": -1 + 2}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            lost["owed_to_me"].as_array().unwrap().len(),
+            0,
+            "a 1s margin was expected to lose to a 2s backward step: {lost}"
+        );
+
+        // The same 2-second step against the margin this file now uses.
+        let held = tool_member_unanswered(
+            &state,
+            &json!({"session_id": claude, "older_than_secs": -MARGIN_SECS + 2}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            held["owed_to_me"].as_array().unwrap().len(),
+            1,
+            "the margin did not survive a 2s backward step: {held}"
+        );
     }
 
     /// A disposition sent with no binding is nudged, never blocked — silencing
@@ -5798,7 +5889,7 @@ mod member_mesh_tests {
 
         let rows = tool_member_unanswered(
             &state,
-            &json!({"session_id": claude, "older_than_secs": -1}),
+            &json!({"session_id": claude, "older_than_secs": -MARGIN_SECS}),
         )
         .await
         .unwrap();
@@ -6788,7 +6879,7 @@ mod member_mesh_tests {
         .unwrap();
         let rows = tool_member_unanswered(
             &state,
-            &json!({"session_id": alice, "older_than_secs": -1}),
+            &json!({"session_id": alice, "older_than_secs": -MARGIN_SECS}),
         )
         .await
         .unwrap();
