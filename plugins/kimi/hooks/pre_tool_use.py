@@ -253,6 +253,100 @@ MODE = os.environ.get("HESTIA_KIMI_GATE_MODE", "enforce").lower()
 _EVENT = {}  # set by main() so deny() can witness the reach it blocks
 
 
+# ---- Scope attestation: report the ALLOWS too, not only the denies ------------------
+#
+# This gate decides locally, so the daemon never sees what it PERMITS — only what it
+# blocks. That made every plugin-gated member permanently unmeasurable: trust could be
+# earned only by being denied and complying, or by peer adjudication, so quiet in-scope
+# competence produced no evidence at all. kimi-code/member sat at `unmeasured` on 2,214
+# actions and 99.5% success while its sibling grain read `high` off 25 denials
+# (dp, 2026-07-26: "why is it unmeasured?").
+#
+# The window is the unit, not the action: one attestation per SCOPE_ATTEST_EVERY
+# decisions, so a landslide of trivial in-scope calls cannot farm trust. One extra MCP
+# call per 200 tool calls — the per-call hot path is untouched, which was the original
+# reason allows went unreported.
+#
+# `attested_by` names THIS gate rather than claiming to be the daemon. A plugin-gate
+# attestation is computed in the member's own process and is forgeable in principle; it
+# is admissible because we already trust this same gate to report its denies honestly,
+# and a member that could forge allows could equally suppress denies. Same trust level,
+# named honestly so a reader can weight it.
+# This gate's ONE identity. Previously spelled as a bare literal at each witness
+# site; naming it once stops the two from drifting (codex spent days reporting as
+# both "codex" and "codex-cli" for exactly that reason).
+HESTIA_PLUGIN_ID = os.environ.get("HESTIA_PLUGIN_ID", "kimi-code")
+SCOPE_ATTEST_EVERY = 200
+_TALLY = os.path.join(OBSERVE_DIR, "scope-tally.json")
+
+
+def _tally_scope(allowed: bool):
+    """Count this decision; emit an attestation when the window closes."""
+    try:
+        os.makedirs(OBSERVE_DIR, exist_ok=True)
+        try:
+            t = json.load(open(_TALLY))
+        except Exception:
+            t = {"allows": 0, "denies": 0}
+        t["allows" if allowed else "denies"] += 1
+        if t["allows"] + t["denies"] >= SCOPE_ATTEST_EVERY:
+            _emit_attestation(t["allows"], t["denies"])
+            t = {"allows": 0, "denies": 0}
+        json.dump(t, open(_TALLY, "w"))
+    except Exception:
+        pass  # accounting must never change a decision
+
+
+def _emit_attestation(allows, denies):
+    import urllib.request
+    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+
+    def post(payload, timeout, hdrs=None):
+        req = urllib.request.Request(
+            endpoint, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream", **(hdrs or {})})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read(), r.headers.get("mcp-session-id")
+
+    _, sid = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                   "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                              "clientInfo": {"name": "hestia-gate-attest", "version": "1"}}}, 1.0)
+    h = {"mcp-session-id": sid} if sid else {}
+    post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, 0.4, h)
+    # `hestia_request_witness` is an ATTRIBUTED append: it refuses an unconnected caller,
+    # because what lands on the chain must carry a proven WHO and not only caller-supplied
+    # data. Connect first and pass the session, or the attestation is silently refused —
+    # which is exactly how the first cut of this failed.
+    raw, _ = post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                   "params": {"name": "hestia_connect",
+                              "arguments": {"plugin_id": HESTIA_PLUGIN_ID,
+                                            "host_agent": HESTIA_PLUGIN_ID,
+                                            "instance_name": "gate-attest"}}}, 1.5, h)
+    sess = None
+    for line in raw.decode("utf-8", "replace").splitlines():
+        if line.startswith("data: {"):
+            try:
+                pl = json.loads(line[6:])
+                if "result" in pl:
+                    sess = json.loads(pl["result"]["content"][0]["text"]).get("sessionId")
+            except Exception:
+                pass
+    if not sess:
+        return
+    post({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+          "params": {"name": "hestia_request_witness",
+                     "arguments": {"session_id": sess,
+                                   "event_type": "scope_attestation",
+                                   "event_data": {
+                                       "plugin_id": HESTIA_PLUGIN_ID,
+                                       "role_lct": _identity_role(),
+                                       "allows": allows,
+                                       "denies": denies,
+                                       "attested_by": "plugin-gate:" + HESTIA_PLUGIN_ID,
+                                   }}}}, 1.5, h)
+
+
 def _attempted_summary(ev, limit=400):
     """The bounded, scrubbed command this gate refused — the WHAT behind the verdict.
 
@@ -331,6 +425,7 @@ def _daemon_witness(verb, reason):
 
 
 def deny(reason, what_to_do, innate=False):
+    _tally_scope(False)   # a denied reach still closes part of the window
     """innate=True -> ALWAYS blocks (egress/secret is irreversible: a leaked read has no undo, so it
     is enforced even in warn-rollout). Tunable scope/safety rules honor MODE: warn surfaces + allows,
     enforce blocks."""
@@ -413,6 +508,10 @@ def main():
                 sys.exit(2)
             sys.stderr.write("hestia: warn [safety] — governor unreachable (warn-rollout: allowed).\n")
 
+    # Count the allow before exiting: this is the gate attesting that the reach was
+    # inside the grant, which is the only not-self-reported evidence of competent work
+    # the system can get.
+    _tally_scope(True)
     sys.exit(0)  # the ONLY allow path — reached only after every gate explicitly passed
 
 

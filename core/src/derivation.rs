@@ -367,16 +367,41 @@ pub fn derive(
     // the only conduct that improves the boundary rather than merely respecting it. A
     // window containing denies scores lower in proportion; the denies themselves are also
     // counted individually above, so a bad window is felt twice, which is intended.
+    // Two authorship shapes reach this event type, and both are legitimate:
+    // daemon-authored entries are FLAT, while anything witnessed through
+    // `hestia_request_witness` is wrapped under `data` (the same convention exoneration
+    // and amnesty already follow). Read either rather than making the plugin gates
+    // pretend to be the daemon — a shape mismatch here silently dropped every
+    // gate-authored attestation while the daemon's own kept working.
+    let att_field = |e: &ChainEntry, k: &str| -> Option<Value> {
+        e.event_data
+            .get(k)
+            .or_else(|| e.event_data.get("data").and_then(|d| d.get(k)))
+            .cloned()
+    };
     for e in entries.iter().filter(|e| {
         e.event_type == "scope_attestation"
-            && entry_str(e, "plugin_id") == Some(plugin_id)
-            && entry_str(e, "role_lct").map_or(true, |r| r == role_lct)
-            // Only the gate may attest. A member-authored attestation would be exactly the
+            && att_field(e, "plugin_id").as_ref().and_then(Value::as_str) == Some(plugin_id)
+            && att_field(e, "role_lct").as_ref().and_then(Value::as_str)
+                .map_or(true, |r| r == role_lct)
+            // Only a GATE may attest; a member-authored attestation is exactly the
             // self-report this dimension exists to exclude.
-            && entry_str(e, "attested_by") == Some("hestia-gate")
+            //
+            // Two attesters are admissible, and the difference is worth naming.
+            // `hestia-gate` is daemon-computed — the member cannot forge it. A
+            // `plugin-gate:<id>` attestation is computed inside the member's own process
+            // and IS forgeable in principle. It is accepted anyway, on a specific
+            // argument: we already trust that same gate to report its DENIES honestly,
+            // and a member able to forge allows could equally suppress denies. The trust
+            // level is identical, so refusing the allows while accepting the denies would
+            // buy no integrity and would leave every plugin-gated member permanently
+            // unmeasurable — which is the hole this closes. The attester is recorded on
+            // the evidence line so a reader can weight it.
+            && att_field(e, "attested_by").as_ref().and_then(Value::as_str)
+                .is_some_and(|a| a == "hestia-gate" || a.starts_with("plugin-gate:"))
     }) {
-        let allows = e.event_data.get("allows").and_then(Value::as_u64).unwrap_or(0);
-        let denies = e.event_data.get("denies").and_then(Value::as_u64).unwrap_or(0);
+        let allows = att_field(e, "allows").as_ref().and_then(Value::as_u64).unwrap_or(0);
+        let denies = att_field(e, "denies").as_ref().and_then(Value::as_u64).unwrap_or(0);
         let total = allows + denies;
         if total == 0 {
             continue;
@@ -390,7 +415,8 @@ pub fn derive(
             event_type: e.event_type.clone(),
             timestamp: e.timestamp,
             contribution: format!(
-                "in-scope window {score:.2} ({allows} allowed, {denies} denied — gate-attested)"
+                "in-scope window {score:.2} ({allows} allowed, {denies} denied — attested by {})",
+                att_field(e, "attested_by").as_ref().and_then(Value::as_str).unwrap_or("gate")
             ),
             reference: Some(format!("{total} gate decisions in this window")),
         });
