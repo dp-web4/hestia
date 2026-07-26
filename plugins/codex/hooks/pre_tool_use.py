@@ -323,7 +323,7 @@ OBSERVE_DIR = os.path.expanduser(os.environ.get("HESTIA_OBSERVE_DIR", "~/.codex/
 _EVENT = {}  # set by main() so deny() can witness the reach it blocks
 
 
-def witness_decision(verb, reason, innate):
+def witness_decision(verb, reason, innate, verdict_available=True):
     """Witness a blocked/warned reach to the observation log. 'Reaching is witnessed' has to INCLUDE
     the reaches we deny — they are the boundary-tests the policy entity most needs (escalation
     triggers, precedent, trust calibration). Denied calls never reach PostToolUse, so observe.sh
@@ -420,6 +420,12 @@ def _daemon_witness(verb, reason):
                            "decision": verb,
                            "adjudicator": "plugin-gate:codex(scope/egress)",
                            "reason": reason[:300],
+                           # False => the gate could not REACH a verdict (subprocess
+                           # timeout / governor unreachable). Structurally not conduct:
+                           # "I could not judge" is not "I judged you badly", and the
+                           # member could not have behaved its way out of it. Derivation
+                           # excludes these from temperament with no exoneration needed.
+                           "verdict_available": verdict_available,
                            "tool_name": _EVENT.get("tool_name") or "",
                            "session_id": _EVENT.get("session_id"),
                            "payload_sha256": ti_hash,
@@ -496,7 +502,9 @@ def main():
     # Gate 2 — society safety (the governor). Only write/exec-class needs the daemon's verdict; fail closed.
     if tool not in READ_CLASS:
         try:
-            env = dict(os.environ, HESTIA_PLUGIN_ID="codex-cli", HESTIA_PRE_FAIL_CLOSED="1")
+            env = dict(os.environ, HESTIA_PLUGIN_ID="codex", HESTIA_PRE_FAIL_CLOSED="1")  # ONE identity:
+            # this said "codex-cli" while the runtime witnessed as "codex", so the delegated
+            # society-safety verdict landed on a different grain than the work it governed.
             # Codex CLAMPS every hook to 3s. The whole gate must finish under that or Codex kills it
             # and FAILS OPEN — so the society-safety subprocess gets 2s, not 6s: a slow/hung daemon
             # then fails CLOSED here (enforce) at 2s instead of fail-open at the 3s clamp. (2026-07-23,
@@ -510,8 +518,19 @@ def main():
             if r.returncode != 0:  # daemon denied, or inconclusive -> fail-closed for a write/exec act
                 msg = (r.stderr.strip() if r.returncode == 2 and r.stderr.strip()
                        else "hestia: deny [safety] — blocked/inconclusive at the society safety gate.")
+                # verdict_available=False ONLY when the subprocess could not answer
+                # (timeout / crash). A real deny from the daemon comes back rc=2 WITH
+                # stderr, and that IS a verdict — it must still count.
+                # rc=2 + stderr is NOT sufficient: the inner hook ALSO exits 2 with stderr
+                # when IT failed closed ("no policy verdict"), which is the very case we
+                # must not count. The marker text is the discriminator — a real daemon
+                # denial is a verdict; the inner fail-closed is the absence of one.
+                _err = r.stderr or ""
+                _no_verdict = ("no policy verdict" in _err) or ("daemon path failed" in _err)
+                _had_verdict = (r.returncode == 2 and bool(_err.strip()) and not _no_verdict)
                 witness_decision("deny" if MODE == "enforce" else "warn",
-                                 "society-safety: " + msg.split("— ", 1)[-1].strip(), False)
+                                 "society-safety: " + msg.split("— ", 1)[-1].strip(), False,
+                                 verdict_available=_had_verdict)
                 if MODE == "enforce":
                     sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
                     sys.exit(2)
@@ -519,7 +538,8 @@ def main():
                                  " (warn-rollout: allowed; would block under enforce)\n")
         except Exception:
             witness_decision("deny" if MODE == "enforce" else "warn",
-                             "society-safety: governor unreachable, failing closed", False)
+                             "society-safety: governor unreachable, failing closed", False,
+                             verdict_available=False)
             if MODE == "enforce":
                 sys.stderr.write("hestia: deny [safety] — could not reach the governor; failing "
                                  "closed on a consequential act.\n")
