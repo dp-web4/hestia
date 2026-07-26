@@ -96,7 +96,7 @@ a different direction.
 A dead gate is reported whoever wrote it — that half is above. But `governed` is a claim
 about *hestia's* enforcement, and letting an owner-agnostic finding negate it pinned CBP
 at `MISWIRED` over a devcontainer path in a third-party repo, with hestia's own gate live
-and fail-closed. The headline was unfixable by any amount of hestia work, which makes it
+and enforcing. The headline was unfixable by any amount of hestia work, which makes it
 an alarm nobody can act on — the fastest way to train a fleet to ignore one.
 
 So a dead **gate** splits by owner, and the default is what matters:
