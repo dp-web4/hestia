@@ -42,7 +42,7 @@ Documentation=file://$SRC_DIR/README.md
 [Service]
 Type=oneshot
 Environment=HESTIA_WORKSPACE=$WORKSPACE
-ExecStart=$BIN
+ExecStart=$BIN --workspace $WORKSPACE
 # Observation only. A non-zero exit here must never look like a governance failure,
 # and the script is written to exit 0 regardless; this is belt-and-braces.
 SuccessExitStatus=0 1
@@ -80,29 +80,42 @@ fi
 # ---- 3. on launch: SessionStart hook --------------------------------------------
 if [ -f "$SETTINGS" ]; then
   cp -a "$SETTINGS" "$SETTINGS.bak.$(date +%Y%m%d-%H%M%S)"
-  BIN="$BIN" python3 - "$SETTINGS" <<'PY'
+  BIN="$BIN" WORKSPACE="$WORKSPACE" python3 - "$SETTINGS" <<'PY'
 import json, os, sys
 path, binp = sys.argv[1], os.environ["BIN"]
 cfg = json.load(open(path))
-cmd = f"{binp} --brief"
+# --workspace, not the environment. A SessionStart hook inherits the harness's env, not
+# the timer unit's, so the hook read the compiled-in CBP default on every other machine
+# and answered UNKNOWN (thor, 2026-07-26). Scope has to travel in the command itself.
+cmd = f"{binp} --workspace {os.environ['WORKSPACE']} --brief"
 hooks = cfg.setdefault("hooks", {}).setdefault("SessionStart", [])
-present = any(cmd in h.get("command", "")
-              for grp in hooks for h in grp.get("hooks", []))
-if present:
+# Match on the BINARY, not the whole command: an earlier install wrote a bare
+# `$BIN --brief`, and matching the full string would leave that one in place and append
+# a second — two inventories per session, one of them wrong.
+stale = [h for grp in hooks for h in grp.get("hooks", [])
+         if binp in h.get("command", "") and h.get("command") != cmd]
+for h in stale:
+    h["command"] = cmd
+present = any(h.get("command") == cmd for grp in hooks for h in grp.get("hooks", []))
+if stale:
+    json.dump(cfg, open(path, "w"), indent=2)
+    print(f"SessionStart hook: updated {len(stale)} existing entry/entries with --workspace")
+elif present:
     print("SessionStart hook: already present")
 else:
     # Its own group: a slow or broken sibling in a shared group must not take the
     # inventory down with it, and vice versa.
     hooks.append({"hooks": [{"type": "command", "command": cmd, "timeout": 10}]})
     json.dump(cfg, open(path, "w"), indent=2)
-    print("SessionStart hook: added (--brief, timeout 10s)")
+    print("SessionStart hook: added (--workspace, --brief, timeout 10s)")
 PY
 else
   echo "SessionStart hook: skipped ($SETTINGS not found)"
 fi
 
 echo
-echo "on demand:  hestia-agent-inventory            # full JSON + witnesses to chain"
-echo "            hestia-agent-inventory --brief    # one line"
-echo "            hestia-agent-inventory --no-witness"
+echo "on demand:  hestia-agent-inventory --workspace $WORKSPACE"
+echo "            (or export HESTIA_WORKSPACE=$WORKSPACE in your shell rc — a bare"
+echo "             invocation falls back to the compiled-in default and answers UNKNOWN)"
+echo "            --brief       one line        --no-witness   skip the chain write"
 echo "next fire:  $(systemctl --user list-timers hestia-agent-inventory.timer --no-pager 2>/dev/null | sed -n 2p)"

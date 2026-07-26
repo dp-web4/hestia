@@ -86,6 +86,7 @@ import os
 import platform
 import re
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 from urllib import request as urlrequest
@@ -95,7 +96,42 @@ try:
 except ModuleNotFoundError:  # <3.11 — TOML harnesses degrade to UNKNOWN, not to clean
     tomllib = None
 
-WORKSPACE = Path(os.environ.get("HESTIA_WORKSPACE", "/mnt/c/exe/projects/ai-agents"))
+DEFAULT_WORKSPACE = "/mnt/c/exe/projects/ai-agents"
+
+
+def resolve_workspace(argv: list[str]) -> tuple[Path, str]:
+    """Where the workspace came from, as well as what it is.
+
+    SCOPE MUST SURVIVE THE TRIGGER (thor, 2026-07-26). `install.sh` wires three triggers
+    and baked the workspace into exactly ONE of them — `Environment=` in the timer unit.
+    A systemd unit's environment is not the shell's and not the hook's, so on Thor the
+    hourly timer read `/home/dp/ai-workspace` while `hestia-agent-inventory --brief` from
+    a terminal AND the SessionStart hook both fell back to the compiled-in CBP default and
+    returned:
+
+        UNKNOWN | agent-atlas registry not readable at /mnt/c/exe/projects/ai-agents/...
+
+    Two of the three triggers were inert on every machine that is not CBP. This degraded
+    honestly — rule 4 doing its job, UNKNOWN and not OK — but an on-demand check that
+    cannot answer is not much better than one that answers wrong, and the SessionStart
+    trigger exists precisely so a session opens KNOWING. So the workspace is now an
+    explicit `--workspace` argument that install.sh writes into all three call sites, and
+    the resolution order is reported rather than assumed.
+    """
+    for i, a in enumerate(argv):
+        if a == "--workspace" and i + 1 < len(argv):
+            return Path(argv[i + 1]), "argv"
+        if a.startswith("--workspace="):
+            return Path(a.split("=", 1)[1]), "argv"
+    if "HESTIA_WORKSPACE" in os.environ:
+        return Path(os.environ["HESTIA_WORKSPACE"]), "env"
+    return Path(DEFAULT_WORKSPACE), "default"
+
+
+# Rebound in main() once argv is known. Module scope keeps the import-time shape for
+# anything that reads these directly.
+WORKSPACE = resolve_workspace([])[0]
+WORKSPACE_SOURCE = "default"
 ATLAS = WORKSPACE / "agent-atlas" / "talk-to"
 PLUGINS = WORKSPACE / "hestia" / "plugins"
 HOME = Path.home()
@@ -252,6 +288,19 @@ def hook_targets(command: str, project_dir: Path | None) -> list[str]:
 PROJECT_CONFIG_GLOBS = (".claude/settings.json", ".claude/settings.local.json",
                         ".codex/config.toml", ".gemini/settings.json")
 
+# A REPO IS NOT ALWAYS A DIRECT CHILD OF THE WORKSPACE (thor, 2026-07-26). The scan was
+# `WORKSPACE.glob("*/" + rel)` — depth 1 exactly. On Thor that missed three real project
+# scopes, and one of them, `synchronism/manuscripts/.claude/settings.local.json`, holds a
+# THIRD enabled PreToolUse gate pointing at the same path that was deleted from web4 on
+# 2026-02-05. The machine reported two dead gates because two is how many the glob could
+# reach. Nested checkouts (a repo vendored inside a repo, a manuscripts subtree, a
+# monorepo package) are ordinary, so the scan goes deeper — and skips the directories
+# where depth is vendored rather than structural, because `node_modules` alone contributes
+# hundreds of `.claude/settings.local.json` files on this box that belong to nobody here.
+PROJECT_SCAN_DEPTH = 3
+SKIP_DIRS = {"node_modules", "vendor", "target", "dist", "build", "site-packages",
+             ".venv", "venv", ".git", "__pycache__", ".next", ".cache"}
+
 
 def config_scopes(dirnames: list[str]) -> list[tuple[Path, Path | None, str]]:
     """(config file, project dir, scope label) for every scope this agent reads."""
@@ -267,11 +316,41 @@ def config_scopes(dirnames: list[str]) -> list[tuple[Path, Path | None, str]]:
         for rel in PROJECT_CONFIG_GLOBS:
             if not any(rel.startswith(d + "/") for d in dirnames):
                 continue
-            for cfg in [WORKSPACE / rel] + sorted(WORKSPACE.glob("*/" + rel)):
+            for cfg in project_config_candidates(rel):
                 if cfg.is_file():
                     # $CLAUDE_PROJECT_DIR is the repo root, i.e. .claude's parent.
                     found.append((cfg, cfg.parent.parent, "project"))
     return found
+
+
+def project_config_candidates(rel: str) -> list[Path]:
+    """`rel` under the workspace and under every non-vendored dir down to DEPTH."""
+    out = [WORKSPACE / rel]
+    frontier = [WORKSPACE]
+    # Symlinked repos are followed (a workspace assembled out of links is a normal
+    # layout), so the walk is cycle-guarded on the RESOLVED path — a self-referential
+    # link is a hang, and a check that hangs past its 10s hook timeout fails open.
+    seen = {str(WORKSPACE.resolve())}
+    for _ in range(PROJECT_SCAN_DEPTH):
+        nxt = []
+        for parent in frontier:
+            try:
+                children = sorted(p for p in parent.iterdir()
+                                  if p.is_dir() and p.name not in SKIP_DIRS)
+            except OSError:
+                continue
+            for child in children:
+                try:
+                    real = str(child.resolve())
+                except OSError:
+                    continue
+                if real in seen:
+                    continue
+                seen.add(real)
+                out.append(child / rel)
+                nxt.append(child)
+        frontier = nxt
+    return out
 
 
 def parse_config(cfg: Path) -> tuple[dict | None, str | None]:
@@ -362,16 +441,8 @@ def owned_by_hestia(command: str, targets: list[str]) -> bool:
     return False
 
 
-def plugins_ref() -> str:
-    """Which ref `plugins_available` was actually read from.
-
-    B is read from the WORKING TREE, so a feature-branch or stale checkout under-counts
-    it — and an under-count flips the remedy for an ungoverned agent from "run
-    install.sh" to "someone must build the adapter". Thor's checkout was on
-    `cleanup/hardbound-runtime-state` and reported 5 plugins where main has 8. Reading
-    from `origin/main` is the fix; stamping the ref is the minimum, because it makes the
-    number falsifiable by whoever reads the report.
-    """
+def worktree_ref() -> str:
+    """Which ref the checkout is sitting on. Reported even when it is not read from."""
     head = PLUGINS.parent / ".git"
     try:
         if head.is_file():  # worktree
@@ -382,28 +453,105 @@ def plugins_ref() -> str:
         return "unknown"
 
 
-def expects(plugin_dir: str) -> dict:
-    """Which hook events a plugin must occupy, and in which role (thor's §3 shape).
-
-    `wired` used to ask "is anything hestia-shaped wired?", which one hook of any kind
-    answers yes. Witnessing and gating are different acts with different failure modes:
-    post-hoc observation CANNOT fail closed, and the whole point of the gate profile is
-    that the pre-hook can. Absent an expects.json the roles are unknown and the agent is
-    reported as such — not as governed.
-    """
-    path = PLUGINS / plugin_dir / "expects.json"
+def _git(*args: str) -> str | None:
+    """git in the hestia checkout, or None. Never raises, never blocks forever."""
     try:
-        data = json.loads(path.read_text())
-    except Exception:
-        return {}
-    return {k: list(v) for k, v in data.items() if isinstance(v, list)}
+        out = subprocess.run(("git", "-C", str(PLUGINS.parent)) + args,
+                             capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.decode(errors="replace") if out.returncode == 0 else None
+
+
+class Registry:
+    """Inventory B — read from `origin/main`, not from whatever branch you are on.
+
+    THE UNDER-COUNT IS NOT COSMETIC (thor, 2026-07-26). The previous cut stamped the ref
+    and called that enough. It is not, because B is what A and C are differenced against,
+    so an under-read propagates into the verdict. Measured on Thor, whose shared checkout
+    sits on `cleanup/hardbound-runtime-state`, 103 commits behind main:
+
+        worktree (stale)  ->  no plugins/claude-code/expects.json  ->  declared = {}
+                          ->  gate_wired = None  ->  claude: GOVERNED, status UNKNOWN
+        origin/main       ->  expects: gate=[PreToolUse]
+                          ->  gate absent + two dead gates  ->  claude: MISWIRED
+
+    Same machine, same instant, same script — opposite verdicts, and the stale one is the
+    reassuring one. Again. A checkout's branch is a fact about whoever is working here,
+    not a fact about what governance exists, and rule 4 says a check may not let the first
+    quietly stand in for the second.
+
+    `origin/main` is a fetched remote-tracking ref: read-only, no network, and it does not
+    care what the working tree is doing — which also makes this safe to run while a
+    sibling session holds the checkout dirty on a branch of its own.
+    """
+
+    def __init__(self) -> None:
+        self.ref = "origin/main"
+        self.source = "origin/main"
+        listing = _git("ls-tree", "--name-only", "origin/main", "plugins/")
+        sha = _git("rev-parse", "--short", "origin/main")
+        if listing is None or sha is None:
+            # No fetched main (shallow clone, no remote, git absent). Fall back to the
+            # tree, and SAY so — a fallback that does not announce itself is the same
+            # defect one layer down.
+            self.source = "worktree"
+            self.ref = worktree_ref()
+            self.names = sorted(p.name for p in PLUGINS.iterdir() if p.is_dir()) \
+                if PLUGINS.is_dir() else []
+            self.degraded = ("plugins read from the working tree, not origin/main "
+                             "(no fetched origin/main here) — B may be under-counted")
+        else:
+            self.ref = sha.strip()
+            self.names = sorted({line.strip().split("/")[1]
+                                 for line in listing.splitlines()
+                                 if line.strip().startswith("plugins/")
+                                 and len(line.strip().split("/")) > 1})
+            self.degraded = None
+
+    def has(self, plugin_dir: str) -> bool:
+        return plugin_dir in self.names
+
+    def harnesses(self) -> list[str]:
+        return sorted(n for n in self.names if n not in NOT_A_HARNESS_PLUGIN)
+
+    def expects(self, plugin_dir: str) -> dict:
+        """Which hook events a plugin must occupy, and in which role (thor's §3 shape).
+
+        `wired` used to ask "is anything hestia-shaped wired?", which one hook of any kind
+        answers yes. Witnessing and gating are different acts with different failure
+        modes: post-hoc observation CANNOT fail closed, and the whole point of the gate
+        profile is that the pre-hook can. Absent an expects.json the roles are unknown and
+        the agent is reported as such — not as governed.
+        """
+        if self.source == "origin/main":
+            raw = _git("show", f"origin/main:plugins/{plugin_dir}/expects.json")
+        else:
+            try:
+                raw = (PLUGINS / plugin_dir / "expects.json").read_text()
+            except OSError:
+                raw = None
+        if raw is None:
+            return {}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        return {k: list(v) for k, v in data.items() if isinstance(v, list)}
+
+
+REGISTRY: Registry | None = None  # built in main(), once WORKSPACE is known
+
+
+def expects(plugin_dir: str) -> dict:
+    return REGISTRY.expects(plugin_dir) if REGISTRY else {}
 
 
 def inspect(atlas_id: str, roots: list[str]) -> dict:
     exes, dirnames, plugin_dir = names_for(atlas_id)
     exe = real_executable(exes, roots)
     homes = [HOME / d for d in dirnames if (HOME / d).is_dir()]
-    plugin_available = (PLUGINS / plugin_dir).is_dir()
+    plugin_available = REGISTRY.has(plugin_dir) if REGISTRY else False
     declared = expects(plugin_dir)
 
     rec: dict = {
@@ -630,20 +778,26 @@ def emit(report: dict, brief: bool) -> int:
 
 
 def main() -> int:
+    global WORKSPACE, WORKSPACE_SOURCE, ATLAS, PLUGINS, REGISTRY
     argv = sys.argv[1:]
     brief = "--brief" in argv
+
+    WORKSPACE, WORKSPACE_SOURCE = resolve_workspace(argv)
+    ATLAS = WORKSPACE / "agent-atlas" / "talk-to"
+    PLUGINS = WORKSPACE / "hestia" / "plugins"
+    REGISTRY = Registry()
 
     if not ATLAS.is_dir():
         return emit({"status": "UNKNOWN", "machine": platform.node(), "reason":
                      f"agent-atlas registry not readable at {ATLAS} — cannot "
-                     "distinguish 'nothing ungoverned' from 'could not look'"}, brief)
+                     "distinguish 'nothing ungoverned' from 'could not look'"
+                     f" (workspace from {WORKSPACE_SOURCE}; pass --workspace PATH "
+                     "or re-run install.sh)"}, brief)
 
     roots = search_roots()
     known = sorted(p.name for p in ATLAS.iterdir() if p.is_dir())
     recs = [inspect(a, roots) for a in known]
-    available = sorted(p.name for p in PLUGINS.iterdir()
-                       if p.is_dir() and p.name not in NOT_A_HARNESS_PLUGIN) \
-        if PLUGINS.is_dir() else []
+    available = REGISTRY.harnesses()
     installed = [r for r in recs if r["installed"]]
     governed = [r for r in installed if r["governed"]]
     gaps = classify(recs)
@@ -658,18 +812,24 @@ def main() -> int:
     # the ref makes that visible rather than silently wrong.
     scope = {
         "workspace": str(WORKSPACE),
-        "workspace_from_env": "HESTIA_WORKSPACE" in os.environ,
+        "workspace_source": WORKSPACE_SOURCE,      # argv | env | default
         "exe_search_roots": roots,
         "config_scopes_read": sorted({c["path"] for r in recs
                                       for c in r["configs_read"]}),
-        "plugins_ref": plugins_ref(),
+        "project_scan_depth": PROJECT_SCAN_DEPTH,
+        "plugins_source": REGISTRY.source,         # origin/main | worktree
+        "plugins_ref": REGISTRY.ref,
+        "worktree_ref": worktree_ref(),
         "toml_supported": tomllib is not None,
     }
     unknowns = sorted({u for r in recs for u in r["unknown"]})
-    if not scope["workspace_from_env"]:
+    if WORKSPACE_SOURCE == "default":
         unknowns.append(
-            f"HESTIA_WORKSPACE unset — fell back to the compiled-in default "
-            f"{WORKSPACE}, which is only correct on the machine it was written on")
+            f"workspace neither passed as --workspace nor set in HESTIA_WORKSPACE — "
+            f"fell back to the compiled-in default {WORKSPACE}, which is only correct "
+            "on the machine it was written on")
+    if REGISTRY.degraded:
+        unknowns.append(REGISTRY.degraded)
 
     # An unestablished scope degrades to UNKNOWN, never to OK (rule 4). MISWIRED still
     # outranks it: a known dead gate is worse news than an unknown.

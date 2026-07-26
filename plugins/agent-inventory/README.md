@@ -40,13 +40,26 @@ the `/mnt/c` 9p mount (cold reads can outlast a hook timeout, and these hooks fa
 
 | when | how |
 |---|---|
-| on launch | `SessionStart` hook, `--brief`, 10s timeout |
-| operator on demand | `hestia-agent-inventory [--brief] [--no-witness]` |
+| on launch | `SessionStart` hook, `--workspace <ws> --brief`, 10s timeout |
+| operator on demand | `hestia-agent-inventory --workspace <ws> [--brief] [--no-witness]` |
 | periodic | `systemd --user` timer, hourly (`OnBootSec=3min`, `Persistent=true`) |
 
-`install.sh` wires all three. The runtime copy lives at `~/.local/bin/` on **ext4**, not
-in the repo on 9p — this check must not become an instance of the fragility it reports.
-Re-run `install.sh` after editing `inventory.py`.
+`install.sh` wires all three, and writes the resolved workspace into **each** of them.
+It has to: a systemd unit's `Environment=` is not the shell's environment and not the
+hook's, so the first cut — which set `HESTIA_WORKSPACE` on the timer only — left the
+other two triggers falling back to the compiled-in CBP default. Measured on Thor
+(2026-07-26): the hourly timer read the right workspace while both the terminal and the
+SessionStart hook answered `UNKNOWN | agent-atlas registry not readable at
+/mnt/c/exe/projects/ai-agents/…`. Honest, per rule 4 — and inert, on every machine that
+is not CBP. **Scope has to travel in the command, not in one trigger's environment.**
+
+Resolution order is `--workspace` → `$HESTIA_WORKSPACE` → compiled-in default, and which
+one answered is reported as `scope.workspace_source`.
+
+The runtime copy lives at `~/.local/bin/` on **ext4**, not in the repo on 9p — this check
+must not become an instance of the fragility it reports. Re-run `install.sh` after editing
+`inventory.py`; it rewrites an existing hook entry in place (matching on the binary path,
+not the whole command) rather than appending a second one.
 
 Every run witnesses to the chain as `agent_inventory`, **including clean results**: a
 record that only ever holds failures cannot distinguish "checked, fine" from "never
@@ -63,14 +76,27 @@ looked" as "where it is"** — and every one of them failed in the *reassuring* 
 |---|---|---|
 | `$HOME/.claude` | project + local scope too | on both machines the enforcement half lives *entirely* in the last two |
 | the working tree | `origin/main` | a feature-branch checkout flips the remedy from `install.sh` to "build an adapter" |
+| depth-1 children of the workspace | repos nest | a third dead `PreToolUse` gate, in `synchronism/manuscripts/`, was simply out of reach of the glob |
 | a compiled-in default path | `$HESTIA_WORKSPACE` | correct on CBP, `UNKNOWN` everywhere else |
 | the substring `hestia` | real gates never say it | deleting codex's live gate still reported `OK` |
 | `$PATH` | `~/.nvm`, `~/.pyenv`, … | `1 installed` from a hook, `3 installed` from a shell, same machine, same minute |
 
 So the check now **reports the scope it achieved** — `scope` in the JSON carries the
-workspace, whether it came from the environment, every executable search root, every
-config file read, and the ref `plugins_available` was resolved from. And **any scope it
-could not establish degrades to `UNKNOWN`, never to `OK`.**
+workspace and where it was resolved from, every executable search root, every config file
+read, the project scan depth, and both the ref `plugins_available` was resolved from
+(`plugins_source`, `plugins_ref`) and the ref the checkout happens to be sitting on
+(`worktree_ref`). And **any scope it could not establish degrades to `UNKNOWN`, never to
+`OK`.**
+
+**Stamping the ref was not enough.** The first cut reported `plugins_ref` and kept reading
+the working tree, on the theory that a visible number is a falsifiable one. But B is what
+A and C are *differenced against*, so an under-read propagates into the verdict rather
+than sitting beside it. On Thor, whose shared checkout sits 103 commits behind main on a
+sibling's branch, the same script at the same instant returned `claude: governed, status
+UNKNOWN` from the tree and `claude: MISWIRED` from `origin/main` — and the stale one was
+the reassuring one. `plugins_available` and `expects.json` are now read from `origin/main`
+(a fetched read-only ref: no network, and safe while a sibling holds the checkout dirty),
+falling back to the tree only when there is no fetched main — and saying so when it does.
 
 Two consequences worth stating plainly:
 
