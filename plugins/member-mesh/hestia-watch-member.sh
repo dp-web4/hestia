@@ -92,6 +92,55 @@ for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me
 ' || true
 }
 
+# Branch 4 of dp's routing algorithm (shared-context/explorations/
+# r6-routing-tcpip-of-trust-2026-07-26): a packet that cannot be delivered
+# REPORTS to the sender. Without this, a dead fire and a notice never sent are
+# indistinguishable at both ends — the sender's unanswered view reads
+# "delivered, unanswered" for mail the member never saw (41 fires / 3 dead /
+# all reported success). The report is a `reply` bound to the failed notice:
+# reply awaits a disposition, so the failure sits in the SENDER's debt row
+# until it acks — reroute, resend, or abandon, and the decision is witnessed.
+# A coordination-kind report could be ignored in silence, which is the silent
+# drop again one layer up. It is sent under the failed member's own gateway
+# identity (instance watch-$PLUGIN) — the border router reporting its LAN
+# host's delivery failure; the binding is legal because the notice was
+# addressed to this plugin. Two ICMP-style suppressions: never report an
+# undelivered report (pointer already carries #undelivered), never report an
+# undelivered ack (terminal; its loop-closing happened daemon-side at send).
+# A failed report is journaled, never fatal — report generation must not kill
+# the router.
+report_unreachable() {
+  local PRIMER_FILE="$1" WHY="$2" ROWS ARGS OUT
+  ROWS=$(python3 - "$PRIMER_FILE" "$WHY" <<'PY'
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: raise SystemExit(0)
+why=sys.argv[2]
+for n in d.get("notices",[]):
+    p=str(n.get("pointer_uri") or "")
+    nid=n.get("id"); sender=n.get("from_plugin")
+    if n.get("kind")=="ack" or "#undelivered" in p: continue
+    if not isinstance(nid,int) or not sender: continue
+    # The pointer keeps naming the undelivered CONTENT; the fragment names
+    # the routing verdict. Bytes, not chars — the daemon's bound is bytes.
+    p=(p+f"#undelivered:{why}").encode()[:512].decode(errors="ignore")
+    print(json.dumps({"to_plugin_id":sender,"kind":"reply",
+                      "pointer_uri":p,"in_reply_to":nid}))
+PY
+) || ROWS=""
+  [ -n "$ROWS" ] || return 0
+  while IFS= read -r ARGS; do
+    [ -n "$ARGS" ] || continue
+    if OUT=$(mesh_rpc hestia_member_notify "$ARGS" 2>/dev/null) \
+       && printf '%s' "$OUT" | grep -q '"queued_id"' \
+       && ! printf '%s' "$OUT" | grep -q '_hestia_error'; then
+      echo "[hestia-watch] UNREACHABLE reported: $ARGS"
+    else
+      echo "[hestia-watch] unreachable-report FAILED (notices remain in $PRIMER_FILE): $ARGS"
+    fi
+  done <<< "$ROWS"
+}
+
 announce_unanswered
 LAST_ANNOUNCE=$(date +%s)
 
@@ -124,7 +173,9 @@ json.dump(d,sys.stdout)
       if "$FIRE" "$PRIMER"; then
         rm -f "$PRIMER"
       else
-        echo "[hestia-watch] fire command failed (notices preserved in $PRIMER)"
+        RC=$?
+        echo "[hestia-watch] fire command failed rc=$RC (notices preserved in $PRIMER)"
+        report_unreachable "$PRIMER" "fire-rc=$RC"
       fi
     else
       python3 -c "import json;d=json.load(open('$PRIMER'));[print(f\"  {n['kind']} from {n['from_plugin']}: {n.get('pointer_uri','')}\") for n in d['notices']]"
