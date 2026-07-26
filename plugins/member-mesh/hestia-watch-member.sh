@@ -86,9 +86,17 @@ for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me
         seen = "delivered, unanswered" if n.get("drained_at") else "NEVER PICKED UP"
         live = n.get("recipient_liveness")
         if live and live != "live": seen += f", recipient {live}"
-        print(f"[hestia-watch] UNANSWERED ({label}): id={n.get(\"id\")} {n.get(\"kind\")} "
-              f"{n.get(\"from_plugin\")}->{n.get(\"to_plugin\")} [{seen}] queued={n.get(\"queued_at\",\"\")}: "
-              f"{n.get(\"pointer_uri\",\"\")}")
+        # Single quotes inside the expressions, deliberately: this block is
+        # already inside a single-quoted shell string, so a backslash-escaped
+        # double quote reaches Python as `\"` — a SyntaxError in every version
+        # (PEP 701 relaxed quote REUSE, not escapes). It was written that way,
+        # and `|| true` swallowed it, so this asker has never printed a line
+        # since it shipped. Found 2026-07-26 running the branch-4 vector: this
+        # thread keeps finding the same shape, and here the alarm nobody reads
+        # turned out to be an alarm that never fired.
+        print("[hestia-watch] UNANSWERED ({}): id={} {} {}->{} [{}] queued={}: {}".format(
+              label, n.get("id"), n.get("kind"), n.get("from_plugin"),
+              n.get("to_plugin"), seen, n.get("queued_at",""), n.get("pointer_uri","")))
 ' || true
 }
 
@@ -123,7 +131,18 @@ for n in d.get("notices",[]):
     if not isinstance(nid,int) or not sender: continue
     # The pointer keeps naming the undelivered CONTENT; the fragment names
     # the routing verdict. Bytes, not chars — the daemon's bound is bytes.
-    p=(p+f"#undelivered:{why}").encode()[:512].decode(errors="ignore")
+    # TRUNCATE THE CONTENT NAME, NEVER THE VERDICT (CBP review 2026-07-26,
+    # case E): a pointer at the 512-byte MTU is legal, so appending the
+    # fragment and then cutting to 512 dropped the `#undelivered` marker for
+    # any pointer over 500 bytes — and at exactly 512 the report came out
+    # byte-identical to the notice it reported on. The marker is the one-hop
+    # visited bit the suppression above reads, so losing it turns suppression
+    # off exactly where pointers are longest, and two gateways with failing
+    # fires report each other's reports once per poll. A degraded content name
+    # is still a lead; a lost verdict is the silent drop this branch exists to
+    # remove.
+    frag=f"#undelivered:{why}".encode()[:512]
+    p=p.encode()[:512-len(frag)].decode(errors="ignore")+frag.decode(errors="ignore")
     print(json.dumps({"to_plugin_id":sender,"kind":"reply",
                       "pointer_uri":p,"in_reply_to":nid}))
 PY

@@ -22,8 +22,14 @@ Four cases:
   D  daemon denies the report -> watcher journals the failure, keeps the
                                  primer, and KEEPS POLLING (report generation
                                  must not kill the router).
+  E  pointer at the 512-byte MTU -> the routing verdict SURVIVES truncation.
+                                 The content name is what degrades, never the
+                                 `#undelivered` marker — the marker is the
+                                 one-hop visited bit case C relies on, so a
+                                 truncation that eats it turns suppression off
+                                 exactly where pointers are longest.
 
-Usage: ./branch4_unreachable_report_test.py   (runtime ~20s, deliberate waits)
+Usage: ./branch4_unreachable_report_test.py   (runtime ~25s, deliberate waits)
 """
 import json
 import os
@@ -165,6 +171,11 @@ NOTICE_ACK = {"id": 43, "kind": "ack", "from_plugin": "claude-code",
 NOTICE_REPORT = {"id": 44, "kind": "reply", "from_plugin": "claude-code",
                  "pointer_uri": "shared-context/forum/y.md#undelivered:fire-rc=3",
                  "queued_at": "2026-07-26T00:00:00Z"}
+# A pointer AT the MTU is legal (handler.rs MAX_POINTER_URI_BYTES = 512, `>` not
+# `>=`), so this is an ordinary notice, not a hostile one.
+MAX_POINTER = "shared-context/forum/" + "a" * (512 - len("shared-context/forum/"))
+NOTICE_MAX = {"id": 45, "kind": "coordination", "from_plugin": "claude-code",
+              "pointer_uri": MAX_POINTER, "queued_at": "2026-07-26T00:00:00Z"}
 
 
 def main():
@@ -203,6 +214,38 @@ def main():
           and len(primers) == 1 and daemon.inbox_calls >= 2,
           f"notify={len(daemon.notify_calls)} inbox={daemon.inbox_calls} "
           f"primers={primers}\n{out}")
+
+    # Case E — truncation must eat the CONTENT NAME, never the routing verdict.
+    # Appending the fragment and then cutting to the MTU loses the marker for
+    # any pointer over 500 bytes, and at exactly 512 the report is byte-identical
+    # to the notice it reports on: the verdict vanishes, case C's suppression
+    # goes blind, and two gateways with failing fires report each other's
+    # reports once per poll forever.
+    daemon, out, primers, _ = run_watcher([dict(NOTICE_MAX)])
+    reports = list(daemon.notify_calls)
+    ptr = reports[0].get("pointer_uri", "") if reports else ""
+    check("E: at the 512-byte MTU the routing verdict survives — marker intact, "
+          "still within MTU, and not byte-identical to the reported notice",
+          len(reports) == 1
+          and "#undelivered:fire-rc=3" in ptr
+          and len(ptr.encode()) <= 512
+          and ptr != MAX_POINTER,
+          f"len={len(ptr.encode())} marker={'#undelivered' in ptr} "
+          f"identical={ptr == MAX_POINTER}\n        ptr={ptr!r}\n{out}")
+    # ...and the report it produced must itself be suppressed on the next hop,
+    # which is the property case C asserts and the only reason the marker matters.
+    daemon2, out2, _, _ = run_watcher([dict(NOTICE_MAX, id=46, pointer_uri=ptr or MAX_POINTER)])
+    check("E: the MTU-length report is suppressed as an input (no report about a report)",
+          len(daemon2.notify_calls) == 0,
+          f"notify_calls={json.dumps(daemon2.notify_calls)}\n{out2}")
+
+    # F — not branch 4, found by reading this test's own output: the unanswered
+    # JOURNAL asker (the weak half of the two-asker design) died on a Python
+    # SyntaxError on every run and `|| true` ate it. A watcher that reports a
+    # crash from the code whose job is making silent debt visible is the
+    # thread's subject, not a lint.
+    check("F: the unanswered asker actually runs (no swallowed SyntaxError)",
+          "SyntaxError" not in out, out)
 
     print()
     if failures:
