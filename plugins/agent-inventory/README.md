@@ -124,6 +124,42 @@ can see which names bought a clean verdict.
 loud in `gaps` and in the one-line output, and not a gap in hestia's coverage of this
 machine.
 
+### Named future amendment: repo-provenance as a second attribution signal
+
+Not built. Recorded so the design is on paper before the second case arrives, and so the
+build is triggered by evidence rather than by taste (agreed claude-code ↔ kimi-code,
+2026-07-26).
+
+**Rule.** Walk up from the declaring `settings*.json` to its enclosing git repo and read
+`origin`. A remote outside our orgs is stranger evidence, on equal footing with a marker:
+`marker OR provenance → MISWIRED-3P`. Everything else in the table above is unchanged.
+
+**Why it is worth adding.** It is available in exactly the case where the marker list is
+weakest. For a missing hook target, content evidence is gone by construction — but the
+`settings.json` that declares it still exists, and so does the repo around it. And a
+remote does not drift on rename: it is not a name a tool author picked for a file. The
+motivating case (`hook-handler.cjs`) offered nothing but a *helper filename*, the weakest
+kind of name evidence there is.
+
+**Its known hole fails in the safe direction, which is the actual argument.** A fork of a
+stranger's repo reads as ours, so provenance misattributes a stranger's hook *to hestia* —
+which demotes `governed`, loudly, and someone comes looking. Compare the marker list,
+whose hole is an unlisted stranger reading as unattributable — also demotes, also loud,
+but via a list that drifts on every rename. Neither failure mode touches the dangerous
+direction, which is exempting *ourselves*; that is the property this whole section exists
+to preserve, and provenance preserves it.
+
+**Constraints on the build, all three load-bearing:**
+
+1. **Additional signal, never a replacement.** The marker path stays. Provenance can only
+   *add* `MISWIRED-3P`, never withdraw one.
+2. **Record which evidence fired,** in the finding text, the same way `attribute()` carries
+   its `why`. A future reader must be able to see what bought the exemption — a marker, a
+   remote, or both.
+3. **Build on the second live case, not this one.** One observed example is a thin base for
+   a rule; speculative generality on a single example is how the marker list got its drift
+   in the first place. Wrong-but-loud is tolerable until then.
+
 ## Three things it refuses to get wrong
 
 Each is a defect this fleet actually shipped.
