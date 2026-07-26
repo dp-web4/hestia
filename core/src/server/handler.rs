@@ -2482,10 +2482,19 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         }),
     )?;
 
+    // Address parsing and peer resolution happened above, in `addressing`:
+    // `Address::Routed` already guarantees both halves non-empty and `resolve_peer`
+    // already refused the unknown-peer and no-table cases with named envelopes. So
+    // Thor's inline `peer.is_empty() || remote_member.is_empty()` guard is subsumed
+    // here rather than dropped — the same refusal, moved to where the name is parsed.
     let queued_id = match &route {
-        Some((peer, peer_lct, remote_member)) => s
-            .inbox_store
-            .enqueue_egress(
+        Some((peer, peer_lct, remote_member)) => {
+            // The egress plane's admission bound (`MAX_EGRESS_QUEUE`) refuses rather
+            // than evicting: dropping a parked forward is a silent loss, while refusing
+            // the newest send reaches a caller who is live and holds the receipt. Named
+            // error, not a bare anyhow — "the forwarding plane is backed up" is a fact
+            // the sender can act on (and it says how backed up).
+            match s.inbox_store.enqueue_egress(
                 peer,
                 peer_lct,
                 remote_member,
@@ -2494,8 +2503,58 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                 &kind,
                 pointer_uri.as_deref(),
                 &entry.hash,
-            )
-            .map_err(|e| anyhow::anyhow!("queueing egress notice: {e}"))?,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    // The refusal gets its OWN chain entry (McNugget T3 on `17a928d`).
+                    // The witness above says `member_notice` and reads, to any third
+                    // party, as an accepted send — the chain cannot distinguish "queued"
+                    // from "refused" without this. The envelope used to assert "the
+                    // refusal is on record too" while appending nothing, which made the
+                    // one path built to keep backpressure attributable the one path that
+                    // left no evidence, and made the claim in its own error text false.
+                    // Appending here rather than moving the witness below the queue
+                    // decision keeps the existing shape deliberate — the act IS the send,
+                    // delivery is a consequence — and `witnessed_entry` joins the two.
+                    //
+                    // Cheap under flood by construction: this fires only when admission
+                    // is REFUSED, i.e. at most once per send that produced no row, and
+                    // the refusal is what a flooding sender is already being told to stop
+                    // doing. That is the opposite of the eviction-counter case, which is
+                    // a mark rather than a witness precisely because evictions happen at
+                    // flood rates.
+                    let depth = s.inbox_store.egress_queued().unwrap_or(0);
+                    let refusal = s.append_chain(
+                        "member_notice_refused",
+                        json!({
+                            "reason": "egress_queue_full",
+                            "to_plugin_id": to_plugin,
+                            "dest_peer": peer,
+                            "from_plugin_id": sender.plugin_id,
+                            "from_role_lct": sender.role_lct,
+                            "egress_queued": depth,
+                            // the `member_notice` entry this refusal voids
+                            "witnessed_entry": entry.hash,
+                        }),
+                    )?;
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_egress_queue_full",
+                        &format!(
+                            "the forwarding plane is not draining, so this notice was \
+                             NOT queued: {e}. Both the act and its refusal are on the \
+                             chain — see witnessEntryHash and refusalEntryHash."
+                        ),
+                        Some(json!({
+                            "to_plugin_id": to_plugin,
+                            "dest_peer": peer,
+                            "egress_queued": depth,
+                            "witnessEntryHash": entry.hash,
+                            "refusalEntryHash": refusal.hash,
+                        })),
+                    ));
+                }
+            }
+        }
         None => s
             .inbox_store
             .enqueue_member(
@@ -5222,6 +5281,68 @@ mod member_mesh_tests {
             .unwrap();
         assert_eq!(kimi_mail["total"], json!(1));
         assert_eq!(kimi_mail["notices"][0]["from_plugin"], json!("claude-code"));
+    }
+
+    /// T3 (McNugget on `17a928d`): a REFUSED forward must be distinguishable from an
+    /// accepted one **on the chain**, not just in an ephemeral tool response.
+    ///
+    /// The witness runs above the queue decision — deliberately, because the act is the
+    /// send and delivery is a consequence — so it appends a plain `member_notice` that
+    /// reads to any third party as a send that was accepted. When admission is refused
+    /// the branch previously returned an envelope asserting "the refusal is on record
+    /// too" and appended nothing, so the one path built to make backpressure
+    /// attributable was the only path that left no evidence, and its own error text was
+    /// false. The refusal now gets its own entry, joined to the witness it voids.
+    #[tokio::test]
+    async fn a_refused_forward_is_on_the_chain_not_just_in_the_reply() {
+        let (_dir, state) = test_state().await;
+        let alice = connect(&state, "claude-code").await;
+
+        // Fill the egress plane to its bound directly — this test is about what the
+        // refusal RECORDS, not about where the bound sits (that is pinned in inbox.rs).
+        {
+            let s = state.lock().await;
+            for i in 0..crate::storage::inbox::MAX_EGRESS_QUEUE {
+                s.inbox_store
+                    .enqueue_egress("thor", "claude-code", "codex-cli", "role:r",
+                                    "reply", Some("forum/x.md#thread=t"),
+                                    &format!("h{i}"))
+                    .unwrap();
+            }
+        }
+
+        let refused = tool_member_notify(
+            &state,
+            &json!({
+                "to_plugin_id": "thor/claude-code", "kind": "review_done",
+                "pointer_uri": "shared-context/forum/x.md#thread=t", "session_id": alice
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(refused["_hestia_error"]["code"], json!("hestia.member_notify_egress_queue_full"),
+                   "setup: expected the bound to fire, got {refused}");
+        let witness = refused["_hestia_error"]["data"]["witnessEntryHash"].as_str().unwrap();
+        let refusal = refused["_hestia_error"]["data"]["refusalEntryHash"].as_str()
+            .expect("the refusal must carry its own chain entry hash");
+        assert_ne!(witness, refusal, "the refusal reused the witness entry");
+
+        let s = state.lock().await;
+        let chain = s.recent_chain(20);
+        let e = chain
+            .iter()
+            .find(|e| e.event_type == "member_notice_refused")
+            .expect("a refused forward left NO trace on the chain");
+        // The join: a third party reading the chain can tell which witnessed act this
+        // refusal voids, without trusting the sender's copy of the reply.
+        assert_eq!(e.event_data["witnessed_entry"], json!(witness));
+        assert_eq!(e.event_data["reason"], json!("egress_queue_full"));
+        assert_eq!(e.event_data["dest_peer"], json!("thor"));
+        // And the accepted-looking witness is still there — the pair is the record,
+        // not the refusal alone.
+        assert!(chain.iter().any(|e| e.event_type == "member_notice"),
+                "the witness that the refusal voids is missing");
     }
 
     /// The unanswered report is only honest if the party it reports on cannot
