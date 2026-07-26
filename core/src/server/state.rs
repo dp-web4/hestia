@@ -74,6 +74,23 @@ pub struct InFlightAction {
 
 /// The mutable core state passed to every request handler.
 pub struct ServerState {
+    /// In-scope work awaiting attestation, keyed by (plugin_id, role_lct) → (allows, denies).
+    ///
+    /// WHY THIS EXISTS. Trust could only be earned two ways — be denied and comply, or be
+    /// adjudicated by a peer — so a member doing quiet, in-scope, competent work was
+    /// literally unmeasurable. On 2026-07-26 kimi-code/member had 2,214 actions at 99.5%
+    /// success and read `unmeasured`, while the same agent's interactive-dev grain read
+    /// `high` off 40 actions and 25 complied-with denials. The system measured how a member
+    /// behaved when caught, not whether it did good work.
+    ///
+    /// Every ALLOW is the gate — NOT the actor — asserting "this was inside your grant".
+    /// That is exactly the not-self-reported evidence the design asks for, and all 17,649 of
+    /// them were being discarded because they arrived bundled with the self-reported "it
+    /// worked". These counters separate the two claims so the trustworthy half can count.
+    ///
+    /// In memory on purpose: a restart forfeits at most one partial window, and persisting
+    /// a tally would make the ATTESTATION rather than the chain the source of truth.
+    pub scope_tally: std::collections::HashMap<(String, String), (u64, u64)>,
     pub vault: Vault,
     pub sessions: HashMap<Uuid, Session>,
     pub actions: HashMap<Uuid, InFlightAction>,
@@ -219,6 +236,7 @@ impl ServerState {
         };
 
         Ok(Self {
+            scope_tally: std::collections::HashMap::new(),
             vault,
             sessions: HashMap::new(),
             actions: HashMap::new(),

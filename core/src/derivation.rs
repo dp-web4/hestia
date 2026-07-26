@@ -349,6 +349,53 @@ pub fn derive(
         });
     }
 
+    // ---- Scope attestations: sustained in-scope work IS governance conduct ----
+    //
+    // Until 2026-07-26 temperament could only be earned by being DENIED and responding
+    // well, so a member that never tripped the gate was unmeasurable no matter how much
+    // correct work it did — kimi-code/member sat at `unmeasured` on 2,214 actions and
+    // 99.5% success, while the same agent's other grain read `high` off 40 actions and 25
+    // denials. The scale graded behaviour-when-caught, not competence.
+    //
+    // An attestation is the GATE (not the actor) reporting a window of its own decisions,
+    // which makes it admissible where the member's outcome log is not. One window is ONE
+    // observation regardless of size: an allow is weak evidence individually, and counting
+    // each would let trivial in-scope volume swamp real adjudications.
+    //
+    // A clean window scores the same 0.85 as complying after a deny — both are "stayed
+    // inside the boundary", and neither should outrank a witnessed appeal (1.0), which is
+    // the only conduct that improves the boundary rather than merely respecting it. A
+    // window containing denies scores lower in proportion; the denies themselves are also
+    // counted individually above, so a bad window is felt twice, which is intended.
+    for e in entries.iter().filter(|e| {
+        e.event_type == "scope_attestation"
+            && entry_str(e, "plugin_id") == Some(plugin_id)
+            && entry_str(e, "role_lct").map_or(true, |r| r == role_lct)
+            // Only the gate may attest. A member-authored attestation would be exactly the
+            // self-report this dimension exists to exclude.
+            && entry_str(e, "attested_by") == Some("hestia-gate")
+    }) {
+        let allows = e.event_data.get("allows").and_then(Value::as_u64).unwrap_or(0);
+        let denies = e.event_data.get("denies").and_then(Value::as_u64).unwrap_or(0);
+        let total = allows + denies;
+        if total == 0 {
+            continue;
+        }
+        let clean = allows as f64 / total as f64;
+        let score = 0.85 * clean;
+        temperament_scores.push(score);
+        temperament_evidence.push(Evidence {
+            chain_position: e.chain_position,
+            hash: e.hash.clone(),
+            event_type: e.event_type.clone(),
+            timestamp: e.timestamp,
+            contribution: format!(
+                "in-scope window {score:.2} ({allows} allowed, {denies} denied — gate-attested)"
+            ),
+            reference: Some(format!("{total} gate decisions in this window")),
+        });
+    }
+
     // ---- Adjudicated V3: evidence from adjudication events for this grain ----
     let mut adj_scores: [Vec<f64>; 3] = Default::default(); // [validity, veracity, valuation]
     let mut adj_evidence: [Vec<Evidence>; 3] = Default::default();
@@ -584,5 +631,61 @@ mod comply_reaches_high {
         assert!(score >= 0.7, "sustained compliance must reach `high`, got {score}");
         assert!(score < 1.0, "compliance must stay below a witnessed appeal, got {score}");
         assert_eq!(d.level, "high", "level should read high, got {}", d.level);
+    }
+}
+
+#[cfg(test)]
+mod scope_attestation_tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use serde_json::{json, Value};
+
+    fn e(pos: u64, min: i64, et: &str, d: Value) -> ChainEntry {
+        ChainEntry { chain_position: pos, hash: format!("h{pos}"), prev_hash: String::new(),
+            event_type: et.to_string(), event_data: d, signer_lct: "test".into(),
+            timestamp: Utc::now() + Duration::minutes(min) }
+    }
+    fn att(pos: u64, allows: u64, denies: u64) -> ChainEntry {
+        e(pos, pos as i64, "scope_attestation", json!({
+            "plugin_id":"m", "role_lct":"role:constellation:member",
+            "allows":allows, "denies":denies, "attested_by":"hestia-gate"}))
+    }
+
+    /// The gap this closes: quiet in-scope work used to be unmeasurable.
+    #[test]
+    fn sustained_clean_work_becomes_measurable_without_ever_being_denied() {
+        let w: Vec<ChainEntry> = (1..=6).map(|i| att(i, 200, 0)).collect();
+        let d = derive("m", "role:constellation:member", &w);
+        let s = d.temperament.score.expect("clean work must be MEASURED, not unmeasured");
+        assert!(s >= 0.7, "sustained clean work should reach `high`, got {s}");
+        assert_eq!(d.level, "high");
+    }
+
+    /// One window is one observation — volume must not buy trust.
+    #[test]
+    fn a_huge_window_counts_once() {
+        let small = derive("m", "role:constellation:member", &[att(1, 10, 0)]);
+        let huge = derive("m", "role:constellation:member", &[att(1, 100_000, 0)]);
+        assert_eq!(small.temperament.observations, huge.temperament.observations,
+                   "window SIZE must not change how much evidence it is");
+        assert_eq!(small.temperament.score, huge.temperament.score);
+    }
+
+    /// A member cannot attest for itself — that would reintroduce self-report.
+    #[test]
+    fn only_the_gate_may_attest() {
+        let forged = e(1, 1, "scope_attestation", json!({
+            "plugin_id":"m", "role_lct":"role:constellation:member",
+            "allows":10_000, "denies":0, "attested_by":"m"}));
+        let d = derive("m", "role:constellation:member", &[forged]);
+        assert_eq!(d.temperament.observations, 0, "self-attestation must not count");
+    }
+
+    /// A dirty window scores below a clean one, proportionally.
+    #[test]
+    fn denies_in_the_window_lower_the_score() {
+        let clean = derive("m", "role:constellation:member", &[att(1, 100, 0)]);
+        let dirty = derive("m", "role:constellation:member", &[att(1, 50, 50)]);
+        assert!(dirty.temperament.score.unwrap() < clean.temperament.score.unwrap());
     }
 }

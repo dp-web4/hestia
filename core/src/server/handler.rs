@@ -509,7 +509,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     let action_id_str = require_string(args, "action_id")?;
     let action_id =
         Uuid::parse_str(&action_id_str).map_err(|_| anyhow::anyhow!("invalid action_id"))?;
-    let s = state.lock().await;
+    let mut s = state.lock().await;
     let action = match s.actions.get(&action_id) {
         Some(a) => a.clone(),
         None => {
@@ -598,6 +598,41 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
             )
         });
+    // SCOPE ATTESTATION — count what the gate judged, allows included.
+    //
+    // The window, not the action, is the unit of evidence. 1,000 in-scope calls attest
+    // ONE observation, not 1,000: an allow is weak evidence individually, and letting
+    // each one count would let a member farm trust with trivial in-scope work and swamp
+    // the 9 real adjudications on this chain under a landslide of `ls`. Rate-of-clean-work
+    // is the signal; volume is not.
+    {
+        let key = (plugin_id_for_chain.clone(), role_lct.to_string());
+        let e = s.scope_tally.entry(key.clone()).or_insert((0, 0));
+        if evaluation.decision == crate::policy::PolicyDecision::Allow {
+            e.0 += 1;
+        } else {
+            e.1 += 1;
+        }
+        let (allows, denies) = *e;
+        if allows + denies >= SCOPE_ATTEST_EVERY {
+            s.scope_tally.remove(&key);
+            let instance_lct = s.member_lct(&plugin_id_for_chain);
+            let _ = s.append_chain(
+                "scope_attestation",
+                json!({
+                    "plugin_id": plugin_id_for_chain,
+                    "instance_lct": instance_lct,
+                    "role_lct": role_lct,
+                    "allows": allows,
+                    "denies": denies,
+                    // The gate attests; the member does not. This is the field that makes
+                    // the entry admissible as not-self-reported evidence, and naming the
+                    // attester is what distinguishes it from the member's own outcome log.
+                    "attested_by": "hestia-gate",
+                }),
+            );
+        }
+    }
     if evaluation.decision != crate::policy::PolicyDecision::Allow {
         // A deny blocks before execution, so this is the ONLY witnessed record of a
         // denied action — carry the full accountability WHO (instance + role +
@@ -1454,6 +1489,11 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
 /// Upper bound on a stored attempt. Long enough to reconstruct intent (a shell line, a
 /// patch header), short enough that a runaway heredoc cannot inflate the chain.
 const ATTEMPTED_MAX: usize = 400;
+
+/// Gate decisions per scope attestation. Small enough that a working member earns
+/// evidence within a session, large enough that the chain does not grow by one entry per
+/// tool call (17,649 outcomes on this chain would have become 17,649 attestations).
+const SCOPE_ATTEST_EVERY: u64 = 200;
 
 /// Scrub obvious secrets out of an attempted command before it is persisted.
 ///
