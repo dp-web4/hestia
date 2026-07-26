@@ -377,6 +377,37 @@ bypass.
 
 ---
 
+## 10b. The class this catalogue kept missing: authority held, not exercised
+
+Every measured bypass above yields to an **ambient property** rather than to a decision:
+`HESTIA_PRE_FAIL_CLOSED` being unset, a hook target being absent, a budget being small.
+None of them is an act anyone took; each is a state the environment happened to be in.
+
+The clearest specimen came from outside hestia, while writing this document. Linking
+issue #49 into the web4 README required a commit; the push landed on a branch protected by
+"changes must be made through a pull request", and the server logged
+`Bypassed rule violations` — because the pushing identity holds admin. The automation ran
+a plain `git push`. **No actor chose to bypass, so no rationale exists, so the log records
+a fact with no reason attached.** A receipt for something nobody decided is not an audit
+trail (dp: "this in itself is an example of what should be governed by written auditable
+policy, not arbitrary choice").
+
+hestia gets this right in exactly one place, which is why the contrast is worth stating:
+the **operator gate requires a signed challenge per session** — authority *exercised as an
+act*, not *held as a bit*. Everything else in the stack, including GitHub's admin flag, is
+the other kind.
+
+The general rule this catalogue should have started with:
+
+> **A control that yields to a property will be bypassed by accident before it is bypassed
+> by intent** — and the accidental case leaves no rationale, which makes it the harder one
+> to audit afterwards.
+
+Mitigation deployed for the git instance: the `post-commit` hook now detects the bypass,
+reports the violated rule loudly, and witnesses a `policy_bypass` entry carrying
+`authority: standing admin attribute` and `justification: null`. It cannot stop the
+bypass; it only refuses to let it be silent.
+
 ## 11. Standing acknowledgements — put these in front of anyone relying on hestia
 
 - The gate runs inside the blast radius; it is not containment.
@@ -386,6 +417,8 @@ bypass.
   daemon means an ungoverned agent.
 - Semantic evasion of the text matcher is unsolved and, in the current design, unsolvable.
 - Identity is **asserted**, not proven.
+- Authority is **held as an attribute**, not exercised as a recorded act — so the most
+  common bypass is accidental, and accidental bypasses leave no rationale to audit.
 - Consequential config read from the environment is config the governed party can write.
   Until §9 lands, the gate's own posture is set on an agent-writable channel.
 - This catalogue is incomplete by construction. Its value is that it is honest about being
