@@ -115,6 +115,32 @@ impl TrustStore {
     /// Apply an outcome and persist, returning `(before, after)` so the caller can
     /// diff the tensor movement into a `ReputationDelta` (the trust-tensor bridge,
     /// P3a). One read + one write, same as `update`.
+    /// Rebuild an entity's stored outcome tensor from an authoritative replay.
+    ///
+    /// `EntityTrust` is a CACHE of the witness chain, and until 2026-07-26 it could only
+    /// be appended to — so a revision to what counts as evidence (an exoneration, an
+    /// amnesty, a refuted success) applied only going forward, and the visible record kept
+    /// a charge the society had already withdrawn. dp: "default policy should be recompute
+    /// from chain on revision event... a society should be able to decide."
+    ///
+    /// The caller supplies the already-filtered outcome sequence, because deciding WHAT
+    /// counts is law and belongs above storage. This function only replays it.
+    pub fn rebuild_from_outcomes(
+        &self,
+        plugin_id: &str,
+        outcomes: &[(bool, f64)],
+    ) -> Result<(EntityTrust, EntityTrust)> {
+        let before = self.get(plugin_id)?;
+        // Start from a clean tensor for this key: a rebuild that started from the current
+        // value would fold the very history it is meant to re-derive.
+        let mut after = EntityTrust::new(plugin_id.to_string());
+        for (success, magnitude) in outcomes {
+            after.update_from_outcome(*success, *magnitude);
+        }
+        self.store(&after)?;
+        Ok((before, after))
+    }
+
     pub fn update_returning_prior(
         &self,
         plugin_id: &str,

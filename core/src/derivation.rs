@@ -126,6 +126,70 @@ fn chain_hash(reference: &str) -> &str {
 /// immutable — and it is why this is an alias rather than a merge.
 pub const IDENTITY_ALIAS_EVENT: &str = "identity_alias";
 
+/// Replay a grain's outcome history from the chain, honouring every witnessed exclusion.
+///
+/// The counterpart to `rebuild_from_outcomes`: this decides WHAT counts (law's job), the
+/// store only replays it. Excluded, in each case because the society has already said the
+/// event is not chargeable conduct:
+///   - a deny that carried NO VERDICT (the gate could not judge — not the member's doing)
+///   - a deny withdrawn by `exoneration`
+///   - a deny inside an `amnesty` class/window
+///   - a SUCCESS later refuted (`refutation` naming its outcome hash) — dp's addition, and
+///     the one that revises DOWNWARD: self-reported success is provisional until
+///     adjudicated, so a verified refutation must subtract it, not merely stop counting it.
+pub fn replay_outcomes(
+    plugin_id: &str,
+    role_lct: &str,
+    window: &[ChainEntry],
+) -> Vec<(bool, f64)> {
+    let entries: Vec<&ChainEntry> = window.iter().collect();
+    let identities = aliased_identities(plugin_id, &entries);
+    let on_grain = |e: &ChainEntry| {
+        entry_str(e, "plugin_id").is_some_and(|p| identities.iter().any(|i| i == p))
+            && entry_str(e, "role_lct").map_or(true, |r| r == role_lct)
+    };
+    // Hashes withdrawn by a witnessed revision, in either direction.
+    let mut withdrawn: HashSet<&str> = HashSet::new();
+    for e in &entries {
+        match e.event_type.as_str() {
+            "exoneration" | "exoneration_correction" => {
+                if let Some(h) = entry_str(e, "deny_hash") { withdrawn.insert(h); }
+            }
+            "refutation" => {
+                if let Some(h) = entry_str(e, "outcome_hash") { withdrawn.insert(h); }
+            }
+            _ => {}
+        }
+    }
+    entries
+        .iter()
+        .filter(|e| on_grain(e) && !withdrawn.contains(e.hash.as_str()))
+        .filter_map(|e| match e.event_type.as_str() {
+            "outcome" => {
+                let ok = e.event_data.get("success").and_then(Value::as_bool).unwrap_or(false);
+                let mag = e.event_data.get("magnitude").and_then(Value::as_f64).unwrap_or(0.5);
+                Some((ok, mag))
+            }
+            // A gate block counts as a negative ONLY if it carried a verdict.
+            "policy_decision"
+                if entry_str(e, "decision") == Some("deny") && !has_no_verdict_entry(e) =>
+            {
+                Some((false, 0.5))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Free-function twin of the in-`derive` closure, so the replay applies the identical rule.
+fn has_no_verdict_entry(e: &ChainEntry) -> bool {
+    if e.event_data.get("verdict_available").and_then(Value::as_bool) == Some(false) {
+        return true;
+    }
+    entry_str(e, "reason")
+        .is_some_and(|r| r.contains("no policy verdict") || r.contains("daemon path failed"))
+}
+
 /// If `plugin_id` was witnessed as an alias OF some other identity, return that identity.
 /// Used for display: a row whose evidence is counted elsewhere must say so, or the same
 /// observations appear twice and look like two members.

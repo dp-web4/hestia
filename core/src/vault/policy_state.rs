@@ -66,6 +66,15 @@ pub struct PolicyOverride {
 /// The policy section of the vault. Captures user choices that need to
 /// survive daemon restarts and travel with the user (when the vault is
 /// portable, i.e. in Hestia consumer mode).
+/// Revision classes that trigger recompute-from-chain by default. Society-overridable.
+pub fn default_revision_events() -> Vec<String> {
+    vec![
+        "exoneration".to_string(),
+        "exoneration_correction".to_string(),
+        "amnesty".to_string(),
+        "refutation".to_string(),
+    ]
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultPolicyState {
     /// One of the four built-in preset names (`permissive`, `safety`,
@@ -76,6 +85,30 @@ pub struct VaultPolicyState {
     /// preset's defaults.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub overrides: HashMap<String, PolicyOverride>,
+
+    /// Which witnessed events REVISE the evidence base, and therefore require the
+    /// stored trust scalar to be recomputed from the chain (dp, 2026-07-26: "a matter of
+    /// hub law, a society should be able to decide... and it shouldn't be flat").
+    ///
+    /// The chain is authoritative; `EntityTrust` is a cache of it. Until now that cache
+    /// could only be appended to, so a correction to what COUNTS as evidence — an
+    /// exoneration, an amnesty, a refuted success — only ever applied going forward, and
+    /// the visible record kept a charge the society had already withdrawn.
+    ///
+    /// Default is deliberately not flat: three distinct revision classes, each of which
+    /// changes the evidence base in a different direction.
+    /// - `exoneration`  — a deny withdrawn as not-the-member's-conduct
+    /// - `amnesty`      — a sovereign class-wide withdrawal
+    /// - `refutation`   — a past SUCCESS verified false. dp's addition, and the one that
+    ///                    is not merely forgiveness: self-reported success is provisional
+    ///                    until adjudicated, so refutation revises the record downward
+    ///                    exactly as exoneration revises it upward.
+    ///
+    /// A society may extend or narrow this; an empty list disables recompute entirely
+    /// (append-only cache, the pre-2026-07-26 behaviour) and that is a legitimate choice
+    /// a society is allowed to make.
+    #[serde(default = "default_revision_events")]
+    pub revision_events: Vec<String>,
 
     /// Extra rules layered on top of the preset's rules. Get sorted in
     /// alongside preset rules at evaluation time.
@@ -141,6 +174,7 @@ pub const DEFAULT_SYNTHETIC_PERSIST_ATTEMPTS: u32 = 3;
 impl Default for VaultPolicyState {
     fn default() -> Self {
         Self {
+            revision_events: default_revision_events(),
             active_preset: "safety".into(),
             overrides: HashMap::new(),
             custom_rules: Vec::new(),

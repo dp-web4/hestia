@@ -1867,6 +1867,51 @@ async fn tool_request_witness(state: &SharedState, args: &Value) -> ToolResult {
             "data": event_data,
         }),
     )?;
+    // ---- revision -> recompute the cache from the chain (society law) ----------
+    // dp, 2026-07-26: "a matter of hub law, a society should be able to decide... default
+    // policy should be recompute from chain on revision event (amnesty/exoneration, but
+    // also verified refutation of past success)".
+    //
+    // EntityTrust is a cache of the chain and was append-only, so a withdrawn charge stayed
+    // visible forever. Now a witnessed revision rebuilds the affected grain by replay. Which
+    // events count is `law.revision_events` — a society may extend it, narrow it, or set it
+    // empty to keep the old append-only behaviour.
+    let law_revisions = s.vault.policy().revision_events.clone();
+    if law_revisions.iter().any(|k| k == &event_type) {
+        // Whose record is being revised: named explicitly, else the subject of the
+        // withdrawn entry. Recompute is scoped to that grain — never fleet-wide.
+        let subject = optional_string(&event_data, "subject_plugin_id")
+            .or_else(|| optional_string(&event_data, "plugin_id"));
+        if let Some(pid) = subject {
+            let role = optional_string(&event_data, "subject_role")
+                .unwrap_or_else(|| crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string());
+            let window = s.chain_store.read_recent(10_000).unwrap_or_default();
+            let outcomes = crate::derivation::replay_outcomes(&pid, &role, &window);
+            let key = s.trust_entity_key(&pid, &role);
+            match s.trust_store.rebuild_from_outcomes(&key, &outcomes) {
+                Ok((before, after)) => {
+                    let _ = s.append_chain(
+                        "trust_recomputed",
+                        json!({
+                            "trigger": event_type,
+                            "trigger_entry": entry.hash,
+                            "subject_plugin_id": pid,
+                            "subject_role": role,
+                            "replayed_outcomes": outcomes.len(),
+                            "actions_before": before.action_count,
+                            "actions_after": after.action_count,
+                            "basis": "replay of the witnessed chain, honouring exclusions",
+                        }),
+                    );
+                }
+                Err(e) => {
+                    // Never fail the revision because its side effect failed — the
+                    // withdrawal itself is the act and is already witnessed above.
+                    eprintln!("trust recompute after {event_type} failed: {e}");
+                }
+            }
+        }
+    }
     Ok(json!({"witnessEntryHash": entry.hash}))
 }
 
