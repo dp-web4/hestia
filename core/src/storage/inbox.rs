@@ -532,13 +532,19 @@ impl SqliteInboxStore {
         Ok(conn.last_insert_rowid() as u64)
     }
 
-    /// Undrained forwards currently parked on the egress plane — the number the
-    /// admission bound in [`Self::enqueue_egress`] tests. Exposed so a caller can
-    /// report the queue depth without provoking the refusal.
+    /// Undrained forwards parked for ONE peer — the number the per-peer stall
+    /// bound in [`Self::enqueue_egress`] tests (S1). Exposed so a caller can report
+    /// one link's depth without provoking the refusal.
     ///
-    /// Plane-wide on purpose: this is the resource bound's view. The per-peer
-    /// stall question is [`Self::egress_queued_for`] (S1) — two different
-    /// questions that were one predicate before the graft.
+    /// Per-peer on purpose: this is the STALL question, and it is not the resource
+    /// question [`Self::egress_queued`] answers. One wedged peer holding its own
+    /// backlog is not a reason to refuse mail to a peer that is answering fine —
+    /// two different questions that were one predicate before the graft.
+    ///
+    /// The predicate drops the `dest_peer IS NOT NULL` conjunct its plane-wide
+    /// sibling carries, and that is not an omission: `NULL = ?1` is NULL, never
+    /// true, so a local row can never match a named peer. Same result, one term
+    /// fewer.
     pub fn egress_queued_for(&self, dest_peer: &str) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
@@ -551,8 +557,14 @@ impl SqliteInboxStore {
         Ok(n as u64)
     }
 
-    /// Undrained forwards parked on the egress plane as a whole — see
+    /// Undrained forwards parked on the egress plane as a whole — the number the
+    /// plane-wide admission bound in [`Self::enqueue_egress`] tests. See
     /// [`Self::egress_queued_for`] for the per-peer count the stall bound tests.
+    ///
+    /// Plane-wide on purpose: this is the RESOURCE bound's view. At 50/200 it is a
+    /// backstop — four fully-wedged peers fit under it before it engages — so in
+    /// any realistic fleet the per-peer bound is the one that binds. Worth knowing
+    /// that is the shape, rather than assuming both bounds bite (Thor, §2).
     pub fn egress_queued(&self) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
@@ -703,6 +715,43 @@ impl SqliteInboxStore {
               ORDER BY id ASC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![cutoff, limit], |r| r.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row? as u64);
+        }
+        Ok(out)
+    }
+
+    /// Parked forwards that can never be sent from this box: no destination LCT.
+    /// G1 (Thor, PR #44 review).
+    ///
+    /// The LCT is a column on the ROW, resolved once at enqueue. So this is not a
+    /// transient condition a later fix to `peers.json` clears — nothing reaches
+    /// these rows again, and no tick can succeed. Two ways they exist: the
+    /// `ALTER TABLE ... ADD COLUMN dest_peer_lct` migration is nullable with no
+    /// backfill, so every row parked by an older daemon reads back empty; and
+    /// before `resolve_peer_at` refused it, a peer entry with an empty `lct_id`
+    /// resolved `Known` and admitted one.
+    ///
+    /// Kept as a READ, symmetric with [`Self::expired_egress`] and for the same
+    /// reason: retiring them owes the sender a report, a report must be witnessed,
+    /// and a store method cannot witness. The caller retires them under
+    /// `EgressFault::Local` — the peer is never named, because the peer was never
+    /// contacted.
+    ///
+    /// `NULL` and `''` both count. The migration produces the first and
+    /// `unwrap_or_default()` on the read path renders it as the second, so a
+    /// predicate that tested only one would leave half the population parked.
+    pub fn undeliverable_egress(&self, limit: u32) -> Result<Vec<u64>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM member_notices
+              WHERE dest_peer IS NOT NULL AND drained_at IS NULL
+                AND (dest_peer_lct IS NULL OR TRIM(dest_peer_lct) = '')
+              ORDER BY id ASC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| r.get::<_, i64>(0))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row? as u64);
@@ -1716,6 +1765,61 @@ mod tests {
         assert_eq!(store.pending_egress(25).unwrap().len(), 1,
                    "an unrelated local send deleted the aged forward");
         assert_eq!(store.pending_egress(25).unwrap()[0].id, egress);
+    }
+
+    /// G1 — the undeliverable sweep has to see BOTH shapes of a missing LCT, and
+    /// they arrive by different routes.
+    ///
+    /// `''` is what the read path produces: `dest_peer_lct` is read as
+    /// `Option<String>` and `unwrap_or_default()`ed, so a caller never sees NULL.
+    /// `NULL` is what the DISK holds for every row parked before the column
+    /// existed — `ALTER TABLE ... ADD COLUMN`, nullable, no backfill. A predicate
+    /// that tested only the shape the code produces would sweep none of the
+    /// population the migration created, which is the entire reason the sweep
+    /// exists. Hence the raw NULL insert below: it is not a contrived row, it is
+    /// what an upgraded daemon actually finds.
+    ///
+    /// And the negative half matters as much: a routable row must not be swept.
+    /// A sweep that retires deliverable mail is a black hole with a receipt.
+    #[test]
+    fn the_undeliverable_sweep_sees_both_an_empty_lct_and_a_legacy_null_one() {
+        let (_tmp, store) = fresh();
+        let empty = store
+            .enqueue_egress("thor", "", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/a.md#t"), "hash-empty")
+            .unwrap();
+        let good = store
+            .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/b.md#t"), "hash-good")
+            .unwrap();
+        // The pre-migration shape, written the way the disk holds it.
+        let legacy = store
+            .enqueue_egress("sovereign", "lct:sov", "claude-code", "codex-cli", "role:r",
+                            "reply", Some("forum/c.md#t"), "hash-legacy")
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE member_notices SET dest_peer_lct = NULL WHERE id = ?1",
+                     params![legacy as i64])
+            .unwrap();
+
+        let swept = store.undeliverable_egress(25).unwrap();
+        assert!(swept.contains(&empty), "the empty-LCT row was not swept: {swept:?}");
+        assert!(swept.contains(&legacy),
+                "the legacy NULL row was not swept — the migration population is the \
+                 whole reason this sweep exists: {swept:?}");
+        assert!(!swept.contains(&good),
+                "a routable forward was swept as undeliverable: {swept:?}");
+        assert_eq!(swept.len(), 2);
+
+        // Retiring one takes it out of the sweep AND out of both admission counts —
+        // the same `drained_at` seam the age bound and the per-peer bound share.
+        store.retire_egress(empty).unwrap();
+        assert!(!store.undeliverable_egress(25).unwrap().contains(&empty));
+        assert_eq!(store.egress_queued_for("thor").unwrap(), 1,
+                   "retirement did not release the per-peer bound");
     }
 
     /// The counterpart to the test above, and the reason the prune's predicate is

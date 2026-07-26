@@ -2467,6 +2467,27 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                         })),
                     ));
                 }
+                crate::addressing::PeerResolution::MalformedEntry { name, defect } => {
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_peer_entry_malformed",
+                        &format!(
+                            "peer '{name}' is in this machine's peer table but its entry is \
+                             unusable ({defect}), so there is no LCT to route on. This is a \
+                             LOCAL defect — my file, my fix — and is reported here rather than \
+                             accepted, because accepting it would park a forward that can never \
+                             be sent and whose eventual retirement would name '{name}' as \
+                             unreachable. Nothing is emitted about the peer. Distinct from \
+                             no-route on purpose: the peer IS listed, so 'not in my table' would \
+                             send you looking for the wrong bug."
+                        ),
+                        Some(json!({
+                            "to_plugin_id": to_plugin,
+                            "peer": name,
+                            "defect": defect,
+                            "defect_scope": "local",
+                        })),
+                    ));
+                }
                 crate::addressing::PeerResolution::NoTable { consulted } => {
                     return Ok(hestia_error_envelope(
                         "hestia.member_notify_no_peer_table",
@@ -2700,12 +2721,18 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
         }
         // Attempts exhausted. Retire the row AND pay what it owes: a retired
         // packet whose sender is never told is the silent drop with extra steps.
+        //
+        // `Peer` scope: reaching here means a drain ran the notifier and got a real
+        // answer back five times. The local-defect cases never arrive — the sweep
+        // below retires them before any drain sees the row, and the drain's own
+        // 126/127 and no-dest-lct arms do not call `mark_failed` at all.
         return Ok(retire_and_report_egress(
             &mut s,
             id,
             &reason,
             attempts,
             &caller.plugin_id,
+            EgressFault::Peer,
         )?);
     }
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
@@ -2719,6 +2746,37 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
     // takes: a report to the sender, witnessed, never a silent delete. That is
     // the distinction the whole thread turns on — a queue may drop things, but
     // it may not drop them quietly.
+    // G1 — the undeliverable sweep, paid BEFORE the age sweep and before the queue
+    // is handed to the drain.
+    //
+    // A row with no `dest_peer_lct` cannot be sent on any tick, ever: the LCT is a
+    // column on the row, so no later repair of the peer table reaches it. Parking
+    // it is therefore not patience, it is a seven-day delay before the age sweep
+    // retires it as `aged-out` — the same peer-facing event, now with the true
+    // local cause erased from the reason. Retire it here instead, immediately, at
+    // zero attempts, through the `Local` arm. The sender is told at once and told
+    // the truth; the peer is not mentioned.
+    //
+    // This population is not hypothetical. `dest_peer_lct` was added by ALTER
+    // TABLE with no backfill, so every forward parked by an older daemon reads
+    // back as `""` on first poll after upgrade — and B1 being live on `main` is
+    // precisely why such rows are parked.
+    let undeliverable = s
+        .inbox_store
+        .undeliverable_egress(limit)
+        .map_err(|e| anyhow::anyhow!("reading undeliverable egress rows: {e}"))?;
+    let mut undeliverable_locally = Vec::new();
+    for id in undeliverable {
+        let report = retire_and_report_egress(
+            &mut s,
+            id,
+            "no-dest-lct",
+            0,
+            &caller.plugin_id,
+            EgressFault::Local,
+        )?;
+        undeliverable_locally.push(report);
+    }
     let expired = s
         .inbox_store
         .expired_egress(EGRESS_MAX_AGE_SECS, limit)
@@ -2731,7 +2789,17 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
             .map_err(|e| anyhow::anyhow!("reading egress row: {e}"))?
             .map(|r| r.attempts)
             .unwrap_or(0);
-        let report = retire_and_report_egress(&mut s, id, "aged-out", attempts, &caller.plugin_id)?;
+        // `Peer` scope: an aged-out row is one nothing could hand off within the
+        // window. That is a statement about the far end or the path to it — the
+        // undeliverable-here cases left through the sweep above.
+        let report = retire_and_report_egress(
+            &mut s,
+            id,
+            "aged-out",
+            attempts,
+            &caller.plugin_id,
+            EgressFault::Peer,
+        )?;
         aged_out.push(report);
     }
     let rows = s
@@ -2755,6 +2823,10 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
         // retirement told which sender.
         "aged_out": aged_out,
         "max_age_secs": EGRESS_MAX_AGE_SECS,
+        // Same contract for the local-defect sweep: retired here, reported to the
+        // sender, and reported to the caller so a drain operator can see that rows
+        // left the queue and why. Silence about a sweep is how it becomes a drop.
+        "undeliverable_locally": undeliverable_locally,
         // Forward on the LCT, never on the name: `hub-notify` resolves peer names
         // by unique PREFIX, so an address would change meaning when an unrelated
         // member joins (McNugget, r6-routing review §4). The LCT here was
@@ -2777,6 +2849,26 @@ const MAX_EGRESS_ATTEMPTS: i64 = 5;
 /// in the one table that holds both.
 const EGRESS_MAX_AGE_SECS: i64 = crate::storage::INBOX_TTL_SECS;
 
+/// Whose defect retired an egress row — the distinction `f8a4d30` exists to keep,
+/// carried into the retirement seam (G1, Thor's PR #44 review).
+///
+/// `egress-drain.sh`'s 126/127 arm already states the rule for the *live* path:
+/// a notifier that could not be invoked "is not the hub's answer, and it is not
+/// evidence about the peer." Retirement is where the rule was still missing,
+/// because retirement is the step that writes something durable. Both arms below
+/// owe the sender a report; only one of them may name a peer in it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EgressFault {
+    /// A hand-off was attempted and did not land. The peer (or the path to it) is
+    /// the subject, and `member_notice_unreachable` is the honest event.
+    Peer,
+    /// Nothing was ever sent. The row was undeliverable from this box — a missing
+    /// destination LCT, a defect in my own table — so the peer was never contacted
+    /// and nothing may be witnessed about it. Still reported: the *sender* is owed
+    /// the news either way, and "my fault, resend" is more actionable than silence.
+    Local,
+}
+
 /// Retire an exhausted egress row and deliver its unreachable report locally.
 ///
 /// The route-back is **always local delivery** and needs no cross-fleet report
@@ -2796,6 +2888,7 @@ fn retire_and_report_egress(
     reason: &str,
     attempts: i64,
     retired_by: &str,
+    fault: EgressFault,
 ) -> anyhow::Result<Value> {
     let Some(row) = s
         .inbox_store
@@ -2820,14 +2913,26 @@ fn retire_and_report_egress(
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
         .take(48)
         .collect();
+    // Both faults are `undelivered` class — nothing at the far end ran either way.
+    // What differs is the SUBJECT: one is a claim about a peer, the other about
+    // this box. The taxonomy segment carries it so a sender reading only the
+    // pointer can tell whose problem it is without fetching the chain entry.
     let report_pointer = format!(
-        "{}#undelivered:v1:undelivered:egress-{}:{}",
+        "{}#undelivered:v1:undelivered:egress-{}{}:{}",
         row.pointer_uri.as_deref().unwrap_or("(no pointer)"),
+        if fault == EgressFault::Local { "local-" } else { "" },
         safe_reason,
         id
     );
     let entry = s.append_chain(
-        "member_notice_unreachable",
+        match fault {
+            EgressFault::Peer => "member_notice_unreachable",
+            // NOT `..._unreachable`: no one tried to reach anyone. An event typed
+            // unreachable is a durable statement that a peer did not answer, and
+            // the peer was never asked. `f8a4d30`'s rule is about the event's
+            // existence and its subject, not only its reason field.
+            EgressFault::Local => "member_notice_undeliverable_local",
+        },
         json!({
             "to_plugin_id": row.from_plugin,
             "original_destination": format!("{}/{}", row.dest_peer, row.to_member),
@@ -2837,6 +2942,15 @@ fn retire_and_report_egress(
             "attempts": attempts,
             "reason": reason,
             "class": "undelivered",
+            // Whose defect this row died of, and — stated as a fact rather than
+            // left to be inferred from the event name — whether the peer was ever
+            // contacted at all. A reader tallying trust signals needs the second
+            // field; a reader routing a fix needs the first.
+            "defect_scope": match fault {
+                EgressFault::Peer => "peer",
+                EgressFault::Local => "local",
+            },
+            "peer_contacted": fault == EgressFault::Peer,
             // Who declared it undeliverable. §5.1 makes misrouting evidence, so a
             // drop record that cannot name the party that dropped it is evidence
             // about nobody.
@@ -2866,6 +2980,10 @@ fn retire_and_report_egress(
         "report_notice_id": queued_id,
         "report_pointer": report_pointer,
         "class": "undelivered",
+        "defect_scope": match fault {
+            EgressFault::Peer => "peer",
+            EgressFault::Local => "local",
+        },
         "witnessEntryHash": entry.hash,
     }))
 }
@@ -5964,6 +6082,136 @@ mod member_mesh_tests {
             "report pointer carries the versioned two-class wire form, got {ptr}"
         );
         assert!(!report["kind"].as_str().unwrap().contains('.'));
+    }
+
+    /// G1, vector 2 (Thor, PR #44 review §3) — a broken line in MY peer table is
+    /// my defect, and must not become a route.
+    ///
+    /// `resolve_peer_at` bound `lct_id` with no non-empty check, so
+    /// `{"name":"cbp","lct_id":""}` resolved `Known { lct_id: "" }`. The empty
+    /// string then flowed onto the egress row, where nothing could send it and the
+    /// retirement named the peer. The refusal is what stops the row being BORN;
+    /// the sweep (next test) is what handles the ones already on disk.
+    ///
+    /// It is deliberately NOT reported as no-route: the peer is sitting right
+    /// there in the table, so "not in my table" would send an operator looking for
+    /// the wrong bug. Same reason `NoTable` was split from `NoRoute` after the
+    /// Sprout stale-map incident — collapsing two local defects into one message
+    /// is how that one took a week to find.
+    #[tokio::test]
+    async fn a_peer_entry_with_an_empty_lct_is_a_local_defect_and_never_a_route() {
+        let (dir, state) = test_state().await;
+        write_peer_table(
+            &dir,
+            r#"{"members":[{"lct_id":"","name":"thor-sage"},
+                           {"lct_id":"c8886562","name":"Sovereign"}]}"#,
+        );
+        let alice = connect(&state, "claude-code").await;
+        let out = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "thor-sage/claude-code", "kind": "reply",
+                    "pointer_uri": "shared-context/for-thor.md", "session_id": alice}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            out["_hestia_error"]["code"], "hestia.member_notify_peer_entry_malformed",
+            "an entry with no LCT resolved as a route: {out}"
+        );
+        assert_eq!(out["_hestia_error"]["data"]["defect_scope"], "local");
+
+        // Nothing was admitted…
+        let pending = tool_egress_pending(&state, &json!({"session_id": alice}))
+            .await
+            .unwrap();
+        assert_eq!(pending["total"], 0, "a row that can never be sent was admitted");
+
+        // …and nothing was witnessed about thor-sage. This is the property the
+        // whole variant exists for: the refusal is synchronous, to a local sender,
+        // and leaves no durable claim about a peer that did nothing.
+        let s = state.lock().await;
+        let chain = s.recent_chain(20);
+        assert!(
+            !chain.iter().any(|e| e.event_type.starts_with("member_notice_unreachable")
+                || e.event_type == "member_notice_undeliverable_local"),
+            "a defect in my own peer table emitted an event about the peer"
+        );
+    }
+
+    /// G1, vector 1 — the population that already exists on every box.
+    ///
+    /// `dest_peer_lct` was added by a nullable `ALTER TABLE` with no backfill, so
+    /// every forward parked by an older daemon reads back as `""`. Those rows
+    /// cannot be sent by any tick (the LCT is a column on the ROW; repairing
+    /// `peers.json` never reaches them), so the question is only HOW they die.
+    ///
+    /// Three properties, and the third is the one that took a review to see:
+    ///  1. no attempt is burned — nothing was sent, so there is nothing to retry;
+    ///  2. the sender IS told, because a retired packet whose sender is never told
+    ///     is the silent drop with extra steps;
+    ///  3. the chain event is `member_notice_undeliverable_local`, NOT
+    ///     `member_notice_unreachable`. Parking these rows instead — the obvious
+    ///     fix, and the one first proposed — does not achieve this: it only defers
+    ///     them seven days to the age sweep, which retires them as `aged-out`
+    ///     through the peer arm, with the true local cause now erased from the
+    ///     reason. Slower, and strictly worse evidence.
+    #[tokio::test]
+    async fn a_forward_with_no_dest_lct_is_retired_as_a_local_defect_not_as_an_unreachable_peer() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        // A legacy row, minted the way the migration leaves them: destination
+        // name intact, LCT absent. Enqueued at the store to model a row that
+        // predates the resolver's refusal above.
+        {
+            let s = state.lock().await;
+            s.inbox_store
+                .enqueue_egress("thor-sage", "", "claude-code", "claude-code", "role:r",
+                                "reply", Some("shared-context/parked.md"), "hash-legacy")
+                .unwrap();
+        }
+
+        let poll = tool_egress_pending(&state, &json!({"session_id": alice}))
+            .await
+            .unwrap();
+
+        // It never reaches a drain: the sweep runs inside the same poll that
+        // builds the pending list, so the queue handed over is already clean.
+        assert_eq!(poll["total"], 0, "an unsendable row was handed to the drain: {poll}");
+        let swept = &poll["undeliverable_locally"][0];
+        assert_eq!(swept["disposition"], "retired");
+        assert_eq!(swept["attempts"], 0, "a row nobody sent burned an attempt");
+        assert_eq!(swept["defect_scope"], "local");
+        assert_eq!(swept["class"], "undelivered");
+
+        // The sender is told, and the pointer says whose fault it was.
+        let drained = tool_member_inbox(&state, &json!({"session_id": alice}))
+            .await
+            .unwrap();
+        assert_eq!(drained["total"], 1, "the sender was never told: {drained}");
+        let ptr = drained["notices"][0]["pointer_uri"].as_str().unwrap();
+        assert!(
+            ptr.contains("#undelivered:v1:undelivered:egress-local-"),
+            "the report pointer does not carry the local scope, got {ptr}"
+        );
+
+        // The chain: nothing typed unreachable, because nobody was unreachable.
+        let s = state.lock().await;
+        let chain = s.recent_chain(20);
+        assert!(
+            !chain.iter().any(|e| e.event_type == "member_notice_unreachable"),
+            "a row that was never sent produced an unreachable claim about thor-sage"
+        );
+        let e = chain
+            .iter()
+            .find(|e| e.event_type == "member_notice_undeliverable_local")
+            .expect("the retirement left no record at all — that is the black hole");
+        assert_eq!(e.event_data["defect_scope"], json!("local"));
+        assert_eq!(
+            e.event_data["peer_contacted"], json!(false),
+            "the entry does not state that the peer was never contacted"
+        );
     }
 
     /// The two planes share one table, and only ONE side knows it.

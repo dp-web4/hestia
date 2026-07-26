@@ -114,14 +114,36 @@ PY
 drain_once() {
   local pending
   pending="$(rpc hestia_egress_pending '{"limit":25}' 2>/dev/null)" || return 0
-  python3 - "$pending" <<'PY' | while IFS=$'\t' read -r id peer lct kind ptr; do
+  # G4 — the field separator is US (0x1f), NOT tab, and the difference is a
+  # silent black hole rather than a style preference.
+  #
+  # Tab is IFS *whitespace*, so `read` collapses a run of tabs into ONE delimiter
+  # and an empty field simply disappears. A row with no `dest_peer_lct` — the
+  # population the nullable `ALTER TABLE` migration created on every box — emitted
+  # `id\tpeer\t\tkind\tptr`, which `read` parsed as four fields with every value
+  # after the gap shifted one place left: `lct` took the KIND, `kind` took the
+  # POINTER. So the `-z "$lct"` guard below could never fire (it was unreachable
+  # dead code), and the drain instead invoked `hub-notify "<kind>" "<pointer>" ""`
+  # — forwarding on a destination that is not an LCT, then marking the row
+  # FORWARDED on a zero exit. Undelivered mail recorded as delivered, which is the
+  # one outcome this whole exploration exists to remove, reached through a shell
+  # word-splitting rule.
+  #
+  # US is not IFS whitespace, so empty fields are preserved positionally. It also
+  # cannot occur in any of these values — a control character is rejected by the
+  # member-id and pointer rules long before it reaches here.
+  #
+  # Found by executing the drain against a stub endpoint, not by reading it: the
+  # guard reads correctly, greps clean, and passes `bash -n`.
+  python3 - "$pending" <<'PY' | while IFS=$'\x1f' read -r id peer lct kind ptr; do
 import ast, sys
 try: d = ast.literal_eval(sys.argv[1])
 except Exception: sys.exit(0)
+US = "\x1f"
 for r in d.get("pending", []):
     # The LCT is what goes on the wire; the NAME is carried for the log only.
-    print(f"{r['id']}\t{r['dest_peer']}\t{r.get('dest_peer_lct') or ''}"
-          f"\t{r['kind']}\t{r.get('pointer_uri') or ''}")
+    print(US.join([str(r['id']), str(r['dest_peer']), r.get('dest_peer_lct') or '',
+                   str(r['kind']), r.get('pointer_uri') or '']))
 PY
     [ -n "${id:-}" ] || continue
     # Forward on the roster-validated LCT, never on the name: `hub-notify`
@@ -129,7 +151,24 @@ PY
     # unrelated member joins (McNugget §4). An empty LCT is a defect, not a
     # cue to fall back to the name — falling back is the hazard itself.
     if [ -z "$lct" ]; then
-      mark_failed "$id" "no-dest-lct" "$peer" "$kind"
+      # G1. This arm must NOT `mark_failed`, for the same reason the 126/127 arm
+      # below must not: nothing was sent, `hub-notify` was never invoked, the peer
+      # was never contacted. `mark_failed` burns an attempt against
+      # MAX_EGRESS_ATTEMPTS and on the fifth tick retires the row with a report
+      # telling the sender the PEER was unreachable — a defect in MY peer table
+      # laundered into witnessed evidence against an innocent member. The rule was
+      # already written seven lines down; the row above it did not meet it.
+      #
+      # Nor does it park: the daemon retires these itself, at zero attempts,
+      # through a path whose chain event is `member_notice_undeliverable_local`.
+      # So in normal operation this arm is UNREACHABLE — the undeliverable sweep
+      # runs inside the same `hestia_egress_pending` call that produced this list,
+      # so such a row is retired before it can be handed to us. It stays as
+      # defense in depth for an older daemon that has no sweep, where the correct
+      # behaviour is still "say it, do not blame anyone for it."
+      say "UNSENDABLE id=$id -> $peer kind=$kind (row has no dest_peer_lct — LOCAL \
+defect, peer never contacted; no attempt burned, no report about the peer; the \
+daemon retires it and tells the sender)"
       continue
     fi
     err="$("$HUB_NOTIFY" "$lct" "$kind" "$ptr" 2>&1 >/dev/null)"; rc=$?

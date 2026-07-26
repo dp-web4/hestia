@@ -162,11 +162,22 @@ pub fn parse_address(to: &str) -> Result<Address, AddressError> {
 ///   local, and a *different* fact: the Sprout stale-map incident (2026-07-14)
 ///   became a false "Sprout is not a member" precisely because these two were
 ///   collapsed.
+/// - [`PeerResolution::MalformedEntry`] — the peer IS in my table and its entry is
+///   broken (G1, Thor's PR #44 review). Local, and distinct from `NoRoute` for the
+///   same reason `NoTable` is: "not in my table" is a *false statement* about a
+///   peer that is sitting right there in it, and the operator who reads it goes
+///   looking for the wrong bug. The variant that mattered most, though, is what it
+///   prevents downstream — an entry with an empty `lct_id` used to resolve `Known`,
+///   which admitted an egress row that could never be sent and whose retirement
+///   named the peer. The comment twelve lines below this one already said a local
+///   file defect must never become evidence about a peer; it was true of an
+///   unparseable table and not yet true of one parseable line inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerResolution {
     Known { name: String, lct_id: String },
     NoRoute { known: Vec<String> },
     NoTable { consulted: String },
+    MalformedEntry { name: String, defect: String },
 }
 
 /// Peer table truth order, stated because it degrades silently otherwise
@@ -244,6 +255,18 @@ pub fn resolve_peer_at(path: &std::path::Path, name: &str) -> PeerResolution {
             continue;
         };
         if n.eq_ignore_ascii_case(name) {
+            // An entry with no LCT is a defect in MY table, not a route. Resolving
+            // it `Known` was how a local file defect got laundered into evidence
+            // about a peer: the empty string flowed through `enqueue_egress` onto
+            // the row, the drain could not send it, and five attempts later the
+            // retirement appended `member_notice_unreachable` naming a peer that
+            // was never contacted. Refuse at the source, where the fault is.
+            if lct.trim().is_empty() {
+                return PeerResolution::MalformedEntry {
+                    name: n.to_string(),
+                    defect: "entry has an empty lct_id".to_string(),
+                };
+            }
             return PeerResolution::Known {
                 name: n.to_string(),
                 lct_id: lct.to_string(),
@@ -358,6 +381,46 @@ mod tests {
             PeerResolution::Known { lct_id, .. } => assert_eq!(lct_id, "c888-2"),
             other => panic!("expected Known, got {other:?}"),
         }
+    }
+
+    /// The same rule as `corrupt_table_reads_as_no_table_not_no_route`, one level
+    /// down: an unparseable FILE was already refused, a broken LINE inside a
+    /// parseable file was not (G1, Thor's PR #44 review §3). The consequence was
+    /// not local — an empty `lct_id` resolved `Known`, admitted an egress row that
+    /// no tick could send, and the retirement named the peer.
+    ///
+    /// Whitespace counts as empty: `" "` is not an LCT, and letting it through
+    /// only moves the failure to the wire where it becomes the peer's problem.
+    #[test]
+    fn an_entry_with_no_lct_is_malformed_not_known_and_not_no_route() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let table = dir.path().join("members.json");
+        std::fs::write(
+            &table,
+            r#"{"members":[{"lct_id":"","name":"thor-sage"},
+                           {"lct_id":"   ","name":"Sovereign"},
+                           {"lct_id":"kimi-3","name":"kimi"}]}"#,
+        )
+        .unwrap();
+        match resolve_peer_at(&table, "thor-sage") {
+            PeerResolution::MalformedEntry { name, .. } => assert_eq!(name, "thor-sage"),
+            other => panic!("empty lct_id must not resolve, got {other:?}"),
+        }
+        assert!(matches!(
+            resolve_peer_at(&table, "sovereign"),
+            PeerResolution::MalformedEntry { .. }
+        ));
+        // A broken neighbour does not break the rest of the table.
+        match resolve_peer_at(&table, "kimi") {
+            PeerResolution::Known { lct_id, .. } => assert_eq!(lct_id, "kimi-3"),
+            other => panic!("expected Known, got {other:?}"),
+        }
+        // And it is NOT no-route: the peer is listed, so saying "not in my table"
+        // would be false and would point the operator at the wrong file.
+        assert!(!matches!(
+            resolve_peer_at(&table, "thor-sage"),
+            PeerResolution::NoRoute { .. }
+        ));
     }
 
     /// A corrupt local file must not become evidence about a peer.
