@@ -236,7 +236,12 @@ impl SqliteInboxStore {
                 chain_hash   TEXT NOT NULL,
                 queued_at    TEXT NOT NULL,
                 in_reply_to  INTEGER,
-                drained_at   TEXT
+                drained_at   TEXT,
+                -- Set when the recipient is NOT local: the peer this notice must be
+                -- forwarded to (r6-routing branch 2). NULL = local delivery, the
+                -- pre-routing behaviour. Nullable ALTER so existing rows stay valid
+                -- without a backfill (the snarc capture silent-death lesson).
+                dest_peer    TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_member_notices_to
                  ON member_notices(to_plugin, queued_at);",
@@ -251,7 +256,7 @@ impl SqliteInboxStore {
                 existing.push(r?);
             }
         }
-        for (col, decl) in [("in_reply_to", "INTEGER"), ("drained_at", "TEXT")] {
+        for (col, decl) in [("in_reply_to", "INTEGER"), ("drained_at", "TEXT"), ("dest_peer", "TEXT")] {
             if !existing.iter().any(|c| c == col) {
                 conn.execute_batch(&format!(
                     "ALTER TABLE member_notices ADD COLUMN {col} {decl}"
@@ -387,6 +392,75 @@ impl SqliteInboxStore {
     /// queued notice is anchored to its witnessed act. `in_reply_to` binds this
     /// send to the notice it answers (see [`Self::member_notice_recipient`] for
     /// the check the caller runs first).
+    /// Enqueue a notice bound for a member on ANOTHER machine (r6-routing branch 2:
+    /// "is it for someone I know? forward it"). Stored in the same table with
+    /// `dest_peer` set; the watcher drains these and hands them to the fleet mesh.
+    ///
+    /// Loop prevention is SPLIT-HORIZON and lives here, not in the packet: only a
+    /// notice whose sender is a LOCAL member is ever egressed, so a packet that
+    /// arrived from outside can never be forwarded back outside. Thor refuted the
+    /// per-packet TTL this proposal originally carried — a hop counter the sender
+    /// writes is not a bound (2026-07-26). The sender identity used here is
+    /// transport-authenticated, not caller-supplied, so there is no forgeable field
+    /// in the loop bound at all. Cost: no third-party transit in v1, which is a
+    /// deliberate limit, not an oversight.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_egress(
+        &self,
+        dest_peer: &str,
+        to_plugin: &str,
+        from_plugin: &str,
+        from_role: &str,
+        kind: &str,
+        pointer_uri: Option<&str>,
+        chain_hash: &str,
+    ) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        conn.execute(
+            "INSERT INTO member_notices
+                (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at, dest_peer)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![to_plugin, from_plugin, from_role, kind, pointer_uri,
+                    chain_hash, Utc::now().to_rfc3339(), dest_peer],
+        )
+        .context("enqueueing egress notice")?;
+        Ok(conn.last_insert_rowid() as u64)
+    }
+
+    /// Undrained egress rows, oldest first: (id, dest_peer, to_plugin, kind, pointer_uri).
+    /// The watcher marks each drained once the fleet mesh has accepted it.
+    pub fn pending_egress(&self, limit: u32) -> Result<Vec<(u64, String, String, String, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, dest_peer, to_plugin, kind, pointer_uri FROM member_notices
+              WHERE dest_peer IS NOT NULL AND drained_at IS NULL
+              ORDER BY id ASC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Mark an egress row forwarded. Separate from delivery: this records that the
+    /// fleet mesh ACCEPTED it, not that the far member read it. Conflating those is
+    /// the "send succeeded != delivered" defect this whole thread is about.
+    pub fn mark_egress_forwarded(&self, id: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE member_notices SET drained_at = ?1 WHERE id = ?2 AND dest_peer IS NOT NULL",
+            params![Utc::now().to_rfc3339(), id as i64],
+        )
+        .context("marking egress forwarded")?;
+        Ok(())
+    }
+
     pub fn enqueue_member(
         &self,
         to_plugin: &str,
