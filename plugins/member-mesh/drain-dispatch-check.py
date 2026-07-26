@@ -121,6 +121,20 @@ def main():
     check("emits no evidence about the peer", not any("mark_failed" in c for c in calls), calls)
     check("says UNSENDABLE", "UNSENDABLE" in log, log)
 
+    # G5 (Thor, hop 3). Blank is not only "". Both daemon-side predicates treat a
+    # whitespace-only LCT as absent — `resolve_peer_at` trims, `undeliverable_egress`
+    # is `TRIM(dest_peer_lct) = ''` — so the drain's backstop must spell it the same
+    # way. It did not: `[ -z "$lct" ]` is false for " ", which forwarded on a blank
+    # destination and marked the row FORWARDED. Same outcome as G4, different door,
+    # and it lives in the one skew this arm exists for (new drain, old daemon with
+    # no sweep). Parameterised because the population is a hand-edited peers.json.
+    for shape, lct in [("a space", " "), ("a tab", "\t")]:
+        blank = [dict(no_lct[0], dest_peer_lct=lct)]
+        calls, log, _ = run_drain(blank, ok)
+        check(f"treats {shape} as absent, not as a destination",
+              not any("mark_forwarded" in c for c in calls) and "UNSENDABLE" in log,
+              f"{calls} | {log}")
+
     print("preflight: an absent notifier is a config error, not an outage (B5)")
     _, log, rc = run_drain(good, os.path.join(tmp, "absent.sh"))
     check("exits 78 (EX_CONFIG) without draining", rc == 78, f"rc={rc} log={log}")

@@ -142,7 +142,17 @@ except Exception: sys.exit(0)
 US = "\x1f"
 for r in d.get("pending", []):
     # The LCT is what goes on the wire; the NAME is carried for the log only.
-    print(US.join([str(r['id']), str(r['dest_peer']), r.get('dest_peer_lct') or '',
+    #
+    # G5 — normalize a whitespace-only LCT to empty HERE, so the `-z` guard below
+    # spells the same predicate the daemon does. Both Rust sites treat blank as
+    # absent (`resolve_peer_at`'s `lct.trim().is_empty()`, `undeliverable_egress`'s
+    # `TRIM(dest_peer_lct) = ''`); `[ -z "$lct" ]` does not, and " " walked past it
+    # to `hub-notify " " ...` and a FORWARDED mark on a zero exit — G4's outcome
+    # through a different door. This is exactly `TRIM(x) = ''`: collapse only when
+    # the value is ALL whitespace, otherwise pass it through verbatim, because
+    # trimming a non-blank LCT would send on a string no witnessed entry attested.
+    lct = r.get('dest_peer_lct') or ''
+    print(US.join([str(r['id']), str(r['dest_peer']), '' if not lct.strip() else lct,
                    str(r['kind']), r.get('pointer_uri') or '']))
 PY
     [ -n "${id:-}" ] || continue
