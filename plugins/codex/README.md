@@ -72,6 +72,51 @@ It bundles the same hooks (referenced via `$CLAUDE_PLUGIN_ROOT`). **Do not run b
 active one on this host; the plugin is the portable form for other machines. (Marketplace-manifest
 quirk in 0.145: the manifest must live at `.agents/plugins/marketplace.json`, not `.codex-plugin/`.)
 
+## Launching Codex (the flags, since they are not the ones you expect)
+
+Codex does **not** use `-c` for continue or `-y` for yolo. `-c` is `--config`. The
+Claude/Kimi muscle memory is actively wrong here, which is why this section exists.
+
+```bash
+# continue the most recent session (the `claude -c` equivalent)
+codex resume --last
+codex resume                 # session picker
+codex resume <id|name>       # a specific one
+codex fork --last            # branch instead of continue
+
+# unattended / auto-approve (the `kimi -y` equivalent) — TWO orthogonal axes
+codex resume --last -a never -s workspace-write
+```
+
+| axis | flag | values |
+|---|---|---|
+| when to ask a human | `-a, --ask-for-approval` | `untrusted` \| `on-request` \| `never` |
+| what it may touch | `-s, --sandbox` | `read-only` \| `workspace-write` \| `danger-full-access` |
+
+Keeping these orthogonal is better than kimi's single `-y`: you can have *never prompt me*
+while still confined to the workspace. `--dangerously-bypass-approvals-and-sandbox` is the
+true full-yolo (both axes off); its own help says *"EXTREMELY DANGEROUS. Intended solely for
+environments that are externally sandboxed."*
+
+Other flags worth knowing: `-C/--cd <DIR>` sets the working root, `--add-dir` adds writable
+dirs, `-m/--model`, `-p/--profile`, `codex exec` for non-interactive runs.
+
+**The approval axis does not touch the gate.** `-a never` suppresses the *prompt* layer
+only; the PreToolUse hook still fires and an `exit 2` deny is still honoured — the same
+result verified for kimi's `-y` (see `reference_kimi_yolo_does_not_bypass_gate`). Codex
+hooks fire on shell, `apply_patch` **and** MCP, not Bash alone.
+
+**`--dangerously-bypass-hook-trust` is the one that does matter to us.** It runs enabled
+hooks *without requiring persisted hook trust for this invocation* — a hook-**trust**
+bypass, not an approval bypass, so it is the flag that interacts with the gate's provenance
+model rather than its prompt layer. Untested against this adapter as of 2026-07-25. Do not
+put it in an unattended launcher before someone checks what our gate does under it.
+
+**Seats are not entities (dp, 2026-07-25).** Codex bills per seat and dp holds two. A seat
+is resource-pool auth, not an identity: both seats act as the one `codex` member, one LCT,
+one trust grain, one scope grant. Concurrency between seats is a work-claim problem, not an
+identity problem.
+
 ## Hardening notes
 - **Fail-open + slow FS = a real gap.** On WSL the repo lives on `/mnt/c` (9p), whose cold-load can
   exceed the hook timeout; a timed-out gate fails **open**. Place the hook scripts (or a symlink) on
