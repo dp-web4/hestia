@@ -241,7 +241,21 @@ impl SqliteInboxStore {
                 -- forwarded to (r6-routing branch 2). NULL = local delivery, the
                 -- pre-routing behaviour. Nullable ALTER so existing rows stay valid
                 -- without a backfill (the snarc capture silent-death lesson).
-                dest_peer    TEXT
+                dest_peer    TEXT,
+                -- The roster-validated LCT the peer NAME resolved to, captured at
+                -- enqueue. The transport is LCT-addressed; names are an edge
+                -- concern. Resolving once and carrying the LCT means the drain
+                -- never re-resolves against a table that may have changed, and
+                -- never hands `hub-notify` a bare name for its prefix matcher to
+                -- guess at (McNugget, r6-routing review §4).
+                dest_peer_lct TEXT,
+                -- Egress delivery is not free and not guaranteed. `attempts`
+                -- counts hand-offs to the fleet mesh that FAILED; at
+                -- MAX_EGRESS_ATTEMPTS the row is retired and an unreachable
+                -- report goes back to the sender. Without this, an egress row is
+                -- the black hole moved one hop out (Kimi, r6-routing §2.4).
+                attempts     INTEGER NOT NULL DEFAULT 0,
+                last_error   TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_member_notices_to
                  ON member_notices(to_plugin, queued_at);",
@@ -256,7 +270,17 @@ impl SqliteInboxStore {
                 existing.push(r?);
             }
         }
-        for (col, decl) in [("in_reply_to", "INTEGER"), ("drained_at", "TEXT"), ("dest_peer", "TEXT")] {
+        for (col, decl) in [
+            ("in_reply_to", "INTEGER"),
+            ("drained_at", "TEXT"),
+            ("dest_peer", "TEXT"),
+            ("dest_peer_lct", "TEXT"),
+            // NOT NULL DEFAULT on an ALTER would be rejected by older SQLite for
+            // a non-constant default; a plain nullable INTEGER read as
+            // `unwrap_or(0)` is equivalent and needs no backfill.
+            ("attempts", "INTEGER"),
+            ("last_error", "TEXT"),
+        ] {
             if !existing.iter().any(|c| c == col) {
                 conn.execute_batch(&format!(
                     "ALTER TABLE member_notices ADD COLUMN {col} {decl}"
@@ -408,6 +432,7 @@ impl SqliteInboxStore {
     pub fn enqueue_egress(
         &self,
         dest_peer: &str,
+        dest_peer_lct: &str,
         to_plugin: &str,
         from_plugin: &str,
         from_role: &str,
@@ -419,33 +444,75 @@ impl SqliteInboxStore {
         Self::ensure_member_schema(&conn)?;
         conn.execute(
             "INSERT INTO member_notices
-                (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at, dest_peer)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
+                 dest_peer, dest_peer_lct, attempts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
             params![to_plugin, from_plugin, from_role, kind, pointer_uri,
-                    chain_hash, Utc::now().to_rfc3339(), dest_peer],
+                    chain_hash, Utc::now().to_rfc3339(), dest_peer, dest_peer_lct],
         )
         .context("enqueueing egress notice")?;
         Ok(conn.last_insert_rowid() as u64)
     }
 
-    /// Undrained egress rows, oldest first: (id, dest_peer, to_plugin, kind, pointer_uri).
-    /// The watcher marks each drained once the fleet mesh has accepted it.
-    pub fn pending_egress(&self, limit: u32) -> Result<Vec<(u64, String, String, String, Option<String>)>> {
+    /// Undrained egress rows, oldest first. The watcher marks each forwarded once
+    /// the fleet mesh has accepted it, or failed when it has not.
+    pub fn pending_egress(&self, limit: u32) -> Result<Vec<EgressRow>> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
         let mut stmt = conn.prepare(
-            "SELECT id, dest_peer, to_plugin, kind, pointer_uri FROM member_notices
+            "SELECT id, dest_peer, dest_peer_lct, to_plugin, from_plugin, kind, pointer_uri,
+                    attempts, last_error
+               FROM member_notices
               WHERE dest_peer IS NOT NULL AND drained_at IS NULL
               ORDER BY id ASC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], |r| {
-            Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok(EgressRow {
+                id: r.get::<_, i64>(0)? as u64,
+                dest_peer: r.get(1)?,
+                dest_peer_lct: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                to_member: r.get(3)?,
+                from_plugin: r.get(4)?,
+                kind: r.get(5)?,
+                pointer_uri: r.get(6)?,
+                attempts: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                last_error: r.get(8)?,
+            })
         })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// One egress row by id, forwarded or not — for building the unreachable
+    /// report that a retired row owes its sender.
+    pub fn egress_row(&self, id: u64) -> Result<Option<EgressRow>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, dest_peer, dest_peer_lct, to_plugin, from_plugin, kind, pointer_uri,
+                    attempts, last_error
+               FROM member_notices WHERE id = ?1 AND dest_peer IS NOT NULL",
+        )?;
+        let mut rows = stmt.query_map(params![id as i64], |r| {
+            Ok(EgressRow {
+                id: r.get::<_, i64>(0)? as u64,
+                dest_peer: r.get(1)?,
+                dest_peer_lct: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                to_member: r.get(3)?,
+                from_plugin: r.get(4)?,
+                kind: r.get(5)?,
+                pointer_uri: r.get(6)?,
+                attempts: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                last_error: r.get(8)?,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
     }
 
     /// Mark an egress row forwarded. Separate from delivery: this records that the
@@ -458,6 +525,47 @@ impl SqliteInboxStore {
             params![Utc::now().to_rfc3339(), id as i64],
         )
         .context("marking egress forwarded")?;
+        Ok(())
+    }
+
+    /// Record a FAILED hand-off attempt and return the new attempt count.
+    ///
+    /// Retrying is safe here in a way it is not at the far end: this row has not
+    /// been processed by anyone, so a re-send is `undelivered`-class (the gate
+    /// refused, nothing ran), never `indeterminate`. That is why egress retries
+    /// and drain retries are different questions.
+    pub fn record_egress_failure(&self, id: u64, reason: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        conn.execute(
+            "UPDATE member_notices
+                SET attempts = COALESCE(attempts, 0) + 1, last_error = ?1
+              WHERE id = ?2 AND dest_peer IS NOT NULL AND drained_at IS NULL",
+            params![reason, id as i64],
+        )
+        .context("recording egress failure")?;
+        let n: Option<i64> = conn
+            .query_row(
+                "SELECT COALESCE(attempts, 0) FROM member_notices WHERE id = ?1",
+                params![id as i64],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(n.unwrap_or(0))
+    }
+
+    /// Retire an egress row that has exhausted its attempts. Marks it drained so
+    /// the queue does not grow without bound; the caller is responsible for the
+    /// unreachable report that this row now owes its sender. Retiring WITHOUT
+    /// reporting would be the silent drop with extra steps.
+    pub fn retire_egress(&self, id: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE member_notices SET drained_at = ?1
+              WHERE id = ?2 AND dest_peer IS NOT NULL AND drained_at IS NULL",
+            params![Utc::now().to_rfc3339(), id as i64],
+        )
+        .context("retiring egress row")?;
         Ok(())
     }
 
@@ -540,8 +648,14 @@ impl SqliteInboxStore {
         // mail to that same recipient. That residual channel is bounded by the
         // flood guard and, unlike the one removed here, requires the attacker
         // to be in a relationship with the victim's counterparty.
+        // …and PER PLANE. An egress row's `to_plugin` is the REMOTE member's
+        // name, which in this fleet is the same name a local member has. Without
+        // `dest_peer IS NULL` the count is inflated by another host's mail and
+        // the eviction can delete it — the cross-member denial channel this cap
+        // was scoped to close, reopened through the forwarding plane.
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM member_notices WHERE to_plugin = ?1 AND drained_at IS NULL",
+            "SELECT COUNT(*) FROM member_notices
+              WHERE to_plugin = ?1 AND drained_at IS NULL AND dest_peer IS NULL",
             params![to_plugin],
             |row| row.get(0),
         )?;
@@ -549,7 +663,8 @@ impl SqliteInboxStore {
             conn.execute(
                 "DELETE FROM member_notices
                  WHERE id = (SELECT MIN(id) FROM member_notices
-                             WHERE to_plugin = ?1 AND drained_at IS NULL)",
+                             WHERE to_plugin = ?1 AND drained_at IS NULL
+                               AND dest_peer IS NULL)",
                 params![to_plugin],
             )
             .context("dropping oldest member notice at cap")?;
@@ -639,6 +754,7 @@ impl SqliteInboxStore {
                             in_reply_to
                      FROM member_notices
                      WHERE to_plugin = ?1 AND queued_at >= ?2 AND drained_at IS NULL
+                       AND dest_peer IS NULL
                      ORDER BY id ASC",
                 )
                 .context("preparing member drain SELECT")?;
@@ -685,7 +801,7 @@ impl SqliteInboxStore {
         };
         tx.execute(
             "UPDATE member_notices SET drained_at = ?2
-             WHERE to_plugin = ?1 AND drained_at IS NULL",
+             WHERE to_plugin = ?1 AND drained_at IS NULL AND dest_peer IS NULL",
             params![to_plugin, now.to_rfc3339()],
         )
         .context("marking drained member notices")?;
@@ -713,7 +829,8 @@ impl SqliteInboxStore {
             "SELECT id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
                     in_reply_to
              FROM member_notices
-             WHERE to_plugin = ?1 AND queued_at >= ?2 AND drained_at IS NULL ORDER BY id ASC",
+             WHERE to_plugin = ?1 AND queued_at >= ?2 AND drained_at IS NULL
+               AND dest_peer IS NULL ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![to_plugin, cutoff], |row| {
             Ok((
@@ -748,7 +865,8 @@ impl SqliteInboxStore {
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
         let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM member_notices WHERE to_plugin = ?1 AND drained_at IS NULL",
+            "SELECT COUNT(*) FROM member_notices
+              WHERE to_plugin = ?1 AND drained_at IS NULL AND dest_peer IS NULL",
             params![to_plugin],
             |row| row.get(0),
         )?;
@@ -764,6 +882,16 @@ impl SqliteInboxStore {
     /// one that was never read. This query closes the loop for RESPONSIVENESS,
     /// not for ACTION — a member who woke, worked in a repo, and said nothing
     /// still shows up. Lookback is bounded by the TTL prune (7d).
+    ///
+    /// **Local plane only** (`dest_peer IS NULL`). An egress row's counterparty
+    /// is on another machine, so a reply to it arrives as a *different* notice
+    /// over the hub whose `in_reply_to` cannot reference this row's local id —
+    /// it could never be bound, and would sit unanswered forever. That is the
+    /// standing false-positive class `forum-note`/`coordination`/`handoff` are
+    /// excluded to avoid, and it would land twice over: an egress row from a
+    /// local member to a same-named remote one matches both `to_plugin` and
+    /// `from_plugin`, so it would appear in `i_owe` AND `owed_to_me` at once.
+    /// Cross-machine response debt is the hub's ledger, not this one's.
     pub fn member_unanswered(
         &self,
         plugin: &str,
@@ -784,6 +912,7 @@ impl SqliteInboxStore {
             "SELECT id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at
              FROM member_notices n
              WHERE (n.to_plugin = ?1 OR n.from_plugin = ?1)
+               AND n.dest_peer IS NULL
                AND n.queued_at < ?2
                AND n.kind IN ({placeholders})
                AND NOT EXISTS (SELECT 1 FROM member_notices r WHERE r.in_reply_to = n.id)
@@ -829,6 +958,30 @@ impl SqliteInboxStore {
         }
         Ok(out)
     }
+}
+
+/// One notice awaiting hand-off to the fleet mesh (r6-routing branch 2).
+///
+/// `attempts` and `last_error` are what make this a queue rather than a second
+/// black hole: an egress row that can fail forever without anyone learning is the
+/// silent drop moved one hop out (Kimi, r6-routing review §2.4).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EgressRow {
+    pub id: u64,
+    pub dest_peer: String,
+    /// Roster-validated at enqueue. The drain forwards on THIS, not on the name —
+    /// re-resolving a name at drain time reintroduces the prefix-matching oracle
+    /// this design removed.
+    pub dest_peer_lct: String,
+    pub to_member: String,
+    /// Always a LOCAL member: only local members can call `member_notify`, so the
+    /// route-back for an egress failure is always local delivery. The one place
+    /// this design is simpler than it looks.
+    pub from_plugin: String,
+    pub kind: String,
+    pub pointer_uri: Option<String>,
+    pub attempts: i64,
+    pub last_error: Option<String>,
 }
 
 /// One member→member notice (the local-mesh wake signal).
