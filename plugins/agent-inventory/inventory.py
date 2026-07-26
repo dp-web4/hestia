@@ -79,9 +79,26 @@ A SIGKILLed hook emits nothing, and nothing reads as fine — so the previous cu
 "answers UNKNOWN on every machine that is not CBP" by replacing it with "answers nothing
 on CBP." Same error, next dimension over, which is once again the error this file exists
 to catch. The remedy is in `scan_projects()` and it is structural, not a benchmark: the
-walk carries an explicit deadline and reports `scan_truncated` + `UNKNOWN` when it fires,
-because 1.5s on a warm 9p cache is not 1.5s on a cold one and no machine in this fleet has
-yet measured the cold number.
+walk carries an explicit deadline and reports `scan_truncated` + `UNKNOWN` when it fires.
+
+And clause 5 has a second half the deadline alone does not satisfy, which the next review
+found (cbp, 2026-07-26, same thread). A budget that fires on EVERY run has not bounded the
+scan, it has redefined it — and because the walk is level-order, the part it gives up is
+never a random sample. It is always the deepest level, which is exactly the level that was
+added to find the gate nobody could see. At the shipped 5s default CBP truncated 3/3 and
+lost both of its depth-3 scopes, honestly and reproducibly. So:
+
+5b. AN HONEST REPORT OF A SYSTEMATICALLY BIASED SAMPLE IS STILL CLAUSE 5's FAILURE. The
+    budget has to fit the slowest machine measured, and the trigger's timeout has to be
+    DERIVED from it rather than written down beside it — two numbers in two files kept in
+    step by prose is the mitigation rule 3 refuses. See PROJECT_SCAN_BUDGET_S,
+    SESSION_HOOK_TIMEOUT_S, and `hook_timeout_finding()`, which is this check run against
+    its own trigger.
+
+One justification did not survive contact with the measurement, and is corrected there
+rather than quietly dropped: the deadline was argued for on "warm is not cold," and cold
+turned out to be ~1.1x. Contention costs more than cold does. The deadline is still right
+— an unbounded 9p stall is real — but for a different reason than the one it shipped with.
 
 Two consequences worth stating plainly, because they are what changed:
 
@@ -99,6 +116,7 @@ has become a gate. Findings go to stdout as JSON and (unless --no-witness) to th
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import re
@@ -319,12 +337,59 @@ PROJECT_SCAN_DEPTH = 3
 SKIP_DIRS = {"node_modules", "vendor", "target", "dist", "build", "site-packages",
              ".venv", "venv", ".git", "__pycache__", ".next", ".cache"}
 
-# Clause 5's structural half. The walk stops when it runs out of budget and SAYS it
-# stopped, rather than relying on the total staying under the trigger's timeout — a
-# warm-cache measurement is not a guarantee, and the cold-cache number on 9p has never
-# been taken anywhere in this fleet. Half the SessionStart budget, leaving the other half
-# for the twenty-odd config parses and the git reads.
-PROJECT_SCAN_BUDGET_S = float(os.environ.get("HESTIA_INVENTORY_SCAN_BUDGET", "5.0"))
+# Clause 5's structural half, and it has two parts: a walk that stops when it runs out of
+# budget and SAYS it stopped, and a budget large enough that stopping is the exception.
+# The first cut shipped only the first part.
+#
+# THE DEFAULT BUDGET DID NOT FIT THE MACHINE IT WAS WRITTEN FOR (cbp, 2026-07-26). Four
+# full-depth walks of the same 3143 directories on CBP's 9p mount:
+#
+#     6.79s   warm, quiet
+#     7.15s   cold (drop_caches)
+#     7.84s   cold (drop_caches)
+#     9.31s   warm, with a sibling `claude -c` working the tree
+#
+# At 5.0s that truncated on EVERY run (3/3 consecutive: 2373 / 2184 / 2157 of 3143 dirs),
+# and the two scopes it dropped were both of the depth-3 ones. A level-order walk spends
+# its budget breadth-first, so truncation is never a random sample — the loss is always at
+# maximum depth, which is precisely the level DEPTH+1 was added to reach. An honest report
+# of a systematically biased sample is rule 5's failure in a smaller hat.
+#
+# Two things measurement corrected, kept next to the number because that is this file's
+# whole ethic:
+#   * COLD IS ~1.1x, NOT AN ORDER OF MAGNITUDE. The previous cut justified this deadline
+#     with "1.5s warm is not 1.5s cold" and noted that nobody in the fleet had taken the
+#     cold number. CBP took it: 7.15 / 7.84 cold against 6.79 warm. (A lower bound —
+#     drop_caches clears the Linux page cache; the Windows side of 9p stays warm.) The
+#     deadline is still right, but for 9a2e124's reason — an unbounded 9p stall — not for
+#     cold-versus-warm, and the justification should not outlive the measurement.
+#   * CONTENTION COSTS MORE THAN COLD DOES. The slowest run was warm, with a sibling
+#     session working the tree — and on this fleet a contended box is the NORMAL state,
+#     not the pathological one.
+#
+# So the budget clears the slowest run anyone has measured, with headroom. THE BUDGET IS A
+# CEILING, NOT A COST: it is a deadline, so a machine that finishes in 0.18s (thor, ext4,
+# 1837 dirs) pays exactly nothing for a large one. A small budget does not buy speed on
+# fast machines; it buys guaranteed loss of the deepest scopes on slow ones.
+PROJECT_SCAN_BUDGET_S = float(os.environ.get("HESTIA_INVENTORY_SCAN_BUDGET", "12.0"))
+
+# ...and the trigger's timeout is DERIVED from that, not written down beside it.
+#
+# Clause 5 couples two numbers that live in two files — this constant, and a `timeout`
+# install.sh writes into ~/.claude/settings.json. Nothing but memory held them together,
+# so CBP's review had to say it in prose: "moved together — either half alone re-creates
+# clause 5's own cliff (8s walk + ~1s overhead against a 10s SIGKILL is silence again)."
+# A rule maintained by whoever read the review is what rule 3 refuses. Two seams close it:
+# install.sh asks the binary for this number instead of carrying a copy, and the binary
+# re-checks the installed hook against it at run time (`hook_timeout_finding`), so drift
+# is DETECTED rather than remembered.
+POST_SCAN_RESERVE_S = 8.0   # config parses, git reads, witness write — worst observed ~1s
+SESSION_HOOK_TIMEOUT_S = int(math.ceil(PROJECT_SCAN_BUDGET_S + POST_SCAN_RESERVE_S))
+
+# The name every trigger invokes (install.sh puts it on ~/.local/bin). Fixed, so the
+# self-check below can ask "what will the harness actually run?" even when this file is
+# being run from the repo copy under a different name.
+INSTALLED_BIN_NAME = "hestia-agent-inventory"
 
 
 def _config_dir_files() -> dict[str, tuple[str, ...]]:
@@ -402,11 +467,15 @@ def scan_projects() -> dict[str, list[Path]]:
     except OSError:
         seen = {str(WORKSPACE)}
     frontier = [WORKSPACE]
+    levels_complete = 0
+    trunc_level: int | None = None
+    trunc_done = trunc_of = 0
     for level in range(PROJECT_SCAN_DEPTH + 1):
         nxt: list[Path] = []
-        for parent in frontier:
+        for done, parent in enumerate(frontier):
             if time.monotonic() > deadline:
                 truncated = True
+                trunc_level, trunc_done, trunc_of = level, done, len(frontier)
                 break
             names: set[str] = set()
             children: list[tuple[Path, bool]] = []
@@ -437,6 +506,7 @@ def scan_projects() -> dict[str, list[Path]]:
                 nxt.append(child)
         if truncated:
             break
+        levels_complete = level + 1
         frontier = nxt
 
     for rel, paths in found.items():
@@ -456,9 +526,21 @@ def scan_projects() -> dict[str, list[Path]]:
         "dirs_scanned": scanned,
         "seconds": round(time.monotonic() - started, 3),
         "truncated": truncated,
-        # What was left unwalked when the budget ran out. 0 with truncated=False is the
-        # difference between "finished" and "stopped and did not say where".
-        "unscanned_frontier": len(frontier) if truncated else 0,
+        # WHERE the walk stopped, which a level-order walk can state exactly: levels
+        # 0..levels_complete-1 are whole, `truncated_at_level` is partial at
+        # level_done/level_of parents, and every deeper level was never enumerated at all.
+        #
+        # The field this replaces, `unscanned_frontier`, reported len(frontier) for the
+        # level in progress — which counted parents already scanned and omitted every
+        # deeper level, so on CBP it read 876 + 2305 = 3181 against a true 3143 (cbp,
+        # 2026-07-26). It erred toward alarming, which is the safe direction and not the
+        # standard: a number emitted next to a claim has to be falsifiable, and this one
+        # was not the count it named. The level is also strictly more actionable, because
+        # the walk being level-order is exactly what makes the loss predictable.
+        "levels_complete": levels_complete,
+        "truncated_at_level": trunc_level,
+        "level_done": trunc_done,
+        "level_of": trunc_of,
     })
     _SCAN = found
     return _SCAN
@@ -583,6 +665,52 @@ def worktree_ref() -> str:
         return ref.split("ref: refs/heads/")[-1] if ref.startswith("ref:") else ref[:12]
     except Exception:
         return "unknown"
+
+
+def hook_timeout_finding() -> tuple[float, str] | None:
+    """Does this check's own trigger still give it longer than it budgets for itself?
+
+    THE CHECK APPLIED TO THE CHECK (cbp, 2026-07-26). Rule 5 binds the scan budget and the
+    SessionStart timeout into one pair, and they live in two files: PROJECT_SCAN_BUDGET_S
+    here, and a `timeout` install.sh writes into ~/.claude/settings.json. Nothing enforced
+    the relation — the review had to state it in prose, and a rule kept alive by whoever
+    read the review is the mitigation rule 3 refuses. install.sh now derives the timeout
+    from the budget, which stops the two from drifting AT INSTALL. This is the other half:
+    they can still be pulled apart afterwards, by a hand edit, by a second installer, or
+    by exporting HESTIA_INVENTORY_SCAN_BUDGET past the timeout that is already written.
+
+    A hook SIGKILLed one second before its walk would have given up emits NOTHING, and
+    nothing reads as clean. This file exists to find gates whose failure mode is silence,
+    so it is obliged to find its own.
+
+    Reads the settings file rather than trusting install.sh's report of it: the question
+    is what the harness will actually run. Matches on the installed binary NAME, not on
+    argv[0], so the finding still surfaces when the repo copy is run by hand.
+    """
+    cfg = HOME / ".claude" / "settings.json"
+    try:
+        data = json.loads(cfg.read_text())
+    except (OSError, ValueError):
+        # No Claude settings on this box, or unreadable. Not a finding about the timeout —
+        # config-readability is already reported per-agent by inspect().
+        return None
+    for grp in (data.get("hooks") or {}).get("SessionStart") or []:
+        for hook in grp.get("hooks") or []:
+            if INSTALLED_BIN_NAME not in hook.get("command", ""):
+                continue
+            timeout = hook.get("timeout")
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+                continue
+            if timeout >= SESSION_HOOK_TIMEOUT_S:
+                continue
+            return timeout, (
+                    f"SessionStart hook timeout is {timeout}s in {cfg}, but this check "
+                    f"budgets {PROJECT_SCAN_BUDGET_S}s for the directory walk alone — on "
+                    f"a slow or contended machine it is killed mid-scan and emits "
+                    f"nothing, which reads as clean (rule 5). The two numbers have "
+                    f"drifted apart; re-run install.sh, which derives the timeout "
+                    f"({SESSION_HOOK_TIMEOUT_S}s) from the budget.")
+    return None
 
 
 def _git(*args: str) -> str | None:
@@ -920,7 +1048,14 @@ def emit(report: dict, brief: bool) -> int:
         scan = (report.get("scope") or {})
         if scan.get("scan_truncated"):
             line += (f" | SCAN TRUNCATED at {scan.get('project_scan_budget_s')}s after "
-                     f"{scan.get('project_scan_dirs')} dirs — project scope incomplete")
+                     f"{scan.get('project_scan_dirs')} dirs, depth level "
+                     f"{scan.get('project_scan_truncated_at_level')} partial "
+                     f"({scan.get('project_scan_level_progress')}) — the DEEPEST project "
+                     "scopes are the ones missing")
+        if scan.get("hook_timeout_installed_s") is not None:
+            line += (f" | HOOK TIMEOUT {scan['hook_timeout_installed_s']}s < "
+                     f"{scan.get('project_scan_budget_s')}s SCAN BUDGET — this check can "
+                     f"be killed mid-scan and print nothing; re-run install.sh")
         if report.get("reason"):
             line += f" | {report['reason']}"
         print(line)
@@ -932,6 +1067,12 @@ def emit(report: dict, brief: bool) -> int:
 def main() -> int:
     global WORKSPACE, WORKSPACE_SOURCE, ATLAS, PLUGINS, REGISTRY
     argv = sys.argv[1:]
+    # Answered before anything else is resolved: install.sh calls this to derive the
+    # SessionStart timeout instead of keeping a second copy of the number, so it must
+    # work with no workspace, no registry, and no walk.
+    if "--print-hook-timeout" in argv:
+        print(SESSION_HOOK_TIMEOUT_S)
+        return 0
     brief = "--brief" in argv
 
     WORKSPACE, WORKSPACE_SOURCE = resolve_workspace(argv)
@@ -974,7 +1115,16 @@ def main() -> int:
         "project_scan_dirs": SCAN_STATS.get("dirs_scanned", 0),
         "project_scan_seconds": SCAN_STATS.get("seconds"),
         "project_scan_budget_s": PROJECT_SCAN_BUDGET_S,
+        "session_hook_timeout_s": SESSION_HOOK_TIMEOUT_S,
         "scan_truncated": SCAN_STATS.get("truncated", False),
+        # Level-order, so "where it stopped" is one integer and the loss is predictable:
+        # levels below `truncated_at_level` were never enumerated, and those are the
+        # deepest project roots — the ones DEPTH+1 exists to reach.
+        "project_scan_levels_complete": SCAN_STATS.get("levels_complete"),
+        "project_scan_truncated_at_level": SCAN_STATS.get("truncated_at_level"),
+        "project_scan_level_progress": (
+            f"{SCAN_STATS.get('level_done')}/{SCAN_STATS.get('level_of')}"
+            if SCAN_STATS.get("truncated") else None),
         "plugins_source": REGISTRY.source,         # origin/main | worktree
         "plugins_ref": REGISTRY.ref,
         "worktree_ref": worktree_ref(),
@@ -988,17 +1138,34 @@ def main() -> int:
             "on the machine it was written on")
     if REGISTRY.degraded:
         unknowns.append(REGISTRY.degraded)
+    drifted = hook_timeout_finding()
+    if drifted:
+        installed_timeout, why = drifted
+        unknowns.append(why)
+        # ...and onto the one-line surface too, for the reason hop 2 learned the hard way:
+        # a finding only in `unknown[]` is invisible to `--brief`, and MISWIRED/PARTIAL
+        # both outrank UNKNOWN, so status can never carry it either. The reader who most
+        # needs this one IS the brief reader — it is the SessionStart hook that gets
+        # killed. A check has as many surfaces as it has readers, and the smallest surface
+        # is the one that gets believed.
+        scope["hook_timeout_installed_s"] = installed_timeout
     if SCAN_STATS.get("truncated"):
         # Rule 5 made explicit. A walk that ran out of budget has NOT established the
         # project scope, and the part it never reached is exactly where the report would
         # otherwise be quietly clean.
+        done = SCAN_STATS.get("levels_complete", 0)
+        whole = f"depth levels 0..{done - 1} complete" if done else "no depth level completed"
         unknowns.append(
             f"project scan hit its {PROJECT_SCAN_BUDGET_S}s budget after "
-            f"{SCAN_STATS.get('dirs_scanned', 0)} directories with "
-            f"{SCAN_STATS.get('unscanned_frontier', 0)} still unwalked — project scope is "
-            "PARTIAL, and any gate under the unwalked part is neither found nor counted "
-            "(raise HESTIA_INVENTORY_SCAN_BUDGET, or read the hourly timer's full-depth "
-            "answer instead)")
+            f"{SCAN_STATS.get('dirs_scanned', 0)} directories: {whole}, level "
+            f"{SCAN_STATS.get('truncated_at_level')} stopped at "
+            f"{SCAN_STATS.get('level_done')}/{SCAN_STATS.get('level_of')} of its parents, "
+            "deeper levels never enumerated — project scope is PARTIAL and any gate under "
+            "the unwalked part is neither found nor counted. The walk is level-order, so "
+            "what is missing is always the DEEPEST scopes, never a random sample: "
+            "truncation costs exactly the level this scan was widened to reach. Raise "
+            "HESTIA_INVENTORY_SCAN_BUDGET (and the SessionStart timeout with it — "
+            f"install.sh derives it), or read the hourly timer's full-depth answer.")
 
     # An unestablished scope degrades to UNKNOWN, never to OK (rule 4). MISWIRED still
     # outranks it: a known dead gate is worse news than an unknown.

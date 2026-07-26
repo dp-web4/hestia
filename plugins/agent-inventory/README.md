@@ -56,6 +56,19 @@ is not CBP. **Scope has to travel in the command, not in one trigger's environme
 Resolution order is `--workspace` → `$HESTIA_WORKSPACE` → compiled-in default, and which
 one answered is reported as `scope.workspace_source`.
 
+**And the workspace `install.sh` writes must not depend on where `install.sh` was run
+from.** It was `$SRC_DIR/../../..`, which is correct from the primary checkout and silently
+`/tmp` from a detached worktree — baked into all three triggers at once, failing in the
+reassuring direction (nothing ungoverned is ever found under `/tmp`). The sharp part is
+that the fleet's own sibling-session protocol *requires* installing from a detached
+worktree on a contended box, so the documented-safe path was the one that mis-scoped, and
+the mitigation was knowledge held by whoever read the PR description. It now derives from
+`git rev-parse --path-format=absolute --git-common-dir`, which resolves to the primary
+repo's `.git` from either place, and **refuses rather than guessing** when that fails —
+`HESTIA_WORKSPACE` is the documented override. A resolved workspace with no
+`agent-atlas/talk-to` under it warns at install time, once, instead of as an `UNKNOWN` from
+three triggers an hour.
+
 The runtime copy lives at `~/.local/bin/` on **ext4**, not in the repo on 9p — this check
 must not become an instance of the fragility it reports. Re-run `install.sh` after editing
 `inventory.py`; it converges the `SessionStart` hook to **exactly one** entry running this
@@ -124,13 +137,72 @@ Two things that make this structural rather than a benchmark:
   once something has read *its* entries, so the deepest level must be scanned even though
   it is never descended into. Getting this wrong silently drops every project root at the
   deepest level — which is the exact class of miss that motivated going deeper at all.
-- **An explicit walk deadline** (`HESTIA_INVENTORY_SCAN_BUDGET`, default 5s). When it
-  fires, `scope.scan_truncated` goes true, the unwalked frontier is reported, and the
-  `--brief` line — the surface a session actually reads — says `SCAN TRUNCATED`. Without
-  that last part a short walk still prints a confident status, because the part it never
-  reached contributes no findings. Nobody in this fleet has yet measured the walk on a
-  **cold** 9p cache, so relying on the total staying under budget is a warm-cache
-  assumption, not a guarantee.
+- **An explicit walk deadline** (`HESTIA_INVENTORY_SCAN_BUDGET`). When it fires,
+  `scope.scan_truncated` goes true, the stopping point is reported, and the `--brief` line
+  — the surface a session actually reads — says `SCAN TRUNCATED`. Without that last part a
+  short walk still prints a confident status, because the part it never reached
+  contributes no findings.
+
+### A budget that always fires is not a bound, it is a redefinition
+
+The deadline shipped at 5s, and CBP's re-review found that 5s **never fit CBP**. Four
+full-depth walks of the same 3143 directories:
+
+| run | wall-clock |
+|---|---|
+| warm, quiet | 6.79s |
+| cold (`drop_caches`) | 7.15s |
+| cold (`drop_caches`) | 7.84s |
+| warm, sibling `claude -c` working the tree | **9.31s** |
+
+So it truncated on every run (3/3: 2373 / 2184 / 2157 of 3143 dirs) — and **both** scopes
+it dropped were the depth-3 ones. The walk is level-order, so its budget goes breadth-first
+and truncation is never a random sample: the loss is always at maximum depth, which is
+exactly the level `DEPTH+1` was added to reach. Truncating honestly and reproducibly at the
+one level that motivated the change is clause 5's failure in a smaller hat.
+
+Two things the measurement corrected, recorded because this file's ethic is that the number
+sits next to the claim:
+
+- **Cold is ~1.1×, not an order of magnitude.** The deadline had been argued for on "warm
+  is not cold" while nobody had taken the cold number. It is 7.15 / 7.84 cold against 6.79
+  warm — a lower bound, since `drop_caches` clears the Linux page cache and the Windows
+  side of 9p stays warm. The deadline is still right, but for the *original* reason (an
+  unbounded 9p stall), not the one it shipped with.
+- **Contention costs more than cold does.** The slowest run was warm with a sibling session
+  working the tree — and on this fleet a contended box is the normal state.
+
+The budget is therefore **12s**, clearing the slowest run measured anywhere. This costs
+fast machines nothing: it is a *ceiling, not a cost*, and Thor (ext4, 1837 dirs) runs in
+0.16s either way. A small budget does not buy speed; it buys guaranteed loss of the deepest
+scopes on slow machines.
+
+### The timeout is derived, not written down twice
+
+Clause 5 couples two numbers in two files — the scan budget in `inventory.py`, and a
+`timeout` that `install.sh` writes into `~/.claude/settings.json`. Either one moved alone
+rebuilds the cliff (a 12s walk against a 15s SIGKILL is silence again), and nothing but
+prose held them together. That is the mitigation rule 3 refuses, so there are now two seams:
+
+- `install.sh` asks the binary (`--print-hook-timeout`, budget + 8s reserve = **20s**)
+  instead of carrying its own copy, and *asserts* the written value afterwards. It also no
+  longer leaves an existing entry's `timeout` alone — `setdefault` meant the machine most
+  in need of the raise, one that already had the hook, was the one that never got it.
+- `inventory.py` re-reads the installed hook at run time and reports drift as `UNKNOWN`
+  (`hook_timeout_finding`). Install-time derivation stops them separating; this catches
+  them being pulled apart afterwards by a hand edit, a second installer, or an
+  `HESTIA_INVENTORY_SCAN_BUDGET` raised past a timeout already on disk. A check whose
+  failure mode is silence is obliged to run itself against its own trigger.
+
+### Where a truncated walk stopped
+
+Because the walk is level-order, "how far did it get" is one integer, and the report says
+it: `project_scan_levels_complete`, `project_scan_truncated_at_level`, and
+`project_scan_level_progress` (`4/302` — parents done over parents at that level). This
+replaces `unscanned_frontier`, which reported `len(frontier)` for the level in progress:
+it counted parents already scanned and omitted every deeper level, reading `876 + 2305 =
+3181` against a true 3143 on CBP. It erred toward alarming, which is the safe direction and
+not the standard — a number emitted next to a claim has to be falsifiable.
 
 **Stamping the ref was not enough.** The first cut reported `plugins_ref` and kept reading
 the working tree, on the theory that a visible number is a falsifiable one. But B is what
