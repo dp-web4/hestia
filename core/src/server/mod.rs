@@ -3,6 +3,7 @@
 //! See `docs/DESIGN_DECISIONS/0005-mcp-surface.md` in the repo root for the
 //! tool / resource specification this server exposes.
 
+mod agents;
 mod dashboard;
 mod handler;
 mod http;
