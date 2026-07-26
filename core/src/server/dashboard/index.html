@@ -319,29 +319,46 @@
   .trust-list { display: flex; flex-direction: column; }
   .trust-row {
     display: grid;
-    grid-template-columns: minmax(9rem, 15rem) minmax(0, 1fr) 3rem 5.5rem;
+    grid-template-columns: minmax(9rem, 15rem) minmax(0, 1fr) 3rem 5.5rem auto;
     gap: 0.75rem;
     align-items: center;
     width: 100%;
     padding: 0.55rem 1.25rem;
-    background: none;
-    border: 0;
     border-top: 1px solid var(--border);
-    color: inherit;
-    font: inherit;
-    text-align: left;
-    cursor: pointer;
   }
   .trust-row:first-child { border-top: 0; }
   .trust-row:hover { background: var(--bg-elev-2); }
   .trust-row .tr-id { font-family: var(--mono); font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .trust-row .tr-role { font-family: var(--mono); font-size: 0.72rem; color: var(--fg-dim); margin-left: 0.4rem; }
   .trust-row .tr-val { font-family: var(--mono); font-size: 0.85rem; text-align: right; font-variant-numeric: tabular-nums; }
-  .trust-row .tr-dim { display: block; font-size: 0.66rem; color: var(--fg-faint); line-height: 1.1; margin-top: 0.1rem; }
+  .trust-row .tr-dim { display: block; font-size: 0.66rem; color: var(--fg-faint); line-height: 1.1; margin-top: 0.2rem; }
+  /* `.bar` sets a height, so it must be a BLOCK box. The first cut wrapped it in a
+     <span>, which is inline — height and the inner fill were ignored and the bar simply
+     did not paint, leaving an invisible strip that happened to be the click target. */
+  .trust-row .tr-bar { display: block; min-width: 0; }
+  .trust-row .bar { display: block; width: 100%; }
+  .bar-unmeasured {
+    border: 1px dashed var(--border);
+    background: transparent;
+    height: 6px;
+    border-radius: 3px;
+  }
+  .tr-detail {
+    font: inherit;
+    font-size: 0.7rem;
+    letter-spacing: 0.04em;
+    padding: 0.2rem 0.6rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--fg-dim);
+    cursor: pointer;
+  }
+  .tr-detail:hover { border-color: var(--accent); color: var(--accent); }
   .trust-row .trust-level { justify-self: end; }
   @media (max-width: 700px) {
-    .trust-row { grid-template-columns: minmax(0, 1fr) 3rem; }
-    .trust-row .bar { display: none; }
+    .trust-row { grid-template-columns: minmax(0, 1fr) 3rem auto; }
+    .trust-row .tr-bar { display: none; }
   }
 
   .trust-item {
@@ -1026,38 +1043,71 @@
     // can share a plugin_id — the codex / codex-cli case).
     trustShown = filtered;
     root.innerHTML = filtered.map((t, i) => {
-      const w = weakestDimension(t);
+      const w = lawScore(t);
       const pct = w.score == null ? 0 : Math.max(0, Math.min(1, w.score)) * 100;
+      // Unmeasured renders an explicitly EMPTY track, not a zero-width fill on a track
+      // you cannot see — "no evidence" and "evidence of zero" must not look alike.
+      const bar = w.score == null
+        ? `<div class="bar bar-unmeasured" title="no adjudicated evidence yet"></div>`
+        : `<div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>`;
       return `
-      <button type="button" class="trust-row" onclick="showTrustDetail(${i})"
-              title="Open the full tensor and its chain receipts">
+      <div class="trust-row">
         <span class="tr-id">${escapeHtml(t.plugin_id)}${trustRole(t) ? `<span class="tr-role">${escapeHtml(shortRole(trustRole(t)))}</span>` : ''}</span>
-        <span>
-          <span class="bar"><div style="width:${pct.toFixed(1)}%"></div></span>
-          <span class="tr-dim">${escapeHtml(w.label)} · ${fmt.int(t.action_count)} action${t.action_count === 1 ? '' : 's'}${t.aliased_to ? ' · folds into ' + escapeHtml(t.aliased_to) : ''}</span>
+        <span class="tr-bar">
+          ${bar}
+          <span class="tr-dim">${escapeHtml(w.label)} · ${fmt.int(t.action_count)} action${t.action_count === 1 ? '' : 's'}</span>
         </span>
-        <span class="tr-val">${w.score == null ? '—' : w.score.toFixed(2)}</span>
+        <span class="tr-val">${w.score == null ? '—' : truncScore(w.score)}</span>
         <span class="trust-level">${escapeHtml(t.level)}</span>
-      </button>`;
+        <button type="button" class="tr-detail" onclick="showTrustDetail(${i})"
+                title="Full tensor, every dimension, and the chain receipts behind it">detail</button>
+      </div>`;
     }).join('');
   }
 
-  // The single collapsed bar reports the LOWEST measured dimension, not a mean. An
-  // average would manufacture a figure no evidence produced and would let a strong grain
-  // mask a failing one — the same masking the orchestrator chips already refuse (they
-  // show the worst grain's level). The dimension's name rides on the row so the number
-  // stays falsifiable at a glance.
-  function weakestDimension(t) {
-    const cand = [
-      ['temperament',    t.derived_temperament],
-      ['adj. validity',  t.adjudicated_validity],
-      ['adj. veracity',  t.adjudicated_veracity],
-      ['adj. valuation', t.adjudicated_valuation],
-      ['outcome record', t.t3_training],
-    ].filter(([, v]) => typeof v === 'number');
-    if (!cand.length) return { score: null, label: 'no measured dimension' };
-    const [label, score] = cand.reduce((a, b) => (b[1] < a[1] ? b : a));
-    return { score, label: cand.length > 1 ? `${label} (weakest of ${cand.length})` : label };
+  // THE ROW'S NUMBER IS THE ONE THE LAW USES (dp, 2026-07-26: "the measurements should
+  // follow the law"). derivation.rs computes the displayed level as the MEAN of the
+  // DERIVED dimensions only — temperament and the three adjudicated ones — and
+  // deliberately excludes `t3_training`, which is the self-reported outcome record.
+  //
+  // My first cut showed the weakest dimension INCLUDING t3_training, and the row then
+  // argued with its own level in both directions:
+  //   kimi-code/member          no derived evidence -> level `unmeasured`, bar read 1.00
+  //                             off a self-report the law does not count
+  //   kimi-code/interactive-dev law mean 0.847 -> `HIGH`, bar read 0.11
+  // Weakest-link is a good principle and it was the wrong one here: a summary that is
+  // not the level's own basis cannot explain the level, it can only contradict it. The
+  // weakest dimension is still worth seeing, so it moves to the detail popup where the
+  // full tensor already lives.
+  const LAW_DIMS = [
+    ['temperament',    t => t.derived_temperament],
+    ['adj. validity',  t => t.adjudicated_validity],
+    ['adj. veracity',  t => t.adjudicated_veracity],
+    ['adj. valuation', t => t.adjudicated_valuation],
+  ];
+  // NEVER ROUND A SCORE ACROSS THE BOUNDARY THAT SET THE LEVEL. derivation.rs splits at
+  // `mean < 0.7 -> medium`, and claude-code/member sits at 0.6988: `toFixed(2)` renders
+  // that as "0.70", so the row read `0.70 MEDIUM` while 0.70 is HIGH by the same law.
+  // Truncating instead of rounding keeps the displayed figure on the side of the
+  // threshold the verdict was actually taken from — the two-decimal display is a
+  // convenience, and a convenience must not overturn the finding.
+  function truncScore(x) { return (Math.floor(x * 100) / 100).toFixed(2); }
+
+  function lawScore(t) {
+    const measured = LAW_DIMS.map(([n, f]) => [n, f(t)]).filter(([, v]) => typeof v === 'number');
+    if (!measured.length) {
+      // Honest-unmeasured, matching the daemon: zero qualifying evidence is not zero
+      // trust and is not the self-reported figure either. Say so; render no fill.
+      return { score: null, label: 'unmeasured — no adjudicated evidence yet', n: 0 };
+    }
+    const mean = measured.reduce((a, [, v]) => a + v, 0) / measured.length;
+    const weakest = measured.reduce((a, b) => (b[1] < a[1] ? b : a));
+    return {
+      score: mean,
+      n: measured.length,
+      label: `mean of ${measured.length} derived dimension${measured.length === 1 ? '' : 's'}`
+           + ` · weakest ${weakest[0]} ${truncScore(weakest[1])}`,
+    };
   }
 
   // Identities folded into this one. Says what was absorbed and how much it carried, so
