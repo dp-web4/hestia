@@ -214,6 +214,10 @@ pub struct RecentEntry {
     pub rule_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// What the member tried to do, bounded and secret-scrubbed. `None` on allows and on
+    /// denies from gates that do not report it yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempted: Option<String>,
 }
 
 /// Flatten a `ChainEntry` into the UI-facing `RecentEntry` shape.
@@ -249,6 +253,10 @@ pub fn flatten_entry(e: crate::storage::ChainEntry) -> RecentEntry {
             .and_then(|v| v.as_str())
             .map(String::from),
         reason: d.get("reason").and_then(|v| v.as_str()).map(String::from),
+        // The bounded, scrubbed command the gate refused. Present only on denies, and
+        // only for gates that send it — absent means "this gate does not report attempts
+        // yet", which the UI must not render as "nothing was attempted".
+        attempted: d.get("attempted").and_then(|v| v.as_str()).map(String::from),
     }
 }
 

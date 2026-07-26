@@ -1363,6 +1363,7 @@
       let status = '';
       let statusClass = 'info';
       let tool = '';
+      let hover = null;   // hover text for the detail cell; null => fall back to `detail`
 
       if (e.event_type === 'outcome') {
         tool = e.tool_name || '?';
@@ -1375,6 +1376,13 @@
         const enforced = e.enforced !== false;
         const ruleLabel = e.rule_name ? ` [${e.rule_name}]` : '';
         detail = `${e.target || ''}${ruleLabel}${e.reason ? ' — ' + e.reason : ''}`;
+        // HOVER SHOWS THE ATTEMPT, NOT THE VERDICT (dp, 2026-07-26). The row already
+        // states the decision; what a reader wants on hover is what was tried. Falls back
+        // to the verdict when a gate does not report an attempt yet, and says WHICH it is
+        // — "no attempt recorded" must not be renderable as "nothing was attempted".
+        hover = e.attempted
+          ? `attempted:\n${e.attempted}\n\nverdict:\n${detail}`
+          : `${detail}\n\n(this gate does not report the attempted command yet)`;
         status = verdict === 'deny' ? (enforced ? 'blocked' : 'would-block') : verdict;
         // deny = coral (the gate actively blocked), warn = yellow (advisory);
         // neither is red — a deny is the trust layer working, not a failure.
@@ -1406,7 +1414,7 @@
           <span class="feed-pos" title="${escapeHtml(whoFull || (e.plugin_id||''))}">#${e.chain_position}${whoPid}</span>
           <span class="feed-time" title="${escapeHtml(absTime)}">${fmt.relTime(e.timestamp)}</span>
           <span class="feed-event ${e.event_type}">${escapeHtml(e.event_type)}</span>
-          <span class="feed-detail" title="${escapeHtml(detail)}">
+          <span class="feed-detail" title="${escapeHtml(hover || detail)}">
             ${tool ? `<span class="feed-tool">${escapeHtml(tool)}</span> ` : ''}${escapeHtml(detail)}
           </span>
           <span class="feed-status ${statusClass}">${status}</span>

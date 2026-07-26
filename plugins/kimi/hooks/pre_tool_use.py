@@ -253,6 +253,44 @@ MODE = os.environ.get("HESTIA_KIMI_GATE_MODE", "enforce").lower()
 _EVENT = {}  # set by main() so deny() can witness the reach it blocks
 
 
+def _attempted_summary(ev, limit=400):
+    """The bounded, scrubbed command this gate refused — the WHAT behind the verdict.
+
+    dp, 2026-07-26: denies carried a verdict and no action, so the chain recorded
+    permitted work verbatim and blocked work not at all — backwards for the entries most
+    worth reviewing. Kimi's own `'$d' is not granted` denial was only diagnosable because
+    the offending token happened to be quoted into the reason string.
+
+    Keeps the REDACTED-receipt intent (never ship an unbounded payload to a
+    less-protected surface) by bounding here and masking credential-shaped values. The
+    daemon scrubs and clamps again on receipt; neither side trusts the other to have.
+    """
+    ti = ev.get("tool_input") or {}
+    raw = ti.get("command") or ti.get("file_path") or ti.get("path") or ""
+    if not raw and ti:
+        try:
+            raw = json.dumps(ti, sort_keys=True, default=str)
+        except Exception:
+            raw = str(ti)
+    raw = " ".join(str(raw).split())
+    KEYS = ("password","passwd","secret","token","api_key","apikey","api-key","auth",
+            "authorization","bearer","credential","private_key","passphrase",
+            "access_key","client_secret")
+    out, mask_next = [], False
+    for tok in raw.split(" "):
+        low = tok.lstrip("-").rstrip(":").lower()
+        if mask_next and not tok.startswith("-"):
+            out.append("***"); mask_next = False; continue
+        if "=" in tok:
+            k, _, _ = tok.partition("=")
+            if any(s in k.lstrip("-").lower() for s in KEYS):
+                out.append(k + "=***"); mask_next = False; continue
+        mask_next = low in KEYS
+        out.append(tok)
+    s = " ".join(out)
+    return s[:limit] + ("\u2026[truncated]" if len(s) > limit else "")
+
+
 def _daemon_witness(verb, reason):
     """Report an enforced deny/warn to the daemon's witness chain (hestia_witness_decision MCP
     tool) so it shows on the dashboard's warn/deny feed and feeds gate-risk trust. Local-gate
@@ -288,6 +326,7 @@ def _daemon_witness(verb, reason):
                                    "tool_name": _EVENT.get("tool_name") or "",
                                    "session_id": _EVENT.get("session_id"),
                                    "payload_sha256": ti_hash,
+                                   "attempted": _attempted_summary(_EVENT),
                                    "role": _identity_role()}}}, h, 0.8)
 
 

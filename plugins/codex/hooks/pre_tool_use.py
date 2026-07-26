@@ -323,6 +323,47 @@ OBSERVE_DIR = os.path.expanduser(os.environ.get("HESTIA_OBSERVE_DIR", "~/.codex/
 _EVENT = {}  # set by main() so deny() can witness the reach it blocks
 
 
+def _attempted_summary(ev, limit=400):
+    """The bounded, scrubbed command this gate refused — the WHAT behind the verdict.
+
+    dp, 2026-07-26: denies carried a verdict and no action, so the chain recorded
+    permitted work verbatim and blocked work not at all. That is backwards for the
+    entries most worth reviewing: a deny you cannot reconstruct cannot be audited,
+    exonerated with confidence, or mined for a false positive. Kimi's `'$d' is not
+    granted` denial was only diagnosable because the offending token happened to be
+    quoted into the reason string.
+
+    The original REDACTED-receipt rule was right about the risk and wrong about the
+    remedy. Keep its intent — never ship an unbounded payload to a less-protected
+    surface — by bounding here and masking credential-shaped values. The daemon scrubs
+    and clamps again on receipt; neither side trusts the other to have done it.
+    """
+    ti = ev.get("tool_input") or {}
+    raw = ti.get("command") or ti.get("file_path") or ti.get("path") or ""
+    if not raw and ti:
+        try:
+            raw = json.dumps(ti, sort_keys=True, default=str)
+        except Exception:
+            raw = str(ti)
+    raw = " ".join(str(raw).split())          # collapse newlines/heredocs to one line
+    KEYS = ("password","passwd","secret","token","api_key","apikey","api-key","auth",
+            "authorization","bearer","credential","private_key","passphrase",
+            "access_key","client_secret")
+    out, mask_next = [], False
+    for tok in raw.split(" "):
+        low = tok.lstrip("-").rstrip(":").lower()
+        if mask_next and not tok.startswith("-"):
+            out.append("***"); mask_next = False; continue
+        if "=" in tok:
+            k, _, _ = tok.partition("=")
+            if any(s in k.lstrip("-").lower() for s in KEYS):
+                out.append(k + "=***"); mask_next = False; continue
+        mask_next = low in KEYS
+        out.append(tok)
+    s = " ".join(out)
+    return s[:limit] + ("\u2026[truncated]" if len(s) > limit else "")
+
+
 def witness_decision(verb, reason, innate, verdict_available=True):
     """Witness a blocked/warned reach to the observation log. 'Reaching is witnessed' has to INCLUDE
     the reaches we deny — they are the boundary-tests the policy entity most needs (escalation
@@ -444,6 +485,7 @@ def _daemon_witness(verb, reason, verdict_available=True):
                            "tool_name": _EVENT.get("tool_name") or "",
                            "session_id": _EVENT.get("session_id"),
                            "payload_sha256": ti_hash,
+                           "attempted": _attempted_summary(_EVENT),
                            "role": _identity_role(),
                        }}}, 0.8)
 

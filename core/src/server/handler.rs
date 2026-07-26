@@ -621,6 +621,16 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 "rule_id": evaluation.rule_id,
                 "rule_name": evaluation.rule_name,
                 "reason": evaluation.reason,
+                // WHAT was attempted, not just what was decided. `target` already
+                // carries the command for Bash/Shell by overloading, but nothing else —
+                // so an Edit or an MCP deny recorded a verdict against a path with no
+                // trace of the operation. Stored explicitly and scrubbed, so the UI has
+                // one field to read for every tool rather than a per-tool special case.
+                "attempted": full_command
+                    .map(redact_secrets)
+                    .map(|a| if a.chars().count() > ATTEMPTED_MAX {
+                        a.chars().take(ATTEMPTED_MAX).collect::<String>() + "…[truncated]"
+                    } else { a }),
             }),
         );
 
@@ -778,6 +788,11 @@ fn gate_direct_tool(
                 "rule_id": evaluation.rule_id,
                 "rule_name": evaluation.rule_name,
                 "reason": evaluation.reason,
+                // No `attempted` here: this is the DIRECT-TOOL gate (vault reads, MCP
+                // calls), which is handed a tool name and a target and never a command
+                // payload. Emitting an empty string would let the UI render "no attempt
+                // recorded" as "nothing was attempted"; omitting the field lets it say
+                // honestly that this gate does not carry one.
             }),
         );
         // The envelope message is what the calling agent reads — carry the
@@ -1436,6 +1451,65 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
 /// Trust note: this is loopback-/mcp-reachable like `hestia_record_outcome`,
 /// which can already push negative outcomes — no NEW poisoning class; the
 /// /mcp caller-auth work (public-release P0-3) gates both together.
+/// Upper bound on a stored attempt. Long enough to reconstruct intent (a shell line, a
+/// patch header), short enough that a runaway heredoc cannot inflate the chain.
+const ATTEMPTED_MAX: usize = 400;
+
+/// Scrub obvious secrets out of an attempted command before it is persisted.
+///
+/// This is DEFENCE IN DEPTH, not the primary control — the sending gate is closer to the
+/// payload and knows its own harness's shapes. But "the sender promised to scrub" is the
+/// kind of assumption that produces the defects this codebase keeps finding, so the
+/// daemon scrubs whatever it is handed.
+///
+/// Deliberately conservative and shape-based rather than a secret detector: it masks the
+/// VALUE after a credential-ish flag or assignment and leaves the rest legible, because
+/// the point of storing the attempt is that a human can read it. It will not catch a
+/// secret with no give-away shape; nothing at this layer could, and claiming otherwise
+/// would be the false-security this whole surface is meant to avoid.
+fn redact_secrets(input: &str) -> String {
+    const KEYS: &[&str] = &[
+        "password", "passwd", "secret", "token", "api_key", "apikey", "api-key",
+        "auth", "authorization", "bearer", "credential", "private_key", "passphrase",
+        "access_key", "session_key", "client_secret",
+    ];
+    let mut out = String::with_capacity(input.len());
+    for (i, tok) in input.split_whitespace().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        // `--token=VALUE` / `TOKEN=VALUE` — mask the value, keep the key so the reader
+        // still learns WHICH knob was being set.
+        if let Some(eq) = tok.find('=') {
+            let (k, _) = tok.split_at(eq);
+            let kl = k.trim_start_matches('-').to_ascii_lowercase();
+            if KEYS.iter().any(|s| kl.contains(s)) {
+                out.push_str(k);
+                out.push_str("=***");
+                continue;
+            }
+        }
+        out.push_str(tok);
+    }
+    // `--token VALUE` (space-separated) needs a second pass over the rebuilt tokens.
+    let toks: Vec<&str> = out.split(' ').collect();
+    let mut fin: Vec<String> = Vec::with_capacity(toks.len());
+    let mut mask_next = false;
+    for t in toks {
+        if mask_next && !t.starts_with('-') {
+            fin.push("***".into());
+            mask_next = false;
+            continue;
+        }
+        mask_next = {
+            let tl = t.trim_start_matches('-').trim_end_matches(':').to_ascii_lowercase();
+            KEYS.iter().any(|s| tl == *s)
+        };
+        fin.push(t.to_string());
+    }
+    fin.join(" ")
+}
+
 async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult {
     let plugin_id = require_string(args, "plugin_id")?;
     let decision = require_string(args, "decision")?;
@@ -1452,6 +1526,24 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     let target = optional_string(args, "target").unwrap_or_default();
     let session_id = optional_string(args, "session_id");
     let payload_sha256 = optional_string(args, "payload_sha256");
+    // WHAT WAS ATTEMPTED (dp, 2026-07-26). Denies used to carry only a verdict, so the
+    // chain recorded permitted work verbatim (`outcome.target`) and blocked work not at
+    // all — backwards for precisely the entries worth reviewing. A deny you cannot
+    // reconstruct cannot be audited, exonerated with confidence, or mined for a false
+    // positive; today's `$d`-is-not-a-repo denial was only diagnosable because the
+    // offending token happened to be quoted into the reason string.
+    //
+    // The original redaction reasoning was sound and aimed at the wrong risk. Keep its
+    // intent — never persist an unbounded payload into a less-protected surface — by
+    // requiring the SENDER to bound and scrub, and by clamping here regardless, since a
+    // gate that over-shares must not be able to make the daemon over-store.
+    let attempted = optional_string(args, "attempted").map(|a| {
+        let mut a = redact_secrets(&a);
+        if a.chars().count() > ATTEMPTED_MAX {
+            a = a.chars().take(ATTEMPTED_MAX).collect::<String>() + "…[truncated]";
+        }
+        a
+    });
     let declared_role = optional_string(args, "role").unwrap_or_default();
     let role_lct = crate::reputation::normalize_constellation_role(&declared_role);
 
@@ -1471,6 +1563,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
             "adjudicator": adjudicator,
             "reason": reason,
             "payload_sha256": payload_sha256,
+            "attempted": attempted,
         }),
     )?;
     // Same asymmetric gate-risk trust as the daemon's own gate decisions.
