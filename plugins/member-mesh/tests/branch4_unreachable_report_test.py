@@ -15,7 +15,11 @@ test uses.
 Four cases:
   A  ordinary notice          -> one `reply` report, bound (in_reply_to=id),
                                  pointer keeps naming the content and gains
-                                 `#undelivered:fire-rc=N`; primer retained.
+                                 `#undelivered:fire-rc=N;via=watch-<member>` —
+                                 the fragment names the routing verdict AND the
+                                 observer, because the chain cannot otherwise
+                                 tell gateway from member (CBP review §4);
+                                 primer retained.
   B  ack notice               -> NO report (terminal; loop closed at send).
   C  pointer already carrying #undelivered -> NO report (ICMP-about-ICMP
                                  suppression — reports never report themselves).
@@ -28,6 +32,10 @@ Four cases:
                                  one-hop visited bit case C relies on, so a
                                  truncation that eats it turns suppression off
                                  exactly where pointers are longest.
+  G  report receipt           -> the journal line carries the daemon's
+                                 recipient_liveness verdict — a report that
+                                 itself queued into a name nothing drains must
+                                 not read as success (CBP review §5).
 
 Usage: ./branch4_unreachable_report_test.py   (runtime ~25s, deliberate waits)
 """
@@ -105,7 +113,8 @@ class StubDaemon:
                                                      "message": "stub denies the report"}}
                     else:
                         payload = {"queued_id": 9000 + len(outer.notify_calls),
-                                   "witnessEntryHash": "stubhash"}
+                                   "witnessEntryHash": "stubhash",
+                                   "recipient_liveness": "live"}
                 else:
                     payload = {}
                 rpc = {"jsonrpc": "2.0", "id": req.get("id", 9),
@@ -189,11 +198,17 @@ def main():
           and reports[0].get("kind") == "reply"
           and reports[0].get("in_reply_to") == 42
           and reports[0].get("pointer_uri")
-          == NOTICE_A["pointer_uri"] + "#undelivered:fire-rc=3")
+          == NOTICE_A["pointer_uri"] + "#undelivered:fire-rc=3;via=watch-dest-member")
     check("A: exactly one bound reply report to the original sender, pointer names "
-          "the undelivered content + the routing verdict", ok,
+          "the undelivered content + the routing verdict + the observer", ok,
           f"notify_calls={json.dumps(reports)}\n{out}")
     check("A: report journaled", "UNREACHABLE reported" in out, out)
+
+    # Case G (CBP review §5) — the report's own receipt is not success-shaped:
+    # the journal line carries the daemon's recipient_liveness verdict, so a
+    # report that queued into a name nothing drains reads as what it is.
+    check("G: the report receipt journals the daemon's recipient_liveness verdict",
+          "UNREACHABLE reported (recipient: live)" in out, out)
 
     # Case B — acks are terminal; an undelivered ack is not reported.
     daemon, out, primers, _ = run_watcher([dict(NOTICE_ACK)])
@@ -224,13 +239,16 @@ def main():
     daemon, out, primers, _ = run_watcher([dict(NOTICE_MAX)])
     reports = list(daemon.notify_calls)
     ptr = reports[0].get("pointer_uri", "") if reports else ""
-    check("E: at the 512-byte MTU the routing verdict survives — marker intact, "
-          "still within MTU, and not byte-identical to the reported notice",
+    check("E: at the 512-byte MTU the routing verdict survives — marker AND "
+          "observer intact, still within MTU, and not byte-identical to the "
+          "reported notice",
           len(reports) == 1
           and "#undelivered:fire-rc=3" in ptr
+          and ";via=watch-dest-member" in ptr
           and len(ptr.encode()) <= 512
           and ptr != MAX_POINTER,
           f"len={len(ptr.encode())} marker={'#undelivered' in ptr} "
+          f"via={';via=watch-dest-member' in ptr} "
           f"identical={ptr == MAX_POINTER}\n        ptr={ptr!r}\n{out}")
     # ...and the report it produced must itself be suppressed on the next hop,
     # which is the property case C asserts and the only reason the marker matters.
