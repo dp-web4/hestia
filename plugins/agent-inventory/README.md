@@ -202,9 +202,11 @@ ruvector/.claude/settings.json               PreToolUse -> /workspaces/ruvector/
 ```
 
 The first two are the same defect Thor reported on Thor, on the machine that wrote the
-check. CBP's **user**-scope gate is live and fail-closed — verified incidentally during
-this work, when it refused an `rm -rf` from this session. The dead ones are one scope down,
-which is precisely why the first cut could not see them.
+check. CBP's **user**-scope gate is live and enforcing — verified incidentally during this
+work, when a daemon deny refused an `rm -rf` from this session — but it is **fail-open**:
+`HESTIA_PRE_FAIL_CLOSED` is unset, and on 2026-07-26 the legacy fallback engine decided 73
+recorded calls (74 attempted; one record destroyed by a torn write in `~/.web4/r6/`). The
+dead ones are one scope down, which is precisely why the first cut could not see them.
 
 Prior reading at `209e154`, same machine, same hour: `OK — 1 installed, 1 governed`.
 Every difference is a blind spot, not a change on disk.
