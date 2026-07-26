@@ -2007,17 +2007,39 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                     Some(json!({ "to_plugin_id": to_plugin })),
                 ));
             }
-            s.inbox_store
-                .enqueue_egress(
-                    peer,
-                    remote_member,
-                    &sender.plugin_id,
-                    &sender.role_lct,
-                    &kind,
-                    pointer_uri.as_deref(),
-                    &entry.hash,
-                )
-                .map_err(|e| anyhow::anyhow!("queueing egress notice: {e}"))?
+            // The egress plane's admission bound (`MAX_EGRESS_QUEUE`) refuses rather
+            // than evicting: a parked forward has no report path on this branch, so
+            // dropping one is a silent loss, while refusing the newest send reaches a
+            // caller who is live and holds the receipt. Named error, not a bare
+            // anyhow — "the forwarding plane is backed up" is a fact the sender can
+            // act on (and it says how backed up).
+            match s.inbox_store.enqueue_egress(
+                peer,
+                remote_member,
+                &sender.plugin_id,
+                &sender.role_lct,
+                &kind,
+                pointer_uri.as_deref(),
+                &entry.hash,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_egress_queue_full",
+                        &format!(
+                            "the forwarding plane is not draining, so this notice was \
+                             NOT queued: {e}. The act is witnessed either way — see \
+                             witnessEntryHash — so the refusal is on record too."
+                        ),
+                        Some(json!({
+                            "to_plugin_id": to_plugin,
+                            "dest_peer": peer,
+                            "egress_queued": s.inbox_store.egress_queued().unwrap_or(0),
+                            "witnessEntryHash": entry.hash,
+                        })),
+                    ));
+                }
+            }
         }
         None => s
             .inbox_store

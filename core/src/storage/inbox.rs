@@ -31,6 +31,15 @@ const INBOX_TTL_SECS: i64 = 7 * 24 * 3600;
 /// beyond drop-oldest is a ZAP Q4 question, not settled here.
 const MAX_INBOX_NOTICES: u64 = 1000;
 
+/// Egress-plane admission cap (r6-routing branch 2). Deliberately its own bound
+/// and deliberately much smaller than the local cap: a forward is parked for a
+/// drain that runs on a 20s tick against a hub that may be down, so a queue this
+/// deep already means the forwarding plane is not working and the honest answer
+/// is to tell the next sender so. Enforced by REFUSING admission, never by
+/// eviction — see [`InboxStore::enqueue_egress`] for why that asymmetry is not
+/// arbitrary.
+const MAX_EGRESS_QUEUE: u64 = 200;
+
 /// One deferred inbound notice, exactly as it arrived: `sealed` is still the
 /// hub-sealed ciphertext; `pair_id` + `hub_pubkey_hex` are the channel context
 /// needed to open it at drain time.
@@ -417,6 +426,26 @@ impl SqliteInboxStore {
     ) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
+        // The forwarding plane carries its OWN bound, because it no longer borrows
+        // the local plane's (see `enqueue_member`: the TTL prune and the cap used to
+        // reach across the seam and delete queued forwards). A bound that EVICTS
+        // needs a report path to stay honest, and on this branch the egress seam has
+        // none — no `mark_egress_failed`, no attempt counter, nothing that can say a
+        // forward was dropped. So this bound REFUSES ADMISSION instead: the caller is
+        // live, holds the receipt, and learns immediately. Backpressure to a present
+        // sender is attributable; eviction of a parked row is the black hole.
+        let queued: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM member_notices
+              WHERE dest_peer IS NOT NULL AND drained_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if queued as u64 >= MAX_EGRESS_QUEUE {
+            anyhow::bail!(
+                "egress queue full ({queued}/{MAX_EGRESS_QUEUE} undrained forwards) — \
+                 refusing admission rather than evicting a queued forward"
+            );
+        }
         conn.execute(
             "INSERT INTO member_notices
                 (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at, dest_peer)
@@ -426,6 +455,21 @@ impl SqliteInboxStore {
         )
         .context("enqueueing egress notice")?;
         Ok(conn.last_insert_rowid() as u64)
+    }
+
+    /// Undrained forwards currently parked on the egress plane — the number the
+    /// admission bound in [`Self::enqueue_egress`] tests. Exposed so a caller can
+    /// report the queue depth without provoking the refusal.
+    pub fn egress_queued(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM member_notices
+              WHERE dest_peer IS NOT NULL AND drained_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(n as u64)
     }
 
     /// Undrained egress rows, oldest first: (id, dest_peer, to_plugin, kind, pointer_uri).
@@ -475,8 +519,15 @@ impl SqliteInboxStore {
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
+        // `dest_peer IS NULL` = the LOCAL plane. Every statement in this function
+        // carries it, because without it a local send reaches across the seam:
+        // this prune DELETED queued forwards (hard, no mark, no report, so branch 4
+        // can never speak for them), and the cap below evicted them. Both were
+        // triggered by traffic between two OTHER members — the forward's sender and
+        // recipient are not parties to the send that destroys it. The forwarding
+        // plane's own bound lives in `enqueue_egress`.
         conn.execute(
-            "DELETE FROM member_notices WHERE queued_at < ?1",
+            "DELETE FROM member_notices WHERE queued_at < ?1 AND dest_peer IS NULL",
             params![cutoff],
         )
         .context("pruning expired member notices")?;
@@ -503,8 +554,16 @@ impl SqliteInboxStore {
         // mail to that same recipient. That residual channel is bounded by the
         // flood guard and, unlike the one removed here, requires the attacker
         // to be in a relationship with the victim's counterparty.
+        // Scoped to the local plane for a second reason beyond the deletion: an
+        // egress row bound for `peer/m` carries `to_plugin = 'm'`, so unfiltered it
+        // spent LOCAL member `m`'s admission budget. That is the cross-member denial
+        // channel the comment above says was closed — reopened across the
+        // local/remote seam instead of across recipients, and worse attributed: the
+        // eviction counter below books the loss under the local id `m`, so the
+        // forensics name a member that was never involved.
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM member_notices WHERE to_plugin = ?1 AND drained_at IS NULL",
+            "SELECT COUNT(*) FROM member_notices
+              WHERE to_plugin = ?1 AND drained_at IS NULL AND dest_peer IS NULL",
             params![to_plugin],
             |row| row.get(0),
         )?;
@@ -512,7 +571,8 @@ impl SqliteInboxStore {
             conn.execute(
                 "DELETE FROM member_notices
                  WHERE id = (SELECT MIN(id) FROM member_notices
-                             WHERE to_plugin = ?1 AND drained_at IS NULL)",
+                             WHERE to_plugin = ?1 AND drained_at IS NULL
+                               AND dest_peer IS NULL)",
                 params![to_plugin],
             )
             .context("dropping oldest member notice at cap")?;
@@ -564,13 +624,30 @@ impl SqliteInboxStore {
     /// "no such row" — which is NOT the same as "forged": notices age out on
     /// the TTL, so an honest late binding to a pruned notice is unverifiable
     /// rather than false. Callers must not read the two cases as one.
+    ///
+    /// For a row on the FORWARDING plane this returns the ROUTED address
+    /// (`peer/member`), not the bare remote member id. An egress row bound for
+    /// `thor/claude-code` stores `to_plugin = 'claude-code'`, so returning the bare
+    /// column let a local member named `claude-code` bind `in_reply_to` to it and be
+    /// told `binding_verified: true` — a witnessed claim to have answered mail
+    /// addressed to a different machine. Returning the routed form makes the
+    /// caller's equality test fail and its error name the real addressee. Returning
+    /// `None` would have been wrong for the reason the paragraph above gives: a
+    /// forward is not *unverifiable*, it is verifiably someone else's.
     pub fn member_notice_recipient(&self, id: u64) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
-        let mut stmt = conn.prepare("SELECT to_plugin FROM member_notices WHERE id = ?1")?;
+        let mut stmt =
+            conn.prepare("SELECT to_plugin, dest_peer FROM member_notices WHERE id = ?1")?;
         let mut rows = stmt.query(params![id as i64])?;
         Ok(match rows.next()? {
-            Some(row) => Some(row.get::<_, String>(0)?),
+            Some(row) => {
+                let to_plugin: String = row.get(0)?;
+                Some(match row.get::<_, Option<String>>(1)? {
+                    Some(peer) => format!("{peer}/{to_plugin}"),
+                    None => to_plugin,
+                })
+            }
             None => None,
         })
     }
@@ -602,6 +679,7 @@ impl SqliteInboxStore {
                             in_reply_to
                      FROM member_notices
                      WHERE to_plugin = ?1 AND queued_at >= ?2 AND drained_at IS NULL
+                       AND dest_peer IS NULL
                      ORDER BY id ASC",
                 )
                 .context("preparing member drain SELECT")?;
@@ -646,9 +724,18 @@ impl SqliteInboxStore {
             }
             out
         };
+        // `dest_peer IS NULL` here is load-bearing twice over. This UPDATE is broader
+        // than the SELECT above (no `queued_at` cutoff), so unfiltered ONE local drain
+        // by member `m` marked EVERY parked forward bound for a remote `m` — including
+        // rows older than the TTL that the SELECT never returned and nobody was ever
+        // shown. And `drained_at` is the exact predicate `pending_egress` reads as
+        // "already handed to the fleet mesh", so the mark did not merely mislabel the
+        // rows, it cancelled the forwards: accepted, witnessed, enqueued, never sent,
+        // never reported, success code — the black hole this branch was built to close,
+        // reconstituted one plane up.
         tx.execute(
             "UPDATE member_notices SET drained_at = ?2
-             WHERE to_plugin = ?1 AND drained_at IS NULL",
+             WHERE to_plugin = ?1 AND drained_at IS NULL AND dest_peer IS NULL",
             params![to_plugin, now.to_rfc3339()],
         )
         .context("marking drained member notices")?;
@@ -666,6 +753,12 @@ impl SqliteInboxStore {
     /// Peeking counts as a sighting for the same reason draining does: the
     /// member reached for its own mailbox. A member that only ever peeks is
     /// still reachable.
+    ///
+    /// `dest_peer IS NULL` matters even though a peek consumes nothing: this is the
+    /// SessionStart surface, so without it a local member's session opened holding
+    /// the `kind`, `pointer_uri` and `from_plugin` of mail addressed to a member on
+    /// another machine. Disclosure needs no drain. README §7.3 is why speculative
+    /// forwarding was kept out of v1; the name collision got there without it.
     pub fn peek_member(&self, to_plugin: &str) -> Result<Vec<MemberNotice>> {
         let now = Utc::now();
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
@@ -676,7 +769,9 @@ impl SqliteInboxStore {
             "SELECT id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
                     in_reply_to
              FROM member_notices
-             WHERE to_plugin = ?1 AND queued_at >= ?2 AND drained_at IS NULL ORDER BY id ASC",
+             WHERE to_plugin = ?1 AND queued_at >= ?2 AND drained_at IS NULL
+               AND dest_peer IS NULL
+             ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![to_plugin, cutoff], |row| {
             Ok((
@@ -707,11 +802,17 @@ impl SqliteInboxStore {
 
     /// Count queued notices for a recipient without consuming (the watcher's
     /// cheap poll — fire the member only when there is something to read).
+    ///
+    /// Local plane only: this count is what decides whether to WAKE a member, and a
+    /// parked forward bound for `peer/m` is not work for local `m`. Unfiltered, a
+    /// forward woke the wrong member — which is also how it got consumed, since the
+    /// session that was woken then drained.
     pub fn member_pending(&self, to_plugin: &str) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
         let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM member_notices WHERE to_plugin = ?1 AND drained_at IS NULL",
+            "SELECT COUNT(*) FROM member_notices
+              WHERE to_plugin = ?1 AND drained_at IS NULL AND dest_peer IS NULL",
             params![to_plugin],
             |row| row.get(0),
         )?;
@@ -727,6 +828,18 @@ impl SqliteInboxStore {
     /// one that was never read. This query closes the loop for RESPONSIVENESS,
     /// not for ACTION — a member who woke, worked in a repo, and said nothing
     /// still shows up. Lookback is bounded by the TTL prune (7d).
+    ///
+    /// **Local plane only, and this one is not symmetry for its own sake.** The
+    /// clearing condition is "some row binds `in_reply_to = n.id`", and for a
+    /// forward that condition is UNSATISFIABLE BY CONSTRUCTION: the answering party
+    /// is on another machine, `enqueue_egress` carries no `in_reply_to` column to
+    /// bind across the seam, and the reply arrives as a watcher FIRE, never as a
+    /// local row. Unfiltered, every forward entered its sender's `owed_to_me` and
+    /// could never leave — the tool whose job is measuring responsiveness accusing
+    /// the fleet of never answering, once per forward, forever. Excluding forwards
+    /// makes it silent about them instead of permanently wrong about them; a real
+    /// unanswered-forward report needs a far-end evidence channel, and this thread's
+    /// finding is that no such channel exists yet (the substrate is negative-only).
     pub fn member_unanswered(
         &self,
         plugin: &str,
@@ -747,6 +860,7 @@ impl SqliteInboxStore {
             "SELECT id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at
              FROM member_notices n
              WHERE (n.to_plugin = ?1 OR n.from_plugin = ?1)
+               AND n.dest_peer IS NULL
                AND n.queued_at < ?2
                AND n.kind IN ({placeholders})
                AND NOT EXISTS (SELECT 1 FROM member_notices r WHERE r.in_reply_to = n.id)
@@ -1160,6 +1274,213 @@ mod tests {
         // And the file on disk is not plaintext SQLite.
         let hdr = &std::fs::read(&path).unwrap()[..16];
         assert_ne!(hdr, b"SQLite format 3\0", "inbox must be encrypted at rest");
+    }
+
+    // ---- the local plane must not see the forwarding plane (r6-routing B1) -------
+    //
+    // `enqueue_egress` stores the REMOTE member id in `to_plugin` with `dest_peer`
+    // alongside, so every local-plane query that keys on `to_plugin` alone matched
+    // forwards too. `claude-code` and `kimi-code` are the two most common member ids
+    // in the fleet, which makes `peer/claude-code` — the address the proposal's own
+    // §3 test used — the default case, not a corner. Each test below fails against
+    // the unfiltered statement it names.
+
+    /// The whole of B1 in one sequence: a forward must be invisible to the local
+    /// member that shares its name, on every local surface, and must SURVIVE that
+    /// member's drain still pending on the egress plane.
+    #[test]
+    fn a_forward_is_not_local_mail_for_the_member_that_shares_its_name() {
+        let (_tmp, store) = fresh();
+        let egress = store
+            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/for-thor.md#thread=t"), "hash-egress")
+            .unwrap();
+        let local = store
+            .enqueue_member("claude-code", "kimi-code", "role:r", "coordination",
+                            Some("forum/for-me.md#thread=t"), "hash-local", None)
+            .unwrap();
+        // The wake decision, the SessionStart disclosure, and the drain: one row each.
+        assert_eq!(store.member_pending("claude-code").unwrap(), 1,
+                   "the forward woke the local member");
+        let peeked = store.peek_member("claude-code").unwrap();
+        assert_eq!(peeked.len(), 1, "SessionStart disclosed another machine's mail");
+        assert_eq!(peeked[0].id, local);
+        let drained = store.drain_member("claude-code").unwrap();
+        assert_eq!(drained.len(), 1, "the local member consumed the forward");
+        assert_eq!(drained[0].chain_hash, "hash-local");
+        // ...and the forward is still there, still pending, still going to Thor.
+        let pending = store.pending_egress(25).unwrap();
+        assert_eq!(pending.len(), 1, "the local drain cancelled the forward");
+        assert_eq!(pending[0].0, egress);
+        assert_eq!(pending[0].1, "thor");
+    }
+
+    /// `drain_member`'s UPDATE is broader than its SELECT (no `queued_at` cutoff),
+    /// so one local drain used to mark EVERY forward bound for a remote member of
+    /// the same name — including rows the SELECT never returned and nobody saw.
+    /// Mass cancel, no log line. Falsifier for the UPDATE specifically: the SELECT
+    /// fix alone still fails this.
+    #[test]
+    fn one_local_drain_cannot_cancel_every_forward_of_that_name() {
+        let (_tmp, store) = fresh();
+        for peer in ["thor", "mcnugget", "legion"] {
+            store
+                .enqueue_egress(peer, "kimi-code", "claude-code", "role:r", "review_done",
+                                Some("forum/x.md#thread=t"), "hash-e")
+                .unwrap();
+        }
+        // An empty drain is enough — the UPDATE does not depend on the SELECT.
+        assert!(store.drain_member("kimi-code").unwrap().is_empty());
+        assert_eq!(store.pending_egress(25).unwrap().len(), 3,
+                   "an empty local drain marked the forwards handed to the mesh");
+    }
+
+    /// Two paths DELETED forwards outright — a hard loss with no mark and no report,
+    /// so branch 4 can never speak for them. Both are triggered by traffic between
+    /// two OTHER members: neither the forward's sender nor its recipient is a party
+    /// to the send that destroys it.
+    #[test]
+    fn a_local_send_cannot_delete_a_parked_forward() {
+        let (_tmp, store) = fresh();
+        let egress = store
+            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/for-thor.md#thread=t"), "hash-egress")
+            .unwrap();
+        // Path 1 — the cap. Local `claude-code` is flooded past MAX_INBOX_NOTICES by
+        // a third party; the eviction takes MIN(id), and the forward is id 1.
+        for i in 0..(MAX_INBOX_NOTICES + 3) {
+            store
+                .enqueue_member("claude-code", "hub-supervisor", "role:r", "coordination",
+                                Some(&format!("forum/f{i}.md#t")), "hash-flood", None)
+                .unwrap();
+        }
+        assert_eq!(store.pending_egress(25).unwrap().len(), 1,
+                   "a flood at the local member of the same name deleted the forward");
+        assert_eq!(store.pending_egress(25).unwrap()[0].0, egress);
+        // The eviction ledger must not book the loss under the local id either: the
+        // count is the only trace an eviction leaves, and 3 evictions of local mail
+        // is a different fact from 4 with a forward among them.
+        assert_eq!(store.member_evictions("claude-code").unwrap(), 3);
+    }
+
+    /// Path 2 — the TTL prune, which runs on EVERY local enqueue and had no
+    /// `dest_peer` clause at all. The row has to be aged past `INBOX_TTL_SECS` for
+    /// the prune to reach it, which is the whole point: `pending_egress` has no TTL
+    /// filter of its own, so a forward that has been waiting on a down hub longer
+    /// than a week was deleted — hard, no mark, nothing branch 4 could report on — by
+    /// the next unrelated local send. (Written this way because the first version of
+    /// this test used fresh rows and passed against the unfiltered statement: the
+    /// mutation check caught it, the assertion did not.)
+    #[test]
+    fn an_aged_forward_survives_the_local_ttl_prune() {
+        let (_tmp, store) = fresh();
+        let egress = store
+            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/for-thor.md#thread=t"), "hash-egress")
+            .unwrap();
+        let stale = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS + 3600)).to_rfc3339();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE member_notices SET queued_at = ?1 WHERE id = ?2",
+                     params![stale, egress as i64])
+            .unwrap();
+        assert_eq!(store.pending_egress(25).unwrap().len(), 1, "setup: still queued");
+        // A send between two OTHER members — neither the forward's sender nor its
+        // recipient is a party to it.
+        store
+            .enqueue_member("codex-cli", "kimi-code", "role:r", "coordination",
+                            Some("forum/unrelated.md#t"), "hash-u", None)
+            .unwrap();
+        assert_eq!(store.pending_egress(25).unwrap().len(), 1,
+                   "an unrelated local send deleted the aged forward");
+        assert_eq!(store.pending_egress(25).unwrap()[0].0, egress);
+    }
+
+    /// A local member must not be able to claim it answered mail addressed to a
+    /// member on another machine. `member_notice_recipient` returned the bare
+    /// `to_plugin`, so `claude-code` binding `in_reply_to` to a forward for
+    /// `thor/claude-code` was told `binding_verified: true` and the claim was
+    /// witnessed. The routed form makes the caller's equality test fail — and,
+    /// deliberately, does NOT return `None`: a forward is not unverifiable, it is
+    /// verifiably someone else's.
+    #[test]
+    fn a_forwards_reply_binding_names_the_routed_addressee() {
+        let (_tmp, store) = fresh();
+        let egress = store
+            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/x.md#thread=t"), "hash-e")
+            .unwrap();
+        assert_eq!(
+            store.member_notice_recipient(egress).unwrap().as_deref(),
+            Some("thor/claude-code"),
+            "a local member of the same name could bind to another machine's mail"
+        );
+        let local = store
+            .enqueue_member("claude-code", "kimi-code", "role:r", "reply",
+                            Some("forum/y.md#t"), "hash-l", None)
+            .unwrap();
+        assert_eq!(store.member_notice_recipient(local).unwrap().as_deref(),
+                   Some("claude-code"), "local rows keep the bare id");
+    }
+
+    /// `member_unanswered`'s clearing condition — some row binds
+    /// `in_reply_to = n.id` — is unsatisfiable for a forward: the answering party is
+    /// on another machine, `enqueue_egress` has no `in_reply_to` column, and the
+    /// reply arrives as a watcher fire rather than a local row. So an unfiltered
+    /// query accused the fleet of never answering, once per forward, forever.
+    #[test]
+    fn a_forward_cannot_poison_its_senders_unanswered_report() {
+        let (_tmp, store) = fresh();
+        store
+            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "review_done",
+                            Some("forum/x.md#thread=t"), "hash-e")
+            .unwrap();
+        // `-1` = "older than one second in the future", i.e. include everything.
+        let owed = store.member_unanswered("codex-cli", &["review_done"], -1).unwrap();
+        assert!(owed.is_empty(), "the forward entered owed_to_me and can never leave");
+        // The local plane still reports, or the filter would have bought silence.
+        store
+            .enqueue_member("kimi-code", "codex-cli", "role:r", "review_done",
+                            Some("forum/y.md#t"), "hash-l", None)
+            .unwrap();
+        assert_eq!(store.member_unanswered("codex-cli", &["review_done"], -1).unwrap().len(), 1);
+    }
+
+    /// Removing the local plane's (wrong) bound from the egress plane leaves the
+    /// egress plane unbounded, which is Kimi's §4. Its replacement REFUSES admission
+    /// rather than evicting, because eviction needs a report path and this branch's
+    /// egress seam has none — no `mark_egress_failed`, no attempt counter. The
+    /// refused sender is live and holds the receipt; an evicted parked row is not.
+    #[test]
+    fn the_egress_plane_carries_its_own_bound_and_it_refuses_rather_than_evicts() {
+        let (_tmp, store) = fresh();
+        let first = store
+            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/first.md#t"), "hash-first")
+            .unwrap();
+        for i in 1..MAX_EGRESS_QUEUE {
+            store
+                .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+                                Some(&format!("forum/f{i}.md#t")), "hash-e")
+                .unwrap();
+        }
+        assert_eq!(store.egress_queued().unwrap(), MAX_EGRESS_QUEUE);
+        let refused = store.enqueue_egress("thor", "claude-code", "codex-cli", "role:r",
+                                           "reply", Some("forum/over.md#t"), "hash-o");
+        assert!(refused.is_err(), "the egress plane admitted past its cap");
+        // The oldest forward is still queued: at the bound we tell the newest sender
+        // no, we do not silently destroy the oldest sender's packet.
+        assert_eq!(store.pending_egress(1).unwrap()[0].0, first);
+        assert_eq!(store.egress_queued().unwrap(), MAX_EGRESS_QUEUE);
+        // And the bound is the EGRESS plane's: local mail is unaffected by a full
+        // egress queue, which is the same seam this whole block is about.
+        store
+            .enqueue_member("claude-code", "kimi-code", "role:r", "coordination",
+                            Some("forum/local.md#t"), "hash-l", None)
+            .unwrap();
+        assert_eq!(store.member_pending("claude-code").unwrap(), 1);
     }
 
     #[test]
