@@ -1,0 +1,4 @@
+{
+  "gate": ["PreToolUse"],
+  "observe": ["PostToolUse"]
+}

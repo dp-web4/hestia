@@ -1,0 +1,4 @@
+{
+  "gate": ["BeforeTool"],
+  "observe": ["AfterTool"]
+}
