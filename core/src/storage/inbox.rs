@@ -1355,6 +1355,46 @@ mod tests {
         assert_eq!(pending[0].1, "thor");
     }
 
+    /// The rows a pre-branch-2 daemon left behind, which the `dest_peer` predicate
+    /// CANNOT protect — and the reason the real guard is at connect, not here.
+    ///
+    /// Before branch 2, `member_notify` did not split the recipient, so
+    /// `to="cbp/claude-code"` parked as a LOCAL row under that literal string:
+    /// `dest_peer IS NULL`. This fleet's deployed daemon is that build (`113a46a`, no
+    /// `split_once('/')` in `member_notify`), so these rows are not hypothetical, and an
+    /// upgrade does not rewrite them. Every statement #42 added filters on
+    /// `dest_peer IS NULL` = "the local plane" — which is exactly where these sit. They
+    /// are therefore simultaneously:
+    ///   - undeliverable: not in the forwarding plane, so `egress-drain` never sees them;
+    ///   - capturable: `drain_member("cbp/claude-code")` hands them over.
+    /// Nothing in the storage layer can tell this row from ordinary local mail — the
+    /// string is all there is. So the bound has to be on who may HOLD that id, which is
+    /// `connect_refuses_a_routed_address_as_a_member_id` in `server::handler`. This test
+    /// exists to keep that reasoning falsifiable: if a later change makes these rows
+    /// undrainable at the storage layer, this test fails and the connect guard's
+    /// justification needs rewriting rather than silently becoming belt-and-braces.
+    #[test]
+    fn legacy_local_rows_addressed_to_a_routed_id_are_undrainable_only_by_identity() {
+        let (_tmp, store) = fresh();
+        // Exactly what the pre-branch-2 daemon wrote: no dest_peer, slash in to_plugin.
+        store
+            .enqueue_member("cbp/claude-code", "codex", "role:r", "coordination",
+                            Some("forum/for-cbp.md#thread=t"), "hash-legacy", None)
+            .unwrap();
+        assert!(
+            store.pending_egress(25).unwrap().is_empty(),
+            "a legacy slashed row appeared in the forwarding plane — then the premise \
+             of this test is wrong and the row is deliverable after all"
+        );
+        assert_eq!(
+            store.member_pending("cbp/claude-code").unwrap(), 1,
+            "the local plane no longer counts it — re-derive the connect guard's rationale"
+        );
+        let drained = store.drain_member("cbp/claude-code").unwrap();
+        assert_eq!(drained.len(), 1, "storage-layer capture is closed; see the doc comment");
+        assert_eq!(drained[0].chain_hash, "hash-legacy");
+    }
+
     /// `drain_member`'s UPDATE is broader than its SELECT (no `queued_at` cutoff),
     /// so one local drain used to mark EVERY forward bound for a remote member of
     /// the same name — including rows the SELECT never returned and nobody saw.

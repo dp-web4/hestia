@@ -250,6 +250,40 @@ type ToolResult = Result<Value, anyhow::Error>;
 
 async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     let plugin_id = require_string(args, "plugin_id")?;
+    // `/` is the routed-address separator (r6-routing branch 2: `peer/member`), so a
+    // member id containing one makes the address form AMBIGUOUS at its own parse site.
+    // This is a guard on the *identity claim*, not on a recipient — the thread's
+    // "accept always, record always" posture governs unknown RECIPIENTS, where a
+    // refusal would silence a member setting up a new watcher. An id the address
+    // grammar cannot represent is a different thing: it is not an identity you can be.
+    //
+    // What it closes, concretely. `plugin_id` is caller-supplied at connect and was
+    // unvalidated, while the drain key IS the caller's resolved `plugin_id`
+    // (`drain_member`). On a build WITHOUT the forwarding plane — which is the deployed
+    // population, not a hypothetical: this fleet's daemon is `113a46a`, 8 commits below
+    // `main`, with no `split_once('/')` anywhere in `member_notify` — a notice sent to
+    // `to="cbp/claude-code"` takes the LOCAL arm and parks under that literal string.
+    // Any local client could then connect claiming `plugin_id = "cbp/claude-code"` and
+    // DRAIN it. So the deploy-order hazard is not only the black-hole-with-a-success-code
+    // already reported; mail addressed to another machine's member was deliverable to a
+    // local claimant. Capture is worse than loss, because loss is eventually noticed.
+    //
+    // HONEST SCOPE, because the reverse is easy to assume: this does NOT rescue the
+    // deployed population. Any commit carrying this guard also carries branch 2
+    // (`e71c422` is already an ancestor of `main`), so installing the guard installs
+    // routing — the two cannot be sequenced by upgrading. Closing it there needs a
+    // backport onto the deployed line, which is a release decision, not a patch. What
+    // this DOES buy is the invariant the address form always assumed and never stated:
+    // on any build that has it, a `/` in an id means "another scale" and nothing else.
+    if plugin_id.contains('/') {
+        return Ok(hestia_error_envelope(
+            "hestia.connect_bad_plugin_id",
+            "a member id may not contain '/': that is the `peer/member` routed-address \
+             separator, and an id containing it would let a local member claim an \
+             address belonging to another machine's member",
+            Some(json!({ "plugin_id": plugin_id })),
+        ));
+    }
     let host_agent = require_string(args, "host_agent")?;
     let plugin_version = optional_string(args, "plugin_version");
     let host_agent_version = optional_string(args, "host_agent_version");
@@ -4538,6 +4572,48 @@ mod member_mesh_tests {
             assert_eq!(
                 out["_hestia_error"]["code"],
                 "hestia.member_notify_bad_pointer"
+            );
+        }
+    }
+
+    /// `plugin_id` is caller-supplied at connect and was unvalidated, while the drain
+    /// key IS the caller's resolved `plugin_id`. So a client could claim
+    /// `cbp/claude-code` — a ROUTED address — as its own local identity. Paired with
+    /// `legacy_local_rows_addressed_to_a_routed_id_are_undrainable` in `storage::inbox`:
+    /// that test shows such rows exist and stay in the local plane; this one shows
+    /// nobody can hold the id needed to drain them.
+    #[tokio::test]
+    async fn connect_refuses_a_routed_address_as_a_member_id() {
+        let (_dir, state) = test_state().await;
+        for bad in ["cbp/claude-code", "a/b", "/", "peer/"] {
+            let out = tool_connect(&state, &json!({"plugin_id": bad, "host_agent": "t"}))
+                .await
+                .unwrap();
+            assert_eq!(
+                out["_hestia_error"]["code"], "hestia.connect_bad_plugin_id",
+                "'{bad}' was accepted as a local member id: {out}"
+            );
+            assert!(
+                out.get("sessionId").is_none(),
+                "'{bad}' got a session despite the refusal: {out}"
+            );
+        }
+    }
+
+    /// The guard's blast radius. A charset refusal at connect is a hard denial, so the
+    /// falsifier that matters is not "does it reject" but "does it reject only that" —
+    /// every id this fleet actually uses must still connect. Widening the predicate
+    /// (e.g. to alphanumeric-only) fails HERE rather than in the field.
+    #[tokio::test]
+    async fn connect_still_accepts_every_member_id_this_fleet_uses() {
+        let (_dir, state) = test_state().await;
+        for ok in ["claude-code", "codex", "kimi-code", "cursor", "claude", "gemini"] {
+            let out = tool_connect(&state, &json!({"plugin_id": ok, "host_agent": "t"}))
+                .await
+                .unwrap();
+            assert!(
+                out["sessionId"].is_string(),
+                "the guard refused a real member id '{ok}': {out}"
             );
         }
     }
