@@ -364,12 +364,27 @@ def witness_decision(verb, reason, innate, verdict_available=True):
     # Fire-and-forget: short timeouts, every failure swallowed — the deny path already exits
     # 2 regardless, and a down daemon must never change the decision.
     try:
-        _daemon_witness(verb, reason)
-    except Exception:
-        pass
+        _daemon_witness(verb, reason, verdict_available)
+    except Exception as e:
+        # Still fail-safe: the deny stands regardless (the caller exits 2 either way).
+        # But no longer SILENT. A bare `except: pass` here hid a NameError that dropped
+        # EVERY daemon-side deny receipt while the local observe log kept working — so the
+        # gate looked healthy from inside, the agent was correctly blocked, and the
+        # dashboard showed nothing. A witness that can fail invisibly is not a witness.
+        # Report on stderr AND to the one channel known to still work.
+        try:
+            sys.stderr.write("hestia: WARNING - deny receipt not delivered to daemon: "
+                             f"{type(e).__name__}: {e}\n")
+            with open(os.path.join(OBSERVE_DIR, "observe.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps({"hook_event_name": "PreToolUse",
+                                    "hestia_decision": verb,
+                                    "witness_delivery_failed": f"{type(e).__name__}: {e}",
+                                    "plugin": "codex"}) + "\n")
+        except Exception:
+            pass
 
 
-def _daemon_witness(verb, reason):
+def _daemon_witness(verb, reason, verdict_available=True):
     """Single-shot MCP call: initialize -> tools/call hestia_witness_decision. ~1s worst case,
     only ever runs on the deny/warn path (never on allows, so no hook-clamp pressure)."""
     import urllib.request
