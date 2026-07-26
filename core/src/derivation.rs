@@ -188,6 +188,30 @@ pub fn derive(
                 || sid.contains("e2e") || sid.contains("debug")
         })
     };
+    // A deny that carries NO VERDICT is not evidence about the member.
+    //
+    // The gate fails closed when it cannot reach a verdict in time — codex's gate gives the
+    // delegated society-safety subprocess 2s (deliberately under Codex's 3s hook clamp, so a
+    // slow daemon fails CLOSED rather than fail-OPEN). The resulting block says "I could not
+    // judge", not "I judged you badly", and the member could not have behaved its way out of
+    // it. Counting it as conduct reads absence-of-judgment as negative-judgment — the same
+    // null-state-mistaken-for-a-real-state defect this corpus keeps finding, arriving inside
+    // the trust computation itself.
+    //
+    // dp, 2026-07-26, on codex being dinged for two of these while the daemon was demonstrably
+    // up (outcomes witnessed seconds either side): "well, fix it".
+    //
+    // Structural, not operator-driven: no exoneration needs filing, because there was never
+    // conduct to exonerate. Matched on the explicit flag going forward, and on the gate's
+    // stable marker text for entries already on the chain.
+    let has_no_verdict = |e: &ChainEntry| -> bool {
+        if e.event_data.get("verdict_available").and_then(Value::as_bool) == Some(false) {
+            return true;
+        }
+        entry_str(e, "reason").is_some_and(|r| {
+            r.contains("no policy verdict") || r.contains("daemon path failed")
+        })
+    };
     let denies: Vec<&&ChainEntry> = entries
         .iter()
         .filter(|e| {
@@ -196,6 +220,7 @@ pub fn derive(
                 && e.event_data.get("enforced").and_then(Value::as_bool) != Some(false)
                 && is_grain(e)
                 && !is_probe(e)
+                && !has_no_verdict(e)
         })
         .collect();
     // Rehab/repair mechanics (dp 2026-07-24: "when it's infrastructure fault
