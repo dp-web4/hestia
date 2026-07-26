@@ -1110,6 +1110,46 @@ async fn tool_witness_adjudication(state: &SharedState, args: &Value) -> ToolRes
     ) {
         return Ok(denied);
     }
+    // Resolve chain references only after attribution + policy gating. Besides
+    // keeping authorization ordering uniform, this prevents an unattributed
+    // caller from using different errors to probe which witness hashes exist.
+    let supersedes = if let Some(reference) = supersedes {
+        let hash = reference.strip_prefix("chain:").unwrap_or(&reference);
+        let prior = s
+            .chain_store
+            .read_by_hash(hash)
+            .map_err(|error| anyhow::anyhow!("reading supersedes entry: {error}"))?;
+        let Some(prior) = prior else {
+            return Ok(hestia_error_envelope(
+                "hestia.adjudication_supersedes_not_found",
+                &format!("supersedes '{reference}' does not resolve to a chain entry"),
+                None,
+            ));
+        };
+        let same_grain = prior.event_type == "adjudication"
+            && prior
+                .event_data
+                .get("subject_plugin_id")
+                .and_then(Value::as_str)
+                == Some(subject_plugin_id.as_str())
+            && prior
+                .event_data
+                .get("subject_role")
+                .and_then(Value::as_str)
+                .map_or(true, |role| role == subject_role)
+            && prior.event_data.get("axis").and_then(Value::as_str) == Some(axis.as_str());
+        if !same_grain {
+            return Ok(hestia_error_envelope(
+                "hestia.adjudication_bad_supersedes",
+                "supersedes must reference an earlier adjudication of the same \
+                 subject, role, and axis",
+                Some(json!({"supersedes": reference})),
+            ));
+        }
+        Some(hash.to_string())
+    } else {
+        None
+    };
 
     let mut computed_claim_confidence: Option<f64> = None;
     let score: Option<f64> = if verdict == "deferred" {
@@ -1292,7 +1332,7 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
         .and_then(Value::as_f64)
         .unwrap_or(0.4)
         .clamp(0.0, 1.0);
-    let reference = optional_string(args, "ref");
+    let mut reference = optional_string(args, "ref");
     let session_id_arg = optional_string(args, "session_id");
 
     let mut s = state.lock().await;
@@ -1319,6 +1359,68 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
         return Ok(denied);
     }
     let subject_instance_lct = s.member_lct(&subject_plugin_id);
+    let mut corrects_axis: Option<String> = None;
+    if cause == ReversalCause::CorrectedAdjudication {
+        let reporter_instance_lct = s.member_lct(&reporter.plugin_id);
+        if reporter.plugin_id == subject_plugin_id
+            || (subject_instance_lct.is_some()
+                && subject_instance_lct == reporter_instance_lct)
+        {
+            return Ok(hestia_error_envelope(
+                "hestia.corrected_adjudication_self",
+                "the subject cannot tombstone an adjudication of itself; a \
+                 correction requires an attributable, law-authorized witness",
+                None,
+            ));
+        }
+        let Some(raw_reference) = reference.as_deref() else {
+            return Ok(hestia_error_envelope(
+                "hestia.corrected_adjudication_needs_ref",
+                "cause=corrected-adjudication requires ref=chain:<hash> of the \
+                 adjudication being corrected",
+                None,
+            ));
+        };
+        let hash = raw_reference
+            .strip_prefix("chain:")
+            .unwrap_or(raw_reference);
+        let prior = s
+            .chain_store
+            .read_by_hash(hash)
+            .map_err(|error| anyhow::anyhow!("reading corrected adjudication: {error}"))?;
+        let Some(prior) = prior else {
+            return Ok(hestia_error_envelope(
+                "hestia.corrected_adjudication_ref_not_found",
+                &format!("ref '{raw_reference}' does not resolve to a chain entry"),
+                None,
+            ));
+        };
+        let same_grain = prior.event_type == "adjudication"
+            && prior
+                .event_data
+                .get("subject_plugin_id")
+                .and_then(Value::as_str)
+                == Some(subject_plugin_id.as_str())
+            && prior
+                .event_data
+                .get("subject_role")
+                .and_then(Value::as_str)
+                .map_or(true, |role| role == subject_role);
+        if !same_grain {
+            return Ok(hestia_error_envelope(
+                "hestia.corrected_adjudication_bad_ref",
+                "corrected-adjudication ref must identify an adjudication of \
+                 the same subject and role",
+                Some(json!({"ref": raw_reference})),
+            ));
+        }
+        corrects_axis = prior
+            .event_data
+            .get("axis")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        reference = Some(hash.to_string());
+    }
 
     // Witness the reversal — the subject's WHO + the reporter's WHO (accountability
     // for who leveled the judgment) + the pointer to the reverted work.
@@ -1337,6 +1439,7 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
             },
             "reason": reason,
             "ref": reference,
+            "corrects_axis": corrects_axis,
             "magnitude": magnitude,
             "reported_by": {
                 "plugin_id": reporter.plugin_id,
@@ -1386,6 +1489,8 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
                 "method": "reversal",
                 "ref": adj_ref,
                 "reason": format!("reversal:{kind}:{}", cause.as_str()),
+                "supersedes": Value::Null,
+                "depends_on": [format!("chain:{}", entry.hash)],
                 "adjudicated_by": {
                     "plugin_id": reporter.plugin_id,
                     "role_lct": reporter.role_lct,
@@ -3432,8 +3537,169 @@ mod accountability_tests {
         assert_eq!(adj.event_data["axis"], "validity");
         assert_eq!(adj.event_data["verdict"], "refuted");
         assert_eq!(adj.event_data["method"], "reversal");
+        assert_eq!(
+            adj.event_data["depends_on"],
+            json!([format!(
+                "chain:{}",
+                out["witnessEntryHash"].as_str().unwrap()
+            )]),
+            "the derived verdict names the reversal that caused it"
+        );
         assert!(s.adjudicated_for_role("worker-agent", role).validity() < 0.5,
             "adjudicated validity moved DOWN off the prior");
+    }
+
+    #[tokio::test]
+    async fn adjudication_supersedes_only_same_grain_and_axis() {
+        let (_dir, state) = test_state().await;
+        let me = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"t",
+                    "role":"role:constellation:interactive-dev"}),
+        )
+        .await
+        .unwrap();
+        let role = "role:constellation:mesh-worker";
+        let original = tool_witness_adjudication(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "axis":"validity","verdict":"refuted","method":"review",
+                    "ref":"pr:125","session_id":me["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        let original_hash = original["witnessEntryHash"].as_str().unwrap();
+
+        let replacement = tool_witness_adjudication(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "axis":"validity","verdict":"upheld","method":"tests",
+                    "ref":"ci:126","supersedes":format!("chain:{original_hash}"),
+                    "depends_on":[format!("chain:{original_hash}")],
+                    "session_id":me["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert!(replacement["witnessEntryHash"].is_string());
+        let bad_axis = tool_witness_adjudication(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "axis":"valuation","verdict":"upheld","method":"usage",
+                    "ref":"deploy:126","supersedes":original_hash,
+                    "session_id":me["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            bad_axis["_hestia_error"]["code"],
+            "hestia.adjudication_bad_supersedes"
+        );
+        let missing = tool_witness_adjudication(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "axis":"validity","verdict":"upheld","method":"tests",
+                    "ref":"ci:127","supersedes":"chain:no-such-hash",
+                    "session_id":me["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            missing["_hestia_error"]["code"],
+            "hestia.adjudication_supersedes_not_found"
+        );
+
+        let s = state.lock().await;
+        let replacement_entry = s
+            .chain_store
+            .read_by_hash(replacement["witnessEntryHash"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            replacement_entry.event_data["supersedes"], original_hash,
+            "chain: input is stored in one canonical form"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrected_adjudication_reversal_requires_and_tombstones_prior_verdict() {
+        let (_dir, state) = test_state().await;
+        let me = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"t",
+                    "role":"role:constellation:interactive-dev"}),
+        )
+        .await
+        .unwrap();
+        let role = "role:constellation:mesh-worker";
+        let original = tool_witness_adjudication(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "axis":"validity","verdict":"refuted","method":"review",
+                    "ref":"pr:125","session_id":me["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        let original_hash = original["witnessEntryHash"].as_str().unwrap();
+
+        let missing = tool_record_reversal(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "kind":"override","cause":"corrected-adjudication",
+                    "session_id":me["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            missing["_hestia_error"]["code"],
+            "hestia.corrected_adjudication_needs_ref"
+        );
+
+        let subject = tool_connect(
+            &state,
+            &json!({"plugin_id":"worker-agent","host_agent":"worker",
+                    "role":role}),
+        )
+        .await
+        .unwrap();
+        let self_correction = tool_record_reversal(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "kind":"override","cause":"corrected-adjudication",
+                    "ref":original_hash,"session_id":subject["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            self_correction["_hestia_error"]["code"],
+            "hestia.corrected_adjudication_self"
+        );
+
+        let corrected = tool_record_reversal(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent","subject_role":role,
+                    "kind":"override","cause":"corrected-adjudication",
+                    "ref":format!("chain:{original_hash}"),
+                    "reason":"review evidence was misread",
+                    "session_id":me["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert!(corrected["witnessEntryHash"].is_string());
+        assert_eq!(corrected["judgmentMutated"], false);
+        assert!(corrected["adjudicationEntryHash"].is_null());
+
+        let s = state.lock().await;
+        let reversal = s
+            .chain_store
+            .read_by_hash(corrected["witnessEntryHash"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(reversal.event_data["ref"], original_hash);
+        assert_eq!(reversal.event_data["corrects_axis"], "validity");
+        let window = s.recent_chain(20);
+        let derived = crate::derivation::derive("worker-agent", role, &window);
+        assert_eq!(derived.validity.observations, 0);
+        assert!(derived.validity.score.is_none());
     }
 
     #[tokio::test]
