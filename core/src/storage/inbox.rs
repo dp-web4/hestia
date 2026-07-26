@@ -663,22 +663,37 @@ impl SqliteInboxStore {
         Ok(n == 1)
     }
 
-    /// Record a FAILED hand-off attempt and return the new attempt count.
+    /// Record a FAILED hand-off attempt and return the new attempt count, or
+    /// `None` if the row was already settled.
     ///
     /// Retrying is safe here in a way it is not at the far end: this row has not
     /// been processed by anyone, so a re-send is `undelivered`-class (the gate
     /// refused, nothing ran), never `indeterminate`. That is why egress retries
     /// and drain retries are different questions.
-    pub fn record_egress_failure(&self, id: u64, reason: &str) -> Result<i64> {
+    ///
+    /// The `Option` is load-bearing (G7, r6-routing hop 4) and it is G6's lesson
+    /// applied to the other half of the transition. The UPDATE has always been
+    /// `drained_at IS NULL`, so a settled row correctly does not increment — but
+    /// the count was then re-read unconditionally and handed back as if it had.
+    /// A caller reading that number cannot tell a fresh failure from a no-op, and
+    /// the two arms it feeds both act on it: below the maximum it answers `retry`
+    /// on a packet already forwarded, and at the maximum it retires and reports a
+    /// packet already retired. `None` means *nothing happened*, which is the only
+    /// answer that lets the caller stay silent.
+    pub fn record_egress_failure(&self, id: u64, reason: &str) -> Result<Option<i64>> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
-        conn.execute(
-            "UPDATE member_notices
-                SET attempts = COALESCE(attempts, 0) + 1, last_error = ?1
-              WHERE id = ?2 AND dest_peer IS NOT NULL AND drained_at IS NULL",
-            params![reason, id as i64],
-        )
-        .context("recording egress failure")?;
+        let updated = conn
+            .execute(
+                "UPDATE member_notices
+                    SET attempts = COALESCE(attempts, 0) + 1, last_error = ?1
+                  WHERE id = ?2 AND dest_peer IS NOT NULL AND drained_at IS NULL",
+                params![reason, id as i64],
+            )
+            .context("recording egress failure")?;
+        if updated != 1 {
+            return Ok(None);
+        }
         let n: Option<i64> = conn
             .query_row(
                 "SELECT COALESCE(attempts, 0) FROM member_notices WHERE id = ?1",
@@ -686,22 +701,32 @@ impl SqliteInboxStore {
                 |r| r.get(0),
             )
             .ok();
-        Ok(n.unwrap_or(0))
+        Ok(Some(n.unwrap_or(0)))
     }
 
     /// Retire an egress row that has exhausted its attempts. Marks it drained so
     /// the queue does not grow without bound; the caller is responsible for the
     /// unreachable report that this row now owes its sender. Retiring WITHOUT
     /// reporting would be the silent drop with extra steps.
-    pub fn retire_egress(&self, id: u64) -> Result<()> {
+    ///
+    /// Returns whether this call made the transition, for the same reason
+    /// `mark_egress_forwarded` does (G6) — and it is the same defect seen from
+    /// the retirement side (G7). The predicate was already here; what was missing
+    /// is the caller's ability to SEE it. `retire_and_report_egress` appends
+    /// `member_notice_unreachable` and enqueues the sender's report after this
+    /// call, so a discarded row count means an already-settled packet is witnessed
+    /// dead a second time — and `member_notice_unreachable` is a durable claim
+    /// about a PEER that a trust tally will count.
+    pub fn retire_egress(&self, id: u64) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE member_notices SET drained_at = ?1
-              WHERE id = ?2 AND dest_peer IS NOT NULL AND drained_at IS NULL",
-            params![Utc::now().to_rfc3339(), id as i64],
-        )
-        .context("retiring egress row")?;
-        Ok(())
+        let n = conn
+            .execute(
+                "UPDATE member_notices SET drained_at = ?1
+                  WHERE id = ?2 AND dest_peer IS NOT NULL AND drained_at IS NULL",
+                params![Utc::now().to_rfc3339(), id as i64],
+            )
+            .context("retiring egress row")?;
+        Ok(n == 1)
     }
 
     /// Egress rows that have outlived the forwarding TTL, oldest first.
@@ -1828,7 +1853,7 @@ mod tests {
 
         // Retiring one takes it out of the sweep AND out of both admission counts —
         // the same `drained_at` seam the age bound and the per-peer bound share.
-        store.retire_egress(empty).unwrap();
+        assert!(store.retire_egress(empty).unwrap(), "the row did not transition");
         assert!(!store.undeliverable_egress(25).unwrap().contains(&empty));
         assert_eq!(store.egress_queued_for("thor").unwrap(), 1,
                    "retirement did not release the per-peer bound");
@@ -1929,7 +1954,7 @@ mod tests {
         //    IMMEDIATELY, which is what downgrades S1's stall from terminal to
         //    transient.
         let before = store.egress_queued_for("thor").unwrap();
-        store.retire_egress(egress).unwrap();
+        assert!(store.retire_egress(egress).unwrap(), "the row did not transition");
         assert_eq!(store.egress_queued_for("thor").unwrap(), before - 1,
                    "a retired row still occupies its peer's admission budget");
         assert_eq!(store.egress_queued().unwrap(), 0,

@@ -2795,10 +2795,25 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
     }
     if let Some(id) = args.get("mark_failed").and_then(|v| v.as_u64()) {
         let reason = optional_string(args, "reason").unwrap_or_else(|| "unspecified".to_string());
-        let attempts = s
+        // G7 — a settled row is settled on this arm too. `record_egress_failure`
+        // has always refused to increment a drained row; what it could not do was
+        // SAY so, and both branches below act on the number it returns. Below the
+        // maximum that answered `retry` on a packet the mesh had already accepted;
+        // at the maximum it fell through to retire-and-report on a packet already
+        // retired — appending a second `member_notice_unreachable` and mailing the
+        // sender a second death notice for one letter. Unbounded, one per call,
+        // and (per G4-auth) callable by anyone with a live session, which makes it
+        // a pump for witnessed claims against an innocent peer.
+        let Some(attempts) = s
             .inbox_store
             .record_egress_failure(id, &reason)
-            .map_err(|e| anyhow::anyhow!("recording egress failure: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("recording egress failure: {e}"))?
+        else {
+            return Ok(json!({
+                "marked": id, "disposition": "noop", "reason": "already-terminal",
+                "by": caller.plugin_id,
+            }));
+        };
         if attempts < MAX_EGRESS_ATTEMPTS {
             return Ok(json!({
                 "marked": id, "disposition": "retry",
@@ -2987,9 +3002,23 @@ fn retire_and_report_egress(
             None,
         ));
     };
-    s.inbox_store
+    // G7 — the retirement half of G6. Every caller reaches here through a SELECT
+    // that filters `drained_at IS NULL`, so today this is defence in depth rather
+    // than the reachable path (that one is `mark_failed`, closed at its own arm).
+    // It is here because the reachable path was reachable exactly because a store
+    // method knew the row was settled and its caller could not find out: the same
+    // discarded row count, one function apart. A witness and a report are owed by
+    // a TRANSITION, not by a request for one.
+    if !s
+        .inbox_store
         .retire_egress(id)
-        .map_err(|e| anyhow::anyhow!("retiring egress row: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("retiring egress row: {e}"))?
+    {
+        return Ok(json!({
+            "marked": id, "disposition": "noop", "reason": "already-terminal",
+            "retired_by": retired_by,
+        }));
+    }
 
     // Sanitize the drain's reason before it becomes part of a pointer: a pointer
     // NAMES a location and is rendered into a fire primer, so it may not carry
@@ -5595,6 +5624,18 @@ mod member_mesh_tests {
     /// The unanswered report is only honest if the party it reports on cannot
     /// steer it: answering is a right over YOUR OWN mail. And once a real
     /// response is bound, the debt clears.
+    ///
+    /// `older_than_secs: -1`, not `0` — G8, r6-routing hop 4, and this is the
+    /// test that has been carried as "intermittent" since 2026-07-26 hop 1.
+    /// `member_unanswered` filters `queued_at < (now - older_than_secs)`, so `0`
+    /// is a ZERO-WIDTH window: the row this test asserts is visible only if
+    /// `Utc::now()` strictly advanced between the enqueue and the query, and
+    /// `Utc::now()` reads `CLOCK_REALTIME`, which is not monotonic. Every
+    /// store-level test already passes `-1`; all four handler-level ones passed
+    /// `0`. Eight green samples on aarch64 were never evidence about this test —
+    /// 207M adjacent `CLOCK_REALTIME` reads on that box showed zero equal and
+    /// zero backward steps, so the window there cannot lose. A one-second forward
+    /// margin removes the dependency on the clock entirely.
     #[tokio::test]
     async fn reply_binding_is_scoped_to_your_own_mail_and_clears_the_debt() {
         let (_dir, state) = test_state().await;
@@ -5628,7 +5669,7 @@ mod member_mesh_tests {
         // Before any answer, the sender sees the notice as owed to them.
         let pre = tool_member_unanswered(
             &state,
-            &json!({"session_id": claude, "older_than_secs": 0}),
+            &json!({"session_id": claude, "older_than_secs": -1}),
         )
         .await
         .unwrap();
@@ -5646,7 +5687,7 @@ mod member_mesh_tests {
         assert_eq!(answer["binding_verified"], json!(true), "{answer}");
         let post = tool_member_unanswered(
             &state,
-            &json!({"session_id": claude, "older_than_secs": 0}),
+            &json!({"session_id": claude, "older_than_secs": -1}),
         )
         .await
         .unwrap();
@@ -5757,7 +5798,7 @@ mod member_mesh_tests {
 
         let rows = tool_member_unanswered(
             &state,
-            &json!({"session_id": claude, "older_than_secs": 0}),
+            &json!({"session_id": claude, "older_than_secs": -1}),
         )
         .await
         .unwrap();
@@ -6439,6 +6480,135 @@ mod member_mesh_tests {
         );
     }
 
+    /// G7 (Thor, hop 4) — the SAME defect as G6, in the sibling function, reached
+    /// from the other side of the transition.
+    ///
+    /// G6 taught `mark_egress_forwarded` to report whether it transitioned, and
+    /// `mark_forwarded` to write no witness when it did not. `retire_egress`
+    /// carries the identical `drained_at IS NULL` predicate — but it returns
+    /// `Result<()>`, so `retire_and_report_egress` cannot see that its UPDATE
+    /// touched nothing, and appends the chain entry and enqueues the sender's
+    /// report unconditionally.
+    ///
+    /// No adversary and no race is required: `mark_failed` on an already-retired
+    /// row skips the increment (`record_egress_failure` is `drained_at IS NULL`)
+    /// and then re-reads `attempts`, which is still at the maximum — so the arm
+    /// falls straight through to the retire-and-report path a second time. A
+    /// drain that retries `mark_failed` after a dropped response does this by
+    /// accident.
+    ///
+    /// What it produces is not a duplicate log line. `member_notice_unreachable`
+    /// is a durable, witnessed claim that a PEER did not answer, and §5.1 makes
+    /// misrouting evidence — so a reader tallying trust signals counts one
+    /// undelivered packet as N failures by thor-sage, and the sender is told N
+    /// times that one letter died. Every entry names `retired_by` correctly; the
+    /// witness is honest and the tally it feeds is not.
+    #[tokio::test]
+    async fn a_settled_row_is_not_retired_and_reported_a_second_time() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        let row_id = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "thor-sage/claude-code", "kind": "reply",
+                    "pointer_uri": "shared-context/alices-mail.md", "session_id": alice}),
+        )
+        .await
+        .unwrap()["queued_id"]
+            .as_u64()
+            .unwrap();
+
+        // Five real hand-off failures: the row exhausts its attempts and is
+        // retired and reported exactly as it should be.
+        let mut last = json!(null);
+        for _ in 0..MAX_EGRESS_ATTEMPTS {
+            last = tool_egress_pending(
+                &state,
+                &json!({"session_id": alice, "mark_failed": row_id, "reason": "timeout"}),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(last["disposition"], "retired", "setup did not exhaust: {last}");
+
+        // The sixth call. The drain never learned whether its fifth landed.
+        let again = tool_egress_pending(
+            &state,
+            &json!({"session_id": alice, "mark_failed": row_id, "reason": "timeout"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            again["disposition"], "noop",
+            "a settled row was retired and reported again: {again}"
+        );
+
+        let s = state.lock().await;
+        let unreachable = s
+            .recent_chain(50)
+            .into_iter()
+            .filter(|e| e.event_type == "member_notice_unreachable")
+            .count();
+        assert_eq!(
+            unreachable, 1,
+            "one undelivered packet produced {unreachable} witnessed unreachable \
+             claims about thor-sage"
+        );
+        drop(s);
+        let inbox = tool_member_inbox(&state, &json!({"session_id": alice}))
+            .await
+            .unwrap();
+        assert_eq!(
+            inbox["total"], 1,
+            "the sender was told {} times that one letter died: {inbox}",
+            inbox["total"]
+        );
+    }
+
+    /// The same settled-row question on the retry side, which is cheaper but
+    /// wrong in the direction that costs a packet: a row that has already been
+    /// FORWARDED answers `mark_failed` with `retry`.
+    ///
+    /// `record_egress_failure` correctly refuses to increment a drained row, and
+    /// the arm then reads the un-incremented count, finds it below the maximum,
+    /// and tells the caller to try again — on a packet the mesh has already
+    /// accepted. The row is gone from `pending_egress`, so a well-behaved drain
+    /// will not act on it; a drain that trusts the disposition it was handed
+    /// re-sends a letter that was already delivered once.
+    #[tokio::test]
+    async fn a_forwarded_row_is_not_told_to_retry() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        let row_id = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "thor-sage/claude-code", "kind": "reply",
+                    "pointer_uri": "shared-context/alices-mail.md", "session_id": alice}),
+        )
+        .await
+        .unwrap()["queued_id"]
+            .as_u64()
+            .unwrap();
+        let fwd = tool_egress_pending(
+            &state,
+            &json!({"session_id": alice, "mark_forwarded": row_id}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fwd["disposition"], "forwarded", "{fwd}");
+
+        let failed = tool_egress_pending(
+            &state,
+            &json!({"session_id": alice, "mark_failed": row_id, "reason": "timeout"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            failed["disposition"], "noop",
+            "an accepted hand-off was told to retry: {failed}"
+        );
+    }
+
     /// The bound that answers G4-auth's blast-radius question with a predicate
     /// instead of prose.
     ///
@@ -6587,6 +6757,14 @@ mod member_mesh_tests {
     /// separate notice. Every forward would have accused the fleet of never
     /// answering, permanently, and — the sender and the remote member sharing a
     /// name here — in both directions at once.
+    ///
+    /// The local notice is a POSITIVE CONTROL, and it is why this test can no
+    /// longer pass for the wrong reason (G8, r6-routing hop 4). `owed_to_me == 0`
+    /// on its own is satisfied just as well by an EMPTY WINDOW as by the
+    /// exclusion it claims to check — verified by running it with
+    /// `older_than_secs: 3600`, a window that provably contains nothing: green.
+    /// With a local row that must appear, an empty window turns this red instead
+    /// of vacuously green, and the assertion discriminates.
     #[tokio::test]
     async fn egress_rows_never_enter_unanswered_accounting() {
         let (dir, state) = test_state().await;
@@ -6599,15 +6777,31 @@ mod member_mesh_tests {
         )
         .await
         .unwrap();
-        let rows = tool_member_unanswered(
+        // Same sender, same window, same counted kind — but local, so it MUST be
+        // counted. Anything that empties the window takes this with it.
+        tool_member_notify(
             &state,
-            &json!({"session_id": alice, "older_than_secs": 0}),
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": "pr/2", "session_id": alice}),
         )
         .await
         .unwrap();
+        let rows = tool_member_unanswered(
+            &state,
+            &json!({"session_id": alice, "older_than_secs": -1}),
+        )
+        .await
+        .unwrap();
+        let owed = rows["owed_to_me"].as_array().unwrap();
         assert_eq!(
-            rows["owed_to_me"].as_array().unwrap().len(),
-            0,
+            owed.len(),
+            1,
+            "the local control is missing — the window is empty and the exclusion \
+             below would have passed for the wrong reason: {rows}"
+        );
+        assert_eq!(
+            owed[0]["to_plugin"],
+            json!("kimi-code"),
             "an egress row has no local clearing path — counting it is a permanent \
              false positive: {rows}"
         );
