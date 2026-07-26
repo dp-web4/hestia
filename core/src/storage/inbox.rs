@@ -2082,6 +2082,100 @@ mod tests {
         // dependency G8 spent two hops removing from this file.
     }
 
+    /// G9, third half (CBP, hop 6) — the debt has never had an unattended payer,
+    /// and that is what makes G9 a priority rather than a regression.
+    ///
+    /// Thor's G9 is confirmed here by execution on the second architecture: the
+    /// crash state recovers on the pre-G7 head (`disposition="retired"`,
+    /// witnesses=1, sender_inbox=1) and is `noop`/0/0 after it. But applying his
+    /// own G7 correction to his G9 — "the shipped drain does not do this by
+    /// accident" — that recovery was never on a systematic path either.
+    /// `mark_failed` is only ever called from the drain's loop over
+    /// `pending_egress`, and the crashed row is settled, so the shipped drain
+    /// never retries it. The pre-G7 recovery required a caller holding a STALE
+    /// ID ACROSS A RESTART, which is the same MCP-client caller class G7 exists
+    /// to silence — G4-auth. G7 did not trade a good behaviour for a bad one.
+    ///
+    /// What it did was remove the last accident that could paper over a gap that
+    /// predates it: NO UNATTENDED PATH CAN SEE A SETTLED ROW THAT OWES A REPORT.
+    /// All three sweeps select `drained_at IS NULL`, which is the same marker the
+    /// row was settled with, so the row leaves every queue at the instant it
+    /// acquires the debt. That is asserted below, and it is why the fix is a
+    /// distinguishable terminal state and not a restored retry: a retry-triggered
+    /// recovery would only ever fire for a crash that happens to be followed by a
+    /// caller with a stale id, while the age and undeliverable sweeps' crash
+    /// windows have never had any recovery at all.
+    ///
+    /// Companion to `forwarded_and_retired_leave_the_same_row_so_an_unpaid_debt_is_unfindable`:
+    /// that one says the debt is not expressible from the row, this one says
+    /// nothing is looking for it in the first place. Both are THE HOLE. If either
+    /// goes red the seam was closed and the record should be replaced by the
+    /// invariant, not amended away.
+    #[test]
+    fn no_unattended_sweep_can_see_a_settled_row_that_still_owes_its_sender_a_report() {
+        let (_tmp, store) = fresh();
+        // A row retired by exhaustion, its report not yet written: the state a
+        // crash inside `retire_and_report_egress` leaves behind.
+        let crashed = store
+            .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/unpaid.md#t"), "hash-c")
+            .unwrap();
+        assert!(store.retire_egress(crashed).unwrap(), "setup did not retire");
+
+        // The same state on the G1 path: no destination LCT, retired at zero
+        // attempts by the daemon's own sweep, crash before the report.
+        let parked = store
+            .enqueue_egress("thor", "", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/parked.md#t"), "hash-p")
+            .unwrap();
+        assert!(store.retire_egress(parked).unwrap(), "setup did not retire the parked row");
+
+        // Every unattended path, at its most permissive setting.
+        let pending: Vec<u64> = store.pending_egress(100).unwrap().into_iter().map(|r| r.id).collect();
+        // `-MARGIN_SECS` = the whole table, and it survives a backward clock step.
+        let expired = store.expired_egress(-MARGIN_SECS, 100).unwrap();
+        let undeliverable = store.undeliverable_egress(100).unwrap();
+
+        for (name, ids) in [
+            ("pending_egress", &pending),
+            ("expired_egress", &expired),
+            ("undeliverable_egress", &undeliverable),
+        ] {
+            assert!(
+                !ids.contains(&crashed),
+                "THE HOLE: {name} would have found the unpaid row — the seam was \
+                 closed, replace this test with the invariant"
+            );
+            assert!(
+                !ids.contains(&parked),
+                "THE HOLE: {name} would have found the unpaid parked row — the seam \
+                 was closed, replace this test with the invariant"
+            );
+        }
+        // Positive control, so the emptiness above cannot be vacuous: an
+        // unsettled row of each shape IS visible to the sweep that owns it. This
+        // is the G8 lesson applied to a G9 test — an absence assertion without one
+        // is a test that passes when the query is broken.
+        let live = store
+            .enqueue_egress("thor", "lct:thor", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/live.md#t"), "hash-l")
+            .unwrap();
+        let live_parked = store
+            .enqueue_egress("thor", "", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/live-parked.md#t"), "hash-lp")
+            .unwrap();
+        let pending: Vec<u64> = store.pending_egress(100).unwrap().into_iter().map(|r| r.id).collect();
+        assert!(pending.contains(&live), "control: a live row must be drainable");
+        assert!(
+            store.expired_egress(-MARGIN_SECS, 100).unwrap().contains(&live),
+            "control: a live row must be reachable by the age sweep"
+        );
+        assert!(
+            store.undeliverable_egress(100).unwrap().contains(&live_parked),
+            "control: a live LCT-less row must be reachable by the G1 sweep"
+        );
+    }
+
     /// `member_unanswered`'s clearing condition — some row binds
     /// `in_reply_to = n.id` — is unsatisfiable for a forward: the answering party is
     /// on another machine, `enqueue_egress` has no `in_reply_to` column, and the
