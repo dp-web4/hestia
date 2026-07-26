@@ -38,7 +38,7 @@ const MAX_INBOX_NOTICES: u64 = 1000;
 /// is to tell the next sender so. Enforced by REFUSING admission, never by
 /// eviction — see [`InboxStore::enqueue_egress`] for why that asymmetry is not
 /// arbitrary.
-const MAX_EGRESS_QUEUE: u64 = 200;
+pub(crate) const MAX_EGRESS_QUEUE: u64 = 200;
 
 /// One deferred inbound notice, exactly as it arrived: `sealed` is still the
 /// hub-sealed ciphertext; `pair_id` + `hub_pubkey_hex` are the channel context
@@ -526,8 +526,25 @@ impl SqliteInboxStore {
         // triggered by traffic between two OTHER members — the forward's sender and
         // recipient are not parties to the send that destroys it. The forwarding
         // plane's own bound lives in `enqueue_egress`.
+        // The predicate is `local OR already-forwarded`, not `local` (McNugget T2 on
+        // `17a928d`). Scoping the prune to the local plane fixed B1 but took the whole
+        // forwarding plane out of the retention policy, including rows that had already
+        // been delivered — so `member_notices` grew without bound on any forwarding
+        // node, keeping every forward ever made, forever. Only the PARKED part of the
+        // plane needs protecting: a queued forward has `drained_at IS NULL`, so it still
+        // survives every local send (B1 stays fixed), while a completed one ages out at
+        // the same 7d as local mail, which is the behaviour before branch 2 existed.
+        //
+        // This does NOT give the parked plane an expiry — nothing here can reclaim an
+        // undrained forward, and that is T1, which is deliberately not fixed by widening
+        // this predicate. An age-based DELETE of a parked forward is exactly the silent
+        // loss `dest_peer IS NULL` was added to stop; retiring one honestly needs the
+        // report path (attempt counter → dead-letter → report home), which lives in
+        // CBP's WIP. See the branch's PR: not landable alone, by design rather than by
+        // omission.
         conn.execute(
-            "DELETE FROM member_notices WHERE queued_at < ?1 AND dest_peer IS NULL",
+            "DELETE FROM member_notices
+              WHERE queued_at < ?1 AND (dest_peer IS NULL OR drained_at IS NOT NULL)",
             params![cutoff],
         )
         .context("pruning expired member notices")?;
@@ -977,6 +994,29 @@ mod tests {
         (tmp, store)
     }
 
+    /// Row-level probes for the retention tests. `pending_egress` is not usable for
+    /// these: it filters on `drained_at IS NULL`, so a DELIVERED row and a DELETED one
+    /// are indistinguishable through it — which is exactly the confusion T2 hid in.
+    fn row_exists(store: &SqliteInboxStore, id: u64) -> bool {
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM member_notices WHERE id = ?1",
+                       params![id as i64], |r| r.get::<_, i64>(0))
+            .unwrap()
+            > 0
+    }
+
+    fn count_rows(store: &SqliteInboxStore) -> i64 {
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM member_notices", [], |r| r.get(0))
+            .unwrap()
+    }
+
     #[test]
     fn member_notices_are_recipient_scoped_and_consume_once() {
         let (_tmp, store) = fresh();
@@ -1396,6 +1436,84 @@ mod tests {
         assert_eq!(store.pending_egress(25).unwrap().len(), 1,
                    "an unrelated local send deleted the aged forward");
         assert_eq!(store.pending_egress(25).unwrap()[0].0, egress);
+    }
+
+    /// The counterpart to the test above, and the reason the prune's predicate is
+    /// `local OR already-forwarded` rather than `local` (McNugget T2). Scoping the
+    /// prune to the local plane protected PARKED forwards, which was the point, but
+    /// it also exempted DELIVERED ones — so a forwarding node kept every forward it
+    /// ever made, forever.
+    ///
+    /// Note what this pins that the sibling test cannot: both tests park an aged row
+    /// and assert about the prune, and the sibling passes under BOTH predicates, so it
+    /// alone does not distinguish them. The discriminator is `drained_at`.
+    #[test]
+    fn an_aged_delivered_forward_is_reclaimed_by_the_ttl_prune() {
+        let (_tmp, store) = fresh();
+        let egress = store
+            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/for-thor.md#thread=t"), "hash-egress")
+            .unwrap();
+        // Delivered, unlike the sibling test: this is the whole difference.
+        store.mark_egress_forwarded(egress).unwrap();
+        let stale = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS + 3600)).to_rfc3339();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE member_notices SET queued_at = ?1 WHERE id = ?2",
+                     params![stale, egress as i64])
+            .unwrap();
+        assert_eq!(count_rows(&store), 1, "setup: the delivered forward is retained");
+        // Any local send runs the prune.
+        store
+            .enqueue_member("codex-cli", "kimi-code", "role:r", "coordination",
+                            Some("forum/unrelated.md#t"), "hash-u", None)
+            .unwrap();
+        assert!(
+            !row_exists(&store, egress),
+            "a delivered forward aged past the TTL was never reclaimed — \
+             member_notices grows without bound on a forwarding node"
+        );
+    }
+
+    /// T1, pinned as a KNOWN GAP rather than left implicit. Nothing in the tree can
+    /// remove a PARKED forward: both `DELETE`s carry `dest_peer IS NULL`, and the
+    /// egress plane's own bound refuses rather than evicts. This test documents that
+    /// and will fail the moment a retirement path exists — at which point it should be
+    /// replaced by the assertion that the path works, NOT deleted.
+    ///
+    /// Widening the prune to cover parked forwards would be the wrong fix: an
+    /// age-based DELETE of an undelivered forward is the silent loss B1 was about.
+    /// Retiring one honestly needs the report path (attempts → dead-letter → report
+    /// home), which is CBP's WIP, and building it here a fourth time is the waste this
+    /// exploration is currently about.
+    #[test]
+    fn known_gap_t1_a_parked_forward_has_no_expiry_on_this_branch() {
+        let (_tmp, store) = fresh();
+        let egress = store
+            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/for-thor.md#thread=t"), "hash-egress")
+            .unwrap();
+        let ancient = (Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE member_notices SET queued_at = ?1 WHERE id = ?2",
+                     params![ancient, egress as i64])
+            .unwrap();
+        for i in 0..3 {
+            store
+                .enqueue_member("codex-cli", "kimi-code", "role:r", "coordination",
+                                Some("forum/unrelated.md#t"), &format!("hash-{i}"), None)
+                .unwrap();
+        }
+        assert!(
+            row_exists(&store, egress),
+            "a retirement path now exists — replace this test with one asserting it \
+             reports home, do not simply delete it"
+        );
     }
 
     /// A local member must not be able to claim it answered mail addressed to a
