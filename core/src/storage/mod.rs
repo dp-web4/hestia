@@ -14,7 +14,7 @@ pub mod inbox;
 pub mod trust;
 
 pub use chain::{ChainEntry, SqliteChainStore};
-pub use inbox::{InboxNotice, SqliteInboxStore};
+pub use inbox::{InboxNotice, SqliteInboxStore, INBOX_TTL_SECS};
 pub use trust::TrustStore;
 
 use std::path::Path;

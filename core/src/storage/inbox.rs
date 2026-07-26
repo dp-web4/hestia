@@ -24,7 +24,7 @@ use uuid::Uuid;
 /// Notice retention. Mirrors the hub's mailbox TTL: entries older than this
 /// are pruned on enqueue and on drain (a stale work item is worse than a
 /// missing one — its context is gone and its sender long since timed out).
-const INBOX_TTL_SECS: i64 = 7 * 24 * 3600;
+pub const INBOX_TTL_SECS: i64 = 7 * 24 * 3600;
 
 /// Queue cap. At the cap the oldest notice is dropped to admit the newest
 /// (same policy as the hub's per-member mailbox) — backpressure signalling
@@ -461,6 +461,36 @@ impl SqliteInboxStore {
         Ok(())
     }
 
+    /// Egress rows that have outlived the forwarding TTL, oldest first.
+    ///
+    /// The local TTL prune deliberately skips this plane (see `enqueue_member`),
+    /// which would otherwise leave the forwarding queue with no bound at all —
+    /// Kimi §4, r6-routing 2026-07-26. So the bound lives here instead, and the
+    /// difference is the whole point: the local prune is a silent `DELETE`,
+    /// while this returns ids to a caller that owes each one a report. Never
+    /// evict a forwarding row quietly — a silently dropped forward is
+    /// indistinguishable from a link failure, which is the defect this
+    /// exploration exists to remove.
+    ///
+    /// Called from the drain's read path because that is where a report can
+    /// actually be emitted; a store method cannot witness one.
+    pub fn expired_egress(&self, older_than_secs: i64, limit: u32) -> Result<Vec<u64>> {
+        let cutoff = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM member_notices
+              WHERE dest_peer IS NOT NULL AND drained_at IS NULL AND queued_at < ?1
+              ORDER BY id ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![cutoff, limit], |r| r.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row? as u64);
+        }
+        Ok(out)
+    }
+
     pub fn enqueue_member(
         &self,
         to_plugin: &str,
@@ -475,8 +505,15 @@ impl SqliteInboxStore {
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
+        // `dest_peer IS NULL` = the LOCAL plane. Egress rows live in this same
+        // table with `dest_peer` set, and they are NOT this prune's to delete: a
+        // forwarding row that ages out owes its sender a report (the
+        // `retire_and_report_egress` path), and a silent DELETE fired by an
+        // unrelated local send is precisely the retire-without-a-receipt this
+        // exploration exists to remove. Bounding the egress queue is the
+        // forwarding plane's job, where a report can actually be emitted.
         conn.execute(
-            "DELETE FROM member_notices WHERE queued_at < ?1",
+            "DELETE FROM member_notices WHERE queued_at < ?1 AND dest_peer IS NULL",
             params![cutoff],
         )
         .context("pruning expired member notices")?;

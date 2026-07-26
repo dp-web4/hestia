@@ -220,6 +220,31 @@ pub fn ensure_member(
         return Some(lct.lct_id()); // hot path: already present
     }
 
+    // Charset gate, and it sits HERE — after the hot path — on purpose. Every
+    // already-minted member short-circuits above, so this rule can never
+    // retroactively silence a member whose id predates it; it constrains only
+    // ids that do not exist yet. See `crate::addressing` for why the constraint
+    // belongs at registration at all: `lct_publish` mints `member:{plugin_id}`
+    // and border-router v1 mints `peer/member`, so an unconstrained id makes
+    // every separator the system invents ambiguous, and the trust store is
+    // encrypted at rest — the retroactive audit that would let us fix it later
+    // cannot be run (r6-routing, 2026-07-26).
+    //
+    // Fail-OPEN, exactly like a persist failure: no LCT means not-yet-published,
+    // never a refused connect. A nonconforming member still connects and still
+    // sends; it simply gets no custodial presence and no `member:` label — which
+    // is precisely the namespace we are protecting.
+    if !crate::addressing::is_mintable_member_id(id) {
+        eprintln!(
+            "[members] WARNING: refusing to mint an LCT for '{id}' — a member id must be \
+             [a-z0-9-] starting alphanumeric (≤{} bytes). The id is still usable; it just \
+             gets no custodial LCT, because `member:{id}` would be ambiguous in the label \
+             namespace.",
+            crate::addressing::MAX_MEMBER_ID_BYTES
+        );
+        return None;
+    }
+
     // First sight: mint an AiSoftware LCT with a custodial keypair.
     let (mut lct, keypair) = Lct::new(EntityType::AiSoftware, None);
     lct.sign_binding(&keypair); // self-issued §3.2 bootstrap, custodial key proves the binding

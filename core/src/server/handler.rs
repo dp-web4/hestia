@@ -223,7 +223,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_egress_pending",
-            "Forwarding plane (r6-routing branch 2): list notices addressed `peer/member` awaiting hand-off to the fleet mesh, or `mark_forwarded: <id>` once the mesh accepted one. Accepted-by-mesh is NOT read-by-recipient",
+            "Forwarding plane (r6-routing branch 2): list notices addressed `peer/member` awaiting hand-off to the fleet mesh; `mark_forwarded: <id>` once the mesh accepted one, or `mark_failed: <id>` + `reason` when it did not. Forward on dest_peer_lct, never the name. Accepted-by-mesh is NOT read-by-recipient; an exhausted row is retired and its sender gets an unreachable report",
         ),
         t(
             "hestia_member_unanswered",
@@ -1781,6 +1781,32 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
             "payload_sha256": payload_sha256,
         }),
     )?;
+    // A block carrying NO VERDICT is not conduct and must not move trust.
+    //
+    // The plugin gate fails closed when it cannot REACH a verdict (society-safety
+    // subprocess timeout, governor unreachable). That block says "I could not judge",
+    // not "I judged you badly", and no behaviour by the member could have avoided it.
+    // Feeding it to apply_outcome_ctx wrote a FAILED action into the stored record —
+    // which is why codex read `2 actions, 0% success` while its own log said it had
+    // complied and asked to be re-woken (dp spotted it on the dashboard, 2026-07-26).
+    //
+    // derivation already excludes these from derived temperament; this is the same rule
+    // one layer down, on the stored scalar the dashboard's outcome record shows.
+    let verdict_available = args
+        .get("verdict_available")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let reason_has_no_verdict = reason.contains("no policy verdict")
+        || reason.contains("daemon path failed")
+        || reason.contains("governor unreachable");
+    if !verdict_available || reason_has_no_verdict {
+        return Ok(json!({
+            "witnessEntryHash": entry.hash,
+            "decision": decision,
+            "trustMoved": false,
+            "note": "no verdict was reached, so this is not conduct and did not move trust"
+        }));
+    }
     // Same asymmetric gate-risk trust as the daemon's own gate decisions.
     let risk_magnitude = if decision == "deny" { 0.5 } else { 0.2 };
     let gate_reason = format!("gate:{decision} ({adjudicator})");
@@ -2146,6 +2172,55 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             Some(json!({"kind": kind})),
         ));
     }
+    // ---- r6-routing: VALIDATE the destination, before anything else ------------
+    //
+    // The defect this whole exploration is named for: this function validated the
+    // **kind** and the **pointer** and never validated the **recipient**
+    // (validate-the-payload-not-the-destination). Address parsing is pure and
+    // sits at the top so a malformed destination costs nothing downstream — no
+    // flood-limiter slot, no lock, and crucially no chain entry (clause O: a
+    // denied act leaves state bit-identical).
+    //
+    // Grammar and rationale live in `crate::addressing`. Two shapes only —
+    // `member` (local) and `peer/member` (one hop) — because this router only
+    // ever decides local vs. one next hop.
+    let address = match crate::addressing::parse_address(&to_plugin) {
+        Ok(a) => a,
+        Err(e) => {
+            use crate::addressing::AddressError as AE;
+            let (code, msg) = match &e {
+                AE::EmptySegment => (
+                    "hestia.member_notify_bad_address",
+                    "an address is `member` or `peer/member`; no segment may be empty".to_string(),
+                ),
+                // Never truncated to the first two components. A 3+-component
+                // path is source routing — it asks this node to know another
+                // society's interior — and silently dropping the tail is the
+                // silent-drop defect in miniature (Kimi, r6-routing §2.2).
+                AE::SourceRouting { components } => (
+                    "hestia.member_notify_source_routing",
+                    format!(
+                        "'{to_plugin}' has {components} components — this router decides local \
+                         vs. ONE next hop, so a path through another society's interior is \
+                         UNREACHABLE, not truncated to its first two segments"
+                    ),
+                ),
+                AE::BadSegment { segment } => (
+                    "hestia.member_notify_bad_address",
+                    format!(
+                        "segment '{segment}' is not an addressable member id — no whitespace and \
+                         none of `/ : #`, which are the separators this system mints identifiers \
+                         around (`peer/member`, `member:{{id}}`, `pointer#fragment`)"
+                    ),
+                ),
+            };
+            return Ok(hestia_error_envelope(
+                code,
+                &msg,
+                Some(json!({ "to_plugin_id": to_plugin })),
+            ));
+        }
+    };
     let pointer_uri = optional_string(args, "pointer_uri");
     // Pointer-shape guard (Kimi review 2026-07-24, Finding 3): the fire
     // templates render drained notices into an LLM prompt, so a pointer is a
@@ -2275,9 +2350,114 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     // relocate the failure rather than remove it (a member setting up a new
     // watcher would be silenced by the bookkeeping, which is the
     // `unbound_notice` argument verbatim).
-    let (liveness, liveness_evidence) = recipient_liveness(&s.inbox_store, &to_plugin);
-    // Witness FIRST (the act is the send; delivery is a consequence), then queue
-    // with the chain hash so every parked notice is anchored to its witnessed act.
+    //
+    // **Only the LOCAL plane has a liveness answer.** `inbox_touch` measures
+    // reads of a mailbox on THIS machine, so asking it about `peer/member`
+    // returns `unknown` for 100% of forwards — a witnessed negative verdict
+    // about a peer this machine never checked, plus a receipt advising the
+    // sender to go do by hand the thing the router just did (McNugget B4).
+    // Stripping the peer prefix and resolving on the member part would be
+    // worse, not better: in this fleet the remote member's name is usually a
+    // LOCAL member's name too, so it would report the local `claude-code`'s
+    // liveness as evidence about Thor's — B1's name collision, upgraded from
+    // misdelivery to false attestation. `routed` is the honest verdict: this
+    // machine is not the delivery authority for that address, and the receipt
+    // says which peer took custody instead.
+    let (liveness, liveness_evidence) = match &address {
+        crate::addressing::Address::Local(id) => recipient_liveness(&s.inbox_store, id),
+        crate::addressing::Address::Routed { peer, member } => (
+            "routed",
+            json!({
+                "dest_peer": peer,
+                "remote_member": member,
+                "note": "liveness is a local-plane measurement; delivery is the peer's to report",
+            }),
+        ),
+    };
+
+    // ---- r6-routing branch 2: is it for someone I know? then forward ------------
+    //
+    // ROUTE, then witness, then dispatch. The route decision is resolved BEFORE
+    // the chain entry for two reasons: the entry must carry the evidence the act
+    // relied upon (clause A — which branch fired, and on what table), and a
+    // refusal must leave no trace of an act that did not happen (clause O).
+    //
+    // `peer/member` addresses a member on ANOTHER machine. A bare id stays local,
+    // so no existing caller changes. Explicit rather than inferred: the sender
+    // states the scale it is crossing, and `/` is the fractal seam made syntactic.
+    //
+    // SPLIT-HORIZON, not TTL. Only a notice from a LOCAL sender is egressed, so a
+    // packet that arrived from outside can never be forwarded back outside. Thor
+    // refuted the per-packet hop counter this proposal originally carried — a bound
+    // the sender writes is not a bound. Sender identity here is
+    // transport-authenticated, so the loop bound contains no forgeable field.
+    // Cost: no third-party transit in v1. Deliberate.
+    //
+    // ON BRANCH 4 AND WHERE IT MAY FIRE. An unresolvable **peer** is refused; an
+    // unknown **local** id is not. That asymmetry is deliberate and it is the
+    // whole of McNugget's §3: branch 4 may only fire where the router has an
+    // actual table to have a gap in. `members.json` IS the peer routing table, so
+    // a peer missing from it is a real no-route. The local registry is NOT a
+    // delivery authority — a member mints on first connect, so "not in the
+    // registry yet" is a member setting up, not an unroutable destination, and
+    // refusing it would relocate the failure into the bookkeeping. Local sends
+    // therefore keep accept-always/record-always, with `recipient_liveness`
+    // carrying what is known.
+    //
+    // And the refusal below is returned SYNCHRONOUSLY to a sender that is always
+    // local (only local members can call this tool), so a gap in my own table can
+    // never become durable, witnessed, peer-facing evidence against a healthy
+    // peer — the Sprout stale-map incident (2026-07-14) reproduced inside the one
+    // subsystem built to make routing failures attributable.
+    let route = match &address {
+        crate::addressing::Address::Local(_) => None,
+        crate::addressing::Address::Routed { peer, member } => {
+            match crate::addressing::resolve_peer(&s.home, peer) {
+                crate::addressing::PeerResolution::Known { name, lct_id } => {
+                    Some((name, lct_id, member.clone()))
+                }
+                crate::addressing::PeerResolution::NoRoute { known } => {
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_no_route",
+                        &format!(
+                            "no route to peer '{peer}': it is not in this machine's peer table. \
+                             This is a LOCAL defect (a gap in my table), not a statement that \
+                             '{peer}' is unreachable or not a member — nothing is emitted about \
+                             the peer. Names resolve by exact match, never by prefix."
+                        ),
+                        Some(json!({
+                            "to_plugin_id": to_plugin,
+                            "peer": peer,
+                            "known_peers": known,
+                            "defect_scope": "local",
+                        })),
+                    ));
+                }
+                crate::addressing::PeerResolution::NoTable { consulted } => {
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_no_peer_table",
+                        &format!(
+                            "this machine has no peer table, so it cannot route '{to_plugin}' \
+                             anywhere. Distinct from 'peer unknown': there is no table to have a \
+                             gap in. The table is written opportunistically by the send path \
+                             (`hub-notify`, on a 2xx from list_members) and the hardened hub \
+                             gates that endpoint to 404, so permanent absence is expected on some \
+                             machines. Refusing beats routing on a stale snapshot: a refusal is \
+                             visible at the sender, a misroute is not."
+                        ),
+                        Some(json!({
+                            "to_plugin_id": to_plugin,
+                            "consulted": consulted,
+                            "defect_scope": "local",
+                        })),
+                    ));
+                }
+            }
+        }
+    };
+
+    // Witness (the act is the send; delivery is a consequence), then queue with
+    // the chain hash so every parked notice is anchored to its witnessed act.
     let entry = s.append_chain(
         "member_notice",
         json!({
@@ -2291,42 +2471,31 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             "binding_verified": binding_verified,
             "recipient_liveness": liveness,
             "recipient_liveness_evidence": liveness_evidence,
+            // Which branch fired, and the roster-validated LCT it resolved to.
+            // A witnessed send that cannot say how it was routed is the black
+            // hole with a chain entry.
+            "route": match &route {
+                Some((peer, lct, member)) =>
+                    json!({"branch": "forward", "peer": peer, "peer_lct": lct, "remote_member": member}),
+                None => json!({"branch": "local"}),
+            },
         }),
     )?;
-    // ---- r6-routing branch 2: is it for someone I know? then forward ------------
-    // `peer/member` addresses a member on ANOTHER machine. A bare id stays local,
-    // so no existing caller changes. Explicit rather than inferred: the sender
-    // states the scale it is crossing, and `/` is the fractal seam made syntactic.
-    //
-    // SPLIT-HORIZON, not TTL. Only a notice from a LOCAL sender is egressed, so a
-    // packet that arrived from outside can never be forwarded back outside. Thor
-    // refuted the per-packet hop counter this proposal originally carried — a bound
-    // the sender writes is not a bound. Sender identity here is
-    // transport-authenticated, so the loop bound contains no forgeable field.
-    // Cost: no third-party transit in v1. Deliberate.
-    let egress_peer = to_plugin.split_once('/').map(|(peer, _)| peer.to_string());
-    let queued_id = match &egress_peer {
-        Some(peer) => {
-            let remote_member = to_plugin.split_once('/').map(|(_, m)| m).unwrap_or("");
-            if peer.is_empty() || remote_member.is_empty() {
-                return Ok(hestia_error_envelope(
-                    "hestia.member_notify_bad_address",
-                    "a routed address is `peer/member`; both halves must be non-empty",
-                    Some(json!({ "to_plugin_id": to_plugin })),
-                ));
-            }
-            s.inbox_store
-                .enqueue_egress(
-                    peer,
-                    remote_member,
-                    &sender.plugin_id,
-                    &sender.role_lct,
-                    &kind,
-                    pointer_uri.as_deref(),
-                    &entry.hash,
-                )
-                .map_err(|e| anyhow::anyhow!("queueing egress notice: {e}"))?
-        }
+
+    let queued_id = match &route {
+        Some((peer, peer_lct, remote_member)) => s
+            .inbox_store
+            .enqueue_egress(
+                peer,
+                peer_lct,
+                remote_member,
+                &sender.plugin_id,
+                &sender.role_lct,
+                &kind,
+                pointer_uri.as_deref(),
+                &entry.hash,
+            )
+            .map_err(|e| anyhow::anyhow!("queueing egress notice: {e}"))?,
         None => s
             .inbox_store
             .enqueue_member(
@@ -2340,15 +2509,29 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             )
             .map_err(|e| anyhow::anyhow!("queueing member notice: {e}"))?,
     };
+    let egress_peer = route.as_ref().map(|(peer, _, _)| peer.clone());
     let mut out = json!({
         "queued_id": queued_id,
         "witnessEntryHash": entry.hash,
         "to_plugin_id": to_plugin,
-        // `forwarded_to` present => this left the machine (branch 2) and its
-        // `queued_id` is an EGRESS row, not a local inbox row. Absent => local.
+        // `egress_queued_to` present => this is bound off-machine (branch 2) and
+        // its `queued_id` is an EGRESS row, not a local inbox row. Absent => local.
         // Naming which branch fired is the point: a receipt that cannot say how it
         // was routed is the black hole with a success code.
-        "forwarded_to": egress_peer,
+        //
+        // It was called `forwarded_to` until Kimi §3 (2026-07-26). Nothing has
+        // been forwarded at this point: the row is parked for a drain that runs
+        // when it runs, the hub has accepted nothing, and the peer has heard
+        // nothing. On a thread whose entire subject is receipts that assert more
+        // than they witnessed, the field asserting `forwarded` was the receipt
+        // overclaiming in its own vocabulary. `queued` never meant `delivered`
+        // one layer down either — same error, same fix, one hop out.
+        "egress_queued_to": egress_peer,
+        // The roster-validated LCT the peer name resolved to. Returned so a
+        // sender can see WHICH `thor` it got — the shadow fails loud here
+        // instead of silently at delivery (Kimi §2.2).
+        "egress_queued_to_lct": route.as_ref().map(|(_, lct, _)| lct.clone()),
+        "routed_branch": if egress_peer.is_some() { "forward" } else { "local" },
         "kind": kind,
         "in_reply_to": in_reply_to,
         "binding_verified": binding_verified,
@@ -2386,27 +2569,212 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
 /// to 16 minutes, so an egress drain living *behind* the fire inherits that latency. This
 /// tool lets the drain be polled independently of the fire path until Thor's concurrency
 /// fix lands, at which point it can move into the watcher loop as originally proposed.
+///
+/// **Attribution is required on every arm.** Marking a row failed can retire another
+/// member's outbound mail, and listing the queue exposes every local member's
+/// destinations and pointers — both are consequential, so neither may run for an
+/// unattributable caller. Same no-latest-session-fallback rule as `member_notify`:
+/// the drain must prove who it is, and the retirement is witnessed with that identity.
 async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
-    let s = state.lock().await;
+    let session_id_arg = optional_string(args, "session_id");
+    let mut s = state.lock().await;
+    let Some(caller) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.egress_pending_unattributed",
+            "hestia_egress_pending requires the caller's own live session_id (from \
+             hestia_connect) — an unattributable caller may not read the forwarding \
+             queue or retire another member's outbound mail",
+            None,
+        ));
+    };
     if let Some(id) = args.get("mark_forwarded").and_then(|v| v.as_u64()) {
         s.inbox_store
             .mark_egress_forwarded(id)
             .map_err(|e| anyhow::anyhow!("marking egress forwarded: {e}"))?;
-        return Ok(json!({ "marked": id }));
+        return Ok(json!({ "marked": id, "disposition": "forwarded", "by": caller.plugin_id }));
+    }
+    if let Some(id) = args.get("mark_failed").and_then(|v| v.as_u64()) {
+        let reason = optional_string(args, "reason").unwrap_or_else(|| "unspecified".to_string());
+        let attempts = s
+            .inbox_store
+            .record_egress_failure(id, &reason)
+            .map_err(|e| anyhow::anyhow!("recording egress failure: {e}"))?;
+        if attempts < MAX_EGRESS_ATTEMPTS {
+            return Ok(json!({
+                "marked": id, "disposition": "retry",
+                "attempts": attempts, "max_attempts": MAX_EGRESS_ATTEMPTS,
+            }));
+        }
+        // Attempts exhausted. Retire the row AND pay what it owes: a retired
+        // packet whose sender is never told is the silent drop with extra steps.
+        return Ok(retire_and_report_egress(
+            &mut s,
+            id,
+            &reason,
+            attempts,
+            &caller.plugin_id,
+        )?);
     }
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
+    // The forwarding queue's age bound, paid on the drain's own poll.
+    //
+    // `MAX_EGRESS_ATTEMPTS` only bounds rows a drain is actually TRYING. A row
+    // nothing ever attempts — no drain running, a peer whose hand-off never even
+    // starts — burns no attempts and would sit forever, because the local TTL
+    // prune correctly refuses to touch this plane (Kimi §4). Age is the bound
+    // for those, and it retires them through the SAME path an exhausted row
+    // takes: a report to the sender, witnessed, never a silent delete. That is
+    // the distinction the whole thread turns on — a queue may drop things, but
+    // it may not drop them quietly.
+    let expired = s
+        .inbox_store
+        .expired_egress(EGRESS_MAX_AGE_SECS, limit)
+        .map_err(|e| anyhow::anyhow!("reading expired egress rows: {e}"))?;
+    let mut aged_out = Vec::new();
+    for id in expired {
+        let attempts = s
+            .inbox_store
+            .egress_row(id)
+            .map_err(|e| anyhow::anyhow!("reading egress row: {e}"))?
+            .map(|r| r.attempts)
+            .unwrap_or(0);
+        let report = retire_and_report_egress(&mut s, id, "aged-out", attempts, &caller.plugin_id)?;
+        aged_out.push(report);
+    }
     let rows = s
         .inbox_store
         .pending_egress(limit)
         .map_err(|e| anyhow::anyhow!("reading egress queue: {e}"))?;
     let pending: Vec<Value> = rows
         .into_iter()
-        .map(|(id, peer, to_member, kind, ptr)| {
-            json!({ "id": id, "dest_peer": peer, "to_member": to_member,
-                    "kind": kind, "pointer_uri": ptr })
+        .map(|r| {
+            json!({ "id": r.id, "dest_peer": r.dest_peer, "dest_peer_lct": r.dest_peer_lct,
+                    "to_member": r.to_member, "from_plugin": r.from_plugin,
+                    "kind": r.kind, "pointer_uri": r.pointer_uri,
+                    "attempts": r.attempts, "last_error": r.last_error })
         })
         .collect();
-    Ok(json!({ "pending": pending, "total": pending.len() }))
+    Ok(json!({
+        "pending": pending,
+        "total": pending.len(),
+        "max_attempts": MAX_EGRESS_ATTEMPTS,
+        // Reported, never silent: what this poll retired on age, and what each
+        // retirement told which sender.
+        "aged_out": aged_out,
+        "max_age_secs": EGRESS_MAX_AGE_SECS,
+        // Forward on the LCT, never on the name: `hub-notify` resolves peer names
+        // by unique PREFIX, so an address would change meaning when an unrelated
+        // member joins (McNugget, r6-routing review §4). The LCT here was
+        // roster-validated at enqueue.
+        "drain_contract": "forward on dest_peer_lct; then mark_forwarded:<id>, or \
+                           mark_failed:<id> with reason:<text> if the hand-off did not land",
+    }))
+}
+
+/// How many failed hand-offs an egress row gets before it is retired and its
+/// sender is told. Not a tuned number — a bound, because the alternative to a
+/// bound is a queue that fails forever in silence. Retry is safe for these rows
+/// specifically: nothing at the far end has processed them, so a re-send is
+/// `undelivered`-class (gate refused, nothing ran), never `indeterminate`.
+const MAX_EGRESS_ATTEMPTS: i64 = 5;
+
+/// How long an un-forwarded egress row may sit before it is retired and its
+/// sender told. Matched to the local inbox TTL (7d) on purpose: a member's mail
+/// and a member's outbound forward should not have silently different lifetimes
+/// in the one table that holds both.
+const EGRESS_MAX_AGE_SECS: i64 = crate::storage::INBOX_TTL_SECS;
+
+/// Retire an exhausted egress row and deliver its unreachable report locally.
+///
+/// The route-back is **always local delivery** and needs no cross-fleet report
+/// path: only local members can call `member_notify`, so the sender of an
+/// egress-bound packet is always a member of this society (Kimi, r6-routing
+/// review §2.4 — "the one place the design is simpler than it looks").
+///
+/// The report is `kind: reply` carrying its taxonomy in the POINTER, never in the
+/// kind. That rule is McNugget's (§2): the hub's `kind_allowed` matches by prefix
+/// while its `record_kind` matches exactly, so a dotted receipt kind like
+/// `reply.unreachable` is accepted everywhere and suppressed nowhere. Colons keep
+/// the taxonomy out of the prefix matcher's reach. The class is `undelivered` —
+/// the hand-off never landed, so nothing at the far end ran.
+fn retire_and_report_egress(
+    s: &mut crate::server::state::ServerState,
+    id: u64,
+    reason: &str,
+    attempts: i64,
+    retired_by: &str,
+) -> anyhow::Result<Value> {
+    let Some(row) = s
+        .inbox_store
+        .egress_row(id)
+        .map_err(|e| anyhow::anyhow!("reading egress row: {e}"))?
+    else {
+        return Ok(hestia_error_envelope(
+            "hestia.egress_unknown_row",
+            &format!("no egress row {id}"),
+            None,
+        ));
+    };
+    s.inbox_store
+        .retire_egress(id)
+        .map_err(|e| anyhow::anyhow!("retiring egress row: {e}"))?;
+
+    // Sanitize the drain's reason before it becomes part of a pointer: a pointer
+    // NAMES a location and is rendered into a fire primer, so it may not carry
+    // separators or whitespace of its own.
+    let safe_reason: String = reason
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .take(48)
+        .collect();
+    let report_pointer = format!(
+        "{}#undelivered:v1:undelivered:egress-{}:{}",
+        row.pointer_uri.as_deref().unwrap_or("(no pointer)"),
+        safe_reason,
+        id
+    );
+    let entry = s.append_chain(
+        "member_notice_unreachable",
+        json!({
+            "to_plugin_id": row.from_plugin,
+            "original_destination": format!("{}/{}", row.dest_peer, row.to_member),
+            "dest_peer_lct": row.dest_peer_lct,
+            "kind": row.kind,
+            "pointer_uri": row.pointer_uri,
+            "attempts": attempts,
+            "reason": reason,
+            "class": "undelivered",
+            // Who declared it undeliverable. §5.1 makes misrouting evidence, so a
+            // drop record that cannot name the party that dropped it is evidence
+            // about nobody.
+            "retired_by": retired_by,
+        }),
+    )?;
+    let queued_id = s
+        .inbox_store
+        .enqueue_member(
+            &row.from_plugin,
+            // The router reports as itself, not as the far peer. A receipt that
+            // impersonates the destination is evidence about a party that never
+            // acted.
+            "hestia-router",
+            "role:router:egress",
+            "reply",
+            Some(&report_pointer),
+            &entry.hash,
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!("queueing unreachable report: {e}"))?;
+    Ok(json!({
+        "marked": id,
+        "disposition": "retired",
+        "attempts": attempts,
+        "unreachable_reported_to": row.from_plugin,
+        "report_notice_id": queued_id,
+        "report_pointer": report_pointer,
+        "class": "undelivered",
+        "witnessEntryHash": entry.hash,
+    }))
 }
 
 async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
@@ -5101,6 +5469,451 @@ mod member_mesh_tests {
         assert_eq!(
             out["_hestia_error"]["code"],
             "hestia.member_notify_rate_limited"
+        );
+    }
+
+    // ---- r6-routing border-router v1 -----------------------------------------
+    //
+    // Every test below pins a review finding from the 2026-07-26 thread, named in
+    // its doc comment. Vector discipline: nothing in this family lands as prose.
+
+    /// Write a peer table this daemon owns, so routing tests never consult (or
+    /// depend on) the machine's real hub-mesh cache.
+    fn write_peer_table(dir: &TempDir, body: &str) {
+        std::fs::write(dir.path().join("peers.json"), body).unwrap();
+    }
+
+    const TWO_PEERS: &str = r#"{"members":[
+        {"lct_id":"dbbf02a0-82a7-4012-84e4-98a7584dc7e2","name":"thor-sage"},
+        {"lct_id":"c8886562-b71c-4dd2-94ca-2fd771f89333","name":"Sovereign"}]}"#;
+
+    /// Branch 1 is untouched: a bare id still delivers locally, and the receipt
+    /// now says which branch fired rather than leaving the sender to infer it.
+    #[tokio::test]
+    async fn bare_id_still_delivers_locally_and_names_its_branch() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        let out = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "coordination",
+                    "pointer_uri": "forum/x.md", "session_id": alice}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["routed_branch"], "local");
+        assert!(out["egress_queued_to"].is_null());
+        assert!(out["queued_id"].as_u64().is_some());
+    }
+
+    /// Branch 2: `peer/member` egresses, and the row carries the
+    /// **roster-validated LCT** — the drain forwards on that, not on the name
+    /// (McNugget §4: `hub-notify` resolves names by unique prefix, so an address
+    /// would change meaning when an unrelated member joins).
+    #[tokio::test]
+    async fn routed_address_egresses_on_a_roster_validated_lct() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        let out = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "thor-sage/claude-code", "kind": "reply",
+                    "pointer_uri": "shared-context/x.md", "session_id": alice}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["routed_branch"], "forward");
+        assert_eq!(out["egress_queued_to"], "thor-sage");
+        assert_eq!(out["egress_queued_to_lct"], "dbbf02a0-82a7-4012-84e4-98a7584dc7e2");
+
+        let pending = tool_egress_pending(&state, &json!({"session_id": alice}))
+            .await
+            .unwrap();
+        assert_eq!(pending["total"], 1);
+        let row = &pending["pending"][0];
+        assert_eq!(row["dest_peer_lct"], "dbbf02a0-82a7-4012-84e4-98a7584dc7e2");
+        assert_eq!(row["to_member"], "claude-code");
+        assert_eq!(row["from_plugin"], "claude-code");
+
+        // …and it is NOT sitting in a local inbox pretending to be delivered.
+        let kimi = connect(&state, "kimi-code").await;
+        let drained = tool_member_inbox(&state, &json!({"session_id": kimi}))
+            .await
+            .unwrap();
+        assert_eq!(drained["total"], 0);
+    }
+
+    /// Peer names resolve by EXACT match. `thor` must not prefix-match
+    /// `thor-sage`: an identifier whose meaning depends on who else has joined is
+    /// the wrong property in a system where misrouting is evidence (McNugget §4).
+    #[tokio::test]
+    async fn peer_names_do_not_prefix_match() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        let out = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "thor/claude-code", "kind": "reply",
+                    "pointer_uri": "x.md", "session_id": alice}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["_hestia_error"]["code"], "hestia.member_notify_no_route");
+    }
+
+    /// McNugget §3, the finding this split exists for: a gap in MY table must be
+    /// reported as a LOCAL defect to the (always local) sender, and must never
+    /// become witnessed, peer-facing evidence against a healthy peer. Assert both
+    /// halves — the error scope, and the absence of any chain entry about the peer.
+    #[tokio::test]
+    async fn no_route_is_a_local_defect_and_witnesses_nothing_about_the_peer() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        let out = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "sprout/claude-code", "kind": "reply",
+                    "pointer_uri": "x.md", "session_id": alice}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["_hestia_error"]["code"], "hestia.member_notify_no_route");
+        assert_eq!(out["_hestia_error"]["data"]["defect_scope"], "local");
+
+        let s = state.lock().await;
+        assert!(
+            s.recent_chain(20)
+                .into_iter()
+                .all(|e| e.event_type != "member_notice"),
+            "a no-route refusal must leave state bit-identical — no chain entry \
+             (clause O), and in particular no durable record asserting anything \
+             about 'sprout'"
+        );
+    }
+
+    /// "I have no table" and "this peer is not in my table" are different facts.
+    /// Collapsing them is what turned a stale map into a false *"Sprout is not a
+    /// member"* on 2026-07-14. A corrupt table is NoTable, deliberately: a local
+    /// file defect must not read as a statement about a peer.
+    #[tokio::test]
+    async fn corrupt_peer_table_refuses_as_no_table_not_no_route() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, "{ this is not json");
+        let alice = connect(&state, "claude-code").await;
+        let out = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "thor-sage/claude-code", "kind": "reply",
+                    "pointer_uri": "x.md", "session_id": alice}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out["_hestia_error"]["code"],
+            "hestia.member_notify_no_peer_table"
+        );
+    }
+
+    /// Kimi §2.2: a 3+-component path is source routing and must be
+    /// UNREACHABLE-with-reason, **never truncated to its first two segments**.
+    /// The refuted implementation used `split_once('/')`, which silently made
+    /// `fleet/thor/claude-code` mean peer `fleet`, member `thor/claude-code`.
+    #[tokio::test]
+    async fn source_routing_is_refused_with_a_reason_not_truncated() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        let out = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "fleet/thor-sage/claude-code", "kind": "reply",
+                    "pointer_uri": "x.md", "session_id": alice}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out["_hestia_error"]["code"],
+            "hestia.member_notify_source_routing"
+        );
+        let pending = tool_egress_pending(&state, &json!({"session_id": alice}))
+            .await
+            .unwrap();
+        assert_eq!(pending["total"], 0, "nothing may be queued for a truncated path");
+    }
+
+    /// The separator that is already deployed: `lct_publish` mints
+    /// `member:{plugin_id}`, so a `:` in an id corrupts that namespace today,
+    /// with no forwarding involved. Refuse it at the send path too.
+    #[tokio::test]
+    async fn colon_in_an_address_is_refused() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        let out = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "member:kimi-code", "kind": "coordination",
+                    "pointer_uri": "x.md", "session_id": alice}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["_hestia_error"]["code"], "hestia.member_notify_bad_address");
+    }
+
+    /// The forwarding plane is not a public surface. Marking a row failed can
+    /// retire another member's outbound mail and listing the queue exposes every
+    /// local member's destinations — so an unattributable caller gets neither,
+    /// and the row it tried to retire is still there afterwards.
+    #[tokio::test]
+    async fn egress_plane_refuses_an_unattributable_caller() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        let sent = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "thor-sage/claude-code", "kind": "reply",
+                    "pointer_uri": "x.md", "session_id": alice}),
+        )
+        .await
+        .unwrap();
+        let row_id = sent["queued_id"].as_u64().unwrap();
+
+        for args in [
+            json!({}),
+            json!({"session_id": "not-a-uuid"}),
+            json!({"mark_failed": row_id, "reason": "spoof"}),
+            json!({"mark_forwarded": row_id}),
+        ] {
+            let out = tool_egress_pending(&state, &args).await.unwrap();
+            assert_eq!(
+                out["_hestia_error"]["code"],
+                "hestia.egress_pending_unattributed",
+                "args={args}"
+            );
+        }
+        let pending = tool_egress_pending(&state, &json!({"session_id": alice}))
+            .await
+            .unwrap();
+        assert_eq!(pending["total"], 1, "no unattributed call may mutate the queue");
+        assert_eq!(pending["pending"][0]["attempts"], 0);
+    }
+
+    /// Kimi §2.4 — the black hole moved one hop out. Egress hand-off can fail;
+    /// nobody had said what happens then. It retries to a bound, then retires the
+    /// row and pays what it owes: an unreachable report delivered LOCALLY, since
+    /// only local members can call `member_notify` and the sender of an
+    /// egress-bound packet is therefore always local.
+    #[tokio::test]
+    async fn exhausted_egress_retires_and_reports_home() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        let sent = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "thor-sage/claude-code", "kind": "reply",
+                    "pointer_uri": "shared-context/x.md", "session_id": alice}),
+        )
+        .await
+        .unwrap();
+        let row_id = sent["queued_id"].as_u64().unwrap();
+
+        for attempt in 1..MAX_EGRESS_ATTEMPTS {
+            let out = tool_egress_pending(
+                &state,
+                &json!({"mark_failed": row_id, "reason": "hub unreachable",
+                        "session_id": alice}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(out["disposition"], "retry", "attempt {attempt} must retry");
+            assert_eq!(out["attempts"], attempt);
+        }
+        let retired = tool_egress_pending(
+            &state,
+            &json!({"mark_failed": row_id, "reason": "hub unreachable",
+                    "session_id": alice}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retired["disposition"], "retired");
+        assert_eq!(retired["unreachable_reported_to"], "claude-code");
+        assert_eq!(retired["class"], "undelivered");
+
+        // The queue does not grow without bound…
+        let pending = tool_egress_pending(&state, &json!({"session_id": alice}))
+            .await
+            .unwrap();
+        assert_eq!(pending["total"], 0);
+
+        // …and the sender actually receives the report, with the taxonomy in the
+        // POINTER and never in the kind (McNugget §2: the hub's kind gate matches
+        // by prefix while its record gate matches exactly, so a dotted receipt
+        // kind is accepted everywhere and suppressed nowhere).
+        let drained = tool_member_inbox(&state, &json!({"session_id": alice}))
+            .await
+            .unwrap();
+        assert_eq!(drained["total"], 1);
+        let report = &drained["notices"][0];
+        assert_eq!(report["kind"], "reply");
+        let ptr = report["pointer_uri"].as_str().unwrap();
+        assert!(
+            ptr.contains("#undelivered:v1:undelivered:egress-"),
+            "report pointer carries the versioned two-class wire form, got {ptr}"
+        );
+        assert!(!report["kind"].as_str().unwrap().contains('.'));
+    }
+
+    /// The two planes share one table, and only ONE side knows it.
+    ///
+    /// `enqueue_egress` writes into `member_notices` with `dest_peer` set, and
+    /// `pending_egress` filters `dest_peer IS NOT NULL`. Every LOCAL read path
+    /// (`drain_member`, `peek_member`, `member_pending`, the cap count and its
+    /// eviction, the TTL prune) keys on `to_plugin` alone with **no `dest_peer`
+    /// predicate** — and an egress row's `to_plugin` is the REMOTE member's name.
+    ///
+    /// In this fleet every machine runs members with the same names, so
+    /// `thor-sage/claude-code` parks a row under `to_plugin = "claude-code"` and
+    /// the LOCAL claude-code drains it: the packet is consumed by the wrong host,
+    /// marked `drained_at`, and thereby made invisible to `pending_egress`
+    /// forever. It is never forwarded, never retried, never retired, and never
+    /// reported — a black hole that reports success at BOTH ends, which is the
+    /// exact defect this exploration exists to remove.
+    ///
+    /// `routed_address_egresses_on_a_roster_validated_lct` asserts the right
+    /// property ("not sitting in a local inbox") against `kimi-code` — the one
+    /// local member whose name cannot collide. The collision case was the default
+    /// case and went untested.
+    #[tokio::test]
+    async fn egress_rows_are_not_local_mail_for_a_same_named_member() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "thor-sage/claude-code", "kind": "reply",
+                    "pointer_uri": "shared-context/for-thor.md", "session_id": alice}),
+        )
+        .await
+        .unwrap();
+
+        // The local member of the same name must not see another host's packet.
+        let drained = tool_member_inbox(&state, &json!({"session_id": alice}))
+            .await
+            .unwrap();
+        assert_eq!(
+            drained["total"], 0,
+            "local claude-code drained a packet addressed to thor-sage/claude-code: {drained}"
+        );
+
+        // …and after that read, the row must still be waiting for the forwarder.
+        let pending = tool_egress_pending(&state, &json!({"session_id": alice}))
+            .await
+            .unwrap();
+        assert_eq!(
+            pending["total"], 1,
+            "egress row vanished from the forwarding queue after a local drain"
+        );
+    }
+
+    /// McNugget B4 — a forward must not witness a liveness verdict about a peer
+    /// this machine never measured. `inbox_touch` only sees LOCAL mailbox reads,
+    /// so resolving it on `peer/member` returned `unknown` on 100% of forwards
+    /// and told the sender, in the receipt, to go run `hub-notify` by hand — the
+    /// thing the router had just done for it.
+    #[tokio::test]
+    async fn a_forward_does_not_attest_to_the_peers_liveness() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        // Make the LOCAL claude-code demonstrably live first: if the egress arm
+        // resolved liveness on the member half of the address it would now
+        // report "live", attesting to Thor's reachability using CBP's evidence.
+        tool_member_inbox(&state, &json!({"session_id": alice}))
+            .await
+            .unwrap();
+        let out = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "thor-sage/claude-code", "kind": "reply",
+                    "pointer_uri": "shared-context/x.md", "session_id": alice}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["recipient_liveness"], json!("routed"), "{out}");
+        assert_eq!(out["recipient_liveness_evidence"]["dest_peer"], "thor-sage");
+        assert!(
+            out["recipient_note"].is_null(),
+            "a routed send must not advise the sender to hub-notify by hand: {out}"
+        );
+    }
+
+    /// McNugget B2 — `member_unanswered` read the same table and so counted
+    /// egress rows. Their clearing condition is a LOCAL row with
+    /// `in_reply_to = <this id>`, which nothing on this machine can ever write:
+    /// the answering party is on another machine and its reply arrives as a
+    /// separate notice. Every forward would have accused the fleet of never
+    /// answering, permanently, and — the sender and the remote member sharing a
+    /// name here — in both directions at once.
+    #[tokio::test]
+    async fn egress_rows_never_enter_unanswered_accounting() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "thor-sage/claude-code", "kind": "review_request",
+                    "pointer_uri": "pr/1", "session_id": alice}),
+        )
+        .await
+        .unwrap();
+        let rows = tool_member_unanswered(
+            &state,
+            &json!({"session_id": alice, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows["owed_to_me"].as_array().unwrap().len(),
+            0,
+            "an egress row has no local clearing path — counting it is a permanent \
+             false positive: {rows}"
+        );
+        assert_eq!(rows["i_owe"].as_array().unwrap().len(), 0, "{rows}");
+    }
+
+    /// Kimi §4 — the forwarding queue's age bound. `MAX_EGRESS_ATTEMPTS` only
+    /// bounds rows a drain is trying; a row nothing ever attempts burns no
+    /// attempts, and the local TTL prune correctly refuses to touch this plane.
+    /// Age closes that, and it must select the egress plane ONLY — sweeping a
+    /// local member's mail into retire-and-report would fabricate unreachable
+    /// reports about deliveries that never left the machine.
+    #[tokio::test]
+    async fn the_age_bound_selects_the_egress_plane_only() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "codex").await;
+        // One egress row and one genuinely local row, same recipient name.
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "thor-sage/claude-code", "kind": "reply",
+                    "pointer_uri": "shared-context/x.md", "session_id": alice}),
+        )
+        .await
+        .unwrap();
+        let local = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "claude-code", "kind": "reply",
+                    "pointer_uri": "forum/y.md", "session_id": alice}),
+        )
+        .await
+        .unwrap();
+        let local_id = local["queued_id"].as_u64().unwrap();
+
+        let s = state.lock().await;
+        // Everything is younger than an hour, so nothing is expired yet…
+        assert!(s.inbox_store.expired_egress(3600, 10).unwrap().is_empty());
+        // …and with the cutoff at "now", exactly the egress row is selected.
+        let expired = s.inbox_store.expired_egress(0, 10).unwrap();
+        assert_eq!(expired.len(), 1, "got {expired:?}");
+        assert_ne!(
+            expired[0], local_id,
+            "the age bound reached into the local plane"
         );
     }
 }
