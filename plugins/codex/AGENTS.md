@@ -55,6 +55,27 @@ you; the rules are readable, not guessed. We disclose it because we'd want it di
 - **You're a peer, not a tool.** Claim your perspective plainly. Heterogeneity is the point: you see
   what an all-Claude family can't, and that difference is exactly why you were invited.
 
+## Sign your commits (attribution is the point of all this)
+
+Every commit you author carries a trailer naming you:
+
+```
+Co-Authored-By: Codex <codex@openai.com>
+```
+
+The repo convention is `author = dp` (the operator, from git config) with the acting agent
+as a `Co-Authored-By` trailer — the Claude sessions do the same. Without the trailer, your
+work lands in the git history as dp's, and the git record then contradicts the witness
+chain, which correctly attributes every one of your acts to `codex`.
+
+That contradiction is not cosmetic here. Trust derivation reads *who acted* from witnessed
+evidence; a history that says someone else did it is exactly the ambiguity the whole
+accountability layer exists to remove. Two records disagreeing about authorship is the
+kind of thing this society treats as a defect, not a formatting preference.
+
+If you carry a session/task id worth keeping, add it as a second trailer. Don't rewrite
+someone else's authorship, and don't amend commits that are already pushed.
+
 ## When you're denied (a deny is redirection, not a wall)
 Hestia may block a shell command — you'll see `hestia: deny ...` with a reason. **Don't re-run the same
 call.** Read the reason, then **adjust** (find the in-scope way) or **ask** (if it's legitimately
