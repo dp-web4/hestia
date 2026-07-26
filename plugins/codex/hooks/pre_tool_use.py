@@ -407,7 +407,16 @@ def _daemon_witness(verb, reason):
     post_s({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "hestia_witness_decision",
                        "arguments": {
-                           "plugin_id": "codex-cli",
+                           # ONE member, one identity. This said "codex-cli" while the
+                           # runtime acted as "codex", so the same agent kept two trust
+                           # grains and two inboxes: gate decisions accrued to one and
+                           # work to the other, halving the evidence on each and making
+                           # adjudication ambiguous (dp spotted both listed as separate
+                           # orchestrators, 2026-07-26). `codex` is the identity that
+                           # holds the scope grant and the identity.json, so it wins.
+                           # Pre-split history stays where it landed; this consolidates
+                           # going forward rather than rewriting the record.
+                           "plugin_id": "codex",
                            "decision": verb,
                            "adjudicator": "plugin-gate:codex(scope/egress)",
                            "reason": reason[:300],
