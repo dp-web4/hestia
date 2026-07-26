@@ -241,6 +241,8 @@ pub async fn serve_with_callback(
         .route("/api/policy/rule", put(policy_upsert_rule))
         .route("/api/policy/rule/:rule_id", delete(policy_delete_rule))
         .route("/api/orchestrators/:id/connect", post(orchestrator_connect))
+        .route("/api/agents", get(agents_inventory))
+        .route("/api/agents/:id/ungovern", post(agent_ungovern))
         .route("/api/chain", get(chain_query))
         // OID4VCI issuance MINTS a presentation SIGNED WITH THE OWNER'S IDENTITY KEY — a consequential
         // act that must be owner-authorized. Fail-closed stopgap (PRD §5.6/§7.1; Nomad's finding, dp's
@@ -1125,6 +1127,73 @@ async fn orchestrator_connect(
             (
                 StatusCode::OK,
                 Json(serde_json::json!({"ok": true, "message": msg})),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+// --- Agent read list (agent-atlas read half) ---
+
+/// `GET /api/agents` → the three inventories: what is installed, what hestia has an
+/// adapter for, and what is actually governed. Read-only; the write half is
+/// `/api/orchestrators/:id/connect` (govern) and `/api/agents/:id/ungovern`.
+async fn agents_inventory() -> impl IntoResponse {
+    match crate::server::agents::inventory() {
+        Ok(v) => (StatusCode::OK, Json(v)),
+        // A failed look is reported as a failed look. Returning an empty inventory here
+        // would render as "nothing ungoverned on this machine", which is the precise
+        // inversion this surface exists to prevent.
+        Err(e) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "UNKNOWN",
+                "reason": format!("inventory could not run: {e}"),
+            })),
+        ),
+    }
+}
+
+/// `POST /api/agents/:id/ungovern` → remove hestia's hook wiring from an agent's config.
+///
+/// surface: agent_ungovern   act: remove enforcement from a governed agent
+/// S: high/reversible [construct: `ungovern` writes a verified backup before any edit]
+/// R: pass [construct: mounted behind `operator_gate` with the rest of /api/*]
+/// W: pass [construct: operator_gate proves an Ed25519 challenge-signed session]
+/// O: pass [construct: backup written + byte-compared before the config is rewritten]
+/// A: pass [construct: append_chain("agent_ungovern") carries agent, backup path and
+///    hooks_removed — the evidence the act relied on, not merely that it happened]
+/// V: present [construct: TOML configs are refused outright rather than edited
+///    approximately; the operator is told to do it by hand]
+/// verdict: PASS
+///
+/// Ungoverning is deliberately louder than governing. Governing adds a gate and a bad
+/// outcome is a blocked tool call; ungoverning REMOVES one, and its bad outcome is an
+/// agent running unwatched while the dashboard still lists it as known.
+async fn agent_ungovern(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match crate::server::agents::ungovern(&id) {
+        Ok((backup, removed)) => {
+            let s = state.lock().await;
+            let _ = s.append_chain(
+                "agent_ungovern",
+                serde_json::json!({
+                    "agent": id, "hooks_removed": removed, "backup": backup,
+                }),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true, "hooks_removed": removed, "backup": backup,
+                    "message": format!(
+                        "{removed} hestia hook(s) removed from {id}; backup at {backup}. \
+                         Restart {id} for this to take effect."),
+                })),
             )
         }
         Err(e) => (

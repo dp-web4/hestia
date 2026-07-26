@@ -128,6 +128,68 @@
     .hs-val { font-size: 1.1rem; }
   }
 
+  /* --- Agents drawer (agent-atlas read half, hung off the title bar) --- */
+  .agents-wrap { position: relative; margin-right: 1.25rem; }
+  .agents-btn {
+    font: inherit; font-size: 0.75rem; letter-spacing: 0.05em; text-transform: uppercase;
+    padding: 0.3rem 0.7rem; border-radius: 999px; border: 1px solid var(--border);
+    background: transparent; color: var(--fg-dim); cursor: pointer;
+  }
+  .agents-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .agents-badge { font-variant-numeric: tabular-nums; margin-left: 0.3rem; }
+  /* Status colour is the finding, not decoration: a machine with a dead gate must not
+     look the same as a clean one from the title bar. */
+  .agents-btn.st-ok      .agents-badge { color: var(--success); }
+  .agents-btn.st-warn    .agents-badge { color: var(--warning); }
+  .agents-btn.st-bad     { border-color: var(--coral); color: var(--coral); }
+  .agents-btn.st-bad     .agents-badge { color: var(--coral); }
+  .agents-btn.st-unknown .agents-badge { color: var(--fg-faint); }
+  .agents-menu {
+    position: absolute; right: 0; top: calc(100% + 0.5rem); z-index: 60;
+    width: min(46rem, 92vw); max-height: 70vh; overflow-y: auto;
+    background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.5); padding: 0.5rem 0;
+  }
+  .agents-menu[hidden] { display: none; }
+  .agents-head {
+    display: flex; align-items: center; gap: 0.75rem;
+    padding: 0.35rem 1rem 0.6rem; border-bottom: 1px solid var(--border);
+    font-size: 0.78rem; color: var(--fg-dim);
+  }
+  .agents-refresh {
+    margin-left: auto; font: inherit; font-size: 0.7rem; padding: 0.15rem 0.55rem;
+    border-radius: 999px; border: 1px solid var(--border); background: transparent;
+    color: var(--fg-dim); cursor: pointer;
+  }
+  .agents-refresh:hover { border-color: var(--accent); color: var(--accent); }
+  .agent-row {
+    display: grid; grid-template-columns: minmax(7rem,1fr) 7.5rem minmax(0,2fr) auto;
+    gap: 0.6rem; align-items: center; padding: 0.45rem 1rem;
+    border-top: 1px solid var(--border); font-size: 0.8rem;
+  }
+  .agent-row:first-of-type { border-top: 0; }
+  .agent-name { font-family: var(--mono); }
+  .agent-state {
+    font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.06em;
+    padding: 0.12rem 0.5rem; border-radius: 999px; justify-self: start; white-space: nowrap;
+  }
+  .agent-state.governed    { background: #4ade8018; color: var(--success); }
+  .agent-state.miswired    { background: #ff7a6618; color: var(--coral); }
+  .agent-state.ungoverned  { background: #facc1518; color: var(--warning); }
+  .agent-state.ungovernable{ background: var(--bg-elev-2); color: var(--fg-faint); }
+  .agent-state.partial     { background: #facc1518; color: var(--warning); }
+  .agent-state.dormant     { background: var(--bg-elev-2); color: var(--fg-faint); }
+  .agent-note { color: var(--fg-faint); font-size: 0.7rem; overflow: hidden; text-overflow: ellipsis; }
+  .agent-act {
+    font: inherit; font-size: 0.68rem; padding: 0.18rem 0.6rem; border-radius: 999px;
+    border: 1px solid var(--border); background: transparent; color: var(--fg-dim); cursor: pointer;
+  }
+  .agent-act:hover { border-color: var(--accent); color: var(--accent); }
+  .agent-act.danger:hover { border-color: var(--coral); color: var(--coral); }
+  .agent-act[disabled] { opacity: 0.35; cursor: not-allowed; }
+  .agents-foot { padding: 0.5rem 1rem 0.25rem; font-size: 0.68rem; color: var(--fg-faint); border-top: 1px solid var(--border); }
+  .agents-sect { padding: 0.5rem 1rem 0.2rem; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--fg-faint); }
+
   /* --- Main --- */
   main {
     grid-area: main;
@@ -319,29 +381,46 @@
   .trust-list { display: flex; flex-direction: column; }
   .trust-row {
     display: grid;
-    grid-template-columns: minmax(9rem, 15rem) minmax(0, 1fr) 3rem 5.5rem;
+    grid-template-columns: minmax(9rem, 15rem) minmax(0, 1fr) 3rem 5.5rem auto;
     gap: 0.75rem;
     align-items: center;
     width: 100%;
     padding: 0.55rem 1.25rem;
-    background: none;
-    border: 0;
     border-top: 1px solid var(--border);
-    color: inherit;
-    font: inherit;
-    text-align: left;
-    cursor: pointer;
   }
   .trust-row:first-child { border-top: 0; }
   .trust-row:hover { background: var(--bg-elev-2); }
   .trust-row .tr-id { font-family: var(--mono); font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .trust-row .tr-role { font-family: var(--mono); font-size: 0.72rem; color: var(--fg-dim); margin-left: 0.4rem; }
   .trust-row .tr-val { font-family: var(--mono); font-size: 0.85rem; text-align: right; font-variant-numeric: tabular-nums; }
-  .trust-row .tr-dim { display: block; font-size: 0.66rem; color: var(--fg-faint); line-height: 1.1; margin-top: 0.1rem; }
+  .trust-row .tr-dim { display: block; font-size: 0.66rem; color: var(--fg-faint); line-height: 1.1; margin-top: 0.2rem; }
+  /* `.bar` sets a height, so it must be a BLOCK box. The first cut wrapped it in a
+     <span>, which is inline — height and the inner fill were ignored and the bar simply
+     did not paint, leaving an invisible strip that happened to be the click target. */
+  .trust-row .tr-bar { display: block; min-width: 0; }
+  .trust-row .bar { display: block; width: 100%; }
+  .bar-unmeasured {
+    border: 1px dashed var(--border);
+    background: transparent;
+    height: 6px;
+    border-radius: 3px;
+  }
+  .tr-detail {
+    font: inherit;
+    font-size: 0.7rem;
+    letter-spacing: 0.04em;
+    padding: 0.2rem 0.6rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--fg-dim);
+    cursor: pointer;
+  }
+  .tr-detail:hover { border-color: var(--accent); color: var(--accent); }
   .trust-row .trust-level { justify-self: end; }
   @media (max-width: 700px) {
-    .trust-row { grid-template-columns: minmax(0, 1fr) 3rem; }
-    .trust-row .bar { display: none; }
+    .trust-row { grid-template-columns: minmax(0, 1fr) 3rem auto; }
+    .trust-row .tr-bar { display: none; }
   }
 
   .trust-item {
@@ -553,6 +632,24 @@
         </select></span>
       </div>
       <div class="hstat"><span class="hs-val success" id="stat-rate">—</span><span class="hs-lab" id="stat-rate-delta">success</span></div>
+    </div>
+    <!-- The read list hangs off the title bar rather than taking a panel (dp): what is
+         installed here, what hestia could govern, what it actually governs. It is a
+         different question from the working screen — "who is on this box" vs "what are
+         they doing" — and it is asked occasionally, so it gets a drawer, not real estate. -->
+    <div class="agents-wrap">
+      <button type="button" class="agents-btn" id="agents-btn" aria-expanded="false"
+              title="Agents installed on this machine, and which of them are governed">
+        agents <span class="agents-badge" id="agents-badge">·</span>
+      </button>
+      <div class="agents-menu" id="agents-menu" hidden>
+        <div class="agents-head">
+          <span id="agents-summary">loading…</span>
+          <button type="button" class="agents-refresh" id="agents-refresh" title="Re-run the inventory now">refresh</button>
+        </div>
+        <div id="agents-body"><div class="empty">…</div></div>
+        <div class="agents-foot" id="agents-foot"></div>
+      </div>
     </div>
     <div class="live">
       <span class="dot"></span>
@@ -1026,38 +1123,71 @@
     // can share a plugin_id — the codex / codex-cli case).
     trustShown = filtered;
     root.innerHTML = filtered.map((t, i) => {
-      const w = weakestDimension(t);
+      const w = lawScore(t);
       const pct = w.score == null ? 0 : Math.max(0, Math.min(1, w.score)) * 100;
+      // Unmeasured renders an explicitly EMPTY track, not a zero-width fill on a track
+      // you cannot see — "no evidence" and "evidence of zero" must not look alike.
+      const bar = w.score == null
+        ? `<div class="bar bar-unmeasured" title="no adjudicated evidence yet"></div>`
+        : `<div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>`;
       return `
-      <button type="button" class="trust-row" onclick="showTrustDetail(${i})"
-              title="Open the full tensor and its chain receipts">
+      <div class="trust-row">
         <span class="tr-id">${escapeHtml(t.plugin_id)}${trustRole(t) ? `<span class="tr-role">${escapeHtml(shortRole(trustRole(t)))}</span>` : ''}</span>
-        <span>
-          <span class="bar"><div style="width:${pct.toFixed(1)}%"></div></span>
-          <span class="tr-dim">${escapeHtml(w.label)} · ${fmt.int(t.action_count)} action${t.action_count === 1 ? '' : 's'}${t.aliased_to ? ' · folds into ' + escapeHtml(t.aliased_to) : ''}</span>
+        <span class="tr-bar">
+          ${bar}
+          <span class="tr-dim">${escapeHtml(w.label)} · ${fmt.int(t.action_count)} action${t.action_count === 1 ? '' : 's'}</span>
         </span>
-        <span class="tr-val">${w.score == null ? '—' : w.score.toFixed(2)}</span>
+        <span class="tr-val">${w.score == null ? '—' : truncScore(w.score)}</span>
         <span class="trust-level">${escapeHtml(t.level)}</span>
-      </button>`;
+        <button type="button" class="tr-detail" onclick="showTrustDetail(${i})"
+                title="Full tensor, every dimension, and the chain receipts behind it">detail</button>
+      </div>`;
     }).join('');
   }
 
-  // The single collapsed bar reports the LOWEST measured dimension, not a mean. An
-  // average would manufacture a figure no evidence produced and would let a strong grain
-  // mask a failing one — the same masking the orchestrator chips already refuse (they
-  // show the worst grain's level). The dimension's name rides on the row so the number
-  // stays falsifiable at a glance.
-  function weakestDimension(t) {
-    const cand = [
-      ['temperament',    t.derived_temperament],
-      ['adj. validity',  t.adjudicated_validity],
-      ['adj. veracity',  t.adjudicated_veracity],
-      ['adj. valuation', t.adjudicated_valuation],
-      ['outcome record', t.t3_training],
-    ].filter(([, v]) => typeof v === 'number');
-    if (!cand.length) return { score: null, label: 'no measured dimension' };
-    const [label, score] = cand.reduce((a, b) => (b[1] < a[1] ? b : a));
-    return { score, label: cand.length > 1 ? `${label} (weakest of ${cand.length})` : label };
+  // THE ROW'S NUMBER IS THE ONE THE LAW USES (dp, 2026-07-26: "the measurements should
+  // follow the law"). derivation.rs computes the displayed level as the MEAN of the
+  // DERIVED dimensions only — temperament and the three adjudicated ones — and
+  // deliberately excludes `t3_training`, which is the self-reported outcome record.
+  //
+  // My first cut showed the weakest dimension INCLUDING t3_training, and the row then
+  // argued with its own level in both directions:
+  //   kimi-code/member          no derived evidence -> level `unmeasured`, bar read 1.00
+  //                             off a self-report the law does not count
+  //   kimi-code/interactive-dev law mean 0.847 -> `HIGH`, bar read 0.11
+  // Weakest-link is a good principle and it was the wrong one here: a summary that is
+  // not the level's own basis cannot explain the level, it can only contradict it. The
+  // weakest dimension is still worth seeing, so it moves to the detail popup where the
+  // full tensor already lives.
+  const LAW_DIMS = [
+    ['temperament',    t => t.derived_temperament],
+    ['adj. validity',  t => t.adjudicated_validity],
+    ['adj. veracity',  t => t.adjudicated_veracity],
+    ['adj. valuation', t => t.adjudicated_valuation],
+  ];
+  // NEVER ROUND A SCORE ACROSS THE BOUNDARY THAT SET THE LEVEL. derivation.rs splits at
+  // `mean < 0.7 -> medium`, and claude-code/member sits at 0.6988: `toFixed(2)` renders
+  // that as "0.70", so the row read `0.70 MEDIUM` while 0.70 is HIGH by the same law.
+  // Truncating instead of rounding keeps the displayed figure on the side of the
+  // threshold the verdict was actually taken from — the two-decimal display is a
+  // convenience, and a convenience must not overturn the finding.
+  function truncScore(x) { return (Math.floor(x * 100) / 100).toFixed(2); }
+
+  function lawScore(t) {
+    const measured = LAW_DIMS.map(([n, f]) => [n, f(t)]).filter(([, v]) => typeof v === 'number');
+    if (!measured.length) {
+      // Honest-unmeasured, matching the daemon: zero qualifying evidence is not zero
+      // trust and is not the self-reported figure either. Say so; render no fill.
+      return { score: null, label: 'unmeasured — no adjudicated evidence yet', n: 0 };
+    }
+    const mean = measured.reduce((a, [, v]) => a + v, 0) / measured.length;
+    const weakest = measured.reduce((a, b) => (b[1] < a[1] ? b : a));
+    return {
+      score: mean,
+      n: measured.length,
+      label: `mean of ${measured.length} derived dimension${measured.length === 1 ? '' : 's'}`
+           + ` · weakest ${weakest[0]} ${truncScore(weakest[1])}`,
+    };
   }
 
   // Identities folded into this one. Says what was absorbed and how much it carried, so
@@ -1354,6 +1484,127 @@
     }
   }
 
+  // ---- Agents drawer: the agent-atlas read half -------------------------------------
+  //
+  // Three inventories and the gaps between them, because each gap has a different
+  // remedy. The gap classes come from the daemon verbatim; this only decides ordering
+  // and which action to offer. Deriving state here rather than reporting the daemon's is
+  // how a view starts disagreeing with the thing it is viewing.
+  const AGENT_STATE_ORDER = ['miswired','partial','ungoverned','ungovernable','governed','dormant_plugin'];
+  const AGENT_STATE_NOTE = {
+    miswired:     'a gate is wired to a target that does not exist — reads as covered, fails OPEN',
+    partial:      'observation wired, enforcement absent',
+    ungoverned:   'installed, adapter exists, not wired',
+    ungovernable: 'installed, no hestia adapter exists yet',
+    governed:     'installed, wired, and the wiring resolves',
+    dormant_plugin: 'adapter ready; this harness is not installed here',
+  };
+  let agentsLast = null;
+
+  function agentStates(inv) {
+    // Invert gaps -> per-agent state, then add everything governed.
+    const st = {};
+    for (const [k, ids] of Object.entries(inv.gaps || {})) {
+      for (const id of ids || []) st[id] = k === 'unknown' ? 'ungovernable' : k;
+    }
+    for (const id of inv.governed || []) if (!st[id]) st[id] = 'governed';
+    return st;
+  }
+
+  function renderAgents(inv) {
+    agentsLast = inv;
+    const btn = $('agents-btn'), badge = $('agents-badge'), body = $('agents-body');
+    if (!inv || inv.status === 'UNKNOWN') {
+      btn.className = 'agents-btn st-unknown';
+      badge.textContent = '?';
+      $('agents-summary').textContent = 'inventory unavailable';
+      body.innerHTML = `<div class="empty">${escapeHtml((inv && inv.reason) || 'no inventory')}</div>`;
+      $('agents-foot').textContent = 'UNKNOWN is not OK — this machine has not been checked.';
+      return;
+    }
+    const st = agentStates(inv);
+    const bad = (inv.gaps.miswired || []).length;
+    const warn = (inv.gaps.ungoverned || []).length + (inv.gaps.partial || []).length
+               + (inv.gaps.ungovernable || []).length;
+    btn.className = 'agents-btn ' + (bad ? 'st-bad' : warn ? 'st-warn' : 'st-ok');
+    badge.textContent = `${(inv.governed || []).length}/${(inv.installed || []).length}`;
+    btn.title = bad ? `${bad} MISWIRED — an enabled gate resolves to nothing and fails open`
+                    : warn ? `${warn} installed but not fully governed`
+                           : 'every installed agent is governed';
+    $('agents-summary').textContent =
+      `${(inv.installed || []).length} installed · ${(inv.plugins_available || []).length} adapters · ${(inv.governed || []).length} governed`;
+
+    const ids = [...new Set([...Object.keys(st)])].sort((a, b) => {
+      const d = AGENT_STATE_ORDER.indexOf(st[a]) - AGENT_STATE_ORDER.indexOf(st[b]);
+      return d || a.localeCompare(b);
+    });
+    const detail = Object.fromEntries((inv.detail || []).map(d => [d.agent, d]));
+    body.innerHTML = ids.map(id => {
+      const s = st[id];
+      const d = detail[id] || {};
+      const finding = (d.findings || []).find(f => /^MISWIRED|^DEAD_HOOK|^FRAGILE|^UNGOVERNED/.test(f));
+      const note = finding ? finding.replace(/^\w+:\s*/, '') : (AGENT_STATE_NOTE[s] || '');
+      // Only offer an action that exists. An adapterless agent has nothing to install,
+      // and offering the button anyway would teach the operator that the button lies.
+      let act = '';
+      if (s === 'governed' || s === 'miswired' || s === 'partial') {
+        act = `<button class="agent-act danger" onclick="agentUngovern('${escapeHtml(id)}')">ungovern</button>`;
+      } else if (s === 'ungoverned' || (s === 'dormant_plugin')) {
+        act = `<button class="agent-act" onclick="agentGovern('${escapeHtml(id)}')"${s === 'dormant_plugin' ? ' disabled title="not installed on this machine"' : ''}>govern</button>`;
+      } else {
+        act = `<button class="agent-act" disabled title="no hestia adapter exists for this harness yet">govern</button>`;
+      }
+      return `<div class="agent-row">
+        <span class="agent-name">${escapeHtml(id)}</span>
+        <span class="agent-state ${s === 'dormant_plugin' ? 'dormant' : escapeHtml(s)}">${escapeHtml(s === 'dormant_plugin' ? 'dormant' : s)}</span>
+        <span class="agent-note" title="${escapeHtml(note)}">${escapeHtml(note)}</span>
+        ${act}
+      </div>`;
+    }).join('');
+
+    const sc = inv.scope || {};
+    $('agents-foot').innerHTML =
+      `scope: workspace <code>${escapeHtml(sc.workspace || '?')}</code>`
+      + (sc.plugins_ref ? ` · adapters from <code>${escapeHtml(sc.plugins_ref)}</code>` : '')
+      + ` · ${(sc.config_scopes_read || []).length} config scope(s) read`
+      + `<br>transcript history for UNGOVERNED agents is ctx's job (agent-atlas read half) — not yet wired here.`;
+  }
+
+  async function loadAgents() {
+    try {
+      const r = await apiFetch('/api/agents', {cache: 'no-store'});
+      renderAgents(r.ok ? await r.json() : {status: 'UNKNOWN', reason: 'HTTP ' + r.status});
+    } catch (e) {
+      renderAgents({status: 'UNKNOWN', reason: String(e)});
+    }
+  }
+
+  window.agentGovern = async function (id) {
+    const b = event && event.target; if (b) b.disabled = true;
+    try {
+      const r = await apiFetch(`/api/orchestrators/${encodeURIComponent(id)}/connect`, {method: 'POST'});
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) alert('govern failed: ' + (j.error || r.status));
+      else alert(j.message || 'governed');
+    } finally { await loadAgents(); }
+  };
+
+  // Ungovern REMOVES enforcement, so it confirms and it names the consequence rather
+  // than asking a generic "are you sure?" — the operator should be agreeing to the
+  // actual outcome, not to a dialog.
+  window.agentUngovern = async function (id) {
+    if (!confirm(
+      `Remove hestia's hooks from "${id}"?\n\n`
+      + `That agent will then run with NO gate and NO witnessing — its actions stop `
+      + `appearing in the chain entirely. A timestamped backup of its config is written `
+      + `first, and the change takes effect when ${id} next restarts.`)) return;
+    try {
+      const r = await apiFetch(`/api/agents/${encodeURIComponent(id)}/ungovern`, {method: 'POST'});
+      const j = await r.json().catch(() => ({}));
+      alert(r.ok ? (j.message || 'ungoverned') : 'ungovern failed: ' + (j.error || r.status));
+    } finally { await loadAgents(); }
+  };
+
   // Calendar window for the feed + windowed stat (hour/day/week/all). The
   // server filters by calendar, not count — a count window silently evicted a
   // quiet plugin's entries whenever busier plugins churned.
@@ -1485,12 +1736,31 @@
     modal.addEventListener('click', (e) => { if (e.target.dataset.close) modal.hidden = true; });
     // Same backdrop/✕/Escape contract for the trust detail popup, so both modals close
     // the three ways a reader will try rather than only the one that was wired.
+    // Agents drawer: open/close, refresh, and close on outside click or Escape.
+    const aBtn = $('agents-btn'), aMenu = $('agents-menu');
+    aBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const open = aMenu.hidden;
+      aMenu.hidden = !open;
+      aBtn.setAttribute('aria-expanded', String(open));
+      if (open) loadAgents();
+    });
+    aMenu.addEventListener('click', (e) => e.stopPropagation());
+    document.addEventListener('click', () => {
+      if (!aMenu.hidden) { aMenu.hidden = true; aBtn.setAttribute('aria-expanded', 'false'); }
+    });
+    $('agents-refresh').addEventListener('click', (e) => { e.stopPropagation(); loadAgents(); });
+    // The badge is a standing alarm, so it must be populated without anyone opening the
+    // drawer — an alarm you have to go looking for is not an alarm.
+    loadAgents();
+
     const tmodal = $('trust-modal');
     tmodal.addEventListener('click', (e) => { if (e.target.dataset.close) tmodal.hidden = true; });
     document.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape') return;
       if (!modal.hidden) modal.hidden = true;
       if (!tmodal.hidden) tmodal.hidden = true;
+      if (!aMenu.hidden) { aMenu.hidden = true; aBtn.setAttribute('aria-expanded', 'false'); }
     });
   })();
 

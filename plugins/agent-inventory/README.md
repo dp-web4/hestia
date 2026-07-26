@@ -22,7 +22,8 @@ separately rather than as one "governed: n/m":
 
 | gap | meaning | remedy |
 |---|---|---|
-| `miswired` | a **gate** event is wired to a target that does not exist | **worst state** — reads as covered while failing open. Fix now. |
+| `miswired` | a **gate** event is wired to a target that does not exist, and the target is hestia's **or unattributable** | **worst state** — reads as covered while failing open. Fix now. |
+| `miswired_3p` | same, but the target is *positively* someone else's tooling | fix it in their repo, or live with it — it does **not** demote `governed`, because no hestia work could clear it |
 | `partial` | observation wired, **enforcement absent** | the state a machine sits in while it *looks* covered. Wire the gate. |
 | `ungoverned` | installed, plugin exists, not wired | run that plugin's `install.sh` — cheapest fix |
 | `ungovernable` | installed, no plugin exists | someone must build the adapter |
@@ -229,6 +230,78 @@ gate to `~/.codex/hooks/pre_tool_use.py`, which says "hestia" nowhere in its nam
 times in its text. Judging by the path is the same judge-by-name error as `command -v`
 matching shell builtins, one level up.
 
+### Findings are owner-agnostic; verdicts are owner-scoped
+
+Both halves of that sentence are load-bearing, and getting either wrong fails silently in
+a different direction.
+
+A dead gate is reported whoever wrote it — that half is above. But `governed` is a claim
+about *hestia's* enforcement, and letting an owner-agnostic finding negate it pinned CBP
+at `MISWIRED` over a devcontainer path in a third-party repo, with hestia's own gate live
+and fail-closed. The headline was unfixable by any amount of hestia work, which makes it
+an alarm nobody can act on — the fastest way to train a fleet to ignore one.
+
+So a dead **gate** splits by owner, and the default is what matters:
+
+| evidence | tag | demotes `governed`? |
+|---|---|---|
+| hestia marker in the command or target | `MISWIRED` | yes |
+| a marker from `THIRD_PARTY_MARKERS` | `MISWIRED-3P` | **no** |
+| neither — *unattributable* | `MISWIRED` | **yes** |
+
+The last row is the one to defend. For a missing target, content evidence is unavailable
+*by construction* — the file is gone — so only the name is left, and hestia's own gates
+deliberately live at nameless ext4 paths (`~/.claude/hooks/pre_tool_use.py`). If
+unattributable meant "not ours", deleting hestia's migrated gate would read as
+**governed with enforcement gone**. Ownership judged by name errs toward innocence; for a
+gate, that is backwards (kimi-code, 2026-07-26).
+
+`THIRD_PARTY_MARKERS` is therefore an allowlist of *strangers*, never an exemption of
+ourselves, and it **will drift** — a new stranger tool is miswired-by-default until
+someone adds it. That is the direction to drift in: a stale list of strangers fails loud,
+a stale exemption of ourselves fails silent. The list is emitted in `scope` so a reader
+can see which names bought a clean verdict.
+
+`MISWIRED-3P` does not appear in the status ladder, on the `FRAGILE` precedent: real,
+loud in `gaps` and in the one-line output, and not a gap in hestia's coverage of this
+machine.
+
+### Named future amendment: repo-provenance as a second attribution signal
+
+Not built. Recorded so the design is on paper before the second case arrives, and so the
+build is triggered by evidence rather than by taste (agreed claude-code ↔ kimi-code,
+2026-07-26).
+
+**Rule.** Walk up from the declaring `settings*.json` to its enclosing git repo and read
+`origin`. A remote outside our orgs is stranger evidence, on equal footing with a marker:
+`marker OR provenance → MISWIRED-3P`. Everything else in the table above is unchanged.
+
+**Why it is worth adding.** It is available in exactly the case where the marker list is
+weakest. For a missing hook target, content evidence is gone by construction — but the
+`settings.json` that declares it still exists, and so does the repo around it. And a
+remote does not drift on rename: it is not a name a tool author picked for a file. The
+motivating case (`hook-handler.cjs`) offered nothing but a *helper filename*, the weakest
+kind of name evidence there is.
+
+**Its known hole fails in the safe direction, which is the actual argument.** A fork of a
+stranger's repo reads as ours, so provenance misattributes a stranger's hook *to hestia* —
+which demotes `governed`, loudly, and someone comes looking. Compare the marker list,
+whose hole is an unlisted stranger reading as unattributable — also demotes, also loud,
+but via a list that drifts on every rename. Neither failure mode touches the dangerous
+direction, which is exempting *ourselves*; that is the property this whole section exists
+to preserve, and provenance preserves it.
+
+**Constraints on the build, all three load-bearing:**
+
+1. **Additional signal, never a replacement.** The marker path stays. Provenance can only
+   *add* `MISWIRED-3P`, never withdraw one.
+2. **Record which evidence fired,** in the finding text, the same way `attribute()` carries
+   its `why`. A future reader must be able to see what bought the exemption — a marker, a
+   remote, or both.
+3. **Build on the second live case, not this one.** One observed example is a thin base for
+   a rule; speculative generality on a single example is how the marker list got its drift
+   in the first place. Wrong-but-loud is tolerable until then.
+
 ## Three things it refuses to get wrong
 
 Each is a defect this fleet actually shipped.
@@ -277,3 +350,29 @@ which is precisely why the first cut could not see them.
 
 Prior reading at `209e154`, same machine, same hour: `OK — 1 installed, 1 governed`.
 Every difference is a blind spot, not a change on disk.
+
+### Later the same day: `UNKNOWN` — 4 installed, 4 governed
+
+All three dead gates above are gone, and **none of them was cleared by the owner split**.
+The two `settings.local.json` gates were emptied when the plugin moved (still on the
+operator queue: restore or ratify). The `ruvector` one was fixed at its source — its nine
+hook commands were rewritten to `$CLAUDE_PROJECT_DIR`, correct in the devcontainer *and*
+in every clone (`ruvector 1cb963c2`), by a sibling session, between this change's baseline
+run and its verification run.
+
+Two things worth keeping, because both cut against the change that shipped here:
+
+- **Running the old code against the current filesystem gives the identical line.** The
+  split is a no-op on this machine today. Its evidence is `test_inventory.py`, not the
+  live report — and the reason that test file exists is that the live state was edited by
+  another member mid-change. A verdict this load-bearing cannot be checked by "run it and
+  look at today's machine."
+- **The proposal's premise was too strong.** It argued the remedy "lives in a repo we do
+  not own" — and then the repo turned out to be ownable and the config simply wrong
+  upstream, where fixing it helps every clone rather than just this box. *Fix the
+  stranger's config* is a third remedy neither member named, and it is the better one when
+  it is available. The split is still right for the case where it genuinely is not; it is
+  no longer justified by the example that motivated it.
+
+`UNKNOWN`, not `OK`, because `HESTIA_WORKSPACE` is unset in this shell — rule 4 working
+as intended.

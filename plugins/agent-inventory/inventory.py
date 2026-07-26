@@ -25,6 +25,9 @@ the whole product**, because each gap has a different remedy:
     installed, plugin exists, unwired→ UNGOVERNED; one install.sh away, cheapest fix
     wired but target missing         → MISWIRED; the worst state, because it reads as
                                        covered while failing open (the gemini case)
+    a STRANGER's gate target missing → MISWIRED-3P; same fail-open finding, but the
+                                       remedy is in a repo we do not own, so it does not
+                                       demote `governed` (see `attribute`)
     plugin exists, not installed     → DORMANT; ready if that harness ever lands here.
                                        A plugin built on nomad is available to CBP the
                                        moment the CLI arrives — that is the fleet working.
@@ -103,8 +106,12 @@ turned out to be ~1.1x. Contention costs more than cold does. The deadline is st
 Two consequences worth stating plainly, because they are what changed:
 
   * DEAD-TARGET DETECTION IS NOT HESTIA-SCOPED. A gate that resolves to nothing fails open
-    no matter who wrote it, so every hook target is stat'd regardless of owner. Only
-    `wired` — "is hestia's adapter in place?" — remains a question about hestia.
+    no matter who wrote it, so every hook target is stat'd regardless of owner. But the
+    VERDICTS are hestia-scoped — `wired` and `governed` both answer "is hestia's
+    enforcement in place?", and letting an owner-agnostic finding negate an owner-scoped
+    verdict pinned this machine at MISWIRED over a stranger's container path, unfixable by
+    any amount of hestia work. Findings owner-agnostic, verdicts owner-scoped, and the
+    unattributable case counted as OURS so the error stays loud.
   * WITNESSING IS NOT GATING. `wired` used to be satisfied by any hestia-shaped hook of any
     kind, so a machine with post-hoc observation and no enforcement read as governed.
     Plugins now declare which events they must occupy (`plugins/*/expects.json`) and the
@@ -655,6 +662,53 @@ def owned_by_hestia(command: str, targets: list[str]) -> bool:
     return False
 
 
+# POSITIVE third-party evidence, for the one case where no other kind exists.
+#
+# `owned_by_hestia` prefers content — "the name is not the thing" — but a dead hook is
+# precisely the case where the content is unavailable BY CONSTRUCTION: the file is gone,
+# so only the name is left. That asymmetry is why this list must name STRANGERS rather
+# than exempt us (kimi-code, id=133 §2): hestia's own gates deliberately live at nameless
+# ext4 paths (`~/.claude/hooks/pre_tool_use.py`), so a rule that lets an unrecognised name
+# mean "not ours" would file our own deleted gate as somebody else's and leave `governed`
+# true with enforcement gone. Unattributable therefore demotes; only a positive match here
+# does not.
+#
+# This list WILL drift — a new stranger tool is miswired-by-default until someone adds it.
+# That is the direction to drift in: a stale allowlist of strangers fails LOUD (their dead
+# gate demotes us and someone investigates), where a stale exemption of ourselves fails
+# SILENT. Every entry needs provenance, and the list is emitted in `scope` so a reader can
+# see which exemption produced a clean verdict.
+THIRD_PARTY_MARKERS = (
+    "claude-flow",          # ruvnet/claude-flow, the tool itself
+    "hook-handler.cjs",     # claude-flow's helper suite (claude-flow/.claude/helpers/)
+    "auto-memory-hook.mjs",  # same suite
+    "ruv-swarm",            # claude-flow's companion MCP tooling
+)
+
+
+def attribute(command: str, targets: list[str], is_hestia: bool) -> tuple[str, str]:
+    """Who owns this hook, and on what evidence — decided once, where the evidence is.
+
+    Findings are plain strings, and both `governed` and `gaps["miswired"]` used to
+    re-derive ownership downstream by string-matching a tag. `is_hestia` is known right
+    here; record it rather than reconstruct it (kimi-code, id=133 §1).
+    """
+    if is_hestia:
+        return "hestia", "hestia marker in the hook command or target"
+    hay = " ".join([command, *targets]).lower()
+    for m in THIRD_PARTY_MARKERS:
+        if m in hay:
+            return "third-party", f"third-party marker '{m}'"
+    return "unattributable", ("no marker either way, and a missing target cannot be "
+                              "asked — treated as ours until proven otherwise")
+
+
+def has_tag(findings: list[str], tag: str) -> bool:
+    """Exact-tag test. `startswith("MISWIRED")` also matches `MISWIRED-3P`, which is the
+    whole distinction this file now draws — so match the tag, not its prefix."""
+    return any(f.split(":", 1)[0] == tag for f in findings)
+
+
 def worktree_ref() -> str:
     """Which ref the checkout is sitting on. Reported even when it is not read from."""
     head = PLUGINS.parent / ".git"
@@ -813,15 +867,39 @@ class Registry:
 REGISTRY: Registry | None = None  # built in main(), once WORKSPACE is known
 
 
+def registry() -> Registry:
+    """The registry, or a loud failure — never a plausible substitute for it.
+
+    THIS FILE'S OWN DEFECT CLASS, IN ITS OWN NEW CODE (found by main's `test_inventory.py`
+    when the two changes met, 2026-07-26). An unbuilt registry used to degrade to
+    `has() -> False` and `expects() -> {}`, which are not neutral defaults: they read as
+    "no plugin exists for this agent", so every agent reports UNGOVERNABLE — *someone must
+    build the adapter* — for a fleet whose adapters are all present. A wrong remedy stated
+    confidently, from a prerequisite nobody noticed was missing. Exactly the shape rule 4
+    exists to refuse, and the same shape as the dead gate that reads as covered.
+
+    Unreachable from the CLI, because `main()` builds it before anything asks. That is the
+    argument for raising rather than defaulting, not against it: the only callers who can
+    reach the None are in-process ones — tests, and whatever imports this next — and they
+    are precisely the callers who cannot tell a wrong answer from a right one.
+    """
+    if REGISTRY is None:
+        raise RuntimeError(
+            "plugin registry not built: call main(), or stub `inventory.REGISTRY`. "
+            "Refusing to answer, because answering 'no plugins' would report every "
+            "agent UNGOVERNABLE and look like a finding.")
+    return REGISTRY
+
+
 def expects(plugin_dir: str) -> dict:
-    return REGISTRY.expects(plugin_dir) if REGISTRY else {}
+    return registry().expects(plugin_dir)
 
 
 def inspect(atlas_id: str, roots: list[str]) -> dict:
     exes, dirnames, plugin_dir = names_for(atlas_id)
     exe = real_executable(exes, roots)
     homes = [HOME / d for d in dirnames if (HOME / d).is_dir()]
-    plugin_available = REGISTRY.has(plugin_dir) if REGISTRY else False
+    plugin_available = registry().has(plugin_dir)
     declared = expects(plugin_dir)
 
     rec: dict = {
@@ -869,21 +947,54 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
                 if not exists:
                     # A gate that resolves to nothing fails OPEN regardless of owner: a
                     # missing command exits 127, and by GATE_PROFILE.md §3 rule 2 any
-                    # non-zero that is not an explicit `exit 2` is an ALLOW.
+                    # non-zero that is not an explicit `exit 2` is an ALLOW. So the
+                    # FINDING stays owner-agnostic — but the VERDICT cannot be, because
+                    # `governed` is a claim about hestia's wiring. A stranger's dead gate
+                    # in a repo we do not own pinned this machine at MISWIRED with
+                    # hestia's own enforcement intact and no reachable remedy, which is
+                    # two grains rendered as one verdict. The owner splits the tag; the
+                    # tag decides the verdict; the evidence rides along so the split is
+                    # auditable rather than trusted.
                     role = "gate" if hook["event"] in declared.get("gate", []) else "hook"
-                    tag = "MISWIRED" if role == "gate" else "DEAD_HOOK"
+                    owner, why = attribute(hook["command"], targets, is_hestia)
+                    if role != "gate":
+                        tag = "DEAD_HOOK"
+                    else:
+                        tag = "MISWIRED-3P" if owner == "third-party" else "MISWIRED"
                     state = "enabled" if hook["enabled"] else "disabled"
                     rec["findings"].append(
                         f"{tag}: {hook['event']} {state}, target does not exist "
-                        f"{where} -> {target}")
+                        f"{where} -> {target} (owner: {owner} — {why})")
                 elif target.startswith("/tmp/"):
                     rec["findings"].append(
                         f"FRAGILE: hook target under /tmp, cleared on reboot "
                         f"{where} -> {target}")
                 elif "/mnt/c/" in target:
+                    # MECHANISM CORRECTED 2026-07-26 (CBP), because the previous wording made
+                    # a quantitative claim and measurement refuted it. Old text: "cold-load can
+                    # exceed the hook timeout". Measured on CBP with the Linux page cache
+                    # dropped between runs:
+                    #   hestia claude gate      9p 0.24-0.26s   ext4 0.18s   timeout 5s  (~20x)
+                    #   web4-governance fallback 9p 0.68-0.74s  ext4 0.32s   budget  2s  (~3x)
+                    # Nothing came near its timeout. Three fleet members migrated hooks off 9p
+                    # on the strength of that sentence, and none of us had measured it — the
+                    # claim was load-bearing and untested.
+                    #
+                    # The finding SURVIVES on a different mechanism. What bites on WSL2 is not
+                    # slow steady-state cold-load, it is tail latency: the 9p mount can stall
+                    # (host FS contention, Defender, a sleeping host), and a stall is UNBOUNDED,
+                    # so no timeout margin protects against it. A 20x median margin says nothing
+                    # about the tail, which is exactly the distinction the old wording collapsed.
+                    # Second, real, cost: 0.06-0.35s per invocation is a latency tax on every
+                    # tool call, independent of any timeout.
+                    #
+                    # Caveat on the numbers, so they are not overread the way the old claim was:
+                    # drop_caches clears the LINUX page cache only. The Windows-side 9p server
+                    # cache stays warm, so these are LOWER BOUNDS on true cold (post-boot) cost.
                     rec["findings"].append(
-                        "FRAGILE: hook target on the 9p mount — cold-load can exceed the "
-                        f"hook timeout, and these hooks fail OPEN {where} -> {target}")
+                        "FRAGILE: hook target on the 9p mount — unbounded stall risk (tail "
+                        "latency, not median: measured median penalty is 0.06-0.35s against "
+                        f"3-20x timeout margins), and these hooks fail OPEN {where} -> {target}")
             if is_hestia and hook["enabled"] and targets and all(
                     Path(t).exists() for t in targets):
                 hestia_hooks.append({**hook, "targets": targets, "scope": scope})
@@ -933,22 +1044,32 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
                 "RESIDUE: config dir present, no executable in any searched root, and "
                 "nothing hestia-wired in it — a leftover, not an installed agent")
 
+    # ONE predicate, two consumers. The demotion had two sites — this line and
+    # `gaps["miswired"]` — and fixing only one flips the field while the gap report keeps
+    # pinning the machine: the same defect re-created inside its own fix (kimi-code,
+    # id=133 §1). Compute it once, on the record, and let both read it.
+    rec["miswired"] = has_tag(rec["findings"], "MISWIRED")
+    rec["miswired_3p"] = has_tag(rec["findings"], "MISWIRED-3P")
     rec["governed"] = bool(rec["installed"] and plugin_available and rec["wired"]
                            and rec["gate_wired"] is not False
-                           and not any(f.startswith("MISWIRED")
-                                       for f in rec["findings"]))
+                           and not rec["miswired"])
     return rec
 
 
 def classify(recs: list[dict]) -> dict:
     """The gaps, each with its own remedy. This is the actionable part."""
     gaps: dict[str, list[str]] = {
-        "miswired": [], "partial": [], "ungoverned": [], "ungovernable": [],
-        "dormant_plugin": [], "unknown": []}
+        "miswired": [], "miswired_3p": [], "partial": [], "ungoverned": [],
+        "ungovernable": [], "dormant_plugin": [], "unknown": []}
     for r in recs:
         if r["unknown"]:
             gaps["unknown"].append(r["agent"])
-        if r["installed"] and any(f.startswith("MISWIRED") for f in r["findings"]):
+        # Its own bucket, and NOT in the elif chain: a stranger's dead gate is a real
+        # finding with a remedy in someone else's repo, so it must not consume the slot
+        # that would otherwise report an actual hestia gap on the same agent.
+        if r["installed"] and r["miswired_3p"]:
+            gaps["miswired_3p"].append(r["agent"])
+        if r["installed"] and r["miswired"]:
             gaps["miswired"].append(r["agent"])
         elif r["installed"] and r["partial"]:
             # The state worth having: observation wired, enforcement absent. It is where
@@ -1129,6 +1250,10 @@ def main() -> int:
         "plugins_ref": REGISTRY.ref,
         "worktree_ref": worktree_ref(),
         "toml_supported": tomllib is not None,
+        # The one allowlist in this file, emitted because it is the only thing that can
+        # turn a MISWIRED into a non-fatal MISWIRED-3P. A reader who wonders why a
+        # machine is clean can see exactly which names bought the exemption.
+        "third_party_markers": list(THIRD_PARTY_MARKERS),
     }
     unknowns = sorted({u for r in recs for u in r["unknown"]})
     if WORKSPACE_SOURCE == "default":
@@ -1169,6 +1294,11 @@ def main() -> int:
 
     # An unestablished scope degrades to UNKNOWN, never to OK (rule 4). MISWIRED still
     # outranks it: a known dead gate is worse news than an unknown.
+    #
+    # `miswired_3p` deliberately does NOT appear in this ladder, on the FRAGILE precedent:
+    # both are real, both are loud in `gaps`/`fragile` and in the brief line, and neither
+    # is a gap in hestia's coverage of this machine. Making it a status rung would restore
+    # exactly the property the split removes — a headline no hestia work can clear.
     status = "OK"
     if gaps["miswired"]:
         status = "MISWIRED"

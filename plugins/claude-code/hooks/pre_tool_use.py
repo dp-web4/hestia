@@ -39,6 +39,12 @@ ENV
                                   (deny-on-daemon-unreachable instead)
   HESTIA_PRE_TOTAL_BUDGET_MS     override TOTAL_BUDGET_MS
   HESTIA_ENDPOINT                override endpoint discovery
+  HESTIA_LEGACY_FALLBACK         path to the legacy web4-governance gate. Set this
+                                  when the hooks are deployed off-repo (local-fs
+                                  deployment), or the relocated gate keeps calling
+                                  a fallback that may not be where it was left.
+                                  A path that does not exist ALLOWS — see
+                                  invoke_legacy_fallback.
 """
 
 from __future__ import annotations
@@ -76,8 +82,16 @@ MIN_POLL_SLEEP_MS = 50
 
 # Path to the legacy fallback hook. Sourced from the same code we ported,
 # but kept in-place under claude-code/plugins/ for fallback robustness.
-LEGACY_FALLBACK = (
-    "/mnt/c/exe/projects/ai-agents/claude-code/plugins/web4-governance/hooks/pre_tool_use.py"
+#
+# Overridable since 2026-07-26: this was a hardcoded absolute path naming one machine's
+# workspace, sitting on the fail-OPEN profile's critical path. A machine that deploys its
+# hooks to local fs (the 9p-migration pattern) could relocate the outer gate and silently
+# leave the fallback behind — and if the path is simply wrong, `invoke_legacy_fallback`
+# returns 0, so a missing fallback ALLOWS. Wrong-path and no-policy are indistinguishable
+# at the exit code. The default preserves the previous behaviour exactly.
+LEGACY_FALLBACK = os.environ.get(
+    "HESTIA_LEGACY_FALLBACK",
+    "/mnt/c/exe/projects/ai-agents/claude-code/plugins/web4-governance/hooks/pre_tool_use.py",
 )
 
 
