@@ -58,8 +58,11 @@ one answered is reported as `scope.workspace_source`.
 
 The runtime copy lives at `~/.local/bin/` on **ext4**, not in the repo on 9p — this check
 must not become an instance of the fragility it reports. Re-run `install.sh` after editing
-`inventory.py`; it rewrites an existing hook entry in place (matching on the binary path,
-not the whole command) rather than appending a second one.
+`inventory.py`; it converges the `SessionStart` hook to **exactly one** entry running this
+binary — rewriting the first, deleting any others, and asserting the invariant rather than
+arguing it, because "no stale entries left" was silently false twice: first when the match
+was on the whole command string, then again when a stale entry and an already-correct entry
+coexisted and both were rewritten to the same string.
 
 Every run witnesses to the chain as `agent_inventory`, **including clean results**: a
 record that only ever holds failures cannot distinguish "checked, fine" from "never
@@ -87,6 +90,47 @@ read, the project scan depth, and both the ref `plugins_available` was resolved 
 (`plugins_source`, `plugins_ref`) and the ref the checkout happens to be sitting on
 (`worktree_ref`). And **any scope it could not establish degrades to `UNKNOWN`, never to
 `OK`.**
+
+## The budget is part of the scope
+
+CBP reviewed the depth-3 cut and found it right about *where* to look and wrong about what
+that costs: **1.15s → 4m22s on CBP**, against a `SessionStart` budget of **10s**. A hook
+killed at 10s does not degrade to `UNKNOWN` — it emits nothing, and nothing reads as clean.
+So the fix for "answers `UNKNOWN` on every machine that is not CBP" had shipped "answers
+nothing on CBP": the same error, one dimension over.
+
+> **A check that cannot finish inside its trigger's timeout has not degraded to `UNKNOWN`.
+> It has degraded to silence, which reads as clean.**
+
+The cost was never the walk. It was `Path.resolve()` on all 3143 directories (a full
+realpath chain each, on 9p), a redundant `is_dir()` re-stating what the dirent already
+answered, the whole walk repeated once per agent, and then `.is_file()` on every candidate
+× every glob. `scan_projects()` walks **once**, memoised, with `os.scandir`, resolves only
+entries that are actually symlinks, and notices `.claude`/`.codex`/`.gemini` *in the dirent
+list it is already holding* instead of stat-ing for them:
+
+| | CBP wall-clock | `newfstatat` (Thor) | subprocess spawns |
+|---|---|---|---|
+| as submitted | 262s | 157,035 | 47 |
+| walk rewrite | **5.8s** | **1,707** | **8** |
+
+Same 30 findings on CBP, same 10 on Thor — this is a cost change, not a scope change. (The
+spawns are `Registry.expects()`, which ran `git show` for all 45 atlas ids, 36 of them for
+plugin dirs the registry already knew were absent.)
+
+Two things that make this structural rather than a benchmark:
+
+- **Scan `DEPTH+1`, descend `DEPTH`.** A directory only becomes a candidate project root
+  once something has read *its* entries, so the deepest level must be scanned even though
+  it is never descended into. Getting this wrong silently drops every project root at the
+  deepest level — which is the exact class of miss that motivated going deeper at all.
+- **An explicit walk deadline** (`HESTIA_INVENTORY_SCAN_BUDGET`, default 5s). When it
+  fires, `scope.scan_truncated` goes true, the unwalked frontier is reported, and the
+  `--brief` line — the surface a session actually reads — says `SCAN TRUNCATED`. Without
+  that last part a short walk still prints a confident status, because the part it never
+  reached contributes no findings. Nobody in this fleet has yet measured the walk on a
+  **cold** 9p cache, so relying on the total staying under budget is a warm-cache
+  assumption, not a guarantee.
 
 **Stamping the ref was not enough.** The first cut reported `plugins_ref` and kept reading
 the working tree, on the theory that a visible number is a falsifiable one. But B is what

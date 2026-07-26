@@ -66,6 +66,23 @@ So rule 3 gets a fourth clause, and it is the one that governs this file's desig
    emitted next to the evidence it was computed from (`scope` in the report), so a reader
    can falsify it instead of trusting it.
 
+And rule 4 has a time dimension, which the cut that added clause 4 promptly fell into
+(cbp reviewing thor, 2026-07-26, thread coordination-1785090931). Widening the scan from
+depth 1 to depth 3 took the run from 1.15s to **4m22s on CBP** — 3143 directories on a 9p
+mount, `Path.resolve()` on every one of them, the whole walk repeated once per agent —
+against a SessionStart hook budget of 10s. So:
+
+5. A CHECK THAT CANNOT FINISH INSIDE ITS TRIGGER'S TIMEOUT HAS NOT DEGRADED TO `UNKNOWN`.
+   IT HAS DEGRADED TO SILENCE, WHICH READS AS CLEAN. The budget is part of the scope.
+
+A SIGKILLed hook emits nothing, and nothing reads as fine — so the previous cut fixed
+"answers UNKNOWN on every machine that is not CBP" by replacing it with "answers nothing
+on CBP." Same error, next dimension over, which is once again the error this file exists
+to catch. The remedy is in `scan_projects()` and it is structural, not a benchmark: the
+walk carries an explicit deadline and reports `scan_truncated` + `UNKNOWN` when it fires,
+because 1.5s on a warm 9p cache is not 1.5s on a cold one and no machine in this fleet has
+yet measured the cold number.
+
 Two consequences worth stating plainly, because they are what changed:
 
   * DEAD-TARGET DETECTION IS NOT HESTIA-SCOPED. A gate that resolves to nothing fails open
@@ -88,6 +105,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib import request as urlrequest
 
@@ -301,6 +319,150 @@ PROJECT_SCAN_DEPTH = 3
 SKIP_DIRS = {"node_modules", "vendor", "target", "dist", "build", "site-packages",
              ".venv", "venv", ".git", "__pycache__", ".next", ".cache"}
 
+# Clause 5's structural half. The walk stops when it runs out of budget and SAYS it
+# stopped, rather than relying on the total staying under the trigger's timeout — a
+# warm-cache measurement is not a guarantee, and the cold-cache number on 9p has never
+# been taken anywhere in this fleet. Half the SessionStart budget, leaving the other half
+# for the twenty-odd config parses and the git reads.
+PROJECT_SCAN_BUDGET_S = float(os.environ.get("HESTIA_INVENTORY_SCAN_BUDGET", "5.0"))
+
+
+def _config_dir_files() -> dict[str, tuple[str, ...]]:
+    """PROJECT_CONFIG_GLOBS, inverted: config dir -> the files wanted inside it."""
+    out: dict[str, list[str]] = {}
+    for rel in PROJECT_CONFIG_GLOBS:
+        cdir, fname = rel.split("/", 1)
+        out.setdefault(cdir, []).append(fname)
+    return {cdir: tuple(fs) for cdir, fs in out.items()}
+
+
+CONFIG_DIR_FILES = _config_dir_files()
+
+_SCAN: dict[str, list[Path]] | None = None
+SCAN_STATS: dict = {}
+
+
+def scan_projects() -> dict[str, list[Path]]:
+    """Every project config file under the workspace, found in ONE walk. Memoised.
+
+    THE SCAN COST MORE THAN THE TRIGGER HAD (cbp, 2026-07-26 — rule 5 above). The
+    depth-3 rewrite was correct about where to look and wrong about what that costs.
+    Isolated on CBP, 3143 directories on the /mnt/c 9p mount:
+
+        Path.iterdir() + is_dir() + resolve() per dir      43.0s   one walk
+        os.scandir()   + realpath only when is_symlink()    1.5s   same 3142 dirs
+
+    `Path.resolve()` is a full realpath chain per directory, and the separate `is_dir()`
+    re-stats what the dirent already answered. Three multipliers on top of that: the walk
+    ran once per (agent x matching glob) with no memoisation — four times — and then
+    `.is_file()` was called on all 3143 candidates x 4 rels, ~12.5k more stats for a few
+    dozen real hits. 4m22s total, against a 10s hook budget.
+
+    So: walk once, and notice the config dirs WHILE reading each directory's entries.
+    `.claude` either is or is not in the dirent list you already have, which turns 12.5k
+    speculative stats into one per config dir that actually exists.
+
+        as submitted                                            262s
+        + scandir, lazy realpath, memoised walk                  21s
+        + notice config dirs during the walk                     5.8s   identical findings
+
+    SCAN DEPTH+1, DESCEND DEPTH. A directory only becomes a candidate project root once
+    something has read ITS entries, so the deepest level must be scanned even though it is
+    never descended into. Recording `parent` as you scan it and stopping at DEPTH silently
+    drops every project root at the deepest level — 2 of 19 scopes on CBP, and the whole
+    point of going deeper was the scope at depth 2 nobody could see.
+
+    Symlinked repos are still followed (a workspace assembled out of links is a normal
+    layout) and the cycle guard still resolves — but only for entries that ARE symlinks,
+    which is where the 43s went. Aliasing that survives that (a symlinked ANCESTOR makes
+    two literal paths for one inode) is caught by deduplicating the found files on their
+    real paths, which is a few dozen realpaths rather than a few thousand.
+    """
+    global _SCAN
+    if _SCAN is not None:
+        return _SCAN
+
+    found: dict[str, list[Path]] = {rel: [] for rel in PROJECT_CONFIG_GLOBS}
+    started = time.monotonic()
+    deadline = started + PROJECT_SCAN_BUDGET_S
+    truncated = False
+    scanned = 0
+
+    def note(root: Path, names: set[str]) -> None:
+        for cdir, fnames in CONFIG_DIR_FILES.items():
+            if cdir not in names:
+                continue
+            for fname in fnames:
+                cfg = root / cdir / fname
+                if cfg.is_file():
+                    found[f"{cdir}/{fname}"].append(cfg)
+
+    try:
+        seen = {os.path.realpath(WORKSPACE)}
+    except OSError:
+        seen = {str(WORKSPACE)}
+    frontier = [WORKSPACE]
+    for level in range(PROJECT_SCAN_DEPTH + 1):
+        nxt: list[Path] = []
+        for parent in frontier:
+            if time.monotonic() > deadline:
+                truncated = True
+                break
+            names: set[str] = set()
+            children: list[tuple[Path, bool]] = []
+            try:
+                with os.scandir(parent) as it:
+                    for entry in it:
+                        names.add(entry.name)
+                        if level == PROJECT_SCAN_DEPTH or entry.name in SKIP_DIRS:
+                            continue
+                        try:
+                            if not entry.is_dir():
+                                continue
+                            children.append((Path(entry.path), entry.is_symlink()))
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+            scanned += 1
+            note(parent, names)
+            for child, is_link in sorted(children, key=lambda c: c[0].name):
+                try:
+                    real = os.path.realpath(child) if is_link else str(child)
+                except OSError:
+                    continue
+                if real in seen:
+                    continue
+                seen.add(real)
+                nxt.append(child)
+        if truncated:
+            break
+        frontier = nxt
+
+    for rel, paths in found.items():
+        uniq, real_seen = [], set()
+        for cfg in paths:
+            try:
+                real = os.path.realpath(cfg)
+            except OSError:
+                real = str(cfg)
+            if real in real_seen:
+                continue
+            real_seen.add(real)
+            uniq.append(cfg)
+        found[rel] = uniq
+
+    SCAN_STATS.update({
+        "dirs_scanned": scanned,
+        "seconds": round(time.monotonic() - started, 3),
+        "truncated": truncated,
+        # What was left unwalked when the budget ran out. 0 with truncated=False is the
+        # difference between "finished" and "stopped and did not say where".
+        "unscanned_frontier": len(frontier) if truncated else 0,
+    })
+    _SCAN = found
+    return _SCAN
+
 
 def config_scopes(dirnames: list[str]) -> list[tuple[Path, Path | None, str]]:
     """(config file, project dir, scope label) for every scope this agent reads."""
@@ -313,44 +475,14 @@ def config_scopes(dirnames: list[str]) -> list[tuple[Path, Path | None, str]]:
                 if cfg.is_file():
                     found.append((cfg, None, "user"))
     if WORKSPACE.is_dir():
+        scanned = scan_projects()
         for rel in PROJECT_CONFIG_GLOBS:
             if not any(rel.startswith(d + "/") for d in dirnames):
                 continue
-            for cfg in project_config_candidates(rel):
-                if cfg.is_file():
-                    # $CLAUDE_PROJECT_DIR is the repo root, i.e. .claude's parent.
-                    found.append((cfg, cfg.parent.parent, "project"))
+            for cfg in scanned[rel]:
+                # $CLAUDE_PROJECT_DIR is the repo root, i.e. .claude's parent.
+                found.append((cfg, cfg.parent.parent, "project"))
     return found
-
-
-def project_config_candidates(rel: str) -> list[Path]:
-    """`rel` under the workspace and under every non-vendored dir down to DEPTH."""
-    out = [WORKSPACE / rel]
-    frontier = [WORKSPACE]
-    # Symlinked repos are followed (a workspace assembled out of links is a normal
-    # layout), so the walk is cycle-guarded on the RESOLVED path — a self-referential
-    # link is a hang, and a check that hangs past its 10s hook timeout fails open.
-    seen = {str(WORKSPACE.resolve())}
-    for _ in range(PROJECT_SCAN_DEPTH):
-        nxt = []
-        for parent in frontier:
-            try:
-                children = sorted(p for p in parent.iterdir()
-                                  if p.is_dir() and p.name not in SKIP_DIRS)
-            except OSError:
-                continue
-            for child in children:
-                try:
-                    real = str(child.resolve())
-                except OSError:
-                    continue
-                if real in seen:
-                    continue
-                seen.add(real)
-                out.append(child / rel)
-                nxt.append(child)
-        frontier = nxt
-    return out
 
 
 def parse_config(cfg: Path) -> tuple[dict | None, str | None]:
@@ -489,7 +621,11 @@ class Registry:
     def __init__(self) -> None:
         self.ref = "origin/main"
         self.source = "origin/main"
-        listing = _git("ls-tree", "--name-only", "origin/main", "plugins/")
+        # `-d`: trees only. Without it a blob sitting directly under `plugins/` — a
+        # README, a .gitignore — counts as an available plugin. Latent on main today,
+        # but B is what A and C are differenced against, so a phantom entry here becomes
+        # a phantom harness in the verdict (cbp, 2026-07-26).
+        listing = _git("ls-tree", "-d", "--name-only", "origin/main", "plugins/")
         sha = _git("rev-parse", "--short", "origin/main")
         if listing is None or sha is None:
             # No fetched main (shallow clone, no remote, git absent). Fall back to the
@@ -523,7 +659,13 @@ class Registry:
         modes: post-hoc observation CANNOT fail closed, and the whole point of the gate
         profile is that the pre-hook can. Absent an expects.json the roles are unknown and
         the agent is reported as such — not as governed.
+
+        Ask the registry before asking git. This is called for all 45 atlas ids and 36 of
+        them name plugin dirs that are not in the registry at all — 36 subprocess spawns
+        to learn what `self.names` already knew (~4s -> ~0.7s on CBP).
         """
+        if not self.has(plugin_dir):
+            return {}
         if self.source == "origin/main":
             raw = _git("show", f"origin/main:plugins/{plugin_dir}/expects.json")
         else:
@@ -769,6 +911,16 @@ def emit(report: dict, brief: bool) -> int:
         extra = [f"{k}={v}" for k, v in gaps.items() if v and k != "dormant_plugin"]
         if extra:
             line += " | " + " ".join(extra)
+        # Rule 5 belongs on the SURFACE, not only in the JSON. A truncated scan can still
+        # produce a confident-looking status — MISWIRED, PARTIAL, even OK — because the
+        # part it never walked contributes no findings, and `unknown[]` is invisible from
+        # here. Reported at 0 budget: `PARTIAL ... partial=['claude']`, with the three dead
+        # gates it had not reached yet nowhere in the line. The one-liner is what a session
+        # actually reads, so the one-liner has to say the look was short.
+        scan = (report.get("scope") or {})
+        if scan.get("scan_truncated"):
+            line += (f" | SCAN TRUNCATED at {scan.get('project_scan_budget_s')}s after "
+                     f"{scan.get('project_scan_dirs')} dirs — project scope incomplete")
         if report.get("reason"):
             line += f" | {report['reason']}"
         print(line)
@@ -817,6 +969,12 @@ def main() -> int:
         "config_scopes_read": sorted({c["path"] for r in recs
                                       for c in r["configs_read"]}),
         "project_scan_depth": PROJECT_SCAN_DEPTH,
+        # Rule 5: the budget is part of the scope, so the walk's own cost is evidence and
+        # is reported next to what it found — including how much of it never happened.
+        "project_scan_dirs": SCAN_STATS.get("dirs_scanned", 0),
+        "project_scan_seconds": SCAN_STATS.get("seconds"),
+        "project_scan_budget_s": PROJECT_SCAN_BUDGET_S,
+        "scan_truncated": SCAN_STATS.get("truncated", False),
         "plugins_source": REGISTRY.source,         # origin/main | worktree
         "plugins_ref": REGISTRY.ref,
         "worktree_ref": worktree_ref(),
@@ -830,6 +988,17 @@ def main() -> int:
             "on the machine it was written on")
     if REGISTRY.degraded:
         unknowns.append(REGISTRY.degraded)
+    if SCAN_STATS.get("truncated"):
+        # Rule 5 made explicit. A walk that ran out of budget has NOT established the
+        # project scope, and the part it never reached is exactly where the report would
+        # otherwise be quietly clean.
+        unknowns.append(
+            f"project scan hit its {PROJECT_SCAN_BUDGET_S}s budget after "
+            f"{SCAN_STATS.get('dirs_scanned', 0)} directories with "
+            f"{SCAN_STATS.get('unscanned_frontier', 0)} still unwalked — project scope is "
+            "PARTIAL, and any gate under the unwalked part is neither found nor counted "
+            "(raise HESTIA_INVENTORY_SCAN_BUDGET, or read the hourly timer's full-depth "
+            "answer instead)")
 
     # An unestablished scope degrades to UNKNOWN, never to OK (rule 4). MISWIRED still
     # outranks it: a known dead gate is worse news than an unknown.

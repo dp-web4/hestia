@@ -41,8 +41,10 @@ Documentation=file://$SRC_DIR/README.md
 
 [Service]
 Type=oneshot
-Environment=HESTIA_WORKSPACE=$WORKSPACE
-ExecStart=$BIN --workspace $WORKSPACE
+# Quoted: systemd splits ExecStart on whitespace, so an unquoted workspace path with a
+# space becomes two arguments and the check silently inspects its first word (cbp).
+Environment="HESTIA_WORKSPACE=$WORKSPACE"
+ExecStart="$BIN" --workspace "$WORKSPACE"
 # Observation only. A non-zero exit here must never look like a governance failure,
 # and the script is written to exit 0 regardless; this is belt-and-braces.
 SuccessExitStatus=0 1
@@ -81,33 +83,62 @@ fi
 if [ -f "$SETTINGS" ]; then
   cp -a "$SETTINGS" "$SETTINGS.bak.$(date +%Y%m%d-%H%M%S)"
   BIN="$BIN" WORKSPACE="$WORKSPACE" python3 - "$SETTINGS" <<'PY'
-import json, os, sys
+import json, os, shlex, sys
 path, binp = sys.argv[1], os.environ["BIN"]
 cfg = json.load(open(path))
 # --workspace, not the environment. A SessionStart hook inherits the harness's env, not
 # the timer unit's, so the hook read the compiled-in CBP default on every other machine
 # and answered UNKNOWN (thor, 2026-07-26). Scope has to travel in the command itself.
-cmd = f"{binp} --workspace {os.environ['WORKSPACE']} --brief"
+# Quoted, because a workspace path with a space otherwise truncates to its first word and
+# the hook answers UNKNOWN about a directory nobody named (cbp, 2026-07-26).
+cmd = f"{shlex.quote(binp)} --workspace {shlex.quote(os.environ['WORKSPACE'])} --brief"
 hooks = cfg.setdefault("hooks", {}).setdefault("SessionStart", [])
-# Match on the BINARY, not the whole command: an earlier install wrote a bare
-# `$BIN --brief`, and matching the full string would leave that one in place and append
-# a second — two inventories per session, one of them wrong.
-stale = [h for grp in hooks for h in grp.get("hooks", [])
-         if binp in h.get("command", "") and h.get("command") != cmd]
-for h in stale:
-    h["command"] = cmd
-present = any(h.get("command") == cmd for grp in hooks for h in grp.get("hooks", []))
-if stale:
-    json.dump(cfg, open(path, "w"), indent=2)
-    print(f"SessionStart hook: updated {len(stale)} existing entry/entries with --workspace")
-elif present:
-    print("SessionStart hook: already present")
+
+# CONVERGE ON ONE ENTRY, DO NOT JUST REWRITE THE ONES YOU RECOGNISE (cbp, 2026-07-26).
+# First cut matched the whole command string, so a bare `$BIN --brief` from an earlier
+# install survived and a second entry was appended. The fix — match on the binary —
+# repaired the case that had been exercised and left the one next door: with a stale entry
+# AND an already-correct entry both present, both were rewritten to the same string and the
+# machine ran two inventories per session. That is the failure the fix was written to
+# prevent, one arrangement over, and Thor is in exactly that state now.
+# So the invariant is not "no stale entries", it is "EXACTLY ONE entry runs this binary" —
+# asserted below rather than argued, because that is the property that was silently false
+# twice. Identity, not equality: two duplicate entries are equal dicts, and list.remove()
+# would take out the one being kept.
+ours = [(grp, h) for grp in hooks for h in grp.get("hooks", [])
+        if binp in h.get("command", "")]
+if ours:
+    keep = ours[0][1]
+    changed = keep.get("command") != cmd
+    keep["command"] = cmd
+    keep.setdefault("type", "command")
+    keep.setdefault("timeout", 10)
+    drop = {id(h) for _, h in ours[1:]}
+    if drop:
+        for grp in hooks:
+            grp["hooks"] = [h for h in grp.get("hooks", []) if id(h) not in drop]
+        # A group emptied by that is ours and now holds nothing; leaving it behind is
+        # harmless but it accumulates one per re-install.
+        hooks[:] = [g for g in hooks if g.get("hooks")]
+    if changed or drop:
+        json.dump(cfg, open(path, "w"), indent=2)
+        print(f"SessionStart hook: converged to 1 entry "
+              f"({'rewritten with --workspace' if changed else 'already correct'}, "
+              f"{len(drop)} duplicate(s) removed)")
+    else:
+        print("SessionStart hook: already present")
 else:
     # Its own group: a slow or broken sibling in a shared group must not take the
     # inventory down with it, and vice versa.
     hooks.append({"hooks": [{"type": "command", "command": cmd, "timeout": 10}]})
     json.dump(cfg, open(path, "w"), indent=2)
     print("SessionStart hook: added (--workspace, --brief, timeout 10s)")
+
+final = [h for grp in cfg["hooks"]["SessionStart"] for h in grp.get("hooks", [])
+         if binp in h.get("command", "")]
+if len(final) != 1:
+    sys.exit(f"SessionStart hook: expected exactly 1 entry running {binp}, found "
+             f"{len(final)} — {path} left as written, backup is alongside it")
 PY
 else
   echo "SessionStart hook: skipped ($SETTINGS not found)"
