@@ -2684,11 +2684,24 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
 /// tool lets the drain be polled independently of the fire path until Thor's concurrency
 /// fix lands, at which point it can move into the watcher loop as originally proposed.
 ///
-/// **Attribution is required on every arm.** Marking a row failed can retire another
-/// member's outbound mail, and listing the queue exposes every local member's
-/// destinations and pointers — both are consequential, so neither may run for an
-/// unattributable caller. Same no-latest-session-fallback rule as `member_notify`:
-/// the drain must prove who it is, and the retirement is witnessed with that identity.
+/// **Attribution is required on every arm — and attribution is not authorization.**
+/// Marking a row failed can retire another member's outbound mail, and listing the
+/// queue exposes every local member's destinations and pointers, so neither may run
+/// for an unattributable caller. Same no-latest-session-fallback rule as
+/// `member_notify`: the caller must prove a specific live session, and every
+/// disposition is witnessed with that identity.
+///
+/// What that does NOT do — stated here because a commit message on this branch
+/// once claimed otherwise (G4-auth, Thor, r6-routing hop 2, and he was right):
+/// `resolve_attributed_caller` asks *"is there a live session?"*, never *"is this
+/// the drain?"*. Any member that can call `hestia_connect` can poll this queue and
+/// dispose of any row in it. That is not closable on the current substrate — a
+/// self-asserted `plugin_id` makes an allowlist one string from bypass, and the
+/// drain is deliberately not the sender, so there is no caller-derived key to scope
+/// the rows by. Every arm is therefore EVIDENTIAL rather than gated: see the
+/// `mark_forwarded` arm for why that is the whole of what this surface can promise,
+/// and `an_unauthorized_mark_forwarded_is_not_prevented_but_names_its_actor` for the
+/// test that pins the un-prevented part in place instead of asserting it away.
 async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
     let session_id_arg = optional_string(args, "session_id");
     let mut s = state.lock().await;
@@ -2702,10 +2715,83 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
         ));
     };
     if let Some(id) = args.get("mark_forwarded").and_then(|v| v.as_u64()) {
-        s.inbox_store
+        // G4-auth (Thor, hop 2) — the honest half of the answer, and the reason
+        // it is a witness and not a gate.
+        //
+        // Attribution here proves a LIVE SESSION, never "is this the drain".
+        // `hestia_connect` is unauthenticated and self-asserts its `plugin_id`,
+        // so a drain allowlist is bypassed by sending a different string: it
+        // would move the assertion, not close the hole. Scoping by construction
+        // the way `tool_member_inbox` does is unavailable for the opposite
+        // reason — the drain is deliberately NOT the sender, so there is no
+        // caller-derived key that selects the rows it must legitimately touch.
+        // Prevention needs an authenticated drain identity, which is a substrate
+        // change and belongs to its own review, not to this graft.
+        //
+        // What is fixable here is the asymmetry that made this arm the dangerous
+        // one: on a surface where every other disposition now names its actor in
+        // the chain (`retired_by`, `defect_scope`, `peer_contacted`), the one
+        // that DESTROYS a packet wrote nothing at all and returned `by` only to
+        // the caller. `f8a4d30`'s rule — a drop record that cannot name the party
+        // that dropped it is evidence about nobody — applies to this arm as much
+        // as to the retirement arms, and it was the only one exempt.
+        //
+        // Deliberately NOT a report to the sender. A forwarded row means the mesh
+        // accepted the hand-off, not that the far member read it; a receipt per
+        // packet would pay the sender's queue cap (whose evictions are
+        // unwitnessed DELETEs) for a claim we are not entitled to make. The chain
+        // is append-only and costs the sender's mailbox nothing.
+        let Some(row) = s
+            .inbox_store
+            .egress_row(id)
+            .map_err(|e| anyhow::anyhow!("reading egress row: {e}"))?
+        else {
+            return Ok(hestia_error_envelope(
+                "hestia.egress_no_such_row",
+                &format!("no egress row {id}"),
+                None,
+            ));
+        };
+        let transitioned = s
+            .inbox_store
             .mark_egress_forwarded(id)
             .map_err(|e| anyhow::anyhow!("marking egress forwarded: {e}"))?;
-        return Ok(json!({ "marked": id, "disposition": "forwarded", "by": caller.plugin_id }));
+        if !transitioned {
+            // G6 — the row already holds a terminal disposition (retired by the
+            // undeliverable or age sweep, or forwarded by an earlier call). Say
+            // so, and write no witness: a second claim on a settled packet is not
+            // an event, and re-stamping it would contradict a chain entry whose
+            // subject already got the truth.
+            return Ok(json!({
+                "marked": id, "disposition": "noop", "reason": "already-terminal",
+                "by": caller.plugin_id,
+            }));
+        }
+        let entry = s.append_chain(
+            "member_notice_forwarded",
+            json!({
+                "egress_id": id,
+                "dest_peer": row.dest_peer,
+                "dest_peer_lct": row.dest_peer_lct,
+                "to_plugin_id": row.from_plugin,
+                "original_destination": format!("{}/{}", row.dest_peer, row.to_member),
+                "kind": row.kind,
+                "pointer_uri": row.pointer_uri,
+                "attempts": row.attempts,
+                // `accepted`, never `delivered`: the mesh took the hand-off. The
+                // far member reading it is a separate, unobserved event, and the
+                // class must not let a reader collapse the two.
+                "class": "accepted",
+                "peer_contacted": true,
+                // Who took the packet out of the queue. Unpreventable is not the
+                // same as unattributable.
+                "forwarded_by": caller.plugin_id,
+            }),
+        )?;
+        return Ok(json!({
+            "marked": id, "disposition": "forwarded", "by": caller.plugin_id,
+            "class": "accepted", "witnessEntryHash": entry.hash,
+        }));
     }
     if let Some(id) = args.get("mark_failed").and_then(|v| v.as_u64()) {
         let reason = optional_string(args, "reason").unwrap_or_else(|| "unspecified".to_string());
@@ -6211,6 +6297,203 @@ mod member_mesh_tests {
         assert_eq!(
             e.event_data["peer_contacted"], json!(false),
             "the entry does not state that the peer was never contacted"
+        );
+    }
+
+    /// G4-auth (Thor, hop 2), measured here rather than accepted — and the test
+    /// asserts the state we can actually reach, not the one we would like.
+    ///
+    /// `resolve_attributed_caller` asks *"is there a live session?"*, never *"is
+    /// this the drain?"*. Any member that can connect can therefore poll the
+    /// forwarding queue and mark any row forwarded. That cannot be PREVENTED on
+    /// this substrate: `hestia_connect` is unauthenticated and self-asserts its
+    /// `plugin_id`, so a `plugin_id` allowlist for the drain is one string away
+    /// from being bypassed and would only move the assertion. It can be made
+    /// EVIDENTIAL, which is the doctrine this plane already runs on (`f8a4d30`:
+    /// a drop record that cannot name the party that dropped it is evidence
+    /// about nobody).
+    ///
+    /// So: Mallory still marks the row. What changes is that the destruction of
+    /// a packet is no longer the one disposition on this surface that writes
+    /// nothing — the chain names her, the row, and its destination.
+    #[tokio::test]
+    async fn an_unauthorized_mark_forwarded_is_not_prevented_but_names_its_actor() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        let sent = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "thor-sage/claude-code", "kind": "reply",
+                    "pointer_uri": "shared-context/alices-mail.md", "session_id": alice}),
+        )
+        .await
+        .unwrap();
+        let row_id = sent["queued_id"].as_u64().unwrap();
+
+        // Mallory is not the sender, not the drain, and holds no role. She only
+        // has a live session — which is all this surface has ever asked for.
+        let mallory = connect(&state, "mallory").await;
+        let listed = tool_egress_pending(&state, &json!({"session_id": mallory}))
+            .await
+            .unwrap();
+        assert_eq!(
+            listed["total"], 1,
+            "the list arm is ungated by construction; if this ever becomes 0 the \
+             substrate changed and G4-auth can be closed properly: {listed}"
+        );
+        let marked = tool_egress_pending(&state, &json!({"session_id": mallory, "mark_forwarded": row_id}))
+            .await
+            .unwrap();
+        assert_eq!(marked["disposition"], "forwarded", "{marked}");
+        assert_eq!(marked["by"], "mallory");
+
+        // Alice's mail is gone and she was not told. Both halves recorded as the
+        // measured state, so a later fix has to change the test, not just pass it.
+        let alices_queue = tool_egress_pending(&state, &json!({"session_id": alice}))
+            .await
+            .unwrap();
+        assert_eq!(alices_queue["total"], 0);
+        let alices_inbox = tool_member_inbox(&state, &json!({"session_id": alice}))
+            .await
+            .unwrap();
+        assert_eq!(
+            alices_inbox["total"], 0,
+            "a forwarded row does not report home, by design — an accepted hand-off \
+             is not a delivery, and inventing a receipt per packet would pay the \
+             sender's queue cap for a claim we cannot make"
+        );
+
+        // The part that must not be silent: who did it.
+        let s = state.lock().await;
+        let e = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "member_notice_forwarded")
+            .expect("a packet left the queue and the chain says nothing about it");
+        assert_eq!(e.event_data["forwarded_by"], json!("mallory"));
+        assert_eq!(e.event_data["egress_id"], json!(row_id));
+        assert_eq!(e.event_data["dest_peer"], json!("thor-sage"));
+        assert_eq!(
+            e.event_data["to_plugin_id"], json!("claude-code"),
+            "the entry does not name whose mail it was"
+        );
+        assert_eq!(
+            e.event_data["class"], json!("accepted"),
+            "forwarded must not be recorded as a delivery"
+        );
+        assert_eq!(e.event_data["peer_contacted"], json!(true));
+    }
+
+    /// G6 (mine, this hop) — `mark_egress_forwarded`'s UPDATE carried no
+    /// `drained_at IS NULL` predicate, so it could re-stamp a row that had
+    /// ALREADY been retired as undeliverable.
+    ///
+    /// That is worse than the ungated arm it lives in. The chain says
+    /// `member_notice_undeliverable_local` with `peer_contacted: false`, the
+    /// sender has been told the truth, and then the row's own final state says
+    /// `forwarded` — a laundering that contradicts a witnessed entry rather than
+    /// merely lacking one. It is reachable without any adversary: the sweep and a
+    /// drain can race on the same row across two polls.
+    ///
+    /// A terminal disposition is terminal. The mark reports `noop` and writes no
+    /// witness, because nothing happened.
+    #[tokio::test]
+    async fn a_retired_row_cannot_be_relabelled_forwarded() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        let row_id = {
+            let s = state.lock().await;
+            s.inbox_store
+                .enqueue_egress("thor-sage", "", "claude-code", "claude-code", "role:r",
+                                "reply", Some("shared-context/parked.md"), "hash-legacy")
+                .unwrap()
+        };
+        // The undeliverable sweep retires it, truthfully, at zero attempts.
+        let poll = tool_egress_pending(&state, &json!({"session_id": alice}))
+            .await
+            .unwrap();
+        assert_eq!(poll["undeliverable_locally"][0]["disposition"], "retired");
+
+        let relabel = tool_egress_pending(
+            &state,
+            &json!({"session_id": alice, "mark_forwarded": row_id}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            relabel["disposition"], "noop",
+            "a retired row was relabelled forwarded: {relabel}"
+        );
+        assert_eq!(relabel["reason"], "already-terminal");
+
+        let s = state.lock().await;
+        let chain = s.recent_chain(20);
+        assert!(
+            chain.iter().any(|e| e.event_type == "member_notice_undeliverable_local"),
+            "the truthful record went missing"
+        );
+        assert!(
+            !chain.iter().any(|e| e.event_type == "member_notice_forwarded"),
+            "the chain now carries two contradicting dispositions for one packet"
+        );
+    }
+
+    /// The bound that answers G4-auth's blast-radius question with a predicate
+    /// instead of prose.
+    ///
+    /// Thor's objection to the new undeliverable sweep is that it fires at zero
+    /// attempts, immediately, from inside the ungated list arm — so an
+    /// unauthorized `{"limit":25}` retires the whole legacy population at once,
+    /// where the pre-existing age sweep at least needed a row to be seven days
+    /// old. True, and the reason it is nevertheless not the dangerous arm is
+    /// checkable: `undeliverable_egress` selects only rows this box can never
+    /// send. An unauthorized poll can make correct, witnessed, truthful work
+    /// happen EARLIER. It cannot touch a sendable row — that still takes
+    /// `mark_forwarded`, which is why that is the arm that had to change.
+    #[tokio::test]
+    async fn an_unauthorized_poll_can_hasten_the_sweep_but_cannot_reach_a_sendable_row() {
+        let (dir, state) = test_state().await;
+        write_peer_table(&dir, TWO_PEERS);
+        let alice = connect(&state, "claude-code").await;
+        let sendable = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "thor-sage/claude-code", "kind": "reply",
+                    "pointer_uri": "shared-context/sendable.md", "session_id": alice}),
+        )
+        .await
+        .unwrap()["queued_id"]
+            .as_u64()
+            .unwrap();
+        {
+            let s = state.lock().await;
+            s.inbox_store
+                .enqueue_egress("thor-sage", "", "claude-code", "claude-code", "role:r",
+                                "reply", Some("shared-context/legacy.md"), "hash-legacy")
+                .unwrap();
+        }
+
+        let mallory = connect(&state, "mallory").await;
+        let poll = tool_egress_pending(&state, &json!({"session_id": mallory, "limit": 25}))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            poll["undeliverable_locally"].as_array().map(|a| a.len()),
+            Some(1),
+            "the sweep did not run for an unauthorized poller — which is not the \
+             property claimed here: {poll}"
+        );
+        assert_eq!(poll["total"], 1, "the sendable row must survive the poll: {poll}");
+        assert_eq!(poll["pending"][0]["id"], sendable);
+        assert_eq!(poll["pending"][0]["attempts"], 0, "an unauthorized poll burned an attempt");
+
+        let s = state.lock().await;
+        assert!(
+            !s.recent_chain(20)
+                .iter()
+                .any(|e| e.event_type == "member_notice_unreachable"),
+            "an unauthorized poll produced an unreachable claim about thor-sage"
         );
     }
 

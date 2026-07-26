@@ -641,14 +641,26 @@ impl SqliteInboxStore {
     /// Mark an egress row forwarded. Separate from delivery: this records that the
     /// fleet mesh ACCEPTED it, not that the far member read it. Conflating those is
     /// the "send succeeded != delivered" defect this whole thread is about.
-    pub fn mark_egress_forwarded(&self, id: u64) -> Result<()> {
+    ///
+    /// Returns whether this call actually made the transition. `drained_at IS NULL`
+    /// is load-bearing (G6, r6-routing hop 5): without it this UPDATE re-stamps a
+    /// row that has already been RETIRED as undeliverable, leaving the chain with
+    /// `member_notice_undeliverable_local` (`peer_contacted: false`, sender already
+    /// told) and the row's own final state saying `forwarded`. That is worse than
+    /// an unwitnessed drop — it is a record that contradicts a witnessed one. No
+    /// adversary is needed: the undeliverable sweep and a drain race on the same
+    /// row across two polls. A terminal disposition is terminal, so the second
+    /// writer learns it changed nothing instead of silently winning.
+    pub fn mark_egress_forwarded(&self, id: u64) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE member_notices SET drained_at = ?1 WHERE id = ?2 AND dest_peer IS NOT NULL",
-            params![Utc::now().to_rfc3339(), id as i64],
-        )
-        .context("marking egress forwarded")?;
-        Ok(())
+        let n = conn
+            .execute(
+                "UPDATE member_notices SET drained_at = ?1
+                  WHERE id = ?2 AND dest_peer IS NOT NULL AND drained_at IS NULL",
+                params![Utc::now().to_rfc3339(), id as i64],
+            )
+            .context("marking egress forwarded")?;
+        Ok(n == 1)
     }
 
     /// Record a FAILED hand-off attempt and return the new attempt count.
@@ -1839,7 +1851,7 @@ mod tests {
                             Some("forum/for-thor.md#thread=t"), "hash-egress")
             .unwrap();
         // Delivered, unlike the sibling test: this is the whole difference.
-        store.mark_egress_forwarded(egress).unwrap();
+        assert!(store.mark_egress_forwarded(egress).unwrap(), "the row did not transition");
         let stale = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS + 3600)).to_rfc3339();
         store
             .conn
