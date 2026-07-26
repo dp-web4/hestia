@@ -463,9 +463,31 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
                         f"FRAGILE: hook target under /tmp, cleared on reboot "
                         f"{where} -> {target}")
                 elif "/mnt/c/" in target:
+                    # MECHANISM CORRECTED 2026-07-26 (CBP), because the previous wording made
+                    # a quantitative claim and measurement refuted it. Old text: "cold-load can
+                    # exceed the hook timeout". Measured on CBP with the Linux page cache
+                    # dropped between runs:
+                    #   hestia claude gate      9p 0.24-0.26s   ext4 0.18s   timeout 5s  (~20x)
+                    #   web4-governance fallback 9p 0.68-0.74s  ext4 0.32s   budget  2s  (~3x)
+                    # Nothing came near its timeout. Three fleet members migrated hooks off 9p
+                    # on the strength of that sentence, and none of us had measured it — the
+                    # claim was load-bearing and untested.
+                    #
+                    # The finding SURVIVES on a different mechanism. What bites on WSL2 is not
+                    # slow steady-state cold-load, it is tail latency: the 9p mount can stall
+                    # (host FS contention, Defender, a sleeping host), and a stall is UNBOUNDED,
+                    # so no timeout margin protects against it. A 20x median margin says nothing
+                    # about the tail, which is exactly the distinction the old wording collapsed.
+                    # Second, real, cost: 0.06-0.35s per invocation is a latency tax on every
+                    # tool call, independent of any timeout.
+                    #
+                    # Caveat on the numbers, so they are not overread the way the old claim was:
+                    # drop_caches clears the LINUX page cache only. The Windows-side 9p server
+                    # cache stays warm, so these are LOWER BOUNDS on true cold (post-boot) cost.
                     rec["findings"].append(
-                        "FRAGILE: hook target on the 9p mount — cold-load can exceed the "
-                        f"hook timeout, and these hooks fail OPEN {where} -> {target}")
+                        "FRAGILE: hook target on the 9p mount — unbounded stall risk (tail "
+                        "latency, not median: measured median penalty is 0.06-0.35s against "
+                        f"3-20x timeout margins), and these hooks fail OPEN {where} -> {target}")
             if is_hestia and hook["enabled"] and targets and all(
                     Path(t).exists() for t in targets):
                 hestia_hooks.append({**hook, "targets": targets, "scope": scope})
