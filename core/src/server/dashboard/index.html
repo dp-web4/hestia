@@ -424,6 +424,7 @@
   .orch-connect[data-connectable="false"] { color: var(--fg-faint); cursor: default; }
   /* connected but idle: live + wired, just no tool calls in the last hour */
   .orch-idle { color: var(--fg-faint); font-size: 0.7rem; margin-left: 0.35rem; }
+.trust-alias { font-size:0.7rem; color:#94a3b8; font-style:italic; margin:0.15rem 0 0.3rem; }
 </style>
 </head>
 <body>
@@ -924,9 +925,16 @@
       // only from witnessed not-the-actor adjudications. Never blended with
       // the self-reported record below; both shown, each labeled (dp: the
       // displayed scores must line up with earned trust).
+      // An aliased identity's evidence folds into another member and is counted
+      // THERE. Say so on the row, or the same observations read twice and two rows
+      // look like two agents (dp saw exactly that with codex / codex-cli).
+      const aliasNote = t.aliased_to
+        ? `<div class="trust-alias">evidence folds into <strong>${escapeHtml(t.aliased_to)}</strong> — counted there, not here</div>`
+        : '';
       const nAdj = (t.adjudicated_counts || [0,0,0]).reduce((a,b)=>a+b, 0);
       const nTemp = t.derived_temperament_n || 0;
       const adjBlock = (nAdj > 0 || nTemp > 0) ? `
+        ${aliasNote}
         ${tensorRow('Temperament', t.derived_temperament)}
         ${tensorRow('Adj. validity', t.adjudicated_validity)}
         ${tensorRow('Adj. veracity', t.adjudicated_veracity)}

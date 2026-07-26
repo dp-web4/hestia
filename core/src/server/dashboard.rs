@@ -176,6 +176,12 @@ pub struct TrustView {
     /// adjudicated evidence.
     #[serde(default)]
     pub derivation: String,
+    /// Set when this identity is a witnessed ALIAS of another: its evidence folds into
+    /// that member and is counted THERE. Without this the dashboard shows the same
+    /// observations twice — once natively, once folded — and a reader cannot tell that
+    /// the two rows are one agent (dp, 2026-07-26).
+    #[serde(default)]
+    pub aliased_to: Option<String>,
 }
 
 /// One recent chain entry, flattened for UI consumption.
@@ -509,6 +515,7 @@ impl ServerState {
                     // Everything in this view flows from update_from_outcome's
                     // self-reported scalar until Stage 3 of the T3-from-V3 arc.
                     derivation: "legacy-lockstep-v1".to_string(),
+                    aliased_to: crate::derivation::alias_target(pid, &stats_window),
                 }
             })
             .collect();

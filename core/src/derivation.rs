@@ -99,6 +99,50 @@ fn entry_str<'a>(e: &'a ChainEntry, key: &str) -> Option<&'a str> {
 
 /// Derive temperament + collect adjudication evidence for one grain from a
 /// chain window (oldest-first order is established internally).
+/// Chain event type that records "identity A's evidence belongs to identity B".
+///
+/// Written when the SAME agent was recorded under two plugin_ids — codex's gate
+/// witnessed as `codex-cli` while its runtime acted as `codex`, so 674 acts and 9
+/// conduct observations landed on different grains and neither showed the whole
+/// member (dp, 2026-07-26).
+///
+/// The record is APPENDED, never applied by rewriting: history stays exactly where it
+/// landed and derivation follows the alias when folding. That is the same discipline
+/// r6-framework §4.2 sets for Results — a correction is a new act, the original is
+/// immutable — and it is why this is an alias rather than a merge.
+pub const IDENTITY_ALIAS_EVENT: &str = "identity_alias";
+
+/// If `plugin_id` was witnessed as an alias OF some other identity, return that identity.
+/// Used for display: a row whose evidence is counted elsewhere must say so, or the same
+/// observations appear twice and look like two members.
+pub fn alias_target(plugin_id: &str, window: &[ChainEntry]) -> Option<String> {
+    window
+        .iter()
+        .filter(|e| e.event_type == IDENTITY_ALIAS_EVENT && entry_str(e, "alias") == Some(plugin_id))
+        .filter_map(|e| entry_str(e, "alias_of").map(str::to_string))
+        .next_back()
+}
+
+/// Resolve the set of plugin_ids whose evidence folds into `plugin_id`: itself, plus
+/// every identity witnessed as an alias OF it. One level only, deliberately — a chain
+/// of aliases is a rename history nobody has needed yet, and transitive resolution
+/// would let two independent aliases silently join two unrelated members.
+fn aliased_identities<'a>(plugin_id: &'a str, entries: &[&'a ChainEntry]) -> Vec<String> {
+    let mut ids = vec![plugin_id.to_string()];
+    for e in entries {
+        if e.event_type == IDENTITY_ALIAS_EVENT
+            && entry_str(e, "alias_of") == Some(plugin_id)
+        {
+            if let Some(a) = entry_str(e, "alias") {
+                if a != plugin_id && !ids.iter().any(|x| x == a) {
+                    ids.push(a.to_string());
+                }
+            }
+        }
+    }
+    ids
+}
+
 pub fn derive(
     plugin_id: &str,
     role_lct: &str,
@@ -108,8 +152,12 @@ pub fn derive(
     entries.sort_by_key(|e| e.chain_position);
 
     // ---- Temperament: governance-response conduct ----
+    // Identities whose evidence folds here: this one, plus any witnessed alias of it.
+    // Without this, an agent recorded under two ids shows work on one grain and conduct
+    // on the other, and neither grain is the member.
+    let identities = aliased_identities(plugin_id, &entries);
     let is_grain = |e: &ChainEntry| {
-        entry_str(e, "plugin_id") == Some(plugin_id)
+        entry_str(e, "plugin_id").is_some_and(|p| identities.iter().any(|i| i == p))
             && entry_str(e, "role_lct").map_or(true, |r| r == role_lct)
     };
     // Probe hygiene (dp 2026-07-24): synthetic verification sessions (gate
