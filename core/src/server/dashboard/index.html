@@ -94,17 +94,82 @@
     50% { opacity: 0.3; }
   }
 
+  /* --- Header metrics (were four cards; now a strip in the title bar) --- */
+  .hstats {
+    display: flex;
+    align-items: center;
+    gap: 1.75rem;
+    margin-left: auto;
+    margin-right: 1.5rem;
+  }
+  .hstat { display: flex; flex-direction: column; align-items: flex-end; line-height: 1.1; }
+  .hs-val {
+    font-size: 1.35rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+  .hs-val.accent { color: var(--accent); }
+  .hs-val.success { color: var(--success); }
+  .hs-lab {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--fg-faint);
+    margin-top: 0.15rem;
+  }
+  .hs-lab select {
+    background: transparent; border: none; color: inherit; cursor: pointer;
+    font: inherit; text-transform: uppercase; letter-spacing: 0.07em; padding: 0;
+  }
+  @media (max-width: 900px) {
+    header { flex-wrap: wrap; row-gap: 0.75rem; }
+    .hstats { margin-left: 0; gap: 1.25rem; }
+    .hs-val { font-size: 1.1rem; }
+  }
+
   /* --- Main --- */
   main {
     grid-area: main;
-    padding: 1.5rem 2rem;
+    padding: 1.25rem 2rem;
     display: flex;
     flex-direction: column;
-    gap: 1.5rem;
-    max-width: 1400px;
+    gap: 1rem;
+    max-width: 1600px;
     margin: 0 auto;
     width: 100%;
   }
+
+  /* The two live surfaces share a row and each scrolls inside its own box, so a long
+     histogram can no longer push the chain off the page. Below ~1100px they stack,
+     where the same guarantee comes from the max-heights instead. */
+  .live-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr);
+    gap: 1rem;
+    align-items: start;
+  }
+  @media (max-width: 1100px) { .live-grid { grid-template-columns: minmax(0, 1fr); } }
+
+  /* On a screen with room for it, the two live panels FILL the space left over instead
+     of claiming a fixed fraction of it. A `62vh` cap cannot know how much sits above it
+     — with four trust grains the panels ended 45px past the fold, and with eight they
+     would end further past, so the fixed cap only ever happened to fit. Filling the
+     remainder makes "the chain is on screen" hold for any number of grains rather than
+     for the number that was there the day it was measured.
+
+     Below these thresholds the app-shell is dropped and the page scrolls normally: on a
+     short screen a pinned shell would squeeze both panels to unusable slivers, which is
+     a worse failure than scrolling. The vh caps still bound them there. */
+  @media (min-width: 1100px) and (min-height: 720px) {
+    html, body { height: 100vh; min-height: 0; overflow: hidden; }
+    main { min-height: 0; overflow: hidden; }
+    .live-grid { flex: 1 1 auto; min-height: 0; }
+    .live-grid > .card { display: flex; flex-direction: column; min-height: 0; max-height: 100%; }
+    .live-grid .tool-list, .live-grid .feed { flex: 1 1 auto; min-height: 8rem; max-height: none; }
+  }
+
+  .head-hint { font-size: 0.7rem; color: var(--fg-faint); margin-left: auto; padding-right: 0.25rem; }
 
   /* --- Orchestrator selector bar --- */
   .orch-bar {
@@ -112,7 +177,7 @@
     flex-wrap: wrap;
     gap: 0.5rem;
     align-items: center;
-    padding: 0.5rem 0;
+    padding: 0.15rem 0;
   }
   .orch-bar-label {
     font-size: 0.75rem;
@@ -246,7 +311,39 @@
   }
 
   /* --- Trust panel --- */
-  .trust-list { display: flex; flex-direction: column; gap: 1.25rem; }
+  /* Collapsed trust: one clickable row per (plugin, role) grain. The bar shows the
+     WEAKEST measured dimension — the fleet's weakest-link principle, and the dimension
+     that sets the level anyway — never an average, which would invent a number that no
+     evidence produced. Which dimension it is gets named on the row, so the single bar
+     is a claim you can check rather than a summary you have to trust. */
+  .trust-list { display: flex; flex-direction: column; }
+  .trust-row {
+    display: grid;
+    grid-template-columns: minmax(9rem, 15rem) minmax(0, 1fr) 3rem 5.5rem;
+    gap: 0.75rem;
+    align-items: center;
+    width: 100%;
+    padding: 0.55rem 1.25rem;
+    background: none;
+    border: 0;
+    border-top: 1px solid var(--border);
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .trust-row:first-child { border-top: 0; }
+  .trust-row:hover { background: var(--bg-elev-2); }
+  .trust-row .tr-id { font-family: var(--mono); font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .trust-row .tr-role { font-family: var(--mono); font-size: 0.72rem; color: var(--fg-dim); margin-left: 0.4rem; }
+  .trust-row .tr-val { font-family: var(--mono); font-size: 0.85rem; text-align: right; font-variant-numeric: tabular-nums; }
+  .trust-row .tr-dim { display: block; font-size: 0.66rem; color: var(--fg-faint); line-height: 1.1; margin-top: 0.1rem; }
+  .trust-row .trust-level { justify-self: end; }
+  @media (max-width: 700px) {
+    .trust-row { grid-template-columns: minmax(0, 1fr) 3rem; }
+    .trust-row .bar { display: none; }
+  }
+
   .trust-item {
     padding: 0.5rem 0;
   }
@@ -305,7 +402,11 @@
   .trust-meta b { color: var(--fg); font-variant-numeric: tabular-nums; font-family: var(--mono); }
 
   /* --- Chain feed --- */
-  .feed { max-height: 70vh; overflow-y: auto; }
+  /* Both live panels are capped and scroll internally. The chain used to be a sibling
+     BELOW an uncapped histogram, so N tools meant N rows of push and the chain left the
+     viewport entirely — the failure dp reported. A cap is what makes the grid's promise
+     hold when the two stack on a narrow screen. */
+  .feed { max-height: 62vh; min-height: 16rem; overflow-y: auto; }
   .feed-row {
     display: grid;
     grid-template-columns: 4rem 3.5rem 7rem 1fr 4rem 9rem;
@@ -347,7 +448,7 @@
   .right-col { display: flex; flex-direction: column; gap: 1.5rem; }
 
   /* --- Tool histogram --- */
-  .tool-list { display: flex; flex-direction: column; gap: 0.5rem; padding: 1rem 1.25rem; }
+  .tool-list { display: flex; flex-direction: column; gap: 0.5rem; padding: 1rem 1.25rem; max-height: 62vh; overflow-y: auto; }
   .tool-row {
     display: grid;
     /* Name column auto-sizes to the longest visible tool name (set in JS as
@@ -434,6 +535,25 @@
       <h1>Hestia</h1>
       <span class="tagline">local-first Web4 trust layer</span>
     </div>
+    <!-- Metrics live in the title bar. They were four full-width cards holding three
+         numbers, one of which was printed twice: "Actions · trailing 60 min" and the
+         range selector's "actions in trailing 60 min" were the same quantity whenever
+         the range was `hour`, which is the default, which is what anyone looking at a
+         screenshot sees. Now there is ONE actions figure and the range selector labels
+         it, so the number and the window it covers cannot drift apart. -->
+    <div class="hstats">
+      <div class="hstat"><span class="hs-val accent" id="stat-chain">—</span><span class="hs-lab">chain</span></div>
+      <div class="hstat">
+        <span class="hs-val" id="stat-actions">—</span>
+        <span class="hs-lab"><select id="range-sel" aria-label="Time range">
+          <option value="hour" selected>last hour</option>
+          <option value="day">last day</option>
+          <option value="week">last week</option>
+          <option value="all">all time</option>
+        </select></span>
+      </div>
+      <div class="hstat"><span class="hs-val success" id="stat-rate">—</span><span class="hs-lab" id="stat-rate-delta">success</span></div>
+    </div>
     <div class="live">
       <span class="dot"></span>
       <span id="live-status">connecting…</span>
@@ -441,62 +561,36 @@
   </header>
 
   <main>
-    <section class="stat-row" id="stats">
-      <div class="stat accent">
-        <div class="label">Witness chain</div>
-        <div class="value" id="stat-chain">—</div>
-        <div class="delta" id="stat-chain-delta">entries recorded</div>
-      </div>
-      <div class="stat">
-        <div class="label">Actions</div>
-        <div class="value" id="stat-actions">—</div>
-        <div class="delta" id="stat-actions-delta">tool calls witnessed · trailing 60 min</div>
-      </div>
-      <div class="stat success">
-        <div class="label">Success rate</div>
-        <div class="value" id="stat-rate">—</div>
-        <div class="delta" id="stat-rate-delta">across all plugins</div>
-      </div>
-      <div class="stat">
-        <div class="label"><select id="range-sel" style="background:transparent;border:none;color:inherit;font:inherit;cursor:pointer;padding:0">
-          <option value="hour" selected>Last hour</option>
-          <option value="day">Last day</option>
-          <option value="week">Last week</option>
-          <option value="all">All time</option>
-        </select></div>
-        <div class="value" id="stat-hour">—</div>
-        <div class="delta" id="stat-hour-delta">actions in trailing 60 min</div>
-      </div>
-    </section>
+    <!-- No "ORCHESTRATORS:" label. The chips are self-evidently orchestrators; the word
+         cost a fifth of a row to say so. -->
+    <div class="orch-bar" id="orch-bar">
+      <span class="orch-chip-empty">none active in the last hour</span>
+    </div>
 
-    <section>
-      <div class="orch-bar" id="orch-bar">
-        <span class="orch-bar-label">Active orchestrators:</span>
-        <span class="orch-chip-empty">none active in the last hour</span>
-      </div>
-    </section>
-
-    <section>
-      <div class="card">
+    <!-- Trust collapses to one row per grain: the weakest measured dimension, which is
+         the one that governs the level anyway. Full tensor + evidence on click. This was
+         a full screen of bars for what is, at a glance, four numbers. -->
+    <div class="card">
+      <div class="card-head">
         <h2 id="trust-title">Plugin trust</h2>
-        <div class="card-body">
-          <div class="trust-list" id="trust-list">
-            <div class="empty">No plugins recorded yet. Connect one to start building trust.</div>
-          </div>
-        </div>
+        <span class="head-hint">click a row for the full tensor and its receipts</span>
       </div>
-    </section>
+      <div class="trust-list" id="trust-list">
+        <div class="empty">No plugins recorded yet. Connect one to start building trust.</div>
+      </div>
+    </div>
 
-    <section>
+    <!-- The two live surfaces, side by side and independently scrollable. Stacked, a
+         long histogram pushed the chain entirely below the fold — the two things most
+         worth watching were the two least visible. Neither can now displace the other. -->
+    <div class="live-grid">
       <div class="card">
-        <h2 id="histogram-title">Tool histogram</h2>
+        <div class="card-head"><h2 id="histogram-title">Tool histogram</h2></div>
         <div class="tool-list" id="tool-list">
           <div class="empty">No tool calls yet.</div>
         </div>
       </div>
-    </section>
 
-    <section>
       <div class="card">
         <div class="card-head">
           <h2 id="feed-title">Witness chain — live</h2>
@@ -511,8 +605,19 @@
           <div class="empty">Waiting for the first chain entry…</div>
         </div>
       </div>
-    </section>
+    </div>
   </main>
+
+  <div class="modal" id="trust-modal" hidden>
+    <div class="modal-backdrop" data-close="1"></div>
+    <div class="modal-panel">
+      <div class="modal-head">
+        <h2 id="trust-modal-title">Trust</h2>
+        <button class="modal-close" data-close="1" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body" id="trust-modal-body"></div>
+    </div>
+  </div>
 
   <div class="modal" id="policy-modal" hidden>
     <div class="modal-backdrop" data-close="1"></div>
@@ -559,6 +664,7 @@
   const seen = new Set();
   let first = true;
   let selectedOrch = null; // currently-filtered orchestrator, or null = "all"
+  let trustShown = [];     // grains as last rendered, so the detail modal opens the right one
   let lastData = null;     // last snapshot, used to re-render on filter clicks without re-fetching
   let feedFilter = 'all';  // 'all' | 'warn' | 'deny'
   let failuresCache = null; // result of last /api/failures fetch, used while FAILED is selected
@@ -755,29 +861,27 @@
 
   function renderStats(s, society, scope) {
     $('stat-chain').textContent = fmt.int(society.chain_length);
-    // Headline = the live pulse (genuine trailing 60 min, independent of what range
-    // you happen to be browsing). The range-scoped total lives in the selector card
-    // below; before this, both cards rendered the same quantity.
-    $('stat-actions').textContent = fmt.int(s.actions_last_hour);
+    // ONE actions figure, scoped to the selected range, with the range selector as its
+    // own label. Previously two cards carried this: a fixed trailing-60-min headline and
+    // a range-scoped total. At the default range they are the same number, so the
+    // dashboard printed it twice and spent a quarter of the stat row doing it. Reading
+    // the value and its window off the same variable also removes the failure mode where
+    // the label said "last week" over an hour's count.
+    $('stat-actions').textContent = fmt.int(s.total_actions);
     $('stat-rate').textContent = s.total_actions === 0 ? '—' : fmt.pct(s.success_rate);
-    // Denies never reach an `outcome` (the gate blocks before the tool runs),
-    // so they're not in the success-rate math — surfaced here as gate activity,
-    // not failure. A deny is the trust layer working.
-    const blocked = s.denied_actions
-      ? ` · ${fmt.int(s.denied_actions)} blocked by policy`
-      : '';
+    // Denies never reach an `outcome` (the gate blocks before the tool runs), so they
+    // are not in the success-rate math — surfaced as gate activity, not failure. A deny
+    // is the trust layer working. The strip has room for the short form only; the full
+    // breakdown rides on the tooltip rather than being dropped.
+    const blocked = s.denied_actions ? `${fmt.int(s.denied_actions)} blocked` : '';
     $('stat-rate-delta').textContent =
+      s.total_actions === 0 ? (blocked || 'success') : (blocked || 'success');
+    $('stat-rate-delta').parentElement.title =
       s.total_actions === 0
-        ? (s.denied_actions ? `${fmt.int(s.denied_actions)} blocked by policy` : (scope ? `for ${scope}` : 'across all plugins'))
-        : `${fmt.int(s.successful_actions)} ok · ${fmt.int(s.failed_actions)} fail${blocked}${scope ? ` · ${scope}` : ''}`;
-    // The card whose label IS the range selector shows the SELECTED range's count.
-    // It was bound to `actions_last_hour`, which used to track the selection and now
-    // (correctly) means a real trailing hour — so the card read "last hour" under a
-    // label saying "trailing 7 days". Value and label must come from the same window.
-    $('stat-hour').textContent = fmt.int(s.total_actions);
-    // Keep the label in lockstep here rather than only in the change handler, so a
-    // reload or a programmatic range change can never leave them disagreeing again.
-    $('stat-hour-delta').textContent = RANGE_DELTA[rangeSel] || '';
+        ? (s.denied_actions ? `${fmt.int(s.denied_actions)} blocked by policy` : (scope ? `no actions for ${scope}` : 'no actions in range'))
+        : `${fmt.int(s.successful_actions)} ok · ${fmt.int(s.failed_actions)} fail`
+          + (s.denied_actions ? ` · ${fmt.int(s.denied_actions)} blocked by policy` : '')
+          + (scope ? ` · ${scope}` : '');
   }
 
   // Trust rows are one per (instance, role) grain, so a plugin can have several.
@@ -804,7 +908,9 @@
     const root = $('orch-bar');
     const orchs = data.orchestrators || [];
     const trustById = aggregateTrustByPlugin(data.trust || []);
-    const header = '<span class="orch-bar-label">Orchestrators:</span>';
+    // No label element: the chips are self-evidently the orchestrator list, and the
+    // word cost more horizontal room than the chips it introduced.
+    const header = '';
     if (!orchs.length) {
       root.innerHTML = header + '<span class="orch-chip-empty">none running or engaged</span>';
       return;
@@ -897,9 +1003,57 @@
       root.innerHTML = selectedOrch
         ? `<div class="empty">No trust data for ${escapeHtml(selectedOrch)}.</div>`
         : '<div class="empty">No plugins active in the last hour.</div>';
+      trustShown = [];
       return;
     }
-    root.innerHTML = filtered.map(t => `
+    // Kept so the detail modal can reopen the exact grain that was clicked, rather than
+    // re-deriving "which row was that" from the id (a plugin has several grains and two
+    // can share a plugin_id — the codex / codex-cli case).
+    trustShown = filtered;
+    root.innerHTML = filtered.map((t, i) => {
+      const w = weakestDimension(t);
+      const pct = w.score == null ? 0 : Math.max(0, Math.min(1, w.score)) * 100;
+      return `
+      <button type="button" class="trust-row" onclick="showTrustDetail(${i})"
+              title="Open the full tensor and its chain receipts">
+        <span class="tr-id">${escapeHtml(t.plugin_id)}${trustRole(t) ? `<span class="tr-role">${escapeHtml(shortRole(trustRole(t)))}</span>` : ''}</span>
+        <span>
+          <span class="bar"><div style="width:${pct.toFixed(1)}%"></div></span>
+          <span class="tr-dim">${escapeHtml(w.label)} · ${fmt.int(t.action_count)} action${t.action_count === 1 ? '' : 's'}${t.aliased_to ? ' · folds into ' + escapeHtml(t.aliased_to) : ''}</span>
+        </span>
+        <span class="tr-val">${w.score == null ? '—' : w.score.toFixed(2)}</span>
+        <span class="trust-level">${escapeHtml(t.level)}</span>
+      </button>`;
+    }).join('');
+  }
+
+  // The single collapsed bar reports the LOWEST measured dimension, not a mean. An
+  // average would manufacture a figure no evidence produced and would let a strong grain
+  // mask a failing one — the same masking the orchestrator chips already refuse (they
+  // show the worst grain's level). The dimension's name rides on the row so the number
+  // stays falsifiable at a glance.
+  function weakestDimension(t) {
+    const cand = [
+      ['temperament',    t.derived_temperament],
+      ['adj. validity',  t.adjudicated_validity],
+      ['adj. veracity',  t.adjudicated_veracity],
+      ['adj. valuation', t.adjudicated_valuation],
+      ['outcome record', t.t3_training],
+    ].filter(([, v]) => typeof v === 'number');
+    if (!cand.length) return { score: null, label: 'no measured dimension' };
+    const [label, score] = cand.reduce((a, b) => (b[1] < a[1] ? b : a));
+    return { score, label: cand.length > 1 ? `${label} (weakest of ${cand.length})` : label };
+  }
+
+  // The expanded view is the OLD card, verbatim — same trustRows(), same meta, same
+  // receipts link. Collapsing the list must not cost any evidence; it only moves it one
+  // click away.
+  window.showTrustDetail = function (i) {
+    const t = trustShown[i];
+    if (!t) return;
+    $('trust-modal-title').textContent =
+      `${t.plugin_id}${trustRole(t) ? ' — ' + shortRole(trustRole(t)) : ''}`;
+    $('trust-modal-body').innerHTML = `
       <div class="trust-item">
         <div class="trust-head">
           <span class="trust-id">${escapeHtml(t.plugin_id)}${trustRole(t) ? `<span class="trust-role" title="${escapeHtml(trustRole(t))}">${escapeHtml(shortRole(trustRole(t)))}</span>` : ''}</span>
@@ -910,9 +1064,9 @@
           <span>actions <b>${fmt.int(t.action_count)}</b></span>
           <span>success <b>${t.action_count === 0 ? '—' : fmt.pct(t.success_rate)}</b>${t.derivation === 'legacy-lockstep-v1' ? ' <span style="opacity:0.55">(self-reported)</span>' : ''}</span>
         </div>
-      </div>
-    `).join('');
-  }
+      </div>`;
+    $('trust-modal').hidden = false;
+  };
 
   function trustRows(t) {
     // Stage 0 of the T3-from-V3 arc (dp 2026-07-24): the legacy path computes ONE
@@ -1176,15 +1330,18 @@
   // server filters by calendar, not count — a count window silently evicted a
   // quiet plugin's entries whenever busier plugins churned.
   let rangeSel = 'hour';
-  const RANGE_DELTA = {
-    hour: 'actions in trailing 60 min',
-    day: 'actions in trailing 24 h',
-    week: 'actions in trailing 7 days',
-    all: 'actions across the whole chain',
+  // The <select> IS the label now, so there is no second string to keep in lockstep —
+  // the class of bug where the caption and the count described different windows is
+  // gone by construction rather than by remembering to update both.
+  const RANGE_TITLE = {
+    hour: 'tool calls witnessed in the trailing 60 minutes',
+    day: 'tool calls witnessed in the trailing 24 hours',
+    week: 'tool calls witnessed in the trailing 7 days',
+    all: 'tool calls witnessed across the whole chain',
   };
   document.getElementById('range-sel').addEventListener('change', e => {
     rangeSel = e.target.value;
-    $('stat-hour-delta').textContent = RANGE_DELTA[rangeSel] || '';
+    $('stat-actions').parentElement.title = RANGE_TITLE[rangeSel] || '';
     tick();
   });
 
@@ -1298,7 +1455,15 @@
     const modal = $('policy-modal');
     $('policy-btn').addEventListener('click', () => { modal.hidden = false; fetchPolicy(); });
     modal.addEventListener('click', (e) => { if (e.target.dataset.close) modal.hidden = true; });
-    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !modal.hidden) modal.hidden = true; });
+    // Same backdrop/✕/Escape contract for the trust detail popup, so both modals close
+    // the three ways a reader will try rather than only the one that was wired.
+    const tmodal = $('trust-modal');
+    tmodal.addEventListener('click', (e) => { if (e.target.dataset.close) tmodal.hidden = true; });
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      if (!modal.hidden) modal.hidden = true;
+      if (!tmodal.hidden) tmodal.hidden = true;
+    });
   })();
 
   tick();
