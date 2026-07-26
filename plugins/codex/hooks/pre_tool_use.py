@@ -139,6 +139,26 @@ def path_targets(tool_input):
     return out
 
 
+def mcp_repo_target(tool_input):
+    """An MCP connector call (GitHub et al.) names its repository in its OWN argument and
+    carries a REPO-RELATIVE `path`. Scoping that path is a category error: resolved against
+    the workspace cwd, its first segment reads as a repo claim, so
+    `arc-agi-3/experiments/x.py` INSIDE a granted dev-SAGE was denied as a claim on a repo
+    named 'arc-agi-3' (Codex live, 2026-07-26 — it complied and reported rather than routing
+    around it via the same connector). Same family as the command-scope false-denies: judge
+    by what the argument RESOLVES to, not by what its text mentions.
+
+    Returns the repo name when the input names one, else None."""
+    if not isinstance(tool_input, dict):
+        return None
+    for k in ("repository_full_name", "repo_full_name", "repository", "repo"):
+        v = tool_input.get(k)
+        if isinstance(v, str) and v.strip():
+            # "owner/name" -> "name"; a bare "name" is already the repo.
+            return v.strip().rstrip("/").split("/")[-1]
+    return None
+
+
 def command_of(tool_input):
     """Codex passes the shell command under tool_input.command (list or str depending on tool)."""
     if isinstance(tool_input, dict):
@@ -441,6 +461,16 @@ def main():
                  "There is no in-scope way to do this; it is not yours to touch.", innate=True)
 
     # Gate 1b — MRH scope. File paths use path-scope; shell commands use command-scope.
+    # An MCP call that names its repo separately is scoped on THAT name; its `path` is
+    # repo-relative and must not be re-scoped (see mcp_repo_target). The forbidden-token
+    # check above still ran over those paths, so egress/secret protection is unaffected.
+    mcp_repo = mcp_repo_target(tinput)
+    if mcp_repo is not None:
+        if mcp_repo not in scopes:
+            deny(f"'{tool}' targets repository '{mcp_repo}' outside your granted scope "
+                 f"({'+'.join(scopes)})",
+                 "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
+        paths = []
     for p in paths:
         if not path_in_scope(p, scopes, event.get("cwd")):
             deny(f"'{tool}' targets '{p[:60]}' outside your granted scope ({'+'.join(scopes)})",
