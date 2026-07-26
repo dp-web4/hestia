@@ -665,6 +665,7 @@
   let first = true;
   let selectedOrch = null; // currently-filtered orchestrator, or null = "all"
   let trustShown = [];     // grains as last rendered, so the detail modal opens the right one
+  let trustFolded = [];    // aliased grains, shown inside the identity they fold into
   let lastData = null;     // last snapshot, used to re-render on filter clicks without re-fetching
   let feedFilter = 'all';  // 'all' | 'warn' | 'deny'
   let failuresCache = null; // result of last /api/failures fetch, used while FAILED is selected
@@ -993,7 +994,7 @@
   function renderTrust(trust) {
     const root = $('trust-list');
     const title = $('trust-title');
-    const filtered = selectedOrch
+    let filtered = selectedOrch
       ? trust.filter(t => t.plugin_id === selectedOrch)
       : trust;
     title.textContent = selectedOrch
@@ -1003,6 +1004,20 @@
       root.innerHTML = selectedOrch
         ? `<div class="empty">No trust data for ${escapeHtml(selectedOrch)}.</div>`
         : '<div class="empty">No plugins active in the last hour.</div>';
+      trustShown = [];
+      return;
+    }
+    // An aliased grain is not a peer of the identity it folds into — that is the whole
+    // content of an alias. It was rendered as a sibling row saying "counted there, not
+    // here", which is accurate and still reads as another agent at a glance; the list is
+    // scanned, not read. So aliased grains leave the list and reappear inside their
+    // TARGET's detail, where the fold is the point rather than a caveat. Nothing is
+    // hidden: the row, its counts and its chain evidence are all one click away, and the
+    // alias itself is a witnessed chain entry either way.
+    trustFolded = filtered.filter(t => t.aliased_to);
+    filtered = filtered.filter(t => !t.aliased_to);
+    if (!filtered.length) {
+      root.innerHTML = '<div class="empty">No unaliased trust grains in this window.</div>';
       trustShown = [];
       return;
     }
@@ -1045,6 +1060,18 @@
     return { score, label: cand.length > 1 ? `${label} (weakest of ${cand.length})` : label };
   }
 
+  // Identities folded into this one. Says what was absorbed and how much it carried, so
+  // "codex has 763 actions" can be checked against "12 of them arrived as codex-cli"
+  // instead of the 12 simply vanishing from view when the alias was recorded.
+  function foldedInto(pluginId) {
+    const rows = trustFolded.filter(f => f.aliased_to === pluginId);
+    if (!rows.length) return '';
+    return `<div class="trust-meta" style="display:block;margin-top:0.75rem;border-top:1px solid var(--border);padding-top:0.6rem">
+      <div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.07em;color:var(--fg-faint);margin-bottom:0.3rem">folded identities</div>
+      ${rows.map(f => `<div style="font-family:var(--mono);font-size:0.8rem">${escapeHtml(f.plugin_id)}${trustRole(f) ? ' <span style="opacity:0.6">' + escapeHtml(shortRole(trustRole(f))) + '</span>' : ''} — <b>${fmt.int(f.action_count)}</b> action${f.action_count === 1 ? '' : 's'}, counted here</div>`).join('')}
+    </div>`;
+  }
+
   // The expanded view is the OLD card, verbatim — same trustRows(), same meta, same
   // receipts link. Collapsing the list must not cost any evidence; it only moves it one
   // click away.
@@ -1064,6 +1091,7 @@
           <span>actions <b>${fmt.int(t.action_count)}</b></span>
           <span>success <b>${t.action_count === 0 ? '—' : fmt.pct(t.success_rate)}</b>${t.derivation === 'legacy-lockstep-v1' ? ' <span style="opacity:0.55">(self-reported)</span>' : ''}</span>
         </div>
+        ${foldedInto(t.plugin_id)}
       </div>`;
     $('trust-modal').hidden = false;
   };

@@ -599,18 +599,50 @@ impl ServerState {
                 })
             })
             .collect();
+        // Identities known only from the chain (no registry entry) still deserve a chip —
+        // an orchestrator we have never heard of is exactly the thing worth surfacing.
+        // But three things were wrong with how they were surfaced:
+        //
+        // 1. ALIASES GOT THEIR OWN CHIP. An `identity_alias` says two names are one
+        //    entity, and the trust row already honours it ("evidence folds into codex —
+        //    counted there, not here"). The chip loop never asked, so codex-cli kept
+        //    appearing beside codex as though a fourth agent were running. The alias is
+        //    the answer to "are these the same?"; a surface that ignores it re-asks the
+        //    question the operator already settled.
+        // 2. LIVENESS WAS FABRICATED. running/engaged/installed/connected were the
+        //    literal `true`, not observations — so an identity last seen days ago
+        //    presented as running right now, and no amount of it being dead could change
+        //    the display. Registry chips derive all four; these now derive what they can
+        //    and decline to claim the rest.
+        // 3. ONE CHIP PER GRAIN, NOT PER IDENTITY. Trust rows are (instance, role), so a
+        //    two-role custom plugin would have produced two identical chips. codex-cli
+        //    has a single grain, which is the only reason this had not shown up yet.
+        let mut custom_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for t in &trust {
-            if crate::orchestrators::lookup(&t.plugin_id).is_none() {
-                orchestrators.push(serde_json::json!({
-                    "id": t.plugin_id,
-                    "name": t.plugin_id,
-                    "running": true,
-                    "engaged": true,
-                    "installed": true,
-                    "connected": true,
-                    "plugin_available": false,
-                }));
+            if t.aliased_to.is_some() {
+                continue; // folded into another identity; it is counted and shown there
             }
+            if crate::orchestrators::lookup(&t.plugin_id).is_some() {
+                continue; // already emitted from the registry, with real liveness
+            }
+            if !custom_seen.insert(t.plugin_id.as_str()) {
+                continue; // one chip per identity, however many role grains it has
+            }
+            let running_now = running.contains(t.plugin_id.as_str());
+            orchestrators.push(serde_json::json!({
+                "id": t.plugin_id,
+                "name": t.plugin_id,
+                "running": running_now,
+                // Presence in `trust` is what "engaged" means for registry entries too
+                // (see the set built above), so this one is a genuine observation.
+                "engaged": true,
+                // Unknown to the registry, so there is no install to probe. Only a live
+                // process is evidence of installation; absent that we do not claim it.
+                "installed": running_now,
+                // Same formula the registry branch uses, rather than a constant.
+                "connected": true,
+                "plugin_available": false,
+            }));
         }
 
         DashboardSnapshot {
