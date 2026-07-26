@@ -1,4 +1,4 @@
-//! Derived trust — `v3-derived-v1` (Stage 2 of the T3-from-V3 arc).
+//! Derived trust — `v3-derived-v2` (Stage 2 of the T3-from-V3 arc).
 //!
 //! The value proposition is AUDITABLE trust: every displayed score must be a
 //! pure function over witnessed evidence, with receipts (score → formula →
@@ -26,16 +26,25 @@
 //! - ask-after-deny (score 1.0): reserved for witnessed escalation/appeal
 //!   events referencing the deny; until hooks emit them, 0.7 is the ceiling —
 //!   documented, not faked.
+//! - confirmed-self-correction (score 0.8): subject-reported reversal linked
+//!   to witnessed original + successful corrective outcomes and confirmed by
+//!   not-the-subject through the dedicated conduct-confirmation surface.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::storage::chain::ChainEntry;
 
-pub const DERIVATION_VERSION: &str = "v3-derived-v1";
+pub const DERIVATION_VERSION: &str = "v3-derived-v2";
+pub const CONDUCT_CONFIRMATION_SCHEMA_V1: &str = "hestia.conduct-confirmation/v1";
 const RETRY_WINDOW_MINUTES: i64 = 10;
+/// A verified self-correction is positive conduct above quiet compliance
+/// (0.7), while 1.0 remains reserved for the fully accountable appeal path.
+/// At 0.8, one observation moves the 0.5 prior to 0.65 (medium, not instant
+/// high) while confirmer reliability is still unweighted in v1.
+pub const SELF_CORRECTION_SCORE: f64 = 0.8;
 /// How much chain the derivation scans (same cap as the dashboard stats scan).
 pub const DERIVATION_SCAN: u64 = 10_000;
 
@@ -111,6 +120,10 @@ pub fn derive(
 ) -> DerivedTrust {
     let mut entries: Vec<&ChainEntry> = window.iter().collect();
     entries.sort_by_key(|e| e.chain_position);
+    let entry_by_hash: HashMap<&str, &ChainEntry> = entries
+        .iter()
+        .map(|entry| (entry.hash.as_str(), *entry))
+        .collect();
 
     // ---- Temperament: governance-response conduct ----
     let is_grain = |e: &ChainEntry| {
@@ -272,6 +285,113 @@ pub fn derive(
         });
     }
 
+    // Independently confirmed self-correction (0.8): the subject reported its
+    // own reversal, both original and corrective outcomes exist on this role
+    // grain, the correction succeeded, and a different actor confirmed the
+    // linkage through the dedicated daemon surface. Revalidate the complete
+    // graph at read time; never trust the event's stored score. Multiple
+    // confirmations of one reversal are receipts, not extra observations.
+    let mut confirmed_reversals: HashSet<&str> = HashSet::new();
+    for confirmation in entries.iter().copied().filter(|entry| {
+        entry.event_type == "conduct_confirmation"
+            && entry_str(entry, "schema") == Some(CONDUCT_CONFIRMATION_SCHEMA_V1)
+            && entry_str(entry, "conduct") == Some("self-correction")
+            && entry_str(entry, "subject_plugin_id") == Some(plugin_id)
+            && entry_str(entry, "subject_role") == Some(role_lct)
+    }) {
+        let confirmer = confirmation
+            .event_data
+            .get("confirmed_by")
+            .and_then(|who| who.get("plugin_id"))
+            .and_then(Value::as_str);
+        let same_instance = match (
+            entry_str(confirmation, "subject_instance_lct"),
+            confirmation
+                .event_data
+                .get("confirmed_by")
+                .and_then(|who| who.get("instance_lct"))
+                .and_then(Value::as_str),
+        ) {
+            (Some(subject), Some(witness)) => subject == witness,
+            _ => false,
+        };
+        if confirmer.is_none() || confirmer == Some(plugin_id) || same_instance {
+            continue;
+        }
+        let (Some(reversal_hash), Some(target_hash), Some(correction_hash)) = (
+            entry_str(confirmation, "reversal_hash"),
+            entry_str(confirmation, "target_hash"),
+            entry_str(confirmation, "correction_hash"),
+        ) else {
+            continue;
+        };
+        let (Some(reversal), Some(target), Some(correction)) = (
+            entry_by_hash.get(chain_hash(reversal_hash)),
+            entry_by_hash.get(chain_hash(target_hash)),
+            entry_by_hash.get(chain_hash(correction_hash)),
+        ) else {
+            continue;
+        };
+        let reversal_target = entry_str(reversal, "ref").map(chain_hash);
+        let valid_reversal = reversal.event_type == "reversal"
+            && entry_str(reversal, "cause") == Some("self-correction")
+            && entry_str(reversal, "subject_plugin_id") == Some(plugin_id)
+            && entry_str(reversal, "subject_role") == Some(role_lct)
+            && reversal
+                .event_data
+                .get("reported_by")
+                .and_then(|who| who.get("plugin_id"))
+                .and_then(Value::as_str)
+                == Some(plugin_id)
+            && reversal_target == Some(target.hash.as_str());
+        let is_subject_outcome = |candidate: &&ChainEntry| {
+            candidate.event_type == "outcome"
+                && entry_str(candidate, "plugin_id") == Some(plugin_id)
+                && entry_str(candidate, "role_lct") == Some(role_lct)
+        };
+        let valid_graph = valid_reversal
+            && is_subject_outcome(target)
+            && is_subject_outcome(correction)
+            && correction
+                .event_data
+                .get("success")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && target.chain_position < reversal.chain_position
+            && target.chain_position < correction.chain_position
+            && reversal.chain_position < confirmation.chain_position
+            && correction.chain_position < confirmation.chain_position;
+        if !valid_graph {
+            continue;
+        }
+        if !confirmed_reversals.insert(reversal.hash.as_str()) {
+            temperament_evidence.push(Evidence {
+                chain_position: confirmation.chain_position,
+                hash: confirmation.hash.clone(),
+                event_type: confirmation.event_type.clone(),
+                timestamp: confirmation.timestamp,
+                contribution: format!(
+                    "EXCLUDED — duplicate confirmation of self-correction reversal #{}",
+                    reversal.chain_position
+                ),
+                reference: Some(format!("chain:{}", reversal.hash)),
+            });
+            continue;
+        }
+        temperament_scores.push(SELF_CORRECTION_SCORE);
+        temperament_evidence.push(Evidence {
+            chain_position: confirmation.chain_position,
+            hash: confirmation.hash.clone(),
+            event_type: confirmation.event_type.clone(),
+            timestamp: confirmation.timestamp,
+            contribution: format!(
+                "confirmed self-correction {:.2} (original #{} → correction #{})",
+                SELF_CORRECTION_SCORE, target.chain_position, correction.chain_position
+            ),
+            reference: Some(format!("chain:{}", reversal.hash)),
+        });
+    }
+
     // ---- Adjudicated V3: evidence from adjudication events for this grain ----
     //
     // Supersession is a read-time projection over immutable history. Both the
@@ -389,9 +509,11 @@ pub fn derive(
         &temperament_scores,
         temperament_evidence,
         "EMA(alpha=0.5/(1+n/10)) over governance-response scores: retry-after-deny 0.0, \
-         comply-after-deny 0.7, witnessed appeal-after-deny 1.0 (emit an `appeal` event \
-         carrying deny_hash + evidence via hestia_request_witness). Synthetic probe \
-         sessions (test/probe/verify/e2e/debug markers) are excluded from conduct.",
+         comply-after-deny 0.7, independently confirmed self-correction 0.8, witnessed \
+         appeal-after-deny 1.0. Self-correction requires a subject-reported reversal, \
+         witnessed original + successful corrective outcomes, and not-the-subject \
+         confirmation; confirmations de-duplicate by reversal. Synthetic probe sessions \
+         (test/probe/verify/e2e/debug markers) are excluded from deny conduct.",
     );
     let mk_adj = |i: usize, name: &str| {
         dim(

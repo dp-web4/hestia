@@ -179,6 +179,7 @@ pub struct VaultEntry {
 | `hestia_vault_get(name, scope)` | Request a credential; may prompt user for approval |
 | `hestia_vault_set(name, scope, value)` | Store a new credential; always requires user approval |
 | `hestia_record_outcome(r6_id, outcome, magnitude)` | Submit an R6/R7 outcome record |
+| `hestia_confirm_self_correction(subject, reversal_ref, correction_ref, reason)` | Independently confirm a witnessed self-correction conduct graph |
 | `hestia_request_witness(event)` | Add a witness chain entry |
 | `hestia_query_policy(action, context)` | Query: allow / deny / warn |
 | `hestia_query_history(filter)` | Read prior actions from the witness chain |
