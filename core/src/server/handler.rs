@@ -76,6 +76,7 @@ impl ServerHandler for HestiaServer {
             "hestia_witness_adjudication" => tool_witness_adjudication(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
+            "hestia_operating_law" => tool_operating_law(&self.state, &args).await,
             "hestia_vault_get" => tool_vault_get(&self.state, &args).await,
             "hestia_vault_set" => tool_vault_set(&self.state, &args).await,
             "hestia_query_history" => tool_query_history(&self.state, &args).await,
@@ -194,6 +195,10 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_query_policy",
             "Query the user's policy for a decision",
+        ),
+        t(
+            "hestia_operating_law",
+            "Read the law you operate under: every rule that can allow, warn or deny YOUR acts, composed across society preset, role, instance, and the operator's bound lists. Ask before you are refused, not after",
         ),
         t("hestia_vault_get", "Request a credential from the vault"),
         t("hestia_vault_set", "Store a credential in the vault"),
@@ -502,6 +507,96 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
     Ok(json!({
         "witnessEntryHash": entry.hash,
         "updatedTrustState": trust_state_json(&trust_state),
+    }))
+}
+
+/// `hestia_operating_law` — publish the law, do not merely enforce it.
+///
+/// dp, 2026-07-26: "the law should be injected into context at launch … transparency. the
+/// lists should live in the vault, but the law should be queriable in-session."
+///
+/// WHY THIS IS A CONTROL AND NOT A CONVENIENCE. A member used to learn the law only by
+/// violating it, and that is the mechanism behind the route-around this work surfaced. A
+/// peer was refused a compound command that deleted and recreated a scratch directory —
+/// the safety preset permits the delete under /tmp but refuses command CHAINING,
+/// deliberately — and nine seconds later reached the same end with `mktemp -d`. It never
+/// learned the rule. It learned that one phrasing failed, and tried another.
+///
+/// Enforcement teaches by refusal, which selects for rephrasing. Publication teaches the
+/// rule, which selects for compliance. Same policy, opposite behaviour. It is the same
+/// inversion hestia#49 argues for at the trust layer: hand the party what it needs to
+/// reason with, rather than a verdict after the fact.
+///
+/// Composed in the order the gate itself folds, and every statement names the LAYER it
+/// came from, so a member can tell a society-wide norm from something bound to it alone.
+async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
+    let s = state.lock().await;
+    let who = resolve_caller(&s, optional_string(args, "session_id").as_deref());
+
+    let mut layers: Vec<(String, &crate::policy::PolicyEngine)> =
+        vec![("society".to_string(), &s.policy_engine)];
+    if let Some(e) = s.role_policy_engines.get(&who.role_lct) {
+        layers.push((format!("role:{}", who.role_lct), e));
+    }
+    if let Some(e) = s
+        .instance_policy_engines
+        .get(&(who.plugin_id.clone(), who.role_lct.clone()))
+    {
+        layers.push((format!("instance:{}", who.plugin_id), e));
+    }
+
+    let mut statements = Vec::new();
+    for (layer, eng) in &layers {
+        for r in &eng.config().rules {
+            // Allow-rules are published too. Telling a member only what is forbidden
+            // teaches that a whole verb is off-limits; telling it "rm IS permitted under
+            // /tmp, standing alone" is what actually produces compliant commands.
+            statements.push(json!({
+                "layer": layer,
+                "rule": r.name,
+                "decision": format!("{:?}", r.decision).to_lowercase(),
+                "law": r.reason.clone().unwrap_or_else(|| r.name.clone()),
+            }));
+        }
+    }
+
+    // Operator-authored lists bound to this member (vault-stored; see vault::policy_lists).
+    let lists = s.vault.policy_lists();
+    let bound = crate::vault::policy_lists::for_member(&lists, &who.plugin_id, &who.role_lct);
+    for l in &bound {
+        let may_read = l.permits(
+            &who.plugin_id,
+            &who.role_lct,
+            crate::vault::policy_lists::ListPerm::Read,
+        );
+        statements.push(json!({
+            "layer": format!("list:{}", l.name),
+            "rule": l.name,
+            "decision": format!("{:?}", l.kind).to_lowercase(),
+            "law": l.description,
+            // Contents only where this member may READ them. A member holding `list` but
+            // not `read` learns that the list governs it and how large it is — enough to
+            // comply and to ask — without being handed the patterns themselves.
+            "entries": if may_read { json!(l.entries) } else { json!(null) },
+            "entry_count": l.entries.len(),
+        }));
+    }
+
+    Ok(json!({
+        "identity": {"plugin_id": who.plugin_id, "role": who.role_lct},
+        "enforced": s.policy_engine.config().enforce,
+        "default_when_no_rule_matches":
+            format!("{:?}", s.policy_engine.config().default_policy).to_lowercase(),
+        "layers": layers.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+        "lists_bound": bound.iter().map(|l| l.name.clone()).collect::<Vec<_>>(),
+        "law": statements,
+        // Quotable: a member can say WHICH law it read, and a reviewer can tell whether
+        // the law changed under it mid-session.
+        "policy_hash": s.policy_engine.content_hash(),
+        "note": "This is the law you operate under. If a rule blocks legitimate work, \
+                 appeal it through the witnessed channel rather than rephrasing around it \
+                 — an appeal is recorded conduct that can change the law; a rephrase is \
+                 neither, and scores as compliance while teaching the society nothing.",
     }))
 }
 

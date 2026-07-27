@@ -12,6 +12,7 @@ pub mod storage;
 pub use document::{Document, ItemRef, Protection};
 pub use entry::VaultEntry;
 pub use policy_state::{OperatorIdentity, PolicyOverride, VaultPolicyState};
+pub mod policy_lists;
 pub mod policy_state;
 pub use storage::{VaultData, default_hestia_home, vault_path};
 
@@ -122,6 +123,21 @@ impl Vault {
     /// Read the policy state stored inside the vault.
     pub fn policy(&self) -> &VaultPolicyState {
         &self.data.policy
+    }
+
+    /// Operator-authored policy lists. Cloned rather than borrowed so callers can hold
+    /// them past the vault lock — the law is read on every session start and every
+    /// `hestia_operating_law` call, and holding the vault while composing a reply is how
+    /// a read path becomes a contention path.
+    pub fn policy_lists(&self) -> policy_lists::PolicyLists {
+        self.data.policy_lists.clone()
+    }
+
+    /// Replace the policy lists and persist. Operator-only surface: the caller is
+    /// responsible for having established operator authority BEFORE reaching here.
+    pub fn set_policy_lists(&mut self, lists: policy_lists::PolicyLists) -> Result<()> {
+        self.data.policy_lists = lists;
+        self.save()
     }
 
     /// Replace the vault's policy state and persist.

@@ -21,7 +21,21 @@ fn safety_rules() -> Vec<PolicyRule> {
             name: "Allow rm in whitelisted scratch dirs (/tmp)".into(),
             priority: 0,
             decision: PolicyDecision::Allow,
-            reason: Some("rm confined to whitelisted scratch dir (/tmp) — permitted".into()),
+            // LAW AS WRITTEN, not a rule id. This string is published to every member at
+            // launch (`hestia_operating_law`), so it has to state the whole condition —
+            // including the standalone requirement, which is the half that actually trips
+            // people. A peer was refused a chained delete-and-recreate and, nine seconds
+            // later, reached the same end another way: it never learned the rule, only
+            // that one phrasing failed (dp, 2026-07-26: "'rm must be standalone' is a
+            // good law").
+            reason: Some(
+                "rm is PERMITTED when it stands alone and every target is an absolute path \
+                 under /tmp. It must be the ONLY command in the call: no &&, ;, |, newline, \
+                 backticks or $(...) alongside it, and no .. in any path. Need to delete \
+                 then recreate? Send them as two separate commands — chaining is what the \
+                 deny catches, not the deletion."
+                    .into(),
+            ),
             r#match: PolicyMatch {
                 tools: Some(vec!["Bash".into()]),
                 command_patterns: Some(vec![
@@ -47,7 +61,15 @@ fn safety_rules() -> Vec<PolicyRule> {
             name: "Block destructive shell commands".into(),
             priority: 1,
             decision: PolicyDecision::Deny,
-            reason: Some("Destructive command blocked by safety preset".into()),
+            reason: Some(
+                "Destructive command blocked by the safety preset. rm is allowed ONLY \
+                 standing alone against absolute /tmp paths (see the allow rule); anything \
+                 chained, relative, path-escaping (..) or outside /tmp lands here. If the \
+                 act is legitimate, appeal it through the witnessed channel rather than \
+                 rephrasing — a rephrase scores as compliance and teaches the society \
+                 nothing."
+                    .into(),
+            ),
             r#match: PolicyMatch {
                 tools: Some(vec!["Bash".into()]),
                 target_patterns: Some(vec![r"rm\s+-".into(), r"mkfs\.".into()]),

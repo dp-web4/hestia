@@ -51,6 +51,11 @@ pub struct VaultData {
     pub policy: super::policy_state::VaultPolicyState,
     #[serde(default)]
     pub documents: Vec<super::document::Document>,
+    /// Operator-authored policy lists, bound to agents and composed into each session's
+    /// published law. `#[serde(default)]` so an existing vault opens unchanged — a vault
+    /// written before lists existed simply has none, rather than failing to decrypt.
+    #[serde(default)]
+    pub policy_lists: super::policy_lists::PolicyLists,
 }
 
 impl Default for VaultData {
@@ -61,6 +66,7 @@ impl Default for VaultData {
             entries: Vec::new(),
             policy: super::policy_state::VaultPolicyState::default(),
             documents: Vec::new(),
+            policy_lists: Default::default(),
         }
     }
 }
