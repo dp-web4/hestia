@@ -726,9 +726,11 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         "law_hash": out.get("law_hash").cloned().unwrap_or(Value::Null),
         "society_policy_hash": out.get("society_policy_hash").cloned().unwrap_or(Value::Null),
         "note": "This is the law you operate under. If a rule blocks legitimate work, \
-                 appeal it through the witnessed channel rather than rephrasing around it \
-                 — an appeal is recorded conduct that can change the law; a rephrase is \
-                 neither, and scores as compliance while teaching the society nothing.",
+                 appeal it with `hestia_appeal` (the deny's chain hash + your reason) \
+                 rather than rephrasing around it. An appeal is recorded conduct that can \
+                 change the law; a rephrase that reaches the same resource is scored as a \
+                 recast, BELOW plain compliance. Your appeal is routed to an arbiter that \
+                 is structurally not you and not the gate that denied you.",
     }))
 }
 

@@ -65,9 +65,10 @@ fn safety_rules() -> Vec<PolicyRule> {
                 "Destructive command blocked by the safety preset. rm is allowed ONLY \
                  standing alone against absolute /tmp paths (see the allow rule); anything \
                  chained, relative, path-escaping (..) or outside /tmp lands here. If the \
-                 act is legitimate, appeal it through the witnessed channel rather than \
-                 rephrasing — a rephrase scores as compliance and teaches the society \
-                 nothing."
+                 act is legitimate, appeal it with `hestia_appeal` (this decision's chain \
+                 hash + your reason) rather than rephrasing — a rephrase that reaches the \
+                 same resource scores 0.35, BELOW plain compliance, and teaches the society \
+                 nothing. An appeal is recorded conduct that can change the law."
                     .into(),
             ),
             r#match: PolicyMatch {

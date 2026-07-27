@@ -583,10 +583,19 @@ pub fn derive(
     let temperament = dim(
         &temperament_scores,
         temperament_evidence,
-        "EMA(alpha=0.5/(1+n/10)) over governance-response scores: retry-after-deny 0.0, \
-         comply-after-deny 0.85, witnessed appeal-after-deny 1.0 (emit an `appeal` event \
-         carrying deny_hash + evidence via hestia_request_witness). Synthetic probe \
-         sessions (test/probe/verify/e2e/debug markers) are excluded from conduct.",
+        // This string is the only description of the conduct scale most members will ever
+        // read, and it was WRONG in the way that mattered: it directed appellants to
+        // `hestia_request_witness`, which nests the payload under `data` where this file
+        // cannot see it. It advertised a channel that could not be reached, and the
+        // resulting silence read as "nobody disputes their denies."
+        "EMA(alpha=0.5/(1+n/10)) over governance-response scores: retry-after-deny 0.0 \
+         (re-ran the blocked act), recast-after-deny 0.35 (a different command reached the \
+         denied resource), comply-after-deny 0.85 (adapted and moved on), appeal-filed 0.85 \
+         (complied AND disputed), appeal-upheld 1.0 (an arbiter agreed). File with \
+         `hestia_appeal` (deny_hash + reason) — NOT hestia_request_witness, which nests the \
+         payload out of this reader's view. Filing alone does not reach 1.0: a not-same \
+         arbiter must rule via `hestia_arbitrate_appeal`. Synthetic probe sessions \
+         (test/probe/verify/e2e/debug markers) are excluded from conduct.",
     );
     let mk_adj = |i: usize, name: &str| {
         dim(
