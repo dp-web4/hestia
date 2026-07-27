@@ -2300,12 +2300,70 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
 /// tool lets the drain be polled independently of the fire path until Thor's concurrency
 /// fix lands, at which point it can move into the watcher loop as originally proposed.
 async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
-    let s = state.lock().await;
+    let mut s = state.lock().await;
+
+    // G4 — ATTRIBUTION IS NOT AUTHORIZATION (thor, PR #44 hop 2, measured live).
+    //
+    // Every arm of this tool used to run before any caller was resolved: `mark_forwarded`
+    // marked and returned from the top of the function, and the list arm handed out every
+    // local member's destinations, pointers and row ids to anyone who could reach the
+    // socket. Thor demonstrated it end to end — Mallory, a plain member who is neither the
+    // sender nor the drain, listed Alice's queue and marked her row forwarded; Alice's
+    // packet was destroyed and Alice was never told. The daemon returned `"by":"mallory"`
+    // to the actor and wrote it nowhere.
+    //
+    // Thor believed this was graft-only. It was not: the egress plane landed on `main`
+    // with the merged routing PRs, so the defect has been live in shipped code. Recording
+    // that correction here because "which branch owns it" decided how urgently it was
+    // treated, and the answer was wrong.
+    //
+    // Three things were missing and all three are restored below:
+    //   (a) AUTHORIZATION. `gate_direct_tool` has 13 call sites in this file and had zero
+    //       here, while `member_inbox` thirty lines away is scoped by construction.
+    //   (b) A CALLER on the destroying arm at all — it never even resolved one.
+    //   (c) A WITNESS. `mark_failed` writes last_error, burns an attempt and can reach
+    //       retire_and_report_egress. `mark_forwarded` wrote drained_at and stopped: the
+    //       ONLY disposition that destroys a packet was the only one that left no trace.
+    let Some(who) = resolve_attributed_caller(&s, optional_string(args, "session_id").as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.egress_unattributed",
+            "hestia_egress_pending requires an attributed caller: this surface reads and \
+             retires OTHER members' outbound mail, so an unattributed caller cannot be \
+             distinguished from the drain.",
+            None,
+        ));
+    };
+    if let Some(denied) = gate_direct_tool(
+        &mut s,
+        &who,
+        "hestia_egress_pending",
+        "mesh_egress",
+        args.get("mark_forwarded")
+            .and_then(|v| v.as_u64())
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "list".into())
+            .as_str(),
+    ) {
+        return Ok(denied);
+    }
+
     if let Some(id) = args.get("mark_forwarded").and_then(|v| v.as_u64()) {
         s.inbox_store
             .mark_egress_forwarded(id)
             .map_err(|e| anyhow::anyhow!("marking egress forwarded: {e}"))?;
-        return Ok(json!({ "marked": id }));
+        // (c) The destroying disposition now leaves a witness naming the actor. The
+        // daemon already knew who it was; it simply never wrote it down.
+        let _ = s.append_chain(
+            "egress_forwarded",
+            json!({
+                "row_id": id,
+                "forwarded_by": who.plugin_id,
+                "role_lct": who.role_lct,
+                "note": "row retired from the egress queue; this is the disposition that \
+                         drops a packet from both admission counts",
+            }),
+        );
+        return Ok(json!({ "marked": id, "by": who.plugin_id, "witnessed": true }));
     }
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
     let rows = s
@@ -4356,6 +4414,64 @@ mod member_mesh_tests {
             .await
             .unwrap();
         c["sessionId"].as_str().unwrap().to_string()
+    }
+
+    /// G4 (thor, PR #44 hop 2): ATTRIBUTION IS NOT AUTHORIZATION.
+    ///
+    /// Thor measured this live and named why the existing coverage could not see it: the
+    /// egress tests use ALICE, THE SENDER, as the drain, so they establish that a
+    /// non-router member drives every arm successfully — and read as reassurance. The
+    /// hazard is on the other axis: not *unattributed* but *unauthorized*.
+    ///
+    /// Mallory is a plain local member: not the sender, not the drain, no role. Before the
+    /// fix she could list every member's destinations, pointers and row ids, and mark any
+    /// row forwarded — destroying the packet while its sender was never told, with the
+    /// daemon returning `"by":"mallory"` and writing it nowhere.
+    #[tokio::test]
+    async fn egress_plane_refuses_an_unattributed_caller_on_every_arm() {
+        let (_dir, state) = test_state().await;
+        let _alice = connect(&state, "claude-code").await; // a live session to fall back TO
+
+        // No session_id at all: the destroying arm must not run, and must not inherit
+        // Alice. This is the arm that used to mark-and-return from the top of the
+        // function, before any caller was resolved.
+        for args in [json!({"mark_forwarded": 1}), json!({"limit": 50})] {
+            let out = tool_egress_pending(&state, &args).await.unwrap();
+            assert_eq!(
+                out["_hestia_error"]["code"], "hestia.egress_unattributed",
+                "every arm must refuse an unattributed caller, got: {out}"
+            );
+        }
+    }
+
+    /// The destroying disposition must leave a witness naming the actor.
+    ///
+    /// `mark_failed` writes last_error, burns an attempt and can reach
+    /// retire_and_report_egress. `mark_forwarded` wrote drained_at and stopped — the only
+    /// disposition that drops a packet from both admission counts was the only one that
+    /// left no trace. The daemon already knew who did it.
+    #[tokio::test]
+    async fn forwarding_a_row_names_the_actor_in_the_receipt() {
+        let (_dir, state) = test_state().await;
+        // A real queued row: Alice sends to a peer's member, which lands on the egress plane.
+        let row_id = {
+            let st = state.lock().await;
+            st.inbox_store
+                .enqueue_egress("thor", "claude-code", "claude-code",
+                                "role:constellation:member", "coordination",
+                                Some("shared-context/alices-mail.md"), "hash")
+                .unwrap()
+        };
+        let sid = connect(&state, "hestia-router").await;
+        let out = tool_egress_pending(
+            &state,
+            &json!({"session_id": sid, "mark_forwarded": row_id}),
+        )
+        .await
+        .unwrap();
+        assert!(out["_hestia_error"].is_null(), "an attributed caller must pass: {out}");
+        assert_eq!(out["by"], "hestia-router", "the receipt must name who retired the row");
+        assert_eq!(out["witnessed"], true, "the destroying disposition must be witnessed");
     }
 
     /// Kimi review 2026-07-24, Finding 1 (the W-gap): with a live session
