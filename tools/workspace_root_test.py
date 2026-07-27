@@ -36,10 +36,31 @@ home whose tail is not a tracked path, so it is not claiming to point at a
 checkout and is not held to the checkout's root. Same for a raw.githubusercontent
 URL. The rule calibrates itself against the repo rather than a denylist.
 
+WHAT AGREEMENT CANNOT TELL YOU
+    Agreement is not correctness. Twelve sites agreeing on a root that does not
+    exist pass an agreement check while every gate they name is ENOENT -- the
+    original defect, uniformly applied. And during a legitimate migration the
+    correctly-moved sites are the minority, so ranking by headcount names them
+    the outlier and instructs you to revert the only ones that work.
+
+    So the roots are also ANCHORED: does `<root>/hestia` hold a checkout on THIS
+    host? That question is put to the filesystem, not the index -- deliberately,
+    and it is the only one here that is. Every other check makes a claim about
+    the repo, which the index answers exactly. This one makes a claim about the
+    host the paths were baked for, and only the host can answer it.
+
+    An anchored root outranks a majority one. An agreement that anchors nowhere
+    is reported UNCONFIRMED, never PASS: the check cannot separate "baked for a
+    host that is not this one" from "wrong everywhere", and PASS would be
+    choosing the flattering reading. Both exit 0 -- a gauge that fails on every
+    host but one gets ignored on all of them, and being ignored is the failure
+    mode this file exists to prevent. The word is the signal, not the code.
+
 Run:  ./tools/workspace_root_test.py
 """
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -70,6 +91,26 @@ def tracked(repo):
 def blob(repo, path):
     out = subprocess.run(["git", "show", f":{path}"], cwd=repo, capture_output=True)
     return out.stdout if out.returncode == 0 else b""
+
+
+def sites(n):
+    return f"{n} site" + ("" if n == 1 else "s")
+
+
+def anchored(root):
+    """Does `root` name a workspace holding a hestia checkout on THIS host?
+
+    The only filesystem question in this file, and the only one that can be
+    asked of the filesystem: whether a baked root is real is a fact about the
+    host, not about the repo. `.git` is `exists`-checked rather than `isdir`
+    because in a worktree it is a file.
+
+    A deploy copy of the tree that is not a checkout does not anchor. That is
+    conservative on purpose -- an unanchored root is reported, not failed, so
+    the cost of being strict here is a word, and the cost of being loose is a
+    disarmed gate that reads as confirmed.
+    """
+    return os.path.exists(os.path.join(os.path.expanduser(root), "hestia", ".git"))
 
 
 def spawnable(content):
@@ -169,41 +210,82 @@ def main():
     # ending in that same basename inside an invocation surface is a sibling
     # claiming to be the same workspace from a different place.
     if roots:
-        majority = max(roots, key=lambda r: len(roots[r]))
-        leaf = majority.rsplit("/", 1)[-1].encode()
+        # Calibrate on the anchored root when there is exactly one, so that a
+        # migration whose new root is still in the minority calibrates on the
+        # root that exists rather than on the one being migrated away from.
+        confirmed = [r for r in roots if anchored(r)]
+        calibration = confirmed[0] if len(confirmed) == 1 else max(
+            roots, key=lambda r: len(roots[r])
+        )
+        leaf = calibration.rsplit("/", 1)[-1].encode()
         sibling = re.compile(
             rb"(?<![\w/.~:-])((?:/|~/)[\w./+-]*?/" + re.escape(leaf) + rb")(?![\w/-])"
         )
         for path, content in surfaces:
             for match in sibling.finditer(content):
                 root = match.group(1).decode()
-                if root != majority:
+                if root != calibration:
                     roots.setdefault(root, []).append((path, root))
-
-    if len(roots) > 1:
-        ranked = sorted(roots.items(), key=lambda kv: -len(kv[1]))
-        majority = ranked[0][0]
-        odd = ranked[1:]
-        print(f"FAIL  {len(roots)} disagreeing checkout roots across "
-              f"{len(surfaces)} invocation surfaces.\n")
-        print(f"    majority ({len(ranked[0][1])} sites):  {majority}")
-        for root, sites in odd:
-            print(f"\n    outlier  ({len(sites)} sites):  {root}")
-            for path, full in sites:
-                print(f"        {path}\n            {full}")
-        print("\nA spawn from the outlier root is ENOENT, and an ENOENT hook is "
-              "fail-open:\nit does not deny, it does not witness, and it does not "
-              "complain. Repoint it\nto the majority root, or if the outlier is "
-              "correct, repoint the majority.")
-        return 1
 
     if not roots:
         print(f"PASS  no checkout roots baked into {len(surfaces)} invocation surfaces")
         return 0
 
-    root, sites = next(iter(roots.items()))
-    print(f"PASS  all {len(sites)} baked checkout references across "
-          f"{len(surfaces)} invocation surfaces agree on {root}")
+    # Re-anchor: the sibling pass can have introduced roots the first one missed.
+    confirmed = [r for r in roots if anchored(r)]
+
+    if len(roots) > 1:
+        if len(confirmed) == 1:
+            # The anchor beats the headcount. This is the migration case: the
+            # moved sites are still the minority, and they are the right ones.
+            keep = confirmed[0]
+            basis = (f"    anchored ({sites(len(roots[keep]))}):  {keep}\n"
+                     f"        a hestia checkout is really there on this host")
+        else:
+            keep = max(roots, key=lambda r: len(roots[r]))
+            note = ("no root anchors to a checkout on this host"
+                    if not confirmed else
+                    f"{len(confirmed)} roots anchor here, so the anchor cannot pick")
+            basis = (f"    majority ({sites(len(roots[keep]))}):  {keep}\n"
+                     f"        ranked by headcount only -- {note}")
+        odd = sorted(((r, s) for r, s in roots.items() if r != keep),
+                     key=lambda kv: -len(kv[1]))
+        print(f"FAIL  {len(roots)} disagreeing checkout roots across "
+              f"{len(surfaces)} invocation surfaces.\n")
+        print(basis)
+        for root, rs in odd:
+            print(f"\n    outlier  ({sites(len(rs))}):  {root}")
+            for path, full in rs:
+                print(f"        {path}\n            {full}")
+        print("\nA spawn from the outlier root is ENOENT, and an ENOENT hook is "
+              "fail-open:\nit does not deny, it does not witness, and it does not "
+              f"complain. Repoint it\nto {keep}"
+              + ("." if len(confirmed) == 1 else
+                 ", or if the outlier is correct, repoint the rest."))
+        return 1
+
+    root, only = next(iter(roots.items()))
+    if confirmed:
+        print(f"PASS  all {len(only)} baked checkout references across "
+              f"{len(surfaces)} invocation surfaces agree on {root},\n"
+              f"      and a hestia checkout is really there on this host")
+        return 0
+
+    here = os.path.dirname(subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        cwd=repo, capture_output=True, text=True, check=True,
+    ).stdout.strip().removesuffix("/.git")) or "(not determinable)"
+    print(f"UNCONFIRMED  all {len(only)} baked checkout references across "
+          f"{len(surfaces)} invocation surfaces\n"
+          f"             agree on {root} -- and nothing is there.\n")
+    print(f"    no hestia checkout at {root}/hestia on this host\n"
+          f"    this checkout's workspace is {here}\n")
+    print("Agreement is not correctness: these sites could be baked for a host "
+          "that is not\nthis one, or they could be wrong everywhere. If this is "
+          "the host they were baked\nfor, every one of them is ENOENT, and an "
+          "ENOENT hook is fail-open -- it does not\ndeny, it does not witness, "
+          "and it does not complain. Exit 0 because this check\ncannot tell "
+          "those two apart; it will not say PASS for the same reason.")
     return 0
 
 
