@@ -242,6 +242,8 @@ pub async fn serve_with_callback(
         .route("/api/policy/rule/:rule_id", delete(policy_delete_rule))
         .route("/api/orchestrators/:id/connect", post(orchestrator_connect))
         .route("/api/agents", get(agents_inventory))
+        .route("/api/gates/verify", get(gates_verify))
+        .route("/api/gates/ratify", post(gates_ratify))
         .route("/api/agents/:id/ungovern", post(agent_ungovern))
         .route("/api/chain", get(chain_query))
         // OID4VCI issuance MINTS a presentation SIGNED WITH THE OWNER'S IDENTITY KEY — a consequential
@@ -1201,6 +1203,99 @@ async fn agent_ungovern(
             Json(serde_json::json!({"error": e.to_string()})),
         ),
     }
+}
+
+// --- Gate integrity ---
+
+/// Known gate files, by member. Fixed paths: a caller-supplied path would let the caller
+/// choose what gets verified, which is the same shape as letting it choose its own law.
+fn known_gate_paths() -> Vec<(String, String)> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    vec![
+        ("claude-code", format!("{home}/.claude/hooks/hestia/pre_tool_use.py")),
+        ("codex", format!("{home}/.codex/hooks/pre_tool_use.py")),
+        ("kimi-code", format!("{home}/.kimi-code/hooks/pre_tool_use.py")),
+        ("gemini", format!("{home}/.gemini/hestia-plugins/gemini/hooks/before_tool.py")),
+    ]
+    .into_iter()
+    .map(|(p, f)| (p.to_string(), f))
+    .filter(|(_, f)| std::path::Path::new(f).is_file())
+    .collect()
+}
+
+/// `GET /api/gates/verify` — hash every known gate and compare to the vault's ratified
+/// expectation. The DAEMON hashes the file; it never asks a gate about itself.
+async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
+    let s = state.lock().await;
+    let exp = s.vault.gate_expectations();
+    let wired: Vec<String> = known_gate_paths().into_iter().map(|(_, f)| f).collect();
+    let verdicts = crate::vault::gate_integrity::verify(&exp, &wired);
+    let findings = verdicts.iter().filter(|v| v.is_finding()).count();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            // MODIFIED outranks everything: a rewritten gate is the live attack, where an
+            // unratified one is merely unexamined.
+            "status": if verdicts.iter().any(|v| matches!(v, crate::vault::gate_integrity::GateVerdict::Modified{..})) {
+                "MODIFIED"
+            } else if findings > 0 { "FINDINGS" } else { "VERIFIED" },
+            "findings": findings,
+            "gates": verdicts,
+            "note": "Tamper-EVIDENT, not tamper-proof. The agent can rewrite its gate; it \
+                     cannot rewrite this expectation, which lives in the operator-gated vault. \
+                     See hestia#49 for what would make a rewritten gate's verdicts stop counting.",
+        })),
+    )
+}
+
+/// `POST /api/gates/ratify` — record the CURRENT bytes of every known gate as expected.
+///
+/// surface: gates_ratify   act: define what a correct gate is
+/// S: high/reversible [construct: previous expectations are replaced, not merged; the
+///    chain keeps the prior ratification]
+/// R: pass [construct: behind `operator_gate` with the rest of /api/*]
+/// W: pass [construct: operator_gate proves an Ed25519 challenge-signed session]
+/// O: pass [construct: hashes computed before the vault write]
+/// A: pass [construct: append_chain("gate_ratified") carries every path and digest]
+/// V: present [construct: refuses when a gate is unreadable — ratifying what you could
+///    not read would launder exactly the tampering this exists to catch]
+/// verdict: PASS
+///
+/// The dangerous direction is ratifying an ALREADY-tampered gate, which would bless the
+/// attack. Nothing here can tell a good build from a bad one; the operator must ratify
+/// from a state they believe correct. The chain entry is what makes that judgement
+/// reviewable afterwards.
+async fn gates_ratify(State(state): State<SharedState>) -> impl IntoResponse {
+    use crate::vault::gate_integrity::{GateExpectation, GateExpectations};
+    let mut s = state.lock().await;
+    let mut exp: GateExpectations = GateExpectations::new();
+    let mut recorded = Vec::new();
+    for (plugin_id, path) in known_gate_paths() {
+        match crate::vault::gate_integrity::hash_file(std::path::Path::new(&path)) {
+            Ok(sha256) => {
+                recorded.push(serde_json::json!({"path": path, "plugin_id": plugin_id, "sha256": sha256}));
+                exp.insert(path, GateExpectation {
+                    sha256,
+                    plugin_id,
+                    ratified_at: chrono::Utc::now(),
+                    note: "operator ratification".into(),
+                });
+            }
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": format!("refusing to ratify: {path} unreadable ({e}). \
+                                      Ratifying a gate you could not read would launder the \
+                                      tampering this is meant to catch."),
+                }))).into_response();
+            }
+        }
+    }
+    if let Err(e) = s.vault.set_gate_expectations(exp) {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()}))).into_response();
+    }
+    let _ = s.append_chain("gate_ratified", serde_json::json!({"gates": recorded}));
+    (StatusCode::OK, Json(serde_json::json!({"ok": true, "ratified": recorded}))).into_response()
 }
 
 // --- Chain endpoints ---
