@@ -61,10 +61,17 @@ pub fn inventory() -> Result<Value> {
                        Install: bash hestia/plugins/agent-inventory/install.sh <workspace>",
         }));
     };
-    let out = Command::new("python3")
-        .arg(&bin)
-        .arg("--no-witness")
-        .output()?;
+    // Invoke the installed entry point DIRECTLY rather than through `python3`.
+    //
+    // It is not always a Python file: agent-inventory's installer writes the entry point
+    // as a small sh wrapper that pins the workspace it detected, with the script beside it
+    // as `.py`. Hardcoding the interpreter meant the daemon ran `python3 <shell script>`
+    // and got a syntax error — and because gate coverage is derived from this, the whole
+    // integrity check degraded to UNKNOWN. Both halves were mine, landed on separate
+    // branches, each correct alone.
+    //
+    // Executing the file lets its shebang decide, which is the point of having one.
+    let out = Command::new(&bin).arg("--no-witness").output()?;
     if !out.status.success() {
         bail!(
             "inventory exited {}: {}",
