@@ -987,18 +987,37 @@
   // must not mask a failing one) and total actions across grains — never whichever
   // row happened to sort last.
   const LEVEL_ORDER = ['minimal', 'low', 'medium', 'medium-high', 'high'];
+  // UNMEASURED IS NOT A LEVEL, AND indexOf SAID IT WAS THE WORST ONE.
+  //
+  // This rolled a plugin's grains up to their worst level. But 'unmeasured' is not in
+  // LEVEL_ORDER, so `LEVEL_ORDER.indexOf('unmeasured')` returned **-1** — below 'minimal' —
+  // and any single grain with no evidence clobbered the whole chip. Measured live
+  // 2026-07-27: codex read UNMEASURED in the header while codex/member was HIGH and
+  // codex/reviewer carried validity 0.920 from three adjudications; kimi-code read
+  // UNMEASURED while kimi-code/interactive-dev was 0.92 HIGH. dp spotted it as "codex and
+  // kimi still show unmeasured despite your adjudication."
+  //
+  // That is absence-of-evidence rendered as worse-than-the-worst-evidence — the same
+  // null-state conflation this codebase keeps finding, arriving here through a -1.
+  //
+  // Worst-of over MEASURED grains only, with coverage reported separately so the absence is
+  // still visible as an absence. A plugin with no measured grain anywhere is honestly
+  // unmeasured; a plugin with one measured grain and two silent ones is its measured level,
+  // and the chip says how much of it is covered.
   function aggregateTrustByPlugin(trust) {
     const byId = {};
     for (const t of trust) {
-      const cur = byId[t.plugin_id];
-      if (!cur) {
-        byId[t.plugin_id] = { level: t.level, action_count: t.action_count, grains: 1 };
-      } else {
-        cur.action_count += t.action_count;
-        cur.grains += 1;
-        if (LEVEL_ORDER.indexOf(t.level) < LEVEL_ORDER.indexOf(cur.level)) cur.level = t.level;
-      }
+      const cur = byId[t.plugin_id] || (byId[t.plugin_id] = {
+        level: null, action_count: 0, grains: 0, measured: 0,
+      });
+      cur.action_count += t.action_count;
+      cur.grains += 1;
+      const rank = LEVEL_ORDER.indexOf(t.level);
+      if (rank < 0) continue;            // unmeasured / unknown: counts as coverage, not as a level
+      cur.measured += 1;
+      if (cur.level === null || rank < LEVEL_ORDER.indexOf(cur.level)) cur.level = t.level;
     }
+    for (const v of Object.values(byId)) if (v.level === null) v.level = 'unmeasured';
     return byId;
   }
 
@@ -1031,7 +1050,10 @@
         // carries data-pid so the click handler attaches and filters to it.
         const t = trustById[o.id] || {};
         const sel = selectedOrch === o.id ? ' selected' : '';
-        const grains = t.grains > 1 ? ` · ${t.grains} trust grains, level = worst` : '';
+        const grains = t.grains > 1
+          ? ` · ${t.grains} trust grains, level = worst of ${t.measured} measured`
+            + (t.measured < t.grains ? ` (${t.grains - t.measured} unmeasured — absence of evidence, not low trust)` : '')
+          : '';
         const state = o.engaged ? `active${grains}` : 'idle';
         const badge = o.engaged
           ? (t.action_count != null ? `<span class="count">${fmt.int(t.action_count)}</span>` : '')
