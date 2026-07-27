@@ -37,6 +37,35 @@ impl PolicyDecision {
     }
 }
 
+/// Which projection of the target text a pattern list matches against.
+///
+/// Exists because `deny-destructive-commands` was matching `rm\s+-` against the entire
+/// Bash command, so it fired on any *mention* of the token — inside a quoted grep pattern,
+/// inside a heredoc writing a test fixture — as readily as on a real invocation. This is
+/// opt-in per rule, not a change to matching in general: a rule that does not name a scope
+/// keeps matching raw text, which is what every other rule (notably the secret-file globs)
+/// depends on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchScope {
+    /// Match the target string as-is. The default, and the historical behaviour.
+    #[default]
+    Raw,
+    /// Match only the regions of a shell command where a token could actually execute,
+    /// with inert content (single-quoted spans, quoted heredoc bodies, non-expanding
+    /// double-quoted spans) blanked out. See [`crate::policy::shell`] for the safety
+    /// argument — in particular that an unparseable command falls back to `Raw`.
+    ExecutablePositions,
+}
+
+impl MatchScope {
+    /// Serde skip helper: keeps `Raw` out of the serialized policy, so adding this field
+    /// leaves the canonical hash of every unmodified rule untouched.
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Raw)
+    }
+}
+
 /// Rate-limit spec on a single rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateLimitSpec {
@@ -81,6 +110,12 @@ pub struct PolicyMatch {
     pub target_patterns: Option<Vec<String>>,
     #[serde(default)]
     pub target_patterns_are_regex: bool,
+
+    /// Which text `target_patterns` runs against. Defaults to
+    /// [`MatchScope::Raw`] — the whole target string — so every existing rule
+    /// and every serialized policy in the vault keeps its exact behaviour.
+    #[serde(default, skip_serializing_if = "MatchScope::is_default")]
+    pub target_patterns_scope: MatchScope,
 
     /// Glob/regex over the full Bash command (different from `target`,
     /// which is usually just the first token).
@@ -143,6 +178,21 @@ pub struct PolicyEvaluation {
     /// trails. Always at least three entries.
     #[serde(default)]
     pub constraints: Vec<String>,
+
+    /// Set when at least one rule was matched against an
+    /// [`MatchScope::ExecutablePositions`] projection that actually differed from the raw
+    /// target — i.e. the gate deliberately declined to look at part of the command.
+    ///
+    /// This exists so the widening cannot be silent. Without it, "no destructive token in
+    /// this command" and "a destructive token that the projection classified as inert" are
+    /// the same record, and an auditor asking *how often does the blanking change an
+    /// outcome* has no field to count. That is the failure this codebase keeps rediscovering
+    /// — the success path destroying the evidence the accountability layer later needs — so
+    /// the projection reports itself even when it changes nothing about the verdict.
+    ///
+    /// It is a MARK, not a gate: it denies nothing and is not consulted by any rule.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inert_content_skipped: bool,
 }
 
 impl PolicyEvaluation {
@@ -186,7 +236,14 @@ impl PolicyEvaluation {
 pub fn fold_strictest(base: PolicyEvaluation, role: PolicyEvaluation) -> PolicyEvaluation {
     let base_rank = (base.decision.severity(), base.enforced);
     let role_rank = (role.decision.severity(), role.enforced);
-    if role_rank > base_rank { role } else { base }
+    // `inert_content_skipped` is a record of what the evaluation DID, not a property of
+    // the verdict that won, so it survives the fold from either side. Dropping it when the
+    // role overlay is stricter would mean a law-gate deny silently erased the fact that the
+    // base engine skipped inert content — the mark exists precisely so that cannot happen.
+    let skipped = base.inert_content_skipped || role.inert_content_skipped;
+    let mut winner = if role_rank > base_rank { role } else { base };
+    winner.inert_content_skipped = skipped;
+    winner
 }
 
 /// The action being evaluated. Mirrors the orchestrator-side R6Action
@@ -226,6 +283,7 @@ mod severity_tests {
             reason: tag.into(),
             enforced,
             constraints: vec![],
+            inert_content_skipped: false,
         }
     }
 

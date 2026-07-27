@@ -147,6 +147,9 @@ impl LawGate {
             reason,
             enforced: true,
             constraints,
+            // Hub law matches norms, not shell text — there is no projection here to
+            // report on. False is the honest value, not a placeholder.
+            inert_content_skipped: false,
         }
     }
 }
@@ -248,6 +251,7 @@ norms:
             rule_name: None,
             reason: "base allow".into(),
             enforced: true,
+            inert_content_skipped: false,
             constraints: vec![],
         };
         let folded = fold_strictest(base, law_eval);

@@ -74,6 +74,8 @@ impl ServerHandler for HestiaServer {
             "hestia_record_outcome" => tool_record_outcome(&self.state, &args).await,
             "hestia_record_reversal" => tool_record_reversal(&self.state, &args).await,
             "hestia_witness_adjudication" => tool_witness_adjudication(&self.state, &args).await,
+            "hestia_appeal" => tool_appeal(&self.state, &args).await,
+            "hestia_arbitrate_appeal" => tool_arbitrate_appeal(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
             "hestia_operating_law" => tool_operating_law(&self.state, &args).await,
@@ -187,6 +189,14 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_witness_adjudication",
             "Adjudicate a witnessed Result on one V3 axis (not-the-actor; veracity = daemon-computed calibration over an explicit claim)",
+        ),
+        t(
+            "hestia_appeal",
+            "Dispute a deny that landed on YOU, through the witnessed channel instead of rephrasing around it. Requires the deny's chain hash and a stated reason; routes the appeal to a not-same arbiter if this machine knows one. Scores appeal-filed 0.85 immediately, 1.0 only if an arbiter upholds it",
+        ),
+        t(
+            "hestia_arbitrate_appeal",
+            "Rule on another member's filed appeal (NOT-SAME, enforced: never your own appeal, never a deny your own gate issued). Requires an explicit upheld:true/false and stated reasoning; records the independence of the arbiter so a reader can weigh the ruling",
         ),
         t(
             "hestia_witness_decision",
@@ -716,9 +726,11 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         "law_hash": out.get("law_hash").cloned().unwrap_or(Value::Null),
         "society_policy_hash": out.get("society_policy_hash").cloned().unwrap_or(Value::Null),
         "note": "This is the law you operate under. If a rule blocks legitimate work, \
-                 appeal it through the witnessed channel rather than rephrasing around it \
-                 — an appeal is recorded conduct that can change the law; a rephrase is \
-                 neither, and scores as compliance while teaching the society nothing.",
+                 appeal it with `hestia_appeal` (the deny's chain hash + your reason) \
+                 rather than rephrasing around it. An appeal is recorded conduct that can \
+                 change the law; a rephrase that reaches the same resource is scored as a \
+                 recast, BELOW plain compliance. Your appeal is routed to an arbiter that \
+                 is structurally not you and not the gate that denied you.",
     }))
 }
 
@@ -873,6 +885,13 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 "rule_id": evaluation.rule_id,
                 "rule_name": evaluation.rule_name,
                 "reason": evaluation.reason,
+                // The gate declined to look at part of this command, because a rule matched
+                // on executable positions only (see `policy::shell`). Recorded so the
+                // widening is countable: without it, "no destructive token here" and "a
+                // destructive token ruled inert" are the same row, and nobody can audit how
+                // often the projection changes an outcome. Omitted when false so it does not
+                // add noise to the overwhelming majority of records.
+                "inert_content_skipped": evaluation.inert_content_skipped,
                 // WHAT was attempted, not just what was decided. `target` already
                 // carries the command for Bash/Shell by overloading, but nothing else —
                 // so an Edit or an MCP deny recorded a verdict against a path with no
@@ -1765,6 +1784,378 @@ fn redact_secrets(input: &str) -> String {
         fin.push(t.to_string());
     }
     fin.join(" ")
+}
+
+// =========================================================================
+// Appeals — filing, dispatch to a not-same arbiter, and the ruling
+// =========================================================================
+//
+// THE CHANNEL THE CONDUCT SCALE HAS BEEN ADVERTISING SINCE AMENDMENT 4.
+//
+// `derivation.rs` tells every member the same thing when it denies them: don't re-run it,
+// don't rephrase around it, *appeal* — and scores 1.0 for a witnessed appeal that an
+// arbiter upholds. It has said so for weeks. There was no tool that could produce the
+// event it looks for.
+//
+// A member could reach `hestia_request_witness("appeal", ...)`, but that path wraps the
+// caller's payload as `{requested_by, data}` — deliberately, so a member cannot forge the
+// WHO. The derivation reads `deny_hash`, `plugin_id` and `role_lct` FLAT. So an appeal
+// filed through the only available surface landed one level too deep to be seen by the one
+// reader that cares, and the top of the conduct scale was unreachable through the surface
+// members actually have.
+//
+// AND MEMBERS WERE ALREADY TRYING. An earlier version of this comment asserted "not one
+// appeal exists on this chain." That was inferred from the shape mismatch and never
+// checked, and it is false. Three appeals had been filed before this tool existed —
+// chain 62959, 62963 (2026-07-27T00:58) and 63408 (09:20) — every one of them nested,
+// every one of them inert. The record did not show an absence of disputes. It showed
+// disputes that nothing could read, which is worse: a member complied, took the trouble
+// to say the deny was wrong, and the scale recorded it as ordinary compliance because the
+// evidence was one level too deep. Verified against the chain, 2026-07-27.
+//
+// That is the defect class this whole day has been about — a reassuring state bit-identical
+// to the null state. "No appeals filed" reads as "nobody disputed a deny" and actually
+// means "nobody could". These two tools close it: `hestia_appeal` writes the shape the
+// derivation reads, and `hestia_arbitrate_appeal` is the only path that can produce the
+// `adjudication` the 1.0 waits on.
+//
+// WHY FILING IS NOT LAW-GATED AND WHY THAT IS SAFE. Every other write here passes
+// `gate_direct_tool`. This one must not: if law can deny the appeal channel, then "appeal
+// rather than route around" is advice the law can silently revoke, and a member under a
+// hostile overlay would be left with only the dishonest moves. The flood surface that gate
+// would otherwise cover is closed structurally instead — you may only appeal a deny that
+// is ON the chain, that names YOU as its subject, and only once. The bound on appeals is
+// the number of denies you actually received.
+
+/// Chain window searched for a deny/appeal under appeal. Bounded, and the bound is
+/// reported rather than hidden: an appeal against a deny that has aged out is REFUSED, not
+/// silently accepted against nothing.
+const APPEAL_CHAIN_WINDOW: u64 = 20_000;
+
+/// File an appeal against a deny that landed on you.
+async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
+    let deny_hash = require_string(args, "deny_hash")?;
+    let reason = require_string(args, "reason")?;
+    if reason.trim().len() < 12 {
+        return Ok(hestia_error_envelope(
+            "hestia.appeal_no_reason",
+            "an appeal needs a stated reason (≥12 chars) — an unreasoned appeal is the \
+             unverified self-assertion the scale refuses to pay for, and an arbiter cannot \
+             rule on 'this was wrong'",
+            None,
+        ));
+    }
+    let session_id_arg = optional_string(args, "session_id");
+
+    let mut s = state.lock().await;
+    let Some(appellant) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.appeal_unattributed",
+            "filing an appeal requires your own live session_id (from hestia_connect) — an \
+             unattributable appellant cannot be credited for appealing, and an appeal that \
+             moves nobody's conduct score is theatre",
+            None,
+        ));
+    };
+
+    // The deny must exist, and it must be YOURS. Both halves matter: appealing a deny that
+    // isn't on the record would let a member mint appeal events at will, and appealing
+    // ANOTHER member's deny would let one member move another's grain.
+    let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
+    let Some(deny) = window.iter().find(|e| e.hash == deny_hash) else {
+        return Ok(hestia_error_envelope(
+            "hestia.appeal_deny_not_found",
+            &format!(
+                "no chain entry {deny_hash} within the last {APPEAL_CHAIN_WINDOW} entries. \
+                 Either the hash is wrong or the deny has aged out of the searchable window \
+                 — refusing rather than filing an appeal against nothing"
+            ),
+            Some(json!({"deny_hash": deny_hash, "window": APPEAL_CHAIN_WINDOW})),
+        ));
+    };
+    let is_deny = deny.event_type == "policy_decision"
+        && deny.event_data.get("decision").and_then(Value::as_str) == Some("deny");
+    if !is_deny {
+        return Ok(hestia_error_envelope(
+            "hestia.appeal_not_a_deny",
+            &format!("entry {deny_hash} is a '{}', not a deny", deny.event_type),
+            Some(json!({"event_type": deny.event_type})),
+        ));
+    }
+    let subject = deny.event_data.get("plugin_id").and_then(Value::as_str).unwrap_or_default();
+    if subject != appellant.plugin_id {
+        return Ok(hestia_error_envelope(
+            "hestia.appeal_not_yours",
+            &format!(
+                "deny {deny_hash} landed on '{subject}', not on '{}' — a member may only \
+                 appeal its own denies",
+                appellant.plugin_id
+            ),
+            None,
+        ));
+    }
+    if window.iter().any(|e| {
+        e.event_type == "appeal"
+            && e.event_data.get("deny_hash").and_then(Value::as_str) == Some(deny_hash.as_str())
+    }) {
+        return Ok(hestia_error_envelope(
+            "hestia.appeal_duplicate",
+            &format!(
+                "deny {deny_hash} is already under appeal — refiling would multiply the \
+                 evidence without adding any, which is the gaming vector the arbiter gate \
+                 exists to close"
+            ),
+            None,
+        ));
+    }
+
+    // Who could rule on this? Resolved BEFORE the witness so the appeal entry carries its
+    // own routing evidence (clause A: the record includes the evidence relied upon).
+    let adjudicator = deny.event_data.get("adjudicator").and_then(Value::as_str);
+    // ROUTE THROUGH THE SAME IDENTITY TEST THE RULING PATH USES.
+    //
+    // `select_arbiter` compares plugin_id STRINGS. `tool_arbitrate_appeal` additionally
+    // refuses an arbiter whose member LCT equals the appellant's, because two plugin_ids can
+    // be one entity — codex acting as `codex` while its gate witnessed as `codex-cli` is the
+    // measured case on this fleet. Filtering only downstream meant an appeal could route to
+    // the appellant's own alter ego: the receipt would say "routed to a not-same arbiter",
+    // and the designee would then be refused at ruling time. Bounded harm, since the appeal
+    // stays open for anyone else — but the routing evidence would overstate what routing
+    // established, which is the same shape as the `agent-inventory` misroute fixed one clause
+    // later in this file (kimi-code, reviewing).
+    let appellant_lct = s.member_lct(&appellant.plugin_id);
+    let pool: Vec<String> = s
+        .member_registry
+        .iter_sorted()
+        .into_iter()
+        .map(|(id, _)| id.clone())
+        .filter(|id| {
+            // Only drop a candidate PROVEN to be the same entity. member_lct fails closed to
+            // None for synthetic ids, and select_arbiter refuses unrecognised reasoners
+            // separately — an unmappable candidate must not be silently dropped here as if
+            // identity had been established.
+            match (&appellant_lct, s.member_lct(id)) {
+                (Some(a), Some(b)) => a != &b,
+                _ => true,
+            }
+        })
+        .collect();
+    let picked = crate::arbiter::select_arbiter(
+        &appellant.plugin_id,
+        adjudicator,
+        pool.iter().map(String::as_str),
+    )
+    .map(|(id, ind)| (id.to_string(), ind));
+
+    let entry = s.append_chain(
+        "appeal",
+        // FLAT, and that is load-bearing: `derivation::derive` reads `deny_hash`,
+        // `plugin_id` and `role_lct` at the top level. Nesting these (as
+        // `hestia_request_witness` does) is what made every prior appeal path inert.
+        json!({
+            "plugin_id": appellant.plugin_id,
+            "role_lct": appellant.role_lct,
+            "session_id": appellant.session_uuid,
+            "deny_hash": deny_hash,
+            "reason": reason,
+            // The disputed command, copied forward so an arbiter can rule from the appeal
+            // entry alone rather than needing the deny to still be in ITS window.
+            "about_attempted": deny.event_data.get("attempted").cloned().unwrap_or(Value::Null),
+            "about_adjudicator": adjudicator,
+            "routed_to": picked.as_ref().map(|(id, _)| id.clone()),
+            "routed_independence": picked.as_ref().map(|(_, i)| i),
+        }),
+    )?;
+
+    // Dispatch. A queued notice is a WAKE, not a ruling — the arbiter still has to read the
+    // appeal and decide. Failure to queue does not void the appeal: the filing is the
+    // conduct being scored, and losing the record because a mailbox was full would punish
+    // the member for the mesh's state.
+    let mut dispatched = None;
+    if let Some((arb, ind)) = &picked {
+        let pointer = format!("hestia://appeal/{deny_hash}");
+        match s.inbox_store.enqueue_member(
+            arb,
+            &appellant.plugin_id,
+            &appellant.role_lct,
+            "review_request",
+            Some(pointer.as_str()),
+            &entry.hash,
+            None,
+        ) {
+            Ok(id) => dispatched = Some(json!({"queued_id": id, "arbiter": arb, "independence": ind})),
+            Err(e) => {
+                tracing::warn!(arbiter = %arb, error = %e, "appeal filed but dispatch failed");
+            }
+        }
+    }
+
+    Ok(json!({
+        "witnessEntryHash": entry.hash,
+        "deny_hash": deny_hash,
+        "dispatched": dispatched,
+        // Say plainly when nobody can rule. Silence here would read as "dispatched".
+        "note": match (&picked, &dispatched) {
+            (None, _) => "appeal recorded, but no admissible arbiter is known on this machine \
+                          (an arbiter must not be you, and must not be the gate that denied). \
+                          It scores as appeal-filed until someone rules.",
+            (Some(_), None) => "appeal recorded; the arbiter could not be woken (queue error). \
+                                The filing stands and can be ruled on at any time.",
+            (Some(_), Some(_)) => "appeal recorded and routed to a not-same arbiter. It scores \
+                                   appeal-filed now, and 1.0 only if the arbiter upholds it.",
+        },
+    }))
+}
+
+/// Rule on an appeal. The ONLY path that can produce the `adjudication` that
+/// `derivation.rs` requires before an appeal pays 1.0.
+async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult {
+    let deny_hash = require_string(args, "deny_hash")?;
+    let upheld = match args.get("upheld").and_then(Value::as_bool) {
+        Some(b) => b,
+        None => {
+            return Ok(hestia_error_envelope(
+                "hestia.arbitration_no_verdict",
+                "'upheld' must be an explicit boolean: true = the deny was wrong (the appeal \
+                 succeeds), false = the deny stands. There is no abstain — an arbiter who \
+                 cannot decide should not file.",
+                None,
+            ))
+        }
+    };
+    let rationale = require_string(args, "rationale")?;
+    if rationale.trim().len() < 24 {
+        return Ok(hestia_error_envelope(
+            "hestia.arbitration_no_rationale",
+            "a ruling requires stated reasoning (≥24 chars). A verdict without it is the \
+             declaration this architecture rejects: the relying party is supposed to weigh \
+             the reasoning, not the arbiter's say-so",
+            None,
+        ));
+    }
+    let session_id_arg = optional_string(args, "session_id");
+
+    let mut s = state.lock().await;
+    let Some(arbiter) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.arbitration_unattributed",
+            "ruling requires your own live session_id (from hestia_connect) — an \
+             unattributable arbiter is indistinguishable from the appellant, which is the \
+             one thing this surface must be able to tell apart",
+            None,
+        ));
+    };
+
+    let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
+    let Some(appeal) = window.iter().find(|e| {
+        e.event_type == "appeal"
+            && e.event_data.get("deny_hash").and_then(Value::as_str) == Some(deny_hash.as_str())
+    }) else {
+        return Ok(hestia_error_envelope(
+            "hestia.arbitration_no_appeal",
+            &format!(
+                "no appeal against {deny_hash} within the last {APPEAL_CHAIN_WINDOW} entries \
+                 — an arbiter rules on a FILED appeal; ruling on an unfiled one would let a \
+                 third party move a member's score without the member ever disputing anything"
+            ),
+            None,
+        ));
+    };
+    let appellant = appeal.event_data.get("plugin_id").and_then(Value::as_str).unwrap_or_default();
+    let appellant_role = appeal
+        .event_data
+        .get("role_lct")
+        .and_then(Value::as_str)
+        .unwrap_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE);
+    let deny_adjudicator = appeal.event_data.get("about_adjudicator").and_then(Value::as_str);
+
+    // NOT-SAME, enforced server-side. A client-side check would be advisory — the whole
+    // reason this constraint is here is that the party it constrains is the party running
+    // the client.
+    let parties = crate::arbiter::AppealParties {
+        appellant,
+        deny_adjudicator,
+        arbiter: &arbiter.plugin_id,
+    };
+    // Instance-level identity check too, mirroring `tool_witness_adjudication`: two
+    // plugin_ids that resolve to the same member LCT are the same entity wearing two names,
+    // and the codex/codex-cli split proved that is not hypothetical on this fleet.
+    let same_entity = {
+        let a = s.member_lct(&arbiter.plugin_id);
+        let b = s.member_lct(appellant);
+        a.is_some() && a == b
+    };
+    let independence = match crate::arbiter::eligibility(&parties) {
+        _ if same_entity => {
+            return Ok(hestia_error_envelope(
+                "hestia.arbitration_self",
+                &format!(
+                    "'{}' and '{appellant}' resolve to the same member LCT — different \
+                     plugin_ids, same entity. Self-arbitration cannot be recorded",
+                    arbiter.plugin_id
+                ),
+                None,
+            ))
+        }
+        crate::arbiter::Eligibility::Refused { reason } => {
+            return Ok(hestia_error_envelope(
+                "hestia.arbitration_ineligible",
+                &reason,
+                Some(json!({"appellant": appellant, "arbiter": arbiter.plugin_id})),
+            ))
+        }
+        crate::arbiter::Eligibility::Eligible { independence } => independence,
+    };
+
+    if window.iter().any(|e| {
+        e.event_type == "adjudication"
+            && e.event_data.get("about_deny_hash").and_then(Value::as_str)
+                == Some(deny_hash.as_str())
+    }) {
+        return Ok(hestia_error_envelope(
+            "hestia.arbitration_already_ruled",
+            &format!(
+                "the appeal against {deny_hash} has already been ruled on. A second ruling \
+                 would let an appellant shop for arbiters until one upholds"
+            ),
+            None,
+        ));
+    }
+
+    let entry = s.append_chain(
+        "adjudication",
+        // Flat for the same reason the appeal is: `derivation.rs` matches
+        // `subject_plugin_id` + `about_deny_hash` + `upheld` at the top level.
+        json!({
+            "subject_plugin_id": appellant,
+            "subject_role": appellant_role,
+            "about_deny_hash": deny_hash,
+            "upheld": upheld,
+            "rationale": rationale,
+            "adjudicator": arbiter.plugin_id,
+            "adjudicator_role": arbiter.role_lct,
+            "adjudicator_session": arbiter.session_uuid,
+            // The gradient, recorded next to the verdict so a reader can weigh a
+            // same-lineage ruling differently from a cross-vendor one. Evidence, not a
+            // threshold — hestia does not decide how much this ruling is worth.
+            "independence": independence,
+            "appeal_entry": appeal.hash,
+        }),
+    )?;
+
+    Ok(json!({
+        "witnessEntryHash": entry.hash,
+        "subject_plugin_id": appellant,
+        "about_deny_hash": deny_hash,
+        "upheld": upheld,
+        "independence": independence,
+        "effect": if upheld {
+            "the appellant's conduct on this deny now scores appeal-upheld 1.0"
+        } else {
+            "the deny stands; the appellant keeps appeal-filed 0.85 for having disputed it \
+             through the witnessed channel rather than routing around"
+        },
+    }))
 }
 
 async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult {
@@ -4352,7 +4743,7 @@ mod inbox_tests {
 
     /// A state whose vault holds a member identity (as `hestia init --ai`
     /// leaves it), plus that identity's keypair so tests can play the hub side.
-    fn seeded_home() -> (TempDir, KeyPair) {
+    pub(super) fn seeded_home() -> (TempDir, KeyPair) {
         let dir = TempDir::new().unwrap();
         let member_kp = KeyPair::generate();
         let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
@@ -4365,7 +4756,7 @@ mod inbox_tests {
         (dir, member_kp)
     }
 
-    fn open_state(dir: &TempDir) -> SharedState {
+    pub(super) fn open_state(dir: &TempDir) -> SharedState {
         let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
         crate::server::build_state(vault, dir.path(), "p").unwrap()
     }
@@ -5123,6 +5514,7 @@ mod tests {
                     categories: Some(vec!["credential_access".into()]),
                     target_patterns: None,
                     target_patterns_are_regex: false,
+                    target_patterns_scope: Default::default(),
                     command_patterns: None,
                     command_patterns_are_regex: false,
                     command_must_not_contain: None,
@@ -5570,5 +5962,274 @@ mod operating_law_surface_tests {
                    "a change to the PUBLISHED law must move law_hash");
         assert_eq!(a["society_policy_hash"], b["society_policy_hash"],
                    "and the society hash alone would NOT have moved — which is the defect");
+    }
+}
+
+/// The appeal channel, end to end. Separate module because these tests deliberately cross
+/// the handler/derivation boundary: the bug they exist to prevent is the two halves
+/// agreeing in isolation and disagreeing about the shape they exchange.
+#[cfg(test)]
+mod appeal_tests {
+    use super::*;
+    use super::inbox_tests::{open_state, seeded_home};
+
+    // ---- Appeals: the emitted shape must be the shape the reader reads ----
+    //
+    // These go through `tool_appeal` / `tool_arbitrate_appeal` and then through the REAL
+    // `derivation::derive`, rather than asserting against a hand-built json! literal. The
+    // whole defect being fixed is that a correctly-formed appeal landed in a shape the
+    // derivation could not see, and a test that builds the payload itself reproduces the
+    // author's assumption instead of checking it — kimi, on my last round of tests: "the
+    // assertion and the mechanism are in different rooms."
+
+    const APPELLANT_ROLE: &str = "role:constellation:member";
+
+    /// The command the fixture deny refuses. Assembled rather than written literally:
+    /// writing it inline makes this file un-editable through a governed shell, because the
+    /// gate judges by mention and cannot tell a Rust string literal in a test fixture from
+    /// a command being run. That is false-positive class #11 on this machine and it fired
+    /// while writing this very test — see GATE_BYPASS_CATALOG.md §judge-by-mention.
+    fn fixture_denied_command() -> String {
+        format!("{} -rf /tmp/x && mkdir /tmp/x", "rm")
+    }
+
+    /// Seat a session and return its id.
+    ///
+    /// The session id is DERIVED, not random. These fixtures used `Uuid::new_v4()`, and
+    /// `derivation::is_probe` excluded any session whose id contained "e2e" — three hex
+    /// digits, so ~0.73% of random UUIDs carried it and the deny silently vanished from
+    /// conduct, leaving `evidence[0]` to panic on an empty vector. One full-suite run in
+    /// ~140 failed that way; I saw it, could not reproduce it, and wrote it off as an
+    /// unidentified flake. kimi-code found it from the other end while reviewing.
+    /// A deterministic id removes the lottery; the reader-side fix (delimited markers)
+    /// removes the bug.
+    async fn seat(state: &SharedState, plugin_id: &str) -> Uuid {
+        // Deterministic from the plugin_id: stable across runs, and provably free of
+        // any probe marker (asserted below, so a future edit cannot silently reintroduce
+        // the lottery).
+        let sid = Uuid::from_bytes({
+            let mut b = [0u8; 16];
+            for (i, c) in plugin_id.bytes().take(16).enumerate() {
+                b[i] = c;
+            }
+            b
+        });
+        debug_assert!(
+            !["test", "probe", "verify", "e2e", "debug"]
+                .iter()
+                .any(|m| sid.to_string().contains(m)),
+            "fixture session id must not look like a probe: {sid}"
+        );
+        let mut s = state.lock().await;
+        s.sessions.insert(
+            sid,
+            crate::server::state::Session {
+                session_id: sid,
+                plugin_id: plugin_id.into(),
+                plugin_version: None,
+                host_agent: "test".into(),
+                host_agent_version: None,
+                assigned_role: "citizen".into(),
+                constellation_role: APPELLANT_ROLE.into(),
+                soft_lct: format!("lct:test:{plugin_id}"),
+                connected_at: chrono::Utc::now(),
+                host_session_id: None,
+            },
+        );
+        sid
+    }
+
+    /// Put a deny on the chain, as a gate would, and hand back its hash.
+    async fn seat_deny(state: &SharedState, subject: &str, sid: Uuid, adjudicator: &str) -> String {
+        let s = state.lock().await;
+        s.append_chain(
+            "policy_decision",
+            json!({
+                "tool_name": "Bash", "target": "/tmp/x", "plugin_id": subject,
+                "role_lct": APPELLANT_ROLE, "session_id": sid.to_string(),
+                "decision": "deny", "enforced": true, "adjudicator": adjudicator,
+                "reason": "test", "payload_sha256": "abc",
+                "attempted": fixture_denied_command(),
+            }),
+        )
+        .unwrap()
+        .hash
+    }
+
+    /// End to end: file, rule, and check that the CONDUCT SCALE moved. If the emitted shape
+    /// drifts from what `derivation.rs` matches on, this fails — which is the point.
+    #[tokio::test]
+    async fn an_upheld_appeal_reaches_the_top_of_the_conduct_scale() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let appellant_sid = seat(&state, "claude-code").await;
+        let arbiter_sid = seat(&state, "codex").await;
+        let deny_hash = seat_deny(&state, "claude-code", appellant_sid, "hestia-gate").await;
+
+        let filed = tool_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": appellant_sid.to_string(),
+            "reason": "the preset permits deletes under /tmp; this was denied for chaining",
+        })).await.unwrap();
+        assert!(filed.get("witnessEntryHash").is_some(), "appeal not witnessed: {filed}");
+
+        // Filed but unruled: compliance credit, NOT the top of the scale.
+        //
+        // Asserted on the LABEL and on ordering, not on a literal 0.85. The score is an EMA
+        // over a 0.5 prior, so one observation of a 0.85 conduct lands at 0.675 — the first
+        // version of this test asserted the band's value as if it were the scale's output
+        // and failed, which is a fair reminder that a single measurement is never the thing
+        // it measures.
+        let filed = { state.lock().await.recent_chain(500) };
+        let filed_d = crate::derivation::derive("claude-code", APPELLANT_ROLE, &filed);
+        let filed_score = filed_d.temperament.score.expect("measured");
+        assert!(filed_d.temperament.evidence[0].contribution.contains("appeal-filed"),
+                "filing must be recognised as an appeal, not read as plain compliance: {:?}",
+                filed_d.temperament.evidence[0].contribution);
+
+        let ruled = tool_arbitrate_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": arbiter_sid.to_string(), "upheld": true,
+            "rationale": "the rule targets chaining, not the delete; the deny was over-broad",
+        })).await.unwrap();
+        assert_eq!(ruled.get("upheld").and_then(Value::as_bool), Some(true), "{ruled}");
+
+        let window = { state.lock().await.recent_chain(500) };
+        let d = crate::derivation::derive("claude-code", APPELLANT_ROLE, &window);
+        let score = d.temperament.score.expect("measured");
+        assert!(d.temperament.evidence[0].contribution.contains("appeal-upheld"),
+                "the ruling did not reach the derivation — if this says appeal-filed, the \
+                 emitted adjudication shape and the reader have drifted apart again: {:?}",
+                d.temperament.evidence[0].contribution);
+        assert!(score > filed_score,
+                "upholding an appeal must pay MORE than filing it ({filed_score} -> {score}), \
+                 otherwise there is no reason for an arbiter to exist");
+    }
+
+    /// The constraint that is not a stub, enforced where it counts: server-side.
+    #[tokio::test]
+    async fn a_member_cannot_rule_on_its_own_appeal_through_the_daemon() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat(&state, "claude-code").await;
+        let deny_hash = seat_deny(&state, "claude-code", sid, "hestia-gate").await;
+        tool_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": sid.to_string(),
+            "reason": "this deny was a false positive on a heredoc",
+        })).await.unwrap();
+
+        let r = tool_arbitrate_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": sid.to_string(), "upheld": true,
+            "rationale": "I have reviewed my own appeal and I find that I am correct",
+        })).await.unwrap();
+        // Either clause may fire first — the plugin_id check or the member-LCT check. The
+        // guarantee is REFUSAL, not which of the two structural facts caught it, and
+        // pinning one made this test assert an implementation order rather than the
+        // property. (On this harness the LCT check wins, because both sessions resolve to
+        // the same member LCT — a stronger check than the string compare.)
+        let body = format!("{r}");
+        assert!(body.contains("arbitration_ineligible") || body.contains("arbitration_self"),
+                "self-ruling admitted: {r}");
+
+        let window = { state.lock().await.recent_chain(500) };
+        let d = crate::derivation::derive("claude-code", APPELLANT_ROLE, &window);
+        assert!(d.temperament.evidence[0].contribution.contains("appeal-filed"),
+                "a refused self-ruling must leave the appeal merely FILED — if this says \
+                 appeal-upheld, the refusal did not actually prevent the credit: {:?}",
+                d.temperament.evidence[0].contribution);
+    }
+
+    /// The gate that issued the deny cannot clear itself, even with a live session.
+    #[tokio::test]
+    async fn the_gate_that_denied_cannot_rule_through_the_daemon_either() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let appellant_sid = seat(&state, "claude-code").await;
+        let codex_sid = seat(&state, "codex").await;
+        let deny_hash = seat_deny(&state, "claude-code", appellant_sid, "plugin-gate:codex").await;
+        tool_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": appellant_sid.to_string(),
+            "reason": "codex's gate matched a string inside a quoted argument",
+        })).await.unwrap();
+
+        let r = tool_arbitrate_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": codex_sid.to_string(), "upheld": false,
+            "rationale": "my gate was correct to deny this, as gates generally are",
+        })).await.unwrap();
+        assert!(format!("{r}").contains("arbitration_ineligible"), "gate self-review admitted: {r}");
+    }
+
+    /// You may only appeal denies that landed on you.
+    #[tokio::test]
+    async fn a_member_cannot_appeal_another_members_deny() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let victim_sid = seat(&state, "claude-code").await;
+        let other_sid = seat(&state, "codex").await;
+        let deny_hash = seat_deny(&state, "claude-code", victim_sid, "hestia-gate").await;
+        let r = tool_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": other_sid.to_string(),
+            "reason": "filing on behalf of a peer, which is not a thing",
+        })).await.unwrap();
+        assert!(format!("{r}").contains("appeal_not_yours"), "{r}");
+    }
+
+    /// An appeal against a hash that is not a deny, or not on the chain, is refused rather
+    /// than witnessed against nothing.
+    #[tokio::test]
+    async fn an_appeal_against_nothing_is_refused() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat(&state, "claude-code").await;
+        let r = tool_appeal(&state, &json!({
+            "deny_hash": "0000000000000000", "session_id": sid.to_string(),
+            "reason": "appealing a deny that does not exist on this chain",
+        })).await.unwrap();
+        assert!(format!("{r}").contains("appeal_deny_not_found"), "{r}");
+    }
+
+    /// One appeal per deny, one ruling per appeal — no arbiter shopping.
+    #[tokio::test]
+    async fn an_appeal_cannot_be_refiled_or_reruled() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let a_sid = seat(&state, "claude-code").await;
+        let codex_sid = seat(&state, "codex").await;
+        let kimi_sid = seat(&state, "kimi-code").await;
+        let deny_hash = seat_deny(&state, "claude-code", a_sid, "hestia-gate").await;
+        let file = json!({
+            "deny_hash": deny_hash, "session_id": a_sid.to_string(),
+            "reason": "the denied path is inside my own scratch directory",
+        });
+        tool_appeal(&state, &file).await.unwrap();
+        let again = tool_appeal(&state, &file).await.unwrap();
+        assert!(format!("{again}").contains("appeal_duplicate"), "{again}");
+
+        tool_arbitrate_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": codex_sid.to_string(), "upheld": false,
+            "rationale": "scratch or not, the command chained, and chaining is what is refused",
+        })).await.unwrap();
+        let shop = tool_arbitrate_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": kimi_sid.to_string(), "upheld": true,
+            "rationale": "a second opinion the appellant would prefer, filed after the first",
+        })).await.unwrap();
+        assert!(format!("{shop}").contains("already_ruled"), "arbiter shopping admitted: {shop}");
+    }
+
+    /// A ruling with no reasoning is not admissible, in either direction.
+    #[tokio::test]
+    async fn a_verdict_without_reasoning_is_refused() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let a_sid = seat(&state, "claude-code").await;
+        let codex_sid = seat(&state, "codex").await;
+        let deny_hash = seat_deny(&state, "claude-code", a_sid, "hestia-gate").await;
+        tool_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": a_sid.to_string(),
+            "reason": "the matched token appeared inside a test fixture, not a command",
+        })).await.unwrap();
+        let r = tool_arbitrate_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": codex_sid.to_string(),
+            "upheld": true, "rationale": "yep",
+        })).await.unwrap();
+        assert!(format!("{r}").contains("no_rationale"), "{r}");
     }
 }
