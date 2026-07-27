@@ -1,13 +1,75 @@
 [Unit]
 Description=Hestia local-first Web4 trust daemon
 Documentation=https://github.com/dp-web4/hestia
-# NOT `After=default.target`: this unit is WantedBy=default.target, so ordering
-# it *after* the target that wants it forms a cycle (default.target -> hestia ->
-# default.target). systemd breaks such cycles by DELETING a start job — and the
-# victim is whichever unit closes the loop, not necessarily this one. On CBP it
-# silently deleted both member-mesh watchers (`After=hestia.service`,
-# `WantedBy=default.target`) at every boot: the mesh was "enabled" and never ran.
+# NOT `After=default.target`. This unit is WantedBy=default.target; ordering it
+# *after* the target that wants it is the latent charge. It does NOT cycle on its
+# own — systemd refuses to build the two-node loop (a target skips its implicit
+# "order me after what I want" edge for any unit declaring a contradicting order;
+# the source comment is literally "Don't create loops"). The cycle needs a THIRD
+# unit to bridge it:
+#
+#   default.target --(implicit after)--> watcher      (WantedBy=default.target)
+#   watcher        --(explicit after)--> hestia       (After=hestia.service)
+#   hestia         --(explicit after)--> default.target   <-- the bad line
+#
+# systemd breaks that by DELETING a start job, and the victim is whichever unit
+# closes the loop — not necessarily this one. On CBP it silently deleted both
+# member-mesh watchers at every boot: the mesh was "enabled" and never ran.
 # Found 2026-07-25, the first reboot after the mesh was armed.
+#
+# Why it stayed hidden: the bad line is harmless until something orders itself
+# after hestia. "It starts fine on my box" is not evidence of absence. Detector
+# that needs no reboot (wanted-but-not-ordered == loop-avoidance already fired):
+#   systemctl --user show default.target -p Wants --value | tr ' ' '\n' \
+#     | grep -qx hestia.service &&
+#   ! systemctl --user show default.target -p After --value | tr ' ' '\n' \
+#     | grep -qx hestia.service &&
+#   echo "LATENT ORDERING CYCLE"
+# (-qx on tokenised lines, not a bare grep: `grep -q hestia.service` also
+# matches a unit merely *named* like it, e.g. myhestia.service.)
+# Packaged as install.sh:verify_service_linux — run it fleet-wide, and let it,
+# not deploy/fleet/ROSTER.md, define which machines are affected.
+# Credit: pub (three-node model + detector), nomad (charge/detonator framing),
+# sprout (initial confirm).
+
+# Bound the retry loop. NOT because a start limit was missing — systemd already
+# applies `StartLimitIntervalSec=10s` / `StartLimitBurst=5` by default. Measured
+# on CBP's live unit, which declares neither key and still reads 10s / 5.
+#
+# The limit was present and *structurally could not fire*: at `RestartSec=5s`
+# at most 2–3 attempts land in any 10s window, so a burst of 5 is unreachable.
+# The unit retries forever, never enters `failed`, and nothing reports it as
+# broken. Observed on nomad: 289 consecutive restarts against
+# `status=226/NAMESPACE` (the [Service] sandboxing below cannot set up mount
+# namespacing under some WSL kernels until the user manager is restarted).
+#
+# So the fix is a window WIDER than burst × RestartSec, not the presence of the
+# setting: 5 × 5s = 25s, so 120s trips it. `StartLimitIntervalSec=10` would
+# reproduce the forever-loop exactly — "add a start limit" is the wrong lesson
+# and invites precisely that. Keep this in sync with `RestartSec` below.
+#
+# Same failure class as the ordering cycle: enabled, no failure signal, not
+# actually running. Prefer a visible `failed` over a silent infinite retry.
+# NOTE: these are [Unit] keys, not [Service] — moved in systemd 229. Anywhere
+# else they are parsed, ignored, and reported green; install.sh probes 1b/1c
+# catch that without needing systemd-analyze or a user bus.
+#
+# Measured, not asserted (CBP, systemd 255.4/WSL2, two units identical but for
+# the window): 120 → `failed` at t=30s on the 5th start ("Start request repeated
+# too quickly"); 10 → 13 restarts at t=70s and still climbing. "Keep in sync"
+# is now enforced by install.sh probe 1d, not just stated here.
+#
+# Where the boundary actually is (CBP, measured — four units, only the window
+# differing; HUB proposed `(burst−1) × RestartSec` on algebra, and the run
+# refuted it): 20 → 15 restarts at t=80s, still climbing; 25 → 15 restarts,
+# still climbing; 30 → `failed` at 5. systemd allows `burst` starts per window
+# and refuses the *burst+1*-th, which lands at burst × RestartSec — so a window
+# of `(burst−1) × RestartSec` = 20s never fires. The refusing start landed at
+# t≈25.0s against a 25s window, i.e. exactly on the edge: at
+# window == burst × RestartSec, sub-second scheduling jitter decides, and here
+# it decided against firing. That is why probe 1d warns on `<=`, not `<`.
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -24,7 +86,6 @@ Environment=HESTIA_WORKSPACE=/mnt/c/exe/projects/ai-agents
 # Sandboxing
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=%h/.hestia
 ProtectHome=read-only
 ReadWritePaths=%h/.hestia
 PrivateTmp=true
