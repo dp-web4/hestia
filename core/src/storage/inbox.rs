@@ -453,12 +453,19 @@ impl SqliteInboxStore {
         Self::ensure_member_schema(&conn)?;
         // The forwarding plane carries its OWN bound, because it no longer borrows
         // the local plane's (see `enqueue_member`: the TTL prune and the cap used to
-        // reach across the seam and delete queued forwards). A bound that EVICTS
-        // needs a report path to stay honest, and on this branch the egress seam has
-        // none — no `mark_egress_failed`, no attempt counter, nothing that can say a
-        // forward was dropped. So this bound REFUSES ADMISSION instead: the caller is
-        // live, holds the receipt, and learns immediately. Backpressure to a present
-        // sender is attributable; eviction of a parked row is the black hole.
+        // reach across the seam and delete queued forwards). A bound that EVICTS needs
+        // a report path to stay honest. This comment used to justify the choice by
+        // saying the egress seam HAS none — no attempt counter, nothing that can say a
+        // forward was dropped. That is no longer true: `mark_failed`,
+        // `MAX_EGRESS_ATTEMPTS` and `retire_and_report_egress` now retire, witness and
+        // report exhausted rows to their sender. The choice stands on the surviving
+        // half of the argument, which never depended on the missing path: refusing
+        // admission tells a caller that is LIVE and holding the receipt, at the moment
+        // it can still do something about it, while evicting a parked row reports to a
+        // sender that has long since gone. The report path bounds how long a row may
+        // FAIL, not how many rows may be admitted; the two bounds do not substitute.
+        // Backpressure to a present sender is attributable; eviction of a parked row
+        // is the black hole.
         let queued: i64 = conn.query_row(
             "SELECT COUNT(*) FROM member_notices
               WHERE dest_peer IS NOT NULL AND drained_at IS NULL",

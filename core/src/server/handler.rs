@@ -2536,8 +2536,14 @@ const MEMBER_NOTICE_KINDS: &[&str] = &[
 /// the `member_notice_unreachable` entry that justifies it, is evidence.
 ///
 /// Receiving members must not filter it out: it is the only notice on this mesh that
-/// says something the recipient cannot learn any other way. Documented in
-/// `plugins/member-mesh/KINDS.md`.
+/// says something the recipient cannot learn any other way, and its pointer IS its
+/// content — strip that and nothing survives but "something died somewhere". Every
+/// deployed rendering path did strip it, for a day, because this sentence pointed at
+/// a KINDS.md section that did not exist yet (Kimi review of PR #62). It does now:
+/// see "Daemon-only" in `plugins/member-mesh/KINDS.md`, which also carries the rule
+/// that rendering paths must admit this as a `(sender, kind)` PAIR — `plugin_id` is
+/// caller-supplied at connect, so the name `hestia` is claimable and the KIND is the
+/// only unforgeable half.
 const DAEMON_NOTICE_KIND_UNREACHABLE: &str = "unreachable";
 
 // ---- id-binding (Kimi ↔ CBP, 2026-07-25): two DIFFERENT per-kind sets ----

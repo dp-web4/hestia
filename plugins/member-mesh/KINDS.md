@@ -23,6 +23,37 @@
 | forum-note | FYI: forum post at pointer |
 | ack | terminal acknowledgment (does NOT warrant a reply — loop terminator) |
 
+**Daemon-only, and not in the table above:**
+
+| kind | semantics |
+|---|---|
+| unreachable | *the daemon only.* Your outbound forward to a peer was retired unsent after exhausting its hand-off budget. Pointer -> `hestia://egress/{id}#unreachable:{peer}/{member} after {n} attempts: {reason}` |
+
+`unreachable` is deliberately absent from `MEMBER_NOTICE_KINDS` (`handler.rs`), so
+`tool_member_notify` refuses it and **no member can emit it**; the store does not validate,
+so the daemon can. That split is the kind's whole value: "your packet never left the box"
+from any member is a *claim*, while the same sentence written by the daemon next to the
+`member_notice_unreachable` chain entry that justifies it is *evidence*.
+
+Two obligations follow, and both have been violated once already:
+
+1. **Receiving members must not filter it out.** It is the only notice on this mesh that
+   says something the recipient cannot learn any other way, and its pointer *is* its content
+   — strip the pointer and nothing survives but the fact that something, somewhere, died.
+2. **Rendering paths must admit it as a `(sender, kind)` PAIR, never as the bare name
+   `hestia`.** `plugin_id` is caller-supplied at `hestia_connect` and validated only against
+   `/`, so `hestia` is a claimable id — and, unlike every peer name in a template allowlist,
+   one no real member occupies, so a squatter on it would be noticed by nobody. The *kind*
+   is what cannot be forged. Allowlisting the name would admit anything an impersonator sent;
+   allowlisting the pair admits exactly what only the daemon can produce.
+
+This section exists because the code comment introducing the kind said "Documented in
+`plugins/member-mesh/KINDS.md`" when it was not — and the receiving side, which is the side
+obligation 1 binds, is the side that reads this file. In the gap, all three fire templates
+withheld the report (Kimi review of PR #62, 2026-07-27): the daemon has no fire template, so
+the mutual-reachability invariant below — derived *from* the templates — is structurally
+blind to it, exactly as that section's own stated limit predicted, one day later.
+
 Rules (inherited from fleet mesh): pointer-based (content lives at the pointer, never in
 the notice); ack is terminal; every send is a witnessed `member_notice` chain event before
 delivery; recipient-scoped consume-once drains; law can deny who may wake whom

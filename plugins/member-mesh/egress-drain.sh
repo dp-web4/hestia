@@ -152,12 +152,25 @@ drain_once() {
     return 0
   fi
   rm -f "$err"
+  # §3.3 (Kimi, PR #62 review). The daemon reports name-only rows on EVERY read —
+  # that per-read report is the whole reason the field exists, the alternative
+  # being a silent name-forward. The only consumer detected the field and printed
+  # an empty string, dropping the report in the same commit that built it.
+  note="$(python3 -c 'import json,sys
+try: d=json.loads(sys.argv[1])
+except Exception: raise SystemExit(0)
+n=d.get("unresolved_note")
+if n: print(str(n).replace("\n"," ")[:500])' "$pending")"
+  [ -n "$note" ] && say "UNRESOLVED $note"
+
   python3 - "$pending" <<'PY' | while IFS=$'\t' read -r id addr is_lct peer kind ptr; do
 import json, sys
 try: d = json.loads(sys.argv[1])
 except Exception: sys.exit(0)
-if d.get("unresolved_note"):
-    print("", file=sys.stderr)
+    # `unresolved_note` is NOT read here — see the `say` above the loop. Writing it
+    # to stderr from inside this block was the original defect's shape twice over:
+    # the text was dropped, and stderr is not the log (`say` is) so even the fixed
+    # text would not have landed where an operator reads.
 for r in d.get("pending", []):
     # forward_on is the address the daemon says to use; forward_on_is_lct says
     # whether it is the roster-validated identifier or the prefix-matchable NAME.
