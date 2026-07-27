@@ -59,11 +59,27 @@ pub enum Independence {
     /// Different member, same lineage (e.g. kimi judging claude — both Claude-Code
     /// lineage). Genuinely separate context and evidence; correlated blind spots.
     CrossMember,
-    /// Different session of the same member. The weakest admissible form: shares model and
-    /// disposition, differs only in what it has seen. Recorded as such so nobody mistakes
-    /// it for independent review.
-    CrossSession,
 }
+
+// THERE IS NO CrossSession TIER, DELIBERATELY.
+//
+// There was one. It was documented as "the weakest admissible form" and the code refused it
+// one clause earlier — `arbiter == appellant` returns Refused before any session comparison
+// can run — so the variant, the branch that built it, and the fields it read were all
+// unreachable. kimi-code, reviewing: "the current state documents a behavior the code
+// doesn't have." Worse, the test that claimed to prove absent sessions fail closed used the
+// SAME plugin_id for both parties, so it exited at clause 1 and would still have passed with
+// the entire session branch deleted. My own standard, turned around: the assertion and the
+// mechanism were in different rooms.
+//
+// Offered the choice of making the tier real or removing it, removing it is the one that
+// matches the doctrine. A second session of the same member is the same model, the same
+// training, the same dispositions, differing only in what it has read. It is precisely the
+// entity that cannot see this entity's blind spots. Every genuine catch on this codebase
+// came from a differently-PLACED reader — kimi, codex, dp, Thor — and none from another
+// session of the same member. Admitting one, even at the bottom of a gradient, would let a
+// member arbitrate its own appeal by opening a second terminal, which is what NotSame exists
+// to prevent.
 
 /// The parties to an appeal, as the daemon knows them.
 #[derive(Debug, Clone)]
@@ -74,8 +90,6 @@ pub struct AppealParties<'a> {
     pub deny_adjudicator: Option<&'a str>,
     /// Who proposes to rule.
     pub arbiter: &'a str,
-    pub arbiter_session: Option<&'a str>,
-    pub appellant_session: Option<&'a str>,
 }
 
 /// Vendor lineage, for the independence gradient. Deliberately coarse and openly
@@ -161,29 +175,16 @@ pub fn eligibility(p: &AppealParties<'_>) -> Eligibility {
             ),
         };
     }
-    // 4. A DIFFERENT SESSION OF THE SAME MEMBER is admissible but weak, and only when the
-    //    sessions are actually distinct and both known. Unknown sessions fail closed: an
-    //    absent session id is exactly how a self-arbitration would be laundered.
-    //
-    //    The appellant's lineage may be unrecognised (anything can be denied, so anything
-    //    can appeal); only the ARBITER must be recognised. An unrecognised appellant simply
-    //    never matches a lineage, so every eligible arbiter grades cross-vendor against it,
-    //    which is the honest reading: we cannot show they share a lineage.
+    // 4. GRADE THE DISTANCE. The appellant's lineage may be unrecognised (anything can be
+    //    denied, so anything can appeal); only the ARBITER must be recognised. An
+    //    unrecognised appellant never matches a lineage, so every eligible arbiter grades
+    //    cross-vendor against it — the honest reading: we cannot show they share a lineage.
+    // Clause 1 already refused `arbiter == appellant`, so by here the two are different
+    // members and the only question left is how far apart they are.
     let independence = if lineage(p.arbiter) != lineage(p.appellant) {
         Independence::CrossVendor
-    } else if p.arbiter != p.appellant {
-        Independence::CrossMember
     } else {
-        match (p.arbiter_session, p.appellant_session) {
-            (Some(a), Some(b)) if a != b => Independence::CrossSession,
-            _ => {
-                return Eligibility::Refused {
-                    reason: "same member, and the sessions are not both known to differ — \
-                             failing closed rather than assuming independence"
-                        .into(),
-                }
-            }
-        }
+        Independence::CrossMember
     };
     Eligibility::Eligible { independence }
 }
@@ -206,7 +207,6 @@ pub fn eligibility(p: &AppealParties<'_>) -> Eligibility {
 pub fn select_arbiter<'a>(
     appellant: &str,
     deny_adjudicator: Option<&str>,
-    appellant_session: Option<&str>,
     candidates: impl IntoIterator<Item = &'a str>,
 ) -> Option<(&'a str, Independence)> {
     let mut best: Option<(&'a str, Independence)> = None;
@@ -215,12 +215,6 @@ pub fn select_arbiter<'a>(
             appellant,
             deny_adjudicator,
             arbiter: cand,
-            // A candidate drawn from the registry has no live session here. That is
-            // exactly the "not both known to differ" case, so a same-member candidate
-            // fails closed inside `eligibility` rather than being admitted as
-            // `CrossSession` on an assumption. Cross-member candidates are unaffected.
-            arbiter_session: None,
-            appellant_session,
         };
         let Eligibility::Eligible { independence } = eligibility(&parties) else {
             continue;
@@ -260,13 +254,7 @@ mod tests {
     use super::*;
 
     fn parties<'a>(appellant: &'a str, arbiter: &'a str, gate: Option<&'a str>) -> AppealParties<'a> {
-        AppealParties {
-            appellant,
-            deny_adjudicator: gate,
-            arbiter,
-            arbiter_session: Some("sA"),
-            appellant_session: Some("sB"),
-        }
+        AppealParties { appellant, deny_adjudicator: gate, arbiter }
     }
 
     /// The constraint that is not a stub.
@@ -315,7 +303,7 @@ mod tests {
     #[test]
     fn dispatch_routes_to_the_most_independent_admissible_candidate() {
         let pool = ["claude-code", "claude-mesh-worker", "codex", "kimi-code"];
-        let picked = select_arbiter("claude-code", Some("hestia-gate"), Some("s1"), pool);
+        let picked = select_arbiter("claude-code", Some("hestia-gate"), pool);
         // codex and kimi are both cross-vendor; the tie breaks on id, reproducibly.
         assert_eq!(picked, Some(("codex", Independence::CrossVendor)));
     }
@@ -324,7 +312,7 @@ mod tests {
     #[test]
     fn dispatch_skips_the_gate_that_issued_the_deny() {
         let pool = ["codex", "kimi-code"];
-        let picked = select_arbiter("claude-code", Some("plugin-gate:codex"), Some("s1"), pool);
+        let picked = select_arbiter("claude-code", Some("plugin-gate:codex"), pool);
         assert_eq!(picked, Some(("kimi-code", Independence::CrossVendor)));
     }
 
@@ -332,7 +320,7 @@ mod tests {
     /// as anything other than "none" is how a self-arbitration gets laundered by plumbing.
     #[test]
     fn a_single_member_machine_has_no_arbiter_rather_than_a_default_one() {
-        assert_eq!(select_arbiter("codex", None, Some("s1"), ["codex"]), None);
+        assert_eq!(select_arbiter("codex", None, ["codex"]), None);
     }
 
     /// THE LIVE ONE. Regression for the first real appeal this surface handled, which was
@@ -343,7 +331,7 @@ mod tests {
         // The registry as it actually was: reasoning harnesses alongside plumbing.
         let registry = ["agent-inventory", "claude-code", "hestia-timer", "mesh-watcher"];
         assert_eq!(
-            select_arbiter("claude-code", None, Some("s1"), registry),
+            select_arbiter("claude-code", None, registry),
             None,
             "with no other harness present the honest answer is 'no arbiter' — anything else \
              routes the dispute into something that cannot rule, while reporting success"
@@ -351,7 +339,7 @@ mod tests {
         // And with a real peer present, the peer wins over the plumbing.
         let with_peer = ["agent-inventory", "claude-code", "kimi-code"];
         assert_eq!(
-            select_arbiter("claude-code", None, Some("s1"), with_peer),
+            select_arbiter("claude-code", None, with_peer),
             Some(("kimi-code", Independence::CrossVendor))
         );
     }
@@ -364,13 +352,24 @@ mod tests {
         assert!(matches!(e, Eligibility::Refused { .. }), "got {e:?}");
     }
 
-    /// Ambiguity fails closed. An absent session is how a self-arbitration would launder.
+    /// A second session of the same member is the same member.
+    ///
+    /// This test replaces `unknown_sessions_fail_closed_rather_than_assuming_independence`,
+    /// which claimed to exercise session comparison while passing both parties the SAME
+    /// plugin_id — so it exited at clause 1 and would have passed with the entire session
+    /// branch deleted (kimi-code, reviewing). The branch is gone now, and this asserts the
+    /// property that actually holds: identity is per MEMBER, and opening another terminal
+    /// does not manufacture an independent judge.
     #[test]
-    fn unknown_sessions_fail_closed_rather_than_assuming_independence() {
-        let e = eligibility(&AppealParties {
-            appellant: "codex", deny_adjudicator: None, arbiter: "codex",
-            arbiter_session: None, appellant_session: None,
-        });
-        assert!(matches!(e, Eligibility::Refused { .. }));
+    fn a_second_session_of_the_same_member_is_still_the_same_member() {
+        let e = eligibility(&parties("codex", "codex", None));
+        assert!(matches!(e, Eligibility::Refused { .. }),
+                "no session-level escape hatch may exist: got {e:?}");
+        // And the tier that used to promise one is gone from the type.
+        assert_eq!(
+            serde_json::to_string(&Independence::CrossMember).unwrap(),
+            "\"cross_member\"",
+            "the gradient is cross_vendor | cross_member — nothing weaker is admissible"
+        );
     }
 }

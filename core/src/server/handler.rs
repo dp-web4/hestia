@@ -1802,7 +1802,16 @@ fn redact_secrets(input: &str) -> String {
 // WHO. The derivation reads `deny_hash`, `plugin_id` and `role_lct` FLAT. So an appeal
 // filed through the only available surface landed one level too deep to be seen by the one
 // reader that cares, and the top of the conduct scale was unreachable through the surface
-// members actually have. Not one appeal exists on this chain.
+// members actually have.
+//
+// AND MEMBERS WERE ALREADY TRYING. An earlier version of this comment asserted "not one
+// appeal exists on this chain." That was inferred from the shape mismatch and never
+// checked, and it is false. Three appeals had been filed before this tool existed —
+// chain 62959, 62963 (2026-07-27T00:58) and 63408 (09:20) — every one of them nested,
+// every one of them inert. The record did not show an absence of disputes. It showed
+// disputes that nothing could read, which is worse: a member complied, took the trouble
+// to say the deny was wrong, and the scale recorded it as ordinary compliance because the
+// evidence was one level too deep. Verified against the chain, 2026-07-27.
 //
 // That is the defect class this whole day has been about — a reassuring state bit-identical
 // to the null state. "No appeals filed" reads as "nobody disputed a deny" and actually
@@ -1903,15 +1912,37 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
     // Who could rule on this? Resolved BEFORE the witness so the appeal entry carries its
     // own routing evidence (clause A: the record includes the evidence relied upon).
     let adjudicator = deny.event_data.get("adjudicator").and_then(Value::as_str);
-    let pool: Vec<String> =
-        s.member_registry.iter_sorted().into_iter().map(|(id, _)| id.clone()).collect();
-    // `session_uuid` is a Uuid, not a string; rendered once here so the eligibility check
-    // and the witnessed record agree on exactly the same text.
-    let appellant_session = appellant.session_uuid.map(|u| u.to_string());
+    // ROUTE THROUGH THE SAME IDENTITY TEST THE RULING PATH USES.
+    //
+    // `select_arbiter` compares plugin_id STRINGS. `tool_arbitrate_appeal` additionally
+    // refuses an arbiter whose member LCT equals the appellant's, because two plugin_ids can
+    // be one entity — codex acting as `codex` while its gate witnessed as `codex-cli` is the
+    // measured case on this fleet. Filtering only downstream meant an appeal could route to
+    // the appellant's own alter ego: the receipt would say "routed to a not-same arbiter",
+    // and the designee would then be refused at ruling time. Bounded harm, since the appeal
+    // stays open for anyone else — but the routing evidence would overstate what routing
+    // established, which is the same shape as the `agent-inventory` misroute fixed one clause
+    // later in this file (kimi-code, reviewing).
+    let appellant_lct = s.member_lct(&appellant.plugin_id);
+    let pool: Vec<String> = s
+        .member_registry
+        .iter_sorted()
+        .into_iter()
+        .map(|(id, _)| id.clone())
+        .filter(|id| {
+            // Only drop a candidate PROVEN to be the same entity. member_lct fails closed to
+            // None for synthetic ids, and select_arbiter refuses unrecognised reasoners
+            // separately — an unmappable candidate must not be silently dropped here as if
+            // identity had been established.
+            match (&appellant_lct, s.member_lct(id)) {
+                (Some(a), Some(b)) => a != &b,
+                _ => true,
+            }
+        })
+        .collect();
     let picked = crate::arbiter::select_arbiter(
         &appellant.plugin_id,
         adjudicator,
-        appellant_session.as_deref(),
         pool.iter().map(String::as_str),
     )
     .map(|(id, ind)| (id.to_string(), ind));
@@ -2015,7 +2046,6 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         ));
     };
 
-    let arbiter_session = arbiter.session_uuid.map(|u| u.to_string());
     let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
     let Some(appeal) = window.iter().find(|e| {
         e.event_type == "appeal"
@@ -2037,7 +2067,6 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         .get("role_lct")
         .and_then(Value::as_str)
         .unwrap_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE);
-    let appellant_session = appeal.event_data.get("session_id").and_then(Value::as_str);
     let deny_adjudicator = appeal.event_data.get("about_adjudicator").and_then(Value::as_str);
 
     // NOT-SAME, enforced server-side. A client-side check would be advisory — the whole
@@ -2047,8 +2076,6 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         appellant,
         deny_adjudicator,
         arbiter: &arbiter.plugin_id,
-        arbiter_session: arbiter_session.as_deref(),
-        appellant_session,
     };
     // Instance-level identity check too, mirroring `tool_witness_adjudication`: two
     // plugin_ids that resolve to the same member LCT are the same entity wearing two names,
@@ -5967,8 +5994,32 @@ mod appeal_tests {
     }
 
     /// Seat a session and return its id.
+    ///
+    /// The session id is DERIVED, not random. These fixtures used `Uuid::new_v4()`, and
+    /// `derivation::is_probe` excluded any session whose id contained "e2e" — three hex
+    /// digits, so ~0.73% of random UUIDs carried it and the deny silently vanished from
+    /// conduct, leaving `evidence[0]` to panic on an empty vector. One full-suite run in
+    /// ~140 failed that way; I saw it, could not reproduce it, and wrote it off as an
+    /// unidentified flake. kimi-code found it from the other end while reviewing.
+    /// A deterministic id removes the lottery; the reader-side fix (delimited markers)
+    /// removes the bug.
     async fn seat(state: &SharedState, plugin_id: &str) -> Uuid {
-        let sid = Uuid::new_v4();
+        // Deterministic from the plugin_id: stable across runs, and provably free of
+        // any probe marker (asserted below, so a future edit cannot silently reintroduce
+        // the lottery).
+        let sid = Uuid::from_bytes({
+            let mut b = [0u8; 16];
+            for (i, c) in plugin_id.bytes().take(16).enumerate() {
+                b[i] = c;
+            }
+            b
+        });
+        debug_assert!(
+            !["test", "probe", "verify", "e2e", "debug"]
+                .iter()
+                .any(|m| sid.to_string().contains(m)),
+            "fixture session id must not look like a probe: {sid}"
+        );
         let mut s = state.lock().await;
         s.sessions.insert(
             sid,

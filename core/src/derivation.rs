@@ -191,10 +191,43 @@ pub fn derive(
     // e2e tests etc.) generate denies that are conduct of the TESTER, not the
     // member. Excluded by explicit marker; the exclusion is disclosed in the
     // formula text so a receipt reader knows the rule.
+    //
+    // "e2e" IS A VALID HEX STRING, AND THIS SILENTLY ATE REAL CONDUCT.
+    //
+    // The markers were matched as bare substrings against the whole session_id. Four of them
+    // cannot occur in a hex UUID. `e2e` can — every character is a hex digit — so any real
+    // session whose v4 UUID happened to contain that trigram had ALL of its governance
+    // conduct dropped from the measurement, silently, at roughly 30/4096 ≈ 0.73% of sessions.
+    // Nothing reported the exclusion; the member simply had less evidence than it earned, and
+    // a member with too few observations reads as unmeasured rather than as well-behaved.
+    //
+    // Found by kimi-code reviewing this PR (2026-07-27), from the other end: the new appeal
+    // tests seat fixtures with `Uuid::new_v4()` session ids, so each test run drew a lottery
+    // ticket and one full-suite run in ~140 failed with an empty evidence vector. I had seen
+    // that failure, failed to reproduce it, and recorded it as "an unidentified flake" — a
+    // 0.73% probabilistic bug is exactly the kind that gets written off as noise, which is
+    // why the write-off was worth naming rather than quietly dropping.
+    //
+    // The fix is to require the marker to be DELIMITED. Probe sessions carry human-written
+    // ids ("gate-e2e-3", "probe_2026"); a random UUID does not put a marker next to a
+    // separator except by a far smaller coincidence. Fails toward MEASURING: an unrecognised
+    // shape now counts as real conduct, because wrongly excluding a member's evidence is the
+    // error that hides, and wrongly including a probe's is the error that shows up as a
+    // surprising score somebody can appeal.
     let is_probe = |e: &ChainEntry| {
+        const MARKERS: [&str; 5] = ["test", "probe", "verify", "e2e", "debug"];
         entry_str(e, "session_id").is_some_and(|sid| {
-            sid.contains("test") || sid.contains("probe") || sid.contains("verify")
-                || sid.contains("e2e") || sid.contains("debug")
+            let lower = sid.to_ascii_lowercase();
+            let bytes = lower.as_bytes();
+            let delim = |b: u8| !b.is_ascii_alphanumeric();
+            MARKERS.iter().any(|m| {
+                lower.match_indices(m).any(|(i, _)| {
+                    let before_ok = i == 0 || delim(bytes[i - 1]);
+                    let after = i + m.len();
+                    let after_ok = after == bytes.len() || delim(bytes[after]);
+                    before_ok && after_ok
+                })
+            })
         })
     };
     // A deny that carries NO VERDICT is not evidence about the member.
@@ -946,6 +979,40 @@ mod recast_tests {
     fn a_much_later_command_is_not_a_recast() {
         let w = vec![deny(1, 0, DENIED), ok(2, RETRY_WINDOW_MINUTES + 5, RECAST)];
         assert!(score(&w) > 0.5, "outside the window, compliance");
+    }
+
+    /// A real member whose UUID happens to contain "e2e" is not a probe.
+    ///
+    /// `is_probe` matched markers as bare substrings, and "e2e" is valid hex — so roughly
+    /// 0.73% of genuine v4 session ids had ALL their governance conduct dropped from the
+    /// measurement with no report. A member silently short of evidence reads as unmeasured
+    /// rather than as well-behaved, which is the failure this whole file keeps guarding
+    /// against, arriving inside the guard itself.
+    #[test]
+    fn a_real_uuid_containing_e2e_is_measured_and_a_delimited_marker_is_not() {
+        // A genuine v4 UUID that carries the trigram. Nothing about it says "probe".
+        let real = "9e2e4c31-11d2-4a55-9f0c-7b3a1d5e8f42";
+        let w = vec![
+            ev(1, 0, "policy_decision", json!({
+                "decision":"deny","enforced":true,"plugin_id":"m","role_lct":ROLE,
+                "session_id":real,"tool_name":"Bash","payload_sha256":"h",
+                "target":"","attempted":DENIED})),
+            ok(2, 1, "git status"),
+        ];
+        let d = derive("m", ROLE, &w);
+        assert!(d.temperament.score.is_some(),
+                "a real session's conduct was dropped because its UUID contains hex 'e2e'");
+        assert!(!d.temperament.evidence.is_empty());
+
+        // A genuinely marked probe session is still excluded.
+        let probe = vec![
+            ev(1, 0, "policy_decision", json!({
+                "decision":"deny","enforced":true,"plugin_id":"m","role_lct":ROLE,
+                "session_id":"gate-e2e-3","tool_name":"Bash","payload_sha256":"h",
+                "target":"","attempted":DENIED})),
+        ];
+        assert!(derive("m", ROLE, &probe).temperament.score.is_none(),
+                "a delimited marker must still exclude the tester's own conduct");
     }
 
     /// Denies with no `attempted` recorded must not be guessed at. Older entries and gates
