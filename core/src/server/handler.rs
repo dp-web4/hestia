@@ -2007,12 +2007,35 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
             }
         })
         .collect();
+    // Reachability is resolved per candidate and fed to routing — an arbiter that cannot
+    // read the appeal supplies no independence in practice, so it must not win a tie.
+    let with_liveness: Vec<(&str, crate::arbiter::Liveness)> = pool
+        .iter()
+        .map(|id| {
+            let live = match recipient_liveness(&s.inbox_store, id).0 {
+                "live" => crate::arbiter::Liveness::Live,
+                "dormant" => crate::arbiter::Liveness::Dormant,
+                _ => crate::arbiter::Liveness::Unknown,
+            };
+            (id.as_str(), live)
+        })
+        .collect();
     let picked = crate::arbiter::select_arbiter(
         &appellant.plugin_id,
         adjudicator,
-        pool.iter().map(String::as_str),
+        with_liveness.into_iter(),
     )
-    .map(|(id, ind)| (id.to_string(), ind));
+    .map(|sel| {
+        (
+            sel.arbiter.to_string(),
+            sel.independence,
+            sel.liveness,
+            sel.passed_over.map(|p| {
+                json!({"arbiter": p.arbiter, "independence": p.independence,
+                       "liveness": p.liveness})
+            }),
+        )
+    });
 
     let entry = s.append_chain(
         "appeal",
@@ -2029,8 +2052,12 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
             // entry alone rather than needing the deny to still be in ITS window.
             "about_attempted": deny.event_data.get("attempted").cloned().unwrap_or(Value::Null),
             "about_adjudicator": adjudicator,
-            "routed_to": picked.as_ref().map(|(id, _)| id.clone()),
-            "routed_independence": picked.as_ref().map(|(_, i)| i),
+            "routed_to": picked.as_ref().map(|(id, ..)| id.clone()),
+            "routed_independence": picked.as_ref().map(|(_, i, ..)| i),
+            "routed_liveness": picked.as_ref().map(|(_, _, l, _)| l),
+            // A more independent arbiter that routing skipped for being unreachable. The
+            // trade is on the record so a reader weighs the ruling with the routing in view.
+            "routing_passed_over": picked.as_ref().and_then(|(.., p)| p.clone()),
         }),
     )?;
 
@@ -2039,7 +2066,7 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
     // conduct being scored, and losing the record because a mailbox was full would punish
     // the member for the mesh's state.
     let mut dispatched = None;
-    if let Some((arb, ind)) = &picked {
+    if let Some((arb, ind, live, _)) = &picked {
         let pointer = format!("hestia://appeal/{deny_hash}");
         match s.inbox_store.enqueue_member(
             arb,
@@ -2050,7 +2077,10 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
             &entry.hash,
             None,
         ) {
-            Ok(id) => dispatched = Some(json!({"queued_id": id, "arbiter": arb, "independence": ind})),
+            Ok(id) => {
+                dispatched = Some(json!({"queued_id": id, "arbiter": arb,
+                                         "independence": ind, "liveness": live}))
+            }
             Err(e) => {
                 tracing::warn!(arbiter = %arb, error = %e, "appeal filed but dispatch failed");
             }
