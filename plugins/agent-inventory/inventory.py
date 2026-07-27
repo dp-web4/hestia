@@ -936,6 +936,22 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
             is_hestia = owned_by_hestia(hook["command"], targets)
             for target in targets:
                 exists = Path(target).exists()
+                # EMIT THE TARGET, not only a finding about it (thor, hestia#52 review).
+                # This loop already stats every hook target on the machine; it was the only
+                # place that knew the real set, and it kept the knowledge to itself. The
+                # gate-integrity check then derived coverage from four hardcoded $HOME
+                # paths, so on a machine whose gates live elsewhere it hashed NOTHING and
+                # reported VERIFIED — a clean verdict over an empty denominator, which is
+                # the inversion these surfaces exist to prevent.
+                rec.setdefault("hook_targets", []).append({
+                    "path": target,
+                    "event": hook.get("event"),
+                    "exists": exists,
+                    "is_gate": hook["event"] in declared.get("gate", []),
+                    "owned_by_hestia": is_hestia,
+                    "config": str(cfg),
+                    "scope": scope,
+                })
                 # Name the exact file, not just the scope: CBP has this same dead gate in
                 # two different project configs, and "[project: settings.local.json]"
                 # twice reads as one duplicated finding rather than two places to fix.

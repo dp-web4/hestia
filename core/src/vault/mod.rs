@@ -13,6 +13,7 @@ pub use document::{Document, ItemRef, Protection};
 pub use entry::VaultEntry;
 pub use policy_state::{OperatorIdentity, PolicyOverride, VaultPolicyState};
 pub mod policy_lists;
+pub mod gate_integrity;
 pub mod policy_state;
 pub use storage::{VaultData, default_hestia_home, vault_path};
 
@@ -137,6 +138,19 @@ impl Vault {
     /// responsible for having established operator authority BEFORE reaching here.
     pub fn set_policy_lists(&mut self, lists: policy_lists::PolicyLists) -> Result<()> {
         self.data.policy_lists = lists;
+        self.save()
+    }
+
+    /// Ratified gate hashes. Read freely; only the operator surface may write them.
+    pub fn gate_expectations(&self) -> gate_integrity::GateExpectations {
+        self.data.gate_expectations.clone()
+    }
+
+    /// Ratify gate bytes as expected. OPERATOR-ONLY — the caller must have established
+    /// operator authority before reaching here, because ratifying an already-tampered gate
+    /// is precisely how an attacker would launder one.
+    pub fn set_gate_expectations(&mut self, e: gate_integrity::GateExpectations) -> Result<()> {
+        self.data.gate_expectations = e;
         self.save()
     }
 

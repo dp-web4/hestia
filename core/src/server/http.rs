@@ -242,6 +242,8 @@ pub async fn serve_with_callback(
         .route("/api/policy/rule/:rule_id", delete(policy_delete_rule))
         .route("/api/orchestrators/:id/connect", post(orchestrator_connect))
         .route("/api/agents", get(agents_inventory))
+        .route("/api/gates/verify", get(gates_verify))
+        .route("/api/gates/ratify", post(gates_ratify))
         .route("/api/agents/:id/ungovern", post(agent_ungovern))
         .route("/api/chain", get(chain_query))
         // OID4VCI issuance MINTS a presentation SIGNED WITH THE OWNER'S IDENTITY KEY — a consequential
@@ -1201,6 +1203,181 @@ async fn agent_ungovern(
             Json(serde_json::json!({"error": e.to_string()})),
         ),
     }
+}
+
+// --- Gate integrity ---
+
+/// The gate set, DISCOVERED rather than declared (thor, hestia#52 review).
+///
+/// This was four hardcoded `$HOME` paths filtered by `is_file()`, and every way that set
+/// could be wrong was silent: a path that is not there is dropped, and a dropped path is
+/// indistinguishable from a clean one. Thor measured the consequence on his own machine —
+/// `known_gate_paths()` discovered `[]`, `/api/gates/verify` returned `VERIFIED,
+/// findings: 0, gates: []`, while that same host had a configured, enabled PreToolUse gate
+/// resolving to a file that does not exist and therefore failing open.
+///
+/// `VERIFIED` over an empty denominator is the declaration-vs-evidence inversion these
+/// modules are about, one level up from where they look for it. `agents_inventory`, fifty
+/// lines below, already refuses exactly this move by returning UNKNOWN when it could not
+/// look; this had no such branch. It is also the SECOND time this blind spot has been
+/// reported against my code by the same reviewer — the first was `inventory.inspect()`
+/// reading only HOME while the precedence chain is user+project+local.
+///
+/// So coverage now comes from the inventory, which already stats every hook target on the
+/// machine across the full scope chain and simply kept the list to itself. One discovery
+/// path, measured once, consumed by both surfaces.
+fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
+    let inv = crate::server::agents::inventory().map_err(|e| e.to_string())?;
+    if inv.get("status").and_then(|v| v.as_str()) == Some("UNKNOWN") {
+        return Err(inv
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("inventory could not establish its scope")
+            .to_string());
+    }
+    let mut out = Vec::new();
+    for rec in inv.get("detail").and_then(|d| d.as_array()).into_iter().flatten() {
+        let agent = rec.get("agent").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+        for t in rec.get("hook_targets").and_then(|d| d.as_array()).into_iter().flatten() {
+            // Gate-role hooks only. An observe hook that vanishes loses evidence; a GATE
+            // that vanishes fails open, and that is what an integrity check is for.
+            if t.get("is_gate").and_then(|v| v.as_bool()) != Some(true) {
+                continue;
+            }
+            if let Some(p) = t.get("path").and_then(|v| v.as_str()) {
+                out.push((agent.clone(), p.to_string()));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// `GET /api/gates/verify` — hash every known gate and compare to the vault's ratified
+/// expectation. The DAEMON hashes the file; it never asks a gate about itself.
+async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
+    let s = state.lock().await;
+    let exp = s.vault.gate_expectations();
+    // An unmeasurable denominator is UNKNOWN, never VERIFIED.
+    let discovered = match discovered_gate_paths() {
+        Ok(d) => d,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "UNKNOWN",
+                    "reason": format!("gate set could not be established: {reason}"),
+                    "note": "Coverage is derived from the inventory's discovered hook \
+                             targets. Without it this check cannot tell 'no gates' from \
+                             'could not look', so it reports neither.",
+                })),
+            );
+        }
+    };
+    if discovered.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "UNKNOWN",
+                "reason": "no gate-role hooks discovered on this machine — that is either a \
+                           genuinely ungoverned host or a discovery failure, and this check \
+                           cannot tell them apart. VERIFIED over an empty set would assert \
+                           the safer of the two without evidence.",
+                "discovered": 0,
+            })),
+        );
+    }
+    let wired: Vec<String> = discovered.iter().map(|(_, f)| f.clone()).collect();
+    let verdicts = crate::vault::gate_integrity::verify(&exp, &wired);
+    let findings = verdicts.iter().filter(|v| v.is_finding()).count();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            // MODIFIED outranks everything: a rewritten gate is the live attack, where an
+            // unratified one is merely unexamined.
+            "status": if verdicts.iter().any(|v| matches!(v, crate::vault::gate_integrity::GateVerdict::Modified{..})) {
+                "MODIFIED"
+            } else if findings > 0 { "FINDINGS" } else { "VERIFIED" },
+            "findings": findings,
+            // The denominator, stated. A reader can now tell how many gates this verdict
+            // covers, which is the fact the previous version silently omitted.
+            "discovered": discovered.len(),
+            "coverage_source": "agent-inventory hook_targets (full scope chain), gate-role only",
+            "gates": verdicts,
+            "note": "Tamper-EVIDENT, not tamper-proof. The agent can rewrite its gate; it \
+                     cannot rewrite this expectation, which lives in the operator-gated vault. \
+                     See hestia#49 for what would make a rewritten gate's verdicts stop counting.",
+        })),
+    )
+}
+
+/// `POST /api/gates/ratify` — record the CURRENT bytes of every known gate as expected.
+///
+/// surface: gates_ratify   act: define what a correct gate is
+/// S: high/reversible [construct: previous expectations are replaced, not merged; the
+///    chain keeps the prior ratification]
+/// R: pass [construct: behind `operator_gate` with the rest of /api/*]
+/// W: pass [construct: operator_gate proves an Ed25519 challenge-signed session]
+/// O: pass [construct: hashes computed before the vault write]
+/// A: pass [construct: append_chain("gate_ratified") carries every path and digest]
+/// V: present [construct: refuses when a gate is unreadable — ratifying what you could
+///    not read would launder exactly the tampering this exists to catch]
+/// verdict: PASS
+///
+/// The dangerous direction is ratifying an ALREADY-tampered gate, which would bless the
+/// attack. Nothing here can tell a good build from a bad one; the operator must ratify
+/// from a state they believe correct. The chain entry is what makes that judgement
+/// reviewable afterwards.
+async fn gates_ratify(State(state): State<SharedState>) -> impl IntoResponse {
+    use crate::vault::gate_integrity::{GateExpectation, GateExpectations};
+    let mut s = state.lock().await;
+    let mut exp: GateExpectations = GateExpectations::new();
+    let mut recorded = Vec::new();
+    // Ratify the DISCOVERED set, for the same reason verify checks it: ratifying a
+    // hardcoded list would bless whichever gates that list happened to name and leave the
+    // rest unratified-and-unmentioned.
+    let discovered = match discovered_gate_paths() {
+        Ok(d) if !d.is_empty() => d,
+        Ok(_) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": "refusing to ratify: no gate-role hooks discovered. Ratifying an \
+                          empty set would record 'this machine's gates are correct' on the \
+                          basis of having found none.",
+            }))).into_response();
+        }
+        Err(reason) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": format!("refusing to ratify: gate set could not be established ({reason})"),
+            }))).into_response();
+        }
+    };
+    for (plugin_id, path) in discovered {
+        match crate::vault::gate_integrity::hash_file(std::path::Path::new(&path)) {
+            Ok(sha256) => {
+                recorded.push(serde_json::json!({"path": path, "plugin_id": plugin_id, "sha256": sha256}));
+                exp.insert(path, GateExpectation {
+                    sha256,
+                    plugin_id,
+                    ratified_at: chrono::Utc::now(),
+                    note: "operator ratification".into(),
+                });
+            }
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": format!("refusing to ratify: {path} unreadable ({e}). \
+                                      Ratifying a gate you could not read would launder the \
+                                      tampering this is meant to catch."),
+                }))).into_response();
+            }
+        }
+    }
+    if let Err(e) = s.vault.set_gate_expectations(exp) {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()}))).into_response();
+    }
+    let _ = s.append_chain("gate_ratified", serde_json::json!({"gates": recorded}));
+    (StatusCode::OK, Json(serde_json::json!({"ok": true, "ratified": recorded}))).into_response()
 }
 
 // --- Chain endpoints ---

@@ -56,6 +56,12 @@ pub struct VaultData {
     /// written before lists existed simply has none, rather than failing to decrypt.
     #[serde(default)]
     pub policy_lists: super::policy_lists::PolicyLists,
+    /// Ratified SHA-256 of every gate file, so a rewritten gate is detectable. Lives here
+    /// because the vault is the one store the governed party cannot write: the agent owns
+    /// the gate `.py`, the operator owns the expectation about it. `#[serde(default)]` so
+    /// an existing vault opens unchanged.
+    #[serde(default)]
+    pub gate_expectations: super::gate_integrity::GateExpectations,
 }
 
 impl Default for VaultData {
@@ -67,6 +73,7 @@ impl Default for VaultData {
             policy: super::policy_state::VaultPolicyState::default(),
             documents: Vec::new(),
             policy_lists: Default::default(),
+            gate_expectations: Default::default(),
         }
     }
 }
