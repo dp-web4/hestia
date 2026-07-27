@@ -528,15 +528,27 @@ impl ServerState {
     ///
     /// Returns the matches (0, 1, or several on an ambiguous prefix) and lets the
     /// caller report which case it is. `Err` means the pointer was malformed.
+    /// Ambiguity is reported, not resolved — but the report must not lie about
+    /// its own scale, so this cap bounds the ENTRIES LISTED only; the count
+    /// beside them comes from `chain_prefix_match_count` and is uncapped.
+    pub const CHAIN_POINTER_LIST_CAP: u64 = 8;
+
     pub fn chain_by_pointer(&self, hash_or_prefix: &str) -> Result<Vec<ChainEntry>> {
-        if hash_or_prefix.len() == 64 {
-            return Ok(self
-                .chain_store
-                .read_by_hash(hash_or_prefix)?
-                .into_iter()
-                .collect());
+        // Validate BEFORE branching on length. The full-hash arm is an equality
+        // match that would happily return "no such entry" for a 64-character
+        // non-hash, which is the malformed-reads-as-absent conflation this
+        // resolver was written to remove.
+        let ptr = crate::storage::chain::validate_hash_pointer(hash_or_prefix)?;
+        if ptr.len() == 64 {
+            return Ok(self.chain_store.read_by_hash(&ptr)?.into_iter().collect());
         }
-        self.chain_store.read_by_hash_prefix(hash_or_prefix, 8)
+        self.chain_store
+            .read_by_hash_prefix(&ptr, Self::CHAIN_POINTER_LIST_CAP)
+    }
+
+    /// True number of entries a prefix matches, for the ambiguity report only.
+    pub fn chain_prefix_match_count(&self, prefix: &str) -> Result<u64> {
+        self.chain_store.count_by_hash_prefix(prefix)
     }
 
     /// Apply an outcome to the trust state for a plugin.

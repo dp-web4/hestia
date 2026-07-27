@@ -3580,14 +3580,29 @@ fn resolve_chain_pointer(
             }
             json!({"pointer": ptr, "resolvedFrom": if ptr.len() == 64 { "hash" } else { "prefix" }, "entry": chain_entry_json(e)})
         }
-        _ => hestia_error_envelope(
+        _ => {
+            // `matches.len()` is capped, so reporting it as THE count understates
+            // any collision wider than the cap — and understates it by a constant,
+            // so a member lengthening the prefix sees "8" then "8" again and
+            // cannot tell it is converging. The listed entries stay capped; the
+            // count does not.
+            let shown = matches.len() as u64;
+            let total = s.chain_prefix_match_count(ptr).unwrap_or(shown).max(shown);
+            hestia_error_envelope(
             "hestia.chain_pointer_ambiguous",
             &format!(
-                "'{ptr}' matches {} chain entries — use more of the hash",
-                matches.len()
+                "'{ptr}' matches {total} chain entries{} — use more of the hash",
+                if total > shown {
+                    format!(", {shown} listed")
+                } else {
+                    String::new()
+                }
             ),
             Some(json!({
                 "pointer": ptr,
+                "matchCount": total,
+                "matchesListed": shown,
+                "matchListCap": super::state::ServerState::CHAIN_POINTER_LIST_CAP,
                 "matches": matches.iter().map(|e| json!({
                     "hash": e.hash,
                     "eventType": e.event_type,
@@ -3595,7 +3610,8 @@ fn resolve_chain_pointer(
                     "chainPosition": e.chain_position,
                 })).collect::<Vec<_>>(),
             })),
-        ),
+        )
+        }
     }
 }
 
@@ -6595,5 +6611,105 @@ mod appeal_tests {
         let any = resolve_chain_pointer(&s, &appeal_hash, None);
         assert_eq!(any["entry"]["eventType"].as_str(), Some("appeal"), "{any}");
         assert_ne!(hash, appeal_hash, "fixture sanity: ruling and appeal are distinct entries");
+    }
+
+    /// Kimi's second nit on #60 (mesh notice 181). The malformed check lived in the PREFIX
+    /// path only, so a full-length pointer skipped it: `read_by_hash` is an equality match,
+    /// 64 characters of non-hex matched no row, and the resolver said **not found** — the
+    /// exact malformed-reads-as-absent conflation it was written to remove, reappearing
+    /// inside the fix at one specific length.
+    ///
+    /// The case half is the same seam from the other side: SQLite's `LIKE` is
+    /// ASCII-case-insensitive and `=` is not, so an UPPERCASE abbreviation resolved while
+    /// the UPPERCASE full hash of that same entry reported not-found.
+    #[tokio::test]
+    async fn a_full_length_pointer_is_validated_like_an_abbreviated_one() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let hash = ruled_appeal(&state).await;
+        let s = state.lock().await;
+
+        // 64 chars, not hex. Before the fix: chain_pointer_not_found.
+        let long_garbage = resolve_chain_pointer(&s, &"z".repeat(64), None);
+        assert_eq!(
+            long_garbage["_hestia_error"]["code"].as_str(),
+            Some("hestia.chain_pointer_malformed"),
+            "a 64-char non-hex pointer is garbled input, not a missing entry: {long_garbage}"
+        );
+
+        // Longer than any chain hash: also malformed, not absent.
+        let too_long = resolve_chain_pointer(&s, &"a".repeat(65), None);
+        assert_eq!(
+            too_long["_hestia_error"]["code"].as_str(),
+            Some("hestia.chain_pointer_malformed"),
+            "{too_long}"
+        );
+
+        // And the length that DOES exist still resolves, so the guard did not overshoot.
+        let good = resolve_chain_pointer(&s, &hash, None);
+        assert_eq!(good["entry"]["hash"].as_str(), Some(hash.as_str()), "{good}");
+
+        // Uppercase, both lengths, same entry — the two arms must agree.
+        let upper_full = resolve_chain_pointer(&s, &hash.to_ascii_uppercase(), None);
+        assert_eq!(
+            upper_full["entry"]["hash"].as_str(),
+            Some(hash.as_str()),
+            "an uppercase full hash resolved as not-found while its own prefix resolved: \
+             {upper_full}"
+        );
+        let upper_prefix = resolve_chain_pointer(&s, &hash[..8].to_ascii_uppercase(), None);
+        assert_eq!(upper_prefix["entry"]["hash"].as_str(), Some(hash.as_str()), "{upper_prefix}");
+    }
+
+    /// Kimi's first nit on #60. The ambiguity report counted the entries it FETCHED, and the
+    /// fetch is capped at 8 — so every collision wider than the cap reported "8", and a
+    /// member lengthening the prefix saw 8, then 8 again, with no way to tell it was
+    /// converging. The listed entries stay capped; the count must not be.
+    #[tokio::test]
+    async fn the_ambiguous_count_is_the_true_count_not_the_capped_one() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let s = state.lock().await;
+
+        // Enough entries that some single hex character collides well past the cap of 8.
+        // 200 entries over 16 first-character buckets: ~12.5 expected in each, and the
+        // largest bucket falling under 9 is not a realistic outcome.
+        for i in 0..200 {
+            s.append_chain("outcome", json!({"filler": i})).unwrap();
+        }
+        let all = s.recent_chain(1000);
+        let mut counts: std::collections::HashMap<char, u64> = std::collections::HashMap::new();
+        for e in &all {
+            *counts.entry(e.hash.chars().next().unwrap()).or_default() += 1;
+        }
+        let (&ch, &true_count) = counts.iter().max_by_key(|(_, n)| **n).unwrap();
+        let cap = crate::server::ServerState::CHAIN_POINTER_LIST_CAP;
+        assert!(
+            true_count > cap,
+            "precondition: the widest bucket ({true_count}) must exceed the cap ({cap}), or \
+             this test cannot see the saturation it exists to catch"
+        );
+
+        let amb = resolve_chain_pointer(&s, &ch.to_string(), None);
+        let data = &amb["_hestia_error"]["data"];
+        assert_eq!(
+            amb["_hestia_error"]["code"].as_str(),
+            Some("hestia.chain_pointer_ambiguous"),
+            "{amb}"
+        );
+        assert_eq!(
+            data["matchCount"].as_u64(),
+            Some(true_count),
+            "the count must be the true number of matches, not the number fetched: {amb}"
+        );
+        assert_eq!(data["matchesListed"].as_u64(), Some(cap), "{amb}");
+        assert_eq!(data["matches"].as_array().map(Vec::len), Some(cap as usize), "{amb}");
+        assert!(
+            amb["_hestia_error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("matches {true_count} chain entries")),
+            "the message a member actually reads must carry the true count too: {amb}"
+        );
     }
 }
