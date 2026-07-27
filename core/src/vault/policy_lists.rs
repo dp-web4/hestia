@@ -9,9 +9,20 @@
 //!
 //! WHY LISTS RATHER THAN MORE RULES. Rules live in code and presets; changing one is a
 //! deploy. A list is data an operator edits, binds to whichever agents it should govern,
-//! and which composes into that session's law at launch. The same policy engine enforces
-//! it — this is about who can author law and how legible it is, not about a second
-//! enforcement path.
+//! and which composes into that session's PUBLISHED law.
+//!
+//! ⚠ NOT YET ENFORCED — and the first version of this doc said otherwise. It claimed "the
+//! same policy engine enforces it", which was false as shipped: nothing consumed these
+//! lists except vault persistence and publication, so an operator-authored DENY list read
+//! as law while permitting the act (kimi, PR #50 review, finding 3). That is precisely the
+//! reassuring-surface-that-does-nothing defect this codebase spent the day cataloguing,
+//! committed in the PR about publishing law honestly.
+//!
+//! What ships here is the SCHEMA, the storage, the binding model and the permission model —
+//! persisted and published, with every published entry carrying `enforced: false`. Wiring
+//! list matching into the policy fold, with allow/deny precedence tests, is the next
+//! change. Until then a list documents intent; it does not bind behaviour, and nothing in
+//! the surface may imply that it does.
 //!
 //! THE FOUR VERBS ARE FOUR, NOT TWO. It is tempting to collapse these into read/write, and
 //! the collapse is where authorization bugs live:
