@@ -47,6 +47,17 @@ Two obligations follow, and both have been violated once already:
    is what cannot be forged. Allowlisting the name would admit anything an impersonator sent;
    allowlisting the pair admits exactly what only the daemon can produce.
 
+**The pair rule is a pattern, not a one-off, and it has a condition** (Kimi, notice 196).
+It protects exactly the kinds that are unforgeable **by construction** — those absent from
+`MEMBER_NOTICE_KINDS`, so that `tool_member_notify` refuses them and every other minting
+path hardcodes its own kind. A future daemon-emitted kind inherits the protection only if
+it is excluded the same way. Add a daemon kind *to* `MEMBER_NOTICE_KINDS` for convenience
+and its pair becomes as claimable as its name, silently, with the rendering allowlists
+still reading as safe. So: **before pairing a new kind into a rendering allowlist, check
+that no member-reachable surface can mint it** — the three non-test `enqueue_member` call
+sites in `handler.rs` are the whole surface to check (appeal: hardcoded `review_request`;
+`tool_member_notify`: validated against `MEMBER_NOTICE_KINDS`; retire: the daemon's own).
+
 This section exists because the code comment introducing the kind said "Documented in
 `plugins/member-mesh/KINDS.md`" when it was not — and the receiving side, which is the side
 obligation 1 binds, is the side that reads this file. In the gap, all three fire templates
