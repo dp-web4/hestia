@@ -228,6 +228,27 @@ mod tests {
         assert!(listed.contains(&"bob".to_string()));
     }
 
+    /// NOTE ON THE ASSERTION BELOW — it used to be `first() != b'{'`, and that
+    /// made this test fail about 1 run in 256.
+    ///
+    /// A sealed blob is `nonce(12) || ciphertext` with no magic header, and the
+    /// nonce is random, so a correctly sealed file starts with `0x7b` by chance
+    /// 1/256 of the time. The test was using *starts with a brace* as a proxy for
+    /// *is plaintext* — which is the exact sniff heuristic
+    /// `sealed_blob_starting_with_brace_byte_still_loads` (directly below) exists
+    /// to prove wrong. The bug had been removed from the code and left standing in
+    /// the test that guards it, so the suite carried a rare red that meant nothing
+    /// and, worse, would have been read as a real regression by whoever hit it.
+    ///
+    /// Caught 2026-07-27 on a full-suite run for #60 — a 366/1 that passed on
+    /// rerun. A flake that clears on rerun is the same conflation this codebase
+    /// keeps finding: *broken* and *unlucky* rendered identically, and rerun-until-
+    /// green is how a real intermittent bug gets trained into background noise.
+    ///
+    /// Asserting the round-trip instead is both stronger and deterministic: the
+    /// bytes on disk must not parse as trust JSON (they are ciphertext), and the
+    /// value must come back through the decrypt path with the update applied.
+
     #[test]
     fn legacy_plaintext_is_read_then_resealed() {
         let dir = TempDir::new().unwrap();
@@ -235,16 +256,27 @@ mod tests {
         // Write a plaintext trust file as an old install would.
         let t = EntityTrust::new("plugin:legacy");
         let f = store.entity_file("plugin:legacy");
-        std::fs::write(&f, serde_json::to_vec_pretty(&t).unwrap()).unwrap();
-        assert_eq!(std::fs::read(&f).unwrap().first(), Some(&b'{'));
+        let plaintext = serde_json::to_vec_pretty(&t).unwrap();
+        std::fs::write(&f, &plaintext).unwrap();
+        assert!(
+            serde_json::from_slice::<EntityTrust>(&std::fs::read(&f).unwrap()).is_ok(),
+            "precondition: the file starts out as parseable plaintext"
+        );
 
         // get() reads the plaintext; update() re-seals it.
         assert_eq!(store.get("legacy").unwrap().action_count, 0);
         store.update("legacy", true, 0.5).unwrap();
-        assert_ne!(
-            std::fs::read(&f).unwrap().first(),
-            Some(&b'{'),
-            "should be re-sealed after write"
+
+        let raw = std::fs::read(&f).unwrap();
+        assert_ne!(raw, plaintext, "the file must have been rewritten");
+        assert!(
+            serde_json::from_slice::<EntityTrust>(&raw).is_err(),
+            "should be re-sealed after write — the bytes on disk still parse as trust JSON"
+        );
+        assert_eq!(
+            store.get("legacy").unwrap().action_count,
+            1,
+            "and the resealed file must still decrypt back to the updated value"
         );
     }
 
