@@ -69,6 +69,40 @@ So rule 3 gets a fourth clause, and it is the one that governs this file's desig
    emitted next to the evidence it was computed from (`scope` in the report), so a reader
    can falsify it instead of trusting it.
 
+And rule 4 has a time dimension, which the cut that added clause 4 promptly fell into
+(cbp reviewing thor, 2026-07-26, thread coordination-1785090931). Widening the scan from
+depth 1 to depth 3 took the run from 1.15s to **4m22s on CBP** — 3143 directories on a 9p
+mount, `Path.resolve()` on every one of them, the whole walk repeated once per agent —
+against a SessionStart hook budget of 10s. So:
+
+5. A CHECK THAT CANNOT FINISH INSIDE ITS TRIGGER'S TIMEOUT HAS NOT DEGRADED TO `UNKNOWN`.
+   IT HAS DEGRADED TO SILENCE, WHICH READS AS CLEAN. The budget is part of the scope.
+
+A SIGKILLed hook emits nothing, and nothing reads as fine — so the previous cut fixed
+"answers UNKNOWN on every machine that is not CBP" by replacing it with "answers nothing
+on CBP." Same error, next dimension over, which is once again the error this file exists
+to catch. The remedy is in `scan_projects()` and it is structural, not a benchmark: the
+walk carries an explicit deadline and reports `scan_truncated` + `UNKNOWN` when it fires.
+
+And clause 5 has a second half the deadline alone does not satisfy, which the next review
+found (cbp, 2026-07-26, same thread). A budget that fires on EVERY run has not bounded the
+scan, it has redefined it — and because the walk is level-order, the part it gives up is
+never a random sample. It is always the deepest level, which is exactly the level that was
+added to find the gate nobody could see. At the shipped 5s default CBP truncated 3/3 and
+lost both of its depth-3 scopes, honestly and reproducibly. So:
+
+5b. AN HONEST REPORT OF A SYSTEMATICALLY BIASED SAMPLE IS STILL CLAUSE 5's FAILURE. The
+    budget has to fit the slowest machine measured, and the trigger's timeout has to be
+    DERIVED from it rather than written down beside it — two numbers in two files kept in
+    step by prose is the mitigation rule 3 refuses. See PROJECT_SCAN_BUDGET_S,
+    SESSION_HOOK_TIMEOUT_S, and `hook_timeout_finding()`, which is this check run against
+    its own trigger.
+
+One justification did not survive contact with the measurement, and is corrected there
+rather than quietly dropped: the deadline was argued for on "warm is not cold," and cold
+turned out to be ~1.1x. Contention costs more than cold does. The deadline is still right
+— an unbounded 9p stall is real — but for a different reason than the one it shipped with.
+
 Two consequences worth stating plainly, because they are what changed:
 
   * DEAD-TARGET DETECTION IS NOT HESTIA-SCOPED. A gate that resolves to nothing fails open
@@ -89,11 +123,14 @@ has become a gate. Findings go to stdout as JSON and (unless --no-witness) to th
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import re
 import shlex
+import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib import request as urlrequest
 
@@ -102,7 +139,42 @@ try:
 except ModuleNotFoundError:  # <3.11 — TOML harnesses degrade to UNKNOWN, not to clean
     tomllib = None
 
-WORKSPACE = Path(os.environ.get("HESTIA_WORKSPACE", "/mnt/c/exe/projects/ai-agents"))
+DEFAULT_WORKSPACE = "/mnt/c/exe/projects/ai-agents"
+
+
+def resolve_workspace(argv: list[str]) -> tuple[Path, str]:
+    """Where the workspace came from, as well as what it is.
+
+    SCOPE MUST SURVIVE THE TRIGGER (thor, 2026-07-26). `install.sh` wires three triggers
+    and baked the workspace into exactly ONE of them — `Environment=` in the timer unit.
+    A systemd unit's environment is not the shell's and not the hook's, so on Thor the
+    hourly timer read `/home/dp/ai-workspace` while `hestia-agent-inventory --brief` from
+    a terminal AND the SessionStart hook both fell back to the compiled-in CBP default and
+    returned:
+
+        UNKNOWN | agent-atlas registry not readable at /mnt/c/exe/projects/ai-agents/...
+
+    Two of the three triggers were inert on every machine that is not CBP. This degraded
+    honestly — rule 4 doing its job, UNKNOWN and not OK — but an on-demand check that
+    cannot answer is not much better than one that answers wrong, and the SessionStart
+    trigger exists precisely so a session opens KNOWING. So the workspace is now an
+    explicit `--workspace` argument that install.sh writes into all three call sites, and
+    the resolution order is reported rather than assumed.
+    """
+    for i, a in enumerate(argv):
+        if a == "--workspace" and i + 1 < len(argv):
+            return Path(argv[i + 1]), "argv"
+        if a.startswith("--workspace="):
+            return Path(a.split("=", 1)[1]), "argv"
+    if "HESTIA_WORKSPACE" in os.environ:
+        return Path(os.environ["HESTIA_WORKSPACE"]), "env"
+    return Path(DEFAULT_WORKSPACE), "default"
+
+
+# Rebound in main() once argv is known. Module scope keeps the import-time shape for
+# anything that reads these directly.
+WORKSPACE = resolve_workspace([])[0]
+WORKSPACE_SOURCE = "default"
 ATLAS = WORKSPACE / "agent-atlas" / "talk-to"
 PLUGINS = WORKSPACE / "hestia" / "plugins"
 HOME = Path.home()
@@ -259,6 +331,227 @@ def hook_targets(command: str, project_dir: Path | None) -> list[str]:
 PROJECT_CONFIG_GLOBS = (".claude/settings.json", ".claude/settings.local.json",
                         ".codex/config.toml", ".gemini/settings.json")
 
+# A REPO IS NOT ALWAYS A DIRECT CHILD OF THE WORKSPACE (thor, 2026-07-26). The scan was
+# `WORKSPACE.glob("*/" + rel)` — depth 1 exactly. On Thor that missed three real project
+# scopes, and one of them, `synchronism/manuscripts/.claude/settings.local.json`, holds a
+# THIRD enabled PreToolUse gate pointing at the same path that was deleted from web4 on
+# 2026-02-05. The machine reported two dead gates because two is how many the glob could
+# reach. Nested checkouts (a repo vendored inside a repo, a manuscripts subtree, a
+# monorepo package) are ordinary, so the scan goes deeper — and skips the directories
+# where depth is vendored rather than structural, because `node_modules` alone contributes
+# hundreds of `.claude/settings.local.json` files on this box that belong to nobody here.
+PROJECT_SCAN_DEPTH = 3
+SKIP_DIRS = {"node_modules", "vendor", "target", "dist", "build", "site-packages",
+             ".venv", "venv", ".git", "__pycache__", ".next", ".cache"}
+
+# Clause 5's structural half, and it has two parts: a walk that stops when it runs out of
+# budget and SAYS it stopped, and a budget large enough that stopping is the exception.
+# The first cut shipped only the first part.
+#
+# THE DEFAULT BUDGET DID NOT FIT THE MACHINE IT WAS WRITTEN FOR (cbp, 2026-07-26). Four
+# full-depth walks of the same 3143 directories on CBP's 9p mount:
+#
+#     6.79s   warm, quiet
+#     7.15s   cold (drop_caches)
+#     7.84s   cold (drop_caches)
+#     9.31s   warm, with a sibling `claude -c` working the tree
+#
+# At 5.0s that truncated on EVERY run (3/3 consecutive: 2373 / 2184 / 2157 of 3143 dirs),
+# and the two scopes it dropped were both of the depth-3 ones. A level-order walk spends
+# its budget breadth-first, so truncation is never a random sample — the loss is always at
+# maximum depth, which is precisely the level DEPTH+1 was added to reach. An honest report
+# of a systematically biased sample is rule 5's failure in a smaller hat.
+#
+# Two things measurement corrected, kept next to the number because that is this file's
+# whole ethic:
+#   * COLD IS ~1.1x, NOT AN ORDER OF MAGNITUDE. The previous cut justified this deadline
+#     with "1.5s warm is not 1.5s cold" and noted that nobody in the fleet had taken the
+#     cold number. CBP took it: 7.15 / 7.84 cold against 6.79 warm. (A lower bound —
+#     drop_caches clears the Linux page cache; the Windows side of 9p stays warm.) The
+#     deadline is still right, but for 9a2e124's reason — an unbounded 9p stall — not for
+#     cold-versus-warm, and the justification should not outlive the measurement.
+#   * CONTENTION COSTS MORE THAN COLD DOES. The slowest run was warm, with a sibling
+#     session working the tree — and on this fleet a contended box is the NORMAL state,
+#     not the pathological one.
+#
+# So the budget clears the slowest run anyone has measured, with headroom. THE BUDGET IS A
+# CEILING, NOT A COST: it is a deadline, so a machine that finishes in 0.18s (thor, ext4,
+# 1837 dirs) pays exactly nothing for a large one. A small budget does not buy speed on
+# fast machines; it buys guaranteed loss of the deepest scopes on slow ones.
+PROJECT_SCAN_BUDGET_S = float(os.environ.get("HESTIA_INVENTORY_SCAN_BUDGET", "12.0"))
+
+# ...and the trigger's timeout is DERIVED from that, not written down beside it.
+#
+# Clause 5 couples two numbers that live in two files — this constant, and a `timeout`
+# install.sh writes into ~/.claude/settings.json. Nothing but memory held them together,
+# so CBP's review had to say it in prose: "moved together — either half alone re-creates
+# clause 5's own cliff (8s walk + ~1s overhead against a 10s SIGKILL is silence again)."
+# A rule maintained by whoever read the review is what rule 3 refuses. Two seams close it:
+# install.sh asks the binary for this number instead of carrying a copy, and the binary
+# re-checks the installed hook against it at run time (`hook_timeout_finding`), so drift
+# is DETECTED rather than remembered.
+POST_SCAN_RESERVE_S = 8.0   # config parses, git reads, witness write — worst observed ~1s
+SESSION_HOOK_TIMEOUT_S = int(math.ceil(PROJECT_SCAN_BUDGET_S + POST_SCAN_RESERVE_S))
+
+# The name every trigger invokes (install.sh puts it on ~/.local/bin). Fixed, so the
+# self-check below can ask "what will the harness actually run?" even when this file is
+# being run from the repo copy under a different name.
+INSTALLED_BIN_NAME = "hestia-agent-inventory"
+
+
+def _config_dir_files() -> dict[str, tuple[str, ...]]:
+    """PROJECT_CONFIG_GLOBS, inverted: config dir -> the files wanted inside it."""
+    out: dict[str, list[str]] = {}
+    for rel in PROJECT_CONFIG_GLOBS:
+        cdir, fname = rel.split("/", 1)
+        out.setdefault(cdir, []).append(fname)
+    return {cdir: tuple(fs) for cdir, fs in out.items()}
+
+
+CONFIG_DIR_FILES = _config_dir_files()
+
+_SCAN: dict[str, list[Path]] | None = None
+SCAN_STATS: dict = {}
+
+
+def scan_projects() -> dict[str, list[Path]]:
+    """Every project config file under the workspace, found in ONE walk. Memoised.
+
+    THE SCAN COST MORE THAN THE TRIGGER HAD (cbp, 2026-07-26 — rule 5 above). The
+    depth-3 rewrite was correct about where to look and wrong about what that costs.
+    Isolated on CBP, 3143 directories on the /mnt/c 9p mount:
+
+        Path.iterdir() + is_dir() + resolve() per dir      43.0s   one walk
+        os.scandir()   + realpath only when is_symlink()    1.5s   same 3142 dirs
+
+    `Path.resolve()` is a full realpath chain per directory, and the separate `is_dir()`
+    re-stats what the dirent already answered. Three multipliers on top of that: the walk
+    ran once per (agent x matching glob) with no memoisation — four times — and then
+    `.is_file()` was called on all 3143 candidates x 4 rels, ~12.5k more stats for a few
+    dozen real hits. 4m22s total, against a 10s hook budget.
+
+    So: walk once, and notice the config dirs WHILE reading each directory's entries.
+    `.claude` either is or is not in the dirent list you already have, which turns 12.5k
+    speculative stats into one per config dir that actually exists.
+
+        as submitted                                            262s
+        + scandir, lazy realpath, memoised walk                  21s
+        + notice config dirs during the walk                     5.8s   identical findings
+
+    SCAN DEPTH+1, DESCEND DEPTH. A directory only becomes a candidate project root once
+    something has read ITS entries, so the deepest level must be scanned even though it is
+    never descended into. Recording `parent` as you scan it and stopping at DEPTH silently
+    drops every project root at the deepest level — 2 of 19 scopes on CBP, and the whole
+    point of going deeper was the scope at depth 2 nobody could see.
+
+    Symlinked repos are still followed (a workspace assembled out of links is a normal
+    layout) and the cycle guard still resolves — but only for entries that ARE symlinks,
+    which is where the 43s went. Aliasing that survives that (a symlinked ANCESTOR makes
+    two literal paths for one inode) is caught by deduplicating the found files on their
+    real paths, which is a few dozen realpaths rather than a few thousand.
+    """
+    global _SCAN
+    if _SCAN is not None:
+        return _SCAN
+
+    found: dict[str, list[Path]] = {rel: [] for rel in PROJECT_CONFIG_GLOBS}
+    started = time.monotonic()
+    deadline = started + PROJECT_SCAN_BUDGET_S
+    truncated = False
+    scanned = 0
+
+    def note(root: Path, names: set[str]) -> None:
+        for cdir, fnames in CONFIG_DIR_FILES.items():
+            if cdir not in names:
+                continue
+            for fname in fnames:
+                cfg = root / cdir / fname
+                if cfg.is_file():
+                    found[f"{cdir}/{fname}"].append(cfg)
+
+    try:
+        seen = {os.path.realpath(WORKSPACE)}
+    except OSError:
+        seen = {str(WORKSPACE)}
+    frontier = [WORKSPACE]
+    levels_complete = 0
+    trunc_level: int | None = None
+    trunc_done = trunc_of = 0
+    for level in range(PROJECT_SCAN_DEPTH + 1):
+        nxt: list[Path] = []
+        for done, parent in enumerate(frontier):
+            if time.monotonic() > deadline:
+                truncated = True
+                trunc_level, trunc_done, trunc_of = level, done, len(frontier)
+                break
+            names: set[str] = set()
+            children: list[tuple[Path, bool]] = []
+            try:
+                with os.scandir(parent) as it:
+                    for entry in it:
+                        names.add(entry.name)
+                        if level == PROJECT_SCAN_DEPTH or entry.name in SKIP_DIRS:
+                            continue
+                        try:
+                            if not entry.is_dir():
+                                continue
+                            children.append((Path(entry.path), entry.is_symlink()))
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+            scanned += 1
+            note(parent, names)
+            for child, is_link in sorted(children, key=lambda c: c[0].name):
+                try:
+                    real = os.path.realpath(child) if is_link else str(child)
+                except OSError:
+                    continue
+                if real in seen:
+                    continue
+                seen.add(real)
+                nxt.append(child)
+        if truncated:
+            break
+        levels_complete = level + 1
+        frontier = nxt
+
+    for rel, paths in found.items():
+        uniq, real_seen = [], set()
+        for cfg in paths:
+            try:
+                real = os.path.realpath(cfg)
+            except OSError:
+                real = str(cfg)
+            if real in real_seen:
+                continue
+            real_seen.add(real)
+            uniq.append(cfg)
+        found[rel] = uniq
+
+    SCAN_STATS.update({
+        "dirs_scanned": scanned,
+        "seconds": round(time.monotonic() - started, 3),
+        "truncated": truncated,
+        # WHERE the walk stopped, which a level-order walk can state exactly: levels
+        # 0..levels_complete-1 are whole, `truncated_at_level` is partial at
+        # level_done/level_of parents, and every deeper level was never enumerated at all.
+        #
+        # The field this replaces, `unscanned_frontier`, reported len(frontier) for the
+        # level in progress — which counted parents already scanned and omitted every
+        # deeper level, so on CBP it read 876 + 2305 = 3181 against a true 3143 (cbp,
+        # 2026-07-26). It erred toward alarming, which is the safe direction and not the
+        # standard: a number emitted next to a claim has to be falsifiable, and this one
+        # was not the count it named. The level is also strictly more actionable, because
+        # the walk being level-order is exactly what makes the loss predictable.
+        "levels_complete": levels_complete,
+        "truncated_at_level": trunc_level,
+        "level_done": trunc_done,
+        "level_of": trunc_of,
+    })
+    _SCAN = found
+    return _SCAN
+
 
 def config_scopes(dirnames: list[str]) -> list[tuple[Path, Path | None, str]]:
     """(config file, project dir, scope label) for every scope this agent reads."""
@@ -271,13 +564,13 @@ def config_scopes(dirnames: list[str]) -> list[tuple[Path, Path | None, str]]:
                 if cfg.is_file():
                     found.append((cfg, None, "user"))
     if WORKSPACE.is_dir():
+        scanned = scan_projects()
         for rel in PROJECT_CONFIG_GLOBS:
             if not any(rel.startswith(d + "/") for d in dirnames):
                 continue
-            for cfg in [WORKSPACE / rel] + sorted(WORKSPACE.glob("*/" + rel)):
-                if cfg.is_file():
-                    # $CLAUDE_PROJECT_DIR is the repo root, i.e. .claude's parent.
-                    found.append((cfg, cfg.parent.parent, "project"))
+            for cfg in scanned[rel]:
+                # $CLAUDE_PROJECT_DIR is the repo root, i.e. .claude's parent.
+                found.append((cfg, cfg.parent.parent, "project"))
     return found
 
 
@@ -416,16 +709,8 @@ def has_tag(findings: list[str], tag: str) -> bool:
     return any(f.split(":", 1)[0] == tag for f in findings)
 
 
-def plugins_ref() -> str:
-    """Which ref `plugins_available` was actually read from.
-
-    B is read from the WORKING TREE, so a feature-branch or stale checkout under-counts
-    it — and an under-count flips the remedy for an ungoverned agent from "run
-    install.sh" to "someone must build the adapter". Thor's checkout was on
-    `cleanup/hardbound-runtime-state` and reported 5 plugins where main has 8. Reading
-    from `origin/main` is the fix; stamping the ref is the minimum, because it makes the
-    number falsifiable by whoever reads the report.
-    """
+def worktree_ref() -> str:
+    """Which ref the checkout is sitting on. Reported even when it is not read from."""
     head = PLUGINS.parent / ".git"
     try:
         if head.is_file():  # worktree
@@ -436,28 +721,185 @@ def plugins_ref() -> str:
         return "unknown"
 
 
-def expects(plugin_dir: str) -> dict:
-    """Which hook events a plugin must occupy, and in which role (thor's §3 shape).
+def hook_timeout_finding() -> tuple[float, str] | None:
+    """Does this check's own trigger still give it longer than it budgets for itself?
 
-    `wired` used to ask "is anything hestia-shaped wired?", which one hook of any kind
-    answers yes. Witnessing and gating are different acts with different failure modes:
-    post-hoc observation CANNOT fail closed, and the whole point of the gate profile is
-    that the pre-hook can. Absent an expects.json the roles are unknown and the agent is
-    reported as such — not as governed.
+    THE CHECK APPLIED TO THE CHECK (cbp, 2026-07-26). Rule 5 binds the scan budget and the
+    SessionStart timeout into one pair, and they live in two files: PROJECT_SCAN_BUDGET_S
+    here, and a `timeout` install.sh writes into ~/.claude/settings.json. Nothing enforced
+    the relation — the review had to state it in prose, and a rule kept alive by whoever
+    read the review is the mitigation rule 3 refuses. install.sh now derives the timeout
+    from the budget, which stops the two from drifting AT INSTALL. This is the other half:
+    they can still be pulled apart afterwards, by a hand edit, by a second installer, or
+    by exporting HESTIA_INVENTORY_SCAN_BUDGET past the timeout that is already written.
+
+    A hook SIGKILLed one second before its walk would have given up emits NOTHING, and
+    nothing reads as clean. This file exists to find gates whose failure mode is silence,
+    so it is obliged to find its own.
+
+    Reads the settings file rather than trusting install.sh's report of it: the question
+    is what the harness will actually run. Matches on the installed binary NAME, not on
+    argv[0], so the finding still surfaces when the repo copy is run by hand.
     """
-    path = PLUGINS / plugin_dir / "expects.json"
+    cfg = HOME / ".claude" / "settings.json"
     try:
-        data = json.loads(path.read_text())
-    except Exception:
-        return {}
-    return {k: list(v) for k, v in data.items() if isinstance(v, list)}
+        data = json.loads(cfg.read_text())
+    except (OSError, ValueError):
+        # No Claude settings on this box, or unreadable. Not a finding about the timeout —
+        # config-readability is already reported per-agent by inspect().
+        return None
+    for grp in (data.get("hooks") or {}).get("SessionStart") or []:
+        for hook in grp.get("hooks") or []:
+            if INSTALLED_BIN_NAME not in hook.get("command", ""):
+                continue
+            timeout = hook.get("timeout")
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+                continue
+            if timeout >= SESSION_HOOK_TIMEOUT_S:
+                continue
+            return timeout, (
+                    f"SessionStart hook timeout is {timeout}s in {cfg}, but this check "
+                    f"budgets {PROJECT_SCAN_BUDGET_S}s for the directory walk alone — on "
+                    f"a slow or contended machine it is killed mid-scan and emits "
+                    f"nothing, which reads as clean (rule 5). The two numbers have "
+                    f"drifted apart; re-run install.sh, which derives the timeout "
+                    f"({SESSION_HOOK_TIMEOUT_S}s) from the budget.")
+    return None
+
+
+def _git(*args: str) -> str | None:
+    """git in the hestia checkout, or None. Never raises, never blocks forever."""
+    try:
+        out = subprocess.run(("git", "-C", str(PLUGINS.parent)) + args,
+                             capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.decode(errors="replace") if out.returncode == 0 else None
+
+
+class Registry:
+    """Inventory B — read from `origin/main`, not from whatever branch you are on.
+
+    THE UNDER-COUNT IS NOT COSMETIC (thor, 2026-07-26). The previous cut stamped the ref
+    and called that enough. It is not, because B is what A and C are differenced against,
+    so an under-read propagates into the verdict. Measured on Thor, whose shared checkout
+    sits on `cleanup/hardbound-runtime-state`, 103 commits behind main:
+
+        worktree (stale)  ->  no plugins/claude-code/expects.json  ->  declared = {}
+                          ->  gate_wired = None  ->  claude: GOVERNED, status UNKNOWN
+        origin/main       ->  expects: gate=[PreToolUse]
+                          ->  gate absent + two dead gates  ->  claude: MISWIRED
+
+    Same machine, same instant, same script — opposite verdicts, and the stale one is the
+    reassuring one. Again. A checkout's branch is a fact about whoever is working here,
+    not a fact about what governance exists, and rule 4 says a check may not let the first
+    quietly stand in for the second.
+
+    `origin/main` is a fetched remote-tracking ref: read-only, no network, and it does not
+    care what the working tree is doing — which also makes this safe to run while a
+    sibling session holds the checkout dirty on a branch of its own.
+    """
+
+    def __init__(self) -> None:
+        self.ref = "origin/main"
+        self.source = "origin/main"
+        # `-d`: trees only. Without it a blob sitting directly under `plugins/` — a
+        # README, a .gitignore — counts as an available plugin. Latent on main today,
+        # but B is what A and C are differenced against, so a phantom entry here becomes
+        # a phantom harness in the verdict (cbp, 2026-07-26).
+        listing = _git("ls-tree", "-d", "--name-only", "origin/main", "plugins/")
+        sha = _git("rev-parse", "--short", "origin/main")
+        if listing is None or sha is None:
+            # No fetched main (shallow clone, no remote, git absent). Fall back to the
+            # tree, and SAY so — a fallback that does not announce itself is the same
+            # defect one layer down.
+            self.source = "worktree"
+            self.ref = worktree_ref()
+            self.names = sorted(p.name for p in PLUGINS.iterdir() if p.is_dir()) \
+                if PLUGINS.is_dir() else []
+            self.degraded = ("plugins read from the working tree, not origin/main "
+                             "(no fetched origin/main here) — B may be under-counted")
+        else:
+            self.ref = sha.strip()
+            self.names = sorted({line.strip().split("/")[1]
+                                 for line in listing.splitlines()
+                                 if line.strip().startswith("plugins/")
+                                 and len(line.strip().split("/")) > 1})
+            self.degraded = None
+
+    def has(self, plugin_dir: str) -> bool:
+        return plugin_dir in self.names
+
+    def harnesses(self) -> list[str]:
+        return sorted(n for n in self.names if n not in NOT_A_HARNESS_PLUGIN)
+
+    def expects(self, plugin_dir: str) -> dict:
+        """Which hook events a plugin must occupy, and in which role (thor's §3 shape).
+
+        `wired` used to ask "is anything hestia-shaped wired?", which one hook of any kind
+        answers yes. Witnessing and gating are different acts with different failure
+        modes: post-hoc observation CANNOT fail closed, and the whole point of the gate
+        profile is that the pre-hook can. Absent an expects.json the roles are unknown and
+        the agent is reported as such — not as governed.
+
+        Ask the registry before asking git. This is called for all 45 atlas ids and 36 of
+        them name plugin dirs that are not in the registry at all — 36 subprocess spawns
+        to learn what `self.names` already knew (~4s -> ~0.7s on CBP).
+        """
+        if not self.has(plugin_dir):
+            return {}
+        if self.source == "origin/main":
+            raw = _git("show", f"origin/main:plugins/{plugin_dir}/expects.json")
+        else:
+            try:
+                raw = (PLUGINS / plugin_dir / "expects.json").read_text()
+            except OSError:
+                raw = None
+        if raw is None:
+            return {}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        return {k: list(v) for k, v in data.items() if isinstance(v, list)}
+
+
+REGISTRY: Registry | None = None  # built in main(), once WORKSPACE is known
+
+
+def registry() -> Registry:
+    """The registry, or a loud failure — never a plausible substitute for it.
+
+    THIS FILE'S OWN DEFECT CLASS, IN ITS OWN NEW CODE (found by main's `test_inventory.py`
+    when the two changes met, 2026-07-26). An unbuilt registry used to degrade to
+    `has() -> False` and `expects() -> {}`, which are not neutral defaults: they read as
+    "no plugin exists for this agent", so every agent reports UNGOVERNABLE — *someone must
+    build the adapter* — for a fleet whose adapters are all present. A wrong remedy stated
+    confidently, from a prerequisite nobody noticed was missing. Exactly the shape rule 4
+    exists to refuse, and the same shape as the dead gate that reads as covered.
+
+    Unreachable from the CLI, because `main()` builds it before anything asks. That is the
+    argument for raising rather than defaulting, not against it: the only callers who can
+    reach the None are in-process ones — tests, and whatever imports this next — and they
+    are precisely the callers who cannot tell a wrong answer from a right one.
+    """
+    if REGISTRY is None:
+        raise RuntimeError(
+            "plugin registry not built: call main(), or stub `inventory.REGISTRY`. "
+            "Refusing to answer, because answering 'no plugins' would report every "
+            "agent UNGOVERNABLE and look like a finding.")
+    return REGISTRY
+
+
+def expects(plugin_dir: str) -> dict:
+    return registry().expects(plugin_dir)
 
 
 def inspect(atlas_id: str, roots: list[str]) -> dict:
     exes, dirnames, plugin_dir = names_for(atlas_id)
     exe = real_executable(exes, roots)
     homes = [HOME / d for d in dirnames if (HOME / d).is_dir()]
-    plugin_available = (PLUGINS / plugin_dir).is_dir()
+    plugin_available = registry().has(plugin_dir)
     declared = expects(plugin_dir)
 
     rec: dict = {
@@ -718,6 +1160,23 @@ def emit(report: dict, brief: bool) -> int:
         extra = [f"{k}={v}" for k, v in gaps.items() if v and k != "dormant_plugin"]
         if extra:
             line += " | " + " ".join(extra)
+        # Rule 5 belongs on the SURFACE, not only in the JSON. A truncated scan can still
+        # produce a confident-looking status — MISWIRED, PARTIAL, even OK — because the
+        # part it never walked contributes no findings, and `unknown[]` is invisible from
+        # here. Reported at 0 budget: `PARTIAL ... partial=['claude']`, with the three dead
+        # gates it had not reached yet nowhere in the line. The one-liner is what a session
+        # actually reads, so the one-liner has to say the look was short.
+        scan = (report.get("scope") or {})
+        if scan.get("scan_truncated"):
+            line += (f" | SCAN TRUNCATED at {scan.get('project_scan_budget_s')}s after "
+                     f"{scan.get('project_scan_dirs')} dirs, depth level "
+                     f"{scan.get('project_scan_truncated_at_level')} partial "
+                     f"({scan.get('project_scan_level_progress')}) — the DEEPEST project "
+                     "scopes are the ones missing")
+        if scan.get("hook_timeout_installed_s") is not None:
+            line += (f" | HOOK TIMEOUT {scan['hook_timeout_installed_s']}s < "
+                     f"{scan.get('project_scan_budget_s')}s SCAN BUDGET — this check can "
+                     f"be killed mid-scan and print nothing; re-run install.sh")
         if report.get("reason"):
             line += f" | {report['reason']}"
         print(line)
@@ -727,20 +1186,32 @@ def emit(report: dict, brief: bool) -> int:
 
 
 def main() -> int:
+    global WORKSPACE, WORKSPACE_SOURCE, ATLAS, PLUGINS, REGISTRY
     argv = sys.argv[1:]
+    # Answered before anything else is resolved: install.sh calls this to derive the
+    # SessionStart timeout instead of keeping a second copy of the number, so it must
+    # work with no workspace, no registry, and no walk.
+    if "--print-hook-timeout" in argv:
+        print(SESSION_HOOK_TIMEOUT_S)
+        return 0
     brief = "--brief" in argv
+
+    WORKSPACE, WORKSPACE_SOURCE = resolve_workspace(argv)
+    ATLAS = WORKSPACE / "agent-atlas" / "talk-to"
+    PLUGINS = WORKSPACE / "hestia" / "plugins"
+    REGISTRY = Registry()
 
     if not ATLAS.is_dir():
         return emit({"status": "UNKNOWN", "machine": platform.node(), "reason":
                      f"agent-atlas registry not readable at {ATLAS} — cannot "
-                     "distinguish 'nothing ungoverned' from 'could not look'"}, brief)
+                     "distinguish 'nothing ungoverned' from 'could not look'"
+                     f" (workspace from {WORKSPACE_SOURCE}; pass --workspace PATH "
+                     "or re-run install.sh)"}, brief)
 
     roots = search_roots()
     known = sorted(p.name for p in ATLAS.iterdir() if p.is_dir())
     recs = [inspect(a, roots) for a in known]
-    available = sorted(p.name for p in PLUGINS.iterdir()
-                       if p.is_dir() and p.name not in NOT_A_HARNESS_PLUGIN) \
-        if PLUGINS.is_dir() else []
+    available = REGISTRY.harnesses()
     installed = [r for r in recs if r["installed"]]
     governed = [r for r in installed if r["governed"]]
     gaps = classify(recs)
@@ -755,11 +1226,29 @@ def main() -> int:
     # the ref makes that visible rather than silently wrong.
     scope = {
         "workspace": str(WORKSPACE),
-        "workspace_from_env": "HESTIA_WORKSPACE" in os.environ,
+        "workspace_source": WORKSPACE_SOURCE,      # argv | env | default
         "exe_search_roots": roots,
         "config_scopes_read": sorted({c["path"] for r in recs
                                       for c in r["configs_read"]}),
-        "plugins_ref": plugins_ref(),
+        "project_scan_depth": PROJECT_SCAN_DEPTH,
+        # Rule 5: the budget is part of the scope, so the walk's own cost is evidence and
+        # is reported next to what it found — including how much of it never happened.
+        "project_scan_dirs": SCAN_STATS.get("dirs_scanned", 0),
+        "project_scan_seconds": SCAN_STATS.get("seconds"),
+        "project_scan_budget_s": PROJECT_SCAN_BUDGET_S,
+        "session_hook_timeout_s": SESSION_HOOK_TIMEOUT_S,
+        "scan_truncated": SCAN_STATS.get("truncated", False),
+        # Level-order, so "where it stopped" is one integer and the loss is predictable:
+        # levels below `truncated_at_level` were never enumerated, and those are the
+        # deepest project roots — the ones DEPTH+1 exists to reach.
+        "project_scan_levels_complete": SCAN_STATS.get("levels_complete"),
+        "project_scan_truncated_at_level": SCAN_STATS.get("truncated_at_level"),
+        "project_scan_level_progress": (
+            f"{SCAN_STATS.get('level_done')}/{SCAN_STATS.get('level_of')}"
+            if SCAN_STATS.get("truncated") else None),
+        "plugins_source": REGISTRY.source,         # origin/main | worktree
+        "plugins_ref": REGISTRY.ref,
+        "worktree_ref": worktree_ref(),
         "toml_supported": tomllib is not None,
         # The one allowlist in this file, emitted because it is the only thing that can
         # turn a MISWIRED into a non-fatal MISWIRED-3P. A reader who wonders why a
@@ -767,10 +1256,41 @@ def main() -> int:
         "third_party_markers": list(THIRD_PARTY_MARKERS),
     }
     unknowns = sorted({u for r in recs for u in r["unknown"]})
-    if not scope["workspace_from_env"]:
+    if WORKSPACE_SOURCE == "default":
         unknowns.append(
-            f"HESTIA_WORKSPACE unset — fell back to the compiled-in default "
-            f"{WORKSPACE}, which is only correct on the machine it was written on")
+            f"workspace neither passed as --workspace nor set in HESTIA_WORKSPACE — "
+            f"fell back to the compiled-in default {WORKSPACE}, which is only correct "
+            "on the machine it was written on")
+    if REGISTRY.degraded:
+        unknowns.append(REGISTRY.degraded)
+    drifted = hook_timeout_finding()
+    if drifted:
+        installed_timeout, why = drifted
+        unknowns.append(why)
+        # ...and onto the one-line surface too, for the reason hop 2 learned the hard way:
+        # a finding only in `unknown[]` is invisible to `--brief`, and MISWIRED/PARTIAL
+        # both outrank UNKNOWN, so status can never carry it either. The reader who most
+        # needs this one IS the brief reader — it is the SessionStart hook that gets
+        # killed. A check has as many surfaces as it has readers, and the smallest surface
+        # is the one that gets believed.
+        scope["hook_timeout_installed_s"] = installed_timeout
+    if SCAN_STATS.get("truncated"):
+        # Rule 5 made explicit. A walk that ran out of budget has NOT established the
+        # project scope, and the part it never reached is exactly where the report would
+        # otherwise be quietly clean.
+        done = SCAN_STATS.get("levels_complete", 0)
+        whole = f"depth levels 0..{done - 1} complete" if done else "no depth level completed"
+        unknowns.append(
+            f"project scan hit its {PROJECT_SCAN_BUDGET_S}s budget after "
+            f"{SCAN_STATS.get('dirs_scanned', 0)} directories: {whole}, level "
+            f"{SCAN_STATS.get('truncated_at_level')} stopped at "
+            f"{SCAN_STATS.get('level_done')}/{SCAN_STATS.get('level_of')} of its parents, "
+            "deeper levels never enumerated — project scope is PARTIAL and any gate under "
+            "the unwalked part is neither found nor counted. The walk is level-order, so "
+            "what is missing is always the DEEPEST scopes, never a random sample: "
+            "truncation costs exactly the level this scan was widened to reach. Raise "
+            "HESTIA_INVENTORY_SCAN_BUDGET (and the SessionStart timeout with it — "
+            f"install.sh derives it), or read the hourly timer's full-depth answer.")
 
     # An unestablished scope degrades to UNKNOWN, never to OK (rule 4). MISWIRED still
     # outranks it: a known dead gate is worse news than an unknown.

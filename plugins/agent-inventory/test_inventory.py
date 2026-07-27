@@ -74,6 +74,31 @@ def test_has_tag():
 
 
 # --- integration: the verdict -----------------------------------------------------
+class _FakeRegistry:
+    """The registry seam, stubbed at the object rather than at its callers.
+
+    `claude-code` is present and declares the roles; everything else is absent — which is
+    also the production shape, since B is read from `origin/main` and most atlas ids name
+    no plugin dir at all.
+    """
+
+    source = "origin/main"
+    ref = "test"
+    degraded = None
+
+    def __init__(self, declared: dict):
+        self._declared = declared
+
+    def has(self, plugin_dir: str) -> bool:
+        return plugin_dir == "claude-code"
+
+    def harnesses(self) -> list[str]:
+        return ["claude-code"]
+
+    def expects(self, plugin_dir: str) -> dict:
+        return dict(self._declared) if self.has(plugin_dir) else {}
+
+
 def build(tmp: Path, extra_hooks: list[tuple[str, str]]) -> dict:
     """One agent record, from a config holding a LIVE hestia gate plus `extra_hooks`.
 
@@ -97,17 +122,23 @@ def build(tmp: Path, extra_hooks: list[tuple[str, str]]) -> dict:
     plugins = tmp / "plugins"
     (plugins / "claude-code").mkdir(parents=True, exist_ok=True)
     orig = (inventory.PLUGINS, inventory.config_scopes,
-            inventory.real_executable, inventory.expects)
+            inventory.real_executable, inventory.REGISTRY)
     inventory.PLUGINS = plugins
     inventory.config_scopes = lambda dirnames: [(cfg, None, "user")]
     inventory.real_executable = lambda exes, roots: "/usr/bin/claude"
-    inventory.expects = lambda plugin_dir: {"gate": ["PreToolUse"],
-                                            "witness": ["PostToolUse"]}
+    # ONE seam, because `inspect` now asks the registry TWICE — `has()` for B
+    # (plugin_available) and `expects()` for the roles — and patching only the second
+    # leaves `REGISTRY is None`, whose `plugin_available = ... if REGISTRY else False`
+    # reads as "no plugin exists" and demotes `governed` for a reason the case under test
+    # has nothing to do with. That is how these tests failed when the registry landed:
+    # every case went False, including the two controls, so the suite reported the split
+    # broken when what had moved was the fixture. Stub the object, not the functions.
+    inventory.REGISTRY = _FakeRegistry({"gate": ["PreToolUse"], "witness": ["PostToolUse"]})
     try:
         return inventory.inspect("claude", [])
     finally:
         (inventory.PLUGINS, inventory.config_scopes,
-         inventory.real_executable, inventory.expects) = orig
+         inventory.real_executable, inventory.REGISTRY) = orig
 
 
 def test_verdict(tmp: Path):

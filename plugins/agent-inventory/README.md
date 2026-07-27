@@ -41,13 +41,42 @@ the `/mnt/c` 9p mount (cold reads can outlast a hook timeout, and these hooks fa
 
 | when | how |
 |---|---|
-| on launch | `SessionStart` hook, `--brief`, 10s timeout |
-| operator on demand | `hestia-agent-inventory [--brief] [--no-witness]` |
+| on launch | `SessionStart` hook, `--workspace <ws> --brief`, 10s timeout |
+| operator on demand | `hestia-agent-inventory --workspace <ws> [--brief] [--no-witness]` |
 | periodic | `systemd --user` timer, hourly (`OnBootSec=3min`, `Persistent=true`) |
 
-`install.sh` wires all three. The runtime copy lives at `~/.local/bin/` on **ext4**, not
-in the repo on 9p — this check must not become an instance of the fragility it reports.
-Re-run `install.sh` after editing `inventory.py`.
+`install.sh` wires all three, and writes the resolved workspace into **each** of them.
+It has to: a systemd unit's `Environment=` is not the shell's environment and not the
+hook's, so the first cut — which set `HESTIA_WORKSPACE` on the timer only — left the
+other two triggers falling back to the compiled-in CBP default. Measured on Thor
+(2026-07-26): the hourly timer read the right workspace while both the terminal and the
+SessionStart hook answered `UNKNOWN | agent-atlas registry not readable at
+/mnt/c/exe/projects/ai-agents/…`. Honest, per rule 4 — and inert, on every machine that
+is not CBP. **Scope has to travel in the command, not in one trigger's environment.**
+
+Resolution order is `--workspace` → `$HESTIA_WORKSPACE` → compiled-in default, and which
+one answered is reported as `scope.workspace_source`.
+
+**And the workspace `install.sh` writes must not depend on where `install.sh` was run
+from.** It was `$SRC_DIR/../../..`, which is correct from the primary checkout and silently
+`/tmp` from a detached worktree — baked into all three triggers at once, failing in the
+reassuring direction (nothing ungoverned is ever found under `/tmp`). The sharp part is
+that the fleet's own sibling-session protocol *requires* installing from a detached
+worktree on a contended box, so the documented-safe path was the one that mis-scoped, and
+the mitigation was knowledge held by whoever read the PR description. It now derives from
+`git rev-parse --path-format=absolute --git-common-dir`, which resolves to the primary
+repo's `.git` from either place, and **refuses rather than guessing** when that fails —
+`HESTIA_WORKSPACE` is the documented override. A resolved workspace with no
+`agent-atlas/talk-to` under it warns at install time, once, instead of as an `UNKNOWN` from
+three triggers an hour.
+
+The runtime copy lives at `~/.local/bin/` on **ext4**, not in the repo on 9p — this check
+must not become an instance of the fragility it reports. Re-run `install.sh` after editing
+`inventory.py`; it converges the `SessionStart` hook to **exactly one** entry running this
+binary — rewriting the first, deleting any others, and asserting the invariant rather than
+arguing it, because "no stale entries left" was silently false twice: first when the match
+was on the whole command string, then again when a stale entry and an already-correct entry
+coexisted and both were rewritten to the same string.
 
 Every run witnesses to the chain as `agent_inventory`, **including clean results**: a
 record that only ever holds failures cannot distinguish "checked, fine" from "never
@@ -64,14 +93,127 @@ looked" as "where it is"** — and every one of them failed in the *reassuring* 
 |---|---|---|
 | `$HOME/.claude` | project + local scope too | on both machines the enforcement half lives *entirely* in the last two |
 | the working tree | `origin/main` | a feature-branch checkout flips the remedy from `install.sh` to "build an adapter" |
+| depth-1 children of the workspace | repos nest | a third dead `PreToolUse` gate, in `synchronism/manuscripts/`, was simply out of reach of the glob |
 | a compiled-in default path | `$HESTIA_WORKSPACE` | correct on CBP, `UNKNOWN` everywhere else |
 | the substring `hestia` | real gates never say it | deleting codex's live gate still reported `OK` |
 | `$PATH` | `~/.nvm`, `~/.pyenv`, … | `1 installed` from a hook, `3 installed` from a shell, same machine, same minute |
 
 So the check now **reports the scope it achieved** — `scope` in the JSON carries the
-workspace, whether it came from the environment, every executable search root, every
-config file read, and the ref `plugins_available` was resolved from. And **any scope it
-could not establish degrades to `UNKNOWN`, never to `OK`.**
+workspace and where it was resolved from, every executable search root, every config file
+read, the project scan depth, and both the ref `plugins_available` was resolved from
+(`plugins_source`, `plugins_ref`) and the ref the checkout happens to be sitting on
+(`worktree_ref`). And **any scope it could not establish degrades to `UNKNOWN`, never to
+`OK`.**
+
+## The budget is part of the scope
+
+CBP reviewed the depth-3 cut and found it right about *where* to look and wrong about what
+that costs: **1.15s → 4m22s on CBP**, against a `SessionStart` budget of **10s**. A hook
+killed at 10s does not degrade to `UNKNOWN` — it emits nothing, and nothing reads as clean.
+So the fix for "answers `UNKNOWN` on every machine that is not CBP" had shipped "answers
+nothing on CBP": the same error, one dimension over.
+
+> **A check that cannot finish inside its trigger's timeout has not degraded to `UNKNOWN`.
+> It has degraded to silence, which reads as clean.**
+
+The cost was never the walk. It was `Path.resolve()` on all 3143 directories (a full
+realpath chain each, on 9p), a redundant `is_dir()` re-stating what the dirent already
+answered, the whole walk repeated once per agent, and then `.is_file()` on every candidate
+× every glob. `scan_projects()` walks **once**, memoised, with `os.scandir`, resolves only
+entries that are actually symlinks, and notices `.claude`/`.codex`/`.gemini` *in the dirent
+list it is already holding* instead of stat-ing for them:
+
+| | CBP wall-clock | `newfstatat` (Thor) | subprocess spawns |
+|---|---|---|---|
+| as submitted | 262s | 157,035 | 47 |
+| walk rewrite | **5.8s** | **1,707** | **8** |
+
+Same 30 findings on CBP, same 10 on Thor — this is a cost change, not a scope change. (The
+spawns are `Registry.expects()`, which ran `git show` for all 45 atlas ids, 36 of them for
+plugin dirs the registry already knew were absent.)
+
+Two things that make this structural rather than a benchmark:
+
+- **Scan `DEPTH+1`, descend `DEPTH`.** A directory only becomes a candidate project root
+  once something has read *its* entries, so the deepest level must be scanned even though
+  it is never descended into. Getting this wrong silently drops every project root at the
+  deepest level — which is the exact class of miss that motivated going deeper at all.
+- **An explicit walk deadline** (`HESTIA_INVENTORY_SCAN_BUDGET`). When it fires,
+  `scope.scan_truncated` goes true, the stopping point is reported, and the `--brief` line
+  — the surface a session actually reads — says `SCAN TRUNCATED`. Without that last part a
+  short walk still prints a confident status, because the part it never reached
+  contributes no findings.
+
+### A budget that always fires is not a bound, it is a redefinition
+
+The deadline shipped at 5s, and CBP's re-review found that 5s **never fit CBP**. Four
+full-depth walks of the same 3143 directories:
+
+| run | wall-clock |
+|---|---|
+| warm, quiet | 6.79s |
+| cold (`drop_caches`) | 7.15s |
+| cold (`drop_caches`) | 7.84s |
+| warm, sibling `claude -c` working the tree | **9.31s** |
+
+So it truncated on every run (3/3: 2373 / 2184 / 2157 of 3143 dirs) — and **both** scopes
+it dropped were the depth-3 ones. The walk is level-order, so its budget goes breadth-first
+and truncation is never a random sample: the loss is always at maximum depth, which is
+exactly the level `DEPTH+1` was added to reach. Truncating honestly and reproducibly at the
+one level that motivated the change is clause 5's failure in a smaller hat.
+
+Two things the measurement corrected, recorded because this file's ethic is that the number
+sits next to the claim:
+
+- **Cold is ~1.1×, not an order of magnitude.** The deadline had been argued for on "warm
+  is not cold" while nobody had taken the cold number. It is 7.15 / 7.84 cold against 6.79
+  warm — a lower bound, since `drop_caches` clears the Linux page cache and the Windows
+  side of 9p stays warm. The deadline is still right, but for the *original* reason (an
+  unbounded 9p stall), not the one it shipped with.
+- **Contention costs more than cold does.** The slowest run was warm with a sibling session
+  working the tree — and on this fleet a contended box is the normal state.
+
+The budget is therefore **12s**, clearing the slowest run measured anywhere. This costs
+fast machines nothing: it is a *ceiling, not a cost*, and Thor (ext4, 1837 dirs) runs in
+0.16s either way. A small budget does not buy speed; it buys guaranteed loss of the deepest
+scopes on slow machines.
+
+### The timeout is derived, not written down twice
+
+Clause 5 couples two numbers in two files — the scan budget in `inventory.py`, and a
+`timeout` that `install.sh` writes into `~/.claude/settings.json`. Either one moved alone
+rebuilds the cliff (a 12s walk against a 15s SIGKILL is silence again), and nothing but
+prose held them together. That is the mitigation rule 3 refuses, so there are now two seams:
+
+- `install.sh` asks the binary (`--print-hook-timeout`, budget + 8s reserve = **20s**)
+  instead of carrying its own copy, and *asserts* the written value afterwards. It also no
+  longer leaves an existing entry's `timeout` alone — `setdefault` meant the machine most
+  in need of the raise, one that already had the hook, was the one that never got it.
+- `inventory.py` re-reads the installed hook at run time and reports drift as `UNKNOWN`
+  (`hook_timeout_finding`). Install-time derivation stops them separating; this catches
+  them being pulled apart afterwards by a hand edit, a second installer, or an
+  `HESTIA_INVENTORY_SCAN_BUDGET` raised past a timeout already on disk. A check whose
+  failure mode is silence is obliged to run itself against its own trigger.
+
+### Where a truncated walk stopped
+
+Because the walk is level-order, "how far did it get" is one integer, and the report says
+it: `project_scan_levels_complete`, `project_scan_truncated_at_level`, and
+`project_scan_level_progress` (`4/302` — parents done over parents at that level). This
+replaces `unscanned_frontier`, which reported `len(frontier)` for the level in progress:
+it counted parents already scanned and omitted every deeper level, reading `876 + 2305 =
+3181` against a true 3143 on CBP. It erred toward alarming, which is the safe direction and
+not the standard — a number emitted next to a claim has to be falsifiable.
+
+**Stamping the ref was not enough.** The first cut reported `plugins_ref` and kept reading
+the working tree, on the theory that a visible number is a falsifiable one. But B is what
+A and C are *differenced against*, so an under-read propagates into the verdict rather
+than sitting beside it. On Thor, whose shared checkout sits 103 commits behind main on a
+sibling's branch, the same script at the same instant returned `claude: governed, status
+UNKNOWN` from the tree and `claude: MISWIRED` from `origin/main` — and the stale one was
+the reassuring one. `plugins_available` and `expects.json` are now read from `origin/main`
+(a fetched read-only ref: no network, and safe while a sibling holds the checkout dirty),
+falling back to the tree only when there is no fetched main — and saying so when it does.
 
 Two consequences worth stating plainly:
 
