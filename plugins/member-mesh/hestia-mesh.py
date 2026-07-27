@@ -8,7 +8,10 @@ Usage:
   hestia-mesh.py unanswered [older_than_secs]            # what has no bound response
 
 Env: HESTIA_ENDPOINT (default http://127.0.0.1:7711/mcp),
-     HESTIA_MESH_PLUGIN (default kimi-code), HESTIA_MESH_HOST_AGENT (default kimi-code-cli).
+     HESTIA_MESH_PLUGIN (default kimi-code), HESTIA_MESH_HOST_AGENT (default kimi-code-cli),
+     HESTIA_ROLE — constellation role declared on hestia_connect. Absent → omitted →
+     the daemon silently defaults to role:constellation:member, splitting the member's
+     acts across two trust grains (the kimi 1140-outcomes-under-'member' split, PR #66).
 Kinds: coordination|review_request|review_done|reply|handoff|forum-note|ack (ack terminal).
 Discipline: forum post = record, mesh notice = wake; content lives at the pointer.
 Bind your dispositions: pass the id of the notice you are answering as the 4th
@@ -42,7 +45,9 @@ def connect():
     h = {"mcp-session-id": sid} if sid else {}
     post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, h)
     c = rpc(h, "hestia_connect", {"plugin_id": PLUGIN, "host_agent": HOST,
-                                  "instance_name": f"mesh-{PLUGIN}"})
+                                  "instance_name": f"mesh-{PLUGIN}",
+                                  **({"role": os.environ["HESTIA_ROLE"]}
+                                     if os.environ.get("HESTIA_ROLE") else {})})
     s = c.get("sessionId") or c.get("session_id")
     if not s:
         print(json.dumps({"error": "connect failed", "detail": c}), file=sys.stderr)
