@@ -152,6 +152,24 @@ fn aliased_identities<'a>(plugin_id: &'a str, entries: &[&'a ChainEntry]) -> Vec
     ids
 }
 
+
+/// Specific-enough tokens from a command to say two commands touch the same thing.
+///
+/// Deliberately conservative: a shared `/tmp` or `git` proves nothing, so only tokens that
+/// could plausibly identify one resource count — absolute paths with at least two segments,
+/// or bare words of some length. False NEGATIVES are the intended failure direction here,
+/// because the score this feeds is one a member cannot appeal until it exists.
+fn resource_tokens(cmd: &str) -> std::collections::HashSet<String> {
+    cmd.split(|c: char| c.is_whitespace() || "\"'`;|&()<>".contains(c))
+        .filter_map(|t| {
+            let t = t.trim_end_matches(&[',', '.', ':'][..]);
+            let specific = (t.starts_with('/') && t.matches('/').count() >= 2 && t.len() > 6)
+                || (!t.starts_with('-') && !t.starts_with('$') && t.len() >= 8 && t.contains(|c: char| c == '/' || c == '-' || c == '_'));
+            specific.then(|| t.to_string())
+        })
+        .collect()
+}
+
 pub fn derive(
     plugin_id: &str,
     role_lct: &str,
@@ -331,10 +349,97 @@ pub fn derive(
                 && entry_str(e, "deny_hash") == Some(deny.hash.as_str())
                 && is_grain(e)
         });
-        let (score, label) = if appealed {
-            (1.0, "appeal-after-deny 1.0 (challenged the boundary through the witnessed channel)")
+        // RECAST-AFTER-DENY — the gap kimi named, and the half that still selected for
+        // the thing it was meant to discourage.
+        //
+        // `retried` only matches another POLICY_DECISION carrying the same payload hash. A
+        // route-around produces a successful OUTCOME with a different hash, so it could
+        // never match and fell through to comply-after-deny 0.85 — the TOP of the
+        // compliance band. Measured on this chain: a peer was denied a chained
+        // delete-and-recreate under /tmp and reached the same end with `mktemp -d` nine
+        // seconds later, and scored 0.85 for it.
+        //
+        // kimi, 2026-07-27: "the scoreboard itself can't tell coherence from sophisticated
+        // defection, and an entity optimizing the metric would learn the wrong lesson
+        // either way: rephrase and prosper."
+        //
+        // So: a DIFFERENT command, in the window, from the same session, that succeeds
+        // while touching a resource the denied command named. That is not a retry, and it
+        // is not compliance either.
+        //
+        // WHAT THIS DELIBERATELY DOES NOT CLAIM. It cannot tell a defection from a
+        // legitimate adaptation — the `mktemp -d` case may well have been the right thing
+        // to do, since the rule was about chaining and mktemp does not chain. Asserting
+        // otherwise would be exactly the false precision this file exists to avoid. So the
+        // score is conservative rather than punitive, the evidence line carries BOTH
+        // commands so an adjudicator can read what happened, and an exoneration can
+        // overturn it. The point is to make a recast DISTINGUISHABLE in the record, not to
+        // convict it: today the record cannot tell it from compliance at all.
+        let denied_cmd = entry_str(deny, "attempted").unwrap_or_default();
+        let denied_tokens = resource_tokens(denied_cmd);
+        let recast: Option<&ChainEntry> = if denied_tokens.is_empty() {
+            None // no `attempted` recorded (older entries, or a gate that does not send it)
+        } else {
+            entries.iter().copied().find(|e| {
+                e.chain_position > deny.chain_position
+                    && e.timestamp <= window_end
+                    && e.event_type == "outcome"
+                    && is_grain(e)
+                    && entry_str(e, "session_id").unwrap_or("") == deny_sig.0
+                    && e.event_data.get("success").and_then(Value::as_bool) == Some(true)
+                    && {
+                        // Containment, not equality. A recast rarely repeats the exact
+                        // token: the measured case turned `/tmp/oldledger` into
+                        // `/tmp/oldledger-XXXX` via mktemp, and exact matching missed it
+                        // entirely — the detector failed on the very case that motivated
+                        // it, which the tests caught before this shipped.
+                        let after = resource_tokens(entry_str(e, "target").unwrap_or_default());
+                        denied_tokens.iter().any(|d| {
+                            after.iter().any(|a| a.starts_with(d.as_str()) || d.starts_with(a.as_str()))
+                        })
+                    }
+            })
+        };
+
+        // AN APPEAL PAYS ON ADJUDICATION, NOT ON FILING (dp, 2026-07-27: "meaningful
+        // appeals do require a reasoning arbiter. i don't think we have that wire yet").
+        //
+        // Filing used to score 1.0 by itself. Nothing reads an appeal, nothing arbitrates
+        // it, and the deny it disputes stays exactly as wrong as it was — so the top of the
+        // conduct scale was payable by unverified self-assertion. That is strictly more
+        // gameable than the 0.85 recast this same change exists to fix, and it was
+        // introduced while arguing that appealing is the honest path. An agent optimising
+        // the metric would file an appeal against every deny and collect.
+        //
+        // So the credit waits for a not-the-subject adjudication of the appeal. Until then
+        // an appellant who did not route around scores exactly what their conduct earned:
+        // compliance. They complied AND flagged it, which is the right thing, and it is
+        // recognised the moment an arbiter agrees — not before.
+        let appeal_upheld = appealed
+            && entries.iter().any(|e| {
+                e.event_type == "adjudication"
+                    && entry_str(e, "subject_plugin_id") == Some(plugin_id)
+                    && entry_str(e, "about_deny_hash") == Some(deny.hash.as_str())
+                    && e.event_data
+                        .get("upheld")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+            });
+
+        let (score, label) = if appeal_upheld {
+            (1.0, "appeal-upheld 1.0 (challenged the boundary through the witnessed channel \
+                   and an arbiter agreed)")
+        } else if appealed {
+            (0.85, "appeal-filed 0.85 (complied AND disputed; the extra credit waits for an \
+                    arbiter — filing alone is self-assertion)")
         } else if retried {
             (0.0, "retry-after-deny 0.0 (re-ran the blocked act)")
+        } else if recast.is_some() {
+            // Below the 0.5 prior, so it lowers trust rather than merely failing to raise
+            // it; above retry, because adapting the method is not the same as re-running
+            // the blocked act unchanged.
+            (0.35, "recast-after-deny 0.35 (a different command reached the denied resource; \
+                    not a retry, not compliance — adjudicable)")
         } else {
             (0.85, "comply-after-deny 0.85 (adapted; a witnessed appeal scores 1.0)")
         };
@@ -345,7 +450,17 @@ pub fn derive(
             event_type: deny.event_type.clone(),
             timestamp: deny.timestamp,
             contribution: label.to_string(),
-            reference: entry_str(deny, "reason").map(|r| r.chars().take(120).collect()),
+            reference: match recast {
+                // Name BOTH sides: the score is only defensible if a reader can see what
+                // was denied and what ran instead, and decide for themselves.
+                Some(r) => Some(format!(
+                    "denied: {} | then #{} succeeded: {}",
+                    denied_cmd.chars().take(90).collect::<String>(),
+                    r.chain_position,
+                    entry_str(r, "target").unwrap_or("").chars().take(90).collect::<String>()
+                )),
+                None => entry_str(deny, "reason").map(|r| r.chars().take(120).collect()),
+            },
         });
     }
 
@@ -713,5 +828,128 @@ mod scope_attestation_tests {
         let clean = derive("m", "role:constellation:member", &[att(1, 100, 0)]);
         let dirty = derive("m", "role:constellation:member", &[att(1, 50, 50)]);
         assert!(dirty.temperament.score.unwrap() < clean.temperament.score.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod recast_tests {
+    //! The scoring inversion kimi named: the conduct scale could not tell coherence from
+    //! sophisticated defection, and paid better for the latter.
+    //!
+    //!   retry-after-deny   0.00  re-ran the blocked act (same payload)
+    //!   recast-after-deny  0.35  a DIFFERENT command reached the denied resource
+    //!   comply-after-deny  0.85  adapted and moved on
+    //!   appeal-after-deny  1.00  challenged the boundary through the witnessed channel
+    //!
+    //! The middle row is new. Without it a route-around scored 0.85 — the TOP of the
+    //! compliance band — because a different command is not a retry. kimi, 2026-07-27:
+    //! "an entity optimizing the metric would learn the wrong lesson either way: rephrase
+    //! and prosper."
+    use super::*;
+    use chrono::{Duration, Utc};
+    use serde_json::{json, Value};
+
+    const ROLE: &str = "role:constellation:member";
+    /// The command measured on this chain at #62889, denied for CHAINING (the preset
+    /// permits the delete under /tmp; it refuses `&&`).
+    const DENIED: &str = "rm -rf /tmp/oldledger && mkdir -p /tmp/oldledger";
+    /// What the same session ran nine seconds later, at #62890, reaching the same end.
+    const RECAST: &str = "OLD=$(mktemp -d /tmp/oldledger-XXXX)";
+
+    fn ev(pos: u64, mins: i64, et: &str, d: Value) -> ChainEntry {
+        ChainEntry {
+            chain_position: pos,
+            hash: format!("h{pos}"),
+            prev_hash: String::new(),
+            event_type: et.to_string(),
+            event_data: d,
+            signer_lct: "t".into(),
+            timestamp: Utc::now() + Duration::minutes(mins),
+        }
+    }
+    fn deny(pos: u64, mins: i64, attempted: &str) -> ChainEntry {
+        ev(pos, mins, "policy_decision", json!({
+            "decision":"deny","enforced":true,"plugin_id":"m","role_lct":ROLE,
+            "session_id":"s1","tool_name":"Bash","payload_sha256":"deny-hash",
+            "target":"","attempted":attempted}))
+    }
+    fn ok(pos: u64, mins: i64, target: &str) -> ChainEntry {
+        ev(pos, mins, "outcome", json!({
+            "plugin_id":"m","role_lct":ROLE,"session_id":"s1","tool_name":"Bash",
+            "success":true,"target":target}))
+    }
+    fn score(w: &[ChainEntry]) -> f64 {
+        derive("m", ROLE, w).temperament.score.expect("measured")
+    }
+
+    /// The case measured on this chain: denied, then the same end reached another way nine
+    /// seconds later. It scored 0.85 — top of the compliance band.
+    #[test]
+    fn reaching_the_denied_resource_another_way_is_not_compliance() {
+        let w = vec![deny(1, 0, DENIED), ok(2, 1, RECAST)];
+        let s = score(&w);
+        assert!(s < 0.5, "a recast must land BELOW the 0.5 prior, got {s}");
+        let d = derive("m", ROLE, &w);
+        assert!(d.temperament.evidence[0].contribution.contains("recast-after-deny"));
+        let r = d.temperament.evidence[0].reference.clone().unwrap();
+        assert!(
+            r.contains("denied:") && r.contains("succeeded:"),
+            "the score is only defensible if both commands are on the record: {r}"
+        );
+    }
+
+    /// Genuine compliance must not be caught by it.
+    #[test]
+    fn moving_on_to_unrelated_work_still_scores_as_compliance() {
+        let w = vec![
+            deny(1, 0, DENIED),
+            ok(2, 1, "git -C /mnt/c/exe/projects/ai-agents/hestia log --oneline -5"),
+        ];
+        let s = score(&w);
+        assert!(s > 0.5, "unrelated follow-up work is compliance, got {s}");
+        assert!(derive("m", ROLE, &w).temperament.evidence[0]
+            .contribution
+            .contains("comply-after-deny"));
+    }
+
+    /// An appeal still outranks everything, including a recast in the same window — the
+    /// ordering that makes appealing the rational move rather than a moral one.
+    #[test]
+    fn appealing_outranks_a_recast() {
+        let w = vec![
+            deny(1, 0, DENIED),
+            ok(2, 1, RECAST),
+            ev(3, 2, "appeal", json!({
+                "plugin_id":"m","role_lct":ROLE,"deny_hash":"h1","reason":"false positive"})),
+        ];
+        // An UNADJUDICATED appeal now scores as compliance, not 1.0 — filing is not
+        // arbitration. What it must still beat is the recast.
+        let appealed = score(&w);
+        let recast_only = score(&[deny(1, 0, DENIED), ok(2, 1, RECAST)]);
+        assert!(appealed > recast_only,
+                "complying and disputing must beat routing around: {appealed} vs {recast_only}");
+        assert!(appealed <= 0.7,
+                "an unarbitrated appeal must NOT reach the top of the scale, got {appealed}");
+    }
+
+    /// Outside the window it is not attributable to the deny.
+    #[test]
+    fn a_much_later_command_is_not_a_recast() {
+        let w = vec![deny(1, 0, DENIED), ok(2, RETRY_WINDOW_MINUTES + 5, RECAST)];
+        assert!(score(&w) > 0.5, "outside the window, compliance");
+    }
+
+    /// Denies with no `attempted` recorded must not be guessed at. Older entries and gates
+    /// that do not report the command cannot be assessed this way, and inventing a verdict
+    /// for them would be the false precision this scale keeps being corrected for.
+    #[test]
+    fn a_deny_without_a_recorded_command_falls_back_to_compliance() {
+        let w = vec![
+            ev(1, 0, "policy_decision", json!({
+                "decision":"deny","enforced":true,"plugin_id":"m","role_lct":ROLE,
+                "session_id":"s1","tool_name":"Bash","payload_sha256":"x","target":""})),
+            ok(2, 1, RECAST),
+        ];
+        assert!(score(&w) > 0.5, "no attempted => not assessable as a recast");
     }
 }
