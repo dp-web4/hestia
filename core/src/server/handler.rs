@@ -885,6 +885,13 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 "rule_id": evaluation.rule_id,
                 "rule_name": evaluation.rule_name,
                 "reason": evaluation.reason,
+                // The gate declined to look at part of this command, because a rule matched
+                // on executable positions only (see `policy::shell`). Recorded so the
+                // widening is countable: without it, "no destructive token here" and "a
+                // destructive token ruled inert" are the same row, and nobody can audit how
+                // often the projection changes an outcome. Omitted when false so it does not
+                // add noise to the overwhelming majority of records.
+                "inert_content_skipped": evaluation.inert_content_skipped,
                 // WHAT was attempted, not just what was decided. `target` already
                 // carries the command for Bash/Shell by overloading, but nothing else —
                 // so an Edit or an MCP deny recorded a verdict against a path with no
@@ -5480,6 +5487,7 @@ mod tests {
                     categories: Some(vec!["credential_access".into()]),
                     target_patterns: None,
                     target_patterns_are_regex: false,
+                    target_patterns_scope: Default::default(),
                     command_patterns: None,
                     command_patterns_are_regex: false,
                     command_must_not_contain: None,

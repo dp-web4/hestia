@@ -1,7 +1,9 @@
 //! The four named policy presets. Ports the constants and
 //! `SAFETY_RULES` list from `presets.py`.
 
-use super::types::{PolicyConfig, PolicyDecision, PolicyMatch, PolicyRule, PresetDefinition};
+use super::types::{
+    MatchScope, PolicyConfig, PolicyDecision, PolicyMatch, PolicyRule, PresetDefinition,
+};
 
 /// Build the safety-preset rule list. Lifted verbatim from `presets.py`:
 /// destructive bash, secret-file reads, memory-file writes, network warns,
@@ -64,17 +66,29 @@ fn safety_rules() -> Vec<PolicyRule> {
             reason: Some(
                 "Destructive command blocked by the safety preset. rm is allowed ONLY \
                  standing alone against absolute /tmp paths (see the allow rule); anything \
-                 chained, relative, path-escaping (..) or outside /tmp lands here. If the \
-                 act is legitimate, appeal it with `hestia_appeal` (this decision's chain \
-                 hash + your reason) rather than rephrasing — a rephrase that reaches the \
-                 same resource scores 0.35, BELOW plain compliance, and teaches the society \
-                 nothing. An appeal is recorded conduct that can change the law."
+                 chained, relative, path-escaping (..) or outside /tmp lands here. This \
+                 matches where the command could EXECUTE, not where the text appears: \
+                 quoting the token as data (a grep pattern, a quoted heredoc body under \
+                 cat/tee, a non-expanding double-quoted string) does not trip it — but \
+                 handing that same text to an interpreter (`sh -c`, `eval`, a pipe into a \
+                 shell) does, and anything the parser cannot read confidently is matched in \
+                 full. If the act is legitimate, appeal it with `hestia_appeal` (this \
+                 decision's chain hash + your reason) rather than rephrasing — a rephrase \
+                 that reaches the same resource scores 0.35, BELOW plain compliance, and \
+                 teaches the society nothing. An appeal is recorded conduct that can change \
+                 the law: this sentence exists because one did (adjudication 62cfdffe)."
                     .into(),
             ),
             r#match: PolicyMatch {
                 tools: Some(vec!["Bash".into()]),
                 target_patterns: Some(vec![r"rm\s+-".into(), r"mkfs\.".into()]),
                 target_patterns_are_regex: true,
+                // Judge the act, not the mention. `handler.rs` hands the whole command in
+                // as `target`, so without this the rule denies `grep "rm -rf" log` — a
+                // read-only search — for saying the word. Ten such denies landed on one
+                // member on 2026-07-27. Falls back to raw matching whenever the shell
+                // parse is uncertain; see `policy::shell`.
+                target_patterns_scope: MatchScope::ExecutablePositions,
                 ..Default::default()
             },
         },
@@ -89,6 +103,9 @@ fn safety_rules() -> Vec<PolicyRule> {
                 // Matches "rm file" (no flags). Flag variants caught by deny rule above.
                 target_patterns: Some(vec![r"rm\s+[^-]".into()]),
                 target_patterns_are_regex: true,
+                // Same reasoning as the deny above: a warn that fires on the word rather
+                // than the act trains members to ignore warns, which is worse than silence.
+                target_patterns_scope: MatchScope::ExecutablePositions,
                 ..Default::default()
             },
         },

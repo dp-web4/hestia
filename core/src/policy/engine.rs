@@ -58,8 +58,12 @@ impl PolicyEngine {
     /// are skipped *if under their limit* (the rule fires only when the
     /// limit has been exceeded).
     pub fn evaluate(&self, action: &PolicyAction<'_>) -> PolicyEvaluation {
+        // Accumulated across every rule consulted, not just the one that fires: the case
+        // worth auditing is precisely the rule that did NOT match because its projection
+        // blanked the token.
+        let mut inert_content_skipped = false;
         for rule in &self.sorted_rules {
-            if !self.rule_matches(action, &rule.r#match) {
+            if !self.rule_matches(action, &rule.r#match, &mut inert_content_skipped) {
                 continue;
             }
             // Rate-limit gate
@@ -89,6 +93,7 @@ impl PolicyEngine {
                     format!("decision:{}", rule.decision.as_str()),
                     format!("rule:{}", rule.id),
                 ],
+                inert_content_skipped,
             };
         }
         // No rule matched
@@ -103,10 +108,16 @@ impl PolicyEngine {
                 format!("decision:{}", self.config.default_policy.as_str()),
                 "rule:default".into(),
             ],
+            inert_content_skipped,
         }
     }
 
-    fn rule_matches(&self, action: &PolicyAction<'_>, m: &PolicyMatch) -> bool {
+    fn rule_matches(
+        &self,
+        action: &PolicyAction<'_>,
+        m: &PolicyMatch,
+        inert_content_skipped: &mut bool,
+    ) -> bool {
         // Tool name match
         if let Some(tools) = &m.tools {
             if !tools.iter().any(|t| t == action.tool_name) {
@@ -119,13 +130,21 @@ impl PolicyEngine {
                 return false;
             }
         }
-        // Target pattern match
+        // Target pattern match. For shell tools the caller substitutes the full command
+        // as `target`, so a rule may ask to be matched against executable positions only
+        // — see `MatchScope`. `project` returns the raw target unchanged for `Raw`, and
+        // also whenever the shell parse is not confident, so this can only ever narrow
+        // matching for rules that opted in.
         if let Some(patterns) = &m.target_patterns {
             let target = match action.target {
                 Some(t) => t,
                 None => return false,
             };
-            if !target_matches(target, patterns, m.target_patterns_are_regex) {
+            let scoped = super::shell::project(target, m.target_patterns_scope);
+            if scoped != target {
+                *inert_content_skipped = true;
+            }
+            if !target_matches(&scoped, patterns, m.target_patterns_are_regex) {
                 return false;
             }
         }
@@ -257,6 +276,53 @@ mod tests {
                 PolicyDecision::Deny,
                 "expected deny for {bad:?}"
             );
+            assert_eq!(v.rule_id.as_deref(), Some("deny-destructive-commands"));
+        }
+    }
+
+    /// The mention-vs-act split, exercised through the REAL safety preset rather than a
+    /// hand-built rule. These are transcribed from denies that actually landed on
+    /// claude-code on 2026-07-27 (`ae5ced17…`, `8bea2e21…`); the second was upheld on
+    /// appeal by kimi-code in adjudication `62cfdffe`. If the rule regresses to matching
+    /// raw text, these fail — which is the point of asserting against `get_preset`.
+    #[test]
+    fn safety_no_longer_denies_a_quoted_mention() {
+        let e = PolicyEngine::new(get_preset("safety").unwrap().config);
+        for ok in [
+            // deny ae5ced17… — a read-only search, blocked for what its pattern said.
+            "ls core/src/policy/ 2>/dev/null && grep -rn \"rm -rf\\|destructive\" core/src/policy/presets.rs | head -30",
+            "grep 'rm -rf' /var/log/audit.log",
+            "cat > /tmp/f.rs <<'RUST'\nlet a = \"rm -rf /tmp/x\";\nRUST",
+            "echo 'the rule blocks rm -rf'",
+        ] {
+            let v = e.evaluate(&bash(ok));
+            assert_ne!(
+                v.decision,
+                PolicyDecision::Deny,
+                "mention should not deny: {ok:?}"
+            );
+        }
+    }
+
+    /// The other half, and the half that matters more: every way the projection could
+    /// have become a hole still denies.
+    #[test]
+    fn safety_still_denies_when_the_mention_can_execute() {
+        let e = PolicyEngine::new(get_preset("safety").unwrap().config);
+        for bad in [
+            "sh -c 'rm -rf /'",
+            "bash -c \"rm -rf /etc\"",
+            "eval 'rm -rf /home'",
+            "echo 'rm -rf /' | sh",
+            "cat <<'X' | bash\nrm -rf /\nX",
+            "echo \"$(rm -rf /etc)\"",
+            "xargs rm -rf",
+            "mystery-tool 'rm -rf /'",
+            // unterminated quote: the parser refuses, so the raw text is matched
+            "grep 'rm -rf /etc",
+        ] {
+            let v = e.evaluate(&bash(bad));
+            assert_eq!(v.decision, PolicyDecision::Deny, "expected deny for {bad:?}");
             assert_eq!(v.rule_id.as_deref(), Some("deny-destructive-commands"));
         }
     }

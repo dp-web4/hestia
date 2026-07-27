@@ -20,6 +20,7 @@ mod law_gate;
 pub mod matchers;
 pub mod presets;
 pub mod rate_limit;
+pub mod shell;
 pub mod types;
 
 pub use engine::PolicyEngine;
@@ -27,7 +28,8 @@ pub use extract::{classify, extract_full_command, extract_target};
 pub use law_gate::{LAW_FILE, LawGate};
 pub use presets::{PRESET_NAMES, get_preset, is_preset_name, list_presets};
 pub use rate_limit::{RateLimitResult, RateLimiter};
+pub use shell::executable_positions;
 pub use types::{
-    PolicyAction, PolicyConfig, PolicyDecision, PolicyEvaluation, PolicyMatch, PolicyRule,
-    PresetDefinition, RateLimitSpec, TimeWindow, fold_strictest,
+    MatchScope, PolicyAction, PolicyConfig, PolicyDecision, PolicyEvaluation, PolicyMatch,
+    PolicyRule, PresetDefinition, RateLimitSpec, TimeWindow, fold_strictest,
 };
