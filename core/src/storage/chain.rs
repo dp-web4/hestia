@@ -271,6 +271,42 @@ impl SqliteChainStore {
         }
     }
 
+    /// Resolve a hash PREFIX to at most `cap` entries (ascending by position so
+    /// the report is stable). Exists because the only place most members ever
+    /// see an entry id is prose that abbreviates it — the operating law cites
+    /// "adjudication 62cfdffe", eight characters, and a member who wants to read
+    /// the ruling behind the rule it is bound by has exactly that. A lookup that
+    /// only accepts the full 64 makes the law's own citation undereferenceable.
+    ///
+    /// Returns every match up to `cap` rather than the first: a prefix collision
+    /// must be REPORTED as ambiguous, never silently resolved to whichever row
+    /// SQLite reached first. Same discipline as the rest of this store — say what
+    /// is known, do not pick for the caller.
+    ///
+    /// Errors on a non-hex prefix rather than returning empty: `LIKE ?1 || '%'`
+    /// treats `%` and `_` in the bound value as wildcards, so a malformed
+    /// pointer would otherwise become a scan that reports a real-looking
+    /// "ambiguous" or a wrong single hit. Empty would also conflate
+    /// *you typed garbage* with *no such entry*, which is the distinction the
+    /// caller most needs.
+    pub fn read_by_hash_prefix(&self, prefix: &str, cap: u64) -> Result<Vec<ChainEntry>> {
+        if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+            anyhow::bail!("chain hash prefix must be non-empty ASCII hex: {prefix:?}");
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+             FROM chain_entries WHERE hash LIKE ?1 || '%'
+             ORDER BY chain_position ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![prefix, cap as i64], row_to_entry)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
     pub fn read_failures(&self, limit: u64) -> Result<Vec<ChainEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

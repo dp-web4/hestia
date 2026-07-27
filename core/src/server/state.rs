@@ -514,6 +514,31 @@ impl ServerState {
         self.chain_store.read_recent(limit).unwrap_or_default()
     }
 
+    /// Resolve a chain-entry pointer — full hash or an abbreviation of it.
+    ///
+    /// The chain's public identifier is its hash: appeals cite `deny_hash`,
+    /// adjudications cite `claim_ref`, mesh notices carry
+    /// `hestia://adjudication/<hash>`, and the operating law cites rulings by an
+    /// eight-character prefix. Every one of those is a POINTER, and until this
+    /// existed no read surface could follow one — `recent_chain` is the only
+    /// exposed reader and it is a count-window over the tail, so an entry more
+    /// than a few hundred events old was addressable and unreachable at the same
+    /// time. That is the filtered-window illusion one level up: the reference
+    /// looks resolvable, and the failure to resolve it looks like absence.
+    ///
+    /// Returns the matches (0, 1, or several on an ambiguous prefix) and lets the
+    /// caller report which case it is. `Err` means the pointer was malformed.
+    pub fn chain_by_pointer(&self, hash_or_prefix: &str) -> Result<Vec<ChainEntry>> {
+        if hash_or_prefix.len() == 64 {
+            return Ok(self
+                .chain_store
+                .read_by_hash(hash_or_prefix)?
+                .into_iter()
+                .collect());
+        }
+        self.chain_store.read_by_hash_prefix(hash_or_prefix, 8)
+    }
+
     /// Apply an outcome to the trust state for a plugin.
     pub fn apply_outcome(
         &self,
