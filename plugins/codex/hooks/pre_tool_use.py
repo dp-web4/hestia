@@ -76,9 +76,39 @@ def _detect_workspace():
 WORKSPACE = _detect_workspace()
 IDENTITY = os.path.expanduser(
     os.environ.get("HESTIA_CODEX_IDENTITY", "~/.codex/hestia-instance/identity.json"))
-CLAUDE_PRE = os.environ.get(
-    "HESTIA_SOCIETY_GATE",
-    os.path.join(WORKSPACE, "hestia/plugins/claude-code/hooks/pre_tool_use.py"))
+def _society_gate_default():
+    """Prefer an ext4 copy of the society gate over the one in the repo.
+
+    THE BUG THIS FIXES. Codex clamps every hook to 3s, so this gate allows its
+    society-safety subprocess 2s and fails CLOSED when that budget is missed. The gate
+    itself was deliberately installed to ~/.codex/hooks (ext4) precisely so a cold read
+    could not eat the budget — and then it delegated the safety check straight back to
+    $WORKSPACE, which on this fleet's WSL boxes is the 9p mount. The delegation undid the
+    protection: codex's own gate is fast, and the thing it waits on is not.
+
+    Measured 2026-07-26: warm, the inner gate answers in 194-336ms and stays there under
+    8 concurrent callers, so neither latency nor lock contention explains a timeout. Cold
+    9p reads do. Codex was blocked from reviewing PRs three times in four minutes with
+    `no policy verdict (daemon path failed)` while the daemon was up the whole time
+    (NRestarts=0) and answering every probe.
+
+    Note the asymmetry with issue #45: the same 9p fragility makes CLAUDE fail OPEN (no
+    governance) and CODEX fail CLOSED (no work). One root cause, opposite symptoms, and
+    the fail-closed one is the visible half — which is why this surfaced as "codex is
+    hitting blocks" rather than as a silent governance hole.
+    """
+    env = os.environ.get("HESTIA_SOCIETY_GATE")
+    if env:
+        return env
+    # The installed ext4 copy, same file the claude harness runs. First existing wins.
+    for cand in (os.path.expanduser("~/.claude/hooks/hestia/pre_tool_use.py"),
+                 os.path.join(WORKSPACE, "hestia/plugins/claude-code/hooks/pre_tool_use.py")):
+        if os.path.isfile(cand):
+            return cand
+    return os.path.join(WORKSPACE, "hestia/plugins/claude-code/hooks/pre_tool_use.py")
+
+
+CLAUDE_PRE = _society_gate_default()
 
 # Innate egress/secret invariants — denied even inside a granted repo. Trust never relaxes these (S1).
 FORBIDDEN = ("/.ssh", ".env", "credentials", "id_rsa", "id_ed25519", "/.git/config", "secrets") + tuple(

@@ -76,6 +76,7 @@ impl ServerHandler for HestiaServer {
             "hestia_witness_adjudication" => tool_witness_adjudication(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
+            "hestia_operating_law" => tool_operating_law(&self.state, &args).await,
             "hestia_vault_get" => tool_vault_get(&self.state, &args).await,
             "hestia_vault_set" => tool_vault_set(&self.state, &args).await,
             "hestia_query_history" => tool_query_history(&self.state, &args).await,
@@ -194,6 +195,10 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_query_policy",
             "Query the user's policy for a decision",
+        ),
+        t(
+            "hestia_operating_law",
+            "Read the law you operate under: every rule that can allow, warn or deny YOUR acts, composed across society preset, role, instance, and the operator's bound lists. Ask before you are refused, not after",
         ),
         t("hestia_vault_get", "Request a credential from the vault"),
         t("hestia_vault_set", "Store a credential in the vault"),
@@ -536,6 +541,184 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
     Ok(json!({
         "witnessEntryHash": entry.hash,
         "updatedTrustState": trust_state_json(&trust_state),
+    }))
+}
+
+/// `hestia_operating_law` — publish the law, do not merely enforce it.
+///
+/// dp, 2026-07-26: "the law should be injected into context at launch … transparency. the
+/// lists should live in the vault, but the law should be queriable in-session."
+///
+/// WHY THIS IS A CONTROL AND NOT A CONVENIENCE. A member used to learn the law only by
+/// violating it, and that is the mechanism behind the route-around this work surfaced. A
+/// peer was refused a compound command that deleted and recreated a scratch directory —
+/// the safety preset permits the delete under /tmp but refuses command CHAINING,
+/// deliberately — and nine seconds later reached the same end with `mktemp -d`. It never
+/// learned the rule. It learned that one phrasing failed, and tried another.
+///
+/// Enforcement teaches by refusal, which selects for rephrasing. Publication teaches the
+/// rule, which selects for compliance. Same policy, opposite behaviour. It is the same
+/// inversion hestia#49 argues for at the trust layer: hand the party what it needs to
+/// reason with, rather than a verdict after the fact.
+///
+/// Composed in the order the gate itself folds, and every statement names the LAYER it
+/// came from, so a member can tell a society-wide norm from something bound to it alone.
+async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
+    let s = state.lock().await;
+    // ATTRIBUTED CALLERS ONLY — and "attributed" means RESOLVED, not "an id was supplied".
+    //
+    // The first fix here guarded on a MISSING session_id, which kimi measured as still
+    // leaky: a present-but-malformed, unknown or stale id fell through to resolve_caller,
+    // which returns ("unknown", DEFAULT_CONSTELLATION_ROLE), and a composed law was
+    // published anyway. Smaller than the original leak — the invalid-id caller no longer
+    // inherits the latest session's role/instance layers — but not zero: it still received
+    // the society layer in full, the existence of every `bound_to: ["*"]` list, and,
+    // because `permits` matches `g.subject == "*"` for ANY subject, the description AND
+    // ENTRIES of any list carrying a wildcard grant. A wildcard-granted list handed its
+    // entries to a caller who presented garbage as an id.
+    //
+    // `resolve_attributed_caller` parses, looks up, and returns None on any failure — the
+    // correct primitive, already in this file, thirty lines from the surface that needed
+    // it. The error contract is now "a caller was attributed", not "an id was supplied".
+    let Some(who) = resolve_attributed_caller(&s, optional_string(args, "session_id").as_deref())
+    else {
+        return Ok(hestia_error_envelope(
+            "hestia.operating_law_unattributed",
+            "hestia_operating_law requires a RESOLVED session: the law is composed FOR a \
+             specific member, so an id that is absent, malformed, unknown or expired cannot \
+             be answered — publishing the society layer and every wildcard-granted list to \
+             an unidentified caller is a smaller leak than the latest-session fallback, not \
+             an acceptable one. Call hestia_connect and pass the session_id it returns.",
+            None,
+        ));
+    };
+
+    let mut layers: Vec<(String, &crate::policy::PolicyEngine)> =
+        vec![("society".to_string(), &s.policy_engine)];
+    if let Some(e) = s.role_policy_engines.get(&who.role_lct) {
+        layers.push((format!("role:{}", who.role_lct), e));
+    }
+    if let Some(e) = s
+        .instance_policy_engines
+        .get(&(who.plugin_id.clone(), who.role_lct.clone()))
+    {
+        layers.push((format!("instance:{}", who.plugin_id), e));
+    }
+
+    let mut statements = Vec::new();
+    for (layer, eng) in &layers {
+        for r in &eng.config().rules {
+            // Allow-rules are published too. Telling a member only what is forbidden
+            // teaches that a whole verb is off-limits; telling it "rm IS permitted under
+            // /tmp, standing alone" is what actually produces compliant commands.
+            statements.push(json!({
+                "layer": layer,
+                "rule": r.name,
+                "decision": format!("{:?}", r.decision).to_lowercase(),
+                "law": r.reason.clone().unwrap_or_else(|| r.name.clone()),
+            }));
+        }
+    }
+
+    // Operator-authored lists bound to this member (vault-stored; see vault::policy_lists).
+    let lists = s.vault.policy_lists();
+    let bound = crate::vault::policy_lists::for_member(&lists, &who.plugin_id, &who.role_lct);
+    for l in &bound {
+        use crate::vault::policy_lists::ListPerm;
+        // METADATA VISIBILITY IS DECIDED, NOT INHERITED (kimi, finding 2). The first cut
+        // published every governing list's name/description/kind/entry_count regardless of
+        // grant, while `absent_grant_fails_closed` asserts a member with no grant gets
+        // nothing — the handler contradicted the model's own test.
+        //
+        // The rule, stated: BEING GOVERNED BY A LIST MAKES ITS EXISTENCE VISIBLE. A member
+        // subject to a rule must be able to learn that the rule exists, or the law is
+        // secret, which is the thing this whole surface opposes. What a grant controls is
+        // DETAIL: `List` adds the description, `Read` adds the entries. So no-grant now
+        // yields name + kind only — enough to know you are governed and to ask — instead
+        // of the full description and size.
+        let may_list = l.permits(&who.plugin_id, &who.role_lct, ListPerm::List);
+        let may_read = l.permits(&who.plugin_id, &who.role_lct, ListPerm::Read);
+        statements.push(json!({
+            "layer": format!("list:{}", l.name),
+            "rule": l.name,
+            "decision": format!("{:?}", l.kind).to_lowercase(),
+            "law": if may_list || may_read { json!(l.description) } else {
+                json!("(governed by this list; you hold neither `list` nor `read` on it — \
+                       ask the operator for detail)")
+            },
+            // Contents only where this member may READ them. A member holding `list` but
+            // not `read` learns that the list governs it and how large it is — enough to
+            // comply and to ask — without being handed the patterns themselves.
+            "entries": if may_read { json!(l.entries) } else { json!(null) },
+            "entry_count": if may_list || may_read { json!(l.entries.len()) } else { json!(null) },
+            "grants_held": {"list": may_list, "read": may_read},
+            // Finding 3: these are PERSISTED AND PUBLISHED, not enforced. Said on every
+            // entry rather than only in prose, so nothing reads them as operative law.
+            "enforced": false,
+            "enforcement_note": "not yet wired into the policy fold — see the PR",
+        }));
+    }
+
+    // PER-LAYER, NOT A SINGLE MISLEADING VALUE (kimi, finding 1 + the related note).
+    // `enforced` and `default_when_no_rule_matches` previously reported the SOCIETY engine
+    // only, so a role or instance overlay could tighten the effective law while these
+    // fields kept describing the base. Rather than assert a composition this code has not
+    // verified, report each layer and let the reader see the fold.
+    let layer_modes: Vec<Value> = layers
+        .iter()
+        .map(|(n, e)| {
+            json!({
+                "layer": n,
+                "enforced": e.config().enforce,
+                "default_when_no_rule_matches":
+                    format!("{:?}", e.config().default_policy).to_lowercase(),
+                "content_hash": e.content_hash(),
+            })
+        })
+        .collect();
+
+    let body = json!({
+        "identity": {"plugin_id": who.plugin_id, "role": who.role_lct},
+        "layer_modes": layer_modes,
+        "layers": layers.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+        "lists_bound": bound.iter().map(|l| l.name.clone()).collect::<Vec<_>>(),
+        "law": statements,
+    });
+
+    // THE HASH COVERS WHAT WAS RETURNED (kimi, finding 1). It was
+    // `policy_engine.content_hash()` — the society layer alone — so a role rule, an
+    // instance rule or a bound list could change while the quoted hash stood still,
+    // defeating the one thing the field exists for: proving WHICH law was read. Hashing
+    // the serialized body covers every layer, every list and the redaction actually
+    // applied to this caller. serde_json::Value is a BTreeMap under the hood, so key order
+    // is canonical and the digest does not move with iteration order.
+    let law_hash = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(serde_json::to_string(&body).unwrap_or_default().as_bytes());
+        format!("{:x}", h.finalize())
+    };
+
+    let mut out = body;
+    if let Some(o) = out.as_object_mut() {
+        o.insert("law_hash".into(), json!(law_hash));
+        o.insert("society_policy_hash".into(), json!(s.policy_engine.content_hash()));
+    }
+    Ok(json!({
+        "identity": out.get("identity").cloned().unwrap_or(Value::Null),
+        "layer_modes": out.get("layer_modes").cloned().unwrap_or(Value::Null),
+        "layers": out.get("layers").cloned().unwrap_or(Value::Null),
+        "lists_bound": out.get("lists_bound").cloned().unwrap_or(Value::Null),
+        "law": out.get("law").cloned().unwrap_or(Value::Null),
+        // Quote THIS to say which law you read: it covers every layer, every bound list,
+        // and the redaction applied to you. `society_policy_hash` is kept only because
+        // existing audit entries reference it.
+        "law_hash": out.get("law_hash").cloned().unwrap_or(Value::Null),
+        "society_policy_hash": out.get("society_policy_hash").cloned().unwrap_or(Value::Null),
+        "note": "This is the law you operate under. If a rule blocks legitimate work, \
+                 appeal it through the witnessed channel rather than rephrasing around it \
+                 — an appeal is recorded conduct that can change the law; a rephrase is \
+                 neither, and scores as compliance while teaching the society nothing.",
     }))
 }
 
@@ -5235,5 +5418,157 @@ mod tests {
             ok["total"], 0,
             "attended drain with no connection is empty, not an error: {ok}"
         );
+    }
+}
+
+#[cfg(test)]
+mod operating_law_surface_tests {
+    //! Tests that call `tool_operating_law` and assert on the JSON IT RETURNS.
+    //!
+    //! The first version of this module was named for the surface and exercised the model:
+    //! it called `PolicyList::metadata_only`, which — as kimi measured — the handler never
+    //! calls. The handler builds its redacted JSON inline, keyed on `may_list`/`may_read`,
+    //! and that logic appeared in no test. So a module named for the surface would have
+    //! stayed green if the handler dropped the `may_list` condition, published entries
+    //! unconditionally, or removed `"enforced": false`.
+    //!
+    //! kimi's phrasing is the one to keep: "the second time this PR has shipped a test
+    //! whose subject is adjacent to the thing it claims to guard — the assertion and the
+    //! mechanism are in different rooms." The first was `absent_grant_fails_closed` passing
+    //! while the handler published metadata regardless of grant.
+    use super::*;
+    use crate::vault::policy_lists::*;
+    use tempfile::TempDir;
+
+    async fn state_with_list(list: PolicyList) -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let mut vault = crate::vault::Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let mut lists = PolicyLists::new();
+        lists.insert(list.name.clone(), list);
+        vault.set_policy_lists(lists).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    fn wildcard_list(grants: Vec<ListGrant>) -> PolicyList {
+        PolicyList {
+            name: "secrets-policy".into(),
+            description: "a description that is itself sensitive".into(),
+            kind: ListKind::Deny,
+            entries: vec!["/etc/shadow".into(), "SECRET-ENTRY".into()],
+            bound_to: vec!["*".into()],
+            grants,
+            enabled: true,
+        }
+    }
+
+    async fn connect(state: &SharedState, plugin: &str) -> String {
+        let c = tool_connect(state, &json!({"plugin_id": plugin, "host_agent": "t"}))
+            .await
+            .unwrap();
+        c["sessionId"].as_str().unwrap().to_string()
+    }
+
+    /// kimi's added falsifier, and the one that makes the invalid-id fix a regression test
+    /// rather than a comment: a `*`-bound, `*`-read-granted list must not reach a caller
+    /// who presented garbage as an id. All four invalid shapes, not just the absent one.
+    #[tokio::test]
+    async fn an_unresolvable_id_gets_no_law_and_no_wildcard_entries() {
+        let (_d, state) = state_with_list(wildcard_list(vec![ListGrant {
+            subject: "*".into(),
+            perms: vec![ListPerm::List, ListPerm::Read],
+        }]))
+        .await;
+        let _live = connect(&state, "claude-code").await; // a session to fall back TO
+
+        for bad in [
+            json!({}),                                                     // absent
+            json!({"session_id": "not-a-uuid"}),                           // malformed
+            json!({"session_id": "00000000-0000-4000-8000-000000000000"}), // unknown
+            json!({"session_id": ""}),                                     // empty
+        ] {
+            let out = tool_operating_law(&state, &bad).await.unwrap();
+            assert_eq!(
+                out["_hestia_error"]["code"], "hestia.operating_law_unattributed",
+                "unresolvable id {bad} must be refused, got: {out}"
+            );
+            let blob = out.to_string();
+            assert!(!blob.contains("SECRET-ENTRY"),
+                    "a wildcard-granted list must not leak entries to an unattributed caller");
+            assert!(!blob.contains("a description that is itself sensitive"),
+                    "nor its description");
+        }
+    }
+
+    /// Being governed makes EXISTENCE visible; DETAIL requires a grant. Asserted on the
+    /// handler's own output, because that is where the redaction is actually written.
+    #[tokio::test]
+    async fn no_grant_sees_the_list_exists_but_not_its_detail() {
+        let (_d, state) = state_with_list(wildcard_list(vec![])).await;
+        let sid = connect(&state, "codex").await;
+        let out = tool_operating_law(&state, &json!({"session_id": sid})).await.unwrap();
+        let blob = out.to_string();
+        assert!(blob.contains("secrets-policy"), "a governed member must learn the list exists");
+        assert!(!blob.contains("SECRET-ENTRY"), "entries require Read");
+        assert!(!blob.contains("a description that is itself sensitive"),
+                "the description requires List");
+        assert_eq!(out["lists_bound"][0], "secrets-policy");
+    }
+
+    /// `Read` publishes entries. This is the assertion that would fail if the handler ever
+    /// dropped the `may_read` condition — the one the previous module could not observe.
+    #[tokio::test]
+    async fn read_grant_publishes_entries_through_the_handler() {
+        let (_d, state) = state_with_list(wildcard_list(vec![ListGrant {
+            subject: "codex".into(),
+            perms: vec![ListPerm::Read],
+        }]))
+        .await;
+        let sid = connect(&state, "codex").await;
+        let out = tool_operating_law(&state, &json!({"session_id": sid})).await.unwrap();
+        assert!(out.to_string().contains("SECRET-ENTRY"), "Read must publish entries");
+    }
+
+    /// The published law must never imply these lists bind behaviour yet. Asserted on the
+    /// wire, so removing the stamp from the handler fails here.
+    #[tokio::test]
+    async fn published_lists_carry_enforced_false_on_the_wire() {
+        let (_d, state) = state_with_list(wildcard_list(vec![])).await;
+        let sid = connect(&state, "codex").await;
+        let out = tool_operating_law(&state, &json!({"session_id": sid})).await.unwrap();
+        let stmt = out["law"].as_array().unwrap().iter()
+            .find(|s| s["rule"] == "secrets-policy").expect("the bound list must be published");
+        assert_eq!(stmt["enforced"], false,
+                   "an operator-authored deny that does not deny must say so on the wire");
+    }
+
+    /// The hash must move when the RETURNED law moves — that is its only purpose, and the
+    /// old `policy_hash` (society engine only) could not do it for a list change.
+    ///
+    /// Note what this test had to be corrected to: the first version changed a list's
+    /// DESCRIPTION for a caller holding no grant, and the hash correctly did not move —
+    /// because the description is redacted to a placeholder for that caller, so the
+    /// returned law was byte-identical. The code was right and the test was wrong. The
+    /// hash covers what was published, not what exists, which is the property worth having:
+    /// two members reading different laws get different hashes, and a change a member
+    /// cannot see does not invalidate the law it was handed.
+    #[tokio::test]
+    async fn the_law_hash_changes_when_the_published_law_changes() {
+        let grant = || vec![ListGrant { subject: "codex".into(),
+                                        perms: vec![ListPerm::List, ListPerm::Read] }];
+        let (_d1, s1) = state_with_list(wildcard_list(grant())).await;
+        let sid1 = connect(&s1, "codex").await;
+        let a = tool_operating_law(&s1, &json!({"session_id": sid1})).await.unwrap();
+
+        let mut other = wildcard_list(grant());
+        other.entries = vec!["A-DIFFERENT-ENTRY".into()];
+        let (_d2, s2) = state_with_list(other).await;
+        let sid2 = connect(&s2, "codex").await;
+        let b = tool_operating_law(&s2, &json!({"session_id": sid2})).await.unwrap();
+
+        assert_ne!(a["law_hash"], b["law_hash"],
+                   "a change to the PUBLISHED law must move law_hash");
+        assert_eq!(a["society_policy_hash"], b["society_policy_hash"],
+                   "and the society hash alone would NOT have moved — which is the defect");
     }
 }
