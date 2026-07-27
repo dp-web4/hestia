@@ -514,6 +514,43 @@ impl ServerState {
         self.chain_store.read_recent(limit).unwrap_or_default()
     }
 
+    /// Resolve a chain-entry pointer — full hash or an abbreviation of it.
+    ///
+    /// The chain's public identifier is its hash: appeals cite `deny_hash`,
+    /// adjudications cite `claim_ref`, mesh notices carry
+    /// `hestia://adjudication/<hash>`, and the operating law cites rulings by an
+    /// eight-character prefix. Every one of those is a POINTER, and until this
+    /// existed no read surface could follow one — `recent_chain` is the only
+    /// exposed reader and it is a count-window over the tail, so an entry more
+    /// than a few hundred events old was addressable and unreachable at the same
+    /// time. That is the filtered-window illusion one level up: the reference
+    /// looks resolvable, and the failure to resolve it looks like absence.
+    ///
+    /// Returns the matches (0, 1, or several on an ambiguous prefix) and lets the
+    /// caller report which case it is. `Err` means the pointer was malformed.
+    /// Ambiguity is reported, not resolved — but the report must not lie about
+    /// its own scale, so this cap bounds the ENTRIES LISTED only; the count
+    /// beside them comes from `chain_prefix_match_count` and is uncapped.
+    pub const CHAIN_POINTER_LIST_CAP: u64 = 8;
+
+    pub fn chain_by_pointer(&self, hash_or_prefix: &str) -> Result<Vec<ChainEntry>> {
+        // Validate BEFORE branching on length. The full-hash arm is an equality
+        // match that would happily return "no such entry" for a 64-character
+        // non-hash, which is the malformed-reads-as-absent conflation this
+        // resolver was written to remove.
+        let ptr = crate::storage::chain::validate_hash_pointer(hash_or_prefix)?;
+        if ptr.len() == 64 {
+            return Ok(self.chain_store.read_by_hash(&ptr)?.into_iter().collect());
+        }
+        self.chain_store
+            .read_by_hash_prefix(&ptr, Self::CHAIN_POINTER_LIST_CAP)
+    }
+
+    /// True number of entries a prefix matches, for the ambiguity report only.
+    pub fn chain_prefix_match_count(&self, prefix: &str) -> Result<u64> {
+        self.chain_store.count_by_hash_prefix(prefix)
+    }
+
     /// Apply an outcome to the trust state for a plugin.
     pub fn apply_outcome(
         &self,

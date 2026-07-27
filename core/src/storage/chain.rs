@@ -271,6 +271,66 @@ impl SqliteChainStore {
         }
     }
 
+    /// Resolve a hash PREFIX to at most `cap` entries (ascending by position so
+    /// the report is stable). Exists because the only place most members ever
+    /// see an entry id is prose that abbreviates it — the operating law cites
+    /// "adjudication 62cfdffe", eight characters, and a member who wants to read
+    /// the ruling behind the rule it is bound by has exactly that. A lookup that
+    /// only accepts the full 64 makes the law's own citation undereferenceable.
+    ///
+    /// Returns every match up to `cap` rather than the first: a prefix collision
+    /// must be REPORTED as ambiguous, never silently resolved to whichever row
+    /// SQLite reached first. Same discipline as the rest of this store — say what
+    /// is known, do not pick for the caller.
+    ///
+    /// Errors on a non-hex prefix rather than returning empty: `LIKE ?1 || '%'`
+    /// treats `%` and `_` in the bound value as wildcards, so a malformed
+    /// pointer would otherwise become a scan that reports a real-looking
+    /// "ambiguous" or a wrong single hit. Empty would also conflate
+    /// *you typed garbage* with *no such entry*, which is the distinction the
+    /// caller most needs.
+    pub fn read_by_hash_prefix(&self, prefix: &str, cap: u64) -> Result<Vec<ChainEntry>> {
+        validate_hash_pointer(prefix)?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+             FROM chain_entries WHERE hash LIKE ?1 || '%'
+             ORDER BY chain_position ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![prefix, cap as i64], row_to_entry)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    /// How many entries a prefix ACTUALLY matches, uncapped.
+    ///
+    /// `read_by_hash_prefix` is capped so an over-short prefix cannot drag the
+    /// chain into memory — but the cap then lands in the ambiguity report, where
+    /// `matches.len()` is a count of what we chose to fetch, not a count of what
+    /// matched. A member told "matches 8 entries" over a true 40 lengthens the
+    /// prefix by one character, gets told 8 again, and has no way to see it is
+    /// converging; the number is doing the opposite of what an ambiguity report
+    /// is for. Kimi's review of #60 (mesh notice 181) named this; it is the same
+    /// class as the bug the resolver exists to fix — a saturated count and a real
+    /// count render identically — one level in from the pointer itself.
+    ///
+    /// Separate query rather than fetching `cap + 1`: a boolean "there are more"
+    /// still cannot tell 9 from 900, and COUNT over the `hash` index never
+    /// materializes a row.
+    pub fn count_by_hash_prefix(&self, prefix: &str) -> Result<u64> {
+        validate_hash_pointer(prefix)?;
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM chain_entries WHERE hash LIKE ?1 || '%'",
+            params![prefix],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u64)
+    }
+
     pub fn read_failures(&self, limit: u64) -> Result<Vec<ChainEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -364,6 +424,36 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<Result<ChainEntry>> {
             chain_position: chain_position as u64,
         })
     })())
+}
+
+/// The single gate every hash-pointer lookup passes, full-length or abbreviated.
+///
+/// It exists because the two paths disagreed. `read_by_hash_prefix` checked hex;
+/// `read_by_hash` is an equality match and checked nothing, so a 64-character
+/// pointer that was not a hash at all — `"z" * 64`, a base64 blob, a truncated
+/// UUID — matched no row and came back **not found**. That reads as *this entry
+/// is not on the chain*, and a member holding a garbled pointer would go looking
+/// for a ruling that was in fact sitting right there under the real hash. It is
+/// the resolver's own defect class turned inward: a malformed input and a real
+/// absence rendering identically. Kimi's review of #60 (mesh notice 181) found
+/// it by feeding the resolver a 64-char non-hex string.
+///
+/// Case is normalized here for the same reason and not one level up: SQLite's
+/// `LIKE` is ASCII-case-insensitive by default while `=` is not, so before this
+/// an UPPERCASE 8-char prefix resolved and the UPPERCASE full hash of the very
+/// same entry reported not-found. Hashes are written lowercase (`compute_hash`),
+/// so lowercasing an all-hex pointer is lossless.
+pub(crate) fn validate_hash_pointer(pointer: &str) -> Result<String> {
+    if pointer.is_empty() || !pointer.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("chain hash pointer must be non-empty ASCII hex: {pointer:?}");
+    }
+    if pointer.len() > 64 {
+        anyhow::bail!(
+            "chain hash pointer is {} chars; a chain hash is 64 (sha256): {pointer:?}",
+            pointer.len()
+        );
+    }
+    Ok(pointer.to_ascii_lowercase())
 }
 
 fn compute_hash(

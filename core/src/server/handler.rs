@@ -9,9 +9,10 @@ use chrono::Utc;
 use rmcp::{
     ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResult, Content, ErrorData, ListResourcesResult,
-        ListToolsResult, PaginatedRequestParams, RawResource, ReadResourceRequestParams,
-        ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerInfo, Tool,
+        CallToolRequestParams, CallToolResult, Content, ErrorData, ListResourceTemplatesResult,
+        ListResourcesResult, ListToolsResult, PaginatedRequestParams, RawResource,
+        RawResourceTemplate, ReadResourceRequestParams, ReadResourceResult, Resource,
+        ResourceContents, ResourceTemplate, ServerCapabilities, ServerInfo, Tool,
     },
     service::{RequestContext, RoleServer},
 };
@@ -133,6 +134,35 @@ impl ServerHandler for HestiaServer {
         Ok(result)
     }
 
+    /// The pointer-shaped resources. These are TEMPLATES, not entries — the chain
+    /// is 60k+ rows, so `list_resources` cannot enumerate them, and before this a
+    /// client had no way to learn that `hestia://adjudication/<hash>` was
+    /// followable at all. An undiscoverable resolver is only marginally better
+    /// than a missing one: the member holding the pointer still has to guess.
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        let mut result = ListResourceTemplatesResult::default();
+        result.resource_templates = vec![
+            make_resource_template(
+                "hestia://adjudication/{hash}",
+                "Adjudication by chain hash",
+                "Dereference the ruling a mesh review_done notice points at. Accepts a full \
+                 hash or an abbreviation (the operating law cites rulings by ~8 chars). Reports \
+                 not-found, ambiguous-prefix and wrong-event-type distinctly.",
+            ),
+            make_resource_template(
+                "hestia://chain/{hash}",
+                "Witness chain entry by hash",
+                "Dereference ANY chain entry by hash or hash prefix — appeals, denies, outcomes, \
+                 member notices. Unlike hestia://witness/recent this is not window-limited.",
+            ),
+        ];
+        Ok(result)
+    }
+
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
@@ -212,7 +242,15 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t("hestia_vault_get", "Request a credential from the vault"),
         t("hestia_vault_set", "Store a credential in the vault"),
-        t("hestia_query_history", "Query the witness chain"),
+        t(
+            "hestia_query_history",
+            "Query the witness chain. filter.hash = DEREFERENCE one entry by its hash (or an \
+             abbreviation of at least ~8 hex chars) anywhere on the chain — this is how you follow \
+             a pointer you were handed: a mesh notice's hestia://adjudication/<hash>, an appeal's \
+             deny_hash, a ruling cited in your operating law. Without it, filter.limit/tool_name \
+             return only the recent tail, so an older entry reads as absent rather than out of \
+             window",
+        ),
         t(
             "hestia_request_witness",
             "Append a custom witness chain event",
@@ -255,6 +293,20 @@ fn hestia_tools() -> Vec<Tool> {
 fn make_resource(uri: &str, name: &str) -> Resource {
     let raw = RawResource::new(uri.to_string(), name.to_string());
     Resource::new(raw, None)
+}
+
+fn make_resource_template(uri_template: &str, name: &str, description: &str) -> ResourceTemplate {
+    ResourceTemplate::new(
+        RawResourceTemplate {
+            uri_template: uri_template.to_string(),
+            name: name.to_string(),
+            title: None,
+            description: Some(description.to_string()),
+            mime_type: Some("application/json".into()),
+            icons: None,
+        },
+        None,
+    )
 }
 
 // =========================================================================
@@ -1216,6 +1268,21 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
     let tool_filter = filter.get("tool_name").and_then(Value::as_str);
 
     let s = state.lock().await;
+
+    // `hash` is a POINTER lookup, not a filter over the recent window: the whole
+    // point is to reach entries the window has scrolled past. It therefore short
+    // -circuits `limit`/`tool_name` rather than composing with them — composing
+    // would silently re-impose the window and make an out-of-window hash read as
+    // "no such entry". Tool twin of the `hestia://chain/<hash>` resource, because
+    // several members on this fleet drive hestia through tools only.
+    if let Some(ptr) = filter
+        .get("hash")
+        .and_then(Value::as_str)
+        .filter(|h| !h.trim().is_empty())
+    {
+        return Ok(resolve_chain_pointer(&s, ptr, None));
+    }
+
     let mut entries = Vec::new();
     for e in s.recent_chain(limit as u64) {
         if let Some(tname) = tool_filter {
@@ -3642,12 +3709,156 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
     // secret with no policy, scope, allowed_consumers, or witness — a sibling
     // path that made the hestia_vault_get gate decorative (GPT 3rd-pass
     // HST-001). Credential reads go through hestia_vault_get, full stop.
+    // Chain-pointer dereference. `hestia://adjudication/<hash>` is the form the
+    // member mesh already emits for review verdicts; `hestia://chain/<hash>`
+    // resolves any entry kind. Both accept an abbreviated hash, because the
+    // operating law cites rulings as eight characters and that citation is the
+    // only entry id most members ever see.
+    //
+    // Resolution failures come back as a JSON error ENVELOPE, not an MCP
+    // `unknown resource` error: the scheme is known and the request was
+    // well-formed — it is the target that is missing, ambiguous or mislabelled,
+    // and collapsing those four outcomes into one protocol error rebuilds the
+    // exact ambiguity this resolver exists to remove.
+    for (prefix, expect) in [
+        ("hestia://adjudication/", Some("adjudication")),
+        ("hestia://chain/", None),
+    ] {
+        if let Some(ptr) = uri.strip_prefix(prefix) {
+            let body = resolve_chain_pointer(&s, ptr, expect);
+            return Ok(serde_json::to_string(&body).unwrap_or("{}".into()));
+        }
+    }
+
     Err(format!("unknown resource: {}", uri))
 }
 
 // =========================================================================
 // Helpers
 // =========================================================================
+
+fn chain_entry_json(e: &crate::storage::chain::ChainEntry) -> Value {
+    json!({
+        "hash": e.hash,
+        "prevHash": e.prev_hash,
+        "timestamp": e.timestamp.to_rfc3339(),
+        "eventType": e.event_type,
+        "eventData": e.event_data,
+        "signerLct": e.signer_lct,
+        "chainPosition": e.chain_position,
+    })
+}
+
+/// Dereference a chain pointer (full hash or prefix), optionally asserting the
+/// entry's kind.
+///
+/// WHY THIS EXISTS. The mesh is pointer-based by rule — "content lives at the
+/// pointer, never in the notice" (member-mesh KINDS.md) — and hestia hands out
+/// `hestia://adjudication/<hash>` pointers that no surface could follow. CBP
+/// received exactly one on 2026-07-27 (notice 161, kimi-code, the ruling on the
+/// judge-by-mention appeal): `resources/read` answered *unknown resource*, and
+/// `hestia_query_history` is a 500-deep window over the tail, so by the time the
+/// notice was delivered the entry it named had scrolled out of every exposed
+/// reader. `read_by_hash` had been sitting in the store the whole time, reachable
+/// only from `tool_witness_adjudication`'s internal `claim_ref` check.
+///
+/// The failure mode is the one this codebase keeps finding: the null state and
+/// the healthy state are bit-identical. An unfollowable pointer and a pointer to
+/// nothing both render as nothing-here, so a ruling that was witnessed, chained
+/// and correctly cited is indistinguishable from a ruling nobody made.
+///
+/// `expect_event_type` is checked and REPORTED, never used to withhold: an
+/// `hestia://adjudication/<h>` that resolves to an `outcome` is a genuine
+/// mislabel the reader must be told about, but hiding the entry would replace one
+/// blindness with another. The entry rides along inside the error's `data`.
+///
+/// Deliberately UNGATED, matching `recent_chain`/`hestia://witness/recent`, which
+/// already return arbitrary entries to any connected caller. This is a strictly
+/// NARROWER read over the same corpus — you must already hold the identifier —
+/// and the chain stores no secret material (`vault_set` records the credential
+/// NAME only; `vault_get` appends nothing). If chain reads are ever scoped, they
+/// must be scoped at `recent_chain` first; scoping only here would move the bulk
+/// path nowhere and cost the targeted one.
+fn resolve_chain_pointer(
+    s: &super::state::ServerState,
+    pointer: &str,
+    expect_event_type: Option<&str>,
+) -> Value {
+    let ptr = pointer.trim();
+    let matches = match s.chain_by_pointer(ptr) {
+        Ok(m) => m,
+        Err(e) => {
+            return hestia_error_envelope(
+                "hestia.chain_pointer_malformed",
+                &format!("'{ptr}' is not a chain hash or hash prefix: {e}"),
+                Some(json!({"pointer": ptr})),
+            )
+        }
+    };
+    match matches.len() {
+        0 => hestia_error_envelope(
+            "hestia.chain_pointer_not_found",
+            &format!("no chain entry matches '{ptr}'"),
+            // chain_length lets a reader tell "not on this chain" from "this
+            // daemon is looking at a different/empty chain" without a second call.
+            Some(json!({"pointer": ptr, "chainLength": s.chain_len()})),
+        ),
+        1 => {
+            let e = &matches[0];
+            if let Some(want) = expect_event_type {
+                if e.event_type != want {
+                    return hestia_error_envelope(
+                        "hestia.chain_pointer_type_mismatch",
+                        &format!(
+                            "'{ptr}' resolves to a '{}' entry, not '{want}' — the pointer is \
+                             mislabelled; the entry is included so you can judge it",
+                            e.event_type
+                        ),
+                        Some(json!({
+                            "pointer": ptr,
+                            "expectedEventType": want,
+                            "actualEventType": e.event_type,
+                            "entry": chain_entry_json(e),
+                        })),
+                    );
+                }
+            }
+            json!({"pointer": ptr, "resolvedFrom": if ptr.len() == 64 { "hash" } else { "prefix" }, "entry": chain_entry_json(e)})
+        }
+        _ => {
+            // `matches.len()` is capped, so reporting it as THE count understates
+            // any collision wider than the cap — and understates it by a constant,
+            // so a member lengthening the prefix sees "8" then "8" again and
+            // cannot tell it is converging. The listed entries stay capped; the
+            // count does not.
+            let shown = matches.len() as u64;
+            let total = s.chain_prefix_match_count(ptr).unwrap_or(shown).max(shown);
+            hestia_error_envelope(
+            "hestia.chain_pointer_ambiguous",
+            &format!(
+                "'{ptr}' matches {total} chain entries{} — use more of the hash",
+                if total > shown {
+                    format!(", {shown} listed")
+                } else {
+                    String::new()
+                }
+            ),
+            Some(json!({
+                "pointer": ptr,
+                "matchCount": total,
+                "matchesListed": shown,
+                "matchListCap": super::state::ServerState::CHAIN_POINTER_LIST_CAP,
+                "matches": matches.iter().map(|e| json!({
+                    "hash": e.hash,
+                    "eventType": e.event_type,
+                    "timestamp": e.timestamp.to_rfc3339(),
+                    "chainPosition": e.chain_position,
+                })).collect::<Vec<_>>(),
+            })),
+        )
+        }
+    }
+}
 
 fn trust_state_json(trust: &EntityTrust) -> Value {
     json!({
@@ -6711,5 +6922,274 @@ mod appeal_tests {
             "upheld": true, "rationale": "yep",
         })).await.unwrap();
         assert!(format!("{r}").contains("no_rationale"), "{r}");
+    }
+
+    // ---- Following the pointer the ruling is delivered as ----
+    //
+    // `hestia_arbitrate_appeal` writes an `adjudication` entry and the arbiter then wakes the
+    // appellant with `hestia://adjudication/<hash>`. That notice arrived on CBP (id=161,
+    // 2026-07-27) and the pointer resolved to NOTHING on every exposed surface. These tests
+    // drive the real ruling path and then dereference what it produced, rather than seeding a
+    // chain entry by hand: a hand-built entry would re-assert my own idea of the ruling's shape,
+    // which is the failure the appeal tests above exist to prevent.
+
+    /// Produce a REAL adjudication and return (its hash, the shared state).
+    async fn ruled_appeal(state: &SharedState) -> String {
+        let a_sid = seat(state, "claude-code").await;
+        let codex_sid = seat(state, "codex").await;
+        let deny_hash = seat_deny(state, "claude-code", a_sid, "hestia-gate").await;
+        tool_appeal(state, &json!({
+            "deny_hash": deny_hash, "session_id": a_sid.to_string(),
+            "reason": "the matched token sat in a heredoc body, never in executable position",
+        })).await.unwrap();
+        let ruled = tool_arbitrate_appeal(state, &json!({
+            "deny_hash": deny_hash, "session_id": codex_sid.to_string(), "upheld": true,
+            "rationale": "the rule targets chaining, not the delete; the deny was over-broad",
+        })).await.unwrap();
+        // `witnessEntryHash` is the ONLY place the ruling's identity surfaces, and only to the
+        // arbiter. The appellant learns it solely because the arbiter chooses to send a notice
+        // carrying it — there is no "was my appeal ruled on?" query. Out of scope here; noted
+        // because this test is the one place that fact is visible.
+        ruled
+            .get("witnessEntryHash")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("ruling must return its chain hash: {ruled}"))
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn the_adjudication_pointer_a_ruling_is_delivered_as_can_be_followed() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let hash = ruled_appeal(&state).await;
+
+        // The exact URI form `hestia_member_notify` carries for kind=review_done.
+        let uri = format!("hestia://adjudication/{hash}");
+        let body = read_resource_body(&state, &uri).await.unwrap_or_else(|e| {
+            panic!("the pointer the mesh hands out must resolve, not 'unknown resource': {e}")
+        });
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["entry"]["hash"].as_str(), Some(hash.as_str()), "{v}");
+        assert_eq!(v["entry"]["eventType"].as_str(), Some("adjudication"), "{v}");
+        assert!(
+            format!("{}", v["entry"]["eventData"]).contains("over-broad"),
+            "the RATIONALE is the point of following the pointer: {v}"
+        );
+
+        // Tool twin — several members drive hestia through tools only and never see resources.
+        let via_tool = tool_query_history(&state, &json!({"filter": {"hash": hash}}))
+            .await
+            .unwrap();
+        assert_eq!(via_tool["entry"]["hash"].as_str(), Some(hash.as_str()), "{via_tool}");
+    }
+
+    /// The regression that motivated all of this: `limit` is a window over the TAIL, so an
+    /// entry that has scrolled past it reads as absent. A hash lookup must not compose with
+    /// the window, or "old" and "nonexistent" stay indistinguishable.
+    #[tokio::test]
+    async fn a_hash_lookup_is_not_limited_by_the_recent_window() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let hash = ruled_appeal(&state).await;
+        {
+            let s = state.lock().await;
+            for i in 0..40 {
+                s.append_chain("outcome", json!({"filler": i})).unwrap();
+            }
+        }
+        // limit=1 would return only the newest filler entry.
+        let windowed = tool_query_history(&state, &json!({"filter": {"limit": 1}})).await.unwrap();
+        assert!(
+            !format!("{windowed}").contains(&hash),
+            "precondition: the ruling must be OUT of the window for this test to mean anything"
+        );
+        let by_hash = tool_query_history(&state, &json!({"filter": {"hash": hash, "limit": 1}}))
+            .await
+            .unwrap();
+        assert_eq!(by_hash["entry"]["hash"].as_str(), Some(hash.as_str()), "{by_hash}");
+    }
+
+    /// The law cites rulings by an eight-character prefix ("adjudication 62cfdffe"). That
+    /// citation is the only entry id most members ever see, so it has to be followable.
+    #[tokio::test]
+    async fn an_abbreviated_hash_resolves_and_an_ambiguous_one_says_so() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let hash = ruled_appeal(&state).await;
+
+        let short = &hash[..8];
+        let body = read_resource_body(&state, &format!("hestia://adjudication/{short}"))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["entry"]["hash"].as_str(), Some(hash.as_str()), "{v}");
+        assert_eq!(v["resolvedFrom"].as_str(), Some("prefix"), "{v}");
+
+        // A prefix that matches everything must be reported as AMBIGUOUS, never
+        // silently resolved to whichever row came back first.
+        let amb = tool_query_history(&state, &json!({"filter": {"hash": ""}})).await.unwrap();
+        assert!(!format!("{amb}").contains("chain_pointer"), "empty hash is not a lookup: {amb}");
+        let short1 = &hash[..1];
+        let one = tool_query_history(&state, &json!({"filter": {"hash": short1}})).await.unwrap();
+        // With ~50 entries a single hex char almost certainly collides; if it happens not to,
+        // the single-match branch is still correct — assert only that it never picks blindly.
+        if let Some(err) = one.get("_hestia_error") {
+            assert_eq!(err["code"].as_str(), Some("hestia.chain_pointer_ambiguous"), "{one}");
+            assert!(err["data"]["matches"].as_array().unwrap().len() > 1, "{one}");
+        } else {
+            assert!(one["entry"]["hash"].as_str().unwrap().starts_with(short1), "{one}");
+        }
+    }
+
+    /// Three distinct ways to fail must not collapse into one. Conflating them is the defect
+    /// class this whole surface exists to close.
+    #[tokio::test]
+    async fn missing_malformed_and_mislabelled_pointers_are_distinguishable() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let hash = ruled_appeal(&state).await;
+
+        let s = state.lock().await;
+
+        let missing = resolve_chain_pointer(&s, &"f".repeat(64), None);
+        assert_eq!(
+            missing["_hestia_error"]["code"].as_str(),
+            Some("hestia.chain_pointer_not_found"),
+            "{missing}"
+        );
+
+        // `LIKE ?1 || '%'` would treat this as a wildcard scan and report a confident,
+        // wrong answer. It must be refused as malformed instead.
+        let malformed = resolve_chain_pointer(&s, "%", None);
+        assert_eq!(
+            malformed["_hestia_error"]["code"].as_str(),
+            Some("hestia.chain_pointer_malformed"),
+            "a SQL wildcard is not a hash: {malformed}"
+        );
+
+        // An `hestia://adjudication/` pointer aimed at a non-adjudication entry: named as a
+        // mislabel, and the entry still handed over so the reader can judge it.
+        let appeal_hash = s
+            .recent_chain(200)
+            .into_iter()
+            .find(|e| e.event_type == "appeal")
+            .expect("the fixture filed an appeal")
+            .hash;
+        let mismatch = resolve_chain_pointer(&s, &appeal_hash, Some("adjudication"));
+        assert_eq!(
+            mismatch["_hestia_error"]["code"].as_str(),
+            Some("hestia.chain_pointer_type_mismatch"),
+            "{mismatch}"
+        );
+        assert_eq!(
+            mismatch["_hestia_error"]["data"]["entry"]["hash"].as_str(),
+            Some(appeal_hash.as_str()),
+            "the entry must ride along — withholding it trades one blindness for another: {mismatch}"
+        );
+
+        // `hestia://chain/` carries no kind claim, so the same entry resolves cleanly there.
+        let any = resolve_chain_pointer(&s, &appeal_hash, None);
+        assert_eq!(any["entry"]["eventType"].as_str(), Some("appeal"), "{any}");
+        assert_ne!(hash, appeal_hash, "fixture sanity: ruling and appeal are distinct entries");
+    }
+
+    /// Kimi's second nit on #60 (mesh notice 181). The malformed check lived in the PREFIX
+    /// path only, so a full-length pointer skipped it: `read_by_hash` is an equality match,
+    /// 64 characters of non-hex matched no row, and the resolver said **not found** — the
+    /// exact malformed-reads-as-absent conflation it was written to remove, reappearing
+    /// inside the fix at one specific length.
+    ///
+    /// The case half is the same seam from the other side: SQLite's `LIKE` is
+    /// ASCII-case-insensitive and `=` is not, so an UPPERCASE abbreviation resolved while
+    /// the UPPERCASE full hash of that same entry reported not-found.
+    #[tokio::test]
+    async fn a_full_length_pointer_is_validated_like_an_abbreviated_one() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let hash = ruled_appeal(&state).await;
+        let s = state.lock().await;
+
+        // 64 chars, not hex. Before the fix: chain_pointer_not_found.
+        let long_garbage = resolve_chain_pointer(&s, &"z".repeat(64), None);
+        assert_eq!(
+            long_garbage["_hestia_error"]["code"].as_str(),
+            Some("hestia.chain_pointer_malformed"),
+            "a 64-char non-hex pointer is garbled input, not a missing entry: {long_garbage}"
+        );
+
+        // Longer than any chain hash: also malformed, not absent.
+        let too_long = resolve_chain_pointer(&s, &"a".repeat(65), None);
+        assert_eq!(
+            too_long["_hestia_error"]["code"].as_str(),
+            Some("hestia.chain_pointer_malformed"),
+            "{too_long}"
+        );
+
+        // And the length that DOES exist still resolves, so the guard did not overshoot.
+        let good = resolve_chain_pointer(&s, &hash, None);
+        assert_eq!(good["entry"]["hash"].as_str(), Some(hash.as_str()), "{good}");
+
+        // Uppercase, both lengths, same entry — the two arms must agree.
+        let upper_full = resolve_chain_pointer(&s, &hash.to_ascii_uppercase(), None);
+        assert_eq!(
+            upper_full["entry"]["hash"].as_str(),
+            Some(hash.as_str()),
+            "an uppercase full hash resolved as not-found while its own prefix resolved: \
+             {upper_full}"
+        );
+        let upper_prefix = resolve_chain_pointer(&s, &hash[..8].to_ascii_uppercase(), None);
+        assert_eq!(upper_prefix["entry"]["hash"].as_str(), Some(hash.as_str()), "{upper_prefix}");
+    }
+
+    /// Kimi's first nit on #60. The ambiguity report counted the entries it FETCHED, and the
+    /// fetch is capped at 8 — so every collision wider than the cap reported "8", and a
+    /// member lengthening the prefix saw 8, then 8 again, with no way to tell it was
+    /// converging. The listed entries stay capped; the count must not be.
+    #[tokio::test]
+    async fn the_ambiguous_count_is_the_true_count_not_the_capped_one() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let s = state.lock().await;
+
+        // Enough entries that some single hex character collides well past the cap of 8.
+        // 200 entries over 16 first-character buckets: ~12.5 expected in each, and the
+        // largest bucket falling under 9 is not a realistic outcome.
+        for i in 0..200 {
+            s.append_chain("outcome", json!({"filler": i})).unwrap();
+        }
+        let all = s.recent_chain(1000);
+        let mut counts: std::collections::HashMap<char, u64> = std::collections::HashMap::new();
+        for e in &all {
+            *counts.entry(e.hash.chars().next().unwrap()).or_default() += 1;
+        }
+        let (&ch, &true_count) = counts.iter().max_by_key(|(_, n)| **n).unwrap();
+        let cap = crate::server::ServerState::CHAIN_POINTER_LIST_CAP;
+        assert!(
+            true_count > cap,
+            "precondition: the widest bucket ({true_count}) must exceed the cap ({cap}), or \
+             this test cannot see the saturation it exists to catch"
+        );
+
+        let amb = resolve_chain_pointer(&s, &ch.to_string(), None);
+        let data = &amb["_hestia_error"]["data"];
+        assert_eq!(
+            amb["_hestia_error"]["code"].as_str(),
+            Some("hestia.chain_pointer_ambiguous"),
+            "{amb}"
+        );
+        assert_eq!(
+            data["matchCount"].as_u64(),
+            Some(true_count),
+            "the count must be the true number of matches, not the number fetched: {amb}"
+        );
+        assert_eq!(data["matchesListed"].as_u64(), Some(cap), "{amb}");
+        assert_eq!(data["matches"].as_array().map(Vec::len), Some(cap as usize), "{amb}");
+        assert!(
+            amb["_hestia_error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("matches {true_count} chain entries")),
+            "the message a member actually reads must carry the true count too: {amb}"
+        );
     }
 }
