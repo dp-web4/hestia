@@ -81,18 +81,26 @@ pub enum Independence {
 // member arbitrate its own appeal by opening a second terminal, which is what NotSame exists
 // to prevent.
 
-/// Whether a candidate arbiter is reachable, as the mesh knows it.
+/// Whether a candidate arbiter is ACTING, as the chain witnessed it.
+///
+/// Measured from the member's own acts (`actor_liveness`), NOT from its mailbox. A watcher
+/// polls a mailbox whether or not the member behind it can run, so "the doorbell rang" and
+/// "someone answered the door" are different facts and this is the second one. Do not read
+/// these variants as deliverability — `recipient_liveness` on the notify surfaces is the
+/// doorbell, and is the right measurement there.
 ///
 /// EVIDENCE, NOT A GATE — a dormant member is still fully eligible to rule, and does rule
 /// the moment it wakes. This only orders the routing choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Liveness {
-    /// Mailbox touched inside the live window.
+    /// Witnessed acting inside the live window — it ran, attempted, ruled, or appealed.
     Live,
-    /// Known to the mesh, but not recently. May wake; may not.
+    /// Last witnessed act is older than the live window but within the day. May wake; may not.
     Dormant,
-    /// Nothing on this mesh is known to deliver to it.
+    /// Never witnessed acting in the bounded window. Absence of evidence, not evidence of
+    /// absence: a member doing only read-class work emits no acts and lands here while
+    /// perfectly alive.
     Unknown,
 }
 

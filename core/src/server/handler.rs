@@ -1933,12 +1933,26 @@ fn actor_liveness(window: &[crate::storage::chain::ChainEntry], plugin_id: &str)
         .filter(|e| {
             e.event_data.get("plugin_id").and_then(Value::as_str) == Some(plugin_id)
                 || e.event_data.get("adjudicator").and_then(Value::as_str) == Some(plugin_id)
+                // `tool_adjudicate` nests the actor instead of naming it at the top level
+                // (handler.rs, `adjudicated_by`). Safe to read: the operator-issued path
+                // (http.rs) puts `operator: true` in that object and no `plugin_id`, so a
+                // sovereign ruling can never be counted as some member's act.
+                || e.event_data
+                    .pointer("/adjudicated_by/plugin_id")
+                    .and_then(Value::as_str)
+                    == Some(plugin_id)
         })
         .map(|e| e.timestamp)
         .max();
     match newest {
         // Windows chosen for the appeal use-case: an arbiter that acted within the hour will
         // very likely see the notice this session; one silent for a day may not for days.
+        //
+        // Known blind spot (kimi-code, PR #64): `outcome` needs an executed act and
+        // `policy_decision` fires on DENIES only, so a member doing an hour of pure
+        // read-class work emits nothing and reads Unknown while fully awake. "Reading
+        // quietly" and "gone" are the same row here. Tolerable only because this is
+        // evidence and not a gate — it reorders routing, it never excludes.
         Some(t) if (now - t).num_minutes() <= 60 => crate::arbiter::Liveness::Live,
         Some(t) if (now - t).num_hours() <= 24 => crate::arbiter::Liveness::Dormant,
         // Silent beyond a day, or never seen acting in this window at all. Unknown rather
