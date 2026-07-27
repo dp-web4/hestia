@@ -12,6 +12,9 @@ Env: HESTIA_ENDPOINT (default http://127.0.0.1:7711/mcp),
      HESTIA_ROLE — constellation role declared on hestia_connect. Absent → omitted →
      the daemon silently defaults to role:constellation:member, splitting the member's
      acts across two trust grains (the kimi 1140-outcomes-under-'member' split, PR #66).
+     Must be one of the PUBLISHED roles (reputation::KNOWN_CONSTELLATION_ROLES); an
+     unpublished string is normalized to member, which this CLI now warns about on
+     stderr rather than letting it pass as a successful connect.
 Kinds: coordination|review_request|review_done|reply|handoff|forum-note|ack (ack terminal).
 Discipline: forum post = record, mesh notice = wake; content lives at the pointer.
 Bind your dispositions: pass the id of the notice you are answering as the 4th
@@ -52,6 +55,18 @@ def connect():
     if not s:
         print(json.dumps({"error": "connect failed", "detail": c}), file=sys.stderr)
         sys.exit(1)
+    # Declaring a role and having it TAKE are different events. A typo, or an
+    # unpublished string, normalizes to role:constellation:member and the connect
+    # succeeds identically — so "it connected" never verified the role. Say so on
+    # stderr (never stdout: callers parse that as JSON) when the daemon reports the
+    # declaration did not survive. Older daemons omit the field; stay quiet then
+    # rather than crying wolf about a readback that does not exist yet.
+    declared = os.environ.get("HESTIA_ROLE")
+    if declared and c.get("roleDeclarationHonored") is False:
+        print(f"hestia-mesh: WARNING: declared HESTIA_ROLE={declared!r} but this session "
+              f"is {c.get('constellationRole')!r}"
+              f"{' (reused session keeps its minted role)' if c.get('reused') else ''}"
+              " — acts land on that grain, not the one you declared.", file=sys.stderr)
     return h, s
 
 def main():

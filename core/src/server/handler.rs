@@ -359,10 +359,21 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     let requested_role =
         optional_string(args, "requested_role").unwrap_or_else(|| "citizen".to_string());
     // The #403 capacity — normalized fail-closed to the published constellation set.
-    let constellation_role = crate::reputation::normalize_constellation_role(
-        optional_string(args, "role").as_deref().unwrap_or(""),
-    )
-    .to_string();
+    let declared_role = optional_string(args, "role").unwrap_or_default();
+    let constellation_role =
+        crate::reputation::normalize_constellation_role(&declared_role).to_string();
+    // Did the caller's declaration SURVIVE normalization? A member that declares
+    // nothing, declares "", or typos the string (`...:interactive_dev`) all land on
+    // DEFAULT_CONSTELLATION_ROLE — indistinguishable, in every downstream record,
+    // from one that deliberately declared `member`. `tool_record_reversal` already
+    // refuses to guess for exactly this reason ("would misattribute the penalty AND
+    // pollute the calibration stream"); connect cannot refuse without breaking live
+    // members mid-flight, so it reports instead. Echoed below so a caller can VERIFY
+    // its declaration took — until now nothing observable said whether it did:
+    // `session_started` is deliberately not chained, and the response carried only
+    // `assignedRole` (the unrelated `requested_role`). kimi-code's role repair was
+    // "live-verified" by a connect that answers — which it does either way.
+    let role_declaration_honored = !declared_role.is_empty() && declared_role == constellation_role;
     let synthetic = args
         .get("synthetic")
         .and_then(|v| v.as_bool())
@@ -386,10 +397,17 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
             .find(|sess| sess.host_session_id.as_deref() == Some(hsid))
         {
             existing.connected_at = Utc::now(); // Guard A: liveness only — no other field mutates
+            // Guard A means a reused session keeps the role it was MINTED with — this
+            // call's `role` argument is ignored outright. Report against the role the
+            // caller actually gets, so "I declared interactive-dev and got a member
+            // session back" is visible rather than silent.
+            let honored = !declared_role.is_empty() && declared_role == existing.constellation_role;
             return Ok(json!({
                 "sessionId": existing.session_id,
                 "softLct": existing.soft_lct,
                 "assignedRole": existing.assigned_role,
+                "constellationRole": existing.constellation_role,
+                "roleDeclarationHonored": honored,
                 "protocolVersion": 1,
                 "reused": true,
             }));
@@ -406,7 +424,7 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         host_agent,
         host_agent_version,
         assigned_role: requested_role.clone(),
-        constellation_role,
+        constellation_role: constellation_role.clone(),
         soft_lct: soft_lct.clone(),
         connected_at: Utc::now(),
         host_session_id,
@@ -474,6 +492,8 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         "sessionId": session_id,
         "softLct": soft_lct,
         "assignedRole": requested_role,
+        "constellationRole": constellation_role,
+        "roleDeclarationHonored": role_declaration_honored,
         "protocolVersion": 1,
     }))
 }
@@ -5883,6 +5903,80 @@ mod tests {
         assert_eq!(
             sess.constellation_role, "role:constellation:member",
             "Guard B: an asserted host_session_id must not change role on reuse"
+        );
+    }
+
+    /// The declared constellation role must be READABLE BACK. Before this, a member
+    /// had no way to tell a taken declaration from a silently-normalized one: connect
+    /// echoed only `assignedRole` (the unrelated `requested_role`, default "citizen"),
+    /// and `session_started` is deliberately never chained. So a typo'd HESTIA_ROLE
+    /// degraded to `member` and the member's evidence quietly split across two grains
+    /// with a connect that answered normally either way — which is precisely how
+    /// kimi-code's repair (hestia 2a06450) was "live-verified".
+    #[tokio::test]
+    async fn connect_echoes_the_constellation_role_and_whether_the_declaration_survived() {
+        let (_dir, shared) = make_shared_state();
+
+        // 1. No role declared → the fail-closed default, and NOT reported as honored.
+        let r = tool_connect(&shared, &json!({"plugin_id": "m1", "host_agent": "h"}))
+            .await
+            .unwrap();
+        assert_eq!(r["constellationRole"], "role:constellation:member");
+        assert_eq!(
+            r["roleDeclarationHonored"], false,
+            "an absent role is a default, not a declaration"
+        );
+
+        // 2. Typo'd role → normalizes to the same default. THIS is the case that was
+        //    invisible: the caller believes it declared interactive-dev.
+        let r = tool_connect(
+            &shared,
+            &json!({"plugin_id": "m2", "host_agent": "h",
+                    "role": "role:constellation:interactive_dev"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["constellationRole"], "role:constellation:member");
+        assert_eq!(
+            r["roleDeclarationHonored"], false,
+            "an unpublished role string was swallowed — the caller must be able to see that"
+        );
+
+        // 3. A published role declared → survives, and is reported as honored.
+        let r = tool_connect(
+            &shared,
+            &json!({"plugin_id": "m3", "host_agent": "h",
+                    "role": "role:constellation:interactive-dev"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["constellationRole"], "role:constellation:interactive-dev");
+        assert_eq!(r["roleDeclarationHonored"], true);
+
+        // 4. Guard A reuse ignores this call's role outright. Report against the role
+        //    the caller ACTUALLY gets, so the silent ignore is observable too.
+        tool_connect(
+            &shared,
+            &json!({"plugin_id": "m4", "host_agent": "h", "host_session_id": "hs-r",
+                    "role": "role:constellation:mesh-worker"}),
+        )
+        .await
+        .unwrap();
+        let r = tool_connect(
+            &shared,
+            &json!({"plugin_id": "m4", "host_agent": "h", "host_session_id": "hs-r",
+                    "role": "role:constellation:interactive-dev"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["reused"], true);
+        assert_eq!(
+            r["constellationRole"], "role:constellation:mesh-worker",
+            "reuse keeps the minted role"
+        );
+        assert_eq!(
+            r["roleDeclarationHonored"], false,
+            "the reused session did NOT honor this call's declaration"
         );
     }
 
