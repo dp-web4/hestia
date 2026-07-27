@@ -174,7 +174,21 @@ def _cell(text):
 
 def render(law):
     """The law as a compact, quotable block. Rules verbatim — a paraphrased rule is a
-    different rule, and the whole point is that what is shown is what is enforced."""
+    different rule.
+
+    AND SHOWN IS NOT ALWAYS ENFORCED, which this function used to assume. Its own docstring
+    claimed "what is shown is what is enforced." Operator-authored lists are published on
+    this surface with `enforced: false` — persisted and announced, but not wired into the
+    policy fold (codex, blocking review of #50; still true today, verified 2026-07-27).
+    This renderer read only `decision` and `law`, so such a list would arrive in every
+    session as an ordinary `deny` row: a rule the member plans around, that stops nothing.
+
+    Harmless only because no operator list exists yet — and dp has asked for
+    operator-editable lists, so it is a live trap rather than a hypothetical one. Note the
+    direction of the failure: the daemon says `enforced: false` honestly, and this hook was
+    about to strip that word on the way to the reader. A publication layer that drops the
+    caveat is how an honest API becomes a dishonest context.
+    """
     ident = law.get("identity") or {}
     lines = [
         "## The law you operate under (hestia, injected at launch)",
@@ -194,6 +208,14 @@ def render(law):
         for r in rules:
             decision = str(r.get("decision", "?"))
             text = " ".join(str(r.get("law", "")).split())
+            # `enforced` is absent on ordinary rules (they enforce) and explicitly false on
+            # published-but-unwired lists. ONLY an explicit false demotes a row: an absent
+            # field must never read as unenforced, or a real deny would be rendered
+            # toothless — the same error pointing the other way, and far more dangerous.
+            if r.get("enforced") is False:
+                note = str(r.get("enforcement_note") or "not wired into the policy fold")
+                decision = f"{decision} · NOT ENFORCED"
+                text = f"**Published, not enforced** ({note}). {text}"
             # Denies get the long budget. They are the rules that STOP you, and they carry
             # the escape hatch — the first cut of this hook truncated the destructive-command
             # deny at 400 chars, landing mid-word in the sentence that tells you a rephrase
@@ -216,6 +238,11 @@ def render(law):
     note = law.get("note")
     if note:
         lines += ["", str(note)]
+    if any(r.get("enforced") is False for r in rules):
+        lines += ["", "> Rows marked **NOT ENFORCED** are published law that no evaluation "
+                      "path currently consumes. They state the operator's intent and will "
+                      "not stop the act. Treat them as intent, not as a gate — and do not "
+                      "read the absence of a block as permission."]
     lines += ["", "Full text and any later amendment: `hestia_operating_law`. "
                   "Dispute a deny with `hestia_appeal` (its chain hash + your reason) — "
                   "never by rephrasing to reach the same resource."]
