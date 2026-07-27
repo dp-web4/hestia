@@ -265,7 +265,19 @@ impl SqliteInboxStore {
                 existing.push(r?);
             }
         }
-        for (col, decl) in [("in_reply_to", "INTEGER"), ("drained_at", "TEXT"), ("dest_peer", "TEXT")] {
+        // `dest_peer_lct`, `attempts` and `last_error` arrive with the forwarding plane's
+        // retire-and-report layer. Added through the same in-place path so an existing
+        // inbox UPGRADES rather than being rebuilt — the queue holds undelivered mail, and
+        // a schema change that dropped it would lose exactly the packets this layer exists
+        // to account for.
+        for (col, decl) in [
+            ("in_reply_to", "INTEGER"),
+            ("drained_at", "TEXT"),
+            ("dest_peer", "TEXT"),
+            ("dest_peer_lct", "TEXT"),
+            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_error", "TEXT"),
+        ] {
             if !existing.iter().any(|c| c == col) {
                 conn.execute_batch(&format!(
                     "ALTER TABLE member_notices ADD COLUMN {col} {decl}"
@@ -923,6 +935,206 @@ impl SqliteInboxStore {
         }
         Ok(out)
     }
+
+    // ---- Forwarding-plane retirement layer (r6-routing graft, recomposed) ----
+    //
+    // main already carries the egress QUEUE (enqueue_egress / pending_egress /
+    // mark_egress_forwarded). What it lacked is the layer deciding when a row can no longer
+    // be sent and what the SENDER is owed then: attempt accounting, a bounded retry,
+    // retirement, and the split between "the peer did not take it" and "this box could
+    // never send it".
+    //
+    // Ported ADDITIVELY rather than by taking the branch's file wholesale. Both sides
+    // changed inbox.rs after diverging — main carries three routing fixes, the branch
+    // eight. A wholesale take reads as "newer" and would silently drop main's three, which
+    // is the merge-shaped version of the defect this whole thread is about.
+
+    /// One egress row by id, forwarded or not — for building the unreachable
+    /// report that a retired row owes its sender.
+    pub fn egress_row(&self, id: u64) -> Result<Option<EgressRow>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, dest_peer, dest_peer_lct, to_plugin, from_plugin, kind, pointer_uri,
+                    attempts, last_error
+               FROM member_notices WHERE id = ?1 AND dest_peer IS NOT NULL",
+        )?;
+        let mut rows = stmt.query_map(params![id as i64], |r| {
+            Ok(EgressRow {
+                id: r.get::<_, i64>(0)? as u64,
+                dest_peer: r.get(1)?,
+                dest_peer_lct: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                to_member: r.get(3)?,
+                from_plugin: r.get(4)?,
+                kind: r.get(5)?,
+                pointer_uri: r.get(6)?,
+                attempts: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                last_error: r.get(8)?,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Undrained forwards parked for ONE peer — the number the per-peer stall
+    /// bound in [`Self::enqueue_egress`] tests (S1). Exposed so a caller can report
+    /// one link's depth without provoking the refusal.
+    ///
+    /// Per-peer on purpose: this is the STALL question, and it is not the resource
+    /// question [`Self::egress_queued`] answers. One wedged peer holding its own
+    /// backlog is not a reason to refuse mail to a peer that is answering fine —
+    /// two different questions that were one predicate before the graft.
+    ///
+    /// The predicate drops the `dest_peer IS NOT NULL` conjunct its plane-wide
+    /// sibling carries, and that is not an omission: `NULL = ?1` is NULL, never
+    /// true, so a local row can never match a named peer. Same result, one term
+    /// fewer.
+    pub fn egress_queued_for(&self, dest_peer: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM member_notices
+              WHERE dest_peer = ?1 AND drained_at IS NULL",
+            params![dest_peer],
+            |row| row.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    /// Egress rows that have outlived the forwarding TTL, oldest first.
+    ///
+    /// The local TTL prune deliberately skips this plane (see `enqueue_member`),
+    /// which would otherwise leave the forwarding queue with no bound at all —
+    /// Kimi §4, r6-routing 2026-07-26. So the bound lives here instead, and the
+    /// difference is the whole point: the local prune is a silent `DELETE`,
+    /// while this returns ids to a caller that owes each one a report. Never
+    /// evict a forwarding row quietly — a silently dropped forward is
+    /// indistinguishable from a link failure, which is the defect this
+    /// exploration exists to remove.
+    ///
+    /// Called from the drain's read path because that is where a report can
+    /// actually be emitted; a store method cannot witness one.
+    pub fn expired_egress(&self, older_than_secs: i64, limit: u32) -> Result<Vec<u64>> {
+        let cutoff = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM member_notices
+              WHERE dest_peer IS NOT NULL AND drained_at IS NULL AND queued_at < ?1
+              ORDER BY id ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![cutoff, limit], |r| r.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row? as u64);
+        }
+        Ok(out)
+    }
+
+    /// Record a FAILED hand-off attempt and return the new attempt count, or
+    /// `None` if the row was already settled.
+    ///
+    /// Retrying is safe here in a way it is not at the far end: this row has not
+    /// been processed by anyone, so a re-send is `undelivered`-class (the gate
+    /// refused, nothing ran), never `indeterminate`. That is why egress retries
+    /// and drain retries are different questions.
+    ///
+    /// The `Option` is load-bearing (G7, r6-routing hop 4) and it is G6's lesson
+    /// applied to the other half of the transition. The UPDATE has always been
+    /// `drained_at IS NULL`, so a settled row correctly does not increment — but
+    /// the count was then re-read unconditionally and handed back as if it had.
+    /// A caller reading that number cannot tell a fresh failure from a no-op, and
+    /// the two arms it feeds both act on it: below the maximum it answers `retry`
+    /// on a packet already forwarded, and at the maximum it retires and reports a
+    /// packet already retired. `None` means *nothing happened*, which is the only
+    /// answer that lets the caller stay silent.
+    pub fn record_egress_failure(&self, id: u64, reason: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let updated = conn
+            .execute(
+                "UPDATE member_notices
+                    SET attempts = COALESCE(attempts, 0) + 1, last_error = ?1
+                  WHERE id = ?2 AND dest_peer IS NOT NULL AND drained_at IS NULL",
+                params![reason, id as i64],
+            )
+            .context("recording egress failure")?;
+        if updated != 1 {
+            return Ok(None);
+        }
+        let n: Option<i64> = conn
+            .query_row(
+                "SELECT COALESCE(attempts, 0) FROM member_notices WHERE id = ?1",
+                params![id as i64],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(Some(n.unwrap_or(0)))
+    }
+
+    /// Retire an egress row that has exhausted its attempts. Marks it drained so
+    /// the queue does not grow without bound; the caller is responsible for the
+    /// unreachable report that this row now owes its sender. Retiring WITHOUT
+    /// reporting would be the silent drop with extra steps.
+    ///
+    /// Returns whether this call made the transition, for the same reason
+    /// `mark_egress_forwarded` does (G6) — and it is the same defect seen from
+    /// the retirement side (G7). The predicate was already here; what was missing
+    /// is the caller's ability to SEE it. `retire_and_report_egress` appends
+    /// `member_notice_unreachable` and enqueues the sender's report after this
+    /// call, so a discarded row count means an already-settled packet is witnessed
+    /// dead a second time — and `member_notice_unreachable` is a durable claim
+    /// about a PEER that a trust tally will count.
+    pub fn retire_egress(&self, id: u64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "UPDATE member_notices SET drained_at = ?1
+                  WHERE id = ?2 AND dest_peer IS NOT NULL AND drained_at IS NULL",
+                params![Utc::now().to_rfc3339(), id as i64],
+            )
+            .context("retiring egress row")?;
+        Ok(n == 1)
+    }
+
+    /// Parked forwards that can never be sent from this box: no destination LCT.
+    /// G1 (Thor, PR #44 review).
+    ///
+    /// The LCT is a column on the ROW, resolved once at enqueue. So this is not a
+    /// transient condition a later fix to `peers.json` clears — nothing reaches
+    /// these rows again, and no tick can succeed. Two ways they exist: the
+    /// `ALTER TABLE ... ADD COLUMN dest_peer_lct` migration is nullable with no
+    /// backfill, so every row parked by an older daemon reads back empty; and
+    /// before `resolve_peer_at` refused it, a peer entry with an empty `lct_id`
+    /// resolved `Known` and admitted one.
+    ///
+    /// Kept as a READ, symmetric with [`Self::expired_egress`] and for the same
+    /// reason: retiring them owes the sender a report, a report must be witnessed,
+    /// and a store method cannot witness. The caller retires them under
+    /// `EgressFault::Local` — the peer is never named, because the peer was never
+    /// contacted.
+    ///
+    /// `NULL` and `''` both count. The migration produces the first and
+    /// `unwrap_or_default()` on the read path renders it as the second, so a
+    /// predicate that tested only one would leave half the population parked.
+    pub fn undeliverable_egress(&self, limit: u32) -> Result<Vec<u64>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM member_notices
+              WHERE dest_peer IS NOT NULL AND drained_at IS NULL
+                AND (dest_peer_lct IS NULL OR TRIM(dest_peer_lct) = '')
+              ORDER BY id ASC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| r.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row? as u64);
+        }
+        Ok(out)
+    }
 }
 
 /// One member→member notice (the local-mesh wake signal).
@@ -981,6 +1193,30 @@ pub struct UnansweredNotice {
     pub pointer_uri: Option<String>,
     pub queued_at: DateTime<Utc>,
     pub drained_at: Option<DateTime<Utc>>,
+}
+
+/// One notice awaiting hand-off to the fleet mesh (r6-routing branch 2).
+///
+/// `attempts` and `last_error` are what make this a queue rather than a second
+/// black hole: an egress row that can fail forever without anyone learning is the
+/// silent drop moved one hop out (Kimi, r6-routing review §2.4).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EgressRow {
+    pub id: u64,
+    pub dest_peer: String,
+    /// Roster-validated at enqueue. The drain forwards on THIS, not on the name —
+    /// re-resolving a name at drain time reintroduces the prefix-matching oracle
+    /// this design removed.
+    pub dest_peer_lct: String,
+    pub to_member: String,
+    /// Always a LOCAL member: only local members can call `member_notify`, so the
+    /// route-back for an egress failure is always local delivery. The one place
+    /// this design is simpler than it looks.
+    pub from_plugin: String,
+    pub kind: String,
+    pub pointer_uri: Option<String>,
+    pub attempts: i64,
+    pub last_error: Option<String>,
 }
 
 #[cfg(test)]
