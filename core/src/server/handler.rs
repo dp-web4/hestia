@@ -5666,9 +5666,11 @@ mod member_mesh_tests {
              AND: assert at the RENDERED layer, not this one. This test stops at the \
              store, which is one boundary early — the same shape PR #62's own acceptance \
              test had (Kimi, notice 197). Before un-ignoring, run the report path \
-             end-to-end into a fired prompt: checks B4/B4b of \
-             `plugins/member-mesh/tests/fire_sender_allowlist_test.py`, which runs \
-             against the real templates. A green store-layer criterion proves the row \
+             end-to-end into a fired prompt: `cargo test --test rendered_layer`, which \
+             shells out to checks B4/B4b of \
+             `plugins/member-mesh/tests/fire_sender_allowlist_test.py` against the real \
+             templates (the seam is wired, not a prose instruction — Kimi, notice 200). \
+             A green store-layer criterion proves the row \
              was written, never that a member was woken by it: {out}"
         );
         assert!(
@@ -5700,8 +5702,8 @@ mod member_mesh_tests {
     ///
     /// NOTE for whoever un-ignores this: turning it green is necessary and NOT sufficient.
     /// It asserts at the store layer. The report path's failure mode has twice been past
-    /// that boundary, so the wiring PR must also assert at the RENDERED layer — see the
-    /// tripwire message above for the check to run.
+    /// that boundary, so the wiring PR must also assert at the RENDERED layer — wired as
+    /// `cargo test --test rendered_layer`, see the tripwire message above.
     #[tokio::test]
     #[ignore = "criterion for the edge-resolution change: enqueue_egress does not yet \
                 accept or store dest_peer_lct (r6-routing, addressing decision pending)"]
