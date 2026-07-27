@@ -231,7 +231,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_egress_pending",
-            "Forwarding plane (r6-routing branch 2): list notices addressed `peer/member` awaiting hand-off to the fleet mesh, or `mark_forwarded: <id>` once the mesh accepted one. Accepted-by-mesh is NOT read-by-recipient",
+            "Forwarding plane (r6-routing branch 2): list notices addressed `peer/member` awaiting hand-off to the fleet mesh (each row carries the dest_peer_lct to forward on, and the list carries the drain contract), then report the outcome — `mark_forwarded: <id>` if the mesh accepted it, or `mark_failed: <id>` with `reason: <text>` if it did not. Accepted-by-mesh is NOT read-by-recipient. Leaving a failed row unreported is not neutral: the attempt bound never fires and the sender is never told its packet died",
         ),
         t(
             "hestia_member_unanswered",
@@ -2460,6 +2460,19 @@ const MEMBER_NOTICE_KINDS: &[&str] = &[
     "ack",
 ];
 
+/// The daemon's own notice kind, and deliberately NOT in [`MEMBER_NOTICE_KINDS`].
+///
+/// `tool_member_notify` validates every member send against that list, so a member
+/// cannot emit this one; the store does not validate, so the daemon can. That split
+/// is the whole value of the kind. An "your packet never left the box" report that
+/// any member could send is a claim; one only the daemon can send, written next to
+/// the `member_notice_unreachable` entry that justifies it, is evidence.
+///
+/// Receiving members must not filter it out: it is the only notice on this mesh that
+/// says something the recipient cannot learn any other way. Documented in
+/// `plugins/member-mesh/KINDS.md`.
+const DAEMON_NOTICE_KIND_UNREACHABLE: &str = "unreachable";
+
 // ---- id-binding (Kimi ↔ CBP, 2026-07-25): two DIFFERENT per-kind sets ----
 //
 // The convention already existed in prose (`re: <notice-id>` in forum
@@ -2831,11 +2844,20 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         "queued_id": queued_id,
         "witnessEntryHash": entry.hash,
         "to_plugin_id": to_plugin,
-        // `forwarded_to` present => this left the machine (branch 2) and its
-        // `queued_id` is an EGRESS row, not a local inbox row. Absent => local.
-        // Naming which branch fired is the point: a receipt that cannot say how it
-        // was routed is the black hole with a success code.
-        "forwarded_to": egress_peer,
+        // `egress_queued_to` present => this took the forwarding branch (branch 2)
+        // and its `queued_id` is an EGRESS row, not a local inbox row. Absent =>
+        // local. Naming which branch fired is the point: a receipt that cannot say
+        // how it was routed is the black hole with a success code.
+        //
+        // Was `forwarded_to` until 2026-07-27 (Kimi, notice 123 §3). At this line
+        // nothing has been forwarded: the row is parked for a drain that runs when
+        // it runs, against a hub that may be down. The commit that shipped the field
+        // named the distinction in its own message — "'the mesh accepted it' and
+        // 'the recipient read it' are different facts" — and then gave the field the
+        // name of the fact it was warning about. This thread is the one about
+        // receipts that overclaim; a receipt is exactly where the overclaim does its
+        // damage, because it is the only artifact the sender keeps.
+        "egress_queued_to": egress_peer,
         "kind": kind,
         "in_reply_to": in_reply_to,
         "binding_verified": binding_verified,
@@ -2912,9 +2934,19 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
         &who,
         "hestia_egress_pending",
         "mesh_egress",
+        // The gate sees WHICH arm, not just which tool. `mark_failed` can retire a
+        // packet and mint a durable claim about a peer, so it must be distinguishable
+        // from a read at the policy layer — a rule that wanted to allow listing while
+        // denying retirement could not express that against a resource string of
+        // "list" for both.
         args.get("mark_forwarded")
             .and_then(|v| v.as_u64())
-            .map(|i| i.to_string())
+            .map(|i| format!("mark_forwarded:{i}"))
+            .or_else(|| {
+                args.get("mark_failed")
+                    .and_then(|v| v.as_u64())
+                    .map(|i| format!("mark_failed:{i}"))
+            })
             .unwrap_or_else(|| "list".into())
             .as_str(),
     ) {
@@ -2939,19 +2971,232 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
         );
         return Ok(json!({ "marked": id, "by": who.plugin_id, "witnessed": true }));
     }
+
+    // ---- the other disposition: the hand-off did not land -----------------------
+    //
+    // This arm did not exist until 2026-07-27, and its absence is why the whole
+    // retirement layer below it was dead code. `record_egress_failure`,
+    // `retire_egress`, `egress_row`, `expired_egress`, `undeliverable_egress` and
+    // `egress_queued_for` were ported into the store on 2026-07-26 — complete, and
+    // each carrying the review lesson that shaped its signature — with **zero
+    // callers, including tests**. The tool advertised `mark_forwarded` and nothing
+    // else, so the only disposition a drainer could express was the one that
+    // destroys a packet. A queue whose sole verb is "gone" is not a queue.
+    //
+    // Being `pub` on a library crate is what let six dead methods compile without a
+    // single `dead_code` warning: the one instrument that would have found this for
+    // free was silenced by an access modifier.
+    if let Some(id) = args.get("mark_failed").and_then(|v| v.as_u64()) {
+        let reason = optional_string(args, "reason").unwrap_or_else(|| "unspecified".into());
+        // G7, consumed as its doc comment asks: `None` means the UPDATE matched no
+        // row — already forwarded, already retired, or never existed. Nothing
+        // happened, so nothing is claimed. Re-reading the counter unconditionally
+        // here would answer `retry` on a packet already sent and, at the bound,
+        // report a peer dead twice over one live delivery.
+        let Some(attempts) = s
+            .inbox_store
+            .record_egress_failure(id, &reason)
+            .map_err(|e| anyhow::anyhow!("recording egress failure: {e}"))?
+        else {
+            return Ok(json!({
+                "row_id": id, "recorded": false, "by": who.plugin_id,
+                "note": "no pending egress row with that id — already forwarded, already \
+                         retired, or never queued. Nothing was recorded and nothing was \
+                         witnessed: a settled packet must not be reported dead a second \
+                         time, because `member_notice_unreachable` is a durable claim \
+                         about a PEER that a trust tally will count.",
+            }));
+        };
+        if attempts < crate::storage::inbox::MAX_EGRESS_ATTEMPTS {
+            return Ok(json!({
+                "row_id": id, "recorded": true, "attempts": attempts,
+                "max_attempts": crate::storage::inbox::MAX_EGRESS_ATTEMPTS,
+                "disposition": "retry", "by": who.plugin_id,
+                "last_error": reason,
+            }));
+        }
+        return retire_and_report_egress(&mut s, id, &who, &reason);
+    }
+
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
     let rows = s
         .inbox_store
         .pending_egress(limit)
         .map_err(|e| anyhow::anyhow!("reading egress queue: {e}"))?;
+    // `dest_peer_lct` is EMPTY on every row this daemon has ever written, and the
+    // response says so per row rather than handing back `""` and letting the drain
+    // decide what that means.
+    //
+    // The column exists, `egress_row` reads it, `undeliverable_egress` filters on it,
+    // and `addressing::resolve_peer` computes it — but `enqueue_egress` neither takes
+    // it as a parameter nor inserts it, and `resolve_peer` has no caller outside its
+    // own module. "Resolved once at the edge, stored on the row" is the design, and
+    // it is documented in the present tense in three places; it does not happen.
+    //
+    // So the drain is told the truth in two fields instead of one: `forward_on` is
+    // the address that actually exists for this row, and `forward_on_is_lct` says
+    // whether it is the roster-validated identifier or the prefix-matchable NAME.
+    // Forwarding on the name is an oracle (McNugget §4) — but silently returning an
+    // empty LCT next to a contract that says "forward on the LCT" would be the same
+    // defect this whole arm exists to close: a field advertised with nothing behind
+    // it. Wiring the resolution is a separate change with a live consequence — the
+    // roster on this box knows `thor-sage` and not `thor`, so exact-match resolution
+    // starts refusing addresses that work today — and that is an addressing decision,
+    // not a bug fix.
     let pending: Vec<Value> = rows
         .into_iter()
-        .map(|(id, peer, to_member, kind, ptr)| {
-            json!({ "id": id, "dest_peer": peer, "to_member": to_member,
-                    "kind": kind, "pointer_uri": ptr })
+        .map(|r| {
+            let lct = (!r.dest_peer_lct.trim().is_empty()).then(|| r.dest_peer_lct.clone());
+            json!({ "id": r.id, "dest_peer": r.dest_peer,
+                    "dest_peer_lct": lct,
+                    "forward_on": lct.clone().unwrap_or_else(|| r.dest_peer.clone()),
+                    "forward_on_is_lct": lct.is_some(),
+                    "to_member": r.to_member, "from_plugin": r.from_plugin,
+                    "kind": r.kind, "pointer_uri": r.pointer_uri,
+                    "attempts": r.attempts, "last_error": r.last_error })
         })
         .collect();
-    Ok(json!({ "pending": pending, "total": pending.len() }))
+    let unresolved = pending
+        .iter()
+        .filter(|r| r["forward_on_is_lct"] == json!(false))
+        .count();
+    let mut out = json!({
+        "pending": pending,
+        "total": pending.len(),
+        // The contract ships WITH the data, so a drainer cannot hold a stale copy of
+        // it. Kimi quoted this text in review on 2026-07-26 from an uncommitted tree;
+        // it had never landed, so the drain was being measured against a contract that
+        // existed only in a review comment.
+        "drain_contract": {
+            "forward_on": "the row's `forward_on` field, and check `forward_on_is_lct`. \
+                           An LCT is roster-validated; a NAME is prefix-resolved by \
+                           hub-notify, so an address on the name changes meaning when an \
+                           unrelated member joins the fleet.",
+            "on_success": "mark_forwarded:<id> — means the MESH accepted it, not that the \
+                           recipient read it.",
+            "on_failure": "mark_failed:<id> with reason:<text>. Leaving a failed row \
+                           pending is not neutral: attempts never increments, the bound \
+                           never fires, and the sender is never told its packet died.",
+            "never": "silence. An empty `pending` list and a refused call must not look \
+                      the same to you — check for `_hestia_error` before concluding the \
+                      queue is empty.",
+            "max_attempts": crate::storage::inbox::MAX_EGRESS_ATTEMPTS,
+        },
+    });
+    if unresolved > 0 {
+        out["unresolved_note"] = json!(format!(
+            "{unresolved} of {} row(s) carry no dest_peer_lct and can only be forwarded on \
+             the NAME. Edge resolution is not wired: `enqueue_egress` never writes the \
+             column. Reported, not gated — refusing these rows would strand mail that \
+             hub-notify's prefix resolver does deliver today.",
+            out["total"]
+        ));
+    }
+    Ok(out)
+}
+
+/// Retire an egress row that has exhausted its attempts, and pay what it owes.
+///
+/// Named in three comments across two files since 2026-07-26, always in the present
+/// indicative ("appends `member_notice_unreachable` and enqueues the sender's
+/// report after this call"), and never written. This is that function. The comments
+/// described it accurately; what was missing was the function.
+///
+/// Retiring without reporting would be the silent drop with extra steps, so the two
+/// happen here or not at all:
+///
+/// 1. `retire_egress` returns whether THIS call made the transition (G6/G7). If it
+///    did not, another drainer got there first and everything below is skipped —
+///    both the witness and the report are once-per-death.
+/// 2. `member_notice_unreachable` on the chain: a durable, third-party-readable
+///    claim that this box could not hand a packet to this peer. §5.1 makes
+///    misrouting a trust signal, so this entry is evidence about the PEER and is
+///    written with the evidence it rests on (attempt count, last error, who drained).
+/// 3. The report to the sender, delivered locally. `from_plugin` on an egress row is
+///    always a local member — only local members can call `member_notify` — so the
+///    route back never crosses the seam and can never itself be egressed.
+///
+/// Failing to enqueue the report is NOT swallowed: a retirement whose report was
+/// lost is exactly the packet-shaped hole this path exists to close, so the caller
+/// gets the error and the retirement is visible on the chain either way.
+fn retire_and_report_egress(
+    s: &mut super::state::ServerState,
+    id: u64,
+    who: &CallerWho,
+    reason: &str,
+) -> ToolResult {
+    let row = s
+        .inbox_store
+        .egress_row(id)
+        .map_err(|e| anyhow::anyhow!("reading egress row for retirement: {e}"))?;
+    let Some(row) = row else {
+        return Ok(json!({
+            "row_id": id, "retired": false,
+            "note": "row vanished between the failure record and retirement",
+        }));
+    };
+    if !s
+        .inbox_store
+        .retire_egress(id)
+        .map_err(|e| anyhow::anyhow!("retiring egress row: {e}"))?
+    {
+        // Lost the race. The other caller witnessed it and reported it; saying so
+        // again would double-count a peer's death in whatever tallies read the chain.
+        return Ok(json!({
+            "row_id": id, "retired": false, "by": who.plugin_id,
+            "note": "already settled by another drainer — not witnessed and not \
+                     reported again",
+        }));
+    }
+    let entry = s.append_chain(
+        "member_notice_unreachable",
+        json!({
+            "row_id": id,
+            "dest_peer": row.dest_peer,
+            "dest_peer_lct": row.dest_peer_lct,
+            "to_member": row.to_member,
+            "from_plugin": row.from_plugin,
+            "kind": row.kind,
+            "pointer_uri": row.pointer_uri,
+            "attempts": row.attempts,
+            "last_error": reason,
+            "retired_by": who.plugin_id,
+            "retired_by_role": who.role_lct,
+            "note": "this box exhausted its hand-off budget for this peer. A claim about \
+                     the PEER, carrying the evidence it rests on — not a claim that the \
+                     recipient refused anything.",
+        }),
+    )?;
+    // The sender is a local member by construction (see doc comment), so this is a
+    // local enqueue and cannot re-enter the egress plane.
+    let report_id = s
+        .inbox_store
+        .enqueue_member(
+            &row.from_plugin,
+            "hestia",
+            crate::reputation::DEFAULT_CONSTELLATION_ROLE,
+            DAEMON_NOTICE_KIND_UNREACHABLE,
+            Some(&format!(
+                "hestia://egress/{id}#unreachable:{}/{} after {} attempts: {reason}",
+                row.dest_peer, row.to_member, row.attempts
+            )),
+            &entry.hash,
+            None,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "egress row {id} was retired and witnessed, but the sender's report could \
+                 NOT be queued ({e}) — {} does not know its packet died",
+                row.from_plugin
+            )
+        })?;
+    Ok(json!({
+        "row_id": id, "retired": true, "by": who.plugin_id,
+        "attempts": row.attempts, "last_error": reason,
+        "witnessEntryHash": entry.hash,
+        "reported_to": row.from_plugin,
+        "report_notice_id": report_id,
+    }))
 }
 
 async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
@@ -5009,13 +5254,248 @@ mod member_mesh_tests {
         // No session_id at all: the destroying arm must not run, and must not inherit
         // Alice. This is the arm that used to mark-and-return from the top of the
         // function, before any caller was resolved.
-        for args in [json!({"mark_forwarded": 1}), json!({"limit": 50})] {
+        // `mark_failed` joins the loop the day it exists. It is the arm that can mint
+        // `member_notice_unreachable` — a durable claim about a PEER — so an
+        // unattributed caller reaching it could indict a healthy peer anonymously.
+        for args in [
+            json!({"mark_forwarded": 1}),
+            json!({"mark_failed": 1, "reason": "x"}),
+            json!({"limit": 50}),
+        ] {
             let out = tool_egress_pending(&state, &args).await.unwrap();
             assert_eq!(
                 out["_hestia_error"]["code"], "hestia.egress_unattributed",
                 "every arm must refuse an unattributed caller, got: {out}"
             );
         }
+    }
+
+    /// The acceptance test for r6-routing branch 4 at the egress seam, and it could
+    /// not have run before 2026-07-27: there was no `mark_failed` arm to drive, and
+    /// `retire_and_report_egress` existed only as a name inside three comments.
+    ///
+    /// dp's criterion for branch 2 was a delivered message. The criterion this
+    /// exploration set for ITSELF is a *reported non-delivery* — the sender learning,
+    /// without reading a log, that its packet never left the box. That is the whole
+    /// sentence, so it is one test: retired, witnessed, and reported.
+    #[tokio::test]
+    async fn an_exhausted_egress_row_is_retired_witnessed_and_reported_to_its_sender() {
+        let (_dir, state) = test_state().await;
+        let row_id = {
+            let st = state.lock().await;
+            st.inbox_store
+                .enqueue_egress("thor", "claude-code", "alice",
+                                "role:constellation:member", "coordination",
+                                Some("shared-context/alices-mail.md"), "hash")
+                .unwrap()
+        };
+        let sid = connect(&state, "hestia-router").await;
+
+        // A deterministically failing hand-off, driven the way the drain drives it.
+        let mut last = json!({});
+        for tick in 1..=crate::storage::inbox::MAX_EGRESS_ATTEMPTS {
+            last = tool_egress_pending(
+                &state,
+                &json!({"session_id": sid, "mark_failed": row_id,
+                        "reason": "hub-notify rc=1"}),
+            )
+            .await
+            .unwrap();
+            assert!(last["_hestia_error"].is_null(), "tick {tick}: {last}");
+            if tick < crate::storage::inbox::MAX_EGRESS_ATTEMPTS {
+                assert_eq!(last["disposition"], "retry", "tick {tick} must retry: {last}");
+                assert_eq!(last["attempts"], tick, "the attempt count must be visible");
+            }
+        }
+
+        assert_eq!(last["retired"], true, "the bound must fire at the bound: {last}");
+        assert_eq!(last["reported_to"], "alice");
+
+        // 1. Retired: it is out of the queue, so it stops being retried forever.
+        let st = state.lock().await;
+        assert!(
+            st.inbox_store.pending_egress(50).unwrap().is_empty(),
+            "a retired row must leave the pending list"
+        );
+
+        // 2. Witnessed: a third party can read the claim AND the evidence under it.
+        let entry = st
+            .chain_store
+            .read_by_hash(last["witnessEntryHash"].as_str().unwrap())
+            .unwrap()
+            .expect("the retirement must be on the chain");
+        assert_eq!(entry.event_type, "member_notice_unreachable");
+        assert_eq!(entry.event_data["dest_peer"], "thor");
+        assert_eq!(entry.event_data["attempts"], crate::storage::inbox::MAX_EGRESS_ATTEMPTS);
+        assert_eq!(entry.event_data["last_error"], "hub-notify rc=1");
+
+        // 3. Reported: the sender is TOLD, in the one place it already reads. A
+        //    retirement whose report only reaches a log file is the silent drop with
+        //    extra steps — the log is the thing nobody reads.
+        let mail = st.inbox_store.drain_member("alice").unwrap();
+        let report = mail
+            .iter()
+            .find(|n| n.kind == DAEMON_NOTICE_KIND_UNREACHABLE)
+            .expect("the sender must learn its packet died");
+        assert!(
+            report.pointer_uri.as_deref().unwrap_or("").contains("thor"),
+            "the report must name the peer that could not be reached: {report:?}"
+        );
+    }
+
+    /// G6/G7, from the retirement side: a settled packet must never be reported dead
+    /// a second time.
+    ///
+    /// `member_notice_unreachable` is a durable claim about a PEER that a trust tally
+    /// will count, so a duplicate is not a harmless retry — it is a second indictment
+    /// of a peer that may have done nothing wrong. This is why
+    /// `record_egress_failure` returns `Option` and `retire_egress` returns `bool`:
+    /// both say "did *this* call make the transition", and both were written months
+    /// before anything consumed the answer.
+    #[tokio::test]
+    async fn a_settled_egress_row_is_not_recorded_failed_or_reported_dead_again() {
+        let (_dir, state) = test_state().await;
+        let row_id = {
+            let st = state.lock().await;
+            st.inbox_store
+                .enqueue_egress("thor", "claude-code", "alice",
+                                "role:constellation:member", "coordination", None, "hash")
+                .unwrap()
+        };
+        let sid = connect(&state, "hestia-router").await;
+        let chain_before = {
+            let st = state.lock().await;
+            st.chain_store.len().unwrap()
+        };
+
+        // It landed. The row is gone.
+        tool_egress_pending(&state, &json!({"session_id": sid, "mark_forwarded": row_id}))
+            .await
+            .unwrap();
+        // A slow duplicate tick now reports it failed. Nothing may happen.
+        let out = tool_egress_pending(
+            &state,
+            &json!({"session_id": sid, "mark_failed": row_id, "reason": "late tick"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["recorded"], false, "a settled row must record nothing: {out}");
+        assert!(out["retired"].is_null(), "and must not claim a retirement: {out}");
+
+        let st = state.lock().await;
+        let unreachable = st
+            .chain_store
+            .read_recent(50)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == "member_notice_unreachable")
+            .count();
+        assert_eq!(unreachable, 0, "a forwarded packet must not indict its peer");
+        assert!(
+            st.chain_store.len().unwrap() > chain_before,
+            "sanity: the forward itself was witnessed, so the chain did move"
+        );
+        assert!(
+            st.inbox_store.drain_member("alice").unwrap().is_empty(),
+            "a sender whose packet WAS forwarded must not be told it was not"
+        );
+    }
+
+    /// Kimi, notice 123 §1a: the drain must forward on `dest_peer_lct`, never on the
+    /// name — `hub-notify` prefix-resolves names, so an address changes meaning when
+    /// an unrelated member joins the roster.
+    ///
+    /// It could not: the read model omitted the field entirely. This change hands the
+    /// drain an address and, in the same breath, says WHICH KIND it is — because
+    /// `dest_peer_lct` is empty on every row this daemon has ever written, and a
+    /// contract that says "forward on the LCT" over a field that is always null is
+    /// unimplementable advice.
+    ///
+    /// This test asserts the half that is true today. The other half — that the LCT is
+    /// actually POPULATED — is a separate change with a live consequence (the roster on
+    /// this box knows `thor-sage`, not `thor`, so exact-match resolution starts refusing
+    /// addresses that work today), and it has its own criterion below. That criterion is
+    /// not met, and the last assertion here is the tripwire that says so *in the suite*
+    /// rather than in prose: the day edge resolution lands, this test goes red and hands
+    /// the person who landed it the follow-up work. A criterion nothing in the tree can
+    /// report is indistinguishable from a criterion nobody tried (Kimi, notice 185 §4).
+    #[tokio::test]
+    async fn the_pending_list_carries_an_address_and_says_which_kind_it_is() {
+        let (_dir, state) = test_state().await;
+        {
+            let st = state.lock().await;
+            st.inbox_store
+                .enqueue_egress("thor", "claude-code", "alice",
+                                "role:constellation:member", "coordination", None, "hash")
+                .unwrap();
+        }
+        let sid = connect(&state, "hestia-router").await;
+        let out = tool_egress_pending(&state, &json!({"session_id": sid, "limit": 50}))
+            .await
+            .unwrap();
+        let row = &out["pending"][0];
+
+        // The drain is never left to guess. It gets an address it can use...
+        assert_eq!(row["forward_on"], "thor", "the drain must be handed an address: {out}");
+        // ...and the fact that this one is the prefix-matchable NAME, not the
+        // roster-validated LCT. Returning `""` for the LCT and letting the drain decide
+        // what that meant is the conflation this arm exists to remove.
+        assert_eq!(row["forward_on_is_lct"], false);
+        assert!(
+            row["dest_peer_lct"].is_null(),
+            "TRIPWIRE: the LCT is populated, so edge resolution landed. Un-ignore \
+             `criterion_edge_resolution_populates_the_lct_on_the_row`, delete these three \
+             assertions, and re-check the drain's name-forwarding fallback: {out}"
+        );
+        assert!(
+            out["unresolved_note"].as_str().unwrap_or("").contains("Edge resolution is not wired"),
+            "an unresolved row must be reported on every read, not silently name-forwarded: {out}"
+        );
+
+        assert_eq!(row["attempts"], 0, "attempts must be visible to the drainer");
+        assert_eq!(
+            out["drain_contract"]["max_attempts"],
+            crate::storage::inbox::MAX_EGRESS_ATTEMPTS,
+            "the contract ships with the data so no drainer holds a stale copy"
+        );
+    }
+
+    /// The criterion for edge resolution, stated as a test so the suite can hold it.
+    ///
+    /// It is `#[ignore]`d, and that is the honest state: `enqueue_egress` does not take
+    /// a `dest_peer_lct` and `addressing::resolve_peer` has no caller outside its own
+    /// module, so this cannot pass. Leaving it un-ignored would make the suite red
+    /// forever, and a permanently-red suite teaches operators to rerun past red — the
+    /// same training the 1/256 reseal flake left behind (Kimi, notice 184 §3). A gauge
+    /// that is always alarming is a gauge nobody reads.
+    ///
+    /// So: ignored, but NAMED and runnable on demand (`cargo test -- --ignored`), and
+    /// wired to the tripwire in the test above, which fails the moment the wiring lands.
+    /// The pair is the distinction Kimi asked for — "not met" is now a state the suite
+    /// can report, separately from "not tried".
+    #[tokio::test]
+    #[ignore = "criterion for the edge-resolution change: enqueue_egress does not yet \
+                accept or store dest_peer_lct (r6-routing, addressing decision pending)"]
+    async fn criterion_edge_resolution_populates_the_lct_on_the_row() {
+        let (_dir, state) = test_state().await;
+        {
+            let st = state.lock().await;
+            st.inbox_store
+                .enqueue_egress("thor", "claude-code", "alice",
+                                "role:constellation:member", "coordination", None, "hash")
+                .unwrap();
+        }
+        let sid = connect(&state, "hestia-router").await;
+        let out = tool_egress_pending(&state, &json!({"session_id": sid, "limit": 50}))
+            .await
+            .unwrap();
+        let row = &out["pending"][0];
+        assert!(
+            row["dest_peer_lct"].is_string(),
+            "the drain cannot forward on an address it is never handed: {out}"
+        );
+        assert_eq!(row["forward_on_is_lct"], true);
+        assert!(out["unresolved_note"].is_null(), "nothing is unresolved once the edge resolves");
     }
 
     /// The destroying disposition must leave a witness naming the actor.
