@@ -341,6 +341,7 @@ nothing.
 private-context/.claude/settings.local.json  PreToolUse -> web4/claude-code-plugin/hooks/pre_tool_use.py  (gone)
 Synchronism/.claude/settings.local.json      PreToolUse -> web4/claude-code-plugin/hooks/pre_tool_use.py  (gone)
 ruvector/.claude/settings.json               PreToolUse -> /workspaces/ruvector/...  (devcontainer path)
+                                             [VOID 2026-07-27 — see below]
 ```
 
 The first two are the same defect Thor reported on Thor, on the machine that wrote the
@@ -355,12 +356,30 @@ Every difference is a blind spot, not a change on disk.
 
 ### Later the same day: `UNKNOWN` — 4 installed, 4 governed
 
-All three dead gates above are gone, and **none of them was cleared by the owner split**.
-The two `settings.local.json` gates were emptied when the plugin moved (still on the
-operator queue: restore or ratify). The `ruvector` one was fixed at its source — its nine
-hook commands were rewritten to `$CLAUDE_PROJECT_DIR`, correct in the devcontainer *and*
-in every clone (`ruvector 1cb963c2`), by a sibling session, between this change's baseline
-run and its verification run.
+**Superseded 2026-07-27 — the earlier account of these three was wrong in both directions.**
+
+- **`ruvector`** — VOID, not fixed. The `$CLAUDE_PROJECT_DIR` rewrite was **reverted**: the
+  repo is a fork of `ruvnet/RuVector` (external work), and rewriting a third party's
+  devcontainer config to make our dashboard read clean was the wrong act. The local clone
+  has since been deleted entirely, so the finding no longer has a subject. Attributing the
+  fix to "a sibling session" was also wrong — it was this tool's own author.
+- **The two `settings.local.json` gates** — NOT gone. They returned, and a third turned up
+  at `Synchronism/manuscripts/.claude/` once the project scan got deeper (#47/#48).
+
+Because the root cause was never the configs. It is
+`claude-code/plugins/web4-governance/settings.template.json`, which still points every
+project it installs at `web4/claude-code-plugin/hooks/` — a tombstone holding only a
+README, since the plugin moved to `claude-code/plugins/web4-governance/hooks/`. Those dead
+gates were not stale leftovers being cleaned up; they were being **manufactured**, which is
+why they kept reappearing after each fix.
+
+The lesson this section is now an example of: **a governance tool's own documentation is
+state, and it goes stale like any other.** Two of the three claims above were false by the
+time anyone read them, in the README of the check whose entire purpose is reporting
+accurate state. Findings need an expiry discipline, or they become the thing they warn
+about.
+
+
 
 Two things worth keeping, because both cut against the change that shipped here:
 

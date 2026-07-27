@@ -9,10 +9,12 @@ that must never regress is therefore case D — a dead gate with no marker eithe
 it is the one the live filesystem can no longer produce.
 
 Which is the second reason this file exists. The split was written against a real
-MISWIRED on CBP: `ruvector/.claude/settings.json` pointing at a devcontainer path. A
-sibling session fixed that config at its source (ruvector 1cb963c2) between the baseline
-run and the verification run, so the live evidence for the change disappeared while the
-change was being made. A verdict this load-bearing cannot be checked by "run it and look
+MISWIRED on CBP: `ruvector/.claude/settings.json` pointing at a devcontainer path.
+(Historical: that fix was later REVERTED — ruvector is a fork of external work and was not
+ours to rewrite — and the clone has since been deleted, so the case no longer exists on any
+live filesystem. The fixtures below preserve it precisely because the world moved on.)
+The config changed between the baseline run and the verification run, so the live evidence
+for the change disappeared while the change was being made. A verdict this load-bearing cannot be checked by "run it and look
 at today's machine" — today's machine is edited by other members mid-session.
 
 Run: python3 test_inventory.py     (no pytest; exit 1 on failure)
