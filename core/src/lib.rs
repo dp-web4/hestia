@@ -8,6 +8,7 @@
 //! - **Society state**: Web4 society with witness chain + trust evolution (after that)
 
 pub mod addressing;
+pub mod arbiter;
 pub mod callback;
 pub mod constellation;
 pub mod delegation;
