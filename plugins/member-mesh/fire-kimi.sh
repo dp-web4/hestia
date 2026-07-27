@@ -13,18 +13,34 @@ LOG_DIR="$HOME/.local/state/hestia-mesh/logs"; mkdir -p "$LOG_DIR"
 # Gate + sanitize in one pass (Kimi review 2026-07-24, Finding 3): the prompt
 # gets a field-allowlisted, control-char-stripped digest — never the raw JSON.
 # The daemon rejects multi-line pointers at enqueue; this is the second wall.
+#
+# Same repair as fire-claude.sh, and the same reason — this allowlist also named
+# `codex-cli`, which has never sent a notice, while Codex sends as `codex`. See
+# the long note in fire-claude.sh for the measured destruction (notice 160).
+# A withheld notice is announced and never silently dropped; a batch left with
+# nothing fireworthy exits non-zero so the consume-once primer is RETAINED.
 DIGEST=$(python3 - "$PRIMER" <<'PY'
 import json,re,sys
-ALLOW={"claude-code","codex-cli"}
+ALLOW={"claude-code","codex","codex-cli"}
 d=json.load(open(sys.argv[1]))
-n=[x for x in d.get("notices",[]) if x.get("kind")!="ack" and x.get("from_plugin") in ALLOW]
+live=[x for x in d.get("notices",[]) if x.get("kind")!="ack"]
 clean=lambda s: re.sub(r"[\x00-\x1f\x7f]","",str(s))[:512]
-for x in n:
-    print(f"- id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} pointer={clean(x.get('pointer_uri',''))} queued_at={clean(x.get('queued_at',''))}")
+for x in live:
+    if x.get("from_plugin") in ALLOW:
+        print(f"- id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} pointer={clean(x.get('pointer_uri',''))} queued_at={clean(x.get('queued_at',''))}")
+    else:
+        print(f"! WITHHELD id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} — sender not on this member's allowlist; pointer withheld, full record in the primer JSON")
 PY
 )
-[ -n "$DIGEST" ] || { echo "[fire-kimi] ack-only/unknown-sender batch — not firing"; exit 0; }
+[ -n "$DIGEST" ] || { echo "[fire-kimi] ack-only batch — not firing"; exit 0; }
 FIREWORTHY=$(printf '%s\n' "$DIGEST" | grep -c '^- ')
+WITHHELD=$(printf '%s\n' "$DIGEST" | grep -c '^! ')
+if [ "$FIREWORTHY" -eq 0 ]; then
+  echo "[fire-kimi] REFUSING: $WITHHELD notice(s) from unallowlisted sender(s), and nothing else to fire." >&2
+  printf '%s\n' "$DIGEST" | grep '^! ' >&2
+  echo "[fire-kimi] The drain is consume-once — exiting 70 so the watcher RETAINS the primer." >&2
+  exit 70
+fi
 # Outstanding debt, same allowlist + sanitizer (see fire-claude.sh). Symmetric
 # by construction: an unanswered report that only one member is shown would
 # measure one member.

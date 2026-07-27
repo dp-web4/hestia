@@ -12,18 +12,57 @@ LOG_DIR="$HOME/.local/state/hestia-mesh/logs"; mkdir -p "$LOG_DIR"
 # Gate + sanitize in one pass (Kimi review 2026-07-24, Finding 3): the prompt
 # gets a field-allowlisted, control-char-stripped digest — never the raw JSON.
 # The daemon rejects multi-line pointers at enqueue; this is the second wall.
+#
+# THIS ALLOWLIST HELD A NAME THAT HAS NEVER SENT ANYTHING (CBP, 2026-07-27).
+#
+# It read `codex-cli`. That is the id Codex's GATE witnesses under; Codex's mesh
+# sends carry `codex`, and every Codex notice on every primer on this machine
+# does. So the filter dropped 100% of Codex's mail, and a drop was bit-identical
+# to an empty inbox — the defect class this whole thread keeps finding, arriving
+# inside the wall built to enforce it.
+#
+# Measured, not inferred: notice 160 was Codex reporting that its OWN fire had
+# failed (`fire-rc=1;via=watch-codex`). It was drained consume-once at
+# 2026-07-27T11:23:16Z, filtered to an empty digest, `exit 0` was read as
+# success, and hestia-watch-member.sh:153 deleted the primer. The mesh's report
+# that a member could not be woken was itself unwakeable. It is provable at all
+# only because line 10 copies the primer BEFORE this filter runs.
+#
+# Two repairs, because the wrong id was only the symptom:
+#   1. Allow the id that actually sends. `codex-cli` stays — it is a real
+#      identity for that member, just not the one on the wire.
+#   2. A DROP IS NEVER SILENT AND NEVER A SUCCESS. An unallowlisted sender still
+#      has its pointer kept out of the prompt — that is what this wall is for —
+#      but the fired session is TOLD the notice was withheld, and a batch with
+#      nothing left to fire exits non-zero so the watcher RETAINS the primer
+#      instead of destroying the only copy. Ack-only still exits 0: an ack is
+#      terminal and nothing is owed. Conflating those two cases in one exit code
+#      is what made the destruction invisible.
 DIGEST=$(python3 - "$PRIMER" <<'PY'
 import json,re,sys
-ALLOW={"kimi-code","codex-cli"}
+ALLOW={"kimi-code","codex","codex-cli"}
 d=json.load(open(sys.argv[1]))
-n=[x for x in d.get("notices",[]) if x.get("kind")!="ack" and x.get("from_plugin") in ALLOW]
+live=[x for x in d.get("notices",[]) if x.get("kind")!="ack"]
 clean=lambda s: re.sub(r"[\x00-\x1f\x7f]","",str(s))[:512]
-for x in n:
-    print(f"- id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} pointer={clean(x.get('pointer_uri',''))} queued_at={clean(x.get('queued_at',''))}")
+for x in live:
+    if x.get("from_plugin") in ALLOW:
+        print(f"- id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} pointer={clean(x.get('pointer_uri',''))} queued_at={clean(x.get('queued_at',''))}")
+    else:
+        # Withheld, NOT discarded. No pointer — the sanitization is the point —
+        # but the sender and id are said out loud, and the primer path is
+        # already in the prompt, so the session can go read the full record.
+        print(f"! WITHHELD id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} — sender not on this member's allowlist; pointer withheld, full record in the primer JSON")
 PY
 )
-[ -n "$DIGEST" ] || { echo "[fire-claude] ack-only/unknown-sender batch — not firing"; exit 0; }
+[ -n "$DIGEST" ] || { echo "[fire-claude] ack-only batch — not firing"; exit 0; }
 FIREWORTHY=$(printf '%s\n' "$DIGEST" | grep -c '^- ')
+WITHHELD=$(printf '%s\n' "$DIGEST" | grep -c '^! ')
+if [ "$FIREWORTHY" -eq 0 ]; then
+  echo "[fire-claude] REFUSING: $WITHHELD notice(s) from unallowlisted sender(s), and nothing else to fire." >&2
+  printf '%s\n' "$DIGEST" | grep '^! ' >&2
+  echo "[fire-claude] The drain is consume-once — exiting 70 so the watcher RETAINS the primer." >&2
+  exit 70
+fi
 # Outstanding debt, same allowlist + sanitizer. Carried in the wake that is
 # already happening — the query has to be ASKED somewhere a reply is possible.
 DEBT=$(python3 - "$PRIMER" <<'PY'
