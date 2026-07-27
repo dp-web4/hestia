@@ -1911,8 +1911,10 @@ const APPEAL_CHAIN_WINDOW: u64 = 20_000;
 /// and a member out of budget rang exactly like a member at work. Verified against the live
 /// mesh the moment it was built, which is the only reason it did not ship:
 ///
-///     doorbell (inbox_touch)     codex live 17:50   kimi dormant 17:35
-///     answered  (witnessed acts) codex  07:40       kimi   19:13
+/// ```text
+/// doorbell (inbox_touch)     codex live 17:50   kimi dormant 17:35
+/// answered  (witnessed acts) codex  07:40       kimi   19:13
+/// ```
 ///
 /// dp had said codex was out for three days. The doorbell said codex was the live one. The
 /// acts say codex has not done anything in twelve hours, which is the truth, and the evidence
@@ -6382,6 +6384,45 @@ mod appeal_tests {
             crate::arbiter::Liveness::Unknown,
             "never seen acting is Unknown, not Dormant — the window is bounded"
         );
+    }
+
+    /// `tool_adjudicate` nests the actor at `adjudicated_by.plugin_id` instead of naming it
+    /// at the top level, so the flat read alone made a member whose only act was a generic
+    /// adjudication look silent. The operator path uses the SAME key with no `plugin_id`,
+    /// and must not be attributable to anyone.
+    #[tokio::test]
+    async fn a_nested_adjudication_is_its_issuers_act_but_an_operator_ruling_is_nobodys() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat(&state, "claude-code").await;
+        {
+            let s = state.lock().await;
+            // As `tool_adjudicate` emits it: the actor is nested, not top-level.
+            s.append_chain("adjudication", json!({
+                "subject": "some-claim", "axis": "correctness", "verdict": "upheld",
+                "adjudicated_by": {
+                    "plugin_id": "kimi-code", "role_lct": APPELLANT_ROLE,
+                    "session_id": sid.to_string()}})).unwrap();
+            // As the operator path emits it: sovereign, no member behind it.
+            s.append_chain("adjudication", json!({
+                "subject": "other-claim", "axis": "correctness", "verdict": "upheld",
+                "adjudicated_by": {
+                    "operator": true, "sovereign_lct_id": "lct:sovereign:dp",
+                    "role_lct": "role:sovereign"}})).unwrap();
+        }
+        let window = { state.lock().await.recent_chain(500) };
+        assert_eq!(
+            actor_liveness(&window, "kimi-code"),
+            crate::arbiter::Liveness::Live,
+            "an adjudication it issued is an act, even when the issuer is nested"
+        );
+        for id in ["dp", "operator", "claude-code", "lct:sovereign:dp"] {
+            assert_eq!(
+                actor_liveness(&window, id),
+                crate::arbiter::Liveness::Unknown,
+                "a sovereign ruling is not evidence that {id} is working"
+            );
+        }
     }
 
     /// End to end: file, rule, and check that the CONDUCT SCALE moved. If the emitted shape
