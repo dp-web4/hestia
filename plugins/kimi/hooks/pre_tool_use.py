@@ -277,13 +277,20 @@ _EVENT = {}  # set by main() so deny() can witness the reach it blocks
 # both "codex" and "codex-cli" for exactly that reason).
 HESTIA_PLUGIN_ID = os.environ.get("HESTIA_PLUGIN_ID", "kimi-code")
 SCOPE_ATTEST_EVERY = 200
-_TALLY = os.path.join(OBSERVE_DIR, "scope-tally.json")
+# Self-contained: this gate has no OBSERVE_DIR of its own, and the first cut of this
+# patch borrowed that name from the CODEX gate — a module-level NameError that would have
+# made the whole gate fail to import. On a Claude-lineage engine an import failure IS a
+# fail-open, so it would have silently removed this member's governance while it worked.
+# Caught pre-flight only because the patched file was executed before being deployed.
+_TALLY_DIR = os.path.expanduser(
+    os.environ.get("HESTIA_OBSERVE_DIR", "~/.kimi-code/hestia-observe"))
+_TALLY = os.path.join(_TALLY_DIR, "scope-tally.json")
 
 
 def _tally_scope(allowed: bool):
     """Count this decision; emit an attestation when the window closes."""
     try:
-        os.makedirs(OBSERVE_DIR, exist_ok=True)
+        os.makedirs(_TALLY_DIR, exist_ok=True)
         try:
             t = json.load(open(_TALLY))
         except Exception:
