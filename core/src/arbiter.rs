@@ -81,6 +81,29 @@ pub enum Independence {
 // member arbitrate its own appeal by opening a second terminal, which is what NotSame exists
 // to prevent.
 
+/// Whether a candidate arbiter is ACTING, as the chain witnessed it.
+///
+/// Measured from the member's own acts (`actor_liveness`), NOT from its mailbox. A watcher
+/// polls a mailbox whether or not the member behind it can run, so "the doorbell rang" and
+/// "someone answered the door" are different facts and this is the second one. Do not read
+/// these variants as deliverability — `recipient_liveness` on the notify surfaces is the
+/// doorbell, and is the right measurement there.
+///
+/// EVIDENCE, NOT A GATE — a dormant member is still fully eligible to rule, and does rule
+/// the moment it wakes. This only orders the routing choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Liveness {
+    /// Witnessed acting inside the live window — it ran, attempted, ruled, or appealed.
+    Live,
+    /// Last witnessed act is older than the live window but within the day. May wake; may not.
+    Dormant,
+    /// Never witnessed acting in the bounded window. Absence of evidence, not evidence of
+    /// absence: a member doing only read-class work emits no acts and lands here while
+    /// perfectly alive.
+    Unknown,
+}
+
 /// The parties to an appeal, as the daemon knows them.
 #[derive(Debug, Clone)]
 pub struct AppealParties<'a> {
@@ -207,27 +230,59 @@ pub fn eligibility(p: &AppealParties<'_>) -> Eligibility {
 pub fn select_arbiter<'a>(
     appellant: &str,
     deny_adjudicator: Option<&str>,
-    candidates: impl IntoIterator<Item = &'a str>,
-) -> Option<(&'a str, Independence)> {
-    let mut best: Option<(&'a str, Independence)> = None;
-    for cand in candidates {
-        let parties = AppealParties {
-            appellant,
-            deny_adjudicator,
-            arbiter: cand,
-        };
-        let Eligibility::Eligible { independence } = eligibility(&parties) else {
-            continue;
-        };
-        let better = match best {
-            None => true,
-            Some((prev_id, prev)) => (independence, cand) < (prev, prev_id),
-        };
-        if better {
-            best = Some((cand, independence));
+    candidates: impl IntoIterator<Item = (&'a str, Liveness)>,
+) -> Option<Selection<'a>> {
+    let mut eligible: Vec<(&'a str, Independence, Liveness)> = Vec::new();
+    for (cand, liveness) in candidates {
+        let parties = AppealParties { appellant, deny_adjudicator, arbiter: cand };
+        if let Eligibility::Eligible { independence } = eligibility(&parties) {
+            eligible.push((cand, independence, liveness));
         }
     }
-    best
+    // REACHABILITY ORDERS BEFORE INDEPENDENCE, and that ordering is the whole point.
+    //
+    // dp, 2026-07-27: "codex will be out for 3 more days." Both appeals open at that moment
+    // were routed to codex, because the tie-break among equally-independent candidates was
+    // alphabetical and `codex` sorts before `kimi-code`. Both would have sat unruled for
+    // three days while a live, equally cross-vendor arbiter read its mail every few minutes.
+    //
+    // An arbiter that cannot read the appeal supplies ZERO independence in practice.
+    // Independence is a property of a ruling that actually happens; ranking an unreachable
+    // maximal-independence candidate first produces "routed to the most independent arbiter
+    // available" over a dispute nobody will ever read — the `agent-inventory` misroute
+    // generalised, and the same reassuring-state-identical-to-the-null-state shape.
+    //
+    // So: reachable first, then most independent among the reachable, then id for
+    // reproducibility. When that trade actually costs independence, the receipt says so —
+    // `passed_over` names the more independent candidate that was skipped and why, so a
+    // relying party weighs the ruling with the routing in view rather than being told a
+    // clean story. Evidence, not declaration.
+    eligible.sort_by(|a, b| (a.2, a.1, a.0).cmp(&(b.2, b.1, b.0)));
+    let (arbiter, independence, liveness) = *eligible.first()?;
+    let passed_over = eligible
+        .iter()
+        .find(|(_, ind, _)| *ind < independence)
+        .map(|(id, ind, live)| PassedOver { arbiter: id, independence: *ind, liveness: *live });
+    Some(Selection { arbiter, independence, liveness, passed_over })
+}
+
+/// Who routing chose, and what it gave up to choose them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Selection<'a> {
+    pub arbiter: &'a str,
+    pub independence: Independence,
+    pub liveness: Liveness,
+    /// A MORE independent candidate that was passed over for being less reachable. `None`
+    /// when reachability cost nothing, which is the common case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passed_over: Option<PassedOver<'a>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PassedOver<'a> {
+    pub arbiter: &'a str,
+    pub independence: Independence,
+    pub liveness: Liveness,
 }
 
 /// A ruling, once an arbiter has actually reasoned about an appeal.
@@ -302,25 +357,28 @@ mod tests {
     /// The dispatch wire: given a real pool, route to the furthest-placed admissible entity.
     #[test]
     fn dispatch_routes_to_the_most_independent_admissible_candidate() {
-        let pool = ["claude-code", "claude-mesh-worker", "codex", "kimi-code"];
-        let picked = select_arbiter("claude-code", Some("hestia-gate"), pool);
-        // codex and kimi are both cross-vendor; the tie breaks on id, reproducibly.
-        assert_eq!(picked, Some(("codex", Independence::CrossVendor)));
+        let pool = [("claude-code", Liveness::Live), ("claude-mesh-worker", Liveness::Live),
+                    ("codex", Liveness::Live), ("kimi-code", Liveness::Live)];
+        let picked = select_arbiter("claude-code", Some("hestia-gate"), pool).unwrap();
+        // codex and kimi are both cross-vendor and both live; the tie breaks on id.
+        assert_eq!(picked.arbiter, "codex");
+        assert_eq!(picked.independence, Independence::CrossVendor);
+        assert_eq!(picked.passed_over, None, "nothing was given up here");
     }
 
     /// The gate that denied is excluded from the pool it would otherwise win.
     #[test]
     fn dispatch_skips_the_gate_that_issued_the_deny() {
-        let pool = ["codex", "kimi-code"];
-        let picked = select_arbiter("claude-code", Some("plugin-gate:codex"), pool);
-        assert_eq!(picked, Some(("kimi-code", Independence::CrossVendor)));
+        let pool = [("codex", Liveness::Live), ("kimi-code", Liveness::Live)];
+        let picked = select_arbiter("claude-code", Some("plugin-gate:codex"), pool).unwrap();
+        assert_eq!(picked.arbiter, "kimi-code");
     }
 
     /// A machine with only the appellant on it has no arbiter, and says so. Rendering this
     /// as anything other than "none" is how a self-arbitration gets laundered by plumbing.
     #[test]
     fn a_single_member_machine_has_no_arbiter_rather_than_a_default_one() {
-        assert_eq!(select_arbiter("codex", None, ["codex"]), None);
+        assert!(select_arbiter("codex", None, [("codex", Liveness::Live)]).is_none());
     }
 
     /// THE LIVE ONE. Regression for the first real appeal this surface handled, which was
@@ -329,7 +387,8 @@ mod tests {
     #[test]
     fn a_cron_plugin_is_not_the_most_independent_judge_on_the_machine() {
         // The registry as it actually was: reasoning harnesses alongside plumbing.
-        let registry = ["agent-inventory", "claude-code", "hestia-timer", "mesh-watcher"];
+        let registry = [("agent-inventory", Liveness::Live), ("claude-code", Liveness::Live),
+                        ("hestia-timer", Liveness::Live), ("mesh-watcher", Liveness::Live)];
         assert_eq!(
             select_arbiter("claude-code", None, registry),
             None,
@@ -337,11 +396,9 @@ mod tests {
              routes the dispute into something that cannot rule, while reporting success"
         );
         // And with a real peer present, the peer wins over the plumbing.
-        let with_peer = ["agent-inventory", "claude-code", "kimi-code"];
-        assert_eq!(
-            select_arbiter("claude-code", None, with_peer),
-            Some(("kimi-code", Independence::CrossVendor))
-        );
+        let with_peer = [("agent-inventory", Liveness::Live), ("claude-code", Liveness::Live),
+                         ("kimi-code", Liveness::Live)];
+        assert_eq!(select_arbiter("claude-code", None, with_peer).unwrap().arbiter, "kimi-code");
     }
 
     /// The same floor applies to the direct ruling path, not only to routing — otherwise an
@@ -350,6 +407,33 @@ mod tests {
     fn an_unrecognised_entity_cannot_rule_even_if_it_asks_directly() {
         let e = eligibility(&parties("claude-code", "agent-inventory", None));
         assert!(matches!(e, Eligibility::Refused { .. }), "got {e:?}");
+    }
+
+    /// THE ONE dp NAMED. Codex out for three days must not keep winning the tie.
+    #[test]
+    fn a_live_arbiter_beats_an_equally_independent_unreachable_one() {
+        // Both cross-vendor relative to claude-code. Alphabetically codex wins; it is out.
+        let pool = [("codex", Liveness::Dormant), ("kimi-code", Liveness::Live)];
+        let picked = select_arbiter("claude-code", None, pool).unwrap();
+        assert_eq!(picked.arbiter, "kimi-code",
+                   "an arbiter that cannot read the appeal supplies no independence at all");
+        assert_eq!(picked.independence, Independence::CrossVendor);
+        // Reachability cost nothing here — same tier — so nothing was passed over.
+        assert_eq!(picked.passed_over, None);
+    }
+
+    /// When reachability DOES cost independence, the receipt says what was given up.
+    #[test]
+    fn trading_independence_for_reachability_is_recorded_not_hidden() {
+        // codex is cross-vendor but dark; claude-mesh-worker is same-lineage but live.
+        let pool = [("codex", Liveness::Unknown), ("claude-mesh-worker", Liveness::Live)];
+        let picked = select_arbiter("claude-code", None, pool).unwrap();
+        assert_eq!(picked.arbiter, "claude-mesh-worker");
+        assert_eq!(picked.independence, Independence::CrossMember);
+        let skipped = picked.passed_over.expect("the trade must be on the record");
+        assert_eq!(skipped.arbiter, "codex");
+        assert_eq!(skipped.independence, Independence::CrossVendor,
+                   "a relying party has to be able to see that a stronger judge was available");
     }
 
     /// A second session of the same member is the same member.

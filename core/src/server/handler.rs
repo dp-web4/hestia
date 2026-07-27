@@ -1919,6 +1919,70 @@ fn redact_secrets(input: &str) -> String {
 /// silently accepted against nothing.
 const APPEAL_CHAIN_WINDOW: u64 = 20_000;
 
+/// Is this member ACTING? — liveness read off its own witnessed acts.
+///
+/// dp, 2026-07-27: *"liveness comes from witnessed actions by the actor (not an automatic
+/// doorbell). right now it asks 'did the door bell ring?'. it should ask 'did someone answer
+/// the door?'"*
+///
+/// The first cut of this routing used `recipient_liveness`, which is derived from
+/// `inbox_touch` — "something read this mailbox recently." A member's WATCHER polls that
+/// mailbox every few minutes whether or not the member can run. So it measured the doorbell,
+/// and a member out of budget rang exactly like a member at work. Verified against the live
+/// mesh the moment it was built, which is the only reason it did not ship:
+///
+/// ```text
+/// doorbell (inbox_touch)     codex live 17:50   kimi dormant 17:35
+/// answered  (witnessed acts) codex  07:40       kimi   19:13
+/// ```
+///
+/// dp had said codex was out for three days. The doorbell said codex was the live one. The
+/// acts say codex has not done anything in twelve hours, which is the truth, and the evidence
+/// was already on the chain — just never consulted.
+///
+/// Only ACTS BY THE ACTOR count. An `outcome` (it ran something), a `policy_decision` (it
+/// attempted something), an `adjudication` it issued, an `appeal` it filed. Deliberately NOT
+/// `member_notice`: a watcher sends those on a member's behalf, which is the doorbell wearing
+/// a different hat — and Codex's own watcher has been queuing "I could not wake Codex" notices
+/// under Codex's id all day. A signal a third party can generate for you is not evidence that
+/// you are working.
+fn actor_liveness(window: &[crate::storage::chain::ChainEntry], plugin_id: &str) -> crate::arbiter::Liveness {
+    const ACT_TYPES: [&str; 4] = ["outcome", "policy_decision", "adjudication", "appeal"];
+    let now = Utc::now();
+    let newest = window
+        .iter()
+        .filter(|e| ACT_TYPES.contains(&e.event_type.as_str()))
+        .filter(|e| {
+            e.event_data.get("plugin_id").and_then(Value::as_str) == Some(plugin_id)
+                || e.event_data.get("adjudicator").and_then(Value::as_str) == Some(plugin_id)
+                // `tool_adjudicate` nests the actor instead of naming it at the top level
+                // (handler.rs, `adjudicated_by`). Safe to read: the operator-issued path
+                // (http.rs) puts `operator: true` in that object and no `plugin_id`, so a
+                // sovereign ruling can never be counted as some member's act.
+                || e.event_data
+                    .pointer("/adjudicated_by/plugin_id")
+                    .and_then(Value::as_str)
+                    == Some(plugin_id)
+        })
+        .map(|e| e.timestamp)
+        .max();
+    match newest {
+        // Windows chosen for the appeal use-case: an arbiter that acted within the hour will
+        // very likely see the notice this session; one silent for a day may not for days.
+        //
+        // Known blind spot (kimi-code, PR #64): `outcome` needs an executed act and
+        // `policy_decision` fires on DENIES only, so a member doing an hour of pure
+        // read-class work emits nothing and reads Unknown while fully awake. "Reading
+        // quietly" and "gone" are the same row here. Tolerable only because this is
+        // evidence and not a gate — it reorders routing, it never excludes.
+        Some(t) if (now - t).num_minutes() <= 60 => crate::arbiter::Liveness::Live,
+        Some(t) if (now - t).num_hours() <= 24 => crate::arbiter::Liveness::Dormant,
+        // Silent beyond a day, or never seen acting in this window at all. Unknown rather
+        // than dormant: the window is bounded, so "no acts here" is not proof of absence.
+        _ => crate::arbiter::Liveness::Unknown,
+    }
+}
+
 /// File an appeal against a deny that landed on you.
 async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
     let deny_hash = require_string(args, "deny_hash")?;
@@ -2027,12 +2091,26 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
             }
         })
         .collect();
+    // Reachability is resolved per candidate and fed to routing — an arbiter that cannot
+    // read the appeal supplies no independence in practice, so it must not win a tie.
+    let with_liveness: Vec<(&str, crate::arbiter::Liveness)> =
+        pool.iter().map(|id| (id.as_str(), actor_liveness(&window, id))).collect();
     let picked = crate::arbiter::select_arbiter(
         &appellant.plugin_id,
         adjudicator,
-        pool.iter().map(String::as_str),
+        with_liveness.into_iter(),
     )
-    .map(|(id, ind)| (id.to_string(), ind));
+    .map(|sel| {
+        (
+            sel.arbiter.to_string(),
+            sel.independence,
+            sel.liveness,
+            sel.passed_over.map(|p| {
+                json!({"arbiter": p.arbiter, "independence": p.independence,
+                       "liveness": p.liveness})
+            }),
+        )
+    });
 
     let entry = s.append_chain(
         "appeal",
@@ -2049,8 +2127,12 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
             // entry alone rather than needing the deny to still be in ITS window.
             "about_attempted": deny.event_data.get("attempted").cloned().unwrap_or(Value::Null),
             "about_adjudicator": adjudicator,
-            "routed_to": picked.as_ref().map(|(id, _)| id.clone()),
-            "routed_independence": picked.as_ref().map(|(_, i)| i),
+            "routed_to": picked.as_ref().map(|(id, ..)| id.clone()),
+            "routed_independence": picked.as_ref().map(|(_, i, ..)| i),
+            "routed_liveness": picked.as_ref().map(|(_, _, l, _)| l),
+            // A more independent arbiter that routing skipped for being unreachable. The
+            // trade is on the record so a reader weighs the ruling with the routing in view.
+            "routing_passed_over": picked.as_ref().and_then(|(.., p)| p.clone()),
         }),
     )?;
 
@@ -2059,7 +2141,7 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
     // conduct being scored, and losing the record because a mailbox was full would punish
     // the member for the mesh's state.
     let mut dispatched = None;
-    if let Some((arb, ind)) = &picked {
+    if let Some((arb, ind, live, _)) = &picked {
         let pointer = format!("hestia://appeal/{deny_hash}");
         match s.inbox_store.enqueue_member(
             arb,
@@ -2070,7 +2152,10 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
             &entry.hash,
             None,
         ) {
-            Ok(id) => dispatched = Some(json!({"queued_id": id, "arbiter": arb, "independence": ind})),
+            Ok(id) => {
+                dispatched = Some(json!({"queued_id": id, "arbiter": arb,
+                                         "independence": ind, "liveness": live}))
+            }
             Err(e) => {
                 tracing::warn!(arbiter = %arb, error = %e, "appeal filed but dispatch failed");
             }
@@ -6359,6 +6444,79 @@ mod appeal_tests {
         )
         .unwrap()
         .hash
+    }
+
+    /// dp's distinction, as a test: the doorbell and the answered door disagree, and the
+    /// answered door is right.
+    #[tokio::test]
+    async fn liveness_reads_the_actors_own_acts_not_its_mailbox() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat(&state, "claude-code").await;
+        {
+            let s = state.lock().await;
+            // An actor that DID something a moment ago.
+            s.append_chain("outcome", json!({
+                "plugin_id": "kimi-code", "role_lct": APPELLANT_ROLE,
+                "session_id": sid.to_string(), "tool_name": "Bash", "success": true,
+                "target": "cargo test"})).unwrap();
+            // codex appears on the chain only as the SENDER of a notice — which its watcher
+            // queues on its behalf. That is the doorbell, and it must not read as working.
+            s.append_chain("member_notice", json!({
+                "from_plugin_id": "codex", "plugin_id": "codex",
+                "to_plugin_id": "claude-code", "kind": "coordination"})).unwrap();
+        }
+        let window = { state.lock().await.recent_chain(500) };
+        assert_eq!(actor_liveness(&window, "kimi-code"), crate::arbiter::Liveness::Live);
+        assert_eq!(
+            actor_liveness(&window, "codex"),
+            crate::arbiter::Liveness::Unknown,
+            "a notice a watcher sent on codex's behalf is not codex doing anything"
+        );
+        assert_eq!(
+            actor_liveness(&window, "gemini"),
+            crate::arbiter::Liveness::Unknown,
+            "never seen acting is Unknown, not Dormant — the window is bounded"
+        );
+    }
+
+    /// `tool_adjudicate` nests the actor at `adjudicated_by.plugin_id` instead of naming it
+    /// at the top level, so the flat read alone made a member whose only act was a generic
+    /// adjudication look silent. The operator path uses the SAME key with no `plugin_id`,
+    /// and must not be attributable to anyone.
+    #[tokio::test]
+    async fn a_nested_adjudication_is_its_issuers_act_but_an_operator_ruling_is_nobodys() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat(&state, "claude-code").await;
+        {
+            let s = state.lock().await;
+            // As `tool_adjudicate` emits it: the actor is nested, not top-level.
+            s.append_chain("adjudication", json!({
+                "subject": "some-claim", "axis": "correctness", "verdict": "upheld",
+                "adjudicated_by": {
+                    "plugin_id": "kimi-code", "role_lct": APPELLANT_ROLE,
+                    "session_id": sid.to_string()}})).unwrap();
+            // As the operator path emits it: sovereign, no member behind it.
+            s.append_chain("adjudication", json!({
+                "subject": "other-claim", "axis": "correctness", "verdict": "upheld",
+                "adjudicated_by": {
+                    "operator": true, "sovereign_lct_id": "lct:sovereign:dp",
+                    "role_lct": "role:sovereign"}})).unwrap();
+        }
+        let window = { state.lock().await.recent_chain(500) };
+        assert_eq!(
+            actor_liveness(&window, "kimi-code"),
+            crate::arbiter::Liveness::Live,
+            "an adjudication it issued is an act, even when the issuer is nested"
+        );
+        for id in ["dp", "operator", "claude-code", "lct:sovereign:dp"] {
+            assert_eq!(
+                actor_liveness(&window, id),
+                crate::arbiter::Liveness::Unknown,
+                "a sovereign ruling is not evidence that {id} is working"
+            );
+        }
     }
 
     /// End to end: file, rule, and check that the CONDUCT SCALE moved. If the emitted shape
