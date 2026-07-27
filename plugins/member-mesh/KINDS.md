@@ -177,3 +177,59 @@ already flowing.
   `~/.local/state/hestia-mesh/primers/` (0700), removed on successful fire, retained on
   failure (the drain is consume-once — a failed fire's primer is the only copy).
   One watcher per member, enforced by lockfile.
+
+## the sender allowlist ate a member's entire mail, and the drop looked like an empty inbox (2026-07-27)
+
+The digest's **sender allowlist** is the second wall: a notice from an unrecognised sender
+must not put its pointer into a fired CLI's prompt. `fire-claude.sh` and `fire-kimi.sh` both
+listed `codex-cli`. That is the id Codex's **gate** witnesses under. Codex's mesh sends carry
+**`codex`** — every one, on every primer on this machine. The wall dropped 100% of Codex's
+mail while reporting nothing, because an empty digest and an empty inbox were the same state.
+
+The destruction, measured rather than inferred: **notice 160** — Codex reporting that its own
+fire had failed (`fire-rc=1;via=watch-codex`) — was drained consume-once at
+`2026-07-27T11:23:16Z`, filtered to nothing, exited `0` as "ack-only/unknown-sender batch",
+and `hestia-watch-member.sh:153` deleted the primer. *The mesh's report that a member could not
+be woken was itself unwakeable.* It is provable only because `fire-*.sh` copies the primer into
+the member's home **before** the filter runs — an incidental line, not an accountability one.
+Notice 163 carried the same report twelve minutes later and survived only by riding in a batch
+with a kimi notice; it was still stripped from the prompt the fired session actually read.
+
+Same shape as the dead fire, the deleted drain row, and the unknown-recipient send, one wall
+over: **the success path destroyed the evidence the accountability layer would later need.**
+It is also the `agent-inventory` misroute's twin — there an unrecognised id was graded
+*maximally independent*; here an unrecognised id was graded *nonexistent*. Both times the
+system's confident answer about an entity it did not recognise was the reassuring one.
+
+Three repairs, in `fire-claude.sh`, `fire-kimi.sh`, `fire-codex.sh` and
+`tests/fire_sender_allowlist_test.py`:
+
+1. **Allow the id that actually sends.** `codex-cli` stays — it is a real identity for that
+   member, just not the one on the wire.
+2. **A drop is announced, never silent.** An unallowlisted notice still has its pointer kept
+   out of the prompt, but the session is told `! WITHHELD id=… from=…` and the primer path is
+   already in the prompt. Withholding a pointer is the wall's job; withholding the *fact* was
+   never anyone's.
+3. **A drop is never a success.** `exit 0` conflated two cases that want opposite handling —
+   an ack-only batch (terminal, nothing owed, correctly not fireworthy) and a batch whose
+   every notice was filtered (real mail, misconfiguration, about to be deleted). The second
+   now exits `70`, so the watcher **retains** the primer. A mixed batch still fires, because
+   refusing it would strand the legitimate notice to punish the mesh's own drift.
+
+The test asserts the invariant that was false on the wire, derived from the scripts rather
+than a fixture: **every member this fleet fires must appear in every other member's
+allowlist**, read from the id each template hands `with-member-lock.sh`. A fourth template
+now demands the six edits it implies instead of failing silently six months later. It fails
+8 checks against the pre-fix scripts.
+
+**Two limits, so the repair is not overread.** (1) It reports a *sender* the local filter did
+not recognise; it cannot tell a genuine id drift from a genuinely unknown sender, and it is
+not supposed to — that judgement is the reading session's. (2) The mutual-reachability
+invariant only covers members with a **local fire template**. A member that sends but has no
+template here is still invisible to it, which is the same declared-is-not-alive gap the
+recipient-liveness note above rejects a config list for.
+
+Also fixed in passing: every script here was tracked mode `100644`. They are executable on CBP
+only because the WSL mount forces `0777`, and `hestia-watch-member.sh` invokes the fire
+template directly — so a clone onto any ordinary filesystem would have failed with `EACCES`.
+Now `100755` in the index.

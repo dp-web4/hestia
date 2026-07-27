@@ -34,18 +34,34 @@ LOG_DIR="$HOME/.local/state/hestia-mesh/logs"; mkdir -p "$LOG_DIR"
 # Gate + sanitize in one pass: the prompt gets a field-allowlisted, control-char-stripped
 # digest, never the raw JSON. ack is terminal, so an ack-only batch must not fire (it
 # would loop). Sender allowlist is local members only.
+#
+# This template's ALLOW was the only one of the three that named its peers correctly — the
+# asymmetry is what exposed the bug in the other two (see fire-claude.sh). The exit-code
+# repair applies here regardless: an unallowlisted sender must be announced, not dropped,
+# and a batch with nothing fireworthy must exit non-zero so the consume-once primer is
+# RETAINED rather than deleted by hestia-watch-member.sh:153.
 DIGEST=$(python3 - "$PRIMER" <<'PY'
 import json,re,sys
 ALLOW={"claude-code","kimi-code"}
 d=json.load(open(sys.argv[1]))
-n=[x for x in d.get("notices",[]) if x.get("kind")!="ack" and x.get("from_plugin") in ALLOW]
+live=[x for x in d.get("notices",[]) if x.get("kind")!="ack"]
 clean=lambda s: re.sub(r"[\x00-\x1f\x7f]","",str(s))[:512]
-for x in n:
-    print(f"- id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} pointer={clean(x.get('pointer_uri',''))} queued_at={clean(x.get('queued_at',''))}")
+for x in live:
+    if x.get("from_plugin") in ALLOW:
+        print(f"- id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} pointer={clean(x.get('pointer_uri',''))} queued_at={clean(x.get('queued_at',''))}")
+    else:
+        print(f"! WITHHELD id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} — sender not on this member's allowlist; pointer withheld, full record in the primer JSON")
 PY
 )
-[ -n "$DIGEST" ] || { echo "[fire-codex] ack-only/unknown-sender batch — not firing"; exit 0; }
+[ -n "$DIGEST" ] || { echo "[fire-codex] ack-only batch — not firing"; exit 0; }
 FIREWORTHY=$(printf '%s\n' "$DIGEST" | grep -c '^- ')
+WITHHELD=$(printf '%s\n' "$DIGEST" | grep -c '^! ')
+if [ "$FIREWORTHY" -eq 0 ]; then
+  echo "[fire-codex] REFUSING: $WITHHELD notice(s) from unallowlisted sender(s), and nothing else to fire." >&2
+  printf '%s\n' "$DIGEST" | grep '^! ' >&2
+  echo "[fire-codex] The drain is consume-once — exiting 70 so the watcher RETAINS the primer." >&2
+  exit 70
+fi
 
 DEBT=$(python3 - "$PRIMER" <<'PY'
 import json,re,sys
