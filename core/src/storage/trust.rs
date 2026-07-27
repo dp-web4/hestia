@@ -201,12 +201,26 @@ mod tests {
         assert_eq!(t.success_count, 1);
 
         // On disk the file is sealed (not plaintext JSON).
+        //
+        // This assertion WAS `raw.first() != b'{'`, the same 1/256 brace-sniff proxy that
+        // #61 removed from `legacy_plaintext_is_read_then_resealed` — and left standing
+        // here, in its twin. A sealed blob is `nonce(12) || ciphertext` with a random
+        // nonce, so it begins with 0x7b by chance once in 256 runs, and the suite goes red
+        // for a reason that means nothing. It cost a full-suite red on 2026-07-27, one run
+        // after #61 landed claiming the class was fixed.
+        //
+        // The lesson #61 already wrote down, arriving again from the file it was written
+        // in: a flake that clears on rerun trains rerun-until-green, and *broken* and
+        // *unlucky* render identically. Fixing one instance of a bug class and not grepping
+        // for its siblings is how the class survives its own fix.
+        //
+        // Deterministic and stronger: the bytes must not parse as trust JSON (they are
+        // ciphertext), and the value must still come back through the decrypt path below.
         let f = store.entity_file(&TrustStore::entity_id("claude-code"));
         let raw = std::fs::read(&f).unwrap();
-        assert_ne!(
-            raw.first(),
-            Some(&b'{'),
-            "trust file should be sealed, not plaintext JSON"
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&raw).is_err(),
+            "trust file should be sealed ciphertext, not parseable plaintext JSON"
         );
 
         drop(store);
