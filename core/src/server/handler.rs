@@ -1188,7 +1188,19 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
         .resolve_plugin_id(session_id_arg.as_deref())
         .unwrap_or_default();
 
-    if !entry.allowed_consumers.is_empty() && !entry.allows(&plugin_id) {
+    // HST-001 (GPT audit, reproduced live 2026-07-27): an EMPTY `allowed_consumers` skipped
+    // this check entirely, so the default credential was world-readable to any caller under
+    // any invented plugin_id. `VaultEntry::allows` documents empty as "nobody"; this guard
+    // read it as "everybody". The full cure is transport authentication (HST-005); this is
+    // the containment dp approved — do not silently reinterpret existing empty-list entries
+    // (that would deny live agents mid-run), but stop treating the exposure as invisible.
+    //
+    // EXPOSED = the entry has no consumer list, so nothing scopes who may read it. Such a
+    // read is ALLOWED (compatibility) but WITNESSED and warned, and the operator can see
+    // which entries are in this state (`exposed` in /api/vault). A scoped entry with a
+    // non-matching caller is denied exactly as before.
+    let exposed = entry.allowed_consumers.is_empty();
+    if !exposed && !entry.allows(&plugin_id) {
         return Ok(hestia_error_envelope(
             "hestia.vault_scope_mismatch",
             &format!(
@@ -1205,6 +1217,26 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
             Some(json!({"name": name, "requested_scope": scope})),
         ));
     }
+    if exposed {
+        tracing::warn!(
+            credential = %name, reader = %plugin_id,
+            "EXPOSED credential read: '{name}' has an empty allowed_consumers list, so it is              readable by ANY caller (HST-001). Set an explicit consumer list via the operator              vault surface."
+        );
+    }
+    // WITNESS THE RELEASE. `tool_vault_get` previously appended nothing, so credential
+    // DISCLOSURE — the actual theft step — left no trace on the evidence plane while the
+    // WRITE was witnessed. The secret value is never recorded, only the name, the reader,
+    // and whether the read went through the exposed bypass.
+    let _ = s.append_chain(
+        "vault_get",
+        json!({
+            "name": name,
+            "plugin_id": who.plugin_id,
+            "role_lct": who.role_lct,
+            "session_id": who.session_uuid,
+            "exposed": exposed,
+        }),
+    );
     Ok(json!({"value": entry.secret}))
 }
 
@@ -1252,6 +1284,20 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
     {
         return Ok(denied);
     }
+    // HST-001 containment on the WRITE side: an empty consumer list is the world-readable
+    // default. If the caller is an attributed member, bind the new credential to that member
+    // rather than leaving it open — the creator can read its own secret, nobody else can,
+    // and the exposure is not manufactured by default. An UNATTRIBUTED caller ("unknown")
+    // is NOT bound to "unknown" — that would grant read to exactly the unauthenticated
+    // callers this is meant to contain — so it is left empty-and-flagged, and the read-path
+    // warning + operator `exposed` view cover it. This narrows the default; it does not
+    // authenticate the writer (that is HST-005, transport auth).
+    let defaulted_consumers = allowed_consumers.is_empty() && who.plugin_id != "unknown";
+    let allowed_consumers = if defaulted_consumers {
+        vec![who.plugin_id.clone()]
+    } else {
+        allowed_consumers
+    };
     let entry = VaultEntry::new(&name, value)
         .with_scope(scope)
         .with_tags(tags)
@@ -1272,10 +1318,11 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
             "plugin_id": who.plugin_id,
             "role_lct": who.role_lct,
             "session_id": who.session_uuid,
+            "defaulted_consumers_to_creator": defaulted_consumers,
         }),
     );
 
-    Ok(json!({"stored": true, "entryId": entry_id}))
+    Ok(json!({"stored": true, "entryId": entry_id, "boundToCreator": defaulted_consumers}))
 }
 
 async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
@@ -6963,5 +7010,101 @@ mod appeal_tests {
                 .contains(&format!("matches {true_count} chain entries")),
             "the message a member actually reads must carry the true count too: {amb}"
         );
+    }
+}
+
+#[cfg(test)]
+mod vault_hst001_tests {
+    //! HST-001 containment: an empty allowed_consumers list must not silently make a
+    //! credential world-readable, and a disclosure must not be invisible on the chain.
+    use super::*;
+    use super::inbox_tests::{open_state, seeded_home};
+
+    async fn seat_session(state: &SharedState, plugin_id: &str) -> Uuid {
+        let sid = Uuid::new_v4();
+        let mut s = state.lock().await;
+        s.sessions.insert(sid, crate::server::state::Session {
+            session_id: sid,
+            plugin_id: plugin_id.into(),
+            plugin_version: None,
+            host_agent: "test".into(),
+            host_agent_version: None,
+            assigned_role: "citizen".into(),
+            constellation_role: "role:constellation:member".into(),
+            soft_lct: format!("lct:test:{plugin_id}"),
+            connected_at: chrono::Utc::now(),
+            host_session_id: None,
+        });
+        sid
+    }
+
+    async fn set(state: &SharedState, sid: Option<Uuid>, name: &str, consumers: Vec<&str>) -> Value {
+        let mut args = json!({"name": name, "value": "DUMMY-SECRET"});
+        if let Some(u) = sid { args["session_id"] = json!(u.to_string()); }
+        if !consumers.is_empty() { args["allowed_consumers"] = json!(consumers); }
+        tool_vault_set(state, &args).await.unwrap()
+    }
+    async fn get(state: &SharedState, sid: Option<Uuid>, name: &str) -> Value {
+        let mut args = json!({"name": name});
+        if let Some(u) = sid { args["session_id"] = json!(u.to_string()); }
+        tool_vault_get(state, &args).await.unwrap()
+    }
+
+    /// The write side: an ATTRIBUTED creator's new credential binds to it, so a DIFFERENT
+    /// member cannot read it — the world-readable default is closed for new entries.
+    #[tokio::test]
+    async fn a_new_credential_from_an_attributed_creator_is_not_world_readable() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let owner = seat_session(&state, "claude-code").await;
+        let other = seat_session(&state, "kimi-code").await;
+        let w = set(&state, Some(owner), "owned-cred", vec![]).await;
+        assert_eq!(w.get("boundToCreator").and_then(Value::as_bool), Some(true),
+                   "an empty list from an attributed creator must bind to the creator: {w}");
+        let denied = get(&state, Some(other), "owned-cred").await;
+        assert!(format!("{denied}").contains("vault_scope_mismatch"),
+                "a different member must not read a creator-bound credential: {denied}");
+        let ok = get(&state, Some(owner), "owned-cred").await;
+        assert_eq!(ok.get("value").and_then(Value::as_str), Some("DUMMY-SECRET"),
+                   "the creator can still read its own: {ok}");
+    }
+
+    /// A pre-existing exposed entry (empty list, e.g. written before this fix) still reads —
+    /// compatibility — but the read is WITNESSED with exposed:true. The disclosure is no
+    /// longer invisible, which was the gap in Finding A.
+    #[tokio::test]
+    async fn an_exposed_read_is_allowed_but_witnessed() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        // Simulate a legacy entry: write it directly with an empty consumer list.
+        {
+            let mut s = state.lock().await;
+            s.vault.upsert(VaultEntry::new("legacy-cred", "DUMMY-SECRET")).unwrap();
+        }
+        let before = { state.lock().await.recent_chain(200).len() };
+        let anon = seat_session(&state, "some-random-caller").await;
+        let r = get(&state, Some(anon), "legacy-cred").await;
+        assert_eq!(r.get("value").and_then(Value::as_str), Some("DUMMY-SECRET"),
+                   "a legacy exposed entry still reads (no live breakage): {r}");
+        let window = { state.lock().await.recent_chain(200) };
+        assert!(window.len() > before, "the read must append a witness entry");
+        let vget = window.iter().rev().find(|e| e.event_type == "vault_get")
+            .expect("disclosure must be witnessed — this is the theft step");
+        assert_eq!(vget.event_data.get("exposed").and_then(Value::as_bool), Some(true),
+                   "the witness must flag it as an exposed read");
+        assert!(!format!("{:?}", vget.event_data).contains("DUMMY-SECRET"),
+                "the secret value must NEVER be written to the chain");
+    }
+
+    /// The scoped case is unchanged: a non-listed caller is denied, as before this fix.
+    #[tokio::test]
+    async fn a_scoped_credential_still_denies_a_non_consumer() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let owner = seat_session(&state, "claude-code").await;
+        let other = seat_session(&state, "kimi-code").await;
+        set(&state, Some(owner), "scoped-cred", vec!["claude-code"]).await;
+        let denied = get(&state, Some(other), "scoped-cred").await;
+        assert!(format!("{denied}").contains("vault_scope_mismatch"), "{denied}");
     }
 }
