@@ -250,6 +250,40 @@ type ToolResult = Result<Value, anyhow::Error>;
 
 async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     let plugin_id = require_string(args, "plugin_id")?;
+    // `/` is the routed-address separator (r6-routing branch 2: `peer/member`), so a
+    // member id containing one makes the address form AMBIGUOUS at its own parse site.
+    // This is a guard on the *identity claim*, not on a recipient — the thread's
+    // "accept always, record always" posture governs unknown RECIPIENTS, where a
+    // refusal would silence a member setting up a new watcher. An id the address
+    // grammar cannot represent is a different thing: it is not an identity you can be.
+    //
+    // What it closes, concretely. `plugin_id` is caller-supplied at connect and was
+    // unvalidated, while the drain key IS the caller's resolved `plugin_id`
+    // (`drain_member`). On a build WITHOUT the forwarding plane — which is the deployed
+    // population, not a hypothetical: this fleet's daemon is `113a46a`, 8 commits below
+    // `main`, with no `split_once('/')` anywhere in `member_notify` — a notice sent to
+    // `to="cbp/claude-code"` takes the LOCAL arm and parks under that literal string.
+    // Any local client could then connect claiming `plugin_id = "cbp/claude-code"` and
+    // DRAIN it. So the deploy-order hazard is not only the black-hole-with-a-success-code
+    // already reported; mail addressed to another machine's member was deliverable to a
+    // local claimant. Capture is worse than loss, because loss is eventually noticed.
+    //
+    // HONEST SCOPE, because the reverse is easy to assume: this does NOT rescue the
+    // deployed population. Any commit carrying this guard also carries branch 2
+    // (`e71c422` is already an ancestor of `main`), so installing the guard installs
+    // routing — the two cannot be sequenced by upgrading. Closing it there needs a
+    // backport onto the deployed line, which is a release decision, not a patch. What
+    // this DOES buy is the invariant the address form always assumed and never stated:
+    // on any build that has it, a `/` in an id means "another scale" and nothing else.
+    if plugin_id.contains('/') {
+        return Ok(hestia_error_envelope(
+            "hestia.connect_bad_plugin_id",
+            "a member id may not contain '/': that is the `peer/member` routed-address \
+             separator, and an id containing it would let a local member claim an \
+             address belonging to another machine's member",
+            Some(json!({ "plugin_id": plugin_id })),
+        ));
+    }
     let host_agent = require_string(args, "host_agent")?;
     let plugin_version = optional_string(args, "plugin_version");
     let host_agent_version = optional_string(args, "host_agent_version");
@@ -2140,17 +2174,71 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                     Some(json!({ "to_plugin_id": to_plugin })),
                 ));
             }
-            s.inbox_store
-                .enqueue_egress(
-                    peer,
-                    remote_member,
-                    &sender.plugin_id,
-                    &sender.role_lct,
-                    &kind,
-                    pointer_uri.as_deref(),
-                    &entry.hash,
-                )
-                .map_err(|e| anyhow::anyhow!("queueing egress notice: {e}"))?
+            // The egress plane's admission bound (`MAX_EGRESS_QUEUE`) refuses rather
+            // than evicting: a parked forward has no report path on this branch, so
+            // dropping one is a silent loss, while refusing the newest send reaches a
+            // caller who is live and holds the receipt. Named error, not a bare
+            // anyhow — "the forwarding plane is backed up" is a fact the sender can
+            // act on (and it says how backed up).
+            match s.inbox_store.enqueue_egress(
+                peer,
+                remote_member,
+                &sender.plugin_id,
+                &sender.role_lct,
+                &kind,
+                pointer_uri.as_deref(),
+                &entry.hash,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    // The refusal gets its OWN chain entry (McNugget T3 on `17a928d`).
+                    // The witness above says `member_notice` and reads, to any third
+                    // party, as an accepted send — the chain cannot distinguish "queued"
+                    // from "refused" without this. The envelope used to assert "the
+                    // refusal is on record too" while appending nothing, which made the
+                    // one path built to keep backpressure attributable the one path that
+                    // left no evidence, and made the claim in its own error text false.
+                    // Appending here rather than moving the witness below the queue
+                    // decision keeps the existing shape deliberate — the act IS the send,
+                    // delivery is a consequence — and `witnessed_entry` joins the two.
+                    //
+                    // Cheap under flood by construction: this fires only when admission
+                    // is REFUSED, i.e. at most once per send that produced no row, and
+                    // the refusal is what a flooding sender is already being told to stop
+                    // doing. That is the opposite of the eviction-counter case, which is
+                    // a mark rather than a witness precisely because evictions happen at
+                    // flood rates.
+                    let depth = s.inbox_store.egress_queued().unwrap_or(0);
+                    let refusal = s.append_chain(
+                        "member_notice_refused",
+                        json!({
+                            "reason": "egress_queue_full",
+                            "to_plugin_id": to_plugin,
+                            "dest_peer": peer,
+                            "from_plugin_id": sender.plugin_id,
+                            "from_role_lct": sender.role_lct,
+                            "egress_queued": depth,
+                            // the `member_notice` entry this refusal voids
+                            "witnessed_entry": entry.hash,
+                        }),
+                    )?;
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_egress_queue_full",
+                        &format!(
+                            "the forwarding plane is not draining, so this notice was \
+                             NOT queued: {e}. Both the act and its refusal are on the \
+                             chain — see witnessEntryHash and refusalEntryHash."
+                        ),
+                        Some(json!({
+                            "to_plugin_id": to_plugin,
+                            "dest_peer": peer,
+                            "egress_queued": depth,
+                            "witnessEntryHash": entry.hash,
+                            "refusalEntryHash": refusal.hash,
+                        })),
+                    ));
+                }
+            }
         }
         None => s
             .inbox_store
@@ -4345,6 +4433,68 @@ mod member_mesh_tests {
         assert_eq!(kimi_mail["notices"][0]["from_plugin"], json!("claude-code"));
     }
 
+    /// T3 (McNugget on `17a928d`): a REFUSED forward must be distinguishable from an
+    /// accepted one **on the chain**, not just in an ephemeral tool response.
+    ///
+    /// The witness runs above the queue decision — deliberately, because the act is the
+    /// send and delivery is a consequence — so it appends a plain `member_notice` that
+    /// reads to any third party as a send that was accepted. When admission is refused
+    /// the branch previously returned an envelope asserting "the refusal is on record
+    /// too" and appended nothing, so the one path built to make backpressure
+    /// attributable was the only path that left no evidence, and its own error text was
+    /// false. The refusal now gets its own entry, joined to the witness it voids.
+    #[tokio::test]
+    async fn a_refused_forward_is_on_the_chain_not_just_in_the_reply() {
+        let (_dir, state) = test_state().await;
+        let alice = connect(&state, "claude-code").await;
+
+        // Fill the egress plane to its bound directly — this test is about what the
+        // refusal RECORDS, not about where the bound sits (that is pinned in inbox.rs).
+        {
+            let s = state.lock().await;
+            for i in 0..crate::storage::inbox::MAX_EGRESS_QUEUE {
+                s.inbox_store
+                    .enqueue_egress("thor", "claude-code", "codex-cli", "role:r",
+                                    "reply", Some("forum/x.md#thread=t"),
+                                    &format!("h{i}"))
+                    .unwrap();
+            }
+        }
+
+        let refused = tool_member_notify(
+            &state,
+            &json!({
+                "to_plugin_id": "thor/claude-code", "kind": "review_done",
+                "pointer_uri": "shared-context/forum/x.md#thread=t", "session_id": alice
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(refused["_hestia_error"]["code"], json!("hestia.member_notify_egress_queue_full"),
+                   "setup: expected the bound to fire, got {refused}");
+        let witness = refused["_hestia_error"]["data"]["witnessEntryHash"].as_str().unwrap();
+        let refusal = refused["_hestia_error"]["data"]["refusalEntryHash"].as_str()
+            .expect("the refusal must carry its own chain entry hash");
+        assert_ne!(witness, refusal, "the refusal reused the witness entry");
+
+        let s = state.lock().await;
+        let chain = s.recent_chain(20);
+        let e = chain
+            .iter()
+            .find(|e| e.event_type == "member_notice_refused")
+            .expect("a refused forward left NO trace on the chain");
+        // The join: a third party reading the chain can tell which witnessed act this
+        // refusal voids, without trusting the sender's copy of the reply.
+        assert_eq!(e.event_data["witnessed_entry"], json!(witness));
+        assert_eq!(e.event_data["reason"], json!("egress_queue_full"));
+        assert_eq!(e.event_data["dest_peer"], json!("thor"));
+        // And the accepted-looking witness is still there — the pair is the record,
+        // not the refusal alone.
+        assert!(chain.iter().any(|e| e.event_type == "member_notice"),
+                "the witness that the refusal voids is missing");
+    }
+
     /// The unanswered report is only honest if the party it reports on cannot
     /// steer it: answering is a right over YOUR OWN mail. And once a real
     /// response is bound, the debt clears.
@@ -4555,6 +4705,48 @@ mod member_mesh_tests {
             assert_eq!(
                 out["_hestia_error"]["code"],
                 "hestia.member_notify_bad_pointer"
+            );
+        }
+    }
+
+    /// `plugin_id` is caller-supplied at connect and was unvalidated, while the drain
+    /// key IS the caller's resolved `plugin_id`. So a client could claim
+    /// `cbp/claude-code` — a ROUTED address — as its own local identity. Paired with
+    /// `legacy_local_rows_addressed_to_a_routed_id_are_undrainable` in `storage::inbox`:
+    /// that test shows such rows exist and stay in the local plane; this one shows
+    /// nobody can hold the id needed to drain them.
+    #[tokio::test]
+    async fn connect_refuses_a_routed_address_as_a_member_id() {
+        let (_dir, state) = test_state().await;
+        for bad in ["cbp/claude-code", "a/b", "/", "peer/"] {
+            let out = tool_connect(&state, &json!({"plugin_id": bad, "host_agent": "t"}))
+                .await
+                .unwrap();
+            assert_eq!(
+                out["_hestia_error"]["code"], "hestia.connect_bad_plugin_id",
+                "'{bad}' was accepted as a local member id: {out}"
+            );
+            assert!(
+                out.get("sessionId").is_none(),
+                "'{bad}' got a session despite the refusal: {out}"
+            );
+        }
+    }
+
+    /// The guard's blast radius. A charset refusal at connect is a hard denial, so the
+    /// falsifier that matters is not "does it reject" but "does it reject only that" —
+    /// every id this fleet actually uses must still connect. Widening the predicate
+    /// (e.g. to alphanumeric-only) fails HERE rather than in the field.
+    #[tokio::test]
+    async fn connect_still_accepts_every_member_id_this_fleet_uses() {
+        let (_dir, state) = test_state().await;
+        for ok in ["claude-code", "codex", "kimi-code", "cursor", "claude", "gemini"] {
+            let out = tool_connect(&state, &json!({"plugin_id": ok, "host_agent": "t"}))
+                .await
+                .unwrap();
+            assert!(
+                out["sessionId"].is_string(),
+                "the guard refused a real member id '{ok}': {out}"
             );
         }
     }
