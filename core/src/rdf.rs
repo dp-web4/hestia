@@ -24,6 +24,15 @@
 //! implement that refusal; it emits the object the refusal will be computed over. That is
 //! the increment: make the evidence addressable before making it decisive.
 //!
+//! **KNOWN, RECORDED, AND UPSTREAM: RDFS DOMAIN POLLUTION ON THE V3 SIDE.** The ontology
+//! declares `rdfs:domain web4:T3Tensor` on `entity`, `role` and `hasDimensionScore`. This
+//! projection emits those edges on `V3Tensor` nodes too, so under RDFS semantics a reasoner
+//! infers every V3 tensor is *also* a T3Tensor — type pollution, a join defect of the same
+//! family as a wrong namespace. The fix belongs to the ontology (a common `web4:Tensor`
+//! superclass, or dropping the domains), not here; kimi-code's review is right that the PR
+//! which makes the graph real should be the one that records the inference it triggers.
+//! Filed against web4-standard rather than worked around locally.
+//!
 //! **ABSENCE IS STRUCTURAL HERE, NOT A LOW NUMBER.** An unmeasured dimension emits **no
 //! `DimensionScore` node at all** — not a node with score 0, not a node marked unknown. A
 //! consumer asking "is there a Validity score?" gets *nothing* rather than something
@@ -48,9 +57,48 @@ use crate::derivation::{DerivedDimension, DerivedTrust};
 /// the test is the thing that will say so.
 pub const WEB4_NS: &str = "https://web4.io/ontology#";
 
-/// Escape a string for a Turtle literal.
+/// Namespace for predicates hestia needs that the Web4 ontology does not (yet) define.
+///
+/// `observationCount` was first emitted as `web4:observationCount` — a predicate that exists
+/// NOWHERE in `t3v3-ontology.ttl`. kimi-code, reviewing: it "will parse, look plausible, and
+/// join with nothing — exactly the failure the namespace story in the module docs warns
+/// about, one level down." It was the same defect as the invented namespace, one predicate
+/// over, in the file that narrates the invented namespace. I had checked the namespace
+/// against the ontology and then stopped checking, as though one lookup discharged the
+/// obligation for every term.
+///
+/// The count is load-bearing for the sufficiency query this graph exists to enable ("witnessed
+/// by how many, fresh enough?"), so dropping it would be the wrong fix. Emitting it under a
+/// hestia namespace keeps `web4:` **exactly the vocabulary that exists** while the coordinated
+/// addition to web4-standard is proposed. A consumer can then tell, from the prefix alone,
+/// which predicates are standard and which are ours — which is the honest state.
+pub const HESTIA_NS: &str = "https://hestia.local/ontology#";
+
+/// Escape a string for a Turtle **string literal** (quoted position).
 fn lit(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "")
+}
+
+/// Escape a string for Turtle **IRIREF** position — `<…>`.
+///
+/// `lit()` was previously used here too, and that was wrong: Turtle's IRIREF grammar admits
+/// **no backslash escapes except `\uXXXX`/`\UXXXXXXXX`**, so `<role:with\"quote>` — which the
+/// old `literals_are_escaped` test pinned as correct — is rejected by a conforming parser.
+/// kimi-code, reviewing: a module whose thesis is *verify against the spec, don't assume*
+/// should not carry a test that codifies a misreading of the format. **A test asserting
+/// invalid output is worse than a missing test — it defends the bug against the next reader.**
+///
+/// Nothing live reaches this today (hashes are hex, roles are charset-constrained at connect,
+/// LCTs are minted), which is precisely why it had to be fixed on the spec rather than on
+/// the symptom.
+fn iri(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\' => format!("\\u{:04X}", c as u32),
+            c if (c as u32) <= 0x20 => format!("\\u{:04X}", c as u32),
+            c => c.to_string(),
+        })
+        .collect()
 }
 
 /// A dimension's ontology term, and which tensor it belongs to.
@@ -89,7 +137,12 @@ impl Tensor {
 
 /// Project one grain's derived trust into Turtle against the Web4 T3/V3 ontology.
 ///
-/// `entity_lct` is the durable member LCT — NOT the `plugin_id`. The plugin_id is a label the
+/// `entity_lct` is the durable member LCT — NOT the `plugin_id`. Note precisely what that
+/// vouches for: `member_lct` is a **naming function**, returning `Some` for any non-empty
+/// non-synthetic string, so a plugin that never connected still derives a well-formed LCT
+/// (the #79 lesson — it never reads the registry). Using it here is right for *joining*,
+/// because the derivation is deterministic and stable; it is not evidence of presence, and
+/// this projection does not claim it is. The plugin_id is a label the
 /// caller supplies; the LCT is what the society minted. Passing the label here would encode
 /// the attribution gap into the graph, which is the one thing this projection exists to close.
 ///
@@ -105,6 +158,8 @@ pub fn trust_to_turtle(derived: &DerivedTrust, entity_lct: &str) -> String {
     let mut out = String::new();
     out.push_str("@prefix web4: <");
     out.push_str(WEB4_NS);
+    out.push_str("> .\n@prefix hestia: <");
+    out.push_str(HESTIA_NS);
     out.push_str("> .\n@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\n");
     out.push_str(&format!(
         "# derived by hestia {} at {}\n# grain: {} as {}\n\n",
@@ -142,8 +197,8 @@ pub fn trust_to_turtle(derived: &DerivedTrust, entity_lct: &str) -> String {
         );
         out.push_str(&format!("{tensor_uri} a web4:{} ;\n", tensor.class()));
         // THE role@agent EDGES. Two properties, not one concatenated key.
-        out.push_str(&format!("  web4:entity <{}> ;\n", lit(entity_lct)));
-        out.push_str(&format!("  web4:role <{}> ;\n", lit(&derived.role_lct)));
+        out.push_str(&format!("  web4:entity <{}> ;\n", iri(entity_lct)));
+        out.push_str(&format!("  web4:role <{}> ;\n", iri(&derived.role_lct)));
         for (i, (name, term, _)) in measured.iter().enumerate() {
             let sep = if i + 1 == measured.len() { " ." } else { " ;" };
             out.push_str(&format!(
@@ -175,11 +230,11 @@ pub fn trust_to_turtle(derived: &DerivedTrust, entity_lct: &str) -> String {
             for e in &d.evidence {
                 out.push_str(&format!(
                     "  web4:witnessedBy <urn:hestia:chain:{}> ;\n",
-                    lit(&e.hash)
+                    iri(&e.hash)
                 ));
             }
             out.push_str(&format!(
-                "  web4:observationCount \"{}\"^^xsd:integer .\n\n",
+                "  hestia:observationCount \"{}\"^^xsd:integer .\n\n",
                 d.observations
             ));
         }
@@ -273,7 +328,7 @@ mod tests {
         let ttl = trust_to_turtle(&grain(None, Some(0.92)), "lct:web4:member:abc123");
         assert!(ttl.contains("web4:witnessedBy <urn:hestia:chain:bbb2>"), "{ttl}");
         assert!(ttl.contains("web4:witnessedBy <urn:hestia:chain:ccc3>"), "{ttl}");
-        assert!(ttl.contains("web4:observationCount \"2\"^^xsd:integer"));
+        assert!(ttl.contains("hestia:observationCount \"2\"^^xsd:integer"));
         // newest observation, so staleness is on the graph
         assert!(ttl.contains("web4:observedAt \"2026-07-28T00:03:00+00:00\""), "{ttl}");
     }
@@ -300,12 +355,36 @@ mod tests {
         assert!(ttl.contains("@prefix web4: <https://web4.io/ontology#> ."), "{ttl}");
     }
 
-    /// Turtle must survive a literal containing a quote or newline without breaking syntax.
+    /// IRI position takes UCHAR, not backslash escapes.
+    ///
+    /// This test previously asserted `<role:with\\"quote>` was correct output. It is not —
+    /// Turtle's IRIREF grammar rejects backslash escapes. The test defended the bug; it now
+    /// pins the fix. A test asserting invalid output is worse than a missing test.
     #[test]
-    fn literals_are_escaped() {
+    fn iri_position_uses_uchar_not_backslash_escapes() {
         let mut g = grain(Some(0.5), None);
         g.role_lct = "role:with\"quote".into();
         let ttl = trust_to_turtle(&g, "lct:web4:member:abc123");
-        assert!(ttl.contains("role:with\\\"quote"), "{ttl}");
+        assert!(ttl.contains("role:with\\u0022quote"), "IRIREF needs UCHAR: {ttl}");
+        assert!(!ttl.contains("role:with\\\\\"quote"), "backslash escape is invalid in IRIREF: {ttl}");
+    }
+
+    /// The two grammars are different and the module must not collapse them again.
+    #[test]
+    fn literal_and_iri_escaping_are_distinct() {
+        assert_eq!(lit("a\"b"), "a\\\"b");
+        assert_eq!(iri("a\"b"), "a\\u0022b");
+    }
+
+    /// Predicates the ontology does not define live under `hestia:`, so a consumer can tell
+    /// standard from local by prefix alone.
+    #[test]
+    fn nonstandard_predicates_are_not_emitted_as_web4() {
+        let ttl = trust_to_turtle(&grain(Some(0.85), None), "lct:web4:member:abc123");
+        assert!(ttl.contains("hestia:observationCount"), "{ttl}");
+        assert!(!ttl.contains("web4:observationCount"),
+                "observationCount is absent from t3v3-ontology.ttl; emitting it as web4: \
+                 forks the vocabulary silently: {ttl}");
+        assert!(ttl.contains("@prefix hestia: <https://hestia.local/ontology#> ."), "{ttl}");
     }
 }
