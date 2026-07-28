@@ -898,6 +898,40 @@ def _launchd_schedule(plists: list[Path]) -> str:
     return "unparseable" if unreadable else "installed-no-schedule"
 
 
+def interpreter_finding() -> str | None:
+    """Did the wrapper have to fall back off its pinned interpreter to run this at all?
+
+    THE PIN IS SCOPE, SO ITS FAILURE IS A FINDING AND NOT AN EXIT CODE (cbp, 2026-07-28,
+    reviewing the launchd branch from the Linux side). install.sh pins the interpreter the
+    installing shell resolved, which on Darwin is a stable homebrew path and on Linux is
+    routinely a venv, a conda prefix or a pyenv shim. When that path goes away the wrapper
+    now falls back to PATH rather than exiting 127 — because a check that dies is
+    indistinguishable from a check that found nothing, and this file exists to find gates
+    whose failure mode is silence. It is obliged to find its own: the wrapper exports
+    HESTIA_INTERPRETER_PIN_BROKEN and this turns it into a reported one.
+
+    Measured before the floor existed: with the pinned venv deleted, `periodic_trigger()`
+    still answered `systemd-user-timer-enabled` with `installed_bin` set — the strongest
+    state here — while every hourly fire was exit 127. Installed, scheduled, and never once
+    run, which is the same pair `installed-not-enabled` and `installed-no-schedule` were
+    both introduced to break apart, one layer further down.
+
+    The run itself is TRUSTWORTHY: same source file, stdlib only, and `sys.executable` is
+    reported so a reader can see which python answered. What is NOT established is that the
+    periodic trigger and the SessionStart hook still agree on an interpreter — which is the
+    whole reason the pin was added.
+    """
+    pinned = os.environ.get("HESTIA_INTERPRETER_PIN_BROKEN")
+    if not pinned:
+        return None
+    return (f"the installed wrapper's pinned interpreter {pinned} no longer exists, so "
+            f"this run fell back to {sys.executable} off PATH. The findings stand — same "
+            f"source, stdlib only — but the triggers are no longer pinned to one "
+            f"interpreter, which is what the pin was for, and a PATH that differs between "
+            f"a daemon and a shell will now silently split them again. Re-run install.sh "
+            f"from the shell whose python3 every trigger should use.")
+
+
 def _git(*args: str) -> str | None:
     """git in the hestia checkout, or None. Never raises, never blocks forever."""
     try:
@@ -1355,6 +1389,11 @@ def emit(report: dict, brief: bool) -> int:
             }[scan["periodic_trigger"]]
             line += (f" | NO PERIODIC TRIGGER — this binary is installed with {why[0]} "
                      f"on {scan.get('periodic_platform')}; {why[1]}")
+        if scan.get("interpreter_pin_broken"):
+            line += (f" | INTERPRETER PIN BROKEN — the wrapper's pinned "
+                     f"{scan['interpreter_pin_broken']} is gone; this ran on "
+                     f"{scan.get('interpreter')} off PATH, so the triggers are no longer "
+                     "pinned to one interpreter. Re-run install.sh")
         if scan.get("hook_timeout_installed_s") is not None:
             line += (f" | HOOK TIMEOUT {scan['hook_timeout_installed_s']}s < "
                      f"{scan.get('project_scan_budget_s')}s SCAN BUDGET — this check can "
@@ -1444,6 +1483,11 @@ def main() -> int:
         "periodic_platform": periodic_platform,
         "periodic_paths_checked": periodic_paths,
         "installed_bin": str(installed_bin) if installed_bin.exists() else None,
+        # Which python actually answered. Reported unconditionally, not only when the pin
+        # breaks: `installed_bin` names a wrapper whose whole job is to make the three
+        # triggers agree on this value, so a fleet dashboard differencing two machines —
+        # or one machine's hook against its own timer — needs it present to compare.
+        "interpreter": sys.executable,
         "scan_truncated": SCAN_STATS.get("truncated", False),
         # Level-order, so "where it stopped" is one integer and the loss is predictable:
         # levels below `truncated_at_level` were never enumerated, and those are the
@@ -1483,6 +1527,13 @@ def main() -> int:
         # killed. A check has as many surfaces as it has readers, and the smallest surface
         # is the one that gets believed.
         scope["hook_timeout_installed_s"] = installed_timeout
+    pin_broken = interpreter_finding()
+    if pin_broken:
+        unknowns.append(pin_broken)
+        # Onto --brief for the same reason the hook-timeout finding is: the reader who
+        # most needs this is the one whose trigger just ran on the wrong python, and the
+        # smallest surface is the one that gets believed.
+        scope["interpreter_pin_broken"] = os.environ["HESTIA_INTERPRETER_PIN_BROKEN"]
     if SCAN_STATS.get("truncated"):
         # Rule 5 made explicit. A walk that ran out of budget has NOT established the
         # project scope, and the part it never reached is exactly where the report would

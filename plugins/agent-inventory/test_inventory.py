@@ -22,6 +22,7 @@ Run: python3 test_inventory.py     (no pytest; exit 1 on failure)
 from __future__ import annotations
 
 import json
+import os
 import plistlib
 import sys
 import tempfile
@@ -289,10 +290,30 @@ def test_periodic_trigger(tmp: Path):
         inventory.HOME = orig
 
 
+def test_interpreter_finding():
+    """A broken pin must become a FINDING, never an exit code and never silence."""
+    orig = os.environ.pop("HESTIA_INTERPRETER_PIN_BROKEN", None)
+    try:
+        check("an intact pin says nothing", inventory.interpreter_finding(), None)
+        os.environ["HESTIA_INTERPRETER_PIN_BROKEN"] = "/tmp/gone-venv/bin/python3"
+        got = inventory.interpreter_finding()
+        check("a broken pin is reported", got is not None, True)
+        # Both halves must be in the sentence: what was pinned, and what actually ran.
+        # "the pin broke" without the replacement leaves the reader unable to tell whether
+        # the run they are holding is trustworthy.
+        check("names the pin", "/tmp/gone-venv/bin/python3" in got, True)
+        check("names what ran instead", sys.executable in got, True)
+    finally:
+        os.environ.pop("HESTIA_INTERPRETER_PIN_BROKEN", None)
+        if orig is not None:
+            os.environ["HESTIA_INTERPRETER_PIN_BROKEN"] = orig
+
+
 if __name__ == "__main__":
     test_attribute()
     test_has_tag()
     test_fallback_enumeration()
+    test_interpreter_finding()
     with tempfile.TemporaryDirectory() as d:
         test_verdict(Path(d))
     with tempfile.TemporaryDirectory() as d:

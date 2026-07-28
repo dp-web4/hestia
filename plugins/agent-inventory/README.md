@@ -216,6 +216,42 @@ said as unmeasured: on a Mac without the Xcode command line tools `/usr/bin/pyth
 stub, and the unpinned wrapper would be exit 127 from launchd while `launchctl print` still
 showed a healthy job with the interval set.
 
+**And on Linux the pin needs a floor** (cbp, 2026-07-28 — the cross-platform review the
+shared edit asked for, and it did bite). `command -v python3` is a *stable* path on a Mac
+and routinely an *ephemeral* one here: a venv, a conda prefix, a pyenv shim, a checkout
+under `/tmp`. Measured on cbp — install with a venv active, then delete the venv:
+
+```
+pinned wrapper    env: '/tmp/hli-venv/bin/python3': No such file or directory   exit 127
+unpinned wrapper  [agent-inventory] OK on cbp: 4 installed, 6 plugins, 4 governed  exit 0
+```
+
+The pin turned a survivable environment change into a permanent 127 — and did it
+**silently**: `periodic_trigger()` still answered `systemd-user-timer-enabled` with
+`installed_bin` set, the strongest state this plugin has, while every hourly fire was 127
+and every `SessionStart` hook emitted nothing. That is exactly the shape named above for a
+Mac without the Xcode CLT and marked *not measured*; on Linux it is reachable by a far more
+ordinary route than a missing toolchain, so it is measured here.
+
+The pin is still right — it fixed a real five-minor-version split between two triggers — so
+this does not revert it. It gives it a floor: **pinned when the pin is there, `PATH` when
+it is not, and the degradation reported rather than fatal.** The wrapper exports
+`HESTIA_INTERPRETER_PIN_BROKEN`, and `interpreter_finding()` turns it into an `unknown[]`
+entry and an `INTERPRETER PIN BROKEN` clause on `--brief`; `scope.interpreter` now carries
+`sys.executable` on every run, broken or not, so two triggers can be differenced. A check
+whose own wrapper exits 127 is an instance of the failure it exists to find. `install.sh`
+also warns at install time when the pin is *already* known to be ephemeral, since that is
+the one moment a human is watching.
+
+Both halves are sabotage-probed to red, and the interesting probe is the first: **neuter
+`interpreter_finding()` and the run recovers silently** — clean `--brief`, exit 0, pin
+broken. The fallback is not the guard. The report is.
+
+For symmetry with the Darwin numbers: on cbp a systemd `--user` unit resolves
+`/usr/bin/python3` 3.12.3 and the shell resolves the identical path, so the pin buys
+nothing here and cost the 127 above — which is why it needs a floor and not a Linux
+exemption.
+
 **A negative result, recorded because it was worth checking:** the narrow launchd `PATH`
 does **not** shrink the A inventory. The obvious worry — `claude` lives in
 `~/.local/bin`, which is on the shell's `PATH` and not on launchd's, so the hourly run
