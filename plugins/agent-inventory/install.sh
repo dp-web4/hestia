@@ -862,8 +862,36 @@ else
 fi
 
 echo
-echo "on demand:  hestia-agent-inventory --workspace $WORKSPACE"
-echo "            (or export HESTIA_WORKSPACE=$WORKSPACE in your shell rc — a bare"
+# THE ADVICE IS A SHELL SYNTAX TOO (McNugget, 2026-07-28, measured on macOS 26.5 by
+# pasting it). Four generated files were counted and fixed; these two lines are a FIFTH
+# surface with the same property and were exempted by not being a file at all. They are
+# not prose — they are a command a human is told to run and a line they are told to put
+# in their shell rc, and they interpolated the value raw:
+#
+#   .../cost$avings   pasted -> `$avings` is unset -> --workspace .../cost. SILENT when
+#                     that directory exists: a clean inventory of somewhere nobody chose,
+#                     which is the same sizing the wrapper's `$` case got one level in.
+#   .../it`id`s       pasted -> command substitution RUNS in the operator's own shell,
+#                     and the `export` half writes `uid=501(dennispalatov) gid=20(staff)
+#                     groups=...` into their SHELL RC, where it persists after this tool.
+#   .../a b           pasted -> truncates at the space. The ordinary macOS path, and the
+#                     one a Mac user is most likely to have.
+#   .../o'brien       pasted -> parse error. The loud one, and the only safe outcome.
+#
+# SIZED AGAINST THE WRAPPER'S: less bad, in the way that matters — nothing here runs on
+# its own, a human has to paste it, so it is not an hourly timer walking the wrong tree.
+# Worse in one narrow way: it is the only surface whose failure LEAVES the plugin. The
+# `export` line's whole instruction is "put this in your shell rc", so the backtick case
+# is persistent, and it is the operator's login shell rather than this tool's runtime.
+#
+# Fixed with `sh_pin` — cbp's function, not a second one. A separate quoting helper for
+# the human-facing half is how two mechanisms drift into disagreeing about the same
+# question. Quoted unconditionally, including when the path is boring: "quote only when
+# it looks like it needs it" is a predicate that has to be right about every future
+# metacharacter, and it is the predicate, not the quoting, that this thread keeps finding
+# wrong.
+echo "on demand:  hestia-agent-inventory --workspace $SH_WORKSPACE"
+echo "            (or export HESTIA_WORKSPACE=$SH_WORKSPACE in your shell rc — a bare"
 echo "             invocation falls back to the compiled-in default and answers UNKNOWN)"
 echo "            --brief       one line        --no-witness   skip the chain write"
 if [ "$PERIODIC" = systemd ]; then

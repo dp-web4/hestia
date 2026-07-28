@@ -674,6 +674,80 @@ def _unquoted_heredocs(src: str) -> list[tuple[str, str]]:
     return out
 
 
+def test_printed_advice_is_pasteable():
+    """The installer's own advice is a shell syntax too — the fifth surface.
+
+    Four GENERATED FILES were counted and fixed (wrapper, hook, plist, unit). These two
+    lines were exempted by not being a file: `on demand: ... --workspace $WORKSPACE` and
+    `export HESTIA_WORKSPACE=$WORKSPACE`. They are not prose. One is a command a human is
+    told to run; the other is a line they are told to put in their SHELL RC. Measured on
+    macOS 26.5 by pasting them (McNugget, 2026-07-28):
+
+        .../cost$avings  -> `$avings` unset -> .../cost, SILENT where that exists
+        .../it`id`s      -> command substitution runs in the operator's shell, and the
+                            export half persists `uid=501(...)` into their rc
+        .../a b          -> truncates at the space (the ordinary macOS path)
+        .../o'brien      -> parse error (the loud one, and the only safe outcome)
+
+    Asserts a ROUND TRIP through /bin/sh, not the presence of quotes, for the reason the
+    two tests above adopted: a check that greps for `'` stays green if `sh_pin` is swapped
+    for something that quotes in shape and not in effect. So this runs the REAL sh_pin,
+    against the REAL echo lines lifted from install.sh, and pastes the result.
+    """
+    src = (Path(__file__).parent / "install.sh").read_text()
+    pin = re.search(r"^sh_pin\(\)\s*\{.*\}\s*$", src, re.M)
+    check("sh_pin is defined in install.sh", bool(pin), True)
+    ondemand = re.search(r'^echo "on demand:.*$', src, re.M)
+    exportln = re.search(r'^echo "\s*\(or export HESTIA_WORKSPACE=.*$', src, re.M)
+    check("the on-demand line is in install.sh", bool(ondemand), True)
+    check("the export-to-rc line is in install.sh", bool(exportln), True)
+    if not (pin and ondemand and exportln):
+        return
+
+    # TWO probes, and the second is the one that matters. The first carries every
+    # character double quotes fail to hold; unpinned it is a PARSE ERROR, so a broken
+    # pin shows up as empty output. That is the loud half, and on its own it would let
+    # this test pass for the wrong reason — "the paste crashed" is not "the paste was
+    # wrong", and the defect being guarded is SILENT. So the quiet probe holds only the
+    # characters that corrupt without complaining (`$`, backtick, space): unpinned it
+    # pastes CLEANLY and returns a different, non-empty path. Same correction the plist
+    # test needed when `&`-escaped-last stayed well-formed and decoded wrong.
+    probes = [
+        ("loud",  "/tmp/cost$avings/it`id`s/o'brien/a\"b/back\\slash/a b/R&D/50%off"),
+        ("quiet", "/tmp/cost$avings/it`id`s/a b/R&D"),
+    ]
+    env = {k: v for k, v in os.environ.items() if k != "HESTIA_WORKSPACE"}
+    # Run the real function and the real lines. Nothing here is a copy of install.sh.
+    # BOTH names are bound, deliberately: if this bound only the pinned one, reverting
+    # a line to the raw `$WORKSPACE` would fail here on an EMPTY expansion — red for the
+    # absence of a variable rather than for the defect, which is a probe that passes
+    # without reproducing what it claims to reproduce.
+    script = (pin.group(0) + '\nWORKSPACE="$1"\nSH_WORKSPACE="$(sh_pin "$1")"\n'
+              + ondemand.group(0) + "\n" + exportln.group(0) + "\n")
+
+    for label, probe in probes:
+        r = subprocess.run(["bash", "-c", script, "_", probe],
+                           capture_output=True, text=True)
+        check(f"the advice lines print ({label})", r.returncode, 0)
+        printed = r.stdout
+
+        # Paste half 1: everything after `--workspace ` is one shell word, or it is a bug.
+        arg = printed.split("--workspace ", 1)[1].splitlines()[0]
+        back = subprocess.run(["/bin/sh", "-c", f"printf %s {arg}"],
+                              capture_output=True, text=True, env=env)
+        check(f"the printed --workspace argument pastes back unchanged ({label})",
+              back.stdout, probe)
+
+        # Paste half 2: the line the operator is told to put in their shell rc.
+        line = printed.split("(or ", 1)[1].split(" in your shell rc", 1)[0]
+        back = subprocess.run(
+            ["/bin/sh", "-c", f'{line}\nprintf %s "$HESTIA_WORKSPACE"'],
+            capture_output=True, text=True, env=env)
+        check(f"the printed export line pastes back unchanged ({label})",
+              back.stdout, probe)
+        check(f"the printed export line runs nothing ({label})", back.stderr, "")
+
+
 if __name__ == "__main__":
     test_attribute()
     test_has_tag()
@@ -683,6 +757,7 @@ if __name__ == "__main__":
     test_plist_xml_escaping()
     test_wrapper_shell_quoting()
     test_unit_specifier_escaping()
+    test_printed_advice_is_pasteable()
     test_unit_verdict()
     with tempfile.TemporaryDirectory() as d:
         test_verdict(Path(d))
