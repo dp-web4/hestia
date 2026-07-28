@@ -339,32 +339,78 @@ def test_wrapper_heredoc_is_inert():
     ${HOME}/bin` passed green, and the installed wrapper had my sandbox path baked into
     the sentence. Escapes are per-token, so the line is stripped of them and what remains
     is what bash will run.
+
+    AND THE `$` HALF WAS STILL SCOPED THE WAY THE BACKTICK HALF HAD JUST STOPPED BEING
+    (cbp, 2026-07-28, measured on Linux by installing). "Scan every heredoc, not the one
+    where the bug was found" got applied to backticks and `$(`; the `$` expansion check
+    stayed WRAP-only AND brace-only. Bare `$NAME` was refused nowhere. The probe is the
+    one directly above with two characters deleted — `# prose about \\$PY and the pin
+    under $HOME/.local/bin` — and it passed green, `bash -n` clean, and shipped a wrapper
+    reading "the pin under /tmp/hli7/home/.local/bin". This file's whole house style is
+    prose that writes `\\$PY`, `\\$PYTHON`, `\\$HOME`, `\\$PYENV_ROOT`: every one of those
+    is ONE BACKSLASH from expanding, and the unbraced form is the likelier typo because it
+    is the shorter one. So `${` was the harder half to type and the only half guarded.
+
+    The fix is a whitelist, not a wider ban. A ban cannot work here — the unit and the
+    plist EXIST to interpolate — but the set that may expand is small, known, and already
+    written down in prose. Naming it turns "someone added an expansion" into a failing
+    test instead of a silent one, which is the same tripwire shape as the delimiter list
+    below. An unknown heredoc gets the empty set: a new generated file refuses every
+    expansion until someone says which ones it meant.
     """
     src = (Path(__file__).parent / "install.sh").read_text()
     heredocs = _unquoted_heredocs(src)
     # Named, so that deleting a heredoc's guard by deleting its `cat` shows up as a count.
     check("all three unquoted heredocs found",
           sorted(d for d, _ in heredocs), ["EOF", "PLIST_EOF", "WRAP"])
+    check("the wrapper heredoc was found", len(dict(heredocs).get("WRAP", "")) > 200, True)
     for delim, body in heredocs:
         # Command substitution is never wanted in a generated file: whatever it names, it
         # runs on the installing machine and the output is what ships. No exceptions, so
         # this half is the same for all three.
         live = [ln for ln in body.splitlines() if "`" in _unescaped(ln)]
         check(f"no unescaped backtick in the {delim} heredoc", live, [])
-        live = [ln for ln in body.splitlines() if "$(" in _unescaped(ln)]
-        check(f"no unescaped command substitution in the {delim} heredoc", live, [])
-    # `${` is different: the unit and the plist EXIST to interpolate, so banning it there
-    # would be banning the feature. WRAP is the one that pins with bare `$PYTHON`/`$BIN`/
-    # `$WORKSPACE` and escapes everything else, so there a live `${` is always a mistake.
-    wrap = dict(heredocs)["WRAP"]
-    check("the wrapper heredoc was found", len(wrap) > 200, True)
-    live = [ln for ln in wrap.splitlines() if "${" in _unescaped(ln)]
-    check("no unescaped brace expansion in the WRAP heredoc", live, [])
+        # Every surviving `$` must be one of the pins this heredoc exists to write. This
+        # subsumes the old `$(`/`${` pair: `$(` has no name, so it lands in the unnamed
+        # bucket and is refused everywhere, and `${HOME}` is refused in WRAP by absence.
+        allowed = _MAY_EXPAND.get(delim, frozenset())
+        live = [f"{ln}   [${n}]" for ln in body.splitlines()
+                for n in _live_expansions(ln) if n not in allowed]
+        check(f"only the named pins expand in the {delim} heredoc", live, [])
 
 
 # `<<-?` then an optionally quoted word; `(?!<)` so the `<<<junk` in install.sh's own
 # prose about plutil is a herestring and not a delimiter named `<junk`.
 _HEREDOC_RE = re.compile(r"""<<-?(?!<)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1""")
+
+# What each generated file is FOR, stated as the set of install-time values it may bake in.
+# Deliberately hand-written rather than derived from the file: derived, it would agree with
+# whatever the file does today and could never disagree with a mistake. Adding an
+# interpolation means adding it here, in the same commit, on purpose.
+_MAY_EXPAND = {
+    # The wrapper pins scope and nothing else. Its body is otherwise prose about `\$PY`.
+    "WRAP": frozenset({"PYTHON", "BIN", "WORKSPACE"}),
+    # The systemd --user unit: what to run and where from.
+    "EOF": frozenset({"SRC_DIR", "BIN", "WORKSPACE"}),
+    # The launchd plist: same, plus the paths launchd needs spelled out absolutely.
+    "PLIST_EOF": frozenset({"BIN", "HOME", "LAUNCHD_LABEL", "LAUNCHD_PATH",
+                            "LOG_DIR", "WORKSPACE"}),
+}
+
+# A live `$` is either `${NAME}`, `$NAME`, or something with no name at all — `$(`, `$$`,
+# `$?`, `$1`. The last group is never a pin, so it is reported under the name it has none
+# of and refused everywhere by not being in any whitelist.
+_EXPANSION_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*)|(.|$))")
+
+
+def _live_expansions(line: str) -> list[str]:
+    """The names bash would expand on this line, after its escapes are stripped.
+
+    `$(`/`$$`/`$?` come back as the literal character so they read in a failure message,
+    and so that nothing unnamed can be whitelisted by accident.
+    """
+    return [(m.group(1) or m.group(2) or m.group(3) or "$")
+            for m in _EXPANSION_RE.finditer(_unescaped(line))]
 
 
 def _unescaped(line: str) -> str:
