@@ -15,7 +15,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -575,6 +575,53 @@ impl SqliteInboxStore {
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
+        // "You may only answer mail addressed to YOU" — enforced HERE, in the
+        // store, not only at the call site (Kimi/CBP git-manager thread,
+        // 2026-07-28, notice 309). Until this check the guard lived inside
+        // `tool_member_notify` — the one site passing `in_reply_to` — which
+        // made it a property of the call-site SET, not of the mechanism:
+        // `member_unanswered` clears on `NOT EXISTS (... r.in_reply_to = n.id)`,
+        // sender-blind, so any future writer reaching the store directly (the
+        // git-manager custodian is the named candidate; the egress-retirement
+        // site already writes daemon-side) could have cleared a debt it was
+        // never asked to pay, silently.
+        //
+        // Same semantics as the tool check it backstops: a binding to an id no
+        // longer on record is ACCEPTED, not rejected — notices age out on the
+        // TTL, so "not found" is unverifiable, not forged. Only a KNOWN
+        // recipient different from the sender is an error. The tool keeps its
+        // own copy for the named error envelope and the witnessed
+        // `binding_verified`; this one is what makes the property hold for
+        // every caller, present and future.
+        //
+        // The recipient comparison replicates `member_notice_recipient`'s
+        // routed form inline — the conn lock is already held, so that method
+        // is not callable here. An egress row's addressee is `peer/member`;
+        // comparing the bare column would let a local member of the same name
+        // bind to another machine's mail.
+        if let Some(rid) = in_reply_to {
+            let addressee: Option<String> = conn
+                .query_row(
+                    "SELECT to_plugin, dest_peer FROM member_notices WHERE id = ?1",
+                    params![rid as i64],
+                    |row| {
+                        let to_plugin: String = row.get(0)?;
+                        Ok(match row.get::<_, Option<String>>(1)? {
+                            Some(peer) => format!("{peer}/{to_plugin}"),
+                            None => to_plugin,
+                        })
+                    },
+                )
+                .optional()
+                .context("resolving in_reply_to addressee")?;
+            if let Some(addressee) = addressee {
+                anyhow::ensure!(
+                    addressee == from_plugin,
+                    "notice {rid} was addressed to '{addressee}', not to '{from_plugin}' — \
+                     a member can only answer its own mail"
+                );
+            }
+        }
         // `dest_peer IS NULL` = the LOCAL plane. Every statement in this function
         // carries it, because without it a local send reaches across the seam:
         // this prune DELETED queued forwards (hard, no mark, no report, so branch 4
@@ -1424,6 +1471,49 @@ mod tests {
         assert!(
             store.member_unanswered("kimi-code", counted, -1).unwrap().is_empty(),
             "a bound response clears the notice it answers"
+        );
+    }
+
+    /// ACCEPTANCE TEST for the git-manager increment (CBP 2026-07-28, re: notice 305;
+    /// landed with the fix, notice 309 thread).
+    ///
+    /// "You may only answer mail addressed to YOU" is enforced in
+    /// `tool_member_notify` (handler.rs, `member_notify_reply_binding_not_yours`),
+    /// AND — since this fix — in the store. `enqueue_member` used to take
+    /// `in_reply_to` as an unvalidated parameter while `member_unanswered`'s
+    /// clearing condition stayed `NOT EXISTS (... r.in_reply_to = n.id)` —
+    /// kind-blind and sender-blind.
+    ///
+    /// So the guard was a property of the CALL-SITE SET, not of the mechanism.
+    /// That held because the only site passing `in_reply_to` was the guarded
+    /// tool. The git-manager custodian would be the first writer that both
+    /// needs the field (bind-don't-fork) and could plausibly sit daemon-side
+    /// of the tool — exactly like the egress-retirement site already does.
+    ///
+    /// THIS TEST FAILED at `e40a5a2` (CBP's falsifier, shared as a patch). It
+    /// is the acceptance criterion for the store-level check in
+    /// `enqueue_member`, landed before that fourth caller exists.
+    #[test]
+    fn store_level_binding_rejects_answering_someone_elses_mail() {
+        let (_tmp, store) = fresh();
+        let asked = store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "review_request",
+                            Some("pr/1"), "h1", None)
+            .unwrap();
+        // codex-cli was never addressed and is not the sender. It answers anyway.
+        let usurped = store.enqueue_member(
+            "claude-code", "codex-cli", "role:r", "review_done",
+            Some("forum/not-mine.md"), "h2", Some(asked),
+        );
+        assert!(
+            usurped.is_err(),
+            "the store accepted a binding from a member the notice was not addressed to; \
+             the 'answer only your own mail' guard lives in tool_member_notify, not here"
+        );
+        assert_eq!(
+            store.member_unanswered("kimi-code", &["review_request"], -1).unwrap().len(),
+            1,
+            "kimi still owes the answer: a third party must not be able to clear the debt"
         );
     }
 
