@@ -25,6 +25,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -428,6 +429,169 @@ def test_plist_xml_escaping():
     check("the escaped value parses and decodes back to the path", back, probe)
 
 
+def test_wrapper_shell_quoting():
+    """The same question as the plist's, asked of the file that was excused from it.
+
+    "Three generated files, three target syntaxes" excused the two shell ones as a
+    category: the hook by `shlex.quote` — which is right, that IS the mechanism — and the
+    wrapper by "it interpolates inside double quotes", which is not. Double quotes are the
+    WEAK shell quoting: `$`, backtick, `\\` and `"` all keep their meaning inside them, and
+    all four are legal in a POSIX path on both platforms (cbp, 2026-07-28, measured on
+    Linux by installing, `bash -n` clean on the generated wrapper in every case).
+
+    Two measured shapes, and the second is why this is not a nit:
+
+    * `.../cost$avings` shipped as `${HESTIA_WORKSPACE:-/tmp/.../cost$avings}`. `$avings`
+      is unset at RUN time, so every fire walked `/tmp/.../cost` — and reported
+      `workspace from env`, because the wrapper's own `env` line had set it.
+    * ``.../it`id`s`` shipped with the backtick pair intact, which is COMMAND SUBSTITUTION
+      in the generated file. The path came back as `/tmp/.../ituid=1000(dp`: `id` ran, on
+      every fire, under the user's timer.
+
+    That second one is the backtick finding one layer down. Escaping the heredoc's PROSE
+    stopped install.sh executing backticks at INSTALL time; nothing stopped a backtick
+    arriving in a VALUE and executing at RUN time. A whitelist notices a NAME that expands
+    and cannot notice what the named value CONTAINS — which is the axis the plist opened,
+    applied to the file the plist's own finding excused.
+
+    Runs the function, per the rule this suite adopted one test up: the whitelist change to
+    SH_* is a rename check and stays green if `sh_pin` stops quoting. So this asserts a
+    ROUND-TRIP through the real construct the wrapper uses — `${HESTIA_WORKSPACE:-$WS_PIN}`
+    under /bin/sh, with the variable unset — because that is the only assertion that fails
+    when the quoting is right in shape and wrong in effect.
+    """
+    src = (Path(__file__).parent / "install.sh").read_text()
+    m = re.search(r"^sh_pin\(\)\s*\{.*\}\s*$", src, re.M)
+    check("sh_pin is defined in install.sh", bool(m), True)
+    if not m:
+        return
+    # Every character double quotes fail to hold, plus the one single quotes cannot hold.
+    probe = "/tmp/cost$avings/it`id`s/o'brien/a\"b/back\\slash/R&D/50%off"
+    r = subprocess.run(["bash", "-c", m.group(0) + '\nsh_pin "$1"', "_", probe],
+                       capture_output=True, text=True)
+    check("sh_pin exits 0", r.returncode, 0)
+    check("sh_pin returns a single-quoted literal",
+          r.stdout.startswith("'") and r.stdout.endswith("'"), True)
+    # The wrapper's own line, with HESTIA_WORKSPACE unset so the pin is what is used. If
+    # `id` were still substitutable the output would carry a uid; if `$avings` were still
+    # live the path would be short. Either way this is an inequality, not a traceback.
+    env = {k: v for k, v in os.environ.items() if k != "HESTIA_WORKSPACE"}
+    back = subprocess.run(
+        ["/bin/sh", "-c", f'WS_PIN={r.stdout}\nprintf %s "${{HESTIA_WORKSPACE:-$WS_PIN}}"'],
+        capture_output=True, text=True, env=env)
+    check("the pinned workspace survives /bin/sh unchanged", back.stdout, probe)
+    # And the env-supplied path still wins, which is the wrapper's other half.
+    env["HESTIA_WORKSPACE"] = "/tmp/from-env"
+    back = subprocess.run(
+        ["/bin/sh", "-c", f'WS_PIN={r.stdout}\nprintf %s "${{HESTIA_WORKSPACE:-$WS_PIN}}"'],
+        capture_output=True, text=True, env=env)
+    check("an inherited HESTIA_WORKSPACE still overrides the pin", back.stdout,
+          "/tmp/from-env")
+
+
+def test_unit_specifier_escaping():
+    """A systemd unit is the THIRD syntax, not a second copy of the shell one.
+
+    `%` is legal in a POSIX path and introduces a SPECIFIER in a unit file, and this is the
+    only one of the four generated files where the common failure is SILENT — because most
+    letters are a valid specifier (cbp, 2026-07-28, measured on systemd 255):
+
+        /tmp/.../50%off      -> %o is the OS ID     -> ExecStart resolves to 50ubuntuff
+        /tmp/.../100%uptime  -> %u is the user name -> 100dpptime
+        /tmp/.../50%zdone    -> z is not a specifier -> "fatal error, unit will not be
+                                started" in ExecStart, silently DROPPED in Environment=
+
+    In the first two the unit parses clean, the timer enables, install.sh prints
+    `installed: hourly timer`, and the hourly run walks a directory nobody named while the
+    other two triggers get the right path. Nothing on either side says so — which is
+    strictly worse than the plist case that opened this axis, where plutil refused and
+    skip_periodic() reported the gap.
+
+    Runs the function, and asks SYSTEMD for the round-trip rather than string-comparing:
+    `systemd-analyze verify` names the RESOLVED ExecStart path in its not-executable error,
+    so a probe pointed at a file that does not exist reports back exactly what systemd
+    made of the escaping. Skipped, and SAID to be skipped, where systemd-analyze is absent
+    (Darwin, minimal installs) — an unrun guard reported as clean is this plugin's subject.
+    """
+    src = (Path(__file__).parent / "install.sh").read_text()
+    m = re.search(r"^sd_escape\(\)\s*\{.*\}\s*$", src, re.M)
+    check("sd_escape is defined in install.sh", bool(m), True)
+    if not m:
+        return
+    probe = "/tmp/50%off/100%uptime/a%%b"
+    r = subprocess.run(["bash", "-c", m.group(0) + '\nsd_escape "$1"', "_", probe],
+                       capture_output=True, text=True)
+    check("sd_escape exits 0", r.returncode, 0)
+    check("sd_escape doubles every percent", r.stdout,
+          "/tmp/50%%off/100%%uptime/a%%%%b")
+    if not shutil.which("systemd-analyze"):
+        print("SKIPPED: sd_escape round-trip — no systemd-analyze on this machine "
+              "(the string assertion above still ran)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        unit = Path(d) / "sd-escape-probe.service"
+        unit.write_text("[Unit]\nDescription=probe\n[Service]\nType=oneshot\n"
+                        f"ExecStart={r.stdout}/NOPE\n")
+        v = subprocess.run(["systemd-analyze", "--user", "verify", str(unit)],
+                           capture_output=True, text=True)
+        # The message names the path systemd resolved. Anything other than the probe back
+        # means a specifier expanded — which is the failure, whether it errored or not.
+        resolved = re.search(r"Command (\S+) is not executable", v.stderr)
+        check("systemd reports back a resolved path", bool(resolved), True)
+        if resolved:
+            check("systemd decodes the escaped value to the original path",
+                  resolved.group(1), probe + "/NOPE")
+
+
+def test_unit_verdict():
+    """"This unit is bad" and "I could not look" are different, and one of them deletes.
+
+    FOUND BY RUNNING THE GUARD, NOT BY READING IT (cbp, 2026-07-28). The lint-before-load
+    backstop was first written as "systemd-analyze rc != 0 means unloadable, remove the
+    units" — the shape the plist's plutil block has. Its first end-to-end run, on a
+    sandboxed install with no XDG_RUNTIME_DIR, deleted a perfectly good timer pair because
+    systemd-analyze had said `Failed to initialize manager: No such device or address`.
+    The CHECKER could not start; nothing was wrong with the units. A guard that reports on
+    a question it never asked, failing in the direction that destroys, is the exact defect
+    this plugin exists to find — so it is worth a test rather than a rewrite in silence.
+
+    The rule that replaced the exit code: A UNIT MAY ONLY BE CONDEMNED ON A MESSAGE THAT
+    NAMES IT. systemd prefixes real complaints with the unit; a manager that would not
+    start names nothing of ours. That gives three verdicts, and the third is the one the
+    exit code cannot express.
+    """
+    src = (Path(__file__).parent / "install.sh").read_text()
+    m = re.search(r"^unit_verdict\(\) \{.*?^\}$", src, re.M | re.S)
+    check("unit_verdict is defined in install.sh", bool(m), True)
+    if not m:
+        return
+
+    def verdict(rc, out):
+        r = subprocess.run(["bash", "-c", m.group(0) + '\nunit_verdict "$1" "$2" "$3"',
+                            "_", str(rc), out, "hestia-agent-inventory"],
+                           capture_output=True, text=True)
+        return r.stdout
+
+    check("clean verify is ok", verdict(0, ""), "ok")
+    # rc=0 with output is systemd's "... ignoring": the unit loads, a setting was dropped.
+    check("a dropped setting is degraded, not fatal",
+          verdict(0, "/x/hestia-agent-inventory.service:5: Failed to resolve specifiers "
+                     "in WS=/tmp/50%zdone, ignoring: Invalid slot"), "degraded")
+    # The real fatal, verbatim from systemd 255.
+    check("a fatal error that names the unit is bad",
+          verdict(1, "/x/hestia-agent-inventory.service:5: Failed to resolve unit "
+                     "specifiers in /tmp/50%zdone: Invalid slot\n"
+                     "hestia-agent-inventory.service: Unit configuration has fatal error, "
+                     "unit will not be started."), "bad")
+    # THE REGRESSION. Verbatim from the run that deleted a good timer.
+    check("a checker that could not start is unverified, NOT bad",
+          verdict(1, "Failed to lookup RuntimeDirectory path: No such device or address\n"
+                     "Failed to initialize manager: No such device or address"),
+          "unverified")
+    check("systemd-analyze missing is the same fact, arriving differently",
+          verdict(1, "systemd-analyze is not installed"), "unverified")
+
+
 # `<<-?` then an optionally quoted word; `(?!<)` so the `<<<junk` in install.sh's own
 # prose about plutil is a herestring and not a delimiter named `<junk`.
 _HEREDOC_RE = re.compile(r"""<<-?(?!<)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1""")
@@ -438,9 +602,18 @@ _HEREDOC_RE = re.compile(r"""<<-?(?!<)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1""")
 # interpolation means adding it here, in the same commit, on purpose.
 _MAY_EXPAND = {
     # The wrapper pins scope and nothing else. Its body is otherwise prose about `\$PY`.
-    "WRAP": frozenset({"PYTHON", "BIN", "WORKSPACE"}),
-    # The systemd --user unit: what to run and where from.
-    "EOF": frozenset({"SRC_DIR", "BIN", "WORKSPACE"}),
+    # SH_*, not the raw names, for the same reason the plist takes XML_* (cbp, 2026-07-28):
+    # this heredoc generates /bin/sh, and `$`, backtick, `\\` and `"` all keep their meaning
+    # inside the double quotes that were said to answer it. A raw `$WORKSPACE` back in here
+    # is a value reaching a syntax that cannot hold it — measured, a workspace path with a
+    # backtick in it became command substitution in the shipped wrapper, run on every fire.
+    # See the sh_pin block in install.sh.
+    "WRAP": frozenset({"SH_PYTHON", "SH_BIN", "SH_WORKSPACE"}),
+    # The systemd --user unit: what to run and where from — and SD_*, because a unit file
+    # is the third syntax, not a second copy of the shell one. `%` is legal in a path and
+    # is a SPECIFIER here; measured, `50%off` reached ExecStart as `50ubuntuff` with the
+    # unit parsing clean. See the sd_escape block in install.sh.
+    "EOF": frozenset({"SD_SRC_DIR", "SD_BIN", "SD_WORKSPACE"}),
     # The launchd plist: same, plus the paths launchd needs spelled out absolutely — and
     # every one of them XML-ESCAPED, which is why they are the XML_* names and not the raw
     # ones (McNugget, 2026-07-28). The raw names are deliberately NOT in this set: a `$HOME`
@@ -508,6 +681,9 @@ if __name__ == "__main__":
     test_interpreter_finding()
     test_wrapper_heredoc_is_inert()
     test_plist_xml_escaping()
+    test_wrapper_shell_quoting()
+    test_unit_specifier_escaping()
+    test_unit_verdict()
     with tempfile.TemporaryDirectory() as d:
         test_verdict(Path(d))
     with tempfile.TemporaryDirectory() as d:
