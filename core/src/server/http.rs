@@ -225,6 +225,7 @@ pub async fn serve_with_callback(
     let operator_surface = axum::Router::new()
         .route("/api/dashboard", get(dashboard_json))
         .route("/api/trust/derivation", get(trust_derivation_json))
+        .route("/api/trust/graph", get(trust_graph_turtle))
         .route("/api/operator/adjudicate", post(operator_adjudicate))
         .route("/api/operator/alias", post(operator_alias))
         .route("/api/operator/amnesty", post(operator_amnesty))
@@ -600,6 +601,36 @@ async fn trust_derivation_json(
     let derived = crate::derivation::derive(&q.plugin_id, &role, &window);
     drop(s);
     Json(serde_json::to_value(derived).unwrap_or_default())
+}
+
+/// The same derived trust as `/api/trust/derivation`, projected into the Web4 T3/V3
+/// ontology as Turtle — `role@agent` as two edges, one `DimensionScore` per MEASURED
+/// dimension, each traversable back to the chain entries that produced it.
+///
+/// Served as `text/turtle` so a relying party can pipe it straight into a triple store and
+/// ask sufficiency questions of it, rather than parsing our JSON and trusting our field
+/// names. That independence is the point: the graph is the portable object, this daemon is
+/// just what happened to emit it.
+async fn trust_graph_turtle(
+    State(state): State<SharedState>,
+    Query(q): Query<DerivationQuery>,
+) -> impl IntoResponse {
+    let s = state.lock().await;
+    let role = q.role.unwrap_or_else(|| "role:constellation:interactive-dev".to_string());
+    let window = s
+        .chain_store
+        .read_recent(crate::derivation::DERIVATION_SCAN)
+        .unwrap_or_default();
+    let derived = crate::derivation::derive(&q.plugin_id, &role, &window);
+    // The DURABLE member LCT, never the caller-supplied plugin_id — emitting the label here
+    // would encode the attribution gap into the graph this projection exists to close.
+    // Unmappable (synthetic / malformed) grains get an explicit urn rather than a guess.
+    let entity_lct = s
+        .member_lct(&q.plugin_id)
+        .unwrap_or_else(|| format!("urn:hestia:unmapped:{}", q.plugin_id));
+    drop(s);
+    let ttl = crate::rdf::trust_to_turtle(&derived, &entity_lct);
+    ([(axum::http::header::CONTENT_TYPE, "text/turtle; charset=utf-8")], ttl)
 }
 
 async fn dashboard_json(
