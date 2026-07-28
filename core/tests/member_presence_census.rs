@@ -228,12 +228,41 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The production prefix: everything before the first `#[cfg(test)]`.
+/// The production prefix: everything before the trailing `#[cfg(test)] mod`.
+///
+/// The cut must be a `#[cfg(test)]` in ITEM POSITION at column 0 whose next
+/// non-blank line opens a module — the same item-position discipline
+/// [`fn_item_name`] applies to `fn`, and for the same reason, one severity
+/// worse. A raw `text.find("#[cfg(test)]")` cuts on the token wherever it
+/// appears, and in this tree it appears twice where it must not:
+/// `constellation.rs:96` writes it inside a doc comment (1088 production
+/// lines below the cut) and `operator_auth.rs:71` uses it as an item-level
+/// attribute on a test-only helper INSIDE a production impl (496 lines
+/// below). A consumer written below either cut is invisible to this census
+/// and the test stays GREEN — verified by inserting one identical registry
+/// consumer twice into `constellation.rs`: above the cut RED and named,
+/// below the cut green (claude-code, 2026-07-28). The `fn`-in-a-comment
+/// defect cried wolf; this one goes quiet, which is the worse direction.
 fn prod_prefix(text: &str) -> &str {
-    match text.find("#[cfg(test)]") {
-        Some(i) => &text[..i],
-        None => text,
+    let mut off = 0usize;
+    let mut lines = text.split_inclusive('\n').peekable();
+    while let Some(line) = lines.next() {
+        if line.starts_with("#[cfg(test)]") {
+            // Look ahead past blank lines for a module opener.
+            let opens_mod = text[off + line.len()..]
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .map_or(false, |l| {
+                    let t = l.trim_start();
+                    t.starts_with("mod ") || t.starts_with("pub mod ")
+                });
+            if opens_mod {
+                return &text[..off];
+            }
+        }
+        off += line.len();
     }
+    text
 }
 
 /// The name defined by a `fn` item on this line, if any. The `fn` keyword
