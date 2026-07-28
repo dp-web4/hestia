@@ -110,12 +110,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Consumers of the naming function: trimmed text of every `.member_lct(`
-/// line, keyed `(file, enclosing fn)`. 13 keys, 17 lines.
+/// line, keyed `(file, enclosing fn)`. 14 keys, 19 lines.
 ///
 /// Every entry here was read by a person and judged a non-gating use
 /// (attribution / emit-path identity resolution) on 2026-07-27. Editing this
 /// table without performing that judgment on the delta is the one move this
 /// test exists to make expensive.
+///
+/// Delta readings, recorded as the header requires:
+/// - 2026-07-28 (kimi-code), merge with `main` at `bc24d82` (PR #67) added
+///   `tool_open_appeals`: caller and appellant are resolved through
+///   `member_lct` and compared for equality — the same NOT-SAME identity
+///   comparison `tool_arbitrate_appeal` performs, here as queue-listing
+///   advisory (`you_may_rule`). It names two existing identities to compare
+///   them; it does not change who gets named, and it does not read the
+///   registry (the presence table stayed green over the same merge).
 const MEMBER_LCT_CENSUS: &[(&str, &[&str])] = &[
     ("server/handler.rs::gate_direct_tool", &[
         "let instance_lct = s.member_lct(&who.plugin_id);",
@@ -126,6 +135,10 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str])] = &[
     ]),
     ("server/handler.rs::tool_arbitrate_appeal", &[
         "let a = s.member_lct(&arbiter.plugin_id);",
+        "let b = s.member_lct(appellant);",
+    ]),
+    ("server/handler.rs::tool_open_appeals", &[
+        "let a = s.member_lct(&c.plugin_id);",
         "let b = s.member_lct(appellant);",
     ]),
     ("server/handler.rs::tool_query_policy", &[
