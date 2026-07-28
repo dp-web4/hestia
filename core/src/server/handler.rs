@@ -1304,7 +1304,30 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
     // replacement, persistence), so they hit the same daemon-side law —
     // GPT 3rd-pass HST-002. classify() already maps hestia_vault_set to
     // credential_access, so the ratified unattended-role deny binds here too.
-    let who = resolve_caller(&s, session_id_arg.as_deref());
+    // WRITES REQUIRE A PROVEN CALLER, NOT A RESOLVED ONE (kimi-code, reviewing #76).
+    //
+    // This used `resolve_caller`, which falls back to the most recently connected session
+    // when no `session_id` is supplied (`resolve_session_uuid`: `max_by_key(connected_at)`).
+    // So an anonymous write did not bind the new credential to "unknown" — it bound it to
+    // WHOEVER HAPPENED TO CONNECT LAST. An innocent member ended up owning a secret an
+    // anonymous caller wrote, and #76's body called that "an attributed creator", which
+    // overstated it: it was a resolved caller, possibly by fallback.
+    //
+    // It did not reopen world-readability — the READ path uses `resolve_plugin_id`, which
+    // requires a session id and yields "" otherwise, so the anonymous writer cannot read its
+    // own write back. The defect is ambient authority: attribution assigned to a bystander.
+    //
+    // Writing a credential is a consequential act, so it now requires the caller's own live
+    // session, the same bar `hestia_appeal` and `hestia_arbitrate_appeal` already hold. This
+    // is the "no latest-session fallback on authority-bearing surfaces" line from
+    // docs/PRD_ASSURANCE.md FR-1, applied where it was still missing.
+    let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.vault_set_unattributed",
+            "storing a credential requires your own live session_id (from hestia_connect) —              an unattributable writer cannot own what it writes, and binding the entry to              the most recent connection would make a bystander its owner",
+            None,
+        ));
+    };
     if let Some(denied) =
         gate_direct_tool(&mut s, &who, "hestia_vault_set", "credential_access", &name)
     {
@@ -1318,6 +1341,10 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
     // callers this is meant to contain — so it is left empty-and-flagged, and the read-path
     // warning + operator `exposed` view cover it. This narrows the default; it does not
     // authenticate the writer (that is HST-005, transport auth).
+    // `who` is now always an attributed caller, so the previous `!= "unknown"` guard is
+    // redundant — kept as a belt-and-braces assertion rather than deleted, because the guard
+    // is what stops a credential being bound to a literal "unknown" owner if resolution ever
+    // loosens again.
     let defaulted_consumers = allowed_consumers.is_empty() && who.plugin_id != "unknown";
     let allowed_consumers = if defaulted_consumers {
         vec![who.plugin_id.clone()]
@@ -8343,6 +8370,33 @@ mod vault_hst001_tests {
                    "the witness must flag it as an exposed read");
         assert!(!format!("{:?}", vget.event_data).contains("DUMMY-SECRET"),
                 "the secret value must NEVER be written to the chain");
+    }
+
+    /// kimi's residual on #76: an ANONYMOUS write must not bind the credential to whoever
+    /// connected last. `resolve_caller` falls back to `max_by_key(connected_at)`, so before
+    /// this fix an unattributed writer made a bystander the owner of a secret it never
+    /// wrote — and could not read it back, because the read path is strict. Ambient
+    /// authority: attribution assigned to an innocent party by ordering.
+    #[tokio::test]
+    async fn an_anonymous_write_is_refused_rather_than_bound_to_the_last_connection() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        // A bystander is the most-recently-connected session — the fallback's target.
+        let bystander = seat_session(&state, "innocent-member").await;
+        let _ = bystander;
+
+        // Write with NO session_id at all.
+        let r = tool_vault_set(&state, &json!({"name": "orphan-cred", "value": "DUMMY"}))
+            .await
+            .unwrap();
+        assert!(
+            format!("{r}").contains("vault_set_unattributed"),
+            "an unattributable write must be refused, not silently attributed: {r}"
+        );
+
+        // And nothing was stored under the bystander's name.
+        let stored = { state.lock().await.vault.get("orphan-cred").is_some() };
+        assert!(!stored, "a refused write must not persist the credential");
     }
 
     /// The scoped case is unchanged: a non-listed caller is denied, as before this fix.
