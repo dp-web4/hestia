@@ -1,0 +1,14 @@
+{
+  "_comment": "Hestia governance hooks for the Google Antigravity CLI (agy). agy reuses the ~/.gemini tree; hooks live in ~/.gemini/config/hooks.json (or a plugin staged under ~/.gemini/antigravity-cli/plugins/<name>/hooks.json). Merge this into that file. INVERTED vs gemini-cli: the PreToolUse gate emits a STDOUT decision object {\"decision\":\"allow\"|\"deny\",\"reason\":...} and agy FAILS CLOSED (a hook that errors / exits non-zero = DENY, blocking every tool call - manaflow-ai/cmux #4768/#5358). So the gate emits an explicit clean verdict on both paths and stays robust+fast so it never spuriously blocks. It covers run_shell_command + write_file/replace + web_fetch/google_web_search (egress) + MCP calls; local read-class tools skip the governor. observe/hydrate emit {} and only wire to non-blocking events. HARDENING: put scripts on ext4 (agy self-updates; a slow 9p hook can block since deny is the failure mode), install at user level, repoint the /mnt/c paths per install. DOCUMENTED-tier: closed-source harness, tool/arg names assumed gemini-shaped - live-verify that normal agy events ALLOW cleanly (an over-strict guess BLOCKS work here, it does not fail safe).",
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": ".*", "hooks": [ { "type": "command", "command": "HESTIA_WORKSPACE=/mnt/c/projects/ai-agents HESTIA_SOCIETY_GATE=/mnt/c/projects/ai-agents/hestia/plugins/claude-code/hooks/pre_tool_use.py python3 /mnt/c/projects/ai-agents/hestia/plugins/antigravity/hooks/pre_tool_use.py", "timeout": 15000 } ] }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "/mnt/c/projects/ai-agents/hestia/plugins/antigravity/hooks/observe.sh", "timeout": 10000 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "HESTIA_WORKSPACE=/mnt/c/projects/ai-agents /mnt/c/projects/ai-agents/hestia/plugins/antigravity/hooks/hydrate.sh", "timeout": 15000 } ] }
+    ]
+  }
+}
