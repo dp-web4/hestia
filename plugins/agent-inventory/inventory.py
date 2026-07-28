@@ -920,11 +920,22 @@ def interpreter_finding() -> str | None:
     reported so a reader can see which python answered. What is NOT established is that the
     periodic trigger and the SessionStart hook still agree on an interpreter — which is the
     whole reason the pin was added.
+
+    "GONE" WAS TOO NARROW, AND THE WORD MATTERED (cbp, 2026-07-28). The wrapper originally
+    reached this only when the pin failed `-x`, so the text said "no longer exists". But a
+    pin can be present, 0755 and unrunnable — a pyenv shim whose version was removed exits
+    127 without starting python — and that case answered -x TRUE, skipped the fallback
+    entirely and produced no report at all: exit 127, stdout 0 bytes, no unknown[] entry.
+    The wrapper now treats gone and cannot-run as one case, so this text has to cover both;
+    saying "no longer exists" about a file the reader can plainly `ls` would send them
+    looking for the wrong fault.
     """
     pinned = os.environ.get("HESTIA_INTERPRETER_PIN_BROKEN")
     if not pinned:
         return None
-    return (f"the installed wrapper's pinned interpreter {pinned} no longer exists, so "
+    return (f"the installed wrapper's pinned interpreter {pinned} is gone or cannot run "
+            f"(it may still be present and executable — a version-manager shim whose "
+            f"version was removed exits without starting python), so "
             f"this run fell back to {sys.executable} off PATH. The findings stand — same "
             f"source, stdlib only — but the triggers are no longer pinned to one "
             f"interpreter, which is what the pin was for, and a PATH that differs between "
@@ -1391,7 +1402,7 @@ def emit(report: dict, brief: bool) -> int:
                      f"on {scan.get('periodic_platform')}; {why[1]}")
         if scan.get("interpreter_pin_broken"):
             line += (f" | INTERPRETER PIN BROKEN — the wrapper's pinned "
-                     f"{scan['interpreter_pin_broken']} is gone; this ran on "
+                     f"{scan['interpreter_pin_broken']} is gone or cannot run; this ran on "
                      f"{scan.get('interpreter')} off PATH, so the triggers are no longer "
                      "pinned to one interpreter. Re-run install.sh")
         if scan.get("hook_timeout_installed_s") is not None:
