@@ -247,6 +247,33 @@ Both halves are sabotage-probed to red, and the interesting probe is the first: 
 `interpreter_finding()` and the run recovers silently** — clean `--brief`, exit 0, pin
 broken. The fallback is not the guard. The report is.
 
+**And the fallback has to be probed, not found** (McNugget, 2026-07-28 — the Darwin side of
+that review, measured end to end through a real launchd agent in a sandboxed `$HOME`).
+`-x` and `command -v` answer *exists*; a floor needs *runs*. On a Mac without the Xcode
+command line tools `/usr/bin/python3` is an xcrun stub — executable, 118KB, and once the
+pinned directory is gone it is the **first** `python3` on the PATH launchd hands a `gui/`
+agent (`/usr/bin:/bin:/usr/sbin:/sbin`). `command -v` finds it, so the `-z` branch never
+fires, and it exits 1 without running a line of this file. What that looked like from the
+operator's side, on the fired agent:
+
+```
+launchctl last exit code = 1
+stdout (agent-inventory.log)   0 bytes          <- the --brief surface
+unknown[]                      no entry         <- no INTERPRETER PIN BROKEN
+scope.periodic_trigger         launchd-agent-installed   } strongest state,
+scope.installed_bin            <the wrapper>             } every fire a no-op
+stderr (agent-inventory.err)   xcrun: error: ...
+```
+
+Which is the same silence the floor was written to end, one platform over — installed,
+scheduled, and never once run, with the one line of evidence sitting in a file nothing
+reads. So the wrapper now runs the fallback once (`"$PY" -c ''`) before trusting it and
+exits **loudly** if it cannot, and `install.sh` asks the same question of the pin before
+writing it — the stub is exactly what `command -v python3` resolves to on a fresh Mac, so
+the pin can be dead on arrival. 13ms, once, and on the install path or the
+already-degraded path only. The general rule this makes twice on this thread: **the
+degraded branch needs a check of its own, because it is the branch nobody is watching.**
+
 For symmetry with the Darwin numbers: on cbp a systemd `--user` unit resolves
 `/usr/bin/python3` 3.12.3 and the shell resolves the identical path, so the pin buys
 nothing here and cost the 127 above — which is why it needs a floor and not a Linux
