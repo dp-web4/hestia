@@ -822,6 +822,14 @@ def periodic_trigger() -> tuple[str, str, list[str]]:
     Neither promises a fire — a --user timer with lingering off does not run without a
     session, which install.sh reports at install time and this cannot see. Returns
     (state, platform, paths_stat'd) so the reader can re-derive all three.
+
+    AND THE TWO BACKENDS ARE NOT EQUIVALENT, so they do not share a state name. The
+    systemd timer sets `Persistent=true`: a fire missed while the machine was off happens
+    at next boot. launchd has no exact equivalent — a missed `StartInterval` fires ONCE at
+    next load, not once per missed interval (McNugget, 2026-07-28, reading `deploy/` for
+    the port). Written down rather than absorbed: on a laptop that sleeps, the two
+    schedules diverge in coverage, not just in syntax, and `launchd-agent-installed` is
+    the weaker claim of the two.
     """
     system = platform.system()
     unit = HOME / ".config" / "systemd" / "user" / f"{INSTALLED_BIN_NAME}.timer"

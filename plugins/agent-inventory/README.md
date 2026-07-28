@@ -245,6 +245,24 @@ fast machines nothing: it is a *ceiling, not a cost*, and Thor (ext4, 1837 dirs)
 0.16s either way. A small budget does not buy speed; it buys guaranteed loss of the deepest
 scopes on slow machines.
 
+The cost model was 9p-and-ext4 only until McNugget took the third filesystem
+(2026-07-28), which was the one open number in this section:
+
+| machine | filesystem | dirs @ depth 3 | walk |
+|---|---|---|---|
+| CBP | 9p, contended | 3143 | **9.31s** |
+| Thor | ext4 | 1837 | 0.16s |
+| McNugget | APFS, local NVMe | 1448 | 0.034 / 0.035 / 0.044s |
+
+~270× headroom on APFS, so 12s is a ceiling there too and not a cliff. Warm, and reported
+as warm — no `drop_caches` equivalent without sudo, though on local NVMe the cold delta is
+small. Method worth keeping: `main()` cannot reach the walk on a machine with no atlas
+clone, so the number was taken by importing `inventory.py`, rebinding `WORKSPACE` and
+calling `scan_projects()` directly with `os.scandir` wrapped for the count — the walk
+itself, not a proxy. That the number needed a workaround to measure at all is the same
+guard this README's *sixth blind spot* section is about; the fallback enumeration means the
+next machine can just run it.
+
 ### The timeout is derived, not written down twice
 
 Clause 5 couples two numbers in two files — the scan budget in `inventory.py`, and a
