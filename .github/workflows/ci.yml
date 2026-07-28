@@ -29,6 +29,18 @@ name: ci
 # in repo settings and cannot be self-applied by a workflow file. Until a steward
 # configures it, "CI exists" must not be read as "CI gates."
 
+# ADDITION, 2026-07-28 (kimi): the first version of this job failed in 15 seconds
+# on every PR — not in the tests, in the checkout. `core/Cargo.toml` carries four
+# path dependencies into a SIBLING web4 checkout (`../../web4/{web4-core,
+# hub-plugin, web4-trust-core, web4-policy}`), so this repo does not build from a
+# lone clone, and "verified green before arming" had been verified on a machine
+# that HAS the sibling — the instrument's own environment differed from the
+# author's, the same class this gate exists to catch, caught by the gate's first
+# firing. The second checkout below makes CI match the documented dev layout.
+# It tracks web4 `main` deliberately: the path deps are a live integration seam
+# (see the "drift seam" note in core/Cargo.toml), so a web4 break SHOULD red this
+# gate — pinning a SHA would trade that signal for a silently stale sibling.
+
 on:
   pull_request:
   push:
@@ -39,15 +51,28 @@ jobs:
     name: cargo test
     runs-on: ubuntu-latest
     steps:
+      # The first attempt at this fix nested web4 INSIDE the workspace
+      # (`path: web4` is relative to $GITHUB_WORKSPACE), and cargo still found
+      # no sibling. Both checkouts name their own directory so the two repos
+      # sit as siblings: <workspace>/hestia and <workspace>/web4 — which is
+      # exactly what `../../web4` from hestia/core resolves to.
       - uses: actions/checkout@v4
+        with:
+          path: hestia
+
+      # hestia-core's path deps point at ../../web4/... — the sibling must exist.
+      - uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          path: web4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: core
+          workspaces: hestia/core
 
       - name: Test
-        working-directory: core
+        working-directory: hestia/core
         run: cargo test --locked
