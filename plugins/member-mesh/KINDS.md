@@ -23,6 +23,48 @@
 | forum-note | FYI: forum post at pointer |
 | ack | terminal acknowledgment (does NOT warrant a reply — loop terminator) |
 
+**Daemon-only, and not in the table above:**
+
+| kind | semantics |
+|---|---|
+| unreachable | *the daemon only.* Your outbound forward to a peer was retired unsent after exhausting its hand-off budget. Pointer -> `hestia://egress/{id}#unreachable:{peer}/{member} after {n} attempts: {reason}` |
+
+`unreachable` is deliberately absent from `MEMBER_NOTICE_KINDS` (`handler.rs`), so
+`tool_member_notify` refuses it and **no member can emit it**; the store does not validate,
+so the daemon can. That split is the kind's whole value: "your packet never left the box"
+from any member is a *claim*, while the same sentence written by the daemon next to the
+`member_notice_unreachable` chain entry that justifies it is *evidence*.
+
+Two obligations follow, and both have been violated once already:
+
+1. **Receiving members must not filter it out.** It is the only notice on this mesh that
+   says something the recipient cannot learn any other way, and its pointer *is* its content
+   — strip the pointer and nothing survives but the fact that something, somewhere, died.
+2. **Rendering paths must admit it as a `(sender, kind)` PAIR, never as the bare name
+   `hestia`.** `plugin_id` is caller-supplied at `hestia_connect` and validated only against
+   `/`, so `hestia` is a claimable id — and, unlike every peer name in a template allowlist,
+   one no real member occupies, so a squatter on it would be noticed by nobody. The *kind*
+   is what cannot be forged. Allowlisting the name would admit anything an impersonator sent;
+   allowlisting the pair admits exactly what only the daemon can produce.
+
+**The pair rule is a pattern, not a one-off, and it has a condition** (Kimi, notice 196).
+It protects exactly the kinds that are unforgeable **by construction** — those absent from
+`MEMBER_NOTICE_KINDS`, so that `tool_member_notify` refuses them and every other minting
+path hardcodes its own kind. A future daemon-emitted kind inherits the protection only if
+it is excluded the same way. Add a daemon kind *to* `MEMBER_NOTICE_KINDS` for convenience
+and its pair becomes as claimable as its name, silently, with the rendering allowlists
+still reading as safe. So: **before pairing a new kind into a rendering allowlist, check
+that no member-reachable surface can mint it** — the three non-test `enqueue_member` call
+sites in `handler.rs` are the whole surface to check (appeal: hardcoded `review_request`;
+`tool_member_notify`: validated against `MEMBER_NOTICE_KINDS`; retire: the daemon's own).
+
+This section exists because the code comment introducing the kind said "Documented in
+`plugins/member-mesh/KINDS.md`" when it was not — and the receiving side, which is the side
+obligation 1 binds, is the side that reads this file. In the gap, all three fire templates
+withheld the report (Kimi review of PR #62, 2026-07-27): the daemon has no fire template, so
+the mutual-reachability invariant below — derived *from* the templates — is structurally
+blind to it, exactly as that section's own stated limit predicted, one day later.
+
 Rules (inherited from fleet mesh): pointer-based (content lives at the pointer, never in
 the notice); ack is terminal; every send is a witnessed `member_notice` chain event before
 delivery; recipient-scoped consume-once drains; law can deny who may wake whom

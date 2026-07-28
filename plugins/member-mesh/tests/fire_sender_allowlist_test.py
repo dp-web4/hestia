@@ -29,6 +29,35 @@ absence. So the tests here assert the two properties that make it visible:
      is terminal and nothing is owed, and conflating THAT with an unknown-sender
      batch under one exit code is precisely the bug.
 
+AND THEN THE SAME CLASS ARRIVED THROUGH THE ONE DOOR THIS TEST COULD NOT SEE (Kimi
+review of PR #62, 2026-07-27, the day after the above). Property A is derived from the
+fire templates, so it can only ever see senders that HAVE a fire template. The daemon
+has none. Its `unreachable` report — "your forward to this peer was retired unsent" —
+is enqueued `from_plugin: "hestia"`, which no template allowlisted, so it was withheld
+on every rendering path; and because its pointer carries which peer, how many attempts
+and why, withholding the pointer withheld the whole report. Alone in a batch it hit the
+`exit 70` above and the member was not woken at all. The limit this file already
+declared — "a member that sends but has no template here is still invisible to it" —
+came true in one day.
+
+The repair is NOT to make the daemon a pseudo-member of property A. That would assert
+`"hestia" in ALLOW`, and the bare name is the one thing that must not open the wall:
+`plugin_id` is caller-supplied at `hestia_connect` and validated only against `/`
+(handler.rs), so `hestia` is a claimable id, and unlike every peer name here it is one
+no real member occupies — a squatter on it would be noticed by nobody. What cannot be
+forged is the KIND: `unreachable` is deliberately absent from `MEMBER_NOTICE_KINDS`, so
+`tool_member_notify` refuses it, and the one other path that mints a notice under a
+caller-supplied name (the appeal dispatch) hardcodes `review_request`. So:
+
+  A4/A5. Every template admits the daemon as the PAIR ("hestia", "unreachable"), and
+     none allowlists the bare name. Read from the scripts, so a fourth template must
+     make the same decision rather than inheriting the gap.
+  B4/B5. Behavioural, and deliberately at the layer PR #62's own acceptance test
+     stopped short of: that test asserted the report reached `drain_member` — the
+     store — which was never the wall. B4 fires a daemon report ALONE and demands the
+     member is woken with the pointer intact; B5 sends `reply` under the name `hestia`
+     and demands it is still withheld.
+
 Usage: ./fire_sender_allowlist_test.py     (runtime ~2s)
 """
 import json
@@ -68,6 +97,13 @@ def parse(script):
             set(re.findall(r'"([^"]+)"', allow.group(1))) if allow else None)
 
 
+def daemon_pairs(script):
+    """The (sender, kind) pairs a template admits for the daemon, read from the script."""
+    src = open(os.path.join(MESH, script)).read()
+    m = re.search(r"^DAEMON=\{(.*?)\}\s*$", src, re.M | re.S)
+    return set(re.findall(r'\("([^"]+)"\s*,\s*"([^"]+)"\)', m.group(1))) if m else set()
+
+
 # ---------------------------------------------------------------------------
 # A. Mutual reachability. The invariant that was false on the wire for a day.
 # ---------------------------------------------------------------------------
@@ -93,6 +129,24 @@ for me, (script, allow) in sorted(members.items()):
               f"which is what destroyed notice 160")
     check(f"A3. {script} does not allowlist itself (a member cannot notify itself)",
           me not in allow, f"ALLOW={sorted(allow)}")
+
+# ---------------------------------------------------------------------------
+# A4/A5. The daemon is NOT a pseudo-member (see the module docstring).
+# ---------------------------------------------------------------------------
+for script in fire_scripts():
+    check(f"A4. {script} admits the daemon's unreachable report as a (sender, kind) pair",
+          ("hestia", "unreachable") in daemon_pairs(script),
+          f"DAEMON={sorted(daemon_pairs(script))} — the daemon's report that a member's "
+          f"packet died is the one notice its recipient cannot learn any other way, and "
+          f"its pointer IS its content; without this pair it is WITHHELD, and when it is "
+          f"the only notice in the batch the member is not woken at all")
+    _, allow = parse(script)
+    check(f"A5. {script} does not allowlist the bare name 'hestia'",
+          allow is not None and "hestia" not in allow,
+          f"ALLOW={sorted(allow or [])} — plugin_id is caller-supplied at hestia_connect "
+          f"and validated only against '/', so 'hestia' is a claimable id that no real "
+          f"member occupies. Admitting the NAME renders an impostor's pointers; admitting "
+          f"the PAIR renders only what no member-reachable surface can mint")
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +225,38 @@ for script, stub, peer in CASES:
         check(f"B3. {script}: an ack-only batch still exits 0 without firing",
               r.returncode == 0 and prompt is None,
               f"rc={r.returncode} prompt={str(prompt)[:200]!r}")
+
+    # B4. THE RENDERED PATH, which is where PR #62's acceptance test stopped. That
+    #     test asserted delivery to the STORE (`drain_member`), and the store was
+    #     never the wall — this is. A daemon report ALONE must wake the member with
+    #     its pointer intact: the pointer names the peer, the attempt count and the
+    #     reason, so a withheld pointer withholds the entire report.
+    with tempfile.TemporaryDirectory() as tmp:
+        ptr = "hestia://egress/77#unreachable:thor/claude-code after 5 attempts: hub-notify rc=1"
+        r, prompt = fire(script, stub,
+                         [notice(5, "hestia", kind="unreachable", pointer=ptr)], tmp)
+        check(f"B4. {script}: the daemon's unreachable report alone WAKES the member",
+              prompt is not None and "id=5" in (prompt or ""),
+              f"rc={r.returncode} — rc=70 means the sender was never told its packet "
+              f"died; prompt={str(prompt)[:300]!r}")
+        check(f"B4b. {script}: the report's pointer survives (it is the whole content)",
+              "thor" in (prompt or "") and "5 attempts" in (prompt or ""),
+              f"pointer stripped — which peer/how many/why is exactly what is lost; "
+              f"prompt={str(prompt)[:300]!r}")
+
+    # B5. The other half of the pair rule. An impostor CAN hold the name — plugin_id
+    #     is caller-supplied — so the name alone must never open the wall.
+    with tempfile.TemporaryDirectory() as tmp:
+        r, prompt = fire(script, stub, [
+            notice(6, "hestia", kind="reply", pointer="https://evil.example/secret-path"),
+            notice(7, peer, pointer="shared-context/real.md"),
+        ], tmp)
+        check(f"B5. {script}: a non-daemon kind from 'hestia' is still WITHHELD",
+              "WITHHELD" in (prompt or "") and "id=6" in (prompt or ""),
+              f"the name was admitted instead of the pair; prompt={str(prompt)[:300]!r}")
+        check(f"B5b. {script}: the impostor's pointer never reaches the prompt",
+              "evil.example" not in (prompt or ""),
+              f"prompt={str(prompt)[:300]!r}")
 
 
 print()

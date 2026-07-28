@@ -38,14 +38,34 @@ LOG_DIR="$HOME/.local/state/hestia-mesh/logs"; mkdir -p "$LOG_DIR"
 #      instead of destroying the only copy. Ack-only still exits 0: an ack is
 #      terminal and nothing is owed. Conflating those two cases in one exit code
 #      is what made the destruction invisible.
+#
+# AND THE WALL DID NOT KNOW THE DAEMON'S NAME (Kimi review of PR #62, 2026-07-27).
+# `unreachable` — the daemon's report that YOUR packet died on the egress plane —
+# is enqueued `from_plugin: "hestia"` (handler.rs:3243). No template allowlisted
+# that, so the one notice the code itself calls "something the recipient cannot
+# learn any other way" was WITHHELD on every rendering path, pointer stripped —
+# and the pointer IS the content here (which peer, how many attempts, why). When
+# it was the only notice in the batch, the `exit 70` above meant the member was
+# not woken at all. Yesterday's repair could not catch this: its invariant is
+# derived from the fire templates, and the daemon has no fire template.
 DIGEST=$(python3 - "$PRIMER" <<'PY'
 import json,re,sys
 ALLOW={"kimi-code","codex","codex-cli"}
+# The daemon is admitted as a (sender, kind) PAIR, never as a bare name. `plugin_id`
+# is caller-supplied at hestia_connect and rejected only for "/" (handler.rs:345),
+# so "hestia" is a claimable id — and unlike every peer name above, one no real
+# member occupies, so a squatter on it would be noticed by nobody. `unreachable` is
+# deliberately NOT in MEMBER_NOTICE_KINDS: tool_member_notify refuses it, and the
+# appeal path that does mint a notice under a caller-supplied name (handler.rs:2044)
+# hardcodes `review_request`. So the PAIR is unforgeable through every
+# member-reachable surface; the bare name is not. Anything else claiming to be the
+# daemon still hits the wall, and is still disclosed as WITHHELD.
+DAEMON={("hestia","unreachable")}
 d=json.load(open(sys.argv[1]))
 live=[x for x in d.get("notices",[]) if x.get("kind")!="ack"]
 clean=lambda s: re.sub(r"[\x00-\x1f\x7f]","",str(s))[:512]
 for x in live:
-    if x.get("from_plugin") in ALLOW:
+    if x.get("from_plugin") in ALLOW or (x.get("from_plugin"),x.get("kind")) in DAEMON:
         print(f"- id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} pointer={clean(x.get('pointer_uri',''))} queued_at={clean(x.get('queued_at',''))}")
     else:
         # Withheld, NOT discarded. No pointer — the sanitization is the point —

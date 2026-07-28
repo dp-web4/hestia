@@ -40,6 +40,19 @@ const MAX_INBOX_NOTICES: u64 = 1000;
 /// arbitrary.
 pub(crate) const MAX_EGRESS_QUEUE: u64 = 200;
 
+/// How many failed hand-offs an egress row survives before it is retired and its
+/// sender is told (r6-routing branch 4, at the egress seam).
+///
+/// This constant has been cited by name in review since 2026-07-26 and did not
+/// exist until 2026-07-27; the retry layer was ported into this module without the
+/// bound that decides when retrying stops. Five is chosen against the drain's 20s
+/// tick: ~100 seconds of a peer being unreachable before the sender hears about
+/// it, which is long enough to ride out a hub restart and short enough that the
+/// sender learns while the context is still live. It is a *bound*, not a
+/// prediction — the point is that some finite number exists, because a retry
+/// budget of infinity is the silent drop wearing a queue's coat.
+pub(crate) const MAX_EGRESS_ATTEMPTS: i64 = 5;
+
 /// One deferred inbound notice, exactly as it arrived: `sealed` is still the
 /// hub-sealed ciphertext; `pair_id` + `hub_pubkey_hex` are the channel context
 /// needed to open it at drain time.
@@ -440,12 +453,19 @@ impl SqliteInboxStore {
         Self::ensure_member_schema(&conn)?;
         // The forwarding plane carries its OWN bound, because it no longer borrows
         // the local plane's (see `enqueue_member`: the TTL prune and the cap used to
-        // reach across the seam and delete queued forwards). A bound that EVICTS
-        // needs a report path to stay honest, and on this branch the egress seam has
-        // none — no `mark_egress_failed`, no attempt counter, nothing that can say a
-        // forward was dropped. So this bound REFUSES ADMISSION instead: the caller is
-        // live, holds the receipt, and learns immediately. Backpressure to a present
-        // sender is attributable; eviction of a parked row is the black hole.
+        // reach across the seam and delete queued forwards). A bound that EVICTS needs
+        // a report path to stay honest. This comment used to justify the choice by
+        // saying the egress seam HAS none — no attempt counter, nothing that can say a
+        // forward was dropped. That is no longer true: `mark_failed`,
+        // `MAX_EGRESS_ATTEMPTS` and `retire_and_report_egress` now retire, witness and
+        // report exhausted rows to their sender. The choice stands on the surviving
+        // half of the argument, which never depended on the missing path: refusing
+        // admission tells a caller that is LIVE and holding the receipt, at the moment
+        // it can still do something about it, while evicting a parked row reports to a
+        // sender that has long since gone. The report path bounds how long a row may
+        // FAIL, not how many rows may be admitted; the two bounds do not substitute.
+        // Backpressure to a present sender is attributable; eviction of a parked row
+        // is the black hole.
         let queued: i64 = conn.query_row(
             "SELECT COUNT(*) FROM member_notices
               WHERE dest_peer IS NOT NULL AND drained_at IS NULL",
@@ -484,18 +504,42 @@ impl SqliteInboxStore {
         Ok(n as u64)
     }
 
-    /// Undrained egress rows, oldest first: (id, dest_peer, to_plugin, kind, pointer_uri).
-    /// The watcher marks each drained once the fleet mesh has accepted it.
-    pub fn pending_egress(&self, limit: u32) -> Result<Vec<(u64, String, String, String, Option<String>)>> {
+    /// Undrained egress rows, oldest first. The drainer marks each drained once the
+    /// fleet mesh has accepted it, or records a failure against it if the hand-off
+    /// did not land.
+    ///
+    /// Returns the full [`EgressRow`], not a tuple, and that is the fix rather than a
+    /// tidy-up (Kimi, notice 123 §1a). The old five-field tuple omitted
+    /// `dest_peer_lct` — so the roster-validated LCT was resolved at the edge, stored
+    /// on the row, and then *never left the daemon on the one path that forwards*.
+    /// The drain could not honour "forward on the LCT, never the name" because it was
+    /// never handed the LCT; re-resolving the name at drain time was the only thing
+    /// the response made possible, which is the prefix-matching oracle this design
+    /// removed. A missing field in a read model is an unavailable behaviour, not an
+    /// omission of detail. `attempts` ships for the same reason: a drainer that cannot
+    /// see the count cannot tell the operator how close a row is to retirement.
+    pub fn pending_egress(&self, limit: u32) -> Result<Vec<EgressRow>> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
         let mut stmt = conn.prepare(
-            "SELECT id, dest_peer, to_plugin, kind, pointer_uri FROM member_notices
+            "SELECT id, dest_peer, dest_peer_lct, to_plugin, from_plugin, kind, pointer_uri,
+                    attempts, last_error
+               FROM member_notices
               WHERE dest_peer IS NOT NULL AND drained_at IS NULL
               ORDER BY id ASC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], |r| {
-            Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok(EgressRow {
+                id: r.get::<_, i64>(0)? as u64,
+                dest_peer: r.get(1)?,
+                dest_peer_lct: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                to_member: r.get(3)?,
+                from_plugin: r.get(4)?,
+                kind: r.get(5)?,
+                pointer_uri: r.get(6)?,
+                attempts: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                last_error: r.get(8)?,
+            })
         })?;
         let mut out = Vec::new();
         for row in rows {
@@ -1587,8 +1631,8 @@ mod tests {
         // ...and the forward is still there, still pending, still going to Thor.
         let pending = store.pending_egress(25).unwrap();
         assert_eq!(pending.len(), 1, "the local drain cancelled the forward");
-        assert_eq!(pending[0].0, egress);
-        assert_eq!(pending[0].1, "thor");
+        assert_eq!(pending[0].id, egress);
+        assert_eq!(pending[0].dest_peer, "thor");
     }
 
     /// The rows a pre-branch-2 daemon left behind, which the `dest_peer` predicate
@@ -1672,7 +1716,7 @@ mod tests {
         }
         assert_eq!(store.pending_egress(25).unwrap().len(), 1,
                    "a flood at the local member of the same name deleted the forward");
-        assert_eq!(store.pending_egress(25).unwrap()[0].0, egress);
+        assert_eq!(store.pending_egress(25).unwrap()[0].id, egress);
         // The eviction ledger must not book the loss under the local id either: the
         // count is the only trace an eviction leaves, and 3 evictions of local mail
         // is a different fact from 4 with a forward among them.
@@ -1711,7 +1755,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.pending_egress(25).unwrap().len(), 1,
                    "an unrelated local send deleted the aged forward");
-        assert_eq!(store.pending_egress(25).unwrap()[0].0, egress);
+        assert_eq!(store.pending_egress(25).unwrap()[0].id, egress);
     }
 
     /// The counterpart to the test above, and the reason the prune's predicate is
@@ -1866,7 +1910,7 @@ mod tests {
         assert!(refused.is_err(), "the egress plane admitted past its cap");
         // The oldest forward is still queued: at the bound we tell the newest sender
         // no, we do not silently destroy the oldest sender's packet.
-        assert_eq!(store.pending_egress(1).unwrap()[0].0, first);
+        assert_eq!(store.pending_egress(1).unwrap()[0].id, first);
         assert_eq!(store.egress_queued().unwrap(), MAX_EGRESS_QUEUE);
         // And the bound is the EGRESS plane's: local mail is unaffected by a full
         // egress queue, which is the same seam this whole block is about.
