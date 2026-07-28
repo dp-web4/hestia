@@ -40,6 +40,30 @@ const MAX_INBOX_NOTICES: u64 = 1000;
 /// arbitrary.
 pub(crate) const MAX_EGRESS_QUEUE: u64 = 200;
 
+/// Per-peer egress admission cap (S1, CBP 2026-07-26; ported here 2026-07-28).
+///
+/// [`MAX_EGRESS_QUEUE`] above is the RESOURCE bound and is right to be plane-wide:
+/// "is this box holding too much undelivered mail?" counts every row. This is the
+/// STALL bound and has to name a peer, because "is one peer's stall eating
+/// everyone's capacity?" counts only that peer's rows. Both questions are real and
+/// they have different answers, so this is added beside the plane-wide bound and
+/// does not substitute for it.
+///
+/// The blast radius is the forwarding plane only — local mail is a separate count
+/// on a separate predicate (`dest_peer IS NULL`, [`MAX_INBOX_NOTICES`]), so a
+/// wedged peer means "the mesh is down", not "the boxes stop". That is also *why*
+/// the local plane stays available as the channel over which to report the egress
+/// refusal.
+///
+/// Set well below the plane-wide bound on purpose: at 50, a peer that is wedged
+/// solid consumes at most a quarter of the plane, so three more peers can wedge
+/// before the resource bound is even in play. The retirement seam
+/// ([`MAX_EGRESS_ATTEMPTS`] → retire → report home) then reclaims the stalled rows,
+/// which is what downgrades this from terminal to transient — but a bound that only
+/// releases on retirement still needs to not take the whole plane hostage in the
+/// meantime.
+pub(crate) const MAX_EGRESS_QUEUE_PER_PEER: u64 = 50;
+
 /// How many failed hand-offs an egress row survives before it is retired and its
 /// sender is told (r6-routing branch 4, at the egress seam).
 ///
@@ -476,6 +500,31 @@ impl SqliteInboxStore {
             anyhow::bail!(
                 "egress queue full ({queued}/{MAX_EGRESS_QUEUE} undrained forwards) — \
                  refusing admission rather than evicting a queued forward"
+            );
+        }
+        // S1. The count above is the RESOURCE bound and is right to be plane-wide.
+        // This one is the STALL bound and has to name the peer, because the two
+        // questions have different answers: one wedged peer holding 200 parked
+        // forwards is not a reason to refuse mail to a peer that is answering fine.
+        // Without this clause it was — every forward to every peer, refused by one
+        // dead link, with the refusal correctly reporting a full plane and saying
+        // nothing about which peer filled it.
+        let queued_peer: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM member_notices
+              WHERE dest_peer = ?1 AND drained_at IS NULL",
+            params![dest_peer],
+            |row| row.get(0),
+        )?;
+        if queued_peer as u64 >= MAX_EGRESS_QUEUE_PER_PEER {
+            // Names the peer, so the receipt distinguishes "this box is full" from
+            // "this one peer is not draining" — the distinction the single bound
+            // could not express, and the one an operator acts on.
+            anyhow::bail!(
+                "egress queue full for peer '{dest_peer}' \
+                 ({queued_peer}/{MAX_EGRESS_QUEUE_PER_PEER} undrained forwards to that \
+                 peer; the plane as a whole is at {queued}/{MAX_EGRESS_QUEUE}) — \
+                 refusing admission for this destination only. Forwards to other peers \
+                 are unaffected: this is one stalled link, not a full forwarding plane."
             );
         }
         conn.execute(
@@ -1984,18 +2033,28 @@ mod tests {
     #[test]
     fn the_egress_plane_carries_its_own_bound_and_it_refuses_rather_than_evicts() {
         let (_tmp, store) = fresh();
-        let first = store
-            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
-                            Some("forum/first.md#t"), "hash-first")
-            .unwrap();
-        for i in 1..MAX_EGRESS_QUEUE {
-            store
-                .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
-                                Some(&format!("forum/f{i}.md#t")), "hash-e")
-                .unwrap();
+        // Fill the plane to its RESOURCE bound without tripping the per-peer STALL
+        // bound (S1). That takes several peers now; before S1 one peer could fill the
+        // whole plane alone, which was exactly the defect — and this test used to fill
+        // it from "thor" alone, so the suite pinned the defect as correct behaviour.
+        let peers = MAX_EGRESS_QUEUE / MAX_EGRESS_QUEUE_PER_PEER;
+        let mut first = 0u64;
+        for p in 0..peers {
+            let peer = format!("peer{p}");
+            for i in 0..MAX_EGRESS_QUEUE_PER_PEER {
+                let id = store
+                    .enqueue_egress(&peer, "claude-code", "codex-cli", "role:r", "reply",
+                                    Some(&format!("forum/f{p}-{i}.md#t")), "hash-e")
+                    .unwrap();
+                if p == 0 && i == 0 {
+                    first = id;
+                }
+            }
         }
         assert_eq!(store.egress_queued().unwrap(), MAX_EGRESS_QUEUE);
-        let refused = store.enqueue_egress("thor", "claude-code", "codex-cli", "role:r",
+        // A peer with NOTHING queued is still refused — the plane-wide bound is a
+        // statement about this box's capacity, not about that peer.
+        let refused = store.enqueue_egress("fresh-peer", "claude-code", "codex-cli", "role:r",
                                            "reply", Some("forum/over.md#t"), "hash-o");
         assert!(refused.is_err(), "the egress plane admitted past its cap");
         // The oldest forward is still queued: at the bound we tell the newest sender
@@ -2009,6 +2068,66 @@ mod tests {
                             Some("forum/local.md#t"), "hash-l", None)
             .unwrap();
         assert_eq!(store.member_pending("claude-code").unwrap(), 1);
+    }
+
+    /// S1's falsifier, stated as the outage rather than as the clause. One peer
+    /// stops draining; nothing else about the box is wrong. Every send to every
+    /// OTHER peer is refused from then on — one dead link, fleet-wide coordination
+    /// outage — and the refusal reports a full plane, which is true and useless: it
+    /// is a disposition without its basis, and it does not name the peer an operator
+    /// would have to go fix.
+    #[test]
+    fn one_wedged_peer_does_not_take_the_forwarding_plane_hostage() {
+        let (_tmp, store) = fresh();
+        // Push at one dead peer as hard as a caller could. Refusals are FINE and
+        // expected — that is the bound doing its job. What must not happen is this
+        // peer consuming the whole plane. Written to be meaningful in both
+        // directions: without S1 every one of these is admitted and the `healthy`
+        // send below fails; with S1 the surplus is refused and `healthy` succeeds.
+        for i in 0..MAX_EGRESS_QUEUE {
+            let _ = store.enqueue_egress("wedged", "claude-code", "codex-cli", "role:r",
+                                         "reply", Some(&format!("forum/w{i}.md#t")), "hash-w");
+        }
+        assert!(store.egress_queued().unwrap() < MAX_EGRESS_QUEUE,
+                "one peer alone filled the forwarding plane: {}/{MAX_EGRESS_QUEUE}",
+                store.egress_queued().unwrap());
+        store
+            .enqueue_egress("healthy", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/h.md#t"), "hash-h")
+            .expect("one stalled peer refused admission to an unrelated, draining peer");
+    }
+
+    /// S1 (CBP, 2026-07-26), the clause-level test: the per-peer bound fires at its
+    /// own threshold, the refusal NAMES the stalled peer, and a healthy peer is
+    /// untouched. `egress_queued_for` is the meter this bound reads; it landed on
+    /// main with zero callers, which is how the bound went missing without a single
+    /// red test.
+    #[test]
+    fn one_wedged_peer_does_not_refuse_admission_for_every_other_peer() {
+        let (_tmp, store) = fresh();
+        for i in 0..MAX_EGRESS_QUEUE_PER_PEER {
+            store
+                .enqueue_egress("wedged", "claude-code", "codex-cli", "role:r", "reply",
+                                Some(&format!("forum/w{i}.md#t")), "hash-w")
+                .unwrap();
+        }
+        assert_eq!(store.egress_queued_for("wedged").unwrap(), MAX_EGRESS_QUEUE_PER_PEER);
+        // That peer is now refused, and the refusal names it rather than the plane.
+        let refused = store.enqueue_egress("wedged", "claude-code", "codex-cli", "role:r",
+                                           "reply", Some("forum/w-over.md#t"), "hash-wo");
+        let msg = refused.unwrap_err().to_string();
+        assert!(msg.contains("wedged"),
+                "the refusal must name the stalled peer, not just report a full plane: {msg}");
+        // …and a healthy peer is completely unaffected. This is the assertion that
+        // fails without the `dest_peer = ?1` clause.
+        store
+            .enqueue_egress("healthy", "claude-code", "codex-cli", "role:r", "reply",
+                            Some("forum/h.md#t"), "hash-h")
+            .expect("one stalled peer refused admission to an unrelated, draining peer");
+        assert_eq!(store.egress_queued_for("healthy").unwrap(), 1);
+        // The plane-wide bound is untouched by all this: it is still the resource
+        // question, and the plane is nowhere near full.
+        assert!(store.egress_queued().unwrap() < MAX_EGRESS_QUEUE);
     }
 
     #[test]

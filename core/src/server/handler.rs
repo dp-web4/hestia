@@ -6507,14 +6507,22 @@ mod member_mesh_tests {
 
         // Fill the egress plane to its bound directly — this test is about what the
         // refusal RECORDS, not about where the bound sits (that is pinned in inbox.rs).
+        // Post-S1 there are two bounds, and this fills the PLANE-WIDE one, spread over
+        // enough peers that no single one trips the per-peer bound first. That keeps
+        // the test agnostic about which peer `thor/claude-code` resolves to: a full
+        // plane refuses every destination, so the refusal envelope under test here is
+        // reached without this test also asserting a routing decision it is not about.
         {
             let s = state.lock().await;
-            for i in 0..crate::storage::inbox::MAX_EGRESS_QUEUE {
-                s.inbox_store
-                    .enqueue_egress("thor", "claude-code", "codex-cli", "role:r",
-                                    "reply", Some("forum/x.md#thread=t"),
-                                    &format!("h{i}"))
-                    .unwrap();
+            let per_peer = crate::storage::inbox::MAX_EGRESS_QUEUE_PER_PEER;
+            for p in 0..(crate::storage::inbox::MAX_EGRESS_QUEUE / per_peer) {
+                for i in 0..per_peer {
+                    s.inbox_store
+                        .enqueue_egress(&format!("filler{p}"), "claude-code", "codex-cli",
+                                        "role:r", "reply", Some("forum/x.md#thread=t"),
+                                        &format!("h{p}-{i}"))
+                        .unwrap();
+                }
             }
         }
 
