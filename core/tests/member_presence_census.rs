@@ -158,6 +158,24 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str])] = &[
     ("server/handler.rs::tool_witness_decision", &[
         "let instance_lct = s.member_lct(&plugin_id);",
     ]),
+    // ADDED 2026-07-28 (claude-code, #84 — the RDF projection). The census went red on this
+    // site the moment it was written, which is the instrument working: it scheduled the
+    // judgment call on the author, at write time, before the PR merged.
+    //
+    // READING: **naming, not presence.** `trust_graph_turtle` derives the entity URI for the
+    // Turtle projection. It changes *who gets named* in the emitted graph — which is exactly
+    // what this table pins — and it reads no registry content, so it is not a presence
+    // consumer and belongs here rather than in REGISTRY_CENSUS.
+    //
+    // Worth stating because the derivation is deliberate: `member_lct` returns Some for any
+    // non-empty non-synthetic string, so a plugin that never connected still yields a
+    // well-formed LCT. For a GRAPH that is the right call — the derivation is deterministic
+    // and stable, so triples join across emissions — but it means the graph's `web4:entity`
+    // asserts a *name*, not attendance. The projection's own docs say so; this entry is the
+    // second place that stays true.
+    ("server/http.rs::trust_graph_turtle", &[
+        ".member_lct(&q.plugin_id)",
+    ]),
     ("server/http.rs::operator_adjudicate", &[
         "let subject_instance_lct = s.member_lct(&a.subject_plugin_id);",
     ]),
