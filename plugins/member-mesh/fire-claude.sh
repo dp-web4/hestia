@@ -119,7 +119,11 @@ echo "[fire-claude] firing claude -p ($FIREWORTHY notice(s)) -> $LOG_DIR/claude-
 # `-k 30` makes the 1800s an actual bound: plain `timeout` only sends TERM, and a
 # CLI that ignores it would hold the member's lock forever.
 HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd /mnt/c/exe/projects/ai-agents && "$HERE_DIR/with-member-lock.sh" claude-code \
+# The fired CLI starts in the fleet workspace (the parent of this repo). Derived,
+# not hardcoded: the absolute path tied every fire — and the rendered-layer suite
+# in CI — to one machine's layout (the gate's first rendered-layer red, 2026-07-28).
+# HESTIA_WORKSPACE overrides.
+cd "${HESTIA_WORKSPACE:-$(cd "$HERE_DIR/../../.." && pwd)}" && "$HERE_DIR/with-member-lock.sh" claude-code \
   timeout -k 30 1800 claude -p --dangerously-skip-permissions "$PROMPT" > "$LOG_DIR/claude-$STAMP.log" 2>&1
 # The fired CLI's rc IS this script's rc. Interpolating $? into an echo made the
 # trailing echo the last command, so the script exited 0 whatever happened — the

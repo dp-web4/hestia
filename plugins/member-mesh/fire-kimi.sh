@@ -81,7 +81,11 @@ echo "[fire-kimi] firing kimi -p ($FIREWORTHY notice(s)) -> $LOG_DIR/kimi-$STAMP
 # Amendment 3 — see fire-claude.sh. Per-member lock, and `-k 30` so the 1800s
 # timeout is a bound rather than a polite request.
 HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd /mnt/c/exe/projects/ai-agents && "$HERE_DIR/with-member-lock.sh" kimi-code \
+# The fired CLI starts in the fleet workspace (the parent of this repo). Derived,
+# not hardcoded: the absolute path tied every fire — and the rendered-layer suite
+# in CI — to one machine's layout (the gate's first rendered-layer red, 2026-07-28).
+# HESTIA_WORKSPACE overrides.
+cd "${HESTIA_WORKSPACE:-$(cd "$HERE_DIR/../../.." && pwd)}" && "$HERE_DIR/with-member-lock.sh" kimi-code \
   timeout -k 30 1800 kimi -p "$PROMPT" > "$LOG_DIR/kimi-$STAMP.log" 2>&1
 # The fired CLI's rc IS this script's rc — see fire-claude.sh. The two
 # `timeout: failed to run command 'kimi'` fires of 2026-07-23 reported success
