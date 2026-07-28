@@ -71,10 +71,23 @@ echo "workspace:  $WORKSPACE  ($WS_FROM)"
 # That direction is the right one — it is a clean refusal, not the half-install USER
 # produced — so this is a diagnostic, not a behaviour change. It is here because every
 # other refusal in this file explains itself (see the workspace block above, rule 4: a
-# scope we cannot establish must not be guessed) and this one did not. It also fixes a
-# measurement gap: the USER finding was measured with `env -i` on Darwin, where bash 3.2
-# DOES supply HOME. On Linux that same command never reaches line 411, so the claim it
-# proved could not be reproduced here until this line existed.
+# scope we cannot establish must not be guessed) and this one did not.
+#
+# AND IT IS NOT A PLATFORM DIFFERENCE — bash 3.2 DOES NOT SUPPLY HOME EITHER (McNugget,
+# 2026-07-28, measured on macOS 26.5, correcting the line that stood here). The reasoning
+# above is right; the one claim attached to it that could only be checked on Darwin was
+# wrong, so it is replaced with the measurement rather than deleted. Measured on
+# /bin/bash 3.2.57: `env -i /bin/bash -c 'echo ${HOME-UNSET}'` prints UNSET, and bash 3.2
+# defaults exactly what bash 5.2 does — PATH, SHELL, PWD, SHLVL yes; HOME, USER, LOGNAME
+# no. Run against the pre-guard revision (66e6a82) this script died on Darwin at
+# `line 61: HOME: unbound variable`: the same line, the same message, nothing installed.
+#
+# So the USER finding was never Darwin-only. It reached line 411 because it was measured
+# under a SANDBOXED $HOME — `env -i HOME=/tmp/... ` — which is the sandbox this thread has
+# run everything in, not a bash version. With HOME supplied and USER unset, both boxes
+# agree: rc=0, all three steps. The two platforms have not diverged here at all, and this
+# guard is worth MORE than the note it replaces claimed — on Darwin it is reachable by the
+# very command that was said to bypass it.
 #
 # Refused, not derived. `id -un` can replace USER because the kernel knows the answer;
 # nothing knows which home directory an unattended install MEANT, and guessing one writes
@@ -476,29 +489,57 @@ UID_N="$(id -u)"
 # ProcessType Background is what tells the scheduler this may be deprioritised — an hourly
 # directory walk must never compete with the user's foreground work.
 LAUNCHD_PATH="$(dirname "$PYTHON"):/usr/bin:/bin:/usr/sbin:/sbin"
+
+# THE WHITELIST SAYS WHICH NAMES MAY EXPAND; IT DOES NOT SAY THE VALUE IS SAFE IN THE FILE
+# BEING GENERATED (McNugget, 2026-07-28, measured on macOS 26.5 by installing). Three
+# generated files, three target syntaxes, and the two whose syntax is shell already answer
+# this: the wrapper interpolates inside double quotes, and the SessionStart hook goes
+# through shlex.quote in step 3. The plist is the one whose syntax is XML, and it
+# interpolated raw. `&`, `<` and `>` are legal in a POSIX path and are metacharacters here.
+#
+# Measured with HESTIA_WORKSPACE=/tmp/mcn-sb2/R&D — a folder name a Mac user types without
+# thinking: plutil said "Encountered unknown ampersand-escape sequence at line 10", the
+# plist was removed, and the periodic trigger was GONE. The same run's other two triggers
+# were fine — the hook read `--workspace '/tmp/mcn-sb2/R&D'` and the wrapper ran and
+# reported. So it was one trigger of three, lost to a character in a path.
+#
+# SIZED HONESTLY, THE WAY THIS THREAD HAS BEEN SIZING THINGS: not a silent failure. The
+# lint-before-load guard below caught it, said so, and skip_periodic() made the gap
+# self-reporting (scope.periodic_trigger=absent, NO PERIODIC TRIGGER on --brief). That is
+# the backstop working. What was wrong is that a path was allowed to reach a syntax that
+# could not hold it, and the diagnostic a reader got named plutil's parser message instead
+# of the character in their own workspace path. Escaping is four lines; the backstop stays
+# exactly where it is, because it also catches truncation, which this does not.
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+XML_LABEL="$(xml_escape "$LAUNCHD_LABEL")"
+XML_BIN="$(xml_escape "$BIN")"
+XML_WORKSPACE="$(xml_escape "$WORKSPACE")"
+XML_HOME="$(xml_escape "$HOME")"
+XML_PATH="$(xml_escape "$LAUNCHD_PATH")"
+XML_LOG_DIR="$(xml_escape "$LOG_DIR")"
 cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>$LAUNCHD_LABEL</string>
+  <key>Label</key><string>$XML_LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$BIN</string>
+    <string>$XML_BIN</string>
     <string>--workspace</string>
-    <string>$WORKSPACE</string>
+    <string>$XML_WORKSPACE</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>HESTIA_WORKSPACE</key><string>$WORKSPACE</string>
-    <key>HOME</key><string>$HOME</string>
-    <key>PATH</key><string>$LAUNCHD_PATH</string>
+    <key>HESTIA_WORKSPACE</key><string>$XML_WORKSPACE</string>
+    <key>HOME</key><string>$XML_HOME</string>
+    <key>PATH</key><string>$XML_PATH</string>
   </dict>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
   <key>ProcessType</key><string>Background</string>
-  <key>StandardOutPath</key><string>$LOG_DIR/agent-inventory.log</string>
-  <key>StandardErrorPath</key><string>$LOG_DIR/agent-inventory.err</string>
+  <key>StandardOutPath</key><string>$XML_LOG_DIR/agent-inventory.log</string>
+  <key>StandardErrorPath</key><string>$XML_LOG_DIR/agent-inventory.err</string>
 </dict>
 </plist>
 PLIST_EOF
