@@ -207,19 +207,44 @@ def _touches_self(tool_name: str, tool_input: Any) -> Optional[str]:
     """Return the matched marker if this call reaches the gate's own code."""
     if not isinstance(tool_input, dict):
         return None
-    haystacks = []
-    for key in ("file_path", "path", "notebook_path", "command", "content", "new_string"):
+    # PATH keys are resolved against cwd so `../hooks/pre_tool_use.py` is caught.
+    # TEXT keys are matched RAW, and that distinction is load-bearing: the first
+    # cut resolved every key, and `os.path.realpath()` on a non-path string
+    # silently prepends the cwd — `realpath("fn main() {}")` is a real path under
+    # wherever the session happens to be standing.
+    #
+    # Scope it honestly: this is cwd-DEPENDENT, not universal. It fires when the
+    # session's cwd sits under a marker directory (the installed hooks dir, or a
+    # tree matching `plugins/claude-code/hooks` / `hestia/hooks`), and in the
+    # common case — cwd at a project root — it does not fire at all. It was found
+    # by the "ordinary work is untouched" case in test_pre_tool_use_self.py, which
+    # runs from the hooks directory and so stands exactly where it bites. Latent,
+    # never observed in the wild, and cheap to remove.
+    #
+    # The false positive is not the expensive half. A spurious refusal costs a
+    # rephrase; a spurious `gate_self_access` WITNESS costs the alert class its
+    # meaning — this event exists to be rare and to be read as evidence about
+    # intent, and an event type that fires on ordinary work gets muted by the
+    # first operator who sees it, which is exactly the burial the block above
+    # gave its own event type to avoid.
+    #
+    # Nothing is lost by matching text raw: `../hooks/pre_tool_use.py` in a shell
+    # command still contains both `hooks/` and a governance filename. What IS
+    # given up is a symlinked alias inside a command string — admitted, and no
+    # worse than the Bash surface's other known gaps.
+    resolved = []
+    for key in ("file_path", "path", "notebook_path"):
         v = tool_input.get(key)
         if isinstance(v, str) and v:
-            haystacks.append(v)
-    # Resolve relative paths against cwd so `../hooks/pre_tool_use.py` is caught.
-    resolved = []
-    for h in haystacks:
-        resolved.append(h)
-        try:
-            resolved.append(os.path.realpath(h))
-        except (OSError, ValueError):
-            pass
+            resolved.append(v)
+            try:
+                resolved.append(os.path.realpath(v))
+            except (OSError, ValueError):
+                pass
+    for key in ("command", "content", "new_string"):
+        v = tool_input.get(key)
+        if isinstance(v, str) and v:
+            resolved.append(v)
     for h in resolved:
         for marker in _SELF_MARKERS:
             if marker and marker in h:
@@ -234,6 +259,120 @@ def _touches_self(tool_name: str, tool_input: Any) -> Optional[str]:
                     return fname
     return None
 
+
+# ---------------------------------------------------------------------------
+# THE GATE'S REGISTRATION IS PART OF THE GATE (2026-07-28, follow-on)
+# ---------------------------------------------------------------------------
+#
+# The block above protects the gate's CODE. It was probed against the evasions
+# it claims to remove, and the cheapest one walked straight through:
+#
+#   Write  ~/.claude/settings.json  content='{}'      -> _touches_self: None
+#   Bash   mv ~/.claude/settings.json{,.bak}          -> _touches_self: None
+#   Edit   ~/.claude/settings.json  (drop the stanza) -> _touches_self: None
+#
+# Verified by direct call against this file at 99d122f, not by reading it. The
+# hook is invoked because `~/.claude/settings.json` names it; that path carries
+# no `hooks/` segment and no governance filename, so every marker missed. One
+# write of `{}` disarms the PreToolUse gate AND the PostToolUse witness — and
+# unlike editing this file it needs no knowledge of what the matcher looks for.
+#
+# So the protection as shipped was strictly weaker than its own claim to "remove
+# the cheap, silent version": the cheapest version was the one it did not see.
+# A control that protects its implementation but not its INSTALLATION protects
+# nothing — this is `gate installed != gate enforced` pointed at itself.
+#
+# DECIDABILITY, per tool, because the honest rule differs by what we can see:
+#
+#   Write / NotebookEdit  we hold the full proposed content. Parse it, compare
+#                         the `hooks` stanza to what is on disk, and refuse only
+#                         if it would CHANGE. A permissions-only edit passes.
+#                         Content we cannot parse is refused: an unreadable
+#                         proposal cannot demonstrate it preserves anything.
+#   Edit                  we hold old_string/new_string. Refuse if either names
+#                         `hooks` or a governance file — that is the only kind of
+#                         edit that can reach the stanza.
+#   Bash                  undecidable. `mv`, `>`, `jq`, `python -c` and a heredoc
+#                         all rewrite the file by different syntax and none of
+#                         them has to say `hooks`. Mention of a settings path is
+#                         refused outright, same stakes-inversion as above: the
+#                         false positive costs one rephrase into Read/Edit, which
+#                         ARE decidable, and the false negative costs the gate.
+#
+# STILL NOT CONTAINMENT, and the gap is now narrower but sharper: settings can
+# also be supplied by CLI flag and by env, neither of which passes through any
+# hook — by construction, since the hook is not running yet when they are read.
+# That surface belongs to whoever installs the agent, not to the agent's gate,
+# and saying so is the point: the boundary is where custody changes, and this
+# file cannot be both sides of it.
+_SETTINGS_MARKERS = (
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+)
+
+# Tokens that mean an edit is reaching the hook registration rather than some
+# unrelated key (permissions, env, model) in the same file.
+_REGISTRATION_TOKENS = ("hooks",) + _GOVERNANCE_FILES
+
+
+def _mentions_settings(s: str) -> bool:
+    return any(m in s.replace("\\", "/") for m in _SETTINGS_MARKERS)
+
+
+def _hooks_stanza(text: str) -> Any:
+    """The `hooks` value of a settings blob, or None if it has none / is unreadable."""
+    try:
+        d = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return d.get("hooks") if isinstance(d, dict) else None
+
+
+def _touches_registration(tool_name: str, tool_input: Any) -> Optional[str]:
+    """Return a marker if this call could disarm the gate by DE-REGISTERING it."""
+    if not isinstance(tool_input, dict):
+        return None
+
+    if tool_name == "Bash":
+        cmd = tool_input.get("command")
+        if isinstance(cmd, str) and _mentions_settings(cmd):
+            return "claude settings file (shell — write intent undecidable)"
+        return None
+
+    path = (
+        tool_input.get("file_path")
+        or tool_input.get("path")
+        or tool_input.get("notebook_path")
+    )
+    if not isinstance(path, str) or not _mentions_settings(path):
+        return None
+
+    # Nothing to disarm if the file registers no hooks. Read failures are treated
+    # as "has hooks": a settings file we cannot read is not a settings file we can
+    # clear.
+    try:
+        with open(os.path.realpath(path), "r", encoding="utf-8") as fh:
+            current = _hooks_stanza(fh.read())
+    except OSError:
+        current = None
+    except Exception:  # noqa: BLE001 — unreadable is not permission
+        current = True
+    if not current:
+        return None
+
+    if "content" in tool_input:
+        content = tool_input.get("content")
+        if not isinstance(content, str):
+            return "claude settings hooks stanza (opaque write)"
+        if _hooks_stanza(content) != current:
+            return "claude settings hooks stanza"
+        return None
+
+    for key in ("old_string", "new_string"):
+        v = tool_input.get(key)
+        if isinstance(v, str) and any(t in v for t in _REGISTRATION_TOKENS):
+            return "claude settings hooks stanza"
+    return None
 
 
 def _witness_self_access(marker: str, tool_name: str) -> bool:
@@ -738,7 +877,9 @@ def main() -> int:
     # SELF-PROTECTION FIRST — before the daemon, and never conditional on it.
     # If this required a verdict, "stop the daemon, then edit the gate" would be
     # the same evasion one layer down.
-    _self_marker = _touches_self(tool_name, tool_input)
+    _self_marker = _touches_self(tool_name, tool_input) or _touches_registration(
+        tool_name, tool_input
+    )
     if _self_marker:
         return deny_self_access(_self_marker, tool_name)
 
