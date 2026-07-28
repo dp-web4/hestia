@@ -362,6 +362,56 @@ timeout the installer just wrote, **20s**, against which 17.9ms is 0.09%. A perc
 the walk measures the workspace's storage; a percentage of the budget measures whether the
 trigger still fits.
 
+**The `$` half was still scoped the way the backtick half had just stopped being** (cbp,
+2026-07-28, measured on Linux by installing). "Scan every heredoc, not the one where the
+bug was found" got applied to backticks and `$(`. The `$` expansion check stayed **WRAP-only
+and brace-only** — bare `$NAME` was refused nowhere. The probe is the `${HOME}` one directly
+above with two characters deleted: `# prose about \$PY and the pin under $HOME/.local/bin`
+passed the new guard green, `bash -n` clean, and shipped a wrapper reading *"the pin under
+/tmp/hli7/home/.local/bin"*. That is the likelier typo, not the rarer one — this file's
+house style writes `\$PY`, `\$PYTHON`, `\$HOME`, `\$PYENV_ROOT`, each one backslash from
+expanding, and `${` was the harder form to type and the only form guarded.
+
+Fixed as a **whitelist, not a wider ban** — a ban cannot work, because the unit and the
+plist exist to interpolate, but the set that may expand is small, known, and was already
+written down in prose: `WRAP` may expand `$PYTHON`/`$BIN`/`$WORKSPACE`, the unit
+`$SRC_DIR`/`$BIN`/`$WORKSPACE`, the plist those plus `$HOME`/`$LAUNCHD_LABEL`/
+`$LAUNCHD_PATH`/`$LOG_DIR`. Anything else — braced, bare, or unnamed (`$(`, `$$`, `$?`) —
+fails, in all three, and an unrecognised heredoc gets the empty set so a new generated file
+refuses every expansion until someone says what it meant. Eight sabotage probes: McNugget's
+four still red, plus bare `$HOME` in `WRAP`, bare `$USER` in the plist, bare `$HOSTNAME` in
+the unit, and `$$` in `WRAP`; `bash -n` clean in all eight. Ninth probe, the one that makes
+the other eight mean something: adding `HOME` to `WRAP`'s set turns the bare-`$HOME` probe
+green again, so the whitelist is what denies and not something else.
+
+**`HOME` is the same sentence about the load-bearing variable** (cbp, 2026-07-28, measured
+on Linux). The `USER` note is exactly right — a variable set by login shells and absent
+from scrubbed ones is not one this script may assume — and it is true of `HOME`, which is
+where all three triggers get *installed*. On bash 5.2 an unset `HOME` is **not** defaulted
+(`PATH` and `SHELL` are; `HOME` and `USER` are not), so `env -i` died at the `BIN=` line
+before step 1 with a bare `line 61: HOME: unbound variable`. **This is not the `USER`
+shape** — it is a clean refusal with nothing installed, the right direction — so the change
+is a diagnostic, not a behaviour change: it explains itself the way every other refusal in
+the file does, and it is *refused, not derived*, because `id -un` can replace `USER` (the
+kernel knows) while nothing knows which home an unattended install meant. It also closes a
+measurement gap: the `USER` finding was measured with `env -i` on Darwin, where bash 3.2
+supplies `HOME`; on Linux that same command never reaches line 411, so **the claim "with
+`USER` unset the install completes all three steps, rc=0" is Darwin-only** and could not be
+reproduced here until this guard existed. With `HOME` set and `USER` unset, Linux does
+match it: rc=0, all three steps, hook at timeout 20s, `lingering: OFF`.
+
+**The two queued nits, taken by whoever touched the file next.** The provenance line was a
+real wrong output — `${HESTIA_WORKSPACE:+from HESTIA_WORKSPACE}${HESTIA_WORKSPACE:-…}`
+prints the label *and then the value*, so a set `HESTIA_WORKSPACE` read `from
+HESTIA_WORKSPACE/mnt/c/exe/projects/ai-agents`; now `from HESTIA_WORKSPACE`. The bare
+`python3` in step 3 is **hygiene, not a defect**, and that is the honest size of it:
+`install.sh` never modifies `PATH` and `PYTHON` is `command -v python3` from the same
+process, so the two always resolved to the same file, and the xcrun-stub case cannot bite
+because step 1 probes `$PYTHON` and exits before step 3 exists. No run on Linux
+distinguishes them. Changed anyway, because "every trigger runs the interpreter we pinned"
+is the invariant, and one of four call sites naming it a second way is how an invariant
+stops being checkable.
+
 **A negative result, recorded because it was worth checking:** the narrow launchd `PATH`
 does **not** shrink the A inventory. The obvious worry — `claude` lives in
 `~/.local/bin`, which is on the shell's `PATH` and not on launchd's, so the hourly run

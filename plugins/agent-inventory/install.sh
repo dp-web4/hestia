@@ -56,7 +56,37 @@ if [ ! -d "$WORKSPACE/agent-atlas/talk-to" ]; then
   echo "install: WARNING — resolved workspace $WORKSPACE has no agent-atlas/talk-to." >&2
   echo "         Every trigger will report UNKNOWN ('could not look') until it does." >&2
 fi
-echo "workspace:  $WORKSPACE  (${HESTIA_WORKSPACE:+from HESTIA_WORKSPACE}${HESTIA_WORKSPACE:-from git --git-common-dir})"
+if [ -n "${HESTIA_WORKSPACE:-}" ]; then WS_FROM="from HESTIA_WORKSPACE"; else WS_FROM="from git --git-common-dir"; fi
+echo "workspace:  $WORKSPACE  ($WS_FROM)"
+
+# THE SAME SENTENCE, ABOUT THE LOAD-BEARING VARIABLE (cbp, 2026-07-28, measured on Linux).
+# The USER note below says it exactly: a variable set by login shells and absent from
+# scrubbed ones is not part of the environment this script may assume. That is true of
+# HOME too, and HOME is where all three triggers get INSTALLED — the next four lines are
+# every path this script writes. On bash 5.2 an unset HOME is not defaulted (measured:
+# `env -i bash -c 'echo $HOME'` is an unbound-variable abort; PATH and SHELL are defaulted,
+# HOME and USER are not), so under `env -i` this script died at the BIN= line below, before
+# step 1, with a bare "line 61: HOME: unbound variable" and nothing installed.
+#
+# That direction is the right one — it is a clean refusal, not the half-install USER
+# produced — so this is a diagnostic, not a behaviour change. It is here because every
+# other refusal in this file explains itself (see the workspace block above, rule 4: a
+# scope we cannot establish must not be guessed) and this one did not. It also fixes a
+# measurement gap: the USER finding was measured with `env -i` on Darwin, where bash 3.2
+# DOES supply HOME. On Linux that same command never reaches line 411, so the claim it
+# proved could not be reproduced here until this line existed.
+#
+# Refused, not derived. `id -un` can replace USER because the kernel knows the answer;
+# nothing knows which home directory an unattended install MEANT, and guessing one writes
+# a wrapper, a unit and a hook into it.
+if [ -z "${HOME:-}" ]; then
+  echo "install: HOME is not set, and every path this script writes is under it." >&2
+  echo "         Login shells set it; scrubbed environments (containers, CI, anything" >&2
+  echo "         launchd or systemd starts) do not, and bash does not default it." >&2
+  echo "         Refusing to guess a home directory: nothing has been installed." >&2
+  echo "         Re-run with: HOME=/path/to/home $0" >&2
+  exit 1
+fi
 
 BIN="$HOME/.local/bin/hestia-agent-inventory"
 UNIT_DIR="$HOME/.config/systemd/user"
@@ -575,8 +605,17 @@ esac
 
 if [ -f "$SETTINGS" ]; then
   cp -a "$SETTINGS" "$SETTINGS.bak.$(date +%Y%m%d-%H%M%S)"
+  # `$PYTHON`, not a bare `python3` — and this one is HYGIENE, not a defect (cbp,
+  # 2026-07-28). Stated plainly because it was queued as a nit for two hops and the honest
+  # answer is smaller than it looked: install.sh never modifies PATH, and `PYTHON` is
+  # `command -v python3` from this same process, so the two always resolved to the same
+  # file. The stub case cannot bite here either — step 1 PROBES `$PYTHON` and exits 1
+  # before step 3 exists. I could not construct a run on Linux where the bare form
+  # differs. It changes anyway, because "every trigger runs the interpreter we pinned" is
+  # the invariant this branch is about, and one of the four call sites naming it a second
+  # way is how that invariant stops being checkable — not because it is broken today.
   BIN="$BIN" WORKSPACE="$WORKSPACE" HOOK_TIMEOUT="$HOOK_TIMEOUT" \
-    python3 - "$SETTINGS" <<'PY'
+    "$PYTHON" - "$SETTINGS" <<'PY'
 import json, os, shlex, sys
 path, binp = sys.argv[1], os.environ["BIN"]
 tmo = int(os.environ["HOOK_TIMEOUT"])
