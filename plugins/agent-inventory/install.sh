@@ -65,12 +65,22 @@ else
   # `$0` PINNED: this line is a COMMAND, and it is the third instance of McNugget's
   # fifth surface. `$0` is the path this script was invoked as — which is inside the
   # workspace, so it carries exactly the metacharacters the rest of this file is about.
-  # Sized honestly and SMALLER than theirs: `$0` is always in command position, so a
-  # corrupted word does not resolve and the paste fails loudly (measured on Linux:
-  # rc=127 for `$`, space and backtick; rc=2 for the apostrophe). The exception is the
-  # one that matters — ``…/it`id`s`` substitutes BEFORE it fails, so `id` ran in the
-  # operator's shell and its output was what the shell then tried to execute. Loud
-  # afterwards is not the same as never having run.
+  # This comment used to size it SMALLER than theirs — "always in command position, so a
+  # corrupted word does not resolve and the paste fails loudly." That was wrong, and the
+  # pin is what makes the line safe, not command position. McNugget refuted it on Darwin
+  # and it reproduces on Linux/dash: command position guarantees the word is EXECUTED, not
+  # that it FAILS. The earlier rc=127 was a property of the fixture — a tmpdir where the
+  # truncation target happened not to exist — not of the position. Measured, unpinned:
+  #   `$`     …/hestia$X/install.sh  next to a real …/hestia/  -> rc=0, RAN A DIFFERENT
+  #           INSTALLER, no diagnostic. Silent.
+  #   space   …/a b/install.sh  next to an executable …/a      -> rc=0, ran …/a and passed
+  #           `b/install.sh` as ARGV. Silent, and it hands on an argument.
+  #   `` ` `` ``…/it`id`s``  -> substitutes BEFORE it fails, so `id` ran in the operator's
+  #           shell whatever happened next. Loud afterwards is not never having run.
+  #   `'`     …/o'brien/…    -> rc=2, unterminated quoted string, parse error before ANY
+  #           execution. This is the only one that genuinely cannot be silent.
+  # So: three of the four are as bad as or worse than the advice-line surface, and the
+  # pinned form runs the intended installer in every case.
   echo "  Re-run with: HESTIA_WORKSPACE=/path/to/workspace $(sh_pin "$0")" >&2
   exit 1
 fi
