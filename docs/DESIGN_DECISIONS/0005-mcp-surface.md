@@ -54,6 +54,12 @@ Establishes the plugin's session. Called once at startup. Sets the plugin's iden
 }
 ```
 
+`assigned_role` normalizes fail-closed: it differs from `requested_role` precisely when the
+request is not an assignable tier. No entitlement source exists yet, so assignment is
+currently always the floor (`citizen`) — every request normalizes there regardless of what
+was asked for. Both the fresh and the reused-session responses echo the stored, normalized
+value.
+
 ### `hestia_begin_action`
 
 Marks the start of an R6/R7 action. Returns an action handle.

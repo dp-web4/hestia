@@ -51,6 +51,22 @@ pub fn normalize_constellation_role(declared: &str) -> &'static str {
         .unwrap_or(DEFAULT_CONSTELLATION_ROLE)
 }
 
+/// The fail-closed floor for `requested_role` (the legacy `assignedRole`
+/// capacity, distinct from the constellation role above).
+pub const DEFAULT_ASSIGNED_ROLE: &str = "citizen";
+
+/// Map a requested role to an assigned one, failing closed to
+/// [`DEFAULT_ASSIGNED_ROLE`]. `assignedRole` was granted verbatim from the
+/// caller's assertion — the third instance of the
+/// caller-supplied-trusted-as-adjudicated class (kimi/CBP thread 2026-07-27).
+/// No entitlement source exists in-tree yet, so the honest normalizer is
+/// degenerate: EVERY request floors to "citizen". The seam is named so a
+/// future entitlement source plugs in HERE, at the boundary — a role becomes
+/// assignable by being granted, never by being asked for.
+pub fn normalize_requested_role(_requested: &str) -> &'static str {
+    DEFAULT_ASSIGNED_ROLE
+}
+
 /// The default sink filename under `<hestia_home>`.
 pub const SINK_FILE: &str = "reputation-deltas.jsonl";
 

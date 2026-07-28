@@ -370,8 +370,15 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     let host_agent_version = optional_string(args, "host_agent_version");
     // The caller's stable host-session id (Claude Code's session_id, etc.), for connect idempotency.
     let host_session_id = optional_string(args, "host_session_id");
-    let requested_role =
-        optional_string(args, "requested_role").unwrap_or_else(|| "citizen".to_string());
+    // Granted, not asserted: `requested_role` was echoed verbatim into
+    // `assignedRole` — caller-supplied trusted as adjudicated. Normalize
+    // fail-closed, the same discipline as `constellation_role` below; with no
+    // entitlement source in-tree the normalizer floors every request to
+    // "citizen" (see `normalize_requested_role`).
+    let requested_role = crate::reputation::normalize_requested_role(
+        optional_string(args, "requested_role").as_deref().unwrap_or(""),
+    )
+    .to_string();
     // The #403 capacity — normalized fail-closed to the published constellation set.
     let declared_role = optional_string(args, "role").unwrap_or_default();
     let constellation_role =
@@ -493,6 +500,11 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     }
 
     s.sessions.insert(session_id, session);
+    // Readback, not a mirror (the #68 shape, one field over): the fresh path
+    // echoes the STORED, normalized role — the same value the reuse path
+    // reads back — so the two paths cannot disagree about what was assigned,
+    // and a later policy change can't silently split them.
+    let assigned_role = s.sessions[&session_id].assigned_role.clone();
 
     // session_started is intentionally NOT written to the witness chain.
     // Sessions are RAM-only by design (transport artifacts); every hook
@@ -505,7 +517,7 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     Ok(json!({
         "sessionId": session_id,
         "softLct": soft_lct,
-        "assignedRole": requested_role,
+        "assignedRole": assigned_role,
         "constellationRole": constellation_role,
         "roleDeclarationHonored": role_declaration_honored,
         "protocolVersion": 1,
@@ -6977,6 +6989,59 @@ mod tests {
         assert_eq!(
             r["roleDeclarationHonored"], false,
             "the reused session did NOT honor this call's declaration"
+        );
+    }
+
+    /// `assignedRole` is granted, not asserted (kimi/CBP thread 2026-07-27).
+    /// `requested_role` was echoed verbatim into the response and stored —
+    /// granted, never adjudicated, the third instance of the
+    /// caller-supplied-trusted-as-adjudicated class. It now normalizes
+    /// fail-closed, the same discipline as `constellation_role` one statement
+    /// down. With no entitlement source in-tree, the normalizer is degenerate:
+    /// every request floors to "citizen".
+    ///
+    /// Acceptance (CBP): this test was run BEFORE the normalizer existed and
+    /// failed — the response came back "administrator" — so it is a live
+    /// gauge, not a test that passes for free beside its own fix.
+    ///
+    /// Second assertion (the #68 shape, one field over): BOTH connect paths
+    /// echo the STORED, normalized value — a readback, not a mirror of the
+    /// request variable — so the two paths cannot disagree about what was
+    /// assigned.
+    #[tokio::test]
+    async fn connect_assigned_role_normalizes_fail_closed_and_both_paths_echo_stored_state() {
+        let (_dir, shared) = make_shared_state();
+        // Fresh path: assert a role no entitlement source granted.
+        let a = tool_connect(&shared, &json!({
+            "plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "hs-role",
+            "requested_role": "administrator"
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            a["assignedRole"], "citizen",
+            "an unentitled requested_role must normalize fail-closed, got: {a}"
+        );
+        // The stored state is the normalized value, not the assertion.
+        {
+            let s = shared.lock().await;
+            let sess = s.sessions.values().next().unwrap();
+            assert_eq!(
+                sess.assigned_role, "citizen",
+                "stored assigned_role must be the normalized floor, not the request"
+            );
+        }
+        // Reuse path: same stored value — a readback consistent with fresh.
+        let b = tool_connect(&shared, &json!({
+            "plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "hs-role",
+            "requested_role": "administrator"
+        }))
+        .await
+        .unwrap();
+        assert_eq!(b["reused"], true, "same host_session_id must reuse: {b}");
+        assert_eq!(
+            b["assignedRole"], a["assignedRole"],
+            "reuse must echo the same stored value as fresh: fresh={a} reuse={b}"
         );
     }
 
