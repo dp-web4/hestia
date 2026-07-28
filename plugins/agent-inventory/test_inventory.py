@@ -25,8 +25,10 @@ import json
 import os
 import plistlib
 import re
+import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import inventory
@@ -379,6 +381,53 @@ def test_wrapper_heredoc_is_inert():
         check(f"only the named pins expand in the {delim} heredoc", live, [])
 
 
+def test_plist_xml_escaping():
+    """The whitelist above renames the plist's pins to XML_*; this asks whether they escape.
+
+    A PROBE THIS GUARD WAS NOT WRITTEN AROUND, applied to the guard I just wrote (McNugget,
+    2026-07-28). The whitelist change is a RENAME CHECK: it fails if a raw `$HOME` comes
+    back to the plist, and it says nothing about whether `xml_escape` escapes anything. Break
+    the `s/&/\\&amp;/` in that sed and every static check above stays green — which is the
+    same "the check names the thing instead of running it" shape this thread has now found
+    four times. So this one runs it.
+
+    `&`, `<` and `>` are legal in a POSIX path and are metacharacters in XML. Measured on
+    macOS 26.5 with HESTIA_WORKSPACE=/tmp/mcn-sb2/R&D: plutil refused the generated plist
+    ("unknown ampersand-escape sequence at line 10"), the installer removed it, and the
+    periodic trigger was gone while the other two triggers installed clean — the wrapper
+    quotes its interpolation and the hook goes through shlex.quote, so shell syntax already
+    handled what XML did not.
+
+    The round-trip is the assertion that matters: escaping is only correct if a parser gives
+    the ORIGINAL path back. Verified live too — launchd holds `/tmp/mcn-sb3/R&D`, decoded,
+    and the job ran with 0 bytes on stderr.
+    """
+    src = (Path(__file__).parent / "install.sh").read_text()
+    m = re.search(r"^xml_escape\(\)\s*\{.*\}\s*$", src, re.M)
+    check("xml_escape is defined in install.sh", bool(m), True)
+    if not m:
+        return
+    probe = "/tmp/R&D/<a>/b & c"
+    r = subprocess.run(["bash", "-c", m.group(0) + '\nxml_escape "$1"', "_", probe],
+                       capture_output=True, text=True)
+    check("xml_escape exits 0", r.returncode, 0)
+    check("xml_escape escapes & < >", r.stdout, "/tmp/R&amp;D/&lt;a&gt;/b &amp; c")
+    # The whole point: a parser must give the path back unchanged. `&` first in that sed or
+    # the `&amp;` it just wrote gets escaped again into `&amp;amp;`, which round-trips wrong
+    # rather than failing to parse — the failure this assertion exists for.
+    #
+    # CAUGHT, NOT RAISED, and that is not decoration: the sabotage probe for this test
+    # (delete the `&` rule from the sed) makes the value UNPARSEABLE, and an uncaught
+    # ParseError ends the run on a traceback with the checks after it never reached. A guard
+    # that crashes is not a guard that reports — the same distinction as a wrapper that
+    # exits 127 silently, one layer up.
+    try:
+        back = ET.fromstring(f"<r><string>{r.stdout}</string></r>")[0].text
+    except ET.ParseError as e:
+        back = f"<not well-formed XML: {e}>"
+    check("the escaped value parses and decodes back to the path", back, probe)
+
+
 # `<<-?` then an optionally quoted word; `(?!<)` so the `<<<junk` in install.sh's own
 # prose about plutil is a herestring and not a delimiter named `<junk`.
 _HEREDOC_RE = re.compile(r"""<<-?(?!<)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1""")
@@ -392,9 +441,16 @@ _MAY_EXPAND = {
     "WRAP": frozenset({"PYTHON", "BIN", "WORKSPACE"}),
     # The systemd --user unit: what to run and where from.
     "EOF": frozenset({"SRC_DIR", "BIN", "WORKSPACE"}),
-    # The launchd plist: same, plus the paths launchd needs spelled out absolutely.
-    "PLIST_EOF": frozenset({"BIN", "HOME", "LAUNCHD_LABEL", "LAUNCHD_PATH",
-                            "LOG_DIR", "WORKSPACE"}),
+    # The launchd plist: same, plus the paths launchd needs spelled out absolutely — and
+    # every one of them XML-ESCAPED, which is why they are the XML_* names and not the raw
+    # ones (McNugget, 2026-07-28). The raw names are deliberately NOT in this set: a `$HOME`
+    # put back into the plist is a value reaching a syntax that cannot hold it, and this
+    # whitelist is already the thing that notices a name it was not told about. `&`, `<` and
+    # `>` are legal in a POSIX path and are metacharacters in XML; measured with a workspace
+    # named `R&D`, plutil refused the plist and the periodic trigger was lost. See the
+    # xml_escape block in install.sh.
+    "PLIST_EOF": frozenset({"XML_BIN", "XML_HOME", "XML_LABEL", "XML_PATH",
+                            "XML_LOG_DIR", "XML_WORKSPACE"}),
 }
 
 # A live `$` is either `${NAME}`, `$NAME`, or something with no name at all — `$(`, `$$`,
@@ -451,6 +507,7 @@ if __name__ == "__main__":
     test_fallback_enumeration()
     test_interpreter_finding()
     test_wrapper_heredoc_is_inert()
+    test_plist_xml_escaping()
     with tempfile.TemporaryDirectory() as d:
         test_verdict(Path(d))
     with tempfile.TemporaryDirectory() as d:

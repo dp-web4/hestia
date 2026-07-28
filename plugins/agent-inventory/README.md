@@ -400,6 +400,50 @@ supplies `HOME`; on Linux that same command never reaches line 411, so **the cla
 reproduced here until this guard existed. With `HOME` set and `USER` unset, Linux does
 match it: rc=0, all three steps, hook at timeout 20s, `lingering: OFF`.
 
+**The whitelist says which names may expand; it does not say the value fits the file being
+generated** (McNugget, 2026-07-28, measured on macOS 26.5 by installing). Three generated
+files, three target syntaxes. The two whose syntax is shell already handle this — the
+wrapper interpolates inside double quotes, the `SessionStart` hook goes through
+`shlex.quote`. The plist's syntax is XML and it interpolated raw, and `&`, `<`, `>` are
+legal in a POSIX path. Measured with `HESTIA_WORKSPACE=/tmp/mcn-sb2/R&D`, a folder name a
+Mac user types without thinking: `plutil` reported *"Encountered unknown ampersand-escape
+sequence at line 10"*, the installer removed the plist, and **the periodic trigger was
+gone** — while the same run's other two triggers installed clean and the hook read
+`--workspace '/tmp/mcn-sb2/R&D'`. One trigger of three, lost to a character in a path.
+
+**Sized the way this thread has been sizing things: not a silent failure.** The
+lint-before-load guard caught it, said so, and `skip_periodic()` made the gap self-reporting
+(`scope.periodic_trigger=absent`, `NO PERIODIC TRIGGER` on `--brief`). That is the backstop
+working, and it stays exactly where it is — it also catches truncation, which escaping does
+not. What was wrong is that a path was allowed to reach a syntax that could not hold it, and
+the diagnostic named `plutil`'s parser message rather than the character in the reader's own
+workspace path. Fixed with `xml_escape` and `XML_*` pins; verified live, launchd holds
+`/tmp/mcn-sb3/R&D` **decoded**, the job ran, stderr 0 bytes.
+
+**And the probe the guard was not written around, applied to that guard.** Renaming the
+plist's pins to `XML_*` makes the whitelist above refuse a raw `$HOME` — but it is a
+*rename* check, and it stays green if `xml_escape` stops escaping. So the test runs the
+function. Four sabotage probes, red with `bash -n` clean in each: a raw `$HOME` back in the
+plist, the `&` rule deleted from the sed, the `&` rule moved last, the function deleted. The
+third is the one that argues for asserting a **round-trip** rather than an output string —
+escaping `&` last turns `<` into `&amp;lt;`, which is still *well-formed* XML, so a parser
+accepts it happily and hands back `&lt;` instead of `<`. And the second probe found a defect
+in the test itself: an uncaught `ParseError` ended the run on a traceback with the later
+checks never reached. A guard that crashes is not a guard that reports — the same
+distinction as a wrapper that exits 127 silently, one layer up. Now caught and reported.
+
+**The one claim in the block above that needed Darwin, corrected** (McNugget, 2026-07-28,
+measured on macOS 26.5). *"`env -i` on Darwin supplies `HOME`, where bash 3.2 does"* is
+**false on this box.** `env -i /bin/bash -c 'echo ${HOME-UNSET}'` prints `UNSET` on
+3.2.57, and bash 3.2 defaults exactly what bash 5.2 defaults — `PATH`, `SHELL`, `PWD`,
+`SHLVL` yes; `HOME`, `USER`, `LOGNAME` no. Run against the pre-guard revision, `env -i`
+died on Darwin at `line 61: HOME: unbound variable` — same line, same message, nothing
+installed. So the `USER` finding was never Darwin-only: it reached line 411 because it was
+measured under a **sandboxed `$HOME`** (`env -i HOME=/tmp/…`), which is the sandbox this
+whole thread has run in, not a bash version. The reasoning the claim was attached to is
+untouched and right, and the `HOME` guard is worth *more* than that note said — on Darwin it
+is reachable by the very command that was said to bypass it.
+
 **The two queued nits, taken by whoever touched the file next.** The provenance line was a
 real wrong output — `${HESTIA_WORKSPACE:+from HESTIA_WORKSPACE}${HESTIA_WORKSPACE:-…}`
 prints the label *and then the value*, so a set `HESTIA_WORKSPACE` read `from
