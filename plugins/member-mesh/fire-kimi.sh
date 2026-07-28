@@ -85,6 +85,35 @@ HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # not hardcoded: the absolute path tied every fire — and the rendered-layer suite
 # in CI — to one machine's layout (the gate's first rendered-layer red, 2026-07-28).
 # HESTIA_WORKSPACE overrides.
+
+# DECLARE THE ROLE THE WOKEN MEMBER ACTS UNDER (dp, 2026-07-28: "kimi's member alias still
+# shows unmeasured with over 3k actions").
+#
+# `witness.py` — the hook that records every outcome — reads HESTIA_ROLE from its
+# environment and OMITS the role when it is unset, at which point the daemon defaults to
+# role:constellation:member. A mesh-fired session inherited no HESTIA_ROLE, so every act it
+# performed landed on the `member` grain while the member's own gate decisions landed on its
+# declared role. Acts on one grain, the decisions governing them on another, and neither
+# grain can score conduct: measured today, kimi had 688 outcomes on interactive-dev and 471
+# on member, the member-grain ones MORE RECENT — so this was still happening, not history.
+#
+# Resolved from the member's OWN identity file rather than hardcoded here: the identity is
+# the authority on its role, and baking a literal into the launcher would be a second place
+# to drift. Unreadable or unset => omitted, exactly as before, so this cannot break a member
+# whose identity we cannot read — it just leaves that member's split visible, which is the
+# honest state and is now reported by the derivation.
+if [[ -z "${HESTIA_ROLE:-}" ]]; then
+  _ident="~/.kimi-code/hestia-instance/identity.json"
+  if [[ -r "${_ident/#\~/$HOME}" ]]; then
+    _role=$(python3 -c 'import json,sys
+try:
+    r=json.load(open(sys.argv[1])).get("role")
+    print(r if isinstance(r,str) and r.startswith("role:") else "")
+except Exception:
+    print("")' "${_ident/#\~/$HOME}" 2>/dev/null)
+    [[ -n "$_role" ]] && export HESTIA_ROLE="$_role"
+  fi
+fi
 cd "${HESTIA_WORKSPACE:-$(cd "$HERE_DIR/../../.." && pwd)}" && "$HERE_DIR/with-member-lock.sh" kimi-code \
   timeout -k 30 1800 kimi -p "$PROMPT" > "$LOG_DIR/kimi-$STAMP.log" 2>&1
 # The fired CLI's rc IS this script's rc — see fire-claude.sh. The two

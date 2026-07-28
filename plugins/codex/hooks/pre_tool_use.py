@@ -422,6 +422,20 @@ def _emit_attestation(allows, denies):
                    "params": {"name": "hestia_connect",
                               "arguments": {"plugin_id": HESTIA_PLUGIN_ID,
                                             "host_agent": HESTIA_PLUGIN_ID,
+                                            # DECLARE THE ROLE ON CONNECT (dp, 2026-07-28:
+                                            # "kimi's member alias still shows unmeasured
+                                            # with over 3k actions"). This gate has always
+                                            # KNOWN its role — it writes `_identity_role()`
+                                            # into the attestation payload below — and never
+                                            # told the daemon on connect, so the session
+                                            # defaulted to role:constellation:member and the
+                                            # attestation landed on a grain the member does
+                                            # not act under. Acts on one grain, the decisions
+                                            # governing them on another, and NEITHER can score
+                                            # conduct. The capability to declare arrived with
+                                            # the connect-echoes-role work; this is the caller
+                                            # that never started using it.
+                                            "role": _identity_role(),
                                             "instance_name": "gate-attest"}}}, 1.5, h)
     sess = None
     for line in raw.decode("utf-8", "replace").splitlines():
