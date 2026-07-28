@@ -28,6 +28,10 @@ name: ci
 # time. It does NOT make red block a merge — that is branch protection, which lives
 # in repo settings and cannot be self-applied by a workflow file. Until a steward
 # configures it, "CI exists" must not be read as "CI gates."
+#
+# And one clause further, learned the hard way below: until a green has actually
+# been observed, "CI runs" must not be read as "CI exists." The sentence above was
+# written by a file that could not resolve its own dependency graph.
 
 on:
   pull_request:
@@ -39,15 +43,47 @@ jobs:
     name: cargo test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Two checkouts, because `core/Cargo.toml` has four path dependencies that
+      # leave the repository: `web4-core`, `hub/hub-plugin`, `web4-trust-core` and
+      # `web4-policy`, all `../../web4/...` — i.e. resolved against the PARENT of
+      # the hestia checkout. A single default `actions/checkout@v4` puts hestia at
+      # `$GITHUB_WORKSPACE` with nothing beside it, so cargo cannot even build the
+      # dependency graph: every run of this workflow between 2026-07-27T23:42Z
+      # (#78's own PR) and this commit died in 8-22s on
+      #
+      #   error: failed to get `hub-plugin` as a dependency of package `hestia`
+      #   Caused by: failed to read /home/runner/work/hestia/web4/hub/hub-plugin/Cargo.toml
+      #
+      # — ten consecutive runs, zero greens, including the four pushes to `main`
+      # that merged #62/#67/#70/#81 and the two PRs open at the time. The gate was
+      # installed and never once ran a test. It read as armed because `gh pr checks`
+      # reported a named check, and because red does not block a merge (see NOTE ON
+      # SCOPE above), so nothing forced anyone to open the log. A gate that has
+      # never been green cannot tell you a regression from its own misconfiguration:
+      # its red carries no information. Whoever next touches this file should make
+      # it fail for the RIGHT reason once before trusting a green.
+      #
+      # `path:` is required on both — checkout refuses a destination outside the
+      # workspace, so hestia cannot be placed one directory down from `web4`; both
+      # are placed one directory IN, which resolves the same relative path.
+      - name: Check out hestia
+        uses: actions/checkout@v4
+        with:
+          path: hestia
+
+      - name: Check out the sibling web4 (four path deps in core/Cargo.toml)
+        uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          path: web4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: core
+          workspaces: hestia/core
 
       - name: Test
-        working-directory: core
+        working-directory: hestia/core
         run: cargo test --locked
