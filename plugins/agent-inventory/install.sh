@@ -23,6 +23,22 @@ set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# `sh_pin` IS DEFINED HERE, NOT AT ITS OTHER USE 290 LINES DOWN (cbp, 2026-07-28).
+# McNugget's fifth surface — the installer's own printed advice is a shell syntax — is
+# right, and the two lines they fixed are not the only instances. The other two are the
+# `Re-run with:` lines in the workspace and HOME refusals, both of which run BEFORE the
+# old definition site, so the fix was not merely unapplied there: it was unreachable.
+# A quoting helper that comes into existence a third of the way down the file cannot
+# protect the refusals, which are the earliest thing this script prints and the messages
+# an operator is most likely to paste without reading — they are what a failed install
+# hands them. Moving one line up is the whole change; the SH_* values stay at their old
+# site because they depend on values not established yet here.
+#
+# Single quotes are the only shell quoting with no interior expansion at all, so this
+# emits the value inside them and closes-escapes-reopens for an embedded quote (`'\''`),
+# the one character single quotes cannot hold.
+sh_pin() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
 # THE WORKSPACE MUST NOT DEPEND ON WHERE THIS SCRIPT WAS RUN FROM (cbp, 2026-07-26).
 # It was `$SRC_DIR/../../..` — correct from the primary checkout, and silently `/tmp` from
 # a detached worktree, baked into all three triggers at once. It fails in the reassuring
@@ -42,22 +58,31 @@ elif GIT_COMMON_DIR="$(git -C "$SRC_DIR" rev-parse --path-format=absolute \
   WORKSPACE="$(cd "$GIT_COMMON_DIR/../.." && pwd)"
 else
   echo "install: cannot establish the workspace." >&2
-  echo "  $SRC_DIR is not inside a git checkout, or git is too old for" >&2
+  echo "  $(sh_pin "$SRC_DIR") is not inside a git checkout, or git is too old for" >&2
   echo "  --path-format=absolute (needs 2.31+). Refusing to guess: the old fallback was" >&2
   echo "  \$SRC_DIR/../../.., which from a detached worktree silently yields /tmp and" >&2
   echo "  bakes it into all three triggers." >&2
-  echo "  Re-run with: HESTIA_WORKSPACE=/path/to/workspace $0" >&2
+  # `$0` PINNED: this line is a COMMAND, and it is the third instance of McNugget's
+  # fifth surface. `$0` is the path this script was invoked as — which is inside the
+  # workspace, so it carries exactly the metacharacters the rest of this file is about.
+  # Sized honestly and SMALLER than theirs: `$0` is always in command position, so a
+  # corrupted word does not resolve and the paste fails loudly (measured on Linux:
+  # rc=127 for `$`, space and backtick; rc=2 for the apostrophe). The exception is the
+  # one that matters — ``…/it`id`s`` substitutes BEFORE it fails, so `id` ran in the
+  # operator's shell and its output was what the shell then tried to execute. Loud
+  # afterwards is not the same as never having run.
+  echo "  Re-run with: HESTIA_WORKSPACE=/path/to/workspace $(sh_pin "$0")" >&2
   exit 1
 fi
 # Establishing it is not the same as it being right. agent-atlas/talk-to is the registry
 # the check cannot run without, so its absence is worth saying HERE — at install time,
 # once — rather than as an UNKNOWN from three triggers an hour for the rest of the week.
 if [ ! -d "$WORKSPACE/agent-atlas/talk-to" ]; then
-  echo "install: WARNING — resolved workspace $WORKSPACE has no agent-atlas/talk-to." >&2
+  echo "install: WARNING — resolved workspace $(sh_pin "$WORKSPACE") has no agent-atlas/talk-to." >&2
   echo "         Every trigger will report UNKNOWN ('could not look') until it does." >&2
 fi
 if [ -n "${HESTIA_WORKSPACE:-}" ]; then WS_FROM="from HESTIA_WORKSPACE"; else WS_FROM="from git --git-common-dir"; fi
-echo "workspace:  $WORKSPACE  ($WS_FROM)"
+echo "workspace:  $(sh_pin "$WORKSPACE")  ($WS_FROM)"
 
 # THE SAME SENTENCE, ABOUT THE LOAD-BEARING VARIABLE (cbp, 2026-07-28, measured on Linux).
 # The USER note below says it exactly: a variable set by login shells and absent from
@@ -97,7 +122,7 @@ if [ -z "${HOME:-}" ]; then
   echo "         Login shells set it; scrubbed environments (containers, CI, anything" >&2
   echo "         launchd or systemd starts) do not, and bash does not default it." >&2
   echo "         Refusing to guess a home directory: nothing has been installed." >&2
-  echo "         Re-run with: HOME=/path/to/home $0" >&2
+  echo "         Re-run with: HOME=/path/to/home $(sh_pin "$0")" >&2
   exit 1
 fi
 
@@ -270,7 +295,7 @@ fi
 # rejected in step 0 — that dropped two working triggers to punish a third; this is the
 # interpreter all three of them are, so there is nothing left to install that would work.
 if ! "$PYTHON" -c '' 2>/dev/null; then
-  echo "install: $PYTHON is on PATH but cannot run python." >&2
+  echo "install: $(sh_pin "$PYTHON") is on PATH but cannot run python." >&2
   echo "         On macOS that is the /usr/bin/python3 xcrun stub with no Xcode command" >&2
   echo "         line tools behind it: xcode-select --install, or put a working python3" >&2
   echo "         first on PATH. Nothing has been installed; all three triggers would run" >&2
@@ -312,7 +337,8 @@ install -m 0755 "$SRC_DIR/inventory.py" "$BIN.py"
 # them and closes-escapes-reopens for an embedded quote (`'\''`) — the one character
 # single quotes cannot hold. Every other use in the wrapper is then a plain `$PY_PIN` /
 # `$WS_PIN` / `$BIN_PIN`, and a variable's VALUE is never re-parsed as shell.
-sh_pin() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+# (`sh_pin` itself is now defined at the top of the file — see the note there: the
+# refusal messages that need it run long before this point.)
 SH_PYTHON="$(sh_pin "$PYTHON")"
 SH_BIN="$(sh_pin "$BIN")"
 SH_WORKSPACE="$(sh_pin "$WORKSPACE")"
@@ -418,8 +444,8 @@ fi
 exec env HESTIA_WORKSPACE="\${HESTIA_WORKSPACE:-\$WS_PIN}" "\$PY" "\$BIN_PIN.py" "\$@"
 WRAP
 chmod 0755 "$BIN"
-echo "installed: $BIN  (source: $SRC_DIR/inventory.py, workspace pinned to $WORKSPACE)"
-echo "           interpreter pinned to $PYTHON"
+echo "installed: $SH_BIN  (source: $(sh_pin "$SRC_DIR/inventory.py"), workspace pinned to $SH_WORKSPACE)"
+echo "           interpreter pinned to $SH_PYTHON"
 
 # Said HERE, once, at the only moment a human is watching — the same argument as the
 # agent-atlas warning at the top. The wrapper will survive the pin going stale, but a pin
@@ -580,8 +606,8 @@ echo "installed: hourly timer (systemd --user)"
 if loginctl show-user "$USER_N" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
   echo "  lingering: ON — the timer fires even with no login session"
 else
-  echo "  lingering: OFF — this timer ONLY fires while $USER_N has a session."
-  echo "             enable with: loginctl enable-linger $USER_N   (needs sudo)"
+  echo "  lingering: OFF — this timer ONLY fires while $(sh_pin "$USER_N") has a session."
+  echo "             enable with: loginctl enable-linger $(sh_pin "$USER_N")   (needs sudo)"
 fi
 else
   # Same shape as the plist's: unverified means uninstalled, said out loud, and step 3
@@ -707,7 +733,7 @@ if [ "$PERIODIC" = launchd ]; then
     launchctl unload "$PLIST" 2>/dev/null || true
     BOOTSTRAP_ERR="$(launchctl load "$PLIST" 2>&1)" || true
   }
-  echo "installed: hourly launchd agent ($PLIST)"
+  echo "installed: hourly launchd agent ($(sh_pin "$PLIST"))"
 
   # `launchctl load` SUCCEEDS ON A VALID PLIST AND SAYS NOTHING ABOUT THE JOB (same
   # finding, deploy/fleet 2026-07-25). So the claim is not "we wrote a file with
@@ -717,12 +743,12 @@ if [ "$PERIODIC" = launchd ]; then
   PRINTED="$(launchctl print "gui/$UID_N/$LAUNCHD_LABEL" 2>&1 || true)"
   INTERVAL="$(printf '%s\n' "$PRINTED" | sed -n 's/.*interval *= *\([0-9][0-9]*\).*/\1/p' | head -1)"
   if [ "$INTERVAL" = 3600 ]; then
-    echo "  launchd:   job loaded in gui/$UID_N, run interval = ${INTERVAL}s"
+    echo "  launchd:   job loaded in gui/$(sh_pin "$UID_N"), run interval = ${INTERVAL}s"
   else
     echo "  WARNING:   the plist is on disk and lints, but launchd does not report a" >&2
-    echo "             3600s run interval for $LAUNCHD_LABEL." >&2
+    echo "             3600s run interval for $(sh_pin "$LAUNCHD_LABEL")." >&2
     echo "             launchctl bootstrap said: ${BOOTSTRAP_ERR:-(nothing)}" >&2
-    echo "             launchctl print gui/$UID_N/$LAUNCHD_LABEL for the full state." >&2
+    echo "             launchctl print $(sh_pin "gui/$UID_N/$LAUNCHD_LABEL") for the full state." >&2
     echo "             Treat the schedule as NOT wired until that says otherwise." >&2
   fi
 
@@ -732,7 +758,7 @@ if [ "$PERIODIC" = launchd ]; then
   # will-fire — and it is worse here because there is no `enable-linger` to point at. The
   # honest remedy is a LaunchDaemon (root, system domain), which is a privilege escalation
   # this observation-only check has no business asking for.
-  echo "  session:   gui/$UID_N — this agent fires only while $USER_N is logged in."
+  echo "  session:   gui/$(sh_pin "$UID_N") — this agent fires only while $(sh_pin "$USER_N") is logged in."
   echo "             There is no launchd equivalent of loginctl enable-linger for a user"
   echo "             agent; a fire missed while logged out or asleep happens ONCE at next"
   echo "             load, not once per missed hour (no Persistent= analogue)."
@@ -768,7 +794,11 @@ fi
 HOOK_TIMEOUT="$("$BIN" --print-hook-timeout 2>/dev/null || true)"
 case "$HOOK_TIMEOUT" in
   ''|*[!0-9]*)
-    echo "install: '$BIN --print-hook-timeout' did not return an integer (got" >&2
+    # McNugget's second reported nit, taken rather than queued. The outer single quotes
+    # were prose-quoting a command, which is the same conflation the whole thread is
+    # about — and they made pinning impossible, since a pinned value carries its own
+    # single quotes. Dropped them and pinned instead: the line is now the command.
+    echo "install: $SH_BIN --print-hook-timeout did not return an integer (got" >&2
     echo "         '${HOOK_TIMEOUT}'). That flag is where the SessionStart timeout comes" >&2
     echo "         from; without it this script would have to hardcode a second copy of" >&2
     echo "         the scan budget, which is the drift it exists to prevent." >&2
@@ -858,7 +888,7 @@ if final[0].get("timeout") != tmo:
              f"{tmo} (derived from the scan budget) — {path} left as written")
 PY
 else
-  echo "SessionStart hook: skipped ($SETTINGS not found)"
+  echo "SessionStart hook: skipped ($(sh_pin "$SETTINGS") not found)"
 fi
 
 echo
@@ -900,9 +930,9 @@ elif [ "$PERIODIC" = launchd ]; then
   # No `list-timers` here: launchd exposes the interval, not the next fire time, so this
   # says the interval and where the last one went rather than inventing a timestamp.
   echo "next fire:  within 3600s of the last run — launchd reports the interval, not a"
-  echo "            next-fire time. Output: $LOG_DIR/agent-inventory.log (.err for stderr)"
-  echo "            state:  launchctl print gui/$UID_N/$LAUNCHD_LABEL"
-  echo "            now:    launchctl kickstart -p gui/$UID_N/$LAUNCHD_LABEL"
+  echo "            next-fire time. Output: $(sh_pin "$LOG_DIR/agent-inventory.log") (.err for stderr)"
+  echo "            state:  launchctl print $(sh_pin "gui/$UID_N/$LAUNCHD_LABEL")"
+  echo "            now:    launchctl kickstart -p $(sh_pin "gui/$UID_N/$LAUNCHD_LABEL")"
 else
   echo "next fire:  never on its own — no periodic trigger on this platform ($PERIODIC_WHY)"
 fi

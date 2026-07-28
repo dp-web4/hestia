@@ -748,6 +748,214 @@ def test_printed_advice_is_pasteable():
         check(f"the printed export line runs nothing ({label})", back.stderr, "")
 
 
+    # The Re-run lines this file's sibling test could not see, round-tripped the same way.
+    # DISCOVERED, not named: every line the installer prints after `Re-run with: ` is
+    # lifted, run, and pasted. The list below is what the file contains, not what this
+    # test was written from — add a third refusal message and it is covered on arrival.
+    # NB: not `"[^"]*Re-run with:[^"]*"` — the pinned form `$(sh_pin "$0")` contains a
+    # quote, so a non-greedy string match truncates the line mid-substitution and every
+    # probe then fails on a bash syntax error rather than on the defect. (It did; the
+    # first version of this test was red for the wrong reason, which is the failure mode
+    # McNugget's own quiet probe was written to avoid.)
+    reruns = [l.split(" >&2")[0].strip()
+              for l in src.splitlines() if re.match(r'\s*echo ".*Re-run with:', l)]
+    check("install.sh has Re-run advice lines to check", len(reruns) >= 2, True)
+    with tempfile.TemporaryDirectory() as td:
+        for probe in ["cost$avings", "it`id`s", "a b", "o'brien"]:
+            d = Path(td) / probe
+            d.mkdir()
+            stub = d / "install.sh"
+            stub.write_text('#!/bin/sh\nprintf STUB-RAN-%s "$0"\n')
+            stub.chmod(0o755)
+            for i, line in enumerate(reruns):
+                # `$0` is bound by bash -c's first positional, which is what the real
+                # `$0` in these lines is: the path the script was invoked as.
+                s = pin.group(0) + "\n" + line + "\n"
+                r = subprocess.run(["bash", "-c", s, str(stub)],
+                                   capture_output=True, text=True)
+                printed = r.stdout.strip()
+                check(f"rerun line {i} prints ({probe})", bool(printed), True)
+                if not printed:
+                    continue
+                cmd = printed.split("Re-run with: ", 1)[1]
+                back = subprocess.run(["/bin/sh", "-c", cmd],
+                                      capture_output=True, text=True, env=env)
+                # The whole assertion: the pasted line reaches the SAME file, and the
+                # shell ran nothing else on the way. Unpinned, `$` and space resolve to
+                # a different path (rc 127), the apostrophe is a parse error (rc 2), and
+                # the backtick SUBSTITUTES FIRST — `id` runs in the operator's shell and
+                # its output becomes the command word. Loud afterwards is not the same
+                # as never having run, and that is the case this catches.
+                check(f"the pasted rerun line reaches the installer ({probe})",
+                      back.stdout, f"STUB-RAN-{stub}")
+
+
+# THE PREDICATE IS THE THING THAT KEEPS BEING WRONG (cbp, 2026-07-28), so this test does
+# not have one. McNugget's own sentence about `sh_pin` — "quote only when it looks like it
+# needs it is a predicate that has to be right about every future metacharacter" — is true
+# one level further out than they applied it: the test above quotes the right way, but
+# WHICH lines it protects is itself a predicate, spelled as two literal regexes. Measured:
+# adding `echo "or: hestia-agent-inventory --workspace $WORKSPACE --brief"` directly BELOW
+# the line it fixed leaves the suite green and `bash -n` clean.
+#
+# Four predicates have now been wrong in four hops — "it is a generated file" (missed the
+# advice), "it is shell already" (double quotes), "it looks like it needs it", and "these
+# two lines". So the rule here has no exemption clause to get wrong: the installer never
+# prints a raw path, informational or not. That costs quotes on lines that had no defect,
+# and buys the removal of the judgement call. It is not the wider ban McNugget rightly
+# refused for the heredocs — that one would have broken the unit and plist, which MUST
+# interpolate at systemd/launchd parse time. Nothing downstream parses this script's
+# stdout (checked: only prose in README and docstrings quotes it), so pinning costs
+# capability nowhere. And on a tool whose entire subject is "the path you got is not the
+# path you meant", printing the exact bytes is arguably the better output anyway.
+# THE FIRST VERSION OF THIS RULE WAS AN ALLOWLIST OF PATH VARIABLES, WHICH IS THE SAME
+# DEFECT ONE TURN LATER. `PATH_VARS = (WORKSPACE, BIN, PYTHON, ...)` refuses exactly the
+# variables somebody thought of, so a NEW variable interpolated into printed output is
+# invisible to it — and there were four already in the file when I wrote it: `$USER_N` in
+# `loginctl enable-linger $USER_N` and `gui/$UID_N/$LAUNCHD_LABEL` in three launchctl
+# lines, all of them commands an operator pastes. I only saw them because the end-to-end
+# install printed them; the rule I had just written said nothing.
+#
+# So it is inverted: EVERY raw expansion in an echo is refused, and the exceptions are
+# enumerated here with a reason each. Unknown variable -> refused, which is the shape
+# McNugget accepted for the heredoc whitelist two hops ago (unknown heredoc -> empty
+# allowed set), applied to the printed side.
+#
+# HONEST ABOUT WHAT IS LEFT: this does not abolish the judgement call, it relocates it
+# from "is this LINE pasteable?" (one decision per line, unrecorded, made by whoever adds
+# a line) to "can this VARIABLE ever hold a path or a shell word?" (one decision per
+# variable, recorded here, reviewed once). That is smaller and auditable, not zero. The
+# claim "no predicate" would be false and this thread has spent six hops on predicates
+# that were believed rather than checked.
+RAW_OK = {
+    "WS_FROM": "one of two literal phrases this script chose; never a path",
+    "PERIODIC": "systemd|launchd|none — chosen from a fixed set here",
+    "PERIODIC_WHY": "an English clause this script wrote",
+    "PIN_WHY": "an English clause this script wrote",
+    "UNIT_LINT": "systemd-analyze's message, quoted as reported; see test_unit_verdict",
+    "INTERVAL": "an integer this script wrote",
+    "BOOTSTRAP_ERR": "launchctl's stderr, quoted as reported and not as a command",
+    "HOOK_TIMEOUT": "the value being REJECTED for not being an integer; printed as data",
+}
+
+
+def _raw_expansions(line: str) -> list[str]:
+    """Raw interpolations left in an echo line after pinned and permitted ones are gone.
+
+    Order matters: `$(sh_pin "$SRC_DIR")` CONTAINS `$SRC_DIR`, so the pinned forms are
+    deleted first and whatever still matches is by definition unpinned. A `\\$SRC_DIR` is
+    an escaped literal naming the variable in prose (install.sh does this deliberately in
+    the workspace refusal) and is not an expansion.
+    """
+    stripped = re.sub(r'\$\(sh_pin "[^"]*"\)', "", line)
+    stripped = re.sub(r"\$\{?SH_[A-Z_]+\}?", "", stripped)
+    out = []
+    for m in re.finditer(r"(?<!\\)\$\{?([A-Za-z_][A-Za-z0-9_]*|0)\b", stripped):
+        if m.group(1) not in RAW_OK:
+            out.append("$" + m.group(1))
+    return out
+
+
+def _strip_heredocs_and_comments(src: str) -> list[tuple[int, str]]:
+    """(1-based lineno, code) for install.sh's own lines, minus heredoc bodies and
+    whole-line comments. Prose mentions `sh_pin` constantly — a check that counts those
+    as uses answers a different question than the one being asked."""
+    out, in_heredoc = [], None
+    for n, line in enumerate(src.splitlines(), 1):
+        if in_heredoc:
+            if line.strip() == in_heredoc:
+                in_heredoc = None
+            continue
+        m = re.search(r"<<-?\s*'?([A-Z][A-Z0-9_]*)'?\s*$", line)
+        if m:
+            in_heredoc = m.group(1)
+            continue
+        if re.match(r"\s*#", line) or not line.strip():
+            continue
+        out.append((n, line))
+    return out
+
+
+def test_helpers_are_defined_before_first_use():
+    """A quoting helper cannot protect what runs above it.
+
+    THIS CHECK EXISTS BECAUSE MY OWN FIX DIDN'T HAVE IT (cbp, 2026-07-28). The finding
+    one test up is that `sh_pin` sat 290 lines below the two refusal messages that needed
+    it, so the fix was not merely unapplied there — it was UNREACHABLE. Moving the
+    definition up is the fix; nothing then held it up. Measured by moving it back: the
+    suite stayed green, `bash -n` stayed clean, and the installer printed
+
+        install: cannot establish the workspace.
+        install.sh: line 73: sh_pin: command not found
+          Re-run with: HESTIA_WORKSPACE=/path/to/workspace
+
+    — the path GONE rather than merely unquoted, and `set -e` does not abort on a failed
+    substitution in an echo argument, so it exits 1 by its own hand as if it had said
+    something. That is a worse output than the defect it replaced, reachable only down
+    the refusal path, which is the path nobody runs. The tidy-up that re-breaks it is the
+    obvious one: put the helper next to the code that mostly uses it.
+
+    General rather than a `sh_pin`-shaped assertion, because writing the check to the size
+    of the example that produced it is this thread's standing finding about both of us.
+    """
+    src = (Path(__file__).parent / "install.sh").read_text()
+    code = _strip_heredocs_and_comments(src)
+    defs = {}
+    for n, line in code:
+        m = re.match(r"\s*([a-z_][a-z0-9_]*)\(\)\s*\{", line)
+        if m:
+            defs.setdefault(m.group(1), n)
+    check("install.sh defines shell helpers to check", len(defs) >= 2, True)
+    for name, dline in sorted(defs.items()):
+        uses = [n for n, line in code
+                if n != dline and re.search(r"\b" + name + r"\b", line)]
+        check(f"{name} is defined before its first use",
+              (name, min(uses) > dline if uses else True), (name, True))
+
+
+def test_no_raw_path_in_printed_output():
+    """Every `echo` in install.sh, with no exemption clause. See the note above.
+
+    This is deliberately a SCAN and not a round trip — the round trips above prove the
+    quoting works; this proves nothing was left out of them. The two checks answer
+    different questions and the plist/unit/wrapper pair split the same way.
+    """
+    src = (Path(__file__).parent / "install.sh").read_text()
+    # Heredoc bodies are a different language with a different parser and are covered by
+    # the whitelist tests above; this is about what THIS script prints.
+    body, in_heredoc = [], None
+    for line in src.splitlines():
+        if in_heredoc:
+            if line.strip() == in_heredoc:
+                in_heredoc = None
+            continue
+        m = re.search(r"<<-?\s*'?([A-Z][A-Z0-9_]*)'?\s*$", line)
+        if m:
+            in_heredoc = m.group(1)
+            continue
+        body.append(line)
+    echoes = [l for l in body if re.match(r"\s*echo ", l)]
+    check("install.sh has echo lines to scan", len(echoes) > 10, True)
+    raw = [(l.strip()[:78], _raw_expansions(l)) for l in echoes]
+    offenders = [(t, v) for t, v in raw if v]
+    check("no echo in install.sh interpolates a value raw", offenders, [])
+    # A variable nobody has classified is refused ON ARRIVAL — the property the allowlist
+    # version did not have, and the reason it missed four live lines.
+    check("an unclassified variable is refused",
+          _raw_expansions('echo "next: $BRAND_NEW_THING"'), ["$BRAND_NEW_THING"])
+    # The guard's own data, flipped — the check that separates "this rule denies it" from
+    # "something denies it". Put WORKSPACE into RAW_OK and a raw `$WORKSPACE` echo must
+    # stop being refused; if it is still refused, something else is doing the work and
+    # this rule is decoration.
+    probe = 'echo "on demand: hestia-agent-inventory --workspace $WORKSPACE"'
+    check("the rule refuses a raw echo", _raw_expansions(probe), ["$WORKSPACE"])
+    RAW_OK["WORKSPACE"] = "TEMPORARY — flipping the guard's own data"
+    try:
+        check("and it is THIS rule doing it", _raw_expansions(probe), [])
+    finally:
+        del RAW_OK["WORKSPACE"]
+
+
 if __name__ == "__main__":
     test_attribute()
     test_has_tag()
@@ -758,6 +966,8 @@ if __name__ == "__main__":
     test_wrapper_shell_quoting()
     test_unit_specifier_escaping()
     test_printed_advice_is_pasteable()
+    test_helpers_are_defined_before_first_use()
+    test_no_raw_path_in_printed_output()
     test_unit_verdict()
     with tempfile.TemporaryDirectory() as d:
         test_verdict(Path(d))
