@@ -132,6 +132,201 @@ def discover_endpoint() -> Optional[str]:
         return None
 
 
+
+# ---------------------------------------------------------------------------
+# THE GATE IS NOT THE AGENT'S TO EDIT — OR TO READ
+# ---------------------------------------------------------------------------
+#
+# dp, 2026-07-28: "an agent that wants to do something it doesn't want governed
+# can use this to turn off the gate, do whatever, then turn it back on like
+# nothing happened. that wouldn't be an accident :)"
+#
+# Correct, and it is the hole that makes every other control optional. Gate
+# integrity (#52) HASHES this file and reports drift on an operator endpoint —
+# tamper-EVIDENT, and only to a human who looks. Nothing in the decision path
+# consults it, so disable -> act -> restore leaves a clean record and a matching
+# hash. The whole governance model rests on a file the governed party can write.
+#
+# THE PRINCIPLE, which we already use elsewhere: you do not get to modify the
+# thing that governs you, for the same reason you do not get to rule on your own
+# appeal. Gate custody belongs to a not-self party.
+#
+# WHY READ IS DENIED TOO, and not only write: reading this file is how you find
+# its blind spots. Every false-positive class we hit this week was discoverable
+# by reading the matcher. Denying read forces evasion to be blind probing, which
+# is noisy, slow and leaves denials on the chain. It converts a silent read into
+# an audible attempt.
+#
+# WHY THIS RUNS BEFORE THE DAEMON CALL AND NEVER CONSULTS IT: if this check
+# required a verdict, then "kill the daemon, then edit the gate" would be the
+# same evasion one layer over. Self-protection has to hold when everything else
+# is down, so it is local, unconditional, and fails CLOSED.
+#
+# ON THE DELIBERATE JUDGE-BY-MENTION: for Bash this scans the WHOLE command for
+# any mention of a self path, which is exactly the matching style that produced
+# ten false positives this week and that policy::shell was written to fix. That
+# is intentional and the stakes invert here. A false positive costs a rephrase;
+# a false negative costs the entire governance model. `sed -i`, `cp`, `>`,
+# `python -c`, `tee` and a heredoc all reach this file by different syntax, and
+# an executable-position parse would have to be right about all of them.
+#
+# WHAT THIS IS NOT: containment. A determined agent can still reach the file by
+# a path this misses, or kill the hook process. This is A1 — cooperative. What it
+# removes is the CHEAP, SILENT version, and it removes "I didn't know" as an
+# account, because the refusal names the rule.
+_SELF = os.path.realpath(__file__)
+_SELF_DIR = os.path.dirname(_SELF)
+_SELF_MARKERS = (
+    _SELF,
+    _SELF_DIR,
+    "plugins/claude-code/hooks",
+    "hestia/hooks",
+)
+
+# THE GOVERNANCE SURFACE, not just this file. Protecting only `pre_tool_use.py`
+# was the first cut, and testing it found the gaps immediately: the SOCIETY gate
+# (`society_pre_tool_use.py` — the one that actually parked a member today) and
+# `witness.py` (the outcome recorder) were both reachable. Disarming the recorder
+# is the worse attack of the two: it does not produce denials, it produces
+# SILENCE, and silence is indistinguishable from "attempted nothing".
+#
+# Matched by filename anywhere, deliberately, so this holds for a peer's copy as
+# well as mine. An agent editing ANOTHER member's gate is not a lesser act — it
+# is disarming an entity that did not consent, and the record would name the
+# victim rather than the author.
+_GOVERNANCE_FILES = (
+    "pre_tool_use.py",
+    "society_pre_tool_use.py",
+    "post_tool_use.py",
+    "witness.py",
+    "law_inject.py",
+)
+
+
+def _touches_self(tool_name: str, tool_input: Any) -> Optional[str]:
+    """Return the matched marker if this call reaches the gate's own code."""
+    if not isinstance(tool_input, dict):
+        return None
+    haystacks = []
+    for key in ("file_path", "path", "notebook_path", "command", "content", "new_string"):
+        v = tool_input.get(key)
+        if isinstance(v, str) and v:
+            haystacks.append(v)
+    # Resolve relative paths against cwd so `../hooks/pre_tool_use.py` is caught.
+    resolved = []
+    for h in haystacks:
+        resolved.append(h)
+        try:
+            resolved.append(os.path.realpath(h))
+        except (OSError, ValueError):
+            pass
+    for h in resolved:
+        for marker in _SELF_MARKERS:
+            if marker and marker in h:
+                return marker
+        # Governance files by name, but only under a hooks directory — so this
+        # catches every member's gate and recorder without blocking an unrelated
+        # file that happens to share a common name.
+        low = h.replace("\\", "/")
+        if "hooks/" in low or "/hooks" in low:
+            for fname in _GOVERNANCE_FILES:
+                if fname in low:
+                    return fname
+    return None
+
+
+
+def _witness_self_access(marker: str, tool_name: str) -> bool:
+    """Append a `gate_self_access` event. Best effort, short budget.
+
+    Its own event_type rather than a policy_decision: a routine deny says an act
+    met a boundary; this says something tried to reach the boundary-DRAWING
+    mechanism. Those should be alertable separately, and burying the second in the
+    volume of the first is how it goes unnoticed.
+
+    Written against `McpHttp` as it actually exists. The first draft of this
+    invented a `DaemonClient(budget_s=).connect()/.call()` that appears nowhere —
+    the same reach-for-a-plausible-API reflex that produced `web4:observationCount`
+    and an invented ontology namespace earlier today. Checked, then written.
+    """
+    endpoint = discover_endpoint()
+    if endpoint is None:
+        return False
+    client = McpHttp(endpoint, time.monotonic() + 1.5)
+    try:
+        if "result" not in client.initialize():
+            return False
+        client.initialized()
+        conn = client.call_tool(
+            "hestia_connect",
+            {"plugin_id": PLUGIN_ID, "host_agent": HOST_AGENT, "instance_name": "gate-self"},
+        )
+        sid = None
+        res = conn.get("result") if isinstance(conn, dict) else None
+        if isinstance(res, dict):
+            content = res.get("content") or []
+            if content and isinstance(content[0], dict):
+                try:
+                    sid = json.loads(content[0].get("text") or "{}").get("sessionId")
+                except (json.JSONDecodeError, AttributeError):
+                    sid = None
+        if not sid:
+            return False
+        out = client.call_tool(
+            "hestia_request_witness",
+            {
+                "session_id": sid,
+                "event_type": "gate_self_access",
+                "event_data": {
+                    "plugin_id": PLUGIN_ID,
+                    "tool_name": tool_name,
+                    "marker": marker,
+                    "gate_path": _SELF,
+                    "severity": "escalate",
+                    "note": (
+                        "an agent attempted to read or modify the gate that governs it; "
+                        "refused locally and unconditionally"
+                    ),
+                },
+            },
+        )
+        return isinstance(out, dict) and "result" in out
+    except Exception:  # noqa: BLE001 — the record must never block the refusal
+        return False
+
+
+def deny_self_access(marker: str, tool_name: str) -> int:
+    """Refuse, loudly, and try to witness it as its own event class.
+
+    Deliberately NOT an ordinary deny: an ordinary deny is a boundary met in the
+    course of work. This is an attempt to reach the mechanism that draws the
+    boundaries, which is evidence about intent rather than about scope — so it
+    gets its own event type so an operator can alert on it separately, and so it
+    cannot be lost in the volume of routine refusals.
+
+    Witnessing is BEST EFFORT and the refusal does not depend on it: if the
+    daemon cannot be reached, the act is still refused and stderr still says so.
+    An unwitnessed refusal is a worse record, never a permission."""
+    witnessed = False
+    try:
+        witnessed = _witness_self_access(marker, tool_name)
+    except Exception:  # noqa: BLE001 — never let the record attempt block the refusal
+        witnessed = False
+    sys.stderr.write(
+        f"hestia: deny [gate-self-access] — {tool_name} reaches the gate's own code "
+        f"({marker}). The gate is not yours to read or modify: an agent that can edit "
+        f"the thing that governs it is not governed. This refusal is recorded as its own "
+        f"event class{'' if witnessed else ' (WITNESS FAILED — the refusal stands regardless)'}"
+        f" and is escalatable.\n"
+        f"If a gate change is genuinely needed, it is installed by the OPERATOR or a "
+        f"not-self custodian — ask, stating what you need changed and why. Do not "
+        f"self-install, and do not work around this by another route: doing so is the "
+        f"behaviour this rule exists to make visible.\n"
+    )
+    debug_log(f"gate-self-access deny: {tool_name} -> {marker} witnessed={witnessed}")
+    return 2
+
+
 def extract_target(tool_input: Any, tool_name: str) -> Optional[str]:
     if not isinstance(tool_input, dict):
         return None
@@ -539,6 +734,13 @@ def main() -> int:
     host_session_id = event.get("session_id")
     tool_use_id = event.get("tool_use_id") or event.get("session_id") or "no-id"
     tool_input = event.get("tool_input") or {}
+
+    # SELF-PROTECTION FIRST — before the daemon, and never conditional on it.
+    # If this required a verdict, "stop the daemon, then edit the gate" would be
+    # the same evasion one layer down.
+    _self_marker = _touches_self(tool_name, tool_input)
+    if _self_marker:
+        return deny_self_access(_self_marker, tool_name)
 
     # Try the daemon first.
     result = ask_daemon(tool_name, tool_input, tool_use_id, host_session_id)
