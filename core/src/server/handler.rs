@@ -1087,23 +1087,12 @@ fn resolve_attributed_caller(
     })
 }
 
-fn resolve_caller(s: &super::state::ServerState, session_id_arg: Option<&str>) -> CallerWho {
-    let session_uuid = resolve_session_uuid(s, session_id_arg);
-    let (plugin_id, role_lct) = session_uuid
-        .and_then(|sid| s.sessions.get(&sid))
-        .map(|sess| (sess.plugin_id.clone(), sess.constellation_role.clone()))
-        .unwrap_or_else(|| {
-            (
-                "unknown".to_string(),
-                crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
-            )
-        });
-    CallerWho {
-        session_uuid,
-        plugin_id,
-        role_lct,
-    }
-}
+// NOTE: `resolve_caller` — the latest-session-fallback resolver — was deleted
+// 2026-07-28 when its last call site (tool_vault_get) was converted to
+// `resolve_attributed_caller`. Every authority-bearing surface now PROVES its caller;
+// an identity borrowed from whichever session connected most recently is a compile
+// error, not a code path. `resolve_session_uuid` survives for `tool_begin_action`'s
+// nil-on-absent use, which never feeds a gate, a consumer check, or a witness WHO.
 
 /// Daemon-side policy gate for the direct-call tool surfaces (vault get/set,
 /// witness append) — a direct MCP call must hit the same law as the client
@@ -1193,7 +1182,23 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
     let session_id_arg = optional_string(args, "session_id");
 
     let mut s = state.lock().await;
-    let who = resolve_caller(&s, session_id_arg.as_deref());
+    // ATTRIBUTED, NOT RESOLVED (the attribution sweep, 2026-07-28 — the fifth and final
+    // site, caught by claude-code reviewing this PR's "zero call sites" claim). The
+    // consumer check below is strict (`resolve_plugin_id` denies anonymous readers of
+    // scoped entries), but `who` fed BOTH the gate and the `vault_get` witness append:
+    // an anonymous read of an EXPOSED entry was recorded under whoever connected last —
+    // misattributing the very disclosure record #76 added to make disclosure visible.
+    // Refused now. The exposed-entry compatibility path is untouched for any ATTRIBUTED
+    // caller: pre-existing empty-list entries still read, warned and witnessed.
+    let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.vault_get_unattributed",
+            "reading a credential requires your own live session_id (from hestia_connect) — \
+             a disclosure must be witnessed under the reader's own name, not borrowed from \
+             whichever member connected most recently",
+            None,
+        ));
+    };
     if let Some(denied) =
         gate_direct_tool(&mut s, &who, "hestia_vault_get", "credential_access", &name)
     {
@@ -2769,7 +2774,23 @@ async fn tool_request_witness(state: &SharedState, args: &Value) -> ToolResult {
     // attributed act: law can deny it per role (category witness_append), and
     // what lands on the chain carries the requesting WHO next to the caller's
     // payload — never only caller-supplied data.
-    let who = resolve_caller(&s, session_id_arg.as_deref());
+    //
+    // ATTRIBUTED, NOT RESOLVED (the attribution sweep, 2026-07-28 — the sharpest of
+    // the five #81 residual sites). `resolve_caller`'s latest-session fallback meant an
+    // anonymous append was recorded as `requested_by` WHOEVER CONNECTED LAST — the chain
+    // could attribute an act to a member that was not the caller, undercutting every
+    // adjudication derived from it. Writing to the evidence plane requires a proven
+    // caller, the same bar as vault writes (#81) and appeals.
+    let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.request_witness_unattributed",
+            "appending to the witness chain requires your own live session_id (from \
+             hestia_connect) — an unattributed append would be recorded under whichever \
+             member connected most recently, and a misattributed record is worse than \
+             a refused one",
+            None,
+        ));
+    };
     if let Some(denied) = gate_direct_tool(
         &mut s,
         &who,
@@ -2869,13 +2890,26 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
     // release never loses the work item (accept-and-defer is exactly the safe
     // downgrade). The transient in-process open above is not a release: the
     // plaintext never leaves the daemon and never rests.
+    // ATTRIBUTED CALLERS ONLY for the open decision (the attribution sweep, 2026-07-28 —
+    // this was the site the #81 sweep table missed). `resolve_caller`'s latest-session
+    // fallback meant the gate on a body-returning open — a secret release — was evaluated
+    // under WHOEVER CONNECTED LAST: an anonymous caller got the most recent member's role
+    // overlay, so an unattended-role deny could become an attended-member allow by
+    // connection ordering. An unattributed caller gets the SAME safe downgrade as a law
+    // deny: the notice defers, still sealed, for an attributed consumer.
     let mut denied_open: Option<Value> = None;
+    let mut unattributed_open = false;
     if !defer_requested {
         let session_id_arg = optional_string(args, "session_id");
-        let who = resolve_caller(&s, session_id_arg.as_deref());
-        denied_open = gate_direct_tool(&mut s, &who, "hestia_notify", "credential_access", &kind);
+        match resolve_attributed_caller(&s, session_id_arg.as_deref()) {
+            Some(who) => {
+                denied_open =
+                    gate_direct_tool(&mut s, &who, "hestia_notify", "credential_access", &kind)
+            }
+            None => unattributed_open = true,
+        }
     }
-    let defer = defer_requested || denied_open.is_some();
+    let defer = defer_requested || denied_open.is_some() || unattributed_open;
 
     // Accept-and-defer (entity-edge inbox): park the STILL-SEALED notice in the
     // durable encrypted inbox BEFORE the receipt record and BEFORE sealing the
@@ -2909,6 +2943,7 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
             "from_hub": hub_lct_id,
             "deferred": defer,
             "deferred_by_law": denied_open.is_some(),
+            "deferred_unattributed": unattributed_open,
         }),
     )?;
 
@@ -2926,6 +2961,10 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
             // Present iff law denied the body-returning open — the caller sees
             // WHY it got a deferral it didn't ask for (honest, not silent).
             "deferredByLaw": denied_open.is_some(),
+            // Present iff the caller could not be attributed — the open was refused
+            // on identity, not on law. Same safe downgrade, different cause, so a
+            // reader can tell "the law said no" from "we could not say who asked".
+            "deferredUnattributed": unattributed_open,
             "kind": kind,
             "pointerUri": pointer_uri,
             "queued": s.inbox_store.len().unwrap_or(0),
@@ -3866,7 +3905,19 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
 async fn tool_inbox(state: &SharedState, args: &Value) -> ToolResult {
     let session_id_arg = optional_string(args, "session_id");
     let mut s = state.lock().await;
-    let who = resolve_caller(&s, session_id_arg.as_deref());
+    // ATTRIBUTED, NOT RESOLVED (the attribution sweep, 2026-07-28). The drain is
+    // consume-once: an anonymous caller gated under the latest-session fallback could
+    // both RELEASE sealed bodies under a bystander's overlay and DESTROY the queue the
+    // bystander had not read. The drain requires a proven caller, before the consume.
+    let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.inbox_unattributed",
+            "draining the inbox requires your own live session_id (from hestia_connect) — \
+             the drain is consume-once and a secret release, so it must not run under an \
+             identity borrowed from whichever member connected most recently",
+            None,
+        ));
+    };
     if let Some(denied) =
         gate_direct_tool(&mut s, &who, "hestia_inbox", "credential_access", "inbox")
     {
@@ -3932,7 +3983,19 @@ async fn tool_inbox(state: &SharedState, args: &Value) -> ToolResult {
 async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
     let session_id_arg = optional_string(args, "session_id");
     let mut s = state.lock().await;
-    let who = resolve_caller(&s, session_id_arg.as_deref());
+    // ATTRIBUTED, NOT RESOLVED (the attribution sweep, 2026-07-28) — same shape as
+    // tool_inbox above: the pull-side drain advances the per-pair cursor (consume-once)
+    // and releases opened secrets, so it must not run under the latest-session fallback.
+    let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.pair_inbox_unattributed",
+            "draining paired-channel secrets requires your own live session_id (from \
+             hestia_connect) — the drain advances the delivery cursor and releases \
+             secrets, so it must not run under an identity borrowed from whichever \
+             member connected most recently",
+            None,
+        ));
+    };
     if let Some(denied) = gate_direct_tool(
         &mut s,
         &who,
@@ -5381,7 +5444,7 @@ mod accountability_tests {
     #[tokio::test]
     async fn reversal_rejects_unattributed_reporter_and_unknown_role() {
         let (_dir, state) = test_state().await;
-        // No session connected → resolve_caller yields no session_uuid.
+        // No session connected → strict attribution yields no caller.
         let out = tool_record_reversal(
             &state,
             &json!({
@@ -5782,9 +5845,32 @@ mod inbox_tests {
         crate::server::build_state(vault, dir.path(), "p").unwrap()
     }
 
+    /// Seat a live session for `plugin_id` (the attributed-caller shape the
+    /// authority surfaces now require).
+    pub(super) async fn seat_session(state: &SharedState, plugin_id: &str) -> Uuid {
+        let sid = Uuid::new_v4();
+        let mut s = state.lock().await;
+        s.sessions.insert(
+            sid,
+            crate::server::state::Session {
+                session_id: sid,
+                plugin_id: plugin_id.into(),
+                plugin_version: None,
+                host_agent: "test".into(),
+                host_agent_version: None,
+                assigned_role: "citizen".into(),
+                constellation_role: "role:constellation:member".into(),
+                soft_lct: format!("lct:test:{plugin_id}"),
+                connected_at: chrono::Utc::now(),
+                host_session_id: None,
+            },
+        );
+        sid
+    }
+
     /// The hub side of the notify wire: seal a body to the member's pinned
     /// pubkey (exactly what `queue_sealed_notice` does hub-side).
-    fn hub_seal(hub_kp: &KeyPair, member_kp: &KeyPair, pair_id: Uuid, body: &Value) -> String {
+    pub(super) fn hub_seal(hub_kp: &KeyPair, member_kp: &KeyPair, pair_id: Uuid, body: &Value) -> String {
         let member_pub = PublicKey::from_bytes(&member_kp.public_key_bytes()).unwrap();
         pair_channel::seal(
             hub_kp,
@@ -5852,7 +5938,10 @@ mod inbox_tests {
 
         // --- restart: the parked notice survived, drain opens + consumes it ---
         let state2 = open_state(&dir);
-        let drained = tool_inbox(&state2, &json!({})).await.unwrap();
+        let reader = seat_session(&state2, "claude-code").await;
+        let drained = tool_inbox(&state2, &json!({"session_id": reader.to_string()}))
+            .await
+            .unwrap();
         assert_eq!(drained["total"], json!(1));
         let n = &drained["notices"][0];
         assert_eq!(n["kind"], json!("notify:task"));
@@ -5861,7 +5950,9 @@ mod inbox_tests {
         assert_eq!(n["body"]["act_id"], json!(act_id));
 
         // Consume-once: a second drain is empty.
-        let again = tool_inbox(&state2, &json!({})).await.unwrap();
+        let again = tool_inbox(&state2, &json!({"session_id": reader.to_string()}))
+            .await
+            .unwrap();
         assert_eq!(again["total"], json!(0));
 
         // And the inbox file on disk is encrypted (not plaintext SQLite).
@@ -5888,12 +5979,14 @@ mod inbox_tests {
         );
 
         let state = open_state(&dir);
+        let opener = seat_session(&state, "claude-code").await;
         let resp = tool_notify(
             &state,
             &json!({
                 "pair_id": pair_id,
                 "hub_pubkey_hex": hex::encode(hub_kp.public_key_bytes()),
-                "sealed": sealed
+                "sealed": sealed,
+                "session_id": opener.to_string()
             }),
         )
         .await
@@ -8409,5 +8502,220 @@ mod vault_hst001_tests {
         set(&state, Some(owner), "scoped-cred", vec!["claude-code"]).await;
         let denied = get(&state, Some(other), "scoped-cred").await;
         assert!(format!("{denied}").contains("vault_scope_mismatch"), "{denied}");
+    }
+}
+
+#[cfg(test)]
+mod authority_attribution_tests {
+    //! The attribution sweep (2026-07-28): the five `resolve_caller` latest-session
+    //! fallback sites the #81 sweep left open. All five are fixed here
+    //! (`tool_request_witness`, `tool_notify`, `tool_inbox`, `tool_pair_inbox`,
+    //! `tool_vault_get` — the last caught in review of this PR's own completeness
+    //! claim; `tool_vault_set` was #81). `resolve_caller` itself is deleted, so the
+    //! class is closed by compile error, not by census. Each test pins the failure
+    //! the fallback made possible: an act performed under the identity of WHOEVER
+    //! CONNECTED LAST.
+    //!
+    //! Every test drives the real tool with NO session_id while a bystander session
+    //! exists — the exact fallback condition — so a regression to `resolve_caller`
+    //! turns these red, not merely different.
+    use super::*;
+    use super::inbox_tests::{hub_seal, open_state, seat_session, seeded_home};
+    use web4_core::crypto::KeyPair;
+
+    /// Sharpest site: the chain itself. An anonymous append must not be recorded
+    /// under the most-recently-connected member's name.
+    #[tokio::test]
+    async fn request_witness_without_session_is_refused_and_appends_nothing() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let _bystander = seat_session(&state, "innocent-member").await;
+
+        let before = { state.lock().await.recent_chain(1000).len() };
+        let r = tool_request_witness(
+            &state,
+            &json!({"event_type": "custom.note", "event_data": {"k": "v"}}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            format!("{r}").contains("request_witness_unattributed"),
+            "an unattributed append must be refused: {r}"
+        );
+        let after = { state.lock().await.recent_chain(1000).len() };
+        assert_eq!(before, after, "a refused append must not reach the chain");
+    }
+
+    /// The attributed path still lands, under the caller's own name.
+    #[tokio::test]
+    async fn request_witness_with_live_session_records_the_actual_caller() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let _bystander = seat_session(&state, "bystander-member").await;
+        let caller = seat_session(&state, "actual-caller").await;
+
+        let r = tool_request_witness(
+            &state,
+            &json!({
+                "event_type": "custom.note",
+                "event_data": {"k": "v"},
+                "session_id": caller.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(r["witnessEntryHash"].is_string(), "{r}");
+        let s = state.lock().await;
+        let e = s
+            .recent_chain(10)
+            .into_iter()
+            .find(|e| e.event_type == "custom.note")
+            .expect("attributed append must land");
+        assert_eq!(
+            e.event_data["requested_by"]["plugin_id"], json!("actual-caller"),
+            "the chain must record the caller, not the most recent connection"
+        );
+    }
+
+    /// A body-returning open with no session gets the same safe downgrade as a
+    /// law deny: deferred, sealed, body NOT returned — and the record says why.
+    #[tokio::test]
+    async fn notify_open_without_session_defers_and_says_so() {
+        let (dir, member_kp) = seeded_home();
+        let hub_kp = KeyPair::generate();
+        let pair_id = Uuid::new_v4();
+        let sealed = hub_seal(&hub_kp, &member_kp, pair_id, &json!({"act_id": Uuid::new_v4()}));
+
+        let state = open_state(&dir);
+        let _bystander = seat_session(&state, "attended-member").await;
+        let resp = tool_notify(
+            &state,
+            &json!({
+                "pair_id": pair_id,
+                "hub_pubkey_hex": hex::encode(hub_kp.public_key_bytes()),
+                "sealed": sealed,
+                // no "defer", no "session_id" — the caller asked for the body,
+                // unattributed
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["deferred"], json!(true), "must defer, not open: {resp}");
+        assert_eq!(resp["deferredUnattributed"], json!(true), "{resp}");
+        assert!(resp.get("body").is_none(), "no body without attribution");
+        let s = state.lock().await;
+        let rec = s
+            .recent_chain(10)
+            .into_iter()
+            .find(|e| e.event_type == "notify.received")
+            .expect("receipt must be witnessed");
+        assert_eq!(rec.event_data["deferred_unattributed"], json!(true));
+        assert_eq!(rec.event_data["deferred_by_law"], json!(false),
+                   "identity, not law, caused this deferral — the record must say which");
+    }
+
+    /// The consume-once drain must not run unattributed: refused, queue intact.
+    #[tokio::test]
+    async fn inbox_without_session_is_refused_and_drains_nothing() {
+        let (dir, member_kp) = seeded_home();
+        let hub_kp = KeyPair::generate();
+        let pair_id = Uuid::new_v4();
+        let sealed = hub_seal(&hub_kp, &member_kp, pair_id, &json!({"act_id": Uuid::new_v4()}));
+
+        // Park one notice (via the defer path, which needs no session).
+        let state = open_state(&dir);
+        let resp = tool_notify(
+            &state,
+            &json!({
+                "pair_id": pair_id,
+                "hub_pubkey_hex": hex::encode(hub_kp.public_key_bytes()),
+                "sealed": sealed, "defer": true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["queued"], json!(1));
+
+        let _bystander = seat_session(&state, "bystander-member").await;
+        let r = tool_inbox(&state, &json!({})).await.unwrap();
+        assert!(
+            format!("{r}").contains("inbox_unattributed"),
+            "an unattributed drain must be refused: {r}"
+        );
+        assert_eq!(
+            state.lock().await.inbox_store.len().unwrap(),
+            1,
+            "a refused drain must leave the queue bit-identical"
+        );
+    }
+
+    /// Same shape on the paired channel: refused before any cursor can move.
+    #[tokio::test]
+    async fn pair_inbox_without_session_is_refused() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let _bystander = seat_session(&state, "bystander-member").await;
+        let r = tool_pair_inbox(&state, &json!({})).await.unwrap();
+        assert!(
+            format!("{r}").contains("pair_inbox_unattributed"),
+            "an unattributed paired-channel drain must be refused: {r}"
+        );
+    }
+
+    /// The fifth site, caught in review of this PR's own "zero call sites" claim:
+    /// an anonymous credential READ was witnessed under the most recent connection's
+    /// name. Refused now — and the exposed-entry compatibility path still works for
+    /// any ATTRIBUTED caller, witnessed under its own name.
+    #[tokio::test]
+    async fn vault_get_without_session_is_refused_not_misattributed() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        // A legacy exposed entry (empty consumer list) — readable pre-fix by anyone,
+        // and the fallback made its disclosure witness name the wrong member.
+        {
+            let mut s = state.lock().await;
+            s.vault
+                .upsert(crate::vault::VaultEntry::new("legacy-cred", "DUMMY-SECRET"))
+                .unwrap();
+        }
+        let bystander = seat_session(&state, "innocent-member").await;
+
+        let r = tool_vault_get(&state, &json!({"name": "legacy-cred"})).await.unwrap();
+        assert!(
+            format!("{r}").contains("vault_get_unattributed"),
+            "an unattributed read must be refused, not witnessed under a bystander: {r}"
+        );
+        let witnessed_anonymous_read = {
+            let s = state.lock().await;
+            s.recent_chain(50)
+                .into_iter()
+                .any(|e| e.event_type == "vault_get")
+        };
+        assert!(
+            !witnessed_anonymous_read,
+            "a refused read must not mint a disclosure witness"
+        );
+
+        // The compatibility path: an ATTRIBUTED caller still reads the exposed entry,
+        // witnessed as exposed, under its OWN name.
+        let reader = seat_session(&state, "random-attributed-caller").await;
+        let ok = tool_vault_get(
+            &state,
+            &json!({"name": "legacy-cred", "session_id": reader.to_string()}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok["value"], json!("DUMMY-SECRET"), "{ok}");
+        let s = state.lock().await;
+        let vget = s
+            .recent_chain(50)
+            .into_iter()
+            .find(|e| e.event_type == "vault_get")
+            .expect("the attributed read must be witnessed");
+        assert_eq!(vget.event_data["exposed"], json!(true));
+        assert_eq!(
+            vget.event_data["plugin_id"], json!("random-attributed-caller"),
+            "the witness names the reader — never the bystander ({bystander})"
+        );
     }
 }
