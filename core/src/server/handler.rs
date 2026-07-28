@@ -3248,6 +3248,10 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     // You may only answer mail that was addressed to YOU. Without this, any
     // member could mark another member's notice answered and the unanswered
     // report would be steerable by the party it reports on.
+    // The same check is now enforced in the store (`Inbox::enqueue_member`,
+    // notice 309 thread) so it holds for writers that never pass through this
+    // tool; the copy here survives for two things the store error cannot give:
+    // the named error envelope, and `binding_verified` on the witnessed event.
     // A binding to an id that is no longer on record is ACCEPTED, not rejected:
     // notices age out on the TTL, so "not found" means unverifiable, not forged
     // — and `binding_verified` in the witnessed event says which one it was.
