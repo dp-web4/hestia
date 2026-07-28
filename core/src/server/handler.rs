@@ -77,6 +77,7 @@ impl ServerHandler for HestiaServer {
             "hestia_witness_adjudication" => tool_witness_adjudication(&self.state, &args).await,
             "hestia_appeal" => tool_appeal(&self.state, &args).await,
             "hestia_arbitrate_appeal" => tool_arbitrate_appeal(&self.state, &args).await,
+            "hestia_open_appeals" => tool_open_appeals(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
             "hestia_operating_law" => tool_operating_law(&self.state, &args).await,
@@ -154,6 +155,15 @@ impl ServerHandler for HestiaServer {
                  not-found, ambiguous-prefix and wrong-event-type distinctly.",
             ),
             make_resource_template(
+                "hestia://appeal/{hash}",
+                "Appeal by deny hash or appeal entry hash",
+                "Dereference the pointer an appeal review_request notice carries. Two \
+                 conventions are in circulation for this URI — the daemon mints the deny_hash, \
+                 hand-written notices have carried the appeal entry's own hash — and BOTH \
+                 resolve here; the reply says which matched. Always returns the ruling-ready \
+                 deny_hash and whether the appeal is still open.",
+            ),
+            make_resource_template(
                 "hestia://chain/{hash}",
                 "Witness chain entry by hash",
                 "Dereference ANY chain entry by hash or hash prefix — appeals, denies, outcomes, \
@@ -227,6 +237,10 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_arbitrate_appeal",
             "Rule on another member's filed appeal (NOT-SAME, enforced: never your own appeal, never a deny your own gate issued). Requires an explicit upheld:true/false and stated reasoning; records the independence of the arbiter so a reader can weigh the ruling",
+        ),
+        t(
+            "hestia_open_appeals",
+            "List appeals nobody has ruled on yet, with the ruling-ready deny_hash for each. Designation is ADVISORY — hestia_arbitrate_appeal never reads it — so any admissible member may rule any of these; pass your session_id and each entry tells you whether you are one. Read-only. This is the discovery surface an arbiter needs: before it existed, a non-designated member had the authority to rule and no way to learn there was anything open",
         ),
         t(
             "hestia_witness_decision",
@@ -2287,6 +2301,15 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         .and_then(Value::as_str)
         .unwrap_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE);
     let deny_adjudicator = appeal.event_data.get("about_adjudicator").and_then(Value::as_str);
+    // FIDELITY TO ROUTING, recorded next to independence. On 2026-07-27 kimi-code ruled two
+    // appeals that had been routed to codex, and the adjudication entries recorded
+    // `independence: cross_vendor` — BIT-IDENTICAL to what a designated codex ruling would
+    // have written, since codex is also cross-vendor relative to the appellant. From the
+    // adjudication alone a relying party could not tell that the designee never participated,
+    // and joining back to the appeal entry only tells you who was ASKED, never whether they
+    // answered. Independence was recorded; fidelity was not. This is the missing half: who
+    // was designated, and whether this arbiter is them.
+    let routed_to = appeal.event_data.get("routed_to").and_then(Value::as_str).map(str::to_string);
 
     // NOT-SAME, enforced server-side. A client-side check would be advisory — the whole
     // reason this constraint is here is that the party it constrains is the party running
@@ -2358,6 +2381,13 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
             // same-lineage ruling differently from a cross-vendor one. Evidence, not a
             // threshold — hestia does not decide how much this ruling is worth.
             "independence": independence,
+            // Advisory designee, echoed, plus the one bit a reader cannot reconstruct.
+            // `was_designee: false` is not a defect in the ruling — designation has never
+            // been a precondition — it is the difference between "routing worked" and
+            // "routing was bypassed and the appeal got ruled anyway", which are the same
+            // chain shape until this field exists.
+            "routed_to": routed_to,
+            "was_designee": routed_to.as_deref() == Some(arbiter.plugin_id.as_str()),
             "appeal_entry": appeal.hash,
         }),
     )?;
@@ -2373,6 +2403,234 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         } else {
             "the deny stands; the appellant keeps appeal-filed 0.85 for having disputed it \
              through the witnessed channel rather than routing around"
+        },
+    }))
+}
+
+// =========================================================================
+// The open-appeals queue
+// =========================================================================
+//
+// WHY THIS EXISTS. On 2026-07-27 two appeals sat unruled for six hours. Both were routed
+// to `codex`, which was out of budget for three days. They were finally ruled — validly,
+// by `kimi-code`, a member the routing never named — because dp noticed, told a
+// `claude-code` session to "get another peer", and that session hand-wrote mesh notices
+// re-pointing the appeals at kimi. Remove any one of those three human-shaped steps and
+// the appeals are open today.
+//
+// The post-mortem (CBP + kimi-code, cross-checked from both ends) found that routing was
+// never the binding constraint. `tool_arbitrate_appeal` enforces exactly NOT-SAME and
+// not-already-ruled; it never reads `routed_to`. **Designation is advisory.** Any admissible
+// member may rule any open appeal at any time. What no member could do was FIND one.
+//
+// `hestia_appeal` writes an appeal. `hestia_arbitrate_appeal` rules one *by `deny_hash`* —
+// which you must already know. Nothing enumerated. So a non-designated arbiter had the
+// authority to rule and no way to discover there was anything to rule on, and "no appeals
+// pending" was bit-identical to "two appeals open and invisible". That is this codebase's
+// recurring defect class — the reassuring state and the null state rendering the same —
+// and it is why the fix is a QUEUE rather than better routing. Routing picks who *should*
+// rule, from evidence (`recipient_liveness`) that the same day proved uncorrelated with
+// capacity to act in BOTH directions (hestia#65). A queue lets whoever *can* rule find the
+// work. It degrades to exactly what happened that afternoon, minus the humans.
+//
+// THREE PROPERTIES ARE LOAD-BEARING, and each one is a thing that actually went wrong:
+//
+// 1. THE SAME WINDOW AS THE RULING PATH. Not a deeper one — the SAME constant. An appeal
+//    listed here that `tool_arbitrate_appeal` cannot find would send an arbiter to a tool
+//    that answers "no appeal against that hash", which is the unfollowable-pointer bug
+//    wearing a queue's clothes. Sharing `APPEAL_CHAIN_WINDOW` makes "listed" and "rulable"
+//    the same predicate by construction. It also means the window's edge is a real hazard —
+//    see `window_saturated` below, which is reported rather than hidden.
+//
+// 2. THE RULING-READY `deny_hash`, PROMINENTLY. kimi-code lost ~20 minutes to this: the
+//    notices it was woken with carried the APPEAL ENTRIES' own chain hashes, while
+//    `tool_arbitrate_appeal` keys only on `deny_hash`. Both were spelled `hestia://appeal/…`.
+//    A queue entry that made an arbiter resolve a namespace before it could act would have
+//    reproduced the exact cost the queue exists to remove. (The resolver now accepts both
+//    and says which it found — see `resolve_appeal_pointer`.)
+//
+// 3. ELIGIBILITY ANSWERED FOR THE CALLER, VIA THE RULING PATH'S OWN FUNCTION. A list that
+//    shows you appeals you are structurally barred from ruling is a list you have to
+//    re-derive NOT-SAME against by hand. This calls `arbiter::eligibility` and the same
+//    member-LCT equality check `tool_arbitrate_appeal` uses, so the annotation cannot drift
+//    from the enforcement. It ANNOTATES; it does not filter, and it does not enforce —
+//    enforcement stays server-side in the ruling path where it belongs. You are shown the
+//    appeals you may not rule, and told why, because a queue that silently omitted them
+//    would be one more surface where absent and excluded look identical.
+//
+// Read-only. Ungated, matching `hestia://witness/recent` and `recent_chain`, over which
+// this is a strictly narrower projection of entries any connected caller can already read.
+
+/// List appeals that no arbiter has ruled on yet.
+async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
+    let session_id_arg = optional_string(args, "session_id");
+    let s = state.lock().await;
+
+    // Attribution is OPTIONAL here and its absence is reported, not defaulted. An
+    // unattributed caller still gets the queue — discovery must not require a session,
+    // or a member whose session lapsed cannot find work it is allowed to do — but it
+    // cannot be told whether IT may rule, and saying nothing about that would read as
+    // "no eligibility concerns".
+    let caller = resolve_attributed_caller(&s, session_id_arg.as_deref());
+
+    let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
+    let head_position = window.first().map(|e| e.chain_position).unwrap_or(0);
+
+    // The join, in one pass: appeals minus adjudications, keyed on the hash both sides
+    // already agree on (`deny_hash` / `about_deny_hash`). This is not new data — every
+    // byte was on the chain the whole time. It is the join, at the ruling path's depth.
+    let ruled: std::collections::HashSet<&str> = window
+        .iter()
+        .filter(|e| e.event_type == "adjudication")
+        .filter_map(|e| e.event_data.get("about_deny_hash").and_then(Value::as_str))
+        .collect();
+
+    let mut open: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut barred = 0u64;
+
+    for e in window.iter().filter(|e| e.event_type == "appeal") {
+        let Some(deny_hash) = e.event_data.get("deny_hash").and_then(Value::as_str) else {
+            continue;
+        };
+        if ruled.contains(deny_hash) {
+            continue;
+        }
+        // One deny, one queue entry. `tool_arbitrate_appeal` rules per `deny_hash`, so a
+        // re-filing against the same deny is one unit of work, not two — listing it twice
+        // would make the second entry unrulable the instant the first is ruled.
+        if !seen.insert(deny_hash) {
+            continue;
+        }
+
+        let appellant = e.event_data.get("plugin_id").and_then(Value::as_str).unwrap_or_default();
+        let deny_adjudicator = e.event_data.get("about_adjudicator").and_then(Value::as_str);
+
+        // Same two checks, same order, same functions as the ruling path (see clause 3
+        // above). Anything else here is a second implementation of NOT-SAME, and two
+        // implementations of a rule are one rule and one future contradiction.
+        let eligibility = caller.as_ref().map(|c| {
+            let same_entity = {
+                let a = s.member_lct(&c.plugin_id);
+                let b = s.member_lct(appellant);
+                a.is_some() && a == b
+            };
+            if same_entity {
+                return json!({
+                    "you_may_rule": false,
+                    "why": format!(
+                        "'{}' and '{appellant}' resolve to the same member LCT — different \
+                         plugin_ids, same entity",
+                        c.plugin_id
+                    ),
+                });
+            }
+            match crate::arbiter::eligibility(&crate::arbiter::AppealParties {
+                appellant,
+                deny_adjudicator,
+                arbiter: &c.plugin_id,
+            }) {
+                crate::arbiter::Eligibility::Eligible { independence } => json!({
+                    "you_may_rule": true,
+                    "independence_if_you_rule": independence,
+                }),
+                crate::arbiter::Eligibility::Refused { reason } => json!({
+                    "you_may_rule": false,
+                    "why": reason,
+                }),
+            }
+        });
+        if matches!(
+            eligibility.as_ref().and_then(|v| v.get("you_may_rule")).and_then(Value::as_bool),
+            Some(false)
+        ) {
+            barred += 1;
+        }
+
+        // How close this appeal is to falling out of the window that makes it rulable.
+        // `recent_chain` is a COUNT window over the tail, so an unruled appeal does not
+        // expire on a clock — it expires when 20,000 further entries are appended, after
+        // which `tool_arbitrate_appeal` answers "no appeal against that hash" and the
+        // appellant is stuck at appeal-filed 0.85 forever, with nothing anywhere marking
+        // the transition. Whether that has ever happened on this chain is UNTESTED — no
+        // surface could have shown it. This field is the instrument; the measurement
+        // follows from running it.
+        let depth = head_position.saturating_sub(e.chain_position);
+        let headroom = APPEAL_CHAIN_WINDOW.saturating_sub(depth);
+
+        let mut entry = json!({
+            // FIRST FIELD, and the name `tool_arbitrate_appeal` takes verbatim. See
+            // clause 2: an arbiter must never have to resolve a namespace to act.
+            "deny_hash": deny_hash,
+            "arbitrate_with": {"tool": "hestia_arbitrate_appeal", "deny_hash": deny_hash},
+            "appellant": appellant,
+            "appellant_role": e.event_data.get("role_lct"),
+            "reason": e.event_data.get("reason"),
+            "about_attempted": e.event_data.get("about_attempted"),
+            "about_adjudicator": deny_adjudicator,
+            "filed_at": e.timestamp.to_rfc3339(),
+            "age_seconds": (Utc::now() - e.timestamp).num_seconds().max(0),
+            "appeal_entry": e.hash,
+            // ADVISORY, and labelled so in the payload rather than only in a comment.
+            // The daemon has never consulted this field when ruling, and a reader who
+            // assumed otherwise would conclude an appeal was someone else's to take.
+            "routing": {
+                "routed_to": e.event_data.get("routed_to"),
+                "routed_independence": e.event_data.get("routed_independence"),
+                "advisory": "designation is evidence of who was ASKED, never a claim on who \
+                             may rule — hestia_arbitrate_appeal does not read it. If you are \
+                             eligible, this appeal is yours to take.",
+            },
+            "window": {
+                "entries_from_head": depth,
+                "headroom_before_unrulable": headroom,
+            },
+        });
+        // Merged at the TOP level of the entry, not nested: `you_may_rule` is the field a
+        // reader scans for, and burying it one key deeper is how it gets missed.
+        if let (Some(Value::Object(elig)), Some(obj)) = (eligibility, entry.as_object_mut()) {
+            obj.extend(elig);
+        }
+        open.push(entry);
+    }
+
+    // Oldest first. The longest-waiting appeal is also the one nearest the window edge,
+    // so latency order and expiry order are the same order — the ordering hint #64 wanted,
+    // as a property of the view rather than a gate the filing path blocks on.
+    open.reverse();
+
+    // The window can only be saturated by a chain longer than it. When it is, appeals
+    // older than the tail are BOTH invisible here and unrulable there, and this count
+    // cannot say how many. Reporting the saturation is the difference between a bounded
+    // answer and a wrong one.
+    let window_saturated = window.len() as u64 >= APPEAL_CHAIN_WINDOW;
+
+    Ok(json!({
+        "open": open,
+        "count": open.len(),
+        "you": caller.as_ref().map(|c| json!({"plugin_id": c.plugin_id, "role_lct": c.role_lct})),
+        "you_may_rule_count": caller.as_ref().map(|_| open.len() as u64 - barred),
+        "note": match (&caller, open.len()) {
+            (None, _) => "no session_id given, so 'you_may_rule' is absent from every entry — \
+                          pass your own session_id (from hestia_connect) to be told which of \
+                          these you are admissible to rule. The list itself is complete either way.",
+            (Some(_), 0) => "no unruled appeals in the searched window. Note the window bound \
+                             below before reading this as 'nobody has disputed anything'.",
+            (Some(_), _) => "designation is advisory: if 'you_may_rule' is true, you can rule it \
+                             now with hestia_arbitrate_appeal, whether or not you were routed it.",
+        },
+        "scope": {
+            "chain_window": APPEAL_CHAIN_WINDOW,
+            "entries_searched": window.len(),
+            "chain_length": s.chain_len(),
+            "window_saturated": window_saturated,
+            "caveat": if window_saturated {
+                "the window is FULL, so appeals older than the searched tail are invisible here \
+                 AND unrulable by hestia_arbitrate_appeal, which searches the same depth. This \
+                 count is a lower bound on what was ever filed, not a count of what exists."
+            } else {
+                "the whole chain fits in the window; this is every appeal ever filed on it."
+            },
         },
     }))
 }
@@ -3878,6 +4136,15 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
     // well-formed — it is the target that is missing, ambiguous or mislabelled,
     // and collapsing those four outcomes into one protocol error rebuilds the
     // exact ambiguity this resolver exists to remove.
+    // `hestia://appeal/<hash>` needs its own resolver and cannot use the table below —
+    // see `resolve_appeal_pointer`. It was absent from that table entirely, which meant the
+    // daemon minted this pointer into every appeal dispatch notice and no surface could
+    // follow it: the same unfollowable-pointer defect the adjudication case fixed, surviving
+    // that fix because that fix was driven by a received ADJUDICATION notice.
+    if let Some(ptr) = uri.strip_prefix("hestia://appeal/") {
+        let body = resolve_appeal_pointer(&s, ptr);
+        return Ok(serde_json::to_string(&body).unwrap_or("{}".into()));
+    }
     for (prefix, expect) in [
         ("hestia://adjudication/", Some("adjudication")),
         ("hestia://chain/", None),
@@ -3904,6 +4171,107 @@ fn chain_entry_json(e: &crate::storage::chain::ChainEntry) -> Value {
         "eventData": e.event_data,
         "signerLct": e.signer_lct,
         "chainPosition": e.chain_position,
+    })
+}
+
+/// Dereference `hestia://appeal/<hash>` — under EITHER of the two conventions in
+/// circulation for that URI, reporting which one was used.
+///
+/// WHY THIS IS NOT A ROW IN THE TABLE ABOVE. `resolve_chain_pointer` looks a hash up as an
+/// ENTRY hash. The pointer `tool_appeal` mints is `hestia://appeal/{deny_hash}`, and a
+/// deny_hash is the hash of the *decision* being disputed — a different entry, of a
+/// different type, that happens to be what the appeal is ABOUT. Adding this prefix to the
+/// table with `expect: Some("appeal")` would therefore have made every daemon-minted appeal
+/// pointer resolve to a type-mismatch error against the deny it names: a plausible-looking
+/// row that fails on the only inputs it will ever receive.
+///
+/// AND THERE ARE TWO CONVENTIONS. kimi-code, 2026-07-27, from the receiving end: the mesh
+/// notices that actually got two stalled appeals ruled carried the APPEAL ENTRIES' own
+/// chain hashes, while the daemon's own dispatch carries the deny hash. Both spelled
+/// `hestia://appeal/…`, nothing distinguishing them, and `tool_arbitrate_appeal` keys only
+/// on the deny hash. It cost the arbiter ~20 minutes of window-scanning to convert one into
+/// the other before it could call the tool at all — and it noted a colder arbiter would
+/// simply have failed.
+///
+/// So: try both, say which hit, and hand back the ruling-ready `deny_hash` in every case.
+/// Normalising to one convention and rejecting the other would break whichever half of the
+/// existing pointers guessed wrong — including every hand-written notice already in flight.
+/// The ambiguity is resolved by ANSWERING it rather than by legislating it away.
+///
+/// The `ruled` flag closes the third gap: an arbiter following a pointer to work that is
+/// already done should learn that here, not from `arbitration_already_ruled` after writing
+/// its reasoning.
+fn resolve_appeal_pointer(s: &super::state::ServerState, pointer: &str) -> Value {
+    let ptr = pointer.trim();
+    if ptr.is_empty() {
+        return hestia_error_envelope(
+            "hestia.appeal_pointer_malformed",
+            "hestia://appeal/ needs a hash: either the deny_hash the appeal disputes (what \
+             this daemon mints) or the appeal entry's own chain hash (what hand-written mesh \
+             notices have carried). Both resolve here.",
+            None,
+        );
+    }
+    let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
+    let is_prefix_of = |full: &str| full == ptr || (ptr.len() >= 8 && full.starts_with(ptr));
+
+    // Convention 1, the daemon's own: the hash names the DENY under appeal.
+    let found = window
+        .iter()
+        .filter(|e| e.event_type == "appeal")
+        .find(|e| {
+            e.event_data
+                .get("deny_hash")
+                .and_then(Value::as_str)
+                .is_some_and(is_prefix_of)
+        })
+        .map(|e| (e, "deny_hash"))
+        // Convention 2, what peers actually send: the hash names the APPEAL ENTRY itself.
+        .or_else(|| {
+            window
+                .iter()
+                .find(|e| e.event_type == "appeal" && is_prefix_of(&e.hash))
+                .map(|e| (e, "appeal_entry_hash"))
+        });
+
+    let Some((appeal, matched_as)) = found else {
+        return hestia_error_envelope(
+            "hestia.appeal_pointer_not_found",
+            &format!(
+                "no appeal in the last {APPEAL_CHAIN_WINDOW} chain entries matches '{ptr}' as \
+                 either a deny_hash or an appeal entry hash. Note this is the SAME window \
+                 hestia_arbitrate_appeal searches: if an appeal was filed against this hash \
+                 and has aged out, it is unrulable too, and that is a real state — not a \
+                 malformed pointer"
+            ),
+            Some(json!({"pointer": ptr, "window": APPEAL_CHAIN_WINDOW, "chainLength": s.chain_len()})),
+        );
+    };
+
+    let deny_hash = appeal.event_data.get("deny_hash").and_then(Value::as_str).unwrap_or_default();
+    let ruling = window.iter().find(|e| {
+        e.event_type == "adjudication"
+            && e.event_data.get("about_deny_hash").and_then(Value::as_str) == Some(deny_hash)
+    });
+
+    json!({
+        "pointer": ptr,
+        // Which namespace the caller handed us. Reported because a member that learns its
+        // pointers are the non-canonical kind can start minting the canonical kind.
+        "matched_as": matched_as,
+        // Ruling-ready, first-class, under the name the ruling tool takes.
+        "deny_hash": deny_hash,
+        "appeal_entry": appeal.hash,
+        "entry": chain_entry_json(appeal),
+        "ruled": ruling.is_some(),
+        "ruling": ruling.map(chain_entry_json),
+        "next": match &ruling {
+            Some(_) => "already ruled — the adjudication entry is inline above. A second \
+                        ruling is refused; there is nothing to do here.",
+            None => "open. If you are not the appellant and not the gate that denied, you may \
+                     rule it now: hestia_arbitrate_appeal with the deny_hash above. You do not \
+                     need to have been routed it — designation is advisory.",
+        },
     })
 }
 
@@ -6748,6 +7116,322 @@ mod tests {
             "attended drain with no connection is empty, not an error: {ok}"
         );
     }
+}
+
+#[cfg(test)]
+mod open_appeals_tests {
+    //! Tests for the appeal DISCOVERY surface — the queue, the pointer resolver, and the
+    //! routing-fidelity field.
+    //!
+    //! Every test here asserts on the JSON the handler actually returns, and every one of
+    //! them fails against the code as it stood before this change: there was no
+    //! `tool_open_appeals` to call, `hestia://appeal/` resolved to `unknown resource`, and
+    //! the adjudication entry had no `was_designee`. That is deliberate — an acceptance
+    //! test that already passes cannot tell a repair from a dead gauge.
+    //!
+    //! They drive the real tools end to end (deny → appeal → rule) rather than
+    //! hand-appending appeal-shaped entries, because the defect this whole seam keeps
+    //! producing is an assertion and a mechanism in different rooms.
+
+    use super::*;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    fn state_with_members(members: &[&str]) -> (TempDir, SharedState, Vec<Uuid>) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let mut st = super::super::state::ServerState::open(vault, dir.path(), "p").unwrap();
+        let mut ids = Vec::new();
+        for m in members {
+            // Mint a durable member LCT, exactly as `tool_connect` does. Without this the
+            // registry is empty, `tool_appeal` finds no candidate pool, and `routed_to` is
+            // null — which is a REAL state (no admissible designee on this machine) but not
+            // the one the incident produced, and testing only it would leave the designated
+            // path unexercised.
+            let sovereign_anchor = st.sovereign_lct.clone();
+            let sovereign_id = st.sovereign.lct_id();
+            let super::super::state::ServerState { vault, member_registry, .. } = &mut st;
+            crate::member_registry::ensure_member(
+                vault,
+                member_registry,
+                m,
+                false,
+                &sovereign_id,
+                &sovereign_anchor,
+            );
+            let sid = Uuid::new_v4();
+            st.sessions.insert(
+                sid,
+                super::super::state::Session {
+                    session_id: sid,
+                    plugin_id: (*m).into(),
+                    plugin_version: None,
+                    host_agent: "test".into(),
+                    host_agent_version: None,
+                    assigned_role: "citizen".into(),
+                    constellation_role: crate::reputation::DEFAULT_CONSTELLATION_ROLE.into(),
+                    soft_lct: format!("lct:{m}"),
+                    connected_at: Utc::now(),
+                    host_session_id: None,
+                },
+            );
+            ids.push(sid);
+        }
+        (dir, std::sync::Arc::new(tokio::sync::Mutex::new(st)), ids)
+    }
+
+    /// A deny on the chain, landed on `plugin_id`, in the shape `tool_appeal` requires.
+    async fn append_deny(shared: &SharedState, plugin_id: &str, attempted: &str) -> String {
+        let mut s = shared.lock().await;
+        s.append_chain(
+            "policy_decision",
+            json!({
+                "plugin_id": plugin_id,
+                "decision": "deny",
+                "adjudicator": "hestia-gate",
+                "attempted": attempted,
+                "reason": "safety preset",
+            }),
+        )
+        .unwrap()
+        .hash
+    }
+
+    async fn file_appeal(shared: &SharedState, sid: Uuid, deny_hash: &str) -> Value {
+        tool_appeal(
+            shared,
+            &json!({
+                "deny_hash": deny_hash,
+                "reason": "the target was read-only and under /tmp",
+                "session_id": sid.to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// THE JOIN. An appeal appears until someone rules it, and then it does not.
+    ///
+    /// This is the whole queue in one assertion, and the state it distinguishes is the one
+    /// that cost six hours: before this surface, "no appeals pending" and "an appeal is open
+    /// and nothing can see it" were the same observation.
+    #[tokio::test]
+    async fn unruled_appeals_are_listed_and_ruled_ones_drop_out() {
+        let (_d, shared, ids) = state_with_members(&["claude-code", "kimi-code"]);
+        let (claude, kimi) = (ids[0], ids[1]);
+
+        let deny = append_deny(&shared, "claude-code", "ls /tmp").await;
+        let filed = file_appeal(&shared, claude, &deny).await;
+        assert!(filed.get("_hestia_error").is_none(), "appeal should file: {filed}");
+
+        let q = tool_open_appeals(&shared, &json!({"session_id": kimi.to_string()}))
+            .await
+            .unwrap();
+        assert_eq!(q["count"], 1, "the open appeal must be discoverable: {q}");
+        assert_eq!(
+            q["open"][0]["deny_hash"], deny,
+            "the queue must hand back the hash hestia_arbitrate_appeal takes, not the \
+             appeal entry hash: {q}"
+        );
+
+        let ruled = tool_arbitrate_appeal(
+            &shared,
+            &json!({
+                "deny_hash": deny,
+                "upheld": true,
+                "rationale": "reading a path is not the destructive act the rule names",
+                "session_id": kimi.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(ruled.get("_hestia_error").is_none(), "kimi may rule claude's appeal: {ruled}");
+
+        let after = tool_open_appeals(&shared, &json!({"session_id": kimi.to_string()}))
+            .await
+            .unwrap();
+        assert_eq!(after["count"], 0, "a ruled appeal must leave the queue: {after}");
+    }
+
+    /// THE HASH THE QUEUE HANDS BACK IS THE HASH THE RULING TOOL ACCEPTS.
+    ///
+    /// Not a tautology — it is the twenty minutes kimi-code lost. The queue carries an
+    /// appeal entry hash AND a deny hash, and only one of them rules. Feeding the field the
+    /// queue advertises straight into the ruling tool is the only assertion that catches a
+    /// future edit swapping them.
+    #[tokio::test]
+    async fn the_advertised_hash_is_the_one_that_rules() {
+        let (_d, shared, ids) = state_with_members(&["claude-code", "codex"]);
+        let (claude, codex) = (ids[0], ids[1]);
+
+        let deny = append_deny(&shared, "claude-code", "rm -rf /tmp/x && echo done").await;
+        file_appeal(&shared, claude, &deny).await;
+
+        let q = tool_open_appeals(&shared, &json!({})).await.unwrap();
+        let advertised = q["open"][0]["arbitrate_with"]["deny_hash"].as_str().unwrap().to_string();
+        assert_ne!(
+            advertised,
+            q["open"][0]["appeal_entry"].as_str().unwrap(),
+            "the two hashes must be distinct for this test to mean anything"
+        );
+
+        let ruled = tool_arbitrate_appeal(
+            &shared,
+            &json!({
+                "deny_hash": advertised,
+                "upheld": false,
+                "rationale": "the chained form is what the rule names; the deny stands",
+                "session_id": codex.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            ruled.get("_hestia_error").is_none(),
+            "the hash the queue advertises must rule without any resolution step: {ruled}"
+        );
+    }
+
+    /// ELIGIBILITY IS ANSWERED, AND THE BARRED ENTRY IS STILL SHOWN.
+    ///
+    /// The appellant sees its own appeal — omitting it would rebuild the null state one
+    /// level in — and is told, in the entry, that it may not rule it.
+    #[tokio::test]
+    async fn the_appellant_is_shown_its_own_appeal_and_told_it_may_not_rule() {
+        let (_d, shared, ids) = state_with_members(&["claude-code", "kimi-code"]);
+        let (claude, kimi) = (ids[0], ids[1]);
+
+        let deny = append_deny(&shared, "claude-code", "cat ~/.ssh/id_ed25519").await;
+        file_appeal(&shared, claude, &deny).await;
+
+        let mine = tool_open_appeals(&shared, &json!({"session_id": claude.to_string()}))
+            .await
+            .unwrap();
+        assert_eq!(mine["count"], 1, "the appellant must still SEE it: {mine}");
+        assert_eq!(
+            mine["open"][0]["you_may_rule"], false,
+            "self-arbitration must be answered here, not discovered at the ruling tool: {mine}"
+        );
+        assert_eq!(mine["you_may_rule_count"], 0, "{mine}");
+
+        let theirs = tool_open_appeals(&shared, &json!({"session_id": kimi.to_string()}))
+            .await
+            .unwrap();
+        assert_eq!(
+            theirs["open"][0]["you_may_rule"], true,
+            "a not-same member must be told it can take this: {theirs}"
+        );
+        assert_eq!(theirs["you_may_rule_count"], 1, "{theirs}");
+    }
+
+    /// AN UNATTRIBUTED CALLER GETS THE LIST AND IS TOLD WHY ELIGIBILITY IS MISSING.
+    ///
+    /// The failure this guards is silent absence: `you_may_rule` simply not being there
+    /// reads as "no eligibility concerns" rather than "not computed".
+    #[tokio::test]
+    async fn without_a_session_the_list_is_complete_and_eligibility_is_absent_not_implied() {
+        let (_d, shared, ids) = state_with_members(&["claude-code"]);
+        let deny = append_deny(&shared, "claude-code", "ls /tmp").await;
+        file_appeal(&shared, ids[0], &deny).await;
+
+        let q = tool_open_appeals(&shared, &json!({})).await.unwrap();
+        assert_eq!(q["count"], 1, "discovery must not require a session: {q}");
+        assert!(q["open"][0].get("you_may_rule").is_none(), "{q}");
+        assert!(q["you"].is_null(), "{q}");
+        assert!(
+            q["note"].as_str().unwrap().contains("session_id"),
+            "the reply must say why eligibility is absent: {q}"
+        );
+    }
+
+    /// BOTH `hestia://appeal/` CONVENTIONS RESOLVE, AND THE REPLY SAYS WHICH.
+    ///
+    /// Convention 1 is what this daemon mints into every dispatch notice. Convention 2 is
+    /// what the hand-written notices that actually got two appeals ruled carried. Before
+    /// this, NEITHER resolved — the prefix was absent from the resolver entirely.
+    #[tokio::test]
+    async fn appeal_pointers_resolve_under_both_conventions() {
+        let (_d, shared, ids) = state_with_members(&["claude-code"]);
+        let deny = append_deny(&shared, "claude-code", "ls /tmp").await;
+        let filed = file_appeal(&shared, ids[0], &deny).await;
+        let appeal_entry = filed["witnessEntryHash"].as_str().unwrap().to_string();
+
+        let by_deny: Value = serde_json::from_str(
+            &read_resource_body(&shared, &format!("hestia://appeal/{deny}")).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(by_deny["matched_as"], "deny_hash", "{by_deny}");
+        assert_eq!(by_deny["deny_hash"], deny, "{by_deny}");
+        assert_eq!(by_deny["ruled"], false, "{by_deny}");
+
+        let by_entry: Value = serde_json::from_str(
+            &read_resource_body(&shared, &format!("hestia://appeal/{appeal_entry}")).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(by_entry["matched_as"], "appeal_entry_hash", "{by_entry}");
+        assert_eq!(
+            by_entry["deny_hash"], deny,
+            "the non-canonical namespace must still yield the RULING-READY hash — converting \
+             it by hand is the cost this resolver exists to remove: {by_entry}"
+        );
+    }
+
+    /// FIDELITY TO ROUTING IS ON THE ADJUDICATION ENTRY.
+    ///
+    /// The live case: an appeal routed to one member, ruled by another, both cross-vendor.
+    /// Without `was_designee` the two rulings are bit-identical on the chain, and a relying
+    /// party cannot tell that routing was bypassed.
+    #[tokio::test]
+    async fn the_adjudication_records_whether_the_arbiter_was_the_designee() {
+        let (_d, shared, ids) = state_with_members(&["claude-code", "codex", "kimi-code"]);
+        let (claude, kimi) = (ids[0], ids[2]);
+
+        let deny = append_deny(&shared, "claude-code", "ls /tmp").await;
+        file_appeal(&shared, claude, &deny).await;
+
+        let q = tool_open_appeals(&shared, &json!({"session_id": kimi.to_string()})).await.unwrap();
+        let designee = q["open"][0]["routing"]["routed_to"].as_str().unwrap().to_string();
+        // The fixture reproduces the incident's exact shape rather than approximating it:
+        // routing designates `codex`, and `kimi-code` — cross-vendor to the appellant on
+        // BOTH counts, so `independence` alone cannot separate them — is who actually rules.
+        // Pinned, because if selection ever changed to pick kimi, the assertion below would
+        // silently start testing the designated path and stop testing the bypassed one.
+        assert_eq!(designee, "codex", "fixture must route away from the ruling member: {q}");
+
+        tool_arbitrate_appeal(
+            &shared,
+            &json!({
+                "deny_hash": deny,
+                "upheld": true,
+                "rationale": "a read under /tmp is not the act the destructive rule names",
+                "session_id": kimi.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let s = shared.lock().await;
+        let adj = s
+            .recent_chain(50)
+            .into_iter()
+            .find(|e| e.event_type == "adjudication")
+            .expect("a ruling was written");
+        assert_eq!(adj.event_data["routed_to"], designee, "{:?}", adj.event_data);
+        assert_eq!(
+            adj.event_data["was_designee"], false,
+            "a ruling by a member that was NOT designated must say so on the adjudication \
+             entry — this is the one bit that separates 'routing worked' from 'routing was \
+             bypassed and it got ruled anyway', and independence cannot carry it: {:?}",
+            adj.event_data
+        );
+        assert_eq!(
+            adj.event_data["independence"], "cross_vendor",
+            "the ambiguity being closed: this ruling's independence is bit-identical to what \
+             a designated codex ruling would have written: {:?}",
+            adj.event_data
+        );
+    }
+
 }
 
 #[cfg(test)]
