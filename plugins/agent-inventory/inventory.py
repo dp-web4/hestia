@@ -126,6 +126,7 @@ import json
 import math
 import os
 import platform
+import plistlib
 import re
 import shlex
 import subprocess
@@ -830,6 +831,20 @@ def periodic_trigger() -> tuple[str, str, list[str]]:
     the port). Written down rather than absorbed: on a laptop that sleeps, the two
     schedules diverge in coverage, not just in syntax, and `launchd-agent-installed` is
     the weaker claim of the two.
+
+    AND THE PLIST'S EXISTENCE WAS NOT THE SCHEDULE (McNugget, 2026-07-28, writing the
+    launchd half on a Mac). The glob alone answered `launchd-agent-installed` for ANY
+    matching plist. But a LaunchAgent with neither `StartInterval` nor
+    `StartCalendarInterval` is not periodic — `RunAtLoad` alone fires at login and never
+    again, and `launchctl bootstrap` accepts it silently. That is the systemd
+    `installed-not-enabled` distinction with no state to hold it, on the side where the
+    positive answer was already the weak one: this file would have reported a schedule
+    for the exact artifact it exists to catch, and the first such artifact would have
+    been the one written next door in `install.sh`. So the keys are read, not assumed —
+    `plistlib` handles XML and binary plists in-process, no `launchctl` subprocess, which
+    keeps the hook budget intact. A plist that will not parse is its own answer: `launchctl`
+    would refuse it too, so nothing is scheduled, but "refused" and "no schedule key" are
+    different repairs and do not share a name.
     """
     system = platform.system()
     unit = HOME / ".config" / "systemd" / "user" / f"{INSTALLED_BIN_NAME}.timer"
@@ -843,8 +858,44 @@ def periodic_trigger() -> tuple[str, str, list[str]]:
     if unit.exists():
         return "systemd-user-timer-installed-not-enabled", system, looked
     if plists:
-        return "launchd-agent-installed", system, looked
+        return f"launchd-agent-{_launchd_schedule(plists)}", system, looked
     return "absent", system, looked
+
+
+# launchd's two periodic keys. `RunAtLoad`, `KeepAlive` and `WatchPaths` are triggers but
+# not schedules: they answer "when something happens", which is the surface this check
+# already has. Only these two make it a REGULAR check.
+LAUNCHD_SCHEDULE_KEYS = ("StartInterval", "StartCalendarInterval")
+
+
+def _launchd_schedule(plists: list[Path]) -> str:
+    """`installed` | `installed-no-schedule` | `unparseable`, over all matching plists.
+
+    Any one scheduled plist is enough — that is a real hourly fire regardless of what
+    else is in the directory. The negative answers are only reached when NONE is, and
+    they are ordered so the weaker knowledge wins: a directory holding one unreadable
+    plist and one readable-but-unscheduled plist reports `unparseable`, because the
+    unreadable one might have carried the schedule and saying `no-schedule` there would
+    be a claim about a file this function could not read.
+
+    A non-dict root counts as unreadable, not as unscheduled. `plistlib.loads(b"<plist/>")`
+    returns None rather than raising (measured, CPython 3.13) — so "it parsed" is not "it is
+    a job description", and the truthful thing to say about a file with no job dictionary in
+    it is that no schedule could be read from it, not that it has none.
+    """
+    unreadable = False
+    for p in plists:
+        try:
+            with p.open("rb") as fh:
+                data = plistlib.load(fh)
+        except Exception:
+            data = None
+        if not isinstance(data, dict):
+            unreadable = True
+            continue
+        if any(k in data for k in LAUNCHD_SCHEDULE_KEYS):
+            return "installed"
+    return "unparseable" if unreadable else "installed-no-schedule"
 
 
 def _git(*args: str) -> str | None:
@@ -1285,10 +1336,25 @@ def emit(report: dict, brief: bool) -> int:
         # Gated on the binary being there: a machine that never ran install.sh has no
         # schedule for the honest reason, and warning about it would be noise on every
         # bare `python3 inventory.py`. The finding is the PAIR — installed, unscheduled.
-        if scan.get("periodic_trigger") == "absent" and scan.get("installed_bin"):
-            line += (" | NO PERIODIC TRIGGER — this binary is installed with no schedule "
-                     f"on {scan.get('periodic_platform')}; it runs only when something "
-                     "calls it, so silence here is not evidence")
+        # `launchd-agent-installed-no-schedule` reads the same to a session and is worse
+        # to a reader: a plist IS present, so `ls ~/Library/LaunchAgents` and `launchctl
+        # bootstrap` both look like a wired schedule. Same sentence, different second
+        # clause — what to go fix is not the same thing.
+        if scan.get("installed_bin") and scan.get("periodic_trigger") in (
+                "absent", "launchd-agent-installed-no-schedule", "launchd-agent-unparseable"):
+            why = {
+                "absent": ("no schedule", "it runs only when something calls it, so "
+                           "silence here is not evidence"),
+                "launchd-agent-installed-no-schedule":
+                    ("a LaunchAgent plist that schedules nothing",
+                     "it has neither StartInterval nor StartCalendarInterval, so launchd "
+                     "loads it and never fires it"),
+                "launchd-agent-unparseable":
+                    ("a LaunchAgent plist that does not parse",
+                     "launchctl will refuse it too; re-run install.sh"),
+            }[scan["periodic_trigger"]]
+            line += (f" | NO PERIODIC TRIGGER — this binary is installed with {why[0]} "
+                     f"on {scan.get('periodic_platform')}; {why[1]}")
         if scan.get("hook_timeout_installed_s") is not None:
             line += (f" | HOOK TIMEOUT {scan['hook_timeout_installed_s']}s < "
                      f"{scan.get('project_scan_budget_s')}s SCAN BUDGET — this check can "

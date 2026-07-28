@@ -6,7 +6,7 @@
 #   on launch          SessionStart hook, --brief, so a session opens knowing whether
 #                      it shares this box with something ungoverned
 #   operator ondemand  `hestia-agent-inventory` on PATH
-#   periodic           systemd USER timer, hourly
+#   periodic           systemd USER timer (Linux) / launchd USER agent (Darwin), hourly
 #
 # WHY THE RUNNING COPY IS NOT THE REPO COPY. The repo lives on /mnt/c, which is 9p, and
 # a cold 9p read can outlast a hook timeout — at which point Claude-lineage hooks fail
@@ -60,6 +60,16 @@ echo "workspace:  $WORKSPACE  (${HESTIA_WORKSPACE:+from HESTIA_WORKSPACE}${HESTI
 
 BIN="$HOME/.local/bin/hestia-agent-inventory"
 UNIT_DIR="$HOME/.config/systemd/user"
+AGENT_DIR="$HOME/Library/LaunchAgents"
+# The plist FILENAME must contain the binary name, because that is what
+# `inventory.py:periodic_trigger()` globs for (`*hestia-agent-inventory*.plist`). Naming
+# it `io.hestia.agent-inventory` reads better and is invisible to the detector, which
+# would report `absent` on a machine this script had just scheduled. The reverse of the
+# usual coupling complaint: here the two files must agree, so the agreement is stated in
+# both. Fleet convention for the prefix is `io.hestia.*` (deploy/templates).
+LAUNCHD_LABEL="io.hestia-agent-inventory"
+PLIST="$AGENT_DIR/$LAUNCHD_LABEL.plist"
+LOG_DIR="$HOME/.local/state/hestia"
 SETTINGS="$HOME/.claude/settings.json"
 
 # ---- 0. which of the three triggers this platform can carry ----------------------
@@ -95,12 +105,15 @@ esac
 if [ "$PERIODIC" = systemd ] && ! command -v systemctl >/dev/null 2>&1; then
   PERIODIC=none; PERIODIC_WHY="Linux, but no systemctl on PATH"
 elif [ "$PERIODIC" = launchd ]; then
-  # NOT YET BUILT, AND SAYING SO IS THE POINT. The launchd half (a StartInterval agent in
-  # ~/Library/LaunchAgents) is McNugget's to write, on the box that can test it and measure
-  # what the hourly walk costs on APFS. Until it lands, Darwin installs two triggers of
-  # three and the check itself reports the third missing. That is a known, visible gap; the
-  # thing it replaces was an unknown, invisible one.
-  PERIODIC=none; PERIODIC_WHY="Darwin — the launchd agent is not written yet"
+  # Same rule as systemctl above, and it is not hypothetical here: `plutil` is what makes
+  # the difference between writing a plist and knowing it parses, and step 2 refuses to
+  # claim a schedule it could not lint. Both tools ship with macOS; a box missing either
+  # is far enough off the platform that guessing is the wrong move.
+  for t in launchctl plutil; do
+    if ! command -v "$t" >/dev/null 2>&1; then
+      PERIODIC=none; PERIODIC_WHY="Darwin, but no $t on PATH"
+    fi
+  done
 elif [ "$PERIODIC" = none ]; then
   PERIODIC_WHY="$(uname -s) has no periodic backend here"
 fi
@@ -109,6 +122,7 @@ fi
 # the script down. The bug class this whole section is about, in one line of its own fix.
 mkdir -p "$(dirname "$BIN")"
 if [ "$PERIODIC" = systemd ]; then mkdir -p "$UNIT_DIR"; fi
+if [ "$PERIODIC" = launchd ]; then mkdir -p "$AGENT_DIR" "$LOG_DIR"; fi
 echo "periodic:   ${PERIODIC}${PERIODIC_WHY:+  ($PERIODIC_WHY)}"
 
 # ---- 1. the executable, on ext4 -------------------------------------------------
@@ -120,18 +134,67 @@ echo "periodic:   ${PERIODIC}${PERIODIC_WHY:+  ($PERIODIC_WHY)}"
 # refuses to trust a compiled-in default it cannot confirm. The rule is right — an
 # unestablished scope must degrade — so the fix is to ESTABLISH it at install time rather
 # than to weaken the rule. A caller-supplied HESTIA_WORKSPACE still wins.
+#
+# THE INTERPRETER IS PINNED FOR THE SAME REASON THE WORKSPACE IS (McNugget, 2026-07-28,
+# measured on Darwin). The wrapper said `python3` and let PATH resolve it, so the three
+# triggers did not have to agree on which python3 that is. A daemon's PATH is not a shell's.
+# Measured with a throwaway LaunchAgent that printed its own environment:
+#
+#   launchd's PATH for a gui/ agent   /usr/bin:/bin:/usr/sbin:/sbin   (no plist override)
+#   `command -v python3` in dp's shell  /opt/homebrew/bin/python3     Python 3.14.4
+#   `command -v python3` under launchd  /usr/bin/python3              Python 3.9.6
+#
+# Two different interpreters, five minor versions apart, chosen by which trigger fired.
+# TODAY THAT IS BENIGN AND THE HONEST THING IS TO SAY SO: both were run against this
+# workspace and printed a byte-identical --brief line. What is not benign is the coupling —
+# step 3 below derives the SessionStart timeout by running this binary under the SHELL's
+# python3, and the periodic trigger would then run it under a different one. The pair that
+# `--print-hook-timeout` exists to keep from drifting is only pinned on one side.
+#
+# NOT MEASURED HERE, and stated as unmeasured: on a Mac without the Xcode command line
+# tools `/usr/bin/python3` is a stub, so the unpinned wrapper is exit 127 from launchd while
+# `launchctl print` still shows a healthy job with the interval set — the schedule real, the
+# plist linting, the detector saying `installed`, and the check never once having run. This
+# box has Xcode, so that path could not be exercised on it.
+#
+# Resolving it HERE, in the same shell that is about to verify it, makes the wrapper
+# independent of whatever PATH each of the three triggers happens to carry. Not
+# Darwin-specific: a systemd --user unit sets no PATH either.
+PYTHON="$(command -v python3 || true)"
+if [ -z "$PYTHON" ]; then
+  echo "install: no python3 on PATH. That is the interpreter every trigger runs;" >&2
+  echo "         refusing to write a wrapper naming one this shell cannot find." >&2
+  exit 1
+fi
 install -m 0755 "$SRC_DIR/inventory.py" "$BIN.py"
 cat > "$BIN" <<WRAP
 #!/bin/sh
-# Generated by agent-inventory/install.sh — pins the workspace detected at install time.
-exec env HESTIA_WORKSPACE="\${HESTIA_WORKSPACE:-$WORKSPACE}" python3 "$BIN.py" "\$@"
+# Generated by agent-inventory/install.sh — pins the workspace and the interpreter
+# detected at install time. Both are scope: a trigger that resolves either from its own
+# environment answers about a directory, or with a python, that nobody chose.
+exec env HESTIA_WORKSPACE="\${HESTIA_WORKSPACE:-$WORKSPACE}" "$PYTHON" "$BIN.py" "\$@"
 WRAP
 chmod 0755 "$BIN"
 echo "installed: $BIN  (source: $SRC_DIR/inventory.py, workspace pinned to $WORKSPACE)"
+echo "           interpreter pinned to $PYTHON"
 
 # ---- 2. periodic: hourly user timer ---------------------------------------------
 # Guarded by the step-0 decision, not by trying it and seeing. Everything from here to the
-# lingering report is systemd-only; step 3 below runs on every platform.
+# lingering report is backend-specific; step 3 below runs on every platform.
+
+# Printed from two places: the platform that has no backend, and the platform that has one
+# whose install could not be COMPLETED (a plist that will not lint). The second is the one
+# worth having a shared exit for — it is where a script is most tempted to keep going and
+# let the schedule be someone's later surprise.
+skip_periodic() {
+  echo "SKIPPED:   periodic trigger — $PERIODIC_WHY"
+  echo "           The binary and the SessionStart hook are still installed, so this"
+  echo "           check answers on demand and at session start. It will NOT run on its"
+  echo "           own. Every run reports that itself: scope.periodic_trigger=absent,"
+  echo "           and --brief carries NO PERIODIC TRIGGER — so the gap does not depend"
+  echo "           on anyone having read this line."
+}
+
 if [ "$PERIODIC" = systemd ]; then
 cat > "$UNIT_DIR/hestia-agent-inventory.service" <<EOF
 [Unit]
@@ -177,13 +240,146 @@ else
   echo "  lingering: OFF — this timer ONLY fires while $USER has a session."
   echo "             enable with: loginctl enable-linger $USER   (needs sudo)"
 fi
+elif [ "$PERIODIC" = launchd ]; then
+UID_N="$(id -u)"
+
+# WHY THESE KEYS, AND WHICH SYSTEMD PROPERTIES HAVE NO ANALOGUE (McNugget, 2026-07-28).
+# The timer above is the specification; this is the nearest launchd can get, and where it
+# cannot get there the gap is named rather than papered over.
+#
+#   StartInterval 3600   = OnUnitActiveSec=1h. Interval since the last run, which is what
+#                          the systemd side means. StartCalendarInterval would be a
+#                          wall-clock slot — a different schedule wearing the same word.
+#   RunAtLoad            ~ OnBootSec=3min. Not equal: RunAtLoad fires AT load, and launchd
+#                          has no delay-after-load key for an interval job. The 3min on the
+#                          systemd side buys boot quiet, not coverage, so this diverges by
+#                          three minutes of contention and nothing else.
+#   (none)               = RandomizedDelaySec=90. launchd has no jitter for StartInterval.
+#                          One machine, one agent — the jitter was for fleets sharing a
+#                          filer, and this walk is local. Recorded as absent, not as fine.
+#   (none)               = Persistent=true. A StartInterval missed while the machine slept
+#                          fires ONCE at next load, not once per missed interval. On a
+#                          laptop that sleeps nightly the two backends diverge in COVERAGE:
+#                          systemd catches up, launchd does not. `periodic_trigger()`
+#                          carries this in its docstring; it is why the states are named
+#                          differently and not merged.
+#
+# PATH is set even though step 1 now pins the interpreter. Belt and braces, and cheap: the
+# thing that failed here was a daemon's PATH being narrower than the shell's, and the
+# wrapper is not the only thing downstream that can want a tool (`git`, for the registry).
+# The pin is the fix; this is the same fact written where the next reader of the plist is.
+#
+# ProcessType Background is what tells the scheduler this may be deprioritised — an hourly
+# directory walk must never compete with the user's foreground work.
+LAUNCHD_PATH="$(dirname "$PYTHON"):/usr/bin:/bin:/usr/sbin:/sbin"
+cat > "$PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LAUNCHD_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$BIN</string>
+    <string>--workspace</string>
+    <string>$WORKSPACE</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HESTIA_WORKSPACE</key><string>$WORKSPACE</string>
+    <key>HOME</key><string>$HOME</string>
+    <key>PATH</key><string>$LAUNCHD_PATH</string>
+  </dict>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>$LOG_DIR/agent-inventory.log</string>
+  <key>StandardErrorPath</key><string>$LOG_DIR/agent-inventory.err</string>
+</dict>
+</plist>
+PLIST_EOF
+
+# LINT BEFORE LOAD, AND REMOVE ON FAILURE. `launchctl` refuses a malformed plist and says
+# so unhelpfully (deploy/fleet/install.sh:verify_service_macos, probe 1) — but the file
+# would still be sitting in ~/Library/LaunchAgents, where `ls` reads as a wired schedule
+# and `periodic_trigger()`'s glob finds it. Leaving it is manufacturing the exact artifact
+# this plugin exists to catch. So: unlinted means uninstalled, said out loud, and the run
+# continues to step 3 because the other two triggers are unaffected.
+#
+# AND `plutil -lint` IS A PARSER, NOT A VALIDATOR — measured, not assumed. Appending
+# `<<<junk` after `</plist>` still lints OK (macOS 26.5): it stops at the closing tag. It
+# catches truncation and malformed XML (a 300-byte cut reports "Encountered unexpected
+# EOF"), and it says nothing about whether the dict describes a job launchd will run. That
+# second question is why the `launchctl print` probe below exists and is not redundant
+# with this one.
+LINT="$(plutil -lint "$PLIST" 2>&1 || true)"
+case "$LINT" in
+  *OK*) : ;;
+  *)
+    rm -f "$PLIST"
+    PERIODIC=none
+    PERIODIC_WHY="Darwin — the generated plist did not lint (plutil: $LINT); removed, not left for launchctl to refuse"
+    skip_periodic ;;
+esac
+
+if [ "$PERIODIC" = launchd ]; then
+  # bootout/bootstrap is the modern spelling and the one that reports errors usefully;
+  # load/unload is kept for older macOS. `bootout` on a label that is not loaded exits
+  # non-zero, which under `set -e` is the same class of abort this whole file is about.
+  launchctl bootout "gui/$UID_N/$LAUNCHD_LABEL" 2>/dev/null || true
+  BOOTSTRAP_ERR="$(launchctl bootstrap "gui/$UID_N" "$PLIST" 2>&1)" || {
+    launchctl unload "$PLIST" 2>/dev/null || true
+    BOOTSTRAP_ERR="$(launchctl load "$PLIST" 2>&1)" || true
+  }
+  echo "installed: hourly launchd agent ($PLIST)"
+
+  # `launchctl load` SUCCEEDS ON A VALID PLIST AND SAYS NOTHING ABOUT THE JOB (same
+  # finding, deploy/fleet 2026-07-25). So the claim is not "we wrote a file with
+  # StartInterval in it" — it is "launchd is holding a job with that interval", which is a
+  # different fact and the only one that makes this a regular check. Ask launchd, not the
+  # filesystem.
+  PRINTED="$(launchctl print "gui/$UID_N/$LAUNCHD_LABEL" 2>&1 || true)"
+  INTERVAL="$(printf '%s\n' "$PRINTED" | sed -n 's/.*interval *= *\([0-9][0-9]*\).*/\1/p' | head -1)"
+  if [ "$INTERVAL" = 3600 ]; then
+    echo "  launchd:   job loaded in gui/$UID_N, run interval = ${INTERVAL}s"
+  else
+    echo "  WARNING:   the plist is on disk and lints, but launchd does not report a" >&2
+    echo "             3600s run interval for $LAUNCHD_LABEL." >&2
+    echo "             launchctl bootstrap said: ${BOOTSTRAP_ERR:-(nothing)}" >&2
+    echo "             launchctl print gui/$UID_N/$LAUNCHD_LABEL for the full state." >&2
+    echo "             Treat the schedule as NOT wired until that says otherwise." >&2
+  fi
+
+  # The distinction that matters, launchd's version of the lingering report. A gui/ domain
+  # agent is bound to the GUI login session: it does not run when nobody is logged in, and
+  # it stops at logout. That is the same fact as `lingering: OFF` — installed is not
+  # will-fire — and it is worse here because there is no `enable-linger` to point at. The
+  # honest remedy is a LaunchDaemon (root, system domain), which is a privilege escalation
+  # this observation-only check has no business asking for.
+  echo "  session:   gui/$UID_N — this agent fires only while $USER is logged in."
+  echo "             There is no launchd equivalent of loginctl enable-linger for a user"
+  echo "             agent; a fire missed while logged out or asleep happens ONCE at next"
+  echo "             load, not once per missed hour (no Persistent= analogue)."
+
+  # Label drift, the agent-inventory shape of deploy/fleet's probe 2. `periodic_trigger()`
+  # answers from a GLOB, so any other plist whose name carries the binary name counts as
+  # this machine's schedule — including a stale one from a rename, pointing at a binary
+  # that no longer exists. One `installed` answer would then cover for a dead job.
+  DRIFT=""
+  for cand in "$AGENT_DIR"/*hestia-agent-inventory*.plist; do
+    [ -f "$cand" ] || continue
+    [ "$cand" = "$PLIST" ] && continue
+    DRIFT="$DRIFT $cand"
+  done
+  if [ -n "$DRIFT" ]; then
+    echo "  WARNING:   LABEL DRIFT — other plists also match the detector's glob:" >&2
+    for d in $DRIFT; do echo "               $d" >&2; done
+    echo "             periodic_trigger() reports 'installed' if ANY of them carries a" >&2
+    echo "             schedule, so a stale one hides a dead job. Review and bootout." >&2
+  fi
+fi
 else
-  echo "SKIPPED:   periodic trigger — $PERIODIC_WHY"
-  echo "           The binary and the SessionStart hook are still installed, so this"
-  echo "           check answers on demand and at session start. It will NOT run on its"
-  echo "           own. Every run reports that itself: scope.periodic_trigger=absent,"
-  echo "           and --brief carries NO PERIODIC TRIGGER — so the gap does not depend"
-  echo "           on anyone having read this line."
+  skip_periodic
 fi
 
 # ---- 3. on launch: SessionStart hook --------------------------------------------
@@ -287,6 +483,13 @@ echo "             invocation falls back to the compiled-in default and answers 
 echo "            --brief       one line        --no-witness   skip the chain write"
 if [ "$PERIODIC" = systemd ]; then
   echo "next fire:  $(systemctl --user list-timers hestia-agent-inventory.timer --no-pager 2>/dev/null | sed -n 2p)"
+elif [ "$PERIODIC" = launchd ]; then
+  # No `list-timers` here: launchd exposes the interval, not the next fire time, so this
+  # says the interval and where the last one went rather than inventing a timestamp.
+  echo "next fire:  within 3600s of the last run — launchd reports the interval, not a"
+  echo "            next-fire time. Output: $LOG_DIR/agent-inventory.log (.err for stderr)"
+  echo "            state:  launchctl print gui/$UID_N/$LAUNCHD_LABEL"
+  echo "            now:    launchctl kickstart -p gui/$UID_N/$LAUNCHD_LABEL"
 else
   echo "next fire:  never on its own — no periodic trigger on this platform ($PERIODIC_WHY)"
 fi

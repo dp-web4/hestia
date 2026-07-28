@@ -22,6 +22,7 @@ Run: python3 test_inventory.py     (no pytest; exit 1 on failure)
 from __future__ import annotations
 
 import json
+import plistlib
 import sys
 import tempfile
 from pathlib import Path
@@ -238,14 +239,49 @@ def test_periodic_trigger(tmp: Path):
         check("wants-symlink is the enable", inventory.periodic_trigger()[0],
               "systemd-user-timer-enabled")
         # Darwin's half, exercised from Linux: the launchd branch is reached by the plist
-        # glob alone, so it is testable on a box that has never seen launchctl.
+        # glob and `plistlib`, so it is testable on a box that has never seen launchctl.
         home2 = tmp / "home2"
-        (home2 / "Library" / "LaunchAgents").mkdir(parents=True)
-        (home2 / "Library" / "LaunchAgents"
-         / f"net.dpcars.{inventory.INSTALLED_BIN_NAME}.plist").write_text("<plist/>")
+        agents = home2 / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
         inventory.HOME = home2
-        check("launchd plist counts", inventory.periodic_trigger()[0],
+        plist = agents / f"io.hestia-{inventory.INSTALLED_BIN_NAME}.plist"
+
+        # THE CASE THE GLOB GOT WRONG. A LaunchAgent with RunAtLoad and no schedule key
+        # fires at login and never again; `launchctl bootstrap` takes it without comment
+        # and `ls` cannot tell it from the real thing. Presence was never the schedule.
+        def write(d):
+            with plist.open("wb") as fh:
+                plistlib.dump(d, fh)
+
+        write({"Label": "x", "RunAtLoad": True})
+        check("RunAtLoad alone is not a schedule", inventory.periodic_trigger()[0],
+              "launchd-agent-installed-no-schedule")
+        write({"Label": "x", "StartInterval": 3600})
+        check("StartInterval is a schedule", inventory.periodic_trigger()[0],
               "launchd-agent-installed")
+        write({"Label": "x", "StartCalendarInterval": {"Minute": 0}})
+        check("StartCalendarInterval is a schedule", inventory.periodic_trigger()[0],
+              "launchd-agent-installed")
+        # launchctl would refuse this too, so nothing is scheduled either way — but "fix
+        # the file" and "add a key" are different repairs, so they are different states.
+        plist.write_text("<plist/>")
+        check("a plist that will not parse says so", inventory.periodic_trigger()[0],
+              "launchd-agent-unparseable")
+        # Unreadable outranks no-schedule: the file this function could not read might
+        # have been the scheduled one, and `no-schedule` would be a claim about it.
+        second = agents / f"io.other-{inventory.INSTALLED_BIN_NAME}.plist"
+        with second.open("wb") as fh:
+            plistlib.dump({"Label": "y", "RunAtLoad": True}, fh)
+        check("unreadable outranks no-schedule", inventory.periodic_trigger()[0],
+              "launchd-agent-unparseable")
+        # ...but one genuine schedule anywhere in the directory IS an hourly fire, whatever
+        # else is lying next to it.
+        with second.open("wb") as fh:
+            plistlib.dump({"Label": "y", "StartInterval": 3600}, fh)
+        check("any scheduled plist wins", inventory.periodic_trigger()[0],
+              "launchd-agent-installed")
+        second.unlink()
+        plist.unlink()
         # The paths are returned so a reader can re-derive the verdict rather than trust
         # it — the same reason `scope` exists at all.
         check("says where it looked", len(inventory.periodic_trigger()[2]), 3)

@@ -43,7 +43,8 @@ the `/mnt/c` 9p mount (cold reads can outlast a hook timeout, and these hooks fa
 |---|---|
 | on launch | `SessionStart` hook, `--workspace <ws> --brief`, 10s timeout |
 | operator on demand | `hestia-agent-inventory --workspace <ws> [--brief] [--no-witness]` |
-| periodic | `systemd --user` timer, hourly (`OnBootSec=3min`, `Persistent=true`) — **Linux only** |
+| periodic | Linux: `systemd --user` timer, hourly (`OnBootSec=3min`, `Persistent=true`) |
+| | Darwin: `launchd` user agent `io.hestia-agent-inventory`, hourly (`StartInterval=3600`, `RunAtLoad`) |
 
 `install.sh` wires **every trigger this platform can carry** — all three on Linux — and
 writes the resolved workspace into each of them.
@@ -167,10 +168,65 @@ Two changes, and the second is the one that matters:
    neither promises a fire (a `--user` timer with lingering off does not run without a
    session). Stats only, no subprocess: this runs inside a hook with a budget.
 
-**Darwin is in scope; the launchd agent is not written.** `install.sh` therefore installs
-two of three triggers on a Mac and says so, and the check reports the third missing on
-every run. That is a known, visible gap where there was an unknown, invisible one — but it
-is still a gap, and closing it needs a box that can test it.
+**Darwin is in scope, and the launchd agent is now written and run.** `install.sh`
+completes on macOS (26.5, McNugget, 2026-07-28 — the first time it has), wiring all three
+triggers. The agent was bootstrapped, fired by `RunAtLoad`, and exited 0 having written a
+real report; `launchctl print` reports `run interval = 3600 seconds`.
+
+The two backends are **not** equivalent, and the differences are named rather than
+smoothed over, because each is a gap in coverage that a shared state name would hide:
+
+| systemd | launchd | consequence |
+|---|---|---|
+| `OnUnitActiveSec=1h` | `StartInterval=3600` | equivalent |
+| `OnBootSec=3min` | `RunAtLoad` | fires *at* load, not 3min after; costs boot quiet, not coverage |
+| `RandomizedDelaySec=90` | — | no jitter for `StartInterval`; one local walk, so recorded as absent rather than fine |
+| `Persistent=true` | — | **a fire missed while asleep happens once at next load, not once per missed hour.** systemd catches up; launchd does not |
+| `loginctl enable-linger` | — | a `gui/` agent runs only while the user is logged in, and there is no user-agent equivalent of lingering. The honest remedy is a `LaunchDaemon`, which is a privilege escalation an observation-only check has no business asking for |
+
+**A plist's existence was never the schedule.** Writing the launchd half surfaced that the
+detector answered `launchd-agent-installed` from the glob alone — so a LaunchAgent with
+`RunAtLoad` and no schedule key, which `launchctl bootstrap` accepts silently and `ls`
+cannot distinguish, read as an hourly check. Measured against the pre-change detector: it
+returned `launchd-agent-installed` and the `--brief` line was clean. That is the systemd
+`installed-not-enabled` distinction with no state to hold it, on the side where the
+positive answer was already the weaker one — and the first such artifact would have been
+the one `install.sh` writes. The keys are now read with `plistlib` (in-process, no
+`launchctl` subprocess, hook budget intact), and the states say how much they claim:
+`launchd-agent-installed`, `-installed-no-schedule`, `-unparseable`. A non-dict root
+counts as unparseable, not unscheduled: `plistlib.loads(b"<plist/>")` returns `None`
+rather than raising, so "it parsed" is not "it is a job description".
+
+**The installer asks launchd, not the filesystem.** `plutil -lint` is a parser, not a
+validator — measured on macOS 26.5, `<<<junk` appended after `</plist>` still lints `OK`,
+because it stops at the closing tag. So an unlinted plist is *removed* rather than left
+where `ls` and the detector's glob would both read it as a wired schedule, and a linted
+one is then checked against `launchctl print gui/$UID/<label>` for the interval launchd
+actually holds. `launchctl load` succeeds on a valid plist and says nothing about the job.
+
+**The interpreter is pinned, like the workspace.** The wrapper said `python3` and let
+`PATH` resolve it. Measured with a throwaway LaunchAgent that printed its own environment:
+launchd hands a `gui/` agent `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, so `python3` resolved to
+`/usr/bin/python3` (3.9.6) under the timer and `/opt/homebrew/bin/python3` (3.14.4) in the
+shell. Both printed a byte-identical `--brief` line here, so today it is benign — but step
+3 derives the `SessionStart` timeout by running the binary under the *shell's* python3, and
+the pair `--print-hook-timeout` exists to keep from drifting was pinned on one side only.
+Not Darwin-specific: a systemd `--user` unit sets no `PATH` either. Not measured here, and
+said as unmeasured: on a Mac without the Xcode command line tools `/usr/bin/python3` is a
+stub, and the unpinned wrapper would be exit 127 from launchd while `launchctl print` still
+showed a healthy job with the interval set.
+
+**A negative result, recorded because it was worth checking:** the narrow launchd `PATH`
+does **not** shrink the A inventory. The obvious worry — `claude` lives in
+`~/.local/bin`, which is on the shell's `PATH` and not on launchd's, so the hourly run
+would report fewer installed agents than the operator does, silently and in the reassuring
+direction — is already closed by `EXTRA_BIN_GLOBS`. `search_roots()` searches `PATH` **∪**
+the `$HOME` version-manager roots, and `.local/bin` is one of them. Measured, same binary,
+same real `$HOME`, `env -i` with launchd's exact `PATH`: byte-identical `--brief` line to
+the full-shell run. Rule #1's fix for nvm on CBP covers launchd on a Mac for free. The
+divergence first seen here (`installed: []` from the agent, `['claude']` from the shell)
+was a sandbox `$HOME` in the test rig, not a defect — chased to the bottom rather than
+shipped as a finding.
 
 ## The budget is part of the scope
 
