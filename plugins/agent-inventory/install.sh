@@ -199,6 +199,24 @@ if [ -z "$PYTHON" ]; then
   echo "         refusing to write a wrapper naming one this shell cannot find." >&2
   exit 1
 fi
+# EXISTS IS NOT RUNS, AND THE INSTALLER IS WHERE THAT IS CHEAPEST TO LEARN (McNugget,
+# 2026-07-28, measured on macOS 26.5). `command -v python3` on a Mac WITHOUT the Xcode
+# command line tools resolves /usr/bin/python3 — which is an xcrun stub, not an
+# interpreter: 118KB, executable, on the default PATH, and `exit 1` with
+# `xcrun: error: invalid active developer path` without running a line of python. The -z
+# guard above passes it. Pinning it would wire all three triggers to an interpreter that
+# has never run once, which is this plugin's own subject matter. Ask it, don't assume:
+# 13ms, once, at the one moment a human is watching. Aborting here is NOT the trade
+# rejected in step 0 — that dropped two working triggers to punish a third; this is the
+# interpreter all three of them are, so there is nothing left to install that would work.
+if ! "$PYTHON" -c '' 2>/dev/null; then
+  echo "install: $PYTHON is on PATH but cannot run python." >&2
+  echo "         On macOS that is the /usr/bin/python3 xcrun stub with no Xcode command" >&2
+  echo "         line tools behind it: xcode-select --install, or put a working python3" >&2
+  echo "         first on PATH. Nothing has been installed; all three triggers would run" >&2
+  echo "         this interpreter, so there is no partial install worth leaving." >&2
+  exit 1
+fi
 install -m 0755 "$SRC_DIR/inventory.py" "$BIN.py"
 cat > "$BIN" <<WRAP
 #!/bin/sh
@@ -210,9 +228,28 @@ cat > "$BIN" <<WRAP
 # PATH and SAY SO through the environment — inventory.py turns HESTIA_INTERPRETER_PIN_BROKEN
 # into a finding on its own report. Exiting 127 here would replace a working check with
 # silence, and silence reads as clean.
+#
+# AND THE FALLBACK IS PROBED, NOT JUST FOUND (McNugget, 2026-07-28, measured end to end on
+# macOS 26.5 through a real launchd agent). `-x` and `command -v` answer "exists"; the
+# floor needs "runs". On a Mac without the Xcode command line tools /usr/bin/python3 is an
+# xcrun stub — and once the pinned directory is gone it is the FIRST python3 on the PATH
+# launchd hands a gui/ agent (/usr/bin:/bin:/usr/sbin:/sbin). Found by `command -v`, so the
+# -z branch never fires; exit 1 without running this file, so nothing reports. Measured:
+# stdout 0 bytes, no unknown[] entry, no INTERPRETER PIN BROKEN clause, and
+# periodic_trigger() still answering `launchd-agent-installed` with installed_bin set —
+# the strongest state this plugin has. That is the same silence the floor was written to
+# end, one platform over. So: run it once before trusting it, and if it cannot run, exit
+# LOUDLY rather than let the stub exit quietly. 13ms, and only on the already-degraded path.
 PY="$PYTHON"
 if [ ! -x "\$PY" ]; then
   PY="\$(command -v python3 2>/dev/null || true)"
+  if [ -n "\$PY" ] && ! "\$PY" -c '' 2>/dev/null; then
+    echo "hestia-agent-inventory: pinned interpreter $PYTHON is gone, and the PATH" >&2
+    echo "  fallback \$PY exists but cannot run python (on macOS /usr/bin/python3 is an" >&2
+    echo "  xcrun stub needing the Xcode command line tools). Re-run install.sh from a" >&2
+    echo "  shell whose python3 works. This check has NOT run." >&2
+    exit 127
+  fi
   if [ -z "\$PY" ]; then
     echo "hestia-agent-inventory: pinned interpreter $PYTHON is gone and there is no" >&2
     echo "  python3 on PATH either. Re-run install.sh. This check has NOT run." >&2
