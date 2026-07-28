@@ -77,6 +77,7 @@ impl ServerHandler for HestiaServer {
             "hestia_witness_adjudication" => tool_witness_adjudication(&self.state, &args).await,
             "hestia_appeal" => tool_appeal(&self.state, &args).await,
             "hestia_arbitrate_appeal" => tool_arbitrate_appeal(&self.state, &args).await,
+            "hestia_open_appeals" => tool_open_appeals(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
             "hestia_operating_law" => tool_operating_law(&self.state, &args).await,
@@ -154,6 +155,15 @@ impl ServerHandler for HestiaServer {
                  not-found, ambiguous-prefix and wrong-event-type distinctly.",
             ),
             make_resource_template(
+                "hestia://appeal/{hash}",
+                "Appeal by deny hash or appeal entry hash",
+                "Dereference the pointer an appeal review_request notice carries. Two \
+                 conventions are in circulation for this URI — the daemon mints the deny_hash, \
+                 hand-written notices have carried the appeal entry's own hash — and BOTH \
+                 resolve here; the reply says which matched. Always returns the ruling-ready \
+                 deny_hash and whether the appeal is still open.",
+            ),
+            make_resource_template(
                 "hestia://chain/{hash}",
                 "Witness chain entry by hash",
                 "Dereference ANY chain entry by hash or hash prefix — appeals, denies, outcomes, \
@@ -229,6 +239,10 @@ fn hestia_tools() -> Vec<Tool> {
             "Rule on another member's filed appeal (NOT-SAME, enforced: never your own appeal, never a deny your own gate issued). Requires an explicit upheld:true/false and stated reasoning; records the independence of the arbiter so a reader can weigh the ruling",
         ),
         t(
+            "hestia_open_appeals",
+            "List appeals nobody has ruled on yet, with the ruling-ready deny_hash for each. Designation is ADVISORY — hestia_arbitrate_appeal never reads it — so any admissible member may rule any of these; pass your session_id and each entry tells you whether you are one. Read-only. This is the discovery surface an arbiter needs: before it existed, a non-designated member had the authority to rule and no way to learn there was anything open",
+        ),
+        t(
             "hestia_witness_decision",
             "Witness an externally-adjudicated plugin-gate deny/warn (chain + gate-risk trust)",
         ),
@@ -269,7 +283,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_egress_pending",
-            "Forwarding plane (r6-routing branch 2): list notices addressed `peer/member` awaiting hand-off to the fleet mesh, or `mark_forwarded: <id>` once the mesh accepted one. Accepted-by-mesh is NOT read-by-recipient",
+            "Forwarding plane (r6-routing branch 2): list notices addressed `peer/member` awaiting hand-off to the fleet mesh (each row carries the dest_peer_lct to forward on, and the list carries the drain contract), then report the outcome — `mark_forwarded: <id>` if the mesh accepted it, or `mark_failed: <id>` with `reason: <text>` if it did not. Accepted-by-mesh is NOT read-by-recipient. Leaving a failed row unreported is not neutral: the attempt bound never fires and the sender is never told its packet died",
         ),
         t(
             "hestia_member_unanswered",
@@ -356,8 +370,15 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     let host_agent_version = optional_string(args, "host_agent_version");
     // The caller's stable host-session id (Claude Code's session_id, etc.), for connect idempotency.
     let host_session_id = optional_string(args, "host_session_id");
-    let requested_role =
-        optional_string(args, "requested_role").unwrap_or_else(|| "citizen".to_string());
+    // Granted, not asserted: `requested_role` was echoed verbatim into
+    // `assignedRole` — caller-supplied trusted as adjudicated. Normalize
+    // fail-closed, the same discipline as `constellation_role` below; with no
+    // entitlement source in-tree the normalizer floors every request to
+    // "citizen" (see `normalize_requested_role`).
+    let requested_role = crate::reputation::normalize_requested_role(
+        optional_string(args, "requested_role").as_deref().unwrap_or(""),
+    )
+    .to_string();
     // The #403 capacity — normalized fail-closed to the published constellation set.
     let declared_role = optional_string(args, "role").unwrap_or_default();
     let constellation_role =
@@ -479,6 +500,11 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     }
 
     s.sessions.insert(session_id, session);
+    // Readback, not a mirror (the #68 shape, one field over): the fresh path
+    // echoes the STORED, normalized role — the same value the reuse path
+    // reads back — so the two paths cannot disagree about what was assigned,
+    // and a later policy change can't silently split them.
+    let assigned_role = s.sessions[&session_id].assigned_role.clone();
 
     // session_started is intentionally NOT written to the witness chain.
     // Sessions are RAM-only by design (transport artifacts); every hook
@@ -491,7 +517,7 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     Ok(json!({
         "sessionId": session_id,
         "softLct": soft_lct,
-        "assignedRole": requested_role,
+        "assignedRole": assigned_role,
         "constellationRole": constellation_role,
         "roleDeclarationHonored": role_declaration_honored,
         "protocolVersion": 1,
@@ -1188,7 +1214,19 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
         .resolve_plugin_id(session_id_arg.as_deref())
         .unwrap_or_default();
 
-    if !entry.allowed_consumers.is_empty() && !entry.allows(&plugin_id) {
+    // HST-001 (GPT audit, reproduced live 2026-07-27): an EMPTY `allowed_consumers` skipped
+    // this check entirely, so the default credential was world-readable to any caller under
+    // any invented plugin_id. `VaultEntry::allows` documents empty as "nobody"; this guard
+    // read it as "everybody". The full cure is transport authentication (HST-005); this is
+    // the containment dp approved — do not silently reinterpret existing empty-list entries
+    // (that would deny live agents mid-run), but stop treating the exposure as invisible.
+    //
+    // EXPOSED = the entry has no consumer list, so nothing scopes who may read it. Such a
+    // read is ALLOWED (compatibility) but WITNESSED and warned, and the operator can see
+    // which entries are in this state (`exposed` in /api/vault). A scoped entry with a
+    // non-matching caller is denied exactly as before.
+    let exposed = entry.allowed_consumers.is_empty();
+    if !exposed && !entry.allows(&plugin_id) {
         return Ok(hestia_error_envelope(
             "hestia.vault_scope_mismatch",
             &format!(
@@ -1205,6 +1243,26 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
             Some(json!({"name": name, "requested_scope": scope})),
         ));
     }
+    if exposed {
+        tracing::warn!(
+            credential = %name, reader = %plugin_id,
+            "EXPOSED credential read: '{name}' has an empty allowed_consumers list, so it is              readable by ANY caller (HST-001). Set an explicit consumer list via the operator              vault surface."
+        );
+    }
+    // WITNESS THE RELEASE. `tool_vault_get` previously appended nothing, so credential
+    // DISCLOSURE — the actual theft step — left no trace on the evidence plane while the
+    // WRITE was witnessed. The secret value is never recorded, only the name, the reader,
+    // and whether the read went through the exposed bypass.
+    let _ = s.append_chain(
+        "vault_get",
+        json!({
+            "name": name,
+            "plugin_id": who.plugin_id,
+            "role_lct": who.role_lct,
+            "session_id": who.session_uuid,
+            "exposed": exposed,
+        }),
+    );
     Ok(json!({"value": entry.secret}))
 }
 
@@ -1246,12 +1304,53 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
     // replacement, persistence), so they hit the same daemon-side law —
     // GPT 3rd-pass HST-002. classify() already maps hestia_vault_set to
     // credential_access, so the ratified unattended-role deny binds here too.
-    let who = resolve_caller(&s, session_id_arg.as_deref());
+    // WRITES REQUIRE A PROVEN CALLER, NOT A RESOLVED ONE (kimi-code, reviewing #76).
+    //
+    // This used `resolve_caller`, which falls back to the most recently connected session
+    // when no `session_id` is supplied (`resolve_session_uuid`: `max_by_key(connected_at)`).
+    // So an anonymous write did not bind the new credential to "unknown" — it bound it to
+    // WHOEVER HAPPENED TO CONNECT LAST. An innocent member ended up owning a secret an
+    // anonymous caller wrote, and #76's body called that "an attributed creator", which
+    // overstated it: it was a resolved caller, possibly by fallback.
+    //
+    // It did not reopen world-readability — the READ path uses `resolve_plugin_id`, which
+    // requires a session id and yields "" otherwise, so the anonymous writer cannot read its
+    // own write back. The defect is ambient authority: attribution assigned to a bystander.
+    //
+    // Writing a credential is a consequential act, so it now requires the caller's own live
+    // session, the same bar `hestia_appeal` and `hestia_arbitrate_appeal` already hold. This
+    // is the "no latest-session fallback on authority-bearing surfaces" line from
+    // docs/PRD_ASSURANCE.md FR-1, applied where it was still missing.
+    let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.vault_set_unattributed",
+            "storing a credential requires your own live session_id (from hestia_connect) —              an unattributable writer cannot own what it writes, and binding the entry to              the most recent connection would make a bystander its owner",
+            None,
+        ));
+    };
     if let Some(denied) =
         gate_direct_tool(&mut s, &who, "hestia_vault_set", "credential_access", &name)
     {
         return Ok(denied);
     }
+    // HST-001 containment on the WRITE side: an empty consumer list is the world-readable
+    // default. If the caller is an attributed member, bind the new credential to that member
+    // rather than leaving it open — the creator can read its own secret, nobody else can,
+    // and the exposure is not manufactured by default. An UNATTRIBUTED caller ("unknown")
+    // is NOT bound to "unknown" — that would grant read to exactly the unauthenticated
+    // callers this is meant to contain — so it is left empty-and-flagged, and the read-path
+    // warning + operator `exposed` view cover it. This narrows the default; it does not
+    // authenticate the writer (that is HST-005, transport auth).
+    // `who` is now always an attributed caller, so the previous `!= "unknown"` guard is
+    // redundant — kept as a belt-and-braces assertion rather than deleted, because the guard
+    // is what stops a credential being bound to a literal "unknown" owner if resolution ever
+    // loosens again.
+    let defaulted_consumers = allowed_consumers.is_empty() && who.plugin_id != "unknown";
+    let allowed_consumers = if defaulted_consumers {
+        vec![who.plugin_id.clone()]
+    } else {
+        allowed_consumers
+    };
     let entry = VaultEntry::new(&name, value)
         .with_scope(scope)
         .with_tags(tags)
@@ -1272,10 +1371,11 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
             "plugin_id": who.plugin_id,
             "role_lct": who.role_lct,
             "session_id": who.session_uuid,
+            "defaulted_consumers_to_creator": defaulted_consumers,
         }),
     );
 
-    Ok(json!({"stored": true, "entryId": entry_id}))
+    Ok(json!({"stored": true, "entryId": entry_id, "boundToCreator": defaulted_consumers}))
 }
 
 async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
@@ -2240,6 +2340,15 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         .and_then(Value::as_str)
         .unwrap_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE);
     let deny_adjudicator = appeal.event_data.get("about_adjudicator").and_then(Value::as_str);
+    // FIDELITY TO ROUTING, recorded next to independence. On 2026-07-27 kimi-code ruled two
+    // appeals that had been routed to codex, and the adjudication entries recorded
+    // `independence: cross_vendor` — BIT-IDENTICAL to what a designated codex ruling would
+    // have written, since codex is also cross-vendor relative to the appellant. From the
+    // adjudication alone a relying party could not tell that the designee never participated,
+    // and joining back to the appeal entry only tells you who was ASKED, never whether they
+    // answered. Independence was recorded; fidelity was not. This is the missing half: who
+    // was designated, and whether this arbiter is them.
+    let routed_to = appeal.event_data.get("routed_to").and_then(Value::as_str).map(str::to_string);
 
     // NOT-SAME, enforced server-side. A client-side check would be advisory — the whole
     // reason this constraint is here is that the party it constrains is the party running
@@ -2311,6 +2420,13 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
             // same-lineage ruling differently from a cross-vendor one. Evidence, not a
             // threshold — hestia does not decide how much this ruling is worth.
             "independence": independence,
+            // Advisory designee, echoed, plus the one bit a reader cannot reconstruct.
+            // `was_designee: false` is not a defect in the ruling — designation has never
+            // been a precondition — it is the difference between "routing worked" and
+            // "routing was bypassed and the appeal got ruled anyway", which are the same
+            // chain shape until this field exists.
+            "routed_to": routed_to,
+            "was_designee": routed_to.as_deref() == Some(arbiter.plugin_id.as_str()),
             "appeal_entry": appeal.hash,
         }),
     )?;
@@ -2326,6 +2442,234 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         } else {
             "the deny stands; the appellant keeps appeal-filed 0.85 for having disputed it \
              through the witnessed channel rather than routing around"
+        },
+    }))
+}
+
+// =========================================================================
+// The open-appeals queue
+// =========================================================================
+//
+// WHY THIS EXISTS. On 2026-07-27 two appeals sat unruled for six hours. Both were routed
+// to `codex`, which was out of budget for three days. They were finally ruled — validly,
+// by `kimi-code`, a member the routing never named — because dp noticed, told a
+// `claude-code` session to "get another peer", and that session hand-wrote mesh notices
+// re-pointing the appeals at kimi. Remove any one of those three human-shaped steps and
+// the appeals are open today.
+//
+// The post-mortem (CBP + kimi-code, cross-checked from both ends) found that routing was
+// never the binding constraint. `tool_arbitrate_appeal` enforces exactly NOT-SAME and
+// not-already-ruled; it never reads `routed_to`. **Designation is advisory.** Any admissible
+// member may rule any open appeal at any time. What no member could do was FIND one.
+//
+// `hestia_appeal` writes an appeal. `hestia_arbitrate_appeal` rules one *by `deny_hash`* —
+// which you must already know. Nothing enumerated. So a non-designated arbiter had the
+// authority to rule and no way to discover there was anything to rule on, and "no appeals
+// pending" was bit-identical to "two appeals open and invisible". That is this codebase's
+// recurring defect class — the reassuring state and the null state rendering the same —
+// and it is why the fix is a QUEUE rather than better routing. Routing picks who *should*
+// rule, from evidence (`recipient_liveness`) that the same day proved uncorrelated with
+// capacity to act in BOTH directions (hestia#65). A queue lets whoever *can* rule find the
+// work. It degrades to exactly what happened that afternoon, minus the humans.
+//
+// THREE PROPERTIES ARE LOAD-BEARING, and each one is a thing that actually went wrong:
+//
+// 1. THE SAME WINDOW AS THE RULING PATH. Not a deeper one — the SAME constant. An appeal
+//    listed here that `tool_arbitrate_appeal` cannot find would send an arbiter to a tool
+//    that answers "no appeal against that hash", which is the unfollowable-pointer bug
+//    wearing a queue's clothes. Sharing `APPEAL_CHAIN_WINDOW` makes "listed" and "rulable"
+//    the same predicate by construction. It also means the window's edge is a real hazard —
+//    see `window_saturated` below, which is reported rather than hidden.
+//
+// 2. THE RULING-READY `deny_hash`, PROMINENTLY. kimi-code lost ~20 minutes to this: the
+//    notices it was woken with carried the APPEAL ENTRIES' own chain hashes, while
+//    `tool_arbitrate_appeal` keys only on `deny_hash`. Both were spelled `hestia://appeal/…`.
+//    A queue entry that made an arbiter resolve a namespace before it could act would have
+//    reproduced the exact cost the queue exists to remove. (The resolver now accepts both
+//    and says which it found — see `resolve_appeal_pointer`.)
+//
+// 3. ELIGIBILITY ANSWERED FOR THE CALLER, VIA THE RULING PATH'S OWN FUNCTION. A list that
+//    shows you appeals you are structurally barred from ruling is a list you have to
+//    re-derive NOT-SAME against by hand. This calls `arbiter::eligibility` and the same
+//    member-LCT equality check `tool_arbitrate_appeal` uses, so the annotation cannot drift
+//    from the enforcement. It ANNOTATES; it does not filter, and it does not enforce —
+//    enforcement stays server-side in the ruling path where it belongs. You are shown the
+//    appeals you may not rule, and told why, because a queue that silently omitted them
+//    would be one more surface where absent and excluded look identical.
+//
+// Read-only. Ungated, matching `hestia://witness/recent` and `recent_chain`, over which
+// this is a strictly narrower projection of entries any connected caller can already read.
+
+/// List appeals that no arbiter has ruled on yet.
+async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
+    let session_id_arg = optional_string(args, "session_id");
+    let s = state.lock().await;
+
+    // Attribution is OPTIONAL here and its absence is reported, not defaulted. An
+    // unattributed caller still gets the queue — discovery must not require a session,
+    // or a member whose session lapsed cannot find work it is allowed to do — but it
+    // cannot be told whether IT may rule, and saying nothing about that would read as
+    // "no eligibility concerns".
+    let caller = resolve_attributed_caller(&s, session_id_arg.as_deref());
+
+    let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
+    let head_position = window.first().map(|e| e.chain_position).unwrap_or(0);
+
+    // The join, in one pass: appeals minus adjudications, keyed on the hash both sides
+    // already agree on (`deny_hash` / `about_deny_hash`). This is not new data — every
+    // byte was on the chain the whole time. It is the join, at the ruling path's depth.
+    let ruled: std::collections::HashSet<&str> = window
+        .iter()
+        .filter(|e| e.event_type == "adjudication")
+        .filter_map(|e| e.event_data.get("about_deny_hash").and_then(Value::as_str))
+        .collect();
+
+    let mut open: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut barred = 0u64;
+
+    for e in window.iter().filter(|e| e.event_type == "appeal") {
+        let Some(deny_hash) = e.event_data.get("deny_hash").and_then(Value::as_str) else {
+            continue;
+        };
+        if ruled.contains(deny_hash) {
+            continue;
+        }
+        // One deny, one queue entry. `tool_arbitrate_appeal` rules per `deny_hash`, so a
+        // re-filing against the same deny is one unit of work, not two — listing it twice
+        // would make the second entry unrulable the instant the first is ruled.
+        if !seen.insert(deny_hash) {
+            continue;
+        }
+
+        let appellant = e.event_data.get("plugin_id").and_then(Value::as_str).unwrap_or_default();
+        let deny_adjudicator = e.event_data.get("about_adjudicator").and_then(Value::as_str);
+
+        // Same two checks, same order, same functions as the ruling path (see clause 3
+        // above). Anything else here is a second implementation of NOT-SAME, and two
+        // implementations of a rule are one rule and one future contradiction.
+        let eligibility = caller.as_ref().map(|c| {
+            let same_entity = {
+                let a = s.member_lct(&c.plugin_id);
+                let b = s.member_lct(appellant);
+                a.is_some() && a == b
+            };
+            if same_entity {
+                return json!({
+                    "you_may_rule": false,
+                    "why": format!(
+                        "'{}' and '{appellant}' resolve to the same member LCT — different \
+                         plugin_ids, same entity",
+                        c.plugin_id
+                    ),
+                });
+            }
+            match crate::arbiter::eligibility(&crate::arbiter::AppealParties {
+                appellant,
+                deny_adjudicator,
+                arbiter: &c.plugin_id,
+            }) {
+                crate::arbiter::Eligibility::Eligible { independence } => json!({
+                    "you_may_rule": true,
+                    "independence_if_you_rule": independence,
+                }),
+                crate::arbiter::Eligibility::Refused { reason } => json!({
+                    "you_may_rule": false,
+                    "why": reason,
+                }),
+            }
+        });
+        if matches!(
+            eligibility.as_ref().and_then(|v| v.get("you_may_rule")).and_then(Value::as_bool),
+            Some(false)
+        ) {
+            barred += 1;
+        }
+
+        // How close this appeal is to falling out of the window that makes it rulable.
+        // `recent_chain` is a COUNT window over the tail, so an unruled appeal does not
+        // expire on a clock — it expires when 20,000 further entries are appended, after
+        // which `tool_arbitrate_appeal` answers "no appeal against that hash" and the
+        // appellant is stuck at appeal-filed 0.85 forever, with nothing anywhere marking
+        // the transition. Whether that has ever happened on this chain is UNTESTED — no
+        // surface could have shown it. This field is the instrument; the measurement
+        // follows from running it.
+        let depth = head_position.saturating_sub(e.chain_position);
+        let headroom = APPEAL_CHAIN_WINDOW.saturating_sub(depth);
+
+        let mut entry = json!({
+            // FIRST FIELD, and the name `tool_arbitrate_appeal` takes verbatim. See
+            // clause 2: an arbiter must never have to resolve a namespace to act.
+            "deny_hash": deny_hash,
+            "arbitrate_with": {"tool": "hestia_arbitrate_appeal", "deny_hash": deny_hash},
+            "appellant": appellant,
+            "appellant_role": e.event_data.get("role_lct"),
+            "reason": e.event_data.get("reason"),
+            "about_attempted": e.event_data.get("about_attempted"),
+            "about_adjudicator": deny_adjudicator,
+            "filed_at": e.timestamp.to_rfc3339(),
+            "age_seconds": (Utc::now() - e.timestamp).num_seconds().max(0),
+            "appeal_entry": e.hash,
+            // ADVISORY, and labelled so in the payload rather than only in a comment.
+            // The daemon has never consulted this field when ruling, and a reader who
+            // assumed otherwise would conclude an appeal was someone else's to take.
+            "routing": {
+                "routed_to": e.event_data.get("routed_to"),
+                "routed_independence": e.event_data.get("routed_independence"),
+                "advisory": "designation is evidence of who was ASKED, never a claim on who \
+                             may rule — hestia_arbitrate_appeal does not read it. If you are \
+                             eligible, this appeal is yours to take.",
+            },
+            "window": {
+                "entries_from_head": depth,
+                "headroom_before_unrulable": headroom,
+            },
+        });
+        // Merged at the TOP level of the entry, not nested: `you_may_rule` is the field a
+        // reader scans for, and burying it one key deeper is how it gets missed.
+        if let (Some(Value::Object(elig)), Some(obj)) = (eligibility, entry.as_object_mut()) {
+            obj.extend(elig);
+        }
+        open.push(entry);
+    }
+
+    // Oldest first. The longest-waiting appeal is also the one nearest the window edge,
+    // so latency order and expiry order are the same order — the ordering hint #64 wanted,
+    // as a property of the view rather than a gate the filing path blocks on.
+    open.reverse();
+
+    // The window can only be saturated by a chain longer than it. When it is, appeals
+    // older than the tail are BOTH invisible here and unrulable there, and this count
+    // cannot say how many. Reporting the saturation is the difference between a bounded
+    // answer and a wrong one.
+    let window_saturated = window.len() as u64 >= APPEAL_CHAIN_WINDOW;
+
+    Ok(json!({
+        "open": open,
+        "count": open.len(),
+        "you": caller.as_ref().map(|c| json!({"plugin_id": c.plugin_id, "role_lct": c.role_lct})),
+        "you_may_rule_count": caller.as_ref().map(|_| open.len() as u64 - barred),
+        "note": match (&caller, open.len()) {
+            (None, _) => "no session_id given, so 'you_may_rule' is absent from every entry — \
+                          pass your own session_id (from hestia_connect) to be told which of \
+                          these you are admissible to rule. The list itself is complete either way.",
+            (Some(_), 0) => "no unruled appeals in the searched window. Note the window bound \
+                             below before reading this as 'nobody has disputed anything'.",
+            (Some(_), _) => "designation is advisory: if 'you_may_rule' is true, you can rule it \
+                             now with hestia_arbitrate_appeal, whether or not you were routed it.",
+        },
+        "scope": {
+            "chain_window": APPEAL_CHAIN_WINDOW,
+            "entries_searched": window.len(),
+            "chain_length": s.chain_len(),
+            "window_saturated": window_saturated,
+            "caveat": if window_saturated {
+                "the window is FULL, so appeals older than the searched tail are invisible here \
+                 AND unrulable by hestia_arbitrate_appeal, which searches the same depth. This \
+                 count is a lower bound on what was ever filed, not a count of what exists."
+            } else {
+                "the whole chain fits in the window; this is every appeal ever filed on it."
+            },
         },
     }))
 }
@@ -2631,6 +2975,25 @@ const MEMBER_NOTICE_KINDS: &[&str] = &[
     "forum-note",
     "ack",
 ];
+
+/// The daemon's own notice kind, and deliberately NOT in [`MEMBER_NOTICE_KINDS`].
+///
+/// `tool_member_notify` validates every member send against that list, so a member
+/// cannot emit this one; the store does not validate, so the daemon can. That split
+/// is the whole value of the kind. An "your packet never left the box" report that
+/// any member could send is a claim; one only the daemon can send, written next to
+/// the `member_notice_unreachable` entry that justifies it, is evidence.
+///
+/// Receiving members must not filter it out: it is the only notice on this mesh that
+/// says something the recipient cannot learn any other way, and its pointer IS its
+/// content — strip that and nothing survives but "something died somewhere". Every
+/// deployed rendering path did strip it, for a day, because this sentence pointed at
+/// a KINDS.md section that did not exist yet (Kimi review of PR #62). It does now:
+/// see "Daemon-only" in `plugins/member-mesh/KINDS.md`, which also carries the rule
+/// that rendering paths must admit this as a `(sender, kind)` PAIR — `plugin_id` is
+/// caller-supplied at connect, so the name `hestia` is claimable and the KIND is the
+/// only unforgeable half.
+const DAEMON_NOTICE_KIND_UNREACHABLE: &str = "unreachable";
 
 // ---- id-binding (Kimi ↔ CBP, 2026-07-25): two DIFFERENT per-kind sets ----
 //
@@ -3003,11 +3366,20 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         "queued_id": queued_id,
         "witnessEntryHash": entry.hash,
         "to_plugin_id": to_plugin,
-        // `forwarded_to` present => this left the machine (branch 2) and its
-        // `queued_id` is an EGRESS row, not a local inbox row. Absent => local.
-        // Naming which branch fired is the point: a receipt that cannot say how it
-        // was routed is the black hole with a success code.
-        "forwarded_to": egress_peer,
+        // `egress_queued_to` present => this took the forwarding branch (branch 2)
+        // and its `queued_id` is an EGRESS row, not a local inbox row. Absent =>
+        // local. Naming which branch fired is the point: a receipt that cannot say
+        // how it was routed is the black hole with a success code.
+        //
+        // Was `forwarded_to` until 2026-07-27 (Kimi, notice 123 §3). At this line
+        // nothing has been forwarded: the row is parked for a drain that runs when
+        // it runs, against a hub that may be down. The commit that shipped the field
+        // named the distinction in its own message — "'the mesh accepted it' and
+        // 'the recipient read it' are different facts" — and then gave the field the
+        // name of the fact it was warning about. This thread is the one about
+        // receipts that overclaim; a receipt is exactly where the overclaim does its
+        // damage, because it is the only artifact the sender keeps.
+        "egress_queued_to": egress_peer,
         "kind": kind,
         "in_reply_to": in_reply_to,
         "binding_verified": binding_verified,
@@ -3084,9 +3456,19 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
         &who,
         "hestia_egress_pending",
         "mesh_egress",
+        // The gate sees WHICH arm, not just which tool. `mark_failed` can retire a
+        // packet and mint a durable claim about a peer, so it must be distinguishable
+        // from a read at the policy layer — a rule that wanted to allow listing while
+        // denying retirement could not express that against a resource string of
+        // "list" for both.
         args.get("mark_forwarded")
             .and_then(|v| v.as_u64())
-            .map(|i| i.to_string())
+            .map(|i| format!("mark_forwarded:{i}"))
+            .or_else(|| {
+                args.get("mark_failed")
+                    .and_then(|v| v.as_u64())
+                    .map(|i| format!("mark_failed:{i}"))
+            })
             .unwrap_or_else(|| "list".into())
             .as_str(),
     ) {
@@ -3111,19 +3493,232 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
         );
         return Ok(json!({ "marked": id, "by": who.plugin_id, "witnessed": true }));
     }
+
+    // ---- the other disposition: the hand-off did not land -----------------------
+    //
+    // This arm did not exist until 2026-07-27, and its absence is why the whole
+    // retirement layer below it was dead code. `record_egress_failure`,
+    // `retire_egress`, `egress_row`, `expired_egress`, `undeliverable_egress` and
+    // `egress_queued_for` were ported into the store on 2026-07-26 — complete, and
+    // each carrying the review lesson that shaped its signature — with **zero
+    // callers, including tests**. The tool advertised `mark_forwarded` and nothing
+    // else, so the only disposition a drainer could express was the one that
+    // destroys a packet. A queue whose sole verb is "gone" is not a queue.
+    //
+    // Being `pub` on a library crate is what let six dead methods compile without a
+    // single `dead_code` warning: the one instrument that would have found this for
+    // free was silenced by an access modifier.
+    if let Some(id) = args.get("mark_failed").and_then(|v| v.as_u64()) {
+        let reason = optional_string(args, "reason").unwrap_or_else(|| "unspecified".into());
+        // G7, consumed as its doc comment asks: `None` means the UPDATE matched no
+        // row — already forwarded, already retired, or never existed. Nothing
+        // happened, so nothing is claimed. Re-reading the counter unconditionally
+        // here would answer `retry` on a packet already sent and, at the bound,
+        // report a peer dead twice over one live delivery.
+        let Some(attempts) = s
+            .inbox_store
+            .record_egress_failure(id, &reason)
+            .map_err(|e| anyhow::anyhow!("recording egress failure: {e}"))?
+        else {
+            return Ok(json!({
+                "row_id": id, "recorded": false, "by": who.plugin_id,
+                "note": "no pending egress row with that id — already forwarded, already \
+                         retired, or never queued. Nothing was recorded and nothing was \
+                         witnessed: a settled packet must not be reported dead a second \
+                         time, because `member_notice_unreachable` is a durable claim \
+                         about a PEER that a trust tally will count.",
+            }));
+        };
+        if attempts < crate::storage::inbox::MAX_EGRESS_ATTEMPTS {
+            return Ok(json!({
+                "row_id": id, "recorded": true, "attempts": attempts,
+                "max_attempts": crate::storage::inbox::MAX_EGRESS_ATTEMPTS,
+                "disposition": "retry", "by": who.plugin_id,
+                "last_error": reason,
+            }));
+        }
+        return retire_and_report_egress(&mut s, id, &who, &reason);
+    }
+
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
     let rows = s
         .inbox_store
         .pending_egress(limit)
         .map_err(|e| anyhow::anyhow!("reading egress queue: {e}"))?;
+    // `dest_peer_lct` is EMPTY on every row this daemon has ever written, and the
+    // response says so per row rather than handing back `""` and letting the drain
+    // decide what that means.
+    //
+    // The column exists, `egress_row` reads it, `undeliverable_egress` filters on it,
+    // and `addressing::resolve_peer` computes it — but `enqueue_egress` neither takes
+    // it as a parameter nor inserts it, and `resolve_peer` has no caller outside its
+    // own module. "Resolved once at the edge, stored on the row" is the design, and
+    // it is documented in the present tense in three places; it does not happen.
+    //
+    // So the drain is told the truth in two fields instead of one: `forward_on` is
+    // the address that actually exists for this row, and `forward_on_is_lct` says
+    // whether it is the roster-validated identifier or the prefix-matchable NAME.
+    // Forwarding on the name is an oracle (McNugget §4) — but silently returning an
+    // empty LCT next to a contract that says "forward on the LCT" would be the same
+    // defect this whole arm exists to close: a field advertised with nothing behind
+    // it. Wiring the resolution is a separate change with a live consequence — the
+    // roster on this box knows `thor-sage` and not `thor`, so exact-match resolution
+    // starts refusing addresses that work today — and that is an addressing decision,
+    // not a bug fix.
     let pending: Vec<Value> = rows
         .into_iter()
-        .map(|(id, peer, to_member, kind, ptr)| {
-            json!({ "id": id, "dest_peer": peer, "to_member": to_member,
-                    "kind": kind, "pointer_uri": ptr })
+        .map(|r| {
+            let lct = (!r.dest_peer_lct.trim().is_empty()).then(|| r.dest_peer_lct.clone());
+            json!({ "id": r.id, "dest_peer": r.dest_peer,
+                    "dest_peer_lct": lct,
+                    "forward_on": lct.clone().unwrap_or_else(|| r.dest_peer.clone()),
+                    "forward_on_is_lct": lct.is_some(),
+                    "to_member": r.to_member, "from_plugin": r.from_plugin,
+                    "kind": r.kind, "pointer_uri": r.pointer_uri,
+                    "attempts": r.attempts, "last_error": r.last_error })
         })
         .collect();
-    Ok(json!({ "pending": pending, "total": pending.len() }))
+    let unresolved = pending
+        .iter()
+        .filter(|r| r["forward_on_is_lct"] == json!(false))
+        .count();
+    let mut out = json!({
+        "pending": pending,
+        "total": pending.len(),
+        // The contract ships WITH the data, so a drainer cannot hold a stale copy of
+        // it. Kimi quoted this text in review on 2026-07-26 from an uncommitted tree;
+        // it had never landed, so the drain was being measured against a contract that
+        // existed only in a review comment.
+        "drain_contract": {
+            "forward_on": "the row's `forward_on` field, and check `forward_on_is_lct`. \
+                           An LCT is roster-validated; a NAME is prefix-resolved by \
+                           hub-notify, so an address on the name changes meaning when an \
+                           unrelated member joins the fleet.",
+            "on_success": "mark_forwarded:<id> — means the MESH accepted it, not that the \
+                           recipient read it.",
+            "on_failure": "mark_failed:<id> with reason:<text>. Leaving a failed row \
+                           pending is not neutral: attempts never increments, the bound \
+                           never fires, and the sender is never told its packet died.",
+            "never": "silence. An empty `pending` list and a refused call must not look \
+                      the same to you — check for `_hestia_error` before concluding the \
+                      queue is empty.",
+            "max_attempts": crate::storage::inbox::MAX_EGRESS_ATTEMPTS,
+        },
+    });
+    if unresolved > 0 {
+        out["unresolved_note"] = json!(format!(
+            "{unresolved} of {} row(s) carry no dest_peer_lct and can only be forwarded on \
+             the NAME. Edge resolution is not wired: `enqueue_egress` never writes the \
+             column. Reported, not gated — refusing these rows would strand mail that \
+             hub-notify's prefix resolver does deliver today.",
+            out["total"]
+        ));
+    }
+    Ok(out)
+}
+
+/// Retire an egress row that has exhausted its attempts, and pay what it owes.
+///
+/// Named in three comments across two files since 2026-07-26, always in the present
+/// indicative ("appends `member_notice_unreachable` and enqueues the sender's
+/// report after this call"), and never written. This is that function. The comments
+/// described it accurately; what was missing was the function.
+///
+/// Retiring without reporting would be the silent drop with extra steps, so the two
+/// happen here or not at all:
+///
+/// 1. `retire_egress` returns whether THIS call made the transition (G6/G7). If it
+///    did not, another drainer got there first and everything below is skipped —
+///    both the witness and the report are once-per-death.
+/// 2. `member_notice_unreachable` on the chain: a durable, third-party-readable
+///    claim that this box could not hand a packet to this peer. §5.1 makes
+///    misrouting a trust signal, so this entry is evidence about the PEER and is
+///    written with the evidence it rests on (attempt count, last error, who drained).
+/// 3. The report to the sender, delivered locally. `from_plugin` on an egress row is
+///    always a local member — only local members can call `member_notify` — so the
+///    route back never crosses the seam and can never itself be egressed.
+///
+/// Failing to enqueue the report is NOT swallowed: a retirement whose report was
+/// lost is exactly the packet-shaped hole this path exists to close, so the caller
+/// gets the error and the retirement is visible on the chain either way.
+fn retire_and_report_egress(
+    s: &mut super::state::ServerState,
+    id: u64,
+    who: &CallerWho,
+    reason: &str,
+) -> ToolResult {
+    let row = s
+        .inbox_store
+        .egress_row(id)
+        .map_err(|e| anyhow::anyhow!("reading egress row for retirement: {e}"))?;
+    let Some(row) = row else {
+        return Ok(json!({
+            "row_id": id, "retired": false,
+            "note": "row vanished between the failure record and retirement",
+        }));
+    };
+    if !s
+        .inbox_store
+        .retire_egress(id)
+        .map_err(|e| anyhow::anyhow!("retiring egress row: {e}"))?
+    {
+        // Lost the race. The other caller witnessed it and reported it; saying so
+        // again would double-count a peer's death in whatever tallies read the chain.
+        return Ok(json!({
+            "row_id": id, "retired": false, "by": who.plugin_id,
+            "note": "already settled by another drainer — not witnessed and not \
+                     reported again",
+        }));
+    }
+    let entry = s.append_chain(
+        "member_notice_unreachable",
+        json!({
+            "row_id": id,
+            "dest_peer": row.dest_peer,
+            "dest_peer_lct": row.dest_peer_lct,
+            "to_member": row.to_member,
+            "from_plugin": row.from_plugin,
+            "kind": row.kind,
+            "pointer_uri": row.pointer_uri,
+            "attempts": row.attempts,
+            "last_error": reason,
+            "retired_by": who.plugin_id,
+            "retired_by_role": who.role_lct,
+            "note": "this box exhausted its hand-off budget for this peer. A claim about \
+                     the PEER, carrying the evidence it rests on — not a claim that the \
+                     recipient refused anything.",
+        }),
+    )?;
+    // The sender is a local member by construction (see doc comment), so this is a
+    // local enqueue and cannot re-enter the egress plane.
+    let report_id = s
+        .inbox_store
+        .enqueue_member(
+            &row.from_plugin,
+            "hestia",
+            crate::reputation::DEFAULT_CONSTELLATION_ROLE,
+            DAEMON_NOTICE_KIND_UNREACHABLE,
+            Some(&format!(
+                "hestia://egress/{id}#unreachable:{}/{} after {} attempts: {reason}",
+                row.dest_peer, row.to_member, row.attempts
+            )),
+            &entry.hash,
+            None,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "egress row {id} was retired and witnessed, but the sender's report could \
+                 NOT be queued ({e}) — {} does not know its packet died",
+                row.from_plugin
+            )
+        })?;
+    Ok(json!({
+        "row_id": id, "retired": true, "by": who.plugin_id,
+        "attempts": row.attempts, "last_error": reason,
+        "witnessEntryHash": entry.hash,
+        "reported_to": row.from_plugin,
+        "report_notice_id": report_id,
+    }))
 }
 
 async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
@@ -3580,6 +4175,15 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
     // well-formed — it is the target that is missing, ambiguous or mislabelled,
     // and collapsing those four outcomes into one protocol error rebuilds the
     // exact ambiguity this resolver exists to remove.
+    // `hestia://appeal/<hash>` needs its own resolver and cannot use the table below —
+    // see `resolve_appeal_pointer`. It was absent from that table entirely, which meant the
+    // daemon minted this pointer into every appeal dispatch notice and no surface could
+    // follow it: the same unfollowable-pointer defect the adjudication case fixed, surviving
+    // that fix because that fix was driven by a received ADJUDICATION notice.
+    if let Some(ptr) = uri.strip_prefix("hestia://appeal/") {
+        let body = resolve_appeal_pointer(&s, ptr);
+        return Ok(serde_json::to_string(&body).unwrap_or("{}".into()));
+    }
     for (prefix, expect) in [
         ("hestia://adjudication/", Some("adjudication")),
         ("hestia://chain/", None),
@@ -3606,6 +4210,107 @@ fn chain_entry_json(e: &crate::storage::chain::ChainEntry) -> Value {
         "eventData": e.event_data,
         "signerLct": e.signer_lct,
         "chainPosition": e.chain_position,
+    })
+}
+
+/// Dereference `hestia://appeal/<hash>` — under EITHER of the two conventions in
+/// circulation for that URI, reporting which one was used.
+///
+/// WHY THIS IS NOT A ROW IN THE TABLE ABOVE. `resolve_chain_pointer` looks a hash up as an
+/// ENTRY hash. The pointer `tool_appeal` mints is `hestia://appeal/{deny_hash}`, and a
+/// deny_hash is the hash of the *decision* being disputed — a different entry, of a
+/// different type, that happens to be what the appeal is ABOUT. Adding this prefix to the
+/// table with `expect: Some("appeal")` would therefore have made every daemon-minted appeal
+/// pointer resolve to a type-mismatch error against the deny it names: a plausible-looking
+/// row that fails on the only inputs it will ever receive.
+///
+/// AND THERE ARE TWO CONVENTIONS. kimi-code, 2026-07-27, from the receiving end: the mesh
+/// notices that actually got two stalled appeals ruled carried the APPEAL ENTRIES' own
+/// chain hashes, while the daemon's own dispatch carries the deny hash. Both spelled
+/// `hestia://appeal/…`, nothing distinguishing them, and `tool_arbitrate_appeal` keys only
+/// on the deny hash. It cost the arbiter ~20 minutes of window-scanning to convert one into
+/// the other before it could call the tool at all — and it noted a colder arbiter would
+/// simply have failed.
+///
+/// So: try both, say which hit, and hand back the ruling-ready `deny_hash` in every case.
+/// Normalising to one convention and rejecting the other would break whichever half of the
+/// existing pointers guessed wrong — including every hand-written notice already in flight.
+/// The ambiguity is resolved by ANSWERING it rather than by legislating it away.
+///
+/// The `ruled` flag closes the third gap: an arbiter following a pointer to work that is
+/// already done should learn that here, not from `arbitration_already_ruled` after writing
+/// its reasoning.
+fn resolve_appeal_pointer(s: &super::state::ServerState, pointer: &str) -> Value {
+    let ptr = pointer.trim();
+    if ptr.is_empty() {
+        return hestia_error_envelope(
+            "hestia.appeal_pointer_malformed",
+            "hestia://appeal/ needs a hash: either the deny_hash the appeal disputes (what \
+             this daemon mints) or the appeal entry's own chain hash (what hand-written mesh \
+             notices have carried). Both resolve here.",
+            None,
+        );
+    }
+    let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
+    let is_prefix_of = |full: &str| full == ptr || (ptr.len() >= 8 && full.starts_with(ptr));
+
+    // Convention 1, the daemon's own: the hash names the DENY under appeal.
+    let found = window
+        .iter()
+        .filter(|e| e.event_type == "appeal")
+        .find(|e| {
+            e.event_data
+                .get("deny_hash")
+                .and_then(Value::as_str)
+                .is_some_and(is_prefix_of)
+        })
+        .map(|e| (e, "deny_hash"))
+        // Convention 2, what peers actually send: the hash names the APPEAL ENTRY itself.
+        .or_else(|| {
+            window
+                .iter()
+                .find(|e| e.event_type == "appeal" && is_prefix_of(&e.hash))
+                .map(|e| (e, "appeal_entry_hash"))
+        });
+
+    let Some((appeal, matched_as)) = found else {
+        return hestia_error_envelope(
+            "hestia.appeal_pointer_not_found",
+            &format!(
+                "no appeal in the last {APPEAL_CHAIN_WINDOW} chain entries matches '{ptr}' as \
+                 either a deny_hash or an appeal entry hash. Note this is the SAME window \
+                 hestia_arbitrate_appeal searches: if an appeal was filed against this hash \
+                 and has aged out, it is unrulable too, and that is a real state — not a \
+                 malformed pointer"
+            ),
+            Some(json!({"pointer": ptr, "window": APPEAL_CHAIN_WINDOW, "chainLength": s.chain_len()})),
+        );
+    };
+
+    let deny_hash = appeal.event_data.get("deny_hash").and_then(Value::as_str).unwrap_or_default();
+    let ruling = window.iter().find(|e| {
+        e.event_type == "adjudication"
+            && e.event_data.get("about_deny_hash").and_then(Value::as_str) == Some(deny_hash)
+    });
+
+    json!({
+        "pointer": ptr,
+        // Which namespace the caller handed us. Reported because a member that learns its
+        // pointers are the non-canonical kind can start minting the canonical kind.
+        "matched_as": matched_as,
+        // Ruling-ready, first-class, under the name the ruling tool takes.
+        "deny_hash": deny_hash,
+        "appeal_entry": appeal.hash,
+        "entry": chain_entry_json(appeal),
+        "ruled": ruling.is_some(),
+        "ruling": ruling.map(chain_entry_json),
+        "next": match &ruling {
+            Some(_) => "already ruled — the adjudication entry is inline above. A second \
+                        ruling is refused; there is nothing to do here.",
+            None => "open. If you are not the appellant and not the gate that denied, you may \
+                     rule it now: hestia_arbitrate_appeal with the deny_hash above. You do not \
+                     need to have been routed it — designation is advisory.",
+        },
     })
 }
 
@@ -5325,13 +6030,262 @@ mod member_mesh_tests {
         // No session_id at all: the destroying arm must not run, and must not inherit
         // Alice. This is the arm that used to mark-and-return from the top of the
         // function, before any caller was resolved.
-        for args in [json!({"mark_forwarded": 1}), json!({"limit": 50})] {
+        // `mark_failed` joins the loop the day it exists. It is the arm that can mint
+        // `member_notice_unreachable` — a durable claim about a PEER — so an
+        // unattributed caller reaching it could indict a healthy peer anonymously.
+        for args in [
+            json!({"mark_forwarded": 1}),
+            json!({"mark_failed": 1, "reason": "x"}),
+            json!({"limit": 50}),
+        ] {
             let out = tool_egress_pending(&state, &args).await.unwrap();
             assert_eq!(
                 out["_hestia_error"]["code"], "hestia.egress_unattributed",
                 "every arm must refuse an unattributed caller, got: {out}"
             );
         }
+    }
+
+    /// The acceptance test for r6-routing branch 4 at the egress seam, and it could
+    /// not have run before 2026-07-27: there was no `mark_failed` arm to drive, and
+    /// `retire_and_report_egress` existed only as a name inside three comments.
+    ///
+    /// dp's criterion for branch 2 was a delivered message. The criterion this
+    /// exploration set for ITSELF is a *reported non-delivery* — the sender learning,
+    /// without reading a log, that its packet never left the box. That is the whole
+    /// sentence, so it is one test: retired, witnessed, and reported.
+    #[tokio::test]
+    async fn an_exhausted_egress_row_is_retired_witnessed_and_reported_to_its_sender() {
+        let (_dir, state) = test_state().await;
+        let row_id = {
+            let st = state.lock().await;
+            st.inbox_store
+                .enqueue_egress("thor", "claude-code", "alice",
+                                "role:constellation:member", "coordination",
+                                Some("shared-context/alices-mail.md"), "hash")
+                .unwrap()
+        };
+        let sid = connect(&state, "hestia-router").await;
+
+        // A deterministically failing hand-off, driven the way the drain drives it.
+        let mut last = json!({});
+        for tick in 1..=crate::storage::inbox::MAX_EGRESS_ATTEMPTS {
+            last = tool_egress_pending(
+                &state,
+                &json!({"session_id": sid, "mark_failed": row_id,
+                        "reason": "hub-notify rc=1"}),
+            )
+            .await
+            .unwrap();
+            assert!(last["_hestia_error"].is_null(), "tick {tick}: {last}");
+            if tick < crate::storage::inbox::MAX_EGRESS_ATTEMPTS {
+                assert_eq!(last["disposition"], "retry", "tick {tick} must retry: {last}");
+                assert_eq!(last["attempts"], tick, "the attempt count must be visible");
+            }
+        }
+
+        assert_eq!(last["retired"], true, "the bound must fire at the bound: {last}");
+        assert_eq!(last["reported_to"], "alice");
+
+        // 1. Retired: it is out of the queue, so it stops being retried forever.
+        let st = state.lock().await;
+        assert!(
+            st.inbox_store.pending_egress(50).unwrap().is_empty(),
+            "a retired row must leave the pending list"
+        );
+
+        // 2. Witnessed: a third party can read the claim AND the evidence under it.
+        let entry = st
+            .chain_store
+            .read_by_hash(last["witnessEntryHash"].as_str().unwrap())
+            .unwrap()
+            .expect("the retirement must be on the chain");
+        assert_eq!(entry.event_type, "member_notice_unreachable");
+        assert_eq!(entry.event_data["dest_peer"], "thor");
+        assert_eq!(entry.event_data["attempts"], crate::storage::inbox::MAX_EGRESS_ATTEMPTS);
+        assert_eq!(entry.event_data["last_error"], "hub-notify rc=1");
+
+        // 3. Reported: the sender is TOLD, in the one place it already reads. A
+        //    retirement whose report only reaches a log file is the silent drop with
+        //    extra steps — the log is the thing nobody reads.
+        let mail = st.inbox_store.drain_member("alice").unwrap();
+        let report = mail
+            .iter()
+            .find(|n| n.kind == DAEMON_NOTICE_KIND_UNREACHABLE)
+            .expect("the sender must learn its packet died");
+        assert!(
+            report.pointer_uri.as_deref().unwrap_or("").contains("thor"),
+            "the report must name the peer that could not be reached: {report:?}"
+        );
+    }
+
+    /// G6/G7, from the retirement side: a settled packet must never be reported dead
+    /// a second time.
+    ///
+    /// `member_notice_unreachable` is a durable claim about a PEER that a trust tally
+    /// will count, so a duplicate is not a harmless retry — it is a second indictment
+    /// of a peer that may have done nothing wrong. This is why
+    /// `record_egress_failure` returns `Option` and `retire_egress` returns `bool`:
+    /// both say "did *this* call make the transition", and both were written months
+    /// before anything consumed the answer.
+    #[tokio::test]
+    async fn a_settled_egress_row_is_not_recorded_failed_or_reported_dead_again() {
+        let (_dir, state) = test_state().await;
+        let row_id = {
+            let st = state.lock().await;
+            st.inbox_store
+                .enqueue_egress("thor", "claude-code", "alice",
+                                "role:constellation:member", "coordination", None, "hash")
+                .unwrap()
+        };
+        let sid = connect(&state, "hestia-router").await;
+        let chain_before = {
+            let st = state.lock().await;
+            st.chain_store.len().unwrap()
+        };
+
+        // It landed. The row is gone.
+        tool_egress_pending(&state, &json!({"session_id": sid, "mark_forwarded": row_id}))
+            .await
+            .unwrap();
+        // A slow duplicate tick now reports it failed. Nothing may happen.
+        let out = tool_egress_pending(
+            &state,
+            &json!({"session_id": sid, "mark_failed": row_id, "reason": "late tick"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["recorded"], false, "a settled row must record nothing: {out}");
+        assert!(out["retired"].is_null(), "and must not claim a retirement: {out}");
+
+        let st = state.lock().await;
+        let unreachable = st
+            .chain_store
+            .read_recent(50)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == "member_notice_unreachable")
+            .count();
+        assert_eq!(unreachable, 0, "a forwarded packet must not indict its peer");
+        assert!(
+            st.chain_store.len().unwrap() > chain_before,
+            "sanity: the forward itself was witnessed, so the chain did move"
+        );
+        assert!(
+            st.inbox_store.drain_member("alice").unwrap().is_empty(),
+            "a sender whose packet WAS forwarded must not be told it was not"
+        );
+    }
+
+    /// Kimi, notice 123 §1a: the drain must forward on `dest_peer_lct`, never on the
+    /// name — `hub-notify` prefix-resolves names, so an address changes meaning when
+    /// an unrelated member joins the roster.
+    ///
+    /// It could not: the read model omitted the field entirely. This change hands the
+    /// drain an address and, in the same breath, says WHICH KIND it is — because
+    /// `dest_peer_lct` is empty on every row this daemon has ever written, and a
+    /// contract that says "forward on the LCT" over a field that is always null is
+    /// unimplementable advice.
+    ///
+    /// This test asserts the half that is true today. The other half — that the LCT is
+    /// actually POPULATED — is a separate change with a live consequence (the roster on
+    /// this box knows `thor-sage`, not `thor`, so exact-match resolution starts refusing
+    /// addresses that work today), and it has its own criterion below. That criterion is
+    /// not met, and the last assertion here is the tripwire that says so *in the suite*
+    /// rather than in prose: the day edge resolution lands, this test goes red and hands
+    /// the person who landed it the follow-up work. A criterion nothing in the tree can
+    /// report is indistinguishable from a criterion nobody tried (Kimi, notice 185 §4).
+    #[tokio::test]
+    async fn the_pending_list_carries_an_address_and_says_which_kind_it_is() {
+        let (_dir, state) = test_state().await;
+        {
+            let st = state.lock().await;
+            st.inbox_store
+                .enqueue_egress("thor", "claude-code", "alice",
+                                "role:constellation:member", "coordination", None, "hash")
+                .unwrap();
+        }
+        let sid = connect(&state, "hestia-router").await;
+        let out = tool_egress_pending(&state, &json!({"session_id": sid, "limit": 50}))
+            .await
+            .unwrap();
+        let row = &out["pending"][0];
+
+        // The drain is never left to guess. It gets an address it can use...
+        assert_eq!(row["forward_on"], "thor", "the drain must be handed an address: {out}");
+        // ...and the fact that this one is the prefix-matchable NAME, not the
+        // roster-validated LCT. Returning `""` for the LCT and letting the drain decide
+        // what that meant is the conflation this arm exists to remove.
+        assert_eq!(row["forward_on_is_lct"], false);
+        assert!(
+            row["dest_peer_lct"].is_null(),
+            "TRIPWIRE: the LCT is populated, so edge resolution landed. Un-ignore \
+             `criterion_edge_resolution_populates_the_lct_on_the_row`, delete these three \
+             assertions, and re-check the drain's name-forwarding fallback. \
+             AND: assert at the RENDERED layer, not this one. This test stops at the \
+             store, which is one boundary early — the same shape PR #62's own acceptance \
+             test had (Kimi, notice 197). Before un-ignoring, run the report path \
+             end-to-end into a fired prompt: `cargo test --test rendered_layer`, which \
+             shells out to checks B4/B4b of \
+             `plugins/member-mesh/tests/fire_sender_allowlist_test.py` against the real \
+             templates (the seam is wired, not a prose instruction — Kimi, notice 200). \
+             A green store-layer criterion proves the row \
+             was written, never that a member was woken by it: {out}"
+        );
+        assert!(
+            out["unresolved_note"].as_str().unwrap_or("").contains("Edge resolution is not wired"),
+            "an unresolved row must be reported on every read, not silently name-forwarded: {out}"
+        );
+
+        assert_eq!(row["attempts"], 0, "attempts must be visible to the drainer");
+        assert_eq!(
+            out["drain_contract"]["max_attempts"],
+            crate::storage::inbox::MAX_EGRESS_ATTEMPTS,
+            "the contract ships with the data so no drainer holds a stale copy"
+        );
+    }
+
+    /// The criterion for edge resolution, stated as a test so the suite can hold it.
+    ///
+    /// It is `#[ignore]`d, and that is the honest state: `enqueue_egress` does not take
+    /// a `dest_peer_lct` and `addressing::resolve_peer` has no caller outside its own
+    /// module, so this cannot pass. Leaving it un-ignored would make the suite red
+    /// forever, and a permanently-red suite teaches operators to rerun past red — the
+    /// same training the 1/256 reseal flake left behind (Kimi, notice 184 §3). A gauge
+    /// that is always alarming is a gauge nobody reads.
+    ///
+    /// So: ignored, but NAMED and runnable on demand (`cargo test -- --ignored`), and
+    /// wired to the tripwire in the test above, which fails the moment the wiring lands.
+    /// The pair is the distinction Kimi asked for — "not met" is now a state the suite
+    /// can report, separately from "not tried".
+    ///
+    /// NOTE for whoever un-ignores this: turning it green is necessary and NOT sufficient.
+    /// It asserts at the store layer. The report path's failure mode has twice been past
+    /// that boundary, so the wiring PR must also assert at the RENDERED layer — wired as
+    /// `cargo test --test rendered_layer`, see the tripwire message above.
+    #[tokio::test]
+    #[ignore = "criterion for the edge-resolution change: enqueue_egress does not yet \
+                accept or store dest_peer_lct (r6-routing, addressing decision pending)"]
+    async fn criterion_edge_resolution_populates_the_lct_on_the_row() {
+        let (_dir, state) = test_state().await;
+        {
+            let st = state.lock().await;
+            st.inbox_store
+                .enqueue_egress("thor", "claude-code", "alice",
+                                "role:constellation:member", "coordination", None, "hash")
+                .unwrap();
+        }
+        let sid = connect(&state, "hestia-router").await;
+        let out = tool_egress_pending(&state, &json!({"session_id": sid, "limit": 50}))
+            .await
+            .unwrap();
+        let row = &out["pending"][0];
+        assert!(
+            row["dest_peer_lct"].is_string(),
+            "the drain cannot forward on an address it is never handed: {out}"
+        );
+        assert_eq!(row["forward_on_is_lct"], true);
+        assert!(out["unresolved_note"].is_null(), "nothing is unresolved once the edge resolves");
     }
 
     /// The destroying disposition must leave a witness naming the actor.
@@ -6065,6 +7019,59 @@ mod tests {
         );
     }
 
+    /// `assignedRole` is granted, not asserted (kimi/CBP thread 2026-07-27).
+    /// `requested_role` was echoed verbatim into the response and stored —
+    /// granted, never adjudicated, the third instance of the
+    /// caller-supplied-trusted-as-adjudicated class. It now normalizes
+    /// fail-closed, the same discipline as `constellation_role` one statement
+    /// down. With no entitlement source in-tree, the normalizer is degenerate:
+    /// every request floors to "citizen".
+    ///
+    /// Acceptance (CBP): this test was run BEFORE the normalizer existed and
+    /// failed — the response came back "administrator" — so it is a live
+    /// gauge, not a test that passes for free beside its own fix.
+    ///
+    /// Second assertion (the #68 shape, one field over): BOTH connect paths
+    /// echo the STORED, normalized value — a readback, not a mirror of the
+    /// request variable — so the two paths cannot disagree about what was
+    /// assigned.
+    #[tokio::test]
+    async fn connect_assigned_role_normalizes_fail_closed_and_both_paths_echo_stored_state() {
+        let (_dir, shared) = make_shared_state();
+        // Fresh path: assert a role no entitlement source granted.
+        let a = tool_connect(&shared, &json!({
+            "plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "hs-role",
+            "requested_role": "administrator"
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            a["assignedRole"], "citizen",
+            "an unentitled requested_role must normalize fail-closed, got: {a}"
+        );
+        // The stored state is the normalized value, not the assertion.
+        {
+            let s = shared.lock().await;
+            let sess = s.sessions.values().next().unwrap();
+            assert_eq!(
+                sess.assigned_role, "citizen",
+                "stored assigned_role must be the normalized floor, not the request"
+            );
+        }
+        // Reuse path: same stored value — a readback consistent with fresh.
+        let b = tool_connect(&shared, &json!({
+            "plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "hs-role",
+            "requested_role": "administrator"
+        }))
+        .await
+        .unwrap();
+        assert_eq!(b["reused"], true, "same host_session_id must reuse: {b}");
+        assert_eq!(
+            b["assignedRole"], a["assignedRole"],
+            "reuse must echo the same stored value as fresh: fresh={a} reuse={b}"
+        );
+    }
+
     #[tokio::test]
     async fn connect_mints_a_member_lct_on_first_sight_not_for_synthetic() {
         let (_dir, shared) = make_shared_state();
@@ -6201,6 +7208,322 @@ mod tests {
             "attended drain with no connection is empty, not an error: {ok}"
         );
     }
+}
+
+#[cfg(test)]
+mod open_appeals_tests {
+    //! Tests for the appeal DISCOVERY surface — the queue, the pointer resolver, and the
+    //! routing-fidelity field.
+    //!
+    //! Every test here asserts on the JSON the handler actually returns, and every one of
+    //! them fails against the code as it stood before this change: there was no
+    //! `tool_open_appeals` to call, `hestia://appeal/` resolved to `unknown resource`, and
+    //! the adjudication entry had no `was_designee`. That is deliberate — an acceptance
+    //! test that already passes cannot tell a repair from a dead gauge.
+    //!
+    //! They drive the real tools end to end (deny → appeal → rule) rather than
+    //! hand-appending appeal-shaped entries, because the defect this whole seam keeps
+    //! producing is an assertion and a mechanism in different rooms.
+
+    use super::*;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    fn state_with_members(members: &[&str]) -> (TempDir, SharedState, Vec<Uuid>) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let mut st = super::super::state::ServerState::open(vault, dir.path(), "p").unwrap();
+        let mut ids = Vec::new();
+        for m in members {
+            // Mint a durable member LCT, exactly as `tool_connect` does. Without this the
+            // registry is empty, `tool_appeal` finds no candidate pool, and `routed_to` is
+            // null — which is a REAL state (no admissible designee on this machine) but not
+            // the one the incident produced, and testing only it would leave the designated
+            // path unexercised.
+            let sovereign_anchor = st.sovereign_lct.clone();
+            let sovereign_id = st.sovereign.lct_id();
+            let super::super::state::ServerState { vault, member_registry, .. } = &mut st;
+            crate::member_registry::ensure_member(
+                vault,
+                member_registry,
+                m,
+                false,
+                &sovereign_id,
+                &sovereign_anchor,
+            );
+            let sid = Uuid::new_v4();
+            st.sessions.insert(
+                sid,
+                super::super::state::Session {
+                    session_id: sid,
+                    plugin_id: (*m).into(),
+                    plugin_version: None,
+                    host_agent: "test".into(),
+                    host_agent_version: None,
+                    assigned_role: "citizen".into(),
+                    constellation_role: crate::reputation::DEFAULT_CONSTELLATION_ROLE.into(),
+                    soft_lct: format!("lct:{m}"),
+                    connected_at: Utc::now(),
+                    host_session_id: None,
+                },
+            );
+            ids.push(sid);
+        }
+        (dir, std::sync::Arc::new(tokio::sync::Mutex::new(st)), ids)
+    }
+
+    /// A deny on the chain, landed on `plugin_id`, in the shape `tool_appeal` requires.
+    async fn append_deny(shared: &SharedState, plugin_id: &str, attempted: &str) -> String {
+        let mut s = shared.lock().await;
+        s.append_chain(
+            "policy_decision",
+            json!({
+                "plugin_id": plugin_id,
+                "decision": "deny",
+                "adjudicator": "hestia-gate",
+                "attempted": attempted,
+                "reason": "safety preset",
+            }),
+        )
+        .unwrap()
+        .hash
+    }
+
+    async fn file_appeal(shared: &SharedState, sid: Uuid, deny_hash: &str) -> Value {
+        tool_appeal(
+            shared,
+            &json!({
+                "deny_hash": deny_hash,
+                "reason": "the target was read-only and under /tmp",
+                "session_id": sid.to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// THE JOIN. An appeal appears until someone rules it, and then it does not.
+    ///
+    /// This is the whole queue in one assertion, and the state it distinguishes is the one
+    /// that cost six hours: before this surface, "no appeals pending" and "an appeal is open
+    /// and nothing can see it" were the same observation.
+    #[tokio::test]
+    async fn unruled_appeals_are_listed_and_ruled_ones_drop_out() {
+        let (_d, shared, ids) = state_with_members(&["claude-code", "kimi-code"]);
+        let (claude, kimi) = (ids[0], ids[1]);
+
+        let deny = append_deny(&shared, "claude-code", "ls /tmp").await;
+        let filed = file_appeal(&shared, claude, &deny).await;
+        assert!(filed.get("_hestia_error").is_none(), "appeal should file: {filed}");
+
+        let q = tool_open_appeals(&shared, &json!({"session_id": kimi.to_string()}))
+            .await
+            .unwrap();
+        assert_eq!(q["count"], 1, "the open appeal must be discoverable: {q}");
+        assert_eq!(
+            q["open"][0]["deny_hash"], deny,
+            "the queue must hand back the hash hestia_arbitrate_appeal takes, not the \
+             appeal entry hash: {q}"
+        );
+
+        let ruled = tool_arbitrate_appeal(
+            &shared,
+            &json!({
+                "deny_hash": deny,
+                "upheld": true,
+                "rationale": "reading a path is not the destructive act the rule names",
+                "session_id": kimi.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(ruled.get("_hestia_error").is_none(), "kimi may rule claude's appeal: {ruled}");
+
+        let after = tool_open_appeals(&shared, &json!({"session_id": kimi.to_string()}))
+            .await
+            .unwrap();
+        assert_eq!(after["count"], 0, "a ruled appeal must leave the queue: {after}");
+    }
+
+    /// THE HASH THE QUEUE HANDS BACK IS THE HASH THE RULING TOOL ACCEPTS.
+    ///
+    /// Not a tautology — it is the twenty minutes kimi-code lost. The queue carries an
+    /// appeal entry hash AND a deny hash, and only one of them rules. Feeding the field the
+    /// queue advertises straight into the ruling tool is the only assertion that catches a
+    /// future edit swapping them.
+    #[tokio::test]
+    async fn the_advertised_hash_is_the_one_that_rules() {
+        let (_d, shared, ids) = state_with_members(&["claude-code", "codex"]);
+        let (claude, codex) = (ids[0], ids[1]);
+
+        let deny = append_deny(&shared, "claude-code", "rm -rf /tmp/x && echo done").await;
+        file_appeal(&shared, claude, &deny).await;
+
+        let q = tool_open_appeals(&shared, &json!({})).await.unwrap();
+        let advertised = q["open"][0]["arbitrate_with"]["deny_hash"].as_str().unwrap().to_string();
+        assert_ne!(
+            advertised,
+            q["open"][0]["appeal_entry"].as_str().unwrap(),
+            "the two hashes must be distinct for this test to mean anything"
+        );
+
+        let ruled = tool_arbitrate_appeal(
+            &shared,
+            &json!({
+                "deny_hash": advertised,
+                "upheld": false,
+                "rationale": "the chained form is what the rule names; the deny stands",
+                "session_id": codex.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            ruled.get("_hestia_error").is_none(),
+            "the hash the queue advertises must rule without any resolution step: {ruled}"
+        );
+    }
+
+    /// ELIGIBILITY IS ANSWERED, AND THE BARRED ENTRY IS STILL SHOWN.
+    ///
+    /// The appellant sees its own appeal — omitting it would rebuild the null state one
+    /// level in — and is told, in the entry, that it may not rule it.
+    #[tokio::test]
+    async fn the_appellant_is_shown_its_own_appeal_and_told_it_may_not_rule() {
+        let (_d, shared, ids) = state_with_members(&["claude-code", "kimi-code"]);
+        let (claude, kimi) = (ids[0], ids[1]);
+
+        let deny = append_deny(&shared, "claude-code", "cat ~/.ssh/id_ed25519").await;
+        file_appeal(&shared, claude, &deny).await;
+
+        let mine = tool_open_appeals(&shared, &json!({"session_id": claude.to_string()}))
+            .await
+            .unwrap();
+        assert_eq!(mine["count"], 1, "the appellant must still SEE it: {mine}");
+        assert_eq!(
+            mine["open"][0]["you_may_rule"], false,
+            "self-arbitration must be answered here, not discovered at the ruling tool: {mine}"
+        );
+        assert_eq!(mine["you_may_rule_count"], 0, "{mine}");
+
+        let theirs = tool_open_appeals(&shared, &json!({"session_id": kimi.to_string()}))
+            .await
+            .unwrap();
+        assert_eq!(
+            theirs["open"][0]["you_may_rule"], true,
+            "a not-same member must be told it can take this: {theirs}"
+        );
+        assert_eq!(theirs["you_may_rule_count"], 1, "{theirs}");
+    }
+
+    /// AN UNATTRIBUTED CALLER GETS THE LIST AND IS TOLD WHY ELIGIBILITY IS MISSING.
+    ///
+    /// The failure this guards is silent absence: `you_may_rule` simply not being there
+    /// reads as "no eligibility concerns" rather than "not computed".
+    #[tokio::test]
+    async fn without_a_session_the_list_is_complete_and_eligibility_is_absent_not_implied() {
+        let (_d, shared, ids) = state_with_members(&["claude-code"]);
+        let deny = append_deny(&shared, "claude-code", "ls /tmp").await;
+        file_appeal(&shared, ids[0], &deny).await;
+
+        let q = tool_open_appeals(&shared, &json!({})).await.unwrap();
+        assert_eq!(q["count"], 1, "discovery must not require a session: {q}");
+        assert!(q["open"][0].get("you_may_rule").is_none(), "{q}");
+        assert!(q["you"].is_null(), "{q}");
+        assert!(
+            q["note"].as_str().unwrap().contains("session_id"),
+            "the reply must say why eligibility is absent: {q}"
+        );
+    }
+
+    /// BOTH `hestia://appeal/` CONVENTIONS RESOLVE, AND THE REPLY SAYS WHICH.
+    ///
+    /// Convention 1 is what this daemon mints into every dispatch notice. Convention 2 is
+    /// what the hand-written notices that actually got two appeals ruled carried. Before
+    /// this, NEITHER resolved — the prefix was absent from the resolver entirely.
+    #[tokio::test]
+    async fn appeal_pointers_resolve_under_both_conventions() {
+        let (_d, shared, ids) = state_with_members(&["claude-code"]);
+        let deny = append_deny(&shared, "claude-code", "ls /tmp").await;
+        let filed = file_appeal(&shared, ids[0], &deny).await;
+        let appeal_entry = filed["witnessEntryHash"].as_str().unwrap().to_string();
+
+        let by_deny: Value = serde_json::from_str(
+            &read_resource_body(&shared, &format!("hestia://appeal/{deny}")).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(by_deny["matched_as"], "deny_hash", "{by_deny}");
+        assert_eq!(by_deny["deny_hash"], deny, "{by_deny}");
+        assert_eq!(by_deny["ruled"], false, "{by_deny}");
+
+        let by_entry: Value = serde_json::from_str(
+            &read_resource_body(&shared, &format!("hestia://appeal/{appeal_entry}")).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(by_entry["matched_as"], "appeal_entry_hash", "{by_entry}");
+        assert_eq!(
+            by_entry["deny_hash"], deny,
+            "the non-canonical namespace must still yield the RULING-READY hash — converting \
+             it by hand is the cost this resolver exists to remove: {by_entry}"
+        );
+    }
+
+    /// FIDELITY TO ROUTING IS ON THE ADJUDICATION ENTRY.
+    ///
+    /// The live case: an appeal routed to one member, ruled by another, both cross-vendor.
+    /// Without `was_designee` the two rulings are bit-identical on the chain, and a relying
+    /// party cannot tell that routing was bypassed.
+    #[tokio::test]
+    async fn the_adjudication_records_whether_the_arbiter_was_the_designee() {
+        let (_d, shared, ids) = state_with_members(&["claude-code", "codex", "kimi-code"]);
+        let (claude, kimi) = (ids[0], ids[2]);
+
+        let deny = append_deny(&shared, "claude-code", "ls /tmp").await;
+        file_appeal(&shared, claude, &deny).await;
+
+        let q = tool_open_appeals(&shared, &json!({"session_id": kimi.to_string()})).await.unwrap();
+        let designee = q["open"][0]["routing"]["routed_to"].as_str().unwrap().to_string();
+        // The fixture reproduces the incident's exact shape rather than approximating it:
+        // routing designates `codex`, and `kimi-code` — cross-vendor to the appellant on
+        // BOTH counts, so `independence` alone cannot separate them — is who actually rules.
+        // Pinned, because if selection ever changed to pick kimi, the assertion below would
+        // silently start testing the designated path and stop testing the bypassed one.
+        assert_eq!(designee, "codex", "fixture must route away from the ruling member: {q}");
+
+        tool_arbitrate_appeal(
+            &shared,
+            &json!({
+                "deny_hash": deny,
+                "upheld": true,
+                "rationale": "a read under /tmp is not the act the destructive rule names",
+                "session_id": kimi.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let s = shared.lock().await;
+        let adj = s
+            .recent_chain(50)
+            .into_iter()
+            .find(|e| e.event_type == "adjudication")
+            .expect("a ruling was written");
+        assert_eq!(adj.event_data["routed_to"], designee, "{:?}", adj.event_data);
+        assert_eq!(
+            adj.event_data["was_designee"], false,
+            "a ruling by a member that was NOT designated must say so on the adjudication \
+             entry — this is the one bit that separates 'routing worked' from 'routing was \
+             bypassed and it got ruled anyway', and independence cannot carry it: {:?}",
+            adj.event_data
+        );
+        assert_eq!(
+            adj.event_data["independence"], "cross_vendor",
+            "the ambiguity being closed: this ruling's independence is bit-identical to what \
+             a designated codex ruling would have written: {:?}",
+            adj.event_data
+        );
+    }
+
 }
 
 #[cfg(test)]
@@ -6963,5 +8286,128 @@ mod appeal_tests {
                 .contains(&format!("matches {true_count} chain entries")),
             "the message a member actually reads must carry the true count too: {amb}"
         );
+    }
+}
+
+#[cfg(test)]
+mod vault_hst001_tests {
+    //! HST-001 containment: an empty allowed_consumers list must not silently make a
+    //! credential world-readable, and a disclosure must not be invisible on the chain.
+    use super::*;
+    use super::inbox_tests::{open_state, seeded_home};
+
+    async fn seat_session(state: &SharedState, plugin_id: &str) -> Uuid {
+        let sid = Uuid::new_v4();
+        let mut s = state.lock().await;
+        s.sessions.insert(sid, crate::server::state::Session {
+            session_id: sid,
+            plugin_id: plugin_id.into(),
+            plugin_version: None,
+            host_agent: "test".into(),
+            host_agent_version: None,
+            assigned_role: "citizen".into(),
+            constellation_role: "role:constellation:member".into(),
+            soft_lct: format!("lct:test:{plugin_id}"),
+            connected_at: chrono::Utc::now(),
+            host_session_id: None,
+        });
+        sid
+    }
+
+    async fn set(state: &SharedState, sid: Option<Uuid>, name: &str, consumers: Vec<&str>) -> Value {
+        let mut args = json!({"name": name, "value": "DUMMY-SECRET"});
+        if let Some(u) = sid { args["session_id"] = json!(u.to_string()); }
+        if !consumers.is_empty() { args["allowed_consumers"] = json!(consumers); }
+        tool_vault_set(state, &args).await.unwrap()
+    }
+    async fn get(state: &SharedState, sid: Option<Uuid>, name: &str) -> Value {
+        let mut args = json!({"name": name});
+        if let Some(u) = sid { args["session_id"] = json!(u.to_string()); }
+        tool_vault_get(state, &args).await.unwrap()
+    }
+
+    /// The write side: an ATTRIBUTED creator's new credential binds to it, so a DIFFERENT
+    /// member cannot read it — the world-readable default is closed for new entries.
+    #[tokio::test]
+    async fn a_new_credential_from_an_attributed_creator_is_not_world_readable() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let owner = seat_session(&state, "claude-code").await;
+        let other = seat_session(&state, "kimi-code").await;
+        let w = set(&state, Some(owner), "owned-cred", vec![]).await;
+        assert_eq!(w.get("boundToCreator").and_then(Value::as_bool), Some(true),
+                   "an empty list from an attributed creator must bind to the creator: {w}");
+        let denied = get(&state, Some(other), "owned-cred").await;
+        assert!(format!("{denied}").contains("vault_scope_mismatch"),
+                "a different member must not read a creator-bound credential: {denied}");
+        let ok = get(&state, Some(owner), "owned-cred").await;
+        assert_eq!(ok.get("value").and_then(Value::as_str), Some("DUMMY-SECRET"),
+                   "the creator can still read its own: {ok}");
+    }
+
+    /// A pre-existing exposed entry (empty list, e.g. written before this fix) still reads —
+    /// compatibility — but the read is WITNESSED with exposed:true. The disclosure is no
+    /// longer invisible, which was the gap in Finding A.
+    #[tokio::test]
+    async fn an_exposed_read_is_allowed_but_witnessed() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        // Simulate a legacy entry: write it directly with an empty consumer list.
+        {
+            let mut s = state.lock().await;
+            s.vault.upsert(VaultEntry::new("legacy-cred", "DUMMY-SECRET")).unwrap();
+        }
+        let before = { state.lock().await.recent_chain(200).len() };
+        let anon = seat_session(&state, "some-random-caller").await;
+        let r = get(&state, Some(anon), "legacy-cred").await;
+        assert_eq!(r.get("value").and_then(Value::as_str), Some("DUMMY-SECRET"),
+                   "a legacy exposed entry still reads (no live breakage): {r}");
+        let window = { state.lock().await.recent_chain(200) };
+        assert!(window.len() > before, "the read must append a witness entry");
+        let vget = window.iter().rev().find(|e| e.event_type == "vault_get")
+            .expect("disclosure must be witnessed — this is the theft step");
+        assert_eq!(vget.event_data.get("exposed").and_then(Value::as_bool), Some(true),
+                   "the witness must flag it as an exposed read");
+        assert!(!format!("{:?}", vget.event_data).contains("DUMMY-SECRET"),
+                "the secret value must NEVER be written to the chain");
+    }
+
+    /// kimi's residual on #76: an ANONYMOUS write must not bind the credential to whoever
+    /// connected last. `resolve_caller` falls back to `max_by_key(connected_at)`, so before
+    /// this fix an unattributed writer made a bystander the owner of a secret it never
+    /// wrote — and could not read it back, because the read path is strict. Ambient
+    /// authority: attribution assigned to an innocent party by ordering.
+    #[tokio::test]
+    async fn an_anonymous_write_is_refused_rather_than_bound_to_the_last_connection() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        // A bystander is the most-recently-connected session — the fallback's target.
+        let bystander = seat_session(&state, "innocent-member").await;
+        let _ = bystander;
+
+        // Write with NO session_id at all.
+        let r = tool_vault_set(&state, &json!({"name": "orphan-cred", "value": "DUMMY"}))
+            .await
+            .unwrap();
+        assert!(
+            format!("{r}").contains("vault_set_unattributed"),
+            "an unattributable write must be refused, not silently attributed: {r}"
+        );
+
+        // And nothing was stored under the bystander's name.
+        let stored = { state.lock().await.vault.get("orphan-cred").is_some() };
+        assert!(!stored, "a refused write must not persist the credential");
+    }
+
+    /// The scoped case is unchanged: a non-listed caller is denied, as before this fix.
+    #[tokio::test]
+    async fn a_scoped_credential_still_denies_a_non_consumer() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let owner = seat_session(&state, "claude-code").await;
+        let other = seat_session(&state, "kimi-code").await;
+        set(&state, Some(owner), "scoped-cred", vec!["claude-code"]).await;
+        let denied = get(&state, Some(other), "scoped-cred").await;
+        assert!(format!("{denied}").contains("vault_scope_mismatch"), "{denied}");
     }
 }

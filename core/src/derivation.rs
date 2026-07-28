@@ -610,6 +610,48 @@ pub fn derive(
         formula: formula.to_string(),
         evidence,
     };
+    // WHY "UNMEASURED" WHEN THE MEMBER CLEARLY ACTED — the role-grain split.
+    //
+    // dp, 2026-07-27: "kimi 'member' alias still shows unmeasured despite over 2.7K actions."
+    //
+    // Measured on this chain: `kimi-code` has 1140 `outcome` entries under
+    // `role:constellation:member` and ZERO policy_decisions there, while its 21 denies sit
+    // under `role:constellation:interactive-dev` with no outcomes. Its gate reads the
+    // member's identity.json and reports the real role; its MCP sessions pass no `role` at
+    // all, and `normalize_constellation_role("")` silently returns the default — `member`.
+    // The two halves of one member's record landed on two grains, and NEITHER can produce a
+    // conduct score: one has acts with nothing governing them, the other has denies with no
+    // following acts to judge the response against.
+    //
+    // This is the codex/codex-cli identity split on the ROLE axis. There the repair was an
+    // `identity_alias` record. Here the honest first move is to stop the silence: an
+    // "unmeasured" meaning "this member's governance evidence is filed under another role"
+    // is a different fact from "this member has no governance history", and rendering them
+    // identically is the null-state defect this file exists to guard against.
+    //
+    // DETECTION ONLY — no folding. Folding two role grains would assert an equivalence
+    // hestia has no authority to assert: nothing here binds a member to a role, so the two
+    // records may genuinely be two capacities. Naming the split hands that judgement to a
+    // reader who can check it.
+    let sibling_role_denies: Option<(String, usize)> = if temperament_scores.is_empty() {
+        let mut by_role: std::collections::BTreeMap<&str, usize> = Default::default();
+        for e in entries.iter() {
+            let same_member =
+                entry_str(e, "plugin_id").is_some_and(|p| identities.iter().any(|i| i == p));
+            if !same_member || e.event_type != "policy_decision" {
+                continue;
+            }
+            if let Some(r) = entry_str(e, "role_lct") {
+                if r != role_lct {
+                    *by_role.entry(r).or_default() += 1;
+                }
+            }
+        }
+        by_role.into_iter().max_by_key(|(_, n)| *n).map(|(r, n)| (r.to_string(), n))
+    } else {
+        None
+    };
+
     // Exclusions ride the SAME receipt (transparency: a reader sees both what
     // counted and what was witnessed-excluded, with the exclusion's evidence).
     temperament_evidence.extend(excluded_evidence);
@@ -630,6 +672,25 @@ pub fn derive(
          arbiter must rule via `hestia_arbitrate_appeal`. Synthetic probe sessions \
          (test/probe/verify/e2e/debug markers) are excluded from conduct.",
     );
+    // An unmeasured grain that says WHY beats one that just says nothing.
+    let temperament = match sibling_role_denies {
+        Some((other_role, n)) => DerivedDimension {
+            formula: format!(
+                "UNMEASURED HERE BECAUSE THE EVIDENCE IS SPLIT ACROSS ROLES: this grain has \
+                 no governance decisions, but the same member has {n} under '{other_role}'. \
+                 Acts and the decisions governing them landed on different role grains, so \
+                 neither side can score conduct — one has acts with nothing governing them, \
+                 the other denies with no following acts to judge. Usually means the member's \
+                 gate reports its declared role while its MCP sessions pass none and are \
+                 defaulted to '{}'. NOT folded: nothing here binds a member to a role, so \
+                 these may genuinely be two capacities — check, do not assume. || {}",
+                crate::reputation::DEFAULT_CONSTELLATION_ROLE,
+                temperament.formula
+            ),
+            ..temperament
+        },
+        None => temperament,
+    };
     let mk_adj = |i: usize, name: &str| {
         dim(
             &adj_scores[i],
@@ -979,6 +1040,44 @@ mod recast_tests {
     fn a_much_later_command_is_not_a_recast() {
         let w = vec![deny(1, 0, DENIED), ok(2, RETRY_WINDOW_MINUTES + 5, RECAST)];
         assert!(score(&w) > 0.5, "outside the window, compliance");
+    }
+
+    /// dp, 2026-07-27: "kimi 'member' alias still shows unmeasured despite over 2.7K actions."
+    ///
+    /// The measured shape: acts on one role grain, the decisions governing them on another.
+    /// Neither side can score, and the bare word "unmeasured" made that indistinguishable
+    /// from a member with no governance history at all.
+    #[test]
+    fn an_unmeasured_grain_says_when_the_evidence_is_filed_under_another_role() {
+        const OTHER: &str = "role:constellation:interactive-dev";
+        let w = vec![
+            // acts, witnessed under the DEFAULTED role
+            ok(1, 0, "cargo test"),
+            ok(2, 1, "git status"),
+            // the decisions governing the same member, witnessed under its DECLARED role
+            ev(3, 2, "policy_decision", json!({
+                "decision":"deny","enforced":true,"plugin_id":"m","role_lct":OTHER,
+                "session_id":"s9","tool_name":"Bash","payload_sha256":"h",
+                "target":"","attempted":DENIED})),
+        ];
+        let d = derive("m", ROLE, &w);
+        assert!(d.temperament.score.is_none(), "still unmeasured — nothing to fold");
+        let f = &d.temperament.formula;
+        assert!(f.contains("SPLIT ACROSS ROLES"), "the split must be named: {f}");
+        assert!(f.contains(OTHER), "and it must say WHERE the evidence went: {f}");
+        assert!(f.contains("NOT folded"),
+                "and must not imply hestia merged two grains it has no authority to merge");
+    }
+
+    /// A member that genuinely has no governance history must NOT get the split explanation
+    /// — that would trade one misleading message for another.
+    #[test]
+    fn a_member_with_no_decisions_anywhere_is_plainly_unmeasured() {
+        let w = vec![ok(1, 0, "cargo test")];
+        let d = derive("m", ROLE, &w);
+        assert!(d.temperament.score.is_none());
+        assert!(!d.temperament.formula.contains("SPLIT ACROSS ROLES"),
+                "no sibling evidence exists, so there is no split to report");
     }
 
     /// A real member whose UUID happens to contain "e2e" is not a probe.

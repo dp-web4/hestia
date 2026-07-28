@@ -1,0 +1,53 @@
+name: ci
+
+# The test gate. Hestia has never had one: before this file, `.github/workflows/`
+# held only `app-android.yml` and `release.yml`, neither of which runs a test, and
+# `git log --diff-filter=D -- .github/workflows/` is empty — this is a boundary
+# being drawn for the first time, not a regression being restored.
+#
+# The invocation is deliberately unqualified. At the commit this file was added,
+# `cargo test` runs five targets — lib (372), the `hestia` bin (8), `calib_export`
+# (0), `tests/persistence.rs` (1), doc-tests (0) — so `--lib` reports a green that
+# covers 372 of 381 and names none of the gap.
+#
+# But the count is not the argument, because the count moves. The target SET moves:
+# `core/tests/` gains a file whenever someone wires an integration seam, and that
+# file falls outside a `--lib` habit on the very day it is written, by the person
+# least able to notice. Concretely, as this lands, `core/tests/rendered_layer.rs`
+# exists only on the unmerged #62 branch — a target no reviewer running `--lib`
+# could have exercised even in principle, because it was not yet in their tree.
+# So the gate selects nothing: which targets a green covers must be a property of
+# the repo, not a per-session choice, and the only invocation with that property is
+# the one that chooses no target at all.
+#
+# `--locked` is not target selection. It fails if the build would rewrite
+# Cargo.lock, so a dependency bump arrives as a reviewable diff rather than as
+# CI drift.
+#
+# NOTE ON SCOPE: this workflow makes green a machine property of the commit at PR
+# time. It does NOT make red block a merge — that is branch protection, which lives
+# in repo settings and cannot be self-applied by a workflow file. Until a steward
+# configures it, "CI exists" must not be read as "CI gates."
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Test
+        working-directory: core
+        run: cargo test --locked

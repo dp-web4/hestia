@@ -642,6 +642,9 @@ async fn vault_list(State(state): State<SharedState>) -> impl IntoResponse {
                     "scope": e.scope,
                     "tags": e.tags,
                     "allowed_consumers": e.allowed_consumers,
+                    // HST-001: empty consumer list == readable by any caller. Surfaced so an
+                    // operator can see and close exposures rather than discovering them.
+                    "exposed": e.allowed_consumers.is_empty(),
                     "created_at": e.created_at,
                     "last_rotated": e.last_rotated,
                 })
