@@ -12,7 +12,8 @@ whole method.
 > source corrected it). CBP then wired this gate in as the real `BeforeTool` hook of an installed
 > gemini-cli 0.52.0 and fired it with model round-trips: in-scope read allowed; out-of-scope read,
 > `../` traversal, symlink escape, absolute out-of-scope, out-of-scope shell command, governor deny
-> and malformed JSON all denied `exit 2`, with the hestia reason surfaced verbatim to the model. Arg
+> and malformed JSON all denied (then all on `exit 2`; policy denies moved to the clean `exit 0` +
+> stdout-JSON channel on 2026-07-28 — see *Two deny channels*), with the reason surfaced to the model. Arg
 > names confirmed live (`read_file` → `file_path` absolute, `run_shell_command` → `command`). The
 > same pass found two holes (ungated web egress, `mcp_context` unread), closed here. Nomad built the
 > adapter from the descriptor + vendor source; CBP owns the rig and the live tier.
@@ -39,11 +40,49 @@ fields this gate needs it is near-identical:
   | timeout (60000ms default) / spawn error | `success:false`, **no output** | **fail open** (tool proceeds) |
 
   Two load-bearing consequences: (a) **exit 1 does NOT block** (correcting the "any non-zero warns"
-  reading) — a gate must use `2`, never `1`, to deny; (b) a block **requires emitted text**: the
+  reading) — a gate must never use `1` to deny; (b) a block **requires emitted text**: the
   runner parses `stdout.trim() || stderr.trim()` (L455), so `exit 2` with empty output leaves
-  `output` undefined and does **not** deny. This gate always writes a stderr reason before `exit 2`.
+  `output` undefined and does **not** deny. Every `exit 2` path here writes a stderr reason first.
   The only fail-open surface is a **timeout / spawn error** — which is exactly why the hook scripts
   belong on ext4 (see Hardening).
+
+  A third row the table above doesn't show: **`exit 0` with a stdout JSON `{"decision":"deny",...}`
+  also blocks** (L459-467), and — because per-hook `success` is exactly `exitCode === 0` — it blocks
+  *without* the operator-facing yellow banner. The gate uses both channels; see below.
+
+### Two deny channels (2026-07-28)
+
+Nomad's live pass on the Nomad rig reported that every deny printed
+`Hook execution for BeforeTool: 0 succeeded, 1 failed` plus a yellow
+`[WARNING] Hook(s) … failed for event BeforeTool`. That was never a safety bug — the tool is blocked
+and the reason reaches the model; the banner is a UI `user-feedback` event that never enters model
+context. It was a **signal** bug: with exit-2-always, `success:false` fired identically for *boundary
+held*, *gate crashed* and *gate timed out*, so the banner carried no information and a genuine
+malfunction was invisible inside its own noise.
+
+Moving **all** denies to `exit 0` + stdout JSON was rejected. The exit code is the gate's fail-closed
+anchor: at exit 2 *any* emitted text denies (unparseable text falls back to `{decision:'deny'}`),
+while at exit 0 the verdict survives only if the JSON parses — a truncated or prefixed payload falls
+back to `{decision:'allow'}`. A blanket swap would trade a cosmetic banner for a **new fail-open
+surface** on the one path that must never have one. So the channel is picked by cause:
+
+| deny cause | channel | operator banner |
+|---|---|---|
+| policy verdict — Gate-1a innate, Gate-1b scope/command-scope, an explicit governor deny | `exit 0` + stdout JSON | none (clean) |
+| anomaly — unreadable event, governor **absent**/unreachable/inconclusive, any uncaught exception | `exit 2` + stderr | raised |
+
+The banner now means *"the gate could not do its job"*, and a held boundary is silent — the wire
+protocol finally agrees with what the deny text has always said ("this is a boundary, not a failure").
+Two consequences for anyone editing the gate:
+
+- **fd 1 is the verdict channel and nothing else.** The runner reads `stdout` *in preference to*
+  `stderr`, so one stray byte on stdout shadows a deny payload and, at exit 0, degrades it to an
+  allow. `_gate()` rebinds `sys.stdout` to stderr and the `path_scope` import runs under a redirect;
+  only `_emit_verdict()` writes fd 1, via `os.write` in a full-write loop.
+- **an absent governor must not be laundered into a clean deny.** `python3 /nonexistent/governor.py`
+  exits 2 with stderr text — byte-identical in shape to a real verdict. The gate stats the governor
+  path *before* spawning, and treats the claude-code governor's own `[fail-closed]` no-verdict marker
+  as an anomaly too, so a down daemon still raises the banner.
 
 Two Gemini-specific things shape the design:
 
@@ -161,26 +200,37 @@ codex convention so nothing drifts across adapters.)
 
 Smoke-tested against synthetic `BeforeTool` events (2026-07-22, on Nomad):
 
-- wrong event (`AfterTool`) → passthrough exit 0 ✓
-- read in-scope repo → allow exit 0 ✓
-- read out-of-scope repo → deny exit 2 (shared `path_scope` realpath reason) ✓
-- secret path (`.env`) → deny exit 2 (innate) ✓
-- shell command reaching an out-of-scope repo → deny exit 2 (command-scope) ✓
-- malformed event JSON → deny exit 2 (fail-closed) ✓
+- wrong event (`AfterTool`) → passthrough allow ✓
+- read in-scope repo → allow ✓
+- read out-of-scope repo → deny, clean channel (shared `path_scope` realpath reason) ✓
+- secret path (`.env`) → deny, clean channel (innate) ✓
+- shell command reaching an out-of-scope repo → deny, clean channel (command-scope) ✓
+- malformed event JSON → deny, anomaly channel (fail-closed) ✓
 
 **Fail-open holes found by repro and closed (2026-07-22, nomad).** The first cut of this gate passed
 the smoke tests above while still allowing all four of these. Regression tests live in `tests/`:
 
 ```sh
-plugins/gemini/tests/gate_holes_repro.sh          # 17/17 here, 12/17 against the pre-fix gate
+plugins/gemini/tests/gate_holes_repro.sh          # 20/20 — the scope/egress/MCP holes, per case
+plugins/gemini/tests/channel_contract_test.py     # 20/20 — the two-channel deny contract
 plugins/gemini/tests/wrapper_failclosed_test.py   # 5/5 — fault-injects the deny-on-exception wrapper
+plugins/gemini/tests/runner_decision.py           # not a test: gemini's own result parser, transcribed
 ```
 
+`runner_decision.py` is the reason the first two are trustworthy. They used to assert the gate's
+**exit code**, which was a fine proxy only while "non-zero == deny" was the whole contract — and it
+never was. `exit 2` with empty output is a fail-open the exit-code assertion cannot see (test passes,
+gate leaks); `exit 0` with a stdout deny is a correct gate the same assertion marks as failing. So the
+cases now assert what gemini's runner actually decides, plus **which channel** carried it (`banner=0`
+clean / `banner=1` anomaly) — because a policy deny quietly regressing to `exit 2` would still "pass"
+on the decision alone. Re-derive the transcription if the CLI is upgraded; the header says how.
+
 They point `HESTIA_SOCIETY_GATE` at a nonexistent path on purpose: a correct gate fails **closed**
-when it cannot reach the governor, so every write/exec/egress case must come back exit 2. Pass a
-gate path as `$1` to test a different revision (keep the copy **inside `hooks/`** — from elsewhere the
-relative `../../lib` import fails and the gate silently falls back to the string check, which
-over-denies and makes a baseline look worse than it is).
+when it cannot reach the governor. Those cases deny on the *anomaly* channel — an absent governor is
+a malfunction and the operator must see it — while Gate-1 denies never consult the governor at all
+and stay clean. Pass a gate path as `$1` to test a different revision (keep the copy **inside
+`hooks/`** — from elsewhere the relative `../../lib` import fails and the gate silently falls back to
+the string check, which over-denies and makes a baseline look worse than it is).
 
 The last section is different and deliberately so: it swaps in a governor stub that **allows**, so
 the only thing that can deny is Gate-1. Egress and MCP are not `READ_CLASS`, so with the governor
@@ -206,8 +256,8 @@ egress arguments at all:
 The exit-code contract these depend on is LIVE-VERIFIED on gemini-cli 0.52.0 by CBP
 (`shared-context/forum/cbp-to-nomad-gemini-hook-contract-LIVE-VERIFIED-2026-07-22.md`): exit 0 =
 allow, **exit 1 = allow+warning**, exit 2+ = deny, and empty output on *both* streams = no decision
-= allow. So `sys.exit(2)` without writing a reason is itself a hole; every deny path here writes to
-stderr first.
+= allow. So `sys.exit(2)` without writing a reason is itself a hole; every anomaly path here writes to
+stderr first, and every policy path writes its decision object to stdout (see *Two deny channels*).
 
 **Live tier (CBP's rig, gemini-cli 0.52.0 + real API, 2026-07-22)** — the `verified` bar is met for
 the core paths: in-scope read allowed and returned contents; out-of-scope read denied with the full
@@ -233,6 +283,11 @@ fail-open timeout behavior empirically (contract-read only).
   vs. this gate, so there is no silent gap between the two layers.
 - **A block must emit text.** Any custom exit-2 path added later MUST write a reason to stderr (empty
   output + exit 2 does not deny — see the contract table). Never `exit 1` to deny (it allows).
+- **Pick the deny channel by cause, not by convenience.** A new *policy* verdict goes through
+  `deny()` (exit 0 + JSON); a new *"we couldn't tell"* path goes through `anomaly()` (exit 2 +
+  stderr). Routing an anomaly down the clean channel hides a malfunction; routing a policy deny down
+  the anomaly channel re-floods the banner and costs it its meaning again. Never `print()` inside the
+  gate — fd 1 belongs to `_emit_verdict()`.
 
 ## Accountability self-audit (RWOA + S + V)
 
@@ -241,7 +296,7 @@ surface: gemini BeforeTool gate   act: allow/deny a foreign member's tool call (
 S: med/reversible (a single denied-or-allowed tool call; irreversible egress is the high-stakes tail) [construct: MODE=enforce default]
 R: n/a — the gate does not authorize on reachability; it authorizes on MRH scope read from role-sourced identity [construct: load_in_scope]
 W: pass — scope comes from the member's identity (role-sourced, grant-time), not a hook-time editable input; society-safety defers to the witnessed claude-code governor [construct: Gate-2 delegation]
-O: pass — the gate runs BeforeTool, before any side effect; a denied act leaves state bit-identical (exit 2, no mutation) [construct: main() before sys.exit]
+O: pass — the gate runs BeforeTool, before any side effect; a denied act leaves state bit-identical (the decision is emitted and the process exits, no mutation) [construct: deny/anomaly before sys.exit]
 A: n/a here — this is an enforcement point, not a ledger writer; witness/continuity is observe.sh + the governor's record [construct: observe.sh]
 V: present — egress/secret is an innate always-deny (the catastrophic-irreversible tail); operator holds the widen/veto [construct: deny(..., innate=True)]
 verdict: PASS (documented; re-audit after live-CLI verification)
