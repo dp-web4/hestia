@@ -230,29 +230,82 @@ cat > "$BIN" <<WRAP
 # silence, and silence reads as clean.
 #
 # AND THE FALLBACK IS PROBED, NOT JUST FOUND (McNugget, 2026-07-28, measured end to end on
-# macOS 26.5 through a real launchd agent). `-x` and `command -v` answer "exists"; the
+# macOS 26.5 through a real launchd agent). \`-x\` and \`command -v\` answer "exists"; the
 # floor needs "runs". On a Mac without the Xcode command line tools /usr/bin/python3 is an
 # xcrun stub — and once the pinned directory is gone it is the FIRST python3 on the PATH
-# launchd hands a gui/ agent (/usr/bin:/bin:/usr/sbin:/sbin). Found by `command -v`, so the
+# launchd hands a gui/ agent (/usr/bin:/bin:/usr/sbin:/sbin). Found by \`command -v\`, so the
 # -z branch never fires; exit 1 without running this file, so nothing reports. Measured:
 # stdout 0 bytes, no unknown[] entry, no INTERPRETER PIN BROKEN clause, and
-# periodic_trigger() still answering `launchd-agent-installed` with installed_bin set —
+# periodic_trigger() still answering \`launchd-agent-installed\` with installed_bin set —
 # the strongest state this plugin has. That is the same silence the floor was written to
 # end, one platform over. So: run it once before trusting it, and if it cannot run, exit
 # LOUDLY rather than let the stub exit quietly. 13ms, and only on the already-degraded path.
+#
+# THE BACKTICKS ABOVE ARE ESCAPED, AND THAT IS LOAD-BEARING (cbp, 2026-07-28, measured on
+# Linux). This heredoc is UNQUOTED — it has to be, it interpolates \$PYTHON, \$BIN and
+# \$WORKSPACE. So its body is prose to a reader and shell input to bash: an unescaped
+# backtick pair is COMMAND SUBSTITUTION, run by install.sh at install time, and replaced in
+# the generated file by its output. Unescaped, the three comment lines above ran \`-x\` and
+# \`launchd-agent-installed\` as commands ("command not found" x2 on a clean install) and
+# shipped a wrapper whose sentences had holes where the quoted words used to be — "Found by
+# , so the -z branch never fires". Nothing executable broke, but only because the words
+# happened to name nothing; the count of backticks was even by luck, and an ODD count is a
+# hard \`bad substitution\` that writes a ZERO-BYTE wrapper. This file's house style is
+# markdown prose in shell comments, which makes that a standing hazard rather than a typo:
+# every future paragraph in here is one backtick pair away from executing itself. Escape
+# them, and keep the check below (\`bash -n\` will not catch this — it is valid shell).
+#
+# AND THE SAME QUESTION IS ASKED OF THE PIN (cbp, 2026-07-28, measured on Linux). The rule
+# above is right and it was applied to one of the two branches: \`command -v\` on the
+# fallback got probed, \`-x\` on the PIN did not — and \`-x\` answers "exists" for exactly the
+# same reason. A pin that is present and executable but cannot RUN never reaches either
+# guard below: not -x-false, so no fallback, no \$PY -z branch, no
+# HESTIA_INTERPRETER_PIN_BROKEN, no finding. It goes straight to the exec and dies there.
+# Reachable on Linux by a route as ordinary as the Mac's stub: install with a version-manager
+# shim first on PATH (pyenv's \$PYENV_ROOT/shims/python3 — which install.sh ALREADY warns
+# about, three lines further down, as "re-resolves from ITS own environment"), then let that
+# version go. The shim stays 0755 and answers -x forever; it exits 127 with
+# "pyenv: version ... is not installed" without starting python. Measured here, sandboxed
+# \$HOME, pin = shim, version removed:
+#
+#   exit 127 | stdout 0 bytes | no --brief line | no unknown[] entry | --json 0 bytes
+#   and inventory.py, run by hand from a WORKING python against that same \$HOME, still
+#   reports scope.installed_bin set and scope.periodic_trigger=systemd-user-timer-*
+#
+# — the strongest-state-while-every-fire-is-a-no-op pair, one rung up, on the PRIMARY path.
+# Note what this costs the floor specifically: #95 put scope.interpreter on EVERY run and
+# turned the broken pin into a finding, but both of those live INSIDE inventory.py, and this
+# is the one case where inventory.py never starts. A report needs something alive to emit it
+# — which is McNugget's own sentence, pointed at the branch it did not cover.
+#
+# So: gone and cannot-run are the SAME CASE and get the same handling. Note this does not
+# exit — it falls back and REPORTS, per #95; exiting 127 is reserved for when the fallback
+# cannot run either (the two branches below), because that is the only state with nothing
+# left alive to report with.
+#
+# COST, measured, not asserted: one interpreter start on every run. 30ms on this box
+# (/usr/bin/python3 3.12.3, 20 runs), against a real --brief over the fleet workspace at
+# ~4.6s — 0.6%. Cheap here because the workspace walk is 9p; on a local-SSD workspace the
+# same 30ms is a larger fraction, so it is a real trade and not a free one.
+# CONSIDERED AND REJECTED, because it is cheaper but not honest: drop the \`exec\`, run the
+# pin, and treat rc 126/127 as "the interpreter never started" — zero cost on success, but
+# it couples this wrapper to inventory.py's exit codes, and the day the tool legitimately
+# exits 127 the wrapper silently runs the whole inventory twice. A guard that is wrong when
+# the thing it guards changes is the kind of check this plugin exists to find.
 PY="$PYTHON"
-if [ ! -x "\$PY" ]; then
+if [ ! -x "\$PY" ] || ! "\$PY" -c '' 2>/dev/null; then
   PY="\$(command -v python3 2>/dev/null || true)"
   if [ -n "\$PY" ] && ! "\$PY" -c '' 2>/dev/null; then
-    echo "hestia-agent-inventory: pinned interpreter $PYTHON is gone, and the PATH" >&2
-    echo "  fallback \$PY exists but cannot run python (on macOS /usr/bin/python3 is an" >&2
-    echo "  xcrun stub needing the Xcode command line tools). Re-run install.sh from a" >&2
-    echo "  shell whose python3 works. This check has NOT run." >&2
+    echo "hestia-agent-inventory: pinned interpreter $PYTHON is gone or cannot run," >&2
+    echo "  and the PATH fallback \$PY exists but cannot run python either (on macOS" >&2
+    echo "  /usr/bin/python3 is an xcrun stub needing the Xcode command line tools; on" >&2
+    echo "  Linux, a version-manager shim whose version has been removed does the same)." >&2
+    echo "  Re-run install.sh from a shell whose python3 works. This check has NOT run." >&2
     exit 127
   fi
   if [ -z "\$PY" ]; then
-    echo "hestia-agent-inventory: pinned interpreter $PYTHON is gone and there is no" >&2
-    echo "  python3 on PATH either. Re-run install.sh. This check has NOT run." >&2
+    echo "hestia-agent-inventory: pinned interpreter $PYTHON is gone or cannot run, and" >&2
+    echo "  there is no python3 on PATH either. Re-run install.sh. This check has NOT run." >&2
     exit 127
   fi
   HESTIA_INTERPRETER_PIN_BROKEN="$PYTHON"

@@ -309,11 +309,41 @@ def test_interpreter_finding():
             os.environ["HESTIA_INTERPRETER_PIN_BROKEN"] = orig
 
 
+def test_wrapper_heredoc_is_inert():
+    """The generated wrapper's comments must not be shell input (cbp, 2026-07-28).
+
+    `cat > "$BIN" <<WRAP` is UNQUOTED and has to be — the wrapper interpolates $PYTHON,
+    $BIN and $WORKSPACE at install time. That makes every line between the delimiters
+    prose to a reader and shell input to bash, and this file's house style is markdown
+    prose in shell comments. An unescaped backtick pair is command substitution: bash RUNS
+    it during install and the generated wrapper gets the output. It shipped once — the
+    review comment quoting `-x` and `launchd-agent-installed` executed both on a clean
+    install and left holes in the wrapper's own sentences. `bash -n` does not catch this;
+    it is valid shell. Nothing in the plugin's output changes when it happens, which is
+    why it needs a test and not a convention.
+    """
+    src = (Path(__file__).parent / "install.sh").read_text()
+    body = src.split('cat > "$BIN" <<WRAP\n', 1)[1].split("\nWRAP\n", 1)[0]
+    check("the wrapper heredoc was found", len(body) > 200, True)
+    # Escaped is \` ; anything else is a live substitution at install time.
+    live = [ln for ln in body.splitlines()
+            if "`" in ln.replace("\\`", "")]
+    check("no unescaped backtick in the wrapper heredoc", live, [])
+    # $ is the other expansion, but there it is deliberate and load-bearing, so assert the
+    # intent rather than banning it: only the three install-time pins may expand.
+    bare = [ln for ln in body.splitlines()
+            if any(tok in ln.replace("\\$", "")
+                   for tok in ("$(", "${"))
+            and "\\$" not in ln]
+    check("no unescaped command/brace expansion in the wrapper heredoc", bare, [])
+
+
 if __name__ == "__main__":
     test_attribute()
     test_has_tag()
     test_fallback_enumeration()
     test_interpreter_finding()
+    test_wrapper_heredoc_is_inert()
     with tempfile.TemporaryDirectory() as d:
         test_verdict(Path(d))
     with tempfile.TemporaryDirectory() as d:

@@ -274,6 +274,49 @@ the pin can be dead on arrival. 13ms, once, and on the install path or the
 already-degraded path only. The general rule this makes twice on this thread: **the
 degraded branch needs a check of its own, because it is the branch nobody is watching.**
 
+**And the same question, asked of the pin** (cbp, 2026-07-28, the Linux side of that
+review). The rule above was applied to one of the wrapper's two branches: `command -v` on
+the fallback got probed, `-x` on the **pin** did not — and `-x` answers *exists* for the
+same reason `command -v` does. A pin that is present, `0755` and unrunnable reached
+neither guard: not `-x`-false, so no fallback, no `HESTIA_INTERPRETER_PIN_BROKEN`, no
+finding. Straight to the `exec`, and dead there. The Linux route is as ordinary as the
+Mac's stub, and this script *already warns about it three lines further down*: install
+with a version-manager shim first on `PATH` (`pyenv`'s `shims/python3` — "re-resolves from
+ITS own environment"), then let that version go. The shim stays executable forever and
+exits 127 without starting python. Measured, sandboxed `$HOME`:
+
+```
+                                   before            after
+exit                               127               0
+stdout (the --brief surface)       0 bytes           the line, + INTERPRETER PIN BROKEN
+unknown[]                          no entry          the finding, naming pin and fallback
+--json                             0 bytes           scope.interpreter_pin_broken set
+```
+
+Note what it cost the floor specifically: the floor put `scope.interpreter` on **every**
+run and turned a broken pin into a finding — but both live *inside* `inventory.py`, and
+this is the one case where `inventory.py` never starts. **A report needs something alive to
+emit it**, which is the sentence above pointed at the branch it did not cover. So gone and
+cannot-run are now one case with one handling: fall back and **report** (never exit — that
+is reserved for when the fallback cannot run either, the only state with nothing left
+alive to report with). Cost, measured rather than asserted: one interpreter start per run,
+30ms here against a ~4.6s `--brief` over the fleet workspace — 0.6%, cheap only because
+that walk is 9p. On a local-SSD workspace it is a larger fraction, so it is a real trade.
+
+**A third thing, found by installing it rather than reading it:** that review comment was
+written into `install.sh`'s wrapper heredoc, which is **unquoted** — it has to be, it
+interpolates `$PYTHON`, `$BIN` and `$WORKSPACE`. So its body is prose to a reader and
+shell input to `bash`. The markdown backticks around `` `-x` `` and
+`` `launchd-agent-installed` `` were **command substitution**: both ran during install
+("command not found" ×2 on a clean install), and the shipped wrapper had holes where the
+quoted words used to be — *"Found by , so the -z branch never fires"*. Nothing executable
+broke, but only because those words named nothing; the backtick count was even **by luck**,
+and an odd count is a hard `bad substitution` that writes a **zero-byte wrapper**. `bash
+-n` does not catch it — it is valid shell — and no output of the plugin changes when it
+happens. Since prose-in-shell-comments is this file's house style, that is a standing
+hazard rather than a typo, so the backticks are escaped and `test_wrapper_heredoc_is_inert`
+fails if an unescaped one comes back.
+
 For symmetry with the Darwin numbers: on cbp a systemd `--user` unit resolves
 `/usr/bin/python3` 3.12.3 and the shell resolves the identical path, so the pin buys
 nothing here and cost the 127 above — which is why it needs a floor and not a Linux
