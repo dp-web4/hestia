@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -375,18 +376,81 @@ def _touches_registration(tool_name: str, tool_input: Any) -> Optional[str]:
     return None
 
 
-def _witness_self_access(marker: str, tool_name: str) -> bool:
-    """Append a `gate_self_access` event. Best effort, short budget.
 
-    Its own event_type rather than a policy_decision: a routine deny says an act
-    met a boundary; this says something tried to reach the boundary-DRAWING
-    mechanism. Those should be alertable separately, and burying the second in the
-    volume of the first is how it goes unnoticed.
 
-    Written against `McpHttp` as it actually exists. The first draft of this
-    invented a `DaemonClient(budget_s=).connect()/.call()` that appears nowhere —
-    the same reach-for-a-plausible-API reflex that produced `web4:observationCount`
-    and an invented ontology namespace earlier today. Checked, then written.
+# ---------------------------------------------------------------------------
+# READ IS ALLOWED AND WITNESSED. WRITE IS REFUSED.
+# ---------------------------------------------------------------------------
+#
+# dp, 2026-07-28, agreeing with kimi's third question: read-denial costs verification,
+# not just evasion.
+#
+# The first cut refused BOTH, arguing that reading the gate is how you find its blind
+# spots. kimi's counter is the one I could not answer: denying read also denies the
+# byte-identity verification it did for #55 and the source-reading behind three of this
+# week's reviews. "A witnessed read is evidence; a refused read is a member who cannot
+# check its own governance."
+#
+# It also contradicted this corpus's own posture. We spent two weeks building PUBLISH THE
+# LAW so a member can read what governs it — then I argued a member must not read the
+# law's implementation. Those pull opposite ways, and I did not notice while writing it.
+#
+# So reads pass and are WITNESSED, which keeps the reconnaissance signal (a member reading
+# gates repeatedly stays visible) without blinding the member to its own law.
+#
+# CLASSIFICATION FAILS CLOSED. For structured tools the split is exact. For Bash it is not
+# decidable in general — `sed -i`, `cp x gate`, `> gate`, `tee gate` all write and nothing
+# in the string reliably says so. Bash is therefore a WRITE unless every segment matches a
+# small read-only allowlist AND there is no redirection or pipe. Same reasoning as
+# policy::shell's inert-head allowlist: widening requires ADDING a name, a reviewable act;
+# forgetting one costs a false refusal, never a hole.
+_READ_ONLY_TOOLS = {"Read", "Grep", "Glob", "NotebookRead"}
+_WRITE_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
+_READ_ONLY_HEADS = {
+    "cat", "less", "more", "head", "tail", "grep", "rg", "egrep", "fgrep",
+    "wc", "md5sum", "sha256sum", "shasum", "cksum", "diff", "file", "stat", "ls",
+}
+_GIT_READ_SUBCOMMANDS = {"show", "diff", "log", "cat-file", "blame"}
+
+
+def _is_read_only(tool_name: str, tool_input: Any) -> bool:
+    """True only when the call is CONFIDENTLY read-only. Ambiguity means write."""
+    if tool_name in _READ_ONLY_TOOLS:
+        return True
+    if tool_name in _WRITE_TOOLS:
+        return False
+    if tool_name not in {"Bash", "Shell"}:
+        return False
+    cmd = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(cmd, str) or not cmd.strip():
+        return False
+    if ">" in cmd or "|" in cmd or "tee " in cmd:
+        return False  # any redirection or pipe: treat as a write
+    for segment in re.split(r"&&|;", cmd):
+        parts = segment.strip().split()
+        if not parts:
+            continue
+        head = os.path.basename(parts[0])
+        if head == "git":
+            if len(parts) < 2 or parts[1] not in _GIT_READ_SUBCOMMANDS:
+                return False
+        elif head not in _READ_ONLY_HEADS:
+            return False
+    return True
+
+
+def _emit_gate_event(event_type: str, marker: str, tool_name: str, *, severity: str) -> bool:
+    """Append a governance-surface event. Best effort, short budget.
+
+    One emitter, two callers, DISTINCT event types — `gate_self_access` for a refused
+    write, `gate_self_read` for a permitted read. Collapsing them into one type would make
+    an alert on the refusal meaningless, since permitted reads are ordinary conduct and
+    refused writes are not.
+
+    Written against `McpHttp` as it actually exists. An earlier draft invented a
+    `DaemonClient(budget_s=).connect()/.call()` that appears nowhere — the same
+    reach-for-a-plausible-API reflex that produced `web4:observationCount` and an invented
+    ontology namespace. Checked, then written.
     """
     endpoint = discover_endpoint()
     if endpoint is None:
@@ -415,23 +479,36 @@ def _witness_self_access(marker: str, tool_name: str) -> bool:
             "hestia_request_witness",
             {
                 "session_id": sid,
-                "event_type": "gate_self_access",
+                "event_type": event_type,
                 "event_data": {
                     "plugin_id": PLUGIN_ID,
                     "tool_name": tool_name,
                     "marker": marker,
                     "gate_path": _SELF,
-                    "severity": "escalate",
-                    "note": (
-                        "an agent attempted to read or modify the gate that governs it; "
-                        "refused locally and unconditionally"
-                    ),
+                    "severity": severity,
                 },
             },
         )
         return isinstance(out, dict) and "result" in out
-    except Exception:  # noqa: BLE001 — the record must never block the refusal
+    except Exception:  # noqa: BLE001 — the record must never block the decision
         return False
+
+
+def _witness_self_read(marker: str, tool_name: str) -> bool:
+    """Record a PERMITTED read of the governance surface.
+
+    A member may inspect what governs it — that is the publish-the-law posture, and
+    refusing it would make a member unable to check its own law. Recording keeps the
+    reconnaissance signal: repeated reads of gates remain visible as a pattern.
+
+    A failed witness never blocks the read. Turning a recording failure into a denial
+    would make the daemon's health a precondition for reading one's own law."""
+    return _emit_gate_event("gate_self_read", marker, tool_name, severity="record")
+
+
+def _witness_self_access(marker: str, tool_name: str) -> bool:
+    """Record a REFUSED write to the governance surface. Escalatable."""
+    return _emit_gate_event("gate_self_access", marker, tool_name, severity="escalate")
 
 
 def deny_self_access(marker: str, tool_name: str) -> int:
@@ -881,7 +958,13 @@ def main() -> int:
         tool_name, tool_input
     )
     if _self_marker:
-        return deny_self_access(_self_marker, tool_name)
+        if _is_read_only(tool_name, tool_input):
+            # Allowed — and RECORDED. A member may inspect what governs it; repeated
+            # reads of the governance surface remain visible as a pattern.
+            _witness_self_read(_self_marker, tool_name)
+            debug_log(f"gate-self-read (allowed, witnessed): {tool_name} -> {_self_marker}")
+        else:
+            return deny_self_access(_self_marker, tool_name)
 
     # Try the daemon first.
     result = ask_daemon(tool_name, tool_input, tool_use_id, host_session_id)

@@ -149,4 +149,31 @@ print()
 if FAILS:
     print(f"FAILED ({len(FAILS)}): " + ", ".join(FAILS))
     sys.exit(1)
+
+# --- read allowed + witnessed, write refused (dp/kimi, 2026-07-28) ---
+G = "/home/dp/.claude/hooks/hestia/pre_tool_use.py"
+
+for label, tool, ti in [
+    ("Read tool", "Read", {"file_path": G}),
+    ("cat", "Bash", {"command": f"cat {G}"}),
+    ("sha256sum verifies byte-identity", "Bash", {"command": f"sha256sum {G}"}),
+    ("git show reads history", "Bash", {"command": f"git show HEAD:{G}"}),
+    ("chained read-only heads", "Bash", {"command": f"grep def {G} && wc -l {G}"}),
+]:
+    check(f"READ allowed: {label}", gate._is_read_only(tool, ti) is True)
+
+for label, tool, ti in [
+    ("Edit tool", "Edit", {"file_path": G}),
+    ("sed -i", "Bash", {"command": f"sed -i s/a/b/ {G}"}),
+    ("cp over the gate", "Bash", {"command": f"cp /tmp/x {G}"}),
+    ("redirect", "Bash", {"command": f"echo x > {G}"}),
+    ("append", "Bash", {"command": f"echo x >> {G}"}),
+    ("tee", "Bash", {"command": f"echo x | tee {G}"}),
+    # a read HEAD with a redirect is a write — the case that makes head-matching alone unsafe
+    ("cat piped INTO the gate", "Bash", {"command": f"cat /tmp/x > {G}"}),
+    ("git checkout -- overwrites", "Bash", {"command": f"git checkout -- {G}"}),
+    ("unrecognised head fails closed", "Bash", {"command": f"vim {G}"}),
+]:
+    check(f"WRITE refused: {label}", gate._is_read_only(tool, ti) is False)
+
 print("all gate self-protection checks passed")
