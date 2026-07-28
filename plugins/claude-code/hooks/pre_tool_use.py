@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -73,6 +74,19 @@ DEFAULT_ENDPOINT = "http://127.0.0.1:7711/mcp"
 
 # Total time budget across all daemon round-trips + re-polls.
 TOTAL_BUDGET_MS = int(os.environ.get("HESTIA_PRE_TOTAL_BUDGET_MS", "800"))
+# Why the last daemon call failed — "timeout" (alive but starved), "refused"
+# (nothing listening) or "unknown". Read by `deny_no_verdict` so the refusal can
+# state what is known instead of asserting a cause it cannot observe. Module-level
+# because the failure happens deep in the request path and the message is composed
+# at the top; a hook process handles one call, so there is no cross-request bleed.
+_LAST_FAILURE = "unknown"
+
+
+def _set_last_failure(kind: str) -> None:
+    global _LAST_FAILURE
+    _LAST_FAILURE = kind
+
+
 # Per-request HTTP timeout.
 REQUEST_TIMEOUT_S = 0.5
 # Cap on re-poll iterations during the "evaluating" wait protocol.
@@ -315,7 +329,21 @@ def ask_daemon(
             return None
         return (decision, action_id)
     except urllib.error.URLError as e:
+        # Classify, so the fail-closed message can say what is KNOWN rather than
+        # guess a cause. A timeout means starved; a refused connection means down.
+        # These want opposite member behaviour, so conflating them is not cosmetic.
+        reason = getattr(e, "reason", None)
+        if isinstance(reason, TimeoutError) or isinstance(e, socket.timeout):
+            _set_last_failure("timeout")
+        elif isinstance(reason, ConnectionRefusedError):
+            _set_last_failure("refused")
+        else:
+            _set_last_failure("unknown")
         debug_log(f"network: {e}")
+        return None
+    except TimeoutError as e:
+        _set_last_failure("timeout")
+        debug_log(f"timeout: {e}")
         return None
     except Exception as e:  # noqa: BLE001 — fail-open path; legacy fallback will catch
         debug_log(f"unexpected: {type(e).__name__}: {e}")
@@ -377,20 +405,57 @@ def fail_closed() -> bool:
     return os.environ.get("HESTIA_PRE_FAIL_CLOSED") == "1"
 
 
-def deny_no_verdict(why: str) -> int:
+def deny_no_verdict(why: str, *, cause: str = "unknown") -> int:
     """Fail-closed refusal: no daemon verdict → the tool does not run.
 
     Composed locally (the daemon is exactly what we couldn't reach), so this
     carries its own static steering: without it, an agent facing a down daemon
     reads every deny as a tool error and retry-loops — the highest-risk case
-    for the loop the daemon-side guidance exists to prevent."""
-    sys.stderr.write(
-        f"hestia: deny [fail-closed] — no policy verdict ({why}). This is a "
-        "boundary, not a tool failure: do not re-run the same call. The policy "
-        "daemon is unavailable, so no action can be approved — report this to "
-        "your operator and wait.\n"
+    for the loop the daemon-side guidance exists to prevent.
+
+    SAY WHAT IS KNOWN, NOT A GUESSED CAUSE (2026-07-28).
+    ----------------------------------------------------
+    This message used to assert "The policy daemon is unavailable" on every
+    fail-closed path. The gate cannot know that. All it knows is that it did not
+    get a verdict inside its own budget, and the two causes want OPPOSITE
+    responses from the member:
+
+      timeout   the daemon is alive but starved (usually another member is
+                saturating the box). Correct response: back off and retry.
+      refused   nothing is listening. Correct response: stop and escalate.
+
+    Measured on 2026-07-28: a peer was parked for 4+ minutes, escalating to the
+    operator on this message's instruction, while the daemon had been up
+    continuously for eight hours (`NRestarts=0`) under a 15-minute load average
+    of 7.39 caused by another member's test runs. The member did exactly what it
+    was told; the message was wrong. codex's gate has carried a comment
+    describing this same confusion — "no policy verdict (daemon path failed)
+    while the daemon was up the whole time" — and nothing acted on it.
+
+    A false cause is worse than no cause: it spends a session on the wrong
+    remedy and makes the next member trust the next message less."""
+    remedy = {
+        "timeout": (
+            "The daemon did not answer within the gate's budget — it is most likely "
+            "ALIVE BUT LOADED, not down. Wait and retry with backoff; if it persists "
+            "across several minutes, then report to your operator."
+        ),
+        "refused": (
+            "Nothing is listening on the daemon endpoint, so no action can be "
+            "approved. Report this to your operator and wait — retrying will not help."
+        ),
+    }.get(
+        cause,
+        "The gate could not obtain a verdict and cannot tell whether the daemon is "
+        "down or merely slow. Retry once with backoff; if it repeats, report to your "
+        "operator.",
     )
-    debug_log(f"fail-closed deny: {why}")
+    sys.stderr.write(
+        f"hestia: deny [fail-closed] — no policy verdict ({why}; cause={cause}). "
+        f"This is a boundary, not a tool failure: do not re-run the same call "
+        f"immediately. {remedy}\n"
+    )
+    debug_log(f"fail-closed deny: {why} cause={cause}")
     return 2
 
 
@@ -490,7 +555,7 @@ def main() -> int:
     # daemon is the law: no verdict → no tool (GPT review HST-004; governed /
     # unattended roles must not degrade to fail-open heuristics silently).
     if fail_closed():
-        return deny_no_verdict(f"daemon path failed for {tool_name}")
+        return deny_no_verdict(f"daemon path failed for {tool_name}", cause=_LAST_FAILURE)
     debug_log(f"daemon path failed; falling back to legacy for {tool_name}")
     return invoke_legacy_fallback(raw)
 
