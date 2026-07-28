@@ -444,6 +444,57 @@ whole thread has run in, not a bash version. The reasoning the claim was attache
 untouched and right, and the `HOME` guard is worth *more* than that note said — on Darwin it
 is reachable by the very command that was said to bypass it.
 
+**The same question, asked of the two files the block above excused — and there are four
+syntaxes, not three** (cbp, 2026-07-28, measured on Linux, systemd 255, by installing).
+The hook's excuse is right and `shlex.quote` is the reason. The wrapper's — *"it
+interpolates inside double quotes"* — is not: double quotes are the **weak** shell quoting,
+and `$`, backtick, `\` and `"` all keep their meaning inside them. And the systemd `.service`
+unit is a syntax of its own, not a second copy of the shell one. Measured, `bash -n` clean on
+every generated file:
+
+| workspace path | what shipped | what ran |
+|---|---|---|
+| `…/cost$avings` | `${HESTIA_WORKSPACE:-…/cost$avings}` in the wrapper | `$avings` is unset at run time → every fire walked `…/cost`, reporting `workspace from env` because the wrapper's own `env` line had set it |
+| ``…/it`id`s`` | the backtick pair, intact, in the wrapper | **command substitution on every fire** — the path came back `…/ituid=1000(dp` |
+| `…/50%off` | `--workspace "…/50%off"` in the unit | `%o` is the OS ID → systemd resolved it to `…/50ubuntuff`; unit parses clean, timer enables, `installed: hourly timer` printed |
+| `…/100%uptime` | same | `%u` is the user name → `…/100dpptime` |
+
+The backtick row is the backtick finding one layer down: escaping the heredoc's *prose*
+stopped `install.sh` executing backticks at **install** time; nothing stopped a backtick
+arriving in a **value** and executing at **run** time, hourly, under the user's own timer.
+A whitelist notices a *name* that expands and cannot notice what the named value *contains*.
+
+**Sized against the plist case: worse, in the one way that matters.** The plist's was a clean
+refusal — `plutil` caught it and `skip_periodic()` said the trigger was gone. These install,
+lint, run and report. The `%` rows are the sharpest: **most letters are a valid specifier**,
+so the common case is silent substitution rather than an error, the periodic trigger walks a
+directory nobody named, and the other two triggers get the right path with nothing on either
+side saying they disagree. (`%z` — not a specifier — is the loud half: `fatal error, unit
+will not be started` in `ExecStart`, silently *dropped* in `Environment=`.)
+
+Fixed with `sh_pin` (single quotes, the only shell quoting with no interior expansion, with
+`'\''` for the one character they cannot hold) and `sd_escape` (`%%`, which is systemd's
+literal percent). Both are `SH_*` / `SD_*` pins for the same reason the plist's are `XML_*`.
+Eight sabotage probes, red with `bash -n` clean in each; a ninth flips the guard's own data —
+put `WORKSPACE` back in `WRAP`'s allowed set and the raw-`$WORKSPACE` probe goes **green**,
+so the whitelist is what denies. The `%` round-trip asks **systemd**, not a string compare:
+`systemd-analyze verify` names the resolved path in its not-executable error, so a probe at a
+nonexistent leaf reports back exactly what systemd made of the escaping.
+
+**And the backstop written for this deleted a good timer on its first run.** Linux had no
+`plutil` analogue — nothing asked systemd whether the units it had just written would load —
+so `systemd-analyze verify` was added before `enable`, condemning on `rc != 0`. Its first
+end-to-end run, on a sandboxed install with no `XDG_RUNTIME_DIR`, removed a perfectly good
+timer pair because systemd-analyze had reported `Failed to initialize manager: No such device
+or address`. **The checker could not start; the units were fine.** That is this plugin's own
+subject matter, committed by the guard written to prevent it — and it failed in the direction
+that destroys. The rule that replaced the exit code: **a unit may only be condemned on a
+message that names it.** Three verdicts, not two — `bad`, `degraded`, and `unverified` —
+because *"this unit is bad"* and *"I could not look"* is the distinction this whole plugin
+exists to keep, one level up. `unverified` is also what a missing `systemd-analyze` gets. In
+a function, `unit_verdict()`, so the suite runs it against the verbatim message that caused
+the deletion rather than checking that the branch exists.
+
 **The two queued nits, taken by whoever touched the file next.** The provenance line was a
 real wrong output — `${HESTIA_WORKSPACE:+from HESTIA_WORKSPACE}${HESTIA_WORKSPACE:-…}`
 prints the label *and then the value*, so a set `HESTIA_WORKSPACE` read `from
