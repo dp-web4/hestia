@@ -51,7 +51,14 @@ jobs:
     name: cargo test
     runs-on: ubuntu-latest
     steps:
+      # The first attempt at this fix nested web4 INSIDE the workspace
+      # (`path: web4` is relative to $GITHUB_WORKSPACE), and cargo still found
+      # no sibling. Both checkouts name their own directory so the two repos
+      # sit as siblings: <workspace>/hestia and <workspace>/web4 — which is
+      # exactly what `../../web4` from hestia/core resolves to.
       - uses: actions/checkout@v4
+        with:
+          path: hestia
 
       # hestia-core's path deps point at ../../web4/... — the sibling must exist.
       - uses: actions/checkout@v4
@@ -64,8 +71,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: core
+          workspaces: hestia/core
 
       - name: Test
-        working-directory: core
+        working-directory: hestia/core
         run: cargo test --locked
