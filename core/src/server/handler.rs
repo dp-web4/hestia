@@ -1087,23 +1087,12 @@ fn resolve_attributed_caller(
     })
 }
 
-fn resolve_caller(s: &super::state::ServerState, session_id_arg: Option<&str>) -> CallerWho {
-    let session_uuid = resolve_session_uuid(s, session_id_arg);
-    let (plugin_id, role_lct) = session_uuid
-        .and_then(|sid| s.sessions.get(&sid))
-        .map(|sess| (sess.plugin_id.clone(), sess.constellation_role.clone()))
-        .unwrap_or_else(|| {
-            (
-                "unknown".to_string(),
-                crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
-            )
-        });
-    CallerWho {
-        session_uuid,
-        plugin_id,
-        role_lct,
-    }
-}
+// NOTE: `resolve_caller` — the latest-session-fallback resolver — was deleted
+// 2026-07-28 when its last call site (tool_vault_get) was converted to
+// `resolve_attributed_caller`. Every authority-bearing surface now PROVES its caller;
+// an identity borrowed from whichever session connected most recently is a compile
+// error, not a code path. `resolve_session_uuid` survives for `tool_begin_action`'s
+// nil-on-absent use, which never feeds a gate, a consumer check, or a witness WHO.
 
 /// Daemon-side policy gate for the direct-call tool surfaces (vault get/set,
 /// witness append) — a direct MCP call must hit the same law as the client
@@ -1193,7 +1182,23 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
     let session_id_arg = optional_string(args, "session_id");
 
     let mut s = state.lock().await;
-    let who = resolve_caller(&s, session_id_arg.as_deref());
+    // ATTRIBUTED, NOT RESOLVED (the attribution sweep, 2026-07-28 — the fifth and final
+    // site, caught by claude-code reviewing this PR's "zero call sites" claim). The
+    // consumer check below is strict (`resolve_plugin_id` denies anonymous readers of
+    // scoped entries), but `who` fed BOTH the gate and the `vault_get` witness append:
+    // an anonymous read of an EXPOSED entry was recorded under whoever connected last —
+    // misattributing the very disclosure record #76 added to make disclosure visible.
+    // Refused now. The exposed-entry compatibility path is untouched for any ATTRIBUTED
+    // caller: pre-existing empty-list entries still read, warned and witnessed.
+    let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.vault_get_unattributed",
+            "reading a credential requires your own live session_id (from hestia_connect) — \
+             a disclosure must be witnessed under the reader's own name, not borrowed from \
+             whichever member connected most recently",
+            None,
+        ));
+    };
     if let Some(denied) =
         gate_direct_tool(&mut s, &who, "hestia_vault_get", "credential_access", &name)
     {
@@ -5439,7 +5444,7 @@ mod accountability_tests {
     #[tokio::test]
     async fn reversal_rejects_unattributed_reporter_and_unknown_role() {
         let (_dir, state) = test_state().await;
-        // No session connected → resolve_caller yields no session_uuid.
+        // No session connected → strict attribution yields no caller.
         let out = tool_record_reversal(
             &state,
             &json!({
@@ -8503,10 +8508,13 @@ mod vault_hst001_tests {
 #[cfg(test)]
 mod authority_attribution_tests {
     //! The attribution sweep (2026-07-28): the five `resolve_caller` latest-session
-    //! fallback sites the #81 sweep left open. Four are fixed here
-    //! (`tool_request_witness`, `tool_notify`, `tool_inbox`, `tool_pair_inbox`;
-    //! `tool_vault_set` was #81). Each test pins the failure the fallback made
-    //! possible: an act performed under the identity of WHOEVER CONNECTED LAST.
+    //! fallback sites the #81 sweep left open. All five are fixed here
+    //! (`tool_request_witness`, `tool_notify`, `tool_inbox`, `tool_pair_inbox`,
+    //! `tool_vault_get` — the last caught in review of this PR's own completeness
+    //! claim; `tool_vault_set` was #81). `resolve_caller` itself is deleted, so the
+    //! class is closed by compile error, not by census. Each test pins the failure
+    //! the fallback made possible: an act performed under the identity of WHOEVER
+    //! CONNECTED LAST.
     //!
     //! Every test drives the real tool with NO session_id while a bystander session
     //! exists — the exact fallback condition — so a regression to `resolve_caller`
@@ -8651,6 +8659,63 @@ mod authority_attribution_tests {
         assert!(
             format!("{r}").contains("pair_inbox_unattributed"),
             "an unattributed paired-channel drain must be refused: {r}"
+        );
+    }
+
+    /// The fifth site, caught in review of this PR's own "zero call sites" claim:
+    /// an anonymous credential READ was witnessed under the most recent connection's
+    /// name. Refused now — and the exposed-entry compatibility path still works for
+    /// any ATTRIBUTED caller, witnessed under its own name.
+    #[tokio::test]
+    async fn vault_get_without_session_is_refused_not_misattributed() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        // A legacy exposed entry (empty consumer list) — readable pre-fix by anyone,
+        // and the fallback made its disclosure witness name the wrong member.
+        {
+            let mut s = state.lock().await;
+            s.vault
+                .upsert(crate::vault::VaultEntry::new("legacy-cred", "DUMMY-SECRET"))
+                .unwrap();
+        }
+        let bystander = seat_session(&state, "innocent-member").await;
+
+        let r = tool_vault_get(&state, &json!({"name": "legacy-cred"})).await.unwrap();
+        assert!(
+            format!("{r}").contains("vault_get_unattributed"),
+            "an unattributed read must be refused, not witnessed under a bystander: {r}"
+        );
+        let witnessed_anonymous_read = {
+            let s = state.lock().await;
+            s.recent_chain(50)
+                .into_iter()
+                .any(|e| e.event_type == "vault_get")
+        };
+        assert!(
+            !witnessed_anonymous_read,
+            "a refused read must not mint a disclosure witness"
+        );
+
+        // The compatibility path: an ATTRIBUTED caller still reads the exposed entry,
+        // witnessed as exposed, under its OWN name.
+        let reader = seat_session(&state, "random-attributed-caller").await;
+        let ok = tool_vault_get(
+            &state,
+            &json!({"name": "legacy-cred", "session_id": reader.to_string()}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok["value"], json!("DUMMY-SECRET"), "{ok}");
+        let s = state.lock().await;
+        let vget = s
+            .recent_chain(50)
+            .into_iter()
+            .find(|e| e.event_type == "vault_get")
+            .expect("the attributed read must be witnessed");
+        assert_eq!(vget.event_data["exposed"], json!(true));
+        assert_eq!(
+            vget.event_data["plugin_id"], json!("random-attributed-caller"),
+            "the witness names the reader — never the bystander ({bystander})"
         );
     }
 }
