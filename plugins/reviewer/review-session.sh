@@ -47,7 +47,7 @@ if [[ -z "$QUEUE_JSON" ]]; then
   exit 1
 fi
 COUNT="$(printf '%s' "$QUEUE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["counts"]["reviewable"])' 2>/dev/null || echo 0)"
-UNATTRIB="$(printf '%s' "$QUEUE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["counts"]["attribution_undetermined"])' 2>/dev/null || echo 0)"
+UNATTRIB="$(printf '%s' "$QUEUE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["counts"]["author_undetermined"])' 2>/dev/null || echo 0)"
 echo "    reviewable: $COUNT   (attribution undetermined: $UNATTRIB — ranked, not excluded)"
 
 if [[ "$COUNT" == "0" ]]; then

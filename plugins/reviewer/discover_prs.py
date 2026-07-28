@@ -67,14 +67,35 @@ TIMEOUT = 45
 
 
 def gh(*args: str, default: Any = None) -> Any:
+    """Run gh; return parsed JSON, or the RAW TEXT when it is not JSON.
+
+    The first version did `json.loads(out.stdout)` unconditionally. Two of the three
+    call sites pass `--jq`, whose output is raw text — so both raised JSONDecodeError,
+    fell to `default`, and the entire attribution pipeline became dead code: `blob` was
+    always "", the commit-trailer path never ran, and the body fallback never saw a body.
+
+    The instrument then reported "16/16 author-undetermined" and I wrote that up as a
+    measurement of the record. It was a measurement of the probe. kimi-code, reviewing:
+    "an absence produced by a broken probe, reported as a fact about the world" — the
+    fleet's own named class, landing on the role built to hunt it.
+
+    Worse than the bug: I "verified" the extraction with a separate `git log` command and
+    reported that the extraction works. I tested the concept and shipped the code.
+    """
     try:
         out = subprocess.run(
             ["gh", *args], capture_output=True, text=True, timeout=TIMEOUT, check=False
         )
         if out.returncode != 0:
             return default
-        return json.loads(out.stdout) if out.stdout.strip() else default
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        text = out.stdout.strip()
+        if not text:
+            return default
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text  # --jq output: raw, and meant to be
+    except (subprocess.TimeoutExpired, OSError):
         return default
 
 
@@ -82,9 +103,26 @@ MEMBER_RE = re.compile(
     r"^(?:Web4-Member|Co-Authored-By):\s*([A-Za-z0-9._-]+)", re.MULTILINE | re.IGNORECASE
 )
 SIGNOFF_RE = re.compile(r"^\s*—\s*([a-z0-9-]+(?:-code)?)\s*$", re.MULTILINE)
-# Trailers that name a MODEL rather than a member carry no attribution — the
-# distinction this fleet keeps rediscovering. "Claude Opus 5" is not a member.
-NOT_A_MEMBER = re.compile(r"^(claude\s|opus|sonnet|gpt|noreply)", re.IGNORECASE)
+# Trailers naming a MODEL rather than a member carry no attribution — the distinction
+# this fleet keeps rediscovering. "Claude Opus 5" is not a member; "claude-code" is.
+#
+# EXACT match on the bare family name, deliberately. The first version used `^claude\s`,
+# but MEMBER_RE captures `([A-Za-z0-9._-]+)` which stops AT the space — so the captured
+# token is "Claude" with nothing after it and the pattern never fired. Fixing the probe
+# above exposed it immediately: every PR began attributing to "Claude". A guard written
+# against a string shape the capture cannot produce is a guard that has never run.
+_MODEL_WORDS = {"claude", "opus", "sonnet", "haiku", "gpt", "gemini", "kimi", "noreply", "anthropic"}
+
+
+def _is_model_not_member(token: str) -> bool:
+    """A BARE family name is a model. A hyphenated id is a member.
+
+    `kimi` is in the set and `kimi-code` is not, which is the correct split — but note
+    the imprecision it leaves: a trailer reading exactly `Co-Authored-By: Kimi` (one such
+    exists on recent main) is discarded rather than resolved to `kimi-code`. Guessing the
+    mapping would manufacture attribution, which is the thing this file exists to stop
+    doing. It is reported as undetermined, and the fix is at the writing end."""
+    return token.strip().lower() in _MODEL_WORDS
 
 
 def author_member(repo: str, number: int, body: str) -> tuple[Optional[str], str]:
@@ -104,8 +142,15 @@ def author_member(repo: str, number: int, body: str) -> tuple[Optional[str], str
         blob = "\n".join(str(c) for c in commits)
     for m in MEMBER_RE.finditer(blob or ""):
         cand = m.group(1).strip()
-        if cand and not NOT_A_MEMBER.match(cand):
+        if cand and not _is_model_not_member(cand):
             return cand, "commit-trailer"
+    # The PR BODY carries trailers too — `Web4-Member:` lands there as often as in a
+    # commit (kimi, reviewing: #70 carried it exactly there). Searching only commits
+    # missed the field this whole mechanism was proposed around.
+    for m in MEMBER_RE.finditer(body or ""):
+        cand = m.group(1).strip()
+        if cand and not _is_model_not_member(cand):
+            return cand, "body-trailer"
     sig = SIGNOFF_RE.findall(body or "")
     if sig:
         return sig[-1].strip(), "body-signature"
