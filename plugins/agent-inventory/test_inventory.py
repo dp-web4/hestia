@@ -185,11 +185,82 @@ def test_verdict(tmp: Path):
           inventory.has_tag(e["findings"], "DEAD_HOOK"), True)
 
 
+# --- unit: the fallback enumeration ------------------------------------------------
+# The atlas guard used to be a hard `return` before search_roots(), so an atlas-less
+# machine got no findings at all — including the ones that never needed atlas. What it
+# actually loses is the ENUMERATION, and the property that must hold is the one that
+# makes the degradation safe: a run on the short list can still report every finding, and
+# can NEVER report OK. Sabotage-checked on CBP 2026-07-28 by deleting the unknowns append:
+# the degraded run went straight to `OK ... 4 installed, 6 plugins, 4 governed`.
+def test_fallback_enumeration():
+    reg = _FakeRegistry({})
+    ids = inventory.fallback_agent_ids(reg)
+    # Every aliased id survives, so the harnesses whose on-disk names diverge from their
+    # atlas id are still looked for by the right names.
+    check("aliased ids kept", set(inventory.ALIASES) <= set(ids), True)
+    # ...and `claude-code` does NOT appear as an id of its own. It is the PLUGIN dir for
+    # atlas id `claude`, so adding it would inspect a phantom agent looking for a `.claude-code`
+    # config dir and a `claude-code` executable that no machine has.
+    check("plugin dir of an aliased id is not re-added", "claude-code" in ids, False)
+    check("its atlas id is what is looked for", "claude" in ids, True)
+    # A registry harness with no alias entry IS an id — that is how codex/gemini/cursor
+    # stay in the universe on a machine with no atlas.
+    reg2 = _FakeRegistry({})
+    reg2.harnesses = lambda: ["claude-code", "codex", "gemini"]
+    ids2 = inventory.fallback_agent_ids(reg2)
+    check("unaliased plugin dirs become ids", {"codex", "gemini"} <= set(ids2), True)
+    check("still no phantom claude-code", "claude-code" in ids2, False)
+    # Sorted and de-duplicated: `known` is enumerated once per id and a repeat is a
+    # doubled inspect() plus a doubled entry in every list downstream.
+    check("sorted, unique", ids2 == sorted(set(ids2)), True)
+
+
+# --- unit: this check's own third trigger -------------------------------------------
+# install.sh installs the binary at step 1 and wires the schedule at step 2, so an abort
+# in between (exit 127 on Darwin, where there is no systemctl) leaves a machine that
+# answers on demand and never runs on its own. Nothing after the fact said so.
+def test_periodic_trigger(tmp: Path):
+    home = tmp / "home"
+    (home / ".config" / "systemd" / "user").mkdir(parents=True)
+    orig = inventory.HOME
+    inventory.HOME = home
+    try:
+        check("no unit, no plist -> absent", inventory.periodic_trigger()[0], "absent")
+        unit = home / ".config/systemd/user" / f"{inventory.INSTALLED_BIN_NAME}.timer"
+        unit.write_text("[Timer]\n")
+        # The distinction install.sh already draws in prose: written != enabled. A unit
+        # file with no wants-symlink is a timer systemd has never been told to start.
+        check("unit alone is not enabled", inventory.periodic_trigger()[0],
+              "systemd-user-timer-installed-not-enabled")
+        wants = home / ".config/systemd/user/timers.target.wants"
+        wants.mkdir()
+        (wants / f"{inventory.INSTALLED_BIN_NAME}.timer").write_text("")
+        check("wants-symlink is the enable", inventory.periodic_trigger()[0],
+              "systemd-user-timer-enabled")
+        # Darwin's half, exercised from Linux: the launchd branch is reached by the plist
+        # glob alone, so it is testable on a box that has never seen launchctl.
+        home2 = tmp / "home2"
+        (home2 / "Library" / "LaunchAgents").mkdir(parents=True)
+        (home2 / "Library" / "LaunchAgents"
+         / f"net.dpcars.{inventory.INSTALLED_BIN_NAME}.plist").write_text("<plist/>")
+        inventory.HOME = home2
+        check("launchd plist counts", inventory.periodic_trigger()[0],
+              "launchd-agent-installed")
+        # The paths are returned so a reader can re-derive the verdict rather than trust
+        # it — the same reason `scope` exists at all.
+        check("says where it looked", len(inventory.periodic_trigger()[2]), 3)
+    finally:
+        inventory.HOME = orig
+
+
 if __name__ == "__main__":
     test_attribute()
     test_has_tag()
+    test_fallback_enumeration()
     with tempfile.TemporaryDirectory() as d:
         test_verdict(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        test_periodic_trigger(Path(d))
     for f in FAILS:
         print("FAIL", f)
     print(f"{'FAILED' if FAILS else 'ok'}: {len(FAILS)} failure(s)")
