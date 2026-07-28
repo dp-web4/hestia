@@ -322,6 +322,46 @@ For symmetry with the Darwin numbers: on cbp a systemd `--user` unit resolves
 nothing here and cost the 127 above — which is why it needs a floor and not a Linux
 exemption.
 
+**The hazard is the heredoc, not the wrapper** (McNugget, 2026-07-28, measured on macOS
+26.5 by installing it). `install.sh` writes **three** unquoted heredocs — `WRAP`, the
+systemd `.service` unit, and the launchd plist — and the last two carry prose comments in
+the same house style, with no guard. Probed: a markdown backtick pair inside an XML comment
+in the plist heredoc, `<!-- ProcessType Background: throttled for `` `id -un` `` -->`. It
+**ran** at install time and the shipped plist carried the installing user's name; `plutil
+-lint` said `OK`, `bash -n` said clean, and the suite said `ok: 0 failure(s)`. And the
+`$(`/`${` half of that guard had a hole of its own: it skipped any line containing `\$`
+*anywhere*, which is nearly every prose line in `WRAP`, because they all quote `` `\$PY` ``.
+Probed: `# prose about \$PY and the pin under ${HOME}/bin` passed green and the installed
+wrapper had the sandbox path baked into its own sentence. Escapes are per **token**. So the
+check now strips escapes per token and scans every unquoted heredoc; unescaped backticks
+and `$(` are refused in all three (command substitution in a generated file is never
+wanted), and `${` stays refused in `WRAP` only, because the unit and the plist exist to
+interpolate. Four sabotage probes, all red, all with `bash -n` still clean.
+
+**And the report about who the job runs as was the one thing taken on trust.** The
+lingering report used `$USER` — on **both** platforms (`loginctl show-user "$USER"` on
+Linux, the `gui/` session line on Darwin). Under `set -euo pipefail` an unset `USER` is a
+hard abort, and it lands mid-install: measured with `env -i`, `rc=1`, stdout ending on
+*"installed: hourly launchd agent … run interval = 3600s"*, an hourly job **loaded** in
+`gui/501`, and **no SessionStart hook** — half-installed and reading as success, the same
+shape as the Darwin abort that opened this thread, one variable instead of one missing
+binary. `USER` is set by login shells and absent from scrubbed ones — containers, CI, and
+anything `launchd` or `systemd` starts, which is exactly the automation that would run an
+installer unattended. It is now `id -un`, which cannot be unset and is how `UID_N` three
+lines away already did it. With `USER` unset the install completes all three steps, `rc=0`,
+stderr empty.
+
+**The cost number, on the other box** (McNugget's answer to the 0.6%). The probe is 17.9ms
+on this box's pinned homebrew python3 3.14.4 and 13.8ms on `/usr/bin/python3` 3.9.6 (20
+runs each) — cheaper than cbp's 30ms. The *run* is much cheaper too: `--brief` over a real
+78G local-SSD workspace is **0.13s** warm and 0.30s cold, and 0.05s on this box's ordinary
+atlas-less path. So the probe is **~14% of a warm run here, not 0.6%** — the ratio is 20×
+worse on APFS-local, because on 9p the walk *is* the run and it hides everything. The trade
+still stands, but not on that ratio: the denominator that matters is the derived hook
+timeout the installer just wrote, **20s**, against which 17.9ms is 0.09%. A percentage of
+the walk measures the workspace's storage; a percentage of the budget measures whether the
+trigger still fits.
+
 **A negative result, recorded because it was worth checking:** the narrow launchd `PATH`
 does **not** shrink the A inventory. The obvious worry — `claude` lives in
 `~/.local/bin`, which is on the shell's `PATH` and not on launchd's, so the hourly run

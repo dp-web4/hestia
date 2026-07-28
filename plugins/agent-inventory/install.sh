@@ -72,6 +72,23 @@ PLIST="$AGENT_DIR/$LAUNCHD_LABEL.plist"
 LOG_DIR="$HOME/.local/state/hestia"
 SETTINGS="$HOME/.claude/settings.json"
 
+# ASKED OF THE ENVIRONMENT, NOT INHERITED FROM IT (McNugget, 2026-07-28, measured here).
+# The lingering report used `$USER`, on both platforms. Under `set -u` an unset USER is a
+# hard abort — and it lands mid-install: on Darwin at the gui/ session line, which is AFTER
+# the launchd agent is bootstrapped and BEFORE step 3 wires the SessionStart hook. Measured
+# with `env -i`: rc=1, stdout ending on "installed: hourly launchd agent ... run interval =
+# 3600s", an hourly job loaded in gui/501, and no hook. Half-installed, reading as success
+# — the same shape as the Darwin abort that opened this thread, one variable instead of one
+# missing binary. The systemd branch has it too, three lines earlier (`loginctl show-user
+# "$USER"`), so it is not a Darwin bug.
+#
+# USER is not part of the environment this script may assume: it is set by login shells and
+# absent from scrubbed ones — containers, CI, and anything launchd or systemd starts, which
+# is precisely the kind of automation that would run an installer unattended. `id -un` asks
+# the kernel the same question and cannot be unset. UID_N below already did it this way; a
+# report about who the job runs as should not be the one thing taken on trust.
+USER_N="$(id -un)"
+
 # ---- 0. which of the three triggers this platform can carry ----------------------
 #
 # DECIDED BEFORE STEP 1, NOT DISCOVERED AT STEP 2 (McNugget, 2026-07-28, on a Mac mini).
@@ -391,11 +408,11 @@ systemctl --user enable --now hestia-agent-inventory.timer >/dev/null
 echo "installed: hourly timer (systemd --user)"
 
 # The distinction that matters: enabled != will fire.
-if loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
+if loginctl show-user "$USER_N" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
   echo "  lingering: ON — the timer fires even with no login session"
 else
-  echo "  lingering: OFF — this timer ONLY fires while $USER has a session."
-  echo "             enable with: loginctl enable-linger $USER   (needs sudo)"
+  echo "  lingering: OFF — this timer ONLY fires while $USER_N has a session."
+  echo "             enable with: loginctl enable-linger $USER_N   (needs sudo)"
 fi
 elif [ "$PERIODIC" = launchd ]; then
 UID_N="$(id -u)"
@@ -513,7 +530,7 @@ if [ "$PERIODIC" = launchd ]; then
   # will-fire — and it is worse here because there is no `enable-linger` to point at. The
   # honest remedy is a LaunchDaemon (root, system domain), which is a privilege escalation
   # this observation-only check has no business asking for.
-  echo "  session:   gui/$UID_N — this agent fires only while $USER is logged in."
+  echo "  session:   gui/$UID_N — this agent fires only while $USER_N is logged in."
   echo "             There is no launchd equivalent of loginctl enable-linger for a user"
   echo "             agent; a fire missed while logged out or asleep happens ONCE at next"
   echo "             load, not once per missed hour (no Persistent= analogue)."

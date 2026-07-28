@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -321,21 +322,81 @@ def test_wrapper_heredoc_is_inert():
     install and left holes in the wrapper's own sentences. `bash -n` does not catch this;
     it is valid shell. Nothing in the plugin's output changes when it happens, which is
     why it needs a test and not a convention.
+
+    THE HAZARD IS THE HEREDOC, NOT THE WRAPPER (McNugget, 2026-07-28, measured on
+    macOS 26.5 by installing). The rule above was right and it was checked in one place.
+    install.sh writes THREE unquoted heredocs — WRAP, the systemd .service unit, and the
+    launchd plist — and the last two carry prose comments in the same house style. Probed:
+    a markdown backtick pair in an XML comment inside the plist heredoc,
+    `<!-- ProcessType Background: throttled for `id -un` -->`. It RAN at install time and
+    the shipped plist carried my username; `plutil -lint` said OK, `bash -n` said clean,
+    and this suite said "ok: 0 failure(s)". So the check below scans every unquoted
+    heredoc, not the one where the bug was found.
+
+    AND THE ESCAPE-EXEMPTION LET THE THING IT GUARDS THROUGH. The `$(`/`${` check skipped
+    any line containing `\\$` anywhere — which is nearly every prose line in WRAP, because
+    they all quote `\\$PY`. Probed: a line reading `# prose about \\$PY and the pin under
+    ${HOME}/bin` passed green, and the installed wrapper had my sandbox path baked into
+    the sentence. Escapes are per-token, so the line is stripped of them and what remains
+    is what bash will run.
     """
     src = (Path(__file__).parent / "install.sh").read_text()
-    body = src.split('cat > "$BIN" <<WRAP\n', 1)[1].split("\nWRAP\n", 1)[0]
-    check("the wrapper heredoc was found", len(body) > 200, True)
-    # Escaped is \` ; anything else is a live substitution at install time.
-    live = [ln for ln in body.splitlines()
-            if "`" in ln.replace("\\`", "")]
-    check("no unescaped backtick in the wrapper heredoc", live, [])
-    # $ is the other expansion, but there it is deliberate and load-bearing, so assert the
-    # intent rather than banning it: only the three install-time pins may expand.
-    bare = [ln for ln in body.splitlines()
-            if any(tok in ln.replace("\\$", "")
-                   for tok in ("$(", "${"))
-            and "\\$" not in ln]
-    check("no unescaped command/brace expansion in the wrapper heredoc", bare, [])
+    heredocs = _unquoted_heredocs(src)
+    # Named, so that deleting a heredoc's guard by deleting its `cat` shows up as a count.
+    check("all three unquoted heredocs found",
+          sorted(d for d, _ in heredocs), ["EOF", "PLIST_EOF", "WRAP"])
+    for delim, body in heredocs:
+        # Command substitution is never wanted in a generated file: whatever it names, it
+        # runs on the installing machine and the output is what ships. No exceptions, so
+        # this half is the same for all three.
+        live = [ln for ln in body.splitlines() if "`" in _unescaped(ln)]
+        check(f"no unescaped backtick in the {delim} heredoc", live, [])
+        live = [ln for ln in body.splitlines() if "$(" in _unescaped(ln)]
+        check(f"no unescaped command substitution in the {delim} heredoc", live, [])
+    # `${` is different: the unit and the plist EXIST to interpolate, so banning it there
+    # would be banning the feature. WRAP is the one that pins with bare `$PYTHON`/`$BIN`/
+    # `$WORKSPACE` and escapes everything else, so there a live `${` is always a mistake.
+    wrap = dict(heredocs)["WRAP"]
+    check("the wrapper heredoc was found", len(wrap) > 200, True)
+    live = [ln for ln in wrap.splitlines() if "${" in _unescaped(ln)]
+    check("no unescaped brace expansion in the WRAP heredoc", live, [])
+
+
+# `<<-?` then an optionally quoted word; `(?!<)` so the `<<<junk` in install.sh's own
+# prose about plutil is a herestring and not a delimiter named `<junk`.
+_HEREDOC_RE = re.compile(r"""<<-?(?!<)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1""")
+
+
+def _unescaped(line: str) -> str:
+    """The line with bash's escapes removed — i.e. what is left for bash to expand.
+
+    Per token, not per line: one escaped `\\$` on a line says nothing about the next `$(`
+    on that same line, and assuming otherwise is what let `${HOME}` through.
+    """
+    return line.replace("\\\\", "").replace("\\`", "").replace("\\$", "")
+
+
+def _unquoted_heredocs(src: str) -> list[tuple[str, str]]:
+    """Every `<<DELIM` heredoc in a shell source whose delimiter is UNQUOTED, as
+    (delim, body). Quoted (`<<'EOF'`) delimiters are literal to bash and are the safe
+    case, so they are not returned. Lines that are shell comments are not scanned for
+    openers — this file talks about heredocs as much as it writes them.
+    """
+    lines = src.splitlines()
+    out, i = [], 0
+    while i < len(lines):
+        m = None if lines[i].lstrip().startswith("#") else _HEREDOC_RE.search(lines[i])
+        if m:
+            quote, delim = m.group(1), m.group(2)
+            j = i + 1
+            while j < len(lines) and lines[j].strip() != delim:
+                j += 1
+            if j < len(lines):          # only a closed heredoc is a heredoc
+                if not quote:
+                    out.append((delim, "\n".join(lines[i + 1:j])))
+                i = j
+        i += 1
+    return out
 
 
 if __name__ == "__main__":
