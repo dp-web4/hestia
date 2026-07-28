@@ -62,7 +62,54 @@ BIN="$HOME/.local/bin/hestia-agent-inventory"
 UNIT_DIR="$HOME/.config/systemd/user"
 SETTINGS="$HOME/.claude/settings.json"
 
-mkdir -p "$(dirname "$BIN")" "$UNIT_DIR"
+# ---- 0. which of the three triggers this platform can carry ----------------------
+#
+# DECIDED BEFORE STEP 1, NOT DISCOVERED AT STEP 2 (McNugget, 2026-07-28, on a Mac mini).
+# This script is `set -euo pipefail` and step 2 called `systemctl --user daemon-reload`
+# unconditionally. On Darwin that is exit 127 and the script dies — AFTER step 1 has
+# installed the binary and pinned the workspace into it, and BEFORE step 3 wires the
+# SessionStart hook. The residue is the exact shape this plugin exists to find: `command -v
+# hestia-agent-inventory` succeeds, the on-demand surface answers, and the two triggers
+# that make it a REGULAR check are absent with nothing after the fact reporting it. Honest
+# at the terminal, silent a day later.
+#
+# The remedy is NOT to abort before step 1. Steps 1 and 3 are platform-neutral — a wrapper
+# script and a JSON edit — and refusing to install them because the periodic backend is
+# missing would drop two working triggers to punish the third. What the failure actually
+# demanded was that the platform question be ASKED FIRST, so what gets installed is decided
+# rather than discovered by an exit code halfway through.
+#
+# So: name the backend, wire what it supports, and make the gap outlive this terminal.
+# `inventory.py:periodic_trigger()` stats for the unit and the plist on every run and puts
+# `NO PERIODIC TRIGGER` on the brief line when the binary is installed with neither — which
+# is what a reader a day later actually sees. Same rule as `lingering: OFF` below: this
+# script already distinguishes "installed" from "will fire", and this is the rung under it.
+PERIODIC_WHY=""
+case "$(uname -s)" in
+  Linux)  PERIODIC=systemd ;;
+  Darwin) PERIODIC=launchd ;;
+  *)      PERIODIC=none ;;
+esac
+# Having the platform is not having the tool: a container with no systemd, or a --user bus
+# that is not running, is Linux and still cannot schedule anything.
+if [ "$PERIODIC" = systemd ] && ! command -v systemctl >/dev/null 2>&1; then
+  PERIODIC=none; PERIODIC_WHY="Linux, but no systemctl on PATH"
+elif [ "$PERIODIC" = launchd ]; then
+  # NOT YET BUILT, AND SAYING SO IS THE POINT. The launchd half (a StartInterval agent in
+  # ~/Library/LaunchAgents) is McNugget's to write, on the box that can test it and measure
+  # what the hourly walk costs on APFS. Until it lands, Darwin installs two triggers of
+  # three and the check itself reports the third missing. That is a known, visible gap; the
+  # thing it replaces was an unknown, invisible one.
+  PERIODIC=none; PERIODIC_WHY="Darwin — the launchd agent is not written yet"
+elif [ "$PERIODIC" = none ]; then
+  PERIODIC_WHY="$(uname -s) has no periodic backend here"
+fi
+
+# Not `[ ... ] && mkdir`: under `set -e` a false test IS the list's exit status and takes
+# the script down. The bug class this whole section is about, in one line of its own fix.
+mkdir -p "$(dirname "$BIN")"
+if [ "$PERIODIC" = systemd ]; then mkdir -p "$UNIT_DIR"; fi
+echo "periodic:   ${PERIODIC}${PERIODIC_WHY:+  ($PERIODIC_WHY)}"
 
 # ---- 1. the executable, on ext4 -------------------------------------------------
 #
@@ -83,6 +130,9 @@ chmod 0755 "$BIN"
 echo "installed: $BIN  (source: $SRC_DIR/inventory.py, workspace pinned to $WORKSPACE)"
 
 # ---- 2. periodic: hourly user timer ---------------------------------------------
+# Guarded by the step-0 decision, not by trying it and seeing. Everything from here to the
+# lingering report is systemd-only; step 3 below runs on every platform.
+if [ "$PERIODIC" = systemd ]; then
 cat > "$UNIT_DIR/hestia-agent-inventory.service" <<EOF
 [Unit]
 Description=hestia agent inventory (installed / plugins available / governed)
@@ -126,6 +176,14 @@ if loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
 else
   echo "  lingering: OFF — this timer ONLY fires while $USER has a session."
   echo "             enable with: loginctl enable-linger $USER   (needs sudo)"
+fi
+else
+  echo "SKIPPED:   periodic trigger — $PERIODIC_WHY"
+  echo "           The binary and the SessionStart hook are still installed, so this"
+  echo "           check answers on demand and at session start. It will NOT run on its"
+  echo "           own. Every run reports that itself: scope.periodic_trigger=absent,"
+  echo "           and --brief carries NO PERIODIC TRIGGER — so the gap does not depend"
+  echo "           on anyone having read this line."
 fi
 
 # ---- 3. on launch: SessionStart hook --------------------------------------------
@@ -227,4 +285,8 @@ echo "on demand:  hestia-agent-inventory --workspace $WORKSPACE"
 echo "            (or export HESTIA_WORKSPACE=$WORKSPACE in your shell rc — a bare"
 echo "             invocation falls back to the compiled-in default and answers UNKNOWN)"
 echo "            --brief       one line        --no-witness   skip the chain write"
-echo "next fire:  $(systemctl --user list-timers hestia-agent-inventory.timer --no-pager 2>/dev/null | sed -n 2p)"
+if [ "$PERIODIC" = systemd ]; then
+  echo "next fire:  $(systemctl --user list-timers hestia-agent-inventory.timer --no-pager 2>/dev/null | sed -n 2p)"
+else
+  echo "next fire:  never on its own — no periodic trigger on this platform ($PERIODIC_WHY)"
+fi

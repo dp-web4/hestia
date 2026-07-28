@@ -206,6 +206,35 @@ def names_for(atlas_id: str) -> tuple[list[str], list[str], str]:
             plugin or atlas_id)
 
 
+def fallback_agent_ids(reg: "Registry") -> list[str]:
+    """The agent universe when agent-atlas is unreadable — narrower, and it says so.
+
+    WHY THIS EXISTS (McNugget, 2026-07-28, measured on a box with no atlas clone). The
+    atlas guard used to be a hard `return`: UNKNOWN in 0.079s, before `search_roots()`,
+    before the walk, before a single hook target was stat'd. Rule 4 as written — but it
+    applied "could not look" to dimensions it COULD look at. A dead `PreToolUse` gate is a
+    stat call, not a registry lookup; so are the A inventory, FRAGILE, and the hook-timeout
+    finding. Inventory B is read from `plugins/` at `origin/main` and never touched atlas
+    either. What atlas actually supplies is the ENUMERATION — the universe of agent ids to
+    go looking for — and losing it costs the ids outside this file's own table, not the
+    findings about the ids inside it.
+
+    So the degradation is now sized to the loss: enumerate from what is on hand, run the
+    whole walk, and carry the gap in `unknowns` so the status ladder can never reach OK.
+    A machine with no atlas gets the owner-agnostic half of the check plus an honest
+    "there may be agents here I never looked for", instead of nothing plus prose.
+
+    Known-incomplete BY CONSTRUCTION, which is the point: `ALIASES` is only the ids whose
+    on-disk names diverge, and the registry only names harnesses hestia has an adapter
+    for. An agent that is installed here, absent from both, and ungoverned is exactly what
+    this run cannot see — hence UNKNOWN, never OK.
+    """
+    ids = set(ALIASES)
+    covered = {names_for(a)[2] for a in ids}
+    ids.update(p for p in reg.harnesses() if p not in covered)
+    return sorted(ids)
+
+
 # $PATH IS NOT AN INSTALLED-NESS TEST EITHER (cbp, 2026-07-26). Rule #1 rejected
 # `command -v` because it matches builtins and replaced it with "a real file on PATH" —
 # but PATH is process-local. nvm, pyenv, asdf and friends inject their bin dir from an
@@ -767,6 +796,49 @@ def hook_timeout_finding() -> tuple[float, str] | None:
     return None
 
 
+def periodic_trigger() -> tuple[str, str, list[str]]:
+    """Is this check on a schedule here, or does it only answer when asked?
+
+    THE SECOND HALF OF THE SAME CHECK-APPLIED-TO-THE-CHECK. `hook_timeout_finding()` asks
+    whether the SessionStart trigger will survive; this asks whether the PERIODIC trigger
+    exists at all — because install.sh can leave the binary behind without it, and after
+    the day the installer's output scrolled away nothing says so. Measured by McNugget on
+    Darwin (2026-07-28): `set -euo pipefail` + `systemctl --user daemon-reload` = exit 127
+    at step 2, AFTER step 1 has installed the binary and pinned the workspace into it. The
+    residue is a machine where `command -v hestia-agent-inventory` succeeds, the on-demand
+    surface answers, and the check never runs on its own. A later reader sees an installed
+    check. That is this file's own defect class, in its own installer.
+
+    It is not Darwin-specific and the platform is not the finding: a Linux box whose
+    install aborted at step 2, or where the units were removed afterwards, is in the same
+    state and reads the same way.
+
+    WHAT IS AND IS NOT CLAIMED. Only stats are done here — no `systemctl`/`launchctl`
+    subprocess, because this runs inside a SessionStart hook with a budget. So the strong
+    answer is the NEGATIVE one: no unit and no plist means no schedule, full stop. The
+    positive answers are weaker by construction and are named to say how weak:
+    `enabled` = systemd's own `timers.target.wants` symlink exists (which install.sh's
+    `enable --now` creates), `installed` = the unit file is there but that symlink is not.
+    Neither promises a fire — a --user timer with lingering off does not run without a
+    session, which install.sh reports at install time and this cannot see. Returns
+    (state, platform, paths_stat'd) so the reader can re-derive all three.
+    """
+    system = platform.system()
+    unit = HOME / ".config" / "systemd" / "user" / f"{INSTALLED_BIN_NAME}.timer"
+    wants = (HOME / ".config" / "systemd" / "user" / "timers.target.wants"
+             / f"{INSTALLED_BIN_NAME}.timer")
+    agents = HOME / "Library" / "LaunchAgents"
+    plists = sorted(agents.glob(f"*{INSTALLED_BIN_NAME}*.plist")) if agents.is_dir() else []
+    looked = [str(unit), str(wants), f"{agents}/*{INSTALLED_BIN_NAME}*.plist"]
+    if wants.exists():
+        return "systemd-user-timer-enabled", system, looked
+    if unit.exists():
+        return "systemd-user-timer-installed-not-enabled", system, looked
+    if plists:
+        return "launchd-agent-installed", system, looked
+    return "absent", system, looked
+
+
 def _git(*args: str) -> str | None:
     """git in the hestia checkout, or None. Never raises, never blocks forever."""
     try:
@@ -1189,6 +1261,26 @@ def emit(report: dict, brief: bool) -> int:
                      f"{scan.get('project_scan_truncated_at_level')} partial "
                      f"({scan.get('project_scan_level_progress')}) — the DEEPEST project "
                      "scopes are the ones missing")
+        # Same argument as the truncation clause above, one dimension over: an
+        # enumeration that never listed an agent produces no finding about it, and a
+        # missing finding is indistinguishable from a clean one on the surface a session
+        # actually reads.
+        if scan.get("agent_enumeration_complete") is False:
+            line += (f" | ENUMERATION PARTIAL — agent ids from {scan['agent_enumeration']}"
+                     f" (no agent-atlas at {scan.get('atlas')}); an installed agent named "
+                     "by neither was never looked for")
+        # The trigger that was never wired is invisible from every trigger that was. A
+        # machine holding the binary but no schedule answers on demand and at session
+        # start and is otherwise silent — which reads as a regular check that found
+        # nothing (McNugget, 2026-07-28: install.sh dies at systemctl on Darwin AFTER
+        # installing the binary).
+        # Gated on the binary being there: a machine that never ran install.sh has no
+        # schedule for the honest reason, and warning about it would be noise on every
+        # bare `python3 inventory.py`. The finding is the PAIR — installed, unscheduled.
+        if scan.get("periodic_trigger") == "absent" and scan.get("installed_bin"):
+            line += (" | NO PERIODIC TRIGGER — this binary is installed with no schedule "
+                     f"on {scan.get('periodic_platform')}; it runs only when something "
+                     "calls it, so silence here is not evidence")
         if scan.get("hook_timeout_installed_s") is not None:
             line += (f" | HOOK TIMEOUT {scan['hook_timeout_installed_s']}s < "
                      f"{scan.get('project_scan_budget_s')}s SCAN BUDGET — this check can "
@@ -1217,16 +1309,29 @@ def main() -> int:
     PLUGINS = WORKSPACE / "hestia" / "plugins"
     REGISTRY = Registry()
 
-    if not ATLAS.is_dir():
-        return emit({"status": "UNKNOWN", "machine": platform.node(), "reason":
-                     f"agent-atlas registry not readable at {ATLAS} — cannot "
-                     "distinguish 'nothing ungoverned' from 'could not look'"
-                     f" (workspace from {WORKSPACE_SOURCE}; pass --workspace PATH "
-                     "or re-run install.sh)"}, brief)
-
     roots = search_roots()
-    known = sorted(p.name for p in ATLAS.iterdir() if p.is_dir())
+    # THE MISSING REGISTRY COSTS THE ENUMERATION, NOT THE WALK (McNugget, 2026-07-28).
+    # This was a `return emit(UNKNOWN)` above `search_roots()`, so an atlas-less machine
+    # got no A inventory, no dead-gate stats, no FRAGILE and no hook-timeout finding —
+    # none of which need atlas — and a payload of `{status, machine, reason}` with no
+    # `scope` key, in the one case where scope IS the whole story. See fallback_agent_ids.
+    if ATLAS.is_dir():
+        known = sorted(p.name for p in ATLAS.iterdir() if p.is_dir())
+        enumeration, enumeration_gap = "agent-atlas", None
+    else:
+        known = fallback_agent_ids(REGISTRY)
+        enumeration = "built-in ALIASES + plugin registry"
+        enumeration_gap = (
+            f"agent-atlas registry not readable at {ATLAS}, so the AGENT ENUMERATION is "
+            f"partial: this run looked for {len(known)} ids known to this file and to "
+            "hestia's plugin registry, and for nothing else. Every finding below is a "
+            "real filesystem fact and stands; what cannot be ruled out is an installed, "
+            "ungoverned agent that neither list names — so 'nothing ungoverned' is still "
+            f"undistinguishable from 'could not look' (workspace from {WORKSPACE_SOURCE}; "
+            "pass --workspace PATH, re-run install.sh, or clone agent-atlas)")
     recs = [inspect(a, roots) for a in known]
+    periodic_state, periodic_platform, periodic_paths = periodic_trigger()
+    installed_bin = HOME / ".local" / "bin" / INSTALLED_BIN_NAME
     available = REGISTRY.harnesses()
     installed = [r for r in recs if r["installed"]]
     governed = [r for r in installed if r["governed"]]
@@ -1243,6 +1348,12 @@ def main() -> int:
     scope = {
         "workspace": str(WORKSPACE),
         "workspace_source": WORKSPACE_SOURCE,      # argv | env | default
+        # Where the list of agent ids came from, and whether it was the whole list. A
+        # fleet dashboard differencing machines needs this to tell "McNugget has no codex"
+        # from "McNugget never looked for one".
+        "agent_enumeration": enumeration,
+        "agent_enumeration_complete": enumeration_gap is None,
+        "atlas": str(ATLAS),
         "exe_search_roots": roots,
         "config_scopes_read": sorted({c["path"] for r in recs
                                       for c in r["configs_read"]}),
@@ -1253,6 +1364,12 @@ def main() -> int:
         "project_scan_seconds": SCAN_STATS.get("seconds"),
         "project_scan_budget_s": PROJECT_SCAN_BUDGET_S,
         "session_hook_timeout_s": SESSION_HOOK_TIMEOUT_S,
+        # This check's own third trigger, reported next to the other two. See
+        # periodic_trigger() for exactly what each state does and does not claim.
+        "periodic_trigger": periodic_state,
+        "periodic_platform": periodic_platform,
+        "periodic_paths_checked": periodic_paths,
+        "installed_bin": str(installed_bin) if installed_bin.exists() else None,
         "scan_truncated": SCAN_STATS.get("truncated", False),
         # Level-order, so "where it stopped" is one integer and the loss is predictable:
         # levels below `truncated_at_level` were never enumerated, and those are the
@@ -1272,6 +1389,8 @@ def main() -> int:
         "third_party_markers": list(THIRD_PARTY_MARKERS),
     }
     unknowns = sorted({u for r in recs for u in r["unknown"]})
+    if enumeration_gap:
+        unknowns.append(enumeration_gap)
     if WORKSPACE_SOURCE == "default":
         unknowns.append(
             f"workspace neither passed as --workspace nor set in HESTIA_WORKSPACE — "

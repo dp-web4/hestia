@@ -43,9 +43,10 @@ the `/mnt/c` 9p mount (cold reads can outlast a hook timeout, and these hooks fa
 |---|---|
 | on launch | `SessionStart` hook, `--workspace <ws> --brief`, 10s timeout |
 | operator on demand | `hestia-agent-inventory --workspace <ws> [--brief] [--no-witness]` |
-| periodic | `systemd --user` timer, hourly (`OnBootSec=3min`, `Persistent=true`) |
+| periodic | `systemd --user` timer, hourly (`OnBootSec=3min`, `Persistent=true`) — **Linux only** |
 
-`install.sh` wires all three, and writes the resolved workspace into **each** of them.
+`install.sh` wires **every trigger this platform can carry** — all three on Linux — and
+writes the resolved workspace into each of them.
 It has to: a systemd unit's `Environment=` is not the shell's environment and not the
 hook's, so the first cut — which set `HESTIA_WORKSPACE` on the timer only — left the
 other two triggers falling back to the compiled-in CBP default. Measured on Thor
@@ -104,6 +105,72 @@ read, the project scan depth, and both the ref `plugins_available` was resolved 
 (`plugins_source`, `plugins_ref`) and the ref the checkout happens to be sitting on
 (`worktree_ref`). And **any scope it could not establish degrades to `UNKNOWN`, never to
 `OK`.**
+
+## A sixth blind spot: the degradation was the wrong size
+
+McNugget reviewed this file from a Mac mini with no `agent-atlas` clone and found the
+guard above doing the thing the table is about, one level up. `UNKNOWN in 0.079s`, before
+`search_roots()`, before the walk, before a single hook target was `stat`'d — **"could not
+look" applied to dimensions it could look at.** A dead `PreToolUse` gate is a `stat` call,
+not a registry lookup; so are the A inventory, `FRAGILE`, and `hook_timeout_finding`.
+Inventory B is read from `plugins/` at `origin/main` and never touched atlas either. The
+three dead gates this README is proudest of catching would have been caught on an
+atlas-less machine — the guard just never got there.
+
+What atlas actually supplies is the **enumeration**: the universe of agent ids to go
+looking for. So that is what its absence now costs, and only that. The run falls back to
+`ALIASES` ∪ the plugin registry, walks everything, and carries the gap in `unknown[]` so
+the status ladder can never reach `OK`. Measured on CBP the same day, atlas present vs.
+atlas hidden:
+
+```
+atlas   : OK      45 ids enumerated   4 installed, 6 plugins, 4 governed   dormant=[cursor, openclaw]
+degraded: UNKNOWN 12 ids enumerated   4 installed, 6 plugins, 4 governed   dormant=[cursor, openclaw]
+                                      + ENUMERATION PARTIAL on the brief line
+```
+
+Identical findings, 33 fewer ids looked for, and it still refuses to say `OK` — which is
+the whole property. Sabotage-checked: delete the `unknowns.append`, and the degraded run
+reports `OK` with the same warning printed next to it. The warning is not the guard.
+
+`scope.agent_enumeration` and `scope.agent_enumeration_complete` say which list was used,
+so a fleet dashboard can tell *"McNugget has no codex"* from *"McNugget never looked for
+one."* The old UNKNOWN payload was `{status, machine, reason}` — no `scope` key at all, in
+the one case where scope was the entire story. There is now no path that emits without it.
+
+## The check has to find its own missing trigger
+
+Same review, on the same box: `install.sh` is `set -euo pipefail` and step 2 called
+`systemctl --user daemon-reload` unconditionally. On Darwin that is **exit 127**, and the
+script dies there — *after* step 1 has installed the binary and pinned the workspace into
+it, and *before* step 3 wires the `SessionStart` hook. Reproduced here on Linux by hiding
+`systemctl` from `PATH`: binary present, `settings.json` untouched, exit 127 at line 119.
+
+The residue is this plugin's own subject matter. `command -v hestia-agent-inventory`
+succeeds, the on-demand surface answers, and **the two triggers that make it a *regular*
+check are absent with nothing after the fact reporting it.** Failing loudly at line 119 of
+a 230-line installer is honest at the terminal and silent a day later.
+
+Two changes, and the second is the one that matters:
+
+1. **The platform question is asked before step 1, not discovered at step 2.** Not by
+   aborting first — steps 1 and 3 are a wrapper script and a JSON edit, platform-neutral
+   both, and dropping two working triggers to punish the third is a worse trade than the
+   bug. `install.sh` names the periodic backend up front, wires what the platform supports,
+   and exits 0 having said what it skipped.
+2. **The gap outlives the terminal.** `scope.periodic_trigger` is `stat`'d on every run,
+   and `--brief` carries `NO PERIODIC TRIGGER` when the binary is installed with no
+   schedule. Not Darwin-specific and the platform is not the finding: a Linux box whose
+   install aborted at step 2, or whose units were removed later, reads identically. The
+   states are named for how much they claim — `enabled` is systemd's own
+   `timers.target.wants` symlink, `installed-not-enabled` is a unit file without it,
+   neither promises a fire (a `--user` timer with lingering off does not run without a
+   session). Stats only, no subprocess: this runs inside a hook with a budget.
+
+**Darwin is in scope; the launchd agent is not written.** `install.sh` therefore installs
+two of three triggers on a Mac and says so, and the check reports the third missing on
+every run. That is a known, visible gap where there was an unknown, invisible one — but it
+is still a gap, and closing it needs a box that can test it.
 
 ## The budget is part of the scope
 
