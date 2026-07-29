@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -130,6 +131,416 @@ def discover_endpoint() -> Optional[str]:
         return v or None
     except OSError:
         return None
+
+
+
+# ---------------------------------------------------------------------------
+# THE GATE IS NOT THE AGENT'S TO EDIT — OR TO READ
+# ---------------------------------------------------------------------------
+#
+# dp, 2026-07-28: "an agent that wants to do something it doesn't want governed
+# can use this to turn off the gate, do whatever, then turn it back on like
+# nothing happened. that wouldn't be an accident :)"
+#
+# Correct, and it is the hole that makes every other control optional. Gate
+# integrity (#52) HASHES this file and reports drift on an operator endpoint —
+# tamper-EVIDENT, and only to a human who looks. Nothing in the decision path
+# consults it, so disable -> act -> restore leaves a clean record and a matching
+# hash. The whole governance model rests on a file the governed party can write.
+#
+# THE PRINCIPLE, which we already use elsewhere: you do not get to modify the
+# thing that governs you, for the same reason you do not get to rule on your own
+# appeal. Gate custody belongs to a not-self party.
+#
+# WHY READ IS DENIED TOO, and not only write: reading this file is how you find
+# its blind spots. Every false-positive class we hit this week was discoverable
+# by reading the matcher. Denying read forces evasion to be blind probing, which
+# is noisy, slow and leaves denials on the chain. It converts a silent read into
+# an audible attempt.
+#
+# WHY THIS RUNS BEFORE THE DAEMON CALL AND NEVER CONSULTS IT: if this check
+# required a verdict, then "kill the daemon, then edit the gate" would be the
+# same evasion one layer over. Self-protection has to hold when everything else
+# is down, so it is local, unconditional, and fails CLOSED.
+#
+# ON THE DELIBERATE JUDGE-BY-MENTION: for Bash this scans the WHOLE command for
+# any mention of a self path, which is exactly the matching style that produced
+# ten false positives this week and that policy::shell was written to fix. That
+# is intentional and the stakes invert here. A false positive costs a rephrase;
+# a false negative costs the entire governance model. `sed -i`, `cp`, `>`,
+# `python -c`, `tee` and a heredoc all reach this file by different syntax, and
+# an executable-position parse would have to be right about all of them.
+#
+# WHAT THIS IS NOT: containment. A determined agent can still reach the file by
+# a path this misses, or kill the hook process. This is A1 — cooperative. What it
+# removes is the CHEAP, SILENT version, and it removes "I didn't know" as an
+# account, because the refusal names the rule.
+_SELF = os.path.realpath(__file__)
+_SELF_DIR = os.path.dirname(_SELF)
+_SELF_MARKERS = (
+    _SELF,
+    _SELF_DIR,
+    "plugins/claude-code/hooks",
+    "hestia/hooks",
+)
+
+# THE GOVERNANCE SURFACE, not just this file. Protecting only `pre_tool_use.py`
+# was the first cut, and testing it found the gaps immediately: the SOCIETY gate
+# (`society_pre_tool_use.py` — the one that actually parked a member today) and
+# `witness.py` (the outcome recorder) were both reachable. Disarming the recorder
+# is the worse attack of the two: it does not produce denials, it produces
+# SILENCE, and silence is indistinguishable from "attempted nothing".
+#
+# Matched by filename anywhere, deliberately, so this holds for a peer's copy as
+# well as mine. An agent editing ANOTHER member's gate is not a lesser act — it
+# is disarming an entity that did not consent, and the record would name the
+# victim rather than the author.
+_GOVERNANCE_FILES = (
+    "pre_tool_use.py",
+    "society_pre_tool_use.py",
+    "post_tool_use.py",
+    "witness.py",
+    "law_inject.py",
+)
+
+
+def _touches_self(tool_name: str, tool_input: Any) -> Optional[str]:
+    """Return the matched marker if this call reaches the gate's own code."""
+    if not isinstance(tool_input, dict):
+        return None
+    # PATH keys are resolved against cwd so `../hooks/pre_tool_use.py` is caught.
+    # TEXT keys are matched RAW, and that distinction is load-bearing: the first
+    # cut resolved every key, and `os.path.realpath()` on a non-path string
+    # silently prepends the cwd — `realpath("fn main() {}")` is a real path under
+    # wherever the session happens to be standing.
+    #
+    # Scope it honestly: this is cwd-DEPENDENT, not universal. It fires when the
+    # session's cwd sits under a marker directory (the installed hooks dir, or a
+    # tree matching `plugins/claude-code/hooks` / `hestia/hooks`), and in the
+    # common case — cwd at a project root — it does not fire at all. It was found
+    # by the "ordinary work is untouched" case in test_pre_tool_use_self.py, which
+    # runs from the hooks directory and so stands exactly where it bites. Latent,
+    # never observed in the wild, and cheap to remove.
+    #
+    # The false positive is not the expensive half. A spurious refusal costs a
+    # rephrase; a spurious `gate_self_access` WITNESS costs the alert class its
+    # meaning — this event exists to be rare and to be read as evidence about
+    # intent, and an event type that fires on ordinary work gets muted by the
+    # first operator who sees it, which is exactly the burial the block above
+    # gave its own event type to avoid.
+    #
+    # Nothing is lost by matching text raw: `../hooks/pre_tool_use.py` in a shell
+    # command still contains both `hooks/` and a governance filename. What IS
+    # given up is a symlinked alias inside a command string — admitted, and no
+    # worse than the Bash surface's other known gaps.
+    resolved = []
+    for key in ("file_path", "path", "notebook_path"):
+        v = tool_input.get(key)
+        if isinstance(v, str) and v:
+            resolved.append(v)
+            try:
+                resolved.append(os.path.realpath(v))
+            except (OSError, ValueError):
+                pass
+    for key in ("command", "content", "new_string"):
+        v = tool_input.get(key)
+        if isinstance(v, str) and v:
+            resolved.append(v)
+    for h in resolved:
+        for marker in _SELF_MARKERS:
+            if marker and marker in h:
+                return marker
+        # Governance files by name, but only under a hooks directory — so this
+        # catches every member's gate and recorder without blocking an unrelated
+        # file that happens to share a common name.
+        low = h.replace("\\", "/")
+        if "hooks/" in low or "/hooks" in low:
+            for fname in _GOVERNANCE_FILES:
+                if fname in low:
+                    return fname
+    return None
+
+
+# ---------------------------------------------------------------------------
+# THE GATE'S REGISTRATION IS PART OF THE GATE (2026-07-28, follow-on)
+# ---------------------------------------------------------------------------
+#
+# The block above protects the gate's CODE. It was probed against the evasions
+# it claims to remove, and the cheapest one walked straight through:
+#
+#   Write  ~/.claude/settings.json  content='{}'      -> _touches_self: None
+#   Bash   mv ~/.claude/settings.json{,.bak}          -> _touches_self: None
+#   Edit   ~/.claude/settings.json  (drop the stanza) -> _touches_self: None
+#
+# Verified by direct call against this file at 99d122f, not by reading it. The
+# hook is invoked because `~/.claude/settings.json` names it; that path carries
+# no `hooks/` segment and no governance filename, so every marker missed. One
+# write of `{}` disarms the PreToolUse gate AND the PostToolUse witness — and
+# unlike editing this file it needs no knowledge of what the matcher looks for.
+#
+# So the protection as shipped was strictly weaker than its own claim to "remove
+# the cheap, silent version": the cheapest version was the one it did not see.
+# A control that protects its implementation but not its INSTALLATION protects
+# nothing — this is `gate installed != gate enforced` pointed at itself.
+#
+# DECIDABILITY, per tool, because the honest rule differs by what we can see:
+#
+#   Write / NotebookEdit  we hold the full proposed content. Parse it, compare
+#                         the `hooks` stanza to what is on disk, and refuse only
+#                         if it would CHANGE. A permissions-only edit passes.
+#                         Content we cannot parse is refused: an unreadable
+#                         proposal cannot demonstrate it preserves anything.
+#   Edit                  we hold old_string/new_string. Refuse if either names
+#                         `hooks` or a governance file — that is the only kind of
+#                         edit that can reach the stanza.
+#   Bash                  undecidable. `mv`, `>`, `jq`, `python -c` and a heredoc
+#                         all rewrite the file by different syntax and none of
+#                         them has to say `hooks`. Mention of a settings path is
+#                         refused outright, same stakes-inversion as above: the
+#                         false positive costs one rephrase into Read/Edit, which
+#                         ARE decidable, and the false negative costs the gate.
+#
+# STILL NOT CONTAINMENT, and the gap is now narrower but sharper: settings can
+# also be supplied by CLI flag and by env, neither of which passes through any
+# hook — by construction, since the hook is not running yet when they are read.
+# That surface belongs to whoever installs the agent, not to the agent's gate,
+# and saying so is the point: the boundary is where custody changes, and this
+# file cannot be both sides of it.
+_SETTINGS_MARKERS = (
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+)
+
+# Tokens that mean an edit is reaching the hook registration rather than some
+# unrelated key (permissions, env, model) in the same file.
+_REGISTRATION_TOKENS = ("hooks",) + _GOVERNANCE_FILES
+
+
+def _mentions_settings(s: str) -> bool:
+    return any(m in s.replace("\\", "/") for m in _SETTINGS_MARKERS)
+
+
+def _hooks_stanza(text: str) -> Any:
+    """The `hooks` value of a settings blob, or None if it has none / is unreadable."""
+    try:
+        d = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return d.get("hooks") if isinstance(d, dict) else None
+
+
+def _touches_registration(tool_name: str, tool_input: Any) -> Optional[str]:
+    """Return a marker if this call could disarm the gate by DE-REGISTERING it."""
+    if not isinstance(tool_input, dict):
+        return None
+
+    if tool_name == "Bash":
+        cmd = tool_input.get("command")
+        if isinstance(cmd, str) and _mentions_settings(cmd):
+            return "claude settings file (shell — write intent undecidable)"
+        return None
+
+    path = (
+        tool_input.get("file_path")
+        or tool_input.get("path")
+        or tool_input.get("notebook_path")
+    )
+    if not isinstance(path, str) or not _mentions_settings(path):
+        return None
+
+    # Nothing to disarm if the file registers no hooks. Read failures are treated
+    # as "has hooks": a settings file we cannot read is not a settings file we can
+    # clear.
+    try:
+        with open(os.path.realpath(path), "r", encoding="utf-8") as fh:
+            current = _hooks_stanza(fh.read())
+    except OSError:
+        current = None
+    except Exception:  # noqa: BLE001 — unreadable is not permission
+        current = True
+    if not current:
+        return None
+
+    if "content" in tool_input:
+        content = tool_input.get("content")
+        if not isinstance(content, str):
+            return "claude settings hooks stanza (opaque write)"
+        if _hooks_stanza(content) != current:
+            return "claude settings hooks stanza"
+        return None
+
+    for key in ("old_string", "new_string"):
+        v = tool_input.get(key)
+        if isinstance(v, str) and any(t in v for t in _REGISTRATION_TOKENS):
+            return "claude settings hooks stanza"
+    return None
+
+
+
+
+# ---------------------------------------------------------------------------
+# READ IS ALLOWED AND WITNESSED. WRITE IS REFUSED.
+# ---------------------------------------------------------------------------
+#
+# dp, 2026-07-28, agreeing with kimi's third question: read-denial costs verification,
+# not just evasion.
+#
+# The first cut refused BOTH, arguing that reading the gate is how you find its blind
+# spots. kimi's counter is the one I could not answer: denying read also denies the
+# byte-identity verification it did for #55 and the source-reading behind three of this
+# week's reviews. "A witnessed read is evidence; a refused read is a member who cannot
+# check its own governance."
+#
+# It also contradicted this corpus's own posture. We spent two weeks building PUBLISH THE
+# LAW so a member can read what governs it — then I argued a member must not read the
+# law's implementation. Those pull opposite ways, and I did not notice while writing it.
+#
+# So reads pass and are WITNESSED, which keeps the reconnaissance signal (a member reading
+# gates repeatedly stays visible) without blinding the member to its own law.
+#
+# CLASSIFICATION FAILS CLOSED. For structured tools the split is exact. For Bash it is not
+# decidable in general — `sed -i`, `cp x gate`, `> gate`, `tee gate` all write and nothing
+# in the string reliably says so. Bash is therefore a WRITE unless every segment matches a
+# small read-only allowlist AND there is no redirection or pipe. Same reasoning as
+# policy::shell's inert-head allowlist: widening requires ADDING a name, a reviewable act;
+# forgetting one costs a false refusal, never a hole.
+_READ_ONLY_TOOLS = {"Read", "Grep", "Glob", "NotebookRead"}
+_WRITE_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
+_READ_ONLY_HEADS = {
+    "cat", "less", "more", "head", "tail", "grep", "rg", "egrep", "fgrep",
+    "wc", "md5sum", "sha256sum", "shasum", "cksum", "diff", "file", "stat", "ls",
+}
+_GIT_READ_SUBCOMMANDS = {"show", "diff", "log", "cat-file", "blame"}
+
+
+def _is_read_only(tool_name: str, tool_input: Any) -> bool:
+    """True only when the call is CONFIDENTLY read-only. Ambiguity means write."""
+    if tool_name in _READ_ONLY_TOOLS:
+        return True
+    if tool_name in _WRITE_TOOLS:
+        return False
+    if tool_name not in {"Bash", "Shell"}:
+        return False
+    cmd = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(cmd, str) or not cmd.strip():
+        return False
+    if ">" in cmd or "|" in cmd or "tee " in cmd:
+        return False  # any redirection or pipe: treat as a write
+    for segment in re.split(r"&&|;", cmd):
+        parts = segment.strip().split()
+        if not parts:
+            continue
+        head = os.path.basename(parts[0])
+        if head == "git":
+            if len(parts) < 2 or parts[1] not in _GIT_READ_SUBCOMMANDS:
+                return False
+        elif head not in _READ_ONLY_HEADS:
+            return False
+    return True
+
+
+def _emit_gate_event(event_type: str, marker: str, tool_name: str, *, severity: str) -> bool:
+    """Append a governance-surface event. Best effort, short budget.
+
+    One emitter, two callers, DISTINCT event types — `gate_self_access` for a refused
+    write, `gate_self_read` for a permitted read. Collapsing them into one type would make
+    an alert on the refusal meaningless, since permitted reads are ordinary conduct and
+    refused writes are not.
+
+    Written against `McpHttp` as it actually exists. An earlier draft invented a
+    `DaemonClient(budget_s=).connect()/.call()` that appears nowhere — the same
+    reach-for-a-plausible-API reflex that produced `web4:observationCount` and an invented
+    ontology namespace. Checked, then written.
+    """
+    endpoint = discover_endpoint()
+    if endpoint is None:
+        return False
+    client = McpHttp(endpoint, time.monotonic() + 1.5)
+    try:
+        if "result" not in client.initialize():
+            return False
+        client.initialized()
+        conn = client.call_tool(
+            "hestia_connect",
+            {"plugin_id": PLUGIN_ID, "host_agent": HOST_AGENT, "instance_name": "gate-self"},
+        )
+        sid = None
+        res = conn.get("result") if isinstance(conn, dict) else None
+        if isinstance(res, dict):
+            content = res.get("content") or []
+            if content and isinstance(content[0], dict):
+                try:
+                    sid = json.loads(content[0].get("text") or "{}").get("sessionId")
+                except (json.JSONDecodeError, AttributeError):
+                    sid = None
+        if not sid:
+            return False
+        out = client.call_tool(
+            "hestia_request_witness",
+            {
+                "session_id": sid,
+                "event_type": event_type,
+                "event_data": {
+                    "plugin_id": PLUGIN_ID,
+                    "tool_name": tool_name,
+                    "marker": marker,
+                    "gate_path": _SELF,
+                    "severity": severity,
+                },
+            },
+        )
+        return isinstance(out, dict) and "result" in out
+    except Exception:  # noqa: BLE001 — the record must never block the decision
+        return False
+
+
+def _witness_self_read(marker: str, tool_name: str) -> bool:
+    """Record a PERMITTED read of the governance surface.
+
+    A member may inspect what governs it — that is the publish-the-law posture, and
+    refusing it would make a member unable to check its own law. Recording keeps the
+    reconnaissance signal: repeated reads of gates remain visible as a pattern.
+
+    A failed witness never blocks the read. Turning a recording failure into a denial
+    would make the daemon's health a precondition for reading one's own law."""
+    return _emit_gate_event("gate_self_read", marker, tool_name, severity="record")
+
+
+def _witness_self_access(marker: str, tool_name: str) -> bool:
+    """Record a REFUSED write to the governance surface. Escalatable."""
+    return _emit_gate_event("gate_self_access", marker, tool_name, severity="escalate")
+
+
+def deny_self_access(marker: str, tool_name: str) -> int:
+    """Refuse, loudly, and try to witness it as its own event class.
+
+    Deliberately NOT an ordinary deny: an ordinary deny is a boundary met in the
+    course of work. This is an attempt to reach the mechanism that draws the
+    boundaries, which is evidence about intent rather than about scope — so it
+    gets its own event type so an operator can alert on it separately, and so it
+    cannot be lost in the volume of routine refusals.
+
+    Witnessing is BEST EFFORT and the refusal does not depend on it: if the
+    daemon cannot be reached, the act is still refused and stderr still says so.
+    An unwitnessed refusal is a worse record, never a permission."""
+    witnessed = False
+    try:
+        witnessed = _witness_self_access(marker, tool_name)
+    except Exception:  # noqa: BLE001 — never let the record attempt block the refusal
+        witnessed = False
+    sys.stderr.write(
+        f"hestia: deny [gate-self-access] — {tool_name} reaches the gate's own code "
+        f"({marker}). The gate is not yours to read or modify: an agent that can edit "
+        f"the thing that governs it is not governed. This refusal is recorded as its own "
+        f"event class{'' if witnessed else ' (WITNESS FAILED — the refusal stands regardless)'}"
+        f" and is escalatable.\n"
+        f"If a gate change is genuinely needed, it is installed by the OPERATOR or a "
+        f"not-self custodian — ask, stating what you need changed and why. Do not "
+        f"self-install, and do not work around this by another route: doing so is the "
+        f"behaviour this rule exists to make visible.\n"
+    )
+    debug_log(f"gate-self-access deny: {tool_name} -> {marker} witnessed={witnessed}")
+    return 2
 
 
 def extract_target(tool_input: Any, tool_name: str) -> Optional[str]:
@@ -539,6 +950,21 @@ def main() -> int:
     host_session_id = event.get("session_id")
     tool_use_id = event.get("tool_use_id") or event.get("session_id") or "no-id"
     tool_input = event.get("tool_input") or {}
+
+    # SELF-PROTECTION FIRST — before the daemon, and never conditional on it.
+    # If this required a verdict, "stop the daemon, then edit the gate" would be
+    # the same evasion one layer down.
+    _self_marker = _touches_self(tool_name, tool_input) or _touches_registration(
+        tool_name, tool_input
+    )
+    if _self_marker:
+        if _is_read_only(tool_name, tool_input):
+            # Allowed — and RECORDED. A member may inspect what governs it; repeated
+            # reads of the governance surface remain visible as a pattern.
+            _witness_self_read(_self_marker, tool_name)
+            debug_log(f"gate-self-read (allowed, witnessed): {tool_name} -> {_self_marker}")
+        else:
+            return deny_self_access(_self_marker, tool_name)
 
     # Try the daemon first.
     result = ask_daemon(tool_name, tool_input, tool_use_id, host_session_id)
