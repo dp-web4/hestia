@@ -1,0 +1,35 @@
+# Test-shaped files that CI deliberately does NOT run, and why.
+#
+# READ BY TWO THINGS, which is the point:
+#   - .github/workflows/ci.yml  (plugin tests job) filters discovery against it
+#   - tools/ci_test_coverage_test.py asserts every test-shaped file in the repo
+#     is either discovered or listed here
+#
+# So a file cannot fall out of CI silently. It either runs, or somebody wrote a
+# sentence about why it can't. Before this file existed, seven of sixteen
+# test-shaped files ran in no job at all and nothing said so.
+#
+# Format: one repo-relative path per line. Blank lines and #-comments ignored.
+# The reason goes in the comment directly above the path. A path listed here
+# that CI actually runs, or that no longer exists, is a RED in the coverage
+# test -- a stale excuse is worse than none, because it reads as a known gap
+# while the gap is closed.
+
+# Host-bound. Asserts a hestia checkout really exists at
+# /mnt/c/exe/projects/ai-agents -- the fleet's path, not a runner's. That
+# assertion IS the test's value (it catches the /mnt/c/projects decoy root);
+# relaxing it so CI can pass would delete what it checks. Run it on the fleet.
+tools/workspace_root_test.py
+
+# Needs the SDK importable (`pip install -e plugin-sdk/python`). Bare python3
+# gives ModuleNotFoundError: hestia_plugin_sdk. Wiring it means adding an
+# install step to a job that deliberately has no dependencies -- worth doing,
+# but as its own job, not by widening a glob until it goes red.
+plugin-sdk/python/tests/test_smoke.py
+
+# pytest-style (pytestmark = pytest.mark.asyncio, test functions never called at
+# module scope) AND needs a live daemon to connect to. Under bare `python3` it
+# exits 0 having run ZERO assertions -- the exact no-op that
+# tools/ci_selfexec_test.py exists to refuse. Running it needs pytest, asyncio
+# and a daemon; until then it is honestly declared dark rather than falsely green.
+plugin-sdk/python/tests/conformance/test_conformance.py
