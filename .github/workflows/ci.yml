@@ -85,12 +85,26 @@ jobs:
   # check that does not exist, which is the same absence-as-OK shape the tests themselves
   # are about. Found while adding a sixth (identity refusal, #108 follow-up), where the
   # honest question was whether adding it changed anything. It did not, until this job.
-  # The count is stated only to date it; the glob below, not this comment, is the gate.
+  # The count is stated only to date it; the discovery below, not this comment, is the gate.
   #
   # DISCOVERED, not listed, for the reason the job above chooses no cargo target: which
   # tests a green covers must be a property of the repo, not of whoever last edited this
-  # file. A new `*_test.py` is gated the day it is written, by the author least able to
-  # notice it was not. The glob is the gate; `set -e` in the loop makes one red fail the job.
+  # file. A new test file is gated the day it is written, by the author least able to
+  # notice it was not. `set -e` in the loop makes one red fail the job.
+  #
+  # AMENDED, 2026-07-29 (CBP): the glob WAS the gate, and it was `plugins/*/tests/*_test.py`
+  # — which could not see `plugins/lib/tests/test_path_scope.py` sitting in a directory it
+  # globs, because the repo uses TWO naming conventions and this job knew one. Seven of
+  # sixteen test-shaped files ran in no job at all, including all of tools/ and a suite
+  # that shipped ungated in #92. Both jobs here refuse a glob matching ZERO; neither could
+  # notice a glob matching seven of nine. That is the same absence-as-OK shape one layer
+  # up from the tests, in the thing that runs them.
+  #
+  # So discovery moved OUT of this file into tools/ci_discovery.py, which CI calls and the
+  # guards import. Not a glob copied into a test — the same code, so there is no copy to
+  # drift. Anything it cannot run is declared, with a written reason, in
+  # tools/ci_excluded_tests.txt; tools/ci_test_coverage_test.py fails on any file that is
+  # neither run nor declared.
   #
   # No web4 sibling and no toolchain: these are hermetic Python — each spins its own stub
   # HTTP daemon on an ephemeral port. If that ever stops being true, this job is where it
@@ -101,14 +115,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run every plugins/*/tests/*_test.py
+      - name: Run every discovered test file (tools/ci_discovery.py bare)
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          tests=(plugins/*/tests/*_test.py)
+          mapfile -t tests < <(python3 tools/ci_discovery.py bare)
           if [ ${#tests[@]} -eq 0 ]; then
-            echo "::error::no plugin tests discovered — the glob or the layout moved"
+            echo "::error::no plugin tests discovered — the layout moved"
             exit 1
           fi
           echo "discovered ${#tests[@]} test file(s):"
@@ -145,17 +158,23 @@ jobs:
           python-version: "3.12"
 
       - name: Test hooks
-        working-directory: plugins/claude-code/hooks
         run: |
-          set -e
-          found=0
-          for t in test_*.py; do
-            [ -e "$t" ] || continue
-            found=1
+          set -euo pipefail
+          # Discovery comes from tools/ci_discovery.py (mode: hooks), the same
+          # module the plugin-tests job and the coverage guards use. This job
+          # used its OWN glob (`test_*.py`) while the other used `*_test.py`,
+          # and each was blind to the other's convention — which is how seven
+          # files ended up in neither. One discovery, three consumers.
+          mapfile -t tests < <(python3 tools/ci_discovery.py hooks)
+          # A discovery that matches nothing must fail loudly. Silently passing
+          # on zero tests is the "absence read as pass" failure this gate
+          # exists to refuse.
+          [ ${#tests[@]} -gt 0 ] || { echo "::error::no hook tests found — refusing to report green"; exit 1; }
+          echo "discovered ${#tests[@]} hook test file(s):"
+          printf '  %s\n' "${tests[@]}"
+          for t in "${tests[@]}"; do
             echo "== $t"
-            python3 "$t"
+            # These import the hook modules sitting beside them, so they run
+            # from their own directory — the reason this job exists separately.
+            ( cd "$(dirname "$t")" && python3 "$(basename "$t")" )
           done
-          # A glob that matches nothing must fail loudly. Silently passing on
-          # zero tests is the "absence read as pass" failure this gate exists
-          # to refuse.
-          [ "$found" = 1 ] || { echo "no hook tests found — refusing to report green"; exit 1; }
