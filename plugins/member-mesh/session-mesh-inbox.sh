@@ -23,7 +23,13 @@
 #      settings.json/config.toml rather than inheriting it from whatever launched the
 #      session; a watcher exports it, an interactive shell does not), HESTIA_MESH_HOST_AGENT.
 DIR="$(dirname "$0")"
-ERR="${TMPDIR:-/tmp}/hestia-mesh-inbox-err.$$"
+# mktemp, not $$: the predictable name is pre-creatable as a symlink by anyone sharing
+# the box, and this script writes to it and then rm -f's it. Fail-open applies here too
+# — if mktemp is missing we take the predictable path rather than lose the inbox, since
+# the symlink case needs a hostile co-tenant and the silence case needs only a typo
+# (kimi's review of #109, non-blocking nit, 2026-07-29).
+ERR="$(mktemp "${TMPDIR:-/tmp}/hestia-mesh-inbox-err.XXXXXX" 2>/dev/null \
+       || echo "${TMPDIR:-/tmp}/hestia-mesh-inbox-err.$$")"
 OUT=$(python3 "$DIR/hestia-mesh.py" peek 2>"$ERR")
 RC=$?
 if [ "$RC" -ne 0 ]; then
