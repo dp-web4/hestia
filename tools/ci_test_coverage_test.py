@@ -99,16 +99,99 @@ def test_ci_actually_calls_the_discovery_module():
           "the hook tests job no longer asks for its list")
 
 
-def test_no_undeclared_orphans():
-    """The load-bearing one. Every test-shaped file is run or declared."""
+# Tracked .py files that LOOK test-adjacent to the anchors below but are not
+# tests. Kept deliberately short: every entry is a place an anchor was told to
+# stop looking, so each one costs a sentence.
+NOT_A_TEST = {
+    "plugin-sdk/python/tests/__init__.py":
+        "package marker, no assertions",
+    "plugin-sdk/python/tests/mock_hestia_server.py":
+        "fixture: the stub daemon the SDK suites connect to, imported not run",
+}
+
+
+def test_discovery_covers_every_test_shaped_file():
+    """Structural, and deliberately NOT the load-bearing check.
+
+    With catch-all discovery this cannot fail: bare_python_files() is defined as
+    everything minus excluded minus hooks, so the three sets partition the whole
+    set by construction. It is kept as a partition invariant -- it would fire if
+    someone reintroduced a glob-shaped filter inside bare_python_files() -- and
+    it is labelled here so nobody reads its green as evidence of coverage. The
+    checks that can actually fail are the two anchors below.
+    """
     every = set(D.all_test_shaped())
     accounted = (set(D.bare_python_files())
                  | set(D.hooks_job_files())
                  | set(D.excluded()))
     orphans = sorted(every - accounted)
-    check("no undeclared orphan tests", not orphans,
-          "these test-shaped files run in NO CI job and are not declared in "
+    check("discovery partitions every test-shaped file", not orphans,
+          "these run in NO job and are not declared in "
           "tools/ci_excluded_tests.txt:\n        " + "\n        ".join(orphans))
+
+
+def test_anchor_naming_no_third_convention():
+    """ANCHOR 1, and one of the two load-bearing checks.
+
+    `is_test_shaped()` recognises two conventions. The bug being fixed here was
+    a job that recognised ONE, so the failure mode is real and cheap to repeat:
+    somebody writes `foo_tests.py` or `tests_foo.py`, no rule matches, and the
+    file is not run, not reported, and not missed.
+
+    A check with no evidence outside its own samples goes green when all of them
+    are wrong the same way. So this sweeps with a DELIBERATELY LOOSER rule --
+    any tracked .py with "test" anywhere in its basename -- and requires the
+    strict rule to have caught everything the loose one found. The two agree
+    today (18 = 18). A third convention breaks the tie and reddens this.
+    """
+    strict = set(D.all_test_shaped())
+    loose = set()
+    for path in D.tracked_python_files():
+        if "test" in path.rsplit("/", 1)[-1].lower():
+            loose.add(path)
+    missed = sorted(loose - strict - set(NOT_A_TEST))
+    check("no test-shaped file escapes is_test_shaped()", not missed,
+          "these have 'test' in the filename but match neither convention "
+          "is_test_shaped() knows, so they are invisible to CI:\n        "
+          + "\n        ".join(missed)
+          + "\n      Either rename to *_test.py / test_*.py, or add to "
+            "NOT_A_TEST with a reason.")
+
+
+def test_anchor_location_tests_directories():
+    """ANCHOR 2, the other load-bearing check.
+
+    Naming is one way to hide; location is the other. Anything living in a
+    `tests/` directory is presumed to be a test regardless of what it is called
+    -- a file named `scenario_one.py` in there is a test somebody forgot to
+    name. Helpers and fixtures are real, so they get NOT_A_TEST entries rather
+    than a blanket exemption for the directory.
+    """
+    strict = set(D.all_test_shaped())
+    in_tests_dir = {
+        p for p in D.tracked_python_files()
+        if "/tests/" in "/" + p or p.startswith("tests/")
+    }
+    missed = sorted(in_tests_dir - strict - set(NOT_A_TEST))
+    check("no unnamed test hides in a tests/ directory", not missed,
+          "these live in a tests/ directory but match no test naming "
+          "convention:\n        " + "\n        ".join(missed)
+          + "\n      Either rename, or add to NOT_A_TEST with a reason.")
+
+
+def test_not_a_test_entries_are_real():
+    """An exemption for a file that no longer exists is a stale hole."""
+    tracked = set(D.tracked_python_files())
+    strict = set(D.all_test_shaped())
+    for path, reason in sorted(NOT_A_TEST.items()):
+        check(f"NOT_A_TEST exists: {path}", path in tracked,
+              "exempted but not a tracked .py file")
+        check(f"NOT_A_TEST not shadowing a real test: {path}",
+              path not in strict,
+              "exempted but it IS test-shaped and CI runs it -- delete the "
+              "exemption")
+        check(f"NOT_A_TEST has a reason: {path}", len(reason.strip()) > 15,
+              "give a reason, not a placeholder")
 
 
 def test_discovery_is_not_vacuous():
@@ -160,7 +243,10 @@ def test_both_conventions_are_discovered():
 
 if __name__ == "__main__":
     test_ci_actually_calls_the_discovery_module()
-    test_no_undeclared_orphans()
+    test_discovery_covers_every_test_shaped_file()
+    test_anchor_naming_no_third_convention()
+    test_anchor_location_tests_directories()
+    test_not_a_test_entries_are_real()
     test_discovery_is_not_vacuous()
     test_exclusions_are_real_used_and_reasoned()
     test_both_conventions_are_discovered()
