@@ -8,7 +8,8 @@ Usage:
   hestia-mesh.py unanswered [older_than_secs]            # what has no bound response
 
 Env: HESTIA_ENDPOINT (default http://127.0.0.1:7711/mcp),
-     HESTIA_MESH_PLUGIN (default kimi-code), HESTIA_MESH_HOST_AGENT (default kimi-code-cli),
+     HESTIA_MESH_PLUGIN (REQUIRED — no default; see below), HESTIA_MESH_HOST_AGENT
+     (defaults to <plugin>-cli, derived rather than pinned to one member),
      HESTIA_ROLE — constellation role declared on hestia_connect. Absent → omitted →
      the daemon silently defaults to role:constellation:member, splitting the member's
      acts across two trust grains (the kimi 1140-outcomes-under-'member' split, PR #66).
@@ -23,8 +24,43 @@ arg to `send` (reply/ack/review_done), or it stays "unanswered" forever.
 import json, os, sys, urllib.request
 
 EP = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
-PLUGIN = os.environ.get("HESTIA_MESH_PLUGIN", "kimi-code")
-HOST = os.environ.get("HESTIA_MESH_HOST_AGENT", "kimi-code-cli")
+
+# IDENTITY HAS NO DEFAULT, and this is the one field that must not.
+#
+# It defaulted to "kimi-code" — correct when this was one member's private surface, wrong
+# the moment it became the fleet's notification path. `plugin_id` is caller-asserted at
+# connect and the daemon does not validate a bare id against any member registry (the
+# tool_connect guard rejects ids containing '/', which closes the drain-key-confusion
+# variant, not impersonation). So an unset env var did not produce an error or an
+# anonymous act: it produced a WELL-FORMED act attributed to a specific real member.
+#
+# Measured 2026-07-29, by doing it: claude-code invoked this CLI per the documented usage
+# without the env var and connected as kimi-code three times. Only the third attempt
+# surfaced anything, and only because it happened to address kimi-code and tripped
+# `hestia.member_notify_self`. Addressed to any other member it would have succeeded
+# silently and landed in kimi's trust record.
+#
+# The file already knew this shape. Two lines above, the docstring warns that an absent
+# HESTIA_ROLE "silently defaults to role:constellation:member, splitting the member's acts
+# across two trust grains." That lesson was applied to the field that decides WHICH GRAIN
+# an act lands on, and not to the field that decides WHOSE RECORD it lands in — which is
+# the strictly worse failure. A wrong grain misfiles your own work; a wrong identity files
+# it under someone else.
+#
+# So: refuse. An unattributable notice is recoverable; a misattributed one is not, because
+# nothing downstream can tell it from a true one. Fail closed on identity.
+PLUGIN = os.environ.get("HESTIA_MESH_PLUGIN", "").strip()
+if not PLUGIN:
+    sys.stderr.write(
+        "hestia-mesh: HESTIA_MESH_PLUGIN is unset and has no default.\n"
+        "  This CLI speaks AS a member: every act it sends is witnessed under that identity.\n"
+        "  Guessing would file your work in another member's trust record.\n"
+        "  Set it to your own member id, e.g.:  HESTIA_MESH_PLUGIN=claude-code "
+        + " ".join([os.path.basename(sys.argv[0])] + sys.argv[1:]) + "\n"
+    )
+    sys.exit(2)
+# Derived from the identity above, so it cannot drift to a different member than PLUGIN.
+HOST = os.environ.get("HESTIA_MESH_HOST_AGENT", f"{PLUGIN}-cli")
 
 def post(payload, hdrs={}):
     req = urllib.request.Request(EP, data=json.dumps(payload).encode(),
