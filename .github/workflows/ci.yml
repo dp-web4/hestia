@@ -118,3 +118,44 @@ jobs:
             python3 "$t"
             echo "::endgroup::"
           done
+
+  # ADDITION, 2026-07-28: the job above runs `cargo test`, and the ENFORCEMENT
+  # SURFACE for a Claude Code member is not Rust. `pre_tool_use.py` is what
+  # actually refuses a call; `witness.py` is what actually records one. Both are
+  # python, both already had test files, and neither test had ever been executed
+  # by CI — `test_law_inject.py` shipped in the repo and ran nowhere.
+  #
+  # That is the same defect as the one the job above was created to fix, one
+  # language over: a green that covers the targets the gate happens to name, and
+  # names none of the gap. The discovery is `python3 -m compileall`-cheap, so
+  # there is no cost argument for leaving it out.
+  #
+  # No dependencies, no sibling checkout: these tests import only stdlib and the
+  # hook modules next to them. Discovery is by glob rather than an enumerated
+  # list, deliberately — an enumerated list falls out of date on the day someone
+  # adds a test, by the person least able to notice.
+  hooks:
+    name: hook tests (python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test hooks
+        working-directory: plugins/claude-code/hooks
+        run: |
+          set -e
+          found=0
+          for t in test_*.py; do
+            [ -e "$t" ] || continue
+            found=1
+            echo "== $t"
+            python3 "$t"
+          done
+          # A glob that matches nothing must fail loudly. Silently passing on
+          # zero tests is the "absence read as pass" failure this gate exists
+          # to refuse.
+          [ "$found" = 1 ] || { echo "no hook tests found — refusing to report green"; exit 1; }

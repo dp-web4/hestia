@@ -8,6 +8,20 @@ use super::types::{
 /// Build the safety-preset rule list. Lifted verbatim from `presets.py`:
 /// destructive bash, secret-file reads, memory-file writes, network warns,
 /// git-push-without-PAT warn.
+///
+/// Shell-rule `tools:` lists carry BOTH `"Bash"` and `"Shell"`. Every other
+/// layer already treats the two as one tool — `extract::target` (`"Bash" |
+/// "Shell"`), `classify` (both → `"command"`), and `handler::tool_query_policy`
+/// (substitutes the full command as target for both) — so listing only `"Bash"`
+/// made these rules silently vacuous for any adapter whose lineage maps a shell
+/// act to `"Shell"`. The gemini adapter does exactly that
+/// (`run_shell_command` → `"Shell"`, plugins/gemini/hooks/before_tool.py), which
+/// meant the destructive-command deny never fired for a gemini member: no rule
+/// matched, so the engine returned allow. Found by nomad on the live rig
+/// (2026-07-28) and reproduced against this daemon on cbp. `Shell` here is the
+/// *narrow* fix — the alternative, lying in the adapter's lineage map by
+/// reporting `run_shell_command` as `"Bash"`, would hide what the member
+/// actually ran. See `shell_rules_judge_shell_like_bash` below.
 fn safety_rules() -> Vec<PolicyRule> {
     vec![
         // Whitelist: allow `rm` (incl. -rf) when EVERY target is an absolute
@@ -39,7 +53,7 @@ fn safety_rules() -> Vec<PolicyRule> {
                     .into(),
             ),
             r#match: PolicyMatch {
-                tools: Some(vec!["Bash".into()]),
+                tools: Some(vec!["Bash".into(), "Shell".into()]),
                 command_patterns: Some(vec![
                     // require >=1 flag (the `-rf` case); flagless `rm /tmp/x`
                     // still falls through to the plain-rm warn rule.
@@ -80,7 +94,7 @@ fn safety_rules() -> Vec<PolicyRule> {
                     .into(),
             ),
             r#match: PolicyMatch {
-                tools: Some(vec!["Bash".into()]),
+                tools: Some(vec!["Bash".into(), "Shell".into()]),
                 target_patterns: Some(vec![r"rm\s+-".into(), r"mkfs\.".into()]),
                 target_patterns_are_regex: true,
                 // Judge the act, not the mention. `handler.rs` hands the whole command in
@@ -99,7 +113,7 @@ fn safety_rules() -> Vec<PolicyRule> {
             decision: PolicyDecision::Warn,
             reason: Some("File deletion flagged - use with caution".into()),
             r#match: PolicyMatch {
-                tools: Some(vec!["Bash".into()]),
+                tools: Some(vec!["Bash".into(), "Shell".into()]),
                 // Matches "rm file" (no flags). Flag variants caught by deny rule above.
                 target_patterns: Some(vec![r"rm\s+[^-]".into()]),
                 target_patterns_are_regex: true,
@@ -310,5 +324,71 @@ mod tests {
     #[test]
     fn unknown_preset_returns_none() {
         assert!(get_preset("paranoid").is_none());
+    }
+
+    /// A shell act must be judged by WHAT IT DOES, not by which adapter's name
+    /// for the shell reached the daemon. Before 2026-07-28 the shell rules
+    /// listed only `"Bash"`, so every rule missed for lineages that report
+    /// `"Shell"` (gemini's `run_shell_command`) and the engine fell through to
+    /// the default ALLOW — a silent hole, not a visible deny.
+    ///
+    /// Asserted as an EQUIVALENCE over both verdict and rule id rather than
+    /// "Shell denies rm -rf": a decision-only check would pass if `Shell` were
+    /// denied by some unrelated rule, and a single-command check would not
+    /// notice a future rule that gets added Bash-only. This test fails if the
+    /// two tool names ever diverge again, whatever the reason.
+    #[test]
+    fn shell_rules_judge_shell_like_bash() {
+        use crate::policy::{PolicyAction, PolicyEngine};
+
+        let e = PolicyEngine::new(get_preset("safety").unwrap().config);
+        // deny (destructive), allow (scratch whitelist), warn (plain rm),
+        // allow (ordinary command) — one per shell rule plus the fallthrough.
+        for cmd in [
+            "rm -rf /home/user/data",
+            "rm -rf /tmp/scratch",
+            "rm /home/user/notes.txt",
+            "ls -la /home/user",
+        ] {
+            let judged = |tool: &'static str| {
+                e.evaluate(&PolicyAction {
+                    tool_name: tool,
+                    category: "command",
+                    target: Some(cmd),
+                    full_command: Some(cmd),
+                })
+            };
+            let bash = judged("Bash");
+            let shell = judged("Shell");
+            assert_eq!(
+                bash.decision, shell.decision,
+                "`{cmd}` judged {:?} as Bash but {:?} as Shell",
+                bash.decision, shell.decision
+            );
+            assert_eq!(
+                bash.rule_id, shell.rule_id,
+                "`{cmd}` matched {:?} as Bash but {:?} as Shell",
+                bash.rule_id, shell.rule_id
+            );
+        }
+    }
+
+    /// The hole this closes was a fallthrough-to-allow, so pin the deny itself
+    /// too — if a future refactor made BOTH names allow, the equivalence test
+    /// above would still pass.
+    #[test]
+    fn shell_lineage_destructive_command_is_denied() {
+        use crate::policy::{PolicyAction, PolicyEngine};
+
+        let e = PolicyEngine::new(get_preset("safety").unwrap().config);
+        let v = e.evaluate(&PolicyAction {
+            tool_name: "Shell",
+            category: "command",
+            target: Some("rm -rf /home/user/data"),
+            full_command: Some("rm -rf /home/user/data"),
+        });
+        assert_eq!(v.decision, PolicyDecision::Deny);
+        assert_eq!(v.rule_id.as_deref(), Some("deny-destructive-commands"));
+        assert!(v.enforced);
     }
 }
