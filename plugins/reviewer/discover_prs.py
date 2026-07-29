@@ -8,8 +8,12 @@ good script and most of it should survive — fresh context per session, worktre
 schedule offset from the workers, separate account routing. Its one structural flaw is a
 **hardcoded three-repo array** from an earlier sprint. Measured 2026-07-28: those three
 (`4-life`, `hardbound`, `web4`) held **zero** open PRs, while **17** sat unreviewed across six
-repos the reviewer could not see. HUB's census puts the long-run shape on it — 1,528 PRs
-across 72 repos, **one** approved review ever.
+repos the reviewer could not see. HUB's census counts 1,528 PRs across 72 repos and **one**
+approved review ever — but that number measures a STRUCTURAL CONSTRAINT, not review
+behaviour: every PR in this org is opened by the one shared account, and GitHub will not let
+an account approve or request-changes on its own PR. Reviews here can only ever be comments.
+Read as "nobody reviews", it is wrong; read as "no review in this org can land in the field
+selection would read", it is the argument for this file.
 
 So the reviewer worked. It was aimed at an empty room.
 
@@ -112,17 +116,34 @@ SIGNOFF_RE = re.compile(r"^\s*—\s*([a-z0-9-]+(?:-code)?)\s*$", re.MULTILINE)
 # above exposed it immediately: every PR began attributing to "Claude". A guard written
 # against a string shape the capture cannot produce is a guard that has never run.
 _MODEL_WORDS = {"claude", "opus", "sonnet", "haiku", "gpt", "gemini", "kimi", "noreply", "anthropic"}
+# A version component: `-5`, `.5`, `-4o`, `-2.5`, `-v3`. Stripped before the lookup because
+# a captured token only reaches the space-free path when the version is HYPHENATED into it.
+_VERSION_TAIL = re.compile(r"[-._]v?\d[A-Za-z0-9.]*$")
 
 
 def _is_model_not_member(token: str) -> bool:
-    """A BARE family name is a model. A hyphenated id is a member.
+    """A member id contains at least one token that is neither a model word nor a version.
 
-    `kimi` is in the set and `kimi-code` is not, which is the correct split — but note
-    the imprecision it leaves: a trailer reading exactly `Co-Authored-By: Kimi` (one such
-    exists on recent main) is discarded rather than resolved to `kimi-code`. Guessing the
-    mapping would manufacture attribution, which is the thing this file exists to stop
-    doing. It is reported as undetermined, and the fix is at the writing end."""
-    return token.strip().lower() in _MODEL_WORDS
+    Two shapes are model names, and only one of them was caught. `Claude` — the bare family
+    name — was. `GPT-5` was NOT: it matches nothing in the set, so the guard passed it and
+    the caller ATTRIBUTED the PR to a member named "GPT-5". kimi-code, re-reviewing 426de31:
+    "manufactured attribution, not discarded attribution" — one step worse than the bare-name
+    imprecision below, and the same defect CLASS as the guard it replaced. Fixing the one
+    string shape I had in hand (`Claude Opus 5`) left every hyphenated shape open.
+
+    So: strip a trailing version, split on the separators MEMBER_RE admits, and call it a
+    model when NOTHING is left that could be an id. `claude-opus-5` -> {claude, opus} -> model.
+    `claude-code` -> `code` survives -> member. `kimi-code` -> member.
+
+    The imprecision that remains is deliberate: a trailer reading exactly `Co-Authored-By:
+    Kimi` (one such exists on recent main) is DISCARDED rather than resolved to `kimi-code`.
+    Guessing that mapping would manufacture attribution, which is what this file exists to
+    stop doing. It is reported as undetermined, and the fix is at the writing end."""
+    stripped = _VERSION_TAIL.sub("", token.strip().lower())
+    parts = [p for p in re.split(r"[-._]", stripped) if p]
+    if not parts:
+        return True  # a bare version, e.g. `5` — not an id either
+    return all(p in _MODEL_WORDS or p.isdigit() for p in parts)
 
 
 def author_member(repo: str, number: int, body: str) -> tuple[Optional[str], str]:
