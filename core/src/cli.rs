@@ -246,6 +246,26 @@ enum ConstellationCmd {
         /// Specific device LCT ids to co-sign with (repeatable).
         #[arg(long = "device")]
         devices: Vec<String>,
+        /// CROSS-DEVICE: gather co-signatures from remote devices over their
+        /// confirmed pairings (each device signs with its OWN key on its own
+        /// machine — real multi-device possession). Devices without a local key
+        /// AND without a confirmed pair are skipped.
+        #[arg(long)]
+        remote: bool,
+        /// Hub URL or connection UUID (default: sole connection).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
+
+    /// DEVICE side of cross-device MFA: drain co-sign requests from confirmed
+    /// pairs, co-sign each with this device's member key, and reply. Run this
+    /// (periodically or `--once`) on every machine that is a device in someone's
+    /// constellation. Bounded: only a fresh, this-device-addressed, in-roster
+    /// constellation challenge is ever signed.
+    CosignServe {
+        /// Drain + respond once and exit (else loop).
+        #[arg(long)]
+        once: bool,
         /// Hub URL or connection UUID (default: sole connection).
         #[arg(long, default_value = "")]
         target: String,
@@ -660,8 +680,15 @@ pub fn run() -> AnyResult<()> {
                 cmd_constellation_revoke_device(&home, &id, &target)
             }
             ConstellationCmd::Enrolled { target } => cmd_constellation_enrolled(&home, &target),
-            ConstellationCmd::Present { all, devices, target } => {
-                cmd_constellation_present(&home, all, &devices, &target)
+            ConstellationCmd::Present { all, devices, remote, target } => {
+                if remote {
+                    cmd_constellation_present_remote(&home, &target)
+                } else {
+                    cmd_constellation_present(&home, all, &devices, &target)
+                }
+            }
+            ConstellationCmd::CosignServe { once, target } => {
+                cmd_constellation_cosign_serve(&home, once, &target)
             }
         },
         Command::Profile(p) => match p {
@@ -2590,6 +2617,171 @@ fn cmd_constellation_present(
     println!("  assurance tier (hub-resolved from ENROLLED devices): {tier}");
     if let Some(vu) = resp.get("valid_until").and_then(|v| v.as_str()) {
         println!("  valid_until: {vu}");
+    }
+    Ok(())
+}
+
+/// Resolve a confirmed pairing whose peer is `peer_uuid` → the pieces
+/// seal_over_pair/open_over_pair need (pairing, active detail, peer static key).
+fn pairing_channel_for(
+    pairings: &hestia::pairing::PairingStore,
+    peer_uuid: uuid::Uuid,
+    client: &HubClient,
+    rest: &str,
+    hub_id: uuid::Uuid,
+    rt: &tokio::runtime::Runtime,
+) -> AnyResult<(hestia::pairing::Pairing, hestia::pairing::PairView, web4_core::crypto::PublicKey)> {
+    let pairing = pairings.pairings.values().find(|p| p.peer_uuid == peer_uuid).cloned()
+        .ok_or_else(|| anyhow::anyhow!("no confirmed pairing with {peer_uuid} (`hub pair-request --to {peer_uuid}`)"))?;
+    let detail = rt.block_on(client.get_pair(rest, hub_id, pairing.pair_id))?;
+    if !detail.is_active() {
+        anyhow::bail!("pair with {peer_uuid} is not active");
+    }
+    let peer_lct = pairing.peer_lct_pubkey()?;
+    Ok((pairing, detail, peer_lct))
+}
+
+/// `constellation present --remote` — the OWNER side of cross-device MFA. Gets one
+/// hub challenge, has each remote device co-sign it over the device's confirmed
+/// pair (the device signs with ITS OWN key on ITS OWN machine), assembles the
+/// attestation, and presents. The hub resolves every device's key from enrollment.
+fn cmd_constellation_present_remote(home: &std::path::Path, target: &str) -> AnyResult<()> {
+    use hestia::constellation::{AssuranceLevel, ConstellationAttestation, CosignRequest, CosignResponse, DeviceSignature};
+    let mut vault = open_vault(home)?;
+    let mut store = ConstellationStore::load(&vault)?;
+    if store.members.is_empty() {
+        anyhow::bail!("no devices in the local constellation");
+    }
+    let hub_store = HubStore::load(&vault)?;
+    let conn = pick_connection(&hub_store, target)?;
+    let member_kp = member_signing_keypair(&vault, &conn.member_key_source)?;
+    let owner = conn.our_lct_id;
+    if store.owner_lct_id != Some(owner) {
+        store.owner_lct_id = Some(owner);
+        store.save(&mut vault)?;
+    }
+    let roster: Vec<uuid::Uuid> = store.members.iter().map(|m| m.lct_id).collect();
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let hub_id = conn.hub_lct_id;
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+
+    // 1. One channel + one challenge — every device signs the SAME nonce.
+    let channel = rt.block_on(client.open_channel(&conn.url, uuid::Uuid::new_v4()))
+        .context("opening channel to hub")?;
+    let challenge = rt.block_on(client.channel_query(&rest, &channel, &member_kp, owner, "constellation_challenge", serde_json::json!({})))?;
+    let nonce = challenge.get("nonce").and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("hub challenge missing nonce"))?.to_string();
+    let issued_at = chrono::Utc::now();
+    let payload = ConstellationAttestation::signing_payload(owner, &roster, &nonce, &issued_at);
+
+    let pairings = hestia::pairing::PairingStore::load(&vault)?;
+    let mut device_signatures: Vec<DeviceSignature> = Vec::new();
+    for m in &store.members {
+        // Local key → sign here. Else remote → co-sign over the pair.
+        if let Some(kp) = load_device_key(&vault, m.lct_id) {
+            device_signatures.push(DeviceSignature { lct_id: m.lct_id, device_type: m.device_type.clone(), pubkey_hex: m.pubkey_hex.clone(), signature: kp.sign(&payload).to_hex() });
+            println!("  local  co-sign: {} ({})", m.name, m.lct_id);
+            continue;
+        }
+        let (pairing, detail, peer_lct) = match pairing_channel_for(&pairings, m.lct_id, &client, &rest, hub_id, &rt) {
+            Ok(t) => t,
+            Err(e) => { println!("  skip {} ({}): {e}", m.name, m.lct_id); continue; }
+        };
+        let req = CosignRequest::new(owner, roster.clone(), nonce.clone(), issued_at, m.lct_id);
+        let body = hestia::pairing::seal_over_pair(&pairing, &detail, &member_kp, &peer_lct, &serde_json::to_vec(&req)?)?;
+        // remember the current tail so we only read the device's NEW reply
+        let start_seq = rt.block_on(client.get_pair_messages(&rest, hub_id, pairing.pair_id, None)).ok()
+            .and_then(|v| v.iter().map(|x| x.seq).max());
+        rt.block_on(client.post_pair_message(&rest, hub_id, owner, &member_kp, pairing.pair_id, body))
+            .with_context(|| format!("sending cosign request to {}", m.lct_id))?;
+        let mut got: Option<CosignResponse> = None;
+        for _ in 0..15 { // ~30s
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let msgs = rt.block_on(client.get_pair_messages(&rest, hub_id, pairing.pair_id, start_seq)).unwrap_or_default();
+            for msg in &msgs {
+                if msg.from != pairing.peer_uuid { continue; }
+                if let Ok(plain) = hestia::pairing::open_over_pair(&pairing, &detail, &member_kp, &peer_lct, &msg.payload) {
+                    if let Ok(resp) = serde_json::from_slice::<CosignResponse>(&plain) {
+                        if resp.kind == CosignResponse::KIND && resp.device_lct_id == m.lct_id { got = Some(resp); break; }
+                    }
+                }
+            }
+            if got.is_some() { break; }
+        }
+        match got {
+            Some(resp) => { device_signatures.push(DeviceSignature { lct_id: m.lct_id, device_type: m.device_type.clone(), pubkey_hex: resp.device_pubkey_hex, signature: resp.signature }); println!("  REMOTE co-sign: {} ({})", m.name, m.lct_id); }
+            None => println!("  no reply from {} ({}) — is `constellation cosign-serve` running there?", m.name, m.lct_id),
+        }
+    }
+
+    let att = ConstellationAttestation {
+        owner_lct_id: owner,
+        owner_pubkey_hex: member_kp.verifying_key().to_hex(),
+        member_lcts: roster,
+        challenge_nonce: nonce,
+        issued_at,
+        claimed_assurance: AssuranceLevel::SingleDevice,
+        owner_signature: member_kp.sign(&payload).to_hex(),
+        device_signatures,
+    };
+    let n = att.device_signatures.len();
+    let resp = rt.block_on(client.channel_query(&rest, &channel, &member_kp, owner, "present_constellation", serde_json::to_value(&att)?))
+        .context("presenting the assembled attestation")?;
+    println!("Presented ({n} co-sign(s), incl. any remote).");
+    println!("  assurance tier (hub-resolved from ENROLLMENT): {}", resp.get("assurance").and_then(|v| v.as_str()).unwrap_or("?"));
+    Ok(())
+}
+
+/// `constellation cosign-serve` — the DEVICE side. Drains co-sign requests from
+/// confirmed pairs, co-signs each with this device's member key (bounded to the
+/// exact challenge), and replies over the same pair. Run on every machine that is
+/// a device in a constellation.
+fn cmd_constellation_cosign_serve(home: &std::path::Path, once: bool, target: &str) -> AnyResult<()> {
+    use hestia::constellation::CosignRequest;
+    let mut vault = open_vault(home)?;
+    let hub_store = HubStore::load(&vault)?;
+    let conn = pick_connection(&hub_store, target)?;
+    let member_kp = member_signing_keypair(&vault, &conn.member_key_source)?;
+    let my_lct = conn.our_lct_id; // the identity the owner enrolled + pairs against
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let hub_id = conn.hub_lct_id;
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+    println!("cosign-serve: device {my_lct} draining confirmed pairs (once={once})");
+    loop {
+        let mut pairings = hestia::pairing::PairingStore::load(&vault)?;
+        let mut advanced = false;
+        let snapshot: Vec<hestia::pairing::Pairing> = pairings.pairings.values().cloned().collect();
+        for p in &snapshot {
+            let detail = match rt.block_on(client.get_pair(&rest, hub_id, p.pair_id)) { Ok(d) if d.is_active() => d, _ => continue };
+            let peer_lct = match p.peer_lct_pubkey() { Ok(k) => k, Err(_) => continue };
+            let since = pairings.cursor(&p.pair_id);
+            let msgs = match rt.block_on(client.get_pair_messages(&rest, hub_id, p.pair_id, since)) { Ok(m) => m, Err(_) => continue };
+            for m in &msgs {
+                if m.from != p.peer_uuid { pairings.set_cursor(p.pair_id, m.seq); advanced = true; continue; }
+                if let Ok(plain) = hestia::pairing::open_over_pair(p, &detail, &member_kp, &peer_lct, &m.payload) {
+                    if let Ok(req) = serde_json::from_slice::<CosignRequest>(&plain) {
+                        if req.kind == CosignRequest::KIND {
+                            match req.cosign(my_lct, &member_kp, chrono::Duration::minutes(5), chrono::Duration::minutes(2), chrono::Utc::now()) {
+                                Ok(resp) => {
+                                    if let Ok(body) = hestia::pairing::seal_over_pair(p, &detail, &member_kp, &peer_lct, &serde_json::to_vec(&resp).unwrap_or_default()) {
+                                        let _ = rt.block_on(client.post_pair_message(&rest, hub_id, my_lct, &member_kp, p.pair_id, body));
+                                        println!("  co-signed for owner {} (nonce {})", req.owner_lct_id, &req.challenge_nonce[..8.min(req.challenge_nonce.len())]);
+                                    }
+                                }
+                                Err(e) => println!("  refused cosign from {}: {e}", p.peer_uuid),
+                            }
+                        }
+                    }
+                }
+                pairings.set_cursor(p.pair_id, m.seq);
+                advanced = true;
+            }
+        }
+        if advanced { pairings.save(&mut vault)?; }
+        if once { break; }
+        std::thread::sleep(std::time::Duration::from_secs(5));
     }
     Ok(())
 }
