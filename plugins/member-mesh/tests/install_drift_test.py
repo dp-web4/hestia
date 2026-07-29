@@ -36,6 +36,32 @@ Properties asserted:
   E. --check EXITS 1 ON DRIFT AND ON UNPINNED, and 0 only when both are clean. An
      audit that cannot fail is the thing this whole class of bug is made of.
 
+WHAT THE FIRST REAL RUN FOUND (kimi's review of this PR, notice 352, 2026-07-29). The
+pin refusal above covers ONE variable, and one variable was not the question. kimi's
+deployed hook carried an inline
+
+    OUT=$(HESTIA_ROLE=role:constellation:interactive-dev python3 ... peek)
+
+that the merged copy does not have. The sync dropped it and printed "synced". The
+member kept its ID and lost its GRAIN — `hestia-mesh.py`'s own docstring says an absent
+`HESTIA_ROLE` normalizes to `role:constellation:member`, a different member-shape than
+the one whose acts were being judged. kimi caught it by reading the diff by hand; the
+installer said nothing. So:
+
+  F. THE SYNC MUST REFUSE WHAT IT WOULD SILENTLY TAKE AWAY. Any `HESTIA_*` the deployed
+     hook assigns and the config command line does not is destroyed by the overwrite.
+     Refuse it, name it, write nothing — the same shape as C, generalized off the single
+     variable that happened to be noticed first. A guard covering one variable and silent
+     about the rest is not a guard, it is a coincidence.
+  G. A MEMBER WITH NO ROLE ANYWHERE IS REPORTED. Not a sync hazard — a standing one, and
+     live on CBP today: `~/.codex/config.toml` pins `HESTIA_MESH_PLUGIN` and no role, and
+     its deployed hook has none either, so codex has been connecting on the daemon's
+     default grain the whole time. Nothing was going to say so, because "pinned" was
+     printed as if it were the whole answer.
+  H. A COMMENTED-OUT HOOK LINE IS NOT A PIN. The original pin check grepped the raw file,
+     so a disabled config line read as "pinned" and unlocked the sync that darkens the
+     member. Found by generalizing the check, not by anyone hitting it.
+
 Hermetic: a fake HOME, a stub CLI, no daemon, no git, no network.
 """
 import hashlib
@@ -73,6 +99,17 @@ def tree_hash(root):
     return h.hexdigest()
 
 
+def member_line(stdout, member):
+    """The audit line for one member. Asserting against whole stdout is not enough: the
+    trailer says 'DRIFT or UNPINNED member found', so a test looking for 'UNPINNED'
+    anywhere passes on a drifted tree with every member pinned. Two of these assertions
+    were written that way first and went green against the unfixed script."""
+    for line in stdout.splitlines():
+        if line.startswith("  ") and line.split()[0:1] == [member]:
+            return line
+    return ""
+
+
 def run(args, home):
     return subprocess.run(
         ["sh", INSTALL] + args,
@@ -93,8 +130,22 @@ sys.exit(0)
 '''
 
 
-def member_home(pin_claude=True, pin_kimi=False, stale=True):
-    """A fake HOME with claude-code + kimi-code installed; kimi unpinned like the real box."""
+# A stale deployed hook that carries a member's own inline role — kimi's real pre-sync
+# copy, reduced to the one line that matters. This is the edit the sync destroys.
+INLINE_ROLE_LINE = (
+    'OUT=$(HESTIA_ROLE=role:constellation:interactive-dev '
+    'python3 "$(dirname "$0")/hestia-mesh.py" peek 2>/dev/null)\n'
+)
+
+
+def member_home(pin_claude=True, pin_kimi=False, stale=True,
+                pin_role=True, inline_role=(), comment_out=()):
+    """A fake HOME with claude-code + kimi-code installed; kimi unpinned like the real box.
+
+    pin_role     — put HESTIA_ROLE on the config command line (the only place it survives)
+    inline_role  — members whose DEPLOYED hook assigns HESTIA_ROLE itself (stale only)
+    comment_out  — members whose config hook line is commented out rather than absent
+    """
     home = tempfile.mkdtemp(prefix="mesh-install-home-")
     layout = {
         "claude-code": (os.path.join(home, ".claude", "hooks", "member-mesh"),
@@ -107,14 +158,19 @@ def member_home(pin_claude=True, pin_kimi=False, stale=True):
         for f in ("hestia-mesh.py", "session-mesh-inbox.sh"):
             dest = os.path.join(hooks, f)
             if stale:
+                body = "#!/bin/sh\n# stale pre-#108 copy\n"
+                if f == "session-mesh-inbox.sh" and member in inline_role:
+                    body += INLINE_ROLE_LINE
                 with open(dest, "w") as fh:
-                    fh.write("#!/bin/sh\n# stale pre-#108 copy\nexit 0\n")
+                    fh.write(body + "exit 0\n")
             else:
                 shutil.copy(os.path.join(SRC, f), dest)
             os.chmod(dest, 0o755)
         pin = f"HESTIA_MESH_PLUGIN={member} " if pinned else ""
+        role = "HESTIA_ROLE=role:constellation:interactive-dev " if pin_role else ""
+        lead = "# " if member in comment_out else ""
         with open(config, "w") as fh:
-            fh.write(f'command = "{pin}{hooks}/session-mesh-inbox.sh"\n')
+            fh.write(f'{lead}command = "{pin}{role}{hooks}/session-mesh-inbox.sh"\n')
     return home, layout
 
 
@@ -182,7 +238,66 @@ p = run(["--check"], unpinned)
 check(p.returncode == 1, f"E3. current but unpinned still exits 1 — the hazard is latent, not absent",
       p.stdout)
 
-for d in (fix, home, clean, drifted, unpinned):
+print("F. sync refuses to silently take away what only the deployed copy carries")
+lossy, llay = member_home(pin_kimi=True, pin_role=False, inline_role=("kimi-code",))
+kimi_hook = os.path.join(llay["kimi-code"][0], "session-mesh-inbox.sh")
+with open(kimi_hook, "rb") as fh:
+    lossy_before = fh.read()
+p = run(["kimi-code"], lossy)
+check(p.returncode == 2, f"F1. sync exits 2 when the overwrite would drop a variable (got {p.returncode})",
+      p.stdout)
+check("HESTIA_ROLE" in p.stdout,
+      "F2. and NAMES the variable — kimi had to read the diff by hand to find it", p.stdout)
+with open(kimi_hook, "rb") as fh:
+    check(fh.read() == lossy_before, "F3. the refused member's hook is byte-for-byte untouched")
+check(not os.path.exists(kimi_hook + ".pre-sync.bak"),
+      "F4. and no half-done backup was left behind")
+p = run(["--check"], lossy)
+check("HESTIA_ROLE" in member_line(p.stdout, "kimi-code"),
+      "F5. --check names the pending loss on that member's own line, before anyone syncs",
+      repr(member_line(p.stdout, "kimi-code")))
+
+# The negative control: the SAME inline assignment is harmless once the config also
+# carries it, because then the overwrite takes nothing away. The refusal is about LOSS,
+# not about the mere presence of a hand edit — otherwise it would just block every sync.
+kept, klay = member_home(pin_kimi=True, pin_role=True, inline_role=("kimi-code",))
+p = run(["kimi-code"], kept)
+check(p.returncode == 0,
+      f"F6. same inline assignment, but pinned in the config too: sync proceeds (got {p.returncode})",
+      p.stdout)
+with open(os.path.join(klay["kimi-code"][0], "session-mesh-inbox.sh"), "rb") as a, \
+        open(os.path.join(SRC, "session-mesh-inbox.sh"), "rb") as b:
+    check(a.read() == b.read(), "F7. and lands byte-identical to the repo")
+
+print("G. a member with no role anywhere is reported, not passed as 'pinned'")
+noroleh, _ = member_home(pin_claude=True, pin_kimi=True, stale=False, pin_role=False)
+p = run(["--check"], noroleh)
+check(p.returncode == 1,
+      f"G1. current + pinned but roleless still exits 1 — the grain is off (got {p.returncode})", p.stdout)
+check("NO-ROLE" in member_line(p.stdout, "kimi-code"),
+      "G2. and says it on the roleless member's own line, not as a tree-wide trailer",
+      repr(member_line(p.stdout, "kimi-code")))
+withrole, _ = member_home(pin_claude=True, pin_kimi=True, stale=False, pin_role=True)
+p = run(["--check"], withrole)
+check(p.returncode == 0, f"G3. and a fully declared tree is still clean (got {p.returncode})", p.stdout)
+
+print("H. a commented-out hook line is not a pin")
+commented, clay = member_home(pin_kimi=True, comment_out=("kimi-code",))
+p = run(["--check"], commented)
+check("UNPINNED" in member_line(p.stdout, "kimi-code"),
+      "H1. a disabled config line reads as UNPINNED on that member's line, not as a pin",
+      repr(member_line(p.stdout, "kimi-code")))
+kimi_hook = os.path.join(clay["kimi-code"][0], "session-mesh-inbox.sh")
+with open(kimi_hook, "rb") as fh:
+    commented_before = fh.read()
+p = run(["kimi-code"], commented)
+check(p.returncode == 2,
+      f"H2. and sync refuses it rather than syncing on a pin nothing executes (got {p.returncode})",
+      p.stdout)
+with open(kimi_hook, "rb") as fh:
+    check(fh.read() == commented_before, "H3. leaving the file untouched")
+
+for d in (fix, home, clean, drifted, unpinned, lossy, kept, noroleh, withrole, commented):
     shutil.rmtree(d, ignore_errors=True)
 
 print()
