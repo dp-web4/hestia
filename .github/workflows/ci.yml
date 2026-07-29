@@ -76,3 +76,45 @@ jobs:
       - name: Test
         working-directory: hestia/core
         run: cargo test --locked
+
+  # ADDITION, 2026-07-29 (CBP): `cargo test` was the whole gate, and the Rust crate is
+  # not the whole repo. Three plugin directories hold real behavioural tests — member-mesh
+  # runs the actual watcher and fire scripts against a stub daemon, plus claude-code's law
+  # injection and gemini's fail-closed wrapper — and NOTHING RAN ANY OF THEM. FIVE test
+  # files, green today, gating nothing: a check nobody consults is indistinguishable from a
+  # check that does not exist, which is the same absence-as-OK shape the tests themselves
+  # are about. Found while adding a sixth (identity refusal, #108 follow-up), where the
+  # honest question was whether adding it changed anything. It did not, until this job.
+  # The count is stated only to date it; the glob below, not this comment, is the gate.
+  #
+  # DISCOVERED, not listed, for the reason the job above chooses no cargo target: which
+  # tests a green covers must be a property of the repo, not of whoever last edited this
+  # file. A new `*_test.py` is gated the day it is written, by the author least able to
+  # notice it was not. The glob is the gate; `set -e` in the loop makes one red fail the job.
+  #
+  # No web4 sibling and no toolchain: these are hermetic Python — each spins its own stub
+  # HTTP daemon on an ephemeral port. If that ever stops being true, this job is where it
+  # will show up as a hang rather than as a lie.
+  plugin-tests:
+    name: plugin tests (python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run every plugins/*/tests/*_test.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tests=(plugins/*/tests/*_test.py)
+          if [ ${#tests[@]} -eq 0 ]; then
+            echo "::error::no plugin tests discovered — the glob or the layout moved"
+            exit 1
+          fi
+          echo "discovered ${#tests[@]} test file(s):"
+          printf '  %s\n' "${tests[@]}"
+          for t in "${tests[@]}"; do
+            echo "::group::$t"
+            python3 "$t"
+            echo "::endgroup::"
+          done

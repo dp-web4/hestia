@@ -182,15 +182,35 @@ rather than a partial one; the two compose.
 
 ## 5. Class D — attacking the record
 
-### D1. Identity spoofing
+### D1. Identity spoofing ⚠️ **DEMONSTRATED, unintentionally**
 **Mechanism.** `HESTIA_ROLE`, `HESTIA_PLUGIN_ID` and `HESTIA_MESH_PLUGIN` are read from the
 environment, so an agent can witness *as someone else* — polluting another member's trust
 and hiding its own conduct.
-**Status.** INFERRED; the env reads are confirmed in source.
+**Status.** MEASURED, 2026-07-29, and not by design. `plugins/member-mesh/hestia-mesh.py`
+defaulted `HESTIA_MESH_PLUGIN` to `kimi-code` — correct when the file was one member's
+private surface, wrong once it became the fleet's notification path. With the env unset,
+**claude-code connected as kimi-code three times** while using the tool exactly as
+documented. No error, and — the part that makes this D1 rather than a config bug — no
+*anonymous* act either: each was a well-formed act attributed to a specific real member.
+It surfaced only by accident, because the third attempt happened to address kimi-code and
+tripped the `hestia.member_notify_self` no-op check. Addressed to any other member it
+would have succeeded silently and settled into kimi's trust record.
+**What that upgrades.** The env read was already confirmed in source; what was inferred was
+that it *reaches the record*. It does. The `tool_connect` guard rejects `plugin_id`s
+containing `/` — that closes the drain-key-confusion variant, not impersonation; a bare
+`kimi-code` passes. Disclosed in PR #108 rather than quietly rewritten, on the D3 precedent.
 **Precedent, non-adversarial:** codex reported under two identities (`codex`, `codex-cli`)
 for days purely by misconfiguration. If a mistake produced a split identity, an intent can.
-**Detection.** WEAK. The daemon accepts the claimed id. The identity-alias mechanism can
-*reconcile* a split after the fact but cannot detect a lie at the time.
+**Detection.** WEAK, and unchanged by the above. The daemon accepts the claimed id. The
+identity-alias mechanism can *reconcile* a split after the fact but cannot detect a lie at
+the time. Note what actually caught this one: a *self*-notify check, i.e. the impersonation
+was visible only because the impersonator addressed the impersonated. That is not detection.
+**Mitigated, partially (PR #108).** The client now refuses to act without an explicit
+member id — `exit 2` before connecting, so no act is minted on the refusal path — and
+derives `HESTIA_MESH_HOST_AGENT` from it rather than pinning a second member's name. This
+removes the *accidental* case only. The deliberate case is untouched: server-side, identity
+is still client-asserted (HST-005), and today the difference between an honest member and a
+forged one is an environment variable.
 **Mitigation direction.** Bind identity to something the agent cannot assert — a per-plugin
 key issued at install, signing each request. Currently unbuilt; this is the deepest
 structural gap in the record's integrity.
@@ -280,7 +300,7 @@ B1 gets it for free.
 | **C1 budget starvation** | **not via chain** | same sweep | **gap** |
 | C2 9p slowness | yes | inventory `FRAGILE` | ✅ (issue #45) |
 | C3 missing fallback | yes | inventory dead-target stat | ✅ |
-| D1 identity spoofing | weak | convergence across witnesses | **structural gap** |
+| **D1 identity spoofing** | **no — a self-notify no-op caught it** | convergence across witnesses | **structural gap** (accidental case closed, #108) |
 | **D3 third-party reputation poisoning** | **no — a human caught it** | — | **structural gap** |
 | D2 non-witnessing | no | — | **accepted limit** |
 | E1 obfuscation | poor | — | **accepted limit** |
