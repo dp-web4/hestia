@@ -78,6 +78,9 @@ impl ServerHandler for HestiaServer {
             "hestia_appeal" => tool_appeal(&self.state, &args).await,
             "hestia_arbitrate_appeal" => tool_arbitrate_appeal(&self.state, &args).await,
             "hestia_open_appeals" => tool_open_appeals(&self.state, &args).await,
+            "hestia_gate_escalation_open" => tool_gate_escalation_open(&self.state, &args).await,
+            "hestia_gate_escalation_poll" => tool_gate_escalation_poll(&self.state, &args).await,
+            "hestia_gate_escalation_claim" => tool_gate_escalation_claim(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
             "hestia_operating_law" => tool_operating_law(&self.state, &args).await,
@@ -241,6 +244,18 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_open_appeals",
             "List appeals nobody has ruled on yet, with the ruling-ready deny_hash for each. Designation is ADVISORY — hestia_arbitrate_appeal never reads it — so any admissible member may rule any of these; pass your session_id and each entry tells you whether you are one. Read-only. This is the discovery surface an arbiter needs: before it existed, a non-designated member had the authority to rule and no way to learn there was anything open",
+        ),
+        t(
+            "hestia_gate_escalation_open",
+            "Ask a HUMAN to approve a write to the governance surface (gate, witness, law_inject, the registration). Stage 2 of dp's 2026-07-29 ruling: the gate refuses these writes, and this is the channel that un-refuses a legitimate one. Returns an escalation_id and a deadline; NO DECISION WITHIN THE WINDOW IS A DENY, not a retry. Witnessed on open. Assurance A1: the operator shares this UID, so approval is tamper-EVIDENT, not tamper-proof",
+        ),
+        t(
+            "hestia_gate_escalation_claim",
+            "Claim a human's approval for a write to the governance surface, or open an escalation and REFUSE. One round trip, because a hook that outlives its harness timeout is killed and the tool then runs ANYWAY — so nothing waits in-hook. Either an approval already exists for this exact (member, file) and is spent here (single use), or the write is refused now and a human decides out of band; re-issue the write to use the approval",
+        ),
+        t(
+            "hestia_gate_escalation_poll",
+            "Read the verdict on an escalation you opened. Read-only and deliberately NOT witnessed — a wait is not an act, and witnessing every poll would bury the opened/decided entries under one member's loop. Only status `approved` permits the write; `pending`, `denied`, `expired` and an UNKNOWN id all refuse, the last two identically on purpose",
         ),
         t(
             "hestia_witness_decision",
@@ -8721,5 +8736,210 @@ mod authority_attribution_tests {
             vget.event_data["plugin_id"], json!("random-attributed-caller"),
             "the witness names the reader — never the bystander ({bystander})"
         );
+    }
+}
+
+// ---------------------------------------------------------------- gate escalation (stage 2)
+//
+// dp, 2026-07-29: "escalate to human for approval (there are legit times when we are actually
+// working on the file), deny on timeout of a couple minutes."
+//
+// Two tools, and the split matters: `open` mutates and is witnessed, `poll` is read-only and is
+// NOT witnessed. Witnessing every poll would bury the chain under one member's wait loop and make
+// the interesting entries — opened, decided — impossible to find. The wait is not an act.
+
+async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::gate_escalation::{now_secs, DEFAULT_TTL_SECS};
+
+    let plugin_id = require_string(args, "plugin_id")?;
+    let tool_name = require_string(args, "tool_name")?;
+    let marker = require_string(args, "marker")?;
+    let role = optional_string(args, "role").unwrap_or_default();
+    let now = now_secs();
+
+    let mut s = state.lock().await;
+    let esc = match s
+        .gate_escalations
+        .open(&plugin_id, &role, &tool_name, &marker, now, DEFAULT_TTL_SECS)
+    {
+        Ok(e) => e,
+        // A refusal to OPEN is itself a deny of the write, so it is witnessed rather than
+        // returned as a bare error the caller might log and forget.
+        Err(e) => {
+            let _ = s.append_chain(
+                "gate_escalation_refused",
+                json!({
+                    "plugin_id": plugin_id,
+                    "tool_name": tool_name,
+                    "marker": marker,
+                    "why": e.to_string(),
+                }),
+            );
+            return Err(anyhow::anyhow!("{e}"));
+        }
+    };
+
+    let entry = s.append_chain(
+        "gate_escalation_opened",
+        json!({
+            "escalation_id": esc.id,
+            "plugin_id": esc.plugin_id,
+            "subject_instance_lct": s.member_lct(&esc.plugin_id),
+            "role": esc.role,
+            "tool_name": esc.tool_name,
+            "marker": esc.marker,
+            "expires_at": esc.expires_at,
+            "ttl_secs": DEFAULT_TTL_SECS,
+            // Recorded so a reader is never left inferring it from silence.
+            "assurance": "A1 — cooperative gate, same-UID operator. This escalation is \
+                          tamper-EVIDENT, not tamper-proof.",
+        }),
+    )?;
+
+    Ok(json!({
+        "escalation_id": esc.id,
+        "status": esc.stored_status(),
+        "expires_at": esc.expires_at,
+        "ttl_secs": DEFAULT_TTL_SECS,
+        "witnessEntryHash": entry.hash,
+        "how_to_decide": format!(
+            "hestia gate approve {id}   (or: hestia gate deny {id} --reason '...')",
+            id = esc.id
+        ),
+        "on_timeout": "DENIED — no decision within the window is a refusal, not a retry",
+    }))
+}
+
+async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::gate_escalation::now_secs;
+
+    let id = require_string(args, "escalation_id")?;
+    let now = now_secs();
+    let s = state.lock().await;
+    let status = s.gate_escalations.status_of(&id, now);
+    let esc = s.gate_escalations.get(&id);
+
+    Ok(json!({
+        "escalation_id": id,
+        "status": status,
+        "permits_write": status.permits_write(),
+        "secs_remaining": esc.map(|e| e.secs_remaining(now)).unwrap_or(0),
+        "decided_by": esc.and_then(|e| e.decided_by.clone()),
+        "decided_via": esc.and_then(|e| e.decided_via),
+        "reason": esc.and_then(|e| e.reason.clone()),
+        // An id this daemon has never seen and an id whose window closed are the SAME answer on
+        // purpose. The caller's only safe reading of "I do not know" is "no".
+        "note": if esc.is_none() {
+            "unknown escalation_id — treated as expired (a restart drops the store, and an \
+             in-flight escalation must then read as denied)"
+        } else {
+            "authoritative as of now; only `approved` permits the write"
+        },
+    }))
+}
+
+/// Claim an existing approval for this governance write, or open an escalation and refuse.
+///
+/// ONE round trip, because the hook has a 5-second harness budget and a hook the harness kills
+/// runs the tool anyway (kimi-code, PR #114 review — the in-hook wait failed OPEN). So the hook
+/// never waits: it asks this once, and either an approval was already granted and is spent here,
+/// or the write is refused and a human decides out of band.
+async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::gate_escalation::{now_secs, APPROVAL_CLAIM_WINDOW_SECS, DEFAULT_TTL_SECS};
+
+    let plugin_id = require_string(args, "plugin_id")?;
+    let tool_name = require_string(args, "tool_name")?;
+    let marker = require_string(args, "marker")?;
+    let role = optional_string(args, "role").unwrap_or_default();
+    let now = now_secs();
+
+    let mut s = state.lock().await;
+
+    if let Some(esc) = s.gate_escalations.claim(&plugin_id, &marker, now) {
+        // Spending an approval is an ACT and is witnessed. The approval itself was already
+        // recorded when it was decided; this entry is what ties it to the write it authorised,
+        // without which the record would show a permission granted and never show it used.
+        let entry = s.append_chain(
+            "gate_escalation_claimed",
+            json!({
+                "escalation_id": esc.id,
+                "plugin_id": esc.plugin_id,
+                "subject_instance_lct": s.member_lct(&esc.plugin_id),
+                "tool_name": tool_name,
+                "marker": esc.marker,
+                "decided_by": esc.decided_by,
+                "decided_via": esc.decided_via,
+                "reason": esc.reason,
+                "secs_from_decision_to_use": now.saturating_sub(esc.opened_at),
+            }),
+        );
+        return Ok(json!({
+            "claimed": true,
+            "permits_write": true,
+            "escalation_id": esc.id,
+            "decided_by": esc.decided_by,
+            "decided_via": esc.decided_via,
+            "reason": esc.reason,
+            "single_use": "this approval is now spent; the next write needs a new one",
+            "witnessEntryHash": entry.ok().map(|e| e.hash),
+        }));
+    }
+
+    // Nothing to claim, so this write is REFUSED. Opening an escalation is not a maybe — it is
+    // the paperwork attached to a refusal that already happened.
+    match s
+        .gate_escalations
+        .open(&plugin_id, &role, &tool_name, &marker, now, DEFAULT_TTL_SECS)
+    {
+        Ok(esc) => {
+            let entry = s.append_chain(
+                "gate_escalation_opened",
+                json!({
+                    "escalation_id": esc.id,
+                    "plugin_id": esc.plugin_id,
+                    "subject_instance_lct": s.member_lct(&esc.plugin_id),
+                    "role": esc.role,
+                    "tool_name": esc.tool_name,
+                    "marker": esc.marker,
+                    "expires_at": esc.expires_at,
+                    "assurance": "A1 — cooperative gate, same-UID operator. Tamper-EVIDENT, \
+                                  not tamper-proof.",
+                }),
+            )?;
+            Ok(json!({
+                "claimed": false,
+                "permits_write": false,
+                "escalation_id": esc.id,
+                "expires_at": esc.expires_at,
+                "decide_within_secs": DEFAULT_TTL_SECS,
+                "retry_within_secs": DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS,
+                "witnessEntryHash": entry.hash,
+                "how_to_decide": format!(
+                    "hestia gate approve {id} --reason '...'   (or: hestia gate deny {id})",
+                    id = esc.id
+                ),
+                "then": "RE-ISSUE the same write; it will claim the approval. The write is \
+                         refused right now, and stays refused until it is retried after a \
+                         human approves.",
+            }))
+        }
+        Err(e) => {
+            let _ = s.append_chain(
+                "gate_escalation_refused",
+                json!({
+                    "plugin_id": plugin_id, "tool_name": tool_name,
+                    "marker": marker, "why": e.to_string(),
+                }),
+            );
+            // Still a refusal of the write — reported as one rather than as a tool error the
+            // caller might read as "inconclusive".
+            Ok(json!({
+                "claimed": false,
+                "permits_write": false,
+                "escalation_id": Value::Null,
+                "error": e.to_string(),
+                "then": "the write is refused",
+            }))
+        }
     }
 }

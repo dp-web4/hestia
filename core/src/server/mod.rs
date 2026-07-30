@@ -5,6 +5,7 @@
 
 mod agents;
 mod dashboard;
+pub mod gate_escalation;
 mod handler;
 mod http;
 pub mod operator_auth;
