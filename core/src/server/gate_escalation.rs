@@ -138,6 +138,15 @@ pub struct Escalation {
     pub opened_at: u64,
     pub expires_at: u64,
     status: Status,
+    /// When a human actually decided. `None` while Pending.
+    ///
+    /// Recorded because `decided_by` and `decided_via` without a timestamp cannot answer the
+    /// one question an attribution record is asked after the fact: how long the approval sat
+    /// before it was spent. kimi-code, PR #114 review — `secs_from_decision_to_use` was
+    /// computed from `opened_at`, so a decision at T+119 was reported as ~2 minutes of use-lag
+    /// that never happened. A mislabeled duration in a record whose point is attribution is
+    /// what a future argument gets built on.
+    pub decided_at: Option<u64>,
     pub decided_by: Option<String>,
     pub decided_via: Option<Channel>,
     pub reason: Option<String>,
@@ -333,6 +342,7 @@ impl EscalationStore {
             opened_at: now,
             expires_at: now.saturating_add(ttl_secs.max(1)),
             status: Status::Pending,
+            decided_at: None,
             decided_by: None,
             decided_via: None,
             reason: None,
@@ -418,6 +428,7 @@ impl EscalationStore {
             Status::Pending => {}
         }
         esc.status = if approve { Status::Approved } else { Status::Denied };
+        esc.decided_at = Some(now);
         esc.decided_by = Some(decided_by.trim().to_string());
         esc.decided_role = Some(decided_role.trim().to_string()).filter(|r| !r.is_empty());
         esc.decided_via = Some(via);
@@ -715,6 +726,42 @@ mod tests {
         );
         // And it did not mutate on the way out.
         assert_eq!(s.status_of(&id, T0 + 1), Status::Pending);
+    }
+
+    #[test]
+    fn a_decision_records_when_it_was_made_not_when_it_was_asked_for() {
+        // The record carried `secs_from_decision_to_use` computed from `opened_at`, which is a
+        // different duration wearing the decision's name. Approve at T0+119 and spend at T0+120:
+        // the honest answer is 1 second, and the old arithmetic said 120.
+        let (mut s, id) = store_with_one();
+        let decided = s
+            .decide(&id, true, "dp", Channel::OperatorSession, Some("legit gate edit"), T0 + 119)
+            .expect("decide");
+        assert_eq!(decided.decided_at, Some(T0 + 119));
+        assert_ne!(
+            decided.decided_at,
+            Some(decided.opened_at),
+            "a decision that lands 119s after the ask must not be recorded at the ask"
+        );
+
+        let now = T0 + 120;
+        let claimed = s.claim("claude-code", "pre_tool_use.py", now).expect("claim");
+        let from_decision = now - claimed.decided_at.expect("a claimed approval was decided");
+        let from_open = now - claimed.opened_at;
+        assert_eq!(from_decision, 1, "decision -> use");
+        assert_eq!(from_open, 120, "open -> use");
+        assert_ne!(
+            from_decision, from_open,
+            "if these ever coincide the test cannot tell the mislabeled field from the fixed one"
+        );
+    }
+
+    #[test]
+    fn a_pending_escalation_has_no_decision_time() {
+        // The absent case has to stay absent: a default of `opened_at` here would silently
+        // reintroduce the same wrong number through the back door.
+        let (s, id) = store_with_one();
+        assert_eq!(s.get(&id).unwrap().decided_at, None);
     }
 
     #[test]

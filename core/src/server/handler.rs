@@ -8880,7 +8880,17 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                 "decided_by": esc.decided_by,
                 "decided_via": esc.decided_via,
                 "reason": esc.reason,
-                "secs_from_decision_to_use": now.saturating_sub(esc.opened_at),
+                // TWO durations, because they answer different questions and the single field
+                // that used to be here answered neither honestly: it was named for the decision
+                // and computed from `opened_at`. kimi-code, PR #114 review.
+                //
+                // Null rather than a fallback when `decided_at` is absent. A claimed escalation
+                // is always Approved and therefore always decided, so this should not occur —
+                // and if it ever does, a missing number is a fact while a substituted one is a
+                // lie in the exact record used to argue about who authorised what.
+                "decided_at": esc.decided_at,
+                "secs_from_decision_to_use": esc.decided_at.map(|d| now.saturating_sub(d)),
+                "secs_from_open_to_use": now.saturating_sub(esc.opened_at),
             }),
         );
         return Ok(json!({
