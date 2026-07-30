@@ -1517,7 +1517,11 @@ async fn operator_gate_escalation(
         &d.id,
         d.approve,
         "operator",
+        // The SOVEREIGN role, named as a role. Who or what fills it is contingent; the
+        // authority is not. dp, 2026-07-30.
+        "role:constellation:sovereign",
         Channel::OperatorSession,
+        None,
         d.reason.as_deref(),
         now,
     ) {
@@ -1532,6 +1536,7 @@ async fn operator_gate_escalation(
                     "marker": esc.marker,
                     "status": esc.stored_status(),
                     "decided_by": esc.decided_by,
+                    "decided_role": esc.decided_role,
                     "decided_via": esc.decided_via,
                     "reason": esc.reason,
                     "secs_into_window": now.saturating_sub(esc.opened_at),
