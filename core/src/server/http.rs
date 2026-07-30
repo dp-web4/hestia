@@ -1539,6 +1539,12 @@ async fn operator_gate_escalation(
                     "decided_role": esc.decided_role,
                     "decided_via": esc.decided_via,
                     "reason": esc.reason,
+                    // Bar, evidence, sufficiency — recorded together (dp + claude-code,
+                    // 2026-07-30): a reader should never have to infer whether the evidence
+                    // was enough from the fact that someone said yes.
+                    "bar": esc.bar,
+                    "factors_present": esc.factors,
+                    "bar_met": esc.bar_met(),
                     "secs_into_window": now.saturating_sub(esc.opened_at),
                 }),
             );

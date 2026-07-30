@@ -125,6 +125,79 @@ pub enum Channel {
     PeerMember,
 }
 
+/// A stated evidence threshold — the bar an approval must clear, RECORDED on the escalation
+/// so a reader can audit "sufficient for this context" instead of inferring sufficiency from
+/// the fact that a decision happened.
+///
+/// dp, 2026-07-30: "no single auth point is 100% trustworthy. this is why we build
+/// constellations, which provide many-factor preponderance of evidence. absolute proof is
+/// unachievable. but enough-for-this absolutely is achievable… sufficient evidence to pass
+/// the trust bar in a specific context." And claude-code, same day: "we record the evidence
+/// and we record the verdict. We do not record the bar… 'sufficient for this context' is
+/// unauditable if the context's bar is never written down."
+///
+/// This is the bar, written down. It is not a wall: at A1 every factor is same-UID evidence,
+/// so a met bar is *stated sufficiency*, not proof. What it changes is that a reader can now
+/// see the criterion, the factors present, and whether they met it — the mismatch becomes a
+/// recorded fact instead of an implicit one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bar {
+    /// One decision from a sovereign channel (operator session / operator CLI) OR a NOT-SAME
+    /// peer — the everyday rule since #114 + #118.
+    SingleApprover,
+    /// One sovereign-channel factor AND one not-same-peer factor — for the surfaces whose
+    /// silent compromise is the whole model.
+    SovereignPlusPeer,
+}
+
+/// The bar a governance file's write must clear. This is POLICY, stated in one place so a
+/// change is a reviewed diff — and copied onto every escalation at open, so the record
+/// carries the criterion that was in force at the time, not today's.
+///
+/// The surfaces differ because the stakes differ: the enforcement path and the outcome
+/// recorder are the two files whose silent compromise ends the model (a gate that permits
+/// everything, a recorder that writes nothing), so they ask for two factors from different
+/// channels; a law renderer is one approver's call. NOTE for the steward: on a box with no
+/// operator session configured, the sovereign half of `SovereignPlusPeer` is hard to reach —
+/// which makes enforcement-path writes wait rather than proceed under a weaker bar. That is
+/// the honest state, and it is visible here rather than implicit. If that is the wrong
+/// trade, this is the one line to change.
+pub fn bar_for(marker: &str) -> Bar {
+    if marker.contains("pre_tool_use.py")
+        || marker.contains("post_tool_use.py")
+        || marker.contains("witness.py")
+    {
+        Bar::SovereignPlusPeer
+    } else {
+        Bar::SingleApprover
+    }
+}
+
+/// One piece of evidence present for a decision. The channels ARE the factor types
+/// (claude-code, 2026-07-30: "Channel — phrase / peer / operator session — I wrote as
+/// alternatives, any one of which approves. They're factor types."); `independence` is the
+/// weighting, already recorded elsewhere. A bar is evaluated against the SET, never against
+/// whichever answer arrived first.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Factor {
+    pub channel: Channel,
+    pub by: String,
+    pub role: Option<String>,
+    pub independence: Option<crate::arbiter::Independence>,
+    pub at: u64,
+}
+
+impl Channel {
+    /// The sovereign channels: the operator, by either door. Who fills the sovereign role is
+    /// contingent; the authority is not (dp, 2026-07-30). A peer is never a sovereign factor,
+    /// which is what makes sovereign-plus-peer a DIFFERENT quantity from two approvals.
+    fn is_sovereign(self) -> bool {
+        matches!(self, Channel::OperatorSession | Channel::LocalCli)
+    }
+}
+
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Escalation {
     pub id: String,
@@ -164,6 +237,14 @@ pub struct Escalation {
     /// that was refused, not a standing permit on the governance surface. Without this, one
     /// approval would license every subsequent edit until the daemon restarted.
     pub consumed_at: Option<u64>,
+    /// The stated bar this escalation must clear — copied from `bar_for(marker)` at open, so
+    /// the record carries the criterion in force at the time. See Bar's doc: this is what
+    /// makes "sufficient for this context" auditable.
+    pub bar: Bar,
+    /// The evidence present, in arrival order. `decide` always appends the decider's factor;
+    /// `corroborate` can add a peer factor while Pending. The bar is evaluated against this
+    /// set — never against whichever answer arrived first.
+    pub factors: Vec<Factor>,
 }
 
 impl Escalation {
@@ -189,13 +270,36 @@ impl Escalation {
 
     /// May this approval still authorise the write it was granted for?
     ///
-    /// Three conditions, all of which have to hold, and each of which is a way this could
-    /// otherwise become a standing permit: it was actually approved, it has not already been
-    /// spent, and the retry window has not closed.
+    /// Four conditions, all of which have to hold, and each of which is a way this could
+    /// otherwise become a standing permit or a quiet widening: it was actually approved, the
+    /// stated bar is MET (an approval short of the bar is recorded but permits nothing — the
+    /// mismatch is visible, never silently sufficient), it has not already been spent, and the
+    /// retry window has not closed.
     pub fn is_claimable(&self, now: u64) -> bool {
         self.status == Status::Approved
+            && self.bar_met()
             && self.consumed_at.is_none()
             && now < self.decided_horizon()
+    }
+
+    /// Does the evidence present meet the stated bar? Evaluated against the factor SET, so a
+    /// cross-vendor peer plus a sovereign decision is a different recorded quantity than
+    /// either alone — which is the whole point of having a bar at all.
+    pub fn bar_met(&self) -> bool {
+        match self.bar {
+            Bar::SingleApprover => self
+                .factors
+                .iter()
+                .any(|f| f.channel.is_sovereign() || f.channel == Channel::PeerMember),
+            Bar::SovereignPlusPeer => {
+                let sov = self.factors.iter().any(|f| f.channel.is_sovereign());
+                let peer = self
+                    .factors
+                    .iter()
+                    .any(|f| f.channel == Channel::PeerMember);
+                sov && peer
+            }
+        }
     }
 
     /// The instant after which an approval stops being claimable.
@@ -349,6 +453,11 @@ impl EscalationStore {
             decided_role: None,
             independence: None,
             consumed_at: None,
+            // The bar is stated AT OPEN and copied from policy, so the record carries the
+            // criterion in force at the time — a later tightening of `bar_for` must not
+            // rewrite what this escalation was judged against.
+            bar: bar_for(marker),
+            factors: Vec::new(),
         };
         self.by_id.insert(id, esc.clone());
         Ok(esc)
@@ -434,6 +543,53 @@ impl EscalationStore {
         esc.decided_via = Some(via);
         esc.independence = independence;
         esc.reason = reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+        // The decider's own factor, always recorded — the bar is evaluated against the SET,
+        // and a decision is evidence first, a verdict second.
+        esc.factors.push(Factor {
+            channel: via,
+            by: decided_by.trim().to_string(),
+            role: esc.decided_role.clone(),
+            independence,
+            at: now,
+        });
+        Ok(esc.clone())
+    }
+
+    /// Add a peer's evidence to a PENDING escalation without deciding it.
+    ///
+    /// This is the accumulation half of the constellation model: approval is not a boolean
+    /// from whichever channel answered first. A peer co-signs here (NOT-SAME, enforced by the
+    /// caller the same way arbitration enforces it), the operator decides later, and `bar_met`
+    /// evaluates the whole set. A corroboration is NOT a decision: it permits nothing by
+    /// itself, it is witnessed separately (so it cannot be laundered into a ruling), and it
+    /// freezes the moment a decision lands — evidence after the fact would let a weak ruling
+    /// be dressed up retroactively.
+    pub fn corroborate(
+        &mut self,
+        id: &str,
+        by: &str,
+        role: &str,
+        independence: Option<crate::arbiter::Independence>,
+        now: u64,
+    ) -> Result<Escalation, DecideError> {
+        if by.trim().is_empty() {
+            return Err(DecideError::AnonymousDecider);
+        }
+        let esc = self.by_id.get_mut(id).ok_or(DecideError::Unknown)?;
+        match esc.status_at(now) {
+            Status::Expired => return Err(DecideError::Expired),
+            s @ (Status::Approved | Status::Denied) => {
+                return Err(DecideError::AlreadyDecided(s))
+            }
+            Status::Pending => {}
+        }
+        esc.factors.push(Factor {
+            channel: Channel::PeerMember,
+            by: by.trim().to_string(),
+            role: Some(role.trim().to_string()).filter(|r| !r.is_empty()),
+            independence,
+            at: now,
+        });
         Ok(esc.clone())
     }
 
@@ -473,6 +629,17 @@ mod tests {
     use super::*;
 
     const T0: u64 = 1_800_000_000;
+
+    /// Opens on `law_inject.py` — the SingleApprover surface. Claim-mechanics tests live
+    /// here because their subject is the claim, not the bar; bar semantics have their own
+    /// module (bar_factor_tests).
+    fn store_with_one_simple_marker() -> (EscalationStore, String) {
+        let mut s = EscalationStore::default();
+        let e = s
+            .open("claude-code", "role:constellation:member", "Edit", "law_inject.py", T0, 120)
+            .expect("open");
+        (s, e.id)
+    }
 
     fn store_with_one() -> (EscalationStore, String) {
         let mut s = EscalationStore::default();
@@ -637,13 +804,13 @@ mod tests {
         // The peer path must not be a second, weaker lane: it produces exactly the same
         // single-use, window-bounded approval the sovereign path does.
         use crate::arbiter::Independence;
-        let (mut s, id) = store_with_one();
+        let (mut s, id) = store_with_one_simple_marker();
         s.decide(&id, true, "kimi-code", "role:constellation:reviewer",
                  Channel::PeerMember, Some(Independence::CrossVendor), Some("ok"), T0 + 2)
             .unwrap();
-        assert!(s.claim("claude-code", "pre_tool_use.py", T0 + 3).is_some());
+        assert!(s.claim("claude-code", "law_inject.py", T0 + 3).is_some());
         assert!(
-            s.claim("claude-code", "pre_tool_use.py", T0 + 4).is_none(),
+            s.claim("claude-code", "law_inject.py", T0 + 4).is_none(),
             "a peer-granted approval must be spent like any other"
         );
     }
@@ -665,12 +832,12 @@ mod tests {
     fn an_approval_is_single_use() {
         // Otherwise one approval is a standing permit on the governance surface until the
         // daemon restarts, which is not what anybody approved.
-        let (mut s, id) = store_with_one();
+        let (mut s, id) = store_with_one_simple_marker();
         s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 5).unwrap();
-        let first = s.claim("claude-code", "pre_tool_use.py", T0 + 6);
+        let first = s.claim("claude-code", "law_inject.py", T0 + 6);
         assert!(first.is_some(), "the approval it was granted for must be claimable");
         assert_eq!(first.unwrap().consumed_at, Some(T0 + 6));
-        let second = s.claim("claude-code", "pre_tool_use.py", T0 + 7);
+        let second = s.claim("claude-code", "law_inject.py", T0 + 7);
         assert!(second.is_none(), "a spent approval must not authorise a second write");
     }
 
@@ -692,29 +859,29 @@ mod tests {
 
     #[test]
     fn an_approval_stops_being_claimable_once_the_retry_window_closes() {
-        let (mut s, id) = store_with_one();
+        let (mut s, id) = store_with_one_simple_marker();
         s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 5).unwrap();
         let horizon = T0 + DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS;
-        assert!(s.claim("claude-code", "pre_tool_use.py", horizon - 1).is_some());
+        assert!(s.claim("claude-code", "law_inject.py", horizon - 1).is_some());
 
-        let (mut s2, id2) = store_with_one();
+        let (mut s2, id2) = store_with_one_simple_marker();
         s2.decide(&id2, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 5).unwrap();
         // A day later must not still be rideable.
-        assert!(s2.claim("claude-code", "pre_tool_use.py", horizon).is_none());
-        assert!(s2.claim("claude-code", "pre_tool_use.py", T0 + 86_400).is_none());
+        assert!(s2.claim("claude-code", "law_inject.py", horizon).is_none());
+        assert!(s2.claim("claude-code", "law_inject.py", T0 + 86_400).is_none());
     }
 
     #[test]
     fn a_claim_matches_on_member_and_file_together() {
         // Approving a change to the gate must not silently authorise a change to witness.py,
         // nor let a different member spend someone else's approval.
-        let (mut s, id) = store_with_one();
+        let (mut s, id) = store_with_one_simple_marker();
         s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 1).unwrap();
         assert!(s.claim("claude-code", "witness.py", T0 + 2).is_none(), "wrong file");
-        assert!(s.claim("kimi-code", "pre_tool_use.py", T0 + 2).is_none(), "wrong member");
-        assert!(s.claim("", "pre_tool_use.py", T0 + 2).is_none(), "empty member");
+        assert!(s.claim("kimi-code", "law_inject.py", T0 + 2).is_none(), "wrong member");
+        assert!(s.claim("", "law_inject.py", T0 + 2).is_none(), "empty member");
         assert!(s.claim("claude-code", "", T0 + 2).is_none(), "empty file");
-        assert!(s.claim("claude-code", "pre_tool_use.py", T0 + 2).is_some(), "the exact pair");
+        assert!(s.claim("claude-code", "law_inject.py", T0 + 2).is_some(), "the exact pair");
     }
 
     #[test]
@@ -787,5 +954,120 @@ mod tests {
         // `old` lapses first; the list must stop offering it as decidable.
         let ids: Vec<&str> = s.pending(T0 + 121).iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, vec![new.id.as_str()]);
+    }
+}
+
+#[cfg(test)]
+mod bar_factor_tests {
+    //! The bar and the factor set (dp 2026-07-30 + claude-code): the record must carry the
+    //! criterion, the evidence, and whether the evidence met it — "sufficient for this
+    //! context" is unauditable if the bar is never written down.
+    use super::*;
+
+    fn open_with(marker: &str) -> (EscalationStore, String) {
+        let mut s = EscalationStore::default();
+        let e = s
+            .open("claude-code", "role:constellation:member", "Edit", marker, T0, 120)
+            .expect("open");
+        (s, e.id)
+    }
+
+    const T0: u64 = 1_800_000_000;
+
+    #[test]
+    fn the_bar_is_stated_at_open_and_differs_by_surface() {
+        // A law renderer and the enforcement path are not the same stakes, and the record
+        // must say which criterion each was judged against — inferred sufficiency is the
+        // defect this exists to remove.
+        let (s1, id1) = open_with("law_inject.py");
+        assert_eq!(s1.get(&id1).unwrap().bar, Bar::SingleApprover);
+        let (s2, id2) = open_with("pre_tool_use.py");
+        assert_eq!(s2.get(&id2).unwrap().bar, Bar::SovereignPlusPeer);
+        let (s3, id3) = open_with("witness.py");
+        assert_eq!(s3.get(&id3).unwrap().bar, Bar::SovereignPlusPeer);
+    }
+
+    #[test]
+    fn a_single_approval_meets_a_single_approver_bar() {
+        let (mut s, id) = open_with("law_inject.py");
+        let e = s
+            .decide(&id, true, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, None, T0 + 5)
+            .expect("approve");
+        assert!(e.bar_met());
+        assert!(e.is_claimable(T0 + 6));
+        // The decider's own factor was recorded — a decision is evidence first, verdict second.
+        assert_eq!(e.factors.len(), 1);
+        assert_eq!(e.factors[0].channel, Channel::OperatorSession);
+    }
+
+    #[test]
+    fn an_approval_short_of_the_bar_is_recorded_but_permits_nothing() {
+        // THE POINT of the whole change: operator alone on an operator+peer surface. The
+        // approval is real, the record shows it, and it still must not permit the write —
+        // the mismatch is visible, never silently sufficient.
+        let (mut s, id) = open_with("pre_tool_use.py");
+        let e = s
+            .decide(&id, true, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, None, T0 + 5)
+            .expect("approve is recorded even when short of the bar");
+        assert_eq!(e.stored_status(), Status::Approved);
+        assert!(!e.bar_met(), "one factor cannot meet a two-factor bar");
+        assert!(
+            !e.is_claimable(T0 + 6),
+            "an approval short of the stated bar must not be claimable"
+        );
+        // And a retry at the daemon level agrees: status_of reports approved, but the write
+        // still cannot proceed — the two answers are different and both recorded.
+        assert_eq!(s.status_of(&id, T0 + 6), Status::Approved);
+    }
+
+    #[test]
+    fn corroboration_accumulates_and_completes_the_bar() {
+        // The constellation model in one test: peer evidence first, operator decision second,
+        // and the set — never the first answer — is what the bar evaluates.
+        let (mut s, id) = open_with("witness.py");
+        let e = s
+            .corroborate(&id, "kimi-code", "role:constellation:member", None, T0 + 3)
+            .expect("peer corroboration lands while pending");
+        assert_eq!(e.factors.len(), 1);
+        assert_eq!(e.factors[0].channel, Channel::PeerMember);
+        // Not decided yet: evidence, not a verdict.
+        assert_eq!(e.stored_status(), Status::Pending);
+        assert!(!e.bar_met());
+
+        let e = s
+            .decide(&id, true, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, Some("reviewed the diff"), T0 + 9)
+            .expect("operator decision after corroboration");
+        assert_eq!(e.factors.len(), 2, "decision appends the decider's own factor");
+        assert!(e.bar_met(), "operator + not-same peer meets the stated bar");
+        assert!(e.is_claimable(T0 + 10));
+    }
+
+    #[test]
+    fn corroboration_freezes_at_decision() {
+        let (mut s, id) = open_with("law_inject.py");
+        s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, None, T0 + 5)
+            .expect("decided");
+        let err = s
+            .corroborate(&id, "kimi-code", "r", None, T0 + 6)
+            .expect_err("evidence after the fact would let a weak ruling be dressed up");
+        assert_eq!(err, DecideError::AlreadyDecided(Status::Approved));
+    }
+
+    #[test]
+    fn corroboration_requires_a_named_peer() {
+        let (mut s, id) = open_with("law_inject.py");
+        let err = s
+            .corroborate(&id, "  ", "r", None, T0 + 3)
+            .expect_err("anonymous evidence in an attribution record is worse than none");
+        assert_eq!(err, DecideError::AnonymousDecider);
+    }
+
+    #[test]
+    fn an_expired_escalation_takes_no_more_evidence() {
+        let (mut s, id) = open_with("law_inject.py");
+        let err = s
+            .corroborate(&id, "kimi-code", "r", None, T0 + 121)
+            .expect_err("expired is expired");
+        assert_eq!(err, DecideError::Expired);
     }
 }

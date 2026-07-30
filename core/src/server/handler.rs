@@ -81,6 +81,9 @@ impl ServerHandler for HestiaServer {
             "hestia_gate_escalation_open" => tool_gate_escalation_open(&self.state, &args).await,
             "hestia_gate_escalation_poll" => tool_gate_escalation_poll(&self.state, &args).await,
             "hestia_gate_escalation_claim" => tool_gate_escalation_claim(&self.state, &args).await,
+            "hestia_gate_escalation_corroborate" => {
+                tool_gate_escalation_corroborate(&self.state, &args).await
+            }
             "hestia_gate_pending_escalations" => tool_gate_pending_escalations(&self.state, &args).await,
             "hestia_gate_arbitrate_escalation" => tool_gate_arbitrate_escalation(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
@@ -258,6 +261,10 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_gate_arbitrate_escalation",
             "Rule on ANOTHER member's governance-write escalation. NOT-SAME enforced server-side using the same independence rules as the appeal arbiter — you can never grant your own gate write. Approving requires a stated reason; refusing does not. Records role@agent and the independence tier. At A1 a peer shares the operator's UID, so this is recorded SECOND-PARTY REVIEW, not an enforced boundary",
+        ),
+        t(
+            "hestia_gate_escalation_corroborate",
+            "Add your evidence to ANOTHER member's pending governance-write escalation WITHOUT deciding it (NOT-SAME enforced). Approval is not first-answer-wins: your factor joins the set, the operator or arbiter decides later, and the stated bar is evaluated over the whole set. A corroboration permits nothing by itself; it is witnessed separately so it cannot be laundered into a ruling",
         ),
         t(
             "hestia_gate_escalation_claim",
@@ -8798,6 +8805,10 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
             "role": esc.role,
             "tool_name": esc.tool_name,
             "marker": esc.marker,
+            // THE BAR, written down (dp 2026-07-30 + claude-code): the evidence and the
+            // verdict were already recorded; without the criterion, "sufficient for this
+            // context" is unauditable. Stated at open, evaluated at decision.
+            "bar": esc.bar,
             "expires_at": esc.expires_at,
             "ttl_secs": DEFAULT_TTL_SECS,
             // Recorded so a reader is never left inferring it from silence.
@@ -8809,6 +8820,7 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     Ok(json!({
         "escalation_id": esc.id,
         "status": esc.stored_status(),
+        "bar": esc.bar,
         "expires_at": esc.expires_at,
         "ttl_secs": DEFAULT_TTL_SECS,
         "witnessEntryHash": entry.hash,
@@ -8832,7 +8844,14 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
     Ok(json!({
         "escalation_id": id,
         "status": status,
-        "permits_write": status.permits_write(),
+        // The bar is part of the answer, always: an approval SHORT of the stated bar is
+        // recorded but permits nothing. The mismatch is a visible state, never an implicit
+        // sufficient. (dp 2026-07-30 + claude-code: the record must carry the bar, not just
+        // the evidence and the verdict.)
+        "permits_write": status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false),
+        "bar": esc.map(|e| e.bar),
+        "bar_met": esc.map(|e| e.bar_met()),
+        "factors_present": esc.map(|e| e.factors.clone()),
         "secs_remaining": esc.map(|e| e.secs_remaining(now)).unwrap_or(0),
         "decided_by": esc.and_then(|e| e.decided_by.clone()),
         "decided_via": esc.and_then(|e| e.decided_via),
@@ -8843,7 +8862,7 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
             "unknown escalation_id — treated as expired (a restart drops the store, and an \
              in-flight escalation must then read as denied)"
         } else {
-            "authoritative as of now; only `approved` permits the write"
+            "authoritative as of now; only `approved` WITH the stated bar met permits the write"
         },
     }))
 }
@@ -9137,6 +9156,12 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
                     "decided_via": decided.decided_via,
                     "independence": independence,
                     "reason": decided.reason,
+                    // The bar, the evidence, and whether the evidence met it — the three
+                    // things a reader needs to audit "sufficient for this context" instead of
+                    // trusting that a decision happened (dp + claude-code, 2026-07-30).
+                    "bar": decided.bar,
+                    "factors_present": decided.factors,
+                    "bar_met": decided.bar_met(),
                     "assurance": "A1 — the peer shares this UID. This is recorded \
                                   SECOND-PARTY REVIEW, not an enforced boundary.",
                 }),
@@ -9149,6 +9174,89 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
                 "independence": independence,
                 "witnessEntryHash": entry.ok().map(|e| e.hash),
                 "note": "the asker must RE-ISSUE the write to claim this; approvals are single use",
+            }))
+        }
+        Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
+}
+
+/// Add a peer's evidence to a PENDING escalation WITHOUT deciding it — the accumulation half
+/// of the constellation model (dp 2026-07-30: "many-factor preponderance of evidence";
+/// claude-code: "approval shouldn't be a boolean from whichever channel answered first. It
+/// should accumulate"). A corroboration permits nothing by itself; it is witnessed separately
+/// so it cannot be laundered into a ruling; and it freezes at decision time.
+async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::arbiter::{eligibility, AppealParties, Eligibility};
+    use crate::server::gate_escalation::now_secs;
+
+    let escalation_id = require_string(args, "escalation_id")?;
+    let session_id_arg = optional_string(args, "session_id");
+    let now = now_secs();
+
+    let mut s = state.lock().await;
+
+    // Same attribution bar as ruling: evidence you cannot be credited for teaches the society
+    // nothing and pollutes the factor set it is meant to strengthen.
+    let Some(arb) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Err(anyhow::anyhow!(
+            "corroborating an escalation requires your own live session_id (from hestia_connect)"
+        ));
+    };
+
+    let Some(esc) = s.gate_escalations.get(&escalation_id).cloned() else {
+        return Err(anyhow::anyhow!(
+            "no such escalation — unknown ids are denies, not retries"
+        ));
+    };
+
+    // NOT-SAME, same arbiter rules: a member may not corroborate its own ask, and the
+    // independence tier is recorded with the factor so a reader can weight it.
+    let independence = match eligibility(&AppealParties {
+        appellant: &esc.plugin_id,
+        deny_adjudicator: None,
+        arbiter: &arb.plugin_id,
+    }) {
+        Eligibility::Eligible { independence } => independence,
+        other => {
+            return Err(anyhow::anyhow!(
+                "you may not corroborate this: {other:?}. Evidence about your own gate write \
+                 is not a second factor — it is the first one wearing a hat."
+            ));
+        }
+    };
+
+    match s.gate_escalations.corroborate(
+        &escalation_id,
+        &arb.plugin_id,
+        &arb.role_lct,
+        Some(independence),
+        now,
+    ) {
+        Ok(updated) => {
+            let entry = s.append_chain(
+                "gate_escalation_corroborated",
+                json!({
+                    "escalation_id": updated.id,
+                    "plugin_id": updated.plugin_id,
+                    "corroborated_by": arb.plugin_id,
+                    "corroborated_role": arb.role_lct,
+                    "independence": independence,
+                    // The state of the evidence set AFTER this factor — so a reader never has
+                    // to reconstruct accumulation order from separate entries.
+                    "factors_present": updated.factors,
+                    "bar": updated.bar,
+                    "bar_met_if_decided_now": updated.bar_met(),
+                }),
+            );
+            Ok(json!({
+                "escalation_id": updated.id,
+                "corroborated": true,
+                "factors_present": updated.factors,
+                "bar": updated.bar,
+                "bar_met_if_decided_now": updated.bar_met(),
+                "witnessEntryHash": entry.ok().map(|e| e.hash),
+                "note": "a corroboration is evidence, not a verdict — it permits nothing by \
+                         itself; the decision still has to land and the stated bar be met",
             }))
         }
         Err(e) => Err(anyhow::anyhow!("{e}")),
