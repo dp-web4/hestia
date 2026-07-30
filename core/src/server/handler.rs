@@ -81,6 +81,8 @@ impl ServerHandler for HestiaServer {
             "hestia_gate_escalation_open" => tool_gate_escalation_open(&self.state, &args).await,
             "hestia_gate_escalation_poll" => tool_gate_escalation_poll(&self.state, &args).await,
             "hestia_gate_escalation_claim" => tool_gate_escalation_claim(&self.state, &args).await,
+            "hestia_gate_pending_escalations" => tool_gate_pending_escalations(&self.state, &args).await,
+            "hestia_gate_arbitrate_escalation" => tool_gate_arbitrate_escalation(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
             "hestia_operating_law" => tool_operating_law(&self.state, &args).await,
@@ -248,6 +250,14 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_gate_escalation_open",
             "Ask a HUMAN to approve a write to the governance surface (gate, witness, law_inject, the registration). Stage 2 of dp's 2026-07-29 ruling: the gate refuses these writes, and this is the channel that un-refuses a legitimate one. Returns an escalation_id and a deadline; NO DECISION WITHIN THE WINDOW IS A DENY, not a retry. Witnessed on open. Assurance A1: the operator shares this UID, so approval is tamper-EVIDENT, not tamper-proof",
+        ),
+        t(
+            "hestia_gate_pending_escalations",
+            "List governance-write escalations nobody has ruled on yet. Pass your session_id and each entry tells you whether YOU may rule it (NOT-SAME: never your own ask). Read-only. A peer that can rule but cannot discover has the authority and no way to learn there is anything open",
+        ),
+        t(
+            "hestia_gate_arbitrate_escalation",
+            "Rule on ANOTHER member's governance-write escalation. NOT-SAME enforced server-side using the same independence rules as the appeal arbiter — you can never grant your own gate write. Approving requires a stated reason; refusing does not. Records role@agent and the independence tier. At A1 a peer shares the operator's UID, so this is recorded SECOND-PARTY REVIEW, not an enforced boundary",
         ),
         t(
             "hestia_gate_escalation_claim",
@@ -8941,5 +8951,196 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                 "then": "the write is refused",
             }))
         }
+    }
+}
+
+// ------------------------------------------- gate escalation: peer arbitration + discovery
+//
+// dp, 2026-07-30: "ultimately, the goal is for y'all to collaborate without me being the
+// bottleneck." And earlier the same day: "sovereign is a role. who or what fills it is
+// secondary."
+//
+// Stage 2 shipped with exactly one way to grant a governance write: the sovereign, reachable
+// only through an operator HTTP handshake or a dev-override token. On this box neither was
+// configured, so the honest state after arming was: writes refused, and NOBODY able to approve
+// one. The first real defects found after arming could not be fixed by the member that found
+// them — a repair path routing through a door that was not built.
+//
+// The fix is not a better door for one person. It is to stop assuming the sovereign role can
+// only be filled by the operator. A NOT-SAME peer can decide, under exactly the independence
+// rules the appeal arbiter already enforces.
+//
+// WHAT THIS IS WORTH, AND WHAT IT IS NOT. At A1 a peer shares this UID, so peer approval is
+// NOT a stronger permission than self-approval would be — it is RECORDED SECOND-PARTY REVIEW.
+// What it buys is that something which is not the asker looked, and that the record says how
+// different that something was (cross-vendor beats cross-member). Anyone reading this as a
+// security boundary is reading it wrong, and the `assurance` field says so on every entry.
+
+async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::arbiter::{eligibility, AppealParties, Eligibility};
+    use crate::server::gate_escalation::now_secs;
+
+    let session_id_arg = optional_string(args, "session_id");
+    let now = now_secs();
+    let s = state.lock().await;
+    let caller = resolve_attributed_caller(&s, session_id_arg.as_deref());
+
+    // Attribution is OPTIONAL for DISCOVERY and its absence is reported rather than defaulted.
+    // A member whose session lapsed must still be able to see there is work; what it cannot be
+    // told is whether IT may rule, and saying nothing about that would read as "no eligibility
+    // concerns" — the same reasoning hestia_open_appeals uses.
+    let items: Vec<Value> = s
+        .gate_escalations
+        .pending(now)
+        .into_iter()
+        .map(|e| {
+            let may_rule = caller.as_ref().map(|c| {
+                matches!(
+                    eligibility(&AppealParties {
+                        appellant: &e.plugin_id,
+                        deny_adjudicator: None,
+                        arbiter: &c.plugin_id,
+                    }),
+                    Eligibility::Eligible { .. }
+                )
+            });
+            json!({
+                "escalation_id": e.id,
+                "asked_by": e.plugin_id,
+                "asked_by_role": e.role,
+                "tool_name": e.tool_name,
+                "marker": e.marker,
+                "opened_at": e.opened_at,
+                "secs_remaining": e.secs_remaining(now),
+                "you_may_rule": may_rule,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "pending": items,
+        "count": items.len(),
+        "you": caller.as_ref().map(|c| json!({"plugin_id": c.plugin_id, "role": c.role_lct})),
+        "caveat": if caller.is_none() {
+            "UNATTRIBUTED caller — pass your session_id from hestia_connect and each entry will \
+             say whether you may rule it. Without it, `you_may_rule` is null, which is not the \
+             same as false."
+        } else {
+            "you_may_rule reflects NOT-SAME only; a true still means a same-UID peer at A1"
+        },
+    }))
+}
+
+async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::arbiter::{eligibility, AppealParties, Eligibility};
+    use crate::server::gate_escalation::{now_secs, Channel};
+
+    let escalation_id = require_string(args, "escalation_id")?;
+    let approve = args
+        .get("approve")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow::anyhow!(
+            "'approve' must be an explicit true or false — an omitted verdict is not a verdict"
+        ))?;
+    let reason = optional_string(args, "reason").unwrap_or_default();
+    let session_id_arg = optional_string(args, "session_id");
+    let now = now_secs();
+
+    let mut s = state.lock().await;
+
+    // Attribution is REQUIRED to rule, unlike discovery. An unattributable arbiter cannot be
+    // credited, and a decision that moves nobody's conduct score teaches the society nothing —
+    // the same rule hestia_appeal enforces on appellants.
+    let Some(arb) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Err(anyhow::anyhow!(
+            "ruling on an escalation requires your own live session_id (from hestia_connect); \
+             an unattributable arbiter cannot be credited and its ruling moves no conduct score"
+        ));
+    };
+
+    let Some(esc) = s.gate_escalations.get(&escalation_id).cloned() else {
+        return Err(anyhow::anyhow!(
+            "no such escalation — unknown ids are denies, not retries"
+        ));
+    };
+
+    // NOT-SAME, server-side, reusing the appeal arbiter's own rules rather than a second
+    // implementation that could drift from them.
+    let independence = match eligibility(&AppealParties {
+        appellant: &esc.plugin_id,
+        deny_adjudicator: None,
+        arbiter: &arb.plugin_id,
+    }) {
+        Eligibility::Eligible { independence } => independence,
+        other => {
+            let _ = s.append_chain(
+                "gate_escalation_arbiter_refused",
+                json!({
+                    "escalation_id": esc.id,
+                    "asked_by": esc.plugin_id,
+                    "would_be_arbiter": arb.plugin_id,
+                    "why": format!("{other:?}"),
+                }),
+            );
+            return Err(anyhow::anyhow!(
+                "you may not rule this: {other:?}. A member cannot grant its own governance \
+                 write — that is the whole point of the escalation. Ask a different member."
+            ));
+        }
+    };
+
+    // Approving needs a stated reason; refusing does not. Refusing is the default and costs
+    // nothing to explain; permitting is what a reader will have to weigh later.
+    if approve {
+        let r = reason.trim();
+        if r.is_empty() || r.len() > 512 || r.chars().any(char::is_control) {
+            return Err(anyhow::anyhow!(
+                "approving a governance write requires a single-line 'reason' (<=512 bytes) — \
+                 a deny does not"
+            ));
+        }
+    }
+
+    match s.gate_escalations.decide(
+        &escalation_id,
+        approve,
+        &arb.plugin_id,
+        &arb.role_lct,
+        Channel::PeerMember,
+        Some(independence),
+        Some(reason.as_str()),
+        now,
+    ) {
+        Ok(decided) => {
+            let entry = s.append_chain(
+                "gate_escalation_decided",
+                json!({
+                    "escalation_id": decided.id,
+                    "plugin_id": decided.plugin_id,
+                    "subject_instance_lct": s.member_lct(&decided.plugin_id),
+                    "tool_name": decided.tool_name,
+                    "marker": decided.marker,
+                    "status": decided.stored_status(),
+                    // role@agent, both halves. Either alone lets the surface lie.
+                    "decided_by": decided.decided_by,
+                    "decided_role": decided.decided_role,
+                    "decided_via": decided.decided_via,
+                    "independence": independence,
+                    "reason": decided.reason,
+                    "assurance": "A1 — the peer shares this UID. This is recorded \
+                                  SECOND-PARTY REVIEW, not an enforced boundary.",
+                }),
+            );
+            Ok(json!({
+                "escalation_id": decided.id,
+                "status": decided.stored_status(),
+                "decided_by": decided.decided_by,
+                "decided_role": decided.decided_role,
+                "independence": independence,
+                "witnessEntryHash": entry.ok().map(|e| e.hash),
+                "note": "the asker must RE-ISSUE the write to claim this; approvals are single use",
+            }))
+        }
+        Err(e) => Err(anyhow::anyhow!("{e}")),
     }
 }

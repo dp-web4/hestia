@@ -117,6 +117,12 @@ pub enum Channel {
     /// Local CLI, authenticated only by filesystem access to HESTIA_HOME. Same-UID as every
     /// member on this box, so this is convenience, not proof.
     LocalCli,
+    /// A NOT-SAME peer member decided it, through the same independence rules the appeal
+    /// arbiter uses. At A1 this is not an enforced boundary — the peer shares this UID — so it
+    /// is recorded SECOND-PARTY REVIEW, not a stronger permission. What it buys is that the
+    /// approval was looked at by something that is not the asker, and the record says how
+    /// different that something is.
+    PeerMember,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -135,6 +141,16 @@ pub struct Escalation {
     pub decided_by: Option<String>,
     pub decided_via: Option<Channel>,
     pub reason: Option<String>,
+    /// The ROLE the decider was filling, not just which agent it was.
+    ///
+    /// dp, 2026-07-30: "at some point we need to stop putting 'human' on a pedestal. and focus
+    /// on the role. sovereign is a role. who or what fills it is secondary." So the record
+    /// carries role@agent: `decided_role` is the half that says by what authority, and
+    /// `decided_by` is the half that says who filled it. Either alone lets the surface lie.
+    pub decided_role: Option<String>,
+    /// How different the decider was from the asker, when a peer decided. `None` for the
+    /// sovereign channels, where the question does not arise.
+    pub independence: Option<crate::arbiter::Independence>,
     /// When the approval was spent. An approval is **single use**: it authorises the one write
     /// that was refused, not a standing permit on the governance surface. Without this, one
     /// approval would license every subsequent edit until the daemon restarted.
@@ -320,6 +336,8 @@ impl EscalationStore {
             decided_by: None,
             decided_via: None,
             reason: None,
+            decided_role: None,
+            independence: None,
             consumed_at: None,
         };
         self.by_id.insert(id, esc.clone());
@@ -379,7 +397,9 @@ impl EscalationStore {
         id: &str,
         approve: bool,
         decided_by: &str,
+        decided_role: &str,
         via: Channel,
+        independence: Option<crate::arbiter::Independence>,
         reason: Option<&str>,
         now: u64,
     ) -> Result<Escalation, DecideError> {
@@ -399,7 +419,9 @@ impl EscalationStore {
         }
         esc.status = if approve { Status::Approved } else { Status::Denied };
         esc.decided_by = Some(decided_by.trim().to_string());
+        esc.decided_role = Some(decided_role.trim().to_string()).filter(|r| !r.is_empty());
         esc.decided_via = Some(via);
+        esc.independence = independence;
         esc.reason = reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
         Ok(esc.clone())
     }
@@ -483,7 +505,7 @@ mod tests {
     fn approval_after_the_deadline_is_refused() {
         let (mut s, id) = store_with_one();
         let err = s
-            .decide(&id, true, "dp", Channel::LocalCli, None, T0 + 121)
+            .decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, None, T0 + 121)
             .expect_err("late approval must be refused");
         assert_eq!(err, DecideError::Expired);
         // And it did not mutate: the record still says nobody decided.
@@ -494,10 +516,10 @@ mod tests {
     #[test]
     fn decisions_are_single_shot() {
         let (mut s, id) = store_with_one();
-        s.decide(&id, false, "dp", Channel::LocalCli, Some("not now"), T0 + 5)
+        s.decide(&id, false, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("not now"), T0 + 5)
             .expect("first decision");
         let err = s
-            .decide(&id, true, "dp", Channel::LocalCli, None, T0 + 6)
+            .decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, None, T0 + 6)
             .expect_err("a deny must not be upgradable to an approve");
         assert_eq!(err, DecideError::AlreadyDecided(Status::Denied));
         assert_eq!(s.status_of(&id, T0 + 6), Status::Denied);
@@ -508,7 +530,7 @@ mod tests {
         // Expiry applies to UNDECIDED escalations only. An approval at T+5 must not silently
         // become a deny at T+121 — the hook may still be mid-write.
         let (mut s, id) = store_with_one();
-        s.decide(&id, true, "dp", Channel::OperatorSession, None, T0 + 5)
+        s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, None, T0 + 5)
             .expect("approve");
         assert_eq!(s.status_of(&id, T0 + 5_000), Status::Approved);
     }
@@ -517,7 +539,7 @@ mod tests {
     fn the_channel_is_recorded_and_the_two_are_not_interchangeable() {
         let (mut s, id) = store_with_one();
         let e = s
-            .decide(&id, true, "dp", Channel::LocalCli, None, T0 + 1)
+            .decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, None, T0 + 1)
             .expect("approve");
         // A same-UID CLI approval and an authenticated operator session are both "approved" and
         // are NOT the same evidence. If this ever collapses to one value, the record loses the
@@ -580,11 +602,60 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_decision_records_role_at_agent_and_its_independence() {
+        // dp, 2026-07-30: "sovereign is a role. who or what fills it is secondary." So the
+        // record must carry BOTH halves. `decided_by` alone cannot say by what authority;
+        // `decided_role` alone cannot say who filled it. Either alone lets the surface lie.
+        use crate::arbiter::Independence;
+        let (mut s, id) = store_with_one();
+        let e = s
+            .decide(
+                &id, true, "kimi-code", "role:constellation:reviewer",
+                Channel::PeerMember, Some(Independence::CrossMember),
+                Some("verified the diff"), T0 + 3,
+            )
+            .expect("peer approve");
+        assert_eq!(e.decided_by.as_deref(), Some("kimi-code"));
+        assert_eq!(e.decided_role.as_deref(), Some("role:constellation:reviewer"));
+        assert_eq!(e.decided_via, Some(Channel::PeerMember));
+        assert_eq!(e.independence, Some(Independence::CrossMember));
+    }
+
+    #[test]
+    fn a_peer_approval_is_claimable_by_the_asker_and_still_single_use() {
+        // The peer path must not be a second, weaker lane: it produces exactly the same
+        // single-use, window-bounded approval the sovereign path does.
+        use crate::arbiter::Independence;
+        let (mut s, id) = store_with_one();
+        s.decide(&id, true, "kimi-code", "role:constellation:reviewer",
+                 Channel::PeerMember, Some(Independence::CrossVendor), Some("ok"), T0 + 2)
+            .unwrap();
+        assert!(s.claim("claude-code", "pre_tool_use.py", T0 + 3).is_some());
+        assert!(
+            s.claim("claude-code", "pre_tool_use.py", T0 + 4).is_none(),
+            "a peer-granted approval must be spent like any other"
+        );
+    }
+
+    #[test]
+    fn the_sovereign_channels_record_no_independence() {
+        // Independence is a question about a PEER. For the sovereign role it does not arise,
+        // and answering it anyway would invent a comparison nobody made.
+        let (mut s, id) = store_with_one();
+        let e = s
+            .decide(&id, true, "operator", "role:constellation:sovereign",
+                    Channel::OperatorSession, None, Some("ok"), T0 + 1)
+            .unwrap();
+        assert_eq!(e.independence, None);
+        assert_eq!(e.decided_role.as_deref(), Some("role:constellation:sovereign"));
+    }
+
+    #[test]
     fn an_approval_is_single_use() {
         // Otherwise one approval is a standing permit on the governance surface until the
         // daemon restarts, which is not what anybody approved.
         let (mut s, id) = store_with_one();
-        s.decide(&id, true, "dp", Channel::LocalCli, Some("ok"), T0 + 5).unwrap();
+        s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 5).unwrap();
         let first = s.claim("claude-code", "pre_tool_use.py", T0 + 6);
         assert!(first.is_some(), "the approval it was granted for must be claimable");
         assert_eq!(first.unwrap().consumed_at, Some(T0 + 6));
@@ -596,7 +667,7 @@ mod tests {
     fn only_an_approved_escalation_is_claimable() {
         for (approve, label) in [(false, "denied")] {
             let (mut s, id) = store_with_one();
-            s.decide(&id, approve, "dp", Channel::LocalCli, None, T0 + 1).unwrap();
+            s.decide(&id, approve, "dp", "role:constellation:sovereign", Channel::LocalCli, None, None, T0 + 1).unwrap();
             assert!(
                 s.claim("claude-code", "pre_tool_use.py", T0 + 2).is_none(),
                 "{label} must not be claimable"
@@ -611,12 +682,12 @@ mod tests {
     #[test]
     fn an_approval_stops_being_claimable_once_the_retry_window_closes() {
         let (mut s, id) = store_with_one();
-        s.decide(&id, true, "dp", Channel::LocalCli, Some("ok"), T0 + 5).unwrap();
+        s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 5).unwrap();
         let horizon = T0 + DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS;
         assert!(s.claim("claude-code", "pre_tool_use.py", horizon - 1).is_some());
 
         let (mut s2, id2) = store_with_one();
-        s2.decide(&id2, true, "dp", Channel::LocalCli, Some("ok"), T0 + 5).unwrap();
+        s2.decide(&id2, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 5).unwrap();
         // A day later must not still be rideable.
         assert!(s2.claim("claude-code", "pre_tool_use.py", horizon).is_none());
         assert!(s2.claim("claude-code", "pre_tool_use.py", T0 + 86_400).is_none());
@@ -627,7 +698,7 @@ mod tests {
         // Approving a change to the gate must not silently authorise a change to witness.py,
         // nor let a different member spend someone else's approval.
         let (mut s, id) = store_with_one();
-        s.decide(&id, true, "dp", Channel::LocalCli, Some("ok"), T0 + 1).unwrap();
+        s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 1).unwrap();
         assert!(s.claim("claude-code", "witness.py", T0 + 2).is_none(), "wrong file");
         assert!(s.claim("kimi-code", "pre_tool_use.py", T0 + 2).is_none(), "wrong member");
         assert!(s.claim("", "pre_tool_use.py", T0 + 2).is_none(), "empty member");
@@ -639,7 +710,7 @@ mod tests {
     fn a_decision_must_name_its_decider() {
         let (mut s, id) = store_with_one();
         assert_eq!(
-            s.decide(&id, true, "   ", Channel::LocalCli, Some("ok"), T0 + 1).unwrap_err(),
+            s.decide(&id, true, "   ", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 1).unwrap_err(),
             DecideError::AnonymousDecider
         );
         // And it did not mutate on the way out.
