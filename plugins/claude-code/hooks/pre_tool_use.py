@@ -511,7 +511,7 @@ def _witness_self_access(marker: str, tool_name: str) -> bool:
     return _emit_gate_event("gate_self_access", marker, tool_name, severity="escalate")
 
 
-def deny_self_access(marker: str, tool_name: str) -> int:
+def deny_self_access(marker: str, tool_name: str, detail: str = "") -> int:
     """Refuse, loudly, and try to witness it as its own event class.
 
     Deliberately NOT an ordinary deny: an ordinary deny is a boundary met in the
@@ -534,12 +534,17 @@ def deny_self_access(marker: str, tool_name: str) -> int:
         f"Reading it is allowed and witnessed; changing it is not. This refusal is its own "
         f"event class{'' if witnessed else ' (WITNESS FAILED — the refusal stands regardless)'}"
         f" and is escalatable.\n"
-        f"If a gate change is genuinely needed, ESCALATE — the write is offered to a human "
-        f"for approval and proceeds only if one approves inside the window. Say what you "
-        f"need changed and why. Do not work around this by another route: doing so is the "
+        f"If a gate change is genuinely needed, ESCALATE — the write is offered to a human, and "
+        f"once one approves it you RETRY this same write and it proceeds. Say what you need "
+        f"changed and why. Do not work around this by another route: doing so is the "
         f"behaviour this rule exists to make visible.\n"
+        # The escalation id belongs HERE and not only on the line above it. stderr is read by
+        # whoever is watching; this string is read by the caller that was refused, and a refusal
+        # is only worth the caller that hears it. Without this, "retry after approval" is advice
+        # the one party who has to act on it never receives.
+        + (f"{detail}\n" if detail else "")
     )
-    debug_log(f"gate-self-access deny: {tool_name} -> {marker} witnessed={witnessed}")
+    debug_log(f"gate-self-access deny: {tool_name} -> {marker} witnessed={witnessed} {detail}")
     return 2
 
 
@@ -552,85 +557,112 @@ def deny_self_access(marker: str, tool_name: str) -> int:
 # also too much -- the fleet legitimately edits its gates (#55, #89, #90 in one week). This
 # is the channel that un-refuses a legitimate one, with a human across it.
 
-# The 0.5s fast-path budget is for a policy verdict on the hot path. Opening and polling
-# an escalation is a mutation plus a witness write, and it is already inside a 2-minute
-# wait -- so it gets its own, longer budget rather than borrowing one sized for something
-# else. A too-tight timeout here would read as 'unreachable' and deny a legitimate write.
-ESCALATION_RPC_TIMEOUT_S = 5.0
-ESCALATION_POLL_S = 3.0
-# Deliberately a little BEYOND the daemon's own TTL, so the daemon is the sole authority on
-# when the window shut. Otherwise the hook could refuse a write that was approved at second
-# 119. Both ends fail closed; only one of them gets to decide the deadline.
-ESCALATION_WALL_S = 135.0
+# THE HOOK MUST NEVER OUTLIVE ITS HARNESS TIMEOUT. Not for tidiness -- for direction.
+#
+# kimi-code caught this reviewing #114: the first version of this file waited 135s for a human
+# while `.claude-plugin/plugin.json` gives the hook a `"timeout": 5`. I then measured what the
+# harness actually does with a hook that overruns, because the failure DIRECTION is the whole
+# question and I was not willing to infer it (Claude Code 2.1.220, two runs differing only in
+# whether the hook slept past its timeout):
+#
+#   fast deny, inside the timeout  -> tool BLOCKED
+#   same deny, sleeping past it    -> tool EXECUTED
+#
+# An overrun is not a refusal. It is an allow with a delay in front of it. So a governance write
+# under the old code would have opened an escalation, been killed mid-wait, and gone through --
+# leaving a `gate_escalation_opened` entry in the chain that reads like process happening while
+# the write sailed underneath it. Worse than stage 1, and worse in the way that is hardest to see.
+#
+# This is the invariant law_inject.py:39 already states in prose for its own budget. Nothing
+# enforced it. test_gate_escalation.py now does, by reading the timeout out of plugin.json.
+ESCALATION_TOTAL_BUDGET_S = 2.5
+ESCALATION_RPC_TIMEOUT_S = 1.0
 
 
 def escalate_self_write(marker: str, tool_name: str) -> Tuple[str, str]:
-    """Offer a governance-surface write to a human. Returns (verdict, detail).
+    """Spend a human approval for a governance-surface write, or refuse and ask for one.
 
-    verdict is 'approved' ONLY on an explicit approval inside the window. Everything else
-    -- denied, expired, daemon unreachable, a malformed answer, an exception -- refuses,
-    because the alternative is a governance write that proceeded because nobody managed to
-    say no.
+    Returns (verdict, detail). 'approved' ONLY when the daemon hands over an unspent,
+    in-window grant for this member and this file. Everything else -- no grant, a pending
+    decision, a denial, a stale or already-spent grant, an unreachable daemon, a malformed
+    answer, running out of budget -- refuses, because the alternative is a governance write
+    that proceeded because nobody managed to say no.
+
+    THE SHAPE, and why it is not a wait:
+
+        1st attempt   ->  no grant  ->  open an escalation, print how to decide, DENY NOW
+        (a human decides, out of band, on their own clock)
+        retry         ->  grant     ->  spent, and the write proceeds
+
+    The hook cannot hold the session open for a person: overrunning the harness timeout does
+    not deny, it ALLOWS (see ESCALATION_TOTAL_BUDGET_S). So the deny is immediate and the
+    human's clock lives in the daemon, where nothing kills it. The daemon's TTL is unchanged
+    at 120s and the grant is spendable for 5 minutes after a decision, so the retry is not
+    racing anything.
 
     Approval lifts the SELF-PROTECTION only. The call then continues to the ordinary policy
     check, so approving a gate edit is not approving whatever else the command would do.
     """
+    budget_ends = time.monotonic() + ESCALATION_TOTAL_BUDGET_S
+    plugin_id = _escalation_plugin_id()
+
+    def _rpc(tool: str, payload: dict) -> Any:
+        """One call, never past the budget. Raises if there is no time left to make it."""
+        left = budget_ends - time.monotonic()
+        if left <= 0.1:
+            raise TimeoutError("escalation budget exhausted")
+        client = McpHttp(discover_endpoint() or DEFAULT_ENDPOINT,
+                         deadline=time.monotonic() + min(ESCALATION_RPC_TIMEOUT_S, left))
+        return client.call_tool(tool, payload)
+
+    # --- Do we already have a yes? One round trip. ---
     try:
-        endpoint = discover_endpoint() or DEFAULT_ENDPOINT
-        client = McpHttp(endpoint, deadline=time.monotonic() + ESCALATION_RPC_TIMEOUT_S)
-        opened = client.call_tool("hestia_gate_escalation_open", {
-            "plugin_id": _escalation_plugin_id(),
+        claimed = _rpc("hestia_gate_escalation_claim",
+                       {"plugin_id": plugin_id, "marker": marker, "tool_name": tool_name})
+    except Exception as e:  # noqa: BLE001
+        # An unreachable daemon is a DENY, never a bypass. If a member could edit the gate by
+        # making the daemon unavailable, the mechanism would be decorative.
+        return "unreachable", f"could not reach the daemon ({type(e).__name__}) -- refused"
+
+    if _dig(claimed, "granted") is True:
+        who = _dig(claimed, "decided_by") or "a human"
+        via = _dig(claimed, "decided_via") or "unknown-channel"
+        esc = _dig(claimed, "escalation_id") or "?"
+        return "approved", f"approved by {who} via {via} (escalation {esc}, grant now spent)"
+
+    why = _dig(claimed, "why") or "no approval on file"
+
+    # --- No. Ask for one, and refuse THIS call. ---
+    # Best-effort: the deny below happens whether or not the ask succeeds. A member who cannot
+    # open an escalation is still refused; they just have nothing to point the operator at.
+    esc_id, how = None, None
+    try:
+        opened = _rpc("hestia_gate_escalation_open", {
+            "plugin_id": plugin_id,
             "role": os.environ.get("HESTIA_ROLE", ""),
             "tool_name": tool_name,
             "marker": marker,
         })
+        esc_id = _dig(opened, "escalation_id")
+        how = _dig(opened, "how_to_decide")
     except Exception as e:  # noqa: BLE001
-        # An unreachable daemon is a DENY, never a bypass. If a member could edit the gate
-        # by making the daemon unavailable, the mechanism would be decorative.
-        return "unreachable", f"could not open an escalation ({type(e).__name__}) -- refused"
+        debug_log(f"gate-self-write: could not open an escalation: {type(e).__name__}: {e}")
 
-    esc_id = _dig(opened, "escalation_id")
-    if not esc_id:
-        return "malformed", "the daemon returned no escalation_id -- refused"
-    how = _dig(opened, "how_to_decide") or f"hestia gate approve {esc_id}"
+    if esc_id:
+        # The deny IS the notification, and it is addressed to both readers: the operator, who
+        # decides, and the member, who has to know that retrying is the protocol rather than
+        # the evasion it would look like otherwise.
+        sys.stderr.write(
+            f"hestia: ESCALATION {esc_id} -- {tool_name} would WRITE to the governance "
+            f"surface ({marker}).\n"
+            f"  REFUSED for now: a hook cannot wait for a human without failing OPEN.\n"
+            f"  To allow:  {how or f'hestia gate approve {esc_id}'}\n"
+            f"  Then RETRY the same write; the approval is good for one write, for 5 minutes.\n"
+        )
+        sys.stderr.flush()
+        return "escalated", f"escalation {esc_id} opened and awaiting a human ({why})"
 
-    # The block IS the notification. No separate alerting path, because that would be a
-    # second thing to keep true: the operator is normally watching this session, and if
-    # nobody is, the timeout denies, which is the safe outcome.
-    sys.stderr.write(
-        f"hestia: ESCALATION {esc_id} -- {tool_name} would WRITE to the governance "
-        f"surface ({marker}).\n"
-        f"  Waiting for a human decision. NO DECISION = DENIED.\n"
-        f"  To allow:  {how}\n"
-    )
-    sys.stderr.flush()
-
-    wall = time.monotonic() + ESCALATION_WALL_S
-    last = "pending"
-    while time.monotonic() < wall:
-        time.sleep(ESCALATION_POLL_S)
-        try:
-            c = McpHttp(discover_endpoint() or DEFAULT_ENDPOINT,
-                            deadline=time.monotonic() + ESCALATION_RPC_TIMEOUT_S)
-            r = c.call_tool("hestia_gate_escalation_poll", {"escalation_id": esc_id})
-        except Exception:  # noqa: BLE001
-            # A dropped poll is not a verdict. Keep waiting until the wall, then deny: a
-            # transient blip must not convert a live approval into a refusal, and a dead
-            # daemon must still end in one.
-            continue
-        status = str(_dig(r, "status") or "").lower()
-        if status:
-            last = status
-        # Trust the daemon's own boolean rather than re-deriving it here. Two places
-        # deciding what "approved" means is how they come to disagree.
-        if _dig(r, "permits_write") is True and status == "approved":
-            who = _dig(r, "decided_by") or "a human"
-            via = _dig(r, "decided_via") or "unknown-channel"
-            return "approved", f"approved by {who} via {via}"
-        if status in ("denied", "expired"):
-            return status, f"{status} -- {_dig(r, 'reason') or 'no reason recorded'}"
-
-    return "timeout", f"no decision within the window (last seen: {last}) -- refused"
+    return "no-grant", f"{why} -- refused, and no escalation could be opened"
 
 
 def _escalation_plugin_id() -> str:
@@ -1109,7 +1141,7 @@ def main() -> int:
             verdict, detail = escalate_self_write(_self_marker, tool_name)
             if verdict != "approved":
                 debug_log(f"gate-self-write escalation {verdict}: {detail}")
-                return deny_self_access(_self_marker, tool_name)
+                return deny_self_access(_self_marker, tool_name, detail)
             # APPROVED -- the self-protection is lifted for THIS call only, and the call
             # continues to the ordinary policy check below. Approving a gate edit is not
             # approving everything else the same command might do.

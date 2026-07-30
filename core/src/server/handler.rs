@@ -80,6 +80,7 @@ impl ServerHandler for HestiaServer {
             "hestia_open_appeals" => tool_open_appeals(&self.state, &args).await,
             "hestia_gate_escalation_open" => tool_gate_escalation_open(&self.state, &args).await,
             "hestia_gate_escalation_poll" => tool_gate_escalation_poll(&self.state, &args).await,
+            "hestia_gate_escalation_claim" => tool_gate_escalation_claim(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
             "hestia_operating_law" => tool_operating_law(&self.state, &args).await,
@@ -250,7 +251,11 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_gate_escalation_poll",
-            "Read the verdict on an escalation you opened. Read-only and deliberately NOT witnessed — a wait is not an act, and witnessing every poll would bury the opened/decided entries under one member's loop. Only status `approved` permits the write; `pending`, `denied`, `expired` and an UNKNOWN id all refuse, the last two identically on purpose",
+            "Read the state of an escalation you opened. Read-only, NOT witnessed, and it AUTHORISES NOTHING — reporting only. A wait is not an act, and witnessing every poll would bury the opened/spent entries under one member's loop. To actually proceed with a write, call hestia_gate_escalation_claim; poll deliberately no longer returns a permits_write field, because two places deciding what `approved` means is how they come to disagree",
+        ),
+        t(
+            "hestia_gate_escalation_claim",
+            "Spend a human approval for a governance-surface write, by (plugin_id, marker). The ONLY thing that may permit such a write, and it permits exactly ONE: the grant is marked spent, so a second write needs a second approval, and an unspent grant goes stale in 5 minutes. Answers {granted:false} for no grant, a stale grant, a spent grant, a denial, or a pending decision — every uncertainty refuses. Witnessed only when it grants. The gate hook denies a governance write IMMEDIATELY and tells you to retry after a human decides; a hook cannot wait for a person, because a hook that overruns its harness timeout does not deny — the tool call proceeds",
         ),
         t(
             "hestia_witness_decision",
@@ -8817,10 +8822,15 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
     Ok(json!({
         "escalation_id": id,
         "status": status,
-        "permits_write": status.permits_write(),
+        // Deliberately NOT `permits_write`. Poll authorises nothing — `claim` is the single place
+        // a write may be permitted, and it spends the grant in the same breath. A second field
+        // that looked like permission is how two places come to disagree about what "approved"
+        // means, which is the failure this whole design keeps steering around.
+        "claimable": esc.map(|e| e.claimable_at(now)).unwrap_or(false),
         "secs_remaining": esc.map(|e| e.secs_remaining(now)).unwrap_or(0),
         "decided_by": esc.and_then(|e| e.decided_by.clone()),
         "decided_via": esc.and_then(|e| e.decided_via),
+        "decided_at": esc.and_then(|e| e.decided_at),
         "reason": esc.and_then(|e| e.reason.clone()),
         // An id this daemon has never seen and an id whose window closed are the SAME answer on
         // purpose. The caller's only safe reading of "I do not know" is "no".
@@ -8828,7 +8838,65 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
             "unknown escalation_id — treated as expired (a restart drops the store, and an \
              in-flight escalation must then read as denied)"
         } else {
-            "authoritative as of now; only `approved` permits the write"
+            "informational; call hestia_gate_escalation_claim to actually spend an approval"
         },
     }))
+}
+
+/// Spend an approval. The ONLY tool that may permit a governance write, and it permits one.
+///
+/// This exists because of a measurement, not a preference. A PreToolUse hook that overruns its
+/// harness timeout is not treated as a denial — the tool call proceeds (Claude Code 2.1.220,
+/// tested with a hook that denies after sleeping past a 2s timeout: the write went through). The
+/// hook therefore cannot hold a session open for a human. It denies immediately, the human decides
+/// out of band, and the member's retry asks this — one round trip, well inside the budget.
+async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::gate_escalation::now_secs;
+
+    let plugin_id = require_string(args, "plugin_id")?;
+    let marker = require_string(args, "marker")?;
+    let tool_name = optional_string(args, "tool_name").unwrap_or_default();
+    let now = now_secs();
+
+    let mut s = state.lock().await;
+    match s.gate_escalations.claim(&plugin_id, &marker, now) {
+        Ok(esc) => {
+            // Witnessed: spending a grant is an act, and it is the act the whole mechanism exists
+            // to make visible. `decided_via` rides along because a same-UID CLI approval and an
+            // authenticated operator session are not the same evidence for the write that follows.
+            let entry = s.append_chain(
+                "gate_escalation_spent",
+                json!({
+                    "escalation_id": esc.id,
+                    "plugin_id": esc.plugin_id,
+                    "subject_instance_lct": s.member_lct(&esc.plugin_id),
+                    "marker": esc.marker,
+                    "tool_name": tool_name,
+                    "decided_by": esc.decided_by,
+                    "decided_via": esc.decided_via,
+                    "decided_at": esc.decided_at,
+                    "assurance": "A1 — cooperative gate, same-UID operator. Tamper-EVIDENT, \
+                                  not tamper-proof.",
+                }),
+            )?;
+            Ok(json!({
+                "granted": true,
+                "escalation_id": esc.id,
+                "marker": esc.marker,
+                "decided_by": esc.decided_by,
+                "decided_via": esc.decided_via,
+                "witnessEntryHash": entry.hash,
+                "note": "grant SPENT — this approval will not permit a second write",
+            }))
+        }
+        // Not witnessed, and not an error: "no, ask a human" is the ordinary answer here, and it
+        // arrives on every retry while the member waits. Witnessing it would bury the opened and
+        // spent entries under the polling of whoever is waiting.
+        Err(e) => Ok(json!({
+            "granted": false,
+            "why": e.to_string(),
+            "note": "DENY. Only an explicit, unspent, in-window approval permits a governance \
+                     write; everything else — including this daemon being unsure — refuses.",
+        })),
+    }
 }
