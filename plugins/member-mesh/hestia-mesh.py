@@ -7,6 +7,15 @@ Usage:
   hestia-mesh.py send <to_plugin_id> <kind> <pointer_uri> [re_notice_id]  # witnessed notify
   hestia-mesh.py unanswered [older_than_secs]            # what has no bound response
 
+Remedy surface (issue #121 — see REMEDY SURFACE below):
+  hestia-mesh.py appeal <deny_hash> <reason...>          # appeal one of YOUR denies (reason >= 12 chars)
+  hestia-mesh.py appeals                                 # open appeals; per-entry you_may_rule
+  hestia-mesh.py arbitrate-appeal <deny_hash> <grant|reject> <rationale...>  # rule an appeal (>= 24 chars)
+  hestia-mesh.py escalate <tool_name> <marker...>        # ask a human/peer to approve a governance write
+  hestia-mesh.py pending                                 # pending gate escalations; per-entry you_may_rule
+  hestia-mesh.py poll <escalation_id>                    # status; unknown id == expired == DENIED
+  hestia-mesh.py arbitrate <escalation_id> <approve|deny> [reason...]        # rule an escalation
+
 Env: HESTIA_ENDPOINT (default http://127.0.0.1:7711/mcp),
      HESTIA_MESH_PLUGIN (REQUIRED — no default; see below), HESTIA_MESH_HOST_AGENT
      (defaults to <plugin>-cli, derived rather than pinned to one member),
@@ -20,6 +29,26 @@ Kinds: coordination|review_request|review_done|reply|handoff|forum-note|ack (ack
 Discipline: forum post = record, mesh notice = wake; content lives at the pointer.
 Bind your dispositions: pass the id of the notice you are answering as the 4th
 arg to `send` (reply/ack/review_done), or it stays "unanswered" forever.
+
+REMEDY SURFACE (added for issue #121):
+  A deny from the gate prescribes `hestia_appeal` / ESCALATE — but those are MCP tools,
+  and a mesh-woken non-interactive session has no hestia MCP server configured, so the
+  prescribed remedy was unreachable by exactly the caller who heard the refusal. The
+  daemon already exposes every remedy tool over the same endpoint this CLI uses, and
+  this CLI already authenticates as the member (hestia_connect) and witnesses every act.
+  So the reachable channel belongs here. What each subcommand wraps:
+    appeal            -> hestia_appeal                  (your own denies only; reason >= 12 chars)
+    appeals           -> hestia_open_appeals            (discovery; attribution optional but passed)
+    arbitrate-appeal  -> hestia_arbitrate_appeal        (NOT-SAME enforced server-side;
+                                                         grant = the deny was wrong, reject = it stands)
+    escalate          -> hestia_gate_escalation_open    (deny-now / decide-out-of-band / retry:
+                                                         the write stays refused until re-issued
+                                                         after an approval, which `claim` spends)
+    pending           -> hestia_gate_pending_escalations
+    poll              -> hestia_gate_escalation_poll    (unknown id reads as expired — a restart
+                                                         drops the store, and that must read as denied)
+    arbitrate         -> hestia_gate_arbitrate_escalation (peer ruling; NOT-SAME enforced server-side)
+  Ruling moves YOUR conduct score: arbitrate only what you actually read.
 """
 import json, os, sys, urllib.request
 
@@ -106,7 +135,10 @@ def connect():
     return h, s
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("peek", "drain", "send", "unanswered"):
+    cmds = ("peek", "drain", "send", "unanswered",
+            "appeal", "appeals", "arbitrate-appeal",
+            "escalate", "pending", "poll", "arbitrate")
+    if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         print(__doc__); sys.exit(2)
     cmd = sys.argv[1]
     h, s = connect()
@@ -117,7 +149,7 @@ def main():
         if len(sys.argv) > 2:
             args["older_than_secs"] = int(sys.argv[2])
         out = rpc(h, "hestia_member_unanswered", args)
-    else:
+    elif cmd == "send":
         if len(sys.argv) < 5:
             print("usage: hestia-mesh.py send <to_plugin_id> <kind> <pointer_uri> [re_notice_id]")
             sys.exit(2)
@@ -126,6 +158,52 @@ def main():
         if len(sys.argv) > 5:
             args["in_reply_to"] = int(sys.argv[5])
         out = rpc(h, "hestia_member_notify", args)
+    elif cmd == "appeal":
+        if len(sys.argv) < 4:
+            print("usage: hestia-mesh.py appeal <deny_hash> <reason...>")
+            sys.exit(2)
+        out = rpc(h, "hestia_appeal", {"deny_hash": sys.argv[2],
+                                       "reason": " ".join(sys.argv[3:]),
+                                       "session_id": s})
+    elif cmd == "appeals":
+        out = rpc(h, "hestia_open_appeals", {"session_id": s})
+    elif cmd == "arbitrate-appeal":
+        if len(sys.argv) < 5 or sys.argv[3] not in ("grant", "reject"):
+            print("usage: hestia-mesh.py arbitrate-appeal <deny_hash> <grant|reject> <rationale...>\n"
+                  "  grant  = the deny was wrong (the appeal succeeds)\n"
+                  "  reject = the deny stands")
+            sys.exit(2)
+        out = rpc(h, "hestia_arbitrate_appeal", {"deny_hash": sys.argv[2],
+                                                 "upheld": sys.argv[3] == "grant",
+                                                 "rationale": " ".join(sys.argv[4:]),
+                                                 "session_id": s})
+    elif cmd == "escalate":
+        if len(sys.argv) < 4:
+            print("usage: hestia-mesh.py escalate <tool_name> <marker...>\n"
+                  "  marker identifies the refused write (as the hook computed it); the approval,\n"
+                  "  if granted, is claimed by RE-ISSUING the same write, not by this command")
+            sys.exit(2)
+        args = {"plugin_id": PLUGIN, "tool_name": sys.argv[2],
+                "marker": " ".join(sys.argv[3:])}
+        if os.environ.get("HESTIA_ROLE"):
+            args["role"] = os.environ["HESTIA_ROLE"]
+        out = rpc(h, "hestia_gate_escalation_open", args)
+    elif cmd == "pending":
+        out = rpc(h, "hestia_gate_pending_escalations", {"session_id": s})
+    elif cmd == "poll":
+        if len(sys.argv) < 3:
+            print("usage: hestia-mesh.py poll <escalation_id>")
+            sys.exit(2)
+        out = rpc(h, "hestia_gate_escalation_poll", {"escalation_id": sys.argv[2]})
+    else:  # arbitrate
+        if len(sys.argv) < 4 or sys.argv[3] not in ("approve", "deny"):
+            print("usage: hestia-mesh.py arbitrate <escalation_id> <approve|deny> [reason...]")
+            sys.exit(2)
+        out = rpc(h, "hestia_gate_arbitrate_escalation",
+                  {"escalation_id": sys.argv[2],
+                   "approve": sys.argv[3] == "approve",
+                   "reason": " ".join(sys.argv[4:]),
+                   "session_id": s})
     print(json.dumps(out, indent=1))
 
 if __name__ == "__main__":
