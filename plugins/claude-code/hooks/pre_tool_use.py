@@ -583,6 +583,8 @@ def request_self_write(marker: str, tool_name: str) -> Tuple[str, str]:
     try:
         endpoint = discover_endpoint() or DEFAULT_ENDPOINT
         client = McpHttp(endpoint, deadline=time.monotonic() + ESCALATION_RPC_TIMEOUT_S)
+        client.initialize()
+        client.initialized()
         r = client.call_tool("hestia_gate_escalation_claim", {
             "plugin_id": _escalation_plugin_id(),
             "role": os.environ.get("HESTIA_ROLE", ""),
