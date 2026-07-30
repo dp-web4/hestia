@@ -471,6 +471,22 @@ def main():
         sys.stderr.write("hestia: deny [gate] — could not parse the tool event; failing closed.\n")
         sys.exit(2)
 
+    # INTERACTIVE HEARTBEAT (forum 2026-07-30): a live session proves itself per
+    # tool call, so hestia-watch-member.sh can YIELD replies to the live session
+    # instead of consuming them into a headless instance the author never meets
+    # (dp: "the reply lands here unbeknownst to you the author" — verified, he
+    # was right). Best-effort, never gating: a failed touch changes nothing here,
+    # and the state is observable where it matters — the heartbeat file's
+    # presence/freshness is what the watcher reads, so a write failure degrades
+    # to the documented default (watcher fires), never to a hidden one.
+    try:
+        hb = os.path.expanduser("~/.kimi-code/hestia-instance/interactive-heartbeat")
+        os.makedirs(os.path.dirname(hb), exist_ok=True)
+        with open(hb, "a", encoding="utf-8"):
+            pass
+    except Exception:
+        pass
+
     if event.get("hook_event_name") != "PreToolUse":
         sys.exit(0)  # not our event
 

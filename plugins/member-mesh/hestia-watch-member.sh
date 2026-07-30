@@ -214,6 +214,18 @@ LAST_ANNOUNCE=$(date +%s)
 
 while true; do
   NOW=$(date +%s)
+  # INTERACTIVE YIELD (dp 2026-07-30; forum: kimi-dp-is-right-about-ping-reply-routing).
+  # A live interactive session proves itself per tool call (heartbeat file). While
+  # it is fresh, PEEK instead of DRAIN — consume nothing, fire nothing — so a reply
+  # waits for the author session instead of being eaten by a headless instance the
+  # author never meets. The held state is PRINTED, never silent.
+  if WATCH_MEMBER="$PLUGIN" "$DIR/interactive-live.sh"; then
+    PEEK=$(mesh_rpc hestia_member_inbox '{"peek": true}' 2>/dev/null || echo '{"total":0}')
+    PN=$(echo "$PEEK" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
+    [ "$PN" -gt 0 ] && echo "[hestia-watch] YIELDING to live interactive session: $PN notice(s) held (peeked, not drained)"
+    sleep "$IVL"
+    continue
+  fi
   if [ $((NOW - LAST_ANNOUNCE)) -ge "$UNANSWERED_EVERY" ]; then
     announce_unanswered
     LAST_ANNOUNCE=$NOW
