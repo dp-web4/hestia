@@ -900,7 +900,7 @@ mod tests {
         // The record carried `secs_from_decision_to_use` computed from `opened_at`, which is a
         // different duration wearing the decision's name. Approve at T0+119 and spend at T0+120:
         // the honest answer is 1 second, and the old arithmetic said 120.
-        let (mut s, id) = store_with_one();
+        let (mut s, id) = store_with_one_simple_marker();
         let decided = s
             .decide(&id, true, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, Some("legit gate edit"), T0 + 119)
             .expect("decide");
@@ -912,7 +912,7 @@ mod tests {
         );
 
         let now = T0 + 120;
-        let claimed = s.claim("claude-code", "pre_tool_use.py", now).expect("claim");
+        let claimed = s.claim("claude-code", "law_inject.py", now).expect("claim");
         let from_decision = now - claimed.decided_at.expect("a claimed approval was decided");
         let from_open = now - claimed.opened_at;
         assert_eq!(from_decision, 1, "decision -> use");
