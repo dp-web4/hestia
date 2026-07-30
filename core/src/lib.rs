@@ -7,6 +7,7 @@
 //! - **MCP server**: rmcp-backed server exposing the surface in ADR-0005 (next)
 //! - **Society state**: Web4 society with witness chain + trust evolution (after that)
 
+pub mod sovereign_phrase;
 pub mod addressing;
 pub mod arbiter;
 pub mod callback;
