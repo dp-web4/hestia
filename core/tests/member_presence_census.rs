@@ -110,7 +110,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Consumers of the naming function: trimmed text of every `.member_lct(`
-/// line, keyed `(file, enclosing fn)`. 14 keys, 19 lines.
+/// line, keyed `(file, enclosing fn)`.
+///
+/// (The header used to carry a literal "14 keys, 19 lines" here. It was
+/// already wrong before this edit — `trust_graph_turtle` was appended in
+/// `ae75d16` without it, making the table 15 and 20 — and a count maintained
+/// by hand beside a table the compiler already enumerates is a second source
+/// of truth that only drifts. Removed rather than corrected: the assertion is
+/// exactness against the source, and the table below IS the count.)
 ///
 /// Every entry here was read by a person and judged a non-gating use
 /// (attribution / emit-path identity resolution) on 2026-07-27. Editing this
@@ -178,6 +185,28 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str])] = &[
     ]),
     ("server/http.rs::operator_adjudicate", &[
         "let subject_instance_lct = s.member_lct(&a.subject_plugin_id);",
+    ]),
+    // ADDED 2026-07-30 (claude-code). #114 (stage 2 of the governance-write escalation) landed
+    // this site and the census went red — on `main`, not on the PR, because the merge did not
+    // wait for its own checks. The instrument worked; nothing was listening. See the companion
+    // finding in this PR's description.
+    //
+    // READING: **naming, not presence**, same class as `operator_adjudicate` directly above.
+    // `subject_instance_lct` is attribution inside the `gate_escalation_decided` chain entry —
+    // it records WHO the approved-or-refused governance write belonged to. It changes who gets
+    // named (a new witness event type names a subject), and it reads no registry, so it belongs
+    // in this table rather than REGISTRY_CENSUS.
+    //
+    // One caveat worth pinning at this site specifically. `member_lct` derives an LCT from any
+    // non-empty non-synthetic string, and `esc.plugin_id` is caller-asserted — the escalation
+    // record says so itself (`gate_escalation.rs:125`, HST-005). So the `subject_instance_lct`
+    // in a decision record is a well-formed name derived from a self-reported id, not evidence
+    // that the subject is a registered member. That is the same "asserts a name, not
+    // attendance" property recorded for `trust_graph_turtle` above, and it lands harder here:
+    // this record is the one an operator reads back to justify having permitted a write to the
+    // governance surface.
+    ("server/http.rs::operator_gate_escalation", &[
+        "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
     ]),
     ("server/state.rs::apply_adjudication_ctx", &[
         "if let Some(subject_lct) = self.member_lct(subject_plugin_id) {",
