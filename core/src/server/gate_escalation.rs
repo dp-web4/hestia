@@ -60,8 +60,35 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-/// How long a pending escalation lives. dp: "deny on timeout of a couple minutes."
-pub const DEFAULT_TTL_SECS: u64 = 120;
+/// How long a pending escalation stays decidable.
+///
+/// It was 120s, from dp's original instruction: *"deny on timeout of a couple minutes."* That
+/// number was correct for the design it was written against and is wrong for the one that
+/// shipped, so it is worth being explicit about why rather than quietly changing it.
+///
+/// **What "a couple of minutes" was bounding.** In the first design the hook BLOCKED, waiting
+/// in-process for a decision. Two minutes was a bound on *how long a member sits frozen* — a
+/// generous ceiling on the cost of asking. The blocking design was removed (it failed OPEN
+/// under the harness timeout; see the module header), and replaced with deny-now /
+/// decide-out-of-band / retry.
+///
+/// **Nothing waits any more.** The write is refused immediately and stays refused. The window
+/// is no longer a member sitting frozen; it is only *how long a decider has to answer before
+/// the ask goes stale*. The constraint the 120s was protecting no longer exists, and keeping
+/// the number preserved the digit while discarding the reason.
+///
+/// **And it made peer arbitration unusable.** #118 lets a NOT-SAME peer rule an escalation, and
+/// a peer is ASYNCHRONOUS — another agent on another schedule, reached by a mesh notice it will
+/// see when it next drains. Two minutes means it essentially never arrives in time. Measured
+/// 2026-07-30: escalation `8bb08a85` was opened, kimi-code was notified over the mesh, and it
+/// expired unruled. Not a failure of the peer; a window sized for someone already watching.
+///
+/// One hour is sized for the decider that actually exists. It costs nothing to be generous
+/// here: a pending escalation permits NOTHING, so a longer window widens no permission — it
+/// only widens the chance that somebody answers. What must stay tight is
+/// `APPROVAL_CLAIM_WINDOW_SECS`, because that one bounds how long a GRANTED approval can be
+/// ridden, and that is where a loose number would actually cost something.
+pub const DEFAULT_TTL_SECS: u64 = 3600;
 
 /// How long an APPROVAL stays claimable after it is granted.
 ///
@@ -1069,5 +1096,71 @@ mod bar_factor_tests {
             .corroborate(&id, "kimi-code", "r", None, T0 + 121)
             .expect_err("expired is expired");
         assert_eq!(err, DecideError::Expired);
+    }
+}
+
+#[cfg(test)]
+mod ttl_tests {
+    use super::*;
+
+    const T0: u64 = 1_800_000_000;
+
+    #[test]
+    fn the_decision_window_outlives_an_asynchronous_peer() {
+        // The regression this guards is not "the number is 3600". It is that a peer reached by
+        // a mesh notice, on its own schedule, can still rule when it gets there. Two minutes
+        // could not, and that is how escalation 8bb08a85 expired unruled on 2026-07-30.
+        let mut s = EscalationStore::default();
+        let e = s.open("claude-code", "r", "Edit", "gate.py", T0, DEFAULT_TTL_SECS).unwrap();
+        let ten_minutes_later = T0 + 600;
+        assert_eq!(
+            s.status_of(&e.id, ten_minutes_later),
+            Status::Pending,
+            "a peer that answers ten minutes later must still find something to rule"
+        );
+        assert!(s
+            .decide(&e.id, true, "kimi-code", "role:constellation:reviewer",
+                    Channel::PeerMember, Some(crate::arbiter::Independence::CrossMember),
+                    Some("reviewed"), ten_minutes_later)
+            .is_ok());
+    }
+
+    #[test]
+    fn a_longer_window_widens_no_permission_while_it_is_open() {
+        // The whole justification for being generous: pending permits NOTHING, so the extra
+        // time buys a chance of an answer and grants nothing in the meantime. If this ever
+        // fails, the generosity became a hole.
+        let mut s = EscalationStore::default();
+        let e = s.open("claude-code", "r", "Edit", "gate.py", T0, DEFAULT_TTL_SECS).unwrap();
+        for t in [T0 + 1, T0 + 600, T0 + 3599] {
+            assert_eq!(s.status_of(&e.id, t), Status::Pending);
+            assert!(!s.status_of(&e.id, t).permits_write(), "pending permitted a write at {t}");
+            assert!(s.claim("claude-code", "gate.py", t).is_none(), "claimable while pending");
+        }
+    }
+
+    #[test]
+    fn the_claim_window_stays_tight_even_though_the_decision_window_grew() {
+        // The two bound different risks and must not drift together. Decision window: how long
+        // someone has to answer (harmless). Claim window: how long a GRANTED approval can be
+        // ridden (not harmless). Widening the first must not widen the second.
+        assert!(
+            APPROVAL_CLAIM_WINDOW_SECS <= 900,
+            "the claim window bounds how long a granted approval stays spendable; it must not \
+             be relaxed alongside the decision window"
+        );
+    }
+
+    #[test]
+    fn an_undecided_escalation_still_expires() {
+        // Generous is not unbounded. An ask nobody ever answers must still go stale, or the
+        // store accumulates open grants forever and 'pending' stops meaning anything.
+        let mut s = EscalationStore::default();
+        let e = s.open("claude-code", "r", "Edit", "gate.py", T0, DEFAULT_TTL_SECS).unwrap();
+        assert_eq!(s.status_of(&e.id, T0 + DEFAULT_TTL_SECS), Status::Expired);
+        assert!(s
+            .decide(&e.id, true, "kimi-code", "r", Channel::PeerMember, None, Some("late"),
+                    T0 + DEFAULT_TTL_SECS + 1)
+            .is_err());
     }
 }
