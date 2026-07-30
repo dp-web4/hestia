@@ -735,7 +735,7 @@ mod tests {
         // the honest answer is 1 second, and the old arithmetic said 120.
         let (mut s, id) = store_with_one();
         let decided = s
-            .decide(&id, true, "dp", Channel::OperatorSession, Some("legit gate edit"), T0 + 119)
+            .decide(&id, true, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, Some("legit gate edit"), T0 + 119)
             .expect("decide");
         assert_eq!(decided.decided_at, Some(T0 + 119));
         assert_ne!(
