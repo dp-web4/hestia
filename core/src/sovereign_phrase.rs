@@ -41,6 +41,14 @@
 //!   which is everyone. Argon2id is what makes that expensive rather than trivial, which is why
 //!   a plain SHA-256 of the phrase would have been close to worthless here.
 //!
+//! * The phrase is a plain `String` from prompt to caller — no `zeroize`, so it lingers in freed
+//!   heap until overwritten. Under A1 that is inside the ceiling already conceded above rather
+//!   than a new hole: a member at this UID can `ptrace` the process and read the phrase while it
+//!   is legitimately live, and scrubbing after use does not close that. It is named because the
+//!   consumer will hold the phrase across a daemon round-trip, where the exposure window stops
+//!   being a few microseconds — `zeroize` belongs there, and this line is the reason it is not
+//!   here (kimi-code, PR #119 review, note 3).
+//!
 //! What it genuinely buys: the bar moves from **read a file** to **subvert a binary or capture a
 //! keystroke**. The first is invisible and free. The second is a deliberate, loud act — and
 //! deliberate-versus-accidental is the distinction this fleet keeps failing to make. Everything
@@ -54,6 +62,11 @@ use argon2::Argon2;
 
 /// Minimum length. Not a policy flourish: the stored hash is world-readable, so a short phrase is
 /// an offline dictionary attack with a head start, and Argon2id cannot rescue four characters.
+///
+/// A floor on length is not a floor on entropy, and against a readable hash entropy is the thing
+/// that actually costs an attacker anything: `password1234` clears this bar and is worth close to
+/// nothing. Hence the name — choose a *phrase*, several unrelated words, not a password. The
+/// enrolment prompt should say so, since this constant cannot.
 pub const MIN_PHRASE_LEN: usize = 12;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -63,10 +76,28 @@ pub enum PhraseError {
     /// No phrase has been enrolled, so nothing can be verified. Fail CLOSED: an unset phrase
     /// must never read as "anything is accepted", which is how an absent control becomes an
     /// open door.
+    ///
+    /// This also absorbs a present-but-empty record (`Some("")`, or whitespace only). Both fail
+    /// closed and both are remedied by re-enrolling, so the distinction does not change what the
+    /// sovereign should do — but it is worth naming that these are different facts: "the file was
+    /// never created" is the expected state before first enrolment, whereas "the file exists and
+    /// is zero bytes" means something truncated it. Only the second is evidence of a problem
+    /// beyond this module, and this variant deliberately does not distinguish them (kimi-code,
+    /// PR #119 review, note 2).
     NotEnrolled,
     /// The stored hash is unparseable — corrupted or truncated. Also fail closed, and say which
     /// of the two it is rather than blaming the caller's phrase.
     CorruptRecord,
+    /// Hashing itself failed while enrolling. Distinct from `CorruptRecord` on purpose: at
+    /// enrolment there is no record yet, so "the record is corrupt" would be a true-sounding
+    /// sentence about a thing that does not exist — the same substitution this module already
+    /// fixed one level down, where a truncated record reported `Mismatch` and sent the sovereign
+    /// to re-type instead of re-enrol (kimi-code, PR #119 review, note 1).
+    ///
+    /// Practically unreachable with `Argon2::default()` params, which is why there is no test
+    /// pinning it: the honest options were an untriggerable branch or a fabricated one, and a
+    /// test that cannot fail is the thing this repo keeps learning not to trust.
+    HashingFailed,
     /// The phrase did not match.
     Mismatch,
 }
@@ -89,6 +120,12 @@ impl std::fmt::Display for PhraseError {
                 "the stored sovereign phrase record is unreadable — refusing rather than \
                  guessing. Re-enrol with `hestia sovereign set-phrase`"
             ),
+            PhraseError::HashingFailed => write!(
+                f,
+                "could not hash the sovereign phrase — nothing was enrolled. This is a fault in \
+                 hestia, not in the phrase you chose; retrying with a different phrase will not \
+                 help"
+            ),
             PhraseError::Mismatch => write!(f, "sovereign phrase did not match"),
         }
     }
@@ -106,7 +143,7 @@ pub fn enrol(phrase: &str) -> Result<String, PhraseError> {
     Argon2::default()
         .hash_password(phrase.as_bytes(), &salt)
         .map(|h| h.to_string())
-        .map_err(|_| PhraseError::CorruptRecord)
+        .map_err(|_| PhraseError::HashingFailed)
 }
 
 /// Verify a candidate against a stored record.
