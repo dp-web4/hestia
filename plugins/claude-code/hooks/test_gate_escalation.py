@@ -1,33 +1,42 @@
 #!/usr/bin/env python3
-"""Stage-2 escalation: the verdict path, against a stub daemon.
+"""Stage-2 escalation: the verdict path and the BUDGET, against a stub daemon.
 
-dp, 2026-07-29: "add escalation since it isn't a tested mechanism yet. do that in separate pr."
-So the mechanism arrives with the tests that make its failure modes visible, and the ones that
-matter are the REFUSALS -- an approval that works and a timeout that quietly allows would look
-identical in a demo.
+dp, 2026-07-29: "add escalation since it isn't a tested mechanism yet."
 
-Runs under bare `python3` at module scope on purpose: CI executes these files directly (see
-tools/ci_discovery.py), and a pytest-style file would be imported, define its functions, exit 0
-and report green no matter what it asserts -- the exact shape tools/ci_selfexec_test.py refuses.
+The first cut of this suite tested every verdict and still shipped a mechanism that could not
+work: it waited 135s in a hook the harness kills at 5s, and a killed hook yields neither exit 2
+nor a JSON deny -- so Claude Code runs the tool ANYWAY. The verdicts were all correct and the
+thing failed OPEN. kimi-code caught it in review (PR #114).
 
-Every case stubs the daemon over real HTTP on a loopback port rather than monkeypatching the
-client, so the envelope handling (`_dig`) is exercised the way the daemon actually answers.
+So this suite now tests two things, and the second is the one that was missing: what the hook
+DECIDES, and how long it TAKES to decide it. A verdict that arrives after the harness has given
+up is not a verdict.
+
+Runs under bare `python3` at module scope: CI executes these files directly (tools/ci_discovery.py),
+and a pytest-style file would import, define its functions, exit 0 and report green no matter what
+it asserts -- exactly what tools/ci_selfexec_test.py refuses.
 """
 from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 HOOK = Path(__file__).resolve().parent / "pre_tool_use.py"
-
 _spec = importlib.util.spec_from_file_location("ptu_under_test", HOOK)
 ptu = importlib.util.module_from_spec(_spec)
 assert _spec and _spec.loader
 _spec.loader.exec_module(ptu)
+
+# The harness timeout this hook ships with, in plugin.json AND in the live settings.json. Every
+# path through the hook must finish inside it with room for the ordinary policy call too.
+HARNESS_TIMEOUT_S = 5.0
+BUDGET_S = 3.0
 
 FAILS: list[str] = []
 RAN: list[str] = []
@@ -41,11 +50,10 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 class _Stub(BaseHTTPRequestHandler):
-    """Minimal MCP-over-HTTP daemon. `script` decides what poll answers."""
+    payload: dict = {}
+    stall_s: float = 0.0
 
-    script: dict = {}
-
-    def log_message(self, *_a):  # silence
+    def log_message(self, *_a):
         pass
 
     def do_POST(self):  # noqa: N802
@@ -54,119 +62,129 @@ class _Stub(BaseHTTPRequestHandler):
             req = json.loads(body or b"{}")
         except ValueError:
             req = {}
-        name = (req.get("params") or {}).get("name", "")
-        if name == "hestia_gate_escalation_open":
-            payload = self.script.get("open", {"escalation_id": "abc123", "how_to_decide": "x"})
-        elif name == "hestia_gate_escalation_poll":
-            seq = self.script.get("poll_seq") or [self.script.get("poll", {})]
-            i = min(self.script.setdefault("_i", 0), len(seq) - 1)
-            self.script["_i"] = self.script["_i"] + 1
-            payload = seq[i]
-        else:
-            payload = {}
-        # Wrapped in content[0].text, which is how the real daemon answers a tools/call.
+        if self.stall_s:
+            time.sleep(self.stall_s)  # accepts the connection, never answers in time
         out = json.dumps({
             "jsonrpc": "2.0", "id": req.get("id", 1),
-            "result": {"content": [{"type": "text", "text": json.dumps(payload)}]},
+            "result": {"content": [{"type": "text", "text": json.dumps(self.payload)}]},
         }).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("mcp-session-id", "stub-session")
-        self.send_header("Content-Length", str(len(out)))
-        self.end_headers()
-        self.wfile.write(out)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("mcp-session-id", "stub")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+        except Exception:  # client already gave up
+            pass
 
 
-def run_with(script: dict, wall: float = 6.0, poll: float = 0.2) -> tuple[str, str]:
-    """Point the hook at a stub daemon and return escalate_self_write's verdict."""
-    _Stub.script = dict(script)
+def run_with(payload: dict, stall_s: float = 0.0) -> tuple[str, str, float]:
+    _Stub.payload, _Stub.stall_s = dict(payload), stall_s
     srv = HTTPServer(("127.0.0.1", 0), _Stub)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    old_wall, old_poll = ptu.ESCALATION_WALL_S, ptu.ESCALATION_POLL_S
-    ptu.ESCALATION_WALL_S, ptu.ESCALATION_POLL_S = wall, poll
-    import os
-    old_ep = os.environ.get("HESTIA_ENDPOINT")
+    old = os.environ.get("HESTIA_ENDPOINT")
     os.environ["HESTIA_ENDPOINT"] = f"http://127.0.0.1:{srv.server_port}/mcp"
+    t0 = time.monotonic()
     try:
-        return ptu.escalate_self_write("pre_tool_use.py", "Edit")
+        v, d = ptu.request_self_write("pre_tool_use.py", "Edit")
     finally:
-        ptu.ESCALATION_WALL_S, ptu.ESCALATION_POLL_S = old_wall, old_poll
-        if old_ep is None:
+        elapsed = time.monotonic() - t0
+        if old is None:
             os.environ.pop("HESTIA_ENDPOINT", None)
         else:
-            os.environ["HESTIA_ENDPOINT"] = old_ep
-        srv.shutdown()
+            os.environ["HESTIA_ENDPOINT"] = old
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+    return v, d, elapsed
 
 
-APPROVED = {"status": "approved", "permits_write": True, "decided_by": "dp",
-            "decided_via": "local_cli"}
+APPROVED = {"claimed": True, "permits_write": True, "decided_by": "dp", "decided_via": "local_cli"}
+REFUSED = {"claimed": False, "permits_write": False, "escalation_id": "abc123",
+           "how_to_decide": "hestia gate approve abc123", "retry_within_secs": 720}
 
-# --- the one path that permits -----------------------------------------------------------
-v, d = run_with({"poll": APPROVED})
-check("approved permits the write", v == "approved", f"{v}: {d}")
-check("approved names who and by what channel", "dp" in d and "local_cli" in d, d)
+# --- the one path that permits ------------------------------------------------------------
+v, d, _ = run_with(APPROVED)
+check("a claimed approval permits the write", v == "approved", f"{v}: {d}")
+check("it names who approved and by what channel", "dp" in d and "local_cli" in d, d)
 
-# --- every other path refuses ------------------------------------------------------------
-v, _ = run_with({"poll": {"status": "denied", "permits_write": False, "reason": "not now"}})
-check("denied refuses", v == "denied", v)
+# --- the ordinary path: refuse now, decide later --------------------------------------------
+v, d, _ = run_with(REFUSED)
+check("no approval yet REFUSES", v == "escalated", f"{v}: {d}")
+check("the refusal carries the escalation id", "abc123" in d, d)
 
-v, _ = run_with({"poll": {"status": "expired", "permits_write": False}})
-check("expired refuses", v == "expired", v)
+# --- an un-upgraded daemon ------------------------------------------------------------------
+# It answers {} to a tool it has never heard of. It must not permit a write by failing to
+# understand the question -- and it must not imply paperwork exists that does not.
+v, d, _ = run_with({})
+check("a daemon with no escalation channel refuses", v == "no-channel", f"{v}: {d}")
+check("and says NO escalation was opened", "NO escalation" in d, d)
 
-v, _ = run_with({"poll": {"status": "pending", "permits_write": False}}, wall=1.2, poll=0.2)
-check("no decision within the window refuses", v == "timeout", v)
+# --- the branches a member would attack ------------------------------------------------------
+v, _, _ = run_with({"claimed": True, "permits_write": False, "escalation_id": "x"})
+check("claimed without permits_write does NOT permit", v != "approved", v)
+v, _, _ = run_with({"claimed": False, "permits_write": True, "escalation_id": "x"})
+check("permits_write without claimed does NOT permit", v != "approved", v)
 
-# An old daemon that has never heard of these tools answers {} -- it must not be able to
-# grant a write by failing to understand the question.
-v, _ = run_with({"open": {}})
-check("a daemon with no escalation_id refuses", v == "malformed", v)
-
-# --- the branch a member would attack ----------------------------------------------------
-# `status: approved` while the daemon's own boolean says no. Two places deciding what
-# "approved" means is how they come to disagree, so the hook trusts permits_write.
-v, _ = run_with({"poll": {"status": "approved", "permits_write": False}}, wall=1.2, poll=0.2)
-check("status=approved without permits_write does NOT permit", v != "approved", v)
-
-# permits_write true while the status says something else must also refuse.
-v, _ = run_with({"poll": {"status": "pending", "permits_write": True}}, wall=1.2, poll=0.2)
-check("permits_write without status=approved does NOT permit", v != "approved", v)
-
-# --- unreachable daemon ------------------------------------------------------------------
-import os as _os
-_old = _os.environ.get("HESTIA_ENDPOINT")
-_os.environ["HESTIA_ENDPOINT"] = "http://127.0.0.1:1/mcp"  # nothing listens on port 1
+# --- unreachable -----------------------------------------------------------------------------
+old = os.environ.get("HESTIA_ENDPOINT")
+os.environ["HESTIA_ENDPOINT"] = "http://127.0.0.1:1/mcp"
+t0 = time.monotonic()
 try:
-    v, d = ptu.escalate_self_write("pre_tool_use.py", "Edit")
+    v, d = ptu.request_self_write("pre_tool_use.py", "Edit")
 finally:
-    if _old is None:
-        _os.environ.pop("HESTIA_ENDPOINT", None)
+    unreachable_elapsed = time.monotonic() - t0
+    if old is None:
+        os.environ.pop("HESTIA_ENDPOINT", None)
     else:
-        _os.environ["HESTIA_ENDPOINT"] = _old
+        os.environ["HESTIA_ENDPOINT"] = old
 check("an unreachable daemon refuses rather than bypassing", v == "unreachable", f"{v}: {d}")
 
-# --- attribution --------------------------------------------------------------------------
-# Never guess a member id. #108 was exactly this defect one layer over: an unset variable
-# produced a well-formed act attributed to a real member.
-_old_p = _os.environ.pop("HESTIA_MESH_PLUGIN", None)
+# --- THE BUDGET: the defect this suite previously could not see -------------------------------
+# A verdict that arrives after the harness has SIGKILLed the hook is not a verdict -- the tool
+# runs anyway. So every path has to finish inside the shipped timeout, and the slow paths are
+# the ones that matter.
+_, _, t_ok = run_with(APPROVED)
+_, _, t_refuse = run_with(REFUSED)
+_, _, t_stall = run_with(REFUSED, stall_s=10.0)  # accepts, then never answers in time
+
+check(f"approved path fits the budget ({t_ok:.2f}s < {BUDGET_S}s)", t_ok < BUDGET_S, f"{t_ok:.2f}s")
+check(f"refusal path fits the budget ({t_refuse:.2f}s < {BUDGET_S}s)", t_refuse < BUDGET_S, f"{t_refuse:.2f}s")
+check(f"a STALLED daemon still fits the budget ({t_stall:.2f}s < {BUDGET_S}s)",
+      t_stall < BUDGET_S, f"{t_stall:.2f}s -- a hook that outruns its harness timeout is KILLED, "
+                          f"and a killed hook does not block the tool")
+check(f"unreachable fits the budget ({unreachable_elapsed:.2f}s < {BUDGET_S}s)",
+      unreachable_elapsed < BUDGET_S, f"{unreachable_elapsed:.2f}s")
+check("the whole hook budget stays under the shipped harness timeout",
+      BUDGET_S < HARNESS_TIMEOUT_S, f"{BUDGET_S} vs {HARNESS_TIMEOUT_S}")
+
+# --- no in-hook wait may be reintroduced -------------------------------------------------------
+# A guard on the defect itself rather than only on its symptom: if someone adds a wait loop back,
+# this fails even if every verdict above still passes.
+src = HOOK.read_text()
+check("the hook does not sleep while waiting for a human",
+      "ESCALATION_WALL_S" not in src and "while time.monotonic() < wall" not in src,
+      "an in-hook wait for a human fails OPEN under the harness timeout")
+
+# --- attribution --------------------------------------------------------------------------------
+_old_p = os.environ.pop("HESTIA_MESH_PLUGIN", None)
 try:
     check("unset identity is 'unattributed', never a guessed member",
           ptu._escalation_plugin_id() == "unattributed", ptu._escalation_plugin_id())
 finally:
     if _old_p is not None:
-        _os.environ["HESTIA_MESH_PLUGIN"] = _old_p
-
-_os.environ["HESTIA_MESH_PLUGIN"] = "kimi-code"
+        os.environ["HESTIA_MESH_PLUGIN"] = _old_p
+os.environ["HESTIA_MESH_PLUGIN"] = "kimi-code"
 check("a set identity is used as given", ptu._escalation_plugin_id() == "kimi-code")
 if _old_p is None:
-    _os.environ.pop("HESTIA_MESH_PLUGIN", None)
+    os.environ.pop("HESTIA_MESH_PLUGIN", None)
 else:
-    _os.environ["HESTIA_MESH_PLUGIN"] = _old_p
+    os.environ["HESTIA_MESH_PLUGIN"] = _old_p
 
-# --- envelope handling --------------------------------------------------------------------
-check("_dig reads a bare object", ptu._dig({"status": "approved"}, "status") == "approved")
-check("_dig reads content[0].text JSON",
-      ptu._dig({"content": [{"text": json.dumps({"status": "denied"})}]}, "status") == "denied")
-check("_dig on a missing key is None, not a crash", ptu._dig({"a": 1}, "status") is None)
+# --- envelope handling ----------------------------------------------------------------------------
+check("_dig reads a bare object", ptu._dig({"claimed": True}, "claimed") is True)
+check("_dig reaches into result.result.content[0].text (the real envelope)",
+      ptu._dig({"result": {"content": [{"text": json.dumps({"claimed": True})}]}}, "claimed") is True)
+check("_dig on a missing key is None, not a crash", ptu._dig({"a": 1}, "claimed") is None)
 
 print()
 if FAILS:

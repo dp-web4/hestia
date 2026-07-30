@@ -557,80 +557,69 @@ def deny_self_access(marker: str, tool_name: str) -> int:
 # wait -- so it gets its own, longer budget rather than borrowing one sized for something
 # else. A too-tight timeout here would read as 'unreachable' and deny a legitimate write.
 ESCALATION_RPC_TIMEOUT_S = 5.0
-ESCALATION_POLL_S = 3.0
-# Deliberately a little BEYOND the daemon's own TTL, so the daemon is the sole authority on
-# when the window shut. Otherwise the hook could refuse a write that was approved at second
-# 119. Both ends fail closed; only one of them gets to decide the deadline.
-ESCALATION_WALL_S = 135.0
+# The claim call must finish well inside the harness's 5s budget for the WHOLE hook, which
+# also has to cover the ordinary policy verdict. Sized for a loopback call to a local daemon,
+# not for a human.
+ESCALATION_RPC_TIMEOUT_S = 1.5
 
 
-def escalate_self_write(marker: str, tool_name: str) -> Tuple[str, str]:
-    """Offer a governance-surface write to a human. Returns (verdict, detail).
+def request_self_write(marker: str, tool_name: str) -> Tuple[str, str]:
+    """One round trip. Returns (verdict, detail); only 'approved' permits the write.
 
-    verdict is 'approved' ONLY on an explicit approval inside the window. Everything else
-    -- denied, expired, daemon unreachable, a malformed answer, an exception -- refuses,
-    because the alternative is a governance write that proceeded because nobody managed to
-    say no.
+    THIS FUNCTION NEVER WAITS, and that is the whole design. The harness kills this hook at 5
+    seconds, and a killed hook yields neither `exit 2` nor a JSON deny -- Claude Code reads
+    that as a non-blocking error and runs the tool anyway. An in-hook wait for a human
+    therefore fails OPEN: the write executes unapproved, with an escalation entry on the chain
+    making it look like the safe path ran. That is strictly worse than refusing outright.
 
-    Approval lifts the SELF-PROTECTION only. The call then continues to the ordinary policy
-    check, so approving a gate edit is not approving whatever else the command would do.
+    So: ask once. Either a human has already approved this exact (member, governance file) and
+    the approval is spent here, or the write is refused now and a human decides out of band.
+    The member then RE-ISSUES the write, and that second attempt claims the approval.
+
+    Every failure -- unreachable, malformed, an old daemon that has never heard of this tool --
+    is a refusal. A daemon that cannot answer must not be a way to get a governance write
+    through.
     """
     try:
         endpoint = discover_endpoint() or DEFAULT_ENDPOINT
         client = McpHttp(endpoint, deadline=time.monotonic() + ESCALATION_RPC_TIMEOUT_S)
-        opened = client.call_tool("hestia_gate_escalation_open", {
+        r = client.call_tool("hestia_gate_escalation_claim", {
             "plugin_id": _escalation_plugin_id(),
             "role": os.environ.get("HESTIA_ROLE", ""),
             "tool_name": tool_name,
             "marker": marker,
         })
     except Exception as e:  # noqa: BLE001
-        # An unreachable daemon is a DENY, never a bypass. If a member could edit the gate
-        # by making the daemon unavailable, the mechanism would be decorative.
-        return "unreachable", f"could not open an escalation ({type(e).__name__}) -- refused"
+        return "unreachable", f"no answer from the daemon ({type(e).__name__}) -- refused"
 
-    esc_id = _dig(opened, "escalation_id")
+    # BOTH flags, and the daemon owns both. Two places deciding what "approved" means is how
+    # they come to disagree, so the hook re-derives nothing.
+    if _dig(r, "claimed") is True and _dig(r, "permits_write") is True:
+        who = _dig(r, "decided_by") or "a human"
+        via = _dig(r, "decided_via") or "unknown-channel"
+        return "approved", f"claimed an approval from {who} via {via} (single use, now spent)"
+
+    esc_id = _dig(r, "escalation_id")
     if not esc_id:
-        return "malformed", "the daemon returned no escalation_id -- refused"
-    how = _dig(opened, "how_to_decide") or f"hestia gate approve {esc_id}"
+        # An old daemon answers {} to a tool it does not know. It must not be able to permit a
+        # write by failing to understand the question -- but it also cannot open an escalation,
+        # so say which of the two this is rather than implying paperwork exists.
+        why = _dig(r, "error") or "this daemon has no escalation channel (is it upgraded?)"
+        return "no-channel", f"refused, and NO escalation was opened -- {why}"
 
-    # The block IS the notification. No separate alerting path, because that would be a
-    # second thing to keep true: the operator is normally watching this session, and if
-    # nobody is, the timeout denies, which is the safe outcome.
+    how = _dig(r, "how_to_decide") or f"hestia gate approve {esc_id}"
+    retry_secs = _dig(r, "retry_within_secs")
     sys.stderr.write(
-        f"hestia: ESCALATION {esc_id} -- {tool_name} would WRITE to the governance "
+        f"hestia: ESCALATION {esc_id} opened — {tool_name} would WRITE to the governance "
         f"surface ({marker}).\n"
-        f"  Waiting for a human decision. NO DECISION = DENIED.\n"
+        f"  THE WRITE IS REFUSED. Nothing is waiting: a human decides out of band.\n"
         f"  To allow:  {how}\n"
+        f"  Then RE-ISSUE the same write"
+        + (f" within {retry_secs}s" if retry_secs else "")
+        + " and it will claim the approval (single use).\n"
     )
     sys.stderr.flush()
-
-    wall = time.monotonic() + ESCALATION_WALL_S
-    last = "pending"
-    while time.monotonic() < wall:
-        time.sleep(ESCALATION_POLL_S)
-        try:
-            c = McpHttp(discover_endpoint() or DEFAULT_ENDPOINT,
-                            deadline=time.monotonic() + ESCALATION_RPC_TIMEOUT_S)
-            r = c.call_tool("hestia_gate_escalation_poll", {"escalation_id": esc_id})
-        except Exception:  # noqa: BLE001
-            # A dropped poll is not a verdict. Keep waiting until the wall, then deny: a
-            # transient blip must not convert a live approval into a refusal, and a dead
-            # daemon must still end in one.
-            continue
-        status = str(_dig(r, "status") or "").lower()
-        if status:
-            last = status
-        # Trust the daemon's own boolean rather than re-deriving it here. Two places
-        # deciding what "approved" means is how they come to disagree.
-        if _dig(r, "permits_write") is True and status == "approved":
-            who = _dig(r, "decided_by") or "a human"
-            via = _dig(r, "decided_via") or "unknown-channel"
-            return "approved", f"approved by {who} via {via}"
-        if status in ("denied", "expired"):
-            return status, f"{status} -- {_dig(r, 'reason') or 'no reason recorded'}"
-
-    return "timeout", f"no decision within the window (last seen: {last}) -- refused"
+    return "escalated", f"escalation {esc_id} opened; write refused pending a human decision"
 
 
 def _escalation_plugin_id() -> str:
@@ -1106,9 +1095,9 @@ def main() -> int:
             _witness_self_read(_self_marker, tool_name)
             debug_log(f"gate-self-read (allowed, witnessed): {tool_name} -> {_self_marker}")
         else:
-            verdict, detail = escalate_self_write(_self_marker, tool_name)
+            verdict, detail = request_self_write(_self_marker, tool_name)
             if verdict != "approved":
-                debug_log(f"gate-self-write escalation {verdict}: {detail}")
+                debug_log(f"gate-self-write {verdict}: {detail}")
                 return deny_self_access(_self_marker, tool_name)
             # APPROVED -- the self-protection is lifted for THIS call only, and the call
             # continues to the ordinary policy check below. Approving a gate edit is not
