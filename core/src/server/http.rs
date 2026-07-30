@@ -227,6 +227,7 @@ pub async fn serve_with_callback(
         .route("/api/trust/derivation", get(trust_derivation_json))
         .route("/api/trust/graph", get(trust_graph_turtle))
         .route("/api/operator/adjudicate", post(operator_adjudicate))
+        .route("/api/operator/gate-escalation", post(operator_gate_escalation))
         .route("/api/operator/alias", post(operator_alias))
         .route("/api/operator/amnesty", post(operator_amnesty))
         .route("/api/failures", get(failures_json))
@@ -1468,4 +1469,92 @@ async fn chain_query(
         })
         .collect();
     Json(serde_json::json!({ "entries": entries }))
+}
+
+/// `POST /api/operator/gate-escalation` {id, approve, reason?} — the STRONG decision channel for
+/// a governance-surface write (stage 2 of dp's 2026-07-29 ruling).
+///
+/// Behind `operator_gate`, so the caller has proved an operator LCT by challenge/response. That
+/// is what makes this channel different from `hestia gate approve` on the CLI, which is
+/// authenticated only by filesystem access to HESTIA_HOME — the same access every member on this
+/// box already has. Both are recorded; `via` keeps them apart, because a reader must be able to
+/// tell a proof from a convenience.
+#[derive(serde::Deserialize)]
+struct GateEscalationDecision {
+    id: String,
+    approve: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn operator_gate_escalation(
+    State(state): State<SharedState>,
+    Json(d): Json<GateEscalationDecision>,
+) -> impl IntoResponse {
+    use crate::server::gate_escalation::{now_secs, Channel};
+
+    // A DENY needs no justification; an APPROVE of a governance write does. The asymmetry is the
+    // point: refusing is the default and costs nothing to explain, while permitting is the act
+    // that will need to be read back later.
+    if d.approve {
+        let r = d.reason.as_deref().unwrap_or("").trim();
+        if r.is_empty() || r.len() > 512 || r.chars().any(char::is_control) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "approving a governance-surface write requires a single-line \
+                              'reason' (<=512 bytes). A deny does not — refusing is the default \
+                              and permitting is what a reader will have to weigh later"
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let now = now_secs();
+    let mut s = state.lock().await;
+    match s.gate_escalations.decide(
+        &d.id,
+        d.approve,
+        "operator",
+        Channel::OperatorSession,
+        d.reason.as_deref(),
+        now,
+    ) {
+        Ok(esc) => {
+            let entry = s.append_chain(
+                "gate_escalation_decided",
+                serde_json::json!({
+                    "escalation_id": esc.id,
+                    "plugin_id": esc.plugin_id,
+                    "subject_instance_lct": s.member_lct(&esc.plugin_id),
+                    "tool_name": esc.tool_name,
+                    "marker": esc.marker,
+                    "status": esc.stored_status(),
+                    "decided_by": esc.decided_by,
+                    "decided_via": esc.decided_via,
+                    "reason": esc.reason,
+                    "secs_into_window": now.saturating_sub(esc.opened_at),
+                }),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "escalation_id": esc.id,
+                    "status": esc.stored_status(),
+                    "witnessEntryHash": entry.ok().map(|e| e.hash),
+                })),
+            )
+                .into_response()
+        }
+        // Every failure mode here leaves the write refused, which is why none of them is a 500.
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": e.to_string(),
+                "effect": "the write stays refused",
+            })),
+        )
+            .into_response(),
+    }
 }

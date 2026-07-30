@@ -149,6 +149,11 @@ pub struct ServerState {
     /// established operator sessions. See `server::operator_auth`.
     pub operator_challenges: crate::server::operator_auth::ChallengeStore,
     pub operator_sessions: crate::server::operator_auth::SessionStore,
+    /// Pending human-approval escalations for writes to the governance surface (stage 2 of
+    /// dp's 2026-07-29 ruling). In-memory ON PURPOSE: a restart drops them, and every
+    /// escalation in flight then reads Expired, which is a deny. Persisting them would let a
+    /// write survive a restart nobody witnessed.
+    pub gate_escalations: crate::server::gate_escalation::EscalationStore,
 }
 
 /// Unix seconds now — the single clock for operator challenge/session TTLs.
@@ -258,6 +263,7 @@ impl ServerState {
             vci_nonces: HashSet::new(),
             operator_challenges: crate::server::operator_auth::ChallengeStore::default(),
             operator_sessions: crate::server::operator_auth::SessionStore::default(),
+            gate_escalations: Default::default(),
         })
     }
 

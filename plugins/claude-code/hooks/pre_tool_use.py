@@ -529,18 +529,160 @@ def deny_self_access(marker: str, tool_name: str) -> int:
     except Exception:  # noqa: BLE001 — never let the record attempt block the refusal
         witnessed = False
     sys.stderr.write(
-        f"hestia: deny [gate-self-access] — {tool_name} reaches the gate's own code "
-        f"({marker}). The gate is not yours to read or modify: an agent that can edit "
-        f"the thing that governs it is not governed. This refusal is recorded as its own "
+        f"hestia: deny [gate-self-access] — {tool_name} WRITES to the gate's own code "
+        f"({marker}). An agent that can edit the thing that governs it is not governed. "
+        f"Reading it is allowed and witnessed; changing it is not. This refusal is its own "
         f"event class{'' if witnessed else ' (WITNESS FAILED — the refusal stands regardless)'}"
         f" and is escalatable.\n"
-        f"If a gate change is genuinely needed, it is installed by the OPERATOR or a "
-        f"not-self custodian — ask, stating what you need changed and why. Do not "
-        f"self-install, and do not work around this by another route: doing so is the "
+        f"If a gate change is genuinely needed, ESCALATE — the write is offered to a human "
+        f"for approval and proceeds only if one approves inside the window. Say what you "
+        f"need changed and why. Do not work around this by another route: doing so is the "
         f"behaviour this rule exists to make visible.\n"
     )
     debug_log(f"gate-self-access deny: {tool_name} -> {marker} witnessed={witnessed}")
     return 2
+
+
+# ---- Stage 2: escalate a governance WRITE to a human ------------------
+#
+# dp, 2026-07-29: "escalate to human for approval (there are legit times when we are
+# actually working on the file), deny on timeout of a couple minutes."
+#
+# Stage 1 (#97) refuses every write to the governance surface. That is correct and it is
+# also too much -- the fleet legitimately edits its gates (#55, #89, #90 in one week). This
+# is the channel that un-refuses a legitimate one, with a human across it.
+
+# The 0.5s fast-path budget is for a policy verdict on the hot path. Opening and polling
+# an escalation is a mutation plus a witness write, and it is already inside a 2-minute
+# wait -- so it gets its own, longer budget rather than borrowing one sized for something
+# else. A too-tight timeout here would read as 'unreachable' and deny a legitimate write.
+ESCALATION_RPC_TIMEOUT_S = 5.0
+ESCALATION_POLL_S = 3.0
+# Deliberately a little BEYOND the daemon's own TTL, so the daemon is the sole authority on
+# when the window shut. Otherwise the hook could refuse a write that was approved at second
+# 119. Both ends fail closed; only one of them gets to decide the deadline.
+ESCALATION_WALL_S = 135.0
+
+
+def escalate_self_write(marker: str, tool_name: str) -> Tuple[str, str]:
+    """Offer a governance-surface write to a human. Returns (verdict, detail).
+
+    verdict is 'approved' ONLY on an explicit approval inside the window. Everything else
+    -- denied, expired, daemon unreachable, a malformed answer, an exception -- refuses,
+    because the alternative is a governance write that proceeded because nobody managed to
+    say no.
+
+    Approval lifts the SELF-PROTECTION only. The call then continues to the ordinary policy
+    check, so approving a gate edit is not approving whatever else the command would do.
+    """
+    try:
+        endpoint = discover_endpoint() or DEFAULT_ENDPOINT
+        client = McpHttp(endpoint, deadline=time.monotonic() + ESCALATION_RPC_TIMEOUT_S)
+        opened = client.call_tool("hestia_gate_escalation_open", {
+            "plugin_id": _escalation_plugin_id(),
+            "role": os.environ.get("HESTIA_ROLE", ""),
+            "tool_name": tool_name,
+            "marker": marker,
+        })
+    except Exception as e:  # noqa: BLE001
+        # An unreachable daemon is a DENY, never a bypass. If a member could edit the gate
+        # by making the daemon unavailable, the mechanism would be decorative.
+        return "unreachable", f"could not open an escalation ({type(e).__name__}) -- refused"
+
+    esc_id = _dig(opened, "escalation_id")
+    if not esc_id:
+        return "malformed", "the daemon returned no escalation_id -- refused"
+    how = _dig(opened, "how_to_decide") or f"hestia gate approve {esc_id}"
+
+    # The block IS the notification. No separate alerting path, because that would be a
+    # second thing to keep true: the operator is normally watching this session, and if
+    # nobody is, the timeout denies, which is the safe outcome.
+    sys.stderr.write(
+        f"hestia: ESCALATION {esc_id} -- {tool_name} would WRITE to the governance "
+        f"surface ({marker}).\n"
+        f"  Waiting for a human decision. NO DECISION = DENIED.\n"
+        f"  To allow:  {how}\n"
+    )
+    sys.stderr.flush()
+
+    wall = time.monotonic() + ESCALATION_WALL_S
+    last = "pending"
+    while time.monotonic() < wall:
+        time.sleep(ESCALATION_POLL_S)
+        try:
+            c = McpHttp(discover_endpoint() or DEFAULT_ENDPOINT,
+                            deadline=time.monotonic() + ESCALATION_RPC_TIMEOUT_S)
+            r = c.call_tool("hestia_gate_escalation_poll", {"escalation_id": esc_id})
+        except Exception:  # noqa: BLE001
+            # A dropped poll is not a verdict. Keep waiting until the wall, then deny: a
+            # transient blip must not convert a live approval into a refusal, and a dead
+            # daemon must still end in one.
+            continue
+        status = str(_dig(r, "status") or "").lower()
+        if status:
+            last = status
+        # Trust the daemon's own boolean rather than re-deriving it here. Two places
+        # deciding what "approved" means is how they come to disagree.
+        if _dig(r, "permits_write") is True and status == "approved":
+            who = _dig(r, "decided_by") or "a human"
+            via = _dig(r, "decided_via") or "unknown-channel"
+            return "approved", f"approved by {who} via {via}"
+        if status in ("denied", "expired"):
+            return status, f"{status} -- {_dig(r, 'reason') or 'no reason recorded'}"
+
+    return "timeout", f"no decision within the window (last seen: {last}) -- refused"
+
+
+def _escalation_plugin_id() -> str:
+    """Who to record as asking. Caller-asserted (HST-005) and named as such.
+
+    Falls back to a literal 'unattributed' rather than to any member id: guessing would
+    file one member's escalation under another's name, which is the defect #108 closed one
+    layer over.
+    """
+    for var in ("HESTIA_MESH_PLUGIN", "HESTIA_PLUGIN_ID"):
+        v = os.environ.get(var, "").strip()
+        if v:
+            return v
+    return "unattributed"
+
+
+def _dig(result: Any, key: str, _depth: int = 0) -> Any:
+    """Find `key` anywhere in an MCP tool result, whatever envelope it arrived in.
+
+    The first version enumerated the shapes it expected -- bare, `result{}`,
+    `content[0].text` -- and the real answer is `result.result.content[0].text`, one level
+    deeper than any branch covered. Every approval then read as "malformed" and the
+    mechanism denied legitimate writes while looking impeccably fail-closed. A refusal that
+    happens for the wrong reason is not a working guard; it is a broken reader wearing one.
+
+    So: search, don't enumerate. Depth-bounded because an unbounded walk over
+    attacker-shaped JSON is its own problem, and JSON text is parsed wherever it appears
+    because that is where the daemon actually puts the payload.
+    """
+    if _depth > 6:
+        return None
+    if isinstance(result, dict):
+        if key in result:
+            return result[key]
+        for v in result.values():
+            found = _dig(v, key, _depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(result, list):
+        for item in result:
+            found = _dig(item, key, _depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(result, str):
+        # A JSON blob carried as text -- content[0].text is exactly this.
+        t = result.strip()
+        if t.startswith("{") or t.startswith("["):
+            try:
+                return _dig(json.loads(t), key, _depth + 1)
+            except (ValueError, TypeError):
+                return None
+    return None
 
 
 def extract_target(tool_input: Any, tool_name: str) -> Optional[str]:
@@ -964,7 +1106,15 @@ def main() -> int:
             _witness_self_read(_self_marker, tool_name)
             debug_log(f"gate-self-read (allowed, witnessed): {tool_name} -> {_self_marker}")
         else:
-            return deny_self_access(_self_marker, tool_name)
+            verdict, detail = escalate_self_write(_self_marker, tool_name)
+            if verdict != "approved":
+                debug_log(f"gate-self-write escalation {verdict}: {detail}")
+                return deny_self_access(_self_marker, tool_name)
+            # APPROVED -- the self-protection is lifted for THIS call only, and the call
+            # continues to the ordinary policy check below. Approving a gate edit is not
+            # approving everything else the same command might do.
+            sys.stderr.write(f"hestia: gate write APPROVED -- {detail}\n")
+            debug_log(f"gate-self-write approved: {detail}")
 
     # Try the daemon first.
     result = ask_daemon(tool_name, tool_input, tool_use_id, host_session_id)
