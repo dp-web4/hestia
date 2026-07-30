@@ -1469,6 +1469,27 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
 /// Event types the daemon itself writes. `request_witness` must not be able to
 /// forge them — a caller-authored "policy_decision" or "outcome" entry would
 /// poison the audit semantics of the whole chain (GPT 3rd-pass HST-003).
+///
+/// `appeal` and `adjudication` are here for a subtler reason than forgery:
+/// `request_witness` wraps the caller's payload as `{requested_by, data}` —
+/// deliberately, so a member cannot forge the WHO — and EVERY reader of these
+/// two types (`tool_arbitrate_appeal`, `tool_open_appeals`, `derivation.rs`,
+/// `appeal_floor`) matches `deny_hash` / `about_deny_hash` FLAT. So a
+/// `request_witness("appeal", …)` is accepted, witnessed, returns success —
+/// and is inert: invisible to the ruling path, the queue, and the conduct
+/// scale. That is not hypothetical: chain 62959/62963/63408 are exactly this
+/// entry, filed 2026-07-27 before `tool_appeal` existed (verified by
+/// `appeal_floor`; 62959 is unrecoverable — no deny_hash anywhere in the
+/// payload). The guidance was fixed two ways (law_inject, the conduct scale's
+/// own text: "NOT hestia_request_witness, which nests"); this is the
+/// structural close — the class fix on the WRITE side (dp-web4/hestia#131),
+/// not teaching three readers to accept both shapes, which would leave the
+/// next producer free to invent a third.
+///
+/// `adjudication` rides along: forgeable through the same hole, and today
+/// inert-by-shape in the benign direction (the same nesting that makes the
+/// appeal invisible makes a forged ruling invisible too). Reserving it now
+/// keeps that true if any reader is ever "fixed" to accept nesting.
 const RESERVED_EVENT_TYPES: &[&str] = &[
     "outcome",
     "policy_decision",
@@ -1477,6 +1498,8 @@ const RESERVED_EVENT_TYPES: &[&str] = &[
     "orchestrator_connect",
     "notify.received",
     "reversal",
+    "appeal",
+    "adjudication",
 ];
 
 /// Reversal kinds — the operational shape of a reversal, distinct from the
@@ -5063,6 +5086,50 @@ mod accountability_tests {
             "role:constellation:member"
         );
         assert_eq!(e.event_data["requested_by"]["plugin_id"], "claude-code");
+    }
+
+    /// Regression pin for dp-web4/hestia#131: the three inert appeals on the
+    /// chain (62959/62963/63408) were minted by `request_witness("appeal", …)`,
+    /// which nests `deny_hash` under `data` where no reader looks. The guidance
+    /// was fixed in two places; this reserves the type so the SHAPE cannot be
+    /// produced at all. `adjudication` is reserved with it — forgeable through
+    /// the same hole, today inert-by-shape only by accident of the same nesting.
+    #[tokio::test]
+    async fn request_witness_cannot_mint_a_shape_no_appeal_reader_can_see() {
+        let (_dir, state) = test_state().await;
+        let m = tool_connect(
+            &state,
+            &json!({
+                "plugin_id":"claude-code","host_agent":"t","role":"role:constellation:member"
+            }),
+        )
+        .await
+        .unwrap();
+        let before = state.lock().await.chain_len();
+        for event_type in ["appeal", "adjudication"] {
+            let r = tool_request_witness(
+                &state,
+                &json!({
+                    "event_type": event_type,
+                    "event_data": {"deny_hash": "ab", "reason": "shape probe"},
+                    "session_id": m["sessionId"]
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                r["_hestia_error"]["code"], "hestia.witness_reserved_event",
+                "{event_type} must be reserved — the nested shape it would mint \
+                 is invisible to every reader of that type: {r}"
+            );
+        }
+        let s = state.lock().await;
+        assert_eq!(
+            s.chain_len(),
+            before,
+            "a refused append must leave no entry — an inert appeal that LANDS \
+             is the exact failure this reserves against"
+        );
     }
 
     /// A reversal is a JUDGMENT signal: it witnesses the subject + reporter, feeds
