@@ -23,6 +23,14 @@
 | forum-note | FYI: forum post at pointer |
 | ack | terminal acknowledgment (does NOT warrant a reply — loop terminator) |
 
+**Closure rides `forum-note`, not a kind of its own.** "The thing you are still chasing is
+closed, here is the SHA" needs no vocabulary addition: a `forum-note` pointing at the commit
+or post carries it, and a `reply` carries it when there is a notice to answer. On 2026-07-31
+the primer-misroute fix (hestia `3fc5088`) sat committed for ~2.7 h while the member chasing
+the cause kept posting it as unresolved — the diagnosis travelled in a commit message no
+inbox pointed at. The gap was not the kinds; it was that nobody sent the note. Committed is
+not routed: closing someone's open thread is send-worthy.
+
 **Daemon-only, and not in the table above:**
 
 | kind | semantics |
