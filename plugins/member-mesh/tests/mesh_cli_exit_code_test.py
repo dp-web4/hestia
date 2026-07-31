@@ -193,6 +193,15 @@ def _death_guard(exc_type, exc, tb):
 
     os._exit because sys.exit() from inside an excepthook is already-unwinding and does
     not reliably set the status; flush explicitly since os._exit skips it.
+
+    WHAT THIS DOES NOT COVER. sys.excepthook is main-thread only, and the stub server
+    runs in a daemon thread. Case bodies all run on the main thread, so the toll is
+    covered -- but do not read the guard as wider than that. Adding threading.excepthook
+    would NOT close it either, and would look like it did: socketserver catches a raise
+    inside a request handler in handle_error() and prints it to stderr itself, so NEITHER
+    hook ever sees the case that actually threatens this file. Measured, not assumed --
+    a probe raising in do_POST fires neither hook. A handler death instead surfaces as a
+    client-side RemoteDisconnected, i.e. as a case FAILING, which is the honest shape.
     """
     traceback.print_exception(exc_type, exc, tb)
     FAILURES.append(f"!! HARNESS DIED: {exc_type.__name__}: {exc}")

@@ -16,8 +16,21 @@ shape the member-mesh thread keeps hitting: the failure path destroyed the evide
 accountability layer needed (KINDS.md, three times).
 
 This test is the instrument's instrument. It runs the real harness against a CLI stub
-that always dies, and asserts the harness SAYS SO. It fails against the unhardened
-harness on checks 2 and 3.
+that always dies, and asserts the harness SAYS SO.
+
+WHAT IT IS RED AGAINST, stated by configuration -- because "2 red before" is true of two
+different setups and therefore identifies neither:
+
+    base as-is (99ec1f9)        checks 1 and 2 red, for the WRONG reason. The seam
+                                below is part of this commit, so the base harness
+                                ignores the stub, measures the already-fixed real CLI,
+                                and goes 25/25 green: rc=0, no toll line.
+    base + the seam line only   checks 2 and 3 red -- the truncation itself. stdout
+                                ends mid-line at `FAIL  K  payload refusal`.
+
+The second is the measurement that means anything, and it needs one line backported. The
+count is 2 either way: a number a wrong setup also produces is not evidence, which is the
+same trap this file exists to write up, hit once more inside its own summary.
 
 No new seam on hestia-mesh.py: the override is HESTIA_MESH_CLI, read by the harness, so
 the no-test-seam posture the harness commits to for the CLI is untouched.
@@ -86,6 +99,42 @@ if __name__ == "__main__":
     #    summary of the per-check lines, and losing those loses which cases were reached.
     check("per-check lines survive", out.count("  FAIL  ") + out.count("  PASS  ") > 0,
           f"no PASS/FAIL lines in {len(out)} bytes of stdout")
+
+    # 5. The lazy-check fix and the death guard are two halves, and checks 1-4 only
+    #    exercise the first: with the lazy form in place nothing above makes the hardened
+    #    harness die, so `_death_guard` runs in no test at all and could rot unnoticed.
+    #    The instrument's instrument had the same blind spot as the instrument -- one
+    #    layer up, in miniature. (kimi-code, PR #140 review.)
+    #
+    #    So: run a COPY of the harness with a raise injected into a case body, and
+    #    require it to announce the truncation. Red pre-fix too -- an unguarded harness
+    #    tracebacks out with rc=1 and no TRUNCATED line, which is the defect itself.
+    ANCHOR = '    dead = f"http://127.0.0.1:{srv.server_port}/mcp"'
+    src = open(HARNESS).read()
+
+    # A sabotage test that quietly stops sabotaging is exactly this branch's subject, so
+    # a missing anchor is RED, never skipped.
+    anchored = src.count(ANCHOR) == 1
+    check("sabotage anchor still present in the harness", anchored,
+          f"count={src.count(ANCHOR)} -- re-point ANCHOR at a line inside a case body")
+
+    if anchored:
+        with tempfile.TemporaryDirectory() as td:
+            stub = os.path.join(td, "always-dies.py")
+            with open(stub, "w") as fh:
+                fh.write(STUB)
+            # The copy sits in the tempdir: HERE moves with it, but HERE only resolves
+            # CLI, and HESTIA_MESH_CLI overrides that.
+            sab = os.path.join(td, "sabotaged_harness.py")
+            with open(sab, "w") as fh:
+                fh.write(src.replace(ANCHOR, '    raise RuntimeError("synthetic case-body raise")\n' + ANCHOR))
+            s = subprocess.run([sys.executable, sab], capture_output=True, text=True,
+                               timeout=180, env=dict(os.environ, HESTIA_MESH_CLI=stub))
+        sout = s.stdout
+        parts = {"HARNESS DIED": "HARNESS DIED" in sout, "TRUNCATED": "TRUNCATED" in sout,
+                 "FLOOR": "FLOOR" in sout, "rc==1": s.returncode == 1}
+        check("a raise out of a case body is announced as a truncated floor",
+              all(parts.values()), f"rc={s.returncode} {parts}")
 
     if FAILURES:
         print(f"\nFAILED ({len(FAILURES)} recorded): {', '.join(FAILURES)}")
