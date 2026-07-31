@@ -49,10 +49,14 @@ import os
 import subprocess
 import sys
 import threading
+import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CLI = os.path.join(os.path.dirname(HERE), "hestia-mesh.py")
+# The seam is on the HARNESS, not on the CLI: harness_toll_test.py points this at a
+# deliberately crashing stub to prove the toll survives. Nothing in hestia-mesh.py
+# knows it is under test, which is the posture this file's docstring commits to.
+CLI = os.environ.get("HESTIA_MESH_CLI") or os.path.join(os.path.dirname(HERE), "hestia-mesh.py")
 
 # What the stub returns for the next tools/call, set per case.
 MODE = {"tool": "ok"}
@@ -151,9 +155,56 @@ FAILURES = []
 
 
 def check(name, cond, detail=""):
+    """`cond` may be a bool or a zero-arg callable.
+
+    Pass a callable whenever computing the condition can raise on the very input the
+    case exists to catch -- `json.loads(out)` on the empty stdout of a crashing CLI is
+    the case that motivated this. An eager argument is evaluated BEFORE check() is
+    entered, so the raise escapes to __main__ and takes the rest of the run with it.
+    A raising callable is a FAIL carrying the exception, and the run continues.
+    """
+    if callable(cond):
+        try:
+            cond = bool(cond())
+        except Exception as e:
+            cond, detail = False, f"raised {type(e).__name__}: {e}"
     print(f"  {'PASS' if cond else 'FAIL'}  {name}" + (f"  -- {detail}" if detail and not cond else ""))
     if not cond:
         FAILURES.append(name)
+
+
+def report():
+    """Print the toll and exit. Called on the clean path AND from the death guard."""
+    if FAILURES:
+        print(f"\nFAILED ({len(FAILURES)} recorded): {', '.join(FAILURES)}", flush=True)
+        sys.exit(1)
+    print("\nAll cases passed.", flush=True)
+
+
+def _death_guard(exc_type, exc, tb):
+    """A raise out of the case body must not be able to under-report the toll.
+
+    The callable form of check() covers the checks that remember to use it. This covers
+    everything else -- and it is the half that matters, because the failure mode is
+    silent: an uncaught exception exits 1, and a clean `FAILED:` exit is ALSO 1, so CI
+    cannot tell them apart. The crashed run simply never prints its toll line, and an
+    absent count reads as a smaller one. That is how this file reported "13 red" for a
+    run whose real toll was 15 (PR #137).
+
+    os._exit because sys.exit() from inside an excepthook is already-unwinding and does
+    not reliably set the status; flush explicitly since os._exit skips it.
+    """
+    traceback.print_exception(exc_type, exc, tb)
+    FAILURES.append(f"!! HARNESS DIED: {exc_type.__name__}: {exc}")
+    print("\n!! the harness raised out of the case body. Every check after this point was\n"
+          "!! NEVER EVALUATED -- the toll below is a FLOOR, not the count.", flush=True)
+    print(f"\nFAILED ({len(FAILURES)} recorded, TRUNCATED): {', '.join(FAILURES)}", flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(1)
+
+
+sys.excepthook = _death_guard
 
 
 if __name__ == "__main__":
@@ -208,7 +259,9 @@ if __name__ == "__main__":
         first2 = "\n".join(err.strip().splitlines()[:2])
         check(f"{label} names itself in stderr line 1", "the daemon refused" in first2,
               f"stderr[:2]={first2[:100]!r}")
-        check(f"{label} stdout stays pure JSON", json.loads(out) is not None, out[:80])
+        # lazy: on a crashing CLI `out` is '', and an eager json.loads('') would raise
+        # before check() is entered and abort the run three checks early.
+        check(f"{label} stdout stays pure JSON", lambda o=out: json.loads(o) is not None, repr(out[:80]))
 
     dead = f"http://127.0.0.1:{srv.server_port}/mcp"
     srv.shutdown()
@@ -223,7 +276,4 @@ if __name__ == "__main__":
     check("I  nothing listening exits 1 (not 3)", p.returncode == 1, f"rc={p.returncode}")
     check("I  nothing listening does not traceback", "Traceback" not in p.stderr,
           p.stderr.strip()[-90:])
-    if FAILURES:
-        print(f"\nFAILED: {', '.join(FAILURES)}")
-        sys.exit(1)
-    print("\nAll cases passed.")
+    report()
