@@ -26,6 +26,22 @@
 #     correct-but-pointless deny on every kimi fire (dp, 2026-07-24).
 set -u
 PRIMER_SRC="${1:?primer file}"
+# REFUSE ANOTHER MEMBER'S MAIL (2026-07-31). The primer now records `for_plugin`; if it
+# names a different member, this is not ours to open. Checked BEFORE the copy below, so a
+# foreign work list is never staged into this member's home — and refused with a non-zero
+# exit so the watcher RETAINS it (the drain is consume-once; the file is the only copy).
+# Absent for_plugin means a legacy primer written before the stamp: allowed, because the
+# per-member directory it now arrives from already establishes the owner. This guard is
+# the cheap second wall, not the fix — see hestia-watch-member.sh.
+MEMBER="codex"
+FOR_PLUGIN=$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("for_plugin") or "")
+except Exception: print("")' "$PRIMER_SRC" 2>/dev/null || echo "")
+if [ -n "$FOR_PLUGIN" ] && [ "$FOR_PLUGIN" != "$MEMBER" ]; then
+  echo "[fire-codex] REFUSING: primer is addressed to '$FOR_PLUGIN', not '$MEMBER' — not this member's mail." >&2
+  echo "[fire-codex] Retained for its owner's watcher: $PRIMER_SRC" >&2
+  exit 70
+fi
 PRIMER_DIR="$HOME/.codex/hestia-mesh-primers"; mkdir -p "$PRIMER_DIR"; chmod 700 "$PRIMER_DIR"
 PRIMER="$PRIMER_DIR/$(basename "$PRIMER_SRC")"
 cp "$PRIMER_SRC" "$PRIMER"

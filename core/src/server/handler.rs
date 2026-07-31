@@ -1415,7 +1415,47 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
     Ok(json!({"stored": true, "entryId": entry_id, "boundToCreator": defaulted_consumers}))
 }
 
+/// The keys that belong INSIDE `filter`. Naming them is the whole fix: put one at
+/// the top level instead and `filter` is `Null`, every field reads as absent, and
+/// the caller is served a default 50-deep window whose JSON is byte-identical in
+/// shape to an honoured one. That is not a missing feature, it is a wrong answer
+/// with no error surface — `{"limit": 500}` returned 50 entries and `hasMore:
+/// false`, and two members disputed a "500-deep window" for a day before probing
+/// the two shapes side by side. `hash` is the worst of the three: it exists to
+/// short-circuit the window so a pointer to an old entry does not read as absent,
+/// and misplacing it silently reinstates the window it was built to escape.
+///
+/// Refuse rather than echo. An echo of the effective limit still lets a caller who
+/// does not read the echo walk away with 50.
+const QUERY_FILTER_KEYS: [&str; 3] = ["limit", "hash", "tool_name"];
+
 async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
+    let misplaced: Vec<&str> = QUERY_FILTER_KEYS
+        .iter()
+        .copied()
+        .filter(|k| args.get(*k).is_some())
+        .collect();
+    if !misplaced.is_empty() {
+        let named = misplaced
+            .iter()
+            .map(|k| format!("`{k}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Ok(hestia_error_envelope(
+            "hestia.query_filter_misplaced",
+            &format!(
+                "{named} belongs inside `filter`, not at the top level: call \
+                 hestia_query_history with {{\"filter\": {{...}}}}. Served as sent, these are \
+                 ignored and you get a default 50-deep window over the tail that looks exactly \
+                 like an honoured answer — so this is refused rather than silently degraded."
+            ),
+            Some(json!({
+                "misplaced": misplaced,
+                "expectedShape": {"filter": {"limit": 500, "tool_name": "<optional>", "hash": "<optional>"}},
+            })),
+        ));
+    }
+
     let filter = args.get("filter").cloned().unwrap_or(Value::Null);
     let limit = filter
         .get("limit")
@@ -1463,7 +1503,15 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
             "chainPosition": e.chain_position,
         }));
     }
-    Ok(json!({"entries": entries, "hasMore": false}))
+    // `hasMore` was the literal `false` on every response, truncated or not, which made it
+    // worse than absent: a caller who DID read it was told the window was complete. It now
+    // reports whether the chain continues below the window that was served. With a
+    // `tool_name` filter that is a statement about the SCAN window, not the match set —
+    // entries below the window were never examined. `limit` is echoed because the 500 cap
+    // silently shortens a deeper request, and the served depth is how a caller tells a
+    // clamp from an exhausted chain.
+    let has_more = s.chain_len() > limit as u64;
+    Ok(json!({"entries": entries, "hasMore": has_more, "limit": limit}))
 }
 
 /// Event types the daemon itself writes. `request_witness` must not be able to
@@ -8364,6 +8412,106 @@ mod appeal_tests {
             .await
             .unwrap();
         assert_eq!(by_hash["entry"]["hash"].as_str(), Some(hash.as_str()), "{by_hash}");
+    }
+
+    /// Every test above passes `{"filter": {...}}`, which is why the bare shape survived: the
+    /// tested call shape and the one an interactive caller naturally writes are different, and
+    /// only the tested one was ever exercised. A top-level `limit` was read as absent, silently
+    /// defaulted to 50, and returned with `hasMore: false` — a degraded answer with the exact
+    /// shape of an honoured one. Two members spent a day disputing a "500-deep window" that was
+    /// 50 deep on both sides.
+    #[tokio::test]
+    async fn a_misplaced_top_level_filter_key_is_refused_not_silently_defaulted() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let s = state.lock().await;
+            for i in 0..60 {
+                s.append_chain("outcome", json!({"filler": i})).unwrap();
+            }
+        }
+
+        for key in ["limit", "tool_name", "hash"] {
+            let bare = tool_query_history(&state, &json!({key: 3})).await.unwrap();
+            let err = bare.get("_hestia_error").unwrap_or_else(|| {
+                panic!("a top-level `{key}` must be refused, not served as a default window: {bare}")
+            });
+            assert_eq!(err["code"].as_str(), Some("hestia.query_filter_misplaced"), "{bare}");
+            assert!(
+                err["data"]["misplaced"].as_array().unwrap().iter().any(|k| k == key),
+                "the refusal must name the key it refused: {bare}"
+            );
+            assert!(
+                err["message"].as_str().unwrap().contains("filter"),
+                "the refusal must show the shape that works, or the caller retries the same way: {bare}"
+            );
+            assert!(bare.get("entries").is_none(), "a refusal must not also serve data: {bare}");
+        }
+
+        // The nested shape is untouched.
+        let ok = tool_query_history(&state, &json!({"filter": {"limit": 3}})).await.unwrap();
+        assert_eq!(ok["entries"].as_array().unwrap().len(), 3, "{ok}");
+    }
+
+    /// The half the call-site lint did not reach. A misplaced `limit` costs depth; a misplaced
+    /// `hash` costs the pointer entirely — `filter.hash` short-circuits the window precisely so
+    /// an old entry does not read as absent, and the bare shape silently puts the window back.
+    /// A caller dereferencing `hestia://adjudication/<hash>` would get 50 unrelated rows and
+    /// conclude the ruling does not exist.
+    #[tokio::test]
+    async fn a_misplaced_hash_does_not_degrade_a_pointer_lookup_into_a_window() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let hash = ruled_appeal(&state).await;
+        {
+            let s = state.lock().await;
+            for i in 0..60 {
+                s.append_chain("outcome", json!({"filler": i})).unwrap();
+            }
+        }
+        let bare = tool_query_history(&state, &json!({"hash": hash})).await.unwrap();
+        assert!(
+            bare.get("entries").is_none(),
+            "the pointer must not come back as a window that happens to exclude it: {bare}"
+        );
+        assert_eq!(
+            bare["_hestia_error"]["code"].as_str(),
+            Some("hestia.query_filter_misplaced"),
+            "{bare}"
+        );
+    }
+
+    /// `hasMore` was the literal `false`, always. That is the second half of the same defect:
+    /// a truncated answer carried no self-reporting surface at all, so a caller who did read
+    /// the field was misled by it rather than merely unserved.
+    #[tokio::test]
+    async fn has_more_reports_truncation_rather_than_being_a_constant() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let s = state.lock().await;
+            for i in 0..30 {
+                s.append_chain("outcome", json!({"filler": i})).unwrap();
+            }
+        }
+        let total = { state.lock().await.chain_len() };
+        assert!(total > 5, "precondition: need a chain deeper than the window");
+
+        let truncated = tool_query_history(&state, &json!({"filter": {"limit": 5}})).await.unwrap();
+        assert_eq!(
+            truncated["hasMore"].as_bool(),
+            Some(true),
+            "a window shallower than the chain has more below it: {truncated}"
+        );
+
+        let whole = tool_query_history(&state, &json!({"filter": {"limit": total + 10}}))
+            .await
+            .unwrap();
+        assert_eq!(
+            whole["hasMore"].as_bool(),
+            Some(false),
+            "a window deeper than the chain has nothing below it: {whole}"
+        );
     }
 
     /// The law cites rulings by an eight-character prefix ("adjudication 62cfdffe"). That
