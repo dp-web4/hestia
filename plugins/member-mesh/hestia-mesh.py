@@ -21,7 +21,7 @@ Discipline: forum post = record, mesh notice = wake; content lives at the pointe
 Bind your dispositions: pass the id of the notice you are answering as the 4th
 arg to `send` (reply/ack/review_done), or it stays "unanswered" forever.
 """
-import json, os, sys, urllib.request
+import json, os, sys, urllib.error, urllib.request
 
 EP = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
 
@@ -62,23 +62,95 @@ if not PLUGIN:
 # Derived from the identity above, so it cannot drift to a different member than PLUGIN.
 HOST = os.environ.get("HESTIA_MESH_HOST_AGENT", f"{PLUGIN}-cli")
 
+class Unreachable(Exception):
+    """No answer at all: connection refused, DNS, timeout. rc=1 — "I never got there"."""
+
+
+class DaemonRefusal(Exception):
+    """The daemon ANSWERED and declined, below the JSON-RPC payload layer. rc=3.
+
+    Carries a synthesized `_hestia_error` so the stdout contract holds: every path
+    that reaches the daemon prints a JSON payload, never a traceback.
+    """
+
+    def __init__(self, payload):
+        super().__init__(payload)
+        self.payload = payload
+
+
+def excerpt(raw, limit=300):
+    """The first bytes of what DID arrive.
+
+    Naming only the tool that failed tells an operator nothing they can act on. The
+    first time a shape-error fires against a real proxy truncating SSE, the body is
+    the whole diagnosis — and it is exactly what a caller cannot recover afterwards,
+    because the response is gone by then.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    raw = (raw or "").strip()
+    return raw[:limit] + (f"… [+{len(raw) - limit} more bytes]" if len(raw) > limit else "")
+
+
+def shape_error(name, code, message, body):
+    return {"_hestia_error": {"code": f"hestia_mesh.{code}",
+                              "message": f"{name}: {message}",
+                              "data": {"body_excerpt": excerpt(body),
+                                       "body_bytes": len(body or "")}}}
+
+
 def post(payload, hdrs={}):
     req = urllib.request.Request(EP, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json",
                  "Accept": "application/json, text/event-stream", **hdrs})
-    r = urllib.request.urlopen(req, timeout=5)
-    return r.read().decode(), r.headers.get("mcp-session-id")
+    try:
+        r = urllib.request.urlopen(req, timeout=5)
+        return r.read().decode(), r.headers.get("mcp-session-id")
+    except urllib.error.HTTPError as e:
+        # The daemon answered — with a non-2xx. urlopen raises here, and an uncaught
+        # HTTPError exits 1 with a traceback and an EMPTY stdout, which reads to a
+        # caller as "never got there" when in fact it got there and was declined.
+        # Measured 2026-07-31 against the live daemon: a stale mcp-session-id returns
+        # 404 "Session not found", and a tools/call with no session returns 422. Both
+        # exited 1 with a traceback on the CLI as merged in #135.
+        # rc=3, not 1: the observable fact is that something answered. Only silence is 1.
+        raise DaemonRefusal({"_hestia_error": {
+            "code": "hestia_mesh.http_error",
+            "message": f"daemon answered HTTP {e.code} ({e.reason})",
+            "data": {"status": e.code, "body_excerpt": excerpt(e.read())}}}) from None
+    except OSError as e:  # URLError (connection refused, DNS) and socket timeouts.
+        raise Unreachable(getattr(e, "reason", None) or e) from None
+
 
 def rpc(h, name, args):
     body, _ = post({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
                     "params": {"name": name, "arguments": args}}, h)
     for line in body.splitlines():
-        if line.startswith("data: {"):
-            return json.loads(json.loads(line[6:])["result"]["content"][0]["text"])
+        if not line.startswith("data: {"):
+            continue
+        try:
+            envelope = json.loads(line[6:])
+        except json.JSONDecodeError as e:
+            return shape_error(name, "unparseable_frame", f"data: frame is not JSON ({e})", body)
+        # A JSON-RPC PROTOCOL error has no `result` key at all — the envelope carries
+        # `error` instead. Indexing ["result"] raised KeyError here, so this shape also
+        # exited 1 with a traceback. Confirmed live on CBP 2026-07-31: an unknown method
+        # returns {"jsonrpc":"2.0","id":9,"error":{"code":-32601,...}}. Normalizing it
+        # into `_hestia_error` is what makes it exit 3 like any other refusal.
+        if "error" in envelope and "result" not in envelope:
+            return {"_hestia_error": {
+                "code": "hestia_mesh.jsonrpc_error",
+                "message": f"{name}: daemon returned a JSON-RPC protocol error",
+                "data": {"jsonrpc_error": envelope["error"]}}}
+        try:
+            return json.loads(envelope["result"]["content"][0]["text"])
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+            return shape_error(name, "unexpected_result_shape",
+                               f"result frame not in the expected shape ({type(e).__name__}: {e})",
+                               body)
     # No `data:` frame at all. Returning {} here made an unparseable response
     # indistinguishable from an empty inbox — see the exit-code note in main().
-    return {"_hestia_error": {"code": "hestia_mesh.no_data_frame",
-                              "message": f"{name}: response carried no data: frame"}}
+    return shape_error(name, "no_data_frame", "response carried no data: frame", body)
 
 
 def failed(out):
@@ -94,6 +166,17 @@ def failed(out):
     to a member id that does not exist, BOTH printed `_hestia_error` and exited 0. Any
     caller writing `hestia-mesh.py send ... || handle` never fired, and the sender
     believed a notice was queued that never was.
+
+    On the second key, `"error"` (kimi-code's nit on #135 — two payload shapes trusted,
+    one documented): it is NOT the MCP tool layer's shape. Every tool refusal uses the
+    `_hestia_error` envelope (ADR-0005 Mechanism A, core/src/server/handler.rs:5); a
+    bare `"error"` payload is emitted only by the OPERATOR REST surface in
+    core/src/server/http.rs, which this CLI never calls and could not authenticate to.
+    So it defended nothing that could reach it — and the JSON-RPC envelope error it
+    looks like it was named for never arrived either, because rpc() raised KeyError on
+    the missing `result` one layer earlier. It is kept, and now reachable: post() turns
+    a non-2xx into a payload carrying the body verbatim, and an operator-surface body
+    is exactly that `{"error": ...}` shape.
     """
     return isinstance(out, dict) and ("_hestia_error" in out or "error" in out)
 
@@ -129,6 +212,21 @@ def main():
     if len(sys.argv) < 2 or sys.argv[1] not in ("peek", "drain", "send", "unanswered"):
         print(__doc__); sys.exit(2)
     cmd = sys.argv[1]
+    try:
+        act(cmd)
+    except DaemonRefusal as r:
+        # Same contract as a payload-level refusal: full JSON on stdout, rc=3.
+        print(json.dumps(r.payload, indent=1))
+        summarize(r.payload)
+        sys.exit(3)
+    except Unreachable as u:
+        # The one case that is genuinely rc=1. stderr, because there is no payload to
+        # parse — saying so beats a traceback that a caller has to regex.
+        print(f"hestia-mesh: no answer from {EP} — {u}", file=sys.stderr)
+        sys.exit(1)
+
+
+def act(cmd):
     h, s = connect()
     if cmd in ("peek", "drain"):
         out = rpc(h, "hestia_member_inbox", {"session_id": s, "peek": cmd == "peek"})
@@ -152,7 +250,25 @@ def main():
     # a caller can tell "I asked wrong" from "it said no" from "I never got there".
     print(json.dumps(out, indent=1))
     if failed(out):
+        summarize(out)
         sys.exit(3)
+
+
+def summarize(payload):
+    """One human line on stderr naming the refusal. Not a duplicate of stdout.
+
+    session-mesh-inbox.sh:35-45 reports a non-zero rc by printing the FIRST TWO LINES
+    OF STDERR. Before this change those two lines were "Traceback (most recent call
+    last):" and a frame — technically present, operationally useless. Routing the
+    diagnosis to stdout as JSON (which that caller discards) would have left the branch
+    correct but mute, so the rc gets a sentence to go with it. stdout stays pure JSON.
+    """
+    err = payload.get("_hestia_error") or payload.get("error") or {}
+    if isinstance(err, dict):
+        detail = f"{err.get('code', '?')}: {err.get('message', '')}".strip().rstrip(":")
+    else:
+        detail = str(err)
+    print(f"hestia-mesh: the daemon refused this call — {detail}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
