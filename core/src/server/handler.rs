@@ -2235,11 +2235,19 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
     // established, which is the same shape as the `agent-inventory` misroute fixed one clause
     // later in this file (kimi-code, reviewing).
     let appellant_lct = s.member_lct(&appellant.plugin_id);
+    let durable_registry_size = s.member_registry.len();
+    let observed_registry_size = s.member_registry.observed_ids_sorted().len();
+    let unpersisted_members: Vec<String> = s
+        .member_registry
+        .unpersisted_ids_sorted()
+        .into_iter()
+        .cloned()
+        .collect();
     let pool: Vec<String> = s
         .member_registry
-        .iter_sorted()
+        .observed_ids_sorted()
         .into_iter()
-        .map(|(id, _)| id.clone())
+        .cloned()
         .filter(|id| {
             // Only drop a candidate PROVEN to be the same entity. member_lct fails closed to
             // None for synthetic ids, and select_arbiter refuses unrecognised reasoners
@@ -2290,6 +2298,14 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
             "routed_to": picked.as_ref().map(|(id, ..)| id.clone()),
             "routed_independence": picked.as_ref().map(|(_, i, ..)| i),
             "routed_liveness": picked.as_ref().map(|(_, _, l, _)| l),
+            // Registry completeness is routing evidence. A member seen this boot may not
+            // have a durable custodial LCT when vault persistence failed; omitting it from
+            // the pool silently reduces independence exactly when local state is degraded.
+            // Publication remains restricted to the durable registry.
+            "routed_pool_size": pool.len(),
+            "routed_registry_size": durable_registry_size,
+            "routed_observed_size": observed_registry_size,
+            "routing_unpersisted_members": unpersisted_members,
             // A more independent arbiter that routing skipped for being unreachable. The
             // trade is on the record so a reader weighs the ruling with the routing in view.
             "routing_passed_over": picked.as_ref().and_then(|(.., p)| p.clone()),
@@ -7496,6 +7512,56 @@ mod open_appeals_tests {
         )
         .await
         .unwrap()
+    }
+
+    /// A first-sight member whose LCT cannot persist is still a real observed
+    /// candidate. Storage degradation must be explicit in the receipt, not silently
+    /// collapse an independent two-member constellation into a one-member pool.
+    #[tokio::test]
+    async fn unpersisted_observed_member_remains_in_appeal_pool_with_evidence() {
+        let (_d, shared, ids) = state_with_members(&["claude-code"]);
+        {
+            let mut s = shared.lock().await;
+            let vault_path = s.vault.path().to_path_buf();
+            std::fs::remove_file(&vault_path).unwrap();
+            std::fs::create_dir(&vault_path).unwrap();
+            let sovereign_anchor = s.sovereign_lct.clone();
+            let sovereign_id = s.sovereign.lct_id();
+            let super::super::state::ServerState { vault, member_registry, .. } = &mut *s;
+            assert!(
+                crate::member_registry::ensure_member(
+                    vault,
+                    member_registry,
+                    "kimi-code",
+                    false,
+                    &sovereign_id,
+                    &sovereign_anchor,
+                )
+                .is_none(),
+                "directory at the vault-file path must make persistence fail"
+            );
+            assert_eq!(member_registry.len(), 1, "durable publication set stays unchanged");
+        }
+
+        let deny = append_deny(&shared, "claude-code", "ls /tmp").await;
+        let filed = file_appeal(&shared, ids[0], &deny).await;
+        let entry_hash = filed["witnessEntryHash"].as_str().expect("appeal was witnessed");
+        let entry = shared
+            .lock()
+            .await
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.hash == entry_hash)
+            .expect("appeal entry is on the chain");
+
+        assert_eq!(entry.event_data["routed_to"], "kimi-code", "{:?}", entry.event_data);
+        assert_eq!(entry.event_data["routed_pool_size"], 1);
+        assert_eq!(entry.event_data["routed_registry_size"], 1);
+        assert_eq!(entry.event_data["routed_observed_size"], 2);
+        assert_eq!(
+            entry.event_data["routing_unpersisted_members"],
+            json!(["kimi-code"])
+        );
     }
 
     /// THE JOIN. An appeal appears until someone rules it, and then it does not.
