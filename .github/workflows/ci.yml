@@ -126,11 +126,26 @@ jobs:
           fi
           echo "discovered ${#tests[@]} test file(s):"
           printf '  %s\n' "${tests[@]}"
+          # RUN ALL, THEN FAIL. A bare `python3 "$t"` under `set -e` exits the step
+          # on the first red, so every test after it in discovery order never runs
+          # and the report says "1 failure" no matter how many there are. Measured
+          # 2026-07-31: main was red on ci_test_coverage_test.py AND
+          # shebang_exec_bit_test.py, and only the first was ever visible — the
+          # second was found by running the suite by hand with the first skipped.
+          # A masked red is worse than a loud one: it reads as "one thing to fix",
+          # so each fix costs a full CI round trip to reveal the next.
+          failed=()
           for t in "${tests[@]}"; do
             echo "::group::$t"
-            python3 "$t"
+            python3 "$t" || failed+=("$t")
             echo "::endgroup::"
           done
+          if [ ${#failed[@]} -gt 0 ]; then
+            printf '::error::%s failed\n' "${failed[@]}"
+            echo "FAILED ${#failed[@]} of ${#tests[@]}: ${failed[*]}"
+            exit 1
+          fi
+          echo "all ${#tests[@]} passed"
 
   # ADDITION, 2026-07-28: the job above runs `cargo test`, and the ENFORCEMENT
   # SURFACE for a Claude Code member is not Rust. `pre_tool_use.py` is what
@@ -172,9 +187,19 @@ jobs:
           [ ${#tests[@]} -gt 0 ] || { echo "::error::no hook tests found — refusing to report green"; exit 1; }
           echo "discovered ${#tests[@]} hook test file(s):"
           printf '  %s\n' "${tests[@]}"
+          # Run all, then fail — same reason as the plugin-tests job above: under
+          # `set -e` the first red hides every test after it, and the count in the
+          # report becomes 1 regardless of the truth.
+          failed=()
           for t in "${tests[@]}"; do
             echo "== $t"
             # These import the hook modules sitting beside them, so they run
             # from their own directory — the reason this job exists separately.
-            ( cd "$(dirname "$t")" && python3 "$(basename "$t")" )
+            ( cd "$(dirname "$t")" && python3 "$(basename "$t")" ) || failed+=("$t")
           done
+          if [ ${#failed[@]} -gt 0 ]; then
+            printf '::error::%s failed\n' "${failed[@]}"
+            echo "FAILED ${#failed[@]} of ${#tests[@]}: ${failed[*]}"
+            exit 1
+          fi
+          echo "all ${#tests[@]} passed"
