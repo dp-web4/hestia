@@ -75,7 +75,27 @@ def rpc(h, name, args):
     for line in body.splitlines():
         if line.startswith("data: {"):
             return json.loads(json.loads(line[6:])["result"]["content"][0]["text"])
-    return {}
+    # No `data:` frame at all. Returning {} here made an unparseable response
+    # indistinguishable from an empty inbox — see the exit-code note in main().
+    return {"_hestia_error": {"code": "hestia_mesh.no_data_frame",
+                              "message": f"{name}: response carried no data: frame"}}
+
+
+def failed(out):
+    """A tool call the DAEMON refused still arrives over a 200 with a JSON-RPC result.
+
+    The refusal is in the payload (`_hestia_error`), so exiting 0 on it reported a
+    rejected notice as a sent one. That is the failure this repo already writes down
+    twice: a refusal is only worth the caller that hears it (#108's rc=2 rendering as
+    an empty inbox), and session-mesh-inbox.sh:35-45 exists precisely to say "could not
+    read" is not "empty" — but it can only say it if this CLI signals.
+
+    Measured 2026-07-31 before this fix: `send` with an over-length pointer, and `send`
+    to a member id that does not exist, BOTH printed `_hestia_error` and exited 0. Any
+    caller writing `hestia-mesh.py send ... || handle` never fired, and the sender
+    believed a notice was queued that never was.
+    """
+    return isinstance(out, dict) and ("_hestia_error" in out or "error" in out)
 
 def connect():
     _, sid = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -126,7 +146,13 @@ def main():
         if len(sys.argv) > 5:
             args["in_reply_to"] = int(sys.argv[5])
         out = rpc(h, "hestia_member_notify", args)
+    # stdout keeps carrying the full payload either way — callers parse it as JSON and
+    # the error body is the diagnostic. Only the exit code changes: 3 = the daemon
+    # answered and refused, distinct from 2 (usage/identity) and 1 (connect failed), so
+    # a caller can tell "I asked wrong" from "it said no" from "I never got there".
     print(json.dumps(out, indent=1))
+    if failed(out):
+        sys.exit(3)
 
 if __name__ == "__main__":
     main()
