@@ -20,7 +20,20 @@ IVL="${WATCH_INTERVAL:-60}"
 # 0700 state dir instead of world-writable /tmp — the fired CLI treats the
 # primer as its authoritative work list.
 STATE="${HESTIA_MESH_STATE:-$HOME/.local/state/hestia-mesh}"
-mkdir -p "$STATE/primers" && chmod 700 "$STATE" "$STATE/primers"
+# PER-MEMBER NAMESPACE (2026-07-31). Primers used to live in ONE directory for every
+# member on the host, named `notice-XXXXXX.json` by mktemp and recording `from_plugin`
+# on each notice and the recipient NOWHERE. The stale-retry loop below then globbed that
+# whole directory and re-fired whatever it found through its own $FIRE — so which member
+# received a retained work list was decided by whichever watcher's glob got there first.
+# On 2026-07-31 that fired Codex's mail (notice 215, and Codex's own debt report) into
+# Kimi's CLI at 10:35:39 and into Codex's at 10:40:45, both watchers logging DELIVERED for
+# the same consume-once list. Kimi could not answer any of it — the daemon correctly
+# refuses `member_notify_reply_binding_not_yours` — so the wake was spent on mail its
+# reader was structurally barred from clearing.
+# The directory is the fix: a file under $PRIMERS is this member's by construction, so
+# nothing downstream has to infer an owner that was never written down.
+PRIMERS="$STATE/primers/$PLUGIN"
+mkdir -p "$PRIMERS" && chmod 700 "$STATE" "$STATE/primers" "$PRIMERS"
 exec 9>"$STATE/watch-$PLUGIN.lock"
 flock -n 9 || { echo "[hestia-watch] another watcher holds $STATE/watch-$PLUGIN.lock — exiting"; exit 1; }
 
@@ -38,7 +51,59 @@ flock -n 9 || { echo "[hestia-watch] another watcher holds $STATE/watch-$PLUGIN.
 # counted in a sidecar, and on exhaustion the primer is SET ASIDE rather than deleted — it
 # is the only copy of a consume-once work list.
 STALE_MAX_ATTEMPTS="${STALE_MAX_ATTEMPTS:-3}"
-for stale in "$STATE"/primers/notice-*.json; do
+
+# RESCUE THE ALREADY-STRANDED (2026-07-31). When the namespace above landed, the flat
+# directory held 24 primers from three members intermixed. They are consume-once work
+# lists — the only copy — so they are moved, never dropped.
+#
+# A member claims ONLY what is provably its own: `for_plugin` if the file has it, else the
+# `unanswered` fold, whose `i_owe` rows are addressed TO the owner and whose `owed_to_me`
+# rows are FROM it. That is structural, not a guess. Anything that resolves to no owner or
+# to more than one is ANNOUNCED AND LEFT ALONE — 7 of the 24 were written by the path where
+# the unanswered RPC failed, so they name nobody, and a work list whose owner is unknown
+# must not be delivered to a guess. That is the whole defect being fixed.
+#
+# Claiming only its own also makes this safe on a half-deployed host: watchers are
+# long-running and reload nothing (#74), so an un-restarted peer may still be writing flat
+# files while this one runs. Touching only what it owns means the two cannot fight.
+migrate_flat_primers() {
+  local f owner moved=0
+  for f in "$STATE"/primers/notice-*.json; do
+    [ -e "$f" ] || break
+    owner=$(python3 - "$f" <<'PY' 2>/dev/null || true
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: print(""); raise SystemExit(0)
+who=set()
+fp=d.get("for_plugin")
+if isinstance(fp,str) and fp:
+    who.add(fp)
+else:
+    u=d.get("unanswered") or {}
+    for r in u.get("i_owe") or []:
+        if r.get("to_plugin"): who.add(r["to_plugin"])
+    for r in u.get("owed_to_me") or []:
+        if r.get("from_plugin"): who.add(r["from_plugin"])
+print(next(iter(who)) if len(who)==1 else "")
+PY
+)
+    if [ "$owner" = "$PLUGIN" ]; then
+      if mv -f "$f" "$PRIMERS/" 2>/dev/null; then
+        moved=$((moved + 1))
+        if [ -e "$f.attempts" ]; then mv -f "$f.attempts" "$PRIMERS/" 2>/dev/null || true; fi
+      fi
+    elif [ -z "$owner" ]; then
+      echo "[hestia-watch] UNATTRIBUTABLE PRIMER (names no member — left in place rather than delivered to a guess): $f"
+    fi
+  done
+  if [ "$moved" -gt 0 ]; then
+    echo "[hestia-watch] rescued $moved stranded primer(s) from the shared directory -> $PRIMERS"
+  fi
+  return 0
+}
+migrate_flat_primers
+
+for stale in "$PRIMERS"/notice-*.json; do
   [ -e "$stale" ] || break
   echo "[hestia-watch] STALE PRIMER (undelivered notices from a failed fire): $stale"
   python3 -c "import json,sys;d=json.load(open(sys.argv[1]));[print(f\"    id={n.get('id')} {n.get('kind')} from {n.get('from_plugin')} queued={n.get('queued_at','')}: {n.get('pointer_uri','')}\") for n in d.get('notices',[])]" "$stale" 2>/dev/null || true
@@ -221,17 +286,26 @@ while true; do
   OUT=$(drain || echo '{"total":0}')
   N=$(echo "$OUT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
   if [ "$N" -gt 0 ]; then
-    PRIMER=$(mktemp "$STATE/primers/notice-XXXXXX.json")
+    PRIMER=$(mktemp "$PRIMERS/notice-XXXXXX.json")
     # The strong asker: fold the member's outstanding debt into the primer, so
     # the question is asked where an answer is possible — inside the wake that
     # is happening anyway. Costs one read; never causes a fire on its own.
     UN=$(unanswered 2>/dev/null || echo '{}')
-    printf '%s' "$OUT" | UN="$UN" python3 -c '
+    printf '%s' "$OUT" | UN="$UN" FOR_PLUGIN="$PLUGIN" python3 -c '
 import json,os,sys
-d=json.load(sys.stdin)
+try: d=json.load(sys.stdin)
+except Exception: d={}
 try: u=json.loads(os.environ.get("UN") or "{}")
 except Exception: u={}
 d["unanswered"]={k:u.get(k,[]) for k in ("i_owe","owed_to_me")}
+# WHO THIS IS FOR — the one fact the primer never stated. It recorded from_plugin on
+# every notice and the recipient nowhere, so a misdelivered work list was
+# indistinguishable from a correct one by reading it, and the four days between notice
+# 160 and the diagnosis were spent without the evidence being on disk anywhere.
+# Stamped OUTSIDE the unanswered fold on purpose: the fold is the path that failed on the
+# 7 primers nobody could attribute, and an owner that only survives the happy path
+# re-creates exactly them.
+d["for_plugin"]=os.environ["FOR_PLUGIN"]
 json.dump(d,sys.stdout)
 ' > "$PRIMER" 2>/dev/null || echo "$OUT" > "$PRIMER"
     echo "[hestia-watch] $N notice(s) for $PLUGIN -> $PRIMER"
