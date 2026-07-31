@@ -74,8 +74,10 @@ Run:  ./tools/conflict_marker_test.py
 
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
+import tempfile
 
 # Set in the child of check G only. Makes main() raise at a fixed point, so the
 # death path is EXERCISED rather than merely present.
@@ -126,16 +128,44 @@ def repo_root():
 
 
 def head_ref(repo):
-    """`<short-sha>` or `<short-sha>-dirty`. A file count with no ref beside it
-    is not checkable -- two machines report different totals and neither is
-    wrong. kimi-code measured 939/940/937 across three checkouts of this repo.
+    """`<short-sha>` plus a suffix naming WHICH divergence, because they move
+    different things. A file count with no ref beside it is not checkable --
+    two machines report different totals and neither is wrong. kimi-code
+    measured 939/940/937 across three checkouts of this repo.
+
+    A single `-dirty` bit was not enough, and the drift it was written for is
+    what shows why. On 2026-07-31 this tree stamped `3e4e040-dirty` and scanned
+    935 against the branch's 940 at `1e65678`. The gap was exactly the 5 files
+    the 23 commits between those refs add, so the SHA carried the whole
+    explanation -- and `-dirty` was set by four untracked paths and one
+    worktree-modified file, none of which can change the number. The suffix
+    said "this total may not be 3e4e040's" about a total that provably was.
+
+    Two independent facts a reader needs, so two independent suffixes:
+
+      +list     the index's file LIST differs from HEAD's tree, so the COUNT is
+                not HEAD's. Only staged adds/deletes/renames do this.
+      +content  some tracked file's worktree bytes differ from HEAD's, so the
+                OFFENDER SET is not HEAD's. Check E reads the working tree
+                (`path.read_text`), not the blob, so an unstaged edit is enough.
+
+    Untracked files get NO suffix. Both detectors reach the index only --
+    E through `git ls-files`, F through `git ls-files -u` -- so an untracked
+    path cannot enter either answer. Marking it would report a divergence that
+    is unreachable by construction, which is how `-dirty` became unreadable.
+    Check H asserts all four cases.
     """
     def git(*a):
         return subprocess.run(
             ["git", *a], cwd=repo, capture_output=True, text=True,
         ).stdout.strip()
     sha = git("rev-parse", "--short", "HEAD") or "?"
-    return sha + ("-dirty" if git("status", "--porcelain") else "")
+    marks = ""
+    if git("diff", "--cached", "--name-only", "--diff-filter=ADR", "HEAD"):
+        marks += "+list"
+    if git("diff", "--name-only", "HEAD"):
+        marks += "+content"
+    return sha + marks
 
 
 def scan_text(text):
@@ -256,6 +286,69 @@ def death_run_reports_its_floor(repo):
     )
 
 
+def stamp_partitions_by_what_moves_the_number(repo):
+    """Build one scratch repo per class of dirt; assert the stamp separates them.
+
+    Synthetic, not read off `repo` -- a stamp asserted only against whatever
+    state this tree happens to be in proves nothing the moment it is cleaned,
+    and the live tree carries at most one class at a time anyway.
+
+    Against the code as merged in #143 every case below stamps `-dirty`, so
+    rows 2 and 4 fail: untracked-only is marked though it cannot be reached,
+    and worktree-modified is indistinguishable from a staged add though only
+    one of them moves the count.
+    """
+    def git(d, *a):
+        return subprocess.run(["git", *a], cwd=d, capture_output=True,
+                              text=True).stdout.strip()
+
+    def scratch():
+        # `--template=` and the gpgsign/hooksPath overrides keep a CI runner's
+        # global config out of these repos: an inherited commit hook or signing
+        # requirement would fail the commit and red H for a reason that has
+        # nothing to do with the stamp.
+        d = pathlib.Path(tempfile.mkdtemp(prefix="cmt-stamp-"))
+        git(d, "init", "-q", "-b", "main", "--template=")
+        git(d, "config", "user.email", "test@local")
+        git(d, "config", "user.name", "test")
+        git(d, "config", "commit.gpgsign", "false")
+        git(d, "config", "core.hooksPath", str(d / ".no-hooks"))
+        (d / "a.txt").write_text("a\n")
+        git(d, "add", "a.txt")
+        git(d, "commit", "-qm", "base")
+        if not git(d, "rev-parse", "--verify", "HEAD"):
+            raise RuntimeError("scratch repo has no HEAD -- git refused the commit")
+        return d
+
+    def suffix(d):
+        return head_ref(d).split("+", 1)[1] if "+" in head_ref(d) else ""
+
+    made = []
+    try:
+        clean = scratch(); made.append(clean)
+
+        untracked = scratch(); made.append(untracked)
+        (untracked / "junk.txt").write_text("junk\n")        # ls-files cannot see it
+
+        worktree = scratch(); made.append(worktree)
+        (worktree / "a.txt").write_text("a modified\n")      # content moves, count does not
+
+        staged = scratch(); made.append(staged)
+        (staged / "b.txt").write_text("b\n")
+        git(staged, "add", "b.txt")                          # the count itself moves
+
+        return (
+            suffix(clean) == ""
+            and suffix(untracked) == ""                      # unreachable => unmarked
+            and suffix(worktree) == "content"
+            and "list" in suffix(staged)
+            and suffix(worktree) != suffix(staged)           # the two are readable apart
+        )
+    finally:
+        for d in made:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 # --- The instrument, proven on synthetic input -------------------------------
 # These do not depend on the tree being dirty. A guard whose only evidence is a
 # transient working-tree state stops proving anything the moment it is cleaned.
@@ -343,6 +436,10 @@ def main():
     check("G  a mid-run death still prints the rows it got, floored",
           lambda: death_run_reports_its_floor(repo),
           "re-runs this file with the death injected after check D")
+
+    check("H  the ref stamp separates dirt that moves the count from dirt that cannot",
+          lambda: stamp_partitions_by_what_moves_the_number(repo),
+          "four scratch repos: clean / untracked / worktree-modified / staged")
 
     return 1 if (report(truncated=bool(_DIED)) or _DIED) else 0
 
