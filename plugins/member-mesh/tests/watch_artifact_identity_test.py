@@ -14,6 +14,7 @@ import hashlib
 import os
 from pathlib import Path
 import select
+import shutil
 import subprocess
 import tempfile
 import time
@@ -45,7 +46,35 @@ def read_until(proc: subprocess.Popen[str], needle: str) -> str:
     )
 
 
-def main() -> None:
+def stop(proc: subprocess.Popen[str]) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=2)
+
+
+def start(script: Path, home: Path, **extra_env: str) -> subprocess.Popen[str]:
+    env = dict(
+        os.environ,
+        HOME=str(home),
+        HESTIA_MESH_STATE=str(home / "state"),
+        HESTIA_ENDPOINT="http://127.0.0.1:1/mcp",
+        WATCH_INTERVAL="0.1",
+        UNANSWERED_EVERY="1",
+        **extra_env,
+    )
+    return subprocess.Popen(
+        [str(script), "artifact-test", "test-host"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+
+
+def real_drift_stays_visible() -> None:
     with tempfile.TemporaryDirectory() as td_raw:
         td = Path(td_raw)
         script = td / "hestia-watch-member.sh"
@@ -54,46 +83,87 @@ def main() -> None:
         script.chmod(0o755)
         expected = hashlib.sha256(original).hexdigest()
 
-        env = dict(
-            os.environ,
-            HOME=str(td / "home"),
-            HESTIA_MESH_STATE=str(td / "state"),
-            HESTIA_ENDPOINT="http://127.0.0.1:1/mcp",
-            WATCH_INTERVAL="0.1",
-            UNANSWERED_EVERY="3600",
-        )
-        proc = subprocess.Popen(
-            [str(script), "artifact-test", "test-host"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env,
-        )
+        proc = start(script, td / "home")
         try:
-            startup = read_until(proc, " ARTIFACT ")
+            startup = read_until(proc, "ARTIFACT plugin=")
+            assert "state=ok" in startup, startup
             assert f"startup_sha256={expected}" in startup, startup
             assert str(script) not in startup, "artifact record leaked its absolute path"
 
-            # Same-length mutation avoids the live-script byte-offset hazard while
-            # proving the process distinguishes loaded bytes from current disk bytes.
+            # Replace atomically. Truncating the inode bash is still parsing can make
+            # it observe EOF and exit successfully before the loop starts — a flaky
+            # test that reports the watcher healthy by killing it is worse than none.
             changed = original.replace(b"local-mesh", b"local_mesh", 1)
             assert changed != original and len(changed) == len(original)
-            script.write_bytes(changed)
+            replacement = script.with_suffix(".new")
+            replacement.write_bytes(changed)
+            replacement.chmod(0o755)
+            os.replace(replacement, script)
             drifted = hashlib.sha256(changed).hexdigest()
 
             drift = read_until(proc, "ARTIFACT DRIFT")
             assert "restart required" in drift, drift
             assert f"startup_sha256={expected}" in drift, drift
             assert f"disk_sha256={drifted}" in drift, drift
-        finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=2)
 
-    print("ok: watcher artifact identity and drift are observable")
+            # Outlive the edge alarm. The next periodic gauge must continue to
+            # report drift, never return to the healthy startup-only shape.
+            gauge = read_until(proc, "ARTIFACT plugin=")
+            assert "state=drift" in gauge, gauge
+            assert "reason=differs-from-startup" in gauge, gauge
+            assert f"disk_sha256={drifted}" in gauge, gauge
+        finally:
+            stop(proc)
+
+
+def unavailable_startup_is_absorbing() -> None:
+    with tempfile.TemporaryDirectory() as td_raw:
+        td = Path(td_raw)
+        script = td / "hestia-watch-member.sh"
+        script.write_bytes(WATCHER.read_bytes())
+        script.chmod(0o755)
+
+        real_python = shutil.which("python3")
+        assert real_python is not None
+        bin_dir = td / "bin"
+        bin_dir.mkdir()
+        enabled = td / "python-enabled"
+        shim = bin_dir / "python3"
+        shim.write_text(
+            "#!/bin/sh\n"
+            f'[ -f "{enabled}" ] || exit 1\n'
+            f'exec "{real_python}" "$@"\n'
+        )
+        shim.chmod(0o755)
+
+        proc = start(
+            script,
+            td / "home",
+            PATH=f"{bin_dir}:{os.environ['PATH']}",
+        )
+        try:
+            startup = read_until(proc, "ARTIFACT plugin=")
+            assert "state=unverifiable" in startup, startup
+            assert "reason=startup-baseline-unavailable" in startup, startup
+            assert "startup_sha256=unavailable" in startup, startup
+
+            # Restoring the hasher does not create a time machine: the current disk
+            # hash becomes visible evidence, but no startup baseline can be inferred.
+            enabled.touch()
+            later = read_until(proc, "ARTIFACT plugin=")
+            assert "state=unverifiable" in later, later
+            assert "reason=startup-baseline-unavailable" in later, later
+            assert "disk_sha256=unavailable" not in later, later
+            assert "ARTIFACT DRIFT" not in later, later
+        finally:
+            stop(proc)
+
+
+def main() -> None:
+    real_drift_stays_visible()
+    unavailable_startup_is_absorbing()
+
+    print("ok: watcher artifact state is persistent, live, and race-free")
 
 
 if __name__ == "__main__":

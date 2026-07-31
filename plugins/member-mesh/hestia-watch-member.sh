@@ -44,27 +44,63 @@ PY
 WATCH_STARTUP_SHA256="$(watch_source_hash 2>/dev/null || true)"
 [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]] || WATCH_STARTUP_SHA256="unavailable"
 WATCH_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-WATCH_DRIFT_REPORTED=0
+WATCH_CURRENT_SHA256="$WATCH_STARTUP_SHA256"
+if [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  WATCH_ARTIFACT_STATE="ok"
+  WATCH_ARTIFACT_REASON="matches-startup"
+else
+  # A baseline never captured cannot be reconstructed later: a hash obtained after
+  # startup says what is on disk NOW, not what this process began executing. Keep
+  # this state absorbing for the process lifetime rather than comparing a real hash
+  # with the sentinel and reporting a false drift when python becomes available.
+  WATCH_ARTIFACT_STATE="unverifiable"
+  WATCH_ARTIFACT_REASON="startup-baseline-unavailable"
+fi
+WATCH_LAST_ALARM_STATE=""
 
 announce_artifact() {
-  echo "[hestia-watch] ARTIFACT plugin=$PLUGIN startup_sha256=$WATCH_STARTUP_SHA256 started=$WATCH_STARTED_AT"
+  # Re-measure here even though the loop also checks every pass. The periodic line
+  # is the level-triggered gauge that survives log rotation; it must never depend on
+  # a prior one-shot alarm still being visible.
+  check_artifact_drift
+  echo "[hestia-watch] ARTIFACT plugin=$PLUGIN state=$WATCH_ARTIFACT_STATE reason=$WATCH_ARTIFACT_REASON startup_sha256=$WATCH_STARTUP_SHA256 disk_sha256=$WATCH_CURRENT_SHA256 started=$WATCH_STARTED_AT"
 }
 
 check_artifact_drift() {
-  local CURRENT
+  local CURRENT STATE REASON
   CURRENT="$(watch_source_hash 2>/dev/null || true)"
-  if [[ ! "$CURRENT" =~ ^[0-9a-f]{64}$ ]]; then
-    if [ "$WATCH_DRIFT_REPORTED" -eq 0 ]; then
-      echo "[hestia-watch] ARTIFACT UNVERIFIABLE — cannot hash the on-disk watcher; startup_sha256=$WATCH_STARTUP_SHA256"
-      WATCH_DRIFT_REPORTED=1
-    fi
+  [[ "$CURRENT" =~ ^[0-9a-f]{64}$ ]] || CURRENT="unavailable"
+
+  if [[ ! "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    STATE="unverifiable"
+    REASON="startup-baseline-unavailable"
+  elif [ "$CURRENT" = "unavailable" ]; then
+    STATE="unverifiable"
+    REASON="disk-hash-unavailable"
   elif [ "$CURRENT" != "$WATCH_STARTUP_SHA256" ]; then
-    if [ "$WATCH_DRIFT_REPORTED" -eq 0 ]; then
-      echo "[hestia-watch] ARTIFACT DRIFT — restart required; startup_sha256=$WATCH_STARTUP_SHA256 disk_sha256=$CURRENT"
-      WATCH_DRIFT_REPORTED=1
-    fi
+    STATE="drift"
+    REASON="differs-from-startup"
   else
-    WATCH_DRIFT_REPORTED=0
+    STATE="ok"
+    REASON="matches-startup"
+  fi
+
+  WATCH_CURRENT_SHA256="$CURRENT"
+  WATCH_ARTIFACT_STATE="$STATE"
+  WATCH_ARTIFACT_REASON="$REASON"
+
+  # Alarms are edges; the periodic ARTIFACT line above is the level. Remember the
+  # last non-ok state rather than a boolean so unverifiable -> drift emits the new,
+  # actionable condition once. Returning to ok clears the edge memory.
+  if [ "$STATE" = "ok" ]; then
+    WATCH_LAST_ALARM_STATE=""
+  elif [ "$STATE" != "$WATCH_LAST_ALARM_STATE" ]; then
+    if [ "$STATE" = "drift" ]; then
+      echo "[hestia-watch] ARTIFACT DRIFT — restart required; startup_sha256=$WATCH_STARTUP_SHA256 disk_sha256=$CURRENT"
+    else
+      echo "[hestia-watch] ARTIFACT UNVERIFIABLE — reason=$REASON startup_sha256=$WATCH_STARTUP_SHA256 disk_sha256=$CURRENT"
+    fi
+    WATCH_LAST_ALARM_STATE="$STATE"
   fi
 }
 
