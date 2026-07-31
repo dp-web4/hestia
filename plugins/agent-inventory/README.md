@@ -43,7 +43,8 @@ the `/mnt/c` 9p mount (cold reads can outlast a hook timeout, and these hooks fa
 |---|---|
 | on launch | `SessionStart` hook, `--workspace <ws> --brief`, 10s timeout |
 | operator on demand | `hestia-agent-inventory --workspace <ws> [--brief] [--no-witness]` |
-| periodic | `systemd --user` timer, hourly (`OnBootSec=3min`, `Persistent=true`) — **Linux only** |
+| periodic | Linux: `systemd --user` timer, hourly (`OnBootSec=3min`, `Persistent=true`) |
+| | Darwin: `launchd` user agent `io.hestia-agent-inventory`, hourly (`StartInterval=3600`, `RunAtLoad`) |
 
 `install.sh` wires **every trigger this platform can carry** — all three on Linux — and
 writes the resolved workspace into each of them.
@@ -167,10 +168,356 @@ Two changes, and the second is the one that matters:
    neither promises a fire (a `--user` timer with lingering off does not run without a
    session). Stats only, no subprocess: this runs inside a hook with a budget.
 
-**Darwin is in scope; the launchd agent is not written.** `install.sh` therefore installs
-two of three triggers on a Mac and says so, and the check reports the third missing on
-every run. That is a known, visible gap where there was an unknown, invisible one — but it
-is still a gap, and closing it needs a box that can test it.
+**Darwin is in scope, and the launchd agent is now written and run.** `install.sh`
+completes on macOS (26.5, McNugget, 2026-07-28 — the first time it has), wiring all three
+triggers. The agent was bootstrapped, fired by `RunAtLoad`, and exited 0 having written a
+real report; `launchctl print` reports `run interval = 3600 seconds`.
+
+The two backends are **not** equivalent, and the differences are named rather than
+smoothed over, because each is a gap in coverage that a shared state name would hide:
+
+| systemd | launchd | consequence |
+|---|---|---|
+| `OnUnitActiveSec=1h` | `StartInterval=3600` | equivalent |
+| `OnBootSec=3min` | `RunAtLoad` | fires *at* load, not 3min after; costs boot quiet, not coverage |
+| `RandomizedDelaySec=90` | — | no jitter for `StartInterval`; one local walk, so recorded as absent rather than fine |
+| `Persistent=true` | — | **a fire missed while asleep happens once at next load, not once per missed hour.** systemd catches up; launchd does not |
+| `loginctl enable-linger` | — | a `gui/` agent runs only while the user is logged in, and there is no user-agent equivalent of lingering. The honest remedy is a `LaunchDaemon`, which is a privilege escalation an observation-only check has no business asking for |
+
+**A plist's existence was never the schedule.** Writing the launchd half surfaced that the
+detector answered `launchd-agent-installed` from the glob alone — so a LaunchAgent with
+`RunAtLoad` and no schedule key, which `launchctl bootstrap` accepts silently and `ls`
+cannot distinguish, read as an hourly check. Measured against the pre-change detector: it
+returned `launchd-agent-installed` and the `--brief` line was clean. That is the systemd
+`installed-not-enabled` distinction with no state to hold it, on the side where the
+positive answer was already the weaker one — and the first such artifact would have been
+the one `install.sh` writes. The keys are now read with `plistlib` (in-process, no
+`launchctl` subprocess, hook budget intact), and the states say how much they claim:
+`launchd-agent-installed`, `-installed-no-schedule`, `-unparseable`. A non-dict root
+counts as unparseable, not unscheduled: `plistlib.loads(b"<plist/>")` returns `None`
+rather than raising, so "it parsed" is not "it is a job description".
+
+**The installer asks launchd, not the filesystem.** `plutil -lint` is a parser, not a
+validator — measured on macOS 26.5, `<<<junk` appended after `</plist>` still lints `OK`,
+because it stops at the closing tag. So an unlinted plist is *removed* rather than left
+where `ls` and the detector's glob would both read it as a wired schedule, and a linted
+one is then checked against `launchctl print gui/$UID/<label>` for the interval launchd
+actually holds. `launchctl load` succeeds on a valid plist and says nothing about the job.
+
+**The interpreter is pinned, like the workspace.** The wrapper said `python3` and let
+`PATH` resolve it. Measured with a throwaway LaunchAgent that printed its own environment:
+launchd hands a `gui/` agent `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, so `python3` resolved to
+`/usr/bin/python3` (3.9.6) under the timer and `/opt/homebrew/bin/python3` (3.14.4) in the
+shell. Both printed a byte-identical `--brief` line here, so today it is benign — but step
+3 derives the `SessionStart` timeout by running the binary under the *shell's* python3, and
+the pair `--print-hook-timeout` exists to keep from drifting was pinned on one side only.
+Not Darwin-specific: a systemd `--user` unit sets no `PATH` either. Not measured here, and
+said as unmeasured: on a Mac without the Xcode command line tools `/usr/bin/python3` is a
+stub, and the unpinned wrapper would be exit 127 from launchd while `launchctl print` still
+showed a healthy job with the interval set.
+
+**And on Linux the pin needs a floor** (cbp, 2026-07-28 — the cross-platform review the
+shared edit asked for, and it did bite). `command -v python3` is a *stable* path on a Mac
+and routinely an *ephemeral* one here: a venv, a conda prefix, a pyenv shim, a checkout
+under `/tmp`. Measured on cbp — install with a venv active, then delete the venv:
+
+```
+pinned wrapper    env: '/tmp/hli-venv/bin/python3': No such file or directory   exit 127
+unpinned wrapper  [agent-inventory] OK on cbp: 4 installed, 6 plugins, 4 governed  exit 0
+```
+
+The pin turned a survivable environment change into a permanent 127 — and did it
+**silently**: `periodic_trigger()` still answered `systemd-user-timer-enabled` with
+`installed_bin` set, the strongest state this plugin has, while every hourly fire was 127
+and every `SessionStart` hook emitted nothing. That is exactly the shape named above for a
+Mac without the Xcode CLT and marked *not measured*; on Linux it is reachable by a far more
+ordinary route than a missing toolchain, so it is measured here.
+
+The pin is still right — it fixed a real five-minor-version split between two triggers — so
+this does not revert it. It gives it a floor: **pinned when the pin is there, `PATH` when
+it is not, and the degradation reported rather than fatal.** The wrapper exports
+`HESTIA_INTERPRETER_PIN_BROKEN`, and `interpreter_finding()` turns it into an `unknown[]`
+entry and an `INTERPRETER PIN BROKEN` clause on `--brief`; `scope.interpreter` now carries
+`sys.executable` on every run, broken or not, so two triggers can be differenced. A check
+whose own wrapper exits 127 is an instance of the failure it exists to find. `install.sh`
+also warns at install time when the pin is *already* known to be ephemeral, since that is
+the one moment a human is watching.
+
+Both halves are sabotage-probed to red, and the interesting probe is the first: **neuter
+`interpreter_finding()` and the run recovers silently** — clean `--brief`, exit 0, pin
+broken. The fallback is not the guard. The report is.
+
+**And the fallback has to be probed, not found** (McNugget, 2026-07-28 — the Darwin side of
+that review, measured end to end through a real launchd agent in a sandboxed `$HOME`).
+`-x` and `command -v` answer *exists*; a floor needs *runs*. On a Mac without the Xcode
+command line tools `/usr/bin/python3` is an xcrun stub — executable, 118KB, and once the
+pinned directory is gone it is the **first** `python3` on the PATH launchd hands a `gui/`
+agent (`/usr/bin:/bin:/usr/sbin:/sbin`). `command -v` finds it, so the `-z` branch never
+fires, and it exits 1 without running a line of this file. What that looked like from the
+operator's side, on the fired agent:
+
+```
+launchctl last exit code = 1
+stdout (agent-inventory.log)   0 bytes          <- the --brief surface
+unknown[]                      no entry         <- no INTERPRETER PIN BROKEN
+scope.periodic_trigger         launchd-agent-installed   } strongest state,
+scope.installed_bin            <the wrapper>             } every fire a no-op
+stderr (agent-inventory.err)   xcrun: error: ...
+```
+
+Which is the same silence the floor was written to end, one platform over — installed,
+scheduled, and never once run, with the one line of evidence sitting in a file nothing
+reads. So the wrapper now runs the fallback once (`"$PY" -c ''`) before trusting it and
+exits **loudly** if it cannot, and `install.sh` asks the same question of the pin before
+writing it — the stub is exactly what `command -v python3` resolves to on a fresh Mac, so
+the pin can be dead on arrival. 13ms, once, and on the install path or the
+already-degraded path only. The general rule this makes twice on this thread: **the
+degraded branch needs a check of its own, because it is the branch nobody is watching.**
+
+**And the same question, asked of the pin** (cbp, 2026-07-28, the Linux side of that
+review). The rule above was applied to one of the wrapper's two branches: `command -v` on
+the fallback got probed, `-x` on the **pin** did not — and `-x` answers *exists* for the
+same reason `command -v` does. A pin that is present, `0755` and unrunnable reached
+neither guard: not `-x`-false, so no fallback, no `HESTIA_INTERPRETER_PIN_BROKEN`, no
+finding. Straight to the `exec`, and dead there. The Linux route is as ordinary as the
+Mac's stub, and this script *already warns about it three lines further down*: install
+with a version-manager shim first on `PATH` (`pyenv`'s `shims/python3` — "re-resolves from
+ITS own environment"), then let that version go. The shim stays executable forever and
+exits 127 without starting python. Measured, sandboxed `$HOME`:
+
+```
+                                   before            after
+exit                               127               0
+stdout (the --brief surface)       0 bytes           the line, + INTERPRETER PIN BROKEN
+unknown[]                          no entry          the finding, naming pin and fallback
+--json                             0 bytes           scope.interpreter_pin_broken set
+```
+
+Note what it cost the floor specifically: the floor put `scope.interpreter` on **every**
+run and turned a broken pin into a finding — but both live *inside* `inventory.py`, and
+this is the one case where `inventory.py` never starts. **A report needs something alive to
+emit it**, which is the sentence above pointed at the branch it did not cover. So gone and
+cannot-run are now one case with one handling: fall back and **report** (never exit — that
+is reserved for when the fallback cannot run either, the only state with nothing left
+alive to report with). Cost, measured rather than asserted: one interpreter start per run,
+30ms here against a ~4.6s `--brief` over the fleet workspace — 0.6%, cheap only because
+that walk is 9p. On a local-SSD workspace it is a larger fraction, so it is a real trade.
+
+**A third thing, found by installing it rather than reading it:** that review comment was
+written into `install.sh`'s wrapper heredoc, which is **unquoted** — it has to be, it
+interpolates `$PYTHON`, `$BIN` and `$WORKSPACE`. So its body is prose to a reader and
+shell input to `bash`. The markdown backticks around `` `-x` `` and
+`` `launchd-agent-installed` `` were **command substitution**: both ran during install
+("command not found" ×2 on a clean install), and the shipped wrapper had holes where the
+quoted words used to be — *"Found by , so the -z branch never fires"*. Nothing executable
+broke, but only because those words named nothing; the backtick count was even **by luck**,
+and an odd count is a hard `bad substitution` that writes a **zero-byte wrapper**. `bash
+-n` does not catch it — it is valid shell — and no output of the plugin changes when it
+happens. Since prose-in-shell-comments is this file's house style, that is a standing
+hazard rather than a typo, so the backticks are escaped and `test_wrapper_heredoc_is_inert`
+fails if an unescaped one comes back.
+
+For symmetry with the Darwin numbers: on cbp a systemd `--user` unit resolves
+`/usr/bin/python3` 3.12.3 and the shell resolves the identical path, so the pin buys
+nothing here and cost the 127 above — which is why it needs a floor and not a Linux
+exemption.
+
+**The hazard is the heredoc, not the wrapper** (McNugget, 2026-07-28, measured on macOS
+26.5 by installing it). `install.sh` writes **three** unquoted heredocs — `WRAP`, the
+systemd `.service` unit, and the launchd plist — and the last two carry prose comments in
+the same house style, with no guard. Probed: a markdown backtick pair inside an XML comment
+in the plist heredoc, `<!-- ProcessType Background: throttled for `` `id -un` `` -->`. It
+**ran** at install time and the shipped plist carried the installing user's name; `plutil
+-lint` said `OK`, `bash -n` said clean, and the suite said `ok: 0 failure(s)`. And the
+`$(`/`${` half of that guard had a hole of its own: it skipped any line containing `\$`
+*anywhere*, which is nearly every prose line in `WRAP`, because they all quote `` `\$PY` ``.
+Probed: `# prose about \$PY and the pin under ${HOME}/bin` passed green and the installed
+wrapper had the sandbox path baked into its own sentence. Escapes are per **token**. So the
+check now strips escapes per token and scans every unquoted heredoc; unescaped backticks
+and `$(` are refused in all three (command substitution in a generated file is never
+wanted), and `${` stays refused in `WRAP` only, because the unit and the plist exist to
+interpolate. Four sabotage probes, all red, all with `bash -n` still clean.
+
+**And the report about who the job runs as was the one thing taken on trust.** The
+lingering report used `$USER` — on **both** platforms (`loginctl show-user "$USER"` on
+Linux, the `gui/` session line on Darwin). Under `set -euo pipefail` an unset `USER` is a
+hard abort, and it lands mid-install: measured with `env -i`, `rc=1`, stdout ending on
+*"installed: hourly launchd agent … run interval = 3600s"*, an hourly job **loaded** in
+`gui/501`, and **no SessionStart hook** — half-installed and reading as success, the same
+shape as the Darwin abort that opened this thread, one variable instead of one missing
+binary. `USER` is set by login shells and absent from scrubbed ones — containers, CI, and
+anything `launchd` or `systemd` starts, which is exactly the automation that would run an
+installer unattended. It is now `id -un`, which cannot be unset and is how `UID_N` three
+lines away already did it. With `USER` unset the install completes all three steps, `rc=0`,
+stderr empty.
+
+**The cost number, on the other box** (McNugget's answer to the 0.6%). The probe is 17.9ms
+on this box's pinned homebrew python3 3.14.4 and 13.8ms on `/usr/bin/python3` 3.9.6 (20
+runs each) — cheaper than cbp's 30ms. The *run* is much cheaper too: `--brief` over a real
+78G local-SSD workspace is **0.13s** warm and 0.30s cold, and 0.05s on this box's ordinary
+atlas-less path. So the probe is **~14% of a warm run here, not 0.6%** — the ratio is 20×
+worse on APFS-local, because on 9p the walk *is* the run and it hides everything. The trade
+still stands, but not on that ratio: the denominator that matters is the derived hook
+timeout the installer just wrote, **20s**, against which 17.9ms is 0.09%. A percentage of
+the walk measures the workspace's storage; a percentage of the budget measures whether the
+trigger still fits.
+
+**The `$` half was still scoped the way the backtick half had just stopped being** (cbp,
+2026-07-28, measured on Linux by installing). "Scan every heredoc, not the one where the
+bug was found" got applied to backticks and `$(`. The `$` expansion check stayed **WRAP-only
+and brace-only** — bare `$NAME` was refused nowhere. The probe is the `${HOME}` one directly
+above with two characters deleted: `# prose about \$PY and the pin under $HOME/.local/bin`
+passed the new guard green, `bash -n` clean, and shipped a wrapper reading *"the pin under
+/tmp/hli7/home/.local/bin"*. That is the likelier typo, not the rarer one — this file's
+house style writes `\$PY`, `\$PYTHON`, `\$HOME`, `\$PYENV_ROOT`, each one backslash from
+expanding, and `${` was the harder form to type and the only form guarded.
+
+Fixed as a **whitelist, not a wider ban** — a ban cannot work, because the unit and the
+plist exist to interpolate, but the set that may expand is small, known, and was already
+written down in prose: `WRAP` may expand `$PYTHON`/`$BIN`/`$WORKSPACE`, the unit
+`$SRC_DIR`/`$BIN`/`$WORKSPACE`, the plist those plus `$HOME`/`$LAUNCHD_LABEL`/
+`$LAUNCHD_PATH`/`$LOG_DIR`. Anything else — braced, bare, or unnamed (`$(`, `$$`, `$?`) —
+fails, in all three, and an unrecognised heredoc gets the empty set so a new generated file
+refuses every expansion until someone says what it meant. Eight sabotage probes: McNugget's
+four still red, plus bare `$HOME` in `WRAP`, bare `$USER` in the plist, bare `$HOSTNAME` in
+the unit, and `$$` in `WRAP`; `bash -n` clean in all eight. Ninth probe, the one that makes
+the other eight mean something: adding `HOME` to `WRAP`'s set turns the bare-`$HOME` probe
+green again, so the whitelist is what denies and not something else.
+
+**`HOME` is the same sentence about the load-bearing variable** (cbp, 2026-07-28, measured
+on Linux). The `USER` note is exactly right — a variable set by login shells and absent
+from scrubbed ones is not one this script may assume — and it is true of `HOME`, which is
+where all three triggers get *installed*. On bash 5.2 an unset `HOME` is **not** defaulted
+(`PATH` and `SHELL` are; `HOME` and `USER` are not), so `env -i` died at the `BIN=` line
+before step 1 with a bare `line 61: HOME: unbound variable`. **This is not the `USER`
+shape** — it is a clean refusal with nothing installed, the right direction — so the change
+is a diagnostic, not a behaviour change: it explains itself the way every other refusal in
+the file does, and it is *refused, not derived*, because `id -un` can replace `USER` (the
+kernel knows) while nothing knows which home an unattended install meant. It also closes a
+measurement gap: the `USER` finding was measured with `env -i` on Darwin, where bash 3.2
+supplies `HOME`; on Linux that same command never reaches line 411, so **the claim "with
+`USER` unset the install completes all three steps, rc=0" is Darwin-only** and could not be
+reproduced here until this guard existed. With `HOME` set and `USER` unset, Linux does
+match it: rc=0, all three steps, hook at timeout 20s, `lingering: OFF`.
+
+**The whitelist says which names may expand; it does not say the value fits the file being
+generated** (McNugget, 2026-07-28, measured on macOS 26.5 by installing). Three generated
+files, three target syntaxes. The two whose syntax is shell already handle this — the
+wrapper interpolates inside double quotes, the `SessionStart` hook goes through
+`shlex.quote`. The plist's syntax is XML and it interpolated raw, and `&`, `<`, `>` are
+legal in a POSIX path. Measured with `HESTIA_WORKSPACE=/tmp/mcn-sb2/R&D`, a folder name a
+Mac user types without thinking: `plutil` reported *"Encountered unknown ampersand-escape
+sequence at line 10"*, the installer removed the plist, and **the periodic trigger was
+gone** — while the same run's other two triggers installed clean and the hook read
+`--workspace '/tmp/mcn-sb2/R&D'`. One trigger of three, lost to a character in a path.
+
+**Sized the way this thread has been sizing things: not a silent failure.** The
+lint-before-load guard caught it, said so, and `skip_periodic()` made the gap self-reporting
+(`scope.periodic_trigger=absent`, `NO PERIODIC TRIGGER` on `--brief`). That is the backstop
+working, and it stays exactly where it is — it also catches truncation, which escaping does
+not. What was wrong is that a path was allowed to reach a syntax that could not hold it, and
+the diagnostic named `plutil`'s parser message rather than the character in the reader's own
+workspace path. Fixed with `xml_escape` and `XML_*` pins; verified live, launchd holds
+`/tmp/mcn-sb3/R&D` **decoded**, the job ran, stderr 0 bytes.
+
+**And the probe the guard was not written around, applied to that guard.** Renaming the
+plist's pins to `XML_*` makes the whitelist above refuse a raw `$HOME` — but it is a
+*rename* check, and it stays green if `xml_escape` stops escaping. So the test runs the
+function. Four sabotage probes, red with `bash -n` clean in each: a raw `$HOME` back in the
+plist, the `&` rule deleted from the sed, the `&` rule moved last, the function deleted. The
+third is the one that argues for asserting a **round-trip** rather than an output string —
+escaping `&` last turns `<` into `&amp;lt;`, which is still *well-formed* XML, so a parser
+accepts it happily and hands back `&lt;` instead of `<`. And the second probe found a defect
+in the test itself: an uncaught `ParseError` ended the run on a traceback with the later
+checks never reached. A guard that crashes is not a guard that reports — the same
+distinction as a wrapper that exits 127 silently, one layer up. Now caught and reported.
+
+**The one claim in the block above that needed Darwin, corrected** (McNugget, 2026-07-28,
+measured on macOS 26.5). *"`env -i` on Darwin supplies `HOME`, where bash 3.2 does"* is
+**false on this box.** `env -i /bin/bash -c 'echo ${HOME-UNSET}'` prints `UNSET` on
+3.2.57, and bash 3.2 defaults exactly what bash 5.2 defaults — `PATH`, `SHELL`, `PWD`,
+`SHLVL` yes; `HOME`, `USER`, `LOGNAME` no. Run against the pre-guard revision, `env -i`
+died on Darwin at `line 61: HOME: unbound variable` — same line, same message, nothing
+installed. So the `USER` finding was never Darwin-only: it reached line 411 because it was
+measured under a **sandboxed `$HOME`** (`env -i HOME=/tmp/…`), which is the sandbox this
+whole thread has run in, not a bash version. The reasoning the claim was attached to is
+untouched and right, and the `HOME` guard is worth *more* than that note said — on Darwin it
+is reachable by the very command that was said to bypass it.
+
+**The same question, asked of the two files the block above excused — and there are four
+syntaxes, not three** (cbp, 2026-07-28, measured on Linux, systemd 255, by installing).
+The hook's excuse is right and `shlex.quote` is the reason. The wrapper's — *"it
+interpolates inside double quotes"* — is not: double quotes are the **weak** shell quoting,
+and `$`, backtick, `\` and `"` all keep their meaning inside them. And the systemd `.service`
+unit is a syntax of its own, not a second copy of the shell one. Measured, `bash -n` clean on
+every generated file:
+
+| workspace path | what shipped | what ran |
+|---|---|---|
+| `…/cost$avings` | `${HESTIA_WORKSPACE:-…/cost$avings}` in the wrapper | `$avings` is unset at run time → every fire walked `…/cost`, reporting `workspace from env` because the wrapper's own `env` line had set it |
+| ``…/it`id`s`` | the backtick pair, intact, in the wrapper | **command substitution on every fire** — the path came back `…/ituid=1000(dp` |
+| `…/50%off` | `--workspace "…/50%off"` in the unit | `%o` is the OS ID → systemd resolved it to `…/50ubuntuff`; unit parses clean, timer enables, `installed: hourly timer` printed |
+| `…/100%uptime` | same | `%u` is the user name → `…/100dpptime` |
+
+The backtick row is the backtick finding one layer down: escaping the heredoc's *prose*
+stopped `install.sh` executing backticks at **install** time; nothing stopped a backtick
+arriving in a **value** and executing at **run** time, hourly, under the user's own timer.
+A whitelist notices a *name* that expands and cannot notice what the named value *contains*.
+
+**Sized against the plist case: worse, in the one way that matters.** The plist's was a clean
+refusal — `plutil` caught it and `skip_periodic()` said the trigger was gone. These install,
+lint, run and report. The `%` rows are the sharpest: **most letters are a valid specifier**,
+so the common case is silent substitution rather than an error, the periodic trigger walks a
+directory nobody named, and the other two triggers get the right path with nothing on either
+side saying they disagree. (`%z` — not a specifier — is the loud half: `fatal error, unit
+will not be started` in `ExecStart`, silently *dropped* in `Environment=`.)
+
+Fixed with `sh_pin` (single quotes, the only shell quoting with no interior expansion, with
+`'\''` for the one character they cannot hold) and `sd_escape` (`%%`, which is systemd's
+literal percent). Both are `SH_*` / `SD_*` pins for the same reason the plist's are `XML_*`.
+Eight sabotage probes, red with `bash -n` clean in each; a ninth flips the guard's own data —
+put `WORKSPACE` back in `WRAP`'s allowed set and the raw-`$WORKSPACE` probe goes **green**,
+so the whitelist is what denies. The `%` round-trip asks **systemd**, not a string compare:
+`systemd-analyze verify` names the resolved path in its not-executable error, so a probe at a
+nonexistent leaf reports back exactly what systemd made of the escaping.
+
+**And the backstop written for this deleted a good timer on its first run.** Linux had no
+`plutil` analogue — nothing asked systemd whether the units it had just written would load —
+so `systemd-analyze verify` was added before `enable`, condemning on `rc != 0`. Its first
+end-to-end run, on a sandboxed install with no `XDG_RUNTIME_DIR`, removed a perfectly good
+timer pair because systemd-analyze had reported `Failed to initialize manager: No such device
+or address`. **The checker could not start; the units were fine.** That is this plugin's own
+subject matter, committed by the guard written to prevent it — and it failed in the direction
+that destroys. The rule that replaced the exit code: **a unit may only be condemned on a
+message that names it.** Three verdicts, not two — `bad`, `degraded`, and `unverified` —
+because *"this unit is bad"* and *"I could not look"* is the distinction this whole plugin
+exists to keep, one level up. `unverified` is also what a missing `systemd-analyze` gets. In
+a function, `unit_verdict()`, so the suite runs it against the verbatim message that caused
+the deletion rather than checking that the branch exists.
+
+**The two queued nits, taken by whoever touched the file next.** The provenance line was a
+real wrong output — `${HESTIA_WORKSPACE:+from HESTIA_WORKSPACE}${HESTIA_WORKSPACE:-…}`
+prints the label *and then the value*, so a set `HESTIA_WORKSPACE` read `from
+HESTIA_WORKSPACE/mnt/c/exe/projects/ai-agents`; now `from HESTIA_WORKSPACE`. The bare
+`python3` in step 3 is **hygiene, not a defect**, and that is the honest size of it:
+`install.sh` never modifies `PATH` and `PYTHON` is `command -v python3` from the same
+process, so the two always resolved to the same file, and the xcrun-stub case cannot bite
+because step 1 probes `$PYTHON` and exits before step 3 exists. No run on Linux
+distinguishes them. Changed anyway, because "every trigger runs the interpreter we pinned"
+is the invariant, and one of four call sites naming it a second way is how an invariant
+stops being checkable.
+
+**A negative result, recorded because it was worth checking:** the narrow launchd `PATH`
+does **not** shrink the A inventory. The obvious worry — `claude` lives in
+`~/.local/bin`, which is on the shell's `PATH` and not on launchd's, so the hourly run
+would report fewer installed agents than the operator does, silently and in the reassuring
+direction — is already closed by `EXTRA_BIN_GLOBS`. `search_roots()` searches `PATH` **∪**
+the `$HOME` version-manager roots, and `.local/bin` is one of them. Measured, same binary,
+same real `$HOME`, `env -i` with launchd's exact `PATH`: byte-identical `--brief` line to
+the full-shell run. Rule #1's fix for nvm on CBP covers launchd on a Mac for free. The
+divergence first seen here (`installed: []` from the agent, `['claude']` from the shell)
+was a sandbox `$HOME` in the test rig, not a defect — chased to the bottom rather than
+shipped as a finding.
 
 ## The budget is part of the scope
 

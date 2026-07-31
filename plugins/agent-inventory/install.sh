@@ -6,7 +6,7 @@
 #   on launch          SessionStart hook, --brief, so a session opens knowing whether
 #                      it shares this box with something ungoverned
 #   operator ondemand  `hestia-agent-inventory` on PATH
-#   periodic           systemd USER timer, hourly
+#   periodic           systemd USER timer (Linux) / launchd USER agent (Darwin), hourly
 #
 # WHY THE RUNNING COPY IS NOT THE REPO COPY. The repo lives on /mnt/c, which is 9p, and
 # a cold 9p read can outlast a hook timeout — at which point Claude-lineage hooks fail
@@ -22,6 +22,22 @@
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# `sh_pin` IS DEFINED HERE, NOT AT ITS OTHER USE 290 LINES DOWN (cbp, 2026-07-28).
+# McNugget's fifth surface — the installer's own printed advice is a shell syntax — is
+# right, and the two lines they fixed are not the only instances. The other two are the
+# `Re-run with:` lines in the workspace and HOME refusals, both of which run BEFORE the
+# old definition site, so the fix was not merely unapplied there: it was unreachable.
+# A quoting helper that comes into existence a third of the way down the file cannot
+# protect the refusals, which are the earliest thing this script prints and the messages
+# an operator is most likely to paste without reading — they are what a failed install
+# hands them. Moving one line up is the whole change; the SH_* values stay at their old
+# site because they depend on values not established yet here.
+#
+# Single quotes are the only shell quoting with no interior expansion at all, so this
+# emits the value inside them and closes-escapes-reopens for an embedded quote (`'\''`),
+# the one character single quotes cannot hold.
+sh_pin() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 # THE WORKSPACE MUST NOT DEPEND ON WHERE THIS SCRIPT WAS RUN FROM (cbp, 2026-07-26).
 # It was `$SRC_DIR/../../..` — correct from the primary checkout, and silently `/tmp` from
@@ -42,25 +58,114 @@ elif GIT_COMMON_DIR="$(git -C "$SRC_DIR" rev-parse --path-format=absolute \
   WORKSPACE="$(cd "$GIT_COMMON_DIR/../.." && pwd)"
 else
   echo "install: cannot establish the workspace." >&2
-  echo "  $SRC_DIR is not inside a git checkout, or git is too old for" >&2
+  echo "  $(sh_pin "$SRC_DIR") is not inside a git checkout, or git is too old for" >&2
   echo "  --path-format=absolute (needs 2.31+). Refusing to guess: the old fallback was" >&2
   echo "  \$SRC_DIR/../../.., which from a detached worktree silently yields /tmp and" >&2
   echo "  bakes it into all three triggers." >&2
-  echo "  Re-run with: HESTIA_WORKSPACE=/path/to/workspace $0" >&2
+  # `$0` PINNED: this line is a COMMAND, and it is the third instance of McNugget's
+  # fifth surface. `$0` is the path this script was invoked as — which is inside the
+  # workspace, so it carries exactly the metacharacters the rest of this file is about.
+  # This comment used to size it SMALLER than theirs — "always in command position, so a
+  # corrupted word does not resolve and the paste fails loudly." That was wrong, and the
+  # pin is what makes the line safe, not command position. McNugget refuted it on Darwin
+  # and it reproduces on Linux/dash: command position guarantees the word is EXECUTED, not
+  # that it FAILS. The earlier rc=127 was a property of the fixture — a tmpdir where the
+  # truncation target happened not to exist — not of the position. Measured, unpinned:
+  #   `$`     …/hestia$X/install.sh  next to a real …/hestia/  -> rc=0, RAN A DIFFERENT
+  #           INSTALLER, no diagnostic. Silent.
+  #   space   …/a b/install.sh  next to an executable …/a      -> rc=0, ran …/a and passed
+  #           `b/install.sh` as ARGV. Silent, and it hands on an argument.
+  #   `` ` `` ``…/it`id`s``  -> substitutes BEFORE it fails, so `id` ran in the operator's
+  #           shell whatever happened next. Loud afterwards is not never having run.
+  #   `'`     …/o'brien/…    -> rc=2, unterminated quoted string, parse error before ANY
+  #           execution. This is the only one that genuinely cannot be silent.
+  # So: three of the four are as bad as or worse than the advice-line surface, and the
+  # pinned form runs the intended installer in every case.
+  echo "  Re-run with: HESTIA_WORKSPACE=/path/to/workspace $(sh_pin "$0")" >&2
   exit 1
 fi
 # Establishing it is not the same as it being right. agent-atlas/talk-to is the registry
 # the check cannot run without, so its absence is worth saying HERE — at install time,
 # once — rather than as an UNKNOWN from three triggers an hour for the rest of the week.
 if [ ! -d "$WORKSPACE/agent-atlas/talk-to" ]; then
-  echo "install: WARNING — resolved workspace $WORKSPACE has no agent-atlas/talk-to." >&2
+  echo "install: WARNING — resolved workspace $(sh_pin "$WORKSPACE") has no agent-atlas/talk-to." >&2
   echo "         Every trigger will report UNKNOWN ('could not look') until it does." >&2
 fi
-echo "workspace:  $WORKSPACE  (${HESTIA_WORKSPACE:+from HESTIA_WORKSPACE}${HESTIA_WORKSPACE:-from git --git-common-dir})"
+if [ -n "${HESTIA_WORKSPACE:-}" ]; then WS_FROM="from HESTIA_WORKSPACE"; else WS_FROM="from git --git-common-dir"; fi
+echo "workspace:  $(sh_pin "$WORKSPACE")  ($WS_FROM)"
+
+# THE SAME SENTENCE, ABOUT THE LOAD-BEARING VARIABLE (cbp, 2026-07-28, measured on Linux).
+# The USER note below says it exactly: a variable set by login shells and absent from
+# scrubbed ones is not part of the environment this script may assume. That is true of
+# HOME too, and HOME is where all three triggers get INSTALLED — the next four lines are
+# every path this script writes. On bash 5.2 an unset HOME is not defaulted (measured:
+# `env -i bash -c 'echo $HOME'` is an unbound-variable abort; PATH and SHELL are defaulted,
+# HOME and USER are not), so under `env -i` this script died at the BIN= line below, before
+# step 1, with a bare "line 61: HOME: unbound variable" and nothing installed.
+#
+# That direction is the right one — it is a clean refusal, not the half-install USER
+# produced — so this is a diagnostic, not a behaviour change. It is here because every
+# other refusal in this file explains itself (see the workspace block above, rule 4: a
+# scope we cannot establish must not be guessed) and this one did not.
+#
+# AND IT IS NOT A PLATFORM DIFFERENCE — bash 3.2 DOES NOT SUPPLY HOME EITHER (McNugget,
+# 2026-07-28, measured on macOS 26.5, correcting the line that stood here). The reasoning
+# above is right; the one claim attached to it that could only be checked on Darwin was
+# wrong, so it is replaced with the measurement rather than deleted. Measured on
+# /bin/bash 3.2.57: `env -i /bin/bash -c 'echo ${HOME-UNSET}'` prints UNSET, and bash 3.2
+# defaults exactly what bash 5.2 does — PATH, SHELL, PWD, SHLVL yes; HOME, USER, LOGNAME
+# no. Run against the pre-guard revision (66e6a82) this script died on Darwin at
+# `line 61: HOME: unbound variable`: the same line, the same message, nothing installed.
+#
+# So the USER finding was never Darwin-only. It reached line 411 because it was measured
+# under a SANDBOXED $HOME — `env -i HOME=/tmp/... ` — which is the sandbox this thread has
+# run everything in, not a bash version. With HOME supplied and USER unset, both boxes
+# agree: rc=0, all three steps. The two platforms have not diverged here at all, and this
+# guard is worth MORE than the note it replaces claimed — on Darwin it is reachable by the
+# very command that was said to bypass it.
+#
+# Refused, not derived. `id -un` can replace USER because the kernel knows the answer;
+# nothing knows which home directory an unattended install MEANT, and guessing one writes
+# a wrapper, a unit and a hook into it.
+if [ -z "${HOME:-}" ]; then
+  echo "install: HOME is not set, and every path this script writes is under it." >&2
+  echo "         Login shells set it; scrubbed environments (containers, CI, anything" >&2
+  echo "         launchd or systemd starts) do not, and bash does not default it." >&2
+  echo "         Refusing to guess a home directory: nothing has been installed." >&2
+  echo "         Re-run with: HOME=/path/to/home $(sh_pin "$0")" >&2
+  exit 1
+fi
 
 BIN="$HOME/.local/bin/hestia-agent-inventory"
 UNIT_DIR="$HOME/.config/systemd/user"
+AGENT_DIR="$HOME/Library/LaunchAgents"
+# The plist FILENAME must contain the binary name, because that is what
+# `inventory.py:periodic_trigger()` globs for (`*hestia-agent-inventory*.plist`). Naming
+# it `io.hestia.agent-inventory` reads better and is invisible to the detector, which
+# would report `absent` on a machine this script had just scheduled. The reverse of the
+# usual coupling complaint: here the two files must agree, so the agreement is stated in
+# both. Fleet convention for the prefix is `io.hestia.*` (deploy/templates).
+LAUNCHD_LABEL="io.hestia-agent-inventory"
+PLIST="$AGENT_DIR/$LAUNCHD_LABEL.plist"
+LOG_DIR="$HOME/.local/state/hestia"
 SETTINGS="$HOME/.claude/settings.json"
+
+# ASKED OF THE ENVIRONMENT, NOT INHERITED FROM IT (McNugget, 2026-07-28, measured here).
+# The lingering report used `$USER`, on both platforms. Under `set -u` an unset USER is a
+# hard abort — and it lands mid-install: on Darwin at the gui/ session line, which is AFTER
+# the launchd agent is bootstrapped and BEFORE step 3 wires the SessionStart hook. Measured
+# with `env -i`: rc=1, stdout ending on "installed: hourly launchd agent ... run interval =
+# 3600s", an hourly job loaded in gui/501, and no hook. Half-installed, reading as success
+# — the same shape as the Darwin abort that opened this thread, one variable instead of one
+# missing binary. The systemd branch has it too, three lines earlier (`loginctl show-user
+# "$USER"`), so it is not a Darwin bug.
+#
+# USER is not part of the environment this script may assume: it is set by login shells and
+# absent from scrubbed ones — containers, CI, and anything launchd or systemd starts, which
+# is precisely the kind of automation that would run an installer unattended. `id -un` asks
+# the kernel the same question and cannot be unset. UID_N below already did it this way; a
+# report about who the job runs as should not be the one thing taken on trust.
+USER_N="$(id -un)"
 
 # ---- 0. which of the three triggers this platform can carry ----------------------
 #
@@ -94,13 +199,22 @@ esac
 # that is not running, is Linux and still cannot schedule anything.
 if [ "$PERIODIC" = systemd ] && ! command -v systemctl >/dev/null 2>&1; then
   PERIODIC=none; PERIODIC_WHY="Linux, but no systemctl on PATH"
+elif [ "$PERIODIC" = systemd ] && ! systemctl --user show-environment >/dev/null 2>&1; then
+  # `systemctl` existing does not mean a user manager is reachable (containers, WSL
+  # without the user bus, scrubbed automation). Discovering that at daemon-reload used
+  # to abort after the binary and unit files were written but before the SessionStart
+  # hook was installed. Decide before step 1 so the two viable triggers still land.
+  PERIODIC=none; PERIODIC_WHY="Linux, but the systemd user manager is unreachable"
 elif [ "$PERIODIC" = launchd ]; then
-  # NOT YET BUILT, AND SAYING SO IS THE POINT. The launchd half (a StartInterval agent in
-  # ~/Library/LaunchAgents) is McNugget's to write, on the box that can test it and measure
-  # what the hourly walk costs on APFS. Until it lands, Darwin installs two triggers of
-  # three and the check itself reports the third missing. That is a known, visible gap; the
-  # thing it replaces was an unknown, invisible one.
-  PERIODIC=none; PERIODIC_WHY="Darwin — the launchd agent is not written yet"
+  # Same rule as systemctl above, and it is not hypothetical here: `plutil` is what makes
+  # the difference between writing a plist and knowing it parses, and step 2 refuses to
+  # claim a schedule it could not lint. Both tools ship with macOS; a box missing either
+  # is far enough off the platform that guessing is the wrong move.
+  for t in launchctl plutil; do
+    if ! command -v "$t" >/dev/null 2>&1; then
+      PERIODIC=none; PERIODIC_WHY="Darwin, but no $t on PATH"
+    fi
+  done
 elif [ "$PERIODIC" = none ]; then
   PERIODIC_WHY="$(uname -s) has no periodic backend here"
 fi
@@ -109,6 +223,7 @@ fi
 # the script down. The bug class this whole section is about, in one line of its own fix.
 mkdir -p "$(dirname "$BIN")"
 if [ "$PERIODIC" = systemd ]; then mkdir -p "$UNIT_DIR"; fi
+if [ "$PERIODIC" = launchd ]; then mkdir -p "$AGENT_DIR" "$LOG_DIR"; fi
 echo "periodic:   ${PERIODIC}${PERIODIC_WHY:+  ($PERIODIC_WHY)}"
 
 # ---- 1. the executable, on ext4 -------------------------------------------------
@@ -120,30 +235,309 @@ echo "periodic:   ${PERIODIC}${PERIODIC_WHY:+  ($PERIODIC_WHY)}"
 # refuses to trust a compiled-in default it cannot confirm. The rule is right — an
 # unestablished scope must degrade — so the fix is to ESTABLISH it at install time rather
 # than to weaken the rule. A caller-supplied HESTIA_WORKSPACE still wins.
+#
+# THE INTERPRETER IS PINNED FOR THE SAME REASON THE WORKSPACE IS (McNugget, 2026-07-28,
+# measured on Darwin). The wrapper said `python3` and let PATH resolve it, so the three
+# triggers did not have to agree on which python3 that is. A daemon's PATH is not a shell's.
+# Measured with a throwaway LaunchAgent that printed its own environment:
+#
+#   launchd's PATH for a gui/ agent   /usr/bin:/bin:/usr/sbin:/sbin   (no plist override)
+#   `command -v python3` in dp's shell  /opt/homebrew/bin/python3     Python 3.14.4
+#   `command -v python3` under launchd  /usr/bin/python3              Python 3.9.6
+#
+# Two different interpreters, five minor versions apart, chosen by which trigger fired.
+# TODAY THAT IS BENIGN AND THE HONEST THING IS TO SAY SO: both were run against this
+# workspace and printed a byte-identical --brief line. What is not benign is the coupling —
+# step 3 below derives the SessionStart timeout by running this binary under the SHELL's
+# python3, and the periodic trigger would then run it under a different one. The pair that
+# `--print-hook-timeout` exists to keep from drifting is only pinned on one side.
+#
+# NOT MEASURED HERE, and stated as unmeasured: on a Mac without the Xcode command line
+# tools `/usr/bin/python3` is a stub, so the unpinned wrapper is exit 127 from launchd while
+# `launchctl print` still shows a healthy job with the interval set — the schedule real, the
+# plist linting, the detector saying `installed`, and the check never once having run. This
+# box has Xcode, so that path could not be exercised on it.
+#
+# Resolving it HERE, in the same shell that is about to verify it, makes the wrapper
+# independent of whatever PATH each of the three triggers happens to carry. Not
+# Darwin-specific: a systemd --user unit sets no PATH either.
+#
+# AND ON LINUX THE PIN NEEDS A FLOOR (cbp, 2026-07-28, measured — this is the Linux review
+# McNugget asked for, and the shared edit did bite). `command -v python3` in the installing
+# shell is a STABLE path on the Mac this was written on (/opt/homebrew/bin/python3) and is
+# routinely an EPHEMERAL one here: a venv, a conda prefix, a pyenv shim, a checkout under
+# /tmp. Measured on cbp — install with a venv active, then delete the venv, which is what
+# `rm -rf` on a project or a `python3 -m venv --clear` does every week:
+#
+#   pinned wrapper (this branch)   env: '/tmp/hli-venv/bin/python3': No such file  exit 127
+#   unpinned wrapper (origin/main) [agent-inventory] OK on cbp: 4 installed ...    exit 0
+#
+# The pin turned a survivable environment change into a permanent 127, and — the part that
+# matters — SILENTLY: `periodic_trigger()` still answered `systemd-user-timer-enabled` with
+# `installed_bin` set, the strongest state this file has, while every hourly fire was 127
+# and every SessionStart hook emitted nothing. That is precisely the shape McNugget named
+# for a Mac without the Xcode CLT and marked NOT MEASURED — "the schedule real, the
+# detector saying installed, and the check never once having run". It is reachable on Linux
+# by a much more ordinary route than a missing toolchain, so it is measured here.
+#
+# The pin is still right — it fixed a real five-minor-version split between two triggers on
+# Darwin — so this does not revert it. It gives it a floor: pinned when the pin is there,
+# PATH when it is not, and the degradation is REPORTED rather than fatal. A check whose own
+# wrapper exits 127 is an instance of the failure it exists to find; rule 5's pairing says
+# the trigger and what it triggers must be evidence about each other.
+#
+# `readlink -f` was considered and is not sufficient: it resolves a venv (-> the base
+# interpreter, durable) but a conda prefix is a real binary and a pyenv shim is a real
+# file, so it fixes one of three cases and would read as fixing all of them.
+#
+# Benefit on this box today, measured for symmetry with the Darwin numbers: a systemd
+# --user unit resolves /usr/bin/python3 3.12.3 and the shell resolves the identical path.
+# The pin buys nothing here and costs the 127 above — which is the whole reason it needs
+# the floor rather than a Linux exemption.
+PYTHON="$(command -v python3 || true)"
+if [ -z "$PYTHON" ]; then
+  echo "install: no python3 on PATH. That is the interpreter every trigger runs;" >&2
+  echo "         refusing to write a wrapper naming one this shell cannot find." >&2
+  exit 1
+fi
+# EXISTS IS NOT RUNS, AND THE INSTALLER IS WHERE THAT IS CHEAPEST TO LEARN (McNugget,
+# 2026-07-28, measured on macOS 26.5). `command -v python3` on a Mac WITHOUT the Xcode
+# command line tools resolves /usr/bin/python3 — which is an xcrun stub, not an
+# interpreter: 118KB, executable, on the default PATH, and `exit 1` with
+# `xcrun: error: invalid active developer path` without running a line of python. The -z
+# guard above passes it. Pinning it would wire all three triggers to an interpreter that
+# has never run once, which is this plugin's own subject matter. Ask it, don't assume:
+# 13ms, once, at the one moment a human is watching. Aborting here is NOT the trade
+# rejected in step 0 — that dropped two working triggers to punish a third; this is the
+# interpreter all three of them are, so there is nothing left to install that would work.
+if ! "$PYTHON" -c '' 2>/dev/null; then
+  echo "install: $(sh_pin "$PYTHON") is on PATH but cannot run python." >&2
+  echo "         On macOS that is the /usr/bin/python3 xcrun stub with no Xcode command" >&2
+  echo "         line tools behind it: xcode-select --install, or put a working python3" >&2
+  echo "         first on PATH. Nothing has been installed; all three triggers would run" >&2
+  echo "         this interpreter, so there is no partial install worth leaving." >&2
+  exit 1
+fi
 install -m 0755 "$SRC_DIR/inventory.py" "$BIN.py"
+
+# THE SAME QUESTION AS THE PLIST, ASKED OF THE FILE THAT WAS EXEMPTED FROM IT (cbp,
+# 2026-07-28, measured on Linux by installing). "Does the value fit the syntax being
+# generated?" was answered for the plist and the two shell files were excused as a
+# category: the hook by `shlex.quote` (right — that IS the mechanism) and this wrapper by
+# "it interpolates inside double quotes" (wrong — double quotes are the weak quoting).
+# `$`, backtick, `\` and `"` all keep their meaning inside them, and all four are legal in
+# a POSIX path on both platforms. Measured, sandboxed $HOME, `bash -n` clean on the
+# generated wrapper in every case:
+#
+#   HESTIA_WORKSPACE=/tmp/.../cost$avings   ->  the shipped wrapper reads
+#     ${HESTIA_WORKSPACE:-/tmp/.../cost$avings}, `$avings` is unset at RUN time, and every
+#     fire walks /tmp/.../cost. The report says `workspace from env` and names the
+#     truncated path, because the wrapper itself set that env — so the run looks sourced.
+#   HESTIA_WORKSPACE=/tmp/.../it`id`s       ->  the backtick pair is COMMAND SUBSTITUTION
+#     in the generated file, run on every fire: the path came back as /tmp/.../ituid=1000(dp.
+#
+# That second one is #99's finding one layer down and is why this is not a nit. #99
+# escaped the backticks in the heredoc's PROSE, which stops install.sh executing them at
+# INSTALL time; nothing stopped a backtick arriving in a VALUE and executing at RUN time,
+# hourly, under the user's own timer. The whitelist above notices a name that expands; it
+# cannot notice what the named value contains.
+#
+# SIZED AGAINST THE PLIST CASE: worse, in the one way that matters here. The plist's was a
+# clean refusal — plutil caught it, skip_periodic() said the trigger was gone. This one
+# installs, lints, runs, and reports; the truncated `$` path only surfaces as UNKNOWN
+# because the wrong directory happened not to exist, and a truncation that lands on a real
+# directory reports a clean inventory of somewhere nobody chose.
+#
+# Fixed by making the three pins arrive as shell LITERALS. Single quotes are the only
+# shell quoting with no interior expansion at all, so `sh_pin` emits the value inside
+# them and closes-escapes-reopens for an embedded quote (`'\''`) — the one character
+# single quotes cannot hold. Every other use in the wrapper is then a plain `$PY_PIN` /
+# `$WS_PIN` / `$BIN_PIN`, and a variable's VALUE is never re-parsed as shell.
+# (`sh_pin` itself is now defined at the top of the file — see the note there: the
+# refusal messages that need it run long before this point.)
+SH_PYTHON="$(sh_pin "$PYTHON")"
+SH_BIN="$(sh_pin "$BIN")"
+SH_WORKSPACE="$(sh_pin "$WORKSPACE")"
 cat > "$BIN" <<WRAP
 #!/bin/sh
-# Generated by agent-inventory/install.sh — pins the workspace detected at install time.
-exec env HESTIA_WORKSPACE="\${HESTIA_WORKSPACE:-$WORKSPACE}" python3 "$BIN.py" "\$@"
+# Generated by agent-inventory/install.sh — pins the workspace and the interpreter
+# detected at install time. Both are scope: a trigger that resolves either from its own
+# environment answers about a directory, or with a python, that nobody chose.
+#
+# The pin is scope, not a hard dependency. If the pinned interpreter is gone, fall back to
+# PATH and SAY SO through the environment — inventory.py turns HESTIA_INTERPRETER_PIN_BROKEN
+# into a finding on its own report. Exiting 127 here would replace a working check with
+# silence, and silence reads as clean.
+#
+# AND THE FALLBACK IS PROBED, NOT JUST FOUND (McNugget, 2026-07-28, measured end to end on
+# macOS 26.5 through a real launchd agent). \`-x\` and \`command -v\` answer "exists"; the
+# floor needs "runs". On a Mac without the Xcode command line tools /usr/bin/python3 is an
+# xcrun stub — and once the pinned directory is gone it is the FIRST python3 on the PATH
+# launchd hands a gui/ agent (/usr/bin:/bin:/usr/sbin:/sbin). Found by \`command -v\`, so the
+# -z branch never fires; exit 1 without running this file, so nothing reports. Measured:
+# stdout 0 bytes, no unknown[] entry, no INTERPRETER PIN BROKEN clause, and
+# periodic_trigger() still answering \`launchd-agent-installed\` with installed_bin set —
+# the strongest state this plugin has. That is the same silence the floor was written to
+# end, one platform over. So: run it once before trusting it, and if it cannot run, exit
+# LOUDLY rather than let the stub exit quietly. 13ms, and only on the already-degraded path.
+#
+# THE BACKTICKS ABOVE ARE ESCAPED, AND THAT IS LOAD-BEARING (cbp, 2026-07-28, measured on
+# Linux). This heredoc is UNQUOTED — it has to be, it interpolates \$PYTHON, \$BIN and
+# \$WORKSPACE. So its body is prose to a reader and shell input to bash: an unescaped
+# backtick pair is COMMAND SUBSTITUTION, run by install.sh at install time, and replaced in
+# the generated file by its output. Unescaped, the three comment lines above ran \`-x\` and
+# \`launchd-agent-installed\` as commands ("command not found" x2 on a clean install) and
+# shipped a wrapper whose sentences had holes where the quoted words used to be — "Found by
+# , so the -z branch never fires". Nothing executable broke, but only because the words
+# happened to name nothing; the count of backticks was even by luck, and an ODD count is a
+# hard \`bad substitution\` that writes a ZERO-BYTE wrapper. This file's house style is
+# markdown prose in shell comments, which makes that a standing hazard rather than a typo:
+# every future paragraph in here is one backtick pair away from executing itself. Escape
+# them, and keep the check below (\`bash -n\` will not catch this — it is valid shell).
+#
+# AND THE SAME QUESTION IS ASKED OF THE PIN (cbp, 2026-07-28, measured on Linux). The rule
+# above is right and it was applied to one of the two branches: \`command -v\` on the
+# fallback got probed, \`-x\` on the PIN did not — and \`-x\` answers "exists" for exactly the
+# same reason. A pin that is present and executable but cannot RUN never reaches either
+# guard below: not -x-false, so no fallback, no \$PY -z branch, no
+# HESTIA_INTERPRETER_PIN_BROKEN, no finding. It goes straight to the exec and dies there.
+# Reachable on Linux by a route as ordinary as the Mac's stub: install with a version-manager
+# shim first on PATH (pyenv's \$PYENV_ROOT/shims/python3 — which install.sh ALREADY warns
+# about, three lines further down, as "re-resolves from ITS own environment"), then let that
+# version go. The shim stays 0755 and answers -x forever; it exits 127 with
+# "pyenv: version ... is not installed" without starting python. Measured here, sandboxed
+# \$HOME, pin = shim, version removed:
+#
+#   exit 127 | stdout 0 bytes | no --brief line | no unknown[] entry | --json 0 bytes
+#   and inventory.py, run by hand from a WORKING python against that same \$HOME, still
+#   reports scope.installed_bin set and scope.periodic_trigger=systemd-user-timer-*
+#
+# — the strongest-state-while-every-fire-is-a-no-op pair, one rung up, on the PRIMARY path.
+# Note what this costs the floor specifically: #95 put scope.interpreter on EVERY run and
+# turned the broken pin into a finding, but both of those live INSIDE inventory.py, and this
+# is the one case where inventory.py never starts. A report needs something alive to emit it
+# — which is McNugget's own sentence, pointed at the branch it did not cover.
+#
+# So: gone and cannot-run are the SAME CASE and get the same handling. Note this does not
+# exit — it falls back and REPORTS, per #95; exiting 127 is reserved for when the fallback
+# cannot run either (the two branches below), because that is the only state with nothing
+# left alive to report with.
+#
+# COST, measured, not asserted: one interpreter start on every run. 30ms on this box
+# (/usr/bin/python3 3.12.3, 20 runs), against a real --brief over the fleet workspace at
+# ~4.6s — 0.6%. Cheap here because the workspace walk is 9p; on a local-SSD workspace the
+# same 30ms is a larger fraction, so it is a real trade and not a free one.
+# CONSIDERED AND REJECTED, because it is cheaper but not honest: drop the \`exec\`, run the
+# pin, and treat rc 126/127 as "the interpreter never started" — zero cost on success, but
+# it couples this wrapper to inventory.py's exit codes, and the day the tool legitimately
+# exits 127 the wrapper silently runs the whole inventory twice. A guard that is wrong when
+# the thing it guards changes is the kind of check this plugin exists to find.
+# The three pins, and the only three lines in this file that carry an install-time value.
+# Single-quoted by sh_pin so the value is a literal: everything below refers to them BY
+# NAME, and a variable's value is not re-scanned for \`\$\`, backticks or quotes.
+PY_PIN=$SH_PYTHON
+BIN_PIN=$SH_BIN
+WS_PIN=$SH_WORKSPACE
+PY="\$PY_PIN"
+if [ ! -x "\$PY" ] || ! "\$PY" -c '' 2>/dev/null; then
+  PY="\$(command -v python3 2>/dev/null || true)"
+  if [ -n "\$PY" ] && ! "\$PY" -c '' 2>/dev/null; then
+    echo "hestia-agent-inventory: pinned interpreter \$PY_PIN is gone or cannot run," >&2
+    echo "  and the PATH fallback \$PY exists but cannot run python either (on macOS" >&2
+    echo "  /usr/bin/python3 is an xcrun stub needing the Xcode command line tools; on" >&2
+    echo "  Linux, a version-manager shim whose version has been removed does the same)." >&2
+    echo "  Re-run install.sh from a shell whose python3 works. This check has NOT run." >&2
+    exit 127
+  fi
+  if [ -z "\$PY" ]; then
+    echo "hestia-agent-inventory: pinned interpreter \$PY_PIN is gone or cannot run, and" >&2
+    echo "  there is no python3 on PATH either. Re-run install.sh. This check has NOT run." >&2
+    exit 127
+  fi
+  HESTIA_INTERPRETER_PIN_BROKEN="\$PY_PIN"
+  export HESTIA_INTERPRETER_PIN_BROKEN
+fi
+exec env HESTIA_WORKSPACE="\${HESTIA_WORKSPACE:-\$WS_PIN}" "\$PY" "\$BIN_PIN.py" "\$@"
 WRAP
 chmod 0755 "$BIN"
-echo "installed: $BIN  (source: $SRC_DIR/inventory.py, workspace pinned to $WORKSPACE)"
+echo "installed: $SH_BIN  (source: $(sh_pin "$SRC_DIR/inventory.py"), workspace pinned to $SH_WORKSPACE)"
+echo "           interpreter pinned to $SH_PYTHON"
+
+# Said HERE, once, at the only moment a human is watching — the same argument as the
+# agent-atlas warning at the top. The wrapper will survive the pin going stale, but a pin
+# that is ALREADY known to be ephemeral is worth one line now rather than a degraded run
+# an hour for the rest of the week.
+PIN_WHY=""
+case "$PYTHON" in
+  "${VIRTUAL_ENV:-/nonexistent}"/*) PIN_WHY="inside the active virtualenv $VIRTUAL_ENV" ;;
+  "${CONDA_PREFIX:-/nonexistent}"/*) PIN_WHY="inside the active conda env $CONDA_PREFIX" ;;
+  */shims/*) PIN_WHY="a version-manager shim, which re-resolves from ITS own environment" ;;
+  /tmp/*) PIN_WHY="under /tmp" ;;
+esac
+if [ -n "$PIN_WHY" ]; then
+  echo "           WARNING: that interpreter is $PIN_WHY." >&2
+  echo "           The wrapper falls back to PATH and reports it if this path disappears," >&2
+  echo "           but the pin is only as durable as that directory. Re-run install.sh" >&2
+  echo "           from a shell whose python3 is the one you want every trigger to use." >&2
+fi
 
 # ---- 2. periodic: hourly user timer ---------------------------------------------
 # Guarded by the step-0 decision, not by trying it and seeing. Everything from here to the
-# lingering report is systemd-only; step 3 below runs on every platform.
+# lingering report is backend-specific; step 3 below runs on every platform.
+
+# Printed from two places: the platform that has no backend, and the platform that has one
+# whose install could not be COMPLETED (a plist that will not lint). The second is the one
+# worth having a shared exit for — it is where a script is most tempted to keep going and
+# let the schedule be someone's later surprise.
+skip_periodic() {
+  echo "SKIPPED:   periodic trigger — $PERIODIC_WHY"
+  echo "           The binary and the SessionStart hook are still installed, so this"
+  echo "           check answers on demand and at session start. It will NOT run on its"
+  echo "           own. Every run reports that itself: scope.periodic_trigger=absent,"
+  echo "           and --brief carries NO PERIODIC TRIGGER — so the gap does not depend"
+  echo "           on anyone having read this line."
+}
+
 if [ "$PERIODIC" = systemd ]; then
+
+# THE THIRD SYNTAX (cbp, 2026-07-28, measured on Linux, systemd 255). "Three generated
+# files, three target syntaxes" undercounted by one: the plist is XML, the hook is shell
+# via shlex.quote, the wrapper is shell via sh_pin above — and this unit file is none of
+# those. A systemd unit has its own metacharacter, `%`, which is legal in a POSIX path and
+# introduces a SPECIFIER here. It is the only one of the four where the common failure is
+# silent, because most letters ARE a valid specifier:
+#
+#   HESTIA_WORKSPACE=/tmp/.../50%off      ->  `%o` is the OS ID. Measured: systemd resolves
+#     the ExecStart argument to /tmp/.../50ubuntuff. The unit parses clean, the timer
+#     enables, this script prints `installed: hourly timer`, and the hourly run walks a
+#     directory nobody named. The other two triggers get the right path, so on-demand and
+#     periodic disagree with nothing on either side saying so.
+#   .../100%uptime  -> `%u` is the user name -> 100dpptime. .../a%hb -> `%h` is $HOME.
+#   .../50%zdone    -> `z` is not a specifier, and this is the LOUD half: ExecStart reports
+#     "Unit configuration has fatal error, unit will not be started", while the same value
+#     in Environment= is dropped with "Failed to resolve specifiers ... ignoring".
+#
+# `%%` is systemd's literal percent. The values below also live inside DOUBLE-QUOTED
+# systemd fields, so percent is not the whole encoder: backslash and quote must use the
+# unit-file C escapes, and a line break cannot be represented by simply copying it into
+# the generated line. Python is already resolved and probed above; use it as the one
+# unambiguous encoder and reject control characters rather than generating a second
+# directive from a path.
+sd_escape() { "$PYTHON" -c 'import sys; s=sys.argv[1]; any(ord(c)<32 or ord(c)==127 for c in s) and sys.exit("install: control character cannot be encoded in a systemd unit path"); sys.stdout.write(s.replace("\\","\\\\").replace("\"","\\\"").replace("%","%%"))' "$1"; }
+SD_SRC_DIR="$(sd_escape "$SRC_DIR")"
+SD_BIN="$(sd_escape "$BIN")"
+SD_WORKSPACE="$(sd_escape "$WORKSPACE")"
 cat > "$UNIT_DIR/hestia-agent-inventory.service" <<EOF
 [Unit]
 Description=hestia agent inventory (installed / plugins available / governed)
-Documentation=file://$SRC_DIR/README.md
+Documentation=file://$SD_SRC_DIR/README.md
 
 [Service]
 Type=oneshot
 # Quoted: systemd splits ExecStart on whitespace, so an unquoted workspace path with a
 # space becomes two arguments and the check silently inspects its first word (cbp).
-Environment="HESTIA_WORKSPACE=$WORKSPACE"
-ExecStart="$BIN" --workspace "$WORKSPACE"
+Environment="HESTIA_WORKSPACE=$SD_WORKSPACE"
+ExecStart="$SD_BIN" --workspace "$SD_WORKSPACE"
 # Observation only. A non-zero exit here must never look like a governance failure,
 # and the script is written to exit 0 regardless; this is belt-and-braces.
 SuccessExitStatus=0 1
@@ -166,24 +560,262 @@ RandomizedDelaySec=90
 WantedBy=timers.target
 EOF
 
+# LINT BEFORE LOAD — THE DARWIN RULE, APPLIED HERE (cbp, 2026-07-28, measured on
+# systemd 255). The plist gets `plutil -lint` before launchctl sees it, and the argument
+# for it holds verbatim on this side: an unloadable unit left in ~/.config/systemd/user
+# reads as a wired schedule to `ls` AND to periodic_trigger()'s glob, which is the exact
+# artifact this plugin exists to catch. Nothing was asking systemd the question, so the
+# escaping above would have been the only guard — and escaping only covers the characters
+# someone thought of. This is the backstop that does not depend on that.
+#
+# AND THE FIRST END-TO-END RUN OF THIS GUARD DELETED A GOOD TIMER. Written as "rc!=0 means
+# unloadable", it removed both units on a sandboxed install where systemd-analyze had said
+# `Failed to initialize manager: No such device or address` — no XDG_RUNTIME_DIR, so the
+# checker could not START. The units were fine. That is this plugin's own subject matter,
+# committed by the backstop written to prevent it: the guard reported on a question it had
+# never actually asked, and the failure was in the direction that destroys.
+#
+# So the rule is not the exit code. THE GUARD MAY ONLY CONDEMN A UNIT ON A MESSAGE THAT
+# NAMES IT. systemd's real complaints are prefixed with the unit ("...service:5: Failed to
+# resolve unit specifiers..."); a manager that would not start names no unit at all, and
+# is `unverified` — the units stay, and the run SAYS they were not checked. Three verdicts,
+# not two, because "this unit is bad" and "I could not look" are the distinction this whole
+# plugin exists to keep, one level up. `unverified` is also what `systemd-analyze` being
+# absent gets, which is the same fact arriving a different way.
+#
+# In a function so the suite can RUN it rather than name it — a static check that this
+# branch exists would stay green for exactly the reason the last four defects here did.
+unit_verdict() {  # $1 = rc, $2 = output, $3 = unit stem
+  case "$1:$2" in
+    0:)   printf 'ok' ;;
+    0:*)  printf 'degraded' ;;        # loaded, and systemd dropped a setting it named
+    *:*"$3"*) printf 'bad' ;;         # it names our unit: the unit is what is wrong
+    *)    printf 'unverified' ;;      # it names nothing of ours: the CHECKER failed
+  esac
+}
+if command -v systemd-analyze >/dev/null 2>&1; then
+  UNIT_LINT="$(systemd-analyze --user verify \
+                 "$UNIT_DIR/hestia-agent-inventory.timer" 2>&1)" && UNIT_RC=0 || UNIT_RC=$?
+else
+  UNIT_RC=1; UNIT_LINT="systemd-analyze is not installed"
+fi
+case "$(unit_verdict "$UNIT_RC" "$UNIT_LINT" hestia-agent-inventory)" in
+  bad)
+    rm -f "$UNIT_DIR/hestia-agent-inventory.service"
+    rm -f "$UNIT_DIR/hestia-agent-inventory.timer"
+    PERIODIC=none
+    PERIODIC_WHY="Linux — the generated units did not verify (systemd-analyze: $UNIT_LINT); removed, not left for the timer to fail into the journal an hour from now" ;;
+  degraded)
+    echo "  WARNING:   systemd-analyze loaded the units but reported:" >&2
+    echo "             $UNIT_LINT" >&2
+    echo "             The timer is installed; a setting it named was dropped." >&2 ;;
+  unverified)
+    echo "  note:      the units were NOT verified before loading — $UNIT_LINT" >&2
+    echo "             They are installed either way; this is 'could not look', not" >&2
+    echo "             'looked and found nothing'." >&2 ;;
+esac
+
+if [ "$PERIODIC" = systemd ]; then
 systemctl --user daemon-reload
 systemctl --user enable --now hestia-agent-inventory.timer >/dev/null
 echo "installed: hourly timer (systemd --user)"
 
 # The distinction that matters: enabled != will fire.
-if loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
+if loginctl show-user "$USER_N" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
   echo "  lingering: ON — the timer fires even with no login session"
 else
-  echo "  lingering: OFF — this timer ONLY fires while $USER has a session."
-  echo "             enable with: loginctl enable-linger $USER   (needs sudo)"
+  echo "  lingering: OFF — this timer ONLY fires while $(sh_pin "$USER_N") has a session."
+  echo "             enable with: loginctl enable-linger $(sh_pin "$USER_N")   (needs sudo)"
 fi
 else
-  echo "SKIPPED:   periodic trigger — $PERIODIC_WHY"
-  echo "           The binary and the SessionStart hook are still installed, so this"
-  echo "           check answers on demand and at session start. It will NOT run on its"
-  echo "           own. Every run reports that itself: scope.periodic_trigger=absent,"
-  echo "           and --brief carries NO PERIODIC TRIGGER — so the gap does not depend"
-  echo "           on anyone having read this line."
+  # Same shape as the plist's: unverified means uninstalled, said out loud, and step 3
+  # still runs because the other two triggers are unaffected.
+  skip_periodic
+fi
+elif [ "$PERIODIC" = launchd ]; then
+UID_N="$(id -u)"
+
+# WHY THESE KEYS, AND WHICH SYSTEMD PROPERTIES HAVE NO ANALOGUE (McNugget, 2026-07-28).
+# The timer above is the specification; this is the nearest launchd can get, and where it
+# cannot get there the gap is named rather than papered over.
+#
+#   StartInterval 3600   = OnUnitActiveSec=1h. Interval since the last run, which is what
+#                          the systemd side means. StartCalendarInterval would be a
+#                          wall-clock slot — a different schedule wearing the same word.
+#   RunAtLoad            ~ OnBootSec=3min. Not equal: RunAtLoad fires AT load, and launchd
+#                          has no delay-after-load key for an interval job. The 3min on the
+#                          systemd side buys boot quiet, not coverage, so this diverges by
+#                          three minutes of contention and nothing else.
+#   (none)               = RandomizedDelaySec=90. launchd has no jitter for StartInterval.
+#                          One machine, one agent — the jitter was for fleets sharing a
+#                          filer, and this walk is local. Recorded as absent, not as fine.
+#   (none)               = Persistent=true. A StartInterval missed while the machine slept
+#                          fires ONCE at next load, not once per missed interval. On a
+#                          laptop that sleeps nightly the two backends diverge in COVERAGE:
+#                          systemd catches up, launchd does not. `periodic_trigger()`
+#                          carries this in its docstring; it is why the states are named
+#                          differently and not merged.
+#
+# PATH is set even though step 1 now pins the interpreter. Belt and braces, and cheap: the
+# thing that failed here was a daemon's PATH being narrower than the shell's, and the
+# wrapper is not the only thing downstream that can want a tool (`git`, for the registry).
+# The pin is the fix; this is the same fact written where the next reader of the plist is.
+#
+# ProcessType Background is what tells the scheduler this may be deprioritised — an hourly
+# directory walk must never compete with the user's foreground work.
+LAUNCHD_PATH="$(dirname "$PYTHON"):/usr/bin:/bin:/usr/sbin:/sbin"
+
+# THE WHITELIST SAYS WHICH NAMES MAY EXPAND; IT DOES NOT SAY THE VALUE IS SAFE IN THE FILE
+# BEING GENERATED (McNugget, 2026-07-28, measured on macOS 26.5 by installing). Three
+# generated files, three target syntaxes, and the two whose syntax is shell already answer
+# this: the wrapper interpolates inside double quotes, and the SessionStart hook goes
+# through shlex.quote in step 3. The plist is the one whose syntax is XML, and it
+# interpolated raw. `&`, `<` and `>` are legal in a POSIX path and are metacharacters here.
+#
+# Measured with HESTIA_WORKSPACE=/tmp/mcn-sb2/R&D — a folder name a Mac user types without
+# thinking: plutil said "Encountered unknown ampersand-escape sequence at line 10", the
+# plist was removed, and the periodic trigger was GONE. The same run's other two triggers
+# were fine — the hook read `--workspace '/tmp/mcn-sb2/R&D'` and the wrapper ran and
+# reported. So it was one trigger of three, lost to a character in a path.
+#
+# SIZED HONESTLY, THE WAY THIS THREAD HAS BEEN SIZING THINGS: not a silent failure. The
+# lint-before-load guard below caught it, said so, and skip_periodic() made the gap
+# self-reporting (scope.periodic_trigger=absent, NO PERIODIC TRIGGER on --brief). That is
+# the backstop working. What was wrong is that a path was allowed to reach a syntax that
+# could not hold it, and the diagnostic a reader got named plutil's parser message instead
+# of the character in their own workspace path. Escaping is four lines; the backstop stays
+# exactly where it is, because it also catches truncation, which this does not.
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+XML_LABEL="$(xml_escape "$LAUNCHD_LABEL")"
+XML_BIN="$(xml_escape "$BIN")"
+XML_WORKSPACE="$(xml_escape "$WORKSPACE")"
+XML_HOME="$(xml_escape "$HOME")"
+XML_PATH="$(xml_escape "$LAUNCHD_PATH")"
+XML_LOG_DIR="$(xml_escape "$LOG_DIR")"
+cat > "$PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$XML_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$XML_BIN</string>
+    <string>--workspace</string>
+    <string>$XML_WORKSPACE</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HESTIA_WORKSPACE</key><string>$XML_WORKSPACE</string>
+    <key>HOME</key><string>$XML_HOME</string>
+    <key>PATH</key><string>$XML_PATH</string>
+  </dict>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>$XML_LOG_DIR/agent-inventory.log</string>
+  <key>StandardErrorPath</key><string>$XML_LOG_DIR/agent-inventory.err</string>
+</dict>
+</plist>
+PLIST_EOF
+
+# LINT BEFORE LOAD, AND REMOVE ON FAILURE. `launchctl` refuses a malformed plist and says
+# so unhelpfully (deploy/fleet/install.sh:verify_service_macos, probe 1) — but the file
+# would still be sitting in ~/Library/LaunchAgents, where `ls` reads as a wired schedule
+# and `periodic_trigger()`'s glob finds it. Leaving it is manufacturing the exact artifact
+# this plugin exists to catch. So: unlinted means uninstalled, said out loud, and the run
+# continues to step 3 because the other two triggers are unaffected.
+#
+# AND `plutil -lint` IS A PARSER, NOT A VALIDATOR — measured, not assumed. Appending
+# `<<<junk` after `</plist>` still lints OK (macOS 26.5): it stops at the closing tag. It
+# catches truncation and malformed XML (a 300-byte cut reports "Encountered unexpected
+# EOF"), and it says nothing about whether the dict describes a job launchd will run. That
+# second question is why the `launchctl print` probe below exists and is not redundant
+# with this one.
+LINT="$(plutil -lint "$PLIST" 2>&1 || true)"
+case "$LINT" in
+  *OK*) : ;;
+  *)
+    rm -f "$PLIST"
+    PERIODIC=none
+    PERIODIC_WHY="Darwin — the generated plist did not lint (plutil: $LINT); removed, not left for launchctl to refuse"
+    skip_periodic ;;
+esac
+
+if [ "$PERIODIC" = launchd ]; then
+  # bootout/bootstrap is the modern spelling and the one that reports errors usefully;
+  # load/unload is kept for older macOS. `bootout` on a label that is not loaded exits
+  # non-zero, which under `set -e` is the same class of abort this whole file is about.
+  launchctl bootout "gui/$UID_N/$LAUNCHD_LABEL" 2>/dev/null || true
+  LAUNCHD_LOADED=0
+  if BOOTSTRAP_ERR="$(launchctl bootstrap "gui/$UID_N" "$PLIST" 2>&1)"; then
+    LAUNCHD_LOADED=1
+  else
+    launchctl unload "$PLIST" 2>/dev/null || true
+    if FALLBACK_ERR="$(launchctl load "$PLIST" 2>&1)"; then
+      LAUNCHD_LOADED=1
+    else
+      BOOTSTRAP_ERR="$BOOTSTRAP_ERR; fallback load: $FALLBACK_ERR"
+    fi
+  fi
+  if [ "$LAUNCHD_LOADED" != 1 ]; then
+    rm -f "$PLIST"
+    PERIODIC=none
+    PERIODIC_WHY="Darwin — launchd refused both bootstrap and load ($BOOTSTRAP_ERR); plist removed"
+    skip_periodic
+  fi
+fi
+
+if [ "$PERIODIC" = launchd ]; then
+  echo "installed: hourly launchd agent ($(sh_pin "$PLIST"))"
+
+  # `launchctl load` SUCCEEDS ON A VALID PLIST AND SAYS NOTHING ABOUT THE JOB (same
+  # finding, deploy/fleet 2026-07-25). So the claim is not "we wrote a file with
+  # StartInterval in it" — it is "launchd is holding a job with that interval", which is a
+  # different fact and the only one that makes this a regular check. Ask launchd, not the
+  # filesystem.
+  PRINTED="$(launchctl print "gui/$UID_N/$LAUNCHD_LABEL" 2>&1 || true)"
+  INTERVAL="$(printf '%s\n' "$PRINTED" | sed -n 's/.*interval *= *\([0-9][0-9]*\).*/\1/p' | head -1)"
+  if [ "$INTERVAL" = 3600 ]; then
+    echo "  launchd:   job loaded in gui/$(sh_pin "$UID_N"), run interval = ${INTERVAL}s"
+  else
+    echo "  WARNING:   the plist is on disk and lints, but launchd does not report a" >&2
+    echo "             3600s run interval for $(sh_pin "$LAUNCHD_LABEL")." >&2
+    echo "             launchctl bootstrap said: ${BOOTSTRAP_ERR:-(nothing)}" >&2
+    echo "             launchctl print $(sh_pin "gui/$UID_N/$LAUNCHD_LABEL") for the full state." >&2
+    echo "             Treat the schedule as NOT wired until that says otherwise." >&2
+  fi
+
+  # The distinction that matters, launchd's version of the lingering report. A gui/ domain
+  # agent is bound to the GUI login session: it does not run when nobody is logged in, and
+  # it stops at logout. That is the same fact as `lingering: OFF` — installed is not
+  # will-fire — and it is worse here because there is no `enable-linger` to point at. The
+  # honest remedy is a LaunchDaemon (root, system domain), which is a privilege escalation
+  # this observation-only check has no business asking for.
+  echo "  session:   gui/$(sh_pin "$UID_N") — this agent fires only while $(sh_pin "$USER_N") is logged in."
+  echo "             There is no launchd equivalent of loginctl enable-linger for a user"
+  echo "             agent; a fire missed while logged out or asleep happens ONCE at next"
+  echo "             load, not once per missed hour (no Persistent= analogue)."
+
+  # Label drift, the agent-inventory shape of deploy/fleet's probe 2. `periodic_trigger()`
+  # answers from a GLOB, so any other plist whose name carries the binary name counts as
+  # this machine's schedule — including a stale one from a rename, pointing at a binary
+  # that no longer exists. One `installed` answer would then cover for a dead job.
+  DRIFT=""
+  for cand in "$AGENT_DIR"/*hestia-agent-inventory*.plist; do
+    [ -f "$cand" ] || continue
+    [ "$cand" = "$PLIST" ] && continue
+    DRIFT="$DRIFT $cand"
+  done
+  if [ -n "$DRIFT" ]; then
+    echo "  WARNING:   LABEL DRIFT — other plists also match the detector's glob:" >&2
+    for d in $DRIFT; do echo "               $d" >&2; done
+    echo "             periodic_trigger() reports 'installed' if ANY of them carries a" >&2
+    echo "             schedule, so a stale one hides a dead job. Review and bootout." >&2
+  fi
+fi
+else
+  skip_periodic
 fi
 
 # ---- 3. on launch: SessionStart hook --------------------------------------------
@@ -196,7 +828,11 @@ fi
 HOOK_TIMEOUT="$("$BIN" --print-hook-timeout 2>/dev/null || true)"
 case "$HOOK_TIMEOUT" in
   ''|*[!0-9]*)
-    echo "install: '$BIN --print-hook-timeout' did not return an integer (got" >&2
+    # McNugget's second reported nit, taken rather than queued. The outer single quotes
+    # were prose-quoting a command, which is the same conflation the whole thread is
+    # about — and they made pinning impossible, since a pinned value carries its own
+    # single quotes. Dropped them and pinned instead: the line is now the command.
+    echo "install: $SH_BIN --print-hook-timeout did not return an integer (got" >&2
     echo "         '${HOOK_TIMEOUT}'). That flag is where the SessionStart timeout comes" >&2
     echo "         from; without it this script would have to hardcode a second copy of" >&2
     echo "         the scan budget, which is the drift it exists to prevent." >&2
@@ -205,8 +841,17 @@ esac
 
 if [ -f "$SETTINGS" ]; then
   cp -a "$SETTINGS" "$SETTINGS.bak.$(date +%Y%m%d-%H%M%S)"
+  # `$PYTHON`, not a bare `python3` — and this one is HYGIENE, not a defect (cbp,
+  # 2026-07-28). Stated plainly because it was queued as a nit for two hops and the honest
+  # answer is smaller than it looked: install.sh never modifies PATH, and `PYTHON` is
+  # `command -v python3` from this same process, so the two always resolved to the same
+  # file. The stub case cannot bite here either — step 1 PROBES `$PYTHON` and exits 1
+  # before step 3 exists. I could not construct a run on Linux where the bare form
+  # differs. It changes anyway, because "every trigger runs the interpreter we pinned" is
+  # the invariant this branch is about, and one of the four call sites naming it a second
+  # way is how that invariant stops being checkable — not because it is broken today.
   BIN="$BIN" WORKSPACE="$WORKSPACE" HOOK_TIMEOUT="$HOOK_TIMEOUT" \
-    python3 - "$SETTINGS" <<'PY'
+    "$PYTHON" - "$SETTINGS" <<'PY'
 import json, os, shlex, sys
 path, binp = sys.argv[1], os.environ["BIN"]
 tmo = int(os.environ["HOOK_TIMEOUT"])
@@ -277,16 +922,51 @@ if final[0].get("timeout") != tmo:
              f"{tmo} (derived from the scan budget) — {path} left as written")
 PY
 else
-  echo "SessionStart hook: skipped ($SETTINGS not found)"
+  echo "SessionStart hook: skipped ($(sh_pin "$SETTINGS") not found)"
 fi
 
 echo
-echo "on demand:  hestia-agent-inventory --workspace $WORKSPACE"
-echo "            (or export HESTIA_WORKSPACE=$WORKSPACE in your shell rc — a bare"
+# THE ADVICE IS A SHELL SYNTAX TOO (McNugget, 2026-07-28, measured on macOS 26.5 by
+# pasting it). Four generated files were counted and fixed; these two lines are a FIFTH
+# surface with the same property and were exempted by not being a file at all. They are
+# not prose — they are a command a human is told to run and a line they are told to put
+# in their shell rc, and they interpolated the value raw:
+#
+#   .../cost$avings   pasted -> `$avings` is unset -> --workspace .../cost. SILENT when
+#                     that directory exists: a clean inventory of somewhere nobody chose,
+#                     which is the same sizing the wrapper's `$` case got one level in.
+#   .../it`id`s       pasted -> command substitution RUNS in the operator's own shell,
+#                     and the `export` half writes `uid=501(dennispalatov) gid=20(staff)
+#                     groups=...` into their SHELL RC, where it persists after this tool.
+#   .../a b           pasted -> truncates at the space. The ordinary macOS path, and the
+#                     one a Mac user is most likely to have.
+#   .../o'brien       pasted -> parse error. The loud one, and the only safe outcome.
+#
+# SIZED AGAINST THE WRAPPER'S: less bad, in the way that matters — nothing here runs on
+# its own, a human has to paste it, so it is not an hourly timer walking the wrong tree.
+# Worse in one narrow way: it is the only surface whose failure LEAVES the plugin. The
+# `export` line's whole instruction is "put this in your shell rc", so the backtick case
+# is persistent, and it is the operator's login shell rather than this tool's runtime.
+#
+# Fixed with `sh_pin` — cbp's function, not a second one. A separate quoting helper for
+# the human-facing half is how two mechanisms drift into disagreeing about the same
+# question. Quoted unconditionally, including when the path is boring: "quote only when
+# it looks like it needs it" is a predicate that has to be right about every future
+# metacharacter, and it is the predicate, not the quoting, that this thread keeps finding
+# wrong.
+echo "on demand:  hestia-agent-inventory --workspace $SH_WORKSPACE"
+echo "            (or export HESTIA_WORKSPACE=$SH_WORKSPACE in your shell rc — a bare"
 echo "             invocation falls back to the compiled-in default and answers UNKNOWN)"
 echo "            --brief       one line        --no-witness   skip the chain write"
 if [ "$PERIODIC" = systemd ]; then
   echo "next fire:  $(systemctl --user list-timers hestia-agent-inventory.timer --no-pager 2>/dev/null | sed -n 2p)"
+elif [ "$PERIODIC" = launchd ]; then
+  # No `list-timers` here: launchd exposes the interval, not the next fire time, so this
+  # says the interval and where the last one went rather than inventing a timestamp.
+  echo "next fire:  within 3600s of the last run — launchd reports the interval, not a"
+  echo "            next-fire time. Output: $(sh_pin "$LOG_DIR/agent-inventory.log") (.err for stderr)"
+  echo "            state:  launchctl print $(sh_pin "gui/$UID_N/$LAUNCHD_LABEL")"
+  echo "            now:    launchctl kickstart -p $(sh_pin "gui/$UID_N/$LAUNCHD_LABEL")"
 else
   echo "next fire:  never on its own — no periodic trigger on this platform ($PERIODIC_WHY)"
 fi

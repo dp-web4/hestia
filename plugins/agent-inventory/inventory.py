@@ -126,6 +126,7 @@ import json
 import math
 import os
 import platform
+import plistlib
 import re
 import shlex
 import subprocess
@@ -830,6 +831,20 @@ def periodic_trigger() -> tuple[str, str, list[str]]:
     the port). Written down rather than absorbed: on a laptop that sleeps, the two
     schedules diverge in coverage, not just in syntax, and `launchd-agent-installed` is
     the weaker claim of the two.
+
+    AND THE PLIST'S EXISTENCE WAS NOT THE SCHEDULE (McNugget, 2026-07-28, writing the
+    launchd half on a Mac). The glob alone answered `launchd-agent-installed` for ANY
+    matching plist. But a LaunchAgent with neither `StartInterval` nor
+    `StartCalendarInterval` is not periodic — `RunAtLoad` alone fires at login and never
+    again, and `launchctl bootstrap` accepts it silently. That is the systemd
+    `installed-not-enabled` distinction with no state to hold it, on the side where the
+    positive answer was already the weak one: this file would have reported a schedule
+    for the exact artifact it exists to catch, and the first such artifact would have
+    been the one written next door in `install.sh`. So the keys are read, not assumed —
+    `plistlib` handles XML and binary plists in-process, no `launchctl` subprocess, which
+    keeps the hook budget intact. A plist that will not parse is its own answer: `launchctl`
+    would refuse it too, so nothing is scheduled, but "refused" and "no schedule key" are
+    different repairs and do not share a name.
     """
     system = platform.system()
     unit = HOME / ".config" / "systemd" / "user" / f"{INSTALLED_BIN_NAME}.timer"
@@ -843,8 +858,116 @@ def periodic_trigger() -> tuple[str, str, list[str]]:
     if unit.exists():
         return "systemd-user-timer-installed-not-enabled", system, looked
     if plists:
-        return "launchd-agent-installed", system, looked
+        return f"launchd-agent-{_launchd_schedule(plists)}", system, looked
     return "absent", system, looked
+
+
+# launchd's two periodic keys. `RunAtLoad`, `KeepAlive` and `WatchPaths` are triggers but
+# not schedules: they answer "when something happens", which is the surface this check
+# already has. Only these two make it a REGULAR check.
+LAUNCHD_SCHEDULE_KEYS = ("StartInterval", "StartCalendarInterval")
+
+
+def _valid_launchd_schedule(data: dict) -> bool:
+    """Whether a parsed job contains a schedule with launchd's documented value shape."""
+    interval = data.get("StartInterval")
+    if isinstance(interval, int) and not isinstance(interval, bool) and interval > 0:
+        return True
+
+    calendar = data.get("StartCalendarInterval")
+    entries = calendar if isinstance(calendar, list) else [calendar]
+    limits = {
+        "Minute": (0, 59), "Hour": (0, 23), "Day": (1, 31),
+        "Weekday": (0, 7), "Month": (1, 12),
+    }
+    for entry in entries:
+        if not isinstance(entry, dict) or any(k not in limits for k in entry):
+            continue
+        if all(
+            isinstance(v, int)
+            and not isinstance(v, bool)
+            and limits[k][0] <= v <= limits[k][1]
+            for k, v in entry.items()
+        ):
+            # An empty dictionary is meaningful to launchd: every omitted field is a
+            # wildcard, so it fires every minute.
+            return True
+    return False
+
+
+def _launchd_schedule(plists: list[Path]) -> str:
+    """`installed` | `installed-no-schedule` | `unparseable`, over all matching plists.
+
+    Any one scheduled plist is enough — that is a real hourly fire regardless of what
+    else is in the directory. The negative answers are only reached when NONE is, and
+    they are ordered so the weaker knowledge wins: a directory holding one unreadable
+    plist and one readable-but-unscheduled plist reports `unparseable`, because the
+    unreadable one might have carried the schedule and saying `no-schedule` there would
+    be a claim about a file this function could not read.
+
+    A non-dict root counts as unreadable, not as unscheduled. `plistlib.loads(b"<plist/>")`
+    returns None rather than raising (measured, CPython 3.13) — so "it parsed" is not "it is
+    a job description", and the truthful thing to say about a file with no job dictionary in
+    it is that no schedule could be read from it, not that it has none.
+    """
+    unreadable = False
+    for p in plists:
+        try:
+            with p.open("rb") as fh:
+                data = plistlib.load(fh)
+        except Exception:
+            data = None
+        if not isinstance(data, dict):
+            unreadable = True
+            continue
+        if _valid_launchd_schedule(data):
+            return "installed"
+    return "unparseable" if unreadable else "installed-no-schedule"
+
+
+def interpreter_finding() -> str | None:
+    """Did the wrapper have to fall back off its pinned interpreter to run this at all?
+
+    THE PIN IS SCOPE, SO ITS FAILURE IS A FINDING AND NOT AN EXIT CODE (cbp, 2026-07-28,
+    reviewing the launchd branch from the Linux side). install.sh pins the interpreter the
+    installing shell resolved, which on Darwin is a stable homebrew path and on Linux is
+    routinely a venv, a conda prefix or a pyenv shim. When that path goes away the wrapper
+    now falls back to PATH rather than exiting 127 — because a check that dies is
+    indistinguishable from a check that found nothing, and this file exists to find gates
+    whose failure mode is silence. It is obliged to find its own: the wrapper exports
+    HESTIA_INTERPRETER_PIN_BROKEN and this turns it into a reported one.
+
+    Measured before the floor existed: with the pinned venv deleted, `periodic_trigger()`
+    still answered `systemd-user-timer-enabled` with `installed_bin` set — the strongest
+    state here — while every hourly fire was exit 127. Installed, scheduled, and never once
+    run, which is the same pair `installed-not-enabled` and `installed-no-schedule` were
+    both introduced to break apart, one layer further down.
+
+    The run itself is TRUSTWORTHY: same source file, stdlib only, and `sys.executable` is
+    reported so a reader can see which python answered. What is NOT established is that the
+    periodic trigger and the SessionStart hook still agree on an interpreter — which is the
+    whole reason the pin was added.
+
+    "GONE" WAS TOO NARROW, AND THE WORD MATTERED (cbp, 2026-07-28). The wrapper originally
+    reached this only when the pin failed `-x`, so the text said "no longer exists". But a
+    pin can be present, 0755 and unrunnable — a pyenv shim whose version was removed exits
+    127 without starting python — and that case answered -x TRUE, skipped the fallback
+    entirely and produced no report at all: exit 127, stdout 0 bytes, no unknown[] entry.
+    The wrapper now treats gone and cannot-run as one case, so this text has to cover both;
+    saying "no longer exists" about a file the reader can plainly `ls` would send them
+    looking for the wrong fault.
+    """
+    pinned = os.environ.get("HESTIA_INTERPRETER_PIN_BROKEN")
+    if not pinned:
+        return None
+    return (f"the installed wrapper's pinned interpreter {pinned} is gone or cannot run "
+            f"(it may still be present and executable — a version-manager shim whose "
+            f"version was removed exits without starting python), so "
+            f"this run fell back to {sys.executable} off PATH. The findings stand — same "
+            f"source, stdlib only — but the triggers are no longer pinned to one "
+            f"interpreter, which is what the pin was for, and a PATH that differs between "
+            f"a daemon and a shell will now silently split them again. Re-run install.sh "
+            f"from the shell whose python3 every trigger should use.")
 
 
 def _git(*args: str) -> str | None:
@@ -1285,10 +1408,30 @@ def emit(report: dict, brief: bool) -> int:
         # Gated on the binary being there: a machine that never ran install.sh has no
         # schedule for the honest reason, and warning about it would be noise on every
         # bare `python3 inventory.py`. The finding is the PAIR — installed, unscheduled.
-        if scan.get("periodic_trigger") == "absent" and scan.get("installed_bin"):
-            line += (" | NO PERIODIC TRIGGER — this binary is installed with no schedule "
-                     f"on {scan.get('periodic_platform')}; it runs only when something "
-                     "calls it, so silence here is not evidence")
+        # `launchd-agent-installed-no-schedule` reads the same to a session and is worse
+        # to a reader: a plist IS present, so `ls ~/Library/LaunchAgents` and `launchctl
+        # bootstrap` both look like a wired schedule. Same sentence, different second
+        # clause — what to go fix is not the same thing.
+        if scan.get("installed_bin") and scan.get("periodic_trigger") in (
+                "absent", "launchd-agent-installed-no-schedule", "launchd-agent-unparseable"):
+            why = {
+                "absent": ("no schedule", "it runs only when something calls it, so "
+                           "silence here is not evidence"),
+                "launchd-agent-installed-no-schedule":
+                    ("a LaunchAgent plist that schedules nothing",
+                     "it has neither StartInterval nor StartCalendarInterval, so launchd "
+                     "loads it and never fires it"),
+                "launchd-agent-unparseable":
+                    ("a LaunchAgent plist that does not parse",
+                     "launchctl will refuse it too; re-run install.sh"),
+            }[scan["periodic_trigger"]]
+            line += (f" | NO PERIODIC TRIGGER — this binary is installed with {why[0]} "
+                     f"on {scan.get('periodic_platform')}; {why[1]}")
+        if scan.get("interpreter_pin_broken"):
+            line += (f" | INTERPRETER PIN BROKEN — the wrapper's pinned "
+                     f"{scan['interpreter_pin_broken']} is gone or cannot run; this ran on "
+                     f"{scan.get('interpreter')} off PATH, so the triggers are no longer "
+                     "pinned to one interpreter. Re-run install.sh")
         if scan.get("hook_timeout_installed_s") is not None:
             line += (f" | HOOK TIMEOUT {scan['hook_timeout_installed_s']}s < "
                      f"{scan.get('project_scan_budget_s')}s SCAN BUDGET — this check can "
@@ -1378,6 +1521,11 @@ def main() -> int:
         "periodic_platform": periodic_platform,
         "periodic_paths_checked": periodic_paths,
         "installed_bin": str(installed_bin) if installed_bin.exists() else None,
+        # Which python actually answered. Reported unconditionally, not only when the pin
+        # breaks: `installed_bin` names a wrapper whose whole job is to make the three
+        # triggers agree on this value, so a fleet dashboard differencing two machines —
+        # or one machine's hook against its own timer — needs it present to compare.
+        "interpreter": sys.executable,
         "scan_truncated": SCAN_STATS.get("truncated", False),
         # Level-order, so "where it stopped" is one integer and the loss is predictable:
         # levels below `truncated_at_level` were never enumerated, and those are the
@@ -1417,6 +1565,13 @@ def main() -> int:
         # killed. A check has as many surfaces as it has readers, and the smallest surface
         # is the one that gets believed.
         scope["hook_timeout_installed_s"] = installed_timeout
+    pin_broken = interpreter_finding()
+    if pin_broken:
+        unknowns.append(pin_broken)
+        # Onto --brief for the same reason the hook-timeout finding is: the reader who
+        # most needs this is the one whose trigger just ran on the wrong python, and the
+        # smallest surface is the one that gets believed.
+        scope["interpreter_pin_broken"] = os.environ["HESTIA_INTERPRETER_PIN_BROKEN"]
     if SCAN_STATS.get("truncated"):
         # Rule 5 made explicit. A walk that ran out of budget has NOT established the
         # project scope, and the part it never reached is exactly where the report would
