@@ -339,12 +339,51 @@ def main():
     # The invariant, not just the stamp: every primer names an owner AND sits in that
     # owner's directory. One assertion covers both halves of the fix, for every member
     # in the tree rather than the one this test happens to be about.
-    primers = []
+    # The read RETRIES, then REPORTS — it does not raise.
+    #
+    # This walk used a bare `json.load` and crashed on CI with a JSONDecodeError at this line
+    # (2026-07-31, blocking every open PR). An unparseable primer is precisely what 3a exists
+    # to catch, so the one condition the assertion is for arrived as a traceback with no
+    # verdict — the same shape as a green that measures nothing, inverted.
+    #
+    # Two causes are possible and they want opposite responses, so the read distinguishes
+    # them rather than picking one:
+    #   - MID-WRITE. The watcher writes primers asynchronously and not atomically, so a walk
+    #     can reach a file between create and flush. A fast local box never hits the window;
+    #     a shared runner does, which is why this passes locally and fails in CI. A brief
+    #     retry settles it and it is not a defect in what was written.
+    #   - MALFORMED. The content is genuinely wrong and no amount of waiting fixes it. That
+    #     is a real finding and must fail loudly, naming the file and what it held.
+    def _read_primer(path, attempts=4, delay=0.15):
+        last = None
+        for i in range(attempts):
+            try:
+                with open(path) as fh:
+                    return json.load(fh), None
+            except (json.JSONDecodeError, OSError) as e:
+                last = e
+                if i + 1 < attempts:
+                    time.sleep(delay)
+        try:
+            raw = open(path, "rb").read()[:200]
+        except OSError:
+            raw = b"<unreadable>"
+        return None, f"{type(last).__name__}: {last} | first 200 bytes: {raw!r}"
+
+    primers, unparseable = [], []
     for root, _, files in os.walk(os.path.join(state, "primers")):
         for f in files:
             if f.startswith("notice-") and f.endswith(".json"):
-                with open(os.path.join(root, f)) as fh:
-                    primers.append((os.path.join(root, f), json.load(fh)))
+                p = os.path.join(root, f)
+                body, err = _read_primer(p)
+                (primers.append((p, body)) if err is None else unparseable.append((p, err)))
+
+    # Reported as its OWN check. Folding it into 3a would let "a primer could not be read"
+    # masquerade as "a primer was misfiled", and those have different repairs.
+    check("3a-pre. every primer on disk is readable JSON (retried, so a mid-write is not a fail)",
+          not unparseable,
+          f"unparseable after retries: {unparseable}")
+
     misfiled = [(p, b.get("for_plugin")) for p, b in primers
                 if b.get("for_plugin") != os.path.basename(os.path.dirname(p))]
     check("3a. every primer names its member and sits in that member's directory",
