@@ -24,7 +24,7 @@
 //! simply not-yet-publishable, never a refused connect (unlike the fail-CLOSED
 //! synthetic exclusion, which is a safety gate).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use web4_core::{EntityType, Lct, LegacyAlias, LegacyDerivation, MrhEdge};
 
 const MEMBERS_NAMESPACE: &str = "members";
@@ -42,10 +42,18 @@ struct PersistedMember {
     keypair_secret_hex: String,
 }
 
-/// In-memory member registry: `plugin_id → LCT`, rebuilt from the vault each boot.
+/// In-memory member registry.
+///
+/// `members` is the durable, publishable `plugin_id → LCT` set rebuilt from the
+/// vault each boot. `observed` is deliberately broader: valid member identities
+/// actually seen this boot, including a member whose first-sight LCT could not be
+/// persisted. Routing must not silently erase such a member from the independent
+/// arbiter pool merely because storage failed; publication must still refuse to
+/// advertise an LCT it cannot reproduce.
 #[derive(Default)]
 pub struct MemberRegistry {
     members: HashMap<String, Lct>,
+    observed: HashSet<String>,
 }
 
 impl MemberRegistry {
@@ -65,6 +73,28 @@ impl MemberRegistry {
         v.sort_by(|a, b| a.0.cmp(b.0));
         v
     }
+
+    /// Valid member identities observed this boot, for operational routing.
+    pub fn observed_ids_sorted(&self) -> Vec<&String> {
+        let mut v: Vec<_> = self.observed.iter().collect();
+        v.sort();
+        v
+    }
+
+    /// Observed identities whose custodial LCT is not durably publishable.
+    ///
+    /// This is evidence, not an error state to hide: appeal receipts carry it so
+    /// reviewers can distinguish "no candidate existed" from "a candidate was
+    /// routed despite degraded persistence."
+    pub fn unpersisted_ids_sorted(&self) -> Vec<&String> {
+        let mut v: Vec<_> = self
+            .observed
+            .iter()
+            .filter(|id| !self.members.contains_key(*id))
+            .collect();
+        v.sort();
+        v
+    }
 }
 
 /// Load the persisted member registry from the vault. Additive: never mints here
@@ -78,7 +108,8 @@ pub fn load_members(vault: &crate::vault::Vault) -> MemberRegistry {
     for p in persisted {
         members.insert(p.plugin_id, p.lct);
     }
-    MemberRegistry { members }
+    let observed = members.keys().cloned().collect();
+    MemberRegistry { members, observed }
 }
 
 /// Attach a citizenship reference to a member's LCT and re-persist, so the member
@@ -216,6 +247,10 @@ pub fn ensure_member(
     if id.is_empty() || is_synthetic {
         return None; // mirror member_lct's fail-closed domain exactly
     }
+    // Observation and durable publication are intentionally separate states.
+    // Record the former before attempting persistence so a failed vault write
+    // cannot silently shrink an appeal's independent-candidate pool.
+    registry.observed.insert(id.to_string());
     if let Some(lct) = registry.members.get(id) {
         return Some(lct.lct_id()); // hot path: already present
     }
@@ -320,6 +355,37 @@ mod tests {
         assert!(ensure_member(&mut vault, &mut reg, "runner", true, "sid", "anchor").is_none());
         assert!(ensure_member(&mut vault, &mut reg, "   ", false, "sid", "anchor").is_none());
         assert_eq!(reg.len(), 0);
+        assert!(reg.observed_ids_sorted().is_empty());
+    }
+
+    #[test]
+    fn persistence_failure_keeps_observed_member_for_routing_but_not_publication() {
+        let (_dir, mut vault) = fresh_vault();
+        // Make the already-open vault unwritable without changing its in-memory
+        // API. This drives the real save_doc failure in ensure_member.
+        std::fs::remove_file(vault.path()).unwrap();
+        std::fs::create_dir(vault.path()).unwrap();
+
+        let mut reg = MemberRegistry::default();
+        assert!(
+            ensure_member(&mut vault, &mut reg, "kimi-code", false, "sid", "anchor").is_none()
+        );
+        assert_eq!(reg.len(), 0, "failed persistence must not become publishable");
+        assert!(reg.iter_sorted().is_empty(), "publish set stays durable-only");
+        assert_eq!(
+            reg.observed_ids_sorted()
+                .into_iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["kimi-code"]
+        );
+        assert_eq!(
+            reg.unpersisted_ids_sorted()
+                .into_iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["kimi-code"]
+        );
     }
 
     #[test]
