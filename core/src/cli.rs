@@ -2153,8 +2153,19 @@ const MESH_KINDS: &[&str] = &[
 /// this binary legitimately runs on hosts without `private-context` checked out,
 /// where the embedded mirror is the safe default.
 fn mesh_kinds() -> Vec<String> {
-    if let Ok(dir) = std::env::var("HUB_MESH_DIR") {
-        if let Ok(text) = std::fs::read_to_string(std::path::Path::new(&dir).join("KINDS")) {
+    mesh_kinds_from(std::env::var("HUB_MESH_DIR").ok().as_deref())
+}
+
+/// The pure core of `mesh_kinds`, split from the environment read so tests can
+/// exercise it WITHOUT mutating the process environment. They previously did
+/// (`set_var`/`remove_var("HUB_MESH_DIR")` in two `#[test]`s at the bottom of
+/// this file): cargo runs tests on threads sharing one environment, so either
+/// test could land its mutation between the other's write and read — a
+/// probabilistic red no green run can disprove (flagged by kimi-code reviewing
+/// dp-web4/hestia#57; confirmed by second-reader inspection 2026-07-27).
+fn mesh_kinds_from(hub_mesh_dir: Option<&str>) -> Vec<String> {
+    if let Some(dir) = hub_mesh_dir {
+        if let Ok(text) = std::fs::read_to_string(std::path::Path::new(dir).join("KINDS")) {
             // Mirror the shell's `grep -Ev '^[[:space:]]*(#|$)'`: drop blank and
             // comment lines (kind lines carry no inline comments).
             let kinds: Vec<String> = text
@@ -2176,7 +2187,13 @@ fn mesh_kinds() -> Vec<String> {
 /// `cmd_hub_notify`, so an unknown kind aborts before the vault opens or a
 /// channel is sealed (no dirty state, nothing emitted).
 fn validate_mesh_kind(kind: &str) -> AnyResult<()> {
-    let kinds = mesh_kinds();
+    validate_mesh_kind_in(&mesh_kinds(), kind)
+}
+
+/// The pure core of `validate_mesh_kind`, taking the vocabulary explicitly for
+/// the same reason as `mesh_kinds_from`: tests must not need to mutate the
+/// shared process environment to reach a specific vocabulary.
+fn validate_mesh_kind_in(kinds: &[String], kind: &str) -> AnyResult<()> {
     if !kinds.iter().any(|k| k == kind) {
         anyhow::bail!(
             "unknown mesh kind '{kind}' — receivers' KINDS gate would silently drop \
@@ -3210,31 +3227,33 @@ mod member_key_source_tests {
 
     #[test]
     fn mesh_kind_validation_fails_closed_on_unknown_kind() {
-        use super::validate_mesh_kind;
-        // Ensure no env override leaks in from the host so we exercise the mirror.
-        std::env::remove_var("HUB_MESH_DIR");
+        use super::{mesh_kinds_from, validate_mesh_kind_in};
+        // The embedded mirror, reached with NO env override — obtained by passing
+        // None rather than by `remove_var`, because mutating the shared process
+        // environment is exactly the race this refactor removes.
+        let kinds = mesh_kinds_from(None);
         // Every embedded kind is accepted.
         for k in super::MESH_KINDS {
-            assert!(validate_mesh_kind(k).is_ok(), "canonical kind rejected: {k}");
+            assert!(validate_mesh_kind_in(&kinds, k).is_ok(), "canonical kind rejected: {k}");
         }
         // An unknown kind is rejected loudly (the forum-note drop hazard).
-        let err = validate_mesh_kind("pr_reviewww").unwrap_err().to_string();
+        let err = validate_mesh_kind_in(&kinds, "pr_reviewww").unwrap_err().to_string();
         assert!(err.contains("unknown mesh kind"), "unexpected error: {err}");
         assert!(err.contains("valid kinds"), "error should list valid kinds: {err}");
     }
 
     #[test]
     fn mesh_kinds_reads_single_source_file_when_present() {
-        use super::mesh_kinds;
+        use super::mesh_kinds_from;
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("KINDS"),
             "# comment line\n\npr_review_request\n  ack  \n# trailing\nforum-note\n",
         )
         .unwrap();
-        std::env::set_var("HUB_MESH_DIR", tmp.path());
-        let kinds = mesh_kinds();
-        std::env::remove_var("HUB_MESH_DIR");
+        // The dir goes in as an argument, never through `set_var` — a second test
+        // mutating HUB_MESH_DIR on another thread can no longer reach this read.
+        let kinds = mesh_kinds_from(Some(tmp.path().to_str().unwrap()));
         assert_eq!(kinds, vec!["pr_review_request", "ack", "forum-note"]);
     }
 
