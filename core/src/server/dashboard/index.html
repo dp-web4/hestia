@@ -341,6 +341,39 @@
     border-bottom: 1px solid var(--border);
   }
   .card-head h2 { border-bottom: none; padding-right: 0.75rem; flex: 1; }
+  /* --- Pending governance decisions --- */
+  .escalations-card { border-color: var(--warning); }
+  .escalations-card .card-head h2 { color: var(--warning); }
+  .escalation-list { display: flex; flex-direction: column; }
+  .escalation-row {
+    display: grid;
+    grid-template-columns: minmax(8rem, 12rem) minmax(0, 1fr) auto;
+    gap: 1rem;
+    align-items: center;
+    padding: 0.65rem 1.25rem;
+    border-top: 1px solid var(--border);
+  }
+  .escalation-row:first-child { border-top: 0; }
+  .escalation-who { font-family: var(--mono); font-size: 0.82rem; }
+  .escalation-about { min-width: 0; }
+  .escalation-marker {
+    display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: var(--mono); font-size: 0.8rem;
+  }
+  .escalation-meta { display: block; color: var(--fg-faint); font-size: 0.68rem; margin-top: 0.2rem; }
+  .escalation-actions { display: flex; gap: 0.4rem; }
+  .esc-btn {
+    border: 1px solid var(--border); border-radius: 4px; padding: 0.28rem 0.65rem;
+    background: transparent; color: var(--fg-dim); font: inherit; font-size: 0.72rem;
+    cursor: pointer;
+  }
+  .esc-btn.approve:hover { border-color: var(--success); color: var(--success); }
+  .esc-btn.deny:hover { border-color: var(--coral); color: var(--coral); }
+  .esc-btn[disabled] { opacity: 0.4; cursor: wait; }
+  @media (max-width: 760px) {
+    .escalation-row { grid-template-columns: 1fr; gap: 0.4rem; }
+    .escalation-actions { justify-content: flex-start; }
+  }
   .feed-filter {
     display: flex; gap: 0.25rem; align-items: center;
     padding: 0.5rem 1rem;
@@ -662,6 +695,17 @@
          cost a fifth of a row to say so. -->
     <div class="orch-bar" id="orch-bar">
       <span class="orch-chip-empty">none active in the last hour</span>
+    </div>
+
+    <!-- An escalation written only to the asking agent's stderr is not a notification
+         to the sovereign. This panel is fed from LIVE pending state, not inferred from
+         chain history, and uses the existing operator-authenticated decision route. -->
+    <div class="card escalations-card" id="escalations-card" hidden>
+      <div class="card-head">
+        <h2 id="escalations-title">Governance decisions</h2>
+        <span class="head-hint">pending permits nothing; approve or deny explicitly</span>
+      </div>
+      <div class="escalation-list" id="escalation-list"></div>
     </div>
 
     <!-- Trust collapses to one row per grain: the weakest measured dimension, which is
@@ -1085,6 +1129,68 @@
     }));
   }
 
+  function renderEscalations(rows) {
+    const card = $('escalations-card');
+    const root = $('escalation-list');
+    rows = rows || [];
+    card.hidden = rows.length === 0;
+    if (!rows.length) {
+      root.innerHTML = '';
+      return;
+    }
+    $('escalations-title').textContent =
+      `Governance decisions — ${rows.length} pending`;
+    root.innerHTML = rows.map(e => {
+      const remaining = Math.max(0, Number(e.secs_remaining || 0));
+      const mins = Math.ceil(remaining / 60);
+      const factors = (e.factors || []).length;
+      return `<div class="escalation-row" data-escalation="${escapeHtml(e.id)}">
+        <span class="escalation-who">${escapeHtml(e.plugin_id || 'unattributed')}</span>
+        <span class="escalation-about">
+          <span class="escalation-marker">${escapeHtml(e.tool_name)} → ${escapeHtml(e.marker)}</span>
+          <span class="escalation-meta">${escapeHtml(e.bar)} · ${factors} factor${factors === 1 ? '' : 's'} · ${mins}m left · ${escapeHtml(e.id)}</span>
+        </span>
+        <span class="escalation-actions">
+          <button class="esc-btn approve" data-esc-id="${escapeHtml(e.id)}" data-esc-approve="true">approve</button>
+          <button class="esc-btn deny" data-esc-id="${escapeHtml(e.id)}" data-esc-approve="false">deny</button>
+        </span>
+      </div>`;
+    }).join('');
+    root.querySelectorAll('.esc-btn').forEach(btn => btn.addEventListener('click', () => {
+      decideEscalation(btn.dataset.escId, btn.dataset.escApprove === 'true', btn);
+    }));
+  }
+
+  async function decideEscalation(id, approve, clicked) {
+    let reason = null;
+    if (approve) {
+      reason = prompt('Why is this governance-surface write safe to approve?');
+      if (reason === null) return;
+      reason = reason.trim();
+      if (!reason) {
+        alert('Approval requires a reason.');
+        return;
+      }
+    } else if (!confirm(`Deny governance escalation ${id}?`)) {
+      return;
+    }
+    const row = clicked.closest('.escalation-row');
+    row.querySelectorAll('button').forEach(b => { b.disabled = true; });
+    try {
+      const res = await apiFetch('/api/operator/gate-escalation', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id, approve, reason}),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+      await tick();
+    } catch (e) {
+      row.querySelectorAll('button').forEach(b => { b.disabled = false; });
+      alert(`Decision failed: ${e.message}`);
+    }
+  }
+
   async function connectOrch(id, el) {
     el.textContent = 'connecting…';
     try {
@@ -1497,6 +1603,7 @@
       : data.stats;
     renderStats(s, data.society, selectedOrch);
     renderOrchBar(data);
+    renderEscalations(data.pending_escalations);
     renderTrust(data.trust);
     renderHistogram(data);
     renderFeed(data.recent);

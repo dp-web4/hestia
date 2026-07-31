@@ -43,6 +43,12 @@ pub struct DashboardSnapshot {
     /// warn/deny feed filters (the `recent` window may not include older denies).
     #[serde(default)]
     pub policy_decisions: Vec<RecentEntry>,
+    /// Governance-surface writes awaiting a decision, oldest first. This is
+    /// live in-memory state rather than a reconstruction from the witness
+    /// chain: an opened event proves an ask existed, not that it remains
+    /// decidable after expiry or restart.
+    #[serde(default)]
+    pub pending_escalations: Vec<serde_json::Value>,
     /// Compatible orchestrators that are running and/or engaged — backs the
     /// orchestrator bar. Each entry carries `running` (process alive),
     /// `installed` (hooks wired into its config), `engaged` (acted in the last
@@ -577,6 +583,18 @@ impl ServerState {
             }
         };
 
+        let escalation_now = crate::server::gate_escalation::now_secs();
+        let pending_escalations = self
+            .gate_escalations
+            .pending(escalation_now)
+            .into_iter()
+            .map(|e| {
+                let mut row = serde_json::to_value(e).unwrap_or_default();
+                row["secs_remaining"] = serde_json::json!(e.secs_remaining(escalation_now));
+                row
+            })
+            .collect();
+
         // Orchestrators: registry entries that are running and/or engaged, plus
         // any engaged plugin not in the registry (custom orchestrators).
         let running = crate::orchestrators::detect_running();
@@ -687,6 +705,7 @@ impl ServerState {
             trust,
             recent,
             policy_decisions,
+            pending_escalations,
             delegations,
             hub_connections,
             profile,
@@ -743,6 +762,39 @@ mod tests {
         assert_eq!(s.society.chain_length, 0);
         assert!(s.trust.is_empty());
         assert!(s.recent.is_empty());
+        assert!(s.pending_escalations.is_empty());
+    }
+
+    #[test]
+    fn snapshot_surfaces_only_live_pending_escalations_with_decision_context() {
+        use crate::server::gate_escalation::{now_secs, DEFAULT_TTL_SECS};
+
+        let (_dir, mut state) = make_state();
+        let now = now_secs();
+        let opened = state
+            .gate_escalations
+            .open(
+                "codex",
+                "role:constellation:member",
+                "apply_patch",
+                "pre_tool_use.py",
+                now,
+                DEFAULT_TTL_SECS,
+            )
+            .unwrap();
+
+        let s = state.dashboard_snapshot(20);
+        assert_eq!(s.pending_escalations.len(), 1);
+        let row = &s.pending_escalations[0];
+        assert_eq!(row["id"], opened.id);
+        assert_eq!(row["plugin_id"], "codex");
+        assert_eq!(row["tool_name"], "apply_patch");
+        assert_eq!(row["marker"], "pre_tool_use.py");
+        assert_eq!(row["bar"], "sovereign_plus_peer");
+        assert!(
+            row["secs_remaining"].as_u64().unwrap() <= DEFAULT_TTL_SECS,
+            "remaining time is derived from the live clock: {row}"
+        );
     }
 
     #[test]
