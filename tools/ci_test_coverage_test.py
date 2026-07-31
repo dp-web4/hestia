@@ -107,6 +107,11 @@ NOT_A_TEST = {
         "package marker, no assertions",
     "plugin-sdk/python/tests/mock_hestia_server.py":
         "fixture: the stub daemon the SDK suites connect to, imported not run",
+    "plugins/gemini/tests/runner_decision.py":
+        "fidelity model of gemini-cli's hook-result parser, imported not run "
+        "(channel_contract_test.py:33 `from runner_decision import decide`); it is "
+        "the thing the gemini tests assert AGAINST, so naming it a test would make "
+        "CI grade the ruler by itself",
 }
 
 
