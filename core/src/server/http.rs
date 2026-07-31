@@ -521,6 +521,7 @@ async fn operator_adjudicate(
             action_type: "adjudication",
             action_target: "operator",
             action_id: "",
+            rule_triggered: "",
             reason: &adj_reason,
         };
         match s.apply_adjudication_ctx(&a.subject_plugin_id, dimension, score, &rep_ctx) {

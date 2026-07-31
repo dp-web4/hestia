@@ -670,6 +670,7 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
         action_type: "tool_execution",
         action_target: &action.tool_name,
         action_id: &rep_action_id,
+        rule_triggered: "",
         reason: if success {
             "outcome:success"
         } else {
@@ -1062,6 +1063,11 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 action_type: "policy_gate",
                 action_target: &action.tool_name,
                 action_id: &action_id_str,
+                // The rule id is in scope HERE — the same `evaluation` whose
+                // rule_id/rule_name go into the policy_decision chain entry
+                // above. Until plumbed, this delta row was the deny record that
+                // could not name the rule that charged the member.
+                rule_triggered: evaluation.rule_id.as_deref().unwrap_or(""),
                 reason: &reason,
             };
             let _ = s.apply_outcome_ctx(&plugin_id_for_chain, false, risk_magnitude, &rep_ctx);
@@ -1796,6 +1802,7 @@ async fn tool_witness_adjudication(state: &SharedState, args: &Value) -> ToolRes
             action_type: "adjudication",
             action_target: &evidence_ref,
             action_id: "",
+            rule_triggered: "",
             reason: &adj_reason,
         };
         adjudicated_state =
@@ -1938,6 +1945,7 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
         action_type: "reversal",
         action_target: &ref_target,
         action_id: "",
+        rule_triggered: "",
         reason: &rev_reason,
     };
     let judgment_mutated = cause.refutes_validity();
@@ -1981,6 +1989,7 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
             action_type: "adjudication",
             action_target: &adj_target,
             action_id: "",
+            rule_triggered: "",
             reason: &adj_reason,
         };
         let _ = s.apply_adjudication_ctx(
@@ -2846,6 +2855,11 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         action_type: "policy_gate",
         action_target: &tool_name,
         action_id: "",
+        // Caller-reported decision (the hook layer's own gate): the rule id, if
+        // any, lives in the caller's free-text `reason` and there is no rule_id
+        // arg on this surface to draw it from — adding one is the hook layer's
+        // half of this fix.
+        rule_triggered: "",
         reason: &gate_reason,
     };
     let trust_state = s.apply_outcome_ctx(&plugin_id, false, risk_magnitude, &rep_ctx)?;
