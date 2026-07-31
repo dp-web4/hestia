@@ -25,7 +25,7 @@ WATCHER = HERE.parent / "hestia-watch-member.sh"
 TIMEOUT = 8.0
 
 
-def read_until(proc: subprocess.Popen[str], needle: str) -> str:
+def read_until(proc: subprocess.Popen[str], needle: str, accept=None) -> str:
     lines: list[str] = []
     deadline = time.monotonic() + TIMEOUT
     assert proc.stdout is not None
@@ -39,7 +39,7 @@ def read_until(proc: subprocess.Popen[str], needle: str) -> str:
         if not line:
             break
         lines.append(line)
-        if needle in line:
+        if needle in line and (accept is None or accept(line)):
             return "".join(lines)
     raise AssertionError(
         f"did not observe {needle!r}; rc={proc.poll()} output={''.join(lines)!r}"
@@ -150,10 +150,17 @@ def unavailable_startup_is_absorbing() -> None:
             # Restoring the hasher does not create a time machine: the current disk
             # hash becomes visible evidence, but no startup baseline can be inferred.
             enabled.touch()
-            later = read_until(proc, "ARTIFACT plugin=")
-            assert "state=unverifiable" in later, later
-            assert "reason=startup-baseline-unavailable" in later, later
-            assert "disk_sha256=unavailable" not in later, later
+            later = read_until(
+                proc,
+                "ARTIFACT plugin=",
+                lambda line: "disk_sha256=unavailable" not in line,
+            )
+            measured = [
+                line for line in later.splitlines() if "ARTIFACT plugin=" in line
+            ][-1]
+            assert "state=unverifiable" in measured, later
+            assert "reason=startup-baseline-unavailable" in measured, later
+            assert "disk_sha256=unavailable" not in measured, later
             assert "ARTIFACT DRIFT" not in later, later
         finally:
             stop(proc)
