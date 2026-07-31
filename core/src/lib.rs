@@ -16,6 +16,7 @@ pub mod delegation;
 pub mod derivation;
 pub mod error;
 pub mod evidence;
+pub mod gate_cli;
 pub mod hub;
 pub mod lct_publish;
 pub mod member_registry;
