@@ -24,6 +24,52 @@ mkdir -p "$STATE/primers" && chmod 700 "$STATE" "$STATE/primers"
 exec 9>"$STATE/watch-$PLUGIN.lock"
 flock -n 9 || { echo "[hestia-watch] another watcher holds $STATE/watch-$PLUGIN.lock — exiting"; exit 1; }
 
+# A long-running bash process executes the script it began reading at startup; changing
+# the file underneath it does not deploy the change and can even leave the process reading
+# from a stale byte offset. Record a snapshot of the source bytes at startup, not the
+# repository commit: an installed copy or dirty worktree can honestly differ from either
+# HEAD or main. Bash does not expose its parsed buffer, so this is explicitly a source
+# snapshot rather than a claim that every byte had already been parsed.
+WATCH_SOURCE="${BASH_SOURCE[0]}"
+watch_source_hash() {
+  python3 - "$WATCH_SOURCE" <<'PY'
+import hashlib, sys
+h = hashlib.sha256()
+with open(sys.argv[1], "rb") as fh:
+    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+        h.update(chunk)
+print(h.hexdigest())
+PY
+}
+WATCH_STARTUP_SHA256="$(watch_source_hash 2>/dev/null || true)"
+[[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]] || WATCH_STARTUP_SHA256="unavailable"
+WATCH_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+WATCH_DRIFT_REPORTED=0
+
+announce_artifact() {
+  echo "[hestia-watch] ARTIFACT plugin=$PLUGIN startup_sha256=$WATCH_STARTUP_SHA256 started=$WATCH_STARTED_AT"
+}
+
+check_artifact_drift() {
+  local CURRENT
+  CURRENT="$(watch_source_hash 2>/dev/null || true)"
+  if [[ ! "$CURRENT" =~ ^[0-9a-f]{64}$ ]]; then
+    if [ "$WATCH_DRIFT_REPORTED" -eq 0 ]; then
+      echo "[hestia-watch] ARTIFACT UNVERIFIABLE — cannot hash the on-disk watcher; startup_sha256=$WATCH_STARTUP_SHA256"
+      WATCH_DRIFT_REPORTED=1
+    fi
+  elif [ "$CURRENT" != "$WATCH_STARTUP_SHA256" ]; then
+    if [ "$WATCH_DRIFT_REPORTED" -eq 0 ]; then
+      echo "[hestia-watch] ARTIFACT DRIFT — restart required; startup_sha256=$WATCH_STARTUP_SHA256 disk_sha256=$CURRENT"
+      WATCH_DRIFT_REPORTED=1
+    fi
+  else
+    WATCH_DRIFT_REPORTED=0
+  fi
+}
+
+announce_artifact
+
 # A retained primer is this mesh's ONLY record of an undelivered consume-once
 # notice, and until now nothing ever read the directory it lands in: two primers
 # sat unclaimed for 13h and 23h before anyone looked (CBP 2026-07-25). Say it out
@@ -213,8 +259,10 @@ announce_unanswered
 LAST_ANNOUNCE=$(date +%s)
 
 while true; do
+  check_artifact_drift
   NOW=$(date +%s)
   if [ $((NOW - LAST_ANNOUNCE)) -ge "$UNANSWERED_EVERY" ]; then
+    announce_artifact
     announce_unanswered
     LAST_ANNOUNCE=$NOW
   fi
