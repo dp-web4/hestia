@@ -18,12 +18,31 @@ assumption that this CLI signals failure by exit code. It didn't.
 Drives the REAL hestia-mesh.py against a stub MCP daemon, same no-test-seam posture
 as the other tests here: nothing in the CLI knows it is under test.
 
+Follow-up (kimi-code's nit 1 on #135, sharpened by measurement): the fix above covered
+only refusals that arrive as a well-formed `result` payload. Every OTHER way the daemon
+can say no escaped as an uncaught Python traceback — rc=1 with an EMPTY stdout, which is
+the "I never got there" code, and which breaks the stdout-carries-the-payload contract
+that #135 itself established. Confirmed live against the daemon on CBP 2026-07-31:
+
+  unknown method     -> {"jsonrpc":"2.0","id":9,"error":{"code":-32601,...}}  (no `result`)
+  stale session id   -> HTTP 404 "Session not found"
+  no session id      -> HTTP 422
+
+The first KeyError'd on ["result"]; the other two raised HTTPError out of urlopen. So
+`failed()`'s second key `"error"` — the one the nit asked about — was defending a shape
+that could not reach it, because rpc() crashed one layer earlier.
+
 Cases:
   A  send refused by the daemon        -> rc=3, and the error payload still on stdout
   B  send accepted                     -> rc=0
   C  peek refused by the daemon        -> rc!=0, so "could not read" != "empty inbox"
   D  response carrying no data: frame  -> rc!=0, not a silent empty result
   E  missing HESTIA_MESH_PLUGIN        -> rc=2 (unchanged; identity != refusal)
+  F  JSON-RPC protocol error envelope  -> rc=3 + payload on stdout, not a traceback
+  G  daemon answers a non-2xx          -> rc=3 + payload on stdout, not a traceback
+  H  result frame in an unknown shape  -> rc=3 + payload on stdout, not a traceback
+  I  nothing listening at all          -> rc=1, the one case that IS "never got there"
+  J  D/G/H name what DID arrive        -> body excerpt in the payload (nit 2)
 """
 import json
 import os
@@ -69,6 +88,23 @@ class Stub(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b": keepalive\n\n")
             return
+        if MODE["tool"] == "rpc_error":
+            # A JSON-RPC PROTOCOL error: `error` instead of `result`, so indexing
+            # ["result"] raised KeyError. Shape copied from the live daemon.
+            return self._frame({"jsonrpc": "2.0", "id": body["id"],
+                                "error": {"code": -32601, "message": "no/such/method"}})
+        if MODE["tool"] == "http_error":
+            # What a stale mcp-session-id actually returns. urlopen raises HTTPError.
+            raw = b'{"error": "operator authentication failed"}'
+            self.send_response(404)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+        if MODE["tool"] == "bad_shape":
+            # 200, well-formed JSON-RPC result, but not the content shape we index.
+            return self._frame({"jsonrpc": "2.0", "id": body["id"],
+                                "result": {"content": []}})
         if MODE["tool"] == "refuse":
             return self._sse(body["id"], {"_hestia_error": {
                 "code": "hestia.member_notify_bad_pointer",
@@ -88,10 +124,12 @@ class Stub(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _sse(self, rid, obj):
-        frame = json.dumps({"jsonrpc": "2.0", "id": rid,
+        return self._frame({"jsonrpc": "2.0", "id": rid,
                             "result": {"content": [{"type": "text",
                                                     "text": json.dumps(obj)}]}})
-        raw = f"event: message\ndata: {frame}\n\n".encode()
+
+    def _frame(self, envelope):
+        raw = f"event: message\ndata: {json.dumps(envelope)}\n\n".encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(raw)))
@@ -144,7 +182,47 @@ if __name__ == "__main__":
                        env_extra={"HESTIA_MESH_PLUGIN": ""}, mode="ok")
     check("E  missing identity still exits 2 (unchanged)", rc == 2, f"rc={rc}")
 
+    # F/G/H: the daemon answered and declined, but not as a `result` payload. Each of
+    # these exited 1 with a traceback and empty stdout on the CLI as merged in #135.
+    for label, mode in (("F  JSON-RPC protocol error", "rpc_error"),
+                        ("G  non-2xx from the daemon", "http_error"),
+                        ("H  unknown result shape", "bad_shape")):
+        rc, out, err = run(["peek"], mode=mode)
+        check(f"{label} exits 3, not 1", rc == 3, f"rc={rc}")
+        check(f"{label} keeps the payload on stdout", "_hestia_error" in out, f"stdout={out[:80]!r}")
+        check(f"{label} does not traceback", "Traceback" not in err, err.strip()[-90:])
+
+    # J (nit 2): naming the tool is not enough — the operator needs what DID arrive,
+    # and the response is gone by the time they go looking.
+    rc, out, _ = run(["drain"], mode="no_frame")
+    check("J  no_data_frame names what did arrive", "body_excerpt" in out, f"stdout={out[:160]!r}")
+    rc, out, _ = run(["peek"], mode="http_error")
+    check("J  http_error carries the response body", "operator authentication failed" in out,
+          f"stdout={out[:160]!r}")
+
+    # K: session-mesh-inbox.sh reports a non-zero rc by printing the first two lines of
+    # STDERR. Those two lines used to be a traceback header; if the diagnosis moves to
+    # stdout (which that caller discards) the branch goes correct-but-mute.
+    for label, mode in (("K  payload refusal", "refuse"), ("K  transport refusal", "http_error")):
+        rc, out, err = run(["peek"], mode=mode)
+        first2 = "\n".join(err.strip().splitlines()[:2])
+        check(f"{label} names itself in stderr line 1", "the daemon refused" in first2,
+              f"stderr[:2]={first2[:100]!r}")
+        check(f"{label} stdout stays pure JSON", json.loads(out) is not None, out[:80])
+
+    dead = f"http://127.0.0.1:{srv.server_port}/mcp"
     srv.shutdown()
+    srv.server_close()  # release the port, so I below is refused rather than timing out
+
+    # I: the one case that really is "I never got there" — nothing listening. Must stay
+    # rc=1 and must NOT be reported as a refusal, or the trio collapses again.
+    env = dict(os.environ, HESTIA_ENDPOINT=dead, HESTIA_MESH_PLUGIN="test-member")
+    env.pop("HESTIA_ROLE", None)
+    p = subprocess.run([sys.executable, CLI, "peek"], capture_output=True, text=True,
+                       env=env, timeout=20)
+    check("I  nothing listening exits 1 (not 3)", p.returncode == 1, f"rc={p.returncode}")
+    check("I  nothing listening does not traceback", "Traceback" not in p.stderr,
+          p.stderr.strip()[-90:])
     if FAILURES:
         print(f"\nFAILED: {', '.join(FAILURES)}")
         sys.exit(1)
