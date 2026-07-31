@@ -264,9 +264,18 @@ def test_periodic_trigger(tmp: Path):
         write({"Label": "x", "StartInterval": 3600})
         check("StartInterval is a schedule", inventory.periodic_trigger()[0],
               "launchd-agent-installed")
+        write({"Label": "x", "StartInterval": "hourly"})
+        check("a StartInterval key with the wrong type is not a schedule",
+              inventory.periodic_trigger()[0], "launchd-agent-installed-no-schedule")
+        write({"Label": "x", "StartInterval": 0})
+        check("a non-positive StartInterval is not a schedule",
+              inventory.periodic_trigger()[0], "launchd-agent-installed-no-schedule")
         write({"Label": "x", "StartCalendarInterval": {"Minute": 0}})
         check("StartCalendarInterval is a schedule", inventory.periodic_trigger()[0],
               "launchd-agent-installed")
+        write({"Label": "x", "StartCalendarInterval": {"Minute": 99}})
+        check("an out-of-range calendar value is not a schedule",
+              inventory.periodic_trigger()[0], "launchd-agent-installed-no-schedule")
         # launchctl would refuse this too, so nothing is scheduled either way — but "fix
         # the file" and "add a key" are different repairs, so they are different states.
         plist.write_text("<plist/>")
@@ -519,11 +528,20 @@ def test_unit_specifier_escaping():
     if not m:
         return
     probe = "/tmp/50%off/100%uptime/a%%b"
-    r = subprocess.run(["bash", "-c", m.group(0) + '\nsd_escape "$1"', "_", probe],
-                       capture_output=True, text=True)
+    r = subprocess.run(
+        ["bash", "-c", 'PYTHON="$(command -v python3)"\n' + m.group(0)
+         + '\nsd_escape "$1"', "_", probe],
+        capture_output=True, text=True)
     check("sd_escape exits 0", r.returncode, 0)
     check("sd_escape doubles every percent", r.stdout,
           "/tmp/50%%off/100%%uptime/a%%%%b")
+    syntax_probe = '/tmp/a"b/back\\slash'
+    syntax = subprocess.run(
+        ["bash", "-c", 'PYTHON="$(command -v python3)"\n' + m.group(0)
+         + '\nsd_escape "$1"', "_", syntax_probe],
+        capture_output=True, text=True)
+    check("sd_escape protects quoted-unit syntax", syntax.stdout,
+          '/tmp/a\\"b/back\\\\slash')
     if not shutil.which("systemd-analyze"):
         print("SKIPPED: sd_escape round-trip — no systemd-analyze on this machine "
               "(the string assertion above still ran)")
@@ -541,6 +559,15 @@ def test_unit_specifier_escaping():
         if resolved:
             check("systemd decodes the escaped value to the original path",
                   resolved.group(1), probe + "/NOPE")
+        quoted = Path(d) / "sd-escape-quoted.service"
+        quoted.write_text("[Service]\nType=oneshot\n"
+                          f'Environment="HESTIA_WORKSPACE={syntax.stdout}"\n'
+                          f'ExecStart="/bin/echo" --workspace "{syntax.stdout}"\n')
+        q = subprocess.run(["systemd-analyze", "--user", "verify", str(quoted)],
+                           capture_output=True, text=True)
+        check("systemd accepts quote/backslash in a quoted argument",
+              "Invalid syntax" not in q.stderr and "Unbalanced quoting" not in q.stderr,
+              True)
 
 
 def test_unit_verdict():

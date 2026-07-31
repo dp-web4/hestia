@@ -199,6 +199,12 @@ esac
 # that is not running, is Linux and still cannot schedule anything.
 if [ "$PERIODIC" = systemd ] && ! command -v systemctl >/dev/null 2>&1; then
   PERIODIC=none; PERIODIC_WHY="Linux, but no systemctl on PATH"
+elif [ "$PERIODIC" = systemd ] && ! systemctl --user show-environment >/dev/null 2>&1; then
+  # `systemctl` existing does not mean a user manager is reachable (containers, WSL
+  # without the user bus, scrubbed automation). Discovering that at daemon-reload used
+  # to abort after the binary and unit files were written but before the SessionStart
+  # hook was installed. Decide before step 1 so the two viable triggers still land.
+  PERIODIC=none; PERIODIC_WHY="Linux, but the systemd user manager is unreachable"
 elif [ "$PERIODIC" = launchd ]; then
   # Same rule as systemctl above, and it is not hypothetical here: `plutil` is what makes
   # the difference between writing a plist and knowing it parses, and step 2 refuses to
@@ -511,11 +517,13 @@ if [ "$PERIODIC" = systemd ]; then
 #     "Unit configuration has fatal error, unit will not be started", while the same value
 #     in Environment= is dropped with "Failed to resolve specifiers ... ignoring".
 #
-# `%%` is systemd's literal percent and round-trips (measured: `50%%off` verifies as
-# `50%off`). That is the whole of sd_escape — `$` needs nothing, because systemd expands
-# `${VAR}` but leaves a bare `$name` mid-word alone, and Documentation= takes specifiers
-# too, so SRC_DIR goes through it as well.
-sd_escape() { printf '%s' "$1" | sed 's/%/%%/g'; }
+# `%%` is systemd's literal percent. The values below also live inside DOUBLE-QUOTED
+# systemd fields, so percent is not the whole encoder: backslash and quote must use the
+# unit-file C escapes, and a line break cannot be represented by simply copying it into
+# the generated line. Python is already resolved and probed above; use it as the one
+# unambiguous encoder and reject control characters rather than generating a second
+# directive from a path.
+sd_escape() { "$PYTHON" -c 'import sys; s=sys.argv[1]; any(ord(c)<32 or ord(c)==127 for c in s) and sys.exit("install: control character cannot be encoded in a systemd unit path"); sys.stdout.write(s.replace("\\","\\\\").replace("\"","\\\"").replace("%","%%"))' "$1"; }
 SD_SRC_DIR="$(sd_escape "$SRC_DIR")"
 SD_BIN="$(sd_escape "$BIN")"
 SD_WORKSPACE="$(sd_escape "$WORKSPACE")"
@@ -739,10 +747,26 @@ if [ "$PERIODIC" = launchd ]; then
   # load/unload is kept for older macOS. `bootout` on a label that is not loaded exits
   # non-zero, which under `set -e` is the same class of abort this whole file is about.
   launchctl bootout "gui/$UID_N/$LAUNCHD_LABEL" 2>/dev/null || true
-  BOOTSTRAP_ERR="$(launchctl bootstrap "gui/$UID_N" "$PLIST" 2>&1)" || {
+  LAUNCHD_LOADED=0
+  if BOOTSTRAP_ERR="$(launchctl bootstrap "gui/$UID_N" "$PLIST" 2>&1)"; then
+    LAUNCHD_LOADED=1
+  else
     launchctl unload "$PLIST" 2>/dev/null || true
-    BOOTSTRAP_ERR="$(launchctl load "$PLIST" 2>&1)" || true
-  }
+    if FALLBACK_ERR="$(launchctl load "$PLIST" 2>&1)"; then
+      LAUNCHD_LOADED=1
+    else
+      BOOTSTRAP_ERR="$BOOTSTRAP_ERR; fallback load: $FALLBACK_ERR"
+    fi
+  fi
+  if [ "$LAUNCHD_LOADED" != 1 ]; then
+    rm -f "$PLIST"
+    PERIODIC=none
+    PERIODIC_WHY="Darwin — launchd refused both bootstrap and load ($BOOTSTRAP_ERR); plist removed"
+    skip_periodic
+  fi
+fi
+
+if [ "$PERIODIC" = launchd ]; then
   echo "installed: hourly launchd agent ($(sh_pin "$PLIST"))"
 
   # `launchctl load` SUCCEEDS ON A VALID PLIST AND SAYS NOTHING ABOUT THE JOB (same

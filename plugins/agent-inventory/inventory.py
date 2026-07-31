@@ -868,6 +868,33 @@ def periodic_trigger() -> tuple[str, str, list[str]]:
 LAUNCHD_SCHEDULE_KEYS = ("StartInterval", "StartCalendarInterval")
 
 
+def _valid_launchd_schedule(data: dict) -> bool:
+    """Whether a parsed job contains a schedule with launchd's documented value shape."""
+    interval = data.get("StartInterval")
+    if isinstance(interval, int) and not isinstance(interval, bool) and interval > 0:
+        return True
+
+    calendar = data.get("StartCalendarInterval")
+    entries = calendar if isinstance(calendar, list) else [calendar]
+    limits = {
+        "Minute": (0, 59), "Hour": (0, 23), "Day": (1, 31),
+        "Weekday": (0, 7), "Month": (1, 12),
+    }
+    for entry in entries:
+        if not isinstance(entry, dict) or any(k not in limits for k in entry):
+            continue
+        if all(
+            isinstance(v, int)
+            and not isinstance(v, bool)
+            and limits[k][0] <= v <= limits[k][1]
+            for k, v in entry.items()
+        ):
+            # An empty dictionary is meaningful to launchd: every omitted field is a
+            # wildcard, so it fires every minute.
+            return True
+    return False
+
+
 def _launchd_schedule(plists: list[Path]) -> str:
     """`installed` | `installed-no-schedule` | `unparseable`, over all matching plists.
 
@@ -893,7 +920,7 @@ def _launchd_schedule(plists: list[Path]) -> str:
         if not isinstance(data, dict):
             unreadable = True
             continue
-        if any(k in data for k in LAUNCHD_SCHEDULE_KEYS):
+        if _valid_launchd_schedule(data):
             return "installed"
     return "unparseable" if unreadable else "installed-no-schedule"
 
