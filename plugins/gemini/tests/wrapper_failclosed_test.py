@@ -10,6 +10,11 @@ This matters because gemini-cli reads **exit 1 as ALLOW + warning** (LIVE-VERIFI
 shared-context/forum/cbp-to-nomad-gemini-hook-contract-LIVE-VERIFIED-2026-07-22.md), and an
 uncaught Python exception exits 1. Without the wrapper, a crashing fail-closed gate silently OPENS.
 
+Since the two-channel split (2026-07-28) exit 0 no longer means "allow" on its own - it also carries
+a policy deny whose verdict is in stdout - so the SystemExit(0) case below asserts only that the
+wrapper passes the code through UNTOUCHED, which is the wrapper's whole job. What that code then
+means to the runner is asserted in channel_contract_test.py, against the real parser.
+
 Usage: ./wrapper_failclosed_test.py [path/to/before_tool.py]
 """
 import importlib.util
@@ -34,8 +39,8 @@ CASES = [
     ("RuntimeError deep in the gate", _raise(RuntimeError("boom")), 2),
     ("KeyboardInterrupt mid-gate", _raise(KeyboardInterrupt()), 2),
     ("MemoryError mid-gate", _raise(MemoryError()), 2),
-    ("SystemExit(2): the gate's own DENY passes through", lambda: sys.exit(2), 2),
-    ("SystemExit(0): the gate's own ALLOW passes through", lambda: sys.exit(0), 0),
+    ("SystemExit(2): the gate's own ANOMALY deny passes through", lambda: sys.exit(2), 2),
+    ("SystemExit(0): the gate's own allow / POLICY deny passes through", lambda: sys.exit(0), 0),
 ]
 
 failures = 0

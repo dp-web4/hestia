@@ -17,15 +17,40 @@ and, per Google's official hooks reference, near-identical in the fields this ga
     So the ONLY fail-open surface is a TIMEOUT or spawn error (hence CBP's ext4-not-/mnt/c note: a 9p
     cold-load that exceeds the hook timeout fails open). A running gate that exits 2+ blocks.
   - CRITICAL: a block requires EMITTED TEXT. The runner parses `stdout.trim() || stderr.trim()`
-    (L455); on exit 2 with EMPTY output, `output` is undefined and the call is NOT denied. So this
-    gate ALWAYS writes a reason to stderr before `exit 2` (see deny() and every exit-2 path). A stdout
-    JSON `{"decision":"deny","reason":...}` at exit 0 would also block (L459-467), but exit-2+stderr
-    is simpler and used here.
+    (L455); on exit 2 with EMPTY output, `output` is undefined and the call is NOT denied. So every
+    exit-2 path here writes a reason to stderr first.
+  - A stdout JSON `{"decision":"deny","reason":...}` at exit 0 ALSO blocks (L459-467). This gate uses
+    BOTH channels, split by cause - see "TWO DENY CHANNELS" below.
 
-This gate is therefore FAIL-CLOSED BY CONSTRUCTION: it only ever exits 0 (explicit confirmed allow) or
-2 (deny, with text). It never exits 1, so it never emits an allow-with-warning by accident. That last
-claim is only true because main() wraps the whole gate in a deny-on-exception - an uncaught Python
-exception exits 1, which the engine reads as ALLOW. See main().
+TWO DENY CHANNELS (2026-07-28, CBP - answering nomad's UX finding from the Nomad live pass):
+Per-hook `success` is exactly `exitCode === 0` (close-handler), and `logHookExecution` prints a yellow
+operator banner - `Hook(s) [...] failed for event BeforeTool` - for every result with success=false.
+So an exit-2 deny is reported to the OPERATOR as a failed hook. It blocks correctly and the banner is
+a UI "user-feedback" event that never reaches the model, so this was never a safety bug. It was a
+SIGNAL bug: with exit-2-always, the banner fired identically for "boundary held", "gate crashed" and
+"gate timed out", so it carried no information and a real malfunction was invisible inside the noise.
+
+The obvious fix - move ALL denies to exit 0 + stdout JSON - was rejected, because the exit code is
+this gate's fail-closed anchor. On exit 2, ANY emitted text denies (unparseable text falls back to
+{decision:'deny'}). On exit 0, the verdict survives only if the JSON parses: a truncated, prefixed or
+otherwise corrupted payload falls back to {decision:'allow'} - corruption fails OPEN. Blanket-swapping
+would trade a cosmetic banner for a new fail-open surface on the one path that must never have one.
+
+So the channel is chosen by CAUSE, which is also what makes the banner informative again:
+  - POLICY deny (Gate-1a innate, Gate-1b scope/command-scope, an explicit governor verdict) -> exit 0
+    + stdout JSON. These are paths where the gate reached a decision and fully controls fd 1, so the
+    fail-open-on-corruption risk is bounded by _emit_verdict() below. Clean deny, no banner.
+  - ANOMALY (unparseable event, governor unreachable or inconclusive, any uncaught exception) ->
+    exit 2 + stderr, unchanged. Corruption here still falls back to deny.
+Net: the banner now means "the gate could not do its job", and a held boundary is silent. The gate's
+own deny text has always said "This is a boundary, not a failure" - the wire protocol now agrees.
+Tests assert the RUNNER's decision (tests/runner_decision.py), never the bare exit code, because
+under this split the exit code alone no longer distinguishes allow from deny.
+
+This gate is therefore FAIL-CLOSED BY CONSTRUCTION: it only ever exits 0 (a confirmed allow, or a
+policy deny carried in stdout JSON) or 2 (an anomaly, with text). It never exits 1, so it never emits
+an allow-with-warning by accident. That last claim is only true because main() wraps the whole gate in
+a deny-on-exception - an uncaught Python exception exits 1, which the engine reads as ALLOW. See main().
 
 FIDELITY NOTE (2026-07-22): the exit-code/deny/fail-open contract above is SOURCE-verified (file+lines
 cited) AND now LIVE-VERIFIED by CBP against an installed gemini-cli 0.52.0 with real model
@@ -62,6 +87,7 @@ Config (all env-overridable; defaults suit a generic install):
   HESTIA_GEMINI_LAUNCH_CWD launch dir granted for the session          (default: os.getcwd())
   HESTIA_FORBIDDEN_EXTRA   comma-separated extra forbidden path tokens (e.g. your private repo names)
 """
+import contextlib
 import json
 import os
 import re
@@ -73,10 +99,15 @@ import subprocess
 # escapes that string-prefix logic cannot see. This gemini gate is its first adopter; if it is absent
 # (partial checkout), we fall back to the inline string check, which still denies the bare-root case.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "lib"))
-try:
-    from path_scope import check_paths as _shared_check_paths  # type: ignore
-except Exception:
-    _shared_check_paths = None
+# fd 1 is the VERDICT CHANNEL (see TWO DENY CHANNELS above): the runner JSON-parses stdout in
+# preference to stderr, so a single stray byte printed by an imported module would shadow a deny
+# payload and - at exit 0 - degrade it to an allow. Import under a redirect so nothing but
+# _emit_verdict() can ever reach stdout.
+with contextlib.redirect_stdout(sys.stderr):
+    try:
+        from path_scope import check_paths as _shared_check_paths  # type: ignore
+    except Exception:
+        _shared_check_paths = None
 
 WORKSPACE = os.environ.get("HESTIA_WORKSPACE", os.path.expanduser("~/ai-workspace"))
 IDENTITY = os.path.expanduser(
@@ -324,23 +355,56 @@ def command_in_scope(cmd, scopes):
 MODE = os.environ.get("HESTIA_GEMINI_GATE_MODE", "enforce").lower()
 
 
+def _emit_verdict(reason):
+    """POLICY-deny channel: write the runner's decision object as the ONLY bytes on fd 1.
+
+    Written with os.write in a full-write loop rather than print(): a short write would truncate the
+    JSON, and truncated JSON at exit 0 is an ALLOW (convertPlainTextToHookOutput's exit-0 branch).
+    ensure_ascii keeps the payload single-byte so a non-ASCII reason cannot straddle a partial write.
+    The caller exits 0 immediately after - there is no code path between this write and the exit.
+    """
+    blob = json.dumps({"decision": "deny", "reason": reason}, ensure_ascii=True).encode("ascii")
+    written = 0
+    while written < len(blob):
+        written += os.write(1, blob[written:])
+
+
 def deny(reason, what_to_do, innate=False):
-    """innate=True -> ALWAYS blocks (egress/secret is irreversible). Tunable rules honor MODE."""
+    """A POLICY deny: the gate reached a verdict. innate=True -> ALWAYS blocks (egress/secret is
+    irreversible); tunable rules honor MODE.
+
+    Exits 0 with a stdout JSON deny, NOT exit 2 - a held boundary is not a hook failure, and reserving
+    exit 2 for anomalies is what gives the operator's banner its meaning back (TWO DENY CHANNELS).
+    The reason text is unchanged and still reaches the model, now as `reason` on the decision object
+    instead of as scraped stderr."""
     if innate or MODE == "enforce":
-        sys.stderr.write(
+        _emit_verdict(
             f"hestia: deny [scope] - {reason}. This is a boundary, not a failure: don't re-run the "
-            f"same call. {what_to_do} Asking is a trust-building act; reaching is witnessed.\n")
-        sys.exit(2)
+            f"same call. {what_to_do} Asking is a trust-building act; reaching is witnessed.")
+        sys.exit(0)
     sys.stderr.write(f"hestia: warn [scope] - {reason} (warn-rollout: allowed; would block under enforce)\n")
 
 
+def anomaly(reason):
+    """The ANOMALY channel: the gate could NOT reach a verdict (unreadable event, unreachable or
+    inconclusive governor, crash). Keeps exit 2 + stderr, where the runner denies on ANY emitted text
+    - so corruption of this message still fails closed - and raises the operator banner, which now
+    means what it says: the gate could not do its job."""
+    sys.stderr.write(reason if reason.endswith("\n") else reason + "\n")
+    sys.exit(2)
+
+
 def _gate():
+    # fd 1 is the verdict channel and nothing else. Rebinding sys.stdout means a stray print() added
+    # here later lands on stderr (ignored whenever stdout carries a verdict) instead of shadowing the
+    # deny payload. Only _emit_verdict(), which writes fd 1 directly, can reach stdout.
+    sys.stdout = sys.stderr
     # Fail-closed skeleton: any unexpected error -> deny (never fall through to allow).
     try:
         event = json.loads(sys.stdin.read() or "{}")
     except Exception:
-        sys.stderr.write("hestia: deny [gate] - could not parse the tool event; failing closed.\n")
-        sys.exit(2)
+        # ANOMALY, not policy: an unreadable event means the gate never got to judge the act.
+        anomaly("hestia: deny [gate] - could not parse the tool event; failing closed.")
 
     if event.get("hook_event_name") != "BeforeTool":
         sys.exit(0)  # not our event
@@ -391,23 +455,46 @@ def _gate():
     # Gate 2 - society safety (the governor). Local-read-class skips it; write/exec AND EGRESS need
     # the daemon's verdict; fail closed.
     if tool.lower() not in READ_CLASS:
+        # A governor that isn't there is an ANOMALY, and it has to be detected BEFORE the spawn:
+        # `python3 /nonexistent/governor.py` exits 2 with text on stderr, which is byte-for-byte the
+        # shape of a real governor verdict. Without this check the missing-daemon case would report
+        # as a clean policy deny - it would still block, but it would block silently, hiding exactly
+        # the malfunction the banner exists to show. (Caught by gate_holes_repro.sh, whose governor
+        # is a nonexistent path on purpose.)
+        if not os.path.isfile(CLAUDE_PRE):
+            if MODE == "enforce":
+                anomaly(f"hestia: deny [safety] - the society safety gate is not at {CLAUDE_PRE}; "
+                        "failing closed on a consequential act.")
+            sys.stderr.write("hestia: warn [safety] - governor missing (warn-rollout: allowed).\n")
+            sys.exit(0)
         try:
             env = dict(os.environ, HESTIA_PLUGIN_ID="gemini-cli", HESTIA_PRE_FAIL_CLOSED="1")
             r = subprocess.run([sys.executable, CLAUDE_PRE], input=json.dumps(to_claude_lineage(event, tool, tinput, mcp)),
                                capture_output=True, text=True, timeout=6, env=env)
             if r.returncode != 0:  # daemon denied, or inconclusive -> fail-closed for a write/exec act
-                msg = (r.stderr.strip() if r.returncode == 2 and r.stderr.strip()
-                       else "hestia: deny [safety] - blocked/inconclusive at the society safety gate.")
+                # Split by which of the two it was. returncode 2 WITH a reason is the governor's own
+                # verdict - a policy deny, carried on the clean channel. Anything else (a crash, a
+                # deny with no reason, an unexpected code) is inconclusive: the governor did not
+                # actually vouch either way, so it takes the anomaly channel and raises the banner.
+                # `[fail-closed]` is the governor's OWN no-verdict marker (claude-code
+                # pre_tool_use.deny_no_verdict): it exits 2 like a verdict but means the policy daemon
+                # was unreachable, so it is an anomaly here too - the operator should see that.
+                text = r.stderr.strip()
+                verdict = text if (r.returncode == 2 and text
+                                   and "[fail-closed]" not in text) else None
                 if MODE == "enforce":
-                    sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
-                    sys.exit(2)
+                    if verdict:
+                        _emit_verdict(verdict)
+                        sys.exit(0)
+                    anomaly(text or "hestia: deny [safety] - blocked/inconclusive at the society "
+                                    "safety gate.")
+                msg = text or "hestia: deny [safety] - blocked/inconclusive at the society safety gate."
                 sys.stderr.write("hestia: warn [safety] - " + msg.split("- ", 1)[-1] +
                                  " (warn-rollout: allowed; would block under enforce)\n")
-        except Exception:
+        except Exception:          # SystemExit is a BaseException: the verdicts above pass through
             if MODE == "enforce":
-                sys.stderr.write("hestia: deny [safety] - could not reach the governor; failing "
-                                 "closed on a consequential act.\n")
-                sys.exit(2)
+                anomaly("hestia: deny [safety] - could not reach the governor; failing "
+                        "closed on a consequential act.")
             sys.stderr.write("hestia: warn [safety] - governor unreachable (warn-rollout: allowed).\n")
 
     sys.exit(0)  # the ONLY allow path - reached only after every gate explicitly passed
@@ -419,7 +506,12 @@ def main():
     LIVE-VERIFIED (CBP, gemini-cli 0.52.0, 2026-07-22): exit 1 is ALLOW+warning, and an uncaught
     Python exception exits 1. So without this wrapper a crashing fail-closed gate silently OPENS -
     confirmed here by repro (`tool_name` non-string -> AttributeError -> exit 1 -> tool ran).
-    SystemExit must pass through untouched: it carries the gate's real 0/2 verdict.
+    SystemExit must pass through untouched: it carries the gate's real verdict - which since the
+    two-channel split is exit 0 for a policy deny (payload already on stdout) as well as for an
+    allow, so this handler must never re-interpret an exit code it did not raise itself.
+    A crash IS an anomaly, so the wrapper's own deny stays on the exit-2 stderr channel: if the crash
+    happened mid-payload, the partial JSON on stdout is unparseable, and unparseable text at exit 2
+    falls back to deny. That is exactly why the anomaly channel kept the exit code.
     """
     try:
         _gate()
