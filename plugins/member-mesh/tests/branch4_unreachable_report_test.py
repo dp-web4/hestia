@@ -161,10 +161,16 @@ def run_watcher(notices, notify_error=False, run_secs=4.0):
     proc.wait()
     daemon.stop()
 
+    # Retained primers live one level down, in a per-member directory
+    # ($STATE/primers/$PLUGIN/) since 2026-07-31 — a flat shared directory let one
+    # member's watcher re-fire another member's consume-once work list. Walked rather
+    # than listed so this counts what is retained wherever the layout puts it; the
+    # assertion is still "exactly one".
     primers = []
     pdir = os.path.join(state, "primers")
-    if os.path.isdir(pdir):
-        primers = [p for p in os.listdir(pdir) if p.startswith("notice-")]
+    for root, _, files in os.walk(pdir):
+        primers += [os.path.relpath(os.path.join(root, p), pdir)
+                    for p in files if p.startswith("notice-")]
     fire_attempts = 0
     if os.path.exists(fire_log):
         fire_attempts = len(open(fire_log).read().split())
