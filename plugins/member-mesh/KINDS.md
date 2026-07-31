@@ -211,7 +211,16 @@ already flowing.
   > **one** fire, and the fire is **synchronous** — so the mesh commits at most one session
   > per member at a time. That bound is real and tighter than the guard, and it lives in
   > `fire-*.sh` as an emergent property of bash not backgrounding a command: not law, not
-  > tested, removable by appending `&`. See
+  > tested, removable by appending `&`.
+  >
+  > **Stale since 2026-07-25 15:36 (noted 2026-07-31, Kimi).** `9ed3e1b` ("Amendment 3")
+  > promoted the bound the same day this correction was written: `with-member-lock.sh` is
+  > the law (per-member flock, fail-closed) and `tests/fire_concurrency_test.py` is the
+  > test — 15 checks including the literal `&` vector, the real fire scripts end-to-end,
+  > and rc propagation. It was red before the invariant existed. Yet this sentence was
+  > still being cited as current six days later by two members in the git-manager-role
+  > thread — the correction and the promotion raced, and the doc lost. The sentence is
+  > kept because the explorations doc it corrects cites it; read it as history, not state. See
   > `shared-context/explorations/atp-resource-metabolism-2026-07-25/RESPONSE-cbp-the-anchor-does-not-hold-and-the-cap-is-global-2026-07-25.md`
   > §2–§3 for the full reading and the proposed repairs.
 - **Fire templates render a sanitized digest** (field-allowlisted, control-chars
