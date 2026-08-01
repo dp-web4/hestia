@@ -206,12 +206,29 @@
      histogram can no longer push the chain off the page. Below ~1100px they stack,
      where the same guarantee comes from the max-heights instead. */
   .live-grid {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr);
+    display: flex;
+    flex-direction: column;
     gap: 1rem;
-    align-items: start;
+    min-height: 0;
   }
-  @media (max-width: 1100px) { .live-grid { grid-template-columns: minmax(0, 1fr); } }
+
+  /* FULL-WIDTH VERTICAL STACK (dp, 2026-07-31): trust, then histogram, then the chain
+     filling what is left. Side-by-side compromised both — the chain lost half its width
+     while the trust row's own grid (id | bar | value | level) collapsed into a column
+     barely wide enough for the id, wrapping "mean of 1 derived dimension" down the page.
+     Full width is what makes the trust row legible; bounding the two summaries to ~3 rows
+     is what leaves the chain room to be the thing you watch.
+     Heights are in rem, not px, so they track the type scale: a trust row is two lines
+     (id + dimension), a tool row is one. Tune the two numbers if 3 rows is wrong. */
+  .trust-list, .tool-list { overflow-y: auto; min-height: 0; }
+  .live-grid .trust-list { max-height: 10.5rem; }   /* ≈ 3 trust rows */
+  .live-grid .tool-list  { max-height: 7rem; }      /* ≈ 3 tool rows  */
+  /* Narrow screens collapse to one column; let the summaries breathe a little more there
+     since the chain is no longer competing for the same horizontal space. */
+  @media (max-width: 1100px) {
+    .live-grid .trust-list { max-height: 14rem; }
+    .live-grid .tool-list  { max-height: 10rem; }
+  }
 
   /* On a screen with room for it, the two live panels FILL the space left over instead
      of claiming a fixed fraction of it. A `62vh` cap cannot know how much sits above it
@@ -227,8 +244,14 @@
     html, body { height: 100vh; min-height: 0; overflow: hidden; }
     main { min-height: 0; overflow: hidden; }
     .live-grid { flex: 1 1 auto; min-height: 0; }
-    .live-grid > .card { display: flex; flex-direction: column; min-height: 0; max-height: 100%; }
-    .live-grid .tool-list, .live-grid .feed { flex: 1 1 auto; min-height: 8rem; max-height: none; }
+    .live-grid > .card {
+      display: flex; flex-direction: column; min-height: 0; max-height: 100%;
+    }
+    /* Only the CHAIN grows. The two summaries are bounded to their top rows and scroll —
+       that bound is the whole reason the stack fits. */
+    .live-grid .feed { flex: 1 1 auto; min-height: 8rem; max-height: none; }
+    .live-grid > .card:not(:last-child) { flex: 0 0 auto; }
+    .live-grid > .card:last-child { flex: 1 1 auto; }
   }
 
   .head-hint { font-size: 0.7rem; color: var(--fg-faint); margin-left: auto; padding-right: 0.25rem; }
@@ -664,23 +687,26 @@
       <span class="orch-chip-empty">none active in the last hour</span>
     </div>
 
-    <!-- Trust collapses to one row per grain: the weakest measured dimension, which is
-         the one that governs the level anyway. Full tensor + evidence on click. This was
-         a full screen of bars for what is, at a glance, four numbers. -->
-    <div class="card">
-      <div class="card-head">
-        <h2 id="trust-title">Plugin trust</h2>
-        <span class="head-hint">click a row for the full tensor and its receipts</span>
-      </div>
-      <div class="trust-list" id="trust-list">
-        <div class="empty">No plugins recorded yet. Connect one to start building trust.</div>
-      </div>
-    </div>
-
-    <!-- The two live surfaces, side by side and independently scrollable. Stacked, a
-         long histogram pushed the chain entirely below the fold — the two things most
-         worth watching were the two least visible. Neither can now displace the other. -->
+    <!-- LAYOUT (dp, 2026-07-31): trust and histogram STACK in a left column, each showing
+         its top three and scrolling; the chain takes the rest of the screen.
+         Two earlier attempts each solved one problem by creating another:
+           - stacked full-height, a long histogram pushed the chain below the fold;
+           - side-by-side, the chain and the histogram compromised each other and trust
+             got squeezed out of the grid entirely into a header strip.
+         Bounding the two summaries at three rows apiece is what makes the stack work: they
+         are reference surfaces you consult, and the chain is the one you WATCH, so only the
+         chain should grow. Trust is back in the grid as a card rather than a chip row. -->
     <div class="live-grid">
+      <div class="card">
+        <div class="card-head">
+          <h2 id="trust-title">Plugin trust</h2>
+          <span class="head-hint">click a row for the full tensor and its receipts</span>
+        </div>
+        <div class="trust-list" id="trust-list">
+          <div class="empty">No plugins recorded yet. Connect one to start building trust.</div>
+        </div>
+      </div>
+
       <div class="card">
         <div class="card-head"><h2 id="histogram-title">Tool histogram</h2></div>
         <div class="tool-list" id="tool-list">
