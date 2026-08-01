@@ -1823,6 +1823,20 @@
     return `${Math.floor(secs / 3600)}h${Math.floor((secs % 3600) / 60)}m`;
   }
 
+  // Which escalation ids are currently rendered, and any reason text the operator has
+  // typed but not yet submitted.
+  //
+  // The first version rebuilt this list from innerHTML on EVERY tick, so the poll wiped
+  // the reason field a second or two into typing and approval was unreachable — the panel
+  // whose whole purpose is "let a human decide" made deciding impossible. A live-updating
+  // surface must not own a field a human is mid-way through filling in.
+  //
+  // So: rebuild only when the SET of pending ids changes; otherwise refresh just the
+  // countdown in place. And carry drafts across a genuine rebuild, because an escalation
+  // arriving or expiring elsewhere in the queue is no reason to discard what was typed here.
+  let escRenderedSig = null;
+  const escDrafts = new Map();
+
   function renderEscalations(data) {
     const pend = data?.pending_escalations ?? [];
     const banner = $('esc-banner');
@@ -1836,9 +1850,31 @@
 
     const list = $('esc-list');
     if (!pend.length) {
-      list.innerHTML = '<div class="empty">No escalations awaiting a decision.</div>';
+      if (escRenderedSig !== '') {
+        escRenderedSig = '';
+        escDrafts.clear();
+        list.innerHTML = '<div class="empty">No escalations awaiting a decision.</div>';
+      }
       return;
     }
+
+    // Drop drafts for escalations that are gone (decided or expired) so the map cannot grow
+    // without bound across a long-lived dashboard session.
+    const live = new Set(pend.map(e => String(e.id)));
+    for (const id of [...escDrafts.keys()]) if (!live.has(id)) escDrafts.delete(id);
+
+    const sig = pend.map(e => String(e.id)).sort().join(',');
+    if (sig === escRenderedSig) {
+      // Same escalations as last tick: touch ONLY the countdown. Inputs, focus position
+      // and selection are left exactly as the operator left them.
+      pend.forEach(e => {
+        const row = list.querySelector(`.esc-row[data-id="${CSS.escape(String(e.id))}"]`);
+        const ttl = row && row.querySelector('.esc-ttl');
+        if (ttl) ttl.textContent = `expires in ${escFmtAge(e.secs_remaining ?? 0)}`;
+      });
+      return;
+    }
+    escRenderedSig = sig;
     list.innerHTML = pend.map(e => {
       // Everything user-supplied goes through textContent below, never innerHTML --
       // `marker` and `claimed_by` are caller-controlled strings.
@@ -1879,10 +1915,17 @@
       const approve = row.querySelector('.esc-approve');
       const deny = row.querySelector('.esc-deny');
       const err = row.querySelector('.esc-err');
+      // Restore anything typed before this rebuild.
+      const draft = escDrafts.get(String(e.id)) || '';
+      reason.value = draft;
+      approve.disabled = !draft.trim();
       // Approve stays disabled until a reason exists. The asymmetry mirrors the daemon:
       // refusing is the default and needs no justification; permitting a governance write
       // is the act that gets read back later, so it must carry its own why.
-      reason.addEventListener('input', () => { approve.disabled = !reason.value.trim(); });
+      reason.addEventListener('input', () => {
+        escDrafts.set(String(e.id), reason.value);
+        approve.disabled = !reason.value.trim();
+      });
       approve.addEventListener('click', () => escDecide(e.id, true, reason.value.trim(), err));
       deny.addEventListener('click', () => escDecide(e.id, false, reason.value.trim(), err));
     });
