@@ -60,6 +60,21 @@ pub struct DashboardSnapshot {
     /// ("hour" | "day" | "week" | "all") — echoed so the UI labels honestly.
     #[serde(default)]
     pub window: String,
+    /// Governance-surface escalations awaiting a decision, newest first.
+    ///
+    /// Carried on the snapshot the dashboard already polls rather than behind a
+    /// new route, because the failure this fixes is not "the operator could not
+    /// fetch the queue" — it is that **nothing ever told them there was one**.
+    /// A route the UI never calls is what we already had: `POST
+    /// /api/operator/gate-escalation` has existed as the strongest human
+    /// decision channel in the system, operator-authenticated, with no front end
+    /// to reach it. Five escalations opened against dp on 2026-08-01 and the
+    /// only notice of any of them was in the denied agent's own stderr.
+    ///
+    /// Riding the tick means a pending escalation becomes visible within one
+    /// poll of being opened, with no operator action required to discover it.
+    #[serde(default)]
+    pub pending_escalations: Vec<serde_json::Value>,
     pub generated_at: DateTime<Utc>,
 }
 
@@ -692,6 +707,39 @@ impl ServerState {
             profile,
             constellation,
             window: window_label.to_string(),
+            pending_escalations: {
+                // `pending()` already drops expired entries, so an escalation
+                // disappears from the operator's view at the same instant it
+                // stops being decidable. A queue that still offers a button for
+                // something the daemon would refuse teaches the operator that
+                // the button lies.
+                let now = crate::server::gate_escalation::now_secs();
+                self.gate_escalations
+                    .pending(now)
+                    .into_iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "id": e.id,
+                            // Caller-asserted (HST-005). Labelled `claimed_by`
+                            // rather than `member` so the UI cannot present a
+                            // claim as an identity — the operator is deciding
+                            // partly ON this string, and it is not authenticated.
+                            "claimed_by": e.plugin_id,
+                            "role": e.role,
+                            "tool_name": e.tool_name,
+                            "marker": e.marker,
+                            "opened_at": e.opened_at,
+                            "expires_at": e.expires_at,
+                            "secs_remaining": e.expires_at.saturating_sub(now),
+                            // The criterion in force when this was opened, so the
+                            // operator reads the bar the escalation was filed
+                            // under rather than today's.
+                            "bar": e.bar,
+                            "factors": e.factors,
+                        })
+                    })
+                    .collect()
+            },
             generated_at: Utc::now(),
         }
     }

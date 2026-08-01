@@ -609,6 +609,31 @@
   .pol-add-wrap summary { cursor: pointer; color: var(--accent); font-size: 0.8rem; }
   .pol-add { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.75rem; }
   /* policy trigger button in the witness-chain header */
+  /* --- governance escalation banner + decision list --- */
+  .esc-banner { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.6rem; padding: 0.5rem 0.8rem;
+    background: #ff7a6618; border: 1px solid var(--coral); border-radius: 6px; color: var(--coral); font-size: 0.82rem; }
+  .esc-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--coral); flex: none; animation: escpulse 2s ease-in-out infinite; }
+  @keyframes escpulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+  .esc-banner-btn { margin-left: auto; background: var(--coral); color: var(--bg); border: 0; border-radius: 999px;
+    padding: 0.2rem 0.8rem; font: inherit; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; cursor: pointer; }
+  .esc-note { font-size: 0.78rem; color: var(--fg-dim); line-height: 1.5; margin-bottom: 0.8rem;
+    padding: 0.5rem 0.7rem; background: var(--bg); border-left: 2px solid var(--border); border-radius: 3px; }
+  .esc-row { border: 1px solid var(--border); border-radius: 6px; padding: 0.7rem 0.8rem; margin-bottom: 0.7rem; background: var(--bg); }
+  .esc-row-head { display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.45rem; }
+  .esc-tool { font-weight: 600; color: var(--fg); }
+  .esc-who { color: var(--fg-dim); font-size: 0.78rem; }
+  .esc-ttl { margin-left: auto; font-size: 0.72rem; color: var(--warning); white-space: nowrap; }
+  .esc-marker { font-family: var(--mono, monospace); font-size: 0.75rem; color: var(--fg-dim); word-break: break-all; margin-bottom: 0.5rem; }
+  .esc-meta { font-size: 0.72rem; color: var(--fg-dim); margin-bottom: 0.5rem; }
+  .esc-actions { display: flex; gap: 0.4rem; align-items: center; }
+  .esc-reason { flex: 1; min-width: 0; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--fg); font: inherit; font-size: 0.78rem; padding: 0.25rem 0.5rem; }
+  .esc-approve, .esc-deny { border: 0; border-radius: 4px; padding: 0.28rem 0.8rem; font: inherit; font-size: 0.75rem; cursor: pointer; white-space: nowrap; }
+  .esc-approve { background: var(--success); color: var(--bg); }
+  .esc-approve:disabled { opacity: 0.4; cursor: not-allowed; }
+  .esc-deny { background: transparent; color: var(--coral); border: 1px solid var(--coral); }
+  .esc-err { color: var(--coral); font-size: 0.75rem; margin-top: 0.4rem; }
+
   .policy-btn { background: var(--accent-dim); color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 0.25rem 0.7rem; font: inherit; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; cursor: pointer; margin-right: 0.5rem; white-space: nowrap; }
   .policy-btn:hover { background: var(--accent); color: var(--bg); }
   /* modal */
@@ -681,6 +706,21 @@
   </header>
 
   <main>
+    <!-- ESCALATION BANNER (2026-08-01). A member's write to a governance surface was refused
+         and offered to a human. Until today the ONLY notice of that was in the denied agent's
+         own stderr: `POST /api/operator/gate-escalation` had existed as the strongest human
+         decision channel in the system — operator-authenticated, higher assurance than the
+         CLI — with no front end to reach it. Five escalations opened against dp in one session
+         and dp saw none of them.
+         It sits ABOVE the grid, not inside a card, because the thing it fixes is not "hard to
+         find" but "never surfaced". Hidden when the queue is empty, so an empty governance
+         queue costs no attention. -->
+    <div class="esc-banner" id="esc-banner" hidden>
+      <span class="esc-dot"></span>
+      <span id="esc-banner-text">…</span>
+      <button class="esc-banner-btn" id="esc-banner-btn">review</button>
+    </div>
+
     <!-- No "ORCHESTRATORS:" label. The chips are self-evidently orchestrators; the word
          cost a fifth of a row to say so. -->
     <div class="orch-bar" id="orch-bar">
@@ -739,6 +779,32 @@
         <button class="modal-close" data-close="1" aria-label="Close">✕</button>
       </div>
       <div class="modal-body" id="trust-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Governance-surface escalation decisions. Renders from the dashboard snapshot the page
+       already polls, and decides through POST /api/operator/gate-escalation — the operator
+       channel, which requires a challenge-signed session. That is deliberately NOT the same
+       authority as `hestia gate approve` on the CLI, which is authenticated only by filesystem
+       access to HESTIA_HOME (the same access every member on this box already has). The daemon
+       records `via` so a reader can tell a proof from a convenience; this front end is the
+       proof side. -->
+  <div class="modal" id="esc-modal" hidden>
+    <div class="modal-backdrop" data-close="1"></div>
+    <div class="modal-panel" id="esc-card">
+      <div class="modal-head">
+        <h2>Governance escalations <span class="pol-mode" id="esc-count"></span></h2>
+        <button class="modal-close" data-close="1" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="esc-note">
+          A member asked to write a governance surface and was refused. Approving authorises
+          <strong>that one write</strong> — it is single-use and expires; it is not a standing permit.
+          The identity shown is <strong>claimed, not authenticated</strong>: you are deciding partly on
+          a string the caller supplied.
+        </div>
+        <div id="esc-list"><div class="empty">No escalations awaiting a decision.</div></div>
+      </div>
     </div>
   </div>
 
@@ -1522,6 +1588,7 @@
       ? ((data.stats_by_plugin || {})[selectedOrch] || statsEmpty)
       : data.stats;
     renderStats(s, data.society, selectedOrch);
+    renderEscalations(data);
     renderOrchBar(data);
     renderTrust(data.trust);
     renderHistogram(data);
@@ -1746,6 +1813,104 @@
     } catch (e) { /* leave previous render */ }
   }
 
+  // --- governance escalations -------------------------------------------------
+  // Rendered from the snapshot the page already polls, so a pending decision appears
+  // within one tick of being opened. No operator action is required to DISCOVER one --
+  // that was the whole defect: the decision channel existed and nothing announced it.
+  function escFmtAge(secs) {
+    if (secs < 60) return `${secs}s`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+    return `${Math.floor(secs / 3600)}h${Math.floor((secs % 3600) / 60)}m`;
+  }
+
+  function renderEscalations(data) {
+    const pend = data?.pending_escalations ?? [];
+    const banner = $('esc-banner');
+    banner.hidden = pend.length === 0;
+    if (pend.length) {
+      const n = pend.length;
+      $('esc-banner-text').textContent =
+        `${n} governance write${n > 1 ? 's' : ''} refused and awaiting your decision`;
+    }
+    $('esc-count').textContent = pend.length ? `${pend.length} pending` : '';
+
+    const list = $('esc-list');
+    if (!pend.length) {
+      list.innerHTML = '<div class="empty">No escalations awaiting a decision.</div>';
+      return;
+    }
+    list.innerHTML = pend.map(e => {
+      // Everything user-supplied goes through textContent below, never innerHTML --
+      // `marker` and `claimed_by` are caller-controlled strings.
+      const id = String(e.id ?? '');
+      return `<div class="esc-row" data-id="${id}">
+        <div class="esc-row-head">
+          <span class="esc-tool"></span>
+          <span class="esc-who"></span>
+          <span class="esc-ttl"></span>
+        </div>
+        <div class="esc-marker"></div>
+        <div class="esc-meta"></div>
+        <div class="esc-actions">
+          <input class="esc-reason" placeholder="reason (required to approve)">
+          <button class="esc-approve" disabled>approve</button>
+          <button class="esc-deny">deny</button>
+        </div>
+        <div class="esc-err" hidden></div>
+      </div>`;
+    }).join('');
+
+    pend.forEach(e => {
+      const row = list.querySelector(`.esc-row[data-id="${CSS.escape(String(e.id))}"]`);
+      if (!row) return;
+      row.querySelector('.esc-tool').textContent = e.tool_name || 'write';
+      // "claimed" is said out loud: plugin_id is caller-asserted (HST-005) and the
+      // operator is deciding partly on this string.
+      row.querySelector('.esc-who').textContent =
+        `claimed by ${e.claimed_by || 'unattributed'} · ${e.role || 'no role'}`;
+      row.querySelector('.esc-ttl').textContent = `expires in ${escFmtAge(e.secs_remaining ?? 0)}`;
+      row.querySelector('.esc-marker').textContent = e.marker || '(no target recorded)';
+      const bar = typeof e.bar === 'string' ? e.bar : JSON.stringify(e.bar ?? '');
+      const nf = Array.isArray(e.factors) ? e.factors.length : 0;
+      row.querySelector('.esc-meta').textContent =
+        `id ${e.id} · bar ${bar} · ${nf} factor${nf === 1 ? '' : 's'} recorded`;
+
+      const reason = row.querySelector('.esc-reason');
+      const approve = row.querySelector('.esc-approve');
+      const deny = row.querySelector('.esc-deny');
+      const err = row.querySelector('.esc-err');
+      // Approve stays disabled until a reason exists. The asymmetry mirrors the daemon:
+      // refusing is the default and needs no justification; permitting a governance write
+      // is the act that gets read back later, so it must carry its own why.
+      reason.addEventListener('input', () => { approve.disabled = !reason.value.trim(); });
+      approve.addEventListener('click', () => escDecide(e.id, true, reason.value.trim(), err));
+      deny.addEventListener('click', () => escDecide(e.id, false, reason.value.trim(), err));
+    });
+  }
+
+  async function escDecide(id, approve, reason, errEl) {
+    errEl.hidden = true;
+    try {
+      const res = await apiFetch('/api/operator/gate-escalation', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, approve, reason: reason || null }),
+      });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { const b = await res.json(); if (b?.error) msg = b.error; } catch (_) {}
+        throw new Error(msg);
+      }
+      // Re-poll rather than mutating locally: the daemon is the authority on whether
+      // that decision actually landed, and a row that vanishes optimistically would be
+      // the same "reports success while measuring nothing" defect this panel exists to fix.
+      await tick();
+    } catch (e) {
+      errEl.textContent = `decision failed: ${e.message}`;
+      errEl.hidden = false;
+    }
+  }
+
   async function polSend(method, path, body) {
     try {
       const res = await apiFetch(path, {
@@ -1790,6 +1955,13 @@
     const modal = $('policy-modal');
     $('policy-btn').addEventListener('click', () => { modal.hidden = false; fetchPolicy(); });
     modal.addEventListener('click', (e) => { if (e.target.dataset.close) modal.hidden = true; });
+
+    // Escalation modal: same backdrop/✕ contract. The list is already current from the
+    // last tick, so opening it shows what is pending without a second fetch.
+    const escModal = $('esc-modal');
+    $('esc-banner-btn').addEventListener('click', () => { escModal.hidden = false; });
+    escModal.addEventListener('click', (e) => { if (e.target.dataset.close) escModal.hidden = true; });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') escModal.hidden = true; });
     // Same backdrop/✕/Escape contract for the trust detail popup, so both modals close
     // the three ways a reader will try rather than only the one that was wired.
     // Agents drawer: open/close, refresh, and close on outside click or Escape.
