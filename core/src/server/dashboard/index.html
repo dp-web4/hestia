@@ -609,6 +609,10 @@
   .pol-add-wrap summary { cursor: pointer; color: var(--accent); font-size: 0.8rem; }
   .pol-add { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.75rem; }
   /* policy trigger button in the witness-chain header */
+  /* A stat that could not be read must look different from a stat that is zero. */
+  .stat-unavailable .hs-val { color: var(--coral); }
+  .stat-unavailable::after { content: " read failed"; font-size: 0.62rem; color: var(--coral); text-transform: uppercase; letter-spacing: 0.06em; }
+
   .pol-scope { font-size: 0.76rem; line-height: 1.45; padding: 0.45rem 0.65rem; border-radius: 4px; margin-bottom: 0.6rem; }
   .pol-scope.society { color: var(--coral); background: #ff7a6618; border: 1px solid var(--coral); }
   .pol-scope.scoped  { color: var(--accent); background: var(--accent-dim); border: 1px solid var(--accent); }
@@ -1125,7 +1129,26 @@
     // dashboard printed it twice and spent a quarter of the stat row doing it. Reading
     // the value and its window off the same variable also removes the failure mode where
     // the label said "last week" over an hour's count.
-    $('stat-actions').textContent = fmt.int(s.total_actions);
+    // A FAILED CHAIN READ MUST NOT RENDER AS ZERO.
+    //
+    // The daemon used to swallow a stats-read error into an empty result, so the console
+    // reported "0 actions" for every member across every timeframe with a 200 OK. dp hit that
+    // on 2026-08-01: an apparently quiet fleet that was in fact 457 acts busy, unfixable by
+    // refresh, which recovered on its own later. On a governance console absence is the single
+    // most trusted reading — it is what an operator watching for unexpected agent activity
+    // most wants to believe — so it is the one that must never be faked.
+    //
+    // The daemon now carries `stats_unavailable`. Render the failure, not a number.
+    const statsBroken = lastData?.stats_unavailable;
+    if (statsBroken) {
+      $('stat-actions').textContent = '—';
+      $('stat-actions').parentElement.title =
+        `Chain read FAILED — these counts are unavailable, not zero. ${statsBroken}`;
+      $('stat-actions').parentElement.classList.add('stat-unavailable');
+    } else {
+      $('stat-actions').textContent = fmt.int(s.total_actions);
+      $('stat-actions').parentElement.classList.remove('stat-unavailable');
+    }
     $('stat-rate').textContent = s.total_actions === 0 ? '—' : fmt.pct(s.success_rate);
     // Denies never reach an `outcome` (the gate blocks before the tool runs), so they
     // are not in the success-rate math — surfaced as gate activity, not failure. A deny

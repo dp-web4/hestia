@@ -82,6 +82,15 @@ pub struct DashboardSnapshot {
     /// thing in the UI to leave running by accident.
     #[serde(default)]
     pub instance_grants: Vec<serde_json::Value>,
+    /// Set when the chain read backing `stats` / `stats_by_plugin` FAILED.
+    ///
+    /// When this is present the counts are not measurements and must not be rendered as
+    /// numbers — they are all zero because nothing could be read, not because nothing happened.
+    /// A governance console showing a quiet fleet because its query broke is the most
+    /// dangerous shape this dashboard can take: the operator is watching for unexpected agent
+    /// activity, and absence is exactly the reading they would trust without checking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats_unavailable: Option<String>,
     pub generated_at: DateTime<Utc>,
 }
 
@@ -314,7 +323,29 @@ impl ServerState {
         // For activity stats, scan the recent window plus a wider sample.
         // The chain can be huge; cap the stats window at 10k entries which
         // is plenty for an "actions seen" picture without scanning forever.
-        let stats_window = self.chain_store.read_recent(10_000).unwrap_or_default();
+        //
+        // A FAILED READ IS NOT ZERO ACTIVITY (2026-08-01). This was
+        // `.unwrap_or_default()`, so any error — lock contention, a busy timeout, transient I/O
+        // — became an empty Vec and the dashboard served HTTP 200 reporting **zero actions for
+        // every member**. And because this read is `read_recent`, NOT range-scoped, one failure
+        // zeroes hour, day and week at the same instant, which is precisely how it presented:
+        // dp saw every member empty across every timeframe, a hard refresh did not help, and it
+        // came back by itself later.
+        //
+        // "Nothing happened" and "we could not find out what happened" are different facts, and
+        // rendering the second as the first is the defect this codebase keeps finding in itself.
+        // Here it was worse than a wrong number: an operator watching a governance console for
+        // unexpected agent activity would have been shown a quiet fleet by a broken query.
+        //
+        // So the error is CARRIED to the surface instead of swallowed. The UI must render
+        // unavailable rather than 0.
+        let (stats_window, stats_read_error) = match self.chain_store.read_recent(10_000) {
+            Ok(v) => (v, None),
+            Err(e) => {
+                tracing::error!("dashboard stats chain read failed: {e}");
+                (Vec::new(), Some(e.to_string()))
+            }
+        };
 
         let mut total = 0u64;
         let mut succ = 0u64;
@@ -747,6 +778,7 @@ impl ServerState {
                     })
                     .collect()
             },
+            stats_unavailable: stats_read_error,
             instance_grants: {
                 let now = crate::server::gate_escalation::now_secs();
                 let mut v: Vec<serde_json::Value> = self
