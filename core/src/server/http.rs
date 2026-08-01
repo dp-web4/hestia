@@ -322,7 +322,25 @@ pub async fn serve_with_callback(
 
 async fn dashboard_html() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            // NO-STORE. The page shipped with no Cache-Control, no ETag and no Last-Modified, so
+            // a browser is free to heuristically cache it — and this page is a single HTML file
+            // containing all of its own JavaScript, redeployed constantly. The operator then
+            // reads a stale UI against a current daemon and cannot tell that apart from a broken
+            // feature.
+            //
+            // That is not hypothetical: it cost a long debugging detour on 2026-08-01. The grant
+            // was live, the daemon was applying it (`layers: ["operator-grant"]`), and the
+            // dashboard kept reporting the society baseline. Two fixes went into the UI before
+            // the question "is the browser running the code I deployed?" got asked — and the
+            // answer had been unfalsifiable the whole time, because nothing in the response said
+            // how old the page was.
+            //
+            // A governance console must never be able to show a stale reading of state that the
+            // operator is about to make decisions from.
+            (header::CACHE_CONTROL, "no-store, must-revalidate"),
+        ],
         Html(load_dashboard_html()),
     )
 }

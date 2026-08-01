@@ -882,6 +882,17 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         "layer_modes": out.get("layer_modes").cloned().unwrap_or(Value::Null),
         "layers": out.get("layers").cloned().unwrap_or(Value::Null),
         "lists_bound": out.get("lists_bound").cloned().unwrap_or(Value::Null),
+        // FORWARDED EXPLICITLY, because this object is an allowlist projection of `body` and a
+        // field absent from it is silently dropped. The grant WAS applied — `layers` already
+        // read `["operator-grant"]` — while `operator_grant` returned null, so a member could be
+        // running under an operator exception and be told there was none. That is the trapdoor
+        // the disclosure exists to prevent, produced by the disclosure's own plumbing.
+        //
+        // Third time in one session that a field landed on a structure something downstream
+        // re-projects: `answers_deny` on the tool the gate does not call, the policy grant on
+        // one of three evaluation sites, and now this. The shape to distrust is any place that
+        // rebuilds a response key by key.
+        "operator_grant": out.get("operator_grant").cloned().unwrap_or(Value::Null),
         "law": out.get("law").cloned().unwrap_or(Value::Null),
         // Quote THIS to say which law you read: it covers every layer, every bound list,
         // and the redaction applied to you. `society_policy_hash` is kept only because
