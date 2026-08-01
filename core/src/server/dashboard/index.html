@@ -1533,17 +1533,34 @@
     // That ambiguity is the defect, not the wrong string: a status surface that cannot be
     // distinguished from a broken mechanism sends you debugging the wrong layer. Same family as
     // the null-state twin — a display that looks identical whether or not the thing worked.
+    //
+    // AND IT MUST REPORT A LIVE GRANT EVEN WITH NOTHING SELECTED. The first version only went
+    // amber when the granted member happened to be the selected one, so granting from the form
+    // — or granting and then clearing the selection — left the button reading `safety` while a
+    // permissive grant was in force. dp hit that too. A control that only tells the truth in one
+    // of its states is not a status surface; the operator has to already know the answer to read
+    // it correctly, which is the opposite of what it is for.
     if (polBtn) {
+      const grants = lastData?.instance_grants ?? [];
       const target = selectedOrch || null;
-      const grant = target
-        ? (lastData?.instance_grants ?? []).find(g => g.plugin_id === target)
-        : null;
+      const grant = target ? grants.find(g => g.plugin_id === target) : null;
       if (grant) {
         polBtn.textContent = `policy: ${grant.preset} · ${target}`;
         polBtn.classList.add('policy-btn-scoped');
         polBtn.title = `Per-member grant: ${target} runs under "${grant.preset}", not the society `
           + `baseline ("${pol ? pol.preset : '?'}"). ${grant.reason ? `Reason: ${grant.reason}. ` : ''}`
           + `Click to view or change.`;
+      } else if (grants.length) {
+        // Grants exist but not on the selected member (or nothing is selected). The society
+        // label alone would be true and misleading: some member on this box is NOT under it.
+        const society = pol ? `${pol.preset}${pol.enforce ? '' : ' (audit)'}` : 'policy';
+        polBtn.textContent = `policy: ${society} · ${grants.length} grant${grants.length > 1 ? 's' : ''}`;
+        polBtn.classList.add('policy-btn-scoped');
+        polBtn.title =
+          `Society baseline is "${pol ? pol.preset : '?'}", but ${grants.length} member(s) are `
+          + `under a per-member grant: `
+          + grants.map(g => `${g.plugin_id} → ${g.preset}`).join(', ')
+          + `. Select a member to scope the buttons to it, or click to review.`;
       } else {
         polBtn.textContent = pol ? `policy: ${pol.preset}${pol.enforce ? '' : ' (audit)'}` : 'policy';
         polBtn.classList.remove('policy-btn-scoped');
