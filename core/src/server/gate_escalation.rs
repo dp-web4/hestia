@@ -143,6 +143,18 @@ pub enum Channel {
     OperatorSession,
     /// Local CLI, authenticated only by filesystem access to HESTIA_HOME. Same-UID as every
     /// member on this box, so this is convenience, not proof.
+    ///
+    /// NOTHING OUTSIDE TESTS CONSTRUCTS THIS. Verified crate-wide 2026-07-31 (claude-code,
+    /// kimi-code): every `Channel::LocalCli` in `core/src` sits inside a `#[cfg(test)]` module.
+    /// That is an absent caller, not a design property — and read `bar_met` before you supply
+    /// one. `is_sovereign` counts this variant as the `sov` conjunct of `SovereignPlusPeer`,
+    /// the bar reserved for the surfaces whose silent compromise ends the model. Wire up a
+    /// member-reachable producer and that bar is met by two same-UID members with filesystem
+    /// access: the two-CHANNEL requirement becomes one channel wearing two names, while the
+    /// diff reads as plumbing. The steward's note at `bar_for` says the sovereign half being
+    /// hard to reach is the intended state — those writes wait rather than proceed under a
+    /// weaker bar. Making it reachable IS that policy change, and belongs in a reviewed diff
+    /// that says which bar it is lowering.
     LocalCli,
     /// A NOT-SAME peer member decided it, through the same independence rules the appeal
     /// arbiter uses. At A1 this is not an enforced boundary — the peer shares this UID — so it
