@@ -610,6 +610,12 @@
   .pol-add { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.75rem; }
   /* policy trigger button in the witness-chain header */
   /* --- governance escalation banner + decision list --- */
+  /* MUST precede the display:flex rule below. The UA stylesheet's `[hidden] { display: none }`
+     loses to ANY author rule that sets display, so `banner.hidden = true` is inert without this
+     and the bar stays lit after the queue empties. `.modal` above already carries the same
+     guard (line ~640); this rule was omitted and the banner was in fact permanently visible —
+     only noticeable once it had a reason to appear. */
+  .esc-banner[hidden] { display: none; }
   .esc-banner { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.6rem; padding: 0.5rem 0.8rem;
     background: #ff7a6618; border: 1px solid var(--coral); border-radius: 6px; color: var(--coral); font-size: 0.82rem; }
   .esc-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--coral); flex: none; animation: escpulse 2s ease-in-out infinite; }
