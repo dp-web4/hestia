@@ -609,6 +609,19 @@
   .pol-add-wrap summary { cursor: pointer; color: var(--accent); font-size: 0.8rem; }
   .pol-add { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.75rem; }
   /* policy trigger button in the witness-chain header */
+  /* --- per-member policy grants --- */
+  .grant-note { font-size: 0.74rem; color: var(--fg-dim); line-height: 1.5; margin: 0.3rem 0 0.6rem;
+    padding: 0.45rem 0.6rem; background: var(--bg); border-left: 2px solid var(--warning); border-radius: 3px; }
+  .grant-add { flex-wrap: wrap; }
+  .grant-row { display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap;
+    border: 1px solid var(--warning); border-radius: 5px; padding: 0.45rem 0.6rem; margin-bottom: 0.45rem; background: var(--bg); }
+  .grant-who { font-weight: 600; color: var(--fg); }
+  .grant-preset { color: var(--warning); font-size: 0.78rem; }
+  .grant-why { color: var(--fg-dim); font-size: 0.74rem; flex-basis: 100%; }
+  .grant-ttl { margin-left: auto; font-size: 0.72rem; color: var(--fg-dim); white-space: nowrap; }
+  .grant-revoke { background: transparent; color: var(--coral); border: 1px solid var(--coral);
+    border-radius: 4px; padding: 0.15rem 0.6rem; font: inherit; font-size: 0.72rem; cursor: pointer; }
+
   /* --- governance escalation banner + decision list --- */
   /* MUST precede the display:flex rule below. The UA stylesheet's `[hidden] { display: none }`
      loses to ANY author rule that sets display, so `banner.hidden = true` is inert without this
@@ -823,6 +836,46 @@
       </div>
       <div class="modal-body">
         <div class="pol-presets" id="pol-presets"></div>
+        <!-- PER-MEMBER GRANTS. The preset above is the SOCIETY baseline and applies to every
+             seat on this box -- including unattended watcher-fired agents -- so using it to
+             unblock one member grants the whole fleet. This section is the scoped alternative.
+             It sits directly under the preset buttons on purpose: that adjacency is the thing
+             that stops the next person reaching for the global switch. -->
+        <div class="pol-section-label">Per-member grants — loosen ONE member without touching the society</div>
+        <div class="grant-note">
+          Held in <strong>memory only</strong>: a grant does not survive a daemon restart, and
+          tightening applied through the vault does. Ratified hub law still binds over a grant.
+          Every grant and revocation is witnessed.
+        </div>
+        <div id="grant-list"><div class="empty">No grants active — every member is on the society baseline.</div></div>
+        <details class="pol-add-wrap">
+          <summary>+ Grant a member a preset</summary>
+          <div class="pol-add grant-add">
+            <input class="pol-input" id="grant-plugin" placeholder="plugin_id (e.g. kimi-code)" size="16">
+            <input class="pol-input" id="grant-role" placeholder="role" list="grant-roles" size="20">
+            <datalist id="grant-roles">
+              <option value="role:constellation:member"></option>
+              <option value="role:constellation:interactive-dev"></option>
+              <option value="role:constellation:mesh-worker"></option>
+              <option value="role:constellation:reviewer"></option>
+              <option value="role:constellation:autonomous-timer"></option>
+            </datalist>
+            <select class="pol-select" id="grant-preset">
+              <option value="permissive">permissive</option>
+              <option value="audit-only">audit-only</option>
+              <option value="safety">safety</option>
+              <option value="strict">strict</option>
+            </select>
+            <select class="pol-select" id="grant-ttl">
+              <option value="3600">1 hour</option>
+              <option value="900">15 min</option>
+              <option value="14400">4 hours</option>
+              <option value="">until restart</option>
+            </select>
+            <input class="pol-input" id="grant-reason" placeholder="reason (required)" size="24">
+            <button class="pol-btn-add" id="grant-add-btn" disabled>grant</button>
+          </div>
+        </details>
         <div class="pol-section-label">Preset rules — change a decision, disable, or revert</div>
         <div id="pol-rules"><div class="empty">Loading…</div></div>
         <div class="pol-section-label">Custom rules</div>
@@ -1595,6 +1648,7 @@
       : data.stats;
     renderStats(s, data.society, selectedOrch);
     renderEscalations(data);
+    renderGrants(data);
     renderOrchBar(data);
     renderTrust(data.trust);
     renderHistogram(data);
@@ -1959,6 +2013,72 @@
       errEl.hidden = false;
     }
   }
+
+  // --- per-member grants -------------------------------------------------------
+  // Rendered from the same snapshot as everything else. A standing exception to society law
+  // that the operator must go looking for is one they will forget they made, so it renders
+  // wherever the policy is read rather than behind its own fetch.
+  function renderGrants(data) {
+    const list = $('grant-list');
+    if (!list) return;
+    const gs = data?.instance_grants ?? [];
+    if (!gs.length) {
+      list.innerHTML = '<div class="empty">No grants active — every member is on the society baseline.</div>';
+      return;
+    }
+    list.innerHTML = gs.map(() => `<div class="grant-row">
+        <span class="grant-who"></span><span class="grant-preset"></span>
+        <span class="grant-ttl"></span><button class="grant-revoke">revoke</button>
+        <span class="grant-why"></span>
+      </div>`).join('');
+    // plugin_id and reason are operator-supplied strings; they go in via textContent, never HTML.
+    list.querySelectorAll('.grant-row').forEach((row, i) => {
+      const g = gs[i];
+      row.querySelector('.grant-who').textContent = `${g.plugin_id} · ${g.role}`;
+      row.querySelector('.grant-preset').textContent = `→ ${g.preset}`;
+      row.querySelector('.grant-ttl').textContent =
+        g.secs_remaining == null ? 'until restart' : `${escFmtAge(g.secs_remaining)} left`;
+      row.querySelector('.grant-why').textContent = g.reason ? `“${g.reason}”` : '(no reason recorded)';
+      row.querySelector('.grant-revoke').addEventListener('click', async () => {
+        await apiFetch(
+          `/api/policy/instance/${encodeURIComponent(g.plugin_id)}/${encodeURIComponent(g.role)}`,
+          { method: 'DELETE' });
+        await tick();
+      });
+    });
+  }
+
+  (function wireGrantForm() {
+    const btn = $('grant-add-btn');
+    if (!btn) return;
+    const plugin = $('grant-plugin'), role = $('grant-role'), reason = $('grant-reason');
+    // A reason is required to WIDEN and not to revoke — the same asymmetry the daemon
+    // enforces and the escalation channel already uses. Refusing costs nothing to explain;
+    // permitting is what gets read back later.
+    const sync = () => { btn.disabled = !(plugin.value.trim() && role.value.trim() && reason.value.trim()); };
+    [plugin, role, reason].forEach(el => el.addEventListener('input', sync));
+    btn.addEventListener('click', async () => {
+      const ttl = $('grant-ttl').value;
+      const body = {
+        plugin_id: plugin.value.trim(),
+        role: role.value.trim(),
+        preset: $('grant-preset').value,
+        reason: reason.value.trim(),
+      };
+      if (ttl) body.expires_in_secs = Number(ttl);
+      const res = await apiFetch('/api/policy/instance', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { const b = await res.json(); if (b?.error) msg = b.error; } catch (_) {}
+        alert(`grant failed: ${msg}`);
+        return;
+      }
+      plugin.value = ''; role.value = ''; reason.value = ''; sync();
+      await tick();
+    });
+  })();
 
   async function polSend(method, path, body) {
     try {

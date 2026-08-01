@@ -75,6 +75,13 @@ pub struct DashboardSnapshot {
     /// poll of being opened, with no operator action required to discover it.
     #[serde(default)]
     pub pending_escalations: Vec<serde_json::Value>,
+    /// Live per-member operator grants. Surfaced on the snapshot the dashboard already polls,
+    /// for the same reason the escalations are: a standing exception to society law that the
+    /// operator has to go looking for is one they will forget they made. These are the only
+    /// control in the system that WIDENS what an agent may do, so they should be the hardest
+    /// thing in the UI to leave running by accident.
+    #[serde(default)]
+    pub instance_grants: Vec<serde_json::Value>,
     pub generated_at: DateTime<Utc>,
 }
 
@@ -739,6 +746,29 @@ impl ServerState {
                         })
                     })
                     .collect()
+            },
+            instance_grants: {
+                let now = crate::server::gate_escalation::now_secs();
+                let mut v: Vec<serde_json::Value> = self
+                    .instance_grants
+                    .iter()
+                    .filter(|(_, g)| g.is_live(now))
+                    .map(|((plugin_id, role), g)| {
+                        serde_json::json!({
+                            "plugin_id": plugin_id,
+                            "role": role,
+                            "preset": g.preset,
+                            "granted_by": g.granted_by,
+                            "reason": g.reason,
+                            "expires_at": g.expires_at,
+                            "secs_remaining": g.expires_at.map(|e| e.saturating_sub(now)),
+                        })
+                    })
+                    .collect();
+                // Stable order, so the list does not reshuffle under the operator's cursor
+                // between polls. HashMap iteration order is not an ordering a UI should inherit.
+                v.sort_by(|a, b| a["plugin_id"].as_str().cmp(&b["plugin_id"].as_str()));
+                v
             },
             generated_at: Utc::now(),
         }
