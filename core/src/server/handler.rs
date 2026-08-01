@@ -733,16 +733,33 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         ));
     };
 
-    let mut layers: Vec<(String, &crate::policy::PolicyEngine)> =
-        vec![("society".to_string(), &s.policy_engine)];
-    if let Some(e) = s.role_policy_engines.get(&who.role_lct) {
-        layers.push((format!("role:{}", who.role_lct), e));
-    }
-    if let Some(e) = s
-        .instance_policy_engines
-        .get(&(who.plugin_id.clone(), who.role_lct.clone()))
-    {
-        layers.push((format!("instance:{}", who.plugin_id), e));
+    // An operator grant SUBSTITUTES the local layers rather than adding to them, so publishing
+    // it alongside society/role/instance would describe a law that is not the one being
+    // enforced. dp's requirement is that a member can always ask what it is operating under —
+    // which means this surface has to reflect the substitution, not merely mention it. A member
+    // told "society: deny" while the gate runs it under a permissive grant has been told the
+    // wrong law, and would waste a session obeying a rule nobody is applying to it.
+    let granted = s
+        .instance_grant(&who.plugin_id, &who.role_lct)
+        .and_then(|g| crate::policy::get_preset(&g.preset).map(|p| (g, p)));
+    let grant_engine = granted
+        .as_ref()
+        .map(|(_, p)| crate::policy::PolicyEngine::new(p.config.clone()));
+
+    let mut layers: Vec<(String, &crate::policy::PolicyEngine)> = Vec::new();
+    if let Some(e) = grant_engine.as_ref() {
+        layers.push(("operator-grant".to_string(), e));
+    } else {
+        layers.push(("society".to_string(), &s.policy_engine));
+        if let Some(e) = s.role_policy_engines.get(&who.role_lct) {
+            layers.push((format!("role:{}", who.role_lct), e));
+        }
+        if let Some(e) = s
+            .instance_policy_engines
+            .get(&(who.plugin_id.clone(), who.role_lct.clone()))
+        {
+            layers.push((format!("instance:{}", who.plugin_id), e));
+        }
     }
 
     let mut statements = Vec::new();
@@ -822,6 +839,22 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         "layer_modes": layer_modes,
         "layers": layers.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
         "lists_bound": bound.iter().map(|l| l.name.clone()).collect::<Vec<_>>(),
+        // DISCLOSED, not merely applied. A member may always see that it is running under an
+        // operator exception, who made it and why — a loosening the subject cannot observe is
+        // a trapdoor, and one it can read is a disclosed exception. It is inside the hashed
+        // body, so a grant appearing or lapsing MOVES `law_hash`: a member that pins the hash
+        // notices the change rather than having to ask.
+        "operator_grant": granted.as_ref().map(|(g, _)| json!({
+            "preset": g.preset,
+            "granted_by": g.granted_by,
+            "granted_at": g.granted_at,
+            "reason": g.reason,
+            "expires_at": g.expires_at,
+            "supersedes": ["society", "role", "instance"],
+            "note": "An operator granted this member a preset in place of the local baseline. \
+                     It is held in memory only and does NOT survive a daemon restart. Ratified \
+                     hub law still binds over it.",
+        })),
         "law": statements,
     });
 
@@ -933,6 +966,29 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     {
         evaluation = crate::policy::fold_strictest(evaluation, inst_engine.evaluate(&pa));
     }
+    // OPERATOR GRANT — applied OUTSIDE the fold, because it is the one input allowed to
+    // loosen and `fold_strictest` would discard it by definition (dp, 2026-08-01: "if i want
+    // to grant permissive it should be my choice without setting all the rest to permissive").
+    //
+    // Deliberately NOT folded: folding is how every other input composes, and adding a
+    // "loosest-wins" branch to the fold would make the fold itself unsafe for the inputs that
+    // must only tighten. Keeping the grant a separate, explicit substitution means the
+    // invariant "law tightens as it gets more specific" still holds for all of role overlay,
+    // instance overlay and hub law, and the one exception is legible at the call site rather
+    // than hidden inside a comparator.
+    //
+    // Society baseline is untouched: a grant is an exception FOR one member, never an edit of
+    // the law. The baseline moves only by amendment.
+    //
+    // ORDERING, and it is a decision rather than an accident: the grant lands BEFORE the hub-law
+    // fold, so ratified society law still folds strictest-wins OVER it and a local operator
+    // cannot grant past it. dp's own framing forces this — "society baseline is encoded in
+    // society law, and can only be changed through law amendment process" — and a grant that
+    // could override hub law WOULD be a law change without an amendment, made by one machine's
+    // operator. So a grant loosens the local baseline (preset + role + instance overlays) and
+    // nothing above it. If that turns out to be too narrow in practice, the fix is an
+    // amendment, which is the correct place for that argument to happen.
+    evaluation = s.apply_instance_grant(&session_plugin_id, &session_role, &pa, evaluation);
     // Third fold input (consolidation 2026-07-10): hub law via the
     // canonical web4-policy engine. Strictest-wins like the role overlay —
     // law can only tighten, never loosen.
@@ -1157,6 +1213,11 @@ fn gate_direct_tool(
     {
         evaluation = crate::policy::fold_strictest(evaluation, inst_engine.evaluate(&pa));
     }
+    // Operator grant — the ENFORCEMENT path. Applied here and not only on the advisory
+    // surfaces, because a grant that shows up in `operating_law` and not in the gate tells a
+    // member it may act and then refuses it. Before the hub-law fold, so ratified society law
+    // still binds and a local operator cannot grant past an amendment-only baseline.
+    evaluation = s.apply_instance_grant(&who.plugin_id, &who.role_lct, &pa, evaluation);
     // Hub-law third input applies to the vault gate too — a norm that
     // denies secret reads must bind here, not only on tool calls.
     if let Some(gate) = &s.law_gate {
@@ -6997,6 +7058,38 @@ mod tests {
     use crate::vault::Vault;
     use chrono::Utc;
     use tempfile::TempDir;
+
+    /// dp, 2026-08-01: "an agent should not be able to change its own or another agent's
+    /// policy." The grant is operator-only BY CONSTRUCTION — it lives behind the
+    /// challenge-signed HTTP surface and has no MCP tool. That is currently true because nobody
+    /// wrote one, which is not a guarantee; this makes it a guarantee.
+    ///
+    /// Written as a denylist over the ACTUAL tool list rather than a comment, because the
+    /// failure mode is somebody adding a convenient `hestia_set_my_policy` months from now and
+    /// every reviewer thinking it looks reasonable in isolation. The read side is deliberately
+    /// permitted: `hestia_operating_law` exists precisely so a member CAN ask what it runs
+    /// under. Read yes, write never.
+    #[test]
+    fn no_mcp_tool_can_set_an_operator_grant() {
+        let names: Vec<String> = hestia_tools().into_iter().map(|t| t.name.to_string()).collect();
+        for n in &names {
+            let l = n.to_ascii_lowercase();
+            let touches_grant = l.contains("grant") || l.contains("instance_policy");
+            assert!(
+                !touches_grant,
+                "MCP tool `{n}` looks like it can reach the operator grant surface. Per-agent \
+                 loosening must stay operator-only (challenge-signed HTTP); if a member could \
+                 call it, an agent could widen its own authority and the control would be \
+                 decorative. Expose it read-only through hestia_operating_law instead."
+            );
+        }
+        // The read path must remain, or the disclosure requirement quietly dies with it.
+        assert!(
+            names.iter().any(|n| n == "hestia_operating_law"),
+            "hestia_operating_law is how a member learns what it is operating under, including \
+             any grant made about it. A loosening the subject cannot see is a trapdoor."
+        );
+    }
 
     fn make_shared_state() -> (TempDir, SharedState) {
         let dir = TempDir::new().unwrap();
