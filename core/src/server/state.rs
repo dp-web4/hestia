@@ -72,7 +72,6 @@ pub struct InFlightAction {
     pub chain_position: u64,
 }
 
-/// The mutable core state passed to every request handler.
 /// An operator's scoped exception to society law for one `(plugin_id, role)`.
 ///
 /// Held in memory only — see `ServerState::instance_grants`. Carries WHO granted it and WHY,
@@ -117,6 +116,15 @@ impl InstanceGrant {
 /// widening a member's authority was a `json.dump` nobody had to ask permission for.
 pub const POLICY_SCOPE_ASYMMETRY: () = ();
 
+/// How much chain the escalation replay scans at startup.
+///
+/// Bounded on purpose: escalations live at most `DEFAULT_TTL_SECS` (1h) plus a claim window, so
+/// anything older than a few thousand entries is terminal by time and cannot be ruled. Scanning
+/// the whole chain (96 MB here) to rebuild an hour of state would make every daemon start pay
+/// for all of history.
+const ESCALATION_REPLAY_SCAN: u64 = 5_000;
+
+/// The mutable core state passed to every request handler.
 pub struct ServerState {
     /// In-scope work awaiting attestation, keyed by (plugin_id, role_lct) → (allows, denies).
     ///
@@ -308,7 +316,7 @@ impl ServerState {
             )?
         };
 
-        Ok(Self {
+        let mut st = Self {
             scope_tally: std::collections::HashMap::new(),
             vault,
             sessions: HashMap::new(),
@@ -324,7 +332,9 @@ impl ServerState {
             policy_engine,
             role_policy_engines,
             instance_policy_engines,
-            // Empty at every startup, by design: grants do not survive a restart.
+            // Empty at every startup, by design: grants do not survive a restart. Escalations
+            // DO — see the rehydrate call after construction. The two are opposite on purpose:
+            // a human's ruling must survive a deploy, a standing permission must not.
             instance_grants: HashMap::new(),
             law_gate,
             synthetic_plugins,
@@ -334,7 +344,26 @@ impl ServerState {
             operator_challenges: crate::server::operator_auth::ChallengeStore::default(),
             operator_sessions: crate::server::operator_auth::SessionStore::default(),
             gate_escalations: Default::default(),
-        })
+        };
+
+        // REHYDRATE ESCALATIONS FROM THE CHAIN.
+        //
+        // Without this, a restart destroyed every pending escalation and every approval a human
+        // had already granted. Measured 2026-08-01: dp approved a governance write, a deploy
+        // restarted the daemon minutes later, and the ruling was gone — so the act of deploying
+        // governance was what destroyed the governance. Under fail-closed with one gate, that is
+        // a fleet stopped mid-approval with the approval lost.
+        //
+        // The chain is read NEWEST-first, so it is reversed: replay amends in arrival order and
+        // applying a decision before the open it belongs to would drop it.
+        let now = crate::server::gate_escalation::now_secs();
+        let mut window = st.chain_store.read_recent(ESCALATION_REPLAY_SCAN).unwrap_or_default();
+        window.reverse();
+        let restored = st.gate_escalations.rehydrate(&window, now);
+        if restored > 0 {
+            eprintln!("[hestia] restored {restored} live escalation(s) from the chain");
+        }
+        Ok(st)
     }
 
     /// Mark a plugin_id as synthetic and persist. Idempotent on membership;

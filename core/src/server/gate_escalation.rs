@@ -44,8 +44,20 @@
 //! * **Timeout.** A pending escalation past its deadline is `Expired`, which the hook treats as a
 //!   deny. Nobody has to be watching for the safe thing to happen.
 //! * **Unknown id.** A poll for an id this store has never seen returns `Expired`, not an error
-//!   the caller might mistake for "still working on it". A daemon restart drops the store, so
-//!   every escalation in flight across a restart correctly reads as denied.
+//!   the caller might mistake for "still working on it".
+//!
+//!   This used to add: *"a daemon restart drops the store, so every escalation in flight across a
+//!   restart correctly reads as denied."* True as written, and it described a real cost as if it
+//!   were a safety property. Deploying a law change REQUIRES a restart, so the act of governing
+//!   destroyed the governance: on 2026-08-01 dp approved a governance write and a deploy minutes
+//!   later erased the ruling — a human had decided and the system had no memory of it. Under
+//!   fail-closed with one gate, that is a fleet stopped mid-approval with the approval gone.
+//!
+//!   The store is now REHYDRATED from the chain at startup (`rehydrate`), so a decision is
+//!   durable because it was witnessed. Fail-closed is unchanged and is what makes replay safe:
+//!   anything the replay cannot positively identify as a grant is not a grant, a spent approval
+//!   restores spent, and a decision whose `opened` entry is outside the window is skipped rather
+//!   than synthesised.
 //! * **A hook that cannot wait.** The harness gives `pre_tool_use.py` **5 seconds**, and a hook
 //!   it kills yields neither `exit 2` nor a JSON deny — Claude Code then runs the tool anyway.
 //!   So waiting in-hook for a human fails OPEN, not closed. The shape is therefore deny-now /
@@ -136,7 +148,7 @@ impl Status {
 
 /// How a decision reached us. Not cosmetic: these carry different evidential weight and the
 /// record must keep them apart.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Channel {
     /// Authenticated operator HTTP session (LCT challenge/response). Strong.
@@ -218,7 +230,7 @@ pub fn bar_for(marker: &str) -> Bar {
 /// alternatives, any one of which approves. They're factor types."); `independence` is the
 /// weighting, already recorded elsewhere. A bar is evaluated against the SET, never against
 /// whichever answer arrived first.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Factor {
     pub channel: Channel,
     pub by: String,
@@ -426,6 +438,117 @@ pub fn now_secs() -> u64 {
 }
 
 impl EscalationStore {
+    /// Rebuild this store from the witness chain (dp, 2026-08-01).
+    ///
+    /// THE STORE IS A PROJECTION, NOT AN AUTHORITY. Escalations were held in memory only, so a
+    /// daemon restart destroyed every pending escalation AND every approval a human had already
+    /// granted. Measured on 2026-08-01: dp approved a governance write, a deploy restarted the
+    /// daemon minutes later, and the ruling was gone — the operator had made a real decision and
+    /// the system had no memory of it. Deploying a law change requires a restart, so the act of
+    /// governing was what destroyed the governance.
+    ///
+    /// Rebuilt by replay rather than by adding a sidecar table, per dp's ruling: the ruling is
+    /// already "a separate act, linked to the previous act it modifies, both properly witnessed,
+    /// all one chain". A second durable copy would be exactly the two-copies-no-comparison shape
+    /// the supervisor thread died on — and it would let the store and the chain disagree about
+    /// who approved what, which is the one disagreement this subsystem must never have. Replay
+    /// means a decision is durable BECAUSE it was witnessed, not in addition to being witnessed.
+    ///
+    /// Entries must arrive OLDEST FIRST; later events amend earlier ones in arrival order, which
+    /// is how the chain already reads. Unknown ids on a decide/claim are skipped rather than
+    /// synthesised: an escalation whose `opened` entry is outside the replay window is one this
+    /// store cannot describe honestly, and inventing a shell for it would put a governance record
+    /// in front of an operator that no witnessed act supports.
+    pub fn rehydrate(&mut self, entries: &[crate::storage::chain::ChainEntry], now: u64) -> usize {
+        let s = |v: &serde_json::Value, k: &str| {
+            v.get(k).and_then(|x| x.as_str()).map(|x| x.to_string())
+        };
+        let u = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_u64());
+        let mut restored = 0usize;
+        for e in entries {
+            let d = &e.event_data;
+            let Some(id) = s(d, "escalation_id") else { continue };
+            match e.event_type.as_str() {
+                "gate_escalation_opened" => {
+                    let (Some(plugin_id), Some(marker), Some(expires_at)) =
+                        (s(d, "plugin_id"), s(d, "marker"), u(d, "expires_at"))
+                    else {
+                        continue;
+                    };
+                    // Terminal-by-time entries are not worth restoring: they cannot be ruled and
+                    // would only pad an operator's queue with things that are already answers.
+                    if expires_at <= now {
+                        continue;
+                    }
+                    self.by_id.insert(
+                        id.clone(),
+                        Escalation {
+                            id,
+                            plugin_id,
+                            role: s(d, "role").unwrap_or_default(),
+                            tool_name: s(d, "tool_name").unwrap_or_default(),
+                            // Recomputed from the marker rather than read from the entry: the
+                            // claim path's `opened` event does not carry `bar`, and a default
+                            // would silently lower the criterion an escalation is judged against.
+                            bar: bar_for(&marker),
+                            marker,
+                            opened_at: u(d, "opened_at").unwrap_or(now),
+                            expires_at,
+                            status: Status::Pending,
+                            decided_at: None,
+                            decided_by: None,
+                            decided_via: None,
+                            decided_role: None,
+                            reason: None,
+                            independence: None,
+                            consumed_at: None,
+                            factors: Vec::new(),
+                        },
+                    );
+                    restored += 1;
+                }
+                "gate_escalation_decided" => {
+                    if let Some(esc) = self.by_id.get_mut(&id) {
+                        esc.status = match s(d, "status").as_deref() {
+                            Some(x) if x.eq_ignore_ascii_case("approved") => Status::Approved,
+                            Some(x) if x.eq_ignore_ascii_case("denied") => Status::Denied,
+                            // An unreadable status must not restore as Approved. Anything this
+                            // replay cannot positively identify as a grant is not a grant.
+                            _ => Status::Denied,
+                        };
+                        esc.decided_at = u(d, "decided_at").or(Some(now));
+                        esc.decided_by = s(d, "decided_by");
+                        esc.decided_role = s(d, "decided_role");
+                        esc.reason = s(d, "reason");
+                        // RESTORE THE EVIDENCE, not just the verdict. `claim` re-checks
+                        // `bar_met()`, which is evaluated against the factor SET — so an
+                        // escalation restored with an empty set reads Approved and then refuses
+                        // to be claimed. That is the worst of both outcomes: the operator sees
+                        // their approval survived the restart and the write is still blocked,
+                        // with nothing on any surface explaining why. Caught by
+                        // `replay_restores_rulings_without_re_arming_spent_ones` before it
+                        // shipped; without that assertion this would have looked like it worked.
+                        if let Some(fs) = d.get("factors_present") {
+                            if let Ok(parsed) = serde_json::from_value::<Vec<Factor>>(fs.clone()) {
+                                esc.factors = parsed;
+                            }
+                        }
+                    }
+                }
+                "gate_escalation_claimed" => {
+                    // An approval is single-use. If the chain shows it was already spent, the
+                    // restored copy must be spent too — otherwise a restart would RE-ARM every
+                    // approval ever granted, turning a crash into a way to reuse a human's yes.
+                    if let Some(esc) = self.by_id.get_mut(&id) {
+                        esc.consumed_at = u(d, "consumed_at").or(Some(now));
+                    }
+                }
+                _ => {}
+            }
+        }
+        restored
+    }
+
     pub fn open(
         &mut self,
         plugin_id: &str,
@@ -668,6 +791,89 @@ mod tests {
     use super::*;
 
     const T0: u64 = 1_800_000_000;
+
+    fn chain_entry(event_type: &str, data: serde_json::Value) -> crate::storage::chain::ChainEntry {
+        crate::storage::chain::ChainEntry {
+            chain_position: 0,
+            hash: String::new(),
+            prev_hash: String::new(),
+            event_type: event_type.to_string(),
+            event_data: data,
+            signer_lct: "test".into(),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// Replay must restore a human's ruling AND must never re-arm one that was already spent.
+    ///
+    /// The second half is the dangerous direction: if a restart resurrected consumed approvals,
+    /// crashing the daemon would become a way to reuse a yes — one approval licensing every
+    /// later write to the same surface, which is exactly what single-use exists to prevent.
+    #[test]
+    fn replay_restores_rulings_without_re_arming_spent_ones() {
+        let opened = |id: &str| {
+            chain_entry(
+                "gate_escalation_opened",
+                serde_json::json!({
+                    "escalation_id": id, "plugin_id": "kimi-code", "role": "role:constellation:member",
+                    "tool_name": "Bash", "marker": "law_inject.py",
+                    "opened_at": T0, "expires_at": T0 + 3600,
+                }),
+            )
+        };
+        let decided = |id: &str, status: &str| {
+            chain_entry(
+                "gate_escalation_decided",
+                serde_json::json!({
+                    "escalation_id": id, "status": status, "decided_by": "operator",
+                    "decided_at": T0 + 10, "reason": "because",
+                    // The evidence, as the real event carries it. Restoring the verdict without
+                    // this leaves the bar unmet and the approval unclaimable.
+                    "factors_present": [{
+                        "channel": "operator_session", "by": "operator",
+                        "role": "role:constellation:sovereign", "independence": null, "at": T0 + 10,
+                    }],
+                }),
+            )
+        };
+
+        // Approved and unspent -> restored as usable.
+        let mut s = EscalationStore::default();
+        assert_eq!(s.rehydrate(&[opened("aaa1"), decided("aaa1", "approved")], T0 + 20), 1);
+        assert_eq!(s.status_of("aaa1", T0 + 20), Status::Approved);
+        assert!(s.claim("kimi-code", "law_inject.py", T0 + 20).is_some());
+
+        // Approved then CLAIMED -> restored as spent, and unclaimable.
+        let mut s2 = EscalationStore::default();
+        s2.rehydrate(
+            &[
+                opened("bbb2"),
+                decided("bbb2", "approved"),
+                chain_entry("gate_escalation_claimed", serde_json::json!({"escalation_id": "bbb2"})),
+            ],
+            T0 + 20,
+        );
+        assert!(
+            s2.claim("kimi-code", "law_inject.py", T0 + 20).is_none(),
+            "a restart re-armed an approval the chain shows was already spent — crashing the \
+             daemon must not be a way to reuse a human's yes"
+        );
+
+        // An unreadable status must NOT restore as a grant.
+        let mut s3 = EscalationStore::default();
+        s3.rehydrate(&[opened("ccc3"), decided("ccc3", "¯\\_(ツ)_/¯")], T0 + 20);
+        assert!(!s3.status_of("ccc3", T0 + 20).permits_write());
+
+        // A decision whose `opened` entry fell outside the replay window is skipped, not
+        // synthesised: a governance record no witnessed act supports must never reach an operator.
+        let mut s4 = EscalationStore::default();
+        assert_eq!(s4.rehydrate(&[decided("ddd4", "approved")], T0 + 20), 0);
+        assert_eq!(s4.status_of("ddd4", T0 + 20), Status::Expired);
+
+        // Already terminal by time -> not restored; it cannot be ruled and would only pad the queue.
+        let mut s5 = EscalationStore::default();
+        assert_eq!(s5.rehydrate(&[opened("eee5")], T0 + 7200), 0);
+    }
 
     /// Opens on `law_inject.py` — the SingleApprover surface. Claim-mechanics tests live
     /// here because their subject is the claim, not the bar; bar semantics have their own
