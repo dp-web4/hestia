@@ -546,11 +546,8 @@ impl ServerState {
         pa: &crate::policy::PolicyAction,
         evaluation: crate::policy::PolicyEvaluation,
     ) -> crate::policy::PolicyEvaluation {
-        let now = crate::server::gate_escalation::now_secs();
         match self
-            .instance_grants
-            .get(&(plugin_id.to_string(), role.to_string()))
-            .filter(|g| g.is_live(now))
+            .instance_grant(plugin_id, role)
             .and_then(|g| crate::policy::get_preset(&g.preset))
         {
             Some(p) => crate::policy::PolicyEngine::new(p.config).evaluate(pa),
@@ -558,12 +555,51 @@ impl ServerState {
         }
     }
 
+    /// Strictness ordering over the built-in presets, so the daemon can tell a TIGHTENING from a
+    /// LOOSENING and route each to the store that fits its lifetime (dp, 2026-08-01).
+    ///
+    /// `permissive` and `audit-only` both let everything through — audit-only records and does
+    /// not enforce — so both rank below the enforcing presets. The exact spacing does not
+    /// matter; only the order does, and only to answer one question: does this grant widen what
+    /// the member may do, or narrow it?
+    pub fn preset_strictness(name: &str) -> u8 {
+        match name {
+            "permissive" => 0,
+            "audit-only" => 1,
+            "safety" => 2,
+            "strict" => 3,
+            // An unknown preset is treated as the strictest thing we know. It cannot be used to
+            // widen by being unrecognised.
+            _ => u8::MAX,
+        }
+    }
+
+    /// Is `preset` a loosening relative to the society baseline currently in force?
+    pub fn is_loosening(&self, preset: &str) -> bool {
+        let society = self.vault.policy().active_preset.clone();
+        Self::preset_strictness(preset) < Self::preset_strictness(&society)
+    }
+
     /// The live grant for `(plugin_id, role)`, for surfaces that must DISCLOSE it rather than
     /// merely apply it. A loosening the subject cannot see is a trapdoor.
+    ///
+    /// Falls back to the wildcard role `*` for the same plugin. dp, 2026-08-01: the operator
+    /// selects an AGENT on the dashboard, not an (agent, role) pair — "when an agent is selected
+    /// and the chain shows only its actions, clicking the policy button should only change the
+    /// policy for the selected agent". A member acts under several roles over its life, and
+    /// requiring the operator to know which one is live right now would make the control
+    /// unusable at exactly the moment it is reached for: something is stuck and needs unblocking.
+    ///
+    /// Exact match wins, so a role-specific grant is still expressible and still beats the
+    /// wildcard — narrow before broad, which is the same precedence every other layer uses.
     pub fn instance_grant(&self, plugin_id: &str, role: &str) -> Option<&InstanceGrant> {
         let now = crate::server::gate_escalation::now_secs();
         self.instance_grants
             .get(&(plugin_id.to_string(), role.to_string()))
+            .or_else(|| {
+                self.instance_grants
+                    .get(&(plugin_id.to_string(), "*".to_string()))
+            })
             .filter(|g| g.is_live(now))
     }
 

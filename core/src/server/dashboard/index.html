@@ -609,6 +609,10 @@
   .pol-add-wrap summary { cursor: pointer; color: var(--accent); font-size: 0.8rem; }
   .pol-add { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.75rem; }
   /* policy trigger button in the witness-chain header */
+  .pol-scope { font-size: 0.76rem; line-height: 1.45; padding: 0.45rem 0.65rem; border-radius: 4px; margin-bottom: 0.6rem; }
+  .pol-scope.society { color: var(--coral); background: #ff7a6618; border: 1px solid var(--coral); }
+  .pol-scope.scoped  { color: var(--accent); background: var(--accent-dim); border: 1px solid var(--accent); }
+
   /* --- per-member policy grants --- */
   .grant-note { font-size: 0.74rem; color: var(--fg-dim); line-height: 1.5; margin: 0.3rem 0 0.6rem;
     padding: 0.45rem 0.6rem; background: var(--bg); border-left: 2px solid var(--warning); border-radius: 3px; }
@@ -835,6 +839,7 @@
         <button class="modal-close" data-close="1" aria-label="Close">✕</button>
       </div>
       <div class="modal-body">
+        <div class="pol-scope society" id="pol-scope"></div>
         <div class="pol-presets" id="pol-presets"></div>
         <!-- PER-MEMBER GRANTS. The preset above is the SOCIETY baseline and applies to every
              seat on this box -- including unattended watcher-fired agents -- so using it to
@@ -1847,6 +1852,17 @@
 
   function renderPolicy(p) {
     $('pol-mode').textContent = `${p.active_preset} · ${p.enforce ? 'enforcing' : 'audit'}`;
+    // SAY WHAT THE BUTTONS WILL CHANGE. The scope was invisible, so a scoped-looking control
+    // silently set the whole society twice in one session. The banner is loud when scoped,
+    // because "this affects everyone" is the assumption that has to be defeated.
+    const scope = $('pol-scope');
+    if (scope) {
+      const target = window.policyTarget && window.policyTarget();
+      scope.textContent = target
+        ? `Presets below apply to ${target} ONLY — a per-member grant, witnessed. Tightening persists; loosening dies with the daemon.`
+        : 'Presets below change the SOCIETY baseline — every member on this machine, including unattended ones. Select a member above to scope it.';
+      scope.className = target ? 'pol-scope scoped' : 'pol-scope society';
+    }
     $('pol-presets').innerHTML = p.presets.map(pr =>
       `<button class="filter-btn${pr.name===p.active_preset?' selected':''}" data-preset="${escapeHtml(pr.name)}" title="${escapeHtml(pr.description)}">${escapeHtml(pr.name)}</button>`
     ).join('');
@@ -2096,7 +2112,26 @@
     const card = $('policy-card');
     card.addEventListener('click', (e) => {
       const t = e.target;
-      if (t.dataset.preset) polSend('PUT', '/api/policy/preset', { preset: t.dataset.preset });
+      if (t.dataset.preset) {
+        const target = window.policyTarget && window.policyTarget();
+        if (target) {
+          // Scoped to the selected member. A reason is required to WIDEN, matching the daemon;
+          // prompt rather than silently sending one, because the record is read back later and
+          // "changed from the dashboard" answers nothing.
+          const reason = prompt(
+            `Set policy for ${target} only (not the society).\n\n` +
+            `Reason (required — this is recorded in the witness chain):`);
+          if (!reason || !reason.trim()) return;
+          polSend('POST', '/api/policy/instance', {
+            plugin_id: target,
+            role: '*',
+            preset: t.dataset.preset,
+            reason: reason.trim(),
+          });
+        } else {
+          polSend('PUT', '/api/policy/preset', { preset: t.dataset.preset });
+        }
+      }
       else if (t.dataset.revert) polSend('DELETE', `/api/policy/override/${encodeURIComponent(t.dataset.revert)}`);
       else if (t.dataset.remove) polSend('DELETE', `/api/policy/rule/${encodeURIComponent(t.dataset.remove)}`);
       else if (t.id === 'pol-add-btn') {
@@ -2127,6 +2162,21 @@
 
     // Escalation modal: same backdrop/✕ contract. The list is already current from the
     // last tick, so opening it shows what is pending without a second fetch.
+    // WHEN A MEMBER IS SELECTED, THE POLICY BUTTON TARGETS THAT MEMBER (dp, 2026-08-01):
+    // "when an agent is selected and the chain shows only its actions, clicking the policy
+    // button should only change the policy for the selected agent."
+    //
+    // The preset buttons were always the SOCIETY preset, so selecting kimi and clicking
+    // `permissive` set every seat on the box permissive — twice, in one session, because the
+    // control looked scoped and was not. Selection already filters the chain and the stats; the
+    // policy control was the one thing in the header that ignored it, which is exactly why it
+    // read as scoped.
+    //
+    // The grain follows what the operator selected: an AGENT, applied with the wildcard role,
+    // because a member acts under several roles and demanding the right one at the moment
+    // something is stuck makes the control useless when it is most needed.
+    window.policyTarget = () => selectedOrch || null;
+
     const escModal = $('esc-modal');
     $('esc-banner-btn').addEventListener('click', () => { escModal.hidden = false; });
     escModal.addEventListener('click', (e) => { if (e.target.dataset.close) escModal.hidden = true; });

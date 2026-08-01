@@ -1040,15 +1040,50 @@ async fn policy_set_instance_grant(
         .map(|s| now + s);
 
     let mut s = state.lock().await;
-    let grant = InstanceGrant {
-        preset: preset.clone(),
-        granted_by: "operator".to_string(),
-        granted_at: now,
-        reason: reason.clone(),
-        expires_at,
+
+    // THE DIRECTION DECIDES THE STORE (dp, 2026-08-01). Each half already had the right
+    // mechanism; what was missing was routing to it.
+    //
+    //   TIGHTENING -> vault instance overlay. Persists across restarts and folds strictest-wins
+    //                 with everything else, which is exactly what a restriction should do. A
+    //                 member restricted for cause must not be freed by a reboot.
+    //   LOOSENING  -> in-memory grant. Substitutes the local baseline and dies with the daemon,
+    //                 so a permission nobody remembers to revoke expires on its own.
+    //
+    // Sending a tightening through the memory path would have made restrictions evaporate on
+    // restart; sending a loosening through the vault would have made permissions permanent and
+    // written to disk. Same control, opposite correct answers.
+    let loosening = s.is_loosening(&preset);
+    let durability = if loosening {
+        s.instance_grants.insert(
+            (plugin_id.clone(), role.clone()),
+            InstanceGrant {
+                preset: preset.clone(),
+                granted_by: "operator".to_string(),
+                granted_at: now,
+                reason: reason.clone(),
+                expires_at,
+            },
+        );
+        "memory-only — a daemon restart revokes it"
+    } else {
+        // A tightening is expressed as the preset's own rules laid over this member, so it
+        // composes with society law by the ordinary fold rather than replacing it.
+        let rules = crate::policy::get_preset(&preset)
+            .map(|p| p.config.rules)
+            .unwrap_or_default();
+        if let Err(e) = s.vault.set_instance_overlay(&plugin_id, &role, rules) {
+            // Fail LOUD. A tightening that silently did not persist is the worst outcome
+            // available here: the operator believes a member is restricted, the UI shows the
+            // restriction until the next restart, and then it is simply gone.
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("vault write failed: {e}")})),
+            );
+        }
+        s.reload_policy();
+        "vault — survives a daemon restart"
     };
-    s.instance_grants
-        .insert((plugin_id.clone(), role.clone()), grant);
     let entry = s.append_chain(
         "policy_instance_grant",
         serde_json::json!({
@@ -1060,7 +1095,8 @@ async fn policy_set_instance_grant(
             "expires_at": expires_at,
             "granted_by": "operator",
             "via": "operator_session",
-            "durability": "memory-only — does not survive a daemon restart",
+            "direction": if loosening { "loosening" } else { "tightening" },
+            "durability": durability,
         }),
     );
     (
@@ -1072,7 +1108,8 @@ async fn policy_set_instance_grant(
             "preset": preset,
             "expires_at": expires_at,
             "witnessEntryHash": entry.map(|e| e.hash).unwrap_or_default(),
-            "note": "In memory only. A daemon restart revokes it.",
+            "direction": if loosening { "loosening" } else { "tightening" },
+            "durability": durability,
         })),
     )
 }
