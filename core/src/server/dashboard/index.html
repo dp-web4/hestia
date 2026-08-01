@@ -659,6 +659,10 @@
 
   .policy-btn { background: var(--accent-dim); color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 0.25rem 0.7rem; font: inherit; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; cursor: pointer; margin-right: 0.5rem; white-space: nowrap; }
   .policy-btn:hover { background: var(--accent); color: var(--bg); }
+  /* A scoped label must not look like the society label — the whole failure was not being able
+     to tell which one you were reading. */
+  .policy-btn-scoped { background: var(--warning); color: var(--bg); border-color: var(--warning); }
+  .policy-btn-scoped:hover { background: var(--warning); color: var(--bg); filter: brightness(1.15); }
   /* modal */
   .modal[hidden] { display: none; }
   .modal { position: fixed; inset: 0; z-index: 50; display: flex; align-items: flex-start; justify-content: center; padding: 5vh 1rem; }
@@ -1519,7 +1523,35 @@
     // not inline in the title.
     const pol = lastData?.policy;
     const polBtn = $('policy-btn');
-    if (polBtn) polBtn.textContent = pol ? `policy: ${pol.preset}${pol.enforce ? '' : ' (audit)'}` : 'policy';
+    // THE LABEL MUST NAME THE LAW THAT IS ACTUALLY IN FORCE FOR WHAT IS ON SCREEN.
+    //
+    // This read `lastData.policy` unconditionally — always the SOCIETY preset — so with a member
+    // selected and a live grant on it, the chain showed that member's actions while the button
+    // above them named a law that member was not being judged under. dp hit exactly that and
+    // could not tell whether the grant had failed to apply or the display had failed to update.
+    //
+    // That ambiguity is the defect, not the wrong string: a status surface that cannot be
+    // distinguished from a broken mechanism sends you debugging the wrong layer. Same family as
+    // the null-state twin — a display that looks identical whether or not the thing worked.
+    if (polBtn) {
+      const target = window.policyTarget && window.policyTarget();
+      const grant = target
+        ? (lastData?.instance_grants ?? []).find(g => g.plugin_id === target)
+        : null;
+      if (grant) {
+        polBtn.textContent = `policy: ${grant.preset} · ${target}`;
+        polBtn.classList.add('policy-btn-scoped');
+        polBtn.title = `Per-member grant: ${target} runs under "${grant.preset}", not the society `
+          + `baseline ("${pol ? pol.preset : '?'}"). ${grant.reason ? `Reason: ${grant.reason}. ` : ''}`
+          + `Click to view or change.`;
+      } else {
+        polBtn.textContent = pol ? `policy: ${pol.preset}${pol.enforce ? '' : ' (audit)'}` : 'policy';
+        polBtn.classList.remove('policy-btn-scoped');
+        polBtn.title = target
+          ? `${target} is on the society baseline — no per-member grant. Click to scope one.`
+          : 'View / edit the society policy';
+      }
+    }
     const filterLabel =
       feedFilter === 'deny' ? 'denies' : feedFilter === 'warn' ? 'warnings' : 'live';
     let baseTitle = `Witness chain — ${filterLabel}`;
