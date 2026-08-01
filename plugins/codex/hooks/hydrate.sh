@@ -85,6 +85,14 @@ try:
 except FileNotFoundError:
     pass
 
+# Keep prose subordinate to the live grant. Enumerating the complement here goes stale as soon as
+# the registry adds a public repo or trust accrues a private grant.
+ident.setdefault("mrh", {})["out_of_scope_note"] = (
+    "outside the launch cwd, denied = any repo not in `in_scope`; the complement is DERIVED "
+    "at read time, never enumerated here; scope widens as role-scoped trust accrues; "
+    "ask-don't-reach (asking IS the trust-building act)"
+)
+
 json.dump(ident, open(ident_p, "w", encoding="utf-8"), indent=2)
 
 # rewrite the dynamic state block in the deployed AGENTS.md (markers required; absent -> skip)

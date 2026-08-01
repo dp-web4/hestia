@@ -73,7 +73,7 @@
       "repo:synchronism-site",
       "repo:web4"
     ],
-    "out_of_scope_note": "the remaining PRIVATE repos (4-gov, dev-SAGE, hardbound, metalinxx, modbatt, modbatt-hardware, portal, web4-modbatt-demo) are denied unless the launch cwd is one of them; scope widens as role-scoped trust accrues; ask-don't-reach (asking IS the trust-building act)",
+    "out_of_scope_note": "outside the launch cwd, denied = any repo not in `in_scope`; the complement is DERIVED at read time, never enumerated here; scope widens as role-scoped trust accrues; ask-don't-reach (asking IS the trust-building act)",
     "sandbox_note": "WRITE boundary for out-of-scope repos = the sandbox (sandbox_mode=workspace-write confines writes to the launch workspace; network_access=false blocks egress). READ boundary = weak: the sandbox reads the whole FS, so a broad relative traversal (grep -r . from workspace root) can read private repos \u2014 the shell gate catches explicit reaches only. Launch Codex in the specific task repo, not the workspace root; a bind-mount that exposes only granted repos is the real read-confinement fix (future)."
   },
   "milestones": [],
