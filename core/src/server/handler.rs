@@ -252,7 +252,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_gate_escalation_open",
-            "Ask a HUMAN to approve a write to the governance surface (gate, witness, law_inject, the registration). Stage 2 of dp's 2026-07-29 ruling: the gate refuses these writes, and this is the channel that un-refuses a legitimate one. Returns an escalation_id and a deadline; NO DECISION WITHIN THE WINDOW IS A DENY, not a retry. Witnessed on open. Assurance A1: the operator shares this UID, so approval is tamper-EVIDENT, not tamper-proof",
+            "Ask a HUMAN to approve a write to the governance surface (gate, witness, law_inject, the registration). Stage 2 of dp's 2026-07-29 ruling: the gate refuses these writes, and this is the channel that un-refuses a legitimate one. Returns an escalation_id and a deadline; NO DECISION WITHIN THE WINDOW IS A DENY, not a retry. Witnessed on open. Assurance A1: the operator shares this UID, so approval is tamper-EVIDENT, not tamper-proof. PASS answers_deny = the chain hash of the deny you are escalating (hestia_witness_decision returns it as witnessEntryHash): without it the escalation is witnessed but UNLINKED, and unlinked escalations cannot be credited as conduct — escalating instead of routing around is the top of the Temperament scale (1.0 on approval), and the link is what makes it readable. It is never inferred from timing",
         ),
         t(
             "hestia_gate_pending_escalations",
@@ -8987,6 +8987,27 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     let tool_name = require_string(args, "tool_name")?;
     let marker = require_string(args, "marker")?;
     let role = optional_string(args, "role").unwrap_or_default();
+    // The chain hash of the DENY this escalation answers (dp, 2026-08-01: "record the ruling
+    // as a separate act, and link it to the previous act it modifies").
+    //
+    // Nothing is mutated. The deny stands as a faithful record that at that moment, under that
+    // law, the act was refused. The escalation is a later, separate act pointing at it, and a
+    // ruling points at the escalation. All witnessed, one chain; the accounting reads the
+    // relation rather than editing history.
+    //
+    // Why this one field is load-bearing: `derivation.rs` already reserves
+    // `ask-after-deny = 1.0` — the TOP of the Temperament scale, above comply-after-deny at
+    // 0.85 — for "witnessed escalation/appeal events REFERENCING THE DENY", and caps every
+    // member at 0.7 until such events exist. The escalation has always been witnessed; it has
+    // never carried the reference. So the highest-scoring conduct in the society has been
+    // unrecordable, and the entire fleet sits at the medium/high boundary. The value was
+    // already in the caller's hand: `hestia_witness_decision` returns `witnessEntryHash`.
+    //
+    // Optional, and deliberately NOT inferred from timing when absent. Guessing the link by
+    // proximity would manufacture the evidence that makes the score real — the same
+    // reports-success-while-measuring-nothing defect this surface keeps producing. No link,
+    // no credit: documented rather than faked, which is the stance the module already took.
+    let answers_deny = optional_string(args, "answers_deny");
     let now = now_secs();
 
     let mut s = state.lock().await;
@@ -9020,6 +9041,9 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
             "role": esc.role,
             "tool_name": esc.tool_name,
             "marker": esc.marker,
+            // The act this one answers. Null when the caller did not supply it — an absent
+            // link reads as absent, never as inferred.
+            "answers_deny": answers_deny,
             // THE BAR, written down (dp 2026-07-30 + claude-code): the evidence and the
             // verdict were already recorded; without the criterion, "sufficient for this
             // context" is unauditable. Stated at open, evaluated at decision.
