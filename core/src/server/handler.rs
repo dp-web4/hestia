@@ -9119,6 +9119,13 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     let tool_name = require_string(args, "tool_name")?;
     let marker = require_string(args, "marker")?;
     let role = optional_string(args, "role").unwrap_or_default();
+    // Chain hash of the deny being escalated. See tool_gate_escalation_open for why this is
+    // load-bearing; it is repeated here because THIS is the entry point the gate actually
+    // uses. `hestia_gate_escalation_open` is the documented door and `..._claim` is the one
+    // the hook calls (claim-or-open in one round trip, because the hook must never wait), so
+    // a field added only to the former is a field the running system never sees. Caught the
+    // same day it shipped, by reading the hook instead of the tool list.
+    let answers_deny = optional_string(args, "answers_deny");
     let now = now_secs();
 
     let mut s = state.lock().await;
@@ -9179,6 +9186,8 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                     "role": esc.role,
                     "tool_name": esc.tool_name,
                     "marker": esc.marker,
+                    // The act this one answers. Null reads as absent, never as inferred.
+                    "answers_deny": answers_deny,
                     "expires_at": esc.expires_at,
                     "assurance": "A1 — cooperative gate, same-UID operator. Tamper-EVIDENT, \
                                   not tamper-proof.",
