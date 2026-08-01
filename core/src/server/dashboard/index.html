@@ -1534,7 +1534,7 @@
     // distinguished from a broken mechanism sends you debugging the wrong layer. Same family as
     // the null-state twin — a display that looks identical whether or not the thing worked.
     if (polBtn) {
-      const target = window.policyTarget && window.policyTarget();
+      const target = selectedOrch || null;
       const grant = target
         ? (lastData?.instance_grants ?? []).find(g => g.plugin_id === target)
         : null;
@@ -1889,7 +1889,7 @@
     // because "this affects everyone" is the assumption that has to be defeated.
     const scope = $('pol-scope');
     if (scope) {
-      const target = window.policyTarget && window.policyTarget();
+      const target = selectedOrch || null;
       scope.textContent = target
         ? `Presets below apply to ${target} ONLY — a per-member grant, witnessed. Tightening persists; loosening dies with the daemon.`
         : 'Presets below change the SOCIETY baseline — every member on this machine, including unattended ones. Select a member above to scope it.';
@@ -2145,7 +2145,7 @@
     card.addEventListener('click', (e) => {
       const t = e.target;
       if (t.dataset.preset) {
-        const target = window.policyTarget && window.policyTarget();
+        const target = selectedOrch || null;
         if (target) {
           // Scoped to the selected member. A reason is required to WIDEN, matching the daemon;
           // prompt rather than silently sending one, because the record is read back later and
@@ -2207,7 +2207,6 @@
     // The grain follows what the operator selected: an AGENT, applied with the wildcard role,
     // because a member acts under several roles and demanding the right one at the moment
     // something is stuck makes the control useless when it is most needed.
-    window.policyTarget = () => selectedOrch || null;
 
     const escModal = $('esc-modal');
     $('esc-banner-btn').addEventListener('click', () => { escModal.hidden = false; });
