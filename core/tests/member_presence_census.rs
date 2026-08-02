@@ -208,6 +208,20 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str])] = &[
     ("server/http.rs::operator_gate_escalation", &[
         "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
     ]),
+    // Per-member policy grants (2026-08-01). Same property as the escalation record above and
+    // for the same reason: `member_lct` asserts a NAME, not attendance, so the subject of a
+    // grant may be a plugin_id no member has ever registered under. That is tolerable here
+    // because a grant is keyed on `(plugin_id, role)` at evaluation time — an id nobody acts
+    // under simply never matches and the grant is inert — but it means an operator can type a
+    // typo and see a live-looking grant that governs nothing. Registered here so the next
+    // reader meets that fact deliberately rather than discovering it from a grant that did
+    // nothing.
+    ("server/http.rs::policy_set_instance_grant", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ]),
+    ("server/http.rs::policy_revoke_instance_grant", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ]),
     ("server/state.rs::apply_adjudication_ctx", &[
         "if let Some(subject_lct) = self.member_lct(subject_plugin_id) {",
     ]),

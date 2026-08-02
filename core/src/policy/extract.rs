@@ -53,9 +53,17 @@ pub fn extract_full_command(tool_name: &str, input: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Map a tool name to a category for rule matching. The category strings
-/// match the ones the preset rules reference (`file_read`, `file_write`,
-/// `command`, `network`, `credential_access`).
+/// Map a tool name to a category for rule matching.
+///
+/// Only `file_read`, `file_write`, `network` and `credential_access` are
+/// actually named by a built-in preset rule. The rest — `command`,
+/// `task_management`, `witness_append`, `unknown` — are minted here and
+/// matched by nothing, so a rule written as `categories: ["command"]` is
+/// silently dead law. (This comment previously listed `command` among the
+/// preset-referenced set; the safety preset governs the shell through
+/// `tools: ["Bash"]` and command patterns, never through the category.)
+/// `tests/gate_category_coverage.rs` pins which is which and goes red when
+/// it changes.
 ///
 /// A tool can belong to multiple categories — for example `Bash` is
 /// both `command` and (potentially) `credential_access` depending on

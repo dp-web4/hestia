@@ -72,6 +72,58 @@ pub struct InFlightAction {
     pub chain_position: u64,
 }
 
+/// An operator's scoped exception to society law for one `(plugin_id, role)`.
+///
+/// Held in memory only — see `ServerState::instance_grants`. Carries WHO granted it and WHY,
+/// because a loosening whose rationale is not recorded is indistinguishable after the fact from
+/// a misconfiguration, and this is the one control in the system that can widen what an agent
+/// may do.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InstanceGrant {
+    /// Preset the grant applies to this member instead of the society baseline.
+    pub preset: String,
+    /// Operator identity from the challenge-signed session that set it.
+    pub granted_by: String,
+    pub granted_at: u64,
+    pub reason: String,
+    /// Wall-clock expiry, when the operator set one. `None` means it lasts until revoked or
+    /// until the daemon restarts — which it always eventually does, so no grant is permanent.
+    pub expires_at: Option<u64>,
+}
+
+impl InstanceGrant {
+    pub fn is_live(&self, now: u64) -> bool {
+        self.expires_at.is_none_or(|e| now < e)
+    }
+}
+
+/// THE ASYMMETRY, stated once so neither half drifts (dp, 2026-08-01):
+///
+/// | direction  | where it lives              | survives restart |
+/// |------------|-----------------------------|------------------|
+/// | TIGHTENING | vault (`instance_overlays`) | **yes**          |
+/// | LOOSENING  | memory (`instance_grants`)  | **no**           |
+///
+/// This is deliberate and the two directions must never be unified into one store. A
+/// RESTRICTION has to be durable — a member restricted for cause must not be freed by a
+/// reboot, and "restart the daemon" would otherwise be the way out of any tightening. A
+/// PERMISSION has to be ephemeral — a grant nobody remembers to revoke must expire on its own,
+/// and the daemon restarting is the backstop that guarantees it does.
+///
+/// Neither lives in an external file. Tightening is vault↔memory: it is written into the
+/// encrypted vault and read back into `instance_policy_engines`, never to a plaintext config
+/// on disk that could be edited around the gate — which is the hole `#133` recorded, where
+/// widening a member's authority was a `json.dump` nobody had to ask permission for.
+pub const POLICY_SCOPE_ASYMMETRY: () = ();
+
+/// How much chain the escalation replay scans at startup.
+///
+/// Bounded on purpose: escalations live at most `DEFAULT_TTL_SECS` (1h) plus a claim window, so
+/// anything older than a few thousand entries is terminal by time and cannot be ruled. Scanning
+/// the whole chain (96 MB here) to rebuild an hour of state would make every daemon start pay
+/// for all of history.
+const ESCALATION_REPLAY_SCAN: u64 = 5_000;
+
 /// The mutable core state passed to every request handler.
 pub struct ServerState {
     /// In-scope work awaiting attestation, keyed by (plugin_id, role_lct) → (allows, denies).
@@ -128,6 +180,30 @@ pub struct ServerState {
     /// wins in the gate, so a specific orchestrator can only tighten its role's
     /// law, never loosen it. Built from the vault's `instance_overlays`.
     pub instance_policy_engines: HashMap<(String, String), crate::policy::PolicyEngine>,
+    /// OPERATOR GRANTS — per-`(plugin_id, role)`, and the ONLY input in the whole fold that
+    /// may LOOSEN (dp, 2026-08-01).
+    ///
+    /// Every other input tightens by construction: role overlay, instance overlay and hub law
+    /// all fold strictest-wins, so law can only get stricter as it gets more specific. That
+    /// invariant is load-bearing and is NOT relaxed here — this is a separate, narrower channel
+    /// that sits outside the fold, and three properties are what make it safe to have at all:
+    ///
+    /// 1. **Memory only.** Never serialized, never written to the vault file. A grant cannot
+    ///    outlive the daemon, so the blast radius of forgetting to revoke one is bounded by the
+    ///    next restart. Ephemerality is the safety property here — the exact inverse of the
+    ///    escalation store, where persistence is the safety property, because a human RULING
+    ///    must survive a deploy while a standing GRANT must not.
+    /// 2. **Operator-set only.** Reachable through the operator-gated HTTP surface
+    ///    (challenge-signed session) and deliberately NOT exposed as an MCP tool. An agent
+    ///    cannot change its own policy or another agent's. `no_mcp_tool_can_set_an_operator_grant`
+    ///    asserts this rather than leaving it to nobody having written the tool yet.
+    /// 3. **Readable by the subject.** An agent can always ask what it is operating under via
+    ///    `hestia_operating_law`, which reports the grant and who made it. A loosening the
+    ///    subject cannot see is a trapdoor; one it can see is a disclosed exception.
+    ///
+    /// Society baseline is NOT this. The baseline lives in society law and moves only by
+    /// amendment — a grant is a scoped exception to it, never an edit of it.
+    pub instance_grants: HashMap<(String, String), InstanceGrant>,
     /// Hub-law gate (consolidation, 2026-07-10): the third fold input.
     /// `None` = no law file at `$HESTIA_HOME/law/hub-law.yaml` (no-op);
     /// `Some(Invalid)` fails closed. See `policy::law_gate`.
@@ -240,7 +316,7 @@ impl ServerState {
             )?
         };
 
-        Ok(Self {
+        let mut st = Self {
             scope_tally: std::collections::HashMap::new(),
             vault,
             sessions: HashMap::new(),
@@ -256,6 +332,10 @@ impl ServerState {
             policy_engine,
             role_policy_engines,
             instance_policy_engines,
+            // Empty at every startup, by design: grants do not survive a restart. Escalations
+            // DO — see the rehydrate call after construction. The two are opposite on purpose:
+            // a human's ruling must survive a deploy, a standing permission must not.
+            instance_grants: HashMap::new(),
             law_gate,
             synthetic_plugins,
             home: home.to_path_buf(),
@@ -264,7 +344,26 @@ impl ServerState {
             operator_challenges: crate::server::operator_auth::ChallengeStore::default(),
             operator_sessions: crate::server::operator_auth::SessionStore::default(),
             gate_escalations: Default::default(),
-        })
+        };
+
+        // REHYDRATE ESCALATIONS FROM THE CHAIN.
+        //
+        // Without this, a restart destroyed every pending escalation and every approval a human
+        // had already granted. Measured 2026-08-01: dp approved a governance write, a deploy
+        // restarted the daemon minutes later, and the ruling was gone — so the act of deploying
+        // governance was what destroyed the governance. Under fail-closed with one gate, that is
+        // a fleet stopped mid-approval with the approval lost.
+        //
+        // The chain is read NEWEST-first, so it is reversed: replay amends in arrival order and
+        // applying a decision before the open it belongs to would drop it.
+        let now = crate::server::gate_escalation::now_secs();
+        let mut window = st.chain_store.read_recent(ESCALATION_REPLAY_SCAN).unwrap_or_default();
+        window.reverse();
+        let restored = st.gate_escalations.rehydrate(&window, now);
+        if restored > 0 {
+            eprintln!("[hestia] restored {restored} live escalation(s) from the chain");
+        }
+        Ok(st)
     }
 
     /// Mark a plugin_id as synthetic and persist. Idempotent on membership;
@@ -423,6 +522,87 @@ impl ServerState {
     /// `subject`. For v1 the hub trusts hestia's sovereign to attest its own
     /// constellation's members; v2's constellation-publish makes membership
     /// independently attestable and removes that residual trust.
+    /// Apply an operator grant for `(plugin_id, role)`, if one is live.
+    ///
+    /// ONE implementation for every evaluation site. There are three — `tool_operating_law`
+    /// (what a member is told it is under), `tool_query_policy` (what it is told when it asks
+    /// about an action), and `gate_direct_tool` (what actually happens). A grant applied to
+    /// some of those and not others produces the worst possible failure: the member is told one
+    /// law and enforced under another, and whichever surface someone checks will look correct.
+    /// Duplicating this by hand is how that happens, so it is written once and called thrice.
+    ///
+    /// SUBSTITUTION, not a fold. The operator said "this member runs under THIS preset"; taking
+    /// the stricter of the two would silently discard the instruction, which is the entire point
+    /// of the control. Every other input composes strictest-wins and keeps that invariant intact
+    /// — this is the one explicit exception, and it is a separate function so it stays legible
+    /// rather than becoming a branch inside a comparator.
+    ///
+    /// Callers must apply this BEFORE folding hub law, so ratified society law still binds. See
+    /// the ordering note at the `gate_direct_tool` call site.
+    pub fn apply_instance_grant(
+        &self,
+        plugin_id: &str,
+        role: &str,
+        pa: &crate::policy::PolicyAction,
+        evaluation: crate::policy::PolicyEvaluation,
+    ) -> crate::policy::PolicyEvaluation {
+        match self
+            .instance_grant(plugin_id, role)
+            .and_then(|g| crate::policy::get_preset(&g.preset))
+        {
+            Some(p) => crate::policy::PolicyEngine::new(p.config).evaluate(pa),
+            None => evaluation,
+        }
+    }
+
+    /// Strictness ordering over the built-in presets, so the daemon can tell a TIGHTENING from a
+    /// LOOSENING and route each to the store that fits its lifetime (dp, 2026-08-01).
+    ///
+    /// `permissive` and `audit-only` both let everything through — audit-only records and does
+    /// not enforce — so both rank below the enforcing presets. The exact spacing does not
+    /// matter; only the order does, and only to answer one question: does this grant widen what
+    /// the member may do, or narrow it?
+    pub fn preset_strictness(name: &str) -> u8 {
+        match name {
+            "permissive" => 0,
+            "audit-only" => 1,
+            "safety" => 2,
+            "strict" => 3,
+            // An unknown preset is treated as the strictest thing we know. It cannot be used to
+            // widen by being unrecognised.
+            _ => u8::MAX,
+        }
+    }
+
+    /// Is `preset` a loosening relative to the society baseline currently in force?
+    pub fn is_loosening(&self, preset: &str) -> bool {
+        let society = self.vault.policy().active_preset.clone();
+        Self::preset_strictness(preset) < Self::preset_strictness(&society)
+    }
+
+    /// The live grant for `(plugin_id, role)`, for surfaces that must DISCLOSE it rather than
+    /// merely apply it. A loosening the subject cannot see is a trapdoor.
+    ///
+    /// Falls back to the wildcard role `*` for the same plugin. dp, 2026-08-01: the operator
+    /// selects an AGENT on the dashboard, not an (agent, role) pair — "when an agent is selected
+    /// and the chain shows only its actions, clicking the policy button should only change the
+    /// policy for the selected agent". A member acts under several roles over its life, and
+    /// requiring the operator to know which one is live right now would make the control
+    /// unusable at exactly the moment it is reached for: something is stuck and needs unblocking.
+    ///
+    /// Exact match wins, so a role-specific grant is still expressible and still beats the
+    /// wildcard — narrow before broad, which is the same precedence every other layer uses.
+    pub fn instance_grant(&self, plugin_id: &str, role: &str) -> Option<&InstanceGrant> {
+        let now = crate::server::gate_escalation::now_secs();
+        self.instance_grants
+            .get(&(plugin_id.to_string(), role.to_string()))
+            .or_else(|| {
+                self.instance_grants
+                    .get(&(plugin_id.to_string(), "*".to_string()))
+            })
+            .filter(|g| g.is_live(now))
+    }
+
     pub fn member_lct(&self, plugin_id: &str) -> Option<String> {
         let id = plugin_id.trim();
         if id.is_empty() || self.is_synthetic(id) {
@@ -569,6 +749,7 @@ impl ServerState {
             action_type: "outcome",
             action_target: "",
             action_id: "",
+            rule_triggered: "",
             reason: if success {
                 "outcome:success"
             } else {
@@ -788,6 +969,7 @@ mod tests {
             action_type: "outcome",
             action_target: "",
             action_id: "",
+            rule_triggered: "",
             reason: "outcome:failure",
         }
     }

@@ -60,6 +60,37 @@ pub struct DashboardSnapshot {
     /// ("hour" | "day" | "week" | "all") — echoed so the UI labels honestly.
     #[serde(default)]
     pub window: String,
+    /// Governance-surface escalations awaiting a decision, newest first.
+    ///
+    /// Carried on the snapshot the dashboard already polls rather than behind a
+    /// new route, because the failure this fixes is not "the operator could not
+    /// fetch the queue" — it is that **nothing ever told them there was one**.
+    /// A route the UI never calls is what we already had: `POST
+    /// /api/operator/gate-escalation` has existed as the strongest human
+    /// decision channel in the system, operator-authenticated, with no front end
+    /// to reach it. Five escalations opened against dp on 2026-08-01 and the
+    /// only notice of any of them was in the denied agent's own stderr.
+    ///
+    /// Riding the tick means a pending escalation becomes visible within one
+    /// poll of being opened, with no operator action required to discover it.
+    #[serde(default)]
+    pub pending_escalations: Vec<serde_json::Value>,
+    /// Live per-member operator grants. Surfaced on the snapshot the dashboard already polls,
+    /// for the same reason the escalations are: a standing exception to society law that the
+    /// operator has to go looking for is one they will forget they made. These are the only
+    /// control in the system that WIDENS what an agent may do, so they should be the hardest
+    /// thing in the UI to leave running by accident.
+    #[serde(default)]
+    pub instance_grants: Vec<serde_json::Value>,
+    /// Set when the chain read backing `stats` / `stats_by_plugin` FAILED.
+    ///
+    /// When this is present the counts are not measurements and must not be rendered as
+    /// numbers — they are all zero because nothing could be read, not because nothing happened.
+    /// A governance console showing a quiet fleet because its query broke is the most
+    /// dangerous shape this dashboard can take: the operator is watching for unexpected agent
+    /// activity, and absence is exactly the reading they would trust without checking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats_unavailable: Option<String>,
     pub generated_at: DateTime<Utc>,
 }
 
@@ -292,7 +323,29 @@ impl ServerState {
         // For activity stats, scan the recent window plus a wider sample.
         // The chain can be huge; cap the stats window at 10k entries which
         // is plenty for an "actions seen" picture without scanning forever.
-        let stats_window = self.chain_store.read_recent(10_000).unwrap_or_default();
+        //
+        // A FAILED READ IS NOT ZERO ACTIVITY (2026-08-01). This was
+        // `.unwrap_or_default()`, so any error — lock contention, a busy timeout, transient I/O
+        // — became an empty Vec and the dashboard served HTTP 200 reporting **zero actions for
+        // every member**. And because this read is `read_recent`, NOT range-scoped, one failure
+        // zeroes hour, day and week at the same instant, which is precisely how it presented:
+        // dp saw every member empty across every timeframe, a hard refresh did not help, and it
+        // came back by itself later.
+        //
+        // "Nothing happened" and "we could not find out what happened" are different facts, and
+        // rendering the second as the first is the defect this codebase keeps finding in itself.
+        // Here it was worse than a wrong number: an operator watching a governance console for
+        // unexpected agent activity would have been shown a quiet fleet by a broken query.
+        //
+        // So the error is CARRIED to the surface instead of swallowed. The UI must render
+        // unavailable rather than 0.
+        let (stats_window, stats_read_error) = match self.chain_store.read_recent(10_000) {
+            Ok(v) => (v, None),
+            Err(e) => {
+                tracing::error!("dashboard stats chain read failed: {e}");
+                (Vec::new(), Some(e.to_string()))
+            }
+        };
 
         let mut total = 0u64;
         let mut succ = 0u64;
@@ -692,6 +745,63 @@ impl ServerState {
             profile,
             constellation,
             window: window_label.to_string(),
+            pending_escalations: {
+                // `pending()` already drops expired entries, so an escalation
+                // disappears from the operator's view at the same instant it
+                // stops being decidable. A queue that still offers a button for
+                // something the daemon would refuse teaches the operator that
+                // the button lies.
+                let now = crate::server::gate_escalation::now_secs();
+                self.gate_escalations
+                    .pending(now)
+                    .into_iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "id": e.id,
+                            // Caller-asserted (HST-005). Labelled `claimed_by`
+                            // rather than `member` so the UI cannot present a
+                            // claim as an identity — the operator is deciding
+                            // partly ON this string, and it is not authenticated.
+                            "claimed_by": e.plugin_id,
+                            "role": e.role,
+                            "tool_name": e.tool_name,
+                            "marker": e.marker,
+                            "opened_at": e.opened_at,
+                            "expires_at": e.expires_at,
+                            "secs_remaining": e.expires_at.saturating_sub(now),
+                            // The criterion in force when this was opened, so the
+                            // operator reads the bar the escalation was filed
+                            // under rather than today's.
+                            "bar": e.bar,
+                            "factors": e.factors,
+                        })
+                    })
+                    .collect()
+            },
+            stats_unavailable: stats_read_error,
+            instance_grants: {
+                let now = crate::server::gate_escalation::now_secs();
+                let mut v: Vec<serde_json::Value> = self
+                    .instance_grants
+                    .iter()
+                    .filter(|(_, g)| g.is_live(now))
+                    .map(|((plugin_id, role), g)| {
+                        serde_json::json!({
+                            "plugin_id": plugin_id,
+                            "role": role,
+                            "preset": g.preset,
+                            "granted_by": g.granted_by,
+                            "reason": g.reason,
+                            "expires_at": g.expires_at,
+                            "secs_remaining": g.expires_at.map(|e| e.saturating_sub(now)),
+                        })
+                    })
+                    .collect();
+                // Stable order, so the list does not reshuffle under the operator's cursor
+                // between polls. HashMap iteration order is not an ordering a UI should inherit.
+                v.sort_by(|a, b| a["plugin_id"].as_str().cmp(&b["plugin_id"].as_str()));
+                v
+            },
             generated_at: Utc::now(),
         }
     }
