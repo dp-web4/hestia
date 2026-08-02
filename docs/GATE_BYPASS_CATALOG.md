@@ -589,23 +589,33 @@ the parent event stream. The OS sandbox may remain inherited; Hestia governance 
 ### 11.4 Git-manager and approval-path bypasses
 
 #### G13. The requester can edit the deployed publisher
-**Status: CONFIRMED-SOURCE and CONFIRMED-PERMISSION.** The inbox refs and submission metadata
-are intentionally requester-writable because they are proposals. The publisher program
-that a credential-holding seat later executes is currently writable in that same workspace.
-Changing it is therefore a supply-chain route into the approval act.
+**Status: CLOSED FOR THE SANDBOXED CODEX SEAT, 2026-08-02 (`shared-context` `2200018e`);
+fleet-wide residual remains.** The inbox refs and submission metadata are intentionally
+requester-writable because they are proposals. The publisher program originally sat in that
+same workspace, so a requester could change the code later run by the credential-holding seat.
 
-The requester need not possess network access if it can change the code later run by the
-networked deputy. “The host decided” is only meaningful if the requester cannot rewrite the
-decision procedure immediately before the host invokes it.
+The executable publisher now lives outside Codex's structural writable root. Acceptance receipts
+record the running publisher's digest and source-parity observation. This removes the route for
+this sandboxed seat and makes accidental substitution visible.
+
+It is not a same-UID fleet boundary: an unsandboxed seat may still be able to write the deployed
+copy, and a deliberately modified publisher can lie about its own digest. “The host decided” is
+therefore structurally stronger for Codex and still cooperative/tamper-evident fleet-wide.
 
 #### G14. Versioned publisher and deployed publisher are separate installations
-**Status: MEASURED, 2026-08-02.** The committed source derives its inbox from its own source
-directory and reports an empty queue there. The live queue is visible only to a copied
-instance in the host inbox. The two copies matched byte-for-byte when checked, but no
-installer or drift guard maintains that fact.
+**Status: SILENT-EMPTY-QUEUE FAILURE CLOSED, 2026-08-02 (`shared-context` `2200018e`);
+deployment distinction retained honestly.** The first committed source derived its inbox from
+its own source directory and reported an empty queue there. “No work” and “wrong installation”
+rendered identically.
 
-This is the same source/deployment split the Hestia deployment checks already diagnose
-elsewhere: correct source is not evidence of correct enforcement.
+The publisher now requires an explicit, structurally valid inbox; a missing bare repository or
+submissions directory is a hard configuration error. Every acceptance compares the running
+publisher to governed source and records both the running digest and parity state.
+
+Source and deployment remain separate objects by design, and parity currently warns rather than
+blocks. That is now a visible, receipt-bound state instead of a healthy-looking empty queue. A
+future reader must still distinguish “matched reviewed source” from “published under a recorded
+mismatch.”
 
 #### G15. Receipts and queue state are requester-writable claims
 **Status: CONFIRMED-DESIGN.** A requester can alter refs, metadata, and receipt files. That
@@ -615,6 +625,20 @@ inbox content is not evidence; every consumer must preserve that distinction.
 
 The repaired receipt-to-tip discriminator closes one accidental authority leak. It does
 not authenticate the receipt's writer.
+
+#### G16. Reusing a PR leaves manager-authored provenance on the prior revision
+**Status: MEASURED on PR #141, 2026-08-02.** Revision acceptance advanced the public branch
+from rejected tip `cf5029e` to repaired tip `3869603`, and the receipt correctly retained both.
+`open_pr()` found the existing PR and returned immediately, so the PR body continued to attest
+the rejected tip and its old base.
+
+Idempotency was implemented as “reuse the object,” but the required invariant is “one PR whose
+managed current-revision state matches the accepted revision.” A reviewer reading the branch and
+a reviewer reading the provenance table were shown different work.
+
+Required repair: on reuse, update a bounded manager-owned current-revision block or add one
+idempotent manager-authored revision note; retain prior tips; and record/return a partial failure
+if the branch advances but provenance refresh does not.
 
 ## 12. Sandbox boundary: what it really holds, and how it can still fail
 
@@ -693,8 +717,10 @@ Without automated red/green probes, both are release assumptions rather than pro
    discriminator before any allowlist widening.
 3. Resolve every connector target canonically to owner + repository identity, regardless of
    selector form, and maintain a connector mutation census.
-4. Make the git publisher and its policy non-requester-writable. Bind deployed bytes to
-   reviewed source and record that digest in every acceptance receipt.
+4. **Landed for the sandboxed Codex seat:** keep the git publisher outside the requester's
+   writable root, compare deployed bytes to reviewed source, and record the running digest and
+   parity state in every acceptance receipt. Extend the structural boundary to other seats where
+   possible, and fix reused-PR provenance (G16).
 5. Keep raw external mutation primitives from general members only after the governed
    manager has completed a real end-to-end change. The efficient path must remain usable.
 6. Separate witness from gate execution so bypassing one does not automatically silence the

@@ -76,6 +76,14 @@ pub struct RepContext<'a> {
     pub action_type: &'a str,
     pub action_target: &'a str,
     pub action_id: &'a str,
+    /// The policy rule whose trip caused this delta, when the caller knows one
+    /// (`""` when not applicable — e.g. execution outcomes, adjudications).
+    /// Until this was plumbed, `ReputationDelta.rule_triggered` was serialized on
+    /// every sink row and hardcoded empty at its sole construction site, so the
+    /// deny record could not say which rule charged whom (measured: 0/339 denies
+    /// attributed, 2026-07-31 — CBP, shared-context/forum/
+    /// cbp-marker-right-and-the-field-already-exists-2026-07-31.md).
+    pub rule_triggered: &'a str,
     pub reason: &'a str,
 }
 
@@ -141,7 +149,7 @@ pub fn delta_from_change(
         action_type: ctx.action_type.to_string(),
         action_target: ctx.action_target.to_string(),
         action_id: ctx.action_id.to_string(),
-        rule_triggered: String::new(),
+        rule_triggered: ctx.rule_triggered.to_string(),
         reason: ctx.reason.to_string(),
         t3_delta,
         v3_delta,
@@ -181,6 +189,7 @@ mod tests {
             action_type: "policy_gate",
             action_target: "Bash",
             action_id: "a1",
+            rule_triggered: "deny-destructive-commands",
             reason: "gate:deny",
         }
     }
@@ -237,6 +246,10 @@ mod tests {
             .expect("a real mutation yields a delta");
         assert_eq!(d.subject_lct, "plugin:x");
         assert_eq!(d.role_lct, V1_CONSTELLATION_ROLE);
+        // The caller-supplied rule id must reach the row — until this plumbing the
+        // field was serialized on every sink row and hardcoded `String::new()`,
+        // which read as data and answered nothing.
+        assert_eq!(d.rule_triggered, "deny-destructive-commands");
         // At least one t3 dimension moved, and every recorded key is a real dim
         // (so the hub won't silently drop it).
         assert!(!d.t3_delta.is_empty());
