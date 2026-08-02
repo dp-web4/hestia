@@ -766,6 +766,11 @@ impl ServerState {
                             "role": e.role,
                             "tool_name": e.tool_name,
                             "marker": e.marker,
+                            // The BASIS for the decision. Without these the panel asks an
+                            // operator to approve a governance write knowing only a tool
+                            // name and a path fragment (dp, 2026-08-02).
+                            "stated_reason": e.stated_reason,
+                            "stated_detail": e.stated_detail,
                             "opened_at": e.opened_at,
                             "expires_at": e.expires_at,
                             "secs_remaining": e.expires_at.saturating_sub(now),

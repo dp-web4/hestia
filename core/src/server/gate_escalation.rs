@@ -259,6 +259,31 @@ pub struct Escalation {
     pub tool_name: String,
     /// Which governance file the write would reach.
     pub marker: String,
+    /// WHY the member says it needs this, in its own words. Caller-asserted like everything
+    /// else here, and worth exactly what a self-declaration is worth — which is more than
+    /// nothing, because it is the only account of intent the decider gets.
+    ///
+    /// dp, 2026-08-02: *"the escalations currently don't provide enough information to
+    /// actually make an informed decision. that's a real issue."*
+    ///
+    /// It was worse than missing. The deny text has always instructed the member to *"say
+    /// what you need changed and why"* — and no field existed to say it in. The operator saw
+    /// an id, an (unattributed) asker, a tool name and a path fragment, then chose. Every
+    /// approval in this system so far was granted on out-of-band trust, because the
+    /// mechanism supplied nothing to judge. A governance surface that asks for a decision
+    /// while withholding the basis is not a control; it is a prompt for a coin flip.
+    /// NB: distinct from `reason` below, which is the DECIDER's rationale. Naming both
+    /// `reason` would merge the asker's claim with the ruler's finding into one field, and
+    /// the whole value of the record is that they are separately attributable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stated_reason: Option<String>,
+    /// WHAT the act would do — the command, or a summary of the edit. Separate from
+    /// `stated_reason` on purpose: intent and effect are different claims and an operator
+    /// needs to compare them. **A stated reason that does not match the payload is the single
+    /// most useful thing this record can surface**, and that comparison is impossible if only
+    /// one of the two is stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stated_detail: Option<String>,
     pub opened_at: u64,
     pub expires_at: u64,
     status: Status,
@@ -490,6 +515,8 @@ impl EscalationStore {
                             // Recomputed from the marker rather than read from the entry: the
                             // claim path's `opened` event does not carry `bar`, and a default
                             // would silently lower the criterion an escalation is judged against.
+                            stated_reason: s(d, "stated_reason"),
+                            stated_detail: s(d, "stated_detail"),
                             bar: bar_for(&marker),
                             marker,
                             opened_at: u(d, "opened_at").unwrap_or(now),
@@ -555,6 +582,8 @@ impl EscalationStore {
         role: &str,
         tool_name: &str,
         marker: &str,
+        stated_reason: Option<&str>,
+        stated_detail: Option<&str>,
         now: u64,
         ttl_secs: u64,
     ) -> Result<Escalation, OpenError> {
@@ -605,6 +634,8 @@ impl EscalationStore {
             role: role.trim().to_string(),
             tool_name: tool_name.to_string(),
             marker: marker.to_string(),
+            stated_reason: stated_reason.map(str::to_string).filter(|v| !v.trim().is_empty()),
+            stated_detail: stated_detail.map(str::to_string).filter(|v| !v.trim().is_empty()),
             opened_at: now,
             expires_at: now.saturating_add(ttl_secs.max(1)),
             status: Status::Pending,
@@ -881,7 +912,7 @@ mod tests {
     fn store_with_one_simple_marker() -> (EscalationStore, String) {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "role:constellation:member", "Edit", "law_inject.py", T0, 120)
+            .open("claude-code", "role:constellation:member", "Edit", "law_inject.py", None, None, T0, 120)
             .expect("open");
         (s, e.id)
     }
@@ -889,7 +920,7 @@ mod tests {
     fn store_with_one() -> (EscalationStore, String) {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "role:constellation:member", "Edit", "pre_tool_use.py", T0, 120)
+            .open("claude-code", "role:constellation:member", "Edit", "pre_tool_use.py", None, None, T0, 120)
             .expect("open");
         (s, e.id)
     }
@@ -975,15 +1006,15 @@ mod tests {
     fn required_fields_are_required() {
         let mut s = EscalationStore::default();
         assert_eq!(
-            s.open("", "r", "Edit", "gate.py", T0, 120).unwrap_err(),
+            s.open("", "r", "Edit", "gate.py", None, None, T0, 120).unwrap_err(),
             OpenError::MissingField("plugin_id")
         );
         assert_eq!(
-            s.open("claude-code", "r", "", "gate.py", T0, 120).unwrap_err(),
+            s.open("claude-code", "r", "", "gate.py", None, None, T0, 120).unwrap_err(),
             OpenError::MissingField("tool_name")
         );
         assert_eq!(
-            s.open("claude-code", "r", "Edit", "   ", T0, 120).unwrap_err(),
+            s.open("claude-code", "r", "Edit", "   ", None, None, T0, 120).unwrap_err(),
             OpenError::MissingField("marker")
         );
     }
@@ -992,25 +1023,25 @@ mod tests {
     fn a_flood_is_refused_and_expired_entries_do_not_hold_the_quota() {
         let mut s = EscalationStore::default();
         for i in 0..MAX_PENDING {
-            s.open("claude-code", "r", "Edit", &format!("f{i}.py"), T0, 120)
+            s.open("claude-code", "r", "Edit", &format!("f{i}.py"), None, None, T0, 120)
                 .expect("under the cap");
         }
         assert_eq!(
-            s.open("claude-code", "r", "Edit", "one-too-many.py", T0, 120)
+            s.open("claude-code", "r", "Edit", "one-too-many.py", None, None, T0, 120)
                 .unwrap_err(),
             OpenError::TooManyPending(MAX_PENDING)
         );
         // Once they lapse, the quota frees — otherwise a member's own timeouts would lock it out
         // of ever escalating again, which is a deny with no decision behind it.
-        s.open("claude-code", "r", "Edit", "later.py", T0 + 121, 120)
+        s.open("claude-code", "r", "Edit", "later.py", None, None, T0 + 121, 120)
             .expect("expired entries must not hold the quota");
     }
 
     #[test]
     fn ids_are_distinct_within_the_same_second() {
         let mut s = EscalationStore::default();
-        let a = s.open("claude-code", "r", "Edit", "gate.py", T0, 120).unwrap();
-        let b = s.open("claude-code", "r", "Edit", "gate.py", T0, 120).unwrap();
+        let a = s.open("claude-code", "r", "Edit", "gate.py", None, None, T0, 120).unwrap();
+        let b = s.open("claude-code", "r", "Edit", "gate.py", None, None, T0, 120).unwrap();
         assert_ne!(a.id, b.id, "same member, same file, same second must still differ");
     }
 
@@ -1180,11 +1211,11 @@ mod tests {
     fn open_reaps_so_terminal_entries_cannot_accumulate_without_bound() {
         let mut s = EscalationStore::default();
         for i in 0..10 {
-            s.open("claude-code", "r", "Edit", &format!("f{i}.py"), T0, 120).unwrap();
+            s.open("claude-code", "r", "Edit", &format!("f{i}.py"), None, None, T0, 120).unwrap();
         }
         assert_eq!(s.len(), 10);
         // Long after they lapsed, one more open sweeps them.
-        s.open("claude-code", "r", "Edit", "later.py", T0 + DEFAULT_TTL_SECS + REAP_KEEP_SECS + 1, 120)
+        s.open("claude-code", "r", "Edit", "later.py", None, None, T0 + DEFAULT_TTL_SECS + REAP_KEEP_SECS + 1, 120)
             .unwrap();
         assert_eq!(s.len(), 1, "reap must run on open, not only in its own test");
     }
@@ -1192,8 +1223,8 @@ mod tests {
     #[test]
     fn pending_lists_oldest_first_and_hides_the_expired() {
         let mut s = EscalationStore::default();
-        let old = s.open("claude-code", "r", "Edit", "a.py", T0, 120).unwrap();
-        let new = s.open("kimi-code", "r", "Write", "b.py", T0 + 30, 120).unwrap();
+        let old = s.open("claude-code", "r", "Edit", "a.py", None, None, T0, 120).unwrap();
+        let new = s.open("kimi-code", "r", "Write", "b.py", None, None, T0 + 30, 120).unwrap();
         let ids: Vec<&str> = s.pending(T0 + 31).iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, vec![old.id.as_str(), new.id.as_str()]);
         // `old` lapses first; the list must stop offering it as decidable.
@@ -1212,7 +1243,7 @@ mod bar_factor_tests {
     fn open_with(marker: &str) -> (EscalationStore, String) {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "role:constellation:member", "Edit", marker, T0, 120)
+            .open("claude-code", "role:constellation:member", "Edit", marker, None, None, T0, 120)
             .expect("open");
         (s, e.id)
     }
@@ -1329,7 +1360,7 @@ mod ttl_tests {
         // a mesh notice, on its own schedule, can still rule when it gets there. Two minutes
         // could not, and that is how escalation 8bb08a85 expired unruled on 2026-07-30.
         let mut s = EscalationStore::default();
-        let e = s.open("claude-code", "r", "Edit", "gate.py", T0, DEFAULT_TTL_SECS).unwrap();
+        let e = s.open("claude-code", "r", "Edit", "gate.py", None, None, T0, DEFAULT_TTL_SECS).unwrap();
         let ten_minutes_later = T0 + 600;
         assert_eq!(
             s.status_of(&e.id, ten_minutes_later),
@@ -1349,7 +1380,7 @@ mod ttl_tests {
         // time buys a chance of an answer and grants nothing in the meantime. If this ever
         // fails, the generosity became a hole.
         let mut s = EscalationStore::default();
-        let e = s.open("claude-code", "r", "Edit", "gate.py", T0, DEFAULT_TTL_SECS).unwrap();
+        let e = s.open("claude-code", "r", "Edit", "gate.py", None, None, T0, DEFAULT_TTL_SECS).unwrap();
         for t in [T0 + 1, T0 + 600, T0 + 3599] {
             assert_eq!(s.status_of(&e.id, t), Status::Pending);
             assert!(!s.status_of(&e.id, t).permits_write(), "pending permitted a write at {t}");
@@ -1374,7 +1405,7 @@ mod ttl_tests {
         // Generous is not unbounded. An ask nobody ever answers must still go stale, or the
         // store accumulates open grants forever and 'pending' stops meaning anything.
         let mut s = EscalationStore::default();
-        let e = s.open("claude-code", "r", "Edit", "gate.py", T0, DEFAULT_TTL_SECS).unwrap();
+        let e = s.open("claude-code", "r", "Edit", "gate.py", None, None, T0, DEFAULT_TTL_SECS).unwrap();
         assert_eq!(s.status_of(&e.id, T0 + DEFAULT_TTL_SECS), Status::Expired);
         assert!(s
             .decide(&e.id, true, "kimi-code", "r", Channel::PeerMember, None, Some("late"),

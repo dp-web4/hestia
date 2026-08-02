@@ -234,6 +234,21 @@ pub fn pending(endpoint: &str, asserted_id: Option<String>, role: &str) -> Resul
                     e.get("secs_remaining").and_then(Value::as_u64).unwrap_or(0),
                     s("marker"),
                 );
+                // THE BASIS, on its own lines. A one-row table cannot carry a rationale, and
+                // an operator ruling from id + asker + path fragment is choosing without
+                // grounds (dp, 2026-08-02). Absence is printed explicitly rather than left
+                // blank: "the member gave no reason" is information the decider should have,
+                // and a blank cell reads as a rendering gap instead of a missing claim.
+                match e.get("stated_reason").and_then(Value::as_str) {
+                    Some(v) if !v.trim().is_empty() => println!("    why:  {v}"),
+                    _ => println!("    why:  (none stated — decide on the payload alone)"),
+                }
+                if let Some(v) = e.get("stated_detail").and_then(Value::as_str) {
+                    if !v.trim().is_empty() {
+                        println!("    what: {v}");
+                    }
+                }
+                println!();
             }
         }
     }

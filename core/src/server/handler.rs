@@ -9112,12 +9112,18 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // reports-success-while-measuring-nothing defect this surface keeps producing. No link,
     // no credit: documented rather than faked, which is the stance the module already took.
     let answers_deny = optional_string(args, "answers_deny");
+    // WHY and WHAT, in the member's own words. The deny text has always told members to
+    // "say what you need changed and why"; until now there was no field to say it in, so
+    // the operator ruled on an id, an asker and a path fragment (dp, 2026-08-02).
+    let stated_reason = optional_string(args, "reason");
+    let stated_detail = optional_string(args, "detail");
     let now = now_secs();
 
     let mut s = state.lock().await;
     let esc = match s
         .gate_escalations
-        .open(&plugin_id, &role, &tool_name, &marker, now, DEFAULT_TTL_SECS)
+        .open(&plugin_id, &role, &tool_name, &marker,
+              stated_reason.as_deref(), stated_detail.as_deref(), now, DEFAULT_TTL_SECS)
     {
         Ok(e) => e,
         // A refusal to OPEN is itself a deny of the write, so it is witnessed rather than
@@ -9230,6 +9236,11 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // a field added only to the former is a field the running system never sees. Caught the
     // same day it shipped, by reading the hook instead of the tool list.
     let answers_deny = optional_string(args, "answers_deny");
+    // WHY and WHAT, in the member's own words. The deny text has always told members to
+    // "say what you need changed and why"; until now there was no field to say it in, so
+    // the operator ruled on an id, an asker and a path fragment (dp, 2026-08-02).
+    let stated_reason = optional_string(args, "reason");
+    let stated_detail = optional_string(args, "detail");
     let now = now_secs();
 
     let mut s = state.lock().await;
@@ -9278,7 +9289,8 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // the paperwork attached to a refusal that already happened.
     match s
         .gate_escalations
-        .open(&plugin_id, &role, &tool_name, &marker, now, DEFAULT_TTL_SECS)
+        .open(&plugin_id, &role, &tool_name, &marker,
+              stated_reason.as_deref(), stated_detail.as_deref(), now, DEFAULT_TTL_SECS)
     {
         Ok(esc) => {
             let entry = s.append_chain(
@@ -9292,6 +9304,8 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                     "marker": esc.marker,
                     // The act this one answers. Null reads as absent, never as inferred.
                     "answers_deny": answers_deny,
+                    "stated_reason": esc.stated_reason,
+                    "stated_detail": esc.stated_detail,
                     "expires_at": esc.expires_at,
                     "assurance": "A1 — cooperative gate, same-UID operator. Tamper-EVIDENT, \
                                   not tamper-proof.",
@@ -9390,6 +9404,11 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
                 "asked_by": e.plugin_id,
                 "asked_by_role": e.role,
                 "tool_name": e.tool_name,
+                // The basis. Absent reads as "the member gave none", which is itself
+                // information — and a reason that does not match the detail is the most
+                // useful thing an operator can notice.
+                "stated_reason": e.stated_reason,
+                "stated_detail": e.stated_detail,
                 "marker": e.marker,
                 "opened_at": e.opened_at,
                 "secs_remaining": e.secs_remaining(now),

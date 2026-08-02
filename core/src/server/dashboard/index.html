@@ -651,6 +651,11 @@
   .esc-who { color: var(--fg-dim); font-size: 0.78rem; }
   .esc-ttl { margin-left: auto; font-size: 0.72rem; color: var(--warning); white-space: nowrap; }
   .esc-marker { font-family: var(--mono, monospace); font-size: 0.75rem; color: var(--fg-dim); word-break: break-all; margin-bottom: 0.5rem; }
+  .esc-why { font-size: 0.8rem; color: var(--fg); margin-bottom: 0.25rem; line-height: 1.45; }
+  .esc-why-absent { color: var(--warning); font-style: italic; }
+  .esc-what { font-family: var(--mono, monospace); font-size: 0.74rem; color: var(--fg-dim);
+    background: var(--bg-elev); border-radius: 3px; padding: 0.3rem 0.5rem; margin-bottom: 0.4rem;
+    white-space: pre-wrap; word-break: break-word; max-height: 8rem; overflow-y: auto; }
   .esc-meta { font-size: 0.72rem; color: var(--fg-dim); margin-bottom: 0.5rem; }
   .esc-actions { display: flex; gap: 0.4rem; align-items: center; }
   .esc-reason { flex: 1; min-width: 0; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px;
@@ -2011,7 +2016,25 @@
     const live = new Set(pend.map(e => String(e.id)));
     for (const id of [...escDrafts.keys()]) if (!live.has(id)) escDrafts.delete(id);
 
-    const sig = pend.map(e => String(e.id)).sort().join(',');
+    // Signature covers ID **and decidable state**, not ID alone.
+    //
+    // dp, 2026-08-02: "when there are multiple things to approve, approving the first one
+    // does not change its displayed status."
+    //
+    // The ID-only signature was added to stop the poll wiping a reason field mid-type, and
+    // it did — but with several escalations open, ruling one leaves the others present, so
+    // the set can be unchanged while a ROW's content is not. The panel then kept rendering
+    // a decision that had already been made.
+    //
+    // Those are two real requirements pulling opposite ways: never clobber an input the
+    // operator is typing into, always reflect a decision immediately. Skipping the render
+    // satisfies the first by breaking the second. Including status in the signature
+    // separates them — the render fires on content change, and typed text survives because
+    // drafts are RESTORED on rebuild (escDrafts), not because the rebuild was skipped.
+    const sig = pend
+      .map(e => `${e.id}:${e.status ?? 'pending'}:${e.secs_remaining == null ? '-' : 'live'}`)
+      .sort()
+      .join(',');
     if (sig === escRenderedSig) {
       // Same escalations as last tick: touch ONLY the countdown. Inputs, focus position
       // and selection are left exactly as the operator left them.
@@ -2034,6 +2057,8 @@
           <span class="esc-ttl"></span>
         </div>
         <div class="esc-marker"></div>
+        <div class="esc-why"></div>
+        <div class="esc-what"></div>
         <div class="esc-meta"></div>
         <div class="esc-actions">
           <input class="esc-reason" placeholder="reason (required to approve)">
@@ -2054,6 +2079,21 @@
         `claimed by ${e.claimed_by || 'unattributed'} · ${e.role || 'no role'}`;
       row.querySelector('.esc-ttl').textContent = `expires in ${escFmtAge(e.secs_remaining ?? 0)}`;
       row.querySelector('.esc-marker').textContent = e.marker || '(no target recorded)';
+      // THE BASIS. An operator ruling from tool + path fragment is choosing without grounds
+      // (dp, 2026-08-02: "the escalations currently don't provide enough information to
+      // actually make an informed decision"). Absence is stated explicitly — "no reason
+      // given" is information, and a blank row reads as a rendering gap instead.
+      const why = row.querySelector('.esc-why'), what = row.querySelector('.esc-what');
+      if (why) {
+        const r = (e.stated_reason || '').trim();
+        why.textContent = r ? `why: ${r}` : 'why: (none stated — decide on the payload alone)';
+        why.classList.toggle('esc-why-absent', !r);
+      }
+      if (what) {
+        const d = (e.stated_detail || '').trim();
+        what.textContent = d ? `what: ${d}` : '';
+        what.hidden = !d;
+      }
       const bar = typeof e.bar === 'string' ? e.bar : JSON.stringify(e.bar ?? '');
       const nf = Array.isArray(e.factors) ? e.factors.length : 0;
       row.querySelector('.esc-meta').textContent =
