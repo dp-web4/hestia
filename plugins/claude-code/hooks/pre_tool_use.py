@@ -409,12 +409,84 @@ _WRITE_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
 _READ_ONLY_HEADS = {
     "cat", "less", "more", "head", "tail", "grep", "rg", "egrep", "fgrep",
     "wc", "md5sum", "sha256sum", "shasum", "cksum", "diff", "file", "stat", "ls",
+    # Added 2026-08-02 after ELEVEN false refusals in one session, every one of them a
+    # read. Widening is "a reviewable act" per the note above, so each name is here on
+    # purpose and the risky ones are guarded below rather than admitted bare.
+    "echo", "printf", "basename", "dirname", "realpath", "readlink", "pwd",
+    "true", "false", "test", "[", "seq", "nl", "cut", "tr", "uniq",
+    "comm", "rev", "du", "df", "which", "type", "id", "whoami", "uname",
+    "jq", "column", "tree",
+    # NOT here: `date` and `hostname` (codex peer review, finding 2). `date -s` sets the
+    # system clock; `hostname X` sets the hostname. A read-looking NAME carrying a mutating
+    # FLAG is precisely what a head allowlist cannot see, which is why `_GUARDED_HEADS`
+    # exists for the cases worth keeping.
+    #
+    # These two survived the first rebuild because that edit covered the logic region and
+    # not this set — the classifier then scored 27/29 with exactly these two failing, while
+    # the standalone prototype had passed 30/30. Without running the cases against the REAL
+    # file this would have shipped claiming all four of codex's findings fixed with two of
+    # them still open, and a test that only ever ran against the prototype would have agreed.
 }
-_GIT_READ_SUBCOMMANDS = {"show", "diff", "log", "cat-file", "blame"}
+# Heads that are read-only ONLY without their writing flags. Kept separate so the guard is
+# impossible to lose by someone appending to the set above.
+#   find  — `-delete`, `-exec`, `-fprint*` execute or write
+#   sort  — `-o FILE` writes
+_GUARDED_HEADS = {
+    "find": ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls"),
+    "sort": ("-o", "--output"),
+}
+# NOT added, deliberately, and each for a demonstrated reason:
+#   sed    — `sed -i` writes; `sed -n '1r /etc/shadow'` reads any file; `-f prog.sed` is
+#            arbitrary. thor refuted an earlier attempt to allow `sed -n` by demonstration,
+#            not by argument.
+#   awk    — can write via `print > "file"` INSIDE the program text, where the redirection
+#            check below cannot see it.
+#   xargs  — runs an arbitrary command.
+#   python/node/sh/bash — obviously.
+# Ambiguity still means write. The point of this change is to stop calling `2>/dev/null` a
+# file write, not to make the classifier clever.
+
+# Separators that START A NEW COMMAND, and redirect operators. Enumerated rather than
+# regex-matched, because the token stream below yields them as discrete tokens.
+#
+# `&` IS HERE (codex peer-review finding 4, 2026-08-02). It was not, so
+# `ls & <mutating command>` was classified read-only from `ls` alone — a protection hole in
+# the deployed gate, not classifier noise. codex withheld the peer factor over it.
+_SEPARATORS = {";", "&", "&&", "|", "||", "\n"}
+_REDIRECTS = {">", ">>", "<", "<<", "<<<", ">&", "&>", ">|", "<&"}
+# `branch` and `remote` are NOT here (codex finding 1): `git branch -d` deletes a ref and
+# `git remote add` rewrites repository config. A read-looking SUBCOMMAND with a mutating
+# FLAG is exactly what a name allowlist cannot see.
+_GIT_READ_SUBCOMMANDS = {"show", "diff", "log", "cat-file", "blame", "status", "rev-parse",
+                         "describe", "ls-files", "ls-tree", "rev-list", "show-ref"}
 
 
 def _is_read_only(tool_name: str, tool_input: Any) -> bool:
-    """True only when the call is CONFIDENTLY read-only. Ambiguity means write."""
+    """True only when the call is CONFIDENTLY read-only. Ambiguity means write.
+
+    TOKENISED, NOT SPLIT (codex peer review, 2026-08-02). The previous version split raw
+    command TEXT, so a quoted operator was indistinguishable from a real one:
+    `grep -E "a|b" f` split inside its own quotes, and `grep ">" f` tripped a substring
+    test for `>`. That is the #116 quoted-token class, and an earlier draft of this widening
+    made it worse rather than better.
+
+    `shlex` with `posix=False` is the fix as a CLASS rather than as more special cases: it
+    preserves quoting, so a quoted `|` or `>` arrives as one data token (`'"a|b"'`) and can
+    never be read as syntax. `posix=True` would strip the quotes and silently keep the bug —
+    the trap this nearly walked into.
+
+    codex's structural point, which is why this is a rewrite and not another list:
+
+        "shell syntax is exceeding what a string splitter can safely model. If this
+         classifier stays lexical, its supported grammar needs to be explicit and everything
+         outside that grammar must remain a write. Another growing list of heads and
+         separators will keep alternating false denial and bypass."
+
+    So the grammar is explicit and CLOSED: enumerated separators, enumerated redirects,
+    enumerated heads. Unparseable input is a write. Unknown syntax is a write. Command
+    substitution is a write. The aim is to stop calling `2>/dev/null` a file write — not to
+    make the classifier clever.
+    """
     if tool_name in _READ_ONLY_TOOLS:
         return True
     if tool_name in _WRITE_TOOLS:
@@ -424,15 +496,56 @@ def _is_read_only(tool_name: str, tool_input: Any) -> bool:
     cmd = tool_input.get("command") if isinstance(tool_input, dict) else None
     if not isinstance(cmd, str) or not cmd.strip():
         return False
-    if ">" in cmd or "|" in cmd or "tee " in cmd:
-        return False  # any redirection or pipe: treat as a write
-    for segment in re.split(r"&&|;", cmd):
-        parts = segment.strip().split()
+
+    # Imported here rather than at module scope: this hook is on the agent's critical path
+    # with an 800ms budget, and `shlex` is only needed on the Bash branch.
+    import shlex
+
+    try:
+        lx = shlex.shlex(cmd, posix=False, punctuation_chars=True)
+        lx.whitespace_split = True
+        tokens = list(lx)
+    except ValueError:
+        # Unbalanced quotes: we cannot know what this runs. Fail closed.
+        return False
+    if not tokens:
+        return False
+
+    segments: list[list[str]] = [[]]
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t in _SEPARATORS:
+            segments.append([])
+            i += 1
+            continue
+        if t in _REDIRECTS:
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+            # fd duplication (`2>&1`) and `/dev/null` write no file. Everything else does.
+            if t in {">&", "&>", "<&"} and nxt and nxt.isdigit():
+                i += 2
+                continue
+            if nxt == "/dev/null":
+                i += 2
+                continue
+            return False
+        # Command substitution runs arbitrary code and its contents are never walked below.
+        if t == "$" or t.startswith("`") or "$(" in t:
+            return False
+        segments[-1].append(t)
+        i += 1
+
+    for parts in segments:
         if not parts:
             continue
-        head = os.path.basename(parts[0])
+        head = os.path.basename(parts[0].strip("'\""))
         if head == "git":
             if len(parts) < 2 or parts[1] not in _GIT_READ_SUBCOMMANDS:
+                return False
+        elif head in _GUARDED_HEADS:
+            # Read-only only without its writing flags. Prefix match so `-exec`,
+            # `-execdir` and `--output=x` are all caught.
+            if any(a.startswith(f) for a in parts[1:] for f in _GUARDED_HEADS[head]):
                 return False
         elif head not in _READ_ONLY_HEADS:
             return False
