@@ -670,6 +670,7 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
         action_type: "tool_execution",
         action_target: &action.tool_name,
         action_id: &rep_action_id,
+        rule_triggered: "",
         reason: if success {
             "outcome:success"
         } else {
@@ -1129,6 +1130,11 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 action_type: "policy_gate",
                 action_target: &action.tool_name,
                 action_id: &action_id_str,
+                // The rule id is in scope HERE — the same `evaluation` whose
+                // rule_id/rule_name go into the policy_decision chain entry
+                // above. Until plumbed, this delta row was the deny record that
+                // could not name the rule that charged the member.
+                rule_triggered: evaluation.rule_id.as_deref().unwrap_or(""),
                 reason: &reason,
             };
             let _ = s.apply_outcome_ctx(&plugin_id_for_chain, false, risk_magnitude, &rep_ctx);
@@ -1868,6 +1874,7 @@ async fn tool_witness_adjudication(state: &SharedState, args: &Value) -> ToolRes
             action_type: "adjudication",
             action_target: &evidence_ref,
             action_id: "",
+            rule_triggered: "",
             reason: &adj_reason,
         };
         adjudicated_state =
@@ -2010,6 +2017,7 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
         action_type: "reversal",
         action_target: &ref_target,
         action_id: "",
+        rule_triggered: "",
         reason: &rev_reason,
     };
     let judgment_mutated = cause.refutes_validity();
@@ -2053,6 +2061,7 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
             action_type: "adjudication",
             action_target: &adj_target,
             action_id: "",
+            rule_triggered: "",
             reason: &adj_reason,
         };
         let _ = s.apply_adjudication_ctx(
@@ -2870,6 +2879,14 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     let target = optional_string(args, "target").unwrap_or_default();
     let session_id = optional_string(args, "session_id");
     let payload_sha256 = optional_string(args, "payload_sha256");
+    // The hook layer's half of rule attribution is sending this; the daemon's
+    // half is reading it. Daemon side lands FIRST: `hestia_tools()` declares
+    // every tool `additionalProperties: true`, so a caller that sends `rule_id`
+    // before this arg exists has it dropped with no error at either end —
+    // populated at the sender, empty in the sink, and indistinguishable from
+    // "the rules genuinely don't attribute" (CBP, shared-context/forum/
+    // cbp-the-split-is-three-way-and-the-ordering-is-a-silent-failure-2026-07-31.md).
+    let rule_id = optional_string(args, "rule_id").unwrap_or_default();
     // WHAT WAS ATTEMPTED (dp, 2026-07-26). Denies used to carry only a verdict, so the
     // chain recorded permitted work verbatim (`outcome.target`) and blocked work not at
     // all — backwards for precisely the entries worth reviewing. A deny you cannot
@@ -2908,6 +2925,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
             "reason": reason,
             "payload_sha256": payload_sha256,
             "attempted": attempted,
+            "rule_id": rule_id,
         }),
     )?;
     // Same asymmetric gate-risk trust as the daemon's own gate decisions.
@@ -2918,6 +2936,14 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         action_type: "policy_gate",
         action_target: &tool_name,
         action_id: "",
+        // Caller-reported decision (the hook layer's own gate). The `reason`
+        // reaching this row is the daemon-built `gate:{decision} ({adjudicator})`
+        // above — the caller's free text goes to the chain entry, not here — so
+        // attribution rides the dedicated `rule_id` arg, not a parse of the
+        // parenthetical. Empty while no caller sends one, correctly: the day-one
+        // check is that the field VARIES on policy_gate rows, not that it is
+        // never empty.
+        rule_triggered: &rule_id,
         reason: &gate_reason,
     };
     let trust_state = s.apply_outcome_ctx(&plugin_id, false, risk_magnitude, &rep_ctx)?;
@@ -9071,6 +9097,46 @@ mod authority_attribution_tests {
         assert_eq!(
             vget.event_data["plugin_id"], json!("random-attributed-caller"),
             "the witness names the reader — never the bystander ({bystander})"
+        );
+    }
+
+    /// The caller-reported gate surface now takes a `rule_id` arg and threads it
+    /// to the reputation row — the daemon side of the three-way split (CBP,
+    /// shared-context/forum/cbp-the-split-is-three-way-and-the-ordering-is-a-silent-failure-2026-07-31.md).
+    /// It must land BEFORE any hook sends the arg, because `hestia_tools()` is
+    /// `additionalProperties: true` across the whole surface: an unread arg is
+    /// dropped with no error at either end. This test is the drift guard that
+    /// the field cannot regress to a constant while a caller is supplying it.
+    #[tokio::test]
+    async fn witness_decision_threads_caller_rule_id_to_reputation_row() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sink = { state.lock().await.reputation_sink() };
+        tool_witness_decision(
+            &state,
+            &json!({
+                "plugin_id": "test-member",
+                "decision": "deny",
+                "adjudicator": "plugin-gate:test(scope)",
+                "rule_id": "test-rule-scope-deny",
+                "tool_name": "Bash",
+                "reason": "caller free text — goes to the chain entry, not the row",
+            }),
+        )
+        .await
+        .expect("witness_decision with a rule_id arg");
+        let body = std::fs::read_to_string(&sink).expect("a delta row was emitted");
+        let last: serde_json::Value =
+            serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            last["rule_triggered"], json!("test-rule-scope-deny"),
+            "the caller-supplied rule id must reach the sink row, not parse out of the reason: {last}"
+        );
+        // And the free-text reason must NOT have leaked into the row's reason,
+        // which is the daemon-built parenthetical form.
+        assert_eq!(
+            last["reason"], json!("gate:deny (plugin-gate:test(scope))"),
+            "the row reason is daemon-built, not caller free text: {last}"
         );
     }
 }
