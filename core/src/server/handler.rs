@@ -252,7 +252,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_gate_escalation_open",
-            "Ask a HUMAN to approve a write to the governance surface (gate, witness, law_inject, the registration). Stage 2 of dp's 2026-07-29 ruling: the gate refuses these writes, and this is the channel that un-refuses a legitimate one. Returns an escalation_id and a deadline; NO DECISION WITHIN THE WINDOW IS A DENY, not a retry. Witnessed on open. Assurance A1: the operator shares this UID, so approval is tamper-EVIDENT, not tamper-proof",
+            "Ask a HUMAN to approve a write to the governance surface (gate, witness, law_inject, the registration). Stage 2 of dp's 2026-07-29 ruling: the gate refuses these writes, and this is the channel that un-refuses a legitimate one. Returns an escalation_id and a deadline; NO DECISION WITHIN THE WINDOW IS A DENY, not a retry. Witnessed on open. Assurance A1: the operator shares this UID, so approval is tamper-EVIDENT, not tamper-proof. PASS answers_deny = the chain hash of the deny you are escalating (hestia_witness_decision returns it as witnessEntryHash): without it the escalation is witnessed but UNLINKED, and unlinked escalations cannot be credited as conduct — escalating instead of routing around is the top of the Temperament scale (1.0 on approval), and the link is what makes it readable. It is never inferred from timing",
         ),
         t(
             "hestia_gate_pending_escalations",
@@ -670,6 +670,7 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
         action_type: "tool_execution",
         action_target: &action.tool_name,
         action_id: &rep_action_id,
+        rule_triggered: "",
         reason: if success {
             "outcome:success"
         } else {
@@ -733,16 +734,33 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         ));
     };
 
-    let mut layers: Vec<(String, &crate::policy::PolicyEngine)> =
-        vec![("society".to_string(), &s.policy_engine)];
-    if let Some(e) = s.role_policy_engines.get(&who.role_lct) {
-        layers.push((format!("role:{}", who.role_lct), e));
-    }
-    if let Some(e) = s
-        .instance_policy_engines
-        .get(&(who.plugin_id.clone(), who.role_lct.clone()))
-    {
-        layers.push((format!("instance:{}", who.plugin_id), e));
+    // An operator grant SUBSTITUTES the local layers rather than adding to them, so publishing
+    // it alongside society/role/instance would describe a law that is not the one being
+    // enforced. dp's requirement is that a member can always ask what it is operating under —
+    // which means this surface has to reflect the substitution, not merely mention it. A member
+    // told "society: deny" while the gate runs it under a permissive grant has been told the
+    // wrong law, and would waste a session obeying a rule nobody is applying to it.
+    let granted = s
+        .instance_grant(&who.plugin_id, &who.role_lct)
+        .and_then(|g| crate::policy::get_preset(&g.preset).map(|p| (g, p)));
+    let grant_engine = granted
+        .as_ref()
+        .map(|(_, p)| crate::policy::PolicyEngine::new(p.config.clone()));
+
+    let mut layers: Vec<(String, &crate::policy::PolicyEngine)> = Vec::new();
+    if let Some(e) = grant_engine.as_ref() {
+        layers.push(("operator-grant".to_string(), e));
+    } else {
+        layers.push(("society".to_string(), &s.policy_engine));
+        if let Some(e) = s.role_policy_engines.get(&who.role_lct) {
+            layers.push((format!("role:{}", who.role_lct), e));
+        }
+        if let Some(e) = s
+            .instance_policy_engines
+            .get(&(who.plugin_id.clone(), who.role_lct.clone()))
+        {
+            layers.push((format!("instance:{}", who.plugin_id), e));
+        }
     }
 
     let mut statements = Vec::new();
@@ -822,6 +840,22 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         "layer_modes": layer_modes,
         "layers": layers.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
         "lists_bound": bound.iter().map(|l| l.name.clone()).collect::<Vec<_>>(),
+        // DISCLOSED, not merely applied. A member may always see that it is running under an
+        // operator exception, who made it and why — a loosening the subject cannot observe is
+        // a trapdoor, and one it can read is a disclosed exception. It is inside the hashed
+        // body, so a grant appearing or lapsing MOVES `law_hash`: a member that pins the hash
+        // notices the change rather than having to ask.
+        "operator_grant": granted.as_ref().map(|(g, _)| json!({
+            "preset": g.preset,
+            "granted_by": g.granted_by,
+            "granted_at": g.granted_at,
+            "reason": g.reason,
+            "expires_at": g.expires_at,
+            "supersedes": ["society", "role", "instance"],
+            "note": "An operator granted this member a preset in place of the local baseline. \
+                     It is held in memory only and does NOT survive a daemon restart. Ratified \
+                     hub law still binds over it.",
+        })),
         "law": statements,
     });
 
@@ -849,6 +883,17 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         "layer_modes": out.get("layer_modes").cloned().unwrap_or(Value::Null),
         "layers": out.get("layers").cloned().unwrap_or(Value::Null),
         "lists_bound": out.get("lists_bound").cloned().unwrap_or(Value::Null),
+        // FORWARDED EXPLICITLY, because this object is an allowlist projection of `body` and a
+        // field absent from it is silently dropped. The grant WAS applied — `layers` already
+        // read `["operator-grant"]` — while `operator_grant` returned null, so a member could be
+        // running under an operator exception and be told there was none. That is the trapdoor
+        // the disclosure exists to prevent, produced by the disclosure's own plumbing.
+        //
+        // Third time in one session that a field landed on a structure something downstream
+        // re-projects: `answers_deny` on the tool the gate does not call, the policy grant on
+        // one of three evaluation sites, and now this. The shape to distrust is any place that
+        // rebuilds a response key by key.
+        "operator_grant": out.get("operator_grant").cloned().unwrap_or(Value::Null),
         "law": out.get("law").cloned().unwrap_or(Value::Null),
         // Quote THIS to say which law you read: it covers every layer, every bound list,
         // and the redaction applied to you. `society_policy_hash` is kept only because
@@ -933,6 +978,29 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     {
         evaluation = crate::policy::fold_strictest(evaluation, inst_engine.evaluate(&pa));
     }
+    // OPERATOR GRANT — applied OUTSIDE the fold, because it is the one input allowed to
+    // loosen and `fold_strictest` would discard it by definition (dp, 2026-08-01: "if i want
+    // to grant permissive it should be my choice without setting all the rest to permissive").
+    //
+    // Deliberately NOT folded: folding is how every other input composes, and adding a
+    // "loosest-wins" branch to the fold would make the fold itself unsafe for the inputs that
+    // must only tighten. Keeping the grant a separate, explicit substitution means the
+    // invariant "law tightens as it gets more specific" still holds for all of role overlay,
+    // instance overlay and hub law, and the one exception is legible at the call site rather
+    // than hidden inside a comparator.
+    //
+    // Society baseline is untouched: a grant is an exception FOR one member, never an edit of
+    // the law. The baseline moves only by amendment.
+    //
+    // ORDERING, and it is a decision rather than an accident: the grant lands BEFORE the hub-law
+    // fold, so ratified society law still folds strictest-wins OVER it and a local operator
+    // cannot grant past it. dp's own framing forces this — "society baseline is encoded in
+    // society law, and can only be changed through law amendment process" — and a grant that
+    // could override hub law WOULD be a law change without an amendment, made by one machine's
+    // operator. So a grant loosens the local baseline (preset + role + instance overlays) and
+    // nothing above it. If that turns out to be too narrow in practice, the fix is an
+    // amendment, which is the correct place for that argument to happen.
+    evaluation = s.apply_instance_grant(&session_plugin_id, &session_role, &pa, evaluation);
     // Third fold input (consolidation 2026-07-10): hub law via the
     // canonical web4-policy engine. Strictest-wins like the role overlay —
     // law can only tighten, never loosen.
@@ -1062,6 +1130,11 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 action_type: "policy_gate",
                 action_target: &action.tool_name,
                 action_id: &action_id_str,
+                // The rule id is in scope HERE — the same `evaluation` whose
+                // rule_id/rule_name go into the policy_decision chain entry
+                // above. Until plumbed, this delta row was the deny record that
+                // could not name the rule that charged the member.
+                rule_triggered: evaluation.rule_id.as_deref().unwrap_or(""),
                 reason: &reason,
             };
             let _ = s.apply_outcome_ctx(&plugin_id_for_chain, false, risk_magnitude, &rep_ctx);
@@ -1157,6 +1230,11 @@ fn gate_direct_tool(
     {
         evaluation = crate::policy::fold_strictest(evaluation, inst_engine.evaluate(&pa));
     }
+    // Operator grant — the ENFORCEMENT path. Applied here and not only on the advisory
+    // surfaces, because a grant that shows up in `operating_law` and not in the gate tells a
+    // member it may act and then refuses it. Before the hub-law fold, so ratified society law
+    // still binds and a local operator cannot grant past an amendment-only baseline.
+    evaluation = s.apply_instance_grant(&who.plugin_id, &who.role_lct, &pa, evaluation);
     // Hub-law third input applies to the vault gate too — a norm that
     // denies secret reads must bind here, not only on tool calls.
     if let Some(gate) = &s.law_gate {
@@ -1796,6 +1874,7 @@ async fn tool_witness_adjudication(state: &SharedState, args: &Value) -> ToolRes
             action_type: "adjudication",
             action_target: &evidence_ref,
             action_id: "",
+            rule_triggered: "",
             reason: &adj_reason,
         };
         adjudicated_state =
@@ -1938,6 +2017,7 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
         action_type: "reversal",
         action_target: &ref_target,
         action_id: "",
+        rule_triggered: "",
         reason: &rev_reason,
     };
     let judgment_mutated = cause.refutes_validity();
@@ -1981,6 +2061,7 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
             action_type: "adjudication",
             action_target: &adj_target,
             action_id: "",
+            rule_triggered: "",
             reason: &adj_reason,
         };
         let _ = s.apply_adjudication_ctx(
@@ -2798,6 +2879,14 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     let target = optional_string(args, "target").unwrap_or_default();
     let session_id = optional_string(args, "session_id");
     let payload_sha256 = optional_string(args, "payload_sha256");
+    // The hook layer's half of rule attribution is sending this; the daemon's
+    // half is reading it. Daemon side lands FIRST: `hestia_tools()` declares
+    // every tool `additionalProperties: true`, so a caller that sends `rule_id`
+    // before this arg exists has it dropped with no error at either end —
+    // populated at the sender, empty in the sink, and indistinguishable from
+    // "the rules genuinely don't attribute" (CBP, shared-context/forum/
+    // cbp-the-split-is-three-way-and-the-ordering-is-a-silent-failure-2026-07-31.md).
+    let rule_id = optional_string(args, "rule_id").unwrap_or_default();
     // WHAT WAS ATTEMPTED (dp, 2026-07-26). Denies used to carry only a verdict, so the
     // chain recorded permitted work verbatim (`outcome.target`) and blocked work not at
     // all — backwards for precisely the entries worth reviewing. A deny you cannot
@@ -2836,6 +2925,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
             "reason": reason,
             "payload_sha256": payload_sha256,
             "attempted": attempted,
+            "rule_id": rule_id,
         }),
     )?;
     // Same asymmetric gate-risk trust as the daemon's own gate decisions.
@@ -2846,6 +2936,14 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         action_type: "policy_gate",
         action_target: &tool_name,
         action_id: "",
+        // Caller-reported decision (the hook layer's own gate). The `reason`
+        // reaching this row is the daemon-built `gate:{decision} ({adjudicator})`
+        // above — the caller's free text goes to the chain entry, not here — so
+        // attribution rides the dedicated `rule_id` arg, not a parse of the
+        // parenthetical. Empty while no caller sends one, correctly: the day-one
+        // check is that the field VARIES on policy_gate rows, not that it is
+        // never empty.
+        rule_triggered: &rule_id,
         reason: &gate_reason,
     };
     let trust_state = s.apply_outcome_ctx(&plugin_id, false, risk_magnitude, &rep_ctx)?;
@@ -6998,6 +7096,38 @@ mod tests {
     use chrono::Utc;
     use tempfile::TempDir;
 
+    /// dp, 2026-08-01: "an agent should not be able to change its own or another agent's
+    /// policy." The grant is operator-only BY CONSTRUCTION — it lives behind the
+    /// challenge-signed HTTP surface and has no MCP tool. That is currently true because nobody
+    /// wrote one, which is not a guarantee; this makes it a guarantee.
+    ///
+    /// Written as a denylist over the ACTUAL tool list rather than a comment, because the
+    /// failure mode is somebody adding a convenient `hestia_set_my_policy` months from now and
+    /// every reviewer thinking it looks reasonable in isolation. The read side is deliberately
+    /// permitted: `hestia_operating_law` exists precisely so a member CAN ask what it runs
+    /// under. Read yes, write never.
+    #[test]
+    fn no_mcp_tool_can_set_an_operator_grant() {
+        let names: Vec<String> = hestia_tools().into_iter().map(|t| t.name.to_string()).collect();
+        for n in &names {
+            let l = n.to_ascii_lowercase();
+            let touches_grant = l.contains("grant") || l.contains("instance_policy");
+            assert!(
+                !touches_grant,
+                "MCP tool `{n}` looks like it can reach the operator grant surface. Per-agent \
+                 loosening must stay operator-only (challenge-signed HTTP); if a member could \
+                 call it, an agent could widen its own authority and the control would be \
+                 decorative. Expose it read-only through hestia_operating_law instead."
+            );
+        }
+        // The read path must remain, or the disclosure requirement quietly dies with it.
+        assert!(
+            names.iter().any(|n| n == "hestia_operating_law"),
+            "hestia_operating_law is how a member learns what it is operating under, including \
+             any grant made about it. A loosening the subject cannot see is a trapdoor."
+        );
+    }
+
     fn make_shared_state() -> (TempDir, SharedState) {
         let dir = TempDir::new().unwrap();
         let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
@@ -8969,6 +9099,46 @@ mod authority_attribution_tests {
             "the witness names the reader — never the bystander ({bystander})"
         );
     }
+
+    /// The caller-reported gate surface now takes a `rule_id` arg and threads it
+    /// to the reputation row — the daemon side of the three-way split (CBP,
+    /// shared-context/forum/cbp-the-split-is-three-way-and-the-ordering-is-a-silent-failure-2026-07-31.md).
+    /// It must land BEFORE any hook sends the arg, because `hestia_tools()` is
+    /// `additionalProperties: true` across the whole surface: an unread arg is
+    /// dropped with no error at either end. This test is the drift guard that
+    /// the field cannot regress to a constant while a caller is supplying it.
+    #[tokio::test]
+    async fn witness_decision_threads_caller_rule_id_to_reputation_row() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sink = { state.lock().await.reputation_sink() };
+        tool_witness_decision(
+            &state,
+            &json!({
+                "plugin_id": "test-member",
+                "decision": "deny",
+                "adjudicator": "plugin-gate:test(scope)",
+                "rule_id": "test-rule-scope-deny",
+                "tool_name": "Bash",
+                "reason": "caller free text — goes to the chain entry, not the row",
+            }),
+        )
+        .await
+        .expect("witness_decision with a rule_id arg");
+        let body = std::fs::read_to_string(&sink).expect("a delta row was emitted");
+        let last: serde_json::Value =
+            serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            last["rule_triggered"], json!("test-rule-scope-deny"),
+            "the caller-supplied rule id must reach the sink row, not parse out of the reason: {last}"
+        );
+        // And the free-text reason must NOT have leaked into the row's reason,
+        // which is the daemon-built parenthetical form.
+        assert_eq!(
+            last["reason"], json!("gate:deny (plugin-gate:test(scope))"),
+            "the row reason is daemon-built, not caller free text: {last}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------- gate escalation (stage 2)
@@ -8987,6 +9157,27 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     let tool_name = require_string(args, "tool_name")?;
     let marker = require_string(args, "marker")?;
     let role = optional_string(args, "role").unwrap_or_default();
+    // The chain hash of the DENY this escalation answers (dp, 2026-08-01: "record the ruling
+    // as a separate act, and link it to the previous act it modifies").
+    //
+    // Nothing is mutated. The deny stands as a faithful record that at that moment, under that
+    // law, the act was refused. The escalation is a later, separate act pointing at it, and a
+    // ruling points at the escalation. All witnessed, one chain; the accounting reads the
+    // relation rather than editing history.
+    //
+    // Why this one field is load-bearing: `derivation.rs` already reserves
+    // `ask-after-deny = 1.0` — the TOP of the Temperament scale, above comply-after-deny at
+    // 0.85 — for "witnessed escalation/appeal events REFERENCING THE DENY", and caps every
+    // member at 0.7 until such events exist. The escalation has always been witnessed; it has
+    // never carried the reference. So the highest-scoring conduct in the society has been
+    // unrecordable, and the entire fleet sits at the medium/high boundary. The value was
+    // already in the caller's hand: `hestia_witness_decision` returns `witnessEntryHash`.
+    //
+    // Optional, and deliberately NOT inferred from timing when absent. Guessing the link by
+    // proximity would manufacture the evidence that makes the score real — the same
+    // reports-success-while-measuring-nothing defect this surface keeps producing. No link,
+    // no credit: documented rather than faked, which is the stance the module already took.
+    let answers_deny = optional_string(args, "answers_deny");
     let now = now_secs();
 
     let mut s = state.lock().await;
@@ -9020,6 +9211,9 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
             "role": esc.role,
             "tool_name": esc.tool_name,
             "marker": esc.marker,
+            // The act this one answers. Null when the caller did not supply it — an absent
+            // link reads as absent, never as inferred.
+            "answers_deny": answers_deny,
             // THE BAR, written down (dp 2026-07-30 + claude-code): the evidence and the
             // verdict were already recorded; without the criterion, "sufficient for this
             // context" is unauditable. Stated at open, evaluated at decision.
@@ -9095,6 +9289,13 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     let tool_name = require_string(args, "tool_name")?;
     let marker = require_string(args, "marker")?;
     let role = optional_string(args, "role").unwrap_or_default();
+    // Chain hash of the deny being escalated. See tool_gate_escalation_open for why this is
+    // load-bearing; it is repeated here because THIS is the entry point the gate actually
+    // uses. `hestia_gate_escalation_open` is the documented door and `..._claim` is the one
+    // the hook calls (claim-or-open in one round trip, because the hook must never wait), so
+    // a field added only to the former is a field the running system never sees. Caught the
+    // same day it shipped, by reading the hook instead of the tool list.
+    let answers_deny = optional_string(args, "answers_deny");
     let now = now_secs();
 
     let mut s = state.lock().await;
@@ -9155,6 +9356,8 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                     "role": esc.role,
                     "tool_name": esc.tool_name,
                     "marker": esc.marker,
+                    // The act this one answers. Null reads as absent, never as inferred.
+                    "answers_deny": answers_deny,
                     "expires_at": esc.expires_at,
                     "assurance": "A1 — cooperative gate, same-UID operator. Tamper-EVIDENT, \
                                   not tamper-proof.",

@@ -1,8 +1,27 @@
 # Hestia
 
-> Universal Web4 presence — for humans and AI.
+> **Governance for multi-vendor AI agents — local-first, witnessed, and earned.**
+> The road to universal Web4 presence for humans and AI. We are some way along it.
 
-Hestia is the open-source local-first layer that gives any entity — human user, AI agent, autonomous service — a **cryptographic identity**, an **encrypted vault**, **delegation authority**, and a **trust record** in the Web4 ecosystem. A cross-platform app for humans. Plugin install for AI agents. CLI and TUI if you live in a terminal. No cloud required.
+Hestia is the open-source local-first daemon that lets **AI agents from different vendors
+share one machine under one law**: a single signed policy every agent transits, a
+hash-chained record of what each one did, a human in the loop when an agent reaches for
+something it should not have, and a trust score **derived from that record** rather than
+asserted. Claude Code, Codex, Kimi, Gemini and Cursor plug into the same gate. No cloud
+required.
+
+That governance is what makes an agent **admissible to a Web4 hub**. A hub cannot verify
+an agent it has no record of; Hestia is where the record is made, so the hub has something
+to check. Governance is the key to hub access, not a feature beside it —
+see [Hub membership](#hub-membership).
+
+**On the headline.** This README used to open *"Universal Web4 presence — for humans and
+AI."* That is the destination and the project is not there. What exists today and is
+exercised daily is the governance layer above; the human-presence half (cross-platform
+app, credential issuance, device constellation) is **built but thinly exercised**, and
+federation is not started. The tables below separate *measured*, *plumbed but unexercised*
+and *not built*, because a status page that flattens those three is the same defect this
+codebase keeps finding in itself: a check that reports success while measuring nothing.
 
 > **Status:** Phase 2 (connected presence). The core (vault, policy engine, witness chain, delegation, plugin SDK) and the cross-platform app are built and working. Hub integration works end-to-end: join a hub, push your profile, open an encrypted member↔hub channel, prove your device constellation, and exchange **end-to-end-sealed member↔member messages** through the hub with a **durable, crash-safe inbox** (accept-and-defer). EUDI-compatible credential issuance is wired. See [Honest Status](#honest-status) below.
 
@@ -48,9 +67,40 @@ same engine for terminal people:
 ### For the Web4 ecosystem
 - Each Hestia instance is a full Web4 presence: LCT identity, T3/V3 trust tensors, witness chain
 - Hub integration: join hubs, push member-tier profiles, query and act over an end-to-end encrypted member↔hub channel
-- Constellation attestation: challenge-bound multi-device proof carried in the hub handshake
-- Credential issuance: OID4VCI issuer endpoints (SD-JWT-VC) — person-scale, EUDI-wallet compatible
-- Federation: portable society state between instances *(Phase 4)*
+- Constellation attestation: challenge-bound multi-device proof carried in the hub handshake *(plumbed, unexercised)*
+- Credential issuance: OID4VCI issuer endpoints (SD-JWT-VC) — person-scale, EUDI-wallet compatible *(plumbed, unexercised)*
+- Federation: portable society state between instances *(Phase 4, not started)*
+
+## Hub membership
+
+**Governance is the entry condition for hub access, not a feature beside it.**
+
+A hub is asked to accept acts from an agent it cannot see. It has three questions and no
+way to answer them alone: *who is this, what may it do, and what has it done?* An agent
+with no local governance can only answer by assertion — and an assertion is exactly what a
+hub must not accept, because anything the agent can say, a compromised or careless agent
+can say identically.
+
+Hestia is where those answers are *made*, so the hub has something to check:
+
+| Hub asks | Hestia supplies |
+|---|---|
+| who is this? | an LCT identity with a key, plus the roles it actually holds |
+| what may it do? | the composed law it operates under — readable by the agent itself, and hashed, so both sides can name the same law |
+| what has it done? | a hash-chained record of its acts, including the ones it was refused and what it did next |
+| should we believe the score? | a trust tensor **derived** from that chain at read time, shipping its receipts — not a number the agent reports about itself |
+
+That last row is the load-bearing one. A self-reported reputation is worth nothing to a
+relying party. A derived one can be recomputed by anyone holding the chain, which is what
+makes it evidence rather than a claim.
+
+**What this does not mean.** A hub should not treat Hestia's word as proof. At A1 the gate
+is cooperative and same-UID: the record is unforgeable-ish and *inspectable*, which is the
+actual product. Web4's own norm applies — a surface makes evidence checkable and never
+encodes a universal trust threshold; how much to trust it stays the relying party's call,
+scaled to stakes. A hub that demands more should require policy-signed acts and an
+assurance profile above A1, and Hestia should be able to say honestly that it does not
+have one yet.
 
 ## What Hestia is not
 
@@ -64,7 +114,63 @@ same engine for terminal people:
 
 ## Honest status
 
-### Built and working (Phase 1)
+*Audited against the running system on 2026-08-01 — method and evidence in
+[`docs/STATUS_AUDIT_2026-08-01.md`](docs/STATUS_AUDIT_2026-08-01.md). Three tiers, kept
+apart on purpose:*
+
+- **Measured** — exercised on a live system, with chain entries or a live probe behind it.
+- **Plumbed** — code and tests exist, the path has not been driven end to end in anger.
+  Not a euphemism for broken; it means nobody has yet found out.
+- **Not built** — stated so it cannot be inferred from silence.
+
+### The governance layer — measured
+
+This is the part that runs every day and has the scars to prove it.
+
+| Component | Status | Evidence |
+|-----------|--------|----------|
+| **Policy gate, multi-vendor** | Measured | One gate, six vendor surfaces (`claude-code`, `codex`, `kimi`, `gemini`, `cursor`, `openclaw`). Claude-lineage hook engines fail OPEN on error, so each adapter is fail-closed by construction. |
+| **Witness chain** | Measured | Hash-linked SQLCipher; every tool call lands. ~86k entries on the reference box. |
+| **Human escalation** | Measured | A refused governance write is offered to a human: dashboard notice, `hestia gate approve/deny`, or an operator-authenticated HTTP decision. Single-use, expiring, witnessed both ends. Store is **rehydrated from the chain**, so a deploy no longer destroys a ruling. |
+| **Peer arbitration** | Measured | A NOT-SAME peer can rule an escalation; `arbiter::eligibility` enforces independence server-side, cross-vendor ranked above cross-member. |
+| **Per-member policy** | Measured | Loosen or tighten ONE agent without moving the society. Tightening persists (vault); loosening is memory-only and dies with the daemon. Operator-only — no MCP tool can set it, asserted by test. |
+| **Trust derivation (T3/V3)** | Measured | Pure read-time function over the chain, versioned, ships its receipts. Temperament scores conduct after a deny: re-running 0.0, adapting 0.85, escalating and being upheld 1.0. Unmeasured renders *unmeasured*, never a default prior. |
+| **Vault** | Measured | ChaCha20-Poly1305 + Argon2id, passphrase-first. |
+| **MCP server** | Measured | **29 tools** over rmcp + Axum. (This table said 12 for months; it was stale, which is why this audit exists.) |
+| **Web dashboard** | Measured | Served by the daemon at `/`; the interface actually used daily. Operator-gated behind an Ed25519 challenge-signed session. |
+| **Delegation** | Measured | Scoped by role+action, signed, revocable. |
+| **Plugin SDK** | Measured | Rust, TypeScript, Python — same interface. |
+
+**Assurance ceiling, stated with it:** all of the above is profile **A1** — a cooperative
+gate running as the same UID as the operator. Tamper-**evident**, not tamper-proof.
+[`docs/GATE_BYPASS_CATALOG.md`](docs/GATE_BYPASS_CATALOG.md) catalogues the ways around it,
+including two environment variables that suffice today. Enforcement against a determined
+agent needs A2+ (separate UID) and is not available now.
+
+### Built but thinly exercised — *plumbed*
+
+Real code, real tests, not yet driven in anger. Believe the code; do not yet believe the
+uptime.
+
+| Component | Status | What is untested |
+|-----------|--------|------------------|
+| **Cross-platform app (Tauri 2)** | Plumbed | 374 source files, last substantive commit 2026-07-24. The README called it "the primary human interface"; in practice the **web dashboard is what gets used**, and the app has not been exercised alongside recent daemon changes. |
+| **Device constellation** | Plumbed | 1,183 lines, 21 unit tests, wired into the hub handshake as multi-device proof. **Zero constellation events in the live chain window** — the path has never been driven on a real second device. |
+| **Credential issuance (OID4VCI / SD-JWT-VC)** | Plumbed | Endpoints exist and are gated; no wallet has completed a round trip here. |
+| **Member↔member sealed channels + durable inbox** | Plumbed | Exercised in tests and in fleet mesh traffic; not under adversarial or multi-hub conditions. |
+| **AI variant (agent-owned vault)** | Plumbed | `--ai` flag exists; ownership model still maturing. |
+
+### Not built
+
+| Component | Status | Blocked on |
+|-----------|--------|------------|
+| **Federation** | Not started | Phase 4 |
+| **Multi-hub connector** | Not started | single-hub works |
+| **Hardware binding** (TPM/YubiKey/SE) | Trait contracts only | Hardbound enterprise tier |
+| **Vault credential injection** | Not started | SDK surface exists |
+| **A2+ enforcement** (separate UID) | Not started | the honest ceiling on everything above |
+
+### Superseded status table (retained for reference)
 
 | Component | Status | Notes |
 |-----------|--------|-------|

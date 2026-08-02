@@ -428,6 +428,43 @@ reports the violated rule loudly, and witnesses a `policy_bypass` entry carrying
 `authority: standing admin attribute` and `justification: null`. It cannot stop the
 bypass; it only refuses to let it be silent.
 
+**Update, 2026-08-01 — the loud version was not enough, and the class recurred.** At 04:39,
+unattended, a watcher-fired `claude-code` session pushed directly to `web4` `main`
+(`76ff2f5`). The witness fired exactly as designed: `authority: standing admin attribute`,
+`justification: null`, `note: "Exercised by automation without deliberation"`. A perfect
+record of something nobody decided — which is what this section predicted, observed in the
+wild, against the mitigation that was supposed to cover it.
+
+dp's ruling:
+
+> *"that authority should rest with the git manager, and it alone. auto sessions should go
+> through the manager like all the others."*
+
+So the authority stops being a property and becomes a **role that has to be transited**.
+`pre-push-guard` (shared-context `scripts/git-census/`, step 1 of `git-manager-role`)
+refuses any push whose destination is a protected branch unless the caller is acting as the
+manager and says why:
+
+```
+GIT_MANAGER_ACT="<why this bypasses PR review>" git push ...
+```
+
+Three properties, stated with their limits:
+
+- **The accidental case ends.** Automation running a plain `git push` does not set the
+  variable, and that was the actual failure mode both times.
+- **The deliberate case must name itself.** The reason is the whole point — §10b's
+  complaint was a receipt with no rationale attached, and a declaration supplies one.
+- **It is still A1 and still cooperative.** `GIT_MANAGER_ACT` is a *declaration, not proof*:
+  any process on this box can set it. This converts an ambient bit into a recorded act; it
+  does not convert it into an enforced boundary. Real enforcement is server-side branch
+  protection that does not yield to admin, which is a GitHub setting and not a hook.
+
+Blast radius is deliberately narrow: the guard returns 0 before any logic unless the push
+targets `main`/`master`, so a defect in it cannot wedge ordinary branch work — and on that
+narrow path it fails **closed**, because "could not tell" must not resolve to "went ahead"
+for this specific act.
+
 ## 11. Standing acknowledgements — put these in front of anyone relying on hestia
 
 - The gate runs inside the blast radius; it is not containment.

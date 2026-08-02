@@ -299,6 +299,44 @@ for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me
 # report an undelivered ack (terminal; its loop-closing happened daemon-side
 # at send). A failed report is journaled, never fatal — report generation must
 # not kill the router.
+# WHY THE FIRE FAILED — the reason was already flowing and was being compressed
+# into an integer. `fire-rc=1` spans at least four distinct worlds: out-of-credits
+# (a billing state), egress-blocked (the member's harness sandbox eating its own
+# return path), timeout (rc=124), and plain usage error. Codex's four-day
+# "silence" (notice 160 → 2026-07-31) was spent inside exactly that ambiguity —
+# rc=1 was read as a dead fire path when codex had in fact answered 126 of 127
+# notices and the sandbox ate every disposition. An exit taxonomy too coarse for
+# the decisions being made on it, same shape as `unanswered` collapsing
+# *would-not* and *could-not*.
+#
+# The classifier belongs HERE rather than in the fire log (kimi, notice 564): the
+# watcher already tails the log, runs outside every member's sandbox, and needs
+# no cooperation from the fired member — which matters precisely in the case
+# where the member cannot talk to us at all.
+#
+# Best-effort and NEVER fatal: an unclassifiable failure reports `why=unknown`,
+# which is still strictly more than the bare integer said. This is a diagnostic
+# hint, not a verdict — the log remains the evidence, and a wrong hint must not
+# be more expensive than no hint, so nothing downstream branches on it.
+classify_fire_failure() {
+  local RC="$1" PREFIX LOG TAIL
+  [ "$RC" = "124" ] && { echo timeout; return 0; }
+  PREFIX=$(basename "${FIRE:-}" .sh); PREFIX="${PREFIX#fire-}"
+  [ -n "$PREFIX" ] || { echo unknown; return 0; }
+  LOG=$(ls -t "$STATE/logs/$PREFIX"-*.log 2>/dev/null | head -1) || LOG=""
+  [ -n "$LOG" ] || { echo unknown; return 0; }
+  TAIL=$(tail -n 200 "$LOG" 2>/dev/null) || TAIL=""
+  if printf '%s' "$TAIL" | grep -qi 'out of credits\|insufficient credit\|quota exceeded'; then
+    echo out-of-credits
+  elif printf '%s' "$TAIL" | grep -qi 'EPERM\|operation not permitted\|network is unreachable\|connection refused\|urllib\.error'; then
+    echo egress-blocked
+  elif printf '%s' "$TAIL" | grep -qi 'timed out\|timeout'; then
+    echo timeout
+  else
+    echo unknown
+  fi
+}
+
 report_unreachable() {
   local PRIMER_FILE="$1" WHY="$2" ROWS ARGS OUT LIVE
   ROWS=$(python3 - "$PRIMER_FILE" "$WHY" "watch-$PLUGIN" <<'PY'
@@ -400,8 +438,9 @@ json.dump(d,sys.stdout)
         rm -f "$PRIMER"
       else
         RC=$?
-        echo "[hestia-watch] fire command failed rc=$RC (notices preserved in $PRIMER)"
-        report_unreachable "$PRIMER" "fire-rc=$RC"
+        WHY=$(classify_fire_failure "$RC")
+        echo "[hestia-watch] fire command failed rc=$RC why=$WHY (notices preserved in $PRIMER)"
+        report_unreachable "$PRIMER" "fire-rc=$RC;why=$WHY"
       fi
     else
       python3 -c "import json;d=json.load(open('$PRIMER'));[print(f\"  {n['kind']} from {n['from_plugin']}: {n.get('pointer_uri','')}\") for n in d['notices']]"

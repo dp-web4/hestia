@@ -133,8 +133,15 @@ class StubDaemon:
         self.httpd.server_close()
 
 
-def run_watcher(notices, notify_error=False, run_secs=4.0):
-    """Run the real watcher once against a stub daemon + always-failing fire."""
+def run_watcher(notices, notify_error=False, run_secs=4.0, plant_fire_log=None):
+    """Run the real watcher once against a stub daemon + always-failing fire.
+
+    `plant_fire_log` writes that text as the fired member's most recent fire log
+    ($STATE/logs/<prefix>-*.log, prefix derived from the fire command's basename)
+    so `classify_fire_failure` has something real to read. None means no log
+    exists at all — the honest default, and the case that must yield
+    `why=unknown` rather than a guess.
+    """
     tmp = tempfile.mkdtemp(prefix="branch4-test-")
     state = os.path.join(tmp, "state")
     fire_log = os.path.join(tmp, "fire.log")
@@ -142,6 +149,11 @@ def run_watcher(notices, notify_error=False, run_secs=4.0):
     with open(fire_stub, "w") as f:
         f.write(f'#!/usr/bin/env bash\necho "$1" >> "{fire_log}"\nexit 3\n')
     os.chmod(fire_stub, 0o755)
+    if plant_fire_log is not None:
+        # fire-stub.sh -> prefix "stub", matching the watcher's own derivation.
+        os.makedirs(os.path.join(state, "logs"), exist_ok=True)
+        with open(os.path.join(state, "logs", "stub-20260731-000000.log"), "w") as f:
+            f.write(plant_fire_log)
 
     daemon = StubDaemon(notices, notify_error=notify_error)
     env = dict(os.environ)
@@ -204,7 +216,8 @@ def main():
           and reports[0].get("kind") == "reply"
           and reports[0].get("in_reply_to") == 42
           and reports[0].get("pointer_uri")
-          == NOTICE_A["pointer_uri"] + "#undelivered:fire-rc=3;via=watch-dest-member")
+          == NOTICE_A["pointer_uri"]
+          + "#undelivered:fire-rc=3;why=unknown;via=watch-dest-member")
     check("A: exactly one bound reply report to the original sender, pointer names "
           "the undelivered content + the routing verdict + the observer", ok,
           f"notify_calls={json.dumps(reports)}\n{out}")
@@ -270,6 +283,39 @@ def main():
     # thread's subject, not a lint.
     check("F: the unanswered asker actually runs (no swallowed SyntaxError)",
           "SyntaxError" not in out, out)
+
+    # H — the exit reason must reach the report. `fire-rc=1` spanned at least four
+    # worlds (out-of-credits / egress-blocked / timeout / usage error) and codex's
+    # four-day "silence" was spent inside that ambiguity: rc=1 read as a dead fire
+    # path while codex had answered 126 of 127 notices and the sandbox ate every
+    # disposition. Each branch is fired here against a REAL planted log, because a
+    # classifier that has never run on anything but the default is a claim.
+    #
+    # Sabotage case first: the classifier must NOT be a constant. `why=unknown`
+    # for every input would satisfy any test that only checks the field exists —
+    # so the assertions below require the branches to DISAGREE with each other.
+    seen = {}
+    for label, planted in [
+        ("out-of-credits", "starting\nERROR: Your workspace is out of credits.\nbye\n"),
+        ("egress-blocked", "starting\nurllib.error.URLError: <EPERM Operation not permitted>\n"),
+        ("timeout", "starting\nthe request timed out after 600s\n"),
+        ("unknown", "starting\nsomething nobody has a pattern for yet\n"),
+    ]:
+        d, o, _, _ = run_watcher([dict(NOTICE_A)], plant_fire_log=planted)
+        rp = list(d.notify_calls)
+        seen[label] = rp[0].get("pointer_uri", "") if rp else ""
+        check(f"H: fire log naming {label} is classified as why={label}",
+              f";why={label};" in seen[label],
+              f"ptr={seen[label]!r}\n{o}")
+
+    check("H: the classifier is not a constant (the four inputs give >1 verdict)",
+          len({v.split(";why=")[-1].split(";")[0] for v in seen.values() if v}) > 1,
+          f"verdicts={seen}")
+    dnl, onl, _, _ = run_watcher([dict(NOTICE_A)], plant_fire_log=None)
+    rnl = list(dnl.notify_calls)
+    check("H: a fire log that does not exist yields unknown, never a guess",
+          len(rnl) == 1 and ";why=unknown;" in rnl[0].get("pointer_uri", ""),
+          f"calls={json.dumps(dnl.notify_calls)}\n{onl}")
 
     print()
     if failures:

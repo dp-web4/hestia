@@ -609,8 +609,64 @@
   .pol-add-wrap summary { cursor: pointer; color: var(--accent); font-size: 0.8rem; }
   .pol-add { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.75rem; }
   /* policy trigger button in the witness-chain header */
+  /* A stat that could not be read must look different from a stat that is zero. */
+  .stat-unavailable .hs-val { color: var(--coral); }
+  .stat-unavailable::after { content: " read failed"; font-size: 0.62rem; color: var(--coral); text-transform: uppercase; letter-spacing: 0.06em; }
+
+  .pol-scope { font-size: 0.76rem; line-height: 1.45; padding: 0.45rem 0.65rem; border-radius: 4px; margin-bottom: 0.6rem; }
+  .pol-scope.society { color: var(--coral); background: #ff7a6618; border: 1px solid var(--coral); }
+  .pol-scope.scoped  { color: var(--accent); background: var(--accent-dim); border: 1px solid var(--accent); }
+
+  /* --- per-member policy grants --- */
+  .grant-note { font-size: 0.74rem; color: var(--fg-dim); line-height: 1.5; margin: 0.3rem 0 0.6rem;
+    padding: 0.45rem 0.6rem; background: var(--bg); border-left: 2px solid var(--warning); border-radius: 3px; }
+  .grant-add { flex-wrap: wrap; }
+  .grant-row { display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap;
+    border: 1px solid var(--warning); border-radius: 5px; padding: 0.45rem 0.6rem; margin-bottom: 0.45rem; background: var(--bg); }
+  .grant-who { font-weight: 600; color: var(--fg); }
+  .grant-preset { color: var(--warning); font-size: 0.78rem; }
+  .grant-why { color: var(--fg-dim); font-size: 0.74rem; flex-basis: 100%; }
+  .grant-ttl { margin-left: auto; font-size: 0.72rem; color: var(--fg-dim); white-space: nowrap; }
+  .grant-revoke { background: transparent; color: var(--coral); border: 1px solid var(--coral);
+    border-radius: 4px; padding: 0.15rem 0.6rem; font: inherit; font-size: 0.72rem; cursor: pointer; }
+
+  /* --- governance escalation banner + decision list --- */
+  /* MUST precede the display:flex rule below. The UA stylesheet's `[hidden] { display: none }`
+     loses to ANY author rule that sets display, so `banner.hidden = true` is inert without this
+     and the bar stays lit after the queue empties. `.modal` above already carries the same
+     guard (line ~640); this rule was omitted and the banner was in fact permanently visible —
+     only noticeable once it had a reason to appear. */
+  .esc-banner[hidden] { display: none; }
+  .esc-banner { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.6rem; padding: 0.5rem 0.8rem;
+    background: #ff7a6618; border: 1px solid var(--coral); border-radius: 6px; color: var(--coral); font-size: 0.82rem; }
+  .esc-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--coral); flex: none; animation: escpulse 2s ease-in-out infinite; }
+  @keyframes escpulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+  .esc-banner-btn { margin-left: auto; background: var(--coral); color: var(--bg); border: 0; border-radius: 999px;
+    padding: 0.2rem 0.8rem; font: inherit; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; cursor: pointer; }
+  .esc-note { font-size: 0.78rem; color: var(--fg-dim); line-height: 1.5; margin-bottom: 0.8rem;
+    padding: 0.5rem 0.7rem; background: var(--bg); border-left: 2px solid var(--border); border-radius: 3px; }
+  .esc-row { border: 1px solid var(--border); border-radius: 6px; padding: 0.7rem 0.8rem; margin-bottom: 0.7rem; background: var(--bg); }
+  .esc-row-head { display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.45rem; }
+  .esc-tool { font-weight: 600; color: var(--fg); }
+  .esc-who { color: var(--fg-dim); font-size: 0.78rem; }
+  .esc-ttl { margin-left: auto; font-size: 0.72rem; color: var(--warning); white-space: nowrap; }
+  .esc-marker { font-family: var(--mono, monospace); font-size: 0.75rem; color: var(--fg-dim); word-break: break-all; margin-bottom: 0.5rem; }
+  .esc-meta { font-size: 0.72rem; color: var(--fg-dim); margin-bottom: 0.5rem; }
+  .esc-actions { display: flex; gap: 0.4rem; align-items: center; }
+  .esc-reason { flex: 1; min-width: 0; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--fg); font: inherit; font-size: 0.78rem; padding: 0.25rem 0.5rem; }
+  .esc-approve, .esc-deny { border: 0; border-radius: 4px; padding: 0.28rem 0.8rem; font: inherit; font-size: 0.75rem; cursor: pointer; white-space: nowrap; }
+  .esc-approve { background: var(--success); color: var(--bg); }
+  .esc-approve:disabled { opacity: 0.4; cursor: not-allowed; }
+  .esc-deny { background: transparent; color: var(--coral); border: 1px solid var(--coral); }
+  .esc-err { color: var(--coral); font-size: 0.75rem; margin-top: 0.4rem; }
+
   .policy-btn { background: var(--accent-dim); color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 0.25rem 0.7rem; font: inherit; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; cursor: pointer; margin-right: 0.5rem; white-space: nowrap; }
   .policy-btn:hover { background: var(--accent); color: var(--bg); }
+  /* A scoped label must not look like the society label — the whole failure was not being able
+     to tell which one you were reading. */
+  .policy-btn-scoped { background: var(--warning); color: var(--bg); border-color: var(--warning); }
+  .policy-btn-scoped:hover { background: var(--warning); color: var(--bg); filter: brightness(1.15); }
   /* modal */
   .modal[hidden] { display: none; }
   .modal { position: fixed; inset: 0; z-index: 50; display: flex; align-items: flex-start; justify-content: center; padding: 5vh 1rem; }
@@ -681,6 +737,21 @@
   </header>
 
   <main>
+    <!-- ESCALATION BANNER (2026-08-01). A member's write to a governance surface was refused
+         and offered to a human. Until today the ONLY notice of that was in the denied agent's
+         own stderr: `POST /api/operator/gate-escalation` had existed as the strongest human
+         decision channel in the system — operator-authenticated, higher assurance than the
+         CLI — with no front end to reach it. Five escalations opened against dp in one session
+         and dp saw none of them.
+         It sits ABOVE the grid, not inside a card, because the thing it fixes is not "hard to
+         find" but "never surfaced". Hidden when the queue is empty, so an empty governance
+         queue costs no attention. -->
+    <div class="esc-banner" id="esc-banner" hidden>
+      <span class="esc-dot"></span>
+      <span id="esc-banner-text">…</span>
+      <button class="esc-banner-btn" id="esc-banner-btn">review</button>
+    </div>
+
     <!-- No "ORCHESTRATORS:" label. The chips are self-evidently orchestrators; the word
          cost a fifth of a row to say so. -->
     <div class="orch-bar" id="orch-bar">
@@ -742,6 +813,32 @@
     </div>
   </div>
 
+  <!-- Governance-surface escalation decisions. Renders from the dashboard snapshot the page
+       already polls, and decides through POST /api/operator/gate-escalation — the operator
+       channel, which requires a challenge-signed session. That is deliberately NOT the same
+       authority as `hestia gate approve` on the CLI, which is authenticated only by filesystem
+       access to HESTIA_HOME (the same access every member on this box already has). The daemon
+       records `via` so a reader can tell a proof from a convenience; this front end is the
+       proof side. -->
+  <div class="modal" id="esc-modal" hidden>
+    <div class="modal-backdrop" data-close="1"></div>
+    <div class="modal-panel" id="esc-card">
+      <div class="modal-head">
+        <h2>Governance escalations <span class="pol-mode" id="esc-count"></span></h2>
+        <button class="modal-close" data-close="1" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="esc-note">
+          A member asked to write a governance surface and was refused. Approving authorises
+          <strong>that one write</strong> — it is single-use and expires; it is not a standing permit.
+          The identity shown is <strong>claimed, not authenticated</strong>: you are deciding partly on
+          a string the caller supplied.
+        </div>
+        <div id="esc-list"><div class="empty">No escalations awaiting a decision.</div></div>
+      </div>
+    </div>
+  </div>
+
   <div class="modal" id="policy-modal" hidden>
     <div class="modal-backdrop" data-close="1"></div>
     <div class="modal-panel" id="policy-card">
@@ -750,7 +847,48 @@
         <button class="modal-close" data-close="1" aria-label="Close">✕</button>
       </div>
       <div class="modal-body">
+        <div class="pol-scope society" id="pol-scope"></div>
         <div class="pol-presets" id="pol-presets"></div>
+        <!-- PER-MEMBER GRANTS. The preset above is the SOCIETY baseline and applies to every
+             seat on this box -- including unattended watcher-fired agents -- so using it to
+             unblock one member grants the whole fleet. This section is the scoped alternative.
+             It sits directly under the preset buttons on purpose: that adjacency is the thing
+             that stops the next person reaching for the global switch. -->
+        <div class="pol-section-label">Per-member grants — loosen ONE member without touching the society</div>
+        <div class="grant-note">
+          Held in <strong>memory only</strong>: a grant does not survive a daemon restart, and
+          tightening applied through the vault does. Ratified hub law still binds over a grant.
+          Every grant and revocation is witnessed.
+        </div>
+        <div id="grant-list"><div class="empty">No grants active — every member is on the society baseline.</div></div>
+        <details class="pol-add-wrap">
+          <summary>+ Grant a member a preset</summary>
+          <div class="pol-add grant-add">
+            <input class="pol-input" id="grant-plugin" placeholder="plugin_id (e.g. kimi-code)" size="16">
+            <input class="pol-input" id="grant-role" placeholder="role" list="grant-roles" size="20">
+            <datalist id="grant-roles">
+              <option value="role:constellation:member"></option>
+              <option value="role:constellation:interactive-dev"></option>
+              <option value="role:constellation:mesh-worker"></option>
+              <option value="role:constellation:reviewer"></option>
+              <option value="role:constellation:autonomous-timer"></option>
+            </datalist>
+            <select class="pol-select" id="grant-preset">
+              <option value="permissive">permissive</option>
+              <option value="audit-only">audit-only</option>
+              <option value="safety">safety</option>
+              <option value="strict">strict</option>
+            </select>
+            <select class="pol-select" id="grant-ttl">
+              <option value="3600">1 hour</option>
+              <option value="900">15 min</option>
+              <option value="14400">4 hours</option>
+              <option value="">until restart</option>
+            </select>
+            <input class="pol-input" id="grant-reason" placeholder="reason (required)" size="24">
+            <button class="pol-btn-add" id="grant-add-btn" disabled>grant</button>
+          </div>
+        </details>
         <div class="pol-section-label">Preset rules — change a decision, disable, or revert</div>
         <div id="pol-rules"><div class="empty">Loading…</div></div>
         <div class="pol-section-label">Custom rules</div>
@@ -991,7 +1129,26 @@
     // dashboard printed it twice and spent a quarter of the stat row doing it. Reading
     // the value and its window off the same variable also removes the failure mode where
     // the label said "last week" over an hour's count.
-    $('stat-actions').textContent = fmt.int(s.total_actions);
+    // A FAILED CHAIN READ MUST NOT RENDER AS ZERO.
+    //
+    // The daemon used to swallow a stats-read error into an empty result, so the console
+    // reported "0 actions" for every member across every timeframe with a 200 OK. dp hit that
+    // on 2026-08-01: an apparently quiet fleet that was in fact 457 acts busy, unfixable by
+    // refresh, which recovered on its own later. On a governance console absence is the single
+    // most trusted reading — it is what an operator watching for unexpected agent activity
+    // most wants to believe — so it is the one that must never be faked.
+    //
+    // The daemon now carries `stats_unavailable`. Render the failure, not a number.
+    const statsBroken = lastData?.stats_unavailable;
+    if (statsBroken) {
+      $('stat-actions').textContent = '—';
+      $('stat-actions').parentElement.title =
+        `Chain read FAILED — these counts are unavailable, not zero. ${statsBroken}`;
+      $('stat-actions').parentElement.classList.add('stat-unavailable');
+    } else {
+      $('stat-actions').textContent = fmt.int(s.total_actions);
+      $('stat-actions').parentElement.classList.remove('stat-unavailable');
+    }
     $('stat-rate').textContent = s.total_actions === 0 ? '—' : fmt.pct(s.success_rate);
     // Denies never reach an `outcome` (the gate blocks before the tool runs), so they
     // are not in the success-rate math — surfaced as gate activity, not failure. A deny
@@ -1389,7 +1546,52 @@
     // not inline in the title.
     const pol = lastData?.policy;
     const polBtn = $('policy-btn');
-    if (polBtn) polBtn.textContent = pol ? `policy: ${pol.preset}${pol.enforce ? '' : ' (audit)'}` : 'policy';
+    // THE LABEL MUST NAME THE LAW THAT IS ACTUALLY IN FORCE FOR WHAT IS ON SCREEN.
+    //
+    // This read `lastData.policy` unconditionally — always the SOCIETY preset — so with a member
+    // selected and a live grant on it, the chain showed that member's actions while the button
+    // above them named a law that member was not being judged under. dp hit exactly that and
+    // could not tell whether the grant had failed to apply or the display had failed to update.
+    //
+    // That ambiguity is the defect, not the wrong string: a status surface that cannot be
+    // distinguished from a broken mechanism sends you debugging the wrong layer. Same family as
+    // the null-state twin — a display that looks identical whether or not the thing worked.
+    //
+    // AND IT MUST REPORT A LIVE GRANT EVEN WITH NOTHING SELECTED. The first version only went
+    // amber when the granted member happened to be the selected one, so granting from the form
+    // — or granting and then clearing the selection — left the button reading `safety` while a
+    // permissive grant was in force. dp hit that too. A control that only tells the truth in one
+    // of its states is not a status surface; the operator has to already know the answer to read
+    // it correctly, which is the opposite of what it is for.
+    if (polBtn) {
+      const grants = lastData?.instance_grants ?? [];
+      const target = selectedOrch || null;
+      const grant = target ? grants.find(g => g.plugin_id === target) : null;
+      if (grant) {
+        polBtn.textContent = `policy: ${grant.preset} · ${target}`;
+        polBtn.classList.add('policy-btn-scoped');
+        polBtn.title = `Per-member grant: ${target} runs under "${grant.preset}", not the society `
+          + `baseline ("${pol ? pol.preset : '?'}"). ${grant.reason ? `Reason: ${grant.reason}. ` : ''}`
+          + `Click to view or change.`;
+      } else if (grants.length) {
+        // Grants exist but not on the selected member (or nothing is selected). The society
+        // label alone would be true and misleading: some member on this box is NOT under it.
+        const society = pol ? `${pol.preset}${pol.enforce ? '' : ' (audit)'}` : 'policy';
+        polBtn.textContent = `policy: ${society} · ${grants.length} grant${grants.length > 1 ? 's' : ''}`;
+        polBtn.classList.add('policy-btn-scoped');
+        polBtn.title =
+          `Society baseline is "${pol ? pol.preset : '?'}", but ${grants.length} member(s) are `
+          + `under a per-member grant: `
+          + grants.map(g => `${g.plugin_id} → ${g.preset}`).join(', ')
+          + `. Select a member to scope the buttons to it, or click to review.`;
+      } else {
+        polBtn.textContent = pol ? `policy: ${pol.preset}${pol.enforce ? '' : ' (audit)'}` : 'policy';
+        polBtn.classList.remove('policy-btn-scoped');
+        polBtn.title = target
+          ? `${target} is on the society baseline — no per-member grant. Click to scope one.`
+          : 'View / edit the society policy';
+      }
+    }
     const filterLabel =
       feedFilter === 'deny' ? 'denies' : feedFilter === 'warn' ? 'warnings' : 'live';
     let baseTitle = `Witness chain — ${filterLabel}`;
@@ -1522,6 +1724,8 @@
       ? ((data.stats_by_plugin || {})[selectedOrch] || statsEmpty)
       : data.stats;
     renderStats(s, data.society, selectedOrch);
+    renderEscalations(data);
+    renderGrants(data);
     renderOrchBar(data);
     renderTrust(data.trust);
     renderHistogram(data);
@@ -1720,6 +1924,17 @@
 
   function renderPolicy(p) {
     $('pol-mode').textContent = `${p.active_preset} · ${p.enforce ? 'enforcing' : 'audit'}`;
+    // SAY WHAT THE BUTTONS WILL CHANGE. The scope was invisible, so a scoped-looking control
+    // silently set the whole society twice in one session. The banner is loud when scoped,
+    // because "this affects everyone" is the assumption that has to be defeated.
+    const scope = $('pol-scope');
+    if (scope) {
+      const target = selectedOrch || null;
+      scope.textContent = target
+        ? `Presets below apply to ${target} ONLY — a per-member grant, witnessed. Tightening persists; loosening dies with the daemon.`
+        : 'Presets below change the SOCIETY baseline — every member on this machine, including unattended ones. Select a member above to scope it.';
+      scope.className = target ? 'pol-scope scoped' : 'pol-scope society';
+    }
     $('pol-presets').innerHTML = p.presets.map(pr =>
       `<button class="filter-btn${pr.name===p.active_preset?' selected':''}" data-preset="${escapeHtml(pr.name)}" title="${escapeHtml(pr.description)}">${escapeHtml(pr.name)}</button>`
     ).join('');
@@ -1746,6 +1961,213 @@
     } catch (e) { /* leave previous render */ }
   }
 
+  // --- governance escalations -------------------------------------------------
+  // Rendered from the snapshot the page already polls, so a pending decision appears
+  // within one tick of being opened. No operator action is required to DISCOVER one --
+  // that was the whole defect: the decision channel existed and nothing announced it.
+  function escFmtAge(secs) {
+    if (secs < 60) return `${secs}s`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+    return `${Math.floor(secs / 3600)}h${Math.floor((secs % 3600) / 60)}m`;
+  }
+
+  // Which escalation ids are currently rendered, and any reason text the operator has
+  // typed but not yet submitted.
+  //
+  // The first version rebuilt this list from innerHTML on EVERY tick, so the poll wiped
+  // the reason field a second or two into typing and approval was unreachable — the panel
+  // whose whole purpose is "let a human decide" made deciding impossible. A live-updating
+  // surface must not own a field a human is mid-way through filling in.
+  //
+  // So: rebuild only when the SET of pending ids changes; otherwise refresh just the
+  // countdown in place. And carry drafts across a genuine rebuild, because an escalation
+  // arriving or expiring elsewhere in the queue is no reason to discard what was typed here.
+  let escRenderedSig = null;
+  const escDrafts = new Map();
+
+  function renderEscalations(data) {
+    const pend = data?.pending_escalations ?? [];
+    const banner = $('esc-banner');
+    banner.hidden = pend.length === 0;
+    if (pend.length) {
+      const n = pend.length;
+      $('esc-banner-text').textContent =
+        `${n} governance write${n > 1 ? 's' : ''} refused and awaiting your decision`;
+    }
+    $('esc-count').textContent = pend.length ? `${pend.length} pending` : '';
+
+    const list = $('esc-list');
+    if (!pend.length) {
+      if (escRenderedSig !== '') {
+        escRenderedSig = '';
+        escDrafts.clear();
+        list.innerHTML = '<div class="empty">No escalations awaiting a decision.</div>';
+      }
+      return;
+    }
+
+    // Drop drafts for escalations that are gone (decided or expired) so the map cannot grow
+    // without bound across a long-lived dashboard session.
+    const live = new Set(pend.map(e => String(e.id)));
+    for (const id of [...escDrafts.keys()]) if (!live.has(id)) escDrafts.delete(id);
+
+    const sig = pend.map(e => String(e.id)).sort().join(',');
+    if (sig === escRenderedSig) {
+      // Same escalations as last tick: touch ONLY the countdown. Inputs, focus position
+      // and selection are left exactly as the operator left them.
+      pend.forEach(e => {
+        const row = list.querySelector(`.esc-row[data-id="${CSS.escape(String(e.id))}"]`);
+        const ttl = row && row.querySelector('.esc-ttl');
+        if (ttl) ttl.textContent = `expires in ${escFmtAge(e.secs_remaining ?? 0)}`;
+      });
+      return;
+    }
+    escRenderedSig = sig;
+    list.innerHTML = pend.map(e => {
+      // Everything user-supplied goes through textContent below, never innerHTML --
+      // `marker` and `claimed_by` are caller-controlled strings.
+      const id = String(e.id ?? '');
+      return `<div class="esc-row" data-id="${id}">
+        <div class="esc-row-head">
+          <span class="esc-tool"></span>
+          <span class="esc-who"></span>
+          <span class="esc-ttl"></span>
+        </div>
+        <div class="esc-marker"></div>
+        <div class="esc-meta"></div>
+        <div class="esc-actions">
+          <input class="esc-reason" placeholder="reason (required to approve)">
+          <button class="esc-approve" disabled>approve</button>
+          <button class="esc-deny">deny</button>
+        </div>
+        <div class="esc-err" hidden></div>
+      </div>`;
+    }).join('');
+
+    pend.forEach(e => {
+      const row = list.querySelector(`.esc-row[data-id="${CSS.escape(String(e.id))}"]`);
+      if (!row) return;
+      row.querySelector('.esc-tool').textContent = e.tool_name || 'write';
+      // "claimed" is said out loud: plugin_id is caller-asserted (HST-005) and the
+      // operator is deciding partly on this string.
+      row.querySelector('.esc-who').textContent =
+        `claimed by ${e.claimed_by || 'unattributed'} · ${e.role || 'no role'}`;
+      row.querySelector('.esc-ttl').textContent = `expires in ${escFmtAge(e.secs_remaining ?? 0)}`;
+      row.querySelector('.esc-marker').textContent = e.marker || '(no target recorded)';
+      const bar = typeof e.bar === 'string' ? e.bar : JSON.stringify(e.bar ?? '');
+      const nf = Array.isArray(e.factors) ? e.factors.length : 0;
+      row.querySelector('.esc-meta').textContent =
+        `id ${e.id} · bar ${bar} · ${nf} factor${nf === 1 ? '' : 's'} recorded`;
+
+      const reason = row.querySelector('.esc-reason');
+      const approve = row.querySelector('.esc-approve');
+      const deny = row.querySelector('.esc-deny');
+      const err = row.querySelector('.esc-err');
+      // Restore anything typed before this rebuild.
+      const draft = escDrafts.get(String(e.id)) || '';
+      reason.value = draft;
+      approve.disabled = !draft.trim();
+      // Approve stays disabled until a reason exists. The asymmetry mirrors the daemon:
+      // refusing is the default and needs no justification; permitting a governance write
+      // is the act that gets read back later, so it must carry its own why.
+      reason.addEventListener('input', () => {
+        escDrafts.set(String(e.id), reason.value);
+        approve.disabled = !reason.value.trim();
+      });
+      approve.addEventListener('click', () => escDecide(e.id, true, reason.value.trim(), err));
+      deny.addEventListener('click', () => escDecide(e.id, false, reason.value.trim(), err));
+    });
+  }
+
+  async function escDecide(id, approve, reason, errEl) {
+    errEl.hidden = true;
+    try {
+      const res = await apiFetch('/api/operator/gate-escalation', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, approve, reason: reason || null }),
+      });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { const b = await res.json(); if (b?.error) msg = b.error; } catch (_) {}
+        throw new Error(msg);
+      }
+      // Re-poll rather than mutating locally: the daemon is the authority on whether
+      // that decision actually landed, and a row that vanishes optimistically would be
+      // the same "reports success while measuring nothing" defect this panel exists to fix.
+      await tick();
+    } catch (e) {
+      errEl.textContent = `decision failed: ${e.message}`;
+      errEl.hidden = false;
+    }
+  }
+
+  // --- per-member grants -------------------------------------------------------
+  // Rendered from the same snapshot as everything else. A standing exception to society law
+  // that the operator must go looking for is one they will forget they made, so it renders
+  // wherever the policy is read rather than behind its own fetch.
+  function renderGrants(data) {
+    const list = $('grant-list');
+    if (!list) return;
+    const gs = data?.instance_grants ?? [];
+    if (!gs.length) {
+      list.innerHTML = '<div class="empty">No grants active — every member is on the society baseline.</div>';
+      return;
+    }
+    list.innerHTML = gs.map(() => `<div class="grant-row">
+        <span class="grant-who"></span><span class="grant-preset"></span>
+        <span class="grant-ttl"></span><button class="grant-revoke">revoke</button>
+        <span class="grant-why"></span>
+      </div>`).join('');
+    // plugin_id and reason are operator-supplied strings; they go in via textContent, never HTML.
+    list.querySelectorAll('.grant-row').forEach((row, i) => {
+      const g = gs[i];
+      row.querySelector('.grant-who').textContent = `${g.plugin_id} · ${g.role}`;
+      row.querySelector('.grant-preset').textContent = `→ ${g.preset}`;
+      row.querySelector('.grant-ttl').textContent =
+        g.secs_remaining == null ? 'until restart' : `${escFmtAge(g.secs_remaining)} left`;
+      row.querySelector('.grant-why').textContent = g.reason ? `“${g.reason}”` : '(no reason recorded)';
+      row.querySelector('.grant-revoke').addEventListener('click', async () => {
+        await apiFetch(
+          `/api/policy/instance/${encodeURIComponent(g.plugin_id)}/${encodeURIComponent(g.role)}`,
+          { method: 'DELETE' });
+        await tick();
+      });
+    });
+  }
+
+  (function wireGrantForm() {
+    const btn = $('grant-add-btn');
+    if (!btn) return;
+    const plugin = $('grant-plugin'), role = $('grant-role'), reason = $('grant-reason');
+    // A reason is required to WIDEN and not to revoke — the same asymmetry the daemon
+    // enforces and the escalation channel already uses. Refusing costs nothing to explain;
+    // permitting is what gets read back later.
+    const sync = () => { btn.disabled = !(plugin.value.trim() && role.value.trim() && reason.value.trim()); };
+    [plugin, role, reason].forEach(el => el.addEventListener('input', sync));
+    btn.addEventListener('click', async () => {
+      const ttl = $('grant-ttl').value;
+      const body = {
+        plugin_id: plugin.value.trim(),
+        role: role.value.trim(),
+        preset: $('grant-preset').value,
+        reason: reason.value.trim(),
+      };
+      if (ttl) body.expires_in_secs = Number(ttl);
+      const res = await apiFetch('/api/policy/instance', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { const b = await res.json(); if (b?.error) msg = b.error; } catch (_) {}
+        alert(`grant failed: ${msg}`);
+        return;
+      }
+      plugin.value = ''; role.value = ''; reason.value = ''; sync();
+      await tick();
+    });
+  })();
+
   async function polSend(method, path, body) {
     try {
       const res = await apiFetch(path, {
@@ -1762,7 +2184,26 @@
     const card = $('policy-card');
     card.addEventListener('click', (e) => {
       const t = e.target;
-      if (t.dataset.preset) polSend('PUT', '/api/policy/preset', { preset: t.dataset.preset });
+      if (t.dataset.preset) {
+        const target = selectedOrch || null;
+        if (target) {
+          // Scoped to the selected member. A reason is required to WIDEN, matching the daemon;
+          // prompt rather than silently sending one, because the record is read back later and
+          // "changed from the dashboard" answers nothing.
+          const reason = prompt(
+            `Set policy for ${target} only (not the society).\n\n` +
+            `Reason (required — this is recorded in the witness chain):`);
+          if (!reason || !reason.trim()) return;
+          polSend('POST', '/api/policy/instance', {
+            plugin_id: target,
+            role: '*',
+            preset: t.dataset.preset,
+            reason: reason.trim(),
+          });
+        } else {
+          polSend('PUT', '/api/policy/preset', { preset: t.dataset.preset });
+        }
+      }
       else if (t.dataset.revert) polSend('DELETE', `/api/policy/override/${encodeURIComponent(t.dataset.revert)}`);
       else if (t.dataset.remove) polSend('DELETE', `/api/policy/rule/${encodeURIComponent(t.dataset.remove)}`);
       else if (t.id === 'pol-add-btn') {
@@ -1790,6 +2231,27 @@
     const modal = $('policy-modal');
     $('policy-btn').addEventListener('click', () => { modal.hidden = false; fetchPolicy(); });
     modal.addEventListener('click', (e) => { if (e.target.dataset.close) modal.hidden = true; });
+
+    // Escalation modal: same backdrop/✕ contract. The list is already current from the
+    // last tick, so opening it shows what is pending without a second fetch.
+    // WHEN A MEMBER IS SELECTED, THE POLICY BUTTON TARGETS THAT MEMBER (dp, 2026-08-01):
+    // "when an agent is selected and the chain shows only its actions, clicking the policy
+    // button should only change the policy for the selected agent."
+    //
+    // The preset buttons were always the SOCIETY preset, so selecting kimi and clicking
+    // `permissive` set every seat on the box permissive — twice, in one session, because the
+    // control looked scoped and was not. Selection already filters the chain and the stats; the
+    // policy control was the one thing in the header that ignored it, which is exactly why it
+    // read as scoped.
+    //
+    // The grain follows what the operator selected: an AGENT, applied with the wildcard role,
+    // because a member acts under several roles and demanding the right one at the moment
+    // something is stuck makes the control useless when it is most needed.
+
+    const escModal = $('esc-modal');
+    $('esc-banner-btn').addEventListener('click', () => { escModal.hidden = false; });
+    escModal.addEventListener('click', (e) => { if (e.target.dataset.close) escModal.hidden = true; });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') escModal.hidden = true; });
     // Same backdrop/✕/Escape contract for the trust detail popup, so both modals close
     // the three ways a reader will try rather than only the one that was wired.
     // Agents drawer: open/close, refresh, and close on outside click or Escape.
