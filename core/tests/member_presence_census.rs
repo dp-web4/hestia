@@ -303,7 +303,7 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str])] = &[
 /// `member_registry` / `load_members(` / `ensure_member(` /
 /// `attach_citizenship(` / `MemberRegistry::` / `.iter_sorted(`, minus the
 /// three registry fns' own definition lines, keyed `(file, enclosing fn)`.
-/// 8 keys, 9 lines.
+/// 8 keys, 11 lines.
 ///
 /// Every entry here was read by a person on 2026-07-27 and judged: one
 /// producer (`tool_connect`'s mint), one boot load, three operator surfaces,
@@ -311,6 +311,14 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str])] = &[
 /// `tool_appeal`'s candidate pool, whose fail-open degradation is hestia#80.
 /// That entry is the reason this table exists: the first census keying could
 /// not see it at all.
+///
+/// Delta reading, 2026-08-02 (codex, PR #159): `tool_appeal` is a safety use
+/// of presence. Arbiter routing now draws candidates from identities observed
+/// this boot, so a vault-persistence failure cannot silently narrow the
+/// independence pool at the moment local state is degraded. Publication stays
+/// restricted to the durable registry. The durable/observed size reads and
+/// unpersisted-member read expose that asymmetry as receipt evidence; they do
+/// not gate membership or publication themselves.
 const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("cli.rs::cmd_lct_publish", &[
         "let members = hestia::member_registry::load_members(&vault);",
@@ -328,8 +336,10 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
         "member_entities: self.member_registry.len(),",
     ]),
     ("server/handler.rs::tool_appeal", &[
-        ".iter_sorted()",
         ".member_registry",
+        ".member_registry",
+        "let durable_registry_size = s.member_registry.len();",
+        "let observed_registry_size = s.member_registry.observed_ids_sorted().len();",
     ]),
     ("server/handler.rs::tool_connect", &[
         "crate::member_registry::ensure_member(",
