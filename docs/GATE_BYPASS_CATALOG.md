@@ -563,6 +563,23 @@ widening seen on 2026-08-02 still omitted this separator and also admitted mutat
 of several nominally read-only commands. Codex withheld the requested peer factor before
 deployment.
 
+**Replacement review, 2026-08-02.** PR #162 added the missing separator and removed the
+first set of mutating heads, but its token grammar was still unsafe at the reviewed tip:
+
+- `shlex(..., punctuation_chars=True)` emits compound operators such as `|&` and `&>>`
+  as whole tokens; unrecognised punctuation then fell through as an ordinary argument;
+- literal newlines were consumed as whitespace, making the declared newline separator
+  unreachable and joining two commands under the first command's head;
+- `posix=False` preserved quotes around guarded flags while only the command head was
+  unquoted, so shell-valid quoted mutation flags evaded the guard; and
+- `tree` was admitted as unguarded despite its file-output option.
+
+The peer factor was denied at `32486b6f8fba`. The advertised 29-case matrix existed only
+in temporary storage, not in the proposed commit, so it could neither be reviewed as part
+of the object nor prevent regression. This strengthens the standing recommendation below:
+a widened lexical grammar needs committed red cases and must reject every punctuation
+form it does not fully model.
+
 #### G10. Semantic indirection defeats command-text policy
 **Status: INFERRED; the inverse false-positive behavior is MEASURED.** Encoded or generated
 commands, interpreter programs, variable indirection, alternate utilities, staged scripts,
@@ -627,8 +644,9 @@ The repaired receipt-to-tip discriminator closes one accidental authority leak. 
 not authenticate the receipt's writer.
 
 #### G16. Reusing a PR leaves manager-authored provenance on the prior revision
-**Status: MEASURED on PR #141, 2026-08-02.** Revision acceptance advanced the public branch
-from rejected tip `cf5029e` to repaired tip `3869603`, and the receipt correctly retained both.
+**Status: PARTIALLY ADDRESSED; failure state remains false-green.** Revision acceptance
+advanced the public branch from rejected tip `cf5029e` to repaired tip `3869603`, and the
+receipt correctly retained both.
 `open_pr()` found the existing PR and returned immediately, so the PR body continued to attest
 the rejected tip and its old base.
 
@@ -636,9 +654,14 @@ Idempotency was implemented as “reuse the object,” but the required invarian
 managed current-revision state matches the accepted revision.” A reviewer reading the branch and
 a reviewer reading the provenance table were shown different work.
 
-Required repair: on reuse, update a bounded manager-owned current-revision block or add one
-idempotent manager-authored revision note; retain prior tips; and record/return a partial failure
-if the branch advances but provenance refresh does not.
+The normal reuse path now rebuilds and refreshes the manager-authored body from the current
+submission, so a successful edit converges without opening a duplicate PR. But a failed
+`gh pr edit` still returns the existing PR object. `accept()` then writes `pr_status: opened`
+and exits successfully even though the publisher just declared the body stale. The branch-
+advanced/body-stale state is therefore still laundered into a healthy receipt.
+
+Remaining repair: make refresh failure an explicit partial-failure result, return non-zero,
+record that publication succeeded while provenance did not, and preserve idempotent retry.
 
 ## 12. Sandbox boundary: what it really holds, and how it can still fail
 
@@ -685,7 +708,7 @@ not production probing.
 |---|---|---|
 | H1 | **Hook timeout/crash is fail-open at the engine.** The adapter tries to fail closed internally, but the harness can kill it before it returns the blocking contract. | No verdict, tool proceeds, usually no witness. |
 | H2 | **Matcher/coverage drift.** A narrowed matcher or new tool event can omit `PreToolUse` while inventory still reports a gate present. | Entire tool class bypasses governance. |
-| H3 | **Tool-name/schema drift.** Gate logic recognizes specific tool names and argument keys. Renames, aliases, repository IDs/URLs, and new payload envelopes can fall through. | Correct policy applied to the wrong or empty target. |
+| H3 | **Tool-name/schema drift and field-purpose confusion.** Gate logic recognizes specific tool names and argument keys. Renames, aliases, repository IDs/URLs, and new payload envelopes can fall through. MEASURED 2026-08-02: a structured `Write` to an ordinary destination was denied because prose in its body mentioned a governance path; content was judged as target. | Correct policy applied to the wrong or empty target; evidence text becomes an act. |
 | H4 | **Nested connector execution.** An outer orchestration call may be hooked while inner MCP calls occur in the harness, or vice versa. Coverage is not yet a tested transitive invariant. | External mutations have ambiguous governance. |
 | H5 | **Exit/output contract drift.** Different harness versions may interpret exit codes, stderr, or structured deny JSON differently. | A deny becomes advisory or an error becomes allow. |
 | H6 | **Argument truncation/normalization.** If the hook sees a shortened, joined, decoded, or otherwise different payload from the executor, it judges a different act. | Evidence and execution disagree while both look internally valid. |
@@ -713,8 +736,9 @@ Without automated red/green probes, both are release assumptions rather than pro
 1. Launch members inside the specific task repository; do not make the workspace root the
    ordinary cwd or writable sandbox root.
 2. Replace the self-access splitter with a real shell parser or define a deliberately small
-   supported grammar; unknown syntax is consequential. Add the single-background-separator
-   discriminator before any allowlist widening.
+   supported grammar; unknown syntax is consequential. Cover compound operators, newlines,
+   quoted arguments, and every admitted command's output options in committed red tests before
+   any allowlist widening. Judge structured tools by their destination fields, never body text.
 3. Resolve every connector target canonically to owner + repository identity, regardless of
    selector form, and maintain a connector mutation census.
 4. **Landed for the sandboxed Codex seat:** keep the git publisher outside the requester's
