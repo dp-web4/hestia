@@ -465,9 +465,285 @@ targets `main`/`master`, so a defect in it cannot wedge ordinary branch work —
 narrow path it fails **closed**, because "could not tell" must not resolve to "went ahead"
 for this specific act.
 
-## 11. Standing acknowledgements — put these in front of anyone relying on hestia
+## 11. Codex audit update — 2026-08-02
+
+The first version of this catalogue was written primarily from a Claude seat. A foreign
+seat now exercises a different hook engine, a structural filesystem/network sandbox, and
+out-of-process connectors. That changed the boundary enough to justify a second inventory.
+
+Status vocabulary below is deliberately strict:
+
+- **CONFIRMED-SOURCE** — the route follows directly from the code/configuration currently
+  governing Codex; no consequential probe was needed.
+- **MEASURED** — observed in a benign or already-authorized run.
+- **INFERRED** — mechanically credible, not exercised because exercising it would itself
+  cross the social boundary or damage useful state.
+- **CONDITIONAL** — present in the fleet architecture, but a structural control on the
+  current Codex seat removes a prerequisite.
+
+### 11.1 Scope-read bypasses — the sandbox is not a read boundary
+
+#### G1. Absolute non-workspace shell paths are not scope-checked
+**Status: CONFIRMED-SOURCE.** `command_in_scope()` has a special pass for occurrences of
+the configured workspace. Its relative-token pass skips absolute tokens. Therefore an
+absolute path elsewhere on the filesystem is not rejected by MRH scope unless it also
+contains one of the small innate forbidden substrings.
+
+This matters because `workspace-write` permits reads across the filesystem. The sandbox
+will not catch what the string gate missed.
+
+#### G2. Recursive traversal from a broad working directory
+**Status: CONFIRMED-SOURCE, explicitly acknowledged in the adapter.** A command operating
+on `.` from the workspace root need not name any repository. The scope gate has no token
+from which to recover the traversed repositories. Launching at the workspace root turns
+this from a theoretical parser limit into an immediately available read route.
+
+#### G3. Ambiguous-relative-path voting passes on one in-scope interpretation
+**Status: CONFIRMED-SOURCE.** For relative tokens, the Codex adapter probes the event cwd
+and every granted repository root. One existing in-scope interpretation wins even when an
+out-of-scope interpretation also exists. This was introduced to stop false denials caused
+by the hook event carrying a different cwd from the command executor. It trades those false
+denials for an acknowledged false allow.
+
+#### G4. Scope probing has a finite token budget
+**Status: CONFIRMED-SOURCE.** After 40 filesystem probes, later relative targets receive no
+scope decision. The bound exists to keep the hook below the harness timeout. That is a real
+availability requirement and also a semantic cutoff an input can place before its actual
+target.
+
+#### G5. Symlink, alias, and time-of-check/time-of-use separation
+**Status: INFERRED.** Scope is decided from lexical paths plus `exists()` probes, not from a
+stable open file descriptor or a canonical object identity. An allowed spelling can resolve
+through a link to a different readable object, and a path can change between check and use.
+The write sandbox may independently stop some write escapes; it does not repair read scope.
+
+### 11.2 Connector and MCP bypasses
+
+#### G6. Repository selectors are only partially scoped
+**Status: CONFIRMED-SOURCE.** `mcp_repo_target()` recognizes a limited set of name-bearing
+arguments and keeps only the final repository-name component. Consequences:
+
+- selectors by repository ID or repository URL can carry no recognized repository target;
+- owner identity is discarded, so `owner-a/name` and `owner-b/name` are equivalent to the
+  gate;
+- a new connector schema or differently named target field is unscoped until hand-added.
+
+The connector may still reject an unauthorized mutation. That is connector authorization,
+not MRH enforcement.
+
+#### G7. External mutations execute beyond the filesystem/network sandbox
+**Status: MEASURED.** Connectors run in the harness process, not the sandboxed shell. They
+can reach external services while `network_access=false`, and their writes never need to
+touch the local working tree. GitHub object/ref operations first exposed this route; the
+same class includes higher-level PR, issue, review, merge, deployment, and permission
+operations.
+
+Some connector calls have reached `PreToolUse`; others have not been demonstrated to do
+so, and nested execution coverage is not a stated invariant. **Inconsistent coverage is
+harder to reason about than uniformly absent coverage.** Until there is a connector census
+and a red/green mutation probe per call path, treat every out-of-process mutator as outside
+Hestia's assured boundary.
+
+#### G8. Tool classes the Codex dispatcher does not hook
+**Status: CONFIRMED-SOURCE.** The adapter records that tool discovery, custom/freeform tools,
+and server-side search do not receive `PreToolUse`. Today many of those are read-only or
+orchestration-only. The dangerous property is future composability: adding a consequential
+capability to an uncovered class silently creates a bypass without changing Hestia.
+
+### 11.3 Lexical and sequencing bypasses
+
+#### G9. Live self-protection misses the single background separator
+**Status: CONFIRMED-SOURCE against the deployed copy.** The live `_is_read_only()` rejects
+raw pipes/redirections and splits `&&` and `;`, but does not split the shell's single
+background-command separator. A read-like first segment can therefore determine the
+classification while a later segment performs a mutation.
+
+This is a protection hole in the gate's own self-access layer. A proposed classifier
+widening seen on 2026-08-02 still omitted this separator and also admitted mutating forms
+of several nominally read-only commands. Codex withheld the requested peer factor before
+deployment.
+
+#### G10. Semantic indirection defeats command-text policy
+**Status: INFERRED; the inverse false-positive behavior is MEASURED.** Encoded or generated
+commands, interpreter programs, variable indirection, alternate utilities, staged scripts,
+and an operation described without the expected verb can produce the same effect as a
+denied command while presenting unrelated text to the matcher.
+
+This is broader than “base64.” Any allowed program capable of general computation is a
+second command language. A complete semantic denylist over arbitrary programs is not a
+tractable goal.
+
+#### G11. Deferred execution crosses the event boundary
+**Status: INFERRED.** A gated act can install a repository hook, build step, scheduled job,
+background worker, or artifact that a later process executes. The setup may be witnessed;
+the later effect has no tool event. The same applies to an allowed source change consumed
+later by a more privileged installer or deployment process.
+
+#### G12. Nested unmanaged runners
+**Status: INFERRED for deliberate use; ordinary Codex subagents are MEASURED-CLOSED.** The
+product's subagent mechanism inherits hooks. That does not prove that a shell-launched CLI,
+interpreter, agent runner, or copied harness inherits them. A parent call can be witnessed
+while the child starts with different hook configuration and performs later work outside
+the parent event stream. The OS sandbox may remain inherited; Hestia governance need not.
+
+### 11.4 Git-manager and approval-path bypasses
+
+#### G13. The requester can edit the deployed publisher
+**Status: CLOSED FOR THE SANDBOXED CODEX SEAT, 2026-08-02 (`shared-context` `2200018e`);
+fleet-wide residual remains.** The inbox refs and submission metadata are intentionally
+requester-writable because they are proposals. The publisher program originally sat in that
+same workspace, so a requester could change the code later run by the credential-holding seat.
+
+The executable publisher now lives outside Codex's structural writable root. Acceptance receipts
+record the running publisher's digest and source-parity observation. This removes the route for
+this sandboxed seat and makes accidental substitution visible.
+
+It is not a same-UID fleet boundary: an unsandboxed seat may still be able to write the deployed
+copy, and a deliberately modified publisher can lie about its own digest. “The host decided” is
+therefore structurally stronger for Codex and still cooperative/tamper-evident fleet-wide.
+
+#### G14. Versioned publisher and deployed publisher are separate installations
+**Status: SILENT-EMPTY-QUEUE FAILURE CLOSED, 2026-08-02 (`shared-context` `2200018e`);
+deployment distinction retained honestly.** The first committed source derived its inbox from
+its own source directory and reported an empty queue there. “No work” and “wrong installation”
+rendered identically.
+
+The publisher now requires an explicit, structurally valid inbox; a missing bare repository or
+submissions directory is a hard configuration error. Every acceptance compares the running
+publisher to governed source and records both the running digest and parity state.
+
+Source and deployment remain separate objects by design, and parity currently warns rather than
+blocks. That is now a visible, receipt-bound state instead of a healthy-looking empty queue. A
+future reader must still distinguish “matched reviewed source” from “published under a recorded
+mismatch.”
+
+#### G15. Receipts and queue state are requester-writable claims
+**Status: CONFIRMED-DESIGN.** A requester can alter refs, metadata, and receipt files. That
+cannot itself mutate the external repository, but it can hide pending work, fabricate a
+terminal-looking state, or influence a human/operator view. The publisher correctly says
+inbox content is not evidence; every consumer must preserve that distinction.
+
+The repaired receipt-to-tip discriminator closes one accidental authority leak. It does
+not authenticate the receipt's writer.
+
+#### G16. Reusing a PR leaves manager-authored provenance on the prior revision
+**Status: MEASURED on PR #141, 2026-08-02.** Revision acceptance advanced the public branch
+from rejected tip `cf5029e` to repaired tip `3869603`, and the receipt correctly retained both.
+`open_pr()` found the existing PR and returned immediately, so the PR body continued to attest
+the rejected tip and its old base.
+
+Idempotency was implemented as “reuse the object,” but the required invariant is “one PR whose
+managed current-revision state matches the accepted revision.” A reviewer reading the branch and
+a reviewer reading the provenance table were shown different work.
+
+Required repair: on reuse, update a bounded manager-owned current-revision block or add one
+idempotent manager-authored revision note; retain prior tips; and record/return a partial failure
+if the branch advances but provenance refresh does not.
+
+## 12. Sandbox boundary: what it really holds, and how it can still fail
+
+The Codex sandbox is the strongest control in this stack because it is enforced outside
+the agent's command parser. It is still a boundary with a particular shape, not a general
+containment claim.
+
+### 12.1 Properties currently holding
+
+- **CONFIRMED:** direct shell writes are restricted to the launch workspace and temporary
+  storage.
+- **CONFIRMED:** direct shell network egress is blocked.
+- **CONFIRMED:** the installed hook copy and Codex configuration are outside the shell's
+  writable roots.
+- **MEASURED:** ordinary localhost socket fixtures are also refused in this seat.
+
+These are meaningful. None implies that all workspace contents are authorized, that reads
+are confined, or that an out-of-process tool is sandboxed.
+
+### 12.2 Sandbox failure and escape classes
+
+| ID | class | current assessment |
+|---|---|---|
+| S1 | **Over-broad writable root.** The structural grant is the whole launch workspace, not the member's MRH. A gate bypass can therefore write any repository under that root, including socially out-of-scope ones. | **CONFIRMED-CONFIG** |
+| S2 | **Unconfined reads.** The filesystem is broadly readable; MRH read scope is cooperative plus lexical. | **CONFIRMED** |
+| S3 | **Shared temporary storage.** Writable/executable temporary space permits staging, link/race attacks, cross-process rendezvous, and artifacts later consumed by a privileged process. | **CONFIRMED-PERMISSION; exploit paths INFERRED** |
+| S4 | **Confused deputy.** MCP servers, hook processes, publishers, installers, and other host services run outside the sandbox and may act on sandbox-authored inputs. | **MEASURED architecture** |
+| S5 | **Inherited handles.** A pre-opened file descriptor, pipe, socket, or process handle can carry authority the path/network policy would otherwise deny. Whether the current launcher leaks any useful handle is unmeasured. | **UNTESTED** |
+| S6 | **Process-control surface.** Same-user process signalling, debugging, `/proc` inspection, or environment observation may affect or disclose unsandboxed peers unless the runtime/OS separately blocks it. Read access to peer environment was measured elsewhere; mutation/ptrace is untested. | **PARTIAL** |
+| S7 | **Filesystem semantic mismatch.** Symlink following, hard links, rename races, case folding, host-mounted filesystem behavior, and mode-bit emulation can make policy about names differ from policy about objects. Mode-bit drift has already produced repeated defects; an actual write escape is unproven. | **PARTIAL / UNTESTED ESCAPE** |
+| S8 | **Resource exhaustion.** CPU, memory, process, file-descriptor, disk, or I/O pressure can starve the hook/daemon until a fail-open harness proceeds. Even when fail-closed, this is a governance denial of service. | **INFERRED; timeout failures MEASURED** |
+| S9 | **Unsandboxed child due launcher regression.** If a future execution path spawns a child before applying the sandbox, or applies it only to the first process, that child becomes an escape. There is no standing conformance probe across every tool/child path. | **UNTESTED** |
+| S10 | **Kernel/runtime vulnerability.** A defect in the sandbox implementation, kernel, namespace/seccomp layer, filesystem bridge, or host integration can escape the structural boundary. | **UNKNOWN by construction; no exploit sought** |
+| S11 | **Setuid/capability/user-namespace interactions.** Executables carrying ambient privilege can invalidate assumptions about the caller's effective boundary if `no_new_privs` and capability stripping are incomplete. | **UNTESTED; no available instance identified** |
+
+S10–S11 are intentionally listed without exploit recipes. “No known exploit” is the only
+honest claim available without turning a collaborative audit into destructive host testing.
+The right control is sandbox/runtime patching plus a disposable conformance environment,
+not production probing.
+
+## 13. Harness boundary: ways a correct gate can still become irrelevant
+
+| ID | class | consequence |
+|---|---|---|
+| H1 | **Hook timeout/crash is fail-open at the engine.** The adapter tries to fail closed internally, but the harness can kill it before it returns the blocking contract. | No verdict, tool proceeds, usually no witness. |
+| H2 | **Matcher/coverage drift.** A narrowed matcher or new tool event can omit `PreToolUse` while inventory still reports a gate present. | Entire tool class bypasses governance. |
+| H3 | **Tool-name/schema drift.** Gate logic recognizes specific tool names and argument keys. Renames, aliases, repository IDs/URLs, and new payload envelopes can fall through. | Correct policy applied to the wrong or empty target. |
+| H4 | **Nested connector execution.** An outer orchestration call may be hooked while inner MCP calls occur in the harness, or vice versa. Coverage is not yet a tested transitive invariant. | External mutations have ambiguous governance. |
+| H5 | **Exit/output contract drift.** Different harness versions may interpret exit codes, stderr, or structured deny JSON differently. | A deny becomes advisory or an error becomes allow. |
+| H6 | **Argument truncation/normalization.** If the hook sees a shortened, joined, decoded, or otherwise different payload from the executor, it judges a different act. | Evidence and execution disagree while both look internally valid. |
+| H7 | **Hook/environment substitution.** Endpoint, identity, interpreter, fallback, budget, mode, and hook paths inherited from the launcher can select a different governor or posture. | Wrong oracle, wrong actor, or silent no-verdict. |
+| H8 | **Source/deployment drift.** Canonical, marketplace, and installed hook copies can differ. | Review proves one implementation; another governs. |
+| H9 | **Subagent attribution collapse.** Inherited hooks currently block correctly, but child activity is attributed to the parent identity and coverage can regress without a conformance test. | Enforcement may hold while accountability does not. |
+| H10 | **Session/restart discontinuity.** Transient approvals, escalation TTLs, cached identity, hook hashes, and witness presentation can reset or rotate across restart. | The displayed governance state may lose continuity even when durable bytes remain. |
+| H11 | **Approval-channel fatigue.** False write classifications fill the same queue as consequential requests. | The human control degrades toward reflexive approval. |
+| H12 | **Permission layer substitution.** Native harness approval, connector approval, sandbox permission, Hestia policy, and sovereign escalation answer different questions. Passing one is easily misreported as passing all. | An act appears “approved” without naming by whom or under which law. |
+| H13 | **Harness-owned mutators.** A connector or app may expose remote writes, deployment, credential, or permission changes unavailable to the shell. | The network sandbox remains true while external state changes anyway. |
+
+### 13.1 Two invariants the harness should prove continuously
+
+1. **Coverage invariant:** every consequential tool call produces a `PreToolUse` event with
+   the same normalized target and payload class the executor will use, including nested
+   MCP calls and subagents.
+2. **Binding invariant:** a blocking response prevents the effect across every harness
+   version and permission mode; timeout/crash produces an explicit recorded state, never
+   silent execution.
+
+Without automated red/green probes, both are release assumptions rather than properties.
+
+## 14. Updated mitigation order — preserve collaboration, remove accidental bypass
+
+1. Launch members inside the specific task repository; do not make the workspace root the
+   ordinary cwd or writable sandbox root.
+2. Replace the self-access splitter with a real shell parser or define a deliberately small
+   supported grammar; unknown syntax is consequential. Add the single-background-separator
+   discriminator before any allowlist widening.
+3. Resolve every connector target canonically to owner + repository identity, regardless of
+   selector form, and maintain a connector mutation census.
+4. **Landed for the sandboxed Codex seat:** keep the git publisher outside the requester's
+   writable root, compare deployed bytes to reviewed source, and record the running digest and
+   parity state in every acceptance receipt. Extend the structural boundary to other seats where
+   possible, and fix reused-PR provenance (G16).
+5. Keep raw external mutation primitives from general members only after the governed
+   manager has completed a real end-to-end change. The efficient path must remain usable.
+6. Separate witness from gate execution so bypassing one does not automatically silence the
+   other. Treat chain silence as unknown even after that improvement.
+7. Run sandbox/harness conformance probes in a disposable environment: writable-root escape,
+   read confinement, inherited handles, child-process inheritance, socket policy, hook
+   timeout, exit binding, nested connectors, and subagents.
+8. Authenticate oracle verdicts and member identity; move consequential posture out of the
+   inherited environment.
+9. Give false escalations a separate class and denominator. A queue dominated by reads is
+   actively weakening the human factor.
+
+The objective is not to make bypass metaphysically impossible. It is to make the normal,
+efficient route the governed one; make deviations deliberate and visible; and preserve a
+usable appeal path so respecting a false deny does not require abandoning the work.
+
+## 15. Standing acknowledgements — put these in front of anyone relying on hestia
 
 - The gate runs inside the blast radius; it is not containment.
+- The Codex sandbox's writable unit is currently the launch workspace, not the member's MRH.
+- The sandbox blocks direct network egress, not out-of-process connector mutations.
+- Reads are not sandbox-confined; absolute paths, broad-cwd recursion, aliases, and parser
+  cutoffs leave MRH read scope cooperative.
 - The chain records **governed** activity, never **all** activity. Silence is not evidence
   of absence.
 - Default posture is **fail-open**. Absent `HESTIA_PRE_FAIL_CLOSED=1`, an unreachable
