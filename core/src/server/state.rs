@@ -749,6 +749,7 @@ impl ServerState {
             action_type: "outcome",
             action_target: "",
             action_id: "",
+            rule_triggered: "",
             reason: if success {
                 "outcome:success"
             } else {
@@ -968,6 +969,7 @@ mod tests {
             action_type: "outcome",
             action_target: "",
             action_id: "",
+            rule_triggered: "",
             reason: "outcome:failure",
         }
     }
