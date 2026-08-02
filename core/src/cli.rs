@@ -121,6 +121,67 @@ enum Command {
     /// Profile / presence links (social, professional, contact)
     #[command(subcommand)]
     Profile(ProfileCmd),
+
+    /// Governance-surface escalations — the remedy every gate deny already names.
+    ///
+    /// Stage 2 (#114) prints `hestia gate approve <id>` on every refusal; the
+    /// subcommand was never written (#116). This is a client over tools the daemon
+    /// already ships — it adds no authority and can only reach verdicts the daemon
+    /// would already permit.
+    Gate {
+        #[command(subcommand)]
+        cmd: GateCmd,
+
+        /// Daemon URL
+        #[arg(long, default_value = "http://127.0.0.1:7711", global = true)]
+        endpoint: String,
+
+        /// Identity to assert to the daemon. This is a CLAIM, not a credential —
+        /// `hestia_connect` authenticates nobody (#63, #128). Defaults to `hestia-cli`
+        /// rather than any member name, so an unnamed caller is visibly a CLI.
+        #[arg(long = "as", global = true)]
+        asserted_id: Option<String>,
+
+        /// Constellation role to declare
+        #[arg(long, default_value = "role:constellation:member", global = true)]
+        role: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum GateCmd {
+    /// List escalations awaiting a decision
+    Pending,
+
+    /// Show one escalation's current state (unknown and expired are the same answer)
+    Poll {
+        /// Escalation id from the deny text
+        escalation_id: String,
+    },
+
+    /// Approve a governance write. Requires --reason; a deny does not.
+    Approve {
+        /// Escalation id from the deny text
+        escalation_id: String,
+        /// Why this write should be permitted (single line, <=512 bytes)
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Refuse a governance write
+    Deny {
+        /// Escalation id from the deny text
+        escalation_id: String,
+        /// Optional rationale
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Add evidence WITHOUT deciding (#122 — approval accumulates as factors)
+    Corroborate {
+        /// Escalation id from the deny text
+        escalation_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -596,6 +657,24 @@ pub fn run() -> AnyResult<()> {
         Command::Info => cmd_info(&home),
         Command::Serve { bind, allow_remote, callback } => cmd_serve(&home, &bind, allow_remote, callback),
         Command::Dashboard { endpoint } => hestia::tui::run(&endpoint),
+        Command::Gate { cmd, endpoint, asserted_id, role } => {
+            use hestia::gate_cli;
+            match cmd {
+                GateCmd::Pending => gate_cli::pending(&endpoint, asserted_id, &role),
+                GateCmd::Poll { escalation_id } => {
+                    gate_cli::poll(&endpoint, &escalation_id, asserted_id, &role)
+                }
+                GateCmd::Approve { escalation_id, reason } => gate_cli::arbitrate(
+                    &endpoint, &escalation_id, true, Some(reason), asserted_id, &role,
+                ),
+                GateCmd::Deny { escalation_id, reason } => gate_cli::arbitrate(
+                    &endpoint, &escalation_id, false, reason, asserted_id, &role,
+                ),
+                GateCmd::Corroborate { escalation_id } => {
+                    gate_cli::corroborate(&endpoint, &escalation_id, asserted_id, &role)
+                }
+            }
+        }
         Command::Vault(v) => match v {
             VaultCmd::List => cmd_vault_list(&home),
             VaultCmd::Get { name } => cmd_vault_get(&home, &name),

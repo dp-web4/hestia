@@ -234,6 +234,16 @@ pub async fn serve_with_callback(
         .route("/api/vault", get(vault_list).post(vault_add))
         .route("/api/vault/:name", delete(vault_delete))
         .route("/api/policy", get(policy_get))
+        // Per-member grants. Behind the operator gate like every other /api route, and
+        // DELIBERATELY absent from the MCP tool list: an agent must not be able to change its
+        // own policy or another agent's, so the only way in is a challenge-signed operator
+        // session. `no_mcp_tool_can_set_an_operator_grant` asserts that rather than trusting
+        // that nobody adds the tool later.
+        .route("/api/policy/instance", post(policy_set_instance_grant))
+        .route(
+            "/api/policy/instance/:plugin_id/:role",
+            delete(policy_revoke_instance_grant),
+        )
         .route("/api/policy/preset", put(policy_set_preset))
         .route("/api/policy/override", put(policy_set_override))
         .route(
@@ -312,7 +322,25 @@ pub async fn serve_with_callback(
 
 async fn dashboard_html() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            // NO-STORE. The page shipped with no Cache-Control, no ETag and no Last-Modified, so
+            // a browser is free to heuristically cache it — and this page is a single HTML file
+            // containing all of its own JavaScript, redeployed constantly. The operator then
+            // reads a stale UI against a current daemon and cannot tell that apart from a broken
+            // feature.
+            //
+            // That is not hypothetical: it cost a long debugging detour on 2026-08-01. The grant
+            // was live, the daemon was applying it (`layers: ["operator-grant"]`), and the
+            // dashboard kept reporting the society baseline. Two fixes went into the UI before
+            // the question "is the browser running the code I deployed?" got asked — and the
+            // answer had been unfalsifiable the whole time, because nothing in the response said
+            // how old the page was.
+            //
+            // A governance console must never be able to show a stale reading of state that the
+            // operator is about to make decisions from.
+            (header::CACHE_CONTROL, "no-store, must-revalidate"),
+        ],
         Html(load_dashboard_html()),
     )
 }
@@ -976,6 +1004,160 @@ async fn policy_get(State(state): State<SharedState>) -> impl IntoResponse {
         "preset_rules": preset_rules,
         "custom_rules": ps.custom_rules,
     }))
+}
+
+/// `POST /api/policy/instance` {plugin_id, role, preset, reason, expires_in_secs?}
+///
+/// Grant one member a preset in place of the local baseline — the operator's scoped exception,
+/// so unblocking one agent no longer means setting the whole society permissive.
+///
+/// Witnessed, because this is the only control in the system that can WIDEN what an agent may
+/// do. A tightening that goes unrecorded is an inconvenience; a loosening that goes unrecorded
+/// is an unexplained capability in the chain later.
+async fn policy_set_instance_grant(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use crate::server::state::InstanceGrant;
+    let sv = |k: &str| {
+        body.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let (plugin_id, role, preset, reason) = (sv("plugin_id"), sv("role"), sv("preset"), sv("reason"));
+    if plugin_id.is_empty() || role.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "plugin_id and role are required"})),
+        );
+    }
+    if !crate::policy::is_preset_name(&preset) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("unknown preset: {preset}")})),
+        );
+    }
+    // A reason is REQUIRED to widen, mirroring the escalation channel where approving needs a
+    // stated why and refusing does not. Revocation (DELETE) needs none: tightening back toward
+    // the baseline is the safe direction and should never be friction.
+    if reason.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "reason is required — a grant is an exception to society law and the \
+                          record has to say why it was made"
+            })),
+        );
+    }
+    let now = crate::server::gate_escalation::now_secs();
+    let expires_at = body
+        .get("expires_in_secs")
+        .and_then(|v| v.as_u64())
+        .map(|s| now + s);
+
+    let mut s = state.lock().await;
+
+    // THE DIRECTION DECIDES THE STORE (dp, 2026-08-01). Each half already had the right
+    // mechanism; what was missing was routing to it.
+    //
+    //   TIGHTENING -> vault instance overlay. Persists across restarts and folds strictest-wins
+    //                 with everything else, which is exactly what a restriction should do. A
+    //                 member restricted for cause must not be freed by a reboot.
+    //   LOOSENING  -> in-memory grant. Substitutes the local baseline and dies with the daemon,
+    //                 so a permission nobody remembers to revoke expires on its own.
+    //
+    // Sending a tightening through the memory path would have made restrictions evaporate on
+    // restart; sending a loosening through the vault would have made permissions permanent and
+    // written to disk. Same control, opposite correct answers.
+    let loosening = s.is_loosening(&preset);
+    let durability = if loosening {
+        s.instance_grants.insert(
+            (plugin_id.clone(), role.clone()),
+            InstanceGrant {
+                preset: preset.clone(),
+                granted_by: "operator".to_string(),
+                granted_at: now,
+                reason: reason.clone(),
+                expires_at,
+            },
+        );
+        "memory-only — a daemon restart revokes it"
+    } else {
+        // A tightening is expressed as the preset's own rules laid over this member, so it
+        // composes with society law by the ordinary fold rather than replacing it.
+        let rules = crate::policy::get_preset(&preset)
+            .map(|p| p.config.rules)
+            .unwrap_or_default();
+        if let Err(e) = s.vault.set_instance_overlay(&plugin_id, &role, rules) {
+            // Fail LOUD. A tightening that silently did not persist is the worst outcome
+            // available here: the operator believes a member is restricted, the UI shows the
+            // restriction until the next restart, and then it is simply gone.
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("vault write failed: {e}")})),
+            );
+        }
+        s.reload_policy();
+        "vault — survives a daemon restart"
+    };
+    let entry = s.append_chain(
+        "policy_instance_grant",
+        serde_json::json!({
+            "plugin_id": plugin_id,
+            "subject_instance_lct": s.member_lct(&plugin_id),
+            "role": role,
+            "preset": preset,
+            "reason": reason,
+            "expires_at": expires_at,
+            "granted_by": "operator",
+            "via": "operator_session",
+            "direction": if loosening { "loosening" } else { "tightening" },
+            "durability": durability,
+        }),
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "plugin_id": plugin_id,
+            "role": role,
+            "preset": preset,
+            "expires_at": expires_at,
+            "witnessEntryHash": entry.map(|e| e.hash).unwrap_or_default(),
+            "direction": if loosening { "loosening" } else { "tightening" },
+            "durability": durability,
+        })),
+    )
+}
+
+/// `DELETE /api/policy/instance/:plugin_id/:role` — revoke a grant, returning the member to the
+/// society baseline. No reason required: tightening is the safe direction.
+async fn policy_revoke_instance_grant(
+    State(state): State<SharedState>,
+    Path((plugin_id, role)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let mut s = state.lock().await;
+    let had = s
+        .instance_grants
+        .remove(&(plugin_id.clone(), role.clone()))
+        .is_some();
+    if had {
+        let _ = s.append_chain(
+            "policy_instance_grant_revoked",
+            serde_json::json!({
+                "plugin_id": plugin_id,
+                "subject_instance_lct": s.member_lct(&plugin_id),
+                "role": role,
+                "via": "operator_session",
+            }),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "revoked": had})),
+    )
 }
 
 async fn policy_set_preset(
