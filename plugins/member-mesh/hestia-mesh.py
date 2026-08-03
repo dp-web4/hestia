@@ -252,6 +252,7 @@ def act(cmd):
     if failed(out):
         summarize(out)
         sys.exit(3)
+    confirm(cmd, out)
 
 
 def summarize(payload):
@@ -269,6 +270,47 @@ def summarize(payload):
     else:
         detail = str(err)
     print(f"hestia-mesh: the daemon refused this call — {detail}", file=sys.stderr)
+
+
+def confirm(cmd, out):
+    """The mirror of summarize(): one human line on stderr naming the SUCCESS.
+
+    A refusal got a sentence in #135; a success did not, and the asymmetry produced
+    duplicate wakes. `send` returns a sorted, `indent=1` payload in which the only
+    proof of delivery — `queued_id` — sits in the MIDDLE, after `binding_verified`,
+    `egress_queued_to`, `in_reply_to`, `kind`, and before a seven-line nested
+    `recipient_liveness_evidence`. So the fleet's habitual `2>&1 | tail -N` shows the
+    tail of the liveness blob and the closing brace, and nothing that says it worked.
+
+    Measured, notices 743/744 (2026-08-03, claude-code -> kimi-code): the same pointer
+    was sent twice, 5.6s apart, because the FIRST send — which succeeded, queueing 743
+    — was read through `| tail -5` and showed `mailbox_reads`, `to_plugin_id`,
+    `witnessEntryHash`, `}`. The resend queued 744 and kimi received the notice twice.
+    (The second read failed too, differently: it parsed the JSON but asked for
+    `notice_id`/`queued`/`delivered`, none of which this payload has, so `.get` handed
+    back three Nones for a call that had just worked. Same class as the daemon's
+    `additionalProperties: true` on the request side — a name nobody validates.)
+
+    stderr, not stdout, and only after stdout is flushed: stdout must stay parseable as
+    a single JSON document (`json.load(sys.stdin)` is a documented caller shape), and
+    the flush is what guarantees this lands LAST rather than first under `2>&1`, where
+    a piped stdout is block-buffered and stderr is not. Last is the whole point.
+    """
+    sys.stdout.flush()
+    if cmd != "send":
+        return
+    qid = out.get("queued_id")
+    bits = [f"queued_id={qid}" if qid is not None else "queued_id=ABSENT",
+            f"to={out.get('to_plugin_id')}", f"kind={out.get('kind')}"]
+    if out.get("in_reply_to") is not None:
+        bits.append(f"in_reply_to={out['in_reply_to']}"
+                    + ("" if out.get("binding_verified") else " (UNVERIFIED)"))
+    if out.get("recipient_liveness"):
+        bits.append(f"liveness={out['recipient_liveness']}")
+    # ABSENT is not hypothetical: an egress-routed send returns a payload with no
+    # queued_id at all, and saying "queued_id=ABSENT" beats printing a bare success.
+    print("hestia-mesh: sent — " + " ".join(bits), file=sys.stderr)
+
 
 if __name__ == "__main__":
     main()
