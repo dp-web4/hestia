@@ -44,7 +44,19 @@ impl ServerHandler for HestiaServer {
             .enable_resources()
             .build();
         info.server_info.name = "hestia".into();
-        info.server_info.version = env!("CARGO_PKG_VERSION").to_string();
+        // Same provenance string as `--version` (build.rs bakes `git describe`
+        // at compile time): every MCP client's initialize handshake now carries
+        // the commit the RUNNING daemon was built from. Without this the daemon
+        // knows its own build string and never says it — a merged fix can sit
+        // undeployed while every query is answered by a binary that predates the
+        // defect being named (mesh-vocabulary thread, 2026-08-03).
+        info.server_info.version = concat!(
+            env!("CARGO_PKG_VERSION"),
+            " (",
+            env!("HESTIA_GIT_VERSION"),
+            ")"
+        )
+        .to_string();
         info
     }
 

@@ -71,6 +71,123 @@ else
 fi
 WATCH_LAST_ALARM_STATE=""
 
+# DAEMON DRIFT (2026-08-03, mesh-vocabulary thread: "landed is three steps short").
+# The watcher refuses to run stale bytes of ITSELF (check_artifact_drift above), but
+# the daemon had no equivalent: it knows its own build string and never compared it
+# to anything. So `hestia_request_scope` sat committed in 7c6ab83 while the running
+# daemon (g32486b6, started before the arc) answered every connect with a 29-tool
+# surface that did not include it — and F1 (PR #165) sat the same way, merged-green
+# and nowhere in effect. The daemon now reports its build provenance on every MCP
+# initialize (serverInfo.version carries the same string `--version` prints); the
+# comparator below is the checkout this watcher runs from.
+# Equality, not ancestry: the honest claim is "the running daemon was built from
+# these bytes", not a guess about direction — both raw strings ship with every
+# verdict so a relying party can draw its own line (inspectable evidence, not
+# prescribed trust). A trailing `-dirty` is stripped before comparison: a dirty
+# worktree is the normal state of a shared checkout and says nothing about when
+# the daemon was built.
+WATCH_REPO_ROOT="$(cd "$(dirname "$WATCH_SOURCE")/../.." 2>/dev/null && pwd || true)"
+
+daemon_version_string() {
+python3 - "$EP" <<'PY'
+import json, sys, urllib.request
+ep = sys.argv[1]
+req = urllib.request.Request(ep,
+    data=json.dumps({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2024-11-05","capabilities":{},
+        "clientInfo":{"name":"hestia-watch","version":"1"}}}).encode(),
+    headers={"Content-Type":"application/json",
+             "Accept":"application/json, text/event-stream"})
+try:
+    body = urllib.request.urlopen(req, timeout=3).read().decode()
+except Exception:
+    raise SystemExit(1)
+for line in body.splitlines():
+    line = line.strip()
+    if line.startswith("data:"):
+        line = line[5:].strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    print(d.get("result", {}).get("serverInfo", {}).get("version", ""))
+    break
+PY
+}
+
+check_daemon_drift() {
+  # $1=refresh re-reads the source describe (startup + hourly announce). The
+  # per-pass call skips it: `git describe` on a slow mount (WSL drvfs) costs
+  # seconds, and per-pass that stalls the FIRST drain past the point where a
+  # watcher looks dead — the daemon's string can only change on a restart, and
+  # noticing a moved checkout within the hour is enough.
+  local VER PROV SOURCE STATE REASON
+  VER="$(daemon_version_string 2>/dev/null || true)"
+  if [ "${1:-}" = "refresh" ] || [ -z "${WATCH_DAEMON_SOURCE_RAW:-}" ]; then
+    WATCH_DAEMON_SOURCE_RAW="$(git -C "$WATCH_REPO_ROOT" describe --tags --always --dirty 2>/dev/null || true)"
+  fi
+  SOURCE="$WATCH_DAEMON_SOURCE_RAW"
+  case "$VER" in
+    *\(*\)) PROV="${VER#*\(}"; PROV="${PROV%\)}" ;;
+    *)      PROV="" ;;
+  esac
+
+  if [ -z "$VER" ]; then
+    # A down daemon is a different, already-visible condition; do not report it
+    # as drift.
+    STATE="unverifiable"
+    REASON="daemon-unreachable"
+  elif [ -z "$PROV" ]; then
+    # A daemon too old to report its build predates the exposure itself — on a
+    # checkout that carries this check, that IS drift, and the alarm is the
+    # correct instruction (rebuild+restart).
+    STATE="drift"
+    REASON="no-build-provenance"
+  elif [ "$PROV" = "unknown" ]; then
+    STATE="unverifiable"
+    REASON="build-provenance-unknown"
+  elif [ -z "$SOURCE" ]; then
+    STATE="unverifiable"
+    REASON="source-not-a-checkout"
+  elif [ "${PROV%-dirty}" = "${SOURCE%-dirty}" ]; then
+    STATE="ok"
+    REASON="matches-source"
+  else
+    STATE="drift"
+    REASON="differs-from-source"
+  fi
+
+  WATCH_DAEMON_STATE="$STATE"
+  WATCH_DAEMON_REASON="$REASON"
+  WATCH_DAEMON_RUNNING="${PROV:-unavailable}"
+  WATCH_DAEMON_SOURCE="${SOURCE:-unavailable}"
+
+  # Same edge-then-level discipline as check_artifact_drift: the alarm is the
+  # transition, the periodic DAEMON line is the gauge that survives rotation.
+  if [ "$STATE" = "ok" ]; then
+    WATCH_DAEMON_LAST_ALARM_STATE=""
+  elif [ "$STATE" != "$WATCH_DAEMON_LAST_ALARM_STATE" ]; then
+    if [ "$STATE" = "drift" ]; then
+      echo "[hestia-watch] DAEMON DRIFT — rebuild+restart required; running=$WATCH_DAEMON_RUNNING source=$WATCH_DAEMON_SOURCE reason=$REASON"
+    else
+      echo "[hestia-watch] DAEMON UNVERIFIABLE — reason=$REASON running=$WATCH_DAEMON_RUNNING source=$WATCH_DAEMON_SOURCE"
+    fi
+    WATCH_DAEMON_LAST_ALARM_STATE="$STATE"
+  fi
+}
+WATCH_DAEMON_STATE="unverifiable"
+WATCH_DAEMON_REASON="not-yet-checked"
+WATCH_DAEMON_RUNNING="unavailable"
+WATCH_DAEMON_SOURCE="unavailable"
+WATCH_DAEMON_LAST_ALARM_STATE=""
+
+announce_daemon() {
+  check_daemon_drift refresh
+  echo "[hestia-watch] DAEMON state=$WATCH_DAEMON_STATE reason=$WATCH_DAEMON_REASON running=$WATCH_DAEMON_RUNNING source=$WATCH_DAEMON_SOURCE"
+}
+
 announce_artifact() {
   # Re-measure here even though the loop also checks every pass. The periodic line
   # is the level-triggered gauge that survives log rotation; it must never depend on
@@ -118,6 +235,7 @@ check_artifact_drift() {
 }
 
 announce_artifact
+announce_daemon
 
 # A retained primer is this mesh's ONLY record of an undelivered consume-once
 # notice, and until now nothing ever read the directory it lands in: two primers
@@ -440,9 +558,11 @@ LAST_ANNOUNCE=$(date +%s)
 
 while true; do
   check_artifact_drift
+  check_daemon_drift
   NOW=$(date +%s)
   if [ $((NOW - LAST_ANNOUNCE)) -ge "$UNANSWERED_EVERY" ]; then
     announce_artifact
+    announce_daemon
     announce_unanswered
     LAST_ANNOUNCE=$NOW
   fi
