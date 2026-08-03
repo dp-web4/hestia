@@ -569,7 +569,7 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
 async fn tool_begin_action(state: &SharedState, args: &Value) -> ToolResult {
     let tool_name = require_string(args, "tool_name")?;
     let target = optional_string(args, "target");
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
     let parameters = args.get("parameters").cloned();
     // The accountability WHY — the actor's stated reason, captured at begin.
     let intent = optional_string(args, "intent");
@@ -731,7 +731,7 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
     // `resolve_attributed_caller` parses, looks up, and returns None on any failure — the
     // correct primitive, already in this file, thirty lines from the surface that needed
     // it. The error contract is now "a caller was attributed", not "an id was supplied".
-    let Some(who) = resolve_attributed_caller(&s, optional_string(args, "session_id").as_deref())
+    let Some(who) = resolve_attributed_caller(&s, optional_session_id(args).as_deref())
     else {
         return Ok(hestia_error_envelope(
             "hestia.operating_law_unattributed",
@@ -1313,7 +1313,7 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
                 .collect()
         })
         .unwrap_or_default();
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
 
     let mut s = state.lock().await;
     // ATTRIBUTED, NOT RESOLVED (the attribution sweep, 2026-07-28 — the fifth and final
@@ -1436,7 +1436,7 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
         })
         .unwrap_or_default();
 
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
 
     let mut s = state.lock().await;
     // Credential WRITES are the same tamper surface as reads (malicious
@@ -1761,7 +1761,7 @@ async fn tool_witness_adjudication(state: &SharedState, args: &Value) -> ToolRes
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
         .unwrap_or_default();
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
 
     let mut s = state.lock().await;
     let Some(adjudicator) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
@@ -1977,7 +1977,7 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
         .unwrap_or(0.4)
         .clamp(0.0, 1.0);
     let reference = optional_string(args, "ref");
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
 
     let mut s = state.lock().await;
     // Strict attribution (P0-1 closure, 2026-07-24): a cross-actor judgment must
@@ -2309,7 +2309,7 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
             None,
         ));
     }
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
 
     let mut s = state.lock().await;
     let Some(appellant) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
@@ -2518,7 +2518,7 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
             None,
         ));
     }
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
 
     let mut s = state.lock().await;
     let Some(arbiter) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
@@ -2715,7 +2715,7 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
 
 /// List appeals that no arbiter has ruled on yet.
 async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
     let s = state.lock().await;
 
     // Attribution is OPTIONAL here and its absence is reported, not defaulted. An
@@ -2901,7 +2901,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     let reason = optional_string(args, "reason").unwrap_or_default();
     let tool_name = optional_string(args, "tool_name").unwrap_or_default();
     let target = optional_string(args, "target").unwrap_or_default();
-    let session_id = optional_string(args, "session_id");
+    let session_id = optional_session_id(args);
     let payload_sha256 = optional_string(args, "payload_sha256");
     // The hook layer's half of rule attribution is sending this; the daemon's
     // half is reading it. Daemon side lands FIRST: `hestia_tools()` declares
@@ -2981,7 +2981,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
 async fn tool_request_witness(state: &SharedState, args: &Value) -> ToolResult {
     let event_type = require_string(args, "event_type")?;
     let event_data = args.get("event_data").cloned().unwrap_or(Value::Null);
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
 
     if RESERVED_EVENT_TYPES.contains(&event_type.as_str()) {
         return Ok(hestia_error_envelope(
@@ -3125,7 +3125,7 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
     let mut denied_open: Option<Value> = None;
     let mut unattributed_open = false;
     if !defer_requested {
-        let session_id_arg = optional_string(args, "session_id");
+        let session_id_arg = optional_session_id(args);
         match resolve_attributed_caller(&s, session_id_arg.as_deref()) {
             Some(who) => {
                 denied_open =
@@ -3396,7 +3396,7 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             ));
         }
     }
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
     // `in_reply_to` binds this send to the notice it answers. Optional on every
     // kind, expected on reply/ack — a silent parse-failure would make a bound
     // response look unbound, which is exactly the false negative this field
@@ -3710,7 +3710,7 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
     //   (c) A WITNESS. `mark_failed` writes last_error, burns an attempt and can reach
     //       retire_and_report_egress. `mark_forwarded` wrote drained_at and stopped: the
     //       ONLY disposition that destroys a packet was the only one that left no trace.
-    let Some(who) = resolve_attributed_caller(&s, optional_string(args, "session_id").as_deref()) else {
+    let Some(who) = resolve_attributed_caller(&s, optional_session_id(args).as_deref()) else {
         return Ok(hestia_error_envelope(
             "hestia.egress_unattributed",
             "hestia_egress_pending requires an attributed caller: this surface reads and \
@@ -3990,7 +3990,7 @@ fn retire_and_report_egress(
 }
 
 async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
     let mut s = state.lock().await;
     // Recipient-scoped by construction: the drain key IS the caller's resolved
     // plugin_id — a member can never drain another member's mail. That only
@@ -4060,7 +4060,7 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
 ///
 /// Read-only and self-scoped: a caller sees only notices it sent or received.
 async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult {
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
     let older_than_secs = args
         .get("older_than_secs")
         .and_then(Value::as_i64)
@@ -4132,7 +4132,7 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
 }
 
 async fn tool_inbox(state: &SharedState, args: &Value) -> ToolResult {
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
     let mut s = state.lock().await;
     // ATTRIBUTED, NOT RESOLVED (the attribution sweep, 2026-07-28). The drain is
     // consume-once: an anonymous caller gated under the latest-session fallback could
@@ -4210,7 +4210,7 @@ async fn tool_inbox(state: &SharedState, args: &Value) -> ToolResult {
 /// cursor doesn't advance). An attended caller gets the opened `SecretEnvelope`s
 /// and the per-pair cursor advances so each secret is delivered once.
 async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
     let mut s = state.lock().await;
     // ATTRIBUTED, NOT RESOLVED (the attribution sweep, 2026-07-28) — same shape as
     // tool_inbox above: the pull-side drain advances the per-pair cursor (consume-once)
@@ -4773,6 +4773,25 @@ fn require_string(args: &Value, key: &str) -> Result<String, anyhow::Error> {
 
 fn optional_string(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(String::from)
+}
+
+/// The session id, under EITHER spelling the surface uses.
+///
+/// `hestia_connect` is the sole producer of a fresh session id and it emits `sessionId` —
+/// camelCase, like every other field it returns (`softLct`, `assignedRole`,
+/// `protocolVersion`). Every consumer here reads snake_case `session_id`, like every other
+/// handler's emissions. Two conventions on opposite sides of one value; and because every
+/// tool is declared `additionalProperties: true` with zero properties (#155), a caller that
+/// pipes connect's response into the next call has its key silently DISCARDED and gets
+/// `operating_law_unattributed` back inside an `isError:false` envelope (#168) — while that
+/// very deny text instructs it to "pass the session_id it returns".
+///
+/// Accepting both makes the instruction true without breaking either convention. snake_case
+/// wins when both are present, so this can never *change* the id an existing caller resolves
+/// — it only resolves one that previously fell through to unattributed.
+/// Pinned by `a_session_id_moves_from_connect_to_a_consumer_under_one_name`.
+fn optional_session_id(args: &Value) -> Option<String> {
+    optional_string(args, "session_id").or_else(|| optional_string(args, "sessionId"))
 }
 
 #[cfg(test)]
@@ -7451,6 +7470,53 @@ mod tests {
         assert_eq!(shared.lock().await.sessions.len(), 2, "distinct host session → distinct hestia session");
     }
 
+    /// The seam between the ONLY producer of a session id and its consumers (#155 instance).
+    ///
+    /// `tool_connect` emits the id as `sessionId` — camelCase, consistent with every other
+    /// field it returns (`softLct`, `assignedRole`, `protocolVersion`). Every consumer reads
+    /// `optional_string(args, "session_id")` — snake_case, consistent with every OTHER handler's
+    /// emissions. Two conventions on opposite sides of one value, and under
+    /// `additionalProperties: true` with zero declared properties the schema layer structurally
+    /// cannot catch a caller crossing between them: the key is discarded and the failure returns
+    /// inside a 200 / `isError:false` envelope (#168) as `hestia.operating_law_unattributed`.
+    ///
+    /// Why no existing test sees it: the `connect()` helpers in these test modules read
+    /// `c["sessionId"]` and hand back a bare `String` which callers then pass as `session_id`.
+    /// **The harness performs the rename that no production caller performs**, so both sides
+    /// stay individually green. Measured live on CBP against build `gf44f8f0` while working the
+    /// #167 scope-consult thread — passing `sessionId` through fails, `session_id` succeeds.
+    ///
+    /// This test crosses the seam: it moves the id under the key name the PRODUCER chose,
+    /// discovered from the response rather than transcribed by hand, which is what a caller
+    /// piping one call's output into the next actually does.
+    #[tokio::test]
+    async fn a_session_id_moves_from_connect_to_a_consumer_under_one_name() {
+        let (_dir, shared) = make_shared_state();
+        let c = tool_connect(&shared, &json!({"plugin_id": "claude-code", "host_agent": "t"}))
+            .await
+            .unwrap();
+
+        // Whatever key the producer actually used — matched case/underscore-insensitively so
+        // this asserts the NAMES AGREE rather than pinning either spelling.
+        let (key, value) = c
+            .as_object()
+            .expect("connect returns an object")
+            .iter()
+            .find(|(k, _)| k.to_ascii_lowercase().replace('_', "") == "sessionid")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .expect("connect must return a session id under some key");
+
+        let mut args = serde_json::Map::new();
+        args.insert(key.clone(), value);
+        let out = tool_operating_law(&shared, &Value::Object(args)).await.unwrap();
+
+        assert!(
+            out.get("_hestia_error").is_none(),
+            "connect emits the session id as `{key}`, but no consumer reads that name, so the \
+             argument was discarded and the call failed wearing success: {out}"
+        );
+    }
+
     /// Guard B (HUB ruling): host_session_id is a descriptive reuse key, NEVER an authz discriminator.
     /// A reuse-connect asserting a different role must NOT change the session's role — the asserted id
     /// cannot escalate. (The tripwire against a future "reuse convenience → auth-by-asserted-id" bleed.)
@@ -9790,7 +9856,7 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
     use crate::arbiter::{eligibility, AppealParties, Eligibility};
     use crate::server::gate_escalation::now_secs;
 
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
     let now = now_secs();
     let s = state.lock().await;
     let caller = resolve_attributed_caller(&s, session_id_arg.as_deref());
@@ -9858,7 +9924,7 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
             "'approve' must be an explicit true or false — an omitted verdict is not a verdict"
         ))?;
     let reason = optional_string(args, "reason").unwrap_or_default();
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
     let now = now_secs();
 
     let mut s = state.lock().await;
@@ -9976,7 +10042,7 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
     use crate::server::gate_escalation::now_secs;
 
     let escalation_id = require_string(args, "escalation_id")?;
-    let session_id_arg = optional_string(args, "session_id");
+    let session_id_arg = optional_session_id(args);
     let now = now_secs();
 
     let mut s = state.lock().await;
