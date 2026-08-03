@@ -141,6 +141,116 @@ def test_no_pytest_dependency():
                   "`python3` -- marks, fixtures and parametrize will not run")
 
 
+PYTEST_ENTRY_POINTS = (
+    "setup_module", "teardown_module", "setup_function", "teardown_function",
+    "setup", "teardown", "pytest_generate_tests",
+)
+
+
+def _pytest_reachable(name: str) -> bool:
+    """Names pytest calls without anyone in the file referencing them.
+
+    `test_*` by collection, the xunit hooks by name. They are the ROOTS of the
+    outside world: no matter who else calls them, pytest gets there without
+    `__main__`, so they can never belong to the `__main__` guard.
+
+    Fixtures would belong here too, and are absent by construction -- a file in
+    the bare-python globs that imports pytest is already failed by
+    `test_no_pytest_dependency`. That is a dependency between two rules in this
+    file, so it is written down rather than left to hold by luck.
+    """
+    return name.startswith("test") or name in PYTEST_ENTRY_POINTS
+
+
+def main_only_nodes(tree: ast.Module) -> set:
+    """ids of every node reachable ONLY through the `__main__` guard.
+
+    Both rules below ask "is this assert / this read outside `__main__`?" and
+    both used to answer it lexically. kimi-code refuted that (notice 795) with
+    the most ordinary refactor there is -- extract function:
+
+        def main() -> int:
+            test_one(); test_two()
+            assert not FAILS, FAILS     # lexically outside the guard...
+        if __name__ == "__main__":
+            sys.exit(main())            # ...reachable only from inside it
+
+    Both rules reported green; pytest reported `2 passed`; bare `python3`
+    exited 1. A read routes through a helper exactly the way a failure channel
+    does, so deciding the LEXICAL location of the read answers a question one
+    hop away from the one being asked.
+
+    So: start from the guard's own body, then to fixpoint absorb any
+    module-level function whose every reference is already inside it. `main`
+    joins, and the assert and the read it holds stop counting as outside.
+
+    ONE PIN, load-bearing: `_pytest_reachable` names never join. Without it the
+    closure swallows the module -- `main` joins, then the `test_*` functions it
+    calls, then the `check()` they call, and the append itself is suddenly
+    in-guard. kimi's first draft of this repair did exactly that and reported a
+    clean zero over all 26 files (notice 796): a rule that could not flag
+    anything, passing the census because the census contains no helper-routed
+    file to regress on. Zero census diff is compatible with a dead rule.
+
+    A SECOND PIN WAS WRITTEN HERE AND REMOVED, because the control that was
+    supposed to justify it came back with no diff at all. The claim was that a
+    function referenced NOWHERE must not join -- "every reference is inside the
+    guard" being vacuously true of zero references -- to stop the closure
+    erasing the zero-reference `teardown_module` this PR adds as four files'
+    channel. The name pin above already covers `teardown_module`, so sabotaging
+    the clause changed no answer anywhere. Pressed for a case where it DID
+    change one, it turned out to change it the wrong way:
+
+        FAILS = []
+        def test_a(): FAILS.append("a")
+        def _report(): assert not FAILS      # zero refs, never a pytest hook
+        if __name__ == "__main__": test_a()
+
+    pytest reports `1 passed`; `_report` never runs; the file is a false green.
+    Absorbing an unreferenced function is the RIGHT answer -- an assert nothing
+    reaches is not a channel -- and the pin suppressed both flags. A hook name
+    this list misses is absorbed the same way and shows up as a loud false
+    positive, which is the direction to fail in.
+
+    Still lexical in one direction: a function called from BOTH `main` and a
+    test stays outside, so a channel reachable only via a long private chain
+    from `__main__` can still read as delivered. That is the conservative
+    direction -- it under-flags, never over-flags -- and it is why the
+    docstrings below claim direct-plus-closure, not decidability.
+    """
+    inside = {
+        id(inner)
+        for node in tree.body
+        if isinstance(node, ast.If) and "__main__" in ast.dump(node.test)
+        for inner in ast.walk(node)
+    }
+    if not inside:
+        return inside
+
+    funcs = {
+        node.name: node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not _pytest_reachable(node.name)
+    }
+    joined: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for name, fn in funcs.items():
+            if name in joined:
+                continue
+            refs = [
+                node for node in ast.walk(tree)
+                if isinstance(node, ast.Name) and node.id == name
+                and isinstance(node.ctx, ast.Load)
+            ]
+            if all(id(node) in inside for node in refs):
+                joined.add(name)
+                inside |= {id(inner) for inner in ast.walk(fn)}
+                changed = True
+    return inside
+
+
 def pytest_blind_functions(src: str) -> list[str]:
     """Names of pytest-collectable `test_*` functions in a module with no way to fail.
 
@@ -174,12 +284,7 @@ def pytest_blind_functions(src: str) -> list[str]:
     if not collectable:
         return []          # pytest collects nothing here; it cannot report a false green
 
-    main_guard = {
-        id(inner)
-        for node in tree.body
-        if isinstance(node, ast.If) and "__main__" in ast.dump(node.test)
-        for inner in ast.walk(node)
-    }
+    main_guard = main_only_nodes(tree)
     has_channel = any(
         isinstance(node, (ast.Assert, ast.Raise)) and id(node) not in main_guard
         for node in ast.walk(tree)
@@ -196,9 +301,14 @@ def undelivered_accumulators(src: str) -> list[str]:
     construction, routed every check it makes to the one invocation CI uses -- whatever
     unrelated `assert` may sit elsewhere in the file.
 
-    Coverage in general is not decidable from an AST. This shape is: it is the exact defect
-    observed five times, and it is what separates a real channel from a scaffolding one
-    without needing to know which asserts measure the subject.
+    Coverage in general is not decidable from an AST, and this shape is not decidable either
+    -- the first version of this docstring said it was. kimi-code refuted that in one hop
+    (notice 795): move the read into a `main()` called only from `__main__` and a lexical rule
+    calls it delivered. `main_only_nodes` closes over that, so what is decided now is reads
+    outside the `__main__` guard AND outside everything only that guard reaches. A read behind
+    a helper shared with a test function still escapes. What the rule buys is the exact defect
+    observed five times, separated from a scaffolding assert without knowing which asserts
+    measure the subject -- not a proof that every check is delivered.
 
     NOT a superset of `pytest_blind_functions`, and not a replacement -- a file with
     collectable tests, no accumulator and no assert at all is caught by that rule and not by
@@ -225,12 +335,7 @@ def undelivered_accumulators(src: str) -> list[str]:
     if not accumulators:
         return []
 
-    main_guard = {
-        id(inner)
-        for node in tree.body
-        if isinstance(node, ast.If) and "__main__" in ast.dump(node.test)
-        for inner in ast.walk(node)
-    }
+    main_guard = main_only_nodes(tree)
 
     appended, receivers = set(), set()
     for node in ast.walk(tree):
@@ -303,8 +408,14 @@ def test_no_pytest_blind_files():
     Existence, not coverage. A file that keeps one asserting test and lets ten others record
     silently passes here. Coverage is not decidable from the AST -- a channel can be reached
     through any depth of helper -- and the defect actually observed was total absence: four
-    files, zero channels between them. Same caveat class as this file's siblings: a green
-    means nobody has removed the last channel, not that every check is delivered.
+    files, zero channels between them.
+
+    "Outside the `__main__` guard" means outside its closure, not outside its braces: an
+    assert in a `main()` that only `__main__` calls is not a channel, and was counted as one
+    until kimi-code's counterexample (notice 795). The closure is still one-sided -- a helper
+    called from both `main` and a test stays outside it, so its assert still counts. Same
+    caveat class as this file's siblings: a green means nobody has removed the last
+    *reachable* channel, not that every check is delivered.
     """
     for path in bare_python_files():
         rel = path.relative_to(REPO).as_posix()
@@ -317,6 +428,90 @@ def test_no_pytest_blind_files():
               "file -- a green identical to the null state, in the invocation a `*_test.py` "
               "name invites. Add a `teardown_module` that asserts the accumulator is empty, "
               "or give the tests an assert.")
+
+
+# Sources both rules must decide correctly. Held here rather than as fixture files because
+# a fixture file under the globs would be discovered and flagged by the very rules it tests.
+_HELPER_HOP = '''\
+import sys
+FAILS: list[str] = []
+def check(name, ok):
+    if not ok:
+        FAILS.append(name)
+def test_one():
+    check("one", 1 == 2)
+def test_two():
+    check("two", 2 == 3)
+def main() -> int:
+    test_one(); test_two()
+    assert not FAILS, FAILS
+    return 0
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+_DEAD_CHANNEL = '''\
+FAILS = []
+def test_a():
+    FAILS.append("a")
+def _report():
+    assert not FAILS
+if __name__ == "__main__":
+    test_a()
+'''
+
+_REAL_CHANNEL = '''\
+FAILS: list[str] = []
+def check(name, ok):
+    if not ok:
+        FAILS.append(name)
+def test_one():
+    check("one", 1 == 2)
+def teardown_module(module):
+    assert not FAILS, FAILS
+if __name__ == "__main__":
+    test_one()
+'''
+
+
+def test_closure_reaches_through_helpers():
+    """Both rules on three sources whose answers a lexical test gets wrong.
+
+    Not a census assertion -- the census cannot carry this, because at `87b5732` it holds no
+    helper-routed file to regress on, which is exactly how a dead version of this closure
+    passes it (kimi-code, notice 796). These are the live controls: the repair must FLAG the
+    first two and must NOT flag the third, and each one fails a different way if the closure
+    is wrong.
+
+    `_HELPER_HOP` is kimi's refutation of #184's decidability claim (notice 795): the
+    extract-function refactor of this repo's own house style. Real accumulator, real assert,
+    `python3 -m pytest` reports `2 passed`, bare `python3` exits 1, and before the closure
+    both rules reported green.
+
+    `_DEAD_CHANNEL` is the case that killed a pin this file briefly carried: an assert in a
+    function nothing references is not a channel, and must be absorbed, not protected.
+
+    `_REAL_CHANNEL` is the shape of the fix applied to four files in this PR. It must stay
+    green, or the closure has eaten the remedy -- the failure mode where a rule flags
+    everything is as dead as the one where it flags nothing.
+    """
+    check("closure flags the helper-hop counterexample (blind)",
+          pytest_blind_functions(_HELPER_HOP) == ["test_one", "test_two"],
+          f"got {pytest_blind_functions(_HELPER_HOP)} -- a read or assert routed one hop "
+          "through main() is being read as lexically outside the guard again")
+    check("closure flags the helper-hop counterexample (undelivered)",
+          undelivered_accumulators(_HELPER_HOP) == ["FAILS"],
+          f"got {undelivered_accumulators(_HELPER_HOP)}")
+    check("an unreferenced assert is not a channel",
+          pytest_blind_functions(_DEAD_CHANNEL) == ["test_a"],
+          f"got {pytest_blind_functions(_DEAD_CHANNEL)} -- pytest never calls `_report`, so "
+          "its assert cannot deliver anything")
+    check("a teardown_module channel stays green",
+          not pytest_blind_functions(_REAL_CHANNEL)
+          and not undelivered_accumulators(_REAL_CHANNEL),
+          f"blind={pytest_blind_functions(_REAL_CHANNEL)} "
+          f"undelivered={undelivered_accumulators(_REAL_CHANNEL)} -- the closure has absorbed "
+          "the pytest entry points and now flags the very remedy this PR applies")
 
 
 def teardown_module(module):
@@ -347,6 +542,7 @@ if __name__ == "__main__":
     test_no_pytest_dependency()
     test_no_pytest_blind_files()
     test_no_undelivered_accumulators()
+    test_closure_reaches_through_helpers()
     for f in FAILS:
         print("FAIL", f)
     n = len(bare_python_files())
