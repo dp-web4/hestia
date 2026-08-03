@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""Tests for the one policy gate.
+
+Four times in two days a refusal named a door the recipient could not open, and every time it
+was written by an author not subject to the constraint that blocked the recipient. This suite
+moves part of that class from "a careful author avoids it" to "the build refuses it".
+
+**Part of it.** `remedies_name_only_globally_registered_doors` proves the tool is registered
+and dispatched in the daemon — it excludes the `request_scope` case, where the door existed
+nowhere. It does NOT prove the refused member can reach it, and it is named for what it
+proves (codex NOT-SAME review of #169, finding 3). The stronger per-recipient invariant needs
+a per-harness capability manifest and is deliberately not claimed until one exists.
+
+Checks that report "nothing was inspected" say so out loud rather than passing quietly — a
+green meaning "nothing ran" is indistinguishable from a green meaning "ran and clean", which
+is the failure this repo keeps rediscovering.
+
+Run:  python3 test_gate_core.py          (offline checks only)
+      HESTIA_MCP=http://127.0.0.1:7711/mcp python3 test_gate_core.py   (also checks the
+                                                                        live tool list)
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import tempfile
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hestia_gate_core as G  # noqa: E402
+
+FAILURES = []
+
+
+def check(name, cond, detail=""):
+    if cond:
+        print(f"  ok    {name}")
+    else:
+        print(f"  FAIL  {name}  {detail}")
+        FAILURES.append(name)
+
+
+# ── the remedy inventory ─────────────────────────────────────────────────────────────────
+def live_tool_names():
+    """The daemon's ACTUAL tool list. Returns None if the daemon is not reachable — in which
+    case this check is SKIPPED and says so, rather than passing vacuously. A green that means
+    'nothing was checked' is the null-state twin of a green that means 'checked and fine'."""
+    url = os.environ.get("HESTIA_MCP")
+    if not url:
+        return None
+    H = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    sid = {}
+
+    def rpc(method, params, rid=1):
+        h = dict(H)
+        if sid.get("v"):
+            h["Mcp-Session-Id"] = sid["v"]
+        body = {"jsonrpc": "2.0", "method": method, "params": params}
+        if rid is not None:
+            body["id"] = rid
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=h)
+        resp = urllib.request.urlopen(req, timeout=20)
+        sid.setdefault("v", resp.headers.get("Mcp-Session-Id"))
+        return resp.read().decode()
+
+    try:
+        rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                           "clientInfo": {"name": "gate-core-test", "version": "1"}})
+        rpc("notifications/initialized", {}, rid=None)
+        raw = rpc("tools/list", {}, rid=2)
+        for line in raw.splitlines():
+            if line.startswith("data: {"):
+                j = json.loads(line[6:])
+                if "result" in j and "tools" in j["result"]:
+                    return {t["name"] for t in j["result"]["tools"]}
+    except Exception as e:
+        print(f"  note  daemon unreachable ({e.__class__.__name__}) — live check SKIPPED")
+    return None
+
+
+def _registered_tools_in_source(candidates):
+    """Which of `candidates` are actually REGISTERED and DISPATCHED in the Rust source.
+
+    Two independent sites must both name the tool, because either alone is forgeable by a
+    stray mention:
+        registration   t("hestia_x", "...")      in `hestia_tools()`
+        dispatch       "hestia_x" => tool_x(...) in the match arm
+    A tool listed but not dispatched is advertised and dead; dispatched but not listed is
+    reachable and undiscoverable. Requiring both is the honest definition of 'exists'."""
+    handler = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "..", "core", "src", "server", "handler.rs")
+    try:
+        body = open(handler, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return set()
+    registered = set(re.findall(r'^\s*t\(\s*\n?\s*"([a-z_]+)"', body, re.M))
+    registered |= set(re.findall(r't\(\s*"([a-z_]+)"\s*,', body))
+    dispatched = set(re.findall(r'^\s*"([a-z_]+)"\s*=>\s*tool_', body, re.M))
+    return {c for c in candidates if c in registered and c in dispatched}
+
+
+def test_remedies_name_only_globally_registered_doors():
+    """Excludes globally ABSENT tools — the `request_scope` case, where the door existed
+    nowhere. It would have caught that on the day it was written, instead of costing kimi a
+    blocked session, a misdirected appeal and a correct-but-useless arbitration.
+
+    IT DOES NOT PROVE RECIPIENT REACHABILITY, and is named for what it proves. (codex #169
+    finding 3.) `tools/list` is the daemon's GLOBAL registry, so this can be green while the
+    refused member cannot call the tool at all — no hestia MCP registration in that harness,
+    or the tool not exposed there. That is the measured `hestia_appeal` class: globally
+    registered the entire time kimi had no way to reach it.
+
+    The stronger invariant needs a per-harness capability manifest or a probe through each
+    shim's own discovery surface. Not claimed until one exists."""
+    live = live_tool_names()
+    if live is None:
+        print("  skip  remedies_name_only_globally_registered_doors (set HESTIA_MCP to run it)")
+        return
+    named = G.remedy_tools()
+    missing = sorted(named - live)
+
+    # RECORD THE DISCRIMINATOR. "The running daemon lacks this tool" has two causes that look
+    # identical here and are not remotely the same defect:
+    #
+    #   NEVER BUILT   — the `request_scope` class. An authoring error: someone wrote a remedy
+    #                   for a door that does not exist anywhere. Fix the remedy, or build it.
+    #   NOT DEPLOYED  — the tool is in the source and the daemon is running an older binary.
+    #                   The remedy is correct and will be true after a restart.
+    #
+    # Reporting both as "the daemon does NOT have it" would support a count, not a judgement —
+    # and the first thing anyone does with an undiscriminated red is relax the check.
+    # READ THE DISPATCH TABLE, NOT THE FILE TEXT. (codex #169 finding 4b.) The first version
+    # searched for a quoted token anywhere under core/src, so a mention in a comment, a
+    # doc-comment or a test fixture would classify a NEVER-BUILT door as merely stale — the
+    # softer verdict, on the more serious defect. A tool exists when it is registered AND
+    # dispatched; nothing else counts.
+    in_source = _registered_tools_in_source(missing)
+    never_built = sorted(set(missing) - in_source)
+    undeployed = sorted(in_source)
+
+    detail = ""
+    if never_built:
+        detail += (f"NEVER BUILT (authoring error — fix the remedy or build the door): "
+                   f"{never_built}. ")
+    if undeployed:
+        detail += (f"NOT DEPLOYED (remedy is correct; the running daemon is older than the "
+                   f"source): {undeployed}. ")
+    # Only a never-built door is an authoring failure. An undeployed one is a true statement
+    # about a stale daemon, and it must still be RED — a member reading that remedy today
+    # cannot use the door — but the fix is a deploy, not an edit.
+    check("remedies_name_only_globally_registered_doors", not missing, detail)
+    # And the inverse worth knowing, though not a failure: doors that exist and no remedy
+    # points at. A door nobody is ever told about is only marginally better than no door.
+    unmentioned = sorted(t for t in live
+                         if t in {"hestia_request_scope", "hestia_appeal",
+                                  "hestia_gate_escalation_open"} and t not in named)
+    if unmentioned:
+        print(f"  note  existing doors no remedy names: {unmentioned}")
+
+
+def test_remedy_text_declares_every_tool_it_names():
+    """`tools` is what the check above reads, so a remedy that names a tool in prose but omits
+    it from `tools` would slip past. Scan the prose too."""
+    bad = []
+    for rule, r in G.REMEDIES.items():
+        in_prose = set(re.findall(r"\bhestia_[a-z_]+\b", r.text))
+        undeclared = in_prose - set(r.tools)
+        if undeclared:
+            bad.append((rule, sorted(undeclared)))
+    check("remedy_text_declares_every_tool_it_names", not bad, str(bad))
+
+
+def test_unregistered_rule_denies_and_never_raises():
+    """codex #169 finding 1. An unknown rule must produce a DENIAL, not an exception.
+
+    The first version asserted the opposite — it treated `_deny` raising KeyError as success.
+    On engines that fail OPEN on exception (which is every lineage engine, and is this
+    module's stated premise) that "loud" path is an ALLOW. The test blessed the fail-open."""
+    try:
+        v = G._deny("rule.that.does.not.exist", "some reason")
+    except Exception as e:
+        check("unregistered_rule_never_raises", False,
+              f"raised {e.__class__.__name__} — on a fail-open engine that is an ALLOW")
+        return
+    check("unregistered_rule_never_raises", True)
+    check("unregistered_rule_denies", v.blocks)
+    check("unregistered_rule_still_carries_text", bool(v.remedy))
+
+
+def test_every_literal_deny_rule_is_registered():
+    """codex #169 finding 1, second half. The runtime now fails closed; the AUTHORING mistake
+    must still be caught at build time, and by enumerating actual call sites rather than by
+    hoping every path is exercised.
+
+    Reads the AST for every literal `_deny("...")` in the core. A future branch adding
+    `_deny("new.rule", ...)` on an untested path is red here even though nothing calls it."""
+    import ast
+    src_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hestia_gate_core.py")
+    tree = ast.parse(open(src_path, encoding="utf-8").read())
+    literal, dynamic = set(), []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_deny"):
+            continue
+        if not node.args:
+            dynamic.append(node.lineno)
+        elif isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+            literal.add(node.args[0].value)
+        else:
+            dynamic.append(node.lineno)
+    unregistered = sorted(literal - set(G.REMEDIES))
+    check("every_literal_deny_rule_is_registered", not unregistered,
+          f"_deny called with unregistered rule ids: {unregistered}")
+    # Policy on dynamic ids, stated rather than assumed: they are NOT allowed in the core,
+    # because a rule id computed at runtime cannot be checked here and would route straight to
+    # the unregistered-rule fallback — a correct refusal with a useless remedy.
+    check("no_dynamic_deny_rule_ids", not dynamic,
+          f"_deny called with a non-literal rule id at lines {dynamic}; the AST check cannot "
+          f"verify those, so they are disallowed in the core")
+    check("deny_call_sites_were_actually_found", len(literal) >= 3,
+          f"only found {len(literal)} literal _deny call sites — the AST walk may be broken, "
+          f"which would make this check silently vacuous")
+
+
+def test_egress_offers_no_door():
+    """The one refusal that must NOT name a remedy tool. A leaked secret has no undo, so
+    offering a channel would imply the act is available at a price."""
+    check("egress_offers_no_door", G.REMEDIES["egress.secret"].tools == ())
+
+
+def test_scope_remedy_distinguishes_itself_from_appeal():
+    """The confusion that cost kimi a cycle. Both scope remedies must name the scope door AND
+    say the appeal channel cannot deliver a path."""
+    for rule in ("mrh.path", "mrh.command"):
+        t = G.REMEDIES[rule].text.lower()
+        check(f"{rule}_names_the_scope_door", "hestia_request_scope" in t)
+        check(f"{rule}_distinguishes_appeal", "hestia_appeal" in t)
+
+
+# ── policy behaviour ─────────────────────────────────────────────────────────────────────
+def _strip_prose(src):
+    """Code lines only — no comments, no docstrings.
+
+    Written as a helper because I got this wrong twice in one session: a drift detector that
+    hashed function TEXT reported comment edits as semantic drift, and the first version of
+    `core_never_calls_sys_exit` matched the phrase inside the core's own docstring saying it
+    never calls it. A check that reads prose is measuring the wrong artifact."""
+    out, ds = [], False
+    for line in src.splitlines():
+        s = line.strip()
+        if s.startswith('"""') or s.startswith("'''"):
+            q = s[:3]
+            ds = not (s.count(q) >= 2 and len(s) > 3)
+            continue
+        if ds or s.startswith("#") or not s:
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _workspace():
+    """A scratch workspace that is NOT under /tmp.
+
+    /tmp is unconditionally in scope, so a fake workspace built with plain `mkdtemp()` is
+    allowed wholesale and every scope assertion passes for the wrong reason — five green
+    checks that measured nothing. Exactly the null-state twin: a pass bit-identical to 'the
+    gate is not running'."""
+    base = os.path.expanduser("~/.cache/hestia-gate-core-tests")
+    os.makedirs(base, exist_ok=True)
+    ws = tempfile.mkdtemp(dir=base)
+    assert not ws.startswith(("/tmp", "/var/tmp")), ws
+    return ws
+
+
+def _profile(tmp, scope):
+    p = os.path.join(tmp, "identity.json")
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump({"mrh": {"in_scope": scope}, "role": "role:constellation:member"}, fh)
+    return G.HarnessProfile(member_id="test-member", identity_path=p,
+                            home_markers=("~/.test-member",))
+
+
+def test_path_and_command_scope():
+    ws = _workspace()
+    for r in ("granted", "notgranted"):
+        os.makedirs(os.path.join(ws, r), exist_ok=True)
+    prof = _profile(ws, ["repo:granted"])
+
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/granted/a.md"], cwd=ws)
+    check("in_scope_path_allows", G.evaluate(ev, prof, ws).decision == "allow")
+
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/notgranted/a.md"], cwd=ws)
+    v = G.evaluate(ev, prof, ws)
+    check("out_of_scope_path_denies", v.blocks and v.rule == "mrh.path")
+    check("deny_carries_a_remedy", "hestia_request_scope" in v.remedy)
+    check("deny_names_the_offending_target", "notgranted" in v.reason)
+
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}"], cwd=ws)
+    check("bare_workspace_root_denies", G.evaluate(ev, prof, ws).blocks)
+
+    # /tmp and the member's own home are always reachable.
+    ev = G.NormalizedEvent(tool="Read", paths=["/tmp/x"], cwd=ws)
+    check("tmp_allows", G.evaluate(ev, prof, ws).decision == "allow")
+
+
+def test_path_grant_reaches_a_sibling_of_the_repos():
+    """`.git-inbox` is a sibling of the repos, so a repo: grant never reaches it — the exact
+    refusal kimi hit on 2026-08-02 while reading the directory the push guard names."""
+    ws = _workspace()
+    os.makedirs(os.path.join(ws, ".git-inbox"), exist_ok=True)
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/.git-inbox/submissions"], cwd=ws)
+
+    without = _profile(ws, ["repo:granted"])
+    check("sibling_denied_without_path_grant", G.evaluate(ev, without, ws).blocks)
+
+    with_grant = _profile(_workspace(), ["repo:granted", "path:.git-inbox"])
+    check("sibling_allowed_with_path_grant",
+          G.evaluate(ev, with_grant, ws).decision == "allow")
+
+
+def test_temp_root_is_a_path_boundary_not_a_prefix():
+    """codex #169 finding 2. `startswith("/tmp")` admits `/tmp-other` — a SIBLING of the temp
+    root, and a directory anyone can create. That would hand a member unconditional reach by
+    naming a directory: no grant, no witness, no operator.
+
+    Same defect class as `reviewer ⊄ review` in the mesh vocabulary: a boundary rule written
+    as a substring rule."""
+    check("temp_root_itself", G._under_temp_root("/tmp"))
+    check("temp_descendant", G._under_temp_root("/tmp/x/y"))
+    check("var_temp_descendant", G._under_temp_root("/var/tmp/x"))
+    # The bypasses.
+    check("sibling_tmp_denied", not G._under_temp_root("/tmp-other/x"))
+    check("sibling_var_tmp_denied", not G._under_temp_root("/var/tmpsecrets/y"))
+    check("tmp_prefix_word_denied", not G._under_temp_root("/tmpfoo"))
+    # And through the real decision path, not just the helper.
+    ws = _workspace()
+    os.makedirs(os.path.join(ws, "granted"), exist_ok=True)
+    prof = _profile(ws, ["repo:granted"])
+    ev = G.NormalizedEvent(tool="Read", paths=["/tmp-other/loot"], cwd=ws)
+    check("sibling_tmp_denied_end_to_end", G.evaluate(ev, prof, ws).blocks)
+
+
+def test_shims_contain_no_policy():
+    """codex #169 finding 4. The module docstring credited this test before it existed.
+
+    Reports what it checked. With no shims present it says so rather than passing silently —
+    a green meaning 'nothing was inspected' is indistinguishable from 'inspected and clean',
+    which is the null-state twin this thread keeps meeting."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    shims = sorted(f for f in os.listdir(here)
+                   if f.startswith("shim_") and f.endswith(".py"))
+    if not shims:
+        print("  note  shims_contain_no_policy: 0 shims present — NOTHING CHECKED "
+              "(live the moment a shim_*.py lands)")
+        return
+    banned = ("in_scope", "FORBIDDEN", "REMEDIES", "Remedy(", "_deny(", "remedy=")
+    bad = []
+    for f in shims:
+        code = _strip_prose(open(os.path.join(here, f), encoding="utf-8").read())
+        hits = [b for b in banned if b in code]
+        if hits:
+            bad.append((f, hits))
+    check("shims_contain_no_policy", not bad,
+          f"{bad} — a shim may only parse events and render verdicts. If it needs a policy "
+          f"choice, add a HarnessProfile field instead of branching in the shim.")
+
+
+def test_egress_beats_scope():
+    """Innate invariants dominate: a secret inside a GRANTED repo is still denied."""
+    ws = _workspace()
+    os.makedirs(os.path.join(ws, "granted"), exist_ok=True)
+    prof = _profile(ws, ["repo:granted"])
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/granted/.env"], cwd=ws)
+    v = G.evaluate(ev, prof, ws)
+    check("egress_beats_scope", v.blocks and v.rule == "egress.secret" and v.innate)
+
+
+def test_missing_identity_fails_narrow_not_wide():
+    """A malformed or absent identity must not grant reach. The default is deliberately one
+    repo, not the workspace."""
+    prof = G.HarnessProfile(member_id="x", identity_path="/nonexistent/identity.json")
+    check("missing_identity_is_narrow", G.load_in_scope(prof) == ["web4"])
+
+
+def test_core_never_exits():
+    """The core returns a Verdict; only shims exit. Every lineage hook engine fails OPEN, so a
+    shim must never be able to confuse 'no verdict' with 'allowed'."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "hestia_gate_core.py"), encoding="utf-8").read()
+    check("core_never_calls_sys_exit", "sys.exit" not in _strip_prose(src))
+
+
+def test_core_is_vendor_agnostic():
+    """No harness may be named in the core — that is what the profile is for. MEMBER_ADDRESSES
+    is the one allowed exception and is checked separately below."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "hestia_gate_core.py"), encoding="utf-8").read()
+    code = []
+    ds = False
+    for line in src.splitlines():
+        s = line.strip()
+        if s.startswith('"""') or s.startswith("'''"):
+            q = s[:3]
+            ds = not (s.count(q) >= 2 and len(s) > 3)
+            continue
+        if ds or s.startswith("#") or not s:
+            continue
+        code.append(line)
+    code = "\n".join(code)
+    # Strip the one sanctioned list of member addresses before scanning.
+    code = re.sub(r"MEMBER_ADDRESSES = frozenset\(\{[^}]*\}\)", "", code)
+    leaked = [v for v in ("kimi", "codex", "cursor", "gemini", "claude-code")
+              if v in code.lower()]
+    check("core_is_vendor_agnostic", not leaked,
+          f"vendor names in core logic: {leaked} — add a HarnessProfile field instead")
+
+
+# EVERY TEST IS CALLED BY NAME, and a second check proves the list is complete.
+#
+# The first version discovered tests by scanning `globals()` for a `test_` prefix. They did
+# run — but `tools/ci_selfexec_test.py` red-flagged the file, and it was right to: a checker
+# cannot see a dynamic dispatch, and neither can a reviewer. Rename a function, or typo the
+# prefix, and it silently stops executing while the file still reports green. That is the
+# null-state twin this suite exists to argue against, sitting in the suite itself.
+#
+# So: explicit calls, plus `test_every_test_is_registered` below, which fails if a `test_*`
+# function exists that this list does not name. Explicit AND complete — either alone rots.
+ALL_TESTS = [
+    "test_remedies_name_only_globally_registered_doors",
+    "test_remedy_text_declares_every_tool_it_names",
+    "test_unregistered_rule_denies_and_never_raises",
+    "test_every_literal_deny_rule_is_registered",
+    "test_egress_offers_no_door",
+    "test_scope_remedy_distinguishes_itself_from_appeal",
+    "test_path_and_command_scope",
+    "test_path_grant_reaches_a_sibling_of_the_repos",
+    "test_temp_root_is_a_path_boundary_not_a_prefix",
+    "test_shims_contain_no_policy",
+    "test_egress_beats_scope",
+    "test_missing_identity_fails_narrow_not_wide",
+    "test_core_never_exits",
+    "test_core_is_vendor_agnostic",
+]
+
+
+def test_every_test_is_registered():
+    """The completeness half. Explicit calls stop a rename from silently disabling a test;
+    this stops a NEW test from silently never running."""
+    defined = {k for k in globals() if k.startswith("test_")}
+    missing = sorted(defined - set(ALL_TESTS) - {"test_every_test_is_registered"})
+    check("every_test_is_registered", not missing,
+          f"defined but not in ALL_TESTS, so never run: {missing}")
+
+
+if __name__ == "__main__":
+    print("hestia_gate_core")
+    test_every_test_is_registered()
+    test_remedies_name_only_globally_registered_doors()
+    test_remedy_text_declares_every_tool_it_names()
+    test_unregistered_rule_denies_and_never_raises()
+    test_every_literal_deny_rule_is_registered()
+    test_egress_offers_no_door()
+    test_scope_remedy_distinguishes_itself_from_appeal()
+    test_path_and_command_scope()
+    test_path_grant_reaches_a_sibling_of_the_repos()
+    test_temp_root_is_a_path_boundary_not_a_prefix()
+    test_shims_contain_no_policy()
+    test_egress_beats_scope()
+    test_missing_identity_fails_narrow_not_wide()
+    test_core_never_exits()
+    test_core_is_vendor_agnostic()
+    print()
+    if FAILURES:
+        print(f"FAILED: {len(FAILURES)} — {FAILURES}")
+        sys.exit(1)
+    print("all checks pass")
