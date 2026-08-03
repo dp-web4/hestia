@@ -141,10 +141,109 @@ def test_no_pytest_dependency():
                   "`python3` -- marks, fixtures and parametrize will not run")
 
 
+def pytest_blind_functions(src: str) -> list[str]:
+    """Names of pytest-collectable `test_*` functions in a module with no way to fail.
+
+    A module-scope `def test_*` is what pytest collects. It fails only by raising -- an
+    `assert`, or an exception. A file whose entire failure signal is `check()` appending to an
+    accumulator that the `__main__` block reads has no such channel: pytest calls the
+    function, the function records, the function returns, pytest prints PASSED.
+
+    The rule is EXISTENCE of a channel somewhere in the module outside the `__main__` guard,
+    not per-function coverage. `teardown_module`, a raising decorator, and an inline `assert`
+    all satisfy it. Returns the collectable names when the module has none at all.
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as exc:
+        return [f"<unparseable: {exc}>"]
+
+    collectable = sorted(
+        node.name for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test")
+    )
+    if not collectable:
+        return []          # pytest collects nothing here; it cannot report a false green
+
+    main_guard = {
+        id(inner)
+        for node in tree.body
+        if isinstance(node, ast.If) and "__main__" in ast.dump(node.test)
+        for inner in ast.walk(node)
+    }
+    has_channel = any(
+        isinstance(node, (ast.Assert, ast.Raise)) and id(node) not in main_guard
+        for node in ast.walk(tree)
+    )
+    return [] if has_channel else collectable
+
+
+def test_no_pytest_blind_files():
+    """The mirror of `test_no_inert_test_functions`, and the half that was missing.
+
+    That guard asks whether bare `python3` executes what pytest would collect. This one asks
+    the reverse and equally load-bearing question: when someone runs the file the way its
+    NAME invites, does a failure reach them?
+
+    Found by kimi-code verifying #175 from a second seat: `gate_self_protection_test.py`
+    reported `8 passed in 0.33s` on the commit whose entire payload was five deliberate
+    failures, and the reviewer nearly returned a "cannot reproduce" on the strength of it.
+    CI was never wrong -- it runs discovered files bare, and the exit code held. The wrong
+    invocation is the LOCAL one, which is the one a reviewer reaches for, during review, and
+    the failure mode is a green identical to the null state.
+
+    The sweep that followed found the shape in four more files. Including this one: the guard
+    against files bare `python3` cannot fail was itself a file pytest could not fail.
+
+    WHAT THIS ASSERTS, AND WHAT IT CANNOT
+    -------------------------------------
+    Existence, not coverage. A file that keeps one asserting test and lets ten others record
+    silently passes here. Coverage is not decidable from the AST -- a channel can be reached
+    through any depth of helper -- and the defect actually observed was total absence: four
+    files, zero channels between them. Same caveat class as this file's siblings: a green
+    means nobody has removed the last channel, not that every check is delivered.
+    """
+    for path in bare_python_files():
+        rel = path.relative_to(REPO).as_posix()
+        blind = pytest_blind_functions(
+            path.read_text(encoding="utf-8", errors="replace"))
+        check(f"pytest can report a failure: {rel}", not blind,
+              f"defines {blind} but the module contains no assert/raise outside its "
+              "`__main__` guard. Under `python3 -m pytest` every one of those functions "
+              "records its failures and returns normally, so pytest reports PASSED on a red "
+              "file -- a green identical to the null state, in the invocation a `*_test.py` "
+              "name invites. Add a `teardown_module` that asserts the accumulator is empty, "
+              "or give the tests an assert.")
+
+
+def teardown_module(module):
+    """Deliver this file's accumulated failures to a harness that reads exceptions.
+
+    `check()` records into `FAILS`, and `FAILS` was read ONLY by the `__main__` block below
+    -- which is how CI invokes this file, so the exit-code path always held. Under
+    `python3 -m pytest`, the invocation a file named `*_test.py` invites, every `test_*` ran
+    its checks, recorded its failures and returned normally: real reds delivered as PASSED.
+
+    pytest calls `teardown_module` after the module's tests and reports a failure here as a
+    module ERROR with a non-zero exit. Bare `python3` never calls it, so nothing about the CI
+    path changes.
+
+    Found by kimi-code while verifying #175: `gate_self_protection_test.py` reported
+    `8 passed` on the commit whose entire payload was five deliberate failures. This file was
+    one of the four the sweep then found in the same shape -- including, sharply, this one:
+    the guard that catches files bare `python3` cannot fail was itself a file pytest could
+    not fail.
+    """
+    assert not FAILS, (
+        f"{len(FAILS)} check(s) failed -- see the FAIL lines in captured stdout: {FAILS}")
+
+
 if __name__ == "__main__":
     test_glob_is_not_empty()
     test_no_inert_test_functions()
     test_no_pytest_dependency()
+    test_no_pytest_blind_files()
     for f in FAILS:
         print("FAIL", f)
     n = len(bare_python_files())
