@@ -152,6 +152,14 @@ def pytest_blind_functions(src: str) -> list[str]:
     The rule is EXISTENCE of a channel somewhere in the module outside the `__main__` guard,
     not per-function coverage. `teardown_module`, a raising decorator, and an inline `assert`
     all satisfy it. Returns the collectable names when the module has none at all.
+
+    KNOWN GAP, and the reason `undelivered_accumulators` exists beside this. An `assert` that
+    measures the TEST RIG rather than the subject satisfies this rule while every check of the
+    subject stays undelivered. `plugins/_shared/test_gate_core.py` is the worked example --
+    one of the four files this PR fixes, and at `87b5732` this rule did NOT flag it, because
+    `_workspace()` asserts that the scratch dir is not under /tmp. Scaffolding hygiene, never
+    a property of the gate. Confirmed from a second seat by kimi-code (notice 791): stripping
+    that file's new `teardown_module` leaves this check green.
     """
     try:
         tree = ast.parse(src)
@@ -177,6 +185,100 @@ def pytest_blind_functions(src: str) -> list[str]:
         for node in ast.walk(tree)
     )
     return [] if has_channel else collectable
+
+
+def undelivered_accumulators(src: str) -> list[str]:
+    """Module-level accumulators that only the `__main__` block ever reads.
+
+    `pytest_blind_functions` asks whether ANY failure channel exists. This asks the sharper
+    question its known gap lets through: is the file's OWN failure record delivered? A module
+    that appends to `FAILS` outside `__main__` and reads it only inside `__main__` has, by
+    construction, routed every check it makes to the one invocation CI uses -- whatever
+    unrelated `assert` may sit elsewhere in the file.
+
+    Coverage in general is not decidable from an AST. This shape is: it is the exact defect
+    observed five times, and it is what separates a real channel from a scaffolding one
+    without needing to know which asserts measure the subject.
+
+    NOT a superset of `pytest_blind_functions`, and not a replacement -- a file with
+    collectable tests, no accumulator and no assert at all is caught by that rule and not by
+    this one. Both run; each catches what the other cannot.
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return []          # the sibling rule reports the parse failure; don't double-report
+
+    if not any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and node.name.startswith("test") for node in tree.body):
+        return []          # pytest collects nothing here; it cannot report a false green
+
+    accumulators = set()
+    for node in tree.body:
+        # `FAILS = []` and `FAILS: list[str] = []` are different nodes. Every file in this
+        # repo uses the annotated form, so an Assign-only scan flags nothing, anywhere.
+        if isinstance(node, ast.Assign) and isinstance(node.value, (ast.List, ast.Dict, ast.Set)):
+            accumulators |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+        elif (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+              and isinstance(node.value, (ast.List, ast.Dict, ast.Set))):
+            accumulators.add(node.target.id)
+    if not accumulators:
+        return []
+
+    main_guard = {
+        id(inner)
+        for node in tree.body
+        if isinstance(node, ast.If) and "__main__" in ast.dump(node.test)
+        for inner in ast.walk(node)
+    }
+
+    appended, receivers = set(), set()
+    for node in ast.walk(tree):
+        if (id(node) not in main_guard and isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in accumulators
+                and node.func.attr in ("append", "add", "extend", "update")):
+            appended.add(node.func.value.id)
+            # The receiver of `FAILS.append(...)` is itself a Load of `FAILS`, and
+            # `ast.walk` yields it as its own node. Excluded by identity -- otherwise every
+            # appended accumulator marks itself as read and this rule flags nothing, ever.
+            receivers.add(id(node.func.value))
+
+    read_outside = {
+        node.id for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id in accumulators
+        and isinstance(node.ctx, ast.Load)
+        and id(node) not in main_guard and id(node) not in receivers
+    }
+    return sorted(appended - read_outside)
+
+
+def test_no_undelivered_accumulators():
+    """The scaffolding-assert gap in `test_no_pytest_blind_files`, closed.
+
+    kimi-code, re-deriving the blind-file census independently at `87b5732` (notice 791),
+    flagged only three of the four files this PR fixes. `plugins/_shared/test_gate_core.py`
+    passes the sibling rule on the strength of one `assert` inside `_workspace()` that checks
+    the scratch directory is not under /tmp -- the test rig, not the gate. Every one of that
+    file's actual checks went to `FAILURES`, and `FAILURES` was read only in `__main__`.
+
+    So the sibling rule's green there was a true answer to a question nobody was asking. This
+    check asks the one that was: at `87b5732` it flags all four, and `harness_toll_test.py` --
+    whose whole body sits inside `__main__`, so pytest collects nothing and no green can be
+    false -- is correctly not among them.
+    """
+    for path in bare_python_files():
+        rel = path.relative_to(REPO).as_posix()
+        undelivered = undelivered_accumulators(
+            path.read_text(encoding="utf-8", errors="replace"))
+        check(f"failure record reaches pytest: {rel}", not undelivered,
+              f"appends to {undelivered} outside `__main__` but reads it only inside, so "
+              "every recorded failure is delivered to the CI invocation alone. Under "
+              "`python3 -m pytest` the tests record and return normally and pytest reports "
+              "PASSED. An unrelated `assert` elsewhere in the file satisfies "
+              "`test_no_pytest_blind_files` without making this any less true. Add a "
+              "`teardown_module` that asserts the accumulator is empty.")
 
 
 def test_no_pytest_blind_files():
@@ -244,6 +346,7 @@ if __name__ == "__main__":
     test_no_inert_test_functions()
     test_no_pytest_dependency()
     test_no_pytest_blind_files()
+    test_no_undelivered_accumulators()
     for f in FAILS:
         print("FAIL", f)
     n = len(bare_python_files())
