@@ -757,6 +757,15 @@
       <button class="esc-banner-btn" id="esc-banner-btn">review</button>
     </div>
 
+    <!-- Scope requests. Same banner shape as the escalations deliberately: this is the same
+         KIND of thing (a member is stopped, a human decides, silence refuses) and giving it a
+         second visual language would make the operator learn two habits for one job. -->
+    <div class="esc-banner" id="scope-banner" hidden>
+      <span class="esc-dot"></span>
+      <span id="scope-banner-text">…</span>
+      <button class="esc-banner-btn" id="scope-banner-btn">review</button>
+    </div>
+
     <!-- No "ORCHESTRATORS:" label. The chips are self-evidently orchestrators; the word
          cost a fifth of a row to say so. -->
     <div class="orch-bar" id="orch-bar">
@@ -840,6 +849,36 @@
           a string the caller supplied.
         </div>
         <div id="esc-list"><div class="empty">No escalations awaiting a decision.</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Scope requests. Decides through POST /api/scope/decide — the operator channel, same
+       challenge-signed session as the escalation panel.
+
+       This exists because the decision surface shipped without a notice. `hestia_request_scope`
+       and both operator endpoints landed 2026-08-02; kimi-code then filed a correctly-formed
+       request, with a stated reason, that dp never saw — because nothing displayed it. The
+       escalation panel's own comment above already names that defect ("a route the UI never
+       calls is what we already had") and it was repeated one surface later by the same author.
+       Building the door is not building the hallway. -->
+  <div class="modal" id="scope-modal" hidden>
+    <div class="modal-backdrop" data-close="1"></div>
+    <div class="modal-panel" id="scope-card">
+      <div class="modal-head">
+        <h2>Scope requests <span class="pol-mode" id="scope-count"></span></h2>
+        <button class="modal-close" data-close="1" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="esc-note">
+          A member asked to read <strong>one path</strong> outside its granted MRH. Approving grants
+          <strong>that one path</strong> — exact match, no prefix, <strong>memory-only</strong>: it dies
+          with the daemon and never touches the member's identity file. A standing widening is a
+          separate, deliberate edit you make. The identity shown is
+          <strong>claimed, not authenticated</strong>. <strong>No answer is a refusal</strong> when the
+          window lapses — not a retry.
+        </div>
+        <div id="scope-list"><div class="empty">No scope requests awaiting a decision.</div></div>
       </div>
     </div>
   </div>
@@ -1730,6 +1769,7 @@
       : data.stats;
     renderStats(s, data.society, selectedOrch);
     renderEscalations(data);
+    renderScopeRequests(data);
     renderGrants(data);
     renderOrchBar(data);
     renderTrust(data.trust);
@@ -1989,6 +2029,118 @@
   // arriving or expiring elsewhere in the queue is no reason to discard what was typed here.
   let escRenderedSig = null;
   const escDrafts = new Map();
+
+  // --- scope requests ----------------------------------------------------------
+  //
+  // Deliberately simpler than the escalation renderer: no draft-preservation map, because
+  // approving a scope request does NOT require typed input. The escalation panel needs drafts
+  // because a reason is mandatory there and a re-render was eating half-typed text (dp,
+  // 2026-08-02: "the field is cleared in a couple seconds"). Here the reason is supplied by
+  // the REQUESTER at filing and is mandatory server-side, so the operator is ruling on someone
+  // else's sentence rather than composing their own. An optional note is still offered; it is
+  // rebuilt each tick and that is acceptable precisely because nothing is lost if it is empty.
+  const scopeDrafts = new Map();
+  let scopeRenderedSig = null;
+
+  function renderScopeRequests(data) {
+    const pend = data?.pending_scope_requests ?? [];
+    const banner = $('scope-banner');
+    banner.hidden = pend.length === 0;
+    if (pend.length) {
+      const n = pend.length;
+      $('scope-banner-text').textContent =
+        `${n} scope request${n > 1 ? 's' : ''} awaiting your decision`;
+    }
+    $('scope-count').textContent = pend.length ? `${pend.length} pending` : '';
+
+    const list = $('scope-list');
+    if (!pend.length) {
+      if (scopeRenderedSig !== '') {
+        scopeRenderedSig = '';
+        scopeDrafts.clear();
+        list.innerHTML = '<div class="empty">No scope requests awaiting a decision.</div>';
+      }
+      return;
+    }
+
+    const live = new Set(pend.map(r => String(r.request_id)));
+    for (const id of [...scopeDrafts.keys()]) if (!live.has(id)) scopeDrafts.delete(id);
+
+    // Signature covers id + decidability, same discipline as the escalation panel: a re-render
+    // that only ticks the clock must not rebuild the DOM under the operator's cursor.
+    const sig = pend.map(r => `${r.request_id}`).join('|');
+    if (sig === scopeRenderedSig) {
+      for (const r of pend) {
+        const ttl = document.getElementById(`scope-ttl-${r.request_id}`);
+        if (ttl) ttl.textContent = `expires in ${escFmtAge(r.secs_remaining ?? 0)}`;
+      }
+      return;
+    }
+    scopeRenderedSig = sig;
+
+    list.innerHTML = '';
+    for (const r of pend) {
+      const row = document.createElement('div');
+      row.className = 'esc-row';
+      const path = String(r.path ?? '');
+      const why = String(r.reason ?? '');
+      row.innerHTML = `
+        <div class="esc-row-head">
+          <span class="esc-tool">read</span>
+          <span class="esc-who">claimed by ${escapeHtml(String(r.claimed_by ?? '?'))}${
+            r.role ? ' · ' + escapeHtml(String(r.role)) : ''}</span>
+          <span class="esc-ttl" id="scope-ttl-${escapeHtml(String(r.request_id))}">${
+            escapeHtml(`expires in ${escFmtAge(r.secs_remaining ?? 0)}`)}</span>
+        </div>
+        <div class="esc-marker">${escapeHtml(path)}</div>
+        <div class="esc-why">why: ${why ? escapeHtml(why) : '(none stated)'}</div>
+        <div class="esc-meta">id ${escapeHtml(String(r.request_id))} · grant is memory-only and expires</div>`;
+
+      const controls = document.createElement('div');
+      controls.className = 'esc-controls';
+      const note = document.createElement('input');
+      note.type = 'text';
+      note.placeholder = 'note (required to grant)';
+      note.value = scopeDrafts.get(String(r.request_id)) ?? '';
+      note.addEventListener('input', () => scopeDrafts.set(String(r.request_id), note.value));
+
+      const mk = (label, granted, cls) => {
+        const b = document.createElement('button');
+        b.className = cls;
+        b.textContent = label;
+        b.addEventListener('click', async () => {
+          // A REASON IS REQUIRED TO GRANT AND NOT TO REFUSE — the same asymmetry the daemon
+          // enforces (`scope_decide` 400s a grant with no reason). Refusing is the safe
+          // direction and must never carry more friction than approving.
+          if (granted && !note.value.trim()) { note.focus(); return; }
+          b.disabled = true;
+          try {
+            const res = await apiFetch('/api/scope/decide', {
+              method: 'POST',
+              body: JSON.stringify({
+                request_id: r.request_id,
+                granted,
+                reason: note.value.trim(),
+              }),
+            });
+            if (!res.ok) { b.disabled = false; return; }
+            scopeDrafts.delete(String(r.request_id));
+            // Force a rebuild next tick rather than optimistically mutating the row: the
+            // daemon owns the outcome, and a UI that shows a decision the daemon has not
+            // recorded is the exact "the button lies" failure the escalation panel names.
+            scopeRenderedSig = null;
+            await tick();
+          } catch (_) { b.disabled = false; }
+        });
+        return b;
+      };
+      controls.appendChild(note);
+      controls.appendChild(mk('grant', true, 'esc-approve'));
+      controls.appendChild(mk('refuse', false, 'esc-deny'));
+      row.appendChild(controls);
+      list.appendChild(row);
+    }
+  }
 
   function renderEscalations(data) {
     const pend = data?.pending_escalations ?? [];
@@ -2290,6 +2442,11 @@
 
     const escModal = $('esc-modal');
     $('esc-banner-btn').addEventListener('click', () => { escModal.hidden = false; });
+    const scopeModal = $('scope-modal');
+    $('scope-banner-btn').addEventListener('click', () => { scopeModal.hidden = false; });
+    scopeModal.addEventListener('click', (e) => {
+      if (e.target.dataset.close) scopeModal.hidden = true;
+    });
     escModal.addEventListener('click', (e) => { if (e.target.dataset.close) escModal.hidden = true; });
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') escModal.hidden = true; });
     // Same backdrop/✕/Escape contract for the trust detail popup, so both modals close
