@@ -960,6 +960,18 @@ impl SqliteInboxStore {
     /// makes it silent about them instead of permanently wrong about them; a real
     /// unanswered-forward report needs a far-end evidence channel, and this thread's
     /// finding is that no such channel exists yet (the substrate is negative-only).
+    ///
+    /// **A non-delivery report must not discharge the notice it reports on**
+    /// (F1, CBP notice 699 thread, 2026-08-03). The watcher's
+    /// `report_unreachable` mints `kind = "reply"` with `in_reply_to` bound to
+    /// the very notice whose delivery failed — a legal binding, since the
+    /// notice was addressed to the watched member. Unfiltered, that row
+    /// satisfies the clearing condition: the announcement of non-delivery read
+    /// back as the answer, and the notice left `owed_to_me` the moment the
+    /// watcher announced it never arrived. The only structural discriminator
+    /// today is the pointer fragment `#undelivered:` (the report borrows the
+    /// member's identity — Defect 2/3 of the same thread — so sender and role
+    /// cannot separate it). A report ABOUT a notice is not a response TO it.
     pub fn member_unanswered(
         &self,
         plugin: &str,
@@ -983,7 +995,10 @@ impl SqliteInboxStore {
                AND n.dest_peer IS NULL
                AND n.queued_at < ?2
                AND n.kind IN ({placeholders})
-               AND NOT EXISTS (SELECT 1 FROM member_notices r WHERE r.in_reply_to = n.id)
+               AND NOT EXISTS (SELECT 1 FROM member_notices r
+                               WHERE r.in_reply_to = n.id
+                                 AND (r.pointer_uri IS NULL
+                                      OR r.pointer_uri NOT LIKE '%#undelivered:%'))
              ORDER BY n.id ASC"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -1471,6 +1486,74 @@ mod tests {
         assert!(
             store.member_unanswered("kimi-code", counted, -1).unwrap().is_empty(),
             "a bound response clears the notice it answers"
+        );
+    }
+
+    /// ACCEPTANCE TEST for F1 (CBP 2026-08-03, notice 699 thread: "the
+    /// undelivered report discharges the notice it reports on"). RED before the
+    /// `NOT LIKE '%#undelivered:%'` predicate landed.
+    ///
+    /// The watcher's non-delivery report (`hestia-watch-member.sh`,
+    /// `report_unreachable`) is minted under the watched member's identity with
+    /// `kind = "reply"` and `in_reply_to = <the notice it reports undelivered>`.
+    /// The clearing condition below was `NOT EXISTS (... r.in_reply_to = n.id)`
+    /// with no pointer filter — so the artifact whose entire job is announcing
+    /// NON-delivery was counted as the proof of an answer, and the notice left
+    /// `owed_to_me` the moment the watcher announced it never arrived. Observed
+    /// on the live chain: notice 687 was answered at 02:29:16 and reported
+    /// undelivered at 02:41:04 (stale-primer retry never re-consults the chain);
+    /// the false report still cleared the row. The alarm silenced the
+    /// instrument it exists to feed.
+    ///
+    /// The marker is the pointer fragment `#undelivered:` — today the ONLY
+    /// structural difference between the report and a genuine reply, since the
+    /// report borrows the member's identity (Defect 2/3 in the same thread:
+    /// watcher connects as the member, no role). A genuine reply must still
+    /// clear; the report must not.
+    #[test]
+    fn an_undelivered_report_does_not_discharge_the_notice_it_reports() {
+        let (_tmp, store) = fresh();
+        // claude-code asks kimi-code; kimi owes the answer.
+        let asked = store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "review_request",
+                            Some("pr/1"), "h1", None)
+            .unwrap();
+        // The fire fails; watch-kimi-code reports non-delivery back to the
+        // sender, binding the notice it reports on — legal binding (the notice
+        // WAS addressed to the watched member), kind reply, marker in the
+        // pointer fragment.
+        store
+            .enqueue_member(
+                "claude-code", "kimi-code", "role:constellation:member", "reply",
+                Some("pr/1#undelivered:fire-rc=124;via=watch-kimi-code"),
+                "h2", Some(asked),
+            )
+            .unwrap();
+        // F1: the report must not clear the notice it reports on.
+        let owed = store
+            .member_unanswered("claude-code", &["review_request"], -1)
+            .unwrap();
+        assert_eq!(owed.len(), 1,
+                   "a non-delivery report must not clear the notice it reports undelivered");
+        assert_eq!(owed[0].id, asked);
+        // The report itself DOES appear under the wider counted-kinds query:
+        // it is a genuine `reply` row awaiting a disposition (in the live
+        // thread, notice 696 was answered by 699). Informational, but a real
+        // row — F1 changes only what it CLEARS, not what it IS.
+        let wider = store
+            .member_unanswered("claude-code", &["review_request", "reply"], -1)
+            .unwrap();
+        assert_eq!(wider.len(), 2, "the report is itself an unanswered reply");
+
+        // A GENUINE reply — same parties, same binding, no marker — still clears.
+        store
+            .enqueue_member("claude-code", "kimi-code", "role:r", "reply",
+                            Some("forum/actual-answer.md"), "h3", Some(asked))
+            .unwrap();
+        assert!(
+            store.member_unanswered("claude-code", &["review_request"], -1)
+                .unwrap().is_empty(),
+            "a genuine reply still discharges the notice"
         );
     }
 
