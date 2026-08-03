@@ -42,6 +42,10 @@ Properties asserted:
      the descendant case, and B pins the honest third answer — a build string
      naming a commit this checkout does not have leaves the direction
      unresolved, and the alarm says so instead of guessing.
+  H. A DIRECTION FLIP IS AN EDGE. `drift` now carries two opposite remedies, so
+     the alarm latch cannot key on state alone: a checkout that was behind the
+     daemon and is then pulled past it changes the instruction without changing
+     the state, and a state-only latch reports that as nothing at all.
 
 Hermetic: the stub is a local HTTP server on an ephemeral port; the source
 side of the comparison is the real checkout this test runs in (CI checkouts
@@ -342,6 +346,9 @@ def check_direction_cases(only: str | None = None) -> None:
             finally:
                 stub.stop()
 
+    if not only or "H".startswith(only):
+        check_direction_flip()
+
     if only and not "G".startswith(only):
         return
     # G. DIVERGENT IS UNRESOLVABLE FOR A SECOND REASON. B's pair is unorderable
@@ -365,6 +372,63 @@ def check_direction_cases(only: str | None = None) -> None:
                 # reporting.
                 read_until(proc, "DAEMON state=drift")
                 assert proc.poll() is None, "watcher stopped on a divergent pair"
+            finally:
+                stop(proc)
+        finally:
+            stub.stop()
+
+
+def check_direction_flip() -> None:
+    # H. A DIRECTION FLIP INSIDE state=drift MUST EMIT A SECOND EDGE.
+    # Found by kimi-code reviewing #176 and reproduced here. The alarm latch used
+    # to key on STATE alone, which was lossless only while `drift` had one reason.
+    # Giving it two opposite remedies made the latch swallow the transition
+    # between them: `source-behind-daemon` fires, the checkout is then pulled past
+    # the daemon's build, and "rebuild+restart required" — the instruction the
+    # whole direction resolver exists to deliver — never reaches the log. Only the
+    # hourly gauge carried it, and "the gauge showed it" is the dead-fire shape
+    # one layer down.
+    #
+    # This is CBP's standing scenario rather than a corner: the shared checkout is
+    # routinely behind the deployed daemon, so every watcher restart latches on
+    # source-behind-daemon first, and the next sibling merge is the flip.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "checkout"
+        _older, newer = synthetic_checkout(root)
+        # A third commit ON TOP of `newer`, so the daemon's build stays an
+        # ancestor of it and the second pair resolves as daemon-behind-source
+        # rather than as a divergent (unresolvable) pair.
+        (root / "marker2").write_text("third\n")
+        git(root, "add", "-A")
+        git(root, "commit", "-qm", "third, past the daemon's build")
+        past = git(root, "describe", "--tags", "--always", "--dirty")
+        git(root, "reset", "--hard", "-q", "HEAD~2")  # phase 1: checkout is behind
+
+        stub = StubDaemon(version=f"0.0.3 ({newer})")
+        try:
+            proc = start(Path(td) / "home", stub.endpoint,
+                         watcher=root / "plugins" / "member-mesh" / WATCHER.name)
+            try:
+                first = read_until(proc, "DAEMON DRIFT")
+                assert "reason=source-behind-daemon" in first, first
+                assert "pull the checkout" in first, first
+
+                # The checkout moves past the daemon's build. State does not
+                # change — it is `drift` on both sides of this line — so only a
+                # latch that remembers the REASON can see anything happen.
+                git(root, "reset", "--hard", "-q", past)
+                second = read_until(
+                    proc, "DAEMON DRIFT",
+                    accept=lambda line: "daemon-behind-source" in line,
+                )
+                assert "rebuild+restart required" in second, second
+                # And the gauge agrees with the edge, so the two instruments are
+                # not reporting different worlds.
+                gauge = read_until(
+                    proc, "DAEMON state=drift",
+                    accept=lambda line: "reason=daemon-behind-source" in line,
+                )
+                assert f"source={past}" in gauge, gauge
             finally:
                 stop(proc)
         finally:
