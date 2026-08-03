@@ -219,6 +219,13 @@ _GOVERNANCE_FILES = (
     "witness.py",
     "law_inject.py",
     "hestia_gate_core.py",
+    # The EXEMPTION LEDGER is a policy artifact too (codex NOT-SAME review of #175).
+    # `gate_self_protection_test.py` holds `EXEMPT`, the list of shared files allowed to
+    # escape the guard. Outside this tuple, the bypass was one unescalated write: add a new
+    # decider to `plugins/_shared/`, add its name to EXEMPT, and every check passes. Its own
+    # comment claimed adding an exemption was "as hard as adding a rule" while the code made
+    # it free — an aspirational claim a reader would have trusted.
+    "gate_self_protection_test.py",
 )
 
 

@@ -29,6 +29,19 @@ answer "does this decide anything?"
 Same instrument class as `core/tests/member_presence_census.rs`, and the same caveat: a green
 here means the enumeration has not changed since a person last looked. It is a fact about
 attention, not about safety.
+
+SCOPE — READ THIS BEFORE CITING A GREEN
+---------------------------------------
+**This protects against writes judged by the CLAUDE adapter, and only that adapter.** (codex
+NOT-SAME review of #175, finding 2.) `_SELF_MARKERS` and `_GOVERNANCE_FILES` exist in exactly
+one gate in the tree. kimi, codex, gemini and cursor run scope and egress checks and have **no
+self-protection mechanism at all**, so there is nothing to extend this list into — and adding
+one per adapter would be a fifth copy of the thing the shared core exists to eliminate.
+
+So a member on another harness can write `hestia_gate_core.py` today and this test will still
+be green, because it is green about the Claude adapter's rule and says nothing about theirs.
+The gap is real, permanent until the shims land, and stated here rather than left for a reader
+to infer coverage this file does not have.
 """
 from __future__ import annotations
 
@@ -42,8 +55,17 @@ HOOK = os.path.join(REPO, "plugins", "claude-code", "hooks", "pre_tool_use.py")
 SHARED = os.path.join(REPO, "plugins", "_shared")
 
 # Files under plugins/_shared/ that do NOT decide policy, each with the reason it is safe.
-# Adding a name here is a judgement someone made; it should be as hard to add as it is to
-# add a rule, which is why it lives in the test rather than in a glob.
+#
+# THIS LEDGER IS A POLICY ARTIFACT, AND IT MUST BE PROTECTED LIKE ONE (codex NOT-SAME review
+# of #175, finding 1). The first version said adding a name here "should be as hard to add as
+# it is to add a rule" — and it was not. This file sat outside `_GOVERNANCE_FILES` and outside
+# the hook-directory markers, so an actor could add a new shared decider AND exempt it here,
+# in one unescalated write, and the guard would pass. The claim was aspirational and the code
+# contradicted it, which is worse than not making the claim: a reader trusts the sentence.
+#
+# `gate_self_protection_test.py` is now in `_GOVERNANCE_FILES`, and
+# `test_the_exemption_ledger_is_itself_protected` below asserts it stays there. Editing this
+# list is now a governed write, which is what the sentence always said it was.
 EXEMPT = {
     "test_gate_core.py": "a test of the core, not a decider; editing it cannot change a verdict "
                          "reached at runtime — only whether the build notices",
@@ -116,6 +138,39 @@ def test_every_shared_file_is_protected_or_exempted():
           f"to EXEMPT here WITH the reason.")
 
 
+def test_the_exemption_ledger_is_itself_protected():
+    """codex #175 finding 1. A ledger that decides what escapes the guard is a policy
+    artifact, and an unprotected one is a bypass with paperwork.
+
+    Without this, the attack is one write: add `decider.py` to `plugins/_shared/`, add
+    `"decider.py": "not a decider, honest"` to EXEMPT, and every check here passes."""
+    g = _governance_files()
+    me = os.path.basename(__file__)
+    check("exemption_ledger_is_protected", me in g,
+          f"{me} holds EXEMPT, which decides what escapes this guard, and is not in "
+          f"_GOVERNANCE_FILES. An actor could add a shared decider and exempt it in the same "
+          f"unescalated write.")
+
+
+def test_the_scope_of_this_protection_is_stated_honestly():
+    """codex #175 finding 2. This protects against writes judged by the CLAUDE adapter only.
+
+    `_SELF_MARKERS` / `_GOVERNANCE_FILES` exist in exactly one gate. kimi, codex, gemini and
+    cursor have scope and egress checks but no self-protection mechanism at all, so there is
+    nothing to extend the list into — and inventing one per adapter is precisely the
+    five-copies problem the shared core exists to end.
+
+    The limitation is therefore real and permanent until the shims land, and the honest
+    response is to SAY so rather than let the PR read as universal protection. This test
+    exists so the claim cannot quietly drift back to 'protected' — it asserts the docs still
+    admit the gap."""
+    doc = sys.modules[__name__].__doc__ or ""
+    for phrase in ("claude", "adapter"):
+        check(f"scope_note_mentions_{phrase}", phrase in doc.lower(),
+              "the module docstring must state that this protection is enforced only by the "
+              "Claude adapter, so a reader does not infer fleet-wide coverage")
+
+
 def test_exemptions_carry_reasons():
     """An exemption without a stated reason is indistinguishable from an oversight."""
     thin = sorted(k for k, v in EXEMPT.items() if len(v.strip()) < 20)
@@ -136,6 +191,8 @@ def test_exemptions_are_not_stale():
 if __name__ == "__main__":
     print("gate self-protection")
     test_the_shared_core_is_protected()
+    test_the_exemption_ledger_is_itself_protected()
+    test_the_scope_of_this_protection_is_stated_honestly()
     test_every_shared_file_is_protected_or_exempted()
     test_exemptions_carry_reasons()
     test_exemptions_are_not_stale()
