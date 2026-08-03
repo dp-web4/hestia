@@ -2245,13 +2245,30 @@ fn mesh_kinds() -> Vec<String> {
 fn mesh_kinds_from(hub_mesh_dir: Option<&str>) -> Vec<String> {
     if let Some(dir) = hub_mesh_dir {
         if let Ok(text) = std::fs::read_to_string(std::path::Path::new(dir).join("KINDS")) {
-            // Mirror the shell's `grep -Ev '^[[:space:]]*(#|$)'`: drop blank and
-            // comment lines (kind lines carry no inline comments).
+            // Mirror the shell end EXACTLY:
+            //   grep -Ev '^[[:space:]]*(#|$)' | sed 's/[[:space:]]*#.*$//'
+            //
+            // The second clause was missing here, and the comment claimed "kind lines carry
+            // no inline comments". They do now — the vocabulary gained fractal roots
+            // documented in place (`review  # review.request | review.request.pr`). So this
+            // end parsed the whole line as one entry, matched nothing, and would have failed
+            // the sender CLOSED on every legitimate kind for any host that set HUB_MESH_DIR
+            // — which is the documented way to put all three ends on one source.
+            //
+            // It never fired because HUB_MESH_DIR is unset wherever we emit, so the embedded
+            // mirror was used and worked: a reconciliation mechanism that would break the
+            // moment anyone used it, sitting unused.
             let kinds: Vec<String> = text
                 .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(str::to_string)
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.is_empty() && !t.starts_with('#')
+                })
+                .map(|l| match l.find('#') {
+                    Some(i) => l[..i].trim().to_string(),
+                    None => l.trim().to_string(),
+                })
+                .filter(|l| !l.is_empty())
                 .collect();
             if !kinds.is_empty() {
                 return kinds;
@@ -2273,7 +2290,37 @@ fn validate_mesh_kind(kind: &str) -> AnyResult<()> {
 /// the same reason as `mesh_kinds_from`: tests must not need to mutate the
 /// shared process environment to reach a specific vocabulary.
 fn validate_mesh_kind_in(kinds: &[String], kind: &str) -> AnyResult<()> {
-    if !kinds.iter().any(|k| k == kind) {
+    // PREFIX ACCEPTANCE, matching the receive gate's `case "$kind" in "$entry".*)`.
+    //
+    // Kinds are fractal (dp, 2026-07-24): each dotted segment NARROWS the one before it, so
+    // allowing `review` admits `review.request.pr` with no vocabulary edit and no receiver
+    // restart. This end compared with `==` only, so it would have refused to SEND a
+    // specialization the receiver would happily ACCEPT — a false-closed that silently caps
+    // the vocabulary at its roots and makes the fractal scheme unusable from hestia.
+    //
+    // A segment boundary is required: `reviewer` is NOT a child of `review`. Matching on a
+    // bare string prefix would turn a narrowing rule into a substring rule, which is how an
+    // allowlist quietly becomes a suffix wildcard.
+    // SHAPE GATE FIRST, mirroring the receive end's:
+    //     ''|*[!A-Za-z0-9._-]*)  -> charset
+    //     .*|*.)                 -> no empty leading/trailing segment
+    //     *..*)                  -> no empty interior segment
+    // Without it `review.` prefix-matches `review` and is admitted, which is a malformed
+    // kind the receiver would refuse — the sender's gate must not be laxer than the gate it
+    // is predicting, or its whole purpose (never emit what will be silently consumed) is
+    // inverted into emitting what will be silently dropped.
+    let well_formed = !kind.is_empty()
+        && kind
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        && !kind.starts_with('.')
+        && !kind.ends_with('.')
+        && !kind.contains("..");
+    let accepted = well_formed
+        && kinds
+            .iter()
+            .any(|k| k == kind || kind.strip_prefix(k.as_str()).is_some_and(|r| r.starts_with('.')));
+    if !accepted {
         anyhow::bail!(
             "unknown mesh kind '{kind}' — receivers' KINDS gate would silently drop \
              (and consume) it. valid kinds: {}",
@@ -3302,6 +3349,75 @@ mod member_key_source_tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("32 bytes"), "unexpected error: {err}");
+    }
+
+    /// The single-source mechanism must actually work when it is used.
+    ///
+    /// `mesh_kinds_from` reads `$HUB_MESH_DIR/KINDS` so all three ends share one
+    /// vocabulary, and its comment asserted "kind lines carry no inline comments". They do
+    /// now — the file gained fractal roots documented inline:
+    ///
+    ///     review              # review.request | review.request.pr | review.done
+    ///
+    /// The shell end strips those (`sed 's/[[:space:]]*#.*$//'`); this end did not, so a
+    /// host that set `HUB_MESH_DIR` — the documented way to keep the ends on one source —
+    /// would parse the entry as the WHOLE LINE, match nothing, and have `validate_mesh_kind`
+    /// fail closed on every legitimate kind. The sender aborts before emitting.
+    ///
+    /// It has never fired because `HUB_MESH_DIR` is unset on the machines that emit, so the
+    /// embedded mirror is used and works. A reconciliation mechanism that would break if
+    /// anyone used it, sitting unused — which is why this asserts PARITY WITH THE SHELL
+    /// rather than merely that parsing returns something.
+    #[test]
+    fn kinds_file_parses_exactly_as_the_shell_end_does() {
+        use super::mesh_kinds_from;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("KINDS"),
+            "# header comment\n\
+             \n\
+             review              # review.request | review.request.pr\n\
+             coordination        # general work coordination\n\
+             plan\n\
+             \t ack \t# terminal\n",
+        )
+        .unwrap();
+        let got = mesh_kinds_from(Some(dir.path().to_str().unwrap()));
+        assert_eq!(
+            got,
+            vec!["review", "coordination", "plan", "ack"],
+            "parsed vocabulary must equal what `grep -Ev '^[[:space:]]*(#|$)' | \
+             sed 's/[[:space:]]*#.*$//'` yields — an inline comment carried into an entry \
+             makes every kind unknown and fails the sender closed"
+        );
+    }
+
+    /// Fractal kinds must be accepted by prefix, as the receive gate accepts them.
+    ///
+    /// The shell gate matches `"$entry".*` so allowing `review` admits `review.request.pr`
+    /// without a vocabulary edit or a receiver restart (dp, 2026-07-24: kinds are fractal,
+    /// each segment narrows the one before it). This end compared with `==` only, so it
+    /// would refuse to SEND a specialization the receiver would happily ACCEPT — a
+    /// false-closed that silently caps the vocabulary at its roots.
+    #[test]
+    fn a_specialization_is_accepted_by_its_root_like_the_receive_gate() {
+        use super::{mesh_kinds_from, validate_mesh_kind_in};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("KINDS"), "review\nforum\nack\n").unwrap();
+        let kinds = mesh_kinds_from(Some(dir.path().to_str().unwrap()));
+        for k in ["review", "review.request", "review.request.pr", "forum.note"] {
+            assert!(
+                validate_mesh_kind_in(&kinds, k).is_ok(),
+                "the receive gate accepts `{k}` by prefix; the sender must not refuse it"
+            );
+        }
+        // Prefix acceptance must not become substring acceptance.
+        for k in ["reviewer", "review.", ".review", "reviewx.y"] {
+            assert!(
+                validate_mesh_kind_in(&kinds, k).is_err(),
+                "`{k}` is not a fractal child of any root and must be refused"
+            );
+        }
     }
 
     #[test]
