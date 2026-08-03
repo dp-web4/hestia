@@ -117,6 +117,71 @@ def test_the_shared_core_is_protected():
           "land it is the ONLY file an attacker needs.")
 
 
+def _load_hook():
+    """Load the hook as a module so its matcher can be CALLED.
+
+    The AST reader above is deliberate and stays: an enumeration assertion must not execute
+    the thing it audits. But the assertion below is about whether the rule FIRES, and there
+    is no way to observe a guard firing without running it. The two are different questions
+    and want different instruments — the mistake this file shipped with was answering the
+    second question with the first one's tool.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_gate_under_test", HOOK)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_the_shared_core_write_is_actually_refused():
+    """kimi-code NOT-SAME review of #175, D1+D2. The regression the membership test cannot see.
+
+    `test_the_shared_core_is_protected` asserts membership in a tuple. That passed while the
+    rule could not fire at the protected file, because `_touches_self` gates the filename loop
+    behind `if "hooks/" in low or "/hooks" in low` — and `plugins/_shared/hestia_gate_core.py`
+    carries no `hooks` segment. A green identical to the null state, guarding the exact
+    consolidation the file's own docstring calls the sharp case.
+
+    So: assert the executable property. Each payload below must return a marker, not None.
+    """
+    mod = _load_hook()
+    touches = mod._touches_self
+    cases = [
+        ("Write", {"file_path": "plugins/_shared/hestia_gate_core.py", "content": "x"},
+         "the canonical policy core, written by relative path"),
+        ("Write", {"file_path": os.path.join(SHARED, "hestia_gate_core.py"), "content": "x"},
+         "the canonical policy core, written by absolute path"),
+        ("Edit", {"file_path": "plugins/_shared/hestia_gate_core.py",
+                  "old_string": "a", "new_string": "b"},
+         "the same file reached by Edit rather than Write"),
+        ("Bash", {"command": "sed -i s/x/y/ plugins/_shared/hestia_gate_core.py"},
+         "the same file reached through the shell"),
+        ("Write", {"file_path": "plugins/claude-code/tests/gate_self_protection_test.py",
+                   "content": "x"},
+         "the EXEMPTION LEDGER — in _GOVERNANCE_FILES, but tests/ has no hooks segment "
+         "either, so the ledger protecting the guard was itself unguarded"),
+    ]
+    for tool, payload, why in cases:
+        marker = touches(tool, payload)
+        check(f"refused__{tool}__{why[:40]}", marker is not None,
+              f"_touches_self returned None. {why}. The write proceeds with no escalation "
+              f"and no gate_self_access witness.")
+
+
+def test_the_hooks_dir_qualifier_is_a_subset_of_the_governed_names():
+    """The weakening list must not drift away from the list it weakens.
+
+    `_HOOKS_DIR_ONLY` names the governance filenames common enough that matching them
+    anywhere would fire on ordinary work. A name there that is NOT in `_GOVERNANCE_FILES`
+    weakens nothing and reads as if it did — and the default for a newly governed name is
+    the STRONG behaviour, so weakening always costs a second, visible edit."""
+    mod = _load_hook()
+    weak = set(getattr(mod, "_HOOKS_DIR_ONLY", ()))
+    g = _governance_files()
+    check("hooks_dir_qualifier_is_a_subset", weak <= g,
+          f"{sorted(weak - g)} are qualified by hooks-dir but are not governed names at all")
+
+
 def test_every_shared_file_is_protected_or_exempted():
     """The scheduled judgement. A new file under plugins/_shared/ is red until someone
     decides whether it decides."""
@@ -191,6 +256,8 @@ def test_exemptions_are_not_stale():
 if __name__ == "__main__":
     print("gate self-protection")
     test_the_shared_core_is_protected()
+    test_the_shared_core_write_is_actually_refused()
+    test_the_hooks_dir_qualifier_is_a_subset_of_the_governed_names()
     test_the_exemption_ledger_is_itself_protected()
     test_the_scope_of_this_protection_is_stated_honestly()
     test_every_shared_file_is_protected_or_exempted()
