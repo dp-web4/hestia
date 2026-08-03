@@ -220,10 +220,36 @@ done
 UNANSWERED_EVERY="${UNANSWERED_EVERY:-3600}"   # journal cadence, seconds
 STALE_AFTER="${STALE_AFTER:-21600}"            # a notice is stale at 6h unbound
 
+# THE WATCHER IS NOT THE MEMBER (F3, CBP notice 699/701/702 thread, 2026-08-03).
+# `mesh_rpc` connects with the watched member's `plugin_id` and, until now, no
+# `role` — so the daemon failed it closed to `role:constellation:member` (PR #66's
+# defect, fixed on the member path and never applied to the watcher's own RPC).
+# Every act this gateway performed was therefore filed under the member it
+# watches, at a role the member did not declare: kimi's trust record carries
+# reports kimi never wrote, and on the chain an unreachable report was
+# indistinguishable from the member itself replying.
+#
+# `mesh-worker` is the published role for exactly this capacity
+# (`reputation::KNOWN_CONSTELLATION_ROLES`), so declaring it needs no daemon
+# change — it turns an ACCIDENTAL discriminator into a designed one. Measured on
+# CBP the same day: over the chain's whole member_notice population (695 rows,
+# positions 1..89974) all 27 non-delivery reports carried the defaulted `member`
+# role, which is why the accident worked; it is still only an accident, because
+# `role` is caller-supplied and any member that loses `HESTIA_ROLE` collides with
+# it silently. Do NOT build a detector on this field alone (see the note on the
+# `#undelivered:` marker at `report_unreachable`) — the durable fix is a reserved
+# KIND for a non-delivery report, which is vocabulary work in KINDS.md.
+#
+# `plugin_id` is still the member's: the watcher genuinely acts on that member's
+# mailbox, and a distinct gateway identity is a daemon-side enrolment question.
+# Role is the one grain the watcher can correct today, from its own side.
+WATCH_ROLE="${HESTIA_WATCH_ROLE:-role:constellation:mesh-worker}"
+
 mesh_rpc() {
-python3 - "$PLUGIN" "$HOST_AGENT" "$EP" "$1" "${2:-}" <<'PY'
+python3 - "$PLUGIN" "$HOST_AGENT" "$EP" "$1" "${2:-}" "$WATCH_ROLE" <<'PY'
 import json, sys, urllib.request
 plugin, host_agent, ep, tool, extra = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+watch_role = sys.argv[6]
 def post(payload, hdrs={}):
     req = urllib.request.Request(ep, data=json.dumps(payload).encode(),
         headers={"Content-Type":"application/json","Accept":"application/json, text/event-stream",**hdrs})
@@ -236,9 +262,24 @@ def rpc(h, name, args):
 _, sid = post({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"hestia-watch","version":"1"}}})
 h = {"mcp-session-id": sid} if sid else {}
 post({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}, h)
-c = rpc(h, "hestia_connect", {"plugin_id": plugin, "host_agent": host_agent, "instance_name": f"watch-{plugin}"})
+c = rpc(h, "hestia_connect", {"plugin_id": plugin, "host_agent": host_agent,
+                              "instance_name": f"watch-{plugin}", "role": watch_role})
 s = c.get("sessionId") or c.get("session_id")
 if not s: print(json.dumps({"error": c})); raise SystemExit(1)
+# Declaring a role and having it TAKE are different events: an unpublished string
+# normalizes to role:constellation:member and the connect succeeds identically, so
+# "it connected" never verified the grain (handler.rs: "kimi-code's role repair was
+# live-verified by a connect that answers — which it does either way"). The daemon
+# echoes the outcome in `roleDeclarationHonored`/`constellationRole`; those are the
+# key names to read — a guard spelled `role`/`role_lct` matches nothing the daemon
+# sends and never fires, which is how this check was first written here. Verified
+# against the live daemon 2026-08-03: mesh-worker comes back honored=true.
+# STDERR, never stdout — every caller of mesh_rpc parses stdout as JSON. Older
+# daemons omit the field entirely (None); stay quiet rather than warn on all of them.
+if c.get("roleDeclarationHonored") is False:
+    print(f"[hestia-watch] WARNING: declared role {watch_role} did NOT survive connect "
+          f"(daemon reports {c.get('constellationRole')!r}) — this gateway's acts are "
+          f"filing under the watched member's grain", file=sys.stderr)
 args = {"session_id": s}
 if extra:
     args.update(json.loads(extra))
