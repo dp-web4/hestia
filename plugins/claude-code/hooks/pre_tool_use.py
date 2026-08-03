@@ -195,12 +195,30 @@ _SELF_MARKERS = (
 # well as mine. An agent editing ANOTHER member's gate is not a lesser act — it
 # is disarming an entity that did not consent, and the record would name the
 # victim rather than the author.
+#
+# `hestia_gate_core.py` added 2026-08-03, on the same reasoning one step ahead of it.
+# PR #169 landed the shared policy core — the file that is to BECOME the single gate for
+# all five harnesses, with the per-harness hooks reduced to adapter shims. It matched
+# nothing here and nothing in `_SELF_MARKERS`, so the whole PR was written unrefused. That
+# was verified by writing it, and disclosed in the PR rather than used.
+#
+# The failure mode consolidation creates: today, disarming the gate means editing five
+# files and tripping this rule five times. After the shims land it means editing ONE file
+# — and if that file is outside the rule, consolidation will have moved the entire policy
+# surface somewhere unguarded while every per-harness protection still reads as intact.
+# The rule would be green about five shims that no longer decide anything.
+#
+# Filename-anywhere is the right mechanism and not merely the convenient one: shims will
+# import the core from several locations, so a directory marker would miss it — and the
+# rationale directly above ("so this holds for a peer's copy as well as mine") is exactly
+# the property needed when one file governs five members.
 _GOVERNANCE_FILES = (
     "pre_tool_use.py",
     "society_pre_tool_use.py",
     "post_tool_use.py",
     "witness.py",
     "law_inject.py",
+    "hestia_gate_core.py",
 )
 
 
