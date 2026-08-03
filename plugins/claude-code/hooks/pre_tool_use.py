@@ -676,7 +676,53 @@ ESCALATION_RPC_TIMEOUT_S = 5.0
 ESCALATION_RPC_TIMEOUT_S = 1.5
 
 
-def request_self_write(marker: str, tool_name: str) -> Tuple[str, str]:
+def _attempted_summary(tool_name: str, tool_input: Any) -> str:
+    """WHAT was attempted, in one bounded line, for the human who has to rule on it.
+
+    dp, 2026-08-03, after approving several in a row: *"the issue remains that they don't
+    tell me what i'm approving or why. they just say 'no reason'."* The dashboard renders
+    `why: (none stated — decide on the payload alone)` and then shows no payload.
+
+    They said no reason because nothing ever sent one. The daemon has accepted
+    `stated_reason` / `stated_detail` on the claim path since 2026-08-02 and this hook has
+    never populated them — the call sent `plugin_id`, `role`, `tool_name`, `marker` and
+    stopped. So an operator saw `Edit` and a directory name and was asked to decide, which
+    is identical whether the command was `sed -n '470,520p'` or `rm -rf`. A live channel
+    with nothing in it.
+
+    kimi's and codex's gates already send an attempted summary — it is why kimi's denials
+    render with the full command and this member's do not. **This is the drift the shared
+    core exists to end, and it drifted in the direction that costs the operator.** Written
+    here rather than only in `hestia_gate_core.py` because the core is not wired yet and
+    the cost is being paid now; when the shims land it belongs on `Verdict` and this copy
+    should go with the rest of the duplication.
+
+    BOUNDED AND SELF-CENSORING. Truncated hard, because an escalation body is read by a
+    human under interruption. Redacted on credential-shaped tokens, because a refusal is not
+    a licence to copy a payload into the witness chain: an egress deny is ABOUT a secret
+    path, so verbatim echo would reproduce the protected thing inside a record that is
+    deliberately easier to read than the file was.
+    """
+    if not isinstance(tool_input, dict):
+        return f"{tool_name} (no inspectable input)"
+    raw = tool_input.get("command")
+    if not isinstance(raw, str):
+        for k in ("file_path", "path", "notebook_path"):
+            v = tool_input.get(k)
+            if isinstance(v, str):
+                return f"{tool_name} -> {v[-140:]}"
+        return f"{tool_name} (no command or path in input)"
+    s = " ".join(raw.split())
+    low = s.lower()
+    for token in ("id_rsa", "id_ed25519", ".env", "credential", "secret",
+                  "token", "passphrase", "api_key", "apikey"):
+        if token in low:
+            return (f"{tool_name} [REDACTED — names a credential-shaped token; "
+                    f"{len(s)} chars withheld rather than copied into the record]")
+    return f"{tool_name}: {s[:220]}" + (" …" if len(s) > 220 else "")
+
+
+def request_self_write(marker: str, tool_name: str, attempted: str = "") -> Tuple[str, str]:
     """One round trip. Returns (verdict, detail); only 'approved' permits the write.
 
     THIS FUNCTION NEVER WAITS, and that is the whole design. The harness kills this hook at 5
@@ -703,6 +749,22 @@ def request_self_write(marker: str, tool_name: str) -> Tuple[str, str]:
             "role": os.environ.get("HESTIA_ROLE", ""),
             "tool_name": tool_name,
             "marker": marker,
+            # WHAT was attempted. The daemon has accepted these two since 2026-08-02 and
+            # this call never sent them, which is why every escalation rendered
+            # "why: (none stated — decide on the payload alone)" and then displayed no
+            # payload. dp, 2026-08-03: "they don't tell me what i'm approving or why."
+            #
+            # `reason` carries the ATTEMPTED ACT, not a rationale, and the distinction is
+            # deliberate: an auto-opened escalation HAS no stated why, because the member
+            # did not choose to escalate — the gate opened it on their behalf after a deny.
+            # Presenting the act as though it were a rationale would be worse than silence,
+            # because it would look like the member had explained itself. A member that
+            # wants to state a why calls `hestia_gate_escalation_open` and supplies one.
+            "reason": attempted or f"{tool_name} -> {marker}",
+            "detail": (
+                "Auto-opened by the gate on a refused write; the member stated no rationale "
+                "because it did not choose to escalate. Approving authorises this one write."
+            ),
         })
     except Exception as e:  # noqa: BLE001
         return "unreachable", f"no answer from the daemon ({type(e).__name__}) -- refused"
@@ -1210,7 +1272,9 @@ def main() -> int:
             _witness_self_read(_self_marker, tool_name)
             debug_log(f"gate-self-read (allowed, witnessed): {tool_name} -> {_self_marker}")
         else:
-            verdict, detail = request_self_write(_self_marker, tool_name)
+            verdict, detail = request_self_write(
+                _self_marker, tool_name, _attempted_summary(tool_name, tool_input)
+            )
             if verdict != "approved":
                 debug_log(f"gate-self-write {verdict}: {detail}")
                 return deny_self_access(_self_marker, tool_name)
