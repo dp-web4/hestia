@@ -225,13 +225,42 @@ impl ServerHandler for HestiaServer {
 // =========================================================================
 
 fn hestia_tools() -> Vec<Tool> {
-    fn t(name: &'static str, description: &'static str) -> Tool {
-        let schema = json!({"type": "object", "additionalProperties": true});
-        let schema_obj = match schema {
+    fn schema_of(schema: Value) -> Arc<serde_json::Map<String, Value>> {
+        Arc::new(match schema {
             Value::Object(m) => m,
             _ => serde_json::Map::new(),
-        };
-        Tool::new(name, description, Arc::new(schema_obj))
+        })
+    }
+    fn t(name: &'static str, description: &'static str) -> Tool {
+        Tool::new(
+            name,
+            description,
+            schema_of(json!({"type": "object", "additionalProperties": true})),
+        )
+    }
+    /// A tool that actually declares its arguments.
+    ///
+    /// `t` above advertises `{"type":"object","additionalProperties":true}` with ZERO
+    /// properties for every tool on this surface, which means an MCP client is told
+    /// each one takes no arguments at all. Nothing is validated and, worse, nothing is
+    /// *offered*: a caller composing a call has only the description to go on, so an
+    /// argument the description omits is an argument that does not exist as far as the
+    /// caller can tell. A key it then guesses wrong is silently discarded.
+    ///
+    /// That is not hypothetical. `hestia_member_notify` never named `pointer_uri` in
+    /// its description, and the only 2 pointerless notices in the 743 this mesh has
+    /// carried (chain 89885 and 90855, 2026-08-03) were both composed against this
+    /// empty schema, from two different sessions, by a caller that had no prompt to
+    /// include the one field that carries the payload.
+    ///
+    /// Deliberately narrow: only `hestia_member_notify` is declared here. Doing the
+    /// whole surface is the right end state and a much larger change — every tool's
+    /// real argument set would have to be read off its handler and kept in sync, and
+    /// getting one wrong ADVERTISES a lie, which is worse than advertising nothing.
+    /// `additionalProperties` stays `true` even here, so this only ever adds
+    /// information; it cannot refuse a call the handler would have accepted.
+    fn t_args(name: &'static str, description: &'static str, schema: Value) -> Tool {
+        Tool::new(name, description, schema_of(schema))
     }
 
     vec![
@@ -327,9 +356,46 @@ fn hestia_tools() -> Vec<Tool> {
             "hestia_notify",
             "Receive a hub->citizen notification: open the sealed body, record receipt, return a sealed ACK. Pass defer:true to park it (still sealed) in the durable encrypted inbox and ACK without returning the body",
         ),
-        t(
+        t_args(
             "hestia_member_notify",
-            "Send a witnessed, pointer-based wake notice to another LOCAL member (fractal mesh; kinds mirror hub-mesh). Pass in_reply_to:<notice id> to bind a disposition (reply/ack/review_done) to the notice it answers. The receipt reports recipient_liveness (live/dormant/unknown) — 'unknown' means nothing on this mesh is known to deliver it, usually a fleet member addressed locally",
+            "Send a witnessed, pointer-based wake notice to another LOCAL member (fractal mesh; kinds mirror hub-mesh). The notice carries NO content: post the content first, then point at it with pointer_uri — a notice without a pointer wakes the recipient with nothing to act on and is refused. Pass in_reply_to:<notice id> to bind a disposition (reply/ack/review_done) to the notice it answers. The receipt reports recipient_liveness (live/dormant/unknown) — 'unknown' means nothing on this mesh is known to deliver it, usually a fleet member addressed locally",
+            json!({
+                "type": "object",
+                "additionalProperties": true,
+                "required": ["to_plugin_id", "kind", "pointer_uri"],
+                "properties": {
+                    "to_plugin_id": {
+                        "type": "string",
+                        "description": "Recipient member id. A bare id stays on this local mesh; `peer/member` routes to a member on another machine via the forwarding plane."
+                    },
+                    "kind": {
+                        "type": "string",
+                        // Exact match, NOT prefix (kimi review of notice 764, F2): the
+                        // handler is `MEMBER_NOTICE_KINDS.contains(&kind)`, so a caller
+                        // told it could send `review_request.pr` gets refused. Fractal
+                        // kind-roots are a real design on the fleet hub-mesh and are not
+                        // implemented on this local surface — advertising them here is
+                        // the exact failure this schema exists to end: a description that
+                        // promises an argument shape the handler does not honor.
+                        "description": "Notice kind (see plugins/member-mesh/KINDS.md). Matched exactly against the enum below; this surface does not accept prefixed specializations.",
+                        "enum": MEMBER_NOTICE_KINDS
+                    },
+                    "pointer_uri": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_POINTER_URI_BYTES,
+                        "description": "REQUIRED. Where the content lives — a repo path, a path#fragment, a URL, or a hestia:// URI. It NAMES a location and never carries content: single line, no control characters. This is the notice's entire payload."
+                    },
+                    "in_reply_to": {
+                        "type": "integer",
+                        "description": "Id of the notice this one answers. Expected on reply/ack/review_done — without it your response does not clear the sender's `unanswered` row. You may only bind to mail addressed to you."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Your own live session_id from hestia_connect. Attribution is never inherited: an unattributable sender cannot notify another member."
+                    }
+                }
+            }),
         ),
         t(
             "hestia_member_inbox",
@@ -3390,24 +3456,80 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             Some(json!({"kind": kind})),
         ));
     }
-    let pointer_uri = optional_string(args, "pointer_uri");
+    // A pointer is the notice's entire payload, so its ABSENCE was the one
+    // malformation this guard let through. Every tool on this surface declares
+    // `additionalProperties: true` with zero declared properties, so a misspelled key
+    // — `pointer`, `pointer_url`, `uri` — is not a usage error any caller hears about:
+    // it is dropped on the floor and the send SUCCEEDS, queueing a notice with nothing
+    // in it. The recipient wakes, finds nothing at no pointer, and pays for the
+    // sender's typo. Measured on this mesh, in BOTH id-spaces because the two do not
+    // join (kimi review of notice 764, F4): notices 700, 747 and 760 in the inbox's
+    // id-space are chain entries 89885, 90855 and 91523 in the witness chain's — and a
+    // `member_notice` chain entry carries no notice id at all, so the only join is
+    // (from, to, kind, timestamp). All three pointerless, all from claude-code, the
+    // first two terminated by kimi-code acking "nothing at any pointer to act on".
+    // Notice 760 is the one that asked kimi to review THIS guard: it was written at
+    // 06:52Z and sent pointerless at 07:55Z because the running daemon was built at
+    // 00:33Z (f863088) — the defect demonstrated itself through the
+    // committed-not-built-not-running gap, on the notice requesting its own review.
+    //
+    // Deny rather than nudge, deliberately unlike `unbound_notice` below. An UNBOUND
+    // notice still carries its content and can be acted on, so gating it would cost
+    // more than it saves. A POINTERLESS notice cannot be acted on by anyone — "content
+    // lives AT the pointer, never in the notice" (KINDS.md) means a notice without one
+    // has no content — so the only question is which party pays for it, and the sender
+    // is the only party who can fix it. This also makes the guard self-consistent: a
+    // 513-byte pointer was already a hard refusal while a missing one sailed through.
+    //
+    // The received key list rides in the error data because it is the actual
+    // diagnosis for the typo class: `additionalProperties: true` means the daemon saw
+    // the caller's `pointer` and said nothing, and naming it back is what turns a
+    // silent drop into a fix.
+    //
+    // Trimmed before the emptiness test rather than only for it (kimi review of notice
+    // 764, F3): testing `p.trim().is_empty()` while storing `p` refuses "   " and then
+    // accepts and PERSISTS "  forum/x.md " with its padding — the recipient dereferences
+    // a path that does not resolve, for a reason nothing in the record names. The shape
+    // guards below now measure the same bytes the recipient will receive.
+    let pointer_uri = optional_string(args, "pointer_uri")
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    let Some(pointer_uri) = pointer_uri else {
+        let mut received: Vec<&str> = args
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        received.sort_unstable();
+        return Ok(hestia_error_envelope(
+            "hestia.member_notify_missing_pointer",
+            "member_notify requires a non-empty `pointer_uri` — a notice is a WAKE and \
+             the pointer is its whole payload, so one without a pointer wakes the \
+             recipient with nothing to act on. Note that this tool accepts any \
+             argument: a misspelled key (`pointer`, `uri`) was silently discarded \
+             rather than refused. Post the content, then point at it.",
+            Some(json!({"received_keys": received})),
+        ));
+    };
     // Pointer-shape guard (Kimi review 2026-07-24, Finding 3): the fire
     // templates render drained notices into an LLM prompt, so a pointer is a
     // prompt-injection carrier if it can hold newlines or escape sequences.
     // A pointer NAMES a location; it never carries content — enforce that
     // shape here, at enqueue, where every sender passes through.
-    if let Some(p) = &pointer_uri {
-        if p.len() > MAX_POINTER_URI_BYTES || p.chars().any(char::is_control) {
-            return Ok(hestia_error_envelope(
-                "hestia.member_notify_bad_pointer",
-                &format!(
-                    "pointer_uri must be a single-line pointer (≤{MAX_POINTER_URI_BYTES} bytes, \
-                     no control characters) — content lives AT the pointer, never in it"
-                ),
-                Some(json!({"pointer_len": p.len()})),
-            ));
-        }
+    if pointer_uri.len() > MAX_POINTER_URI_BYTES || pointer_uri.chars().any(char::is_control) {
+        return Ok(hestia_error_envelope(
+            "hestia.member_notify_bad_pointer",
+            &format!(
+                "pointer_uri must be a single-line pointer (≤{MAX_POINTER_URI_BYTES} bytes, \
+                 no control characters) — content lives AT the pointer, never in it"
+            ),
+            Some(json!({"pointer_len": pointer_uri.len()})),
+        ));
     }
+    // Re-wrapped rather than threaded through as a plain String: the storage column
+    // stays nullable because the daemon's OWN emitters (`unreachable`) are not routed
+    // through this function, so narrowing the type here would misreport the schema.
+    // Only the member-reachable path is now total.
+    let pointer_uri = Some(pointer_uri);
     let session_id_arg = optional_session_id(args);
     // `in_reply_to` binds this send to the notice it answers. Optional on every
     // kind, expected on reply/ack — a silent parse-failure would make a bound
@@ -6724,8 +6846,15 @@ mod member_mesh_tests {
         let (_dir, state) = test_state().await;
         let _alice = connect(&state, "claude-code").await; // the would-be spoof target
 
+        // The pointer is here so the call REACHES the attribution check. Shape guards
+        // run ahead of it (kind, then pointer), so a pointerless send now stops at
+        // `member_notify_missing_pointer` and this test would pass on the wrong
+        // refusal — green while asserting nothing about attribution.
         for bad_sid in [None, Some("not-a-uuid"), Some("00000000-0000-4000-8000-000000000000")] {
-            let mut args = json!({"to_plugin_id": "kimi-code", "kind": "coordination"});
+            let mut args = json!({
+                "to_plugin_id": "kimi-code", "kind": "coordination",
+                "pointer_uri": "shared-context/forum/x.md"
+            });
             if let Some(sid) = bad_sid {
                 args["session_id"] = json!(sid);
             }
@@ -7062,6 +7191,277 @@ mod member_mesh_tests {
             assert_eq!(
                 out["_hestia_error"]["code"],
                 "hestia.member_notify_bad_pointer"
+            );
+        }
+    }
+
+    /// The absence that the malformation guard above let through. Every tool here
+    /// declares `additionalProperties: true` with zero declared properties, so a
+    /// misspelled pointer key is DISCARDED, not refused — the send succeeded and
+    /// queued a notice with no payload. Measured live: chain 89885 and 90855, both
+    /// `reply`, both claude-code -> kimi-code, 2h53m apart on 2026-08-03, the only 2
+    /// pointerless notices in all 743 the mesh has ever carried.
+    ///
+    /// `pointer` and `uri` are in the table because the typo IS the bug — a guard that
+    /// only catches a wholly absent key still lets the real-world shape through.
+    #[tokio::test]
+    async fn member_notify_refuses_a_pointerless_notice() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "claude-code").await;
+        let kimi = connect(&state, "kimi-code").await;
+
+        for args in [
+            json!({"to_plugin_id": "kimi-code", "kind": "reply", "session_id": sid}),
+            json!({"to_plugin_id": "kimi-code", "kind": "reply", "session_id": sid,
+                   "pointer_uri": ""}),
+            json!({"to_plugin_id": "kimi-code", "kind": "reply", "session_id": sid,
+                   "pointer_uri": "   "}),
+            json!({"to_plugin_id": "kimi-code", "kind": "reply", "session_id": sid,
+                   "pointer_uri": Value::Null}),
+            // The typo class: the daemon saw these and said nothing.
+            json!({"to_plugin_id": "kimi-code", "kind": "reply", "session_id": sid,
+                   "pointer": "shared-context/forum/x.md"}),
+            json!({"to_plugin_id": "kimi-code", "kind": "reply", "session_id": sid,
+                   "uri": "shared-context/forum/x.md"}),
+        ] {
+            let out = tool_member_notify(&state, &args).await.unwrap();
+            assert_eq!(
+                out["_hestia_error"]["code"], "hestia.member_notify_missing_pointer",
+                "accepted a notice with no payload: {args} -> {out}"
+            );
+            assert!(
+                out.get("queued_id").is_none(),
+                "refused but still queued: {args} -> {out}"
+            );
+        }
+
+        // Clause O: the refusal dominates every side effect. Nothing was witnessed and
+        // the recipient's inbox is untouched — a wake that costs the recipient nothing
+        // is the entire point of refusing at the sender.
+        let kimi_mail = tool_member_inbox(&state, &json!({"session_id": kimi}))
+            .await
+            .unwrap();
+        assert_eq!(kimi_mail["total"], json!(0), "a refused send reached the inbox");
+        let s = state.lock().await;
+        assert!(
+            s.recent_chain(50)
+                .into_iter()
+                .all(|e| e.event_type != "member_notice"),
+            "a refused send must not witness a member_notice"
+        );
+    }
+
+    /// The advertisement must match the enforcement. `hestia_member_notify` is the one
+    /// tool on this surface that declares its arguments, and a declared `required` key
+    /// the handler does NOT actually require is a lie told to every MCP client that
+    /// reads the schema — strictly worse than the empty schema it replaced, because a
+    /// caller can act on it. So each advertised-required key is removed in turn from an
+    /// otherwise-valid call and the send must not succeed.
+    ///
+    /// This is the falsifier for the schema, not for the guard: it fails if someone
+    /// adds a `required` entry for convenience, and it fails if someone relaxes a
+    /// handler check while leaving the schema promising it.
+    #[tokio::test]
+    async fn member_notify_enforces_every_argument_its_schema_declares_required() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "claude-code").await;
+
+        let tool = hestia_tools()
+            .into_iter()
+            .find(|t| t.name == "hestia_member_notify")
+            .expect("hestia_member_notify is not on the tool surface");
+        let required: Vec<String> = tool.input_schema["required"]
+            .as_array()
+            .expect("hestia_member_notify must declare a `required` list")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(!required.is_empty());
+
+        let valid = json!({
+            "to_plugin_id": "kimi-code", "kind": "reply",
+            "pointer_uri": "shared-context/forum/x.md", "session_id": sid
+        });
+        // The control: with everything present it goes through, so a failure below is
+        // attributable to the removed key and not to a broken fixture.
+        let out = tool_member_notify(&state, &valid).await.unwrap();
+        assert!(out["queued_id"].is_number(), "fixture does not send: {out}");
+
+        // Both refusal SHAPES count as a refusal here, deliberately, and the split is
+        // worth naming: `pointer_uri` refuses with the `_hestia_error` envelope that
+        // ADR-0005 makes this surface's convention, while `to_plugin_id` and `kind` go
+        // through `require_string` and come back as a transport-level `Err`. Two shapes
+        // for the same class of "you called this wrong" — a pre-existing inconsistency
+        // this test declines to paper over OR to fix, since `require_string` is shared
+        // by most of the surface and converting it is its own change. What is asserted
+        // is the property the schema actually promises: the call does not go through.
+        for key in &required {
+            let mut args = valid.clone();
+            args.as_object_mut().unwrap().remove(key);
+            let refused = match tool_member_notify(&state, &args).await {
+                Err(_) => true,
+                Ok(out) => out.get("queued_id").is_none() && out.get("_hestia_error").is_some(),
+            };
+            assert!(
+                refused,
+                "schema advertises `{key}` as required but the handler accepted its absence"
+            );
+        }
+
+        // And the declared properties must name every argument the handler reads, or
+        // the schema is back to hiding one — which is the whole defect.
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        for key in ["to_plugin_id", "kind", "pointer_uri", "in_reply_to", "session_id"] {
+            assert!(props.contains_key(key), "schema omits the `{key}` argument");
+        }
+    }
+
+    /// The emptiness test and the stored value must measure the same bytes (kimi review
+    /// of notice 764, F3). Testing `p.trim().is_empty()` while storing `p` refuses a
+    /// pointer that is ALL whitespace and then accepts and persists one that is merely
+    /// padded — and a padded pointer is worse than a refused one, because it arrives
+    /// looking well-formed and fails at dereference, in the recipient's session, for a
+    /// reason nothing in the record names.
+    ///
+    /// The recipient's inbox is the assertion surface on purpose: normalizing on the way
+    /// in and denormalizing on the way out would pass any test that only re-read the
+    /// sender's receipt.
+    #[tokio::test]
+    async fn member_notify_stores_the_pointer_the_recipient_will_dereference() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "claude-code").await;
+        let kimi = connect(&state, "kimi-code").await;
+
+        let out = tool_member_notify(
+            &state,
+            &json!({
+                "to_plugin_id": "kimi-code", "kind": "reply", "session_id": sid,
+                "pointer_uri": "  shared-context/forum/x.md#t \t"
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(out["queued_id"].is_number(), "a padded pointer was refused: {out}");
+
+        let mail = tool_member_inbox(&state, &json!({"session_id": kimi}))
+            .await
+            .unwrap();
+        assert_eq!(
+            mail["notices"][0]["pointer_uri"],
+            json!("shared-context/forum/x.md#t"),
+            "the recipient got padding it has to strip itself: {mail}"
+        );
+    }
+
+    /// The `kind` schema advertises exact matching; the handler must not be looser or
+    /// tighter than the enum it publishes (kimi review of notice 764, F2). The schema
+    /// previously told callers kinds were "accepted by prefix, so a specialization like
+    /// review_request.pr needs no vocabulary edit" — true of the fleet hub-mesh, false
+    /// here, where the check is `MEMBER_NOTICE_KINDS.contains(&kind)`. A caller that
+    /// believed the sentence got refused.
+    ///
+    /// Two directions, because a description can drift either way: every kind the schema
+    /// lists must actually send, and a prefixed specialization of a listed kind must
+    /// actually be refused. If fractal kind-roots are implemented here later, this test
+    /// is where that decision has to be made explicitly rather than by a comment.
+    #[tokio::test]
+    async fn member_notify_kind_enum_is_exactly_what_the_handler_accepts() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "claude-code").await;
+
+        let tool = hestia_tools()
+            .into_iter()
+            .find(|t| t.name == "hestia_member_notify")
+            .expect("hestia_member_notify is not on the tool surface");
+        let advertised: Vec<String> = tool.input_schema["properties"]["kind"]["enum"]
+            .as_array()
+            .expect("`kind` must publish an enum")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            advertised,
+            MEMBER_NOTICE_KINDS.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+            "the published enum drifted from the list the handler checks"
+        );
+
+        // The prose, not just the enum. This is the assertion that would have caught the
+        // original defect: the enum was already exact and correct while the description
+        // beside it promised prefix acceptance, and a caller reads the sentence. Keyed on
+        // the word rather than the sentence so a reworded version of the same promise
+        // still trips it — if prefix matching is ever implemented, this line is the
+        // deliberate edit that records the decision.
+        let kind_desc = tool.input_schema["properties"]["kind"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase();
+        assert!(
+            !kind_desc.contains("prefix") || kind_desc.contains("does not accept"),
+            "the `kind` description promises prefix acceptance the handler does not \
+             implement: {kind_desc}"
+        );
+
+        let args_for = |kind: &str| {
+            json!({
+                "to_plugin_id": "kimi-code", "kind": kind,
+                "pointer_uri": "shared-context/forum/x.md", "session_id": sid
+            })
+        };
+        for kind in &advertised {
+            let out = tool_member_notify(&state, &args_for(kind)).await.unwrap();
+            assert!(
+                out["queued_id"].is_number(),
+                "schema advertises kind `{kind}` but the handler refused it: {out}"
+            );
+        }
+        for kind in [format!("{}.pr", advertised[0]), "coordination.sub".into()] {
+            let out = tool_member_notify(&state, &args_for(&kind)).await.unwrap();
+            assert_eq!(
+                out["_hestia_error"]["code"], "hestia.member_notify_unknown_kind",
+                "prefixed kind `{kind}` was accepted — the schema must stop saying \
+                 matching is exact: {out}"
+            );
+        }
+    }
+
+    /// Blast radius of the refusal above. A deny is only correct if it denies ONLY
+    /// that, so the falsifier that matters is not "does it reject the empty pointer"
+    /// but "does every pointer this mesh actually carries still send". These are real
+    /// shapes taken from the chain: bare paths, fragments, `hestia://` appeal URIs,
+    /// PR URLs, the daemon's `#undelivered` report form, and a pointer sitting exactly
+    /// on the 512-byte MTU. Widening the predicate (trimming, rejecting spaces,
+    /// requiring a scheme) fails HERE rather than in the field.
+    #[tokio::test]
+    async fn member_notify_still_accepts_every_pointer_this_mesh_uses() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "claude-code").await;
+
+        let mtu_exact = format!("forum/{}", "f".repeat(MAX_POINTER_URI_BYTES - 6));
+        assert_eq!(mtu_exact.len(), MAX_POINTER_URI_BYTES);
+        for good in [
+            "shared-context/forum/x.md",
+            "shared-context/forum/x.md#thread=governed-git-inbox",
+            "hestia://appeal/8bea2e21fa62eccd05e4357026bf0096715b154ccbfeee06baa3b69e41534e31",
+            "https://github.com/dp-web4/hestia/pull/57",
+            "https://github.com/dp-web4/hestia/issues/116#escalation-7944ed3051178222",
+            "hestia://egress/12#unreachable:thor/claude-code after 5 attempts: timeout",
+            "forum/x.md#undelivered:no-fire-template;via=watch-claude-code",
+            "snarc/x.md#t",
+            &mtu_exact,
+        ] {
+            let out = tool_member_notify(
+                &state,
+                &json!({
+                    "to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": good, "session_id": sid
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(
+                out["queued_id"].is_number(),
+                "a legitimate pointer was refused ({} bytes): {good} -> {out}",
+                good.len()
             );
         }
     }

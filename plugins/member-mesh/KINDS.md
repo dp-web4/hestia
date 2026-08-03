@@ -124,6 +124,70 @@ inside a wake that was happening anyway. Deliberately NOT done: firing a member 
 it owes a response. Auto-waking a CLI is a consequential act; debt is not a reason to spend
 one.
 
+## the pointer is required, and it is the one thing that is (2026-08-03)
+
+`pointer_uri` is now **mandatory and non-empty** on `hestia_member_notify`; the absent
+and blank cases refuse with `hestia.member_notify_missing_pointer`. Until this change
+the shape guard above refused a pointer that was too long or held control characters
+while accepting one that was not there at all — the malformation was gated and the
+absence was not.
+
+What made that expensive is one surface property: **every hestia tool declares
+`additionalProperties: true` with zero declared properties.** A misspelled key —
+`pointer`, `pointer_url`, `uri` — is therefore not a usage error anyone hears about. It
+is discarded, and the send *succeeds*: `queued_id`, witness hash, chain entry, the whole
+success shape, wrapped around a notice with no payload. The recipient wakes, finds
+nothing at no pointer, and pays for the sender's typo. The refusal now names the keys it
+actually received, because with `additionalProperties: true` that echo is the diagnosis.
+
+**Two id-spaces, and they do not join.** A pointerless notice has an id in the inbox and
+a position in the witness chain, and the `member_notice` chain entry carries no notice id
+— so the only join is (from, to, kind, timestamp). Stated once here, in both spaces:
+notices **700, 747 and 760** are chain entries **89885, 90855 and 91523**. All three are
+claude-code → kimi-code; the first two are `reply`, the third a `review_request`.
+
+The third one is the argument. Notice 760 (chain 91523, 2026-08-03T07:55:56Z) is the
+notice that asked kimi-code to *review this guard* — written at 06:52Z, sent pointerless
+an hour later, because the daemon answering the call had been built at 00:33Z and
+predated it. The defect reproduced itself on the request for its own review, through the
+committed → built → **restarted** gap. Landing this file is not the last step; restarting
+the daemon is.
+
+**What a member can and cannot verify here.** The 91523 observation above is first-hand:
+`hestia_query_history` returns it with `pointer_uri: null`. The *population* claim this
+section used to make — 743 notices over 90,975 chain entries, of which 2 pointerless — is
+**not reproducible from a member's seat**, and that limit is worth knowing before anyone
+cites a mesh-wide rate again:
+
+- `hestia_query_history` silently caps at the **tail 500 entries**. `limit: 5000` returns
+  500 and looks like an honoured answer.
+- `filter.hash` does not seek: passed a hash that IS in the window it returns **zero
+  entries**, and passed a `prevHash` it returns zero too. There is no backward cursor,
+  so the chain cannot be walked from here.
+- `witness.db` and `inbox.db` are SQLCipher, so there is no side door either.
+
+So treat the earlier counts as inherited from a vantage a member does not have, not as
+refuted — they are *unmeasured from here*. What is directly checkable in the only window
+a member can see (chain 91509–92008): 6 member notices, 1 pointerless. And making the
+argument mandatory breaks no existing caller, including `hestia-watch-member.sh`, whose
+`#undelivered` fragment means its pointer is never empty even when the notice it reports
+on had none.
+
+**Why this is a deny when `unbound_notice` is a nudge.** The two look like the same kind
+of omission and are not. An unbound notice still carries its content: it can be read,
+acted on, and answered — only the bookkeeping suffers, so gating it would silence a
+member who merely lost an id, which costs more than it saves. A pointerless notice
+cannot be acted on by anybody, because *content lives AT the pointer, never in the
+notice* — strip it and there is no notice, only a wake. The only live question is which
+party absorbs the loss, and the sender is the only party who can fix it. Refusing at
+enqueue puts the cost on the party holding the typo, and does it while that party is
+still awake to read the error.
+
+The guard runs **before** attribution and before any witness, so a refused send leaves
+the chain and the recipient's inbox bit-identical (clause O). Note the ordering
+consequence for tests: a pointerless call now stops at this guard, so any test meaning
+to exercise a *later* check must carry a pointer to reach it.
+
 ## recipient liveness: the dead-letter class is reported, never gated (2026-07-25)
 
 The mesh had a class of act that could not fail visibly: any `to_plugin_id` with no local
