@@ -60,17 +60,31 @@ blocks the recipient**. `claude-code` is not path-scoped at all, so every door i
 to it, and it cannot discover the problem by following its own instructions.
 
 **A remedy is a claim about someone else's reachability.** So remedies live in one table
-(`REMEDIES`), refusals are constructed from a *rule id* rather than a sentence, and `_deny`
-raises on an unregistered rule. `test_remedies_name_only_real_doors` checks every named tool
-against the daemon's live list — and discriminates the two causes, because they are not the
-same defect:
+(`REMEDIES`), and refusals are constructed from a *rule id* rather than a sentence.
+
+`_deny` **returns a denial** for an unregistered rule — it does not raise. The first version
+raised, reasoning that a missing remedy should be loud; codex named the consequence (finding
+1): these engines fail **open** on exception, so the "loud" path was an allow. Loudness is the
+test's job (`test_every_literal_deny_rule_is_registered` walks the AST for every literal
+`_deny("...")` call site); fail-closed is the runtime's.
+
+`test_remedies_name_only_globally_registered_doors` checks every named tool against the
+daemon's live list — and discriminates the two causes, because they are not the same defect:
 
 - **NEVER BUILT** — the `request_scope` class. An authoring error.
 - **NOT DEPLOYED** — the tool is in source, the daemon is older. The remedy is correct; the fix
   is a deploy.
 
-Both are red. Only one is a mistake. *(It is red right now, `NOT DEPLOYED`, on
-`hestia_request_scope`.)*
+Both are red. Only one is a mistake. The discriminator reads the **registration and dispatch
+sites** in `handler.rs`, not a quoted token anywhere in the Rust source — a mention in a
+comment or fixture would otherwise misclassify a never-built door as merely stale, applying
+the softer verdict to the worse defect (codex finding 4b).
+
+**It proves registration, not recipient reachability, and is named for that** (codex finding
+3). `tools/list` is the daemon's *global* registry, so it can be green while the refused
+member cannot call the tool at all — exactly the measured `hestia_appeal` class, globally
+registered the whole time kimi had no way to reach it. The stronger invariant needs a
+per-harness capability manifest; not claimed until one exists.
 
 One remedy deliberately names **no** door: `egress.secret`. A leaked read has no undo, so
 offering a channel would imply the act is available at a price.
@@ -89,6 +103,11 @@ render(verdict)        -> (exit_code, stderr)  # harness exit-code contract
 A shim contains **no** scope logic, **no** forbidden list, **no** remedy text, and **no**
 decision. If a shim needs a policy choice, the profile is missing a field — add the field, do
 not branch in the shim.
+
+`test_shims_contain_no_policy` checks every `shim_*.py` here. No shim exists yet, so it
+currently **reports that it checked nothing** rather than passing silently. The first version
+of this README credited that test before it was written (codex finding 4a) — a doc that
+credits an absent check is worse than no doc, because it retires the reviewer's attention.
 
 What legitimately differs, and is therefore all a profile carries: identity path, home markers,
 launch-cwd env var, mode env var, workspace env var, member id, default role. That is the
@@ -126,6 +145,12 @@ cannot mistake "the core returned nothing" for "the core allowed it".
 - **`/tmp` is unconditionally in scope**, which made the first version of these tests pass for
   the wrong reason — five green checks measuring nothing, a pass bit-identical to "the gate is
   not running". Fixtures now build workspaces outside `/tmp` and assert it.
+- **The temp-root check was a prefix match, not a path boundary** (codex finding 2):
+  `startswith("/tmp")` admitted `/tmp-other/...` and `/var/tmpsecrets/...` — *siblings* of the
+  temp roots, and directories anyone can create. A member could have taken unconditional reach
+  by naming a directory: no grant, no witness, no operator. Same defect class as
+  `reviewer ⊄ review` in the mesh vocabulary — a boundary rule written as a substring rule.
+  Now compares at the separator, with red cases for both sibling spellings and one end-to-end.
 
 ## Running the tests
 

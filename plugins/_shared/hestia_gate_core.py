@@ -56,9 +56,23 @@ to it and it cannot discover the problem by following its own instructions.
 
 **A remedy is a claim about someone else's reachability.** So remedies live HERE, in one
 table, and `remedy_tools()` enumerates every tool any remedy names — which
-`test_remedies_name_only_real_doors` checks against the daemon's live tool list. A remedy
-that names a door nobody built stops being a thing a careful author avoids and becomes a
-thing the test suite refuses.
+`test_remedies_name_only_globally_registered_doors` checks against the daemon's live tool list.
+
+**That test is weaker than the claim, and the gap is the interesting part.** (codex NOT-SAME
+review of #169, finding 3.) It queries the daemon's *global* `tools/list`, so it proves
+REGISTRATION, not RECIPIENT REACHABILITY. It can be green while the refused member cannot
+reach the tool at all — the harness may have no hestia MCP registration, or not expose that
+tool. That is not hypothetical: it is the measured `hestia_appeal` class, where the tool was
+globally registered the whole time kimi had no way to call it.
+
+So the honest scope: this excludes **globally absent** tools — the `request_scope` case, where
+the door existed nowhere. It does NOT yet make fake remedies unwriteable in general. The
+stronger invariant needs a per-harness capability manifest, or a probe through each shim's own
+tool-discovery surface, and is deliberately not claimed until one exists.
+
+The first version of this file claimed the strong property. Naming the weaker one is not a
+retreat — an instrument that overstates its own coverage is the defect this whole thread keeps
+finding, and it would be a poor joke to ship it inside the fix for it.
 
 THE SHIM BOUNDARY
 -----------------
@@ -69,8 +83,14 @@ A shim may set ONLY what `HarnessProfile` carries, and may implement only:
 
 A shim contains NO scope logic, NO forbidden list, NO remedy text, and NO decision. If a
 shim needs to make a policy choice, the profile is missing a field — add the field, do not
-branch in the shim. `test_shims_contain_no_policy` enforces this by construction rather than
-by review.
+branch in the shim.
+
+`test_shims_contain_no_policy` checks this over every file matching `shim_*.py` here. **No
+shim exists yet, so today it reports that it checked nothing** rather than passing silently
+— a green that means "nothing was inspected" is the null-state twin of a green that means
+"inspected and clean". The first version of this docstring said the test "enforces this by
+construction"; the test did not exist (codex NOT-SAME review of #169, finding 4). A doc that
+credits an absent check is worse than no doc: it retires the reviewer's attention.
 
 FAIL-CLOSED IS THE SHIM'S JOB, AND IT IS NOT NEGOTIABLE
 -------------------------------------------------------
@@ -230,15 +250,35 @@ class Verdict:
         return self.decision == "deny"
 
 
+#: Remedy used when a refusal names a rule with no registered entry. Should be unreachable —
+#: `test_every_literal_deny_rule_is_registered` reads the AST and reds the build first — but
+#: "should be unreachable" is not a runtime guarantee, and here being wrong costs a governed act.
+UNREGISTERED_RULE_REMEDY = (
+    "This refusal has no registered remedy, which is itself a defect in the gate — please "
+    "report it. The act is still refused: a gate that cannot say what to do next must not "
+    "therefore allow the act."
+)
+
+
 def _deny(rule: str, reason: str, innate: bool = False) -> Verdict:
     """The ONLY constructor of a refusal. Takes a rule id, not a sentence — which is what
-    makes 'a remedy naming a door nobody built' unwriteable rather than merely discouraged."""
+    makes 'a remedy naming a door nobody built' unwriteable rather than merely discouraged.
+
+    **RETURNS A DENIAL FOR AN UNKNOWN RULE. IT DOES NOT RAISE.** (codex NOT-SAME review of
+    #169, finding 1.) The first version raised `KeyError`, reasoning that a refusal with no
+    remedy should be loud. codex named the consequence: *this module's own premise is that
+    these hook engines fail OPEN on exception.* So the "loud" path was an escaping exception,
+    in a gate, on an engine that reads an exception as allow — the exact failure mode this
+    file exists to prevent, introduced by the check meant to enforce it.
+
+    Loudness belongs to the TEST, where being wrong costs a red build. Fail-closed belongs to
+    the RUNTIME, where being wrong costs a governed act. The first version used one mechanism
+    for both jobs and got the runtime one backwards."""
     r = REMEDIES.get(rule)
-    if r is None:                                   # fail closed, and loudly
-        raise KeyError(
-            f"no remedy registered for rule '{rule}'. A refusal must tell the member what to "
-            f"do; add an entry to REMEDIES (and its tools) rather than inlining a sentence."
-        )
+    if r is None:
+        return Verdict("deny", rule or "gate.internal",
+                       f"{reason} [gate defect: no remedy registered for rule '{rule}']",
+                       UNREGISTERED_RULE_REMEDY, innate)
     return Verdict("deny", rule, reason, r.text, innate)
 
 
@@ -340,7 +380,7 @@ def path_in_scope(path: str, scopes, workspace: str, profile: HarnessProfile,
     if not p.startswith("/") and not p.startswith("~"):
         cwd = (cwd or os.getcwd()).replace("\\", "/")
         p = os.path.normpath(os.path.join(cwd, p)).replace("\\", "/")
-    if p.startswith(("/tmp", "/var/tmp")):
+    if _under_temp_root(p):
         return True
     if workspace in p:
         rest = p.split(workspace, 1)[1].lstrip("/")
@@ -416,6 +456,25 @@ def command_in_scope(cmd: str, scopes, workspace: str, cwd: Optional[str] = None
             if not in_scope_vote and oos_vote:
                 return False, oos_vote
     return True, None
+
+
+#: Roots that are always reachable regardless of MRH — scratch space, not governed territory.
+TEMP_ROOTS = ("/tmp", "/var/tmp")
+
+
+def _under_temp_root(path: str) -> bool:
+    """Is this path the temp root itself, or a DESCENDANT of it?
+
+    codex NOT-SAME review of #169, finding 2. The inherited check was
+    `p.startswith(("/tmp", "/var/tmp"))`, which is a string-prefix test, not a path-boundary
+    test — so `/tmp-other/x` and `/var/tmpsecrets/y` read as temporary. Those are SIBLINGS of
+    the temp roots, and a directory anyone can create: a member could be handed unconditional
+    reach by naming a directory, with no grant, no witness and no operator involved.
+
+    Same defect class as the census's `reviewer ⊄ review`: a boundary rule implemented as a
+    substring rule. The fix is the same shape — compare at the separator."""
+    p = os.path.normpath(path.replace("\\", "/")).replace("\\", "/")
+    return any(p == r or p.startswith(r + "/") for r in TEMP_ROOTS)
 
 
 def _elide(path: str, keep: int = 72) -> str:
