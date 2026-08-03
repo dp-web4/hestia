@@ -78,6 +78,8 @@ impl ServerHandler for HestiaServer {
             "hestia_appeal" => tool_appeal(&self.state, &args).await,
             "hestia_arbitrate_appeal" => tool_arbitrate_appeal(&self.state, &args).await,
             "hestia_open_appeals" => tool_open_appeals(&self.state, &args).await,
+            "hestia_request_scope" => tool_request_scope(&self.state, &args).await,
+            "hestia_scope_status" => tool_scope_status(&self.state, &args).await,
             "hestia_gate_escalation_open" => tool_gate_escalation_open(&self.state, &args).await,
             "hestia_gate_escalation_poll" => tool_gate_escalation_poll(&self.state, &args).await,
             "hestia_gate_escalation_claim" => tool_gate_escalation_claim(&self.state, &args).await,
@@ -249,6 +251,14 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_open_appeals",
             "List appeals nobody has ruled on yet, with the ruling-ready deny_hash for each. Designation is ADVISORY — hestia_arbitrate_appeal never reads it — so any admissible member may rule any of these; pass your session_id and each entry tells you whether you are one. Read-only. This is the discovery surface an arbiter needs: before it existed, a non-designated member had the authority to rule and no way to learn there was anything open",
+        ),
+        t(
+            "hestia_request_scope",
+            "Ask the operator for read access to ONE path outside your granted MRH. Requires an absolute path and a stated reason — the operator has only that sentence to rule on. This is the door the scope deny has been naming; it now exists. DIFFERENT CHANNEL FROM hestia_appeal, on purpose: an appeal asks whether a deny was WRONG and yields a verdict on conduct; this accepts the deny and asks for reach. An upheld appeal grants no access, and a granted request repairs no score. Any grant is MEMORY-ONLY and dies with the daemon — it never edits your identity file. Returns pending and permits nothing; no answer within the window is a refusal, not a retry",
+        ),
+        t(
+            "hestia_scope_status",
+            "What you may reach beyond your standing MRH right now, and every scope request you have filed with its ruling. Read-only and deliberately unwitnessed — reading your own permissions is not an act",
         ),
         t(
             "hestia_gate_escalation_open",
@@ -856,6 +866,20 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
                      It is held in memory only and does NOT survive a daemon restart. Ratified \
                      hub law still binds over it.",
         })),
+        // Scope grants, disclosed for the same reason and inside the same hashed body: a
+        // widening the subject cannot see is a trapdoor whether it widens a PRESET or a PATH.
+        // Being in `body` means a grant appearing or lapsing moves `law_hash`, so a member that
+        // pins the hash learns its reach changed instead of discovering it by trying.
+        "scope_grants": s.live_scope_grants(&who.plugin_id)
+            .iter()
+            .map(|r| json!({
+                "path": r.path,
+                "granted_by": r.decided_by,
+                "requested_because": r.reason,
+                "decision_reason": r.decision_reason,
+                "expires_at": r.expires_at,
+            }))
+            .collect::<Vec<_>>(),
         "law": statements,
     });
 
@@ -7128,6 +7152,142 @@ mod tests {
         );
     }
 
+    /// The scope channel must be ASK-only from MCP. `hestia_request_scope` files a request;
+    /// nothing an agent can call decides one.
+    ///
+    /// This is the same guarantee as the grant test above, and it needs its own assertion
+    /// because the failure would look different and more innocent: not "an agent set its own
+    /// policy" but "an agent approved its own file request", which reads like a convenience
+    /// until you notice it is the entire control.
+    #[test]
+    fn no_mcp_tool_can_decide_a_scope_request() {
+        let names: Vec<String> = hestia_tools().into_iter().map(|t| t.name.to_string()).collect();
+        for n in &names {
+            let l = n.to_ascii_lowercase();
+            if !l.contains("scope") {
+                continue;
+            }
+            assert!(
+                l == "hestia_request_scope" || l == "hestia_scope_status",
+                "MCP tool `{n}` reaches the scope surface. Only ASKING (hestia_request_scope) \
+                 and READING (hestia_scope_status) may be member-callable — deciding is \
+                 operator-only, through the challenge-signed HTTP surface. A member holding \
+                 both halves is not governed by the control, it operates it."
+            );
+        }
+        assert!(
+            names.iter().any(|n| n == "hestia_request_scope"),
+            "The scope deny text names this tool. It existing is the point: a refusal that \
+             names a door nobody built teaches members that the witnessed channels are fiction."
+        );
+    }
+
+    /// APPEAL AND SCOPE ARE DIFFERENT CHANNELS, asserted at the surface a member actually reads.
+    ///
+    /// kimi-code, 2026-08-02, arriving at this independently while blocked by it:
+    ///
+    /// > *"even an upheld appeal doesn't unlock anything… otherwise the appeal would be a
+    /// > backdoor around law, and the whole structure collapses into 'deny, appeal, proceed
+    /// > anyway.'"*
+    ///
+    /// The risk is not that someone wires appeal-upheld to a scope grant on purpose. It is that
+    /// the two descriptions drift until a member reasonably concludes appealing will get it the
+    /// file — which is exactly the wrong turn kimi was pushed into, and it cost a full cycle.
+    /// The descriptions are the map; this asserts the map says there are two doors.
+    #[test]
+    fn the_scope_tool_tells_members_it_is_not_the_appeal_channel() {
+        let tools = hestia_tools();
+        let d = |name: &str| -> String {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.description.clone().unwrap_or_default().to_string())
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+        };
+        let scope = d("hestia_request_scope");
+        assert!(
+            scope.contains("appeal"),
+            "hestia_request_scope must name hestia_appeal and say how it differs. A member \
+             choosing a channel reads exactly this text, and the one time it didn't say, the \
+             member picked the door that structurally cannot help it."
+        );
+        assert!(
+            scope.contains("memory-only") || scope.contains("dies with the daemon"),
+            "The tool must disclose that a grant is ephemeral. A member that believes it \
+             received a standing widening will build on sand, and one that knows the grant \
+             dies with the daemon asks again instead of assuming."
+        );
+        let appeal = d("hestia_appeal");
+        assert!(
+            !appeal.is_empty(),
+            "hestia_appeal must remain listed — the scope tool points at it by name."
+        );
+    }
+
+    /// A grant is for ONE file. Prefix generosity here would turn an approved read of a note
+    /// into an approved read of its directory, carrying the operator's real signature on a
+    /// wider thing than they read.
+    #[test]
+    fn a_scope_grant_covers_exactly_one_path() {
+        use crate::server::state::{normalize_scope_path, ScopeRequest};
+        let r = ScopeRequest {
+            id: "scope-test".into(),
+            plugin_id: "kimi-code".into(),
+            role: "*".into(),
+            path: "/mnt/c/exe/dpx/notes.md".into(),
+            reason: "dp asked me to read this in-session".into(),
+            requested_at: 100,
+            expires_at: 200,
+            granted: Some(true),
+            decided_by: Some("operator".into()),
+            decided_at: Some(110),
+            decision_reason: Some("yes, that file".into()),
+        };
+        assert!(r.grants("/mnt/c/exe/dpx/notes.md", 150));
+        // The sibling, the parent and the child are all OUTSIDE the grant.
+        assert!(!r.grants("/mnt/c/exe/dpx/secrets.md", 150));
+        assert!(!r.grants("/mnt/c/exe/dpx", 150));
+        assert!(!r.grants("/mnt/c/exe/dpx/notes.md/inner", 150));
+        // Expiry is a hard edge, not a grace period.
+        assert!(!r.grants("/mnt/c/exe/dpx/notes.md", 200));
+        assert_eq!(r.status(250), "expired");
+        // Spelling must not create a second, unusable grant.
+        assert_eq!(
+            normalize_scope_path("/mnt/c//exe/dpx/./sub/../notes.md"),
+            "/mnt/c/exe/dpx/notes.md"
+        );
+        // A `..` cannot climb above the root.
+        assert_eq!(normalize_scope_path("/../../etc/shadow"), "/etc/shadow");
+    }
+
+    /// Silence refuses, here as everywhere else. An undecided request that runs out its window
+    /// is `expired`, and expired grants nothing — so waiting is never a strategy.
+    #[test]
+    fn an_unanswered_scope_request_expires_into_a_refusal() {
+        use crate::server::state::ScopeRequest;
+        let mut r = ScopeRequest {
+            id: "scope-test".into(),
+            plugin_id: "kimi-code".into(),
+            role: String::new(),
+            path: "/x/y.md".into(),
+            reason: "needed for the task at hand".into(),
+            requested_at: 0,
+            expires_at: 100,
+            granted: None,
+            decided_by: None,
+            decided_at: None,
+            decision_reason: None,
+        };
+        assert_eq!(r.status(50), "pending");
+        assert_eq!(r.status(100), "expired");
+        assert!(!r.grants("/x/y.md", 100));
+        // And a refusal is a refusal at any time — it never lapses into permission.
+        r.granted = Some(false);
+        assert_eq!(r.status(50), "refused");
+        assert!(!r.grants("/x/y.md", 50));
+    }
+
     fn make_shared_state() -> (TempDir, SharedState) {
         let dir = TempDir::new().unwrap();
         let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
@@ -9244,6 +9404,195 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
             id = esc.id
         ),
         "on_timeout": "DENIED — no decision within the window is a refusal, not a retry",
+    }))
+}
+
+/// `hestia_request_scope` — a member asks the operator to reach ONE path outside its MRH.
+///
+/// This tool exists because a refusal named it before anyone built it. The kimi scope gate has
+/// been telling members to *"request it (request_scope)"* while the tool list held 29 tools and
+/// none of them was that one; the same deny never mentioned `hestia_appeal` either. kimi did the
+/// right thing with the only door it could find — filed an appeal — and reached a channel that
+/// by design cannot hand over a file. (dp + kimi-code, 2026-08-02.)
+///
+/// The separation kimi named is the whole design and is preserved here:
+///
+/// > *"even an upheld appeal doesn't unlock anything… otherwise the appeal would be a backdoor
+/// > around law, and the whole structure collapses into 'deny, appeal, proceed anyway.'"*
+///
+/// So: **appeal → verdict on conduct. request_scope → grant of reach.** Filing here scores
+/// nothing and repairs nothing; upholding an appeal there opens nothing. A member that believes
+/// a deny was WRONG appeals it. A member that accepts the deny and still needs the file asks
+/// here. Both are witnessed, neither substitutes for the other, and a member may legitimately do
+/// both about the same deny — they are different questions.
+///
+/// **Asking is not receiving.** This returns `pending` and permits nothing. Only the operator
+/// answers, only through the operator-gated HTTP surface, and an unanswered request expires into
+/// a refusal.
+async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::gate_escalation::now_secs;
+    use crate::server::state::{normalize_scope_path, ScopeRequest, SCOPE_REQUEST_TTL_SECS};
+
+    let plugin_id = require_string(args, "plugin_id")?;
+    let role = optional_string(args, "role").unwrap_or_default();
+    let raw_path = require_string(args, "path")?;
+    // REQUIRED, and the reason the escalation channel had to be fixed twice: dp, 2026-08-02 —
+    // "the escalations currently don't provide enough information to actually make an informed
+    // decision." An operator staring at a member id and a path fragment is being asked to
+    // rubber-stamp, not to decide. A record that omits the discriminating field supports a
+    // count, not a judgement.
+    let reason = require_string(args, "reason")?;
+
+    let path = normalize_scope_path(&raw_path);
+    // ONE FILE, stated as a rule rather than left to good manners. A member asking for `/` and
+    // being granted it would be a scope grab wearing a request's clothes — and it would carry
+    // the operator's genuine approval, which is worse than an ungoverned read because it looks
+    // decided. The narrow ask is the entire reason this channel is safe to have.
+    if !path.starts_with('/') {
+        return Err(anyhow::anyhow!(
+            "path must be absolute — a relative path means something different to the daemon \
+             than to the gate that will enforce it, and a grant both sides read differently \
+             grants nothing safely"
+        ));
+    }
+    if path == "/" || path.trim_end_matches('/').is_empty() {
+        return Err(anyhow::anyhow!(
+            "refused: a scope request names ONE file, not the root. Ask for what you need to \
+             read; if the work genuinely needs a wider standing scope, that is an amendment to \
+             your MRH and belongs to the operator, not to this channel"
+        ));
+    }
+    if reason.trim().len() < 12 {
+        return Err(anyhow::anyhow!(
+            "reason is too thin to decide on. Say what you are doing and why this path is \
+             needed for it — the operator has only this sentence to rule on"
+        ));
+    }
+
+    let now = now_secs();
+    let mut s = state.lock().await;
+
+    // An already-live grant answers the ask without a second act. Told plainly rather than
+    // silently deduplicated, so a member never wonders whether its request went nowhere.
+    if s.has_scope_grant(&plugin_id, &path) {
+        return Ok(json!({
+            "status": "already_granted",
+            "path": path,
+            "note": "you already hold a live grant for this exact path; no new request was filed",
+        }));
+    }
+
+    // Derived, not random — same construction as the escalation store, so an id is reproducible
+    // from the record that minted it. The request count is in the digest so a member re-asking
+    // for the same path in the same second gets a distinct record rather than overwriting its
+    // own earlier ask.
+    let id = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"hestia:scope-request:");
+        h.update(now.to_be_bytes());
+        h.update((s.scope_requests.len() as u64).to_be_bytes());
+        h.update(plugin_id.as_bytes());
+        h.update(path.as_bytes());
+        let hex: String = h.finalize()[..6].iter().map(|b| format!("{b:02x}")).collect();
+        format!("scope-{hex}")
+    };
+    let req = ScopeRequest {
+        id: id.clone(),
+        plugin_id: plugin_id.clone(),
+        role: role.clone(),
+        path: path.clone(),
+        reason: reason.clone(),
+        requested_at: now,
+        expires_at: now + SCOPE_REQUEST_TTL_SECS,
+        granted: None,
+        decided_by: None,
+        decided_at: None,
+        decision_reason: None,
+    };
+    s.scope_requests.insert(id.clone(), req);
+
+    let entry = s.append_chain(
+        "scope_requested",
+        json!({
+            "request_id": id,
+            "plugin_id": plugin_id,
+            "subject_instance_lct": s.member_lct(&plugin_id),
+            "role": role,
+            // Both spellings: what the member typed and what the daemon will compare. If those
+            // ever diverge in a way that surprises someone, the record shows where.
+            "path": path,
+            "path_as_asked": raw_path,
+            "reason": reason,
+            "expires_at": now + SCOPE_REQUEST_TTL_SECS,
+            "assurance": "A1 — the grant is recorded here and enforced by the plugin gate. \
+                          Tamper-EVIDENT, not tamper-proof.",
+        }),
+    )?;
+
+    Ok(json!({
+        "request_id": id,
+        "status": "pending",
+        "path": path,
+        "expires_at": now + SCOPE_REQUEST_TTL_SECS,
+        "witnessEntryHash": entry.hash,
+        "permits_read": false,
+        "on_timeout": "REFUSED — no answer within the window is a refusal, not a retry",
+        "next": "poll hestia_scope_status; a human decides this, out of band",
+        // Said here because this is exactly the moment a member is deciding which door to use,
+        // and the two doors have been confused once already.
+        "note": "this asks for REACH. If you believe the deny itself was wrong, that is \
+                 hestia_appeal — a different question, separately witnessed, and an upheld \
+                 appeal still grants no reach",
+    }))
+}
+
+/// `hestia_scope_status` — what a member may reach beyond its standing MRH, and what it has asked
+/// for. Read-only and unwitnessed: reading your own permissions is not an act.
+async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::gate_escalation::now_secs;
+
+    let plugin_id = require_string(args, "plugin_id")?;
+    let now = now_secs();
+    let s = state.lock().await;
+
+    let mut mine: Vec<&crate::server::state::ScopeRequest> = s
+        .scope_requests
+        .values()
+        .filter(|r| r.plugin_id == plugin_id)
+        .collect();
+    mine.sort_by_key(|r| std::cmp::Reverse(r.requested_at));
+
+    let requests: Vec<Value> = mine
+        .iter()
+        .map(|r| {
+            json!({
+                "request_id": r.id,
+                "path": r.path,
+                "reason": r.reason,
+                "status": r.status(now),
+                "requested_at": r.requested_at,
+                "expires_at": r.expires_at,
+                "decided_by": r.decided_by,
+                "decided_at": r.decided_at,
+                "decision_reason": r.decision_reason,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "plugin_id": plugin_id,
+        "requests": requests,
+        // The operative list, separated from the history, because "what may I read right now"
+        // and "what have I asked for" are different questions and only one of them is a
+        // permission.
+        "live_grants": s.live_scope_grants(&plugin_id)
+            .iter()
+            .map(|r| json!({"path": r.path, "expires_at": r.expires_at, "granted_by": r.decided_by}))
+            .collect::<Vec<_>>(),
+        "lifetime": "memory-only — every grant here dies with the daemon and is never written \
+                     to your identity file. A standing widening of your MRH is a different, \
+                     operator-made change to that file.",
     }))
 }
 

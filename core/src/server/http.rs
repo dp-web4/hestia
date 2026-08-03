@@ -244,6 +244,11 @@ pub async fn serve_with_callback(
             "/api/policy/instance/:plugin_id/:role",
             delete(policy_revoke_instance_grant),
         )
+        // Scope requests. The member half is MCP (`hestia_request_scope`); the deciding half is
+        // here, behind the operator gate, for the same reason the grant above is: a member that
+        // could answer its own ask would be holding both halves of the control.
+        .route("/api/scope/requests", get(scope_list_requests))
+        .route("/api/scope/decide", post(scope_decide))
         .route("/api/policy/preset", put(policy_set_preset))
         .route("/api/policy/override", put(policy_set_override))
         .route(
@@ -1158,6 +1163,184 @@ async fn policy_revoke_instance_grant(
     (
         StatusCode::OK,
         Json(serde_json::json!({"ok": true, "revoked": had})),
+    )
+}
+
+/// `GET /api/scope/requests` — every scope request, newest first, with everything needed to rule.
+///
+/// Carries the member's stated reason inline rather than an id the operator must go look up.
+/// dp, 2026-08-02: *"the escalations currently don't provide enough information to actually make
+/// an informed decision. that's a real issue."* A decision surface that shows only WHO and WHAT
+/// invites approval-by-fatigue; the WHY is the field the ruling is actually about.
+async fn scope_list_requests(State(state): State<SharedState>) -> impl IntoResponse {
+    let now = crate::server::gate_escalation::now_secs();
+    let s = state.lock().await;
+    let mut all: Vec<&crate::server::state::ScopeRequest> = s.scope_requests.values().collect();
+    all.sort_by_key(|r| std::cmp::Reverse(r.requested_at));
+    let items: Vec<serde_json::Value> = all
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "request_id": r.id,
+                "plugin_id": r.plugin_id,
+                "role": r.role,
+                "path": r.path,
+                "reason": r.reason,
+                "status": r.status(now),
+                "requested_at": r.requested_at,
+                "expires_at": r.expires_at,
+                "decided_by": r.decided_by,
+                "decided_at": r.decided_at,
+                "decision_reason": r.decision_reason,
+            })
+        })
+        .collect();
+    let pending = items
+        .iter()
+        .filter(|i| i["status"] == "pending")
+        .count();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"requests": items, "pending": pending})),
+    )
+}
+
+/// `POST /api/scope/decide` {request_id, granted, reason?, expires_in_secs?}
+///
+/// The operator's answer. Grants are memory-only and time-bounded; refusals are recorded with the
+/// same weight, because a channel that only remembers its approvals cannot show that it was ever
+/// used as a filter.
+async fn scope_decide(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use crate::server::state::SCOPE_REQUEST_TTL_SECS;
+    let request_id = body
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let granted = match body.get("granted").and_then(|v| v.as_bool()) {
+        Some(g) => g,
+        // No default. An absent verdict is not a deny and not an approve — it is a malformed
+        // call, and guessing either way would put a ruling in the chain that nobody made.
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "granted must be explicitly true or false"})),
+            )
+        }
+    };
+    let reason = body
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // Same asymmetry as every other control here: widening needs a stated why, narrowing does
+    // not. Refusing is the safe direction and must never carry more friction than approving.
+    if granted && reason.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "reason is required to grant — this widens what a member can reach, and \
+                          a widening whose rationale is not recorded is indistinguishable \
+                          afterwards from a misconfiguration"
+            })),
+        );
+    }
+    let now = crate::server::gate_escalation::now_secs();
+    let window = body
+        .get("expires_in_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(SCOPE_REQUEST_TTL_SECS);
+
+    let mut s = state.lock().await;
+    let Some(req) = s.scope_requests.get(&request_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no such scope request"})),
+        );
+    };
+    // An expired or already-decided request is not re-openable here. Re-deciding one would let a
+    // refusal become an approval with no new ask on the record, which is precisely the shape the
+    // escalation store refuses for the same reason.
+    let status = req.status(now);
+    if status != "pending" {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("request is {status}, not pending — a new request is the way \
+                                  back in, so the ask and its answer stay paired"),
+            })),
+        );
+    }
+    let (plugin_id, path, ask) = (req.plugin_id.clone(), req.path.clone(), req.reason.clone());
+    let expires_at = if granted { now + window } else { req.expires_at };
+
+    // ORDER: WITNESS, THEN WIDEN.
+    //
+    // The record is written before the grant takes effect, and the grant is applied only if the
+    // record committed. The reverse order — which `policy_set_instance_grant` still uses — has a
+    // window where a failed chain append leaves a LIVE grant that nothing recorded: the exact
+    // shape the accountability block calls an A failure, and the worst version of it, since the
+    // unrecorded artifact is a widening of what a member may reach.
+    //
+    // Nothing observes the entry between the append and the apply — one lock, no await — so a
+    // recorded-but-unapplied grant is not reachable either. The residual failure is a panic in
+    // between, which leaves a record of a grant that is not live: safe direction, and legible.
+    let entry = s.append_chain(
+        if granted { "scope_granted" } else { "scope_refused" },
+        serde_json::json!({
+            "request_id": request_id,
+            "plugin_id": plugin_id,
+            "subject_instance_lct": s.member_lct(&plugin_id),
+            "path": path,
+            // The ask travels with the answer. A ruling that records only the verdict leaves a
+            // reader to reconstruct what was asked from a separate entry — and the pairing is
+            // the whole evidentiary value of the record.
+            "requested_because": ask,
+            "decision_reason": reason,
+            "granted_by": "operator",
+            "via": "operator_session",
+            "expires_at": expires_at,
+            "durability": "memory-only — a daemon restart revokes it; identity.json is untouched",
+        }),
+    );
+    let entry = match entry {
+        Ok(e) => e,
+        // Fail LOUD and change nothing. A grant that could not be witnessed must not exist:
+        // this is the one surface in the system where an unrecorded success is worse than a
+        // recorded failure.
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("witness append failed, decision NOT applied: {e}")
+                })),
+            )
+        }
+    };
+
+    if let Some(req) = s.scope_requests.get_mut(&request_id) {
+        req.granted = Some(granted);
+        req.decided_by = Some("operator".to_string());
+        req.decided_at = Some(now);
+        req.decision_reason = if reason.is_empty() { None } else { Some(reason.clone()) };
+        req.expires_at = expires_at;
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "request_id": request_id,
+            "granted": granted,
+            "path": path,
+            "expires_at": expires_at,
+            "witnessEntryHash": entry.hash,
+        })),
     )
 }
 

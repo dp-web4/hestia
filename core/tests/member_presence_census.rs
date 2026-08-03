@@ -72,6 +72,20 @@
 //!    price of catching Sabotage B. If this ever becomes the red people
 //!    ignore, that is the signal to reconsider, in the open.
 //!
+//! **A third, now closed, and the reason to distrust the other two less than
+//! you distrust this header.** Until 2026-08-02 the scan stopped at each
+//! file's FIRST `#[cfg(test)]` module. `handler.rs` has nine, interleaved, the
+//! first at line 4778 of 10050 — so this census read 47% of the tree's largest
+//! governance file and pinned a table describing all of it. Four live
+//! attribution sites (the gate-escalation surface, #114 and #152) had never
+//! appeared. Both tables were green throughout. The `member_lct` table gained
+//! those four on the fix; the REGISTRY table gained nothing, which is the one
+//! genuinely reassuring result here — no presence consumer was hiding below
+//! the cut. Stated at this length because the lesson is not "a bug was fixed":
+//! it is that this file has now twice described its own coverage more
+//! confidently than its code delivered, and both times the gap was found by
+//! someone walking into it rather than by reading the header.
+//!
 //! **What the test actually does.** "Presence is not a safety gate" is a
 //! negative over an open set, and no test can assert that. The bounded,
 //! performable twin is the enumeration the negative ranges over: the
@@ -91,8 +105,8 @@
 //! Saying so here is what stops it from calcifying into a "proof."
 //!
 //! **Method, stated so it is checkable against its own evidence:** walk
-//! `core/src/**/*.rs`, truncate each file at its first `#[cfg(test)]` (test
-//! modules are consumers of the *API*, not of *presence*), track the nearest
+//! `core/src/**/*.rs`, SKIP each `#[cfg(test)] mod` block and resume after it
+//! (test modules are consumers of the *API*, not of *presence*), track the nearest
 //! preceding `fn` definition per line (the `fn` keyword in item position —
 //! start of line after visibility/modifier prefixes — so a comment saying
 //! "fn" can never re-key what follows; same-named fns in one file are
@@ -231,6 +245,55 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str])] = &[
     ("server/state.rs::apply_outcome_ctx", &[
         "if let Some(subject_lct) = self.member_lct(plugin_id) {",
     ]),
+    // ── ADDED 2026-08-02 (claude-code). FOUR OF THESE FIVE ARE NOT NEW CODE. ──
+    //
+    // They became visible when `production_lines` replaced `prod_prefix` (see its doc comment):
+    // the scanner used to stop at the FIRST `#[cfg(test)] mod`, and `handler.rs` carries nine
+    // of them interleaved with production code, the first at line 4778 of 10050. So this table
+    // has been pinning 47% of that file and reporting on all of it. The gate-escalation naming
+    // surface — landed in #114 and #152 — has never been in the census at all.
+    //
+    // This is recorded as a finding, not a tidy-up: the census's own header warns that a cut
+    // which hides code "goes quiet, which is the worse direction", names two files where it
+    // happened, and then the instrument had the same defect one level up, in the largest
+    // governance file in the tree. It was found only because a new surface straddled the cut
+    // and went red on one of its two sites. A change landing entirely below line 4778 would
+    // have passed green through a whole new consequential path.
+    //
+    // READING for the four pre-existing sites (`tool_gate_escalation_open`,
+    // `tool_gate_escalation_claim` ×2, `tool_gate_arbitrate_escalation`): **naming, not
+    // presence**, identical in class to `operator_gate_escalation` above — attribution inside
+    // the escalation chain entries, recording WHOSE governance write was asked for, claimed or
+    // ruled. No registry read. The HST-005 caveat recorded at `operator_gate_escalation`
+    // applies unchanged and now applies at four more sites: `esc.plugin_id` is caller-asserted,
+    // so `subject_instance_lct` is a well-formed name derived from a self-reported id, not
+    // evidence of membership. These records are what an operator reads back to justify having
+    // permitted a governance write, so that caveat is load-bearing here.
+    //
+    // READING for `tool_request_scope` (genuinely new): **naming, not presence**, same class.
+    // It attributes a scope REQUEST to its asker in the `scope_requested` entry. Asking permits
+    // nothing, and the same self-reported-id caveat holds — but the paired decision record
+    // (`http.rs::scope_decide`) is the one that widens reach, and it is keyed on the same
+    // asserted `plugin_id`. As with `policy_set_instance_grant`, a typo yields a live-looking
+    // grant that matches nothing and is inert. Read deliberately, not discovered later.
+    ("server/handler.rs::tool_gate_escalation_open", &[
+        "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
+    ]),
+    ("server/handler.rs::tool_gate_escalation_claim", &[
+        "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
+        "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
+    ]),
+    ("server/handler.rs::tool_gate_arbitrate_escalation", &[
+        "\"subject_instance_lct\": s.member_lct(&decided.plugin_id),",
+    ]),
+    ("server/handler.rs::tool_request_scope", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ]),
+    // The operator's answer to a scope request. Widens what a member may reach, memory-only and
+    // time-bounded; this line names the subject in the `scope_granted`/`scope_refused` entry.
+    ("server/http.rs::scope_decide", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ]),
     ("server/state.rs::trust_entity_key", &[
         "match self.member_lct(plugin_id) {",
     ]),
@@ -302,7 +365,7 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The production prefix: everything before the trailing `#[cfg(test)] mod`.
+/// The production lines of a file: everything OUTSIDE a `#[cfg(test)] mod` block.
 ///
 /// The cut must be a `#[cfg(test)]` in ITEM POSITION at column 0 whose next
 /// non-blank line opens a module — the same item-position discipline
@@ -317,26 +380,62 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// consumer twice into `constellation.rs`: above the cut RED and named,
 /// below the cut green (claude-code, 2026-07-28). The `fn`-in-a-comment
 /// defect cried wolf; this one goes quiet, which is the worse direction.
-fn prod_prefix(text: &str) -> &str {
-    let mut off = 0usize;
-    let mut lines = text.split_inclusive('\n').peekable();
-    while let Some(line) = lines.next() {
+///
+/// **2026-08-02, claude-code — the same quiet defect, one layer up, found by
+/// walking into it.** This was `prod_prefix`, returning everything before the
+/// FIRST test module and calling it "the trailing `#[cfg(test)] mod`". That
+/// name encodes an assumption — one test module, at the end — which
+/// `handler.rs` has never satisfied: it carries **nine** `#[cfg(test)]` blocks
+/// interleaved with production code, the first at line 4778 of 10050. So the
+/// census read 47% of the largest and most governance-dense file in the tree
+/// and reported on all of it. Everything past 4778 was invisible: the entire
+/// gate-escalation surface, and four live `member_lct` attribution sites that
+/// have never appeared in the pinned table.
+///
+/// It was found because adding a tenth production fn below the cut went red on
+/// one of its two new naming sites and green on the other. A tripwire that
+/// fires on half of a change is how you learn the tripwire is the thing being
+/// measured — and had the new code landed entirely below 4778, the census
+/// would have stayed green through a whole new consequential surface.
+///
+/// So the scan now SKIPS test modules and resumes after them, rather than
+/// stopping at the first one. The end of a module is a `}` at column 0: an
+/// item-position brace, the mirror of the item-position rules above, and far
+/// more robust than counting braces through test bodies full of `json!({..})`
+/// and string literals. If a file is ever formatted so that a top-level item
+/// does not close at column 0, this reverts to over-scanning — a LOUD failure
+/// (test code shows up in the census and a human dispositions it), which is
+/// the correct direction for this instrument to fail.
+fn production_lines(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut lines = text.lines().enumerate().peekable();
+    let all: Vec<&str> = text.lines().collect();
+    let mut skipping = false;
+    while let Some((i, line)) = lines.next() {
+        if skipping {
+            // Item-position closing brace ends the module.
+            if line == "}" {
+                skipping = false;
+            }
+            continue;
+        }
         if line.starts_with("#[cfg(test)]") {
             // Look ahead past blank lines for a module opener.
-            let opens_mod = text[off + line.len()..]
-                .lines()
+            let opens_mod = all[i + 1..]
+                .iter()
                 .find(|l| !l.trim().is_empty())
-                .map_or(false, |l| {
+                .is_some_and(|l| {
                     let t = l.trim_start();
                     t.starts_with("mod ") || t.starts_with("pub mod ")
                 });
             if opens_mod {
-                return &text[..off];
+                skipping = true;
+                continue;
             }
         }
-        off += line.len();
+        out.push(line);
     }
-    text
+    out
 }
 
 /// The name defined by a `fn` item on this line, if any. The `fn` keyword
@@ -388,7 +487,7 @@ fn census(symbols: &[&str], skip_defs: bool) -> BTreeMap<String, Vec<String>> {
             .replace('\\', "/");
         let mut current_fn = "(top-level)".to_string();
         let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-        for line in prod_prefix(&text).lines() {
+        for line in production_lines(&text) {
             if let Some(name) = fn_item_name(line) {
                 let n = seen.entry(name.clone()).or_insert(0);
                 *n += 1;

@@ -97,6 +97,88 @@ impl InstanceGrant {
     }
 }
 
+/// A member's request to reach ONE path outside its standing MRH, and the operator's answer.
+///
+/// WHY THIS EXISTS (dp + kimi-code, 2026-08-02). kimi was directed by dp in-session to read a
+/// file outside its granted scope. The plugin gate refused — correctly, the path was outside
+/// `HESTIA_WORKSPACE` entirely — and told it to *"request it (request_scope)"*. **That tool did
+/// not exist.** 29 MCP tools, none scope-related, and the message never named `hestia_appeal`
+/// either. kimi followed the only door it could find, filed an appeal, and reached a mechanism
+/// that by design cannot deliver a file.
+///
+/// Because appeals and scope are DIFFERENT CHANNELS, and must stay so. kimi put it exactly:
+///
+/// > *"even an upheld appeal doesn't unlock anything. The appeal machinery repairs the trust
+/// > record of the deny. It cannot and by design must not edit permissions — otherwise the
+/// > appeal would be a backdoor around law, and the whole structure collapses into 'deny,
+/// > appeal, proceed anyway.'"*
+///
+/// So an appeal yields a VERDICT and this yields a GRANT. Nothing here touches conduct scoring,
+/// and nothing in the appeal path touches scope.
+///
+/// SHAPE, inherited from `InstanceGrant` because the reasoning is identical:
+///   * **memory only** — never written to `identity.json`. A standing widening is dp's act on
+///     that file; this is a session-scoped exception that dies with the daemon, so a grant
+///     nobody remembers to revoke expires on its own.
+///   * **operator-granted** — the member may ASK; only the operator may answer.
+///   * **one path** — a request names a single target, not a prefix tree. A member asking for
+///     `path:` and receiving the workspace would be a scope grab wearing a request's clothes.
+///   * **disclosed** — visible in `hestia_operating_law`, because a widening the subject cannot
+///     see is as much a trapdoor as one it cannot audit.
+///
+/// kimi also declined to edit its own identity even when dp offered — *"a member widening its
+/// own scope silently is exactly the act the law treats as corrosive, sanctioned or not."* This
+/// exists so that restraint does not have to cost the work.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScopeRequest {
+    pub id: String,
+    /// Caller-asserted, like every other plugin_id here (HST-005).
+    pub plugin_id: String,
+    pub role: String,
+    /// The ONE path being asked for.
+    pub path: String,
+    /// Why, in the member's words. Required — a scope ask with no stated need is not
+    /// decidable, and this is the field whose absence made escalations unrulable.
+    pub reason: String,
+    pub requested_at: u64,
+    pub expires_at: u64,
+    /// `None` = still pending. `Some(true)` = granted.
+    pub granted: Option<bool>,
+    pub decided_by: Option<String>,
+    pub decided_at: Option<u64>,
+    pub decision_reason: Option<String>,
+}
+
+impl ScopeRequest {
+    /// Live = granted, and not past its window. A refused or expired request grants nothing,
+    /// and an unanswered one grants nothing — the default is always the standing MRH.
+    pub fn grants(&self, path: &str, now: u64) -> bool {
+        self.granted == Some(true) && now < self.expires_at && self.path == path
+    }
+
+    /// One word for the whole record. `expires_at` means the same thing in both phases — the
+    /// moment this record stops mattering — so an undecided request that runs out the clock
+    /// reads `expired`, and **expired is a refusal, not a retry**, exactly as the escalation
+    /// channel already rules. Silence has to decide the same way everywhere or members will
+    /// learn that waiting is a strategy.
+    pub fn status(&self, now: u64) -> &'static str {
+        match self.granted {
+            Some(true) if now < self.expires_at => "granted",
+            Some(true) => "expired",
+            Some(false) => "refused",
+            None if now < self.expires_at => "pending",
+            None => "expired",
+        }
+    }
+}
+
+/// How long an undecided scope request stays askable, and the default life of a grant.
+///
+/// Both are the same 8 hours, and that is not laziness: a request is a question about work
+/// happening NOW, and a grant is permission to do that same work. A window that outlives the
+/// task turns a scoped exception into a standing one by inattention.
+pub const SCOPE_REQUEST_TTL_SECS: u64 = 8 * 3600;
+
 /// THE ASYMMETRY, stated once so neither half drifts (dp, 2026-08-01):
 ///
 /// | direction  | where it lives              | survives restart |
@@ -204,6 +286,16 @@ pub struct ServerState {
     /// Society baseline is NOT this. The baseline lives in society law and moves only by
     /// amendment — a grant is a scoped exception to it, never an edit of it.
     pub instance_grants: HashMap<(String, String), InstanceGrant>,
+    /// Scope requests and the operator's answers, keyed by request id. See `ScopeRequest`.
+    ///
+    /// Memory-only for the same reason `instance_grants` is: this widens reach, so it must
+    /// expire on its own. It is the ANSWER to the deny text that has been telling members to
+    /// "request it" since before there was anywhere to send the request.
+    ///
+    /// Deliberately keyed by id and not by `(plugin, path)`: the record of an ASK that was
+    /// refused is as much of the account as the record of one that was granted, and a map
+    /// keyed by target would let a re-ask overwrite a refusal.
+    pub scope_requests: HashMap<String, ScopeRequest>,
     /// Hub-law gate (consolidation, 2026-07-10): the third fold input.
     /// `None` = no law file at `$HESTIA_HOME/law/hub-law.yaml` (no-op);
     /// `Some(Invalid)` fails closed. See `policy::law_gate`.
@@ -238,6 +330,38 @@ pub fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Lexically normalise a scope path so that a grant and a check agree on what "the same file"
+/// means, without touching the filesystem.
+///
+/// Collapses repeated separators, drops `.`, and resolves `..` against the accumulated prefix.
+/// Purely textual: it does NOT resolve symlinks and does not stat anything, because the daemon
+/// records the grant while the plugin gate enforces it, and the two may not even see the same
+/// mount. What this buys is that `/a//b/../b/c` and `/a/b/c` cannot become two different grants
+/// — which would let a member hold a grant it cannot use, or an operator revoke one that stays
+/// live under another spelling.
+///
+/// A `..` that would escape the root is dropped rather than kept, so no normalised path can
+/// climb above `/`.
+pub fn normalize_scope_path(path: &str) -> String {
+    let p = path.trim();
+    let mut out: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
+    }
+    let joined = out.join("/");
+    if p.starts_with('/') {
+        format!("/{joined}")
+    } else {
+        joined
+    }
 }
 
 impl ServerState {
@@ -336,6 +460,8 @@ impl ServerState {
             // DO — see the rehydrate call after construction. The two are opposite on purpose:
             // a human's ruling must survive a deploy, a standing permission must not.
             instance_grants: HashMap::new(),
+            // Same reasoning, same lifetime: a widening dies with the daemon.
+            scope_requests: HashMap::new(),
             law_gate,
             synthetic_plugins,
             home: home.to_path_buf(),
@@ -601,6 +727,43 @@ impl ServerState {
                     .get(&(plugin_id.to_string(), "*".to_string()))
             })
             .filter(|g| g.is_live(now))
+    }
+
+    /// Every live scope grant a member currently holds — what the gate consults, and what
+    /// `hestia_operating_law` discloses.
+    ///
+    /// NOT role-scoped, unlike `instance_grant`. A path grant answers "may this member read
+    /// this file for this session", and the member does not change identity when it changes
+    /// role. Adding a role dimension here would only create a way for a grant to silently
+    /// stop applying midway through the work it was granted for.
+    pub fn live_scope_grants(&self, plugin_id: &str) -> Vec<&ScopeRequest> {
+        let now = crate::server::gate_escalation::now_secs();
+        let mut live: Vec<&ScopeRequest> = self
+            .scope_requests
+            .values()
+            .filter(|r| r.plugin_id == plugin_id && r.granted == Some(true) && now < r.expires_at)
+            .collect();
+        live.sort_by_key(|r| r.requested_at);
+        live
+    }
+
+    /// Does this member hold a live grant for exactly this path?
+    ///
+    /// **Exact match, deliberately.** A grant is for one file. Prefix matching here would turn
+    /// "you may read `/x/y/notes.md`" into "you may read everything under `/x/y`", which is the
+    /// scope grab this whole mechanism exists to make unnecessary — and it would do it silently,
+    /// with the operator's approval attached to the narrower thing they actually read.
+    ///
+    /// Paths are compared after lexical normalisation only. This is A1: the caller asserts its
+    /// own plugin_id and the plugin-side gate does the enforcing, so this answers "is there a
+    /// grant of record", not "is this filesystem object reachable". A symlink is still a
+    /// symlink; see `docs/GATE_BYPASS_CATALOG.md`.
+    pub fn has_scope_grant(&self, plugin_id: &str, path: &str) -> bool {
+        let now = crate::server::gate_escalation::now_secs();
+        let want = normalize_scope_path(path);
+        self.scope_requests
+            .values()
+            .any(|r| r.plugin_id == plugin_id && r.grants(&want, now))
     }
 
     pub fn member_lct(&self, plugin_id: &str) -> Option<String> {
