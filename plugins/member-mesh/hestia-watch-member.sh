@@ -80,12 +80,22 @@ WATCH_LAST_ALARM_STATE=""
 # and nowhere in effect. The daemon now reports its build provenance on every MCP
 # initialize (serverInfo.version carries the same string `--version` prints); the
 # comparator below is the checkout this watcher runs from.
-# Equality, not ancestry: the honest claim is "the running daemon was built from
-# these bytes", not a guess about direction — both raw strings ship with every
-# verdict so a relying party can draw its own line (inspectable evidence, not
-# prescribed trust). A trailing `-dirty` is stripped before comparison: a dirty
-# worktree is the normal state of a shared checkout and says nothing about when
-# the daemon was built.
+# Equality, not ancestry, is the VERDICT: the honest claim is "the running daemon
+# was built from these bytes", not a guess about direction — both raw strings ship
+# with every verdict so a relying party can draw its own line (inspectable
+# evidence, not prescribed trust). A trailing `-dirty` is stripped before
+# comparison: a dirty worktree is the normal state of a shared checkout and says
+# nothing about when the daemon was built.
+# But the REMEDY is directional, and equality cannot supply it. A mismatch has two
+# opposite causes: the daemon is behind the checkout (rebuild+restart), or the
+# checkout is behind the daemon (pull — rebuilding from it would REGRESS the
+# running binary). Observed on CBP the same hour this check was merged: the daemon
+# was deployed at f863088 from a clean worktree while the shared checkout every
+# watcher runs from sat 11 commits behind and permanently dirty, so an alarm
+# reading "rebuild+restart required" was instructing the fleet to walk the daemon
+# backwards. So: ancestry is resolved where it CAN be (both sides name a commit
+# this checkout has) and reported as the reason, and the imperative follows it.
+# Where it cannot, the wording stays neutral rather than guessing.
 WATCH_REPO_ROOT="$(cd "$(dirname "$WATCH_SOURCE")/../.." 2>/dev/null && pwd || true)"
 
 daemon_version_string() {
@@ -115,6 +125,31 @@ for line in body.splitlines():
     print(d.get("result", {}).get("serverInfo", {}).get("version", ""))
     break
 PY
+}
+
+drift_direction() {
+  # $1=running describe, $2=source describe. Echoes one of daemon-behind-source /
+  # source-behind-daemon / differs-from-source. `git describe` ends in `-g<sha>`
+  # for any commit past a tag and is a bare sha when the checkout has no tags
+  # (CI's depth-1 clone), so accept both shapes. A commit this checkout does not
+  # have — an unfetched branch, a stub's invented sha — resolves to no direction,
+  # which is a real fourth state and not a licence to pick one.
+  local RUN="${1%-dirty}" SRC="${2%-dirty}" A B
+  A="${RUN##*-g}"; B="${SRC##*-g}"
+  case "$A$B" in *[!0-9a-f]*) return 0 ;; esac
+  git -C "$WATCH_REPO_ROOT" cat-file -e "${A}^{commit}" 2>/dev/null || return 0
+  git -C "$WATCH_REPO_ROOT" cat-file -e "${B}^{commit}" 2>/dev/null || return 0
+  if git -C "$WATCH_REPO_ROOT" merge-base --is-ancestor "$A" "$B" 2>/dev/null; then
+    printf 'daemon-behind-source'
+  elif git -C "$WATCH_REPO_ROOT" merge-base --is-ancestor "$B" "$A" 2>/dev/null; then
+    printf 'source-behind-daemon'
+  fi
+  # Divergent history (both commits present, neither an ancestor) falls out of
+  # the chain having printed nothing, and the caller's `${REASON:-...}` supplies
+  # the neutral wording. No explicit `return 0` is needed: an `if` whose every
+  # condition tested false and which has no `else` exits 0 by rule, so `set -e`
+  # is not waiting here — verified against a real divergent pair rather than
+  # assumed in either direction.
 }
 
 check_daemon_drift() {
@@ -156,7 +191,8 @@ check_daemon_drift() {
     REASON="matches-source"
   else
     STATE="drift"
-    REASON="differs-from-source"
+    REASON="$(drift_direction "$PROV" "$SOURCE")"
+    REASON="${REASON:-differs-from-source}"
   fi
 
   WATCH_DAEMON_STATE="$STATE"
@@ -170,7 +206,17 @@ check_daemon_drift() {
     WATCH_DAEMON_LAST_ALARM_STATE=""
   elif [ "$STATE" != "$WATCH_DAEMON_LAST_ALARM_STATE" ]; then
     if [ "$STATE" = "drift" ]; then
-      echo "[hestia-watch] DAEMON DRIFT — rebuild+restart required; running=$WATCH_DAEMON_RUNNING source=$WATCH_DAEMON_SOURCE reason=$REASON"
+      # The remedy follows the resolved direction. "rebuild+restart" is the right
+      # instruction only when the daemon is the stale side; told to a machine whose
+      # CHECKOUT is the stale side it walks the daemon backwards, which is the
+      # failure this branch exists to not cause.
+      local FIX
+      case "$REASON" in
+        source-behind-daemon) FIX="pull the checkout — the daemon is AHEAD; rebuilding from here would regress it" ;;
+        daemon-behind-source) FIX="rebuild+restart required" ;;
+        *)                    FIX="direction unresolved — compare the two strings before acting" ;;
+      esac
+      echo "[hestia-watch] DAEMON DRIFT — $FIX; running=$WATCH_DAEMON_RUNNING source=$WATCH_DAEMON_SOURCE reason=$REASON"
     else
       echo "[hestia-watch] DAEMON UNVERIFIABLE — reason=$REASON running=$WATCH_DAEMON_RUNNING source=$WATCH_DAEMON_SOURCE"
     fi
