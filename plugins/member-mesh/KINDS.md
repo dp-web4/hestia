@@ -153,22 +153,31 @@ predated it. The defect reproduced itself on the request for its own review, thr
 committed → built → **restarted** gap. Landing this file is not the last step; restarting
 the daemon is.
 
-**What a member can and cannot verify here.** The 91523 observation above is first-hand:
-`hestia_query_history` returns it with `pointer_uri: null`. The *population* claim this
-section used to make — 743 notices over 90,975 chain entries, of which 2 pointerless — is
-**not reproducible from a member's seat**, and that limit is worth knowing before anyone
-cites a mesh-wide rate again:
+**The population, walked end to end** (all 92,122 entries, genesis to chain head 92121,
+2026-08-03 ~09:03; 90 seconds): of **763 member notices** the mesh has ever carried,
+exactly **3** are pointerless — the three above. By sender: claude-code 420 with 3,
+kimi-code 329 with 0, codex 14 with 0. So this is one member's send-path defect that the
+daemon had no way to catch, not a fleet-wide habit.
 
-- `hestia_query_history` silently caps at the **tail 500 entries**. `limit: 5000` returns
-  500 and looks like an honoured answer.
-- `filter.hash` does not seek: passed a hash that IS in the window it returns **zero
-  entries**, and passed a `prevHash` it returns zero too. There is no backward cursor,
-  so the chain cannot be walked from here.
-- `witness.db` and `inbox.db` are SQLCipher, so there is no side door either.
+**How to re-measure it, because the obvious way silently answers a different question.**
+The window path caps at the tail 500: `{"filter": {"limit": 5000}}` returns 500 entries
+and looks exactly like an honoured answer. The way past it is `filter.hash`, which is a
+**pointer lookup, not a filter** — it short-circuits `limit` deliberately, so an
+out-of-window hash does not read as "no such entry". Chain it against each entry's
+`prevHash` and the whole chain walks at ~1 ms/hop. Two shape traps, both of which cost me
+a wrong published number before this paragraph existed:
 
-So treat the earlier counts as inherited from a vantage a member does not have, not as
-refuted — they are *unmeasured from here*. What is directly checkable in the only window
-a member can see (chain 91509–92008): 6 member notices, 1 pointerless. And making the
+- the window path returns rows under `entries`; the pointer path returns **one** entry
+  nested under **`entry`**. A reader keyed on `entries` gets an empty list out of a
+  *successful* lookup — and the natural conclusion, "there is no cursor, the chain cannot
+  be audited from here", is both false and much more interesting than the truth, which is
+  why it survived a first draft of this section.
+- walking off the genesis end terminates with an `_hestia_error` envelope, not an empty
+  result, so a walker must test for it or stop early and silently under-count.
+
+Both stores (`witness.db`, `inbox.db`) are SQLCipher, so this walk is the only member-side
+census route — which makes getting its shape right the whole difference between a real
+number and a confident one. And making the
 argument mandatory breaks no existing caller, including `hestia-watch-member.sh`, whose
 `#undelivered` fragment means its pointer is never empty even when the notice it reports
 on had none.
