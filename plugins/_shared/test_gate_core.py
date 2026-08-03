@@ -417,13 +417,60 @@ def test_core_is_vendor_agnostic():
           f"vendor names in core logic: {leaked} — add a HarnessProfile field instead")
 
 
+# EVERY TEST IS CALLED BY NAME, and a second check proves the list is complete.
+#
+# The first version discovered tests by scanning `globals()` for a `test_` prefix. They did
+# run — but `tools/ci_selfexec_test.py` red-flagged the file, and it was right to: a checker
+# cannot see a dynamic dispatch, and neither can a reviewer. Rename a function, or typo the
+# prefix, and it silently stops executing while the file still reports green. That is the
+# null-state twin this suite exists to argue against, sitting in the suite itself.
+#
+# So: explicit calls, plus `test_every_test_is_registered` below, which fails if a `test_*`
+# function exists that this list does not name. Explicit AND complete — either alone rots.
+ALL_TESTS = [
+    "test_remedies_name_only_globally_registered_doors",
+    "test_remedy_text_declares_every_tool_it_names",
+    "test_unregistered_rule_denies_and_never_raises",
+    "test_every_literal_deny_rule_is_registered",
+    "test_egress_offers_no_door",
+    "test_scope_remedy_distinguishes_itself_from_appeal",
+    "test_path_and_command_scope",
+    "test_path_grant_reaches_a_sibling_of_the_repos",
+    "test_temp_root_is_a_path_boundary_not_a_prefix",
+    "test_shims_contain_no_policy",
+    "test_egress_beats_scope",
+    "test_missing_identity_fails_narrow_not_wide",
+    "test_core_never_exits",
+    "test_core_is_vendor_agnostic",
+]
+
+
+def test_every_test_is_registered():
+    """The completeness half. Explicit calls stop a rename from silently disabling a test;
+    this stops a NEW test from silently never running."""
+    defined = {k for k in globals() if k.startswith("test_")}
+    missing = sorted(defined - set(ALL_TESTS) - {"test_every_test_is_registered"})
+    check("every_test_is_registered", not missing,
+          f"defined but not in ALL_TESTS, so never run: {missing}")
+
+
 if __name__ == "__main__":
     print("hestia_gate_core")
-    for fn in sorted(
-        (v for k, v in list(globals().items()) if k.startswith("test_")),
-        key=lambda f: f.__code__.co_firstlineno,
-    ):
-        fn()
+    test_every_test_is_registered()
+    test_remedies_name_only_globally_registered_doors()
+    test_remedy_text_declares_every_tool_it_names()
+    test_unregistered_rule_denies_and_never_raises()
+    test_every_literal_deny_rule_is_registered()
+    test_egress_offers_no_door()
+    test_scope_remedy_distinguishes_itself_from_appeal()
+    test_path_and_command_scope()
+    test_path_grant_reaches_a_sibling_of_the_repos()
+    test_temp_root_is_a_path_boundary_not_a_prefix()
+    test_shims_contain_no_policy()
+    test_egress_beats_scope()
+    test_missing_identity_fails_narrow_not_wide()
+    test_core_never_exits()
+    test_core_is_vendor_agnostic()
     print()
     if FAILURES:
         print(f"FAILED: {len(FAILURES)} — {FAILURES}")
