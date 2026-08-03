@@ -46,6 +46,7 @@ to infer coverage this file does not have.
 from __future__ import annotations
 
 import ast
+import functools
 import os
 import sys
 
@@ -86,6 +87,42 @@ def check(name, cond, detail=""):
         FAILURES.append(name)
 
 
+# THE FILE MUST MEAN THE SAME THING UNDER BOTH INVOCATIONS (kimi-code, verifying #175 at
+# 6220e75). `check()` only records; `FAILURES` was read only by the `__main__` block below.
+# CI runs discovered tests bare (`tools/ci_discovery.py bare` -> `python3 "$t"`), so the exit
+# code held — but under `python3 -m pytest`, the invocation a file named `*_test.py` invites,
+# every `test_*` returned normally and pytest reported 8 PASSED while five checks FAILED. A
+# green identical to the null state, guarding the PR whose own subject is a green identical to
+# the null state. kimi almost sent a "cannot reproduce" on the strength of it.
+#
+# `check()` deliberately stays non-raising: the bare run's job is to report EVERY failure, not
+# to stop at the first, and that property is why the five-row table above is readable at all.
+# So the raise lives at the test-function boundary instead, and only for callers that are not
+# the bare runner — pytest gets the delta as an AssertionError, `__main__` gets it as exit 1.
+_BARE = False
+
+
+def asserting(fn):
+    """Re-raise a test function's newly recorded failures for a harness that reads exceptions.
+
+    Snapshot-and-delta rather than `if FAILURES:` — with the latter, one early red would make
+    every later test fail too, and a run where four of five tests are red-by-contagion cannot
+    be read against the five-row table this PR exists to publish.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        before = len(FAILURES)
+        result = fn(*args, **kwargs)
+        new = FAILURES[before:]
+        if new and not _BARE:
+            raise AssertionError(
+                f"{len(new)} check(s) failed in {fn.__name__}: {new}. "
+                f"Run `python3 {os.path.relpath(__file__, REPO)}` from the repo root for the "
+                f"full detail lines — that is how CI invokes it.")
+        return result
+    return wrapper
+
+
 def _governance_files():
     """Read `_GOVERNANCE_FILES` out of the hook's AST.
 
@@ -105,6 +142,7 @@ def _governance_files():
     return set()
 
 
+@asserting
 def test_the_shared_core_is_protected():
     """The specific regression. `hestia_gate_core.py` must be named in the rule."""
     g = _governance_files()
@@ -133,6 +171,7 @@ def _load_hook():
     return mod
 
 
+@asserting
 def test_the_shared_core_write_is_actually_refused():
     """kimi-code NOT-SAME review of #175, D1+D2. The regression the membership test cannot see.
 
@@ -168,6 +207,7 @@ def test_the_shared_core_write_is_actually_refused():
               f"and no gate_self_access witness.")
 
 
+@asserting
 def test_the_hooks_dir_qualifier_is_a_subset_of_the_governed_names():
     """The weakening list must not drift away from the list it weakens.
 
@@ -182,6 +222,7 @@ def test_the_hooks_dir_qualifier_is_a_subset_of_the_governed_names():
           f"{sorted(weak - g)} are qualified by hooks-dir but are not governed names at all")
 
 
+@asserting
 def test_every_shared_file_is_protected_or_exempted():
     """The scheduled judgement. A new file under plugins/_shared/ is red until someone
     decides whether it decides."""
@@ -203,6 +244,7 @@ def test_every_shared_file_is_protected_or_exempted():
           f"to EXEMPT here WITH the reason.")
 
 
+@asserting
 def test_the_exemption_ledger_is_itself_protected():
     """codex #175 finding 1. A ledger that decides what escapes the guard is a policy
     artifact, and an unprotected one is a bypass with paperwork.
@@ -217,6 +259,7 @@ def test_the_exemption_ledger_is_itself_protected():
           f"unescalated write.")
 
 
+@asserting
 def test_the_scope_of_this_protection_is_stated_honestly():
     """codex #175 finding 2. This protects against writes judged by the CLAUDE adapter only.
 
@@ -236,12 +279,14 @@ def test_the_scope_of_this_protection_is_stated_honestly():
               "Claude adapter, so a reader does not infer fleet-wide coverage")
 
 
+@asserting
 def test_exemptions_carry_reasons():
     """An exemption without a stated reason is indistinguishable from an oversight."""
     thin = sorted(k for k, v in EXEMPT.items() if len(v.strip()) < 20)
     check("exemptions_carry_reasons", not thin, f"exempt with no real reason: {thin}")
 
 
+@asserting
 def test_exemptions_are_not_stale():
     """An exemption naming a file that no longer exists is dead weight that makes the list
     look more considered than it is."""
@@ -254,6 +299,10 @@ def test_exemptions_are_not_stale():
 
 
 if __name__ == "__main__":
+    # The bare runner reads FAILURES itself and wants the whole table, so switch `asserting`
+    # off. This assignment is the ONLY difference between the two invocations, and it changes
+    # how failures are DELIVERED, never whether they are detected.
+    _BARE = True
     print("gate self-protection")
     test_the_shared_core_is_protected()
     test_the_shared_core_write_is_actually_refused()
