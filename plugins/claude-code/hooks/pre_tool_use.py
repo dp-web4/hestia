@@ -683,12 +683,20 @@ def _attempted_summary(tool_name: str, tool_input: Any) -> str:
     tell me what i'm approving or why. they just say 'no reason'."* The dashboard renders
     `why: (none stated — decide on the payload alone)` and then shows no payload.
 
-    They said no reason because nothing ever sent one. The daemon has accepted
-    `stated_reason` / `stated_detail` on the claim path since 2026-08-02 and this hook has
-    never populated them — the call sent `plugin_id`, `role`, `tool_name`, `marker` and
-    stopped. So an operator saw `Edit` and a directory name and was asked to decide, which
-    is identical whether the command was `sed -n '470,520p'` or `rm -rf`. A live channel
-    with nothing in it.
+    They said no reason because nothing ever sent one. The daemon has accepted the operator's
+    two questions on the claim path since 2026-08-02 and this hook never populated them — the
+    call sent `plugin_id`, `role`, `tool_name`, `marker` and stopped. So an operator saw
+    `Edit` and a directory name and was asked to decide, which is identical whether the
+    command was `sed -n '470,520p'` or `rm -rf`. A live channel with nothing in it.
+
+    **THE WIRE ARGUMENTS ARE `reason` AND `detail`.** Not `stated_reason` / `stated_detail` —
+    those are only how the daemon STORES and re-emits them, in the `gate_escalation_opened`
+    chain entry and in `hestia_gate_pending_escalations`. An earlier draft of this docstring
+    named the stored pair, and codex caught it before it could mislead anyone (NOT-SAME review
+    of #175). The consequence would have been silent and permanent: hestia tools are
+    `additionalProperties: true`, so sending two keys nobody reads SUCCEEDS, the escalation is
+    filed, and the operator surface renders "why: (none stated)" forever — the exact bug this
+    function exists to fix, reintroduced by the comment describing the fix.
 
     kimi's and codex's gates already send an attempted summary — it is why kimi's denials
     render with the full command and this member's do not. **This is the drift the shared
