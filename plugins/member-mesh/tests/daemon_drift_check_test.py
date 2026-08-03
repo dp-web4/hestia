@@ -161,6 +161,29 @@ def synthetic_checkout(root: Path) -> tuple[str, str]:
     return older, newer
 
 
+def divergent_checkout(root: Path) -> str:
+    """Leave HEAD on `main` and return the describe of a sibling branch.
+
+    Both commits exist here and neither is an ancestor of the other — the only
+    pair that makes BOTH `merge-base --is-ancestor` calls run and answer no.
+    B's unresolvable pair short-circuits earlier, on a commit the checkout does
+    not have, so without this case that branch is never executed by any test.
+    """
+    synthetic_checkout(root)
+    base = git(root, "rev-parse", "HEAD~1")
+    git(root, "checkout", "-q", "-b", "side", base)
+    (root / "side-marker").write_text("side\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "side")
+    side = git(root, "describe", "--tags", "--always", "--dirty")
+    git(root, "checkout", "-q", "main")
+    for a, b in (("side", "main"), ("main", "side")):
+        rc = subprocess.run(["git", "-C", str(root), "merge-base",
+                             "--is-ancestor", a, b]).returncode
+        assert rc != 0, f"{a} is an ancestor of {b} — not a divergent pair"
+    return side
+
+
 def source_describe() -> str:
     out = subprocess.run(
         ["git", "-C", str(HERE.parent.parent.parent),
@@ -318,6 +341,34 @@ def check_direction_cases(only: str | None = None) -> None:
                     stop(proc)
             finally:
                 stub.stop()
+
+    if only and not "G".startswith(only):
+        return
+    # G. DIVERGENT IS UNRESOLVABLE FOR A SECOND REASON. B's pair is unorderable
+    # because a commit is MISSING; here both are present and the history simply
+    # forks — a daemon built on a branch while the checkout sits on main. Same
+    # neutral wording, different cause, and only this one exercises the path
+    # where both `merge-base` calls actually run and both say no.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "checkout"
+        side = divergent_checkout(root)
+        stub = StubDaemon(version=f"0.0.3 ({side})")
+        try:
+            proc = start(Path(td) / "home", stub.endpoint,
+                         watcher=root / "plugins" / "member-mesh" / WATCHER.name)
+            try:
+                line = read_until(proc, "DAEMON DRIFT")
+                assert "reason=differs-from-source" in line, line
+                assert "direction unresolved" in line, line
+                # The level survives the pair the resolver cannot order: a
+                # verdict it declines to refine is still a verdict it must keep
+                # reporting.
+                read_until(proc, "DAEMON state=drift")
+                assert proc.poll() is None, "watcher stopped on a divergent pair"
+            finally:
+                stop(proc)
+        finally:
+            stub.stop()
 
 
 if __name__ == "__main__":

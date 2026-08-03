@@ -144,6 +144,12 @@ drift_direction() {
   elif git -C "$WATCH_REPO_ROOT" merge-base --is-ancestor "$B" "$A" 2>/dev/null; then
     printf 'source-behind-daemon'
   fi
+  # Divergent history (both commits present, neither an ancestor) falls out of
+  # the chain having printed nothing, and the caller's `${REASON:-...}` supplies
+  # the neutral wording. No explicit `return 0` is needed: an `if` whose every
+  # condition tested false and which has no `else` exits 0 by rule, so `set -e`
+  # is not waiting here — verified against a real divergent pair rather than
+  # assumed in either direction.
 }
 
 check_daemon_drift() {
