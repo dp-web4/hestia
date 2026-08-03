@@ -35,6 +35,13 @@ Properties asserted:
      semver with no parenthesized build string) is the exact condition this
      check exists to catch; reporting it as "unverifiable" would let the one
      daemon that needs rebuilding pass silently.
+  E/F. THE REMEDY NAMES THE STALE SIDE. Equality is the verdict but it is not
+     the repair: a daemon behind its checkout needs rebuild+restart, a checkout
+     behind its daemon needs a pull, and the first instruction given in the
+     second situation walks the daemon backwards. E pins the ancestor case, F
+     the descendant case, and B pins the honest third answer — a build string
+     naming a commit this checkout does not have leaves the direction
+     unresolved, and the alarm says so instead of guessing.
 
 Hermetic: the stub is a local HTTP server on an ephemeral port; the source
 side of the comparison is the real checkout this test runs in (CI checkouts
@@ -123,6 +130,37 @@ class StubDaemon:
         self.server.server_close()
 
 
+def git(root: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(root), *args],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+def synthetic_checkout(root: Path) -> tuple[str, str]:
+    """A two-commit checkout carrying its own copy of the watcher.
+
+    The direction cases cannot use the real checkout: a DESCENDANT of HEAD does
+    not exist in it, and CI's depth-1 clone has no HEAD~1 either, so neither
+    direction is constructible there. Only the git plumbing has to be real for
+    ancestry to mean anything, and here it is. Returns (older, newer) describes.
+    """
+    wm = root / "plugins" / "member-mesh"
+    wm.mkdir(parents=True)
+    (wm / WATCHER.name).write_bytes(WATCHER.read_bytes())
+    (wm / WATCHER.name).chmod(0o755)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
+    git(root, "config", "user.email", "drift-test@example.invalid")
+    git(root, "config", "user.name", "drift test")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "watcher")
+    older = git(root, "describe", "--tags", "--always", "--dirty")
+    (root / "marker").write_text("second\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "second")
+    newer = git(root, "describe", "--tags", "--always", "--dirty")
+    assert older != newer, (older, newer)
+    return older, newer
+
+
 def source_describe() -> str:
     out = subprocess.run(
         ["git", "-C", str(HERE.parent.parent.parent),
@@ -163,7 +201,7 @@ def stop(proc: subprocess.Popen[str]) -> None:
         proc.wait(timeout=2)
 
 
-def start(home: Path, endpoint: str) -> subprocess.Popen[str]:
+def start(home: Path, endpoint: str, watcher: Path = WATCHER) -> subprocess.Popen[str]:
     env = dict(
         os.environ,
         HOME=str(home),
@@ -173,7 +211,7 @@ def start(home: Path, endpoint: str) -> subprocess.Popen[str]:
         UNANSWERED_EVERY="1",  # gauge every second: the level, not just the edge
     )
     return subprocess.Popen(
-        [str(WATCHER), "daemon-drift-test", "test-host"],
+        [str(watcher), "daemon-drift-test", "test-host"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -199,9 +237,14 @@ def main() -> None:
                 assert f"running={matching}" in startup, startup
 
                 # B. a divergent build alarms on the edge, naming both sides…
+                # `deadbeef` is not a commit this checkout has, so the direction
+                # is genuinely unresolvable and the alarm must NOT pick one:
+                # "rebuild+restart" here would be a guess, and E/F below show the
+                # guess is wrong half the time.
                 stub.version = f"0.0.3 ({drifted})"
                 drift = read_until(proc, "DAEMON DRIFT")
-                assert "rebuild+restart required" in drift, drift
+                assert "direction unresolved" in drift, drift
+                assert "rebuild+restart" not in drift, drift
                 assert f"running={drifted}" in drift, drift
                 assert f"source={describe}" in drift or f"source={matching}" in drift, drift
 
@@ -228,7 +271,53 @@ def main() -> None:
     finally:
         stub.stop()
 
-    print("ok: daemon build drift is reported on the edge and held on the level")
+    check_direction_cases()
+
+    print("ok: daemon build drift is reported on the edge, held on the level, "
+          "and names which side is stale")
+
+
+def check_direction_cases(only: str | None = None) -> None:
+    # E/F. THE REMEDY IS DIRECTIONAL AND EQUALITY CANNOT SUPPLY IT.
+    # Observed on CBP 2026-08-03, the hour this check merged: the daemon was
+    # deployed at f863088 from a clean worktree while the shared checkout every
+    # watcher runs from sat 12 commits behind, so the alarm read "rebuild+restart
+    # required" for a daemon that was AHEAD — an instruction that, followed, would
+    # have installed a binary older than the one it replaced. Mismatch is one
+    # verdict with two opposite repairs; the alarm has to say which.
+    for label, head_at, running_is, want_reason, want_fix in (
+        ("E daemon-behind-source", "newer", "older", "daemon-behind-source",
+         "rebuild+restart required"),
+        ("F source-behind-daemon", "older", "newer", "source-behind-daemon",
+         "pull the checkout"),
+    ):
+        # `only` exists so each case can be run alone against an unpatched
+        # watcher: a case that never executes because an earlier one aborted has
+        # not been shown to be red, and a guard never seen red is a claim.
+        if only and not label.startswith(only):
+            continue
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "checkout"
+            older, newer = synthetic_checkout(root)
+            if head_at == "older":
+                git(root, "reset", "--hard", "-q", "HEAD~1")
+            running = older if running_is == "older" else newer
+            stub = StubDaemon(version=f"0.0.3 ({running})")
+            try:
+                proc = start(Path(td) / "home", stub.endpoint,
+                             watcher=root / "plugins" / "member-mesh" / WATCHER.name)
+                try:
+                    line = read_until(proc, "DAEMON DRIFT")
+                    assert f"reason={want_reason}" in line, (label, line)
+                    assert want_fix in line, (label, line)
+                    if want_reason == "source-behind-daemon":
+                        # The wrong instruction must be absent, not merely
+                        # outranked: a line carrying both reads as either.
+                        assert "rebuild+restart" not in line, (label, line)
+                finally:
+                    stop(proc)
+            finally:
+                stub.stop()
 
 
 if __name__ == "__main__":
