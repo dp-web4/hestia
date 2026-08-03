@@ -69,7 +69,7 @@ else
   WATCH_ARTIFACT_STATE="unverifiable"
   WATCH_ARTIFACT_REASON="startup-baseline-unavailable"
 fi
-WATCH_LAST_ALARM_STATE=""
+WATCH_LAST_ALARM_KEY=""
 
 # DAEMON DRIFT (2026-08-03, mesh-vocabulary thread: "landed is three steps short").
 # The watcher refuses to run stale bytes of ITSELF (check_artifact_drift above), but
@@ -202,9 +202,23 @@ check_daemon_drift() {
 
   # Same edge-then-level discipline as check_artifact_drift: the alarm is the
   # transition, the periodic DAEMON line is the gauge that survives rotation.
+  # The latch key is state:reason, not state alone. While `drift` had exactly one
+  # reason, state was a lossless stand-in for the instruction; the direction
+  # resolver above gave it three, two of which are OPPOSITE remedies. CBP's
+  # standing case walks between them: a watcher restarted while the shared
+  # checkout is behind latches on source-behind-daemon, then a sibling merge and
+  # pull move the checkout PAST the daemon's build — and a state-only latch
+  # swallows that edge, so the one instruction this check exists to deliver
+  # (rebuild+restart, the daemon is the stale side) is never spoken. Measured,
+  # not reasoned: kimi-code's review of #176 drove the flip and the second edge
+  # did not fire. Latch on what the alarm SAYS, so a changed remedy is an edge.
+  # The same line closes a second, older silence in the other direction: the
+  # UNVERIFIABLE branch prints its reason, and daemon-unreachable ->
+  # build-provenance-unknown (a daemon that restarts into a build reporting no
+  # provenance) is a different sentence that state alone could not tell apart.
   if [ "$STATE" = "ok" ]; then
-    WATCH_DAEMON_LAST_ALARM_STATE=""
-  elif [ "$STATE" != "$WATCH_DAEMON_LAST_ALARM_STATE" ]; then
+    WATCH_DAEMON_LAST_ALARM_KEY=""
+  elif [ "$STATE:$REASON" != "$WATCH_DAEMON_LAST_ALARM_KEY" ]; then
     if [ "$STATE" = "drift" ]; then
       # The remedy follows the resolved direction. "rebuild+restart" is the right
       # instruction only when the daemon is the stale side; told to a machine whose
@@ -220,14 +234,14 @@ check_daemon_drift() {
     else
       echo "[hestia-watch] DAEMON UNVERIFIABLE — reason=$REASON running=$WATCH_DAEMON_RUNNING source=$WATCH_DAEMON_SOURCE"
     fi
-    WATCH_DAEMON_LAST_ALARM_STATE="$STATE"
+    WATCH_DAEMON_LAST_ALARM_KEY="$STATE:$REASON"
   fi
 }
 WATCH_DAEMON_STATE="unverifiable"
 WATCH_DAEMON_REASON="not-yet-checked"
 WATCH_DAEMON_RUNNING="unavailable"
 WATCH_DAEMON_SOURCE="unavailable"
-WATCH_DAEMON_LAST_ALARM_STATE=""
+WATCH_DAEMON_LAST_ALARM_KEY=""
 
 announce_daemon() {
   check_daemon_drift refresh
@@ -266,17 +280,25 @@ check_artifact_drift() {
   WATCH_ARTIFACT_REASON="$REASON"
 
   # Alarms are edges; the periodic ARTIFACT line above is the level. Remember the
-  # last non-ok state rather than a boolean so unverifiable -> drift emits the new,
-  # actionable condition once. Returning to ok clears the edge memory.
+  # last non-ok state:reason rather than a boolean so unverifiable -> drift emits
+  # the new, actionable condition once. Returning to ok clears the edge memory.
+  # The reason joins the key to match check_daemon_drift, where it is load-bearing.
+  # Here it changes NOTHING reachable today and the honest note is why: the only
+  # two unverifiable reasons are startup-baseline-unavailable and
+  # disk-hash-unavailable, and the first is absorbing — WATCH_STARTUP_SHA256 is
+  # assigned once at startup and tested first, so a run that enters it never
+  # leaves it, and no flip between reasons exists to swallow. This line is
+  # alignment, not a repair; it earns its place by removing a difference between
+  # two otherwise identical latches that a reader would have to re-derive.
   if [ "$STATE" = "ok" ]; then
-    WATCH_LAST_ALARM_STATE=""
-  elif [ "$STATE" != "$WATCH_LAST_ALARM_STATE" ]; then
+    WATCH_LAST_ALARM_KEY=""
+  elif [ "$STATE:$REASON" != "$WATCH_LAST_ALARM_KEY" ]; then
     if [ "$STATE" = "drift" ]; then
       echo "[hestia-watch] ARTIFACT DRIFT — restart required; startup_sha256=$WATCH_STARTUP_SHA256 disk_sha256=$CURRENT"
     else
       echo "[hestia-watch] ARTIFACT UNVERIFIABLE — reason=$REASON startup_sha256=$WATCH_STARTUP_SHA256 disk_sha256=$CURRENT"
     fi
-    WATCH_LAST_ALARM_STATE="$STATE"
+    WATCH_LAST_ALARM_KEY="$STATE:$REASON"
   fi
 }
 
