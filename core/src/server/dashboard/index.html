@@ -2096,8 +2096,23 @@
       }
       const bar = typeof e.bar === 'string' ? e.bar : JSON.stringify(e.bar ?? '');
       const nf = Array.isArray(e.factors) ? e.factors.length : 0;
+      // WHAT WILL YOUR APPROVAL DO — stated before the click, not discovered after it.
+      //
+      // dp, 2026-08-04: "do they actually unblock anything when i approve?" — asked after
+      // approving one whose bar was sovereign_plus_peer, which recorded `approved` and still
+      // refused the write because no peer had corroborated. Both cases rendered identically:
+      // the bar's NAME was shown, its CONSEQUENCE never was.
+      const suffices = e.operator_alone_suffices !== false;   // absent (older daemon) => assume
+      const needs = typeof e.still_needs === 'string' ? e.still_needs : '';
       row.querySelector('.esc-meta').textContent =
-        `id ${e.id} · bar ${bar} · ${nf} factor${nf === 1 ? '' : 's'} recorded`;
+        `id ${e.id} · bar ${bar} · ${nf} factor${nf === 1 ? '' : 's'} recorded · ` +
+        (suffices
+          ? 'your approval is sufficient'
+          : `YOUR APPROVAL ALONE WILL NOT PERMIT THIS — still needs ${needs}`);
+      // Colour it, because a sentence in the metadata line is easy to skim past and this is
+      // the one an operator must not skim: approving here is correct and insufficient, and
+      // watching nothing happen afterwards is what teaches people the button is decorative.
+      row.querySelector('.esc-meta').style.color = suffices ? '' : 'var(--warning)';
 
       const reason = row.querySelector('.esc-reason');
       const approve = row.querySelector('.esc-approve');

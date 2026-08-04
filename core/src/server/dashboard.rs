@@ -779,6 +779,47 @@ impl ServerState {
                             // under rather than today's.
                             "bar": e.bar,
                             "factors": e.factors,
+                            // WILL THE OPERATOR'S APPROVAL ACTUALLY PERMIT THE WRITE?
+                            //
+                            // dp, 2026-08-04: *"do they actually unblock anything when i
+                            // approve?"* — asked after approving `236a43ae3e687a6a`, which was
+                            // recorded `approved` and still refused the write, because its bar
+                            // is `sovereign_plus_peer` and no peer ever corroborated. The panel
+                            // showed the bar's NAME and never said what it MEANT for the person
+                            // about to click. Those two cases render identically today:
+                            //
+                            //   single_approver      -> your approval is sufficient
+                            //   sovereign_plus_peer  -> your approval is NECESSARY, NOT SUFFICIENT
+                            //
+                            // Approving the second and watching nothing happen is the strongest
+                            // possible teacher that the button is decorative. It is not — the
+                            // mechanism works, four writes landed on approvals last night — but
+                            // an operator cannot tell a working control from a broken one when
+                            // the surface withholds the discriminator.
+                            "operator_alone_suffices": match e.bar {
+                                crate::server::gate_escalation::Bar::SingleApprover => true,
+                                crate::server::gate_escalation::Bar::SovereignPlusPeer => e
+                                    .factors
+                                    .iter()
+                                    .any(|f| {
+                                        f.channel
+                                            == crate::server::gate_escalation::Channel::PeerMember
+                                    }),
+                            },
+                            // Stated positively so the UI never has to infer the remedy from a
+                            // false boolean: what is still missing, in the operator's terms.
+                            "still_needs": match e.bar {
+                                crate::server::gate_escalation::Bar::SovereignPlusPeer
+                                    if !e.factors.iter().any(|f| {
+                                        f.channel
+                                            == crate::server::gate_escalation::Channel::PeerMember
+                                    }) =>
+                                {
+                                    Some("an independent NOT-SAME peer factor \
+                                          (hestia_gate_escalation_corroborate)")
+                                }
+                                _ => None,
+                            },
                         })
                     })
                     .collect()
