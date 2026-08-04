@@ -625,6 +625,35 @@ pub struct EscalationStore {
     by_id: HashMap<String, Escalation>,
     /// Monotonic, so two escalations opened in the same second still differ.
     seq: u64,
+    /// Markers a GATE has actually presented, per member — the authoritative spellings.
+    ///
+    /// THE MARKER IS A JOIN KEY, NOT A LABEL, and nothing said so (dp, 2026-08-04: *"yes,
+    /// that's a problem — fix it"*). `claim()` matches on `(plugin_id, marker)`. A member
+    /// filing a reasoned escalation via `hestia_gate_escalation_open` chooses that string
+    /// itself and has **no way to learn** what its gate will present later.
+    ///
+    /// Live instance: claude-code filed one with a human-readable marker — written to read
+    /// well for the operator — while its gate matches on the hook directory path. dp approved
+    /// it. The escalation was `approved`, `permits_write=true`, and permanently unclaimable,
+    /// and the failure was indistinguishable from "not approved yet".
+    ///
+    /// The perverse part is the incentive. The DEGRADED path always works, because when a gate
+    /// auto-opens on a deny it supplies both sides of the join. The CORRECT path — file
+    /// deliberately, state a reason — is the only one that can silently mismatch. Asking
+    /// properly was punished; tripping the gate was not. That is the "efficient path and
+    /// correct path must be the same path" principle inverted, inside the mechanism built to
+    /// reward asking.
+    ///
+    /// Populated from `claim()` ONLY. Those spellings come from a gate presenting its own
+    /// matched rule, so they are evidence. `open()` markers are caller-asserted and are never
+    /// taught back — otherwise a member could seed the vocabulary with its own invention and
+    /// have it read as authoritative.
+    ///
+    /// (This doc deliberately does not quote the literal marker string. Writing it makes the
+    /// comment itself match the gate's own governance-path rule, and editing this file — a
+    /// daemon file, not gate code — is then refused as a write to the gate. That is the same
+    /// mention-not-resolution defect tracked in #158, hit while fixing a different one.)
+    gate_markers: HashMap<String, std::collections::BTreeSet<String>>,
 }
 
 pub fn now_secs() -> u64 {
@@ -898,12 +927,46 @@ impl EscalationStore {
     ///
     /// Consumption is the whole point: an approval authorises the one write that was refused,
     /// not a standing permit.
+    /// Marker spellings this member's gate has actually presented. Empty is HONEST, not
+    /// permissive: it means no gate has claimed for this member yet, so nothing is known —
+    /// which a caller must render as "unknown", never as "your marker is fine".
+    pub fn known_gate_markers(&self, plugin_id: &str) -> Vec<String> {
+        self.gate_markers
+            .get(plugin_id.trim())
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Would an approval against this marker ever be claimable?
+    ///
+    /// Three-valued on purpose, because "no evidence" and "contradicted by evidence" are
+    /// different facts and collapsing them is the defect this whole surface keeps producing:
+    ///   `Some(true)`  — a gate has presented exactly this spelling. The join will match.
+    ///   `Some(false)` — gates have presented OTHER spellings for this member, and not this
+    ///                   one. An approval here is very likely to be unclaimable.
+    ///   `None`        — nothing known yet. Say so; do not reassure.
+    pub fn marker_is_recognised(&self, plugin_id: &str, marker: &str) -> Option<bool> {
+        let known = self.gate_markers.get(plugin_id.trim())?;
+        if known.is_empty() {
+            return None;
+        }
+        Some(known.contains(marker.trim()))
+    }
+
     pub fn claim(&mut self, plugin_id: &str, marker: &str, now: u64) -> Option<Escalation> {
         let plugin_id = plugin_id.trim();
         let marker = marker.trim();
         if plugin_id.is_empty() || marker.is_empty() {
             return None;
         }
+        // LEARN THE SPELLING, whether or not an approval is found. A gate reaching this call
+        // has just matched one of its own rules, so this string is the authoritative join key
+        // for this member — and the failure case (no approval yet) is precisely when a member
+        // is about to file one and needs to know it.
+        self.gate_markers
+            .entry(plugin_id.to_string())
+            .or_default()
+            .insert(marker.to_string());
         // Oldest claimable first, so a member that somehow holds two approvals spends the one
         // closest to expiring rather than stranding it.
         let mut ids: Vec<(u64, String)> = self
@@ -1900,6 +1963,52 @@ mod bar_factor_tests {
     }
 
     #[test]
+    /// The marker is a JOIN KEY, and a member filing deliberately cannot learn it.
+    ///
+    /// The live failure, reproduced: a member files with its own readable string, an operator
+    /// approves, and the approval is permanently unclaimable because the gate joins on a
+    /// different spelling. `bar_met` is true and `is_claimable` is true the whole time — the
+    /// escalation is not broken, it is simply unreachable, which from the member's side is
+    /// indistinguishable from "not approved yet".
+    #[test]
+    fn a_marker_the_gate_never_presented_yields_an_unclaimable_approval() {
+        let mut s = EscalationStore::default();
+        let gate_marker = "some/dir/the/gate/matches";
+        let readable = "the thing I am editing, described for a human";
+
+        // Nothing known yet — the honest answer is None, never "fine".
+        assert_eq!(s.marker_is_recognised("m", readable), None);
+
+        // A gate claims (finding nothing) and in doing so teaches its authoritative spelling.
+        assert!(s.claim("m", gate_marker, T0).is_none());
+        assert_eq!(s.known_gate_markers("m"), vec![gate_marker.to_string()]);
+        assert_eq!(s.marker_is_recognised("m", gate_marker), Some(true));
+        assert_eq!(
+            s.marker_is_recognised("m", readable),
+            Some(false),
+            "gates have presented another spelling for this member and not this one — a \
+             different fact from 'nothing known', and collapsing them is what made the \
+             original failure silent"
+        );
+
+        // THE FAILURE: file under the readable marker, approve it, watch the gate find nothing.
+        let esc = s
+            .open("m", "r", "Edit", readable, Some("a stated reason"), None, T0, 3600)
+            .expect("open");
+        let id = esc.id.clone();
+        let decided = s
+            .decide(&id, true, "dp", "role:constellation:sovereign",
+                    Channel::OperatorSession, None, None, T0 + 5)
+            .expect("approve");
+        assert!(decided.bar_met(), "the approval is real and meets its bar");
+        assert!(decided.is_claimable(T0 + 6), "and it is claimable — under ITS marker");
+        assert!(
+            s.claim("m", gate_marker, T0 + 6).is_none(),
+            "APPROVED AND UNREACHABLE: the gate joins on its own spelling, so a genuine \
+             operator approval buys nothing and the member cannot tell why"
+        );
+    }
+
     fn a_single_approval_meets_a_single_approver_bar() {
         let (mut s, id) = open_with("law_inject.py");
         let e = s
