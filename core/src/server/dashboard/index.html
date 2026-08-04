@@ -2032,13 +2032,21 @@
 
   // --- scope requests ----------------------------------------------------------
   //
-  // Deliberately simpler than the escalation renderer: no draft-preservation map, because
-  // approving a scope request does NOT require typed input. The escalation panel needs drafts
-  // because a reason is mandatory there and a re-render was eating half-typed text (dp,
-  // 2026-08-02: "the field is cleared in a couple seconds"). Here the reason is supplied by
-  // the REQUESTER at filing and is mandatory server-side, so the operator is ruling on someone
-  // else's sentence rather than composing their own. An optional note is still offered; it is
-  // rebuilt each tick and that is acceptable precisely because nothing is lost if it is empty.
+  // Drafts ARE preserved here, for the same reason the escalation panel preserves them: the
+  // poll rebuilds this list every 2s and would otherwise eat a half-typed note (dp,
+  // 2026-08-02: "the field is cleared in a couple seconds").
+  //
+  // An earlier version of this comment said the opposite — "no draft-preservation map,
+  // because approving a scope request does NOT require typed input" — sitting directly above
+  // `const scopeDrafts = new Map()`, which the code then populates and prunes. kimi caught it
+  // (NOT-SAME review of #186): a comment contradicted by the line beneath it, in a PR whose
+  // own thesis is that claims must match artifacts. It was written while reasoning about the
+  // design and never revised when the code went the other way, which is the ordinary way this
+  // defect happens and the reason it is worth naming rather than quietly deleting.
+  //
+  // The real difference from the escalation panel is narrower: there a reason is MANDATORY to
+  // approve, here the requester already supplied the why and the operator's note is required
+  // only to GRANT. So the map protects a shorter piece of typing — not none.
   const scopeDrafts = new Map();
   let scopeRenderedSig = null;
 
@@ -2448,7 +2456,16 @@
       if (e.target.dataset.close) scopeModal.hidden = true;
     });
     escModal.addEventListener('click', (e) => { if (e.target.dataset.close) escModal.hidden = true; });
-    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') escModal.hidden = true; });
+    // Escape closes BOTH governance modals. The scope panel was added with backdrop and ✕ but
+    // not Escape, breaking the close contract this file documents for the escalation modal —
+    // "the three ways a reader will try" (kimi NOT-SAME review of #186). A modal that ignores
+    // one of the three teaches the operator that this panel is different from the one beside
+    // it, which is the opposite of why it reuses the escalation panel's shape.
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      escModal.hidden = true;
+      scopeModal.hidden = true;
+    });
     // Same backdrop/✕/Escape contract for the trust detail popup, so both modals close
     // the three ways a reader will try rather than only the one that was wired.
     // Agents drawer: open/close, refresh, and close on outside click or Escape.

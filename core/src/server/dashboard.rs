@@ -938,6 +938,14 @@ mod tests {
         };
 
         state.scope_requests.insert("pend".into(), mk("pend", None, now + SCOPE_REQUEST_TTL_SECS));
+        // A SECOND pending request, filed EARLIER, so the oldest-first ordering is proven
+        // rather than asserted in a comment (kimi NOT-SAME review of #186). The first fixture
+        // gave all four the same `requested_at`, so the sort could have been absent, reversed
+        // or arbitrary and the test would still have passed — a green about a claim it never
+        // exercised, which is the defect this whole thread keeps finding.
+        let mut older = mk("older", None, now + SCOPE_REQUEST_TTL_SECS);
+        older.requested_at = now.saturating_sub(600);
+        state.scope_requests.insert("older".into(), older);
         state.scope_requests.insert("granted".into(), mk("granted", Some(true), now + 3600));
         state.scope_requests.insert("refused".into(), mk("refused", Some(false), now + 3600));
         // An undecided request past its window is EXPIRED, and expired is a refusal — it must
@@ -950,9 +958,20 @@ mod tests {
             .iter()
             .map(|r| r["request_id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, vec!["pend"], "only the live pending request may be offered");
+        // OLDEST FIRST: the one closest to lapsing needs a human soonest, and an unanswered
+        // request expires into a REFUSAL. Asserted on order, not just membership.
+        assert_eq!(
+            ids,
+            vec!["older", "pend"],
+            "only live pending requests may be offered, oldest first — the one nearest its \
+             deadline is the one a human must see first"
+        );
 
-        let row = &s.pending_scope_requests[0];
+        let row = s
+            .pending_scope_requests
+            .iter()
+            .find(|r| r["request_id"] == "pend")
+            .expect("the pending fixture must be present");
         // THE BASIS travels with the ask. A queue that shows who and what but not why is the
         // "no reason" defect arriving on a second surface (dp, 2026-08-03).
         assert_eq!(row["reason"], "dp directed me to read this in-session");
