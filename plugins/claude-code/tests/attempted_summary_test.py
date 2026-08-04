@@ -122,7 +122,83 @@ def test_no_input_is_stated_not_guessed():
     check("no_command_or_path", "no command or path" in m._attempted_summary("Bash", {"x": 1}))
 
 
+def teardown_module(_module=None):
+    """PYTEST-VISIBLE DELIVERY of the accumulated result (codex/gpt audit of #185, blocker A).
+
+    `check()` records into `FAILURES` and only `__main__` exits non-zero. Under bare `python3`
+    that is red; under `pytest` every test function returns None, nothing raises, and the file
+    reports GREEN while carrying failures. Red under one invocation and green under another is
+    the same null-state twin this repo's own self-execution guard exists to catch — and it was
+    sitting in the test written to prove a security fix.
+
+    `teardown_module` runs once after the module's tests under pytest and is inert under bare
+    execution, so both invocations now agree. The accumulate-then-report shape is deliberately
+    kept: it is what printed all seven leaking payloads at once instead of stopping at the
+    first, and that is why the finding was actionable rather than a single symptom."""
+    assert not FAILURES, f"{len(FAILURES)} check(s) failed: {FAILURES}"
+
+
+class _RecordingClient:
+    """Captures the outgoing MCP payload instead of sending it.
+
+    Substituted for the hook's real client so the test observes exactly what the daemon would
+    receive — no socket, no daemon, no timing."""
+
+    calls = []
+
+    def __init__(self, *_a, **_kw):
+        pass
+
+    def initialize(self):
+        return {"result": {}}
+
+    def initialized(self):
+        return None
+
+    def call_tool(self, name, args):
+        type(self).calls.append((name, args))
+        # Deny the claim so `request_self_write` takes its refusal path and the caller is not
+        # told a write was permitted. The payload is what we came for.
+        return {"result": {"claimed": False, "escalation_id": "stub-esc"}}
+
+
+def test_the_claim_sends_reason_and_detail_not_the_stored_names():
+    """THE LOAD-BEARING WIRE PROPERTY, actually captured (blocker B).
+
+    The previous suite exercised `_attempted_summary()` and never observed the call it feeds.
+    That is the gap the function's own docstring warns about: hestia tools accept unknown
+    properties, so sending `stated_reason`/`stated_detail` — the names the daemon *stores* them
+    under — SUCCEEDS silently and renders `why: (none stated)` forever. A green test proving
+    the summary is well-formed says nothing about whether it arrives.
+
+    So: swap in a recording client, drive the real code path, and assert on the emitted keys."""
+    m = _load_hook()
+    _RecordingClient.calls = []
+    real = m.McpHttp
+    try:
+        m.McpHttp = _RecordingClient
+        m.request_self_write("some/marker", "Edit", "Edit: touched a governed file")
+    finally:
+        m.McpHttp = real
+
+    claims = [a for (n, a) in _RecordingClient.calls if n == "hestia_gate_escalation_claim"]
+    check("claim_was_sent", len(claims) == 1, f"{len(claims)} claim calls captured")
+    if not claims:
+        return
+    payload = claims[0]
+    check("sends_reason", payload.get("reason") == "Edit: touched a governed file",
+          f"reason not delivered: {payload.get('reason')!r}")
+    check("sends_detail", isinstance(payload.get("detail"), str) and payload["detail"],
+          "detail missing — the operator surface renders it as `what:`")
+    # The exact trap, asserted: the stored names must NOT be on the wire, because sending them
+    # succeeds and produces a permanently reasonless escalation.
+    check("does_not_send_stated_reason", "stated_reason" not in payload,
+          "sending the STORED name succeeds silently and yields 'why: (none stated)' forever")
+    check("does_not_send_stated_detail", "stated_detail" not in payload)
+
+
 ALL_TESTS = [
+    "test_the_claim_sends_reason_and_detail_not_the_stored_names",
     "test_the_summary_is_bounded",
     "test_credential_shapes_are_redacted",
     "test_ordinary_commands_are_not_redacted",
@@ -140,6 +216,7 @@ def test_every_test_is_registered():
 if __name__ == "__main__":
     print("attempted_summary")
     test_every_test_is_registered()
+    test_the_claim_sends_reason_and_detail_not_the_stored_names()
     test_the_summary_is_bounded()
     test_credential_shapes_are_redacted()
     test_ordinary_commands_are_not_redacted()
@@ -149,4 +226,5 @@ if __name__ == "__main__":
     if FAILURES:
         print(f"FAILED: {len(FAILURES)} — {FAILURES}")
         sys.exit(1)
+    teardown_module()
     print("all checks pass")
