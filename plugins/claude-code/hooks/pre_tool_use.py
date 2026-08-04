@@ -718,16 +718,65 @@ def _attempted_summary(tool_name: str, tool_input: Any) -> str:
         for k in ("file_path", "path", "notebook_path"):
             v = tool_input.get(k)
             if isinstance(v, str):
+                # THE PATH FALLBACK IS REDACTED TOO (kimi #185, finding 2). It returned the
+                # path bare. Lower risk than a command — paths, not contents — but a path can
+                # BE the secret, and an inconsistent rule is one a reader cannot rely on.
+                # Confirmed leaking before this existed.
+                if _credential_shaped(v):
+                    return (f"{tool_name} [REDACTED — the target is a credential-shaped path; "
+                            f"{len(v)} chars withheld rather than copied into the record]")
                 return f"{tool_name} -> {v[-140:]}"
         return f"{tool_name} (no command or path in input)"
     s = " ".join(raw.split())
-    low = s.lower()
-    for token in ("id_rsa", "id_ed25519", ".env", "credential", "secret",
-                  "token", "passphrase", "api_key", "apikey"):
-        if token in low:
-            return (f"{tool_name} [REDACTED — names a credential-shaped token; "
-                    f"{len(s)} chars withheld rather than copied into the record]")
+    if _credential_shaped(s):
+        return (f"{tool_name} [REDACTED — names a credential-shaped token; "
+                f"{len(s)} chars withheld rather than copied into the record]")
     return f"{tool_name}: {s[:220]}" + (" …" if len(s) > 220 else "")
+
+
+#: Shapes that carry secrets in a real shell command — not merely filenames that suggest one.
+#:
+#: kimi NOT-SAME review of #185, finding 2. The first list held key-material filenames and a
+#: few English nouns, and a red test confirmed SEVEN shapes passing through verbatim into the
+#: signed, hash-chained record: `Authorization:`/`Bearer` headers, `--password=` flags,
+#: `PASSWORD=` assignments, ssh config paths, PEM `BEGIN` blocks, bare `bearer`, and the
+#: unredacted path fallback.
+#:
+#: WHY THIS IS AN EGRESS SURFACE AT ALL, which I did not see when I wrote it: before this
+#: function, nothing from a denied command was sent anywhere. It is the change that STARTS
+#: copying command text into the witness chain — so it introduces the leak it must then
+#: prevent. And a witnessed record is deliberately easier to read, and harder to expunge, than
+#: the file the deny was protecting. Redaction here is not hygiene; it is the reason the
+#: feature is safe to have.
+#:
+#: Substring matching on a lowered string, deliberately: a regex over attacker-shaped command
+#: text is its own hazard, and the cost of a false positive is one unhelpfully-vague escalation
+#: while the cost of a false negative is a secret in the permanent record. Asymmetric, so this
+#: errs loud. `test_ordinary_commands_are_not_redacted` bounds the over-matching.
+_CREDENTIAL_SHAPES = (
+    # key material and its filenames
+    "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".pem", ".p12", ".pfx",
+    "begin rsa private key", "begin openssh private key", "begin private key",
+    "begin ec private key", "begin certificate",
+    # ssh / gpg config trees — a path can be the secret
+    "/.ssh", ".ssh/", "/.gnupg", ".netrc", ".pgpass", ".htpasswd",
+    # http auth
+    "authorization:", "authorization ", "bearer ", "x-api-key", "proxy-authorization",
+    # generic secret words, and the flag/env spellings that actually appear
+    "password", "passwd", "passphrase", "credential", "secret", "api_key", "apikey",
+    "access_key", "access-key", "private_key", "private-key", "client_secret",
+    "token=", "_token", "auth_token", "session_token", "refresh_token",
+    ".env", "dotenv",
+)
+
+
+def _credential_shaped(text: str) -> bool:
+    """Does this text plausibly carry a secret? Substring, lowered, no regex.
+
+    One helper for both the command and the path branch so the two cannot drift — the
+    inconsistency kimi flagged was exactly that they already had."""
+    low = text.lower()
+    return any(shape in low for shape in _CREDENTIAL_SHAPES)
 
 
 def request_self_write(marker: str, tool_name: str, attempted: str = "") -> Tuple[str, str]:
