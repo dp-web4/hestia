@@ -676,7 +676,110 @@ ESCALATION_RPC_TIMEOUT_S = 5.0
 ESCALATION_RPC_TIMEOUT_S = 1.5
 
 
-def request_self_write(marker: str, tool_name: str) -> Tuple[str, str]:
+def _attempted_summary(tool_name: str, tool_input: Any) -> str:
+    """WHAT was attempted, in one bounded line, for the human who has to rule on it.
+
+    dp, 2026-08-03, after approving several in a row: *"the issue remains that they don't
+    tell me what i'm approving or why. they just say 'no reason'."* The dashboard renders
+    `why: (none stated — decide on the payload alone)` and then shows no payload.
+
+    They said no reason because nothing ever sent one. The daemon has accepted the operator's
+    two questions on the claim path since 2026-08-02 and this hook never populated them — the
+    call sent `plugin_id`, `role`, `tool_name`, `marker` and stopped. So an operator saw
+    `Edit` and a directory name and was asked to decide, which is identical whether the
+    command was `sed -n '470,520p'` or `rm -rf`. A live channel with nothing in it.
+
+    **THE WIRE ARGUMENTS ARE `reason` AND `detail`.** Not `stated_reason` / `stated_detail` —
+    those are only how the daemon STORES and re-emits them, in the `gate_escalation_opened`
+    chain entry and in `hestia_gate_pending_escalations`. An earlier draft of this docstring
+    named the stored pair, and codex caught it before it could mislead anyone (NOT-SAME review
+    of #175). The consequence would have been silent and permanent: hestia tools are
+    `additionalProperties: true`, so sending two keys nobody reads SUCCEEDS, the escalation is
+    filed, and the operator surface renders "why: (none stated)" forever — the exact bug this
+    function exists to fix, reintroduced by the comment describing the fix.
+
+    kimi's and codex's gates already send an attempted summary — it is why kimi's denials
+    render with the full command and this member's do not. **This is the drift the shared
+    core exists to end, and it drifted in the direction that costs the operator.** Written
+    here rather than only in `hestia_gate_core.py` because the core is not wired yet and
+    the cost is being paid now; when the shims land it belongs on `Verdict` and this copy
+    should go with the rest of the duplication.
+
+    BOUNDED AND SELF-CENSORING. Truncated hard, because an escalation body is read by a
+    human under interruption. Redacted on credential-shaped tokens, because a refusal is not
+    a licence to copy a payload into the witness chain: an egress deny is ABOUT a secret
+    path, so verbatim echo would reproduce the protected thing inside a record that is
+    deliberately easier to read than the file was.
+    """
+    if not isinstance(tool_input, dict):
+        return f"{tool_name} (no inspectable input)"
+    raw = tool_input.get("command")
+    if not isinstance(raw, str):
+        for k in ("file_path", "path", "notebook_path"):
+            v = tool_input.get(k)
+            if isinstance(v, str):
+                # THE PATH FALLBACK IS REDACTED TOO (kimi #185, finding 2). It returned the
+                # path bare. Lower risk than a command — paths, not contents — but a path can
+                # BE the secret, and an inconsistent rule is one a reader cannot rely on.
+                # Confirmed leaking before this existed.
+                if _credential_shaped(v):
+                    return (f"{tool_name} [REDACTED — the target is a credential-shaped path; "
+                            f"{len(v)} chars withheld rather than copied into the record]")
+                return f"{tool_name} -> {v[-140:]}"
+        return f"{tool_name} (no command or path in input)"
+    s = " ".join(raw.split())
+    if _credential_shaped(s):
+        return (f"{tool_name} [REDACTED — names a credential-shaped token; "
+                f"{len(s)} chars withheld rather than copied into the record]")
+    return f"{tool_name}: {s[:220]}" + (" …" if len(s) > 220 else "")
+
+
+#: Shapes that carry secrets in a real shell command — not merely filenames that suggest one.
+#:
+#: kimi NOT-SAME review of #185, finding 2. The first list held key-material filenames and a
+#: few English nouns, and a red test confirmed SEVEN shapes passing through verbatim into the
+#: signed, hash-chained record: `Authorization:`/`Bearer` headers, `--password=` flags,
+#: `PASSWORD=` assignments, ssh config paths, PEM `BEGIN` blocks, bare `bearer`, and the
+#: unredacted path fallback.
+#:
+#: WHY THIS IS AN EGRESS SURFACE AT ALL, which I did not see when I wrote it: before this
+#: function, nothing from a denied command was sent anywhere. It is the change that STARTS
+#: copying command text into the witness chain — so it introduces the leak it must then
+#: prevent. And a witnessed record is deliberately easier to read, and harder to expunge, than
+#: the file the deny was protecting. Redaction here is not hygiene; it is the reason the
+#: feature is safe to have.
+#:
+#: Substring matching on a lowered string, deliberately: a regex over attacker-shaped command
+#: text is its own hazard, and the cost of a false positive is one unhelpfully-vague escalation
+#: while the cost of a false negative is a secret in the permanent record. Asymmetric, so this
+#: errs loud. `test_ordinary_commands_are_not_redacted` bounds the over-matching.
+_CREDENTIAL_SHAPES = (
+    # key material and its filenames
+    "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".pem", ".p12", ".pfx",
+    "begin rsa private key", "begin openssh private key", "begin private key",
+    "begin ec private key", "begin certificate",
+    # ssh / gpg config trees — a path can be the secret
+    "/.ssh", ".ssh/", "/.gnupg", ".netrc", ".pgpass", ".htpasswd",
+    # http auth
+    "authorization:", "authorization ", "bearer ", "x-api-key", "proxy-authorization",
+    # generic secret words, and the flag/env spellings that actually appear
+    "password", "passwd", "passphrase", "credential", "secret", "api_key", "apikey",
+    "access_key", "access-key", "private_key", "private-key", "client_secret",
+    "token=", "_token", "auth_token", "session_token", "refresh_token",
+    ".env", "dotenv",
+)
+
+
+def _credential_shaped(text: str) -> bool:
+    """Does this text plausibly carry a secret? Substring, lowered, no regex.
+
+    One helper for both the command and the path branch so the two cannot drift — the
+    inconsistency kimi flagged was exactly that they already had."""
+    low = text.lower()
+    return any(shape in low for shape in _CREDENTIAL_SHAPES)
+
+
+def request_self_write(marker: str, tool_name: str, attempted: str = "") -> Tuple[str, str]:
     """One round trip. Returns (verdict, detail); only 'approved' permits the write.
 
     THIS FUNCTION NEVER WAITS, and that is the whole design. The harness kills this hook at 5
@@ -703,6 +806,22 @@ def request_self_write(marker: str, tool_name: str) -> Tuple[str, str]:
             "role": os.environ.get("HESTIA_ROLE", ""),
             "tool_name": tool_name,
             "marker": marker,
+            # WHAT was attempted. The daemon has accepted these two since 2026-08-02 and
+            # this call never sent them, which is why every escalation rendered
+            # "why: (none stated — decide on the payload alone)" and then displayed no
+            # payload. dp, 2026-08-03: "they don't tell me what i'm approving or why."
+            #
+            # `reason` carries the ATTEMPTED ACT, not a rationale, and the distinction is
+            # deliberate: an auto-opened escalation HAS no stated why, because the member
+            # did not choose to escalate — the gate opened it on their behalf after a deny.
+            # Presenting the act as though it were a rationale would be worse than silence,
+            # because it would look like the member had explained itself. A member that
+            # wants to state a why calls `hestia_gate_escalation_open` and supplies one.
+            "reason": attempted or f"{tool_name} -> {marker}",
+            "detail": (
+                "Auto-opened by the gate on a refused write; the member stated no rationale "
+                "because it did not choose to escalate. Approving authorises this one write."
+            ),
         })
     except Exception as e:  # noqa: BLE001
         return "unreachable", f"no answer from the daemon ({type(e).__name__}) -- refused"
@@ -1210,7 +1329,9 @@ def main() -> int:
             _witness_self_read(_self_marker, tool_name)
             debug_log(f"gate-self-read (allowed, witnessed): {tool_name} -> {_self_marker}")
         else:
-            verdict, detail = request_self_write(_self_marker, tool_name)
+            verdict, detail = request_self_write(
+                _self_marker, tool_name, _attempted_summary(tool_name, tool_input)
+            )
             if verdict != "approved":
                 debug_log(f"gate-self-write {verdict}: {detail}")
                 return deny_self_access(_self_marker, tool_name)
