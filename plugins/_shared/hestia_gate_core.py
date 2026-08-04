@@ -373,6 +373,44 @@ def detect_workspace(profile: HarnessProfile) -> str:
     return os.path.expanduser("~/ai-workspace")
 
 
+#: Prefixes an `in_scope` entry may carry. Recognised DELIBERATELY rather than stripped by a
+#: blind `split(":", 1)[-1]` (kimi #188, finding 3): that form silently collapsed `repo:*` and
+#: `path:*` to the bare wildcard, so an operator writing what looks like "every repo" would
+#: have granted "everything, including outside the workspace" — UNSCOPED by emergent side
+#: effect rather than by decision. An unknown prefix is now dropped rather than guessed at.
+_SCOPE_PREFIXES = ("repo:", "path:")
+
+
+def _parse_scope_entries(entries) -> tuple:
+    """`["repo:web4", "path:.git-inbox"]` -> `("web4", ".git-inbox")`.
+
+    Raises on a non-string element so the caller can fail closed rather than let an
+    AttributeError escape the gate. Only a BARE `"*"` yields the unscoped marker; a prefixed
+    wildcard is refused outright, because "every repo" and "no boundary at all" are different
+    grants and the difference must not turn on parser incidentals."""
+    out = []
+    for e in entries:
+        if not isinstance(e, str):
+            raise TypeError(f"scope entry is not a string: {e!r}")
+        e = e.strip()
+        if e == AgentPolicy.UNSCOPED:
+            out.append(AgentPolicy.UNSCOPED)
+            continue
+        for p in _SCOPE_PREFIXES:
+            if e.startswith(p):
+                rest = e[len(p):]
+                # A prefixed wildcard is NOT unscoped. Dropped, loudly-by-absence: the operator
+                # who meant "everything" writes a bare "*", which is auditable as such.
+                if rest and rest != AgentPolicy.UNSCOPED:
+                    out.append(rest)
+                break
+        else:
+            # Unprefixed and not the wildcard: a bare repo name, the legacy spelling.
+            if e:
+                out.append(e)
+    return tuple(out)
+
+
 def resolve_agent_policy(profile: HarnessProfile,
                          vault_reader=None) -> AgentPolicy:
     """Resolve the per-agent layer, naming the store it came from.
@@ -404,11 +442,19 @@ def resolve_agent_policy(profile: HarnessProfile,
         if isinstance(got, dict):
             scope = got.get("in_scope")
             if isinstance(scope, list):
-                return AgentPolicy(
-                    member_id=profile.member_id,
-                    scope=tuple(s.split(":", 1)[-1] for s in scope),
-                    source="vault",
-                )
+                # PARSE INSIDE THE GUARD (kimi #188, finding 2). The reader call was wrapped and
+                # the parse was not, so a non-string element in `in_scope` propagated an
+                # AttributeError out of the gate. On a fail-open harness an exception escaping
+                # the gate IS an allow — the exact shape `_deny` was corrected for earlier in
+                # this file. Bad data must resolve to "unresolved", never to a traceback.
+                try:
+                    parsed = _parse_scope_entries(scope)
+                except Exception:
+                    parsed = None
+                if parsed is not None:
+                    return AgentPolicy(
+                        member_id=profile.member_id, scope=parsed, source="vault",
+                    )
 
     # 2. Local replica — fail-closed fallback, marked stale.
     try:
@@ -418,7 +464,7 @@ def resolve_agent_policy(profile: HarnessProfile,
         if isinstance(scope, list):
             return AgentPolicy(
                 member_id=profile.member_id,
-                scope=tuple(s.split(":", 1)[-1] for s in scope),
+                scope=_parse_scope_entries(scope),
                 source="local-replica",
                 stale=True,
             )
@@ -671,8 +717,30 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     # outside every workspace passed both Read and Bash with no operator involvement. Now the
     # same outcome requires someone to have written `*` into the vault, where it can be audited,
     # revoked, and expired. Same behaviour, opposite accountability.
+    # ...AND ONLY FROM A TRUSTED SOURCE. `stale` was written in three places and read in NONE
+    # (kimi NOT-SAME review of #188, finding 1). `evaluate()` never inspected it, and no call
+    # passes a `vault_reader` today — so every resolution came from `identity.json`, the file
+    # this module's own docstring calls member-writable, and was honoured in full INCLUDING the
+    # unscoped bypass. **A member could write `"*"` into its own identity file and receive
+    # blanket ALLOW.** The audit block I shipped claimed the opposite on two lines
+    # (`W: the member cannot write its own authority`, `V: stale replica cannot add grants`),
+    # which per CLAUDE.md is itself an A violation: the block described the intent, not the
+    # build. Fourth time in this thread I verified the artifact rather than the behaviour — the
+    # field existed and the docstring explained it, and nothing read it.
+    #
+    # WHY `*` IS TREATED DIFFERENTLY FROM A STALE REPO LIST, since both come from the same
+    # untrusted file: a repo list widens to specific named directories and stays bounded by the
+    # workspace, so a compromised replica buys named, auditable reach. `*` removes the boundary
+    # entirely, and is precisely the value a member would write to escape. Different in kind,
+    # not degree. Standing scope from a stale replica is still honoured — that is what keeps a
+    # down daemon from bricking every member — but it can never widen to everything.
     if pol.is_unscoped():
-        return ALLOW
+        if not pol.stale:
+            return ALLOW
+        # Stale + unscoped: drop the wildcard so it cannot match downstream, and evaluate the
+        # remaining standing scope normally. Fails narrow, which is the direction a replica may
+        # move in.
+        scopes = [s for s in scopes if s != AgentPolicy.UNSCOPED]
 
     # Gate 1b — MRH scope. File paths use path-scope; shell commands use command-scope.
     for p in event.paths:

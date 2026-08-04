@@ -398,6 +398,64 @@ def test_unscoped_must_be_declared_never_inferred():
           "`*` short-circuits MRH scope only, and must sit AFTER the innate egress gate")
 
 
+def test_a_member_cannot_grant_itself_blanket_allow_via_its_own_identity_file():
+    """kimi NOT-SAME review of #188, finding 1 — a privilege-escalation path I shipped inside
+    the file meant to close one.
+
+    `stale` was written in three places and read in NONE. No call passes a `vault_reader`
+    today, so every resolution came from `identity.json` — member-writable, as this module's
+    own docstring says — and was honoured in full INCLUDING `is_unscoped()`. A member could
+    write `"*"` into its own identity file and receive blanket ALLOW, while my audit block
+    claimed `the member cannot write its own authority`.
+
+    This is the exploit, written as the test: identity file says `*`, no vault reachable."""
+    ws = _workspace()
+    os.makedirs(os.path.join(ws, "granted"), exist_ok=True)
+    prof = _profile(ws, ["*"])          # the member writes the wildcard into its OWN file
+    pol = G.resolve_agent_policy(prof)  # no vault_reader — the situation in every call today
+
+    check("self_written_wildcard_is_marked_stale", pol.stale is True and pol.is_unscoped())
+
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/notgranted/x.md"], cwd=ws)
+    v = G.evaluate(ev, prof, ws, policy=pol)
+    check("stale_wildcard_does_not_grant_blanket_allow", v.blocks,
+          "a member wrote '*' into its own identity file and the gate allowed everything — "
+          "the audit block claimed the member cannot write its own authority")
+
+    # A VAULT-SOURCED wildcard still works: the fix must narrow the untrusted path only, not
+    # break the declared grant it exists to make explicit.
+    trusted = G.resolve_agent_policy(prof, vault_reader=lambda m: {"in_scope": ["*"]})
+    check("vault_wildcard_still_allows",
+          not trusted.stale and G.evaluate(ev, prof, ws, policy=trusted).decision == "allow")
+
+
+def test_malformed_vault_payload_fails_closed_instead_of_raising():
+    """kimi #188, finding 2. The reader call was wrapped; the PARSE was not. A non-string
+    element propagated an AttributeError out of the gate — and on a fail-open harness an
+    exception escaping the gate IS an allow, the same shape `_deny` was corrected for."""
+    ws = _workspace()
+    prof = G.HarnessProfile(member_id="x", identity_path="/nonexistent/identity.json")
+    try:
+        pol = G.resolve_agent_policy(prof, vault_reader=lambda m: {"in_scope": ["repo:a", 7, None]})
+    except Exception as e:
+        check("malformed_vault_never_raises", False, f"raised {e.__class__.__name__}")
+        return
+    check("malformed_vault_never_raises", True)
+    check("malformed_vault_grants_nothing", pol.scope == () and pol.source == "unresolved")
+
+
+def test_prefixed_wildcard_is_not_unscoped():
+    """kimi #188, finding 3. `split(":", 1)[-1]` collapsed `repo:*` to the bare wildcard, so an
+    operator writing what reads as "every repo" would have granted "no boundary at all" —
+    UNSCOPED by parser incidental rather than by decision."""
+    check("bare_wildcard_is_unscoped", G._parse_scope_entries(["*"]) == ("*",))
+    check("repo_wildcard_is_not_unscoped", "*" not in G._parse_scope_entries(["repo:*"]))
+    check("path_wildcard_is_not_unscoped", "*" not in G._parse_scope_entries(["path:*"]))
+    check("normal_entries_still_parse",
+          G._parse_scope_entries(["repo:web4", "path:.git-inbox", "legacy"])
+          == ("web4", ".git-inbox", "legacy"))
+
+
 def test_policy_resolution_names_its_source_and_fails_closed():
     """A policy that cannot say where it came from is not auditable, and an unreachable vault
     must narrow rather than widen."""
@@ -498,6 +556,9 @@ ALL_TESTS = [
     "test_temp_root_is_a_path_boundary_not_a_prefix",
     "test_shims_contain_no_policy",
     "test_unscoped_must_be_declared_never_inferred",
+    "test_a_member_cannot_grant_itself_blanket_allow_via_its_own_identity_file",
+    "test_malformed_vault_payload_fails_closed_instead_of_raising",
+    "test_prefixed_wildcard_is_not_unscoped",
     "test_policy_resolution_names_its_source_and_fails_closed",
     "test_egress_beats_scope",
     "test_missing_identity_fails_narrow_not_wide",
@@ -548,6 +609,9 @@ if __name__ == "__main__":
     test_temp_root_is_a_path_boundary_not_a_prefix()
     test_shims_contain_no_policy()
     test_unscoped_must_be_declared_never_inferred()
+    test_a_member_cannot_grant_itself_blanket_allow_via_its_own_identity_file()
+    test_malformed_vault_payload_fails_closed_instead_of_raising()
+    test_prefixed_wildcard_is_not_unscoped()
     test_policy_resolution_names_its_source_and_fails_closed()
     test_egress_beats_scope()
     test_missing_identity_fails_narrow_not_wide()
