@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """A refusal that names a remedy is making a promise about a surface nobody compares.
 
+STATUS: this is a GREEN STANDING REGRESSION GUARD. The defect described below was fixed on
+`main` — the CLI now carries `gate` — and this checker exists so the class cannot return
+silently. It is not a report of a live break; the history is kept because the shape is the
+reusable part, and because a guard whose origin is deleted is one nobody knows the cost of.
+
 WHAT HAPPENED (CBP, 2026-07-31, thread supervisor-role-2026-07-31). The gate refused a
 write, and told the session how to appeal it: run `hestia gate approve <id> --reason ...`.
 The shipped binary answers `error: unrecognized subcommand 'gate'`. Four escalations were
@@ -49,10 +54,15 @@ Properties asserted:
      advertisement in C for the wrong reason. Which of "the promise is broken" and "the
      reader broke" is true has to stay distinguishable, or the first fix attempted will be
      to the wrong file.
-  C. EVERY ADVERTISED CLI INVOCATION RESOLVES.  <-- RED TODAY: `hestia gate`.
-  D. EVERY ADVERTISED MCP TOOL RESOLVES. Green today, and it is the half that shows the
-     check is not merely spelling `gate` — the law's `hestia_appeal` is extracted by the
-     same rule and does resolve.
+  C. EVERY ADVERTISED CLI INVOCATION RESOLVES.
+     THE ORIGINAL FINDING, now historical: when this checker was written the gate's own
+     remedy text advertised `hestia gate approve …` and the CLI had never carried a `gate`
+     subcommand. A refusal was telling members to run a command that did not exist. That
+     defect is fixed on `main` — `gate` is present — and this property is now the
+     REGRESSION GUARD for the fix rather than a report of a live break.
+  D. EVERY ADVERTISED MCP TOOL RESOLVES. Green from the start, and it is the half that
+     shows the check is not merely spelling `gate` — the law's `hestia_appeal` is
+     extracted by the same rule and does resolve.
   E. THIS FILE NAMES NO GOVERNANCE FILE. Enforced here, against the list read out of the
      gate at runtime, because of how the finding was reported: the same gate refuses a
      WRITE whose content merely mentions one of those filenames near the token `hooks/`
