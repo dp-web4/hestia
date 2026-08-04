@@ -367,6 +367,65 @@ def test_shims_contain_no_policy():
           f"choice, add a HarnessProfile field instead of branching in the shim.")
 
 
+def test_unscoped_must_be_declared_never_inferred():
+    """dp's P0 ruling: per-agent modifications must be an EXPLICIT part of the one law.
+
+    An absent check is not explicit. claude-code had no MRH evaluation at all — measured
+    2026-08-03, a `dpx` path outside every workspace, invented by the member with no operator
+    involvement, passed both Read and Bash. Now the same reach requires `*` to have been
+    written into the vault, where it can be audited, revoked and expired.
+
+    Tested through `evaluate()`, not by reading the dataclass: the question is whether the GATE
+    behaves differently, not whether a field holds a string."""
+    ws = _workspace()
+    os.makedirs(os.path.join(ws, "granted"), exist_ok=True)
+    prof = _profile(ws, ["repo:granted"])
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/notgranted/x.md"], cwd=ws)
+
+    empty = G.AgentPolicy(member_id="m", scope=(), source="unresolved")
+    check("empty_scope_grants_nothing", G.evaluate(ev, prof, ws, policy=empty).blocks,
+          "an unresolvable policy must grant NOTHING — the old load_in_scope returned "
+          "['web4'] on failure, which is a guess that GRANTS")
+
+    unscoped = G.AgentPolicy(member_id="m", scope=("*",), source="vault")
+    check("declared_unscoped_allows", G.evaluate(ev, prof, ws, policy=unscoped).decision == "allow")
+
+    # AND `*` IS A SCOPE GRANT, NOT A LICENCE. The innate egress invariant binds every member
+    # equally; trust does not relax it, so unlimited reach must still not buy a credential.
+    secret = G.NormalizedEvent(tool="Read", paths=[f"{ws}/granted/.env"], cwd=ws)
+    v = G.evaluate(secret, prof, ws, policy=unscoped)
+    check("unscoped_still_cannot_reach_a_secret", v.blocks and v.rule == "egress.secret" and v.innate,
+          "`*` short-circuits MRH scope only, and must sit AFTER the innate egress gate")
+
+
+def test_policy_resolution_names_its_source_and_fails_closed():
+    """A policy that cannot say where it came from is not auditable, and an unreachable vault
+    must narrow rather than widen."""
+    ws = _workspace()
+    prof = _profile(ws, ["repo:granted"])
+
+    # Vault wins, and says so.
+    pol = G.resolve_agent_policy(prof, vault_reader=lambda m: {"in_scope": ["repo:fromvault"]})
+    check("vault_is_the_authority", pol.scope == ("fromvault",) and pol.source == "vault")
+    check("vault_result_is_not_stale", pol.stale is False)
+
+    # Vault unreachable -> replica, MARKED STALE so a caller can refuse to honour grants from it.
+    def boom(_m):
+        raise RuntimeError("daemon unreachable")
+    pol = G.resolve_agent_policy(prof, vault_reader=boom)
+    check("falls_back_to_replica", pol.source == "local-replica" and "granted" in pol.scope)
+    check("replica_is_marked_stale", pol.stale is True,
+          "a replica can only be staler than the vault; the caller must be able to tell")
+
+    # Neither -> nothing granted. Not a narrow guess. Nothing.
+    nowhere = G.HarnessProfile(member_id="x", identity_path="/nonexistent/identity.json")
+    pol = G.resolve_agent_policy(nowhere, vault_reader=lambda m: None)
+    check("unresolvable_grants_nothing", pol.scope == () and pol.source == "unresolved")
+    check("unresolvable_is_not_unscoped", not pol.is_unscoped(),
+          "empty means NOTHING GRANTED; conflating it with '*' is how an absent check becomes "
+          "a silent permission")
+
+
 def test_egress_beats_scope():
     """Innate invariants dominate: a secret inside a GRANTED repo is still denied."""
     ws = _workspace()
@@ -438,6 +497,8 @@ ALL_TESTS = [
     "test_path_grant_reaches_a_sibling_of_the_repos",
     "test_temp_root_is_a_path_boundary_not_a_prefix",
     "test_shims_contain_no_policy",
+    "test_unscoped_must_be_declared_never_inferred",
+    "test_policy_resolution_names_its_source_and_fails_closed",
     "test_egress_beats_scope",
     "test_missing_identity_fails_narrow_not_wide",
     "test_core_never_exits",
@@ -486,6 +547,8 @@ if __name__ == "__main__":
     test_path_grant_reaches_a_sibling_of_the_repos()
     test_temp_root_is_a_path_boundary_not_a_prefix()
     test_shims_contain_no_policy()
+    test_unscoped_must_be_declared_never_inferred()
+    test_policy_resolution_names_its_source_and_fails_closed()
     test_egress_beats_scope()
     test_missing_identity_fails_narrow_not_wide()
     test_core_never_exits()
