@@ -82,6 +82,26 @@ pub struct DashboardSnapshot {
     /// thing in the UI to leave running by accident.
     #[serde(default)]
     pub instance_grants: Vec<serde_json::Value>,
+    /// Scope requests awaiting a decision — a member asking to read ONE path outside its MRH.
+    ///
+    /// Carried here for the identical reason the escalations are, and it is the identical
+    /// failure repeated one surface later. `hestia_request_scope` and its operator half
+    /// (`GET /api/scope/requests`, `POST /api/scope/decide`) shipped 2026-08-02 with **no
+    /// front end**, so kimi-code filed a correctly-formed request, with a stated reason, that
+    /// dp could not see. dp, 2026-08-03: *"i don't see any open escalations"* — and later,
+    /// about this exact request, *"everything you saw presented"* did not include it, because
+    /// nothing presented it.
+    ///
+    /// The doc comment on `pending_escalations` above describes that same defect as already
+    /// fixed: *"a route the UI never calls is what we already had."* It was written by the
+    /// author who then built a second route the UI never called. **Building the decision
+    /// surface is not building the notice**, and the notice is the half that decides whether a
+    /// human ever rules.
+    ///
+    /// Pending only. A decided request is history and belongs in the chain, not in a queue
+    /// that implies something is owed.
+    #[serde(default)]
+    pub pending_scope_requests: Vec<serde_json::Value>,
     /// Set when the chain read backing `stats` / `stats_by_plugin` FAILED.
     ///
     /// When this is present the counts are not measurements and must not be rendered as
@@ -783,6 +803,36 @@ impl ServerState {
                     })
                     .collect()
             },
+            pending_scope_requests: {
+                let now = crate::server::gate_escalation::now_secs();
+                let mut v: Vec<serde_json::Value> = self
+                    .scope_requests
+                    .values()
+                    .filter(|r| r.status(now) == "pending")
+                    .map(|r| {
+                        serde_json::json!({
+                            "request_id": r.id,
+                            // Caller-asserted (HST-005), labelled the same way the escalation
+                            // panel labels it: the operator decides partly ON this string and
+                            // it is not authenticated.
+                            "claimed_by": r.plugin_id,
+                            "role": r.role,
+                            "path": r.path,
+                            // THE BASIS. A scope request without its stated why is the
+                            // "no reason" defect arriving on a second surface, and this one
+                            // has no excuse — `reason` is REQUIRED at filing.
+                            "reason": r.reason,
+                            "requested_at": r.requested_at,
+                            "expires_at": r.expires_at,
+                            "secs_remaining": r.expires_at.saturating_sub(now),
+                        })
+                    })
+                    .collect();
+                // Oldest first: the one closest to lapsing is the one that needs a human
+                // soonest, and an unanswered request expires into a REFUSAL.
+                v.sort_by_key(|x| x["requested_at"].as_u64().unwrap_or(0));
+                v
+            },
             stats_unavailable: stats_read_error,
             instance_grants: {
                 let now = crate::server::gate_escalation::now_secs();
@@ -858,6 +908,77 @@ mod tests {
         assert_eq!(s.society.chain_length, 0);
         assert!(s.trust.is_empty());
         assert!(s.recent.is_empty());
+    }
+
+    /// The snapshot must CARRY pending scope requests, and must drop the decided ones.
+    ///
+    /// Asserted on the payload rather than on "the field exists", because today's lesson was
+    /// exactly that distinction: a peer replaced a membership assertion in the gate's
+    /// self-protection test with five behavioural probes and proved the rule could not fire
+    /// while the test stayed green. A panel test that only checked the struct had a field
+    /// would repeat it — the operator does not read the struct.
+    #[test]
+    fn snapshot_carries_pending_scope_requests_and_drops_decided_ones() {
+        use crate::server::state::{ScopeRequest, SCOPE_REQUEST_TTL_SECS};
+        let (_dir, mut state) = make_state();
+        let now = crate::server::gate_escalation::now_secs();
+
+        let mk = |id: &str, granted: Option<bool>, expires: u64| ScopeRequest {
+            id: id.to_string(),
+            plugin_id: "kimi-code".into(),
+            role: "role:constellation:member".into(),
+            path: format!("/outside/{id}.md"),
+            reason: "dp directed me to read this in-session".into(),
+            requested_at: now,
+            expires_at: expires,
+            granted,
+            decided_by: granted.map(|_| "operator".to_string()),
+            decided_at: granted.map(|_| now),
+            decision_reason: None,
+        };
+
+        state.scope_requests.insert("pend".into(), mk("pend", None, now + SCOPE_REQUEST_TTL_SECS));
+        // A SECOND pending request, filed EARLIER, so the oldest-first ordering is proven
+        // rather than asserted in a comment (kimi NOT-SAME review of #186). The first fixture
+        // gave all four the same `requested_at`, so the sort could have been absent, reversed
+        // or arbitrary and the test would still have passed — a green about a claim it never
+        // exercised, which is the defect this whole thread keeps finding.
+        let mut older = mk("older", None, now + SCOPE_REQUEST_TTL_SECS);
+        older.requested_at = now.saturating_sub(600);
+        state.scope_requests.insert("older".into(), older);
+        state.scope_requests.insert("granted".into(), mk("granted", Some(true), now + 3600));
+        state.scope_requests.insert("refused".into(), mk("refused", Some(false), now + 3600));
+        // An undecided request past its window is EXPIRED, and expired is a refusal — it must
+        // not sit in the queue offering a button the daemon would refuse.
+        state.scope_requests.insert("lapsed".into(), mk("lapsed", None, now.saturating_sub(1)));
+
+        let s = state.dashboard_snapshot(20);
+        let ids: Vec<&str> = s
+            .pending_scope_requests
+            .iter()
+            .map(|r| r["request_id"].as_str().unwrap())
+            .collect();
+        // OLDEST FIRST: the one closest to lapsing needs a human soonest, and an unanswered
+        // request expires into a REFUSAL. Asserted on order, not just membership.
+        assert_eq!(
+            ids,
+            vec!["older", "pend"],
+            "only live pending requests may be offered, oldest first — the one nearest its \
+             deadline is the one a human must see first"
+        );
+
+        let row = s
+            .pending_scope_requests
+            .iter()
+            .find(|r| r["request_id"] == "pend")
+            .expect("the pending fixture must be present");
+        // THE BASIS travels with the ask. A queue that shows who and what but not why is the
+        // "no reason" defect arriving on a second surface (dp, 2026-08-03).
+        assert_eq!(row["reason"], "dp directed me to read this in-session");
+        assert_eq!(row["path"], "/outside/pend.md");
+        // Caller-asserted, and labelled so the UI cannot render a claim as an identity.
+        assert_eq!(row["claimed_by"], "kimi-code");
+        assert!(row.get("secs_remaining").is_some());
     }
 
     #[test]
