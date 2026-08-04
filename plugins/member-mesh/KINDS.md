@@ -173,7 +173,22 @@ a wrong published number before this paragraph existed:
   be audited from here", is both false and much more interesting than the truth, which is
   why it survived a first draft of this section.
 - walking off the genesis end terminates with an `_hestia_error` envelope, not an empty
-  result, so a walker must test for it or stop early and silently under-count.
+  result, so a walker must test for it or stop early and silently under-count. The code is
+  **`hestia.chain_pointer_not_found`** — but do not assert on that code alone, because it
+  does not mean "genesis". Genesis (position 0, `session_started`, 2026-05-16) carries a
+  `prevHash` of **64 ASCII zeros**, a sentinel rather than an empty or absent field, and
+  the daemon answers that sentinel with exactly the same code it gives any well-formed
+  hash that is not in the chain (measured 2026-08-03: the all-zeros sentinel and a
+  fabricated `dede…` hash returned byte-identical codes; only a *malformed* key —
+  non-hex, wrong length — separates out, as `hestia.chain_pointer_malformed`). So a
+  walker whose cursor is corrupted at position 40,000 terminates *identically* to one
+  that reached genesis, and under-counts by 40,000 while reporting a clean stop. **Assert
+  that the terminating key is the all-zeros sentinel**, not merely that the walk errored.
+- the terminating envelope carries `data.chainLength`, which is the completeness check the
+  code cannot give: compare it against your own walked count. It is read live at the moment
+  of the error, so it legitimately *exceeds* the count by whatever was appended during the
+  walk (2026-08-03: walked 92,369 from head position 92,368, `chainLength` 92,375 — six
+  entries appended across a 99-second walk). A shortfall is growth; an excess is a bug.
 
 Both stores (`witness.db`, `inbox.db`) are SQLCipher, so this walk is the only member-side
 census route — which makes getting its shape right the whole difference between a real
