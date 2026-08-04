@@ -454,6 +454,25 @@ def test_every_test_is_registered():
           f"defined but not in ALL_TESTS, so never run: {missing}")
 
 
+def teardown_module(module):
+    """Deliver this file's accumulated failures to a harness that reads exceptions.
+
+    `check()` records into `FAILURES`, read only by the `__main__` block below. That is how
+    CI invokes this file, so its exit code always held -- but under `python3 -m pytest` every
+    `test_*` recorded its failures and returned normally, and real reds were reported as
+    PASSED. pytest calls this after the module's tests; bare `python3` never calls it.
+
+    Sharpest here of the four: this is the test of `hestia_gate_core.py`, the policy core all
+    five harnesses are to consolidate onto. A local pytest run of the gate core's own tests
+    could not have told anyone it was broken.
+
+    See `tools/ci_selfexec_test.py::test_no_pytest_blind_files` for the guard that now makes
+    the absence of this channel a failure rather than a thing someone has to notice.
+    """
+    assert not FAILURES, (
+        f"{len(FAILURES)} check(s) failed -- see the FAIL lines in captured stdout: {FAILURES}")
+
+
 if __name__ == "__main__":
     print("hestia_gate_core")
     test_every_test_is_registered()

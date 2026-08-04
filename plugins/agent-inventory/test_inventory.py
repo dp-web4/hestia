@@ -983,6 +983,21 @@ def test_no_raw_path_in_printed_output():
         del RAW_OK["WORKSPACE"]
 
 
+def teardown_module(module):
+    """Deliver this file's accumulated failures to a harness that reads exceptions.
+
+    `check()` records into `FAILS`, read only by the `__main__` block below. That is how CI
+    invokes this file, so its exit code always held -- but under `python3 -m pytest` every
+    `test_*` recorded its failures and returned normally, and real reds were reported as
+    PASSED. pytest calls this after the module's tests; bare `python3` never calls it.
+
+    See `tools/ci_selfexec_test.py::test_no_pytest_blind_files` for the guard that now makes
+    the absence of this channel a failure rather than a thing someone has to notice.
+    """
+    assert not FAILS, (
+        f"{len(FAILS)} check(s) failed -- see the FAIL lines in captured stdout: {FAILS}")
+
+
 if __name__ == "__main__":
     test_attribute()
     test_has_tag()
