@@ -561,11 +561,14 @@ PY
 
 drain() { mesh_rpc hestia_member_inbox; }
 unanswered() { mesh_rpc hestia_member_unanswered "{\"older_than_secs\": $STALE_AFTER}"; }
-# The journal wants the 6h floor; `primer_spent` asks without one so the fold it reads
-# is the complete debt rather than the stale tail. It does NOT depend on this having
-# worked — see SPENT_MIN_AGE_SECS — but a fold that covers everything is still the
-# right thing to ask for, and `older_than_secs` is the daemon's real parameter name
-# (any other spelling is discarded into a success, #155).
+# The journal wants the 6h floor; `primer_spent` asks for a floor of ZERO so the fold it
+# reads is the complete debt rather than the stale tail. Asked-for-and-zero, not absent:
+# the argument is sent explicitly, because omitting it is not "no floor" — the daemon
+# substitutes MEMBER_UNANSWERED_DEFAULT_SECS (6h) for a missing OR misspelled key and
+# reports success either way (#155), so the only way to actually get zero is to say so.
+# The guard does NOT depend on this having worked — see SPENT_MIN_AGE_SECS — but a fold
+# that covers everything is still the right thing to ask for, and `older_than_secs` is
+# the daemon's real parameter name (any other spelling is discarded into a success).
 unanswered_now() { mesh_rpc hestia_member_unanswered '{"older_than_secs": 0}'; }
 
 # The startup stale-primer pass. Deferred to here only because it needs `mesh_rpc`;
