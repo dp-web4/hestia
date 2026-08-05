@@ -150,6 +150,14 @@ The criticism is about what it *is*. Against the canonical checklist:
 | assignment authority-gated | **None.** `normalize_constellation_role(&declared_role)` — the caller declares it |
 | rotation preserves identity | **N/A** — nothing to rotate |
 
+There is a second consequence, and it reaches further than naming. `web4-core/src/r6.rs` on `ReputationDelta`:
+
+> *"Key: reputation is ROLE-CONTEXTUALIZED. The `role_lct` field determines which MRH role-pairing link this delta applies to. **There is no global reputation.**"*
+
+Canonical reputation is deliberately scoped to the *office* — that is what makes T3/V3 mean something rather than being a popularity score. Hestia's fold keys on the same field name and feeds it a **capacity string**. So every reputation delta this fleet has accumulated is contextualized on *what kind of session was running*, not on *what authority was exercised*.
+
+The buckets are real and internally consistent; they are simply indexed on the wrong axis. Which also means the T3/V3 that dp's ladder would eventually threshold on (§5.4) is not yet measuring the thing the threshold would need — one more reason the middle rung is a later arrival, and one more reason to fix the axis before anything is built on top of the numbers.
+
 The field name deserves its own line. It is called **`role_lct`** and it is a `&str`. Every reader of the chain — and every operator surface, including the ledger I shipped this morning, which renders `role@agent` — sees a field named for a canonical concept whose type contradicts it. That naming is a large part of why this gap stayed invisible: the record *looks* like it carries role identity.
 
 ### 3.2 The system that is canonical, and inert
@@ -291,15 +299,81 @@ That gives, in order:
 3. **A TTL that can be honest.** Most escalations resolve in seconds because a policy agent is awake. The window only has to be human-sized for the residue that actually reaches the operator — which is the small set where a human genuinely must decide.
 4. **A use for T3/V3 that is not decorative.** Today the trust tensors are computed, folded, and consulted by no decision. Threshold-selecting a resolver is the first place they would carry weight.
 
-### 5.4 A tension to settle before building it
+### 5.4 Provisional occupancy — the loud placeholder
 
-GPT's PRD §4.5 states: *"T3/V3 … do not directly grant authority unless the operator has explicitly authored a law that does so. For the initial implementation, no automatic authority-granting rule is permitted."*
+*An earlier draft of this section raised the PRD §4.5 T3/V3 tension as something to "settle before building." dp dissolved it rather than settling it, and the correction is worth carrying because my version was **blocker-shaped**, which is the instinct this section now argues against.*
 
-dp's ladder selects a resolver by `[kind, T3/V3 threshold]`. That **is** authority flowing from a trust score.
+dp, 2026-08-05:
 
-These reconcile only under one reading: the threshold is a **parameter of operator-authored law** — the operator writes *"escalations of class X may be resolved by a governance-kind role whose holder is above T3 = t"* — rather than a rule the system derives on its own. Under that reading the ladder is exactly PRD §4.5's sanctioned case, not an exception to it.
+> *"we can't threshold something that isn't built yet. placeholders are inevitable at this stage and should be clearly flagged as such, but they should not be blockers (nor quietly subsume the role they're not qualified to fill). that should actually be a key, LOUD feature of roles — 'we don't have a properly qualified agent available but this has to be done so this is the best we've got, audit often'."*
 
-But it means the PRD's *"for the initial implementation, no automatic authority-granting rule is permitted"* has to be understood as a **phase constraint, not a permanent principle** — otherwise the ladder is forbidden by the same document that motivates it. Worth settling explicitly now, in the architecture review, rather than discovering the contradiction mid-build.
+The T3/V3 rung of the ladder cannot gate anything yet, because the tensors it would threshold on are not built. That does not make the ladder premature; it makes the **middle rung a later arrival**, and the design has to work — and be honest — before it lands.
+
+#### The precedent is already canonical
+
+This is not a new mechanism. `web4-core/src/r6.rs`:
+
+```rust
+pub enum SovereignStrength {
+    /// Member-attested only: the sovereign is a phase-1 placeholder, so the hub
+    /// cannot verify the `(instance, role)` binding. Ordered **below** `Hardware`.
+    Placeholder,
+    /// Hardware-bound sovereign (TPM): the `instance_lct` is unforgeable.
+    Hardware,
+}
+
+impl Default for SovereignStrength {
+    fn default() -> Self {
+        // Fail-closed: an unstated strength is the weakest claim.
+        SovereignStrength::Placeholder
+    }
+}
+```
+
+Every property dp asks for is already here, one level over: a named placeholder variant, **ordered below** the real thing, defaulting to the weakest claim, and degrading the *claim* rather than blocking the *act*. Hestia already prints it on every startup — `sovereign LCT … (self-issued bootstrap, placeholder strength)`.
+
+So the proposal is to apply a proven shape from **sovereign strength** to **role occupancy**.
+
+#### Shape
+
+```rust
+enum OccupancyBasis {
+    /// The filler meets the role's stated requirements.
+    Qualified,
+    /// No qualified filler was available and the office had to be filled anyway.
+    Provisional {
+        because: String,
+        audit_every: Duration,
+        last_audited: Option<Timestamp>,
+    },
+}
+```
+
+Defaulting to `Provisional`, fail-closed, for the same reason `SovereignStrength` does: an unstated basis is the weakest claim.
+
+Three properties, and the third is the one usually dropped:
+
+1. **Not a blocker.** The act proceeds. An office that must be filled gets filled.
+2. **Not silent.** The basis rides on every verdict, chain entry, and operator surface the role touches. A provisional occupant cannot look like a qualified one at any point a reader might check.
+3. **Carries its own audit cadence.** *"Audit often"* becomes a field, not an intention — and a lapsed `audit_every` is itself a finding, surfaced the same way drift is. Without this, "provisional" decays into permanent-but-labelled, which is how a placeholder quietly becomes the design.
+
+#### What it would say today, immediately
+
+Hestia's Policy-Entity (§5.1) is a placeholder that has **quietly subsumed a base-mandatory office** — exactly the failure dp names. Under this model the gate's every verdict would carry:
+
+> `PolicyEntity: provisional — occupant is a rule table, no qualified policy agent exists. audit_every 7d, last audited never.`
+
+That single line converts the largest unexamined assumption in the system from something an auditor must discover by reading source into something the system announces on every act.
+
+#### Why this matters beyond hestia
+
+Spec §1.1: *"Other societies establish and maintain trust in a society by auditing that its base-mandatory roles are filled, are operating, and are producing the expected outputs."*
+
+Today a placeholder occupant and a qualified one are **indistinguishable from outside**. An auditing society sees "Policy-Entity: filled" and cannot tell whether that means an accountable agent or a rule table nobody appointed.
+
+This is the same principle I applied to hub's V2-1 deviation in §2.1, pointed one level further in: *an intended deviation that looks identical to a defect is a deviation nobody can audit.* Its occupancy form is — **a provisional occupant that looks identical to a qualified one is an occupancy nobody can audit.** `OccupancyBasis` is what makes the base-mandatory audit mechanism able to see what it was designed to check.
+
+I would propose it upstream alongside the agent-capacity enum and role kinds (§4.2). Of the three, this is the one with the strongest existing precedent and the least new surface — and the only one that improves the honesty of a system that has not built anything else yet.
 
 ---
 
@@ -323,6 +397,8 @@ But it means the PRD's *"for the initial implementation, no automatic authority-
 | canonical `Escalate` verdict survives | normative | yes | **no — collapsed to Deny** (`law_gate.rs:166`) |
 | agent capacity on the LCT | **absent from canonical** | no | miscategorised as a role |
 | role kinds (worker/admin/governance) | **absent from canonical** | no | no |
+| provisional-occupancy flag | **absent from canonical** (but `SovereignStrength::Placeholder` is the precedent) | no | **no — the placeholder is silent** |
+| reputation contextualized on the office | normative (*"no global reputation"*) | via `web4-core` | **no — keyed on capacity** |
 | role law (per-role rules) | implied | law evaluates `assign_role` | **no** |
 
 ---
