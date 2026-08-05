@@ -2199,52 +2199,17 @@ fn hex_to_32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// Expand a leading `~/` (or bare `~`) to `$HOME`. Raw key-file paths are
-/// user-supplied and often written with a tilde; `std::fs` won't expand it.
-fn expand_tilde(path: &str) -> std::path::PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return std::path::Path::new(&home).join(rest);
-        }
-    } else if path == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return std::path::PathBuf::from(home);
-        }
-    }
-    std::path::PathBuf::from(path)
-}
-
 /// Resolve the keypair that signs member-tier acts to a hub, per its
-/// `member_key_source`. `VaultIdentity` reads `ai_identity_secret` from the
-/// sealed vault (default); `ChannelKeyFile` reads a raw 32-byte Ed25519 seed —
-/// byte-for-byte the same format the mesh `channel_client` loads, so the CLI and
-/// the watcher present the *same* pinned key to the hub.
+/// `member_key_source`. Thin delegate: the implementation lives in
+/// `hestia::hub` because the daemon's tool handlers must resolve the signer
+/// through the SAME function — the hub pins one key per member LCT, and a
+/// second copy of this logic is how `tool_cosign` came to sign with the vault
+/// identity on channel-key boxes.
 fn member_signing_keypair(
     vault: &hestia::vault::Vault,
     source: &hestia::hub::MemberKeySource,
 ) -> AnyResult<web4_core::crypto::KeyPair> {
-    use hestia::hub::MemberKeySource;
-    match source {
-        MemberKeySource::VaultIdentity => {
-            let secret_hex = vault.get("ai_identity_secret").map(|e| e.secret.clone())
-                .ok_or_else(|| anyhow::anyhow!(
-                    "no member identity key in vault — run `hestia init --ai`, or self-add to the hub \
-                     so it pins your pubkey (Sovereign-seeded members can't push from here yet)"
-                ))?;
-            let secret_bytes = hex_to_32(&secret_hex)
-                .ok_or_else(|| anyhow::anyhow!("ai_identity_secret is not 32-byte hex"))?;
-            Ok(web4_core::crypto::KeyPair::from_secret_bytes(&secret_bytes))
-        }
-        MemberKeySource::ChannelKeyFile { path } => {
-            let p = expand_tilde(path);
-            let raw = std::fs::read(&p)
-                .with_context(|| format!("reading channel key file {}", p.display()))?;
-            let seed: [u8; 32] = raw.as_slice().try_into().map_err(|_| anyhow::anyhow!(
-                "channel key file {} must be exactly 32 bytes (got {})", p.display(), raw.len()
-            ))?;
-            Ok(web4_core::crypto::KeyPair::from_secret_bytes(&seed))
-        }
-    }
+    hestia::hub::member_signing_keypair(vault, source)
 }
 
 // ---- hub notify (mesh referenced_act, signed by the vault member key) --------
@@ -3451,7 +3416,7 @@ mod serve_guard_tests {
 
 #[cfg(test)]
 mod member_key_source_tests {
-    use super::{expand_tilde, member_signing_keypair};
+    use super::member_signing_keypair;
     use hestia::hub::MemberKeySource;
     use hestia::vault::{Vault, VaultEntry};
 
@@ -3621,12 +3586,6 @@ mod member_key_source_tests {
         assert_eq!(kinds, vec!["pr_review_request", "ack", "forum-note"]);
     }
 
-    #[test]
-    fn expand_tilde_expands_leading_home() {
-        std::env::set_var("HOME", "/home/tester");
-        assert_eq!(expand_tilde("~/.web4/x/channel_key.bin"),
-                   std::path::PathBuf::from("/home/tester/.web4/x/channel_key.bin"));
-        assert_eq!(expand_tilde("/abs/path"), std::path::PathBuf::from("/abs/path"));
-        assert_eq!(expand_tilde("~"), std::path::PathBuf::from("/home/tester"));
-    }
+    // `expand_tilde` moved to `hestia::hub` with member_signing_keypair; its test
+    // moved with it (hub.rs `expand_tilde_expands_leading_home`).
 }

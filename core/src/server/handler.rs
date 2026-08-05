@@ -4460,19 +4460,35 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
 /// is present per request to gate it. That makes the `serve_owners` check the
 /// only thing standing between a confirmed peer and this machine's signature —
 /// it is load-bearing here in a way it is not on the CLI path.
+///
+/// The identity comes from the HUB CONNECTION, exactly as `cosign-serve` derives
+/// it (`conn.our_lct_id` + `member_signing_keypair(conn.member_key_source)`), and
+/// NOT from `ai_identity_*`. Those differ on precisely the machines this path
+/// exists for: a box whose non-interactive watcher signs with an on-disk channel
+/// key has that channel key pinned at the hub (see `hub::MemberKeySource`), so
+/// the vault identity is a key the hub does not know this member by. Measured on
+/// Legion 2026-08-04: the hub's pinned pubkey for `61525719…` is byte-identical
+/// to `~/.web4/legion/channel_key.bin`, not to `ai_identity_pubkey`.
 async fn tool_cosign(state: &SharedState, args: &Value) -> ToolResult {
     let req: crate::constellation::CosignRequest = serde_json::from_value(args.clone())
         .map_err(|e| anyhow::anyhow!("not a valid cosign request: {e}"))?;
     let s = state.lock().await;
-    // This device's identity — the member LCT id the owner enrolled + its key.
-    let my_lct = s.vault.get("ai_identity_lct_id")
-        .and_then(|e| Uuid::parse_str(e.secret.trim()).ok())
-        .ok_or_else(|| anyhow::anyhow!("no member identity — run `hestia init --ai`"))?;
-    let secret_hex = s.vault.get("ai_identity_secret").map(|e| e.secret.clone())
-        .ok_or_else(|| anyhow::anyhow!("no member identity secret"))?;
-    let arr: [u8; 32] = hex::decode(secret_hex.trim()).ok().and_then(|b| b.try_into().ok())
-        .ok_or_else(|| anyhow::anyhow!("identity secret must be 32-byte hex"))?;
-    let key = web4_core::crypto::KeyPair::from_secret_bytes(&arr);
+    // This device's identity, per hub connection. Selected by the addressee so a
+    // multi-hub member answers as the identity the request names rather than
+    // guessing one; `cosign` re-checks the match as its own guard.
+    let hubs = crate::hub::HubStore::load(&s.vault)?;
+    let conn = hubs.connections.iter()
+        .find(|c| c.our_lct_id == req.device_lct_id)
+        .ok_or_else(|| anyhow::anyhow!(
+            "refusing to co-sign: request addressed to {} but this member is {} on its hub \
+             connection(s) — the owner's roster entry must carry the hub member LCT \
+             (`constellation add-remote <lct>`)",
+            req.device_lct_id,
+            hubs.connections.iter().map(|c| c.our_lct_id.to_string())
+                .collect::<Vec<_>>().join(", ")
+        ))?;
+    let my_lct = conn.our_lct_id;
+    let key = crate::hub::member_signing_keypair(&s.vault, &conn.member_key_source)?;
     // Read fresh per request (not cached at startup) so `constellation serve-owner
     // --remove` revokes a running daemon's consent without a restart.
     let serve_owners = crate::constellation::ConstellationStore::load(&s.vault)
@@ -6518,6 +6534,150 @@ mod inbox_tests {
             s.inbox_store.len().unwrap(),
             1,
             "the notice parked, not lost"
+        );
+    }
+}
+
+/// The UNATTENDED co-sign path, exercised as the daemon actually reaches it.
+///
+/// Everything below is about one question the CLI path never has to ask: *which
+/// key am I, and which LCT am I?* `cosign-serve` answers it from the hub
+/// connection. `tool_cosign` used to answer it from `ai_identity_*`, which is a
+/// different answer on every box whose watcher signs with a channel key — i.e.
+/// on every box that can actually run this path unattended.
+#[cfg(test)]
+mod daemon_cosign_tests {
+    use super::*;
+    use crate::constellation::{ConstellationStore, CosignRequest};
+    use crate::hub::{HubConnection, HubStore, MemberKeySource};
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    /// A daemon state whose hub connection is a CHANNEL-KEY member — the shape
+    /// `hub set-member-key --channel-key` produces, and the shape every
+    /// autonomous fleet box is in. The vault identity is deliberately a
+    /// DIFFERENT key, because that is the real configuration: `hestia init --ai`
+    /// mints `ai_identity_*`, and the channel key is generated separately.
+    async fn channel_key_daemon(
+        dir: &TempDir,
+        member_lct: Uuid,
+        channel_seed: [u8; 32],
+    ) -> (SharedState, web4_core::crypto::KeyPair) {
+        let key_path = dir.path().join("channel_key.bin");
+        std::fs::write(&key_path, channel_seed).unwrap();
+
+        let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let vault_identity = web4_core::crypto::KeyPair::generate();
+        let secret_hex: String =
+            vault_identity.secret_key_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        vault
+            .add(crate::vault::VaultEntry::new("ai_identity_lct_id", Uuid::new_v4().to_string()))
+            .unwrap();
+        vault.add(crate::vault::VaultEntry::new("ai_identity_secret", secret_hex)).unwrap();
+
+        let store = HubStore {
+            connections: vec![HubConnection {
+                id: Uuid::new_v4(),
+                url: "http://hub.example".into(),
+                hub_lct_id: Uuid::new_v4(),
+                our_lct_id: member_lct,
+                connected_at: Utc::now(),
+                last_seen: None,
+                api_version: "v1".into(),
+                rest_endpoint: "/v1".into(),
+                hubs_joined: vec![],
+                member_key_source: MemberKeySource::ChannelKeyFile {
+                    path: key_path.to_str().unwrap().into(),
+                },
+            }],
+        };
+        store.save(&mut vault).unwrap();
+
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (state, vault_identity)
+    }
+
+    fn request(owner: Uuid, device: Uuid) -> Value {
+        serde_json::to_value(CosignRequest {
+            kind: CosignRequest::KIND.to_string(),
+            owner_lct_id: owner,
+            roster: vec![device],
+            challenge_nonce: "nonce-from-the-hub".into(),
+            issued_at: Utc::now(),
+            device_lct_id: device,
+        })
+        .unwrap()
+    }
+
+    async fn consent_to(state: &SharedState, owner: Uuid) {
+        let mut s = state.lock().await;
+        let mut c = ConstellationStore::load(&s.vault).unwrap();
+        c.allow_owner(owner);
+        c.save(&mut s.vault).unwrap();
+    }
+
+    /// THE REGRESSION. The daemon must co-sign with the key the HUB PINNED for
+    /// this member — the channel key — not with `ai_identity_secret`. Before the
+    /// fix this returned the vault identity's pubkey: a key the hub does not
+    /// know this member by, so the hub rejects the attestation and the
+    /// cross-device round-trip cannot complete on any channel-key box.
+    #[tokio::test]
+    async fn daemon_cosigns_with_the_hub_pinned_key_not_the_vault_identity() {
+        let dir = TempDir::new().unwrap();
+        let owner = Uuid::new_v4();
+        let device = Uuid::new_v4();
+        let seed = [9u8; 32];
+        let (state, vault_identity) = channel_key_daemon(&dir, device, seed).await;
+        consent_to(&state, owner).await;
+
+        let resp = tool_cosign(&state, &request(owner, device)).await.unwrap();
+        let got = resp["device_pubkey_hex"].as_str().unwrap();
+
+        let pinned = web4_core::crypto::KeyPair::from_secret_bytes(&seed);
+        assert_eq!(
+            got,
+            pinned.verifying_key().to_hex(),
+            "the daemon must sign as the member the hub pinned (the channel key)"
+        );
+        assert_ne!(
+            got,
+            vault_identity.verifying_key().to_hex(),
+            "signing with ai_identity_secret yields a key the hub never pinned for this member"
+        );
+        assert_eq!(resp["device_lct_id"].as_str().unwrap(), device.to_string());
+    }
+
+    /// The identity is the hub connection's `our_lct_id`, so a request addressed
+    /// to the vault's `ai_identity_lct_id` is NOT this device. Fail closed, and
+    /// say which id we actually answer to — the alternative is the owner
+    /// debugging an opaque refusal against the wrong uuid.
+    #[tokio::test]
+    async fn a_request_addressed_to_another_identity_is_refused_by_name() {
+        let dir = TempDir::new().unwrap();
+        let owner = Uuid::new_v4();
+        let device = Uuid::new_v4();
+        let (state, _) = channel_key_daemon(&dir, device, [9u8; 32]).await;
+        consent_to(&state, owner).await;
+
+        let stranger = Uuid::new_v4();
+        let err = tool_cosign(&state, &request(owner, stranger)).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(&stranger.to_string()), "names the addressee: {msg}");
+        assert!(msg.contains(&device.to_string()), "names who we actually are: {msg}");
+    }
+
+    /// The consent gate still holds on the fixed path — the identity fix must not
+    /// have quietly moved the `serve_owners` check off the unattended surface.
+    #[tokio::test]
+    async fn an_unconsented_owner_is_still_refused_on_the_daemon_path() {
+        let dir = TempDir::new().unwrap();
+        let device = Uuid::new_v4();
+        let (state, _) = channel_key_daemon(&dir, device, [9u8; 32]).await;
+
+        let err = tool_cosign(&state, &request(Uuid::new_v4(), device)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("serve-owners"),
+            "consent must still gate the unattended path: {err}"
         );
     }
 }
