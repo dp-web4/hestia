@@ -725,14 +725,12 @@ def deny_self_access(marker: str, tool_name: str) -> int:
 # also too much -- the fleet legitimately edits its gates (#55, #89, #90 in one week). This
 # is the channel that un-refuses a legitimate one, with a human across it.
 
-# The 0.5s fast-path budget is for a policy verdict on the hot path. Opening and polling
-# an escalation is a mutation plus a witness write, and it is already inside a 2-minute
-# wait -- so it gets its own, longer budget rather than borrowing one sized for something
-# else. A too-tight timeout here would read as 'unreachable' and deny a legitimate write.
-ESCALATION_RPC_TIMEOUT_S = 5.0
 # The claim call must finish well inside the harness's 5s budget for the WHOLE hook, which
 # also has to cover the ordinary policy verdict. Sized for a loopback call to a local daemon,
 # not for a human.
+# (A 5.0 assignment preceded this one from the constant's introduction in 5e15636 (#114)
+# and was shadowed by it for the constant's entire life -- 1.5 has always been the value
+# in force. Removed 2026-08-05; zero behaviour change.)
 ESCALATION_RPC_TIMEOUT_S = 1.5
 
 
