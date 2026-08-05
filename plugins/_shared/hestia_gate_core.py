@@ -450,7 +450,14 @@ def _parse_scope_entries(entries) -> tuple:
             # Unprefixed and not the wildcard: a bare repo name, the legacy spelling.
             if e:
                 out.append(e)
-    return tuple(out)
+    # A scope entry is a NAME. `.` and `..` are path syntax, cannot name a directory, and each
+    # granted wide as a bare entry (kimi #940 B1-B4): scope `.` reached every repo via the
+    # `/./` spelling, scope `..` reached past the workspace root. Normalising first (see
+    # path_in_scope) already makes them unmatchable — but "unmatchable" is a claim about a
+    # matcher, and this thread reversed exactly that claim once already (#937 finding C:
+    # `ssh:/etc` was inert, `ssh:etc` granted). Dropped here too, so the guarantee does not
+    # depend on the caller of the day. No live policy carries one; all are bare repo names.
+    return tuple(s for s in out if s.strip("."))
 
 
 def resolve_agent_policy(profile: HarnessProfile,
@@ -596,7 +603,19 @@ def path_in_scope(path: str, scopes, workspace: str, profile: HarnessProfile,
     """In-scope if it is the member's own home, /tmp, or under a granted repo.
 
     Relative paths resolve against the event cwd — `scripts/x` inside a granted repo is that
-    repo's subdir, not the workspace-root `scripts` dir (2026-07-23 false-deny class)."""
+    repo's subdir, not the workspace-root `scripts` dir (2026-07-23 false-deny class).
+
+    NORMALISE FIRST, THEN LET CONTAINMENT DECIDE (kimi #940 B5). Normalisation used to run on
+    the RELATIVE branch only, so an absolute path was judged on its lexical first segment:
+    with scope `("repo-a",)`, `<ws>/repo-a/../repo-b/secret` took `seg = "repo-a"` and was
+    GRANTED while resolving into an ungranted repo. The relative spelling of that same path
+    was already denied — which pins the seat: the absolute branch skipping normpath, not the
+    segment rule. Every caller-supplied spelling now resolves before anything reads a segment.
+
+    Containment is also a boundary test, not `workspace in p`. That substring form judged any
+    path merely CONTAINING the workspace string by whatever followed it. Same defect class as
+    `_under_temp_root`'s pre-#169 `startswith(("/tmp",...))` — and the same fix: compare at
+    the separator."""
     p = path.replace("\\", "/")
     low = p.lower()
     for marker in profile.home_markers:
@@ -605,12 +624,13 @@ def path_in_scope(path: str, scopes, workspace: str, profile: HarnessProfile,
             return True
     if not p.startswith("/") and not p.startswith("~"):
         cwd = (cwd or os.getcwd()).replace("\\", "/")
-        p = os.path.normpath(os.path.join(cwd, p)).replace("\\", "/")
+        p = os.path.join(cwd, p)
+    p = os.path.normpath(p).replace("\\", "/")
     if _under_temp_root(p):
         return True
-    if workspace in p:
-        rest = p.split(workspace, 1)[1].lstrip("/")
-        seg = rest.split("/", 1)[0] if rest else ""
+    ws = workspace.replace("\\", "/").rstrip("/")
+    if ws and (p == ws or p.startswith(ws + "/")):
+        seg = p[len(ws):].lstrip("/").split("/", 1)[0]
         if seg == "":
             return False          # bare workspace root — the glob-the-root antipattern
         return seg in scopes
@@ -630,11 +650,17 @@ def command_in_scope(cmd: str, scopes, workspace: str, cwd: Optional[str] = None
     escapes string parsing entirely — the engine sandbox, not this check, is the fs boundary."""
     ws = workspace.rstrip("/")
     for after in cmd.split(workspace)[1:]:
-        head = after.lstrip("/")
-        head = re.split(r"""[\s"'`);&|<>]""", head, 1)[0]
-        head = head.split("/", 1)[0]
-        if head not in scopes:
-            return False, (head or "<workspace root>")
+        # Resolve the whole token before reading a segment off it (kimi #940 B7). Taking the
+        # head lexically let `cat <ws>/repo-a/../repo-b/secret` pass on `repo-a` while
+        # resolving into an ungranted repo — path_in_scope's B5 one function over. A command's
+        # text is member-controlled end to end, so this one needs no harness to cooperate.
+        tok = re.split(r"""[\s"'`);&|<>]""", after.lstrip("/"), 1)[0]
+        resolved = os.path.normpath(f"{ws}/{tok}").replace("\\", "/")
+        if resolved != ws and not resolved.startswith(ws + "/"):
+            return False, (tok or "<workspace root>")   # traversed out of the workspace
+        seg = resolved[len(ws):].lstrip("/").split("/", 1)[0]
+        if seg not in scopes:
+            return False, (seg or "<workspace root>")
 
     # Pass 2 — relative tokens. The event cwd is NOT reliable: the engine may run each command
     # with a per-command workdir the event does not carry (observed live via the Codex gate —
@@ -714,14 +740,21 @@ def _offending_segment(path: str, workspace: str, cwd: Optional[str] = None) -> 
     """The workspace-relative first segment that was not granted, or None if the path simply
     lies outside the workspace entirely (a different fact, and worth saying differently —
     `/mnt/c/exe/dpx/` was outside `HESTIA_WORKSPACE` altogether, and telling kimi it was 'not
-    granted' would have implied a grant could fix it)."""
+    granted' would have implied a grant could fix it).
+
+    Normalises on the same rule as `path_in_scope`, and must: judged lexically, the deny for
+    `<ws>/repo-a/../repo-b/secret` read "'repo-a' is not granted" — naming the repo the member
+    DOES hold as the offender, for a reach that resolved into `repo-b`. A member handed that
+    would go asking for scope it already has. This is the defect in this function's own
+    docstring — a deny that hides its trigger — arriving through the segment rule instead of
+    through truncation."""
     p = path.replace("\\", "/")
     if not p.startswith("/") and not p.startswith("~"):
-        p = os.path.normpath(os.path.join((cwd or os.getcwd()).replace("\\", "/"), p))
-        p = p.replace("\\", "/")
-    if workspace in p:
-        rest = p.split(workspace, 1)[1].lstrip("/")
-        seg = rest.split("/", 1)[0] if rest else ""
+        p = os.path.join((cwd or os.getcwd()).replace("\\", "/"), p)
+    p = os.path.normpath(p).replace("\\", "/")
+    ws = workspace.replace("\\", "/").rstrip("/")
+    if ws and (p == ws or p.startswith(ws + "/")):
+        seg = p[len(ws):].lstrip("/").split("/", 1)[0]
         return seg or "<workspace root>"
     return None
 
