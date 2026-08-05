@@ -476,6 +476,19 @@ _READ_ONLY_HEADS = {
     "true", "false", "test", "[", "seq", "nl", "cut", "tr", "uniq",
     "comm", "rev", "du", "df", "which", "type", "id", "whoami", "uname",
     "jq", "column", "tree",
+    # `cd` added 2026-08-05, and it is the cheapest of the four fixes in this pass because
+    # `cd` is a head that CANNOT write — there is no flag, no argument and no spelling of it
+    # that modifies a file. Its absence cost a real refusal: `cd h && grep -n foo <gate>`,
+    # a read of the gate for symbol names while writing a defect report about the gate, was
+    # refused and opened escalation 851e0d0ec5a4bf0c on the operator. `grep -n foo <gate>`
+    # alone is permitted, so the only thing the refusal measured was that the member changed
+    # directory first.
+    #
+    # Segment walking is what makes this safe, and the test says so rather than trusting it:
+    # separators split `cd /tmp && sed -i s/a/b/ <gate>` into two segments and the second is
+    # head-checked on `sed`. Adding `cd` frees the `cd` segment, never the one after it.
+    # (`cd_does_not_launder` in tests/gate_false_refusal_test.py.)
+    "cd",
     # NOT here: `date` and `hostname` (codex peer review, finding 2). `date -s` sets the
     # system clock; `hostname X` sets the hostname. A read-looking NAME carrying a mutating
     # FLAG is precisely what a head allowlist cannot see, which is why `_GUARDED_HEADS`
@@ -514,6 +527,27 @@ _GUARDED_HEADS = {
 # the deployed gate, not classifier noise. codex withheld the peer factor over it.
 _SEPARATORS = {";", "&", "&&", "|", "||", "\n"}
 _REDIRECTS = {">", ">>", "<", "<<", "<<<", ">&", "&>", ">|", "<&"}
+# INPUT redirects create and modify nothing. Split out 2026-08-05, and the split is the
+# narrow, provable half of a larger argument kimi-code and I have been having about the FP6
+# remedy — "the redirect branch should return the write target". It cannot, for `<`: there
+# is no write target, and `tee <gate> < evil.py` traced to THIS branch (not the head branch,
+# as my forum table claimed) would hand a resolver `evil.py` as the thing being written.
+#
+# What that argument settles here, ahead of the resolver: treating `<` as a write is not
+# conservative, it is just wrong, and it costs refusals. `grep foo < <gate>` was refused
+# while `cat <gate>` was permitted — the same act, decided by spelling.
+#
+# `<<` and `<<<` take a DELIMITER or a literal, not a filename, so there is nothing to
+# resolve there either. `<&` duplicates a descriptor for reading.
+#
+# The hole this could open, and why it does not: an input redirect that feeds an
+# INTERPRETER (`sh < evil.sh`, `python3 < evil.py`) is still refused — by the head
+# allowlist, which is where that danger actually lives, since `sh evil.sh` with no redirect
+# at all is the same attack and was never caught by the redirect branch. The test asserts
+# the migration rather than the verdict: `shell_reads_a_script` pairs `sh < evil.sh`
+# (refused) with `cat < evil.sh` (permitted), and only a live head check makes that pair
+# possible. Output redirects (`>`, `>>`, `>|`, `>&`, `&>`) are untouched.
+_INPUT_REDIRECTS = {"<", "<<", "<<<", "<&"}
 # `branch` and `remote` are NOT here (codex finding 1): `git branch -d` deletes a ref and
 # `git remote add` rewrites repository config. A read-looking SUBCOMMAND with a mutating
 # FLAG is exactly what a name allowlist cannot see.
@@ -581,6 +615,12 @@ def _is_read_only(tool_name: str, tool_input: Any) -> bool:
             continue
         if t in _REDIRECTS:
             nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+            # An input redirect writes nothing; consume it and its operand. The operand is
+            # a source file, a heredoc delimiter or a literal — never a destination — so it
+            # must not fall through and be head-checked as if it started a command.
+            if t in _INPUT_REDIRECTS:
+                i += 2
+                continue
             # fd duplication (`2>&1`) and `/dev/null` write no file. Everything else does.
             if t in {">&", "&>", "<&"} and nxt and nxt.isdigit():
                 i += 2
