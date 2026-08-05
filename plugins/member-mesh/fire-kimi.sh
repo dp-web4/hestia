@@ -146,6 +146,17 @@ except Exception:
     print("")' "${_ident/#\~/$HOME}" 2>/dev/null)
     [[ -n "$_role" ]] && export HESTIA_ROLE="$_role"
   fi
+  # AND SAY SO WHEN IT DOES NOT RESOLVE — see fire-claude.sh for the full account. Short
+  # version: "unreadable => omitted => the split stays visible" stopped being true once a
+  # member's hook registration carried a `${HESTIA_ROLE:-...}` default, because the default
+  # PAINTS the unresolved case as an attended session instead of leaving it blank. Silence
+  # was load-bearing for a promise that no longer holds.
+  if [[ -z "${HESTIA_ROLE:-}" ]]; then
+    echo "[fire-kimi] WARNING: role unresolved — no HESTIA_ROLE in the environment and no" \
+         "role readable from $_ident. This session's acts will land under whatever default" \
+         "the member's hook registration supplies, which is NOT a declared autonomous role." \
+         "Hydrate the identity file or export HESTIA_ROLE before the fire."
+  fi
 fi
 cd "${HESTIA_WORKSPACE:-$(cd "$HERE_DIR/../../.." && pwd)}" && "$HERE_DIR/with-member-lock.sh" kimi-code \
   timeout -k 30 1800 kimi -p "$PROMPT" > "$LOG_DIR/kimi-$STAMP.log" 2>&1

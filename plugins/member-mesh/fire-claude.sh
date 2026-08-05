@@ -184,6 +184,27 @@ except Exception:
     print("")' "${_ident/#\~/$HOME}" 2>/dev/null)
     [[ -n "$_role" ]] && export HESTIA_ROLE="$_role"
   fi
+  # AND SAY SO WHEN IT DOES NOT RESOLVE. The paragraph above promised that an unreadable
+  # identity "just leaves that member's split visible, which is the honest state". That
+  # promise expired on 2026-08-03, when ~/.claude/settings.json grew
+  # HESTIA_ROLE="${HESTIA_ROLE:-role:constellation:interactive-dev}" on the three hestia hook
+  # registrations: an unresolved role is no longer BLANK, it is PAINTED as an attended
+  # interactive session. Two changes, each defensible alone, that together turn a visible gap
+  # into a silent misattribution.
+  #
+  # Measured on CBP 2026-08-05: this branch has never resolved for claude-code. The
+  # claude-code plugin ships no `instance/identity.seed.json` and no `hooks/hydrate.sh`
+  # (codex, gemini and kimi all ship both), so NOTHING IN THE TREE WRITES THE FILE THIS
+  # READS, and every mesh-fired autonomous session on that box was recorded as
+  # `interactive-dev` — indistinguishable from an attended one. Nothing said a word about it.
+  # This is that word. It does not decide anyone's role; it refuses to be quiet about not
+  # knowing it.
+  if [[ -z "${HESTIA_ROLE:-}" ]]; then
+    echo "[fire-claude] WARNING: role unresolved — no HESTIA_ROLE in the environment and no" \
+         "role readable from $_ident. This session's acts will land under whatever default" \
+         "the member's hook registration supplies, which is NOT a declared autonomous role." \
+         "Hydrate the identity file or export HESTIA_ROLE before the fire."
+  fi
 fi
 cd "${HESTIA_WORKSPACE:-$(cd "$HERE_DIR/../../.." && pwd)}" && "$HERE_DIR/with-member-lock.sh" claude-code \
   timeout -k 30 1800 claude -p --dangerously-skip-permissions "$PROMPT" > "$LOG_DIR/claude-$STAMP.log" 2>&1
