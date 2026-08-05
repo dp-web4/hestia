@@ -274,10 +274,19 @@ def _workspace():
     return ws
 
 
-def _profile(tmp, scope):
+def _profile(tmp, scope, certified=True):
+    """A member identity file.
+
+    CERTIFIED BY DEFAULT after the #188 redesign: an uncertified replica now grants nothing,
+    so a fixture without a cert block would make every scope test assert the refusal path
+    instead of the logic it means to exercise. Pass `certified=False` to get the raw shape a
+    member writes for itself."""
     p = os.path.join(tmp, "identity.json")
+    mrh = {"in_scope": scope}
+    if certified:
+        mrh["replica"] = {"generation": 1, "expires_at": G.now_secs() + 3600}
     with open(p, "w", encoding="utf-8") as fh:
-        json.dump({"mrh": {"in_scope": scope}, "role": "role:constellation:member"}, fh)
+        json.dump({"mrh": mrh, "role": "role:constellation:member"}, fh)
     return G.HarnessProfile(member_id="test-member", identity_path=p,
                             home_markers=("~/.test-member",))
 
@@ -429,6 +438,60 @@ def test_a_member_cannot_grant_itself_blanket_allow_via_its_own_identity_file():
           not trusted.stale and G.evaluate(ev, prof, ws, policy=trusted).decision == "allow")
 
 
+def _replica(tmp, scope, generation=1, ttl=3600):
+    """An identity file carrying a certified replica block."""
+    p = os.path.join(tmp, "identity.json")
+    cert = {"generation": generation, "expires_at": G.now_secs() + ttl}
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump({"mrh": {"in_scope": scope, "replica": cert}, "role": "role:x"}, fh)
+    return G.HarnessProfile(member_id="m", identity_path=p)
+
+
+def test_an_uncertified_replica_is_refused_not_honoured():
+    """codex/gpt audit of #188: **stale does not mean narrower.**
+
+    My design rested on "a replica can only be staler, and staler-standing is narrower." That
+    holds for grants ADDED since the copy and FAILS for grants REVOKED since it — a replica
+    still carrying a revoked grant is WIDER than current policy. Revocation is exactly the
+    operation an authority most needs to work, and exactly the one the fallback defeated.
+
+    So a replica is not trusted for being old. It is trusted for being certified, and only
+    within limits it carries itself."""
+    ws = _workspace()
+    # A plain identity file — no replica block. This is the shape a member writes itself.
+    plain = _profile(ws, ["repo:granted"], certified=False)
+    pol = G.resolve_agent_policy(plain)
+    check("uncertified_replica_grants_nothing", pol.scope == (),
+          f"an uncertified file was honoured: {pol.scope}")
+    check("uncertified_says_why", pol.source == "replica-uncertified", pol.source)
+
+    # Certified and live: honoured, and it says which policy it is.
+    good = _replica(_workspace(), ["repo:granted"])
+    pol = G.resolve_agent_policy(good)
+    check("certified_replica_is_honoured", "granted" in pol.scope)
+    check("certified_replica_carries_generation", pol.generation == 1)
+
+    # Certified but EXPIRED: refused. The longer the authority has been unreachable, the more
+    # likely a revocation this copy cannot know about — expiry bounds that unknowability.
+    old = _replica(_workspace(), ["repo:granted"], ttl=-1)
+    pol = G.resolve_agent_policy(old)
+    check("expired_replica_grants_nothing", pol.scope == () and pol.source == "replica-expired",
+          f"{pol.source} {pol.scope}")
+
+
+def test_a_replica_can_never_widen_to_unscoped():
+    """Even certified, the one value a member would write to escape must not come from here."""
+    ws = _workspace()
+    os.makedirs(os.path.join(ws, "granted"), exist_ok=True)
+    prof = _replica(_workspace(), ["*"])
+    pol = G.resolve_agent_policy(prof)
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/notgranted/x.md"], cwd=ws)
+    check("certified_wildcard_still_does_not_grant_everything",
+          G.evaluate(ev, prof, ws, policy=pol).blocks,
+          "a replica yielded blanket ALLOW — certification bounds staleness, it does not "
+          "confer the authority to remove the boundary entirely")
+
+
 def test_malformed_vault_payload_fails_closed_instead_of_raising():
     """kimi #188, finding 2. The reader call was wrapped; the PARSE was not. A non-string
     element propagated an AttributeError out of the gate — and on a fail-open harness an
@@ -557,6 +620,8 @@ ALL_TESTS = [
     "test_shims_contain_no_policy",
     "test_unscoped_must_be_declared_never_inferred",
     "test_a_member_cannot_grant_itself_blanket_allow_via_its_own_identity_file",
+    "test_an_uncertified_replica_is_refused_not_honoured",
+    "test_a_replica_can_never_widen_to_unscoped",
     "test_malformed_vault_payload_fails_closed_instead_of_raising",
     "test_prefixed_wildcard_is_not_unscoped",
     "test_policy_resolution_names_its_source_and_fails_closed",
@@ -610,6 +675,8 @@ if __name__ == "__main__":
     test_shims_contain_no_policy()
     test_unscoped_must_be_declared_never_inferred()
     test_a_member_cannot_grant_itself_blanket_allow_via_its_own_identity_file()
+    test_an_uncertified_replica_is_refused_not_honoured()
+    test_a_replica_can_never_widen_to_unscoped()
     test_malformed_vault_payload_fails_closed_instead_of_raising()
     test_prefixed_wildcard_is_not_unscoped()
     test_policy_resolution_names_its_source_and_fails_closed()

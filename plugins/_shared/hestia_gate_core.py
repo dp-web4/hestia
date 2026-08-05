@@ -247,11 +247,35 @@ class AgentPolicy:
     instance overlays.
 
     But the local gate must still decide when the daemon is down, or "stop the daemon, then act"
-    becomes the bypass. So: **vault is authority, the local file is a derived replica.** The
-    daemon writes the replica; the gate reads it; nobody hand-edits it. Daemon up, replica is
-    fresh. Daemon down, the gate enforces the last known standing policy and grants nothing new —
-    which is the correct direction to fail, because a replica can only ever be *staler*, and
-    stale-standing is narrower than live-plus-grants.
+    becomes the bypass. So: **vault is authority, the local file is a derived replica.**
+
+    **"STALE IS NARROWER" WAS FALSE, AND IT WAS THE PREMISE THIS DESIGN RESTED ON.** (codex/gpt
+    open-PR audit, 2026-08-04.) I argued a replica can only ever be staler, and staler-standing
+    is narrower, so honouring it fails safe. That holds for grants ADDED since the copy. It
+    fails for grants **REVOKED** since the copy: if the vault revoked `repo:private-context`, a
+    replica still carrying it is **WIDER** than current policy. Revocation and expiry are
+    precisely the operations a policy authority most needs to work, and precisely the ones the
+    fallback silently defeated.
+
+    So a replica is not trusted for being old. It is trusted for being **CERTIFIED**, and only
+    within limits it carries itself:
+
+      * `generation` — a monotonic counter issued by the authority. A replica with no
+        generation makes no claim about which policy it is and is refused outright.
+      * `expires_at` — a wall-clock horizon written by the authority. Past it, the replica is
+        refused rather than honoured, because the longer the daemon has been unreachable the
+        more likely a revocation has happened that this copy cannot know about. Bounded
+        staleness is the only kind that is safe.
+      * never widens — a replica may never yield `UNSCOPED` (see `evaluate`), so the one value
+        a member would write into its own file to escape cannot come from this path.
+
+    What is still NOT solved, stated because the audit was right that the last version claimed
+    more than it did: this module cannot verify a signature it has no key for, and a
+    member-writable file can forge a generation as easily as a scope. **Certification has to be
+    a MAC or signature the authority issues and the gate verifies**, and that needs a key
+    distribution this file does not own. Until then `generation`/`expires_at` bound the damage
+    and make the gap explicit; they do not close it. The honest summary is that a stale replica
+    is now *time-limited and self-describing*, not *authenticated*.
     """
 
     #: Sentinel for "this member is deliberately unscoped." Never inferred from an empty list —
@@ -265,9 +289,13 @@ class AgentPolicy:
     #: Where this policy was resolved from, carried so a reader never has to guess which store
     #: won. A policy that cannot say where it came from is not auditable.
     source: str = "unresolved"
-    #: True when the daemon could not be consulted and this is the on-disk replica. The gate
-    #: still enforces, but must not treat it as current for GRANTS — only for standing scope.
+    #: True when the daemon could not be consulted and this is the on-disk replica.
     stale: bool = False
+    #: Monotonic generation issued by the policy authority. A replica may only be honoured if
+    #: it carries one; `None` means the file made no claim about which policy it is.
+    generation: Optional[int] = None
+    #: Wall-clock second after which this replica must not be honoured at all.
+    expires_at: Optional[int] = None
 
     def is_unscoped(self) -> bool:
         return self.UNSCOPED in self.scope
@@ -381,6 +409,12 @@ def detect_workspace(profile: HarnessProfile) -> str:
 _SCOPE_PREFIXES = ("repo:", "path:")
 
 
+def now_secs() -> int:
+    """Wall clock, isolated so a test can bound expiry without patching the stdlib."""
+    import time
+    return int(time.time())
+
+
 def _parse_scope_entries(entries) -> tuple:
     """`["repo:web4", "path:.git-inbox"]` -> `("web4", ".git-inbox")`.
 
@@ -462,11 +496,27 @@ def resolve_agent_policy(profile: HarnessProfile,
             mrh = json.load(fh).get("mrh", {})
         scope = mrh.get("in_scope")
         if isinstance(scope, list):
+            # A REPLICA MUST SAY WHICH POLICY IT IS AND HOW LONG IT IS GOOD FOR.
+            # Absent either, it is not a certified replica — it is just a file. Refused,
+            # because "old" was never the safety property; BOUNDED and DECLARED is.
+            cert = mrh.get("replica") if isinstance(mrh.get("replica"), dict) else {}
+            gen = cert.get("generation")
+            exp = cert.get("expires_at")
+            if not isinstance(gen, int) or not isinstance(exp, int):
+                return AgentPolicy(member_id=profile.member_id, scope=(),
+                                   source="replica-uncertified", stale=True)
+            if now_secs() >= exp:
+                # The longer the authority has been unreachable, the likelier a revocation
+                # this copy cannot know about. Expiry is the bound on that unknowability.
+                return AgentPolicy(member_id=profile.member_id, scope=(),
+                                   source="replica-expired", stale=True)
             return AgentPolicy(
                 member_id=profile.member_id,
                 scope=_parse_scope_entries(scope),
                 source="local-replica",
                 stale=True,
+                generation=gen,
+                expires_at=exp,
             )
     except Exception:
         pass
