@@ -111,6 +111,29 @@ pub struct DashboardSnapshot {
     /// activity, and absence is exactly the reading they would trust without checking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats_unavailable: Option<String>,
+    /// Set when the chain read backing `recent` FAILED.
+    ///
+    /// THE SAME DEFECT AS `stats_unavailable`, ONE FIELD OVER, found 2026-08-04 by dp:
+    /// *"chain display still blank for all agents all timelines. something got broken."*
+    ///
+    /// The 2026-08-01 fix hardened `read_recent(10_000)` for the stats and left
+    /// `read_recent_window` — the live feed — on `.unwrap_or_default()`. So an error became an
+    /// empty Vec, the daemon served HTTP 200, and the feed rendered as *nothing happened*
+    /// while the panel beside it correctly said *unavailable*. The comment above the stats read
+    /// already describes this exact presentation, including the words "dp saw every member
+    /// empty across every timeframe... and it came back by itself later". It came back by
+    /// itself again.
+    ///
+    /// Why it surfaced now rather than in August: `witness.db` is ~119MB and growing, the
+    /// daemon sits near 800MB resident, and this read runs under the global state lock. A busy
+    /// timeout or lock contention that was rare at 30MB is ordinary at 119MB — the failure rate
+    /// rose to meet a hazard that had been latent the whole time.
+    ///
+    /// A governance console showing a quiet fleet because its query broke is the most dangerous
+    /// shape this dashboard can take: the operator is watching for unexpected agent activity,
+    /// and absence is exactly the reading they would trust without checking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_unavailable: Option<String>,
     pub generated_at: DateTime<Utc>,
 }
 
@@ -604,13 +627,21 @@ impl ServerState {
         // Recent feed: flatten the outcome / session_started / etc. shape.
         // Calendar-windowed (count cap is transport safety, not the filter).
         let cutoff_str = window_cutoff.map(|c| c.to_rfc3339());
-        let recent: Vec<RecentEntry> = self
+        // CARRY THE ERROR, exactly as the stats read above does. `.unwrap_or_default()` here
+        // turned every failure into an empty feed indistinguishable from a quiet fleet — see
+        // `recent_unavailable`. The two reads now fail the same way, which is the point: a
+        // reader should not have to know which panel was hardened and which was not.
+        let (recent_raw, recent_read_error) = match self
             .chain_store
             .read_recent_window(cutoff_str.as_deref(), recent_cap)
-            .unwrap_or_default()
-            .into_iter()
-            .map(flatten_entry)
-            .collect();
+        {
+            Ok(v) => (v, None),
+            Err(e) => {
+                tracing::error!("dashboard recent-feed chain read failed: {e}");
+                (Vec::new(), Some(e.to_string()))
+            }
+        };
+        let recent: Vec<RecentEntry> = recent_raw.into_iter().map(flatten_entry).collect();
 
         let delegations = crate::delegation::DelegationStore::load(&self.vault)
             .ok()
@@ -834,6 +865,7 @@ impl ServerState {
                 v
             },
             stats_unavailable: stats_read_error,
+            recent_unavailable: recent_read_error,
             instance_grants: {
                 let now = crate::server::gate_escalation::now_secs();
                 let mut v: Vec<serde_json::Value> = self
@@ -979,6 +1011,47 @@ mod tests {
         // Caller-asserted, and labelled so the UI cannot render a claim as an identity.
         assert_eq!(row["claimed_by"], "kimi-code");
         assert!(row.get("secs_remaining").is_some());
+    }
+
+    /// A FAILED FEED READ MUST BE DISTINGUISHABLE FROM AN EMPTY CHAIN.
+    ///
+    /// dp, 2026-08-04: "chain display still blank for all agents all timelines." The feed read
+    /// was `.unwrap_or_default()`, so any error became an empty Vec and the dashboard served
+    /// HTTP 200 rendering "Waiting for the first chain entry…" over a chain that was actively
+    /// being written. The stats read beside it had been hardened for this exact defect on
+    /// 2026-08-01 and the feed was left behind.
+    ///
+    /// Asserted on the SERIALIZED payload, because that is what the browser reads — and because
+    /// the whole family of defects this repo keeps finding is a field being present in a struct
+    /// while absent from the thing that consumes it.
+    #[test]
+    fn an_empty_feed_and_a_failed_feed_are_distinguishable_on_the_wire() {
+        let (_dir, state) = make_state();
+
+        // A genuinely empty chain: no entries, and NO failure claimed.
+        let s = state.dashboard_snapshot(20);
+        let v = serde_json::to_value(&s).expect("serialize");
+        assert!(s.recent.is_empty(), "fixture has no entries");
+        assert!(
+            v.get("recent_unavailable").is_none(),
+            "an empty chain must not claim a read failure — that would cry wolf on a quiet fleet"
+        );
+
+        // The two states must not be the same JSON. If `recent_unavailable` is absent in both,
+        // the browser has no way to tell "nothing happened" from "we could not find out".
+        let mut broken = s.clone();
+        broken.recent_unavailable = Some("database is locked".into());
+        let bv = serde_json::to_value(&broken).expect("serialize");
+        assert_eq!(
+            bv["recent_unavailable"], "database is locked",
+            "the failure reason must reach the client verbatim; a bare boolean would tell the \
+             operator something is wrong without telling them what"
+        );
+        assert_ne!(
+            v.get("recent_unavailable"),
+            bv.get("recent_unavailable"),
+            "empty and unavailable serialize identically — this is the defect, not the fix"
+        );
     }
 
     #[test]

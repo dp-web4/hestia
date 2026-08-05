@@ -1642,6 +1642,23 @@
     if (selectedOrch) baseTitle += ` · ${selectedOrch}`;
     title.textContent = baseTitle;
     if (!filtered.length) {
+      // A FAILED READ IS NOT AN EMPTY CHAIN, and it must never be offered as one.
+      //
+      // dp, 2026-08-04: "chain display still blank for all agents all timelines. something
+      // got broken." Every message below is a statement about the DATA — "waiting for the
+      // first entry", "try a wider range" — and each of them is a lie when the read failed.
+      // The second one is the worst: it sends the operator to widen a window that will come
+      // back just as empty, so the interface actively misdirects the person debugging it.
+      //
+      // The daemon now carries `recent_unavailable`, exactly as it carries
+      // `stats_unavailable`. Render the failure.
+      const feedBroken = lastData?.recent_unavailable;
+      if (feedBroken) {
+        root.innerHTML = `<div class="empty stat-unavailable">Chain read FAILED — this feed is ` +
+          `unavailable, not empty. Entries are still being written; the dashboard could not ` +
+          `read them.<br><small>${escapeHtml(String(feedBroken))}</small></div>`;
+        return;
+      }
       const noun = feedFilter === 'deny' ? 'denies' : feedFilter === 'warn' ? 'warnings' : 'chain entries';
       const empty = selectedOrch
         ? `No ${noun} for ${escapeHtml(selectedOrch)}.`
