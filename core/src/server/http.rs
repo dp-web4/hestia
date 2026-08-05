@@ -263,6 +263,9 @@ pub async fn serve_with_callback(
         .route("/api/gates/ratify", post(gates_ratify))
         .route("/api/agents/:id/ungovern", post(agent_ungovern))
         .route("/api/chain", get(chain_query))
+        // The admin ledger — governance history with status facets. Operator-gated for the same
+        // reason /api/chain is: it is the society's whole record of who ruled on what.
+        .route("/api/governance/ledger", get(governance_ledger))
         // OID4VCI issuance MINTS a presentation SIGNED WITH THE OWNER'S IDENTITY KEY — a consequential
         // act that must be owner-authorized. Fail-closed stopgap (PRD §5.6/§7.1; Nomad's finding, dp's
         // §12 disposition): gate it behind the operator session like every other consequential surface,
@@ -1810,10 +1813,21 @@ async fn chain_query(
     };
     let limit = q.limit.unwrap_or(default_cap);
     let cutoff_str = cutoff.map(|c: chrono::DateTime<chrono::Utc>| c.to_rfc3339());
-    let entries: Vec<super::dashboard::RecentEntry> = s
-        .chain_store
-        .read_recent_window(cutoff_str.as_deref(), limit)
-        .unwrap_or_default()
+    // A FAILED read must not render as an EMPTY chain. This is the third site of the defect fixed
+    // in the dashboard snapshot on 2026-08-01 (stats) and 2026-08-02 (#190, the recent feed): a
+    // `.unwrap_or_default()` turned a read error into a green, empty, entirely plausible display.
+    // dp read that as "chain display still blank for all agents all timelines" — the display was
+    // not blank, it was LYING, and a 119MB witness.db is what made the failure ordinary. Fixing
+    // one call site and not the class is why it came back; this is the call site the history view
+    // actually uses.
+    let (raw, read_error) = match s.chain_store.read_recent_window(cutoff_str.as_deref(), limit) {
+        Ok(v) => (v, None),
+        Err(e) => {
+            tracing::error!("chain query read failed: {e}");
+            (Vec::new(), Some(e.to_string()))
+        }
+    };
+    let entries: Vec<super::dashboard::RecentEntry> = raw
         .into_iter()
         .map(super::dashboard::flatten_entry)
         .filter(|e| {
@@ -1834,7 +1848,82 @@ async fn chain_query(
             true
         })
         .collect();
-    Json(serde_json::json!({ "entries": entries }))
+    Json(serde_json::json!({ "entries": entries, "read_error": read_error }))
+}
+
+/// `GET /api/governance/ledger?status=&range=&limit=` — the operator's ledger of ADMIN acts.
+///
+/// dp, 2026-08-05: *"i need a separate witness chain of admin actions from which i can
+/// select/review/approve/deny, sortable by all/open/approved/denied ... currently i do not see any
+/// escalations for me to approve/deny, nor can i see any history."*
+///
+/// The pending panels answered only "what is waiting". Everything decided, and everything nobody
+/// ruled on before its window closed, was invisible — not missing from the chain, just never
+/// projected by any reader. This is that reader. See `governance_ledger` for why it is a
+/// projection over the one chain rather than a second store.
+///
+/// Behind `operator_gate` like every other consequential surface: this is the whole governance
+/// history of the society, including who ruled on what and why.
+async fn governance_ledger(
+    State(state): State<SharedState>,
+    Query(q): Query<LedgerQuery>,
+) -> impl IntoResponse {
+    use crate::server::governance_ledger as gl;
+
+    let s = state.lock().await;
+    let now_dt = chrono::Utc::now();
+    // Admin acts are rare compared with member traffic, so the default window reaches back FAR.
+    // A day-shaped default would reproduce the original complaint for anything ruled last week.
+    let cutoff = match q.range.as_deref() {
+        Some("day") => Some(now_dt - chrono::Duration::days(1)),
+        Some("week") => Some(now_dt - chrono::Duration::weeks(1)),
+        Some("all") => None,
+        // Default: a month. Long enough that an operator returning after a break sees the period
+        // they were away for, which is exactly when this view matters most.
+        _ => Some(now_dt - chrono::Duration::days(30)),
+    };
+    let cutoff_str = cutoff.map(|c: chrono::DateTime<chrono::Utc>| c.to_rfc3339());
+    // The cap counts ADMIN ACTS, not chain entries — `read_recent_by_types` filters in SQL — so a
+    // wide range costs what its answer costs. Scanning the whole chain to discard member traffic
+    // would put the heaviest read in the daemon behind a UI panel.
+    const LEDGER_CAP: u64 = 5_000;
+
+    let (raw, read_error) = match s.chain_store.read_recent_by_types(
+        cutoff_str.as_deref(),
+        gl::GOVERNANCE_EVENTS,
+        LEDGER_CAP,
+    ) {
+        Ok(v) => (v, None),
+        Err(e) => {
+            tracing::error!("governance ledger chain read failed: {e}");
+            (Vec::new(), Some(e.to_string()))
+        }
+    };
+    let scanned = raw.len() as u64;
+    // The window FILLED. There may be older admin acts this page cannot see, and a reader must be
+    // told rather than shown a short list that looks complete.
+    let truncated = scanned >= LEDGER_CAP;
+
+    let now = crate::server::gate_escalation::now_secs();
+    let rows = gl::project(&raw, now);
+    let mut page = gl::page(
+        rows,
+        q.status.as_deref().unwrap_or("all"),
+        q.limit.unwrap_or(500).min(2_000) as usize,
+    );
+    page.truncated = truncated;
+    page.scanned = scanned;
+    page.read_error = read_error;
+    Json(page)
+}
+
+#[derive(serde::Deserialize)]
+struct LedgerQuery {
+    /// all | open | approved | denied | expired | recorded
+    status: Option<String>,
+    /// day | week | month (default) | all
+    range: Option<String>,
+    limit: Option<u64>,
 }
 
 /// `POST /api/operator/gate-escalation` {id, approve, reason?} — the STRONG decision channel for

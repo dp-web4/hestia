@@ -630,6 +630,36 @@
   .grant-revoke { background: transparent; color: var(--coral); border: 1px solid var(--coral);
     border-radius: 4px; padding: 0.15rem 0.6rem; font: inherit; font-size: 0.72rem; cursor: pointer; }
 
+  /* --- governance ledger (admin acts, with history) ---
+     Deliberately NOT a banner. A banner hides when its queue empties, which is correct for
+     "something needs you now" and exactly wrong for a ledger: the complaint that produced this
+     panel was that an expired escalation and a decided one were equally invisible, so the way in
+     must be present whether or not anything is pending. */
+  .ledger-tabs { display: flex; gap: 0.3rem; flex-wrap: wrap; margin-bottom: 0.7rem; }
+  .ledger-tab { background: transparent; color: var(--fg-dim); border: 1px solid var(--border);
+    border-radius: 999px; padding: 0.2rem 0.7rem; font: inherit; font-size: 0.72rem; cursor: pointer; }
+  .ledger-tab[aria-selected="true"] { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .ledger-tab .lt-n { opacity: 0.7; margin-left: 0.3rem; }
+  .ledger-row { border: 1px solid var(--border); border-left-width: 3px; border-radius: 6px;
+    padding: 0.55rem 0.7rem; margin-bottom: 0.5rem; background: var(--bg); }
+  .ledger-row.st-open { border-left-color: var(--coral); }
+  .ledger-row.st-approved { border-left-color: var(--success, #6ee7a8); }
+  .ledger-row.st-denied { border-left-color: var(--fg-dim); }
+  /* Expired gets the WARNING colour, not the denied grey. Nobody ruled — that is a failure of
+     the process, not an outcome of it, and it must not read as a decision. */
+  .ledger-row.st-expired { border-left-color: var(--warning); }
+  .ledger-row.st-recorded { border-left-color: var(--border); }
+  .ledger-head { display: flex; align-items: baseline; gap: 0.45rem; flex-wrap: wrap; }
+  .ledger-badge { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.06em;
+    border-radius: 3px; padding: 0.05rem 0.35rem; border: 1px solid currentColor; }
+  .ledger-when { margin-left: auto; font-size: 0.7rem; color: var(--fg-dim); white-space: nowrap; }
+  .ledger-subject { font-family: var(--mono, monospace); font-size: 0.74rem; color: var(--fg-dim);
+    word-break: break-all; margin-top: 0.25rem; }
+  .ledger-why { font-size: 0.78rem; color: var(--fg); margin-top: 0.3rem; line-height: 1.45; }
+  .ledger-verdict { font-size: 0.72rem; color: var(--fg-dim); margin-top: 0.3rem; }
+  .ledger-warn { font-size: 0.75rem; color: var(--warning); margin-bottom: 0.6rem;
+    border: 1px solid var(--warning); border-radius: 4px; padding: 0.4rem 0.6rem; }
+
   /* --- governance escalation banner + decision list --- */
   /* MUST precede the display:flex rule below. The UA stylesheet's `[hidden] { display: none }`
      loses to ANY author rule that sets display, so `banner.hidden = true` is inert without this
@@ -721,6 +751,18 @@
          installed here, what hestia could govern, what it actually governs. It is a
          different question from the working screen — "who is on this box" vs "what are
          they doing" — and it is asked occasionally, so it gets a drawer, not real estate. -->
+    <!-- LEDGER (dp, 2026-08-05): "i need a separate witness chain of admin actions from which i
+         can select/review/approve/deny, sortable by all/open/approved/denied ... currently i do
+         not see any escalations for me to approve/deny, nor can i see any history."
+         It sits in the title bar rather than behind a banner because a banner is a notification
+         and this is a record. The two escalations dp could not find had EXPIRED — a banner had
+         nothing to show, correctly, and that was the whole failure. -->
+    <div class="agents-wrap">
+      <button type="button" class="agents-btn" id="ledger-btn"
+              title="Governance ledger — escalations, law edits, grants, adjudications, with history">
+        ledger <span class="agents-badge" id="ledger-badge">·</span>
+      </button>
+    </div>
     <div class="agents-wrap">
       <button type="button" class="agents-btn" id="agents-btn" aria-expanded="false"
               title="Agents installed on this machine, and which of them are governed">
@@ -824,6 +866,52 @@
         <button class="modal-close" data-close="1" aria-label="Close">✕</button>
       </div>
       <div class="modal-body" id="trust-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- GOVERNANCE LEDGER. Projects the admin subset of the witness chain — escalations, scope
+       requests, law edits, permission grants and revocations, adjudications, operator acts —
+       with status facets and inline decision on anything still open.
+
+       Why it is not fed by the dashboard snapshot like the panels below it: the snapshot carries
+       only what is PENDING, and `pending()` drops the expired by design. Everything dp asked to
+       see — history, what was approved, what was denied, what nobody ruled on — is by definition
+       what the snapshot has already discarded. So this reads the chain, through
+       GET /api/governance/ledger.
+
+       Expired is rendered as its own status, in the warning colour, never folded into denied.
+       Both refuse the act; only one of them is a decision. -->
+  <div class="modal" id="ledger-modal" hidden>
+    <div class="modal-backdrop" data-close="1"></div>
+    <div class="modal-panel" id="ledger-card">
+      <div class="modal-head">
+        <h2>Governance ledger <span class="pol-mode" id="ledger-scanned"></span></h2>
+        <button class="modal-close" data-close="1" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="esc-note">
+          Every <strong>admin act</strong> on this society's chain: who asked, who ruled, and why.
+          <strong>Expired</strong> means the window closed with nobody ruling — that is not a
+          decision, and it is shown separately from <strong>denied</strong> for that reason.
+          Identities shown are <strong>claimed, not authenticated</strong>.
+        </div>
+        <div class="ledger-warn" id="ledger-error" hidden></div>
+        <div class="ledger-tabs" id="ledger-tabs">
+          <button class="ledger-tab" data-status="all" aria-selected="true">all<span class="lt-n" data-n="all"></span></button>
+          <button class="ledger-tab" data-status="open" aria-selected="false">open<span class="lt-n" data-n="open"></span></button>
+          <button class="ledger-tab" data-status="approved" aria-selected="false">approved<span class="lt-n" data-n="approved"></span></button>
+          <button class="ledger-tab" data-status="denied" aria-selected="false">denied<span class="lt-n" data-n="denied"></span></button>
+          <button class="ledger-tab" data-status="expired" aria-selected="false">expired<span class="lt-n" data-n="expired"></span></button>
+          <button class="ledger-tab" data-status="recorded" aria-selected="false">recorded<span class="lt-n" data-n="recorded"></span></button>
+          <select id="ledger-range" aria-label="Ledger time range" style="margin-left:auto;font-size:0.72rem;">
+            <option value="day">last day</option>
+            <option value="week">last week</option>
+            <option value="month" selected>last 30 days</option>
+            <option value="all">all time</option>
+          </select>
+        </div>
+        <div id="ledger-list"><div class="empty">loading…</div></div>
+      </div>
     </div>
   </div>
 
@@ -2319,6 +2407,142 @@
     }
   }
 
+  // --- governance ledger -------------------------------------------------------
+  // Fetched on demand, not on the poll tick. It reads a wide chain window, and paying for that
+  // every few seconds to render a panel nobody has open would put the daemon's heaviest read on
+  // a timer — the same shape as the bulk-read retention that took RSS from 60MB to 526MB in one
+  // interval on 2026-08-04.
+  let ledgerStatus = 'all';
+  let ledgerRange = 'month';
+  const ledgerDrafts = new Map();
+
+  function ledgerFmtWhen(iso) {
+    try { return new Date(iso).toLocaleString(); } catch (_) { return iso; }
+  }
+
+  async function loadLedger() {
+    const list = $('ledger-list');
+    const errEl = $('ledger-error');
+    try {
+      const res = await apiFetch(
+        `/api/governance/ledger?status=${encodeURIComponent(ledgerStatus)}&range=${encodeURIComponent(ledgerRange)}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+
+      // A failed chain read must never render as an empty ledger. That substitution — error
+      // shown as absence — is the defect this whole panel was built in response to.
+      const notes = [];
+      if (data.read_error) notes.push(`chain read FAILED: ${data.read_error}. This list is incomplete.`);
+      if (data.truncated) notes.push(`window filled at ${data.scanned} entries — older admin acts exist beyond this range.`);
+      errEl.hidden = notes.length === 0;
+      errEl.textContent = notes.join(' ');
+
+      const c = data.counts || {};
+      document.querySelectorAll('#ledger-tabs .lt-n').forEach((el) => {
+        const n = c[el.dataset.n];
+        el.textContent = (n === undefined || n === null) ? '' : ` ${n}`;
+      });
+      $('ledger-badge').textContent = c.open ? String(c.open) : '·';
+      $('ledger-scanned').textContent = `${data.scanned ?? 0} scanned`;
+
+      const rows = data.rows || [];
+      if (!rows.length) {
+        // Say which filter is empty. A bare "nothing here" under a selected tab is how an
+        // operator concludes the system is quiet when they are looking through one facet.
+        list.innerHTML = `<div class="empty">No <strong>${ledgerStatus}</strong> admin acts in this range.</div>`;
+        return;
+      }
+      list.innerHTML = rows.map(renderLedgerRow).join('');
+      wireLedgerRows(rows);
+    } catch (e) {
+      errEl.hidden = false;
+      errEl.textContent = `ledger unavailable: ${e.message}`;
+      list.innerHTML = '<div class="empty">—</div>';
+    }
+  }
+
+  function renderLedgerRow(r) {
+    const who = [r.role, r.plugin_id].filter(Boolean).join('@') || 'unknown';
+    const decidable = r.status === 'open' && (r.kind === 'escalation' || r.kind === 'scope_request');
+    const ttl = (r.secs_remaining !== undefined && r.secs_remaining !== null)
+      ? `${Math.floor(r.secs_remaining / 60)}m left` : '';
+    const verdict = r.decided_by
+      ? `${r.status} by ${escapeHtml(r.decided_by)}${r.decided_via ? ` (${escapeHtml(r.decided_via)})` : ''}${
+          r.decision_reason ? ` — ${escapeHtml(r.decision_reason)}` : ''}`
+      : (r.status === 'expired' ? 'no ruling before the window closed' : '');
+    return `
+      <div class="ledger-row st-${escapeHtml(r.status)}" data-id="${escapeHtml(r.id)}" data-kind="${escapeHtml(r.kind)}">
+        <div class="ledger-head">
+          <span class="ledger-badge">${escapeHtml(r.kind.replace(/_/g, ' '))}</span>
+          <span class="ledger-badge">${escapeHtml(r.status)}</span>
+          <strong>${escapeHtml(r.tool_name || r.event_type)}</strong>
+          <span class="esc-who">${escapeHtml(who)}</span>
+          <span class="ledger-when">${escapeHtml(ledgerFmtWhen(r.opened_at))}${ttl ? ` · ${ttl}` : ''}</span>
+        </div>
+        ${r.subject ? `<div class="ledger-subject">${escapeHtml(r.subject)}</div>` : ''}
+        ${r.reason ? `<div class="ledger-why">${escapeHtml(r.reason)}</div>` : ''}
+        ${r.detail ? `<div class="esc-what">${escapeHtml(r.detail)}</div>` : ''}
+        ${r.open_not_in_window ? '<div class="ledger-verdict"><em>the original request is outside this window</em></div>' : ''}
+        ${r.claimed_at ? `<div class="ledger-verdict">approval was claimed ${escapeHtml(ledgerFmtWhen(r.claimed_at))}</div>` : ''}
+        ${r.corroborations && r.corroborations.length
+            ? `<div class="ledger-verdict">corroborated by ${escapeHtml(r.corroborations.join(', '))}</div>` : ''}
+        ${verdict ? `<div class="ledger-verdict">${verdict}</div>` : ''}
+        ${decidable ? `
+          <div class="esc-actions" style="margin-top:0.45rem;">
+            <input class="esc-reason ledger-reason" type="text" placeholder="reason (required to approve)">
+            <button class="esc-approve ledger-approve" disabled>approve</button>
+            <button class="esc-deny ledger-deny">deny</button>
+          </div>
+          <div class="esc-err ledger-err" hidden></div>` : ''}
+        <div class="ledger-verdict" style="opacity:0.55;">${escapeHtml(r.opened_hash.slice(0, 16))}</div>
+      </div>`;
+  }
+
+  function wireLedgerRows(rows) {
+    document.querySelectorAll('#ledger-list .ledger-row').forEach((el) => {
+      const approve = el.querySelector('.ledger-approve');
+      if (!approve) return;
+      const id = el.dataset.id, kind = el.dataset.kind;
+      const reason = el.querySelector('.ledger-reason');
+      const deny = el.querySelector('.ledger-deny');
+      const err = el.querySelector('.ledger-err');
+      reason.value = ledgerDrafts.get(id) || '';
+      approve.disabled = !reason.value.trim();
+      // Same asymmetry the daemon enforces and the escalation panel already uses: a deny needs
+      // no justification, an approve does.
+      reason.addEventListener('input', () => {
+        ledgerDrafts.set(id, reason.value);
+        approve.disabled = !reason.value.trim();
+      });
+      const go = async (ok) => {
+        err.hidden = true;
+        try {
+          const res = kind === 'scope_request'
+            ? await apiFetch('/api/scope/decide', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ request_id: id, granted: ok, reason: reason.value.trim() || null }) })
+            : await apiFetch('/api/operator/gate-escalation', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id, approve: ok, reason: reason.value.trim() || null }) });
+          if (!res.ok) {
+            let msg = `HTTP ${res.status}`;
+            try { const b = await res.json(); if (b?.error) msg = b.error; } catch (_) {}
+            throw new Error(msg);
+          }
+          ledgerDrafts.delete(id);
+          // Re-read rather than mutating locally: the daemon decides whether the ruling landed.
+          await loadLedger();
+          await tick();
+        } catch (e) {
+          err.textContent = `decision failed: ${e.message}`;
+          err.hidden = false;
+        }
+      };
+      approve.addEventListener('click', () => go(true));
+      deny.addEventListener('click', () => go(false));
+    });
+  }
+
   // --- per-member grants -------------------------------------------------------
   // Rendered from the same snapshot as everything else. A standing exception to society law
   // that the operator must go looking for is one they will forget they made, so it renders
@@ -2478,10 +2702,26 @@
     // "the three ways a reader will try" (kimi NOT-SAME review of #186). A modal that ignores
     // one of the three teaches the operator that this panel is different from the one beside
     // it, which is the opposite of why it reuses the escalation panel's shape.
+    // Governance ledger: same backdrop / ✕ / Escape contract as the two panels above, because
+    // an operator should not have to learn a third habit for the same job.
+    const ledgerModal = $('ledger-modal');
+    $('ledger-btn').addEventListener('click', () => { ledgerModal.hidden = false; loadLedger(); });
+    ledgerModal.addEventListener('click', (e) => { if (e.target.dataset.close) ledgerModal.hidden = true; });
+    $('ledger-tabs').addEventListener('click', (e) => {
+      const tab = e.target.closest('.ledger-tab');
+      if (!tab) return;
+      ledgerStatus = tab.dataset.status;
+      document.querySelectorAll('#ledger-tabs .ledger-tab').forEach((t) =>
+        t.setAttribute('aria-selected', String(t === tab)));
+      loadLedger();
+    });
+    $('ledger-range').addEventListener('change', (e) => { ledgerRange = e.target.value; loadLedger(); });
+
     document.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape') return;
       escModal.hidden = true;
       scopeModal.hidden = true;
+      ledgerModal.hidden = true;
     });
     // Same backdrop/✕/Escape contract for the trust detail popup, so both modals close
     // the three ways a reader will try rather than only the one that was wired.

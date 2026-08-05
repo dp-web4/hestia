@@ -483,12 +483,28 @@ impl ServerState {
         // The chain is read NEWEST-first, so it is reversed: replay amends in arrival order and
         // applying a decision before the open it belongs to would drop it.
         let now = crate::server::gate_escalation::now_secs();
-        let mut window = st.chain_store.read_recent(ESCALATION_REPLAY_SCAN).unwrap_or_default();
+        // A FAILED replay read must not look like "there was nothing to restore". Under
+        // `.unwrap_or_default()` a read error silently produced zero live escalations, and the
+        // only log line fired when the count was NON-zero — so the failure case was the silent
+        // one. That is the worst direction here: every in-flight approval an operator had already
+        // granted would be gone, with the daemon reporting nothing at all.
+        let mut window = match st.chain_store.read_recent(ESCALATION_REPLAY_SCAN) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!(
+                    "[hestia] CRITICAL: escalation replay read FAILED ({e}) — live escalations \
+                     were NOT restored. Any approval granted before this restart is lost and must \
+                     be re-filed. This is not the same as there having been none."
+                );
+                tracing::error!("escalation replay chain read failed: {e}");
+                Vec::new()
+            }
+        };
         window.reverse();
         let restored = st.gate_escalations.rehydrate(&window, now);
-        if restored > 0 {
-            eprintln!("[hestia] restored {restored} live escalation(s) from the chain");
-        }
+        // Log the zero too. "restored 0" and "did not look" are different facts, and only one of
+        // them used to be visible.
+        eprintln!("[hestia] restored {restored} live escalation(s) from the chain");
         Ok(st)
     }
 
