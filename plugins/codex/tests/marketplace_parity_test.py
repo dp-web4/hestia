@@ -52,17 +52,38 @@ Properties asserted:
   C. A STALE EXCEPTION IS RED. A path listed that is now identical, or that no longer
      exists in either tree, fails -- the ci_excluded_tests.txt rule, same reason: a
      stale excuse reads as a known gap while the gap is closed.
-  D. POLICY PARITY IS NOT EXCEPTABLE, and this is the property the file is for. The
-     scope constants are compared on MEANING, not bytes: hydrate's PRIVATE_EXCEPTIONS
-     set, and the seed's mrh.in_scope set. A path in the exceptions file suppresses A,
-     never D. Otherwise the exceptions file becomes the place a scope divergence hides,
-     which is the shape of the bug rather than a fix for it.
+  D. POLICY PARITY IS ABOUT DIRECTION, NOT EQUALITY, and this is the property the
+     file is for. The scope constants are compared on MEANING, not bytes: hydrate's
+     PRIVATE_EXCEPTIONS set, and the seed's mrh.in_scope set. A path in the
+     exceptions file suppresses A, never D.
 
-     D IS RED ON THE DAY THIS LANDS. That is the finding, reported as a check rather
-     than as a paragraph. It is not mine to close: changing what the shipped seed
-     grants is a scope grant to every future foreign member, which wants an owner and
-     a human gate, not an autonomous session's own authority. Making the divergence
-     impossible to hide is the part that is mine.
+     THE FIRST VERSION ASSERTED EQUALITY AND WAS WRONG (codex/gpt open-PR audit,
+     2026-08-04). It went red because the bundle lacks two of this operator's
+     private repos -- reporting CORRECT behaviour as drift, and inviting a "fix"
+     that would have copied private grants into the portable artifact. That turns a
+     drift detector into an AUTHORITY LEAK: a public bundle carrying one operator's
+     private repo names into every installation that unpacks it.
+
+     The three trees -- canonical source, portable bundle, installed copy -- differ
+     along two independent axes, and the first version conflated them:
+
+       MECHANISM  gate logic, hook coverage, witnessing, fail-closed behaviour.
+                  MUST match. Asserted by A/B/C and D5/D6.
+       AUTHORITY  MRH grants, private exceptions, operator overlays.
+                  MUST differ per installation. A bundle that matches here is broken.
+
+     So D now asserts the direction: the portable artifact may hold FEWER grants
+     than canonical, never more (D2, D4) -- extra is a leak, fewer is the point --
+     and every withheld grant must be DECLARED (D4b). Narrower is correct; silently
+     narrower is how the original finding hid, because the identity merge rule only
+     ever widens, so a base the bundle lacks is one a bundle install can never
+     accrue. A marketplace member therefore has a real, permanent capability gap
+     versus a repo member. That is a deliberate boundary, and D4b makes it knowledge
+     rather than folklore.
+
+     The original finding stands unchanged and is preserved above: four of five
+     shared files had diverged and nothing compared them. What changed is the
+     invariant, not the evidence.
 
 Hermetic: reads the checkout it lives in. No network, no daemon, no fixtures.
 
@@ -229,12 +250,29 @@ if os.path.exists(ch) and os.path.exists(bh):
           f"canonical={cpe} bundle={bpe} — the construct changed; teach this reader, "
           f"do not let it return nothing")
     if cpe is not None and bpe is not None:
-        check(cpe == bpe,
-              "D2. the shipped hydrate regenerates against the same private exceptions",
-              f"canonical={sorted(cpe)}\nbundle   ={sorted(bpe)}\n"
-              f"bundle-only={sorted(bpe - cpe)} missing-from-bundle={sorted(cpe - bpe)}\n"
-              "the merge rule only ever widens, so a base the bundle lacks is one a "
-              "bundle install can never accrue")
+        # THE DIRECTION IS THE INVARIANT, NOT EQUALITY (codex/gpt audit 2026-08-04).
+        #
+        # This asserted `cpe == bpe` and went red because the bundle lacks two of this
+        # operator's private repos. That red was reporting CORRECT behaviour as drift, and
+        # the "fix" it invited — copy the missing grants into the shipped artifact — would
+        # have turned a drift detector into an AUTHORITY LEAK: a public bundle carrying one
+        # operator's private repo names into every installation that ever unpacks it.
+        #
+        # The three trees (canonical source, portable bundle, installed copy) differ along
+        # two independent axes and the first version conflated them:
+        #
+        #   MECHANISM   gate logic, hook coverage, witnessing, fail-closed behaviour.
+        #               Must match. Asserted by D5/D6 and the byte-parity section above.
+        #   AUTHORITY   MRH grants, private repo exceptions, operator overlays.
+        #               MUST differ per installation. A bundle that matches here is broken.
+        #
+        # So the portable artifact may hold FEWER private exceptions than canonical, never
+        # more: extra is a leak, fewer is the point.
+        leaked = sorted(bpe - cpe)
+        check(not leaked,
+              "D2. the shipped hydrate leaks no private exception the canonical tree lacks",
+              f"bundle-only={leaked}\nA portable artifact must not carry authority no one "
+              f"granted in it. Fewer than canonical is correct; MORE is the leak.")
 
 cs, bs = os.path.join(CANON, "instance", "identity.seed.json"), \
          os.path.join(BUNDLE, "instance", "identity.seed.json")
@@ -244,11 +282,31 @@ if os.path.exists(cs) and os.path.exists(bs):
           "D3. mrh.in_scope is readable in both seeds",
           f"canonical={cin is not None} bundle={bin_ is not None}")
     if cin is not None and bin_ is not None:
-        check(cin == bin_,
-              "D4. the shipped seed grants the same scope as the canonical seed",
-              f"canonical={len(cin)} bundle={len(bin_)}\n"
-              f"missing-from-bundle={sorted(cin - bin_)}\n"
-              f"bundle-only={sorted(bin_ - cin)}")
+        # Same split as D2. The shipped seed SHOULD be narrower — it is installed on machines
+        # that were granted nothing by this operator.
+        over = sorted(bin_ - cin)
+        check(not over,
+              "D4. the shipped seed grants no scope the canonical seed does not",
+              f"canonical={len(cin)} bundle={len(bin_)}\nbundle-only={over}\n"
+              f"A bundle wider than canonical hands every installer authority nobody issued.")
+
+        # AND THE DIFFERENCE MUST BE DECLARED, not merely permitted. Narrower is correct, but
+        # silently narrower is how the original finding hid: an install accrues scope by a
+        # merge rule that only ever widens, so a base the bundle lacks is one a bundle install
+        # can NEVER reach. That is a real, permanent capability gap between a repo member and a
+        # marketplace member — worth knowing deliberately rather than discovering when someone
+        # asks why their install cannot see a repo.
+        withheld = sorted(cin - bin_)
+        # Read the ledger RAW, comments included: the declared paths are the machine-readable
+        # half, but the REASON a thing is withheld is written in the prose above it, and that
+        # prose is what a human needs. load_exceptions() strips it by design.
+        ledger = open(EXCEPTIONS, encoding="utf-8").read() if os.path.exists(EXCEPTIONS) else ""
+        undeclared = [w for w in withheld if w not in ledger]
+        check(not undeclared,
+              "D4b. every scope withheld from the bundle is declared in PARITY_EXCEPTIONS.txt",
+              f"withheld={withheld}\nundeclared={undeclared}\n"
+              f"Withholding private authority from a portable artifact is CORRECT. Doing it "
+              f"without a written reason is how a capability gap becomes folklore.")
 
 cj, bj = os.path.join(CANON, "hooks", "hooks.json"), os.path.join(BUNDLE, "hooks", "hooks.json")
 if os.path.exists(cj) and os.path.exists(bj):

@@ -57,3 +57,21 @@ plugins/codex/instance/identity.seed.json
 # not, canonical ships a capability the portable form deliberately withholds and
 # nothing says so. Either way it wants a sentence from an owner, not silence.
 plugins/codex/hooks/witness.py
+
+# ---------------------------------------------------------------------------
+# SCOPE WITHHELD FROM THE PORTABLE BUNDLE (declared 2026-08-04)
+#
+# These are grants the canonical tree holds and the shipped bundle deliberately
+# does NOT. Withholding them is correct — a public artifact must not carry one
+# operator's private authority into every installation that unpacks it — but the
+# consequence is permanent and worth stating, because the identity merge rule only
+# ever WIDENS: a base the bundle lacks is one a bundle install can never accrue.
+#
+# So a marketplace member has a real, permanent capability gap versus a repo
+# member. That is a deliberate boundary, not a defect, and it is written here so
+# it is knowledge rather than folklore when someone asks why their install cannot
+# see a repo.
+#
+#   repo:memory           — dp's private memory repo; not shippable authority
+#   repo:private-context  — fleet-private operational context; the same
+# ---------------------------------------------------------------------------
