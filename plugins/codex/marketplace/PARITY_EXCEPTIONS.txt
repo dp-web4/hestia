@@ -1,0 +1,77 @@
+# Files that differ between the canonical codex plugin tree and the marketplace
+# bundle that ships it, and why.
+#
+# READ BY ONE THING, which is the point:
+#   - plugins/codex/tests/marketplace_parity_test.py asserts every file the two
+#     trees share is byte-identical OR listed here with a sentence above it.
+#
+# Same shape as tools/ci_excluded_tests.txt, one layer over: there, a test either
+# runs or somebody wrote why it can't. Here, a shipped file either matches the
+# canonical one or somebody wrote why it doesn't. Before this file existed, four
+# of the five shared files had diverged and nothing in the repo compared them.
+#
+# Format: one repo-relative path (canonical side) per line. Blank lines and
+# #-comments ignored. The reason goes in the comment directly above the path.
+#
+# A path listed here that is actually identical, or that no longer exists in
+# either tree, is a RED -- a stale excuse reads as a known gap while the gap is
+# closed, which is worse than no excuse at all.
+#
+# LISTING A PATH HERE DOES NOT EXEMPT ITS POLICY. The scope constants
+# (hydrate's PRIVATE_EXCEPTIONS, the seed's mrh.in_scope) are compared
+# separately and cannot be excepted -- see property D in the test. A byte
+# exception must not be a place to hide a scope divergence.
+
+# STRUCTURAL AND CORRECT. The bundle resolves scripts through
+# $CLAUDE_PLUGIN_ROOT because a plugin does not know its own install path; the
+# canonical copy bakes this host's paths because it is this host's deployment.
+# These two cannot be byte-identical and should not be. (Both register the same
+# four events -- PreToolUse/PostToolUse/SessionStart/SessionEnd -- which is the
+# part that must not drift, and does not today.)
+plugins/codex/hooks/hooks.json
+
+# UNRESOLVED -- THIS IS THE FINDING, NOT AN ACCEPTED DIVERGENCE. The bundled
+# gate is an older snapshot: 11,529 bytes against the canonical 42,091, ~558
+# changed lines. It predates the cwd-aware scoping (9 `cwd` references against
+# 26) and has none of the vote logic (`in_scope_vote`/`oos_vote`, 7 references
+# against 0) -- `path_in_scope`/`command_in_scope` there still take no `cwd` at
+# all. Every fix that has landed in the canonical gate since the bundle was cut
+# is absent from the artifact plugins/codex/README.md calls "the portable form
+# for other machines." Listed so the test can go green on the rest and stay red
+# on the policy (property D); NOT listed as acceptable. Owner needed.
+plugins/codex/hooks/pre_tool_use.py
+
+# UNRESOLVED -- same finding, and it is the one with teeth. The bundled hydrate
+# carries PRIVATE_EXCEPTIONS = {"shared-context"} where canonical carries
+# {"shared-context", "memory", "private-context"}. Property D fails on this and
+# is meant to. Kept here only so the byte comparison does not double-report it.
+plugins/codex/hooks/hydrate.sh
+
+# UNRESOLVED -- the seed half of the same divergence: 23 mrh.in_scope entries
+# against canonical's 25, missing repo:memory and repo:private-context.
+# Property D fails on this and is meant to.
+plugins/codex/instance/identity.seed.json
+
+# NOT SHIPPED, and this may be deliberate -- the bundle has no witness.py. If a
+# foreign member is meant to witness, the bundle is missing the hook; if it is
+# not, canonical ships a capability the portable form deliberately withholds and
+# nothing says so. Either way it wants a sentence from an owner, not silence.
+plugins/codex/hooks/witness.py
+
+# ---------------------------------------------------------------------------
+# SCOPE WITHHELD FROM THE PORTABLE BUNDLE (declared 2026-08-04)
+#
+# These are grants the canonical tree holds and the shipped bundle deliberately
+# does NOT. Withholding them is correct — a public artifact must not carry one
+# operator's private authority into every installation that unpacks it — but the
+# consequence is permanent and worth stating, because the identity merge rule only
+# ever WIDENS: a base the bundle lacks is one a bundle install can never accrue.
+#
+# So a marketplace member has a real, permanent capability gap versus a repo
+# member. That is a deliberate boundary, not a defect, and it is written here so
+# it is knowledge rather than folklore when someone asks why their install cannot
+# see a repo.
+#
+#   repo:memory           — dp's private memory repo; not shippable authority
+#   repo:private-context  — fleet-private operational context; the same
+# ---------------------------------------------------------------------------
