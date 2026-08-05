@@ -251,6 +251,26 @@ enum ConstellationCmd {
         device_type: String,
     },
 
+    /// Add a REMOTE device — another machine that holds its own key and co-signs
+    /// over a confirmed hub pair (`cosign-serve` there). Unlike `add`, this uses
+    /// the peer's REAL hub member LCT and stores NO private key locally, which is
+    /// exactly what `present --remote` requires to route a co-sign request to it
+    /// instead of signing on this box. The pubkey is resolved from the hub's pin,
+    /// so the peer does not have to publish one.
+    AddRemote {
+        /// The peer's hub member LCT id (UUID) — the identity its `cosign-serve`
+        /// answers as, and the peer of your confirmed pairing with it.
+        lct_id: String,
+        /// Device name for the roster (e.g. "Thor", "CBP").
+        name: String,
+        /// Device type: desktop | mobile | server | agent | hardware
+        #[arg(long, default_value = "server")]
+        device_type: String,
+        /// Hub URL or connection UUID (default: sole connection).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
+
     /// List devices in the constellation
     List,
 
@@ -317,6 +337,21 @@ enum ConstellationCmd {
         #[arg(long, default_value = "")]
         target: String,
     },
+
+    /// DEVICE side: consent to act as an MFA factor for an owner. `cosign-serve`
+    /// refuses every owner not listed, so this is the explicit local act that
+    /// makes a co-sign possible. Confirming a hub pairing does NOT imply it — a
+    /// pair is transport, and being someone's second factor is a separate grant.
+    ServeOwner {
+        /// The owner's LCT id (UUID) — the `owner_lct_id` their requests carry.
+        lct_id: String,
+        /// Withdraw consent instead of granting it.
+        #[arg(long)]
+        remove: bool,
+    },
+
+    /// List the owners this device has consented to co-sign for.
+    ServeOwners,
 
     /// DEVICE side of cross-device MFA: drain co-sign requests from confirmed
     /// pairs, co-sign each with this device's member key, and reply. Run this
@@ -749,6 +784,9 @@ pub fn run() -> AnyResult<()> {
         },
         Command::Constellation(c) => match c {
             ConstellationCmd::Add { name, device_type } => cmd_constellation_add(&home, &name, &device_type),
+            ConstellationCmd::AddRemote { lct_id, name, device_type, target } => {
+                cmd_constellation_add_remote(&home, &lct_id, &name, &device_type, &target)
+            }
             ConstellationCmd::List => cmd_constellation_list(&home),
             ConstellationCmd::Remove { id } => cmd_constellation_remove(&home, &id),
             ConstellationCmd::Proof => cmd_constellation_proof(&home),
@@ -766,6 +804,10 @@ pub fn run() -> AnyResult<()> {
                     cmd_constellation_present(&home, all, &devices, &target)
                 }
             }
+            ConstellationCmd::ServeOwner { lct_id, remove } => {
+                cmd_constellation_serve_owner(&home, &lct_id, remove)
+            }
+            ConstellationCmd::ServeOwners => cmd_constellation_serve_owners(&home),
             ConstellationCmd::CosignServe { once, target } => {
                 cmd_constellation_cosign_serve(&home, once, &target)
             }
@@ -2157,52 +2199,17 @@ fn hex_to_32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// Expand a leading `~/` (or bare `~`) to `$HOME`. Raw key-file paths are
-/// user-supplied and often written with a tilde; `std::fs` won't expand it.
-fn expand_tilde(path: &str) -> std::path::PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return std::path::Path::new(&home).join(rest);
-        }
-    } else if path == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return std::path::PathBuf::from(home);
-        }
-    }
-    std::path::PathBuf::from(path)
-}
-
 /// Resolve the keypair that signs member-tier acts to a hub, per its
-/// `member_key_source`. `VaultIdentity` reads `ai_identity_secret` from the
-/// sealed vault (default); `ChannelKeyFile` reads a raw 32-byte Ed25519 seed —
-/// byte-for-byte the same format the mesh `channel_client` loads, so the CLI and
-/// the watcher present the *same* pinned key to the hub.
+/// `member_key_source`. Thin delegate: the implementation lives in
+/// `hestia::hub` because the daemon's tool handlers must resolve the signer
+/// through the SAME function — the hub pins one key per member LCT, and a
+/// second copy of this logic is how `tool_cosign` came to sign with the vault
+/// identity on channel-key boxes.
 fn member_signing_keypair(
     vault: &hestia::vault::Vault,
     source: &hestia::hub::MemberKeySource,
 ) -> AnyResult<web4_core::crypto::KeyPair> {
-    use hestia::hub::MemberKeySource;
-    match source {
-        MemberKeySource::VaultIdentity => {
-            let secret_hex = vault.get("ai_identity_secret").map(|e| e.secret.clone())
-                .ok_or_else(|| anyhow::anyhow!(
-                    "no member identity key in vault — run `hestia init --ai`, or self-add to the hub \
-                     so it pins your pubkey (Sovereign-seeded members can't push from here yet)"
-                ))?;
-            let secret_bytes = hex_to_32(&secret_hex)
-                .ok_or_else(|| anyhow::anyhow!("ai_identity_secret is not 32-byte hex"))?;
-            Ok(web4_core::crypto::KeyPair::from_secret_bytes(&secret_bytes))
-        }
-        MemberKeySource::ChannelKeyFile { path } => {
-            let p = expand_tilde(path);
-            let raw = std::fs::read(&p)
-                .with_context(|| format!("reading channel key file {}", p.display()))?;
-            let seed: [u8; 32] = raw.as_slice().try_into().map_err(|_| anyhow::anyhow!(
-                "channel key file {} must be exactly 32 bytes (got {})", p.display(), raw.len()
-            ))?;
-            Ok(web4_core::crypto::KeyPair::from_secret_bytes(&seed))
-        }
-    }
+    hestia::hub::member_signing_keypair(vault, source)
 }
 
 // ---- hub notify (mesh referenced_act, signed by the vault member key) --------
@@ -2500,15 +2507,19 @@ fn compute_content_hash(pointer: &str) -> String {
 
 // ---- constellation commands -------------------------------------------------
 
-fn cmd_constellation_add(home: &std::path::Path, name: &str, device_type: &str) -> AnyResult<()> {
-    let dt = match device_type {
+fn parse_device_type(device_type: &str) -> AnyResult<DeviceType> {
+    Ok(match device_type {
         "desktop" => DeviceType::Desktop,
         "mobile" => DeviceType::Mobile,
         "server" => DeviceType::Server,
         "agent" => DeviceType::Agent,
         "hardware" => DeviceType::Hardware,
         other => anyhow::bail!("unknown device type: {other} (expected: desktop, mobile, server, agent, hardware)"),
-    };
+    })
+}
+
+fn cmd_constellation_add(home: &std::path::Path, name: &str, device_type: &str) -> AnyResult<()> {
+    let dt = parse_device_type(device_type)?;
 
     let kp = web4_core::crypto::KeyPair::generate();
     let pubkey_hex = kp.verifying_key().to_hex();
@@ -2531,6 +2542,70 @@ fn cmd_constellation_add(home: &std::path::Path, name: &str, device_type: &str) 
     println!("  type:    {device_type}");
     println!("  LCT ID:  {lct_id}");
     println!("  pubkey:  {}", &pubkey_hex[..16]);
+    Ok(())
+}
+
+/// `constellation add-remote` — put ANOTHER machine in the roster under the LCT
+/// it already answers as, so `present --remote` routes a co-sign request to it.
+///
+/// Why this exists: `add` mints `Uuid::new_v4()` and persists a device private
+/// key here, so every member it creates fails both conditions the remote branch
+/// of `present --remote` needs (member id == the peer's LCT, and NO local key).
+/// Before this command the cross-device path was unreachable from the CLI and
+/// the transport could only ever be exercised single-machine.
+fn cmd_constellation_add_remote(
+    home: &std::path::Path,
+    lct_id: &str,
+    name: &str,
+    device_type: &str,
+    target: &str,
+) -> AnyResult<()> {
+    let lct = uuid::Uuid::parse_str(lct_id).with_context(|| format!("invalid UUID: {lct_id}"))?;
+    let dt = parse_device_type(device_type)?;
+
+    let mut vault = open_vault(home)?;
+    let hub_store = HubStore::load(&vault)?;
+    let conn = pick_connection(&hub_store, target)?;
+
+    if lct == conn.our_lct_id {
+        anyhow::bail!(
+            "{lct} is THIS member — a remote device must be another machine \
+             (use `constellation add` for a local device)"
+        );
+    }
+
+    // The hub's pin is the authoritative pubkey: it is the key the hub verifies
+    // the peer's acts against, and the same one `cosign-serve` signs with. Taking
+    // it from here rather than from the peer means the peer publishes nothing —
+    // there is no CLI that prints a member's own pubkey.
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+    let pubkey = rt
+        .block_on(client.resolve_member_pubkey(&rest, conn.hub_lct_id, lct))
+        .with_context(|| format!("resolving hub-pinned pubkey for {lct}"))?;
+    let pubkey_hex = hex::encode(pubkey.to_bytes());
+
+    let mut store = ConstellationStore::load(&vault)?;
+    if store.owner_lct_id.is_none() {
+        store.owner_lct_id = Some(conn.our_lct_id);
+    }
+    store.add_remote_device(lct, name, dt, &pubkey_hex, vec![])?;
+    store.save(&mut vault)?;
+
+    // Deliberately NO device_key_name(lct) entry: holding a private key for a
+    // remote device would both defeat the point (the device's key must never
+    // leave its own box) and silently divert `present --remote` back to signing
+    // locally, which is the defect this command exists to fix.
+    println!("Remote device added to constellation:");
+    println!("  name:    {name}");
+    println!("  type:    {device_type}");
+    println!("  LCT ID:  {lct}  (peer's own hub member identity)");
+    println!("  pubkey:  {}  (hub-pinned)", &pubkey_hex[..16]);
+    println!();
+    println!("No private key is held here — {name} co-signs on its own machine.");
+    println!("Next: `hestia constellation enroll {lct}`, confirm a pair with the peer,");
+    println!("then `hestia constellation present --remote` while it runs `cosign-serve`.");
     Ok(())
 }
 
@@ -2853,7 +2928,12 @@ fn cmd_constellation_present_remote(home: &std::path::Path, target: &str) -> Any
             if got.is_some() { break; }
         }
         match got {
-            Some(resp) => { device_signatures.push(DeviceSignature { lct_id: m.lct_id, device_type: m.device_type.clone(), pubkey_hex: resp.device_pubkey_hex, signature: resp.signature }); println!("  REMOTE co-sign: {} ({})", m.name, m.lct_id); }
+            // Bind the remote branch to the ENROLLED roster key, exactly as the local
+            // branch above does — never carry the responder's self-reported pubkey.
+            Some(resp) => match resp.check_device_pubkey(&m.pubkey_hex) {
+                Ok(()) => { device_signatures.push(DeviceSignature { lct_id: m.lct_id, device_type: m.device_type.clone(), pubkey_hex: m.pubkey_hex.clone(), signature: resp.signature }); println!("  REMOTE co-sign: {} ({})", m.name, m.lct_id); }
+                Err(e) => println!("  skip {} ({}): {e}", m.name, m.lct_id),
+            },
             None => println!("  no reply from {} ({}) — is `constellation cosign-serve` running there?", m.name, m.lct_id),
         }
     }
@@ -2876,6 +2956,51 @@ fn cmd_constellation_present_remote(home: &std::path::Path, target: &str) -> Any
     Ok(())
 }
 
+/// `constellation serve-owner` — the explicit device-side consent act. Grants (or
+/// with `--remove` withdraws) permission for one owner to use this machine as an
+/// MFA factor. Kept separate from pairing on purpose: `pair-confirm` establishes a
+/// channel, and inferring "…and I'll co-sign for you" from it is exactly the
+/// conflation this command exists to break.
+fn cmd_constellation_serve_owner(home: &std::path::Path, lct_id: &str, remove: bool) -> AnyResult<()> {
+    let owner: uuid::Uuid = lct_id
+        .parse()
+        .with_context(|| format!("'{lct_id}' is not a valid LCT id (expected a UUID)"))?;
+    let mut vault = open_vault(home)?;
+    let mut store = ConstellationStore::load(&vault)?;
+    if remove {
+        if store.disallow_owner(owner) {
+            store.save(&mut vault)?;
+            println!("withdrew consent: {owner} can no longer co-sign through this device");
+        } else {
+            println!("{owner} was not on the serve-owners list — nothing to withdraw");
+        }
+    } else if store.allow_owner(owner) {
+        store.save(&mut vault)?;
+        println!("consented: this device will co-sign constellation challenges for owner {owner}");
+        println!("run `hestia constellation cosign-serve` to start answering them.");
+    } else {
+        println!("{owner} is already on the serve-owners list");
+    }
+    Ok(())
+}
+
+/// `constellation serve-owners` — show who this device has agreed to be a factor
+/// for. An empty list is the fail-closed default, not a misconfiguration.
+fn cmd_constellation_serve_owners(home: &std::path::Path) -> AnyResult<()> {
+    let vault = open_vault(home)?;
+    let store = ConstellationStore::load(&vault)?;
+    if store.serve_owners.is_empty() {
+        println!("no owners consented — this device will refuse every co-sign request.");
+        println!("grant one with `hestia constellation serve-owner <owner-lct-id>`.");
+        return Ok(());
+    }
+    println!("owners this device will co-sign for:");
+    for owner in &store.serve_owners {
+        println!("  {owner}");
+    }
+    Ok(())
+}
+
 /// `constellation cosign-serve` — the DEVICE side. Drains co-sign requests from
 /// confirmed pairs, co-signs each with this device's member key (bounded to the
 /// exact challenge), and replies over the same pair. Run on every machine that is
@@ -2891,8 +3016,17 @@ fn cmd_constellation_cosign_serve(home: &std::path::Path, once: bool, target: &s
     let hub_id = conn.hub_lct_id;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
+    let consented = ConstellationStore::load(&vault)?.serve_owners.len();
     println!("cosign-serve: device {my_lct} draining confirmed pairs (once={once})");
+    if consented == 0 {
+        println!("  WARNING: no consented owners — every request will be refused.");
+        println!("  grant one with `hestia constellation serve-owner <owner-lct-id>`.");
+    } else {
+        println!("  serving {consented} consented owner(s) — `constellation serve-owners` to list");
+    }
     loop {
+        // Reloaded each pass, so `serve-owner --remove` takes effect without a restart.
+        let serve_owners = ConstellationStore::load(&vault)?.serve_owners;
         let mut pairings = hestia::pairing::PairingStore::load(&vault)?;
         let mut advanced = false;
         let snapshot: Vec<hestia::pairing::Pairing> = pairings.pairings.values().cloned().collect();
@@ -2906,7 +3040,7 @@ fn cmd_constellation_cosign_serve(home: &std::path::Path, once: bool, target: &s
                 if let Ok(plain) = hestia::pairing::open_over_pair(p, &detail, &member_kp, &peer_lct, &m.payload) {
                     if let Ok(req) = serde_json::from_slice::<CosignRequest>(&plain) {
                         if req.kind == CosignRequest::KIND {
-                            match req.cosign(my_lct, &member_kp, chrono::Duration::minutes(5), chrono::Duration::minutes(2), chrono::Utc::now()) {
+                            match req.cosign(my_lct, &member_kp, &serve_owners, chrono::Duration::minutes(5), chrono::Duration::minutes(2), chrono::Utc::now()) {
                                 Ok(resp) => {
                                     if let Ok(body) = hestia::pairing::seal_over_pair(p, &detail, &member_kp, &peer_lct, &serde_json::to_vec(&resp).unwrap_or_default()) {
                                         let _ = rt.block_on(client.post_pair_message(&rest, hub_id, my_lct, &member_kp, p.pair_id, body));
@@ -3282,7 +3416,7 @@ mod serve_guard_tests {
 
 #[cfg(test)]
 mod member_key_source_tests {
-    use super::{expand_tilde, member_signing_keypair};
+    use super::member_signing_keypair;
     use hestia::hub::MemberKeySource;
     use hestia::vault::{Vault, VaultEntry};
 
@@ -3452,12 +3586,6 @@ mod member_key_source_tests {
         assert_eq!(kinds, vec!["pr_review_request", "ack", "forum-note"]);
     }
 
-    #[test]
-    fn expand_tilde_expands_leading_home() {
-        std::env::set_var("HOME", "/home/tester");
-        assert_eq!(expand_tilde("~/.web4/x/channel_key.bin"),
-                   std::path::PathBuf::from("/home/tester/.web4/x/channel_key.bin"));
-        assert_eq!(expand_tilde("/abs/path"), std::path::PathBuf::from("/abs/path"));
-        assert_eq!(expand_tilde("~"), std::path::PathBuf::from("/home/tester"));
-    }
+    // `expand_tilde` moved to `hestia::hub` with member_signing_keypair; its test
+    // moved with it (hub.rs `expand_tilde_expands_leading_home`).
 }

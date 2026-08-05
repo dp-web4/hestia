@@ -240,6 +240,66 @@ pub enum MemberKeySource {
     ChannelKeyFile { path: String },
 }
 
+/// Expand a leading `~/` (or bare `~`) to `$HOME`. Raw key-file paths are
+/// user-supplied and often written with a tilde; `std::fs` won't expand it.
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::Path::new(&home).join(rest);
+        }
+    } else if path == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home);
+        }
+    }
+    std::path::PathBuf::from(path)
+}
+
+fn hex_to_32(s: &str) -> Option<[u8; 32]> {
+    hex::decode(s.trim()).ok()?.try_into().ok()
+}
+
+/// Resolve the keypair that signs member-tier acts to a hub, per its
+/// `member_key_source`. `VaultIdentity` reads `ai_identity_secret` from the
+/// sealed vault (default); `ChannelKeyFile` reads a raw 32-byte Ed25519 seed —
+/// byte-for-byte the same format the mesh `channel_client` loads, so the CLI and
+/// the watcher present the *same* pinned key to the hub.
+///
+/// Lives here rather than in the CLI because it is not a CLI concern: the hub
+/// pins ONE key per member LCT (see [`MemberKeySource`]), so *every* surface
+/// that signs as this member — CLI, daemon tool handlers, watchers — must
+/// resolve through this one function or it signs as a member the hub does not
+/// know. It previously sat in `cli.rs`, and `tool_cosign` (the unattended
+/// daemon co-sign path) consequently reached straight for `ai_identity_secret`
+/// and produced signatures under an unpinned key on exactly the channel-key
+/// boxes this enum exists for.
+pub fn member_signing_keypair(
+    vault: &crate::vault::Vault,
+    source: &MemberKeySource,
+) -> Result<KeyPair> {
+    match source {
+        MemberKeySource::VaultIdentity => {
+            let secret_hex = vault.get("ai_identity_secret").map(|e| e.secret.clone())
+                .ok_or_else(|| anyhow::anyhow!(
+                    "no member identity key in vault — run `hestia init --ai`, or self-add to the hub \
+                     so it pins your pubkey (Sovereign-seeded members can't push from here yet)"
+                ))?;
+            let secret_bytes = hex_to_32(&secret_hex)
+                .ok_or_else(|| anyhow::anyhow!("ai_identity_secret is not 32-byte hex"))?;
+            Ok(KeyPair::from_secret_bytes(&secret_bytes))
+        }
+        MemberKeySource::ChannelKeyFile { path } => {
+            let p = expand_tilde(path);
+            let raw = std::fs::read(&p)
+                .with_context(|| format!("reading channel key file {}", p.display()))?;
+            let seed: [u8; 32] = raw.as_slice().try_into().map_err(|_| anyhow::anyhow!(
+                "channel key file {} must be exactly 32 bytes (got {})", p.display(), raw.len()
+            ))?;
+            Ok(KeyPair::from_secret_bytes(&seed))
+        }
+    }
+}
+
 /// A connected hub — persisted locally.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HubConnection {
@@ -1608,5 +1668,53 @@ mod tests {
         assert!(store.find_by_url("https://hub.example.com").is_some());
         assert!(store.find_by_url("https://other.com").is_none());
         assert!(store.find_by_id(id).is_some());
+    }
+
+    #[test]
+    fn expand_tilde_expands_leading_home() {
+        std::env::set_var("HOME", "/home/tester");
+        assert_eq!(expand_tilde("~/.web4/x/channel_key.bin"),
+                   std::path::PathBuf::from("/home/tester/.web4/x/channel_key.bin"));
+        assert_eq!(expand_tilde("/abs/path"), std::path::PathBuf::from("/abs/path"));
+        assert_eq!(expand_tilde("~"), std::path::PathBuf::from("/home/tester"));
+    }
+
+    /// The bug this function exists to prevent: a channel-key member's signer is
+    /// the SEED FILE, not `ai_identity_secret`. Reaching for the vault identity
+    /// directly (as `tool_cosign` did) yields a key the hub never pinned, so the
+    /// co-signature is rejected — on exactly the unattended boxes that need it.
+    #[test]
+    fn channel_key_source_does_not_resolve_to_the_vault_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = [7u8; 32];
+        let key_path = dir.path().join("channel_key.bin");
+        std::fs::write(&key_path, seed).unwrap();
+
+        let mut vault =
+            crate::vault::Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let vault_identity = KeyPair::generate();
+        let secret_hex: String =
+            vault_identity.secret_key_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        vault.add(crate::vault::VaultEntry::new("ai_identity_secret", secret_hex)).unwrap();
+
+        let from_vault =
+            member_signing_keypair(&vault, &MemberKeySource::VaultIdentity).unwrap();
+        let from_channel = member_signing_keypair(
+            &vault,
+            &MemberKeySource::ChannelKeyFile { path: key_path.to_str().unwrap().into() },
+        )
+        .unwrap();
+
+        assert_eq!(from_vault.verifying_key().to_hex(), vault_identity.verifying_key().to_hex());
+        assert_eq!(
+            from_channel.verifying_key().to_hex(),
+            KeyPair::from_secret_bytes(&seed).verifying_key().to_hex()
+        );
+        assert_ne!(
+            from_vault.verifying_key().to_hex(),
+            from_channel.verifying_key().to_hex(),
+            "a channel-key member signs with the seed file; resolving the vault identity \
+             instead produces a key the hub does not pin for this member"
+        );
     }
 }

@@ -388,6 +388,17 @@ fn sig_from_hex(hex_str: &str) -> anyhow::Result<web4_core::crypto::SignatureByt
 pub struct ConstellationStore {
     pub owner_lct_id: Option<Uuid>,
     pub members: Vec<ConstellationMember>,
+    /// Owners this machine is willing to be an MFA factor FOR — the device-side
+    /// inverse of `members`. `cosign` refuses any owner not listed here, so the
+    /// list must be populated by an explicit local act (`constellation
+    /// serve-owner`). Deliberately NOT derived from a confirmed pairing: a pair
+    /// is a transport agreement, and today confirming one silently also means "I
+    /// consent to be your second factor". `add-remote` makes naming an arbitrary
+    /// confirmed peer a one-liner, which is what turns that conflation into a
+    /// real gap. `#[serde(default)]` so existing vault documents load; an empty
+    /// list means serve nobody, which is the fail-closed default we want.
+    #[serde(default)]
+    pub serve_owners: Vec<Uuid>,
 }
 
 impl ConstellationStore {
@@ -428,6 +439,66 @@ impl ConstellationStore {
         };
         self.members.push(member);
         self.members.last().unwrap()
+    }
+
+    /// Add a device whose key lives on ANOTHER machine, under the LCT that
+    /// machine already answers as. Distinct from `add_device`, which mints a
+    /// fresh `lct_id` and (at the CLI) a locally-custodied private key — both of
+    /// which make `present --remote` take its local-signing branch and never
+    /// reach the device. The remote co-sign path requires a member that carries
+    /// the peer's REAL lct_id and has no local key, so the id is caller-supplied
+    /// here rather than generated.
+    ///
+    /// Rejects a duplicate id: unlike a minted UUID, `lct_id` is caller-supplied
+    /// and a second entry for one device would put it in the roster twice, which
+    /// changes the canonical roster hash every peer signs over.
+    pub fn add_remote_device(
+        &mut self,
+        lct_id: Uuid,
+        name: &str,
+        device_type: DeviceType,
+        pubkey_hex: &str,
+        capabilities: Vec<String>,
+    ) -> anyhow::Result<&ConstellationMember> {
+        if let Some(existing) = self.members.iter().find(|m| m.lct_id == lct_id) {
+            anyhow::bail!(
+                "device {lct_id} is already in the constellation as {:?} — \
+                 `constellation remove {lct_id}` first if you mean to re-add it",
+                existing.name
+            );
+        }
+        let member = ConstellationMember {
+            lct_id,
+            name: name.to_string(),
+            device_type,
+            pubkey_hex: pubkey_hex.to_string(),
+            added_at: Utc::now(),
+            last_seen: None,
+            capabilities,
+            reachable: false,
+            status: DeviceStatus::Active,
+        };
+        self.members.push(member);
+        Ok(self.members.last().unwrap())
+    }
+
+    /// Consent to act as an MFA factor for `owner`. Returns false if already
+    /// listed (idempotent, not an error — re-running the command is harmless).
+    pub fn allow_owner(&mut self, owner: Uuid) -> bool {
+        if self.serve_owners.contains(&owner) {
+            return false;
+        }
+        self.serve_owners.push(owner);
+        true
+    }
+
+    /// Withdraw consent for `owner`. Returns false if they weren't listed.
+    /// Withdrawal takes effect at the next `cosign` — a running `cosign-serve`
+    /// reloads the store each pass, so it does not need restarting.
+    pub fn disallow_owner(&mut self, owner: Uuid) -> bool {
+        let before = self.serve_owners.len();
+        self.serve_owners.retain(|o| *o != owner);
+        self.serve_owners.len() != before
     }
 
     /// Set a device's enrollment status. Revoking is the authoritative way to
@@ -601,8 +672,9 @@ pub struct CosignResponse {
     pub device_lct_id: Uuid,
     /// The device's Ed25519 signature over `signing_payload(...)`, hex.
     pub signature: String,
-    /// The device's public key (hex) — informational; the HUB resolves the real
-    /// key from enrollment and ignores this. Lets the owner sanity-check locally.
+    /// The device's public key (hex). The HUB resolves the real key from enrollment
+    /// and ignores this; the OWNER checks it against the roster pin before assembling
+    /// the attestation — see [`CosignResponse::check_device_pubkey`].
     pub device_pubkey_hex: String,
 }
 
@@ -613,21 +685,37 @@ impl CosignRequest {
         Self { kind: Self::KIND.to_string(), owner_lct_id, roster, challenge_nonce, issued_at, device_lct_id }
     }
 
-    /// The device co-signs. Verifies the request is a well-formed constellation
-    /// challenge addressed to THIS device, checks freshness (never sign a stale or
-    /// future-dated challenge), then signs EXACTLY the `signing_payload` bytes with
-    /// `device_key`. Returns the response the owner assembles. Bounded surface: the
-    /// device only ever signs the deterministic challenge payload, not caller bytes.
+    /// The device co-signs. Verifies the request comes from an owner this machine
+    /// has CONSENTED to serve, is a well-formed constellation challenge addressed
+    /// to THIS device, and is fresh (never sign a stale or future-dated challenge),
+    /// then signs EXACTLY the `signing_payload` bytes with `device_key`. Returns
+    /// the response the owner assembles. Bounded surface: the device only ever
+    /// signs the deterministic challenge payload, not caller bytes.
+    ///
+    /// `allowed_owners` is [`ConstellationStore::serve_owners`]. It is a parameter
+    /// rather than a check in `cosign-serve`'s drain loop on purpose: this is where
+    /// the other guards live, so a second caller of `cosign` cannot acquire the
+    /// signing power without also passing the consent list. An empty slice refuses
+    /// everything — fail closed.
     pub fn cosign(
         &self,
         device_lct_id: Uuid,
         device_key: &KeyPair,
+        allowed_owners: &[Uuid],
         max_age: chrono::Duration,
         future_skew: chrono::Duration,
         now: DateTime<Utc>,
     ) -> anyhow::Result<CosignResponse> {
         if self.kind != Self::KIND {
             anyhow::bail!("not a cosign request (kind '{}')", self.kind);
+        }
+        if !allowed_owners.contains(&self.owner_lct_id) {
+            anyhow::bail!(
+                "owner {} is not on this device's serve-owners list — refusing to be \
+                 their MFA factor. A confirmed pairing is transport, not consent; run \
+                 `hestia constellation serve-owner {}` here to opt in",
+                self.owner_lct_id, self.owner_lct_id,
+            );
         }
         if self.device_lct_id != device_lct_id {
             anyhow::bail!("cosign request addressed to {}, not this device {}", self.device_lct_id, device_lct_id);
@@ -656,11 +744,67 @@ impl CosignRequest {
 
 impl CosignResponse {
     pub const KIND: &'static str = "constellation_cosign_response";
+
+    /// The owner-side sanity check the field's doc comment promises. The key the
+    /// responder signed with must be the key the roster entry pins — for a remote
+    /// member, the one `add-remote` resolved from the hub. They are equal by
+    /// construction (`cosign-serve` signs with the member key the hub pinned), so a
+    /// mismatch means the peer's local `member_key_source` has drifted from the pin
+    /// — `hub set-member-key --channel-key` re-points the local signer without
+    /// re-pinning anything at the hub. Hub-side that surfaces as an opaque
+    /// verification reject; caught here it names the cause.
+    pub fn check_device_pubkey(&self, expected_hex: &str) -> anyhow::Result<()> {
+        if !self.device_pubkey_hex.eq_ignore_ascii_case(expected_hex) {
+            anyhow::bail!(
+                "device {} co-signed with pubkey {} but the roster pins {} — the peer's \
+                 member key no longer matches the hub's pin (see `hub set-member-key`); \
+                 refusing to submit a signature the hub will reject",
+                self.device_lct_id, self.device_pubkey_hex, expected_hex,
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of `add_remote_device`: the roster entry must carry the
+    /// PEER's id verbatim. `present --remote` addresses the co-sign request to
+    /// `m.lct_id` and the peer bails unless it equals its own member LCT, so a
+    /// minted id (what `add_device` does) can never reach another machine.
+    #[test]
+    fn test_add_remote_device_preserves_peer_lct() {
+        let mut store = ConstellationStore::default();
+        let peer = Uuid::new_v4();
+        let kp = KeyPair::generate();
+
+        let m = store
+            .add_remote_device(peer, "Thor", DeviceType::Server, &kp.verifying_key().to_hex(), vec![])
+            .expect("first add of a peer succeeds");
+        assert_eq!(m.lct_id, peer, "remote member must keep the peer's own LCT");
+
+        // add_device mints instead — the contrast this command exists to fix.
+        store.add_device("Local", DeviceType::Desktop, &kp.verifying_key().to_hex(), vec![]);
+        assert_ne!(store.members[1].lct_id, peer);
+    }
+
+    /// A caller-supplied id can collide; a minted one cannot. Two entries for one
+    /// device would change the canonical roster hash every peer signs over.
+    #[test]
+    fn test_add_remote_device_rejects_duplicate() {
+        let mut store = ConstellationStore::default();
+        let peer = Uuid::new_v4();
+        let kp = KeyPair::generate();
+        let pk = kp.verifying_key().to_hex();
+
+        store.add_remote_device(peer, "Thor", DeviceType::Server, &pk, vec![]).unwrap();
+        let again = store.add_remote_device(peer, "Thor again", DeviceType::Server, &pk, vec![]);
+
+        assert!(again.is_err(), "re-adding the same peer must be refused");
+        assert_eq!(store.members.len(), 1, "roster must not grow on a refused add");
+    }
 
     #[test]
     fn test_add_and_remove_device() {
@@ -1150,7 +1294,7 @@ mod tests {
         let roster = vec![remote_dev, Uuid::new_v4()];
 
         let req = CosignRequest::new(owner, roster.clone(), nonce.clone(), issued_at, remote_dev);
-        let resp = req.cosign(remote_dev, &remote_key, chrono::Duration::minutes(5), chrono::Duration::minutes(2), issued_at).unwrap();
+        let resp = req.cosign(remote_dev, &remote_key, &[owner], chrono::Duration::minutes(5), chrono::Duration::minutes(2), issued_at).unwrap();
         assert_eq!(resp.kind, CosignResponse::KIND);
         assert_eq!(resp.device_lct_id, remote_dev);
 
@@ -1164,20 +1308,93 @@ mod tests {
     }
 
     #[test]
+    fn owner_binds_remote_cosign_to_the_roster_pin() {
+        // The remote branch of `present --remote` used to carry the responder's
+        // self-reported pubkey into the attestation unchecked, while the local branch
+        // used the roster's. Not a forgery vector (the hub resolves the key from the
+        // ENROLLED set) but it turned a key-source drift into an opaque hub-side
+        // reject. The owner now compares, so the mismatch is named where it happens.
+        let owner = Uuid::new_v4();
+        let dev = Uuid::new_v4();
+        let key = KeyPair::generate();
+        let roster = vec![dev];
+        let issued_at = Utc::now();
+        let req = CosignRequest::new(owner, roster, "n".to_string(), issued_at, dev);
+        let resp = req.cosign(dev, &key, &[owner], chrono::Duration::minutes(5), chrono::Duration::minutes(2), issued_at).unwrap();
+
+        // Equal by construction: cosign-serve signs with the member key the hub pinned,
+        // which is what add-remote wrote into the roster entry.
+        assert!(resp.check_device_pubkey(&key.verifying_key().to_hex()).is_ok());
+        // Hex case is not identity.
+        assert!(resp.check_device_pubkey(&key.verifying_key().to_hex().to_uppercase()).is_ok());
+        // A peer whose local member_key_source drifted from the hub pin is refused.
+        let err = resp.check_device_pubkey(&KeyPair::generate().verifying_key().to_hex()).unwrap_err().to_string();
+        assert!(err.contains("roster pins"), "the error names the cause: {err}");
+    }
+
+    #[test]
     fn device_refuses_to_cosign_wrong_target_or_stale() {
         let dev = Uuid::new_v4();
+        let owner = Uuid::new_v4();
         let key = KeyPair::generate();
         let now = Utc::now();
         let mk = |device_lct: Uuid, issued: DateTime<Utc>| CosignRequest::new(
-            Uuid::new_v4(), vec![dev], "n".into(), issued, device_lct);
+            owner, vec![dev], "n".into(), issued, device_lct);
         let ma = chrono::Duration::minutes(5); let sk = chrono::Duration::minutes(2);
+        let ok = [owner];
         // addressed to a different device
-        assert!(mk(Uuid::new_v4(), now).cosign(dev, &key, ma, sk, now).is_err());
+        assert!(mk(Uuid::new_v4(), now).cosign(dev, &key, &ok, ma, sk, now).is_err());
         // stale challenge
-        assert!(mk(dev, now - chrono::Duration::minutes(6)).cosign(dev, &key, ma, sk, now).is_err());
+        assert!(mk(dev, now - chrono::Duration::minutes(6)).cosign(dev, &key, &ok, ma, sk, now).is_err());
         // future-dated
-        assert!(mk(dev, now + chrono::Duration::minutes(5)).cosign(dev, &key, ma, sk, now).is_err());
+        assert!(mk(dev, now + chrono::Duration::minutes(5)).cosign(dev, &key, &ok, ma, sk, now).is_err());
         // valid
-        assert!(mk(dev, now).cosign(dev, &key, ma, sk, now).is_ok());
+        assert!(mk(dev, now).cosign(dev, &key, &ok, ma, sk, now).is_ok());
+    }
+
+    #[test]
+    fn device_refuses_to_cosign_for_an_unconsented_owner() {
+        // Finding (b): being someone's MFA factor is a grant distinct from having a
+        // confirmed pairing with them. `add-remote` makes naming an arbitrary
+        // confirmed peer a one-liner, so without this the peer's assurance tier
+        // becomes a function of the OWNER's roster edits alone.
+        let dev = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let key = KeyPair::generate();
+        let now = Utc::now();
+        let req = CosignRequest::new(owner, vec![dev], "n".into(), now, dev);
+        let ma = chrono::Duration::minutes(5); let sk = chrono::Duration::minutes(2);
+
+        // Fail closed: an empty list serves nobody, which is the default state.
+        let err = req.cosign(dev, &key, &[], ma, sk, now).unwrap_err().to_string();
+        assert!(err.contains("serve-owners list"), "the error names the fix: {err}");
+        // A DIFFERENT consented owner does not transfer.
+        assert!(req.cosign(dev, &key, &[Uuid::new_v4()], ma, sk, now).is_err());
+        // Consent granted — and every other guard still applies afterwards.
+        assert!(req.cosign(dev, &key, &[owner], ma, sk, now).is_ok());
+    }
+
+    #[test]
+    fn serve_owner_consent_is_idempotent_and_withdrawable() {
+        let mut store = ConstellationStore::default();
+        let owner = Uuid::new_v4();
+        assert!(store.serve_owners.is_empty(), "default is serve nobody");
+
+        assert!(store.allow_owner(owner), "first grant takes effect");
+        assert!(!store.allow_owner(owner), "re-granting is a no-op, not a duplicate");
+        assert_eq!(store.serve_owners, vec![owner]);
+
+        assert!(store.disallow_owner(owner), "withdrawal takes effect");
+        assert!(!store.disallow_owner(owner), "withdrawing twice is a no-op");
+        assert!(store.serve_owners.is_empty());
+    }
+
+    #[test]
+    fn serve_owners_defaults_when_absent_from_a_stored_document() {
+        // Vault documents written before this field existed must still load —
+        // and must load as "serve nobody", never as "serve everybody".
+        let store: ConstellationStore =
+            serde_json::from_str(r#"{"owner_lct_id":null,"members":[]}"#).unwrap();
+        assert!(store.serve_owners.is_empty());
     }
 }
