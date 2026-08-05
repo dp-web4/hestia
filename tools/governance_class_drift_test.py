@@ -33,6 +33,18 @@ comment once claimed adding an exemption was "as hard as adding a rule" while th
 code made it free; the difference here is that the sentence you are reading is the
 claim, and it is the weaker one.)
 
+TWO THINGS THE FIRST CUT GOT WRONG, both found by running the matcher rather than
+reading it, and both now checked. (1) The matcher's filename loop returns the FIRST
+tuple entry that is a substring of the text, so a governed name containing an earlier
+entry NEVER REACHES THE BAR AS ITSELF -- it is priced, escalated and approved under
+the other name. One of the seven is in that state. The consequence is not cosmetic:
+approvals are keyed on the marker string by exact equality, so those two files share
+one price and one permit. (2) Two of the seven names have no file in this repo at
+all; their only instances are installed copies. Both facts are declared per row and
+red when they change. The general lesson, since this file exists to make governance
+legible: **a binding test between two lists binds the lists, not the behaviour** --
+what the matcher EMITS is a third thing, and it was the one that mattered.
+
 THREE NAMES ARE DECLARED `AWAITING`. That is not an oversight, it is the point. I
 can measure what the bar does; I cannot decide what it should do -- that is a policy
 call for the steward, and writing my preference into a test would be exactly the
@@ -73,6 +85,9 @@ AWAITING = None  # declared open: measured, not yet decided
 EXACT = "the bar names it exactly"
 SUBSTRING = "the bar names a DIFFERENT file whose basename this one ends with"
 UNNAMED = "the bar never names it"
+SHADOWED = ("the matcher never emits this name at all -- an EARLIER tuple entry is a "
+            "substring of it, so an act on this file carries that other name's marker "
+            "and that other name's price")
 
 
 # ---------------------------------------------------------------------------
@@ -85,36 +100,60 @@ UNNAMED = "the bar never names it"
 # `intended` is the class this surface SHOULD ask for. `via` is how it reaches its
 # class today, and it is declared rather than derived so that a rename which changes
 # the mechanism (see `<society-gate>`) cannot pass unnoticed.
+#
+# `tracked` says whether a file in THIS repo carries this basename. Two do not, and
+# that is not a typo in the tuple: the matcher protects a NAME, and for those two the
+# only instances are installed copies with no canonical source here. It is declared
+# per row rather than counted, so losing a referent reds the row that lost it.
 DECLARED = (
-    dict(key="pre_", label="<gate>", intended=STRONG, via=EXACT,
+    dict(key="pre_", label="<gate>", intended=STRONG, via=EXACT, tracked=True,
          why="The enforcement path. A gate that permits everything ends the model; "
              "the bar's own doc comment names this class first. Stated policy."),
 
-    dict(key="post", label="<post-hook>", intended=STRONG, via=EXACT,
+    dict(key="post", label="<post-hook>", intended=STRONG, via=EXACT, tracked=False,
          why="The other half of the outcome record. Same class as <witness> in the "
-             "bar's doc comment. Stated policy."),
+             "bar's doc comment. Stated policy. NOT TRACKED HERE: this name's only "
+             "instances are installed copies, and the tracked file that does this "
+             "job carries the same stem with a different extension -- which the "
+             "tuple, matched as a literal substring, does not cover. So the strong "
+             "class is real for the deployed artifact and absent for the one in "
+             "review. Not filed as a defect: which of the two should be governed is "
+             "a question about the deployment, not about this file."),
 
-    dict(key="witn", label="<witness>", intended=STRONG, via=EXACT,
+    dict(key="witn", label="<witness>", intended=STRONG, via=EXACT, tracked=True,
          why="The outcome recorder. Disarming it produces SILENCE rather than "
              "denials, and silence is indistinguishable from 'attempted nothing'. "
              "Named in the bar's doc comment. Stated policy."),
 
-    dict(key="law_", label="<law-renderer>", intended=SINGLE, via=UNNAMED,
+    dict(key="law_", label="<law-renderer>", intended=SINGLE, via=UNNAMED, tracked=True,
          why="Stated policy, and the only weak row that IS one: the bar's doc "
              "comment says a law renderer is one approver's call. Declared here so "
              "the deliberate case is distinguishable from the inherited ones."),
 
     # ---- the three the bar has never been asked about ----
 
-    dict(key="soci", label="<society-gate>", intended=AWAITING, via=SUBSTRING,
-         why="Reaches the two-factor bar TODAY, but by accident: its basename ends "
-             "with <gate>'s and the bar's test is `contains`. Rename the file and "
-             "it drops to one approver with nothing red anywhere. This is the copy "
-             "that actually parked a member, so the weak-by-rename exposure is on "
-             "the live enforcement path. DECIDE: name it in the bar explicitly "
-             "(cost: one rust line) or accept a class that depends on spelling."),
+    dict(key="soci", label="<society-gate>", intended=AWAITING, via=SHADOWED,
+         tracked=False,
+         why="CORRECTED 2026-08-05 -- the row shipped in 8552e4e said this name "
+             "reaches the strong bar by a substring accident IN THE BAR, and that "
+             "the remedy was one rust line. Both are wrong, and the second is the "
+             "expensive error: the bar never receives this name. The matcher's "
+             "filename loop returns the FIRST tuple entry that is a substring of "
+             "the text, <gate>'s name is a substring of this one and sits at index "
+             "0, so an act on this file emits <gate>'s marker. Naming this file in "
+             "the bar would add a clause nothing can reach -- and check E would "
+             "stay green about it, because the name IS in the matcher's tuple. "
+             "Measured in-process against the enforcing copy, 7/7 names, exactly "
+             "one shadowed. What follows is a live consequence, not a style note: "
+             "the approval system keys on the marker string with exact equality, "
+             "so one approval to edit <gate> is spendable on this file and vice "
+             "versa -- and this is the copy that actually parked a member. Two "
+             "files, two owners, one price and one permit. DECIDE: whether the "
+             "matcher should resolve the longest match rather than the first (cost: "
+             "one python line, and it makes the bar reachable), or whether one "
+             "approval covering both files is the intended scope."),
 
-    dict(key="hestia_", label="<policy-core>", intended=AWAITING, via=UNNAMED,
+    dict(key="hestia_", label="<policy-core>", intended=AWAITING, via=UNNAMED, tracked=True,
          why="One approver today. Added to the matcher 2026-08-03, after the bar's "
              "doc comment was written, so its class was inherited from an omission "
              "rather than chosen. The matcher's own comment says this file is to "
@@ -123,6 +162,7 @@ DECLARED = (
              "DECIDE: before the shims land, not after."),
 
     dict(key="gate_self", label="<exemption-ledger>", intended=AWAITING, via=UNNAMED,
+         tracked=True,
          why="One approver today, same inheritance. This file holds the list of "
              "shared deciders allowed to ESCAPE the guard, so an approval here buys "
              "an unbounded number of future unescalated writes. DECIDE: whether the "
@@ -217,6 +257,38 @@ def _bar_names(text):
     return re.findall(r'contains\("([^"]+)"\)', text[start:end]) or None
 
 
+def _emitted_marker(name, governed):
+    """The marker the matcher would hand the bar for a path naming `name`.
+
+    TRANSCRIBED, not paraphrased: the matcher's filename loop walks its tuple in
+    order and RETURNS the first entry that is a substring of the text. So a name
+    that contains an earlier entry never reaches the bar as itself -- the same
+    first-match shadowing already known between the marker tuple's file and
+    directory elements, one level down, inside the governed tuple.
+
+    Two conditions of the real loop are not modelled and both only ever produce
+    LESS matching, never more: an act whose text also hits a `_SELF_MARKERS`
+    element returns that instead, and a name on the hooks-dir-only list needs a
+    hooks segment in the text. This function assumes the favourable case (a path
+    under a hooks directory, no marker hit) and therefore reports the STRONGEST
+    marker a name can attain -- so a name it calls shadowed is shadowed under every
+    condition.
+
+    The transcription was validated once against the real function rather than
+    trusted: imported in-process and called for all 7 governed names on a
+    `/.../hooks/<name>` path, 2026-08-05 -- 7/7 agreement, exactly one shadowed.
+    That probe is not run here; importing the matcher is what this file's docstring
+    promises not to do."""
+    return next((f for f in governed if f in name), None)
+
+
+def _tracked_basenames():
+    """Every basename with at least one tracked file in this repo."""
+    out = subprocess.run(["git", "ls-files", "-z"], cwd=REPO,
+                         capture_output=True, check=True).stdout
+    return {os.path.basename(raw.decode()) for raw in out.split(b"\0") if raw}
+
+
 # ---------------------------------------------------------------------------
 # THE CHECKS
 # ---------------------------------------------------------------------------
@@ -297,18 +369,43 @@ def audit(matcher_text=None, bar_text=None, declared=DECLARED):
                 "exists to end. Add a row above, with a written reason.")
 
     # --- B/C/D. derived vs declared, per name.
-    awaiting = []
+    def _from_bar(name):
+        """(class, mechanism) for the marker string `name`, per the bar alone."""
+        hit = [s for s in strong if s in name]
+        if not hit:
+            return SINGLE, UNNAMED
+        return STRONG, (EXACT if hit[0] == name else SUBSTRING)
+
+    tracked_names = _tracked_basenames()
+    awaiting, shadowed_n, untracked_n = [], 0, 0
     for g in governed:
         row = by_name.get(g)
         if row is None:
             continue
-        hit = [s for s in strong if s in g]
-        if not hit:
-            derived, via = SINGLE, UNNAMED
-        elif hit[0] == g:
-            derived, via = STRONG, EXACT
+        # G. What the MATCHER emits comes first: a shadowed name never reaches the
+        # bar, so deriving its class from the bar's opinion of ITS OWN spelling is
+        # deriving from a string the bar is never handed.
+        emitted = _emitted_marker(g, governed)
+        if emitted != g:
+            derived, _ignored = _from_bar(emitted)
+            via = SHADOWED
+            shadowed_n += 1
         else:
-            derived, via = STRONG, SUBSTRING
+            derived, via = _from_bar(g)
+
+        # H. a governed name with no tracked file here governs installed copies only.
+        is_tracked = g in tracked_names
+        if not is_tracked:
+            untracked_n += 1
+        if is_tracked != row["tracked"]:
+            bad(f"{row['label']}: declared tracked={row['tracked']}, measured "
+                f"tracked={is_tracked} -- a tracked file with this basename "
+                f"{'appeared' if is_tracked else 'is gone'}. A governed name with no "
+                f"file here is protection that exists as a STRING: nothing in this "
+                f"repo can be reviewed, diffed, or renamed-with-a-red for it, and "
+                f"its class is a claim about an artifact no in-tree test has seen. "
+                f"Gaining one is the good direction and still a reviewed diff -- the "
+                f"class was written for the copy nobody could read.")
 
         if via != row["via"]:
             bad(f"{row['label']}: reaches its class by a DIFFERENT mechanism than "
@@ -325,9 +422,22 @@ def audit(matcher_text=None, bar_text=None, declared=DECLARED):
             mark = "MISMATCH"
         else:
             mark = "ok"
-        out.append(f"  {row['label']:<22} {derived:<16} {mark}")
+        note = ("  [shadowed: priced as another name]" if via is SHADOWED else "")
+        note += ("  [installed-only: no file here]" if not is_tracked else "")
+        out.append(f"  {row['label']:<22} {derived:<16} {mark}{note}")
+
+    out.append("")
+    out.append(f"{shadowed_n} of {len(governed)} governed names never reach the bar "
+               f"as themselves (an earlier tuple entry is a substring); "
+               f"{untracked_n} name no file tracked in this repo")
 
     # --- E. the bar names nothing the matcher does not govern.
+    #
+    # Note what E does NOT catch, since the gap cost this file a wrong row: a bar
+    # clause naming a SHADOWED governed name passes E -- the name is in the tuple,
+    # so the branch reads as covered -- while the matcher can never emit it, so the
+    # clause is dead. E asks whether the bar's names are governed; only the shadow
+    # check above asks whether the bar can ever be handed them.
     for s in strong:
         if not any(s in g for g in governed):
             bad("`bar_for` routes a basename the matcher does not govern -- the bar "
@@ -433,42 +543,62 @@ def selftest():
     exact_rows = [r for r in DECLARED if r["intended"] is STRONG and r["via"] is EXACT]
     exact_name = next(g for g in governed
                       if any(g.startswith(r["key"]) for r in exact_rows) and g in strong)
-    # The row whose class depends on a spelling accident, and its governed name.
-    sub_row = next(r for r in DECLARED if r["via"] is SUBSTRING)
-    sub_name = next(g for g in governed if g.startswith(sub_row["key"]))
+    # The row whose name never reaches the bar as itself, and that governed name.
+    shadow_row = next(r for r in DECLARED if r["via"] is SHADOWED)
+    shadow_name = next(g for g in governed if g.startswith(shadow_row["key"]))
+    # The declaration with that row's `via` put back to what 8552e4e shipped. The
+    # error this file corrects lived in the DECLARATION, not in either source, so a
+    # sabotage set that only ever mutates the sources cannot reach its own class of
+    # defect -- and this file shipped one.
+    was_substring = tuple(dict(r, via=SUBSTRING) if r is shadow_row else r
+                          for r in DECLARED)
     # A row to collide a key against, and a victim name to rename onto its key.
     other_row = next(r for r in DECLARED if r["intended"] is SINGLE)
     other_name = next(g for g in governed if g.startswith(other_row["key"]))
     collide_key = exact_rows[0]["key"]
 
     unknown = "zz_ungoverned_probe.py"
+    # (label, matcher text, bar text, declaration, expected failure substring)
     cases = [
         ("a governed name is REMOVED, orphaning its declaration",
-         _drop_line(mt, f'"{governed[-1]}"'), bt, "matches 0 governed names"),
+         _drop_line(mt, f'"{governed[-1]}"'), bt, DECLARED,
+         "matches 0 governed names"),
 
         ("a NEW governed name lands with no declared class",
-         _insert_before(mt, f'"{governed[0]}"', f'    "{unknown}",\n'), bt,
+         _insert_before(mt, f'"{governed[0]}"', f'    "{unknown}",\n'), bt, DECLARED,
          "NO declared class"),
 
         ("the bar stops naming a surface declared two-factor",
-         mt, _drop_line(bt, f'contains("{exact_name}")'), "change the bar"),
+         mt, _drop_line(bt, f'contains("{exact_name}")'), DECLARED, "change the bar"),
 
         ("the bar prices a name the matcher does not govern",
          mt, _insert_before(bt, 'contains("',
                             f'        || marker.contains("{unknown}")\n'),
-         "does not govern"),
+         DECLARED, "does not govern"),
 
         ("a new DIRECTORY marker widens the set that cannot reach the strong bar",
          _insert_before(mt, f'"{marker_lits[0]}"', '    "zz/dir/marker",\n'), bt,
-         "marker tuple's shape moved"),
+         DECLARED, "marker tuple's shape moved"),
 
-        ("a rename demotes a surface that reached the strong bar by accident",
-         _rename(mt, sub_name, sub_name[:len(sub_row["key"])] + "_renamed.py"), bt,
-         "DIFFERENT mechanism"),
+        ("a rename lifts a shadowed name out from under the one pricing it",
+         _rename(mt, shadow_name,
+                 shadow_name[:len(shadow_row["key"])] + "_renamed.py"), bt,
+         DECLARED, "DIFFERENT mechanism"),
 
         ("a rename makes two governed names collide on one declaration key",
-         _rename(mt, other_name, collide_key + other_name), bt,
+         _rename(mt, other_name, collide_key + other_name), bt, DECLARED,
          "matches 2 governed names"),
+
+        ("a rename puts a name UNDER an earlier one, so the bar never sees it",
+         _rename(mt, other_name, other_row["key"] + exact_name), bt, DECLARED,
+         "never emits this name"),
+
+        ("a governed name loses the last tracked file that carries it",
+         _rename(mt, other_name, other_name[:-3] + "zz.py"), bt, DECLARED,
+         "measured tracked=False"),
+
+        ("the DECLARATION mis-states the mechanism (the 8552e4e row, restored)",
+         mt, bt, was_substring, "DIFFERENT mechanism"),
     ]
 
     base_fails, _ = audit()
@@ -479,8 +609,8 @@ def selftest():
         return 1
 
     bad = 0
-    for label, m_text, b_text, expect in cases:
-        fails, _ = audit(matcher_text=m_text, bar_text=b_text)
+    for label, m_text, b_text, decl, expect in cases:
+        fails, _ = audit(matcher_text=m_text, bar_text=b_text, declared=decl)
         hit = any(expect in f for f in fails)
         if not hit:
             bad += 1
