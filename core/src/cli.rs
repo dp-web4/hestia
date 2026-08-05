@@ -338,6 +338,21 @@ enum ConstellationCmd {
         target: String,
     },
 
+    /// DEVICE side: consent to act as an MFA factor for an owner. `cosign-serve`
+    /// refuses every owner not listed, so this is the explicit local act that
+    /// makes a co-sign possible. Confirming a hub pairing does NOT imply it — a
+    /// pair is transport, and being someone's second factor is a separate grant.
+    ServeOwner {
+        /// The owner's LCT id (UUID) — the `owner_lct_id` their requests carry.
+        lct_id: String,
+        /// Withdraw consent instead of granting it.
+        #[arg(long)]
+        remove: bool,
+    },
+
+    /// List the owners this device has consented to co-sign for.
+    ServeOwners,
+
     /// DEVICE side of cross-device MFA: drain co-sign requests from confirmed
     /// pairs, co-sign each with this device's member key, and reply. Run this
     /// (periodically or `--once`) on every machine that is a device in someone's
@@ -789,6 +804,10 @@ pub fn run() -> AnyResult<()> {
                     cmd_constellation_present(&home, all, &devices, &target)
                 }
             }
+            ConstellationCmd::ServeOwner { lct_id, remove } => {
+                cmd_constellation_serve_owner(&home, &lct_id, remove)
+            }
+            ConstellationCmd::ServeOwners => cmd_constellation_serve_owners(&home),
             ConstellationCmd::CosignServe { once, target } => {
                 cmd_constellation_cosign_serve(&home, once, &target)
             }
@@ -2972,6 +2991,51 @@ fn cmd_constellation_present_remote(home: &std::path::Path, target: &str) -> Any
     Ok(())
 }
 
+/// `constellation serve-owner` — the explicit device-side consent act. Grants (or
+/// with `--remove` withdraws) permission for one owner to use this machine as an
+/// MFA factor. Kept separate from pairing on purpose: `pair-confirm` establishes a
+/// channel, and inferring "…and I'll co-sign for you" from it is exactly the
+/// conflation this command exists to break.
+fn cmd_constellation_serve_owner(home: &std::path::Path, lct_id: &str, remove: bool) -> AnyResult<()> {
+    let owner: uuid::Uuid = lct_id
+        .parse()
+        .with_context(|| format!("'{lct_id}' is not a valid LCT id (expected a UUID)"))?;
+    let mut vault = open_vault(home)?;
+    let mut store = ConstellationStore::load(&vault)?;
+    if remove {
+        if store.disallow_owner(owner) {
+            store.save(&mut vault)?;
+            println!("withdrew consent: {owner} can no longer co-sign through this device");
+        } else {
+            println!("{owner} was not on the serve-owners list — nothing to withdraw");
+        }
+    } else if store.allow_owner(owner) {
+        store.save(&mut vault)?;
+        println!("consented: this device will co-sign constellation challenges for owner {owner}");
+        println!("run `hestia constellation cosign-serve` to start answering them.");
+    } else {
+        println!("{owner} is already on the serve-owners list");
+    }
+    Ok(())
+}
+
+/// `constellation serve-owners` — show who this device has agreed to be a factor
+/// for. An empty list is the fail-closed default, not a misconfiguration.
+fn cmd_constellation_serve_owners(home: &std::path::Path) -> AnyResult<()> {
+    let vault = open_vault(home)?;
+    let store = ConstellationStore::load(&vault)?;
+    if store.serve_owners.is_empty() {
+        println!("no owners consented — this device will refuse every co-sign request.");
+        println!("grant one with `hestia constellation serve-owner <owner-lct-id>`.");
+        return Ok(());
+    }
+    println!("owners this device will co-sign for:");
+    for owner in &store.serve_owners {
+        println!("  {owner}");
+    }
+    Ok(())
+}
+
 /// `constellation cosign-serve` — the DEVICE side. Drains co-sign requests from
 /// confirmed pairs, co-signs each with this device's member key (bounded to the
 /// exact challenge), and replies over the same pair. Run on every machine that is
@@ -2987,8 +3051,17 @@ fn cmd_constellation_cosign_serve(home: &std::path::Path, once: bool, target: &s
     let hub_id = conn.hub_lct_id;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
+    let consented = ConstellationStore::load(&vault)?.serve_owners.len();
     println!("cosign-serve: device {my_lct} draining confirmed pairs (once={once})");
+    if consented == 0 {
+        println!("  WARNING: no consented owners — every request will be refused.");
+        println!("  grant one with `hestia constellation serve-owner <owner-lct-id>`.");
+    } else {
+        println!("  serving {consented} consented owner(s) — `constellation serve-owners` to list");
+    }
     loop {
+        // Reloaded each pass, so `serve-owner --remove` takes effect without a restart.
+        let serve_owners = ConstellationStore::load(&vault)?.serve_owners;
         let mut pairings = hestia::pairing::PairingStore::load(&vault)?;
         let mut advanced = false;
         let snapshot: Vec<hestia::pairing::Pairing> = pairings.pairings.values().cloned().collect();
@@ -3002,7 +3075,7 @@ fn cmd_constellation_cosign_serve(home: &std::path::Path, once: bool, target: &s
                 if let Ok(plain) = hestia::pairing::open_over_pair(p, &detail, &member_kp, &peer_lct, &m.payload) {
                     if let Ok(req) = serde_json::from_slice::<CosignRequest>(&plain) {
                         if req.kind == CosignRequest::KIND {
-                            match req.cosign(my_lct, &member_kp, chrono::Duration::minutes(5), chrono::Duration::minutes(2), chrono::Utc::now()) {
+                            match req.cosign(my_lct, &member_kp, &serve_owners, chrono::Duration::minutes(5), chrono::Duration::minutes(2), chrono::Utc::now()) {
                                 Ok(resp) => {
                                     if let Ok(body) = hestia::pairing::seal_over_pair(p, &detail, &member_kp, &peer_lct, &serde_json::to_vec(&resp).unwrap_or_default()) {
                                         let _ = rt.block_on(client.post_pair_message(&rest, hub_id, my_lct, &member_kp, p.pair_id, body));

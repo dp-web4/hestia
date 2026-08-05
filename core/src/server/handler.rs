@@ -4450,9 +4450,16 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
 /// challenge; this device signs EXACTLY the constellation-challenge payload with
 /// its member identity key and returns the signature. **Bounded surface:** it
 /// only ever signs a well-formed, fresh, THIS-device-addressed constellation
-/// challenge (`CosignRequest::cosign` enforces target/roster/freshness) — never
-/// arbitrary caller bytes. The owner drops the returned signature into the
-/// attestation; the hub then resolves this device's key from ENROLLMENT.
+/// challenge (`CosignRequest::cosign` enforces owner-consent/target/roster/
+/// freshness) — never arbitrary caller bytes. The owner drops the returned
+/// signature into the attestation; the hub then resolves this device's key from
+/// ENROLLMENT.
+///
+/// **This is the UNATTENDED co-sign path.** Unlike `constellation cosign-serve`,
+/// it runs inside a long-lived daemon holding an already-open vault, so no human
+/// is present per request to gate it. That makes the `serve_owners` check the
+/// only thing standing between a confirmed peer and this machine's signature —
+/// it is load-bearing here in a way it is not on the CLI path.
 async fn tool_cosign(state: &SharedState, args: &Value) -> ToolResult {
     let req: crate::constellation::CosignRequest = serde_json::from_value(args.clone())
         .map_err(|e| anyhow::anyhow!("not a valid cosign request: {e}"))?;
@@ -4466,8 +4473,13 @@ async fn tool_cosign(state: &SharedState, args: &Value) -> ToolResult {
     let arr: [u8; 32] = hex::decode(secret_hex.trim()).ok().and_then(|b| b.try_into().ok())
         .ok_or_else(|| anyhow::anyhow!("identity secret must be 32-byte hex"))?;
     let key = web4_core::crypto::KeyPair::from_secret_bytes(&arr);
+    // Read fresh per request (not cached at startup) so `constellation serve-owner
+    // --remove` revokes a running daemon's consent without a restart.
+    let serve_owners = crate::constellation::ConstellationStore::load(&s.vault)
+        .map(|c| c.serve_owners)
+        .unwrap_or_default();
     let resp = req
-        .cosign(my_lct, &key, chrono::Duration::minutes(5), chrono::Duration::minutes(2), Utc::now())
+        .cosign(my_lct, &key, &serve_owners, chrono::Duration::minutes(5), chrono::Duration::minutes(2), Utc::now())
         .map_err(|e| anyhow::anyhow!("refusing to co-sign: {e}"))?;
     Ok(serde_json::to_value(resp)?)
 }
