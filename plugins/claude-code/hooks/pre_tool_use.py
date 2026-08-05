@@ -195,12 +195,37 @@ _SELF_MARKERS = (
 # well as mine. An agent editing ANOTHER member's gate is not a lesser act — it
 # is disarming an entity that did not consent, and the record would name the
 # victim rather than the author.
+#
+# `hestia_gate_core.py` added 2026-08-03, on the same reasoning one step ahead of it.
+# PR #169 landed the shared policy core — the file that is to BECOME the single gate for
+# all five harnesses, with the per-harness hooks reduced to adapter shims. It matched
+# nothing here and nothing in `_SELF_MARKERS`, so the whole PR was written unrefused. That
+# was verified by writing it, and disclosed in the PR rather than used.
+#
+# The failure mode consolidation creates: today, disarming the gate means editing five
+# files and tripping this rule five times. After the shims land it means editing ONE file
+# — and if that file is outside the rule, consolidation will have moved the entire policy
+# surface somewhere unguarded while every per-harness protection still reads as intact.
+# The rule would be green about five shims that no longer decide anything.
+#
+# Filename-anywhere is the right mechanism and not merely the convenient one: shims will
+# import the core from several locations, so a directory marker would miss it — and the
+# rationale directly above ("so this holds for a peer's copy as well as mine") is exactly
+# the property needed when one file governs five members.
 _GOVERNANCE_FILES = (
     "pre_tool_use.py",
     "society_pre_tool_use.py",
     "post_tool_use.py",
     "witness.py",
     "law_inject.py",
+    "hestia_gate_core.py",
+    # The EXEMPTION LEDGER is a policy artifact too (codex NOT-SAME review of #175).
+    # `gate_self_protection_test.py` holds `EXEMPT`, the list of shared files allowed to
+    # escape the guard. Outside this tuple, the bypass was one unescalated write: add a new
+    # decider to `plugins/_shared/`, add its name to EXEMPT, and every check passes. Its own
+    # comment claimed adding an exemption was "as hard as adding a rule" while the code made
+    # it free — an aspirational claim a reader would have trusted.
+    "gate_self_protection_test.py",
 )
 
 
@@ -250,14 +275,28 @@ def _touches_self(tool_name: str, tool_input: Any) -> Optional[str]:
         for marker in _SELF_MARKERS:
             if marker and marker in h:
                 return marker
-        # Governance files by name, but only under a hooks directory — so this
-        # catches every member's gate and recorder without blocking an unrelated
-        # file that happens to share a common name.
+        # Governance files by name, ANYWHERE by default. `_HOOKS_DIR_ONLY` carves out the
+        # names common enough that matching them everywhere would fire on ordinary work.
+        #
+        # THE DEFAULT WAS INVERTED, AND THE INVERSION WAS THE DEFECT. This required a `hooks/`
+        # segment before consulting `_GOVERNANCE_FILES` at all — so `plugins/_shared/
+        # hestia_gate_core.py` (the policy core for all five harnesses) and the exemption
+        # ledger under `tests/` were named in a protected tuple that COULD NOT FIRE against
+        # them. Five behavioural probes proved it: relative write, absolute write, Edit, Bash,
+        # and the ledger — every one returned None while the membership test stayed green.
+        #
+        # So: a newly governed name is protected because someone added it, not because they
+        # also remembered where it lives. Weakening is now an explicit, visible second edit
+        # into `_HOOKS_DIR_ONLY`, and the subset test keeps that list from drifting away from
+        # the list it weakens.
         low = h.replace("\\", "/")
-        if "hooks/" in low or "/hooks" in low:
-            for fname in _GOVERNANCE_FILES:
-                if fname in low:
-                    return fname
+        in_hooks = "hooks/" in low or "/hooks" in low
+        for fname in _GOVERNANCE_FILES:
+            if fname not in low:
+                continue
+            if fname in _HOOKS_DIR_ONLY and not in_hooks:
+                continue
+            return fname
     return None
 
 
@@ -306,6 +345,27 @@ def _touches_self(tool_name: str, tool_input: Any) -> Optional[str]:
 # That surface belongs to whoever installs the agent, not to the agent's gate,
 # and saying so is the point: the boundary is where custody changes, and this
 # file cannot be both sides of it.
+# Governance filenames that are ONLY governed under a `hooks/` path — the deliberate
+# weakening, kept small and visible.
+#
+# These are common enough that matching them anywhere would fire on ordinary work: a repo can
+# legitimately hold an unrelated `witness.py`, and `post_tool_use.py` appears in vendor
+# examples and documentation. The distinctive names — `hestia_gate_core.py`, the exemption
+# ledger — are NOT here, so they are governed wherever they live.
+#
+# The direction matters more than the contents. A name added to `_GOVERNANCE_FILES` is
+# protected by default; weakening it costs a second, deliberate edit into this tuple, and the
+# subset test refuses an entry here that is not governed at all. Before, the default ran the
+# other way and a governed name silently protected nothing unless someone also happened to put
+# it in a hooks directory.
+_HOOKS_DIR_ONLY = (
+    "pre_tool_use.py",
+    "society_pre_tool_use.py",
+    "post_tool_use.py",
+    "witness.py",
+    "law_inject.py",
+)
+
 _SETTINGS_MARKERS = (
     ".claude/settings.json",
     ".claude/settings.local.json",
