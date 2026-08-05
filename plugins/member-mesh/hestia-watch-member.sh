@@ -371,29 +371,115 @@ PY
 }
 migrate_flat_primers
 
-for stale in "$PRIMERS"/notice-*.json; do
-  [ -e "$stale" ] || break
-  echo "[hestia-watch] STALE PRIMER (undelivered notices from a failed fire): $stale"
-  python3 -c "import json,sys;d=json.load(open(sys.argv[1]));[print(f\"    id={n.get('id')} {n.get('kind')} from {n.get('from_plugin')} queued={n.get('queued_at','')}: {n.get('pointer_uri','')}\") for n in d.get('notices',[])]" "$stale" 2>/dev/null || true
-  [ -n "$FIRE" ] || continue
-  attempts_file="$stale.attempts"
-  attempts="$(cat "$attempts_file" 2>/dev/null || echo 0)"
-  [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
-  if [ "$attempts" -ge "$STALE_MAX_ATTEMPTS" ]; then
-    echo "[hestia-watch] STALE PRIMER exhausted ($attempts/$STALE_MAX_ATTEMPTS) — set aside: $stale.exhausted"
-    mv -f "$stale" "$stale.exhausted" 2>/dev/null && rm -f "$attempts_file"
-    continue
-  fi
-  echo $((attempts + 1)) > "$attempts_file"
-  echo "[hestia-watch] RETRYING stale primer (attempt $((attempts + 1))/$STALE_MAX_ATTEMPTS): $stale"
-  if "$FIRE" "$stale"; then
-    rm -f "$stale" "$attempts_file"
-    echo "[hestia-watch] stale primer DELIVERED on retry: $stale"
-  else
-    rc=$?
-    echo "[hestia-watch] stale retry failed rc=$rc (preserved, will retry): $stale"
-  fi
-done
+# ...and ASK BEFORE RE-FIRING (2026-08-05). The retry above decides on `$FIRE`'s exit
+# code, which is a fact about the harness and not about whether the notices were handled.
+# A wake that ran, replied, committed and pushed, and then hit the launcher's timeout,
+# returns nonzero and gets its work list retained — this mesh's own rc=124 reports are
+# 9/9 false for exactly that reason. The retention is then re-fired at every watcher
+# restart, in `mktemp` alphabetical order, one model wake apiece.
+#
+# Measured on CBP the day this was written: 18 retained primers for `claude-code`
+# carrying 46 notices; 31 were of a kind the daemon counts and NONE of the 31 was still
+# owed, and the remaining 15 were `ack`/`review_done`, kinds that never await a response
+# at all. Zero undischarged work, 18 wakes queued to re-deliver it — including the one
+# that woke the session that found this, for a notice answered six minutes after it was
+# first drained, two days earlier.
+#
+# So consult the daemon. `i_owe` is the mesh's OWN predicate for "this notice awaits my
+# response"; a notice absent from it is discharged by the same rule every other surface
+# in this system uses, and a kind outside `MEMBER_KINDS_AWAIT_RESPONSE` can never appear
+# there — which is correct, it was never owed one. Naming no kind list here is
+# deliberate: the daemon's constant stays the single definition.
+#
+# Every failure direction FIRES ANYWAY. A wasted wake is recoverable; a work list
+# retired on a false "spent" is not, and consume-once means there is no second copy.
+# So the guard judges only notices inside a WINDOW where absence from the fold carries
+# information, and treats everything else as unmeasured:
+#   - RPC fails, daemon down, refusal payload -> unknown                       -> fire
+#   - notice OLDER than SPENT_MAX_AGE_SECS — past the point where the daemon prunes
+#     the inbox (7d), so absence means "pruned", not "answered"                 -> fire
+#   - notice YOUNGER than SPENT_MIN_AGE_SECS — this is the trap, and it points the
+#     unsafe way. `i_owe` shows a row only if it is older than the floor, so a LARGER
+#     floor hides MORE unanswered notices, and every hidden row reads as discharged.
+#     Under #155 (every tool is `additionalProperties: true` with zero declared
+#     properties) a misspelled `older_than_secs` is discarded into a success and
+#     MEMBER_UNANSWERED_DEFAULT_SECS (6h) applies without saying so — which would
+#     retire the primer of a notice stranded forty minutes ago. Refusing to judge
+#     anything younger than that same 6h makes the verdict independent of whether the
+#     argument was honoured at all: inside the window, both spellings return the same
+#     rows. The floor is not trusted; it is made irrelevant.               -> fire
+# Nothing above can produce a false "spent". That asymmetry is the whole design.
+SPENT_MAX_AGE_SECS="${SPENT_MAX_AGE_SECS:-518400}"   # 6d — deliberately INSIDE the daemon's 7d inbox TTL
+SPENT_MIN_AGE_SECS="${SPENT_MIN_AGE_SECS:-21600}"    # 6h — MEMBER_UNANSWERED_DEFAULT_SECS, the floor we refuse to depend on
+
+# $1 = primer path, $2 = the `unanswered` fold, fetched once per pass. Exit 0 ONLY when
+# every notice in the primer is inside the measurable window and absent from `i_owe`.
+primer_spent() {
+  python3 - "$1" "$SPENT_MAX_AGE_SECS" "$2" "$SPENT_MIN_AGE_SECS" <<'PY'
+import datetime, json, sys
+primer, max_age, fold_raw, min_age = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+try:
+    fold = json.loads(fold_raw)
+    notices = json.load(open(primer)).get("notices") or []
+except Exception:
+    raise SystemExit(1)                     # unreadable either side -> unmeasured
+# A refusal, an error envelope or a truncated body is not an empty debt. The key must
+# be PRESENT: `.get("i_owe") or []` would read every one of those as "nothing owed".
+if not isinstance(fold, dict) or not isinstance(fold.get("i_owe"), list):
+    raise SystemExit(1)
+if not notices:
+    raise SystemExit(1)                     # nothing to judge -> leave the old path alone
+owed = {n.get("id") for n in fold["i_owe"] if isinstance(n, dict)}
+now = datetime.datetime.now(datetime.timezone.utc)
+for n in notices:
+    if n.get("id") is None or n.get("id") in owed:
+        raise SystemExit(1)
+    try:
+        q = datetime.datetime.fromisoformat(str(n.get("queued_at", "")).replace("Z", "+00:00"))
+    except ValueError:
+        raise SystemExit(1)
+    age = (now - q).total_seconds()
+    if age > max_age or age < min_age:
+        raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
+# Wrapped in a function only so it can run AFTER `mesh_rpc` is defined; it is still
+# called from the startup path, in the same place, before the first poll.
+retry_stale_primers() {
+  local fold; fold="$(unanswered_now 2>/dev/null || true)"
+  for stale in "$PRIMERS"/notice-*.json; do
+    [ -e "$stale" ] || break
+    echo "[hestia-watch] STALE PRIMER (undelivered notices from a failed fire): $stale"
+    python3 -c "import json,sys;d=json.load(open(sys.argv[1]));[print(f\"    id={n.get('id')} {n.get('kind')} from {n.get('from_plugin')} queued={n.get('queued_at','')}: {n.get('pointer_uri','')}\") for n in d.get('notices',[])]" "$stale" 2>/dev/null || true
+    [ -n "$FIRE" ] || continue
+    attempts_file="$stale.attempts"
+    # Before the attempt budget, not after: a discharged list should retire on the
+    # first pass that can prove it, whatever the counter says.
+    if primer_spent "$stale" "$fold"; then
+      echo "[hestia-watch] STALE PRIMER ALREADY DISCHARGED (the daemon owes nothing for any notice in it) — retired without a fire: $stale.discharged"
+      mv -f "$stale" "$stale.discharged" 2>/dev/null && rm -f "$attempts_file"
+      continue
+    fi
+    attempts="$(cat "$attempts_file" 2>/dev/null || echo 0)"
+    [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
+    if [ "$attempts" -ge "$STALE_MAX_ATTEMPTS" ]; then
+      echo "[hestia-watch] STALE PRIMER exhausted ($attempts/$STALE_MAX_ATTEMPTS) — set aside: $stale.exhausted"
+      mv -f "$stale" "$stale.exhausted" 2>/dev/null && rm -f "$attempts_file"
+      continue
+    fi
+    echo $((attempts + 1)) > "$attempts_file"
+    echo "[hestia-watch] RETRYING stale primer (attempt $((attempts + 1))/$STALE_MAX_ATTEMPTS): $stale"
+    if "$FIRE" "$stale"; then
+      rm -f "$stale" "$attempts_file"
+      echo "[hestia-watch] stale primer DELIVERED on retry: $stale"
+    else
+      rc=$?
+      echo "[hestia-watch] stale retry failed rc=$rc (preserved, will retry): $stale"
+    fi
+  done
+}
 
 # The unanswered row exists (daemon-side) only if something ASKS on a cadence —
 # a queryable quantity nobody queries is the same defect as an alarm written to
@@ -475,6 +561,16 @@ PY
 
 drain() { mesh_rpc hestia_member_inbox; }
 unanswered() { mesh_rpc hestia_member_unanswered "{\"older_than_secs\": $STALE_AFTER}"; }
+# The journal wants the 6h floor; `primer_spent` asks without one so the fold it reads
+# is the complete debt rather than the stale tail. It does NOT depend on this having
+# worked — see SPENT_MIN_AGE_SECS — but a fold that covers everything is still the
+# right thing to ask for, and `older_than_secs` is the daemon's real parameter name
+# (any other spelling is discarded into a success, #155).
+unanswered_now() { mesh_rpc hestia_member_unanswered '{"older_than_secs": 0}'; }
+
+# The startup stale-primer pass. Deferred to here only because it needs `mesh_rpc`;
+# it still runs before the first poll, and before the unanswered journal announce.
+retry_stale_primers
 
 # Render the unanswered rows for a human (journal) or for a fire primer.
 announce_unanswered() {
