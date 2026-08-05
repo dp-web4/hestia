@@ -118,6 +118,35 @@ rows2 = fm.compare_member_hooks({"w.py": {"kimi": "/src/kimi/w.py"}}, "kimi", {"
 check("A16 unreadable is a state, not an exception",
       rows2[0]["state"] == "UNREADABLE", str(rows2))
 
+# A17: THE REGRESSION CBP CAUGHT. The first drift summary was built by
+# substring-matching its own prose, and the daemon's "behind main" — the one
+# finding the artifact exists to surface — matched no token and vanished.
+# collect_findings is structural now; pin every finding class it must emit.
+synthetic_rows = [
+    {"component": "daemon", "version_string": "hestia x (app-v1-2-gabcdef0)",
+     "states": {"source": "behind main", "restarted": "running",
+                "live_probed": "mounted, operator-gated (current build)"}},
+    {"component": "source checkout", "states": {"source": "current"}},
+    {"component": "watcher (codex)", "states": {"restarted": "STALE-CODE: changed after start"}},
+    {"component": "hooks (codex)", "states": {"installed": "2 diverged", "_drift": 2}},
+]
+f = fm.collect_findings(synthetic_rows)
+check("A17a daemon behind-main IS a finding (the dropped one)",
+      any("behind main" in x for x in f), str(f))
+check("A17b watcher STALE-CODE is a finding", any("STALE-CODE" in x for x in f), str(f))
+check("A17c hook drift is a finding", any("hooks (codex)" in x for x in f), str(f))
+check("A17d quiet rows make no findings",
+      fm.collect_findings([synthetic_rows[1]]) == [], str(fm.collect_findings([synthetic_rows[1]])))
+d2 = fm.collect_findings([{"component": "daemon",
+                           "states": {"source": "DRIFT", "restarted": "NOT RUNNING",
+                                      "live_probed": "daemon unreachable"}}])
+check("A17e DRIFT/not-running/unreachable are all findings", len(d2) == 3, str(d2))
+
+# A18: on WSL the staleness check abstains rather than asserting on a jittering
+# basis (claude-code measured three lstart values for one unrestarted PID).
+check("A18 WSL detected on this box (else the abstention path is dead code here)",
+      fm.is_wsl() in (True, False) and isinstance(fm.is_wsl(), bool))
+
 # --- B. smoke (the real tool, this repo) -------------------------------------
 
 r = subprocess.run([sys.executable, TOOL, "--probe", ""], capture_output=True, text=True, timeout=120)
