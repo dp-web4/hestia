@@ -251,6 +251,26 @@ enum ConstellationCmd {
         device_type: String,
     },
 
+    /// Add a REMOTE device — another machine that holds its own key and co-signs
+    /// over a confirmed hub pair (`cosign-serve` there). Unlike `add`, this uses
+    /// the peer's REAL hub member LCT and stores NO private key locally, which is
+    /// exactly what `present --remote` requires to route a co-sign request to it
+    /// instead of signing on this box. The pubkey is resolved from the hub's pin,
+    /// so the peer does not have to publish one.
+    AddRemote {
+        /// The peer's hub member LCT id (UUID) — the identity its `cosign-serve`
+        /// answers as, and the peer of your confirmed pairing with it.
+        lct_id: String,
+        /// Device name for the roster (e.g. "Thor", "CBP").
+        name: String,
+        /// Device type: desktop | mobile | server | agent | hardware
+        #[arg(long, default_value = "server")]
+        device_type: String,
+        /// Hub URL or connection UUID (default: sole connection).
+        #[arg(long, default_value = "")]
+        target: String,
+    },
+
     /// List devices in the constellation
     List,
 
@@ -749,6 +769,9 @@ pub fn run() -> AnyResult<()> {
         },
         Command::Constellation(c) => match c {
             ConstellationCmd::Add { name, device_type } => cmd_constellation_add(&home, &name, &device_type),
+            ConstellationCmd::AddRemote { lct_id, name, device_type, target } => {
+                cmd_constellation_add_remote(&home, &lct_id, &name, &device_type, &target)
+            }
             ConstellationCmd::List => cmd_constellation_list(&home),
             ConstellationCmd::Remove { id } => cmd_constellation_remove(&home, &id),
             ConstellationCmd::Proof => cmd_constellation_proof(&home),
@@ -2500,15 +2523,19 @@ fn compute_content_hash(pointer: &str) -> String {
 
 // ---- constellation commands -------------------------------------------------
 
-fn cmd_constellation_add(home: &std::path::Path, name: &str, device_type: &str) -> AnyResult<()> {
-    let dt = match device_type {
+fn parse_device_type(device_type: &str) -> AnyResult<DeviceType> {
+    Ok(match device_type {
         "desktop" => DeviceType::Desktop,
         "mobile" => DeviceType::Mobile,
         "server" => DeviceType::Server,
         "agent" => DeviceType::Agent,
         "hardware" => DeviceType::Hardware,
         other => anyhow::bail!("unknown device type: {other} (expected: desktop, mobile, server, agent, hardware)"),
-    };
+    })
+}
+
+fn cmd_constellation_add(home: &std::path::Path, name: &str, device_type: &str) -> AnyResult<()> {
+    let dt = parse_device_type(device_type)?;
 
     let kp = web4_core::crypto::KeyPair::generate();
     let pubkey_hex = kp.verifying_key().to_hex();
@@ -2531,6 +2558,70 @@ fn cmd_constellation_add(home: &std::path::Path, name: &str, device_type: &str) 
     println!("  type:    {device_type}");
     println!("  LCT ID:  {lct_id}");
     println!("  pubkey:  {}", &pubkey_hex[..16]);
+    Ok(())
+}
+
+/// `constellation add-remote` — put ANOTHER machine in the roster under the LCT
+/// it already answers as, so `present --remote` routes a co-sign request to it.
+///
+/// Why this exists: `add` mints `Uuid::new_v4()` and persists a device private
+/// key here, so every member it creates fails both conditions the remote branch
+/// of `present --remote` needs (member id == the peer's LCT, and NO local key).
+/// Before this command the cross-device path was unreachable from the CLI and
+/// the transport could only ever be exercised single-machine.
+fn cmd_constellation_add_remote(
+    home: &std::path::Path,
+    lct_id: &str,
+    name: &str,
+    device_type: &str,
+    target: &str,
+) -> AnyResult<()> {
+    let lct = uuid::Uuid::parse_str(lct_id).with_context(|| format!("invalid UUID: {lct_id}"))?;
+    let dt = parse_device_type(device_type)?;
+
+    let mut vault = open_vault(home)?;
+    let hub_store = HubStore::load(&vault)?;
+    let conn = pick_connection(&hub_store, target)?;
+
+    if lct == conn.our_lct_id {
+        anyhow::bail!(
+            "{lct} is THIS member — a remote device must be another machine \
+             (use `constellation add` for a local device)"
+        );
+    }
+
+    // The hub's pin is the authoritative pubkey: it is the key the hub verifies
+    // the peer's acts against, and the same one `cosign-serve` signs with. Taking
+    // it from here rather than from the peer means the peer publishes nothing —
+    // there is no CLI that prints a member's own pubkey.
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+    let pubkey = rt
+        .block_on(client.resolve_member_pubkey(&rest, conn.hub_lct_id, lct))
+        .with_context(|| format!("resolving hub-pinned pubkey for {lct}"))?;
+    let pubkey_hex = hex::encode(pubkey.to_bytes());
+
+    let mut store = ConstellationStore::load(&vault)?;
+    if store.owner_lct_id.is_none() {
+        store.owner_lct_id = Some(conn.our_lct_id);
+    }
+    store.add_remote_device(lct, name, dt, &pubkey_hex, vec![])?;
+    store.save(&mut vault)?;
+
+    // Deliberately NO device_key_name(lct) entry: holding a private key for a
+    // remote device would both defeat the point (the device's key must never
+    // leave its own box) and silently divert `present --remote` back to signing
+    // locally, which is the defect this command exists to fix.
+    println!("Remote device added to constellation:");
+    println!("  name:    {name}");
+    println!("  type:    {device_type}");
+    println!("  LCT ID:  {lct}  (peer's own hub member identity)");
+    println!("  pubkey:  {}  (hub-pinned)", &pubkey_hex[..16]);
+    println!();
+    println!("No private key is held here — {name} co-signs on its own machine.");
+    println!("Next: `hestia constellation enroll {lct}`, confirm a pair with the peer,");
+    println!("then `hestia constellation present --remote` while it runs `cosign-serve`.");
     Ok(())
 }
 

@@ -430,6 +430,47 @@ impl ConstellationStore {
         self.members.last().unwrap()
     }
 
+    /// Add a device whose key lives on ANOTHER machine, under the LCT that
+    /// machine already answers as. Distinct from `add_device`, which mints a
+    /// fresh `lct_id` and (at the CLI) a locally-custodied private key — both of
+    /// which make `present --remote` take its local-signing branch and never
+    /// reach the device. The remote co-sign path requires a member that carries
+    /// the peer's REAL lct_id and has no local key, so the id is caller-supplied
+    /// here rather than generated.
+    ///
+    /// Rejects a duplicate id: unlike a minted UUID, `lct_id` is caller-supplied
+    /// and a second entry for one device would put it in the roster twice, which
+    /// changes the canonical roster hash every peer signs over.
+    pub fn add_remote_device(
+        &mut self,
+        lct_id: Uuid,
+        name: &str,
+        device_type: DeviceType,
+        pubkey_hex: &str,
+        capabilities: Vec<String>,
+    ) -> anyhow::Result<&ConstellationMember> {
+        if let Some(existing) = self.members.iter().find(|m| m.lct_id == lct_id) {
+            anyhow::bail!(
+                "device {lct_id} is already in the constellation as {:?} — \
+                 `constellation remove {lct_id}` first if you mean to re-add it",
+                existing.name
+            );
+        }
+        let member = ConstellationMember {
+            lct_id,
+            name: name.to_string(),
+            device_type,
+            pubkey_hex: pubkey_hex.to_string(),
+            added_at: Utc::now(),
+            last_seen: None,
+            capabilities,
+            reachable: false,
+            status: DeviceStatus::Active,
+        };
+        self.members.push(member);
+        Ok(self.members.last().unwrap())
+    }
+
     /// Set a device's enrollment status. Revoking is the authoritative way to
     /// stop a device contributing assurance (a revoked key that can still sign
     /// must never count). Returns false if the device isn't in the roster.
@@ -661,6 +702,42 @@ impl CosignResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of `add_remote_device`: the roster entry must carry the
+    /// PEER's id verbatim. `present --remote` addresses the co-sign request to
+    /// `m.lct_id` and the peer bails unless it equals its own member LCT, so a
+    /// minted id (what `add_device` does) can never reach another machine.
+    #[test]
+    fn test_add_remote_device_preserves_peer_lct() {
+        let mut store = ConstellationStore::default();
+        let peer = Uuid::new_v4();
+        let kp = KeyPair::generate();
+
+        let m = store
+            .add_remote_device(peer, "Thor", DeviceType::Server, &kp.verifying_key().to_hex(), vec![])
+            .expect("first add of a peer succeeds");
+        assert_eq!(m.lct_id, peer, "remote member must keep the peer's own LCT");
+
+        // add_device mints instead — the contrast this command exists to fix.
+        store.add_device("Local", DeviceType::Desktop, &kp.verifying_key().to_hex(), vec![]);
+        assert_ne!(store.members[1].lct_id, peer);
+    }
+
+    /// A caller-supplied id can collide; a minted one cannot. Two entries for one
+    /// device would change the canonical roster hash every peer signs over.
+    #[test]
+    fn test_add_remote_device_rejects_duplicate() {
+        let mut store = ConstellationStore::default();
+        let peer = Uuid::new_v4();
+        let kp = KeyPair::generate();
+        let pk = kp.verifying_key().to_hex();
+
+        store.add_remote_device(peer, "Thor", DeviceType::Server, &pk, vec![]).unwrap();
+        let again = store.add_remote_device(peer, "Thor again", DeviceType::Server, &pk, vec![]);
+
+        assert!(again.is_err(), "re-adding the same peer must be refused");
+        assert_eq!(store.members.len(), 1, "roster must not grow on a refused add");
+    }
 
     #[test]
     fn test_add_and_remove_device() {
