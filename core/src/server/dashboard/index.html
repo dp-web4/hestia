@@ -657,6 +657,15 @@
     word-break: break-all; margin-top: 0.25rem; }
   .ledger-why { font-size: 0.78rem; color: var(--fg); margin-top: 0.3rem; line-height: 1.45; }
   .ledger-verdict { font-size: 0.72rem; color: var(--fg-dim); margin-top: 0.3rem; }
+  /* Two identifiers, visibly different. The escalation id is what a human types into
+     `hestia gate approve`; the chain hash is where the evidence lives. Rendering them in one
+     undifferentiated register is what made them indistinguishable in the first cut. */
+  .ledger-ids { display: flex; gap: 0.9rem; flex-wrap: wrap; margin-top: 0.4rem;
+    font-family: var(--mono, monospace); font-size: 0.72rem; }
+  .ledger-idpair { color: var(--fg-dim); }
+  .ledger-idpair strong { color: var(--fg); font-weight: 600; }
+  .ledger-idlab { text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.62rem;
+    color: var(--fg-dim); opacity: 0.7; margin-right: 0.3rem; }
   .ledger-warn { font-size: 0.75rem; color: var(--warning); margin-bottom: 0.6rem;
     border: 1px solid var(--warning); border-radius: 4px; padding: 0.4rem 0.6rem; }
 
@@ -2494,8 +2503,32 @@
             <button class="esc-deny ledger-deny">deny</button>
           </div>
           <div class="esc-err ledger-err" hidden></div>` : ''}
-        <div class="ledger-verdict" style="opacity:0.55;">${escapeHtml(r.opened_hash.slice(0, 16))}</div>
+        ${renderLedgerIdentity(r)}
       </div>`;
+  }
+
+  // THE ID A HUMAN NEEDS, LABELLED — and never confusable with the chain hash.
+  //
+  // dp, 2026-08-05: "none of the acts in the record match the numbers you provided." They did.
+  // The first cut of this panel rendered ONLY `opened_hash.slice(0,16)`, unlabelled, and never
+  // rendered `r.id` at all — it went into `data-id` for the buttons and nowhere a reader could
+  // see it. A truncated chain hash and an escalation id are both 16 hex characters, so the row
+  // displayed something that looks exactly like the identifier, is not it, and cannot be matched
+  // against anything an agent quotes or `hestia gate approve` accepts.
+  //
+  // Two different identifiers rendered in one visual register, with the load-bearing one absent.
+  // That is the same defect class this ledger was built to surface, shipped inside the ledger.
+  function renderLedgerIdentity(r) {
+    const decidable = r.kind === 'escalation' || r.kind === 'scope_request';
+    const chain = `<span class="ledger-idpair"><span class="ledger-idlab">chain</span>${
+      escapeHtml(r.opened_hash.slice(0, 16))}</span>`;
+    // For a one-shot act the id IS the chain hash; printing it twice would re-teach the
+    // conflation this function exists to end.
+    if (!decidable) return `<div class="ledger-ids">${chain}</div>`;
+    return `<div class="ledger-ids">
+      <span class="ledger-idpair"><span class="ledger-idlab">id</span><strong>${escapeHtml(r.id)}</strong></span>
+      ${chain}
+    </div>`;
   }
 
   function wireLedgerRows(rows) {
