@@ -32,16 +32,34 @@ the test is on the weaker, derivable predicate:
     marker contains SOME governance filename  =>  `bar_for` may still miss it, since
     it checks only three of the seven. Reported as "maybe strong", never as proof.
 
-The proven direction is the one that carries the finding; the unproven direction is
-reported honestly rather than rounded up.
+THAT SECOND ROW IS NOW DECIDED, and the answer changes the headline. The one-sided
+version was not a limit of the evidence -- it was a limit of where the probe was
+willing to look. `bar_for`'s three literals live in the Rust source in this same
+repo, so they can be READ at runtime instead of transcribed. Reading them keeps the
+constraint that motivated the one-sidedness (no such literal appears in this file)
+while removing the blind spot it caused.
+
+What it found: of the governance names the matcher protects, the bar tests only a
+subset, and one of the names it does NOT test is the shared policy core -- the file
+the matcher's own comment says is to BECOME the single gate for all five harnesses.
+So a `maybe strong` row was in fact a weak one, and the count of acts that cannot
+reach the strong bar was under-reported by one. A one-sided instrument does not
+report a bound; it gets read as a point ([[one-sided-refutability]]).
+
+One name reaches the strong bar by SUBSTRING ACCIDENT rather than by design (its
+basename ends with another governed basename), so renaming that file would silently
+demote it. The drift table below states each name's class as derived, so a future
+addition to either list shows up as an unclassified row instead of a silence.
 
 NO LITERAL MARKER PATH OR GOVERNANCE FILENAME APPEARS IN THIS SOURCE. Every one is
-derived from the imported module's own constants. That is not a style choice -- a
-literal would make this file refused by the gate it measures.
+derived from the imported module's own constants, or read from the bar's own source.
+That is not a style choice -- a literal would make this file refused by the gate it
+measures.
 
 Run: python3 tools/marker_bar_probe.py
 """
 import os
+import re
 import sys
 
 HOME = os.path.expanduser("~")
@@ -61,11 +79,48 @@ WITNESS = [f for f in GOV if f.startswith("wit")][0]
 GATE = [f for f in GOV if f.startswith("pre_")][0]
 CORE = [f for f in GOV if f.startswith("hestia_")][0]
 
+
+# ---------------------------------------------------------------------------
+# THE BAR'S OWN LIST, READ FROM THE BAR'S OWN SOURCE
+# ---------------------------------------------------------------------------
+# Transcribing these three would duplicate a pinned list AND make this file
+# unwritable, which is why the first cut of this probe declined to test them at all.
+# Reading them costs neither: the strings never appear here, only in the Rust file
+# that already owns them. If that file moves or the function is rewritten, we say so
+# and fall back to the one-sided verdicts rather than guessing.
+BAR_SRC = os.path.join(REPO, "core", "src", "server", "gate_escalation.rs")
+
+
+def _bar_names(path):
+    """The filenames `bar_for` routes to the two-factor bar, or None if unreadable."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+    except OSError:
+        return None
+    start = src.find("pub fn bar_for")
+    if start < 0:
+        return None
+    end = src.find("\n}", start)
+    if end < 0:
+        return None
+    body = src[start:end]
+    names = re.findall(r'contains\("([^"]+)"\)', body)
+    return names or None
+
+
+STRONG = _bar_names(BAR_SRC)
+
 dirs_in_tuple = sum(1 for m in G._SELF_MARKERS if not any(f in m for f in GOV))
 print(f"imported from : {G.__file__}")
 print(f"_SELF_DIR     : {G._SELF_DIR}")
 print(f"marker tuple  : {len(G._SELF_MARKERS)} elements, {dirs_in_tuple} of them "
       f"name no file at all")
+if STRONG is None:
+    print(f"bar source    : UNREADABLE at {BAR_SRC} -- verdicts stay one-sided")
+else:
+    print(f"bar source    : {len(STRONG)} of {len(GOV)} governed names route to the "
+          f"two-factor bar")
 print()
 
 tilde_dir = "~" + INSTALLED_DIR[len(HOME):]
@@ -96,25 +151,66 @@ for name, tool, inp in CASES:
     marker = G._touches_self(tool, inp)
     named = [f for f in GOV if marker and f in marker]
     if marker is None:
-        verdict = "NOT MATCHED AT ALL"
+        verdict, weak, why = "NOT MATCHED AT ALL", False, ""
     elif not named:
-        verdict = "single approver (PROVEN)"
+        # No governed filename in the marker, so a bar testing for filenames cannot
+        # match whatever subset it tests. True regardless of STRONG.
+        verdict, weak, why = "single approver (PROVEN)", True, "NAMES A DIRECTORY, NOT A FILE"
+    elif STRONG is None:
+        verdict, weak, why = "maybe strong", False, ""
+    elif any(s in marker for s in STRONG):
+        verdict, weak, why = "sovereign+peer (PROVEN)", False, ""
     else:
-        verdict = "maybe strong"
-    rows.append((name, marker, verdict))
+        verdict, weak, why = ("single approver (PROVEN)", True,
+                              "GOVERNED NAME THE BAR DOES NOT TEST")
+    rows.append((name, marker, verdict, weak, why))
 
 w = max(len(r[0]) for r in rows)
-weak = 0
-for name, marker, verdict in rows:
+weak_count = 0
+for name, marker, verdict, weak, why in rows:
     shown = marker if marker else "-"
-    if marker and not any(f in marker for f in GOV):
-        shown += "   <-- NAMES A DIRECTORY, NOT A FILE"
-        weak += 1
+    if why:
+        shown += f"   <-- {why}"
+    if weak:
+        weak_count += 1
     print(f"{name:<{w}}  ->  {verdict}")
     print(f"{'':<{w}}      marker: {shown}")
 
 print()
-print(f"{weak} of {len(rows)} acts on the governance surface carry a marker that "
-      f"names no file,")
-print("so the strong bar is unreachable for them no matter what it tests for.")
-sys.exit(1 if weak else 0)
+print(f"{weak_count} of {len(rows)} acts on the governance surface cannot reach the "
+      f"two-factor bar.")
+
+if STRONG is not None:
+    # Every governed name, classified. An unclassified row here is the drift this
+    # table exists to surface: the matcher's list and the bar's list are maintained
+    # in two languages with nothing binding them.
+    print()
+    print("Governed name -> bar, derived from both sources:")
+    unreachable = []
+    for f in GOV:
+        hit = [s for s in STRONG if s in f]
+        if not hit:
+            unreachable.append(f)
+            print(f"  {f:<34} single approver  <-- the bar never names it")
+        elif hit[0] != f:
+            print(f"  {f:<34} sovereign+peer   <-- by SUBSTRING ACCIDENT on "
+                  f"{hit[0]!r}; a rename silently demotes it")
+        else:
+            print(f"  {f:<34} sovereign+peer")
+    if unreachable:
+        print()
+        print(f"{len(unreachable)} of {len(GOV)} governed names can never reach the "
+              f"two-factor bar, however")
+        print("precisely the marker resolves. Making the marker resolution-aware "
+              "does not reach them.")
+        print()
+        print("This table reports REACHABILITY, not intent. The bar's doc comment "
+              "classes one of")
+        print("these deliberately (a law renderer is one approver's call) and says "
+              "nothing about")
+        print("the others -- all of which were added to the matcher after that "
+              "comment was written.")
+        print("The bar carries no per-name class, so no instrument can tell "
+              "deliberate from stale.")
+
+sys.exit(1 if weak_count else 0)
