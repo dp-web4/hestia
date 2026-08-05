@@ -250,6 +250,68 @@ impl SqliteChainStore {
         Ok(out)
     }
 
+    /// Most-recent entries of specific event types, newest first.
+    ///
+    /// Exists so the governance ledger can find admin acts without pulling every member act into
+    /// memory to throw away. Admin events are rare — a handful a day against thousands of
+    /// outcomes — so a scan-then-filter would have to materialise ~100k entries to surface ~50,
+    /// and that is the exact bulk-read-retention shape measured on 2026-08-04: RSS 60MB → 526MB
+    /// inside one five-minute interval, then flat. Filtering in SQL makes `limit` mean "how many
+    /// admin acts", so a wide time range costs what its ANSWER costs rather than what the chain
+    /// weighs.
+    ///
+    /// An empty `event_types` returns no rows rather than everything: a caller that computed an
+    /// empty type list is asking for nothing, and widening that to the whole chain would be the
+    /// same silent-widening failure the ledger's status filter refuses.
+    pub fn read_recent_by_types(
+        &self,
+        cutoff_rfc3339: Option<&str>,
+        event_types: &[&str],
+        limit: u64,
+    ) -> Result<Vec<ChainEntry>> {
+        if event_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders = vec!["?"; event_types.len()].join(",");
+        let (sql, has_cutoff) = match cutoff_rfc3339 {
+            Some(_) => (
+                format!(
+                    "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+                     FROM chain_entries
+                     WHERE event_type IN ({placeholders}) AND timestamp >= ?
+                     ORDER BY chain_position DESC LIMIT ?"
+                ),
+                true,
+            ),
+            None => (
+                format!(
+                    "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+                     FROM chain_entries
+                     WHERE event_type IN ({placeholders})
+                     ORDER BY chain_position DESC LIMIT ?"
+                ),
+                false,
+            ),
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = event_types
+            .iter()
+            .map(|t| Box::new(t.to_string()) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        if has_cutoff {
+            binds.push(Box::new(cutoff_rfc3339.unwrap().to_string()));
+        }
+        binds.push(Box::new(limit as i64));
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(std::convert::AsRef::as_ref).collect();
+        let rows = stmt.query_map(refs.as_slice(), row_to_entry)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
     /// Most-recent "didn't succeed" entries (descending). Includes both
     /// failed outcomes (`event_type='outcome'`, success=false) and
     /// policy denials (`event_type='policy_decision'`, decision='deny').
@@ -541,6 +603,52 @@ mod tests {
             SqliteChainStore::open(&path, [9u8; 32]).is_err(),
             "wrong key must fail"
         );
+    }
+
+    #[test]
+    fn read_recent_by_types_selects_only_the_named_types() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(&dir.path().join("w.db"), TEST_KEY).unwrap();
+        let signer = "lct:web4:hestia:sovereign:test";
+        store.append("outcome", json!({"success": true}), signer).unwrap();
+        store.append("gate_escalation_opened", json!({"escalation_id": "a"}), signer).unwrap();
+        store.append("outcome", json!({"success": true}), signer).unwrap();
+        store.append("policy_edit", json!({"change": "set_preset"}), signer).unwrap();
+
+        let got = store
+            .read_recent_by_types(None, &["gate_escalation_opened", "policy_edit"], 100)
+            .unwrap();
+        assert_eq!(got.len(), 2, "member traffic must not reach the admin ledger");
+        // Newest first — an operator opens the ledger to see what is waiting.
+        assert_eq!(got[0].event_type, "policy_edit");
+        assert_eq!(got[1].event_type, "gate_escalation_opened");
+    }
+
+    /// An empty type list asks for NOTHING. Widening it to the whole chain would hand a caller
+    /// every member act under a query that requested none — the silent-widening failure the
+    /// ledger's status filter refuses for the same reason.
+    #[test]
+    fn read_recent_by_types_with_no_types_returns_nothing_not_everything() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(&dir.path().join("w.db"), TEST_KEY).unwrap();
+        store
+            .append("outcome", json!({"success": true}), "lct:web4:hestia:sovereign:test")
+            .unwrap();
+        assert!(store.read_recent_by_types(None, &[], 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_recent_by_types_honours_the_time_cutoff() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(&dir.path().join("w.db"), TEST_KEY).unwrap();
+        let signer = "lct:web4:hestia:sovereign:test";
+        store.append("policy_edit", json!({"change": "a"}), signer).unwrap();
+        // A cutoff in the future excludes everything already written; the past includes it. This
+        // proves the cutoff is bound and applied, not accepted and ignored.
+        let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        let past = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        assert!(store.read_recent_by_types(Some(&future), &["policy_edit"], 100).unwrap().is_empty());
+        assert_eq!(store.read_recent_by_types(Some(&past), &["policy_edit"], 100).unwrap().len(), 1);
     }
 
     #[test]
