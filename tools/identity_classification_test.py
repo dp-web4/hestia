@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """A classification of identity fields is enforceable only if something else decides it.
 
-The proposal on `supervisor-role-2026-07-31` is to hash the *core* of
+The proposal on `supervisor-role-2026-07-31` (source of record:
+shared-context/forum/cbp-identity-core-is-instructive-meta-is-informative-hash-the-core-2026-07-31.md
+-- it lives in the shared-context repo, not this one) is to hash the *core* of
 `identity.json` and let the *meta* churn, with the split stated as a rule rather
 than a list:
 
@@ -16,10 +18,25 @@ unknown keys failing closed as core, because a field that lands outside the hash
 by default is the exact drift the hash exists to catch, reintroduced at the
 hash's own boundary.
 
-This is that requirement, executable -- plus the three questions the requirement
+This is that requirement, executable -- plus the questions the requirement
 implies once you try to run it.
 
-THE INVARIANT (four parts, each its own property)
+THE TABLE WAS COMPLETED 2026-08-04 (kimi, on PR #157): the codex review proposed
+the classification, dp ratified it as the field owner ("you do it"), and every
+shipped key is now declared. The review also corrected this file: `phase` joined
+`phases`; stale declarations are gated (G2); discovery vacuity is gated (G1);
+property D was renamed to what it measures; and the walk itself is now under
+test (E), because every other property trusts it.
+
+THE INVARIANT (four properties, plus two guards and a self-test)
+
+  G1 DISCOVERY    The artifact and hook sets are nonzero -- a discovery that
+                  finds nothing is a blind gauge, not a green one.
+
+  G2 NO STALE DECLARATIONS
+                  Every key the table declares appears in at least one shipped
+                  artifact. A typo or retired field must not sit in the total
+                  table forever.
 
   A  TOTAL        Every key present in any identity artifact this repo ships is
                   declared core or meta. UNACCOUNTED must be 0.
@@ -41,12 +58,24 @@ THE INVARIANT (four parts, each its own property)
                   core and the classification is wrong." An annotation next to
                   the field cannot notice the new reader. A check can.
 
-  D  UNIFORM PROVENANCE
+  D  PRODUCER SHAPE   (renamed from UNIFORM PROVENANCE -- codex review: the
+                  walk sees writer shapes, not semantic producers, and the name
+                  must claim what the measurement delivers)
                   For each CORE field, the members whose writer DERIVES it must
                   be all of them or none of them. A field derived from a live
                   source on one member and frozen at seed on another is not one
                   field with one meaning; it is two fields with one name, and a
                   hash over it compares objects with different producers.
+                  The product decision behind it (dp, 2026-08-04): a core field
+                  has ONE semantic producer -- for `mrh.in_scope`, the public
+                  repository inventory plus explicit per-install or earned
+                  grants. A frozen seed is bootstrap input, not an alternate
+                  permanent authority.
+
+  E  WALK SELF-TEST   Synthetic fixtures with known-correct answers run through
+                  the walk every invocation. All of A-D trust the walk; if it
+                  silently breaks, C false-passes on the reader nobody resolved
+                  -- the muted-gauge failure this file exists against.
 
 WHY D IS NOT AN AESTHETIC POINT
 
@@ -140,19 +169,46 @@ REPO = pathlib.Path(
 # --------------------------------------------------------------------------
 
 CORE = {
+    # The two fields a decider actually consumes (property B proves it, and the
+    # walk is the evidence, not the assertion). Classification ratified by dp
+    # 2026-08-04, adopting the codex review's table on PR #157: core means a
+    # decider reads it; policy-shaped prose with no enforcer is meta.
     "mrh.in_scope": "it is what the gate permits",
-    "role":         "instructive",
-    "entity":       "the subject the rest is about",
+    "role":         "instructive -- the gates key scope decisions on it",
 }
 
 META = {
+    # Record of what happened (the session bookkeeping the hydrates maintain).
     "session_count": "record of what happened",
     "last_session":  "record of what happened",
+    "first_session": "record of what happened",
     "sessions":      "record of what happened",
     "phases":        "history",
+    "phase":         "history",
     "milestones":    "history",
     "relationships": "history",
     "t3":            "a cache of a chain derivation -- see property C",
+    # Descriptive -- they say what the member IS, and nothing deciding reads them.
+    "substrate":     "descriptive",
+    "occupancy":     "descriptive",
+    "boundaries":    "descriptive",
+    "role_note":     "descriptive prose",
+    # `entity` is META TODAY: no decider anywhere in the tree reads it (checked
+    # against the whole tree by hand, and property B would catch a new reader
+    # appearing in a hook). Making it core is identity-binding work (issues
+    # #63/#128), not a label change -- declaring it core now would be prose
+    # pretending to be policy, which is exactly property B's failure.
+    "entity":        "the subject the rest is about -- meta until a decider exists (#63/#128)",
+    # Policy-shaped prose. Meta BECAUSE nothing enforces it: the thread found
+    # `out_of_scope_note` denying a repo that `in_scope` in the same object
+    # grants, and the contradiction survived precisely because nothing reads
+    # either sentence. Calling them core would launder prose into apparent
+    # authority. If a decider ever consumes one, property C goes red -- that is
+    # the classification working, not breaking.
+    "mrh.scope_policy":            "policy-shaped prose; no enforcer",
+    "mrh.out_of_scope_note":       "policy-shaped prose; no enforcer",
+    "mrh.sandbox_note":            "policy-shaped prose; no enforcer",
+    "mrh.server_side_tools_note":  "policy-shaped prose; no enforcer",
 }
 
 # Keys beginning with `_` are prose the JSON format has no other home for
@@ -327,6 +383,13 @@ def identity_field_access(src: str, argv=None):
                 if p:
                     writes.add(".".join(p))
             else:
+                # A Subscript in Store context is the TARGET of an assignment
+                # and was already counted as a write by the Assign branch
+                # above. ast.walk visits it again as a bare node; counting it
+                # here as well would record every write as a read too, and a
+                # write-only decider would spuriously satisfy property B.
+                if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store):
+                    continue
                 p = resolve(node)
                 if p:
                     reads.add(".".join(p))
@@ -463,8 +526,18 @@ def prop_c_silent_core(per_member):
 
 
 def prop_d_provenance(per_member, artifacts):
-    """A core field is 'carried' by a member if that member ships an identity
-    artifact containing it. Among carriers, who DERIVES it?"""
+    """PRODUCER SHAPE: for each CORE field, every carrier shares one producer
+    shape -- all derive it from a live source, or all carry it frozen.
+
+    Renamed from UNIFORM PROVENANCE (codex review, PR #157): the walk sees
+    writer SHAPES, not semantic producers, and the name must claim what the
+    measurement delivers. The product decision behind it (dp, 2026-08-04,
+    ratifying the codex review): a core field has ONE semantic producer -- for
+    `mrh.in_scope`, the public repository inventory plus explicit per-install
+    or earned grants. A frozen seed is bootstrap input, not an alternate
+    permanent authority. Under that decision a shape split IS a defect: the
+    frozen carrier's field is a different object with the same name.
+    """
     carriers = {}
     for rel, obj in artifacts.items():
         if isinstance(obj, Exception):
@@ -478,12 +551,73 @@ def prop_d_provenance(per_member, artifacts):
     for f in CORE:
         holds = carriers.get(f, set())
         if not holds:
-            continue
+            split[f] = ([], [])        # no carrier: cannot verify provenance
+            continue                   # of a field this table calls core
         derives = {m for m in holds if f in per_member.get(m, {}).get("writes", set())}
         frozen = holds - derives
         if derives and frozen:
             split[f] = (sorted(derives), sorted(frozen))
     return split
+
+
+def prop_e_selftest():
+    """THE WALK MUST SEE WHAT IT CLAIMS TO SEE (kimi review, PR #157).
+
+    Every property above trusts the taint walk, and until this property existed
+    nothing tested it: if the walk silently broke, C would false-pass on a
+    reader nobody resolved -- the exact muted-gauge failure this file's own
+    header warns about. So the walk is run here over synthetic sources with
+    known-correct answers. Each fixture is tiny, self-contained, and fails LOUD
+    if the walk's resolution changes under it.
+    """
+    failures = []
+
+    # E1: a subscript WRITE is not also a READ. (The walk visits the target
+    # Subscript twice: once via the Assign, once as a bare node. The second
+    # visit used to record a read; a write-only decider would then satisfy B
+    # spuriously.)
+    src = ('import json\n'
+           'ident = json.load(open("identity.json"))\n'
+           'ident["role"] = "role:test"\n')
+    reads, writes = identity_field_access(src)
+    if "role" not in writes:
+        failures.append("E1: subscript write not recorded as a write")
+    if "role" in reads:
+        failures.append("E1: subscript write ALSO recorded as a read (Store ctx not skipped)")
+
+    # E2: taint propagates through assignment and .get chains to a READ.
+    src = ('import json\n'
+           'p = "identity.json"\n'
+           'd = json.load(open(p))\n'
+           'role = d.get("role")\n'
+           'print(role)\n')
+    reads, _ = identity_field_access(src)
+    if "role" not in reads:
+        failures.append("E2: .get chain through a const-named path not seen as a read")
+
+    # E3: a decider reading a META field must trip property C.
+    fake = {"fake-member": {"reads": {"t3"}, "writes": set(), "files": []}}
+    if not prop_c_silent_core(fake):
+        failures.append("E3: a planted meta-reading decider did not trip C (C is muted)")
+
+    # E4: a producer-shape split must trip property D.
+    fake_members = {"deriver": {"reads": set(), "writes": {"mrh.in_scope"}, "files": []},
+                    "freezer": {"reads": set(), "writes": set(), "files": []}}
+    fake_artifacts = {
+        "plugins/deriver/instance/identity.seed.json": {"mrh": {"in_scope": ["repo:a"]}, "role": "r"},
+        "plugins/freezer/instance/identity.seed.json": {"mrh": {"in_scope": ["repo:a"]}, "role": "r"},
+    }
+    split = prop_d_provenance(fake_members, fake_artifacts)
+    got = split.get("mrh.in_scope")
+    if not got or got[0] != ["deriver"] or got[1] != ["freezer"]:
+        failures.append(f"E4: planted derive/freeze split not detected by D (got {got})")
+
+    # E5: a core field with NO carrier must not pass D vacuously.
+    split = prop_d_provenance({}, {"plugins/a/instance/identity.seed.json": {"role": "r"}})
+    if "mrh.in_scope" not in split:
+        failures.append("E5: D passes vacuously when a core field has no carrier")
+
+    return failures
 
 
 def main():
@@ -507,6 +641,30 @@ def main():
         print()
 
     fails = []
+
+    # G1 ANTI-VACUITY (codex review, PR #157): a discovery that found nothing
+    # must read as the check being BLIND, never as green. A and D both loop
+    # over the discovered sets; an empty tree passes them vacuously.
+    if not artifacts or not per_file:
+        fails.append("G1")
+        print(f"FAIL  G1 DISCOVERY: {len(artifacts)} artifacts, {len(per_file)} hook "
+              f"sources -- the check found nothing, which is a blind gauge, not a green one")
+    else:
+        print(f"PASS  G1 DISCOVERY: nonzero artifact and hook sets")
+
+    # G2 NO STALE DECLARATIONS (codex review, PR #157, on `phases` vs `phase`):
+    # every key the table declares must appear in at least one shipped
+    # artifact. A typo or a retired field otherwise sits in the supposedly
+    # total table forever, declaring authority over a key nothing ships.
+    stale = sorted((set(CORE) | set(META)) - set(seen))
+    if stale:
+        fails.append("G2")
+        print(f"\nFAIL  G2 STALE DECLARATIONS: {len(stale)} declared key(s) appear in "
+              f"no shipped artifact")
+        for k in stale:
+            print(f"        {k:22s} declared, shipped nowhere")
+    else:
+        print(f"\nPASS  G2 STALE DECLARATIONS: every declared key ships somewhere")
 
     # A
     if unaccounted:
@@ -555,9 +713,15 @@ def main():
     # D
     if split:
         fails.append("D")
-        print(f"\nFAIL  D UNIFORM PROVENANCE: {len(split)} core field(s) are derived "
-              f"on some members and frozen on others")
+        print(f"\nFAIL  D PRODUCER SHAPE: {len(split)} core field(s) without one "
+              f"uniform producer shape")
         for f, (derives, frozen) in split.items():
+            if not derives and not frozen:
+                print(f"        {f}\n"
+                      f"            carried by NO shipped artifact -- a field this table "
+                      f"calls core\n            has no producer to verify. Vacuous green "
+                      f"here would be the muted gauge.")
+                continue
             print(f"        {f}\n"
                   f"            derived by {', '.join(derives)}\n"
                   f"            frozen at seed on {', '.join(frozen)} "
@@ -565,14 +729,28 @@ def main():
         print("      Both shapes produce a self-consistent file, so a hash taken by "
               "each writer\n      over its own output matches on both -- and the "
               "frozen one never writes, so it\n      never submits a hash at all. "
-              "An absent record is not a disagreeing one.")
+              "An absent record is not a disagreeing one. One core\n      field, "
+              "one semantic producer (dp 2026-08-04): a frozen seed is bootstrap "
+              "input, not\n      an alternate permanent authority.")
     else:
-        print(f"\nPASS  D UNIFORM PROVENANCE: every core field has one producer shape")
+        print(f"\nPASS  D PRODUCER SHAPE: every core field has one producer shape")
+
+    # E
+    e_failures = prop_e_selftest()
+    if e_failures:
+        fails.append("E")
+        print(f"\nFAIL  E WALK SELF-TEST: {len(e_failures)} fixture(s) broke")
+        for d in e_failures:
+            print(f"        {d}")
+        print("      Every other property trusts this walk; a red here mutes the "
+              "whole file.")
+    else:
+        print(f"\nPASS  E WALK SELF-TEST: the walk sees what it claims to see")
 
     if fails:
         print(f"\nRED  properties {', '.join(fails)}")
         return 1
-    print("\nGREEN  A, B, C, D")
+    print("\nGREEN  G1, G2, A, B, C, D, E")
     return 0
 
 
