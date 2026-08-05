@@ -439,6 +439,14 @@ def _parse_scope_entries(entries) -> tuple:
                     out.append(rest)
                 break
         else:
+            # An UNRECOGNISED prefix is dropped, not kept (kimi #937, finding C, sharpened by
+            # probe). The comment above claimed "dropped"; the code kept it, and kept was not
+            # inert: `ssh:/etc` cannot match a first path segment, but `ssh:etc` CAN — it
+            # grants a workspace child literally named that. That is finding 3's defect one
+            # shape over: a parser incidental producing a grant nobody wrote. Fails narrow —
+            # a legitimate entry misspelled this way is denied and asks for scope.
+            if ":" in e:
+                continue
             # Unprefixed and not the wildcard: a bare repo name, the legacy spelling.
             if e:
                 out.append(e)

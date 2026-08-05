@@ -492,6 +492,39 @@ def test_a_replica_can_never_widen_to_unscoped():
           "confer the authority to remove the boundary entirely")
 
 
+def test_an_unknown_prefix_is_dropped_and_could_previously_grant():
+    """kimi #937 finding C, sharpened by probe before accepting it.
+
+    kimi read the doc-vs-code gap (comment: unknown prefix "dropped"; code: kept) as inert
+    and recommended fixing the DOC, on the basis that a colon-bearing entry can never equal a
+    first path segment. That holds only for the slash-bearing form they tested. `ssh:etc` has
+    no slash, so it is a legal single segment, and the kept entry GRANTED a workspace child
+    literally named that — finding 3's defect one shape over, in the granting direction. So
+    the code side moved, not the doc."""
+    ws = _workspace()
+    prof = G.HarnessProfile(member_id="m", identity_path="/nonexistent/identity.json")
+
+    check("unknown_prefix_with_slash_dropped", G._parse_scope_entries(["ssh:/etc"]) == ())
+    check("unknown_prefix_without_slash_dropped", G._parse_scope_entries(["ssh:etc"]) == (),
+          "the shape that could actually grant")
+
+    # The regression this closes: parsed-and-kept, it matched a real segment.
+    check("kept_unknown_prefix_would_have_granted",
+          G.path_in_scope(f"{ws}/ssh:etc/secret", ["ssh:etc"], ws, prof),
+          "if this is False the probe no longer demonstrates the risk — recheck path_in_scope")
+    check("dropped_unknown_prefix_grants_nothing",
+          not G.path_in_scope(f"{ws}/ssh:etc/secret",
+                              list(G._parse_scope_entries(["ssh:etc"])), ws, prof))
+
+    # The spellings that must survive: the drop is narrow, not a blanket colon ban on grants.
+    check("known_prefixes_still_parse",
+          G._parse_scope_entries(["repo:web4", "path:.git-inbox"]) == ("web4", ".git-inbox"))
+    check("legacy_bare_name_still_parses", G._parse_scope_entries(["web4"]) == ("web4",))
+    check("bare_wildcard_still_unscoped", G._parse_scope_entries(["*"]) == ("*",))
+    check("prefixed_wildcard_still_collapses_to_nothing",
+          G._parse_scope_entries(["repo:*", "path:*"]) == ())
+
+
 def test_malformed_vault_payload_fails_closed_instead_of_raising():
     """kimi #188, finding 2. The reader call was wrapped; the PARSE was not. A non-string
     element propagated an AttributeError out of the gate — and on a fail-open harness an
@@ -622,6 +655,7 @@ ALL_TESTS = [
     "test_a_member_cannot_grant_itself_blanket_allow_via_its_own_identity_file",
     "test_an_uncertified_replica_is_refused_not_honoured",
     "test_a_replica_can_never_widen_to_unscoped",
+    "test_an_unknown_prefix_is_dropped_and_could_previously_grant",
     "test_malformed_vault_payload_fails_closed_instead_of_raising",
     "test_prefixed_wildcard_is_not_unscoped",
     "test_policy_resolution_names_its_source_and_fails_closed",
@@ -677,6 +711,7 @@ if __name__ == "__main__":
     test_a_member_cannot_grant_itself_blanket_allow_via_its_own_identity_file()
     test_an_uncertified_replica_is_refused_not_honoured()
     test_a_replica_can_never_widen_to_unscoped()
+    test_an_unknown_prefix_is_dropped_and_could_previously_grant()
     test_malformed_vault_payload_fails_closed_instead_of_raising()
     test_prefixed_wildcard_is_not_unscoped()
     test_policy_resolution_names_its_source_and_fails_closed()
