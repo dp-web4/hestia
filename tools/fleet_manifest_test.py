@@ -139,7 +139,7 @@ synthetic_rows = [
     {"component": "daemon", "version_string": "hestia x (app-v1-2-gabcdef0)",
      "states": {"source": "behind main", "restarted": "running",
                 "live_probed": "mounted, operator-gated (current build)"}},
-    {"component": "source checkout", "states": {"source": "current"}},
+    {"component": "source checkout", "states": {"source": "current", "dirty": 0}},
     {"component": "watcher (codex)", "states": {"restarted": "STALE-CODE: changed after start"}},
     {"component": "hooks (codex)", "states": {"installed": "2 diverged", "_drift": 2}},
 ]
@@ -148,7 +148,7 @@ check("A17a daemon behind-main IS a finding (the dropped one)",
       any("behind main" in x for x in f), str(f))
 check("A17b watcher STALE-CODE is a finding", any("STALE-CODE" in x for x in f), str(f))
 check("A17c hook drift is a finding", any("hooks (codex)" in x for x in f), str(f))
-check("A17d quiet rows make no findings",
+check("A17d quiet-and-CLEAN rows make no findings (distinguished from quiet-blind, A17g/h)",
       fm.collect_findings([synthetic_rows[1]]) == [], str(fm.collect_findings([synthetic_rows[1]])))
 d2 = fm.collect_findings([{"component": "daemon",
                            "states": {"source": "DRIFT", "restarted": "NOT RUNNING",
@@ -158,6 +158,25 @@ d3 = fm.collect_findings([{"component": "daemon",
                            "states": {"source": "current", "restarted": "2 PROCESSES"}}])
 check("A17f multiple daemons IS a finding (multiplicity is not a tiebreak)",
       any("PROCESSES" in x for x in d3), str(d3))
+
+# A17g/h: claude-code's re-review finding. The two unverifiable hook shapes
+# (files unreadable; comparison never reached) used to fall through to a
+# CLEAN summary — the muted gauge. Both must now speak, as their own class.
+blind1 = fm.collect_findings([{"component": "hooks (kimi-code)",
+                               "states": {"installed": "5 unreadable", "_drift": 0,
+                                          "_unverifiable": 5,
+                                          "_unverifiable_detail": "5 source unreadable"}}])
+check("A17g unverifiable hook files are a finding (blind, not clean)",
+      any("5 unverifiable (5 source unreadable)" in x for x in blind1), str(blind1))
+blind2 = fm.collect_findings([{"component": "hooks (claude)",
+                               "states": {"installed": "unverifiable — canonical index failed "
+                                                       "(git ls-files)"}}])
+check("A17h comparison-never-reached (no _drift key) is a finding",
+      any("canonical index failed" in x for x in blind2), str(blind2))
+d4 = fm.collect_findings([{"component": "source checkout",
+                           "states": {"source": "current", "dirty": 2}}])
+check("A17i dirty-only checkout is a finding via its own field (policy: keep)",
+      any("2 dirty" in x for x in d4), str(d4))
 
 # A18: on WSL the staleness check abstains rather than asserting on a jittering
 # basis (claude-code measured three lstart values for one unrestarted PID).
@@ -179,6 +198,11 @@ if manifest:
     comps = [row.get("component", "") for row in manifest.get("rows", [])]
     check("B4 daemon row present", "daemon" in comps, str(comps))
     check("B5 checkout row present", "source checkout" in comps, str(comps))
+    co = next((row for row in manifest["rows"] if row.get("component") == "source checkout"), {})
+    cost = co.get("states", {})
+    check("B5b checkout states split: source is one fact, dirty its own field",
+          cost.get("source") in ("current", "NOT at origin/main")
+          and isinstance(cost.get("dirty"), int), str(cost))
     hook_rows = [c for c in comps if c.startswith("hooks (")]
     check("B6 one hooks row per MEMBERS entry",
           len(hook_rows) == len(fm.MEMBERS), f"{hook_rows} vs {list(fm.MEMBERS)}")

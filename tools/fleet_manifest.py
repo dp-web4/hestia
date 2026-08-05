@@ -203,14 +203,35 @@ def collect_findings(rows):
         elif comp == "source checkout":
             if st.get("source", "") != "current":
                 findings.append(f"source checkout: {st.get('source')}")
+            # Dirty-at-main is a finding on this fleet BY POLICY (claude-code
+            # ruling, PR #199): watchers run from the shared checkout, so
+            # uncommitted WIP there is exactly "what is running is not what
+            # is in main". It is its own field so the policy is one line,
+            # stated — not an equality test on a composite prose string.
+            if st.get("dirty"):
+                findings.append(f"source checkout: {st['dirty']} dirty "
+                                f"(running checkout diverges from main)")
         elif comp.startswith("watcher ("):
             rst = st.get("restarted", "")
             if rst.startswith("STALE-CODE") or rst == "script not found":
                 findings.append(f"{comp}: {rst}")
         elif comp.startswith("hooks ("):
-            n = st.get("_drift", 0)
-            if n:
+            n = st.get("_drift")
+            if n is None:
+                # The row never reached per-file comparison (canonical index
+                # failed, or the install dir was unreadable from this seat).
+                # That is BLIND, not clean — the row IS the finding, and it
+                # must not fall through to silence (claude-code re-review,
+                # PR #199: an empty drift_summary reads as "nothing is
+                # wrong", never as "I could not look").
                 findings.append(f"{comp}: {st.get('installed')}")
+            else:
+                if n:
+                    findings.append(f"{comp}: {st.get('installed')}")
+                u = st.get("_unverifiable", 0)
+                if u:
+                    findings.append(f"{comp}: {u} unverifiable "
+                                    f"({st.get('_unverifiable_detail', 'unreadable')})")
     return findings
 
 
@@ -294,9 +315,12 @@ def checkout_facts():
     dirty = git("status", "--porcelain")
     row["dirty_files"] = [l[3:] for l in dirty.splitlines() if l and not l.startswith("??")]
     row["untracked"] = sum(1 for l in dirty.splitlines() if l.startswith("??"))
-    row["states"] = {"source": "current" if head == main else "NOT at origin/main"}
-    if row["dirty_files"]:
-        row["states"]["source"] += f", {len(row['dirty_files'])} dirty"
+    row["states"] = {"source": "current" if head == main else "NOT at origin/main",
+                     "dirty": len(row["dirty_files"])}
+    # at-origin/main? and dirty? are orthogonal facts and stay in their own
+    # fields; joining them into one prose string makes every consumer an
+    # equality test on composite text (the substring-match defect this tool
+    # was rewritten to stop, one field over — claude-code re-review, PR #199).
     return row
 
 
@@ -432,12 +456,22 @@ def hook_facts(member_overrides):
             row["files"].append(f)
 
         n = {}
+        unver_sides = {}
         for f in row["files"]:
             key = f["state"].split(" ")[0]
             n[key] = n.get(key, 0) + 1
+            if key == "UNREADABLE":
+                side = "source" if "(source)" in f["state"] else "installed"
+                unver_sides[side] = unver_sides.get(side, 0) + 1
         row["states"]["installed"] = ", ".join(f"{v} {k.lower()}" for k, v in sorted(n.items())) \
             or "no hook files"
         row["states"]["_drift"] = n.get("DIVERGED", 0) + n.get("MISSING", 0)
+        # Unverifiable is its own class beside _drift, never folded into it:
+        # an unreadable file is a blind gauge, not a measured difference, and
+        # drift_summary must say "I could not look" distinctly from "clean".
+        row["states"]["_unverifiable"] = sum(unver_sides.values())
+        row["states"]["_unverifiable_detail"] = " + ".join(
+            f"{v} {k} unreadable" for k, v in sorted(unver_sides.items()))
         rows.append(row)
     return rows
 
