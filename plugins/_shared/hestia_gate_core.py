@@ -864,6 +864,99 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     return ALLOW
 
 
+# ── Gate availability telemetry ──────────────────────────────────────────────────────────
+#
+# A FAIL-CLOSED DENY IS NOT A MEMBER EVENT, AND IT NEVER REACHES THE CHAIN.
+#
+# dp, 2026-08-04: *"it is probably correct not to log timeout fail-closed, at least not as
+# agent's fault because it's infra failure. but we should log it somewhere..."* — and then, on
+# where: *"the chain is there to witness member events, not infra telemetry."*
+#
+# THE DEFECT THIS ANSWERS. When the daemon is unreachable the gate denies — correctly. It then
+# tries to witness that deny through the same daemon it could not reach, the call fails, and
+# `deny()` swallows it so a recording failure can never become a permission. There is no spool,
+# so the event simply does not exist. dp saw one live: kimi hit
+# `deny [fail-closed] — no policy verdict (daemon path failed for Edit)` and nothing appeared
+# anywhere.
+#
+# The consequence is worse than a missing row. Every OTHER deny — scope, egress, safety — is
+# recorded, because the daemon was up to record it. Only the daemon-down ones vanish. So the
+# chain is **biased clean** exactly where infrastructure trouble would show, and the dashboard
+# cannot display the problem it is a symptom of. kimi's measured "45% of 301 denies are
+# daemon-down" came from WIRE LOGS, not the chain — which is precisely why it was measurable.
+#
+# WHY IT MUST NOT BE A CHAIN ENTRY, which is the part worth getting right. The absence was
+# doing two jobs: protecting the member's record (right) and hiding the fault (wrong). If these
+# denies were witnessed as `policy_decision`, they would score against the member — ~135 of 301
+# at the measured rate — and the Temperament ladder reads a deny as *a boundary the member met
+# and how it responded*. An unreachable daemon is not a boundary; it is a missing referee.
+# Scoring it would corrupt conduct in the opposite direction and be very hard to unpick later.
+#
+# So: a different record, in a different place, with a different consumer. The chain witnesses
+# what MEMBERS did. This file records whether the gate could decide at all.
+#
+# WHAT IT BUYS. Gate availability is currently unmeasurable from the chain — contention was
+# inferred from wire logs and external latency probes. This gives a per-member series answering
+# "how often can the gate not decide", which is the number that would have surfaced the
+# contention weeks ago instead of an operator noticing a blank panel.
+
+#: Appended by every harness, read by the member-mesh watcher. One JSON object per line.
+#: Under `$HESTIA_HOME` because that is shared across members on a box and the watcher already
+#: knows it — a per-member path would need discovery the watcher does not have.
+GATE_TELEMETRY_RELPATH = "telemetry/gate-unavailable.jsonl"
+
+#: Refuse to grow without bound. Telemetry that fills a disk becomes an outage of its own, and
+#: this file is written on exactly the path where the system is already unwell.
+GATE_TELEMETRY_MAX_BYTES = 2 * 1024 * 1024
+
+
+def record_gate_unavailable(member_id: str, tool: str, cause: str,
+                            detail: str = "", home: Optional[str] = None) -> bool:
+    """Record that the gate could not obtain a verdict. Returns True if written.
+
+    NEVER RAISES, and never blocks a decision. This runs on the failure path of a system that
+    is already degraded; a telemetry writer that can throw would convert an infra hiccup into a
+    gate crash, and on a fail-open harness a gate crash is an ALLOW. The refusal has already
+    been decided by the time this is called — nothing here can change it.
+
+    `cause` distinguishes the two shapes the caller must respond to differently, and which the
+    current deny text conflates:
+        "timeout"  — the daemon is alive but starved. Back off and retry.
+        "refused"  — nothing is listening. Stop and escalate to the operator.
+        "unknown"  — could not tell. Say so rather than guessing; a wrong cause sends the
+                     member to the wrong response, which is how a peer sat parked for four
+                     minutes on 2026-07-28 while the daemon had been up for eight hours.
+    """
+    try:
+        root = home or os.environ.get("HESTIA_HOME") or os.path.expanduser("~/.hestia")
+        path = os.path.join(root, GATE_TELEMETRY_RELPATH)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Rotate rather than truncate: the oldest events are the ones that establish a trend,
+        # and a file that silently restarts at zero is another absence-reads-as-quiet defect.
+        try:
+            if os.path.getsize(path) > GATE_TELEMETRY_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        rec = {
+            "ts": int(__import__("time").time()),
+            "member": member_id,
+            "tool": tool,
+            "cause": cause if cause in ("timeout", "refused", "unknown") else "unknown",
+            "detail": detail[:200],
+            # Stated in the record so a reader never has to infer it from the filename.
+            "kind": "gate_unavailable",
+            "note": "infrastructure availability, NOT a member act — must never score conduct",
+        }
+        # O_APPEND so concurrent members interleave whole lines rather than corrupting each
+        # other. Several harnesses write this file at once, by design.
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        return True
+    except Exception:
+        return False
+
+
 def needs_society_gate(tool: str) -> bool:
     """Read-class is fully covered above, so only write/exec-class needs the daemon's verdict.
     This is what keeps a down daemon from bricking reads while still failing closed on writes."""
