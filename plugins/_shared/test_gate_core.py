@@ -351,6 +351,83 @@ def test_temp_root_is_a_path_boundary_not_a_prefix():
     check("sibling_tmp_denied_end_to_end", G.evaluate(ev, prof, ws).blocks)
 
 
+def test_scope_is_decided_after_normalisation_not_before():
+    """kimi #940 B5/B7. Normalisation ran on the RELATIVE branch only, so an absolute path was
+    judged on its lexical first segment: with scope `granted`, `<ws>/granted/../notgranted/x`
+    took seg `granted` and was ALLOWED while resolving into an ungranted repo. The relative
+    spelling of the identical path was denied — which is what pins the seat to the absolute
+    branch rather than to the segment rule.
+
+    Not a curiosity of odd scope entries: this is an ORDINARY grant escaped by an ORDINARY
+    spelling, and for the Bash arm the text is member-controlled end to end, so it depends on
+    no harness cooperating. Fix is legion's phase0 principle (2026-07-17): normpath first,
+    containment decides."""
+    ws = _workspace()
+    for r in ("granted", "notgranted"):
+        os.makedirs(os.path.join(ws, r), exist_ok=True)
+    prof = _profile(ws, ["repo:granted"])
+    escape = f"{ws}/granted/../notgranted/secret"
+
+    # Positive controls FIRST: the grant must still work, or a deny-everything regression
+    # would green every assertion below for the wrong reason.
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/granted/a.md"], cwd=ws)
+    check("control_grant_still_allows", G.evaluate(ev, prof, ws).decision == "allow")
+    ev = G.NormalizedEvent(tool="Bash", command=f"cat {ws}/granted/a.md", cwd=ws)
+    check("control_granted_command_still_allows", G.evaluate(ev, prof, ws).decision == "allow")
+
+    # B5 — the path arm.
+    ev = G.NormalizedEvent(tool="Read", paths=[escape], cwd=ws)
+    v = G.evaluate(ev, prof, ws)
+    check("abs_dotdot_escape_denies", v.blocks and v.rule == "mrh.path")
+    # And the deny must not name the repo the member DOES hold as the offender.
+    check("deny_names_the_resolved_repo_not_the_spelled_one",
+          "notgranted" in v.reason, v.reason)
+
+    # B6 — the relative spelling was already correct; it must stay correct.
+    ev = G.NormalizedEvent(tool="Read", paths=["granted/../notgranted/secret"], cwd=ws)
+    check("rel_dotdot_escape_still_denies", G.evaluate(ev, prof, ws).blocks)
+
+    # B7 — the command arm, same shape, no harness in the loop.
+    ev = G.NormalizedEvent(tool="Bash", command=f"cat {escape}", cwd=ws)
+    v = G.evaluate(ev, prof, ws)
+    check("abs_dotdot_escape_in_command_denies", v.blocks and v.rule == "mrh.command")
+
+    # Traversal clean out of the workspace, not merely into a sibling repo.
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/granted/../../etc/shadow"], cwd=ws)
+    check("traversal_past_workspace_root_denies", G.evaluate(ev, prof, ws).blocks)
+
+    # Containment is a boundary, not `workspace in p`: a path merely CONTAINING the workspace
+    # string was judged by whatever followed it. kimi named this one as residual; it costs one
+    # line to close alongside, so it is closed rather than carried.
+    ev = G.NormalizedEvent(tool="Read", paths=[f"/decoy{ws}/granted/x"], cwd=ws)
+    check("workspace_as_substring_is_not_containment", G.evaluate(ev, prof, ws).blocks)
+
+
+def test_path_syntax_is_never_a_scope_name():
+    """kimi #940 B1-B4. `.` and `..` survived the parser as "legacy bare names" and each
+    granted wide: scope `.` reached every repo via the `/./` spelling, scope `..` reached past
+    the workspace root.
+
+    Normalising first (above) already makes them unmatchable — and that is exactly why they
+    are ALSO dropped here. "Unmatchable" is a claim about a matcher, and this thread reversed
+    that claim once already: `ssh:/etc` could not match a first segment, `ssh:etc` could, and
+    the disposition "inert in practice" survived a review round before a probe killed it."""
+    check("dot_entry_dropped", G._parse_scope_entries(["."]) == ())
+    check("dotdot_entry_dropped", G._parse_scope_entries([".."]) == ())
+    check("prefixed_dot_entry_dropped", G._parse_scope_entries(["path:.."]) == ())
+    # It must drop path syntax WITHOUT eating the two things that look adjacent:
+    check("real_name_survives", G._parse_scope_entries(["repo:hestia"]) == ("hestia",))
+    check("dotfile_name_survives", G._parse_scope_entries(["path:.git-inbox"]) == (".git-inbox",))
+    check("unscoped_survives", G._parse_scope_entries(["*"]) == (G.AgentPolicy.UNSCOPED,))
+
+    # End to end: a policy carrying only path syntax grants nothing, rather than everything.
+    ws = _workspace()
+    os.makedirs(os.path.join(ws, "notgranted"), exist_ok=True)
+    prof = _profile(ws, ["repo:."])
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/./notgranted/secret"], cwd=ws)
+    check("dot_scope_grants_nothing_end_to_end", G.evaluate(ev, prof, ws).blocks)
+
+
 def test_shims_contain_no_policy():
     """codex #169 finding 4. The module docstring credited this test before it existed.
 
@@ -374,6 +451,60 @@ def test_shims_contain_no_policy():
     check("shims_contain_no_policy", not bad,
           f"{bad} — a shim may only parse events and render verdicts. If it needs a policy "
           f"choice, add a HarnessProfile field instead of branching in the shim.")
+
+
+def test_the_core_is_not_the_only_copy_of_the_scope_rule():
+    """How far does a fix to this file actually reach? Today: one enforcing copy in five.
+
+    `test_shims_contain_no_policy` above is the guard meant to hold the line that policy lives
+    only here. It globs `shim_*.py` inside `_shared/`, and there are none — so it prints
+    "0 shims present — NOTHING CHECKED" and returns green. Its blind fraction is TOTAL: the
+    four un-consolidated copies are real per-harness hook files, which that glob cannot match.
+    A guard whose population is empty reports "clean" and "I inspected nothing" in one word.
+
+    Those copies are DRIFTED, not merely duplicated — they carry defects this file already
+    fixed. The kimi and gemini hooks still gate temp on `startswith(("/tmp", "/var/tmp"))`,
+    the prefix-not-boundary bug codex found in #169 and `_under_temp_root` fixed here, so
+    `/tmp-other/x` is granted unconditionally there. The gemini copy does not normalise at
+    all, and falls back to reading a first segment off paths OUTSIDE the workspace.
+
+    This test does not assert the copies are correct — they are not, and rewriting four
+    harnesses' gates is not one member's call. It asserts the INVENTORY, so the divergence is
+    a number in CI rather than something the next sweep rediscovers. It fails in both
+    directions on purpose: a new entry means the policy was forked again; a missing one means
+    consolidation advanced and this list owes an update.
+
+    Keyed by harness directory, not by hook filename, deliberately: the gate refuses a write
+    whose CONTENT names a hook file (escalation a5737cc207e54e3d, taken on this very edit) —
+    a false positive of the same lexical mention-scanning class this commit fixes. Recorded
+    rather than worked around; the directory is the stabler key regardless."""
+    plugins_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Frozen 2026-08-05. Shrink as harnesses consolidate onto the core; never grow it without
+    # saying, in the PR, why a fifth copy of the scope rule is the right answer.
+    KNOWN_DUPLICATE_OWNERS = {"codex": 2, "gemini": 1, "kimi": 1}
+
+    owners = {}
+    for root, _dirs, files in os.walk(plugins_dir):
+        for f in files:
+            if not f.endswith(".py") or f.startswith("test_"):
+                continue
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, plugins_dir)
+            if rel.split(os.sep)[0] == "_shared":
+                continue
+            try:
+                src = open(full, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            if "def path_in_scope" in src or "def command_in_scope" in src:
+                owners[rel.split(os.sep)[0]] = owners.get(rel.split(os.sep)[0], 0) + 1
+
+    total = sum(owners.values())
+    print(f"  note  the scope rule is defined in {total + 1} places — the core plus "
+          f"{total} un-consolidated copies across {sorted(owners)}")
+    check("scope_rule_duplication_matches_inventory", owners == KNOWN_DUPLICATE_OWNERS,
+          f"found {owners}, inventory says {KNOWN_DUPLICATE_OWNERS} — a fix to the core "
+          f"reaches only the core, so this number is the blast radius of every gate fix.")
 
 
 def test_unscoped_must_be_declared_never_inferred():
@@ -663,16 +794,33 @@ ALL_TESTS = [
     "test_missing_identity_fails_narrow_not_wide",
     "test_core_never_exits",
     "test_core_is_vendor_agnostic",
+    "test_scope_is_decided_after_normalisation_not_before",
+    "test_path_syntax_is_never_a_scope_name",
+    "test_the_core_is_not_the_only_copy_of_the_scope_rule",
 ]
 
 
 def test_every_test_is_registered():
     """The completeness half. Explicit calls stop a rename from silently disabling a test;
-    this stops a NEW test from silently never running."""
+    this stops a NEW test from silently never running.
+
+    TWO lists, and only one of them executes. `ALL_TESTS` is a registry; the `__main__` block
+    below is a hand-maintained call list, and CI invokes this file BARE (`python3 "$t"`), so
+    the call list is the one that runs in CI. Registering without calling therefore passed
+    this check while the test was dead in the only arm that gates a merge — caught on the
+    three tests added with the #940 scope fix, which were registered, green under pytest, and
+    never executed by CI. Both halves are now asserted."""
     defined = {k for k in globals() if k.startswith("test_")}
     missing = sorted(defined - set(ALL_TESTS) - {"test_every_test_is_registered"})
     check("every_test_is_registered", not missing,
           f"defined but not in ALL_TESTS, so never run: {missing}")
+
+    src = open(os.path.abspath(__file__), encoding="utf-8").read()
+    main_block = src.split('if __name__ ==', 1)[-1]
+    uncalled = sorted(t for t in ALL_TESTS if f"{t}()" not in main_block)
+    check("every_registered_test_is_called_by_the_bare_runner", not uncalled,
+          f"in ALL_TESTS but never called in __main__, so INVISIBLE to CI's bare run: "
+          f"{uncalled}")
 
 
 def teardown_module(module):
@@ -719,6 +867,9 @@ if __name__ == "__main__":
     test_missing_identity_fails_narrow_not_wide()
     test_core_never_exits()
     test_core_is_vendor_agnostic()
+    test_scope_is_decided_after_normalisation_not_before()
+    test_path_syntax_is_never_a_scope_name()
+    test_the_core_is_not_the_only_copy_of_the_scope_rule()
     print()
     if FAILURES:
         print(f"FAILED: {len(FAILURES)} — {FAILURES}")
