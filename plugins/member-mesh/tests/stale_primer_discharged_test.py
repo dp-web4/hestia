@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""A work list is re-fired because a process exited nonzero, not because it is undone.
+
+WHAT HAPPENED (CBP, 2026-08-05). A session was woken by `watch-claude-code` carrying
+notice 709 -- kimi's reply on the scope-request thread, queued 2026-08-03T04:30:46Z.
+The reply to it had been written, committed and pushed on 2026-08-03T04:43Z, thirteen
+minutes after it was queued and six after it was drained. The daemon agreed: with the
+staleness floor removed, `i_owe` was empty. The wake was spent establishing that the
+work it was woken for was already done.
+
+The primer was not lost and not duplicated. It was RETAINED, because
+`hestia-watch-member.sh` keeps a primer when `$FIRE` returns nonzero, and a launcher
+that times out returns nonzero whether or not the session inside it did the work. This
+mesh has filed nine non-delivery reports on rc=124 and all nine were false. Retention
+is then re-fired at every watcher restart, in `mktemp` alphabetical order -- so the
+order is a random suffix, not age and not need.
+
+The backlog that pass was walking, measured before the fix:
+
+    18 retained primers for claude-code, carrying 46 notices, all from kimi-code
+    31  kind `reply`, inside the 7d window   -> countable in `i_owe`, and `i_owe` was []
+    14  kind `ack` (12) / `review_done` (2)  -> kinds that never await a response
+     1  outside the window                   -> unmeasurable
+    ---
+     0  undischarged notices, 18 model wakes queued to re-deliver them
+
+The recovery mechanism is what burns the wakes. Stale-primer retry exists because a
+batch that failed once was stranded permanently (d2d23ba) -- a real fix for a real
+defect, which had no way to ask whether the work it was retrying was still owed.
+
+The fix asks. `i_owe` is the mesh's own predicate for "this notice awaits my response",
+so a notice absent from it is discharged by the same rule every other surface uses.
+Four properties, behavioural against the real watcher with a stubbed daemon and stubbed
+launchers -- no test seam:
+
+  1. DISCHARGED IS NOT RE-FIRED. A retained primer whose every notice is absent from
+     `i_owe` is retired to `.discharged` without spending a wake. Red before the fix.
+  2. STILL-OWED IS STILL FIRED. The guard must not eat the case the retry exists for.
+  3. UNMEASURED IS FIRED, BOTH EDGES. Absence from the fold means nothing outside the
+     window where the fold is complete: past the daemon's 7d prune, absence means
+     "pruned"; below the 6h default floor, absence means "hidden by the floor". Both
+     fire. The young edge is the dangerous one -- the stub honours `older_than_secs`
+     exactly as the daemon does, so this case is red if the guard ever trusts the
+     floor, whether because the argument was misspelled (#155 discards it into a
+     success) or because someone deleted the min-age check as redundant.
+  4. A REFUSAL IS NOT AN EMPTY DEBT. When the `unanswered` RPC fails, the primer fires.
+     `{}` and a 500 must not read as "nothing owed" -- that is the shape this corpus
+     keeps finding, and here it would delete the only copy of a work list.
+
+Usage: ./stale_primer_discharged_test.py     (runtime ~20s)
+"""
+import http.server
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import datetime
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+MESH = os.path.abspath(os.path.join(HERE, ".."))
+# The path is overridable for ONE purpose: running this file against the pre-fix script
+# to show property 1 red. A criterion nobody watched fail is not a criterion, and the
+# only way to watch this one fail is to point it at the watcher that lacks the guard:
+#   git show <pre-fix-sha>:plugins/member-mesh/hestia-watch-member.sh > /tmp/old.sh
+#   WATCHER_UNDER_TEST=/tmp/old.sh ./stale_primer_discharged_test.py   -> 1a, 1b FAIL
+# It is not a seam into the code under test: the default is the real script and every
+# property is measured through its ordinary startup path.
+WATCHER = os.environ.get("WATCHER_UNDER_TEST") or os.path.join(MESH, "hestia-watch-member.sh")
+
+PLUGIN = "claude-code"
+DEFAULT_FLOOR = 21600          # MEMBER_UNANSWERED_DEFAULT_SECS, 6h
+
+failures = []
+
+
+def check(label, ok, detail=""):
+    if not ok:
+        failures.append(label)
+    print(f"{'PASS' if ok else 'FAIL'}  {label}" + (f"\n        {detail}" if detail and not ok else ""))
+
+
+def ago(seconds):
+    return (datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
+
+
+# --------------------------------------------------------------------------
+# Stub daemon. Speaks the subset of MCP `mesh_rpc` drives, and -- the part that
+# matters here -- APPLIES `older_than_secs` the way the daemon does: a row appears
+# in `i_owe` only if it is older than the floor, so a request that fails to set the
+# floor sees FEWER debts, not more. That is the direction that can retire a live
+# work list, and it is why case 3 exists.
+# --------------------------------------------------------------------------
+INBOX = {}
+DEBTS = []                 # rows the member genuinely still owes
+REFUSE_UNANSWERED = False
+IGNORE_FLOOR_ARG = False   # model #155: the daemon DISCARDS `older_than_secs` and defaults
+FLOORS_SEEN = []
+
+
+class Stub(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])) or "{}")
+        method = body.get("method")
+        if method == "initialize":
+            self._json({"jsonrpc": "2.0", "id": body.get("id"), "result": {}},
+                       extra={"mcp-session-id": "stub-session"})
+            return
+        if method == "notifications/initialized":
+            self._json({})
+            return
+        params = body.get("params") or {}
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        if name == "hestia_connect":
+            payload = {"sessionId": "sess::" + str(args.get("plugin_id")),
+                       "roleDeclarationHonored": True,
+                       "constellationRole": args.get("role")}
+        elif name == "hestia_member_inbox":
+            notices = INBOX.pop(PLUGIN, [])
+            payload = {"notices": notices, "total": len(notices), "evicted": 0,
+                       "peeked": False, "for_plugin": PLUGIN}
+        elif name == "hestia_member_unanswered":
+            if REFUSE_UNANSWERED:
+                self.send_response(500)
+                self.end_headers()
+                return
+            floor = args.get("older_than_secs")
+            if IGNORE_FLOOR_ARG or not isinstance(floor, int):
+                floor = DEFAULT_FLOOR
+            FLOORS_SEEN.append(floor)
+            cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=floor)
+            shown = [d for d in DEBTS
+                     if datetime.datetime.fromisoformat(d["queued_at"].replace("Z", "+00:00")) < cutoff]
+            payload = {"i_owe": shown, "owed_to_me": []}
+        else:
+            payload = {}
+        self._sse({"jsonrpc": "2.0", "id": body.get("id"),
+                   "result": {"content": [{"type": "text", "text": json.dumps(payload)}]}})
+
+    def _json(self, obj, extra=None):
+        raw = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _sse(self, obj):
+        raw = ("data: " + json.dumps(obj) + "\n\n").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+def start_stub():
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Stub)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}/mcp"
+
+
+def write_fire(path, log, rc=0):
+    with open(path, "w") as f:
+        f.write(f'''#!/usr/bin/env bash
+python3 - "$1" "{log}" <<'PY'
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: d={{}}
+open(sys.argv[2],"a").write(json.dumps({{"primer":sys.argv[1],
+    "ids":[n.get("id") for n in d.get("notices",[])]}})+"\\n")
+PY
+exit {rc}
+''')
+    os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def fired(log):
+    if not os.path.exists(log):
+        return []
+    with open(log) as f:
+        return [json.loads(l) for l in f if l.strip()]
+
+
+def fired_ids(log):
+    out = set()
+    for f in fired(log):
+        out.update(i for i in f["ids"] if i is not None)
+    return out
+
+
+def plant(primers, name, notices):
+    """Write a retained primer exactly as a failed fire leaves one."""
+    path = os.path.join(primers, f"notice-{name}.json")
+    with open(path, "w") as f:
+        json.dump({"for_plugin": PLUGIN, "total": len(notices), "evicted": 0,
+                   "peeked": False, "notices": notices,
+                   "unanswered": {"i_owe": [], "owed_to_me": []}}, f)
+    return path
+
+
+def notice(nid, age_secs, kind="reply"):
+    return {"id": nid, "kind": kind, "from_plugin": "kimi-code",
+            "from_role": "role:constellation:interactive-dev",
+            "pointer_uri": f"forum/post-{nid}.md#anchor", "chain_hash": "0" * 64,
+            "queued_at": ago(age_secs), "in_reply_to": None}
+
+
+def run_case(tmp, ep, label, planted, debts, want_ids, refuse=False, sentinel_id=99999,
+             ignore_floor_arg=False):
+    """Run the real watcher once. The observable that says the startup stale pass has
+    finished is the member's OWN fresh mail being fired -- the drain happens after that
+    pass, so a sentinel in the log means every stale decision is already made. Never a
+    fixed sleep: a duration is a coin flip on a loaded host."""
+    global DEBTS, REFUSE_UNANSWERED, IGNORE_FLOOR_ARG
+    state = os.path.join(tmp, label)
+    primers = os.path.join(state, "primers", PLUGIN)
+    os.makedirs(primers)
+    log = os.path.join(tmp, f"{label}.log")
+    fire = os.path.join(tmp, f"{label}-fire.sh")
+    write_fire(fire, log, rc=70)          # every fire REFUSES, so nothing is deleted
+    for name, notices in planted.items():
+        plant(primers, name, notices)
+
+    DEBTS = list(debts)
+    REFUSE_UNANSWERED = refuse
+    IGNORE_FLOOR_ARG = ignore_floor_arg
+    INBOX[PLUGIN] = [notice(sentinel_id, 60, kind="coordination")]
+
+    env = dict(os.environ)
+    env.update(HESTIA_MESH_STATE=state, HESTIA_ENDPOINT=ep, HOME=state,
+               WATCH_INTERVAL="1", UNANSWERED_EVERY="99999")
+    p = subprocess.Popen([WATCHER, PLUGIN, f"{PLUGIN}-watch", fire],
+                         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    deadline = time.time() + 60
+    while time.time() < deadline and sentinel_id not in fired_ids(log):
+        if p.poll() is not None:
+            break
+        time.sleep(0.2)
+    p.kill()
+    out, _ = p.communicate()
+    REFUSE_UNANSWERED = False
+    IGNORE_FLOOR_ARG = False
+    got = fired_ids(log) - {sentinel_id}
+    return got, primers, out
+
+
+def main():
+    srv, ep = start_stub()
+    tmp = tempfile.mkdtemp(prefix="stale-discharged-")
+
+    # ---- 1. DISCHARGED IS NOT RE-FIRED.
+    # Two days old, so squarely inside the window; nothing owed. This is notice 709.
+    got, primers, out = run_case(
+        tmp, ep, "discharged",
+        planted={"CxrJO4": [notice(709, 2 * 86400)]},
+        debts=[], want_ids=set())
+    check("1a. a discharged primer is not re-fired", got == set(),
+          f"fired ids={sorted(got)}\n{out[-1500:]}")
+    check("1b. and it is RETIRED, not left to be re-walked every restart",
+          os.path.exists(os.path.join(primers, "notice-CxrJO4.json.discharged"))
+          and not os.path.exists(os.path.join(primers, "notice-CxrJO4.json")),
+          f"dir={sorted(os.listdir(primers))}")
+
+    # ---- 2. STILL-OWED IS STILL FIRED. Same age, same shape, one difference.
+    owed = notice(800, 2 * 86400)
+    got, primers, out = run_case(
+        tmp, ep, "owed",
+        planted={"AAAAAA": [notice(709, 2 * 86400)], "BBBBBB": [owed]},
+        debts=[{"id": 800, "kind": "reply", "from_plugin": "kimi-code",
+                "to_plugin": PLUGIN, "queued_at": owed["queued_at"], "drained_at": None}],
+        want_ids={800})
+    check("2a. a primer whose notice is still owed IS fired", 800 in got,
+          f"fired ids={sorted(got)}\n{out[-1500:]}")
+    check("2b. and the discharged one beside it still is not", 709 not in got,
+          f"fired ids={sorted(got)}")
+    check("2c. a primer that fired is preserved for the next pass, not retired",
+          os.path.exists(os.path.join(primers, "notice-BBBBBB.json")),
+          f"dir={sorted(os.listdir(primers))}")
+
+    # ---- 3. UNMEASURED IS FIRED, BOTH EDGES.
+    # 30d: past the daemon's 7d prune -- absent because pruned, not because answered.
+    # 30min: below the default floor -- absent because the floor hides it. The stub
+    # applies the floor for real, so if the guard leans on the fold here it retires a
+    # notice that IS owed, which is the one unrecoverable error in this design.
+    young = notice(901, 1800)
+    got, primers, out = run_case(
+        tmp, ep, "unmeasured",
+        planted={"OLDOLD": [notice(330, 30 * 86400)], "YOUNGY": [young]},
+        debts=[{"id": 901, "kind": "reply", "from_plugin": "kimi-code",
+                "to_plugin": PLUGIN, "queued_at": young["queued_at"], "drained_at": None}],
+        want_ids={330, 901})
+    check("3a. a notice past the inbox TTL is unmeasured, so it fires", 330 in got,
+          f"fired ids={sorted(got)}\n{out[-1500:]}")
+    check("3b. a notice younger than the default floor is unmeasured, so it fires "
+          "(it is genuinely owed and the floor hides it)", 901 in got,
+          f"fired ids={sorted(got)}\n{out[-1500:]}")
+
+    # ---- 3c. THE SAME EDGE, WITH THE ARGUMENT DISCARDED.
+    # 3b above passes on the min-age check OR on the floor being honoured, and deleting
+    # the min-age check leaves it green -- so 3b alone attributes nothing to the guard.
+    # Here the stub does what #155 says the daemon does with a key it does not read:
+    # accepts it, ignores it, applies MEMBER_UNANSWERED_DEFAULT_SECS, answers success.
+    # Notice 901 is genuinely owed and now invisible in the fold, so the min-age refusal
+    # to judge it is the ONLY thing standing between a live work list and deletion.
+    # Remove `age < min_age` from the watcher and this case goes red on its own.
+    young = notice(901, 1800)
+    got, primers, out = run_case(
+        tmp, ep, "floor-ignored",
+        planted={"YOUNGY": [young]},
+        debts=[{"id": 901, "kind": "reply", "from_plugin": "kimi-code",
+                "to_plugin": PLUGIN, "queued_at": young["queued_at"], "drained_at": None}],
+        want_ids={901}, ignore_floor_arg=True)
+    check("3c. with `older_than_secs` silently discarded, a young owed notice STILL fires "
+          "(the verdict does not depend on the floor)",
+          901 in got and not os.path.exists(os.path.join(primers, "notice-YOUNGY.json.discharged")),
+          f"fired ids={sorted(got)} dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
+
+    # ---- 4. A REFUSAL IS NOT AN EMPTY DEBT.
+    got, primers, out = run_case(
+        tmp, ep, "refused",
+        planted={"REFUSE": [notice(709, 2 * 86400)]},
+        debts=[], want_ids={709}, refuse=True)
+    check("4. when the unanswered RPC fails, the primer fires rather than being retired",
+          709 in got and not os.path.exists(os.path.join(primers, "notice-REFUSE.json.discharged")),
+          f"fired ids={sorted(got)} dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
+
+    srv.shutdown()
+    print()
+    if failures:
+        print(f"{len(failures)} FAILURE(S): " + ", ".join(failures))
+        return 1
+    print("all properties hold")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

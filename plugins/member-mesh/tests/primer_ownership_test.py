@@ -253,14 +253,29 @@ def main():
     # real shared directory was in.
     INBOX["codex"] = [{"id": 215, "kind": "coordination", "from_plugin": "claude-code",
                        "pointer_uri": "hestia://appeals-waiting-for-you", "queued_at": "2026-07-31T00:00:00Z"}]
+    # The notice each member is about (215, 500) is listed as STILL OWED, alongside the
+    # older debt that names the owner. This is not decoration: since 2026-08-05 the
+    # stale-retry pass asks the daemon whether a retained primer is still owed and
+    # retires it without a fire when it is not (stale_primer_discharged_test.py). A
+    # fixture whose notices are absent from `i_owe` therefore describes DISCHARGED work,
+    # and every retry this file measures would correctly not happen -- case 2 would then
+    # pass or fail on the age of a hardcoded 2026-07-31 date relative to whenever the
+    # suite runs, which is a flake, not a test. Ownership and budget are what this file
+    # is about; keeping its work list live is how they stay measurable.
     UNANSWERED["codex"] = {
         "i_owe": [{"id": 126, "kind": "reply", "from_plugin": "claude-code", "to_plugin": "codex",
-                   "pointer_uri": "p", "queued_at": "2026-07-26T00:00:00Z", "drained_at": None}],
+                   "pointer_uri": "p", "queued_at": "2026-07-26T00:00:00Z", "drained_at": None},
+                  {"id": 215, "kind": "coordination", "from_plugin": "claude-code", "to_plugin": "codex",
+                   "pointer_uri": "hestia://appeals-waiting-for-you",
+                   "queued_at": "2026-07-31T00:00:00Z", "drained_at": None}],
         "owed_to_me": [],
     }
     UNANSWERED["kimi-code"] = {
         "i_owe": [{"id": 496, "kind": "reply", "from_plugin": "claude-code", "to_plugin": "kimi-code",
-                   "pointer_uri": "q", "queued_at": "2026-07-31T00:00:00Z", "drained_at": None}],
+                   "pointer_uri": "q", "queued_at": "2026-07-31T00:00:00Z", "drained_at": None},
+                  {"id": 500, "kind": "coordination", "from_plugin": "claude-code", "to_plugin": "kimi-code",
+                   "pointer_uri": "kimis-own-mail",
+                   "queued_at": "2026-07-31T00:00:00Z", "drained_at": None}],
         "owed_to_me": [],
     }
     KIMI_NOTICE = {"id": 500, "kind": "coordination", "from_plugin": "claude-code",
