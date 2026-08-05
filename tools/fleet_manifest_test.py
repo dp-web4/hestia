@@ -111,12 +111,77 @@ check("A14 installed-only named", by_file["novel.py"].startswith("INSTALLED-ONLY
 check("A15 canonical-never-installed is MISSING",
       by_file.get("ghost.py", "").startswith("MISSING"), str(by_file))
 
-# A16: UNREADABLE is carried as a state, never raised
+# A16: UNREADABLE is carried as a state, never raised — on EITHER side, with
+# the blind side named (PR #199 finding 3: an unreadable SOURCE against a
+# readable install must not manufacture a DIVERGED; that false positive costs
+# a redeploy of a file nobody could read).
 CONTENT["/src/kimi/gate.py"] = "SAME"
 rows2 = fm.compare_member_hooks({"w.py": {"kimi": "/src/kimi/w.py"}}, "kimi", {"w.py": "w.py"},
                                 lambda p: "UNREADABLE:PermissionError")
 check("A16 unreadable is a state, not an exception",
-      rows2[0]["state"] == "UNREADABLE", str(rows2))
+      rows2[0]["state"] == "UNREADABLE (installed)", str(rows2))
+
+
+def digest_source_blind(path):
+    return "UNREADABLE:PermissionError" if path.startswith("/src/") else "deadbeef"
+
+
+rows3 = fm.compare_member_hooks({"w.py": {"kimi": "/src/kimi/w.py"}}, "kimi", {"w.py": "w.py"},
+                                digest_source_blind)
+check("A16b unreadable SOURCE is not DIVERGED",
+      rows3[0]["state"] == "UNREADABLE (source)", str(rows3))
+
+# A17: THE REGRESSION CBP CAUGHT. The first drift summary was built by
+# substring-matching its own prose, and the daemon's "behind main" — the one
+# finding the artifact exists to surface — matched no token and vanished.
+# collect_findings is structural now; pin every finding class it must emit.
+synthetic_rows = [
+    {"component": "daemon", "version_string": "hestia x (app-v1-2-gabcdef0)",
+     "states": {"source": "behind main", "restarted": "running",
+                "live_probed": "mounted, operator-gated (current build)"}},
+    {"component": "source checkout", "states": {"source": "current", "dirty": 0}},
+    {"component": "watcher (codex)", "states": {"restarted": "STALE-CODE: changed after start"}},
+    {"component": "hooks (codex)", "states": {"installed": "2 diverged", "_drift": 2}},
+]
+f = fm.collect_findings(synthetic_rows)
+check("A17a daemon behind-main IS a finding (the dropped one)",
+      any("behind main" in x for x in f), str(f))
+check("A17b watcher STALE-CODE is a finding", any("STALE-CODE" in x for x in f), str(f))
+check("A17c hook drift is a finding", any("hooks (codex)" in x for x in f), str(f))
+check("A17d quiet-and-CLEAN rows make no findings (distinguished from quiet-blind, A17g/h)",
+      fm.collect_findings([synthetic_rows[1]]) == [], str(fm.collect_findings([synthetic_rows[1]])))
+d2 = fm.collect_findings([{"component": "daemon",
+                           "states": {"source": "DRIFT", "restarted": "NOT RUNNING",
+                                      "live_probed": "daemon unreachable"}}])
+check("A17e DRIFT/not-running/unreachable are all findings", len(d2) == 3, str(d2))
+d3 = fm.collect_findings([{"component": "daemon",
+                           "states": {"source": "current", "restarted": "2 PROCESSES"}}])
+check("A17f multiple daemons IS a finding (multiplicity is not a tiebreak)",
+      any("PROCESSES" in x for x in d3), str(d3))
+
+# A17g/h: claude-code's re-review finding. The two unverifiable hook shapes
+# (files unreadable; comparison never reached) used to fall through to a
+# CLEAN summary — the muted gauge. Both must now speak, as their own class.
+blind1 = fm.collect_findings([{"component": "hooks (kimi-code)",
+                               "states": {"installed": "5 unreadable", "_drift": 0,
+                                          "_unverifiable": 5,
+                                          "_unverifiable_detail": "5 source unreadable"}}])
+check("A17g unverifiable hook files are a finding (blind, not clean)",
+      any("5 unverifiable (5 source unreadable)" in x for x in blind1), str(blind1))
+blind2 = fm.collect_findings([{"component": "hooks (claude)",
+                               "states": {"installed": "unverifiable — canonical index failed "
+                                                       "(git ls-files)"}}])
+check("A17h comparison-never-reached (no _drift key) is a finding",
+      any("canonical index failed" in x for x in blind2), str(blind2))
+d4 = fm.collect_findings([{"component": "source checkout",
+                           "states": {"source": "current", "dirty": 2}}])
+check("A17i dirty-only checkout is a finding via its own field (policy: keep)",
+      any("2 dirty" in x for x in d4), str(d4))
+
+# A18: on WSL the staleness check abstains rather than asserting on a jittering
+# basis (claude-code measured three lstart values for one unrestarted PID).
+check("A18 WSL detected on this box (else the abstention path is dead code here)",
+      fm.is_wsl() in (True, False) and isinstance(fm.is_wsl(), bool))
 
 # --- B. smoke (the real tool, this repo) -------------------------------------
 
@@ -133,6 +198,11 @@ if manifest:
     comps = [row.get("component", "") for row in manifest.get("rows", [])]
     check("B4 daemon row present", "daemon" in comps, str(comps))
     check("B5 checkout row present", "source checkout" in comps, str(comps))
+    co = next((row for row in manifest["rows"] if row.get("component") == "source checkout"), {})
+    cost = co.get("states", {})
+    check("B5b checkout states split: source is one fact, dirty its own field",
+          cost.get("source") in ("current", "NOT at origin/main")
+          and isinstance(cost.get("dirty"), int), str(cost))
     hook_rows = [c for c in comps if c.startswith("hooks (")]
     check("B6 one hooks row per MEMBERS entry",
           len(hook_rows) == len(fm.MEMBERS), f"{hook_rows} vs {list(fm.MEMBERS)}")
@@ -145,10 +215,11 @@ if manifest:
 # --- C. anti-vacuity ----------------------------------------------------------
 
 canon = fm.canonical_index()
-check("C1 canonical index non-empty on the real repo", len(canon) > 0, f"len={len(canon)}")
-check("C2 every member has at least one canonical hook",
-      all(any(d == pd for c in canon.values() for d in c) for _, pd in fm.MEMBERS.values()),
-      str({m: pd for m, (_, pd) in fm.MEMBERS.items()}))
+check("C1 canonical index non-empty on the real repo", bool(canon), f"len={canon and len(canon)}")
+if canon:
+    check("C2 every member has at least one canonical hook",
+          all(any(d == pd for c in canon.values() for d in c) for _, pd in fm.MEMBERS.values()),
+          str({m: pd for m, (_, pd) in fm.MEMBERS.items()}))
 check("C3 MEMBERS itself non-empty", len(fm.MEMBERS) > 0)
 
 print()

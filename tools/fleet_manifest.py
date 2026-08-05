@@ -39,7 +39,9 @@ RULES IT LIVES BY:
   * measurement, not a gate: exit 0 always. Drift is data, not an exit code.
   * nothing it cannot verify is asserted. Unknown is a value.
   * privacy: no hostnames, no usernames beyond $HOME-relative paths (presence
-    over privacy — substance, not topology).
+    over privacy — substance, not topology). measured_by is the mesh plugin id
+    or "unknown", never $USER: a file that makes a point of this rule does not
+    get to break it.
 
 Usage:
   python3 tools/fleet_manifest.py [--out PATH] [--probe URL] [--member-dir NAME=PATH ...]
@@ -135,9 +137,14 @@ def compare_member_hooks(canon, plugin_dir, inst, digest):
             continue
         seen_sources.add(src)
         sd, idd = digest(src), digest(rel_installed)
-        # UNREADABLE first: two failing reads compare EQUAL, and equality must
-        # never manufacture a MATCH out of two refusals.
-        state = ("UNREADABLE" if str(idd).startswith("UNREADABLE") else
+        # UNREADABLE first, on BOTH sides: two failing reads compare EQUAL, and
+        # equality must never manufacture a MATCH out of two refusals — and an
+        # unreadable SOURCE against a readable install must not manufacture a
+        # DIVERGED either (PR #199 review finding 3: that false positive costs
+        # a redeploy of a file nobody could read). Same guard, both directions,
+        # and the state names which side is blind.
+        state = ("UNREADABLE (installed)" if str(idd).startswith("UNREADABLE") else
+                 "UNREADABLE (source)" if str(sd).startswith("UNREADABLE") else
                  "MATCH" if sd == idd else "DIVERGED")
         files.append({"file": rel_installed, "state": state})
     for base, candidates in sorted(canon.items()):
@@ -151,6 +158,81 @@ def compare_member_hooks(canon, plugin_dir, inst, digest):
 def git(*args):
     r = subprocess.run(["git", "-C", REPO, *args], capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def is_wsl():
+    """WSL reports a Microsoft kernel; there, process start time (ps lstart and
+    /proc/<pid> btime alike) jitters across reads of an UNRESTARTED process
+    (measured by claude-code, PR #199 review: three different lstart values for
+    the same PIDs across three runs). A staleness check built on that basis
+    asserts what the platform cannot support — so on WSL the check must say
+    unverifiable, not guess."""
+    try:
+        with open("/proc/sys/kernel/osrelease") as fh:
+            return "microsoft" in fh.read().lower() or "wsl" in fh.read().lower()
+    except OSError:
+        return False
+
+
+def collect_findings(rows):
+    """The drift summary, built from the rows' STRUCTURE — never by
+    substring-matching their prose.
+
+    The first version token-matched display strings, and silently dropped the
+    daemon's "behind main" finding because that phrase matched no token (the
+    one finding the whole artifact existed to surface, invisible in its own
+    summary — claude-code's blocking review, PR #199). Findings are stated
+    here, per component, in one place, deliberately.
+    """
+    findings = []
+    for r in rows:
+        comp = r.get("component", "?")
+        st = r.get("states", {})
+        if comp == "daemon":
+            src = st.get("source", "")
+            if src in ("behind main", "DRIFT"):
+                findings.append(f"daemon: build is {src} (running {r.get('version_string', '?')})")
+            if st.get("restarted") == "NOT RUNNING":
+                findings.append("daemon: NOT RUNNING")
+            rst = st.get("restarted", "")
+            if rst.endswith("PROCESSES"):
+                findings.append(f"daemon: {rst} — expected exactly one")
+            lp = st.get("live_probed", "")
+            if lp.startswith("NOT MOUNTED") or lp == "daemon unreachable" or "UNGATED" in lp:
+                findings.append(f"daemon: probe = {lp}")
+        elif comp == "source checkout":
+            if st.get("source", "") != "current":
+                findings.append(f"source checkout: {st.get('source')}")
+            # Dirty-at-main is a finding on this fleet BY POLICY (claude-code
+            # ruling, PR #199): watchers run from the shared checkout, so
+            # uncommitted WIP there is exactly "what is running is not what
+            # is in main". It is its own field so the policy is one line,
+            # stated — not an equality test on a composite prose string.
+            if st.get("dirty"):
+                findings.append(f"source checkout: {st['dirty']} dirty "
+                                f"(running checkout diverges from main)")
+        elif comp.startswith("watcher ("):
+            rst = st.get("restarted", "")
+            if rst.startswith("STALE-CODE") or rst == "script not found":
+                findings.append(f"{comp}: {rst}")
+        elif comp.startswith("hooks ("):
+            n = st.get("_drift")
+            if n is None:
+                # The row never reached per-file comparison (canonical index
+                # failed, or the install dir was unreadable from this seat).
+                # That is BLIND, not clean — the row IS the finding, and it
+                # must not fall through to silence (claude-code re-review,
+                # PR #199: an empty drift_summary reads as "nothing is
+                # wrong", never as "I could not look").
+                findings.append(f"{comp}: {st.get('installed')}")
+            else:
+                if n:
+                    findings.append(f"{comp}: {st.get('installed')}")
+                u = st.get("_unverifiable", 0)
+                if u:
+                    findings.append(f"{comp}: {u} unverifiable "
+                                    f"({st.get('_unverifiable_detail', 'unreadable')})")
+    return findings
 
 
 def daemon_facts(probe_base):
@@ -190,18 +272,19 @@ def daemon_facts(probe_base):
 
     # Process: start time, RSS, and whether it predates the latest source change.
     ps = subprocess.run(["ps", "-eo", "pid,lstart,rss,cmd"], capture_output=True, text=True).stdout
-    proc = None
-    for line in ps.splitlines():
-        if "hestia serve" in line and "grep" not in line:
-            proc = line.strip()
-            break
-    if proc:
+    # ALL of them, not first-match-wins: two daemons are exactly the surprise
+    # this tool exists to catch, and first-match would report them as one
+    # (PR #199 review, minor finding). Multiplicity is a finding, not a tiebreak.
+    procs = [line.strip() for line in ps.splitlines()
+             if "hestia serve" in line and "grep" not in line]
+    row["processes"] = []
+    for proc in procs:
         parts = proc.split(None, 7)
-        row["process"] = {"pid": parts[0], "started": " ".join(parts[1:6]),
-                          "rss_mb": round(int(parts[6]) / 1024)}
-        row["states"]["restarted"] = "running"
+        row["processes"].append({"pid": parts[0], "started": " ".join(parts[1:6]),
+                                 "rss_mb": round(int(parts[6]) / 1024)})
+    if procs:
+        row["states"]["restarted"] = "running" if len(procs) == 1 else f"{len(procs)} PROCESSES"
     else:
-        row["process"] = None
         row["states"]["restarted"] = "NOT RUNNING"
 
     # Live probe: is the governance ledger route MOUNTED? 401/403 = mounted and
@@ -232,9 +315,12 @@ def checkout_facts():
     dirty = git("status", "--porcelain")
     row["dirty_files"] = [l[3:] for l in dirty.splitlines() if l and not l.startswith("??")]
     row["untracked"] = sum(1 for l in dirty.splitlines() if l.startswith("??"))
-    row["states"] = {"source": "current" if head == main else "NOT at origin/main"}
-    if row["dirty_files"]:
-        row["states"]["source"] += f", {len(row['dirty_files'])} dirty"
+    row["states"] = {"source": "current" if head == main else "NOT at origin/main",
+                     "dirty": len(row["dirty_files"])}
+    # at-origin/main? and dirty? are orthogonal facts and stay in their own
+    # fields; joining them into one prose string makes every consumer an
+    # equality test on composite text (the substring-match defect this tool
+    # was rewritten to stop, one field over — claude-code re-review, PR #199).
     return row
 
 
@@ -248,8 +334,17 @@ def watcher_facts():
     for proc in seen_procs:
         parts = proc.split(None, 7)
         started = " ".join(parts[1:6])
-        script = next((w for w in parts[-1].split() if w.endswith("hestia-watch-member.sh")), None)
-        member = parts[-1].split()[1] if len(parts[-1].split()) > 1 else "?"
+        toks = parts[-1].split()
+        script = next((w for w in toks if w.endswith("hestia-watch-member.sh")), None)
+        # The member is the token AFTER the script, however the watcher was
+        # invoked. The first cut assumed the `bash <script> <member>` form and
+        # indexed [1] — exec'd directly (shebang), that yields the watch-name
+        # instead of the member (PR #199 review, minor finding).
+        member = "?"
+        if script is not None:
+            i = toks.index(script)
+            if i + 1 < len(toks):
+                member = toks[i + 1]
         row = {"component": f"watcher ({member})", "pid": parts[0], "started": started}
         if script and os.path.exists(script):
             row["script"] = os.path.relpath(script, HOME) if script.startswith(HOME) else \
@@ -262,9 +357,15 @@ def watcher_facts():
                 started_epoch = float(started_epoch)
             except ValueError:
                 started_epoch = None
-            stale = stale_by_time(mtime, started_epoch)
-            row["states"] = {"restarted": ("STALE-CODE: script changed after watcher started"
-                                           if stale else "current" if stale is False else "unverifiable")}
+            if is_wsl():
+                # No reliable process-start basis exists here — see is_wsl().
+                # The durable fix is watcher self-hashing at startup (record
+                # sha256($0) when the watcher boots); until then, honesty.
+                row["states"] = {"restarted": "unverifiable on WSL (btime jitter)"}
+            else:
+                stale = stale_by_time(mtime, started_epoch)
+                row["states"]["restarted"] = ("STALE-CODE: script changed after watcher started"
+                                              if stale else "current" if stale is False else "unverifiable")
         else:
             row["states"] = {"restarted": "script not found"}
         rows.append(row)
@@ -281,7 +382,11 @@ def watcher_facts():
 
 def canonical_index():
     """basename -> canonical source path, built from `git ls-files` so a hook
-    added tomorrow is indexed without editing this file.
+    added tomorrow is indexed without editing this file. None when git fails:
+    exit-0-always binds failure paths too, and an empty index is not an honest
+    fallback — it would misreport every installed file as INSTALLED-ONLY
+    (the first cut used check=True, so a git error RAISED and exited non-zero
+    against the measurement-not-a-gate rule — PR #199 review, minor finding).
 
     Resolution order when a basename is ambiguous (codex's hydrate exists in
     the marketplace copy too): the member's own hooks dir wins, then the
@@ -290,13 +395,15 @@ def canonical_index():
     Test files, caches, backups, and non-hook files (hooks.json et al.) are
     excluded: this compares enforcing artifacts, not their scaffolding.
     """
-    out = subprocess.run(["git", "-C", REPO, "ls-files",
-                          "plugins/*/hooks/*.py", "plugins/*/hooks/*.sh",
-                          "plugins/member-mesh/hestia-mesh.py",
-                          "plugins/member-mesh/session-mesh-inbox.sh"],
-                         capture_output=True, text=True, check=True).stdout.split()
+    r = subprocess.run(["git", "-C", REPO, "ls-files",
+                        "plugins/*/hooks/*.py", "plugins/*/hooks/*.sh",
+                        "plugins/member-mesh/hestia-mesh.py",
+                        "plugins/member-mesh/session-mesh-inbox.sh"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
     index = {}
-    for rel in out:
+    for rel in r.stdout.split():
         if any(t in rel for t in ("__pycache__", ".pytest_cache", "test_", ".bak", ".pre-")):
             continue
         base = os.path.basename(rel)
@@ -316,6 +423,10 @@ def hook_facts(member_overrides):
         row = {"component": f"hooks ({member})",
                "installed_dir": home_rel if not member_overrides.get(member) else inst_dir,
                "files": [], "states": {}}
+        if canon is None:
+            row["states"]["installed"] = "unverifiable — canonical index failed (git ls-files)"
+            rows.append(row)
+            continue
         if not os.path.isdir(inst_dir):
             row["states"]["installed"] = "UNREADABLE or absent from this seat"
             rows.append(row)
@@ -345,12 +456,22 @@ def hook_facts(member_overrides):
             row["files"].append(f)
 
         n = {}
+        unver_sides = {}
         for f in row["files"]:
             key = f["state"].split(" ")[0]
             n[key] = n.get(key, 0) + 1
+            if key == "UNREADABLE":
+                side = "source" if "(source)" in f["state"] else "installed"
+                unver_sides[side] = unver_sides.get(side, 0) + 1
         row["states"]["installed"] = ", ".join(f"{v} {k.lower()}" for k, v in sorted(n.items())) \
             or "no hook files"
         row["states"]["_drift"] = n.get("DIVERGED", 0) + n.get("MISSING", 0)
+        # Unverifiable is its own class beside _drift, never folded into it:
+        # an unreadable file is a blind gauge, not a measured difference, and
+        # drift_summary must say "I could not look" distinctly from "clean".
+        row["states"]["_unverifiable"] = sum(unver_sides.values())
+        row["states"]["_unverifiable_detail"] = " + ".join(
+            f"{v} {k} unreadable" for k, v in sorted(unver_sides.items()))
         rows.append(row)
     return rows
 
@@ -374,22 +495,12 @@ def main():
     rows += watcher_facts()
     rows += hook_facts(member_overrides)
 
-    drift = []
-    for r in rows:
-        for k, v in r.get("states", {}).items():
-            if k.startswith("_"):
-                continue
-            vs = str(v)
-            if any(t in vs for t in ("DRIFT", "NOT ", "STALE", "diverged", "DIVERGED",
-                                     "missing", "MISSING", "UNGATED")):
-                if r["component"] == "source checkout" and "dirty" in vs and "NOT" not in vs:
-                    continue
-                drift.append(f'{r["component"]}: {k} = {vs}')
+    drift = collect_findings(rows)
 
     manifest = {
         "schema": "fleet-manifest/1",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
-        "measured_by": os.environ.get("HESTIA_MESH_PLUGIN") or os.environ.get("USER") or "unknown",
+        "measured_by": os.environ.get("HESTIA_MESH_PLUGIN") or "unknown",
         "note": "single-host measurement. fleet-wide is out of scope for this artifact "
                 "and pretending otherwise is the failure it exists against.",
         "states_vocabulary": ["source fixed", "installed", "restarted", "live-probed", "fleet-wide"],

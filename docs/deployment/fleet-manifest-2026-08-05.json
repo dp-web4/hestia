@@ -1,7 +1,7 @@
 {
   "schema": "fleet-manifest/1",
-  "generated_at": "2026-08-05T19:25:38Z",
-  "measured_by": "dp",
+  "generated_at": "2026-08-05T20:27:21Z",
+  "measured_by": "kimi-code",
   "note": "single-host measurement. fleet-wide is out of scope for this artifact and pretending otherwise is the failure it exists against.",
   "states_vocabulary": [
     "source fixed",
@@ -14,21 +14,23 @@
     {
       "component": "daemon",
       "states": {
-        "source": "behind main",
+        "source": "DRIFT",
         "restarted": "running",
         "live_probed": "mounted, operator-gated (current build)"
       },
       "binary": ".local/bin/hestia",
-      "binary_sha256": "ea4a82f59731cfb02f1e31c626d7aef7b0436a0b621271f7c8c5da259e5df34b",
-      "version_string": "hestia 0.0.3 (app-v0.1.2-503-gf3abeda)",
-      "build_commit": "f3abeda",
+      "binary_sha256": "c836be7fe0ae725b0de0acf93544a050d5529a82e25069097bcf89599851c16b",
+      "version_string": "hestia 0.0.3 (app-v0.1.2-511-ga2d3421)",
+      "build_commit": "a2d3421",
       "main_commit": "ab642b77f7cf",
-      "build_is_ancestor_of_main": true,
-      "process": {
-        "pid": "479391",
-        "started": "Wed Aug 5 11:24:26 2026",
-        "rss_mb": 517
-      },
+      "build_is_ancestor_of_main": false,
+      "processes": [
+        {
+          "pid": "537589",
+          "started": "Wed Aug 5 12:45:04 2026",
+          "rss_mb": 417
+        }
+      ],
       "probe": {
         "url_route": "/api/governance/ledger",
         "result": "HTTP 401"
@@ -36,44 +38,47 @@
     },
     {
       "component": "source checkout",
-      "path": "hestia",
-      "head": "ab642b77f7cf",
+      "path": "kimi-fix-199",
+      "head": "25635b0fad84",
       "origin_main": "ab642b77f7cf",
       "detached": true,
-      "dirty_files": [],
-      "untracked": 8,
+      "dirty_files": [
+        "ools/fleet_manifest.py",
+        "tools/fleet_manifest_test.py"
+      ],
+      "untracked": 0,
       "states": {
-        "source": "current"
+        "source": "NOT at origin/main, 2 dirty"
       }
     },
     {
       "component": "watcher (codex)",
       "pid": "493466",
-      "started": "Wed Aug 5 11:37:23 2026",
-      "script": "hestia/plugins/member-mesh/hestia-watch-member.sh",
-      "script_sha256": "be71c74890d98d72b0de25be46dd7fdf3b6f6f440d059dad65f7ef35edf62a9c",
+      "started": "Wed Aug 5 11:31:13 2026",
+      "script": "../plugins/member-mesh/hestia-watch-member.sh",
+      "script_sha256": "4f2c1eae552555a08022724b98bdd53207a872b30ee1808467d20179331d7c5b",
       "states": {
-        "restarted": "current"
+        "restarted": "unverifiable on WSL (btime jitter)"
       }
     },
     {
       "component": "watcher (kimi-code)",
       "pid": "493468",
-      "started": "Wed Aug 5 11:37:23 2026",
-      "script": "hestia/plugins/member-mesh/hestia-watch-member.sh",
-      "script_sha256": "be71c74890d98d72b0de25be46dd7fdf3b6f6f440d059dad65f7ef35edf62a9c",
+      "started": "Wed Aug 5 11:31:13 2026",
+      "script": "../plugins/member-mesh/hestia-watch-member.sh",
+      "script_sha256": "4f2c1eae552555a08022724b98bdd53207a872b30ee1808467d20179331d7c5b",
       "states": {
-        "restarted": "current"
+        "restarted": "unverifiable on WSL (btime jitter)"
       }
     },
     {
       "component": "watcher (claude-code)",
       "pid": "493499",
-      "started": "Wed Aug 5 11:37:23 2026",
-      "script": "hestia/plugins/member-mesh/hestia-watch-member.sh",
-      "script_sha256": "be71c74890d98d72b0de25be46dd7fdf3b6f6f440d059dad65f7ef35edf62a9c",
+      "started": "Wed Aug 5 11:31:13 2026",
+      "script": "../plugins/member-mesh/hestia-watch-member.sh",
+      "script_sha256": "4f2c1eae552555a08022724b98bdd53207a872b30ee1808467d20179331d7c5b",
       "states": {
-        "restarted": "current"
+        "restarted": "unverifiable on WSL (btime jitter)"
       }
     },
     {
@@ -225,13 +230,13 @@
         },
         {
           "file": "witness.py",
-          "state": "MATCH",
+          "state": "DIVERGED",
           "source": "plugins/codex/hooks/witness.py"
         }
       ],
       "states": {
-        "installed": "2 diverged, 4 match",
-        "_drift": 2
+        "installed": "3 diverged, 3 match",
+        "_drift": 3
       }
     },
     {
@@ -244,8 +249,10 @@
     }
   ],
   "drift_summary": [
-    "hooks (kimi-code): installed = 1 ambiguous, 2 diverged, 1 installed-only, 3 match",
-    "hooks (claude-code): installed = 4 diverged, 4 installed-only, 1 match",
-    "hooks (codex): installed = 2 diverged, 4 match"
+    "daemon: build is DRIFT (running hestia 0.0.3 (app-v0.1.2-511-ga2d3421))",
+    "source checkout: NOT at origin/main, 2 dirty",
+    "hooks (kimi-code): 1 ambiguous, 2 diverged, 1 installed-only, 3 match",
+    "hooks (claude-code): 4 diverged, 4 installed-only, 1 match",
+    "hooks (codex): 3 diverged, 3 match"
   ]
 }
