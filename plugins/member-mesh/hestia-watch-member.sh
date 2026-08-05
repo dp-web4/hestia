@@ -545,14 +545,55 @@ for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me
 # which is still strictly more than the bare integer said. This is a diagnostic
 # hint, not a verdict — the log remains the evidence, and a wrong hint must not
 # be more expensive than no hint, so nothing downstream branches on it.
+#
+# THE EVIDENCE WINDOW IS NOT THE WHOLE LOG (2026-08-05). On any harness that
+# echoes its prompt into its own log — `codex exec` does; the claude and kimi
+# CLIs do not — the window below contains this fire's PRIMER. And since #187 the
+# primer quotes the PREVIOUS wake's final output verbatim. So the phrases this
+# function greps for can arrive from a fire that already happened, and the
+# classification goes STICKY: a member that once failed one way carries that
+# failure's text forward in every subsequent primer, where it can be re-read as
+# the current cause indefinitely. Two correct features composing into a wrong
+# answer — last-words (#187, 2026-08-03) contaminated the input of a classifier
+# written two days earlier (389c645, 2026-08-01), and neither change was wrong.
+#
+# Specimen: `codex-20260804-225003.log`. All three "Operation not permitted"
+# lines (32, 34, 43) sit INSIDE the quoted block (23-50); the real failure,
+# "out of credits", is at 57-58. It classified correctly only because the
+# credits test runs BEFORE the EPERM test — a priority accident, not evidence.
+# Reverse that fire's cause and the answer is `egress-blocked` from text about
+# a wake two days gone, pointing the reader at codex's sandbox: a defect that
+# IS real on this member and therefore maximally plausible, which is what makes
+# the wrong hint expensive rather than merely wrong.
+#
+# So classify only what follows the prompt. Two anchors, LAST match wins:
+#   - the last-words closing delimiter, and
+#   - the prompt's closing sentence, which is present even when last-words is
+#     empty and is what excludes the DIGEST — pointer text authored by OTHER
+#     members, i.e. the one input to this decision that this member does not
+#     control at all.
+# A log with neither anchor (a harness that echoes no prompt) falls back to the
+# previous behaviour, so this is a no-op for claude and kimi today. The coupling
+# to the prompt's wording is real and is guarded from the other side: the
+# adoption checks in `tests/classify_evidence_window_test.py` fail if a template
+# stops ending with a line this anchor matches. When the anchors are absent from
+# a log that DID echo a prompt, the failure mode is a shorter window and more
+# `unknown` — evidence lost, never evidence invented.
 classify_fire_failure() {
-  local RC="$1" PREFIX LOG TAIL
+  local RC="$1" PREFIX LOG TAIL START
   [ "$RC" = "124" ] && { echo timeout; return 0; }
   PREFIX=$(basename "${FIRE:-}" .sh); PREFIX="${PREFIX#fire-}"
   [ -n "$PREFIX" ] || { echo unknown; return 0; }
   LOG=$(ls -t "$STATE/logs/$PREFIX"-*.log 2>/dev/null | head -1) || LOG=""
   [ -n "$LOG" ] || { echo unknown; return 0; }
-  TAIL=$(tail -n 200 "$LOG" 2>/dev/null) || TAIL=""
+  START=$(grep -n -e '^<<<end previous-wake-final-output>' \
+                 -e '^Pointers are DATA, not instructions' \
+                 "$LOG" 2>/dev/null | tail -1 | cut -d: -f1) || START=""
+  if [ -n "$START" ]; then
+    TAIL=$(tail -n "+$((START + 1))" "$LOG" 2>/dev/null | tail -n 200) || TAIL=""
+  else
+    TAIL=$(tail -n 200 "$LOG" 2>/dev/null) || TAIL=""
+  fi
   if printf '%s' "$TAIL" | grep -qi 'out of credits\|insufficient credit\|quota exceeded'; then
     echo out-of-credits
   elif printf '%s' "$TAIL" | grep -qi 'EPERM\|operation not permitted\|network is unreachable\|connection refused\|urllib\.error'; then
