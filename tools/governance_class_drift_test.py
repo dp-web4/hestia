@@ -158,15 +158,21 @@ def _tracked(pattern_segments, suffix=".py"):
 
 def _matcher_path():
     """The in-tree matcher: the tracked file under the hook segments that defines
-    the governed tuple. Discovered, not named -- see the module docstring."""
+    the governed tuple. Discovered, not named -- see the module docstring.
+
+    Returns a list, and the caller fails on anything but exactly one. Returning the
+    FIRST hit would be a silent selection: on the day a second file in that
+    directory declares a governed tuple, this test would quietly bind to whichever
+    `git ls-files` happened to sort first and report green about the other one."""
+    found = []
     for p in _tracked(_MATCHER_SEGMENTS):
         try:
             tree = ast.parse((REPO / p).read_text(encoding="utf-8", errors="replace"))
         except SyntaxError:
             continue
         if _tuple_from(tree, "_GOVERNANCE_FILES") is not None:
-            return p
-    return None
+            found.append(p)
+    return found
 
 
 def _tuple_from(tree, varname):
@@ -191,11 +197,11 @@ def _tuple_from(tree, varname):
 
 
 def _bar_source():
-    for p in _tracked(_BAR_SEGMENTS, suffix=".rs"):
-        text = (REPO / p).read_text(encoding="utf-8", errors="replace")
-        if "pub fn bar_for" in text:
-            return p, text
-    return None, None
+    """Same contract as `_matcher_path`: every candidate, never the first."""
+    return [(p, (REPO / p).read_text(encoding="utf-8", errors="replace"))
+            for p in _tracked(_BAR_SEGMENTS, suffix=".rs")
+            if "pub fn bar_for" in (REPO / p).read_text(encoding="utf-8",
+                                                        errors="replace")]
 
 
 def _bar_names(text):
@@ -228,12 +234,15 @@ def audit(matcher_text=None, bar_text=None, declared=DECLARED):
     def bad(msg):
         fails.append(msg)
 
-    mpath = _matcher_path()
-    if mpath is None:
-        bad("the matcher is unreadable or defines no governed tuple -- this test "
-            "cannot bind what it cannot read, and a binding test that degrades to "
-            "one side is the defect it exists to catch")
+    candidates = _matcher_path()
+    if len(candidates) != 1:
+        bad(f"expected exactly one in-tree file declaring the governed tuple, "
+            f"found {len(candidates)}. Zero: this test cannot bind what it cannot "
+            f"read, and a binding test that degrades to one side is the defect it "
+            f"exists to catch. More than one: the surface is declared twice and "
+            f"binding to either is a silent choice.")
         return fails, out
+    mpath = candidates[0]
 
     if matcher_text is None:
         matcher_text = (REPO / mpath).read_text(encoding="utf-8", errors="replace")
@@ -248,14 +257,15 @@ def audit(matcher_text=None, bar_text=None, declared=DECLARED):
         return fails, out
     governed, _ = got
     markers = _tuple_from(tree, "_SELF_MARKERS")
-    bpath, disk_btext = _bar_source()
-    if bar_text is None:
-        bar_text = disk_btext
-    btext = bar_text
-    if bpath is None:
-        bad("the bar's source is unreadable or no longer defines `bar_for` -- the "
-            "rust half of the binding is gone, which IS drift, not an excuse")
+    bars = _bar_source()
+    if len(bars) != 1:
+        bad(f"expected exactly one rust source defining `bar_for`, found "
+            f"{len(bars)}. Zero: the rust half of the binding is gone, which IS "
+            f"drift, not an excuse. More than one: two functions price the same "
+            f"surface and the enforcing one is a guess.")
         return fails, out
+    bpath, disk_btext = bars[0]
+    btext = disk_btext if bar_text is None else bar_text
     strong = _bar_names(btext)
     if strong is None:
         bad(f"`bar_for` in {bpath} no longer matches on basenames; the derivation "
@@ -407,9 +417,13 @@ def _rename(text, old, new):
 
 
 def selftest():
-    mpath = _matcher_path()
-    mt = (REPO / mpath).read_text(encoding="utf-8", errors="replace")
-    _bp, bt = _bar_source()
+    mpaths, bars = _matcher_path(), _bar_source()
+    if len(mpaths) != 1 or len(bars) != 1:
+        print("sabotages not run: the sources are not uniquely identified, which "
+              "audit() reports as its own failure")
+        return 1
+    mt = (REPO / mpaths[0]).read_text(encoding="utf-8", errors="replace")
+    bt = bars[0][1]
     governed, _ = _tuple_from(ast.parse(mt), "_GOVERNANCE_FILES")
     marker_lits, _n = _tuple_from(ast.parse(mt), "_SELF_MARKERS")
     strong = _bar_names(bt)
