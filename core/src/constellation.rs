@@ -642,8 +642,9 @@ pub struct CosignResponse {
     pub device_lct_id: Uuid,
     /// The device's Ed25519 signature over `signing_payload(...)`, hex.
     pub signature: String,
-    /// The device's public key (hex) — informational; the HUB resolves the real
-    /// key from enrollment and ignores this. Lets the owner sanity-check locally.
+    /// The device's public key (hex). The HUB resolves the real key from enrollment
+    /// and ignores this; the OWNER checks it against the roster pin before assembling
+    /// the attestation — see [`CosignResponse::check_device_pubkey`].
     pub device_pubkey_hex: String,
 }
 
@@ -697,6 +698,26 @@ impl CosignRequest {
 
 impl CosignResponse {
     pub const KIND: &'static str = "constellation_cosign_response";
+
+    /// The owner-side sanity check the field's doc comment promises. The key the
+    /// responder signed with must be the key the roster entry pins — for a remote
+    /// member, the one `add-remote` resolved from the hub. They are equal by
+    /// construction (`cosign-serve` signs with the member key the hub pinned), so a
+    /// mismatch means the peer's local `member_key_source` has drifted from the pin
+    /// — `hub set-member-key --channel-key` re-points the local signer without
+    /// re-pinning anything at the hub. Hub-side that surfaces as an opaque
+    /// verification reject; caught here it names the cause.
+    pub fn check_device_pubkey(&self, expected_hex: &str) -> anyhow::Result<()> {
+        if !self.device_pubkey_hex.eq_ignore_ascii_case(expected_hex) {
+            anyhow::bail!(
+                "device {} co-signed with pubkey {} but the roster pins {} — the peer's \
+                 member key no longer matches the hub's pin (see `hub set-member-key`); \
+                 refusing to submit a signature the hub will reject",
+                self.device_lct_id, self.device_pubkey_hex, expected_hex,
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1238,6 +1259,31 @@ mod tests {
         // Bound: a tampered roster produces a different payload the sig won't cover.
         let tampered = ConstellationAttestation::signing_payload(owner, &[Uuid::new_v4()], &nonce, &issued_at);
         assert!(pk.verify(&tampered, &sig).is_err(), "the co-sign is bound to the exact roster+nonce");
+    }
+
+    #[test]
+    fn owner_binds_remote_cosign_to_the_roster_pin() {
+        // The remote branch of `present --remote` used to carry the responder's
+        // self-reported pubkey into the attestation unchecked, while the local branch
+        // used the roster's. Not a forgery vector (the hub resolves the key from the
+        // ENROLLED set) but it turned a key-source drift into an opaque hub-side
+        // reject. The owner now compares, so the mismatch is named where it happens.
+        let owner = Uuid::new_v4();
+        let dev = Uuid::new_v4();
+        let key = KeyPair::generate();
+        let roster = vec![dev];
+        let issued_at = Utc::now();
+        let req = CosignRequest::new(owner, roster, "n".to_string(), issued_at, dev);
+        let resp = req.cosign(dev, &key, chrono::Duration::minutes(5), chrono::Duration::minutes(2), issued_at).unwrap();
+
+        // Equal by construction: cosign-serve signs with the member key the hub pinned,
+        // which is what add-remote wrote into the roster entry.
+        assert!(resp.check_device_pubkey(&key.verifying_key().to_hex()).is_ok());
+        // Hex case is not identity.
+        assert!(resp.check_device_pubkey(&key.verifying_key().to_hex().to_uppercase()).is_ok());
+        // A peer whose local member_key_source drifted from the hub pin is refused.
+        let err = resp.check_device_pubkey(&KeyPair::generate().verifying_key().to_hex()).unwrap_err().to_string();
+        assert!(err.contains("roster pins"), "the error names the cause: {err}");
     }
 
     #[test]

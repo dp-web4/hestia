@@ -2944,7 +2944,12 @@ fn cmd_constellation_present_remote(home: &std::path::Path, target: &str) -> Any
             if got.is_some() { break; }
         }
         match got {
-            Some(resp) => { device_signatures.push(DeviceSignature { lct_id: m.lct_id, device_type: m.device_type.clone(), pubkey_hex: resp.device_pubkey_hex, signature: resp.signature }); println!("  REMOTE co-sign: {} ({})", m.name, m.lct_id); }
+            // Bind the remote branch to the ENROLLED roster key, exactly as the local
+            // branch above does — never carry the responder's self-reported pubkey.
+            Some(resp) => match resp.check_device_pubkey(&m.pubkey_hex) {
+                Ok(()) => { device_signatures.push(DeviceSignature { lct_id: m.lct_id, device_type: m.device_type.clone(), pubkey_hex: m.pubkey_hex.clone(), signature: resp.signature }); println!("  REMOTE co-sign: {} ({})", m.name, m.lct_id); }
+                Err(e) => println!("  skip {} ({}): {e}", m.name, m.lct_id),
+            },
             None => println!("  no reply from {} ({}) — is `constellation cosign-serve` running there?", m.name, m.lct_id),
         }
     }
