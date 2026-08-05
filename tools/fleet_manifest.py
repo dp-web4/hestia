@@ -408,6 +408,12 @@ def canonical_index():
             continue
         base = os.path.basename(rel)
         member_dir = rel.split("/")[1] if rel.startswith("plugins/") else ""
+        # The marketplace bundle is a SEPARATE artifact from the member's
+        # canonical hooks, not another candidate for them (#151's comparator is
+        # its judge). Keying it under the member's name would let the bundle's
+        # copy win the canonical slot and report correct installs as diverged.
+        if rel.startswith("plugins/codex/marketplace/"):
+            member_dir = "codex(marketplace)"
         index.setdefault(base, {})[member_dir] = os.path.join(REPO, rel)
     return index
 

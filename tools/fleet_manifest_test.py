@@ -221,6 +221,13 @@ if canon:
           all(any(d == pd for c in canon.values() for d in c) for _, pd in fm.MEMBERS.values()),
           str({m: pd for m, (_, pd) in fm.MEMBERS.items()}))
 check("C3 MEMBERS itself non-empty", len(fm.MEMBERS) > 0)
+# C4: the marketplace bundle is not the member's canonical (regression — it
+# keyed as plain "codex", so codex's correctly-redeployed pre_tool_use.py
+# measured as diverged against the bundle's older copy).
+mk = fm.canonical_index()
+check("C4 no marketplace path keyed as plain 'codex'",
+      not any("marketplace" in p for c in mk.values() for d, p in c.items() if d == "codex"),
+      str({b: c for b, c in mk.items() if "marketplace" in str(c)}))
 
 print()
 if failures:
