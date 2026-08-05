@@ -464,6 +464,85 @@ Subdimensions require a parent, and I am not certain of these:
 
 I would not guess these into the tree. Parent choice determines how the fold weights them, and a wrong parent is the same class of error as `role_lct` holding a capacity: a name that makes the record self-describing and wrong.
 
+### 5.6 The three dimensions are three evidence classes — and that names the fleet's whole defect class
+
+dp, 2026-08-05: *"another nuance is that talent is largely declared, training is audited, and temperament is witnessed."*
+
+This is the load-bearing observation of the whole thread, and it reaches well past roles.
+
+T3's three dimensions are not three *topics* of trust. They are three **kinds of evidence**, each with a different cost to produce, a different cost to fake, and a different decay:
+
+| dimension | evidence | who produces it | falsifiable by | decays |
+|---|---|---|---|---|
+| **Talent** | **declared** | the subject (or its vendor) | nothing, until acted on | instantly — stale on arrival |
+| **Training** | **audited** | an examiner, at a point in time | re-audit | steadily — *needs a cadence* |
+| **Temperament** | **witnessed** | the record, continuously | the chain itself | not at all — it accumulates |
+
+That ordering — **declared < audited < witnessed** — is a falsifiability ordering, and it is the same doctrine this repo already runs on. `CLAUDE.md`: *"Trust is a contextual preponderance of evidence scaled to stakes"*, and *"reachability is weak evidence, not authority."* dp's nuance says T3 has been encoding exactly that ordering all along, unnamed.
+
+#### T3 cannot currently express it
+
+```rust
+pub struct SubDimensionScore {
+    pub score: f64,
+    pub weight: f64,            // confidence
+    pub observation_count: u64, // quantity
+    pub parent: TrustDimension,
+}
+```
+
+`weight` and `observation_count` capture **how much** evidence exists. Nothing captures **what kind**. So a talent score asserted a thousand times and a temperament score witnessed a thousand times are indistinguishable to the fold — a declaration repeated often enough acquires the confidence of an observation.
+
+The missing field is small:
+
+```rust
+pub enum EvidenceClass { Declared, Audited, Witnessed }
+```
+
+on `SubDimensionScore` (and conceptually on the roots, since they are already typed by class). Without it, "high T3" is not a statement anyone can act on, because it does not say whether the subject said so, someone checked, or the record shows it.
+
+#### It explains §5.5 rather than merely agreeing with it
+
+`training:context-inspectable` is measurable on day one **because auditing is point-in-time.** It needs no history — an examiner checks five facts and is done. Temperament cannot work that way; witnessing is inherently cumulative. Talent needs nothing at all, which is exactly why it is the weakest.
+
+It also gives §5.4's `audit_every` its proper home: **audited evidence is the class that decays**, so a cadence is structurally required there and nowhere else. Witnessed evidence self-refreshes. Declared evidence cannot be refreshed, only re-asserted.
+
+#### Each class has a characteristic failure, and ours is the third
+
+- **Declared → lying**, or honest self-misestimation. Cheap to produce, worthless alone.
+- **Audited → staleness and auditor capture.** A passing audit from six months ago, or an examiner who is not independent of the subject. (This is why NOT-SAME matters: it is an *independence* property of the auditor.)
+- **Witnessed → gaps read as absence.** The record shows what was recorded. Silence is not evidence of good conduct; it is evidence of nothing.
+
+**The third one bites this fleet right now, and it is worth stating against ourselves.** A fail-closed deny is unwitnessable by construction — the gate refuses *because* the daemon is unreachable, and the witness goes to that same daemon. So the chain is **biased clean exactly where infrastructure trouble occurred**, which means every temperament score derived from it is systematically *overstated* precisely in the intervals where things went wrong. Our strongest evidence class has a known, structural blind spot, and a tensor that reports temperament without reporting that gap is overclaiming.
+
+#### What this actually names: evidence-class substitution
+
+Every recurring defect this fleet has hit is the same error — **a declared value sitting where an audited or witnessed one belongs:**
+
+| defect | declared | should have been |
+|---|---|---|
+| `plugin_id` / role at connect (GPT's P0) | caller says who it is | witnessed, key-bound |
+| `merged ≠ deployed` | the PR says it landed | audited (installed digest) |
+| `registration ≠ reachability` | the registry says it exists | witnessed (a live probe) |
+| `granted ≠ consulted` (§3.2) | the vault says authority exists | witnessed (in a decision) |
+| `claim()` on `(plugin_id, marker)` | the marker asserts the act | witnessed (who resolved, under what authority) |
+| STALE-CODE by timestamp (#199) | mtime asserts staleness | audited (digest at start vs on disk) |
+| **my own four-turn misdiagnosis today** | **the source said the classifier was fixed** | **audited — the installed digest said otherwise** |
+
+That last row is why I am confident this is the right frame rather than a tidy one. I spent four turns diagnosing a *deployment* gap as a *code* defect, and published it, because I trusted a declaration (source) over an audit (digest). kimi's manifest — an auditing instrument — corrected me in one run.
+
+**So: `verify behaviour, not the artifact` is the special case. The general rule is: know which evidence class you are holding, and never let a weaker one stand in for a stronger.**
+
+#### Consequence for the ladder
+
+§5.3 asks *"who is sufficiently permitted to resolve this?"* The answer must never be grounded in **declared** evidence — a resolver selected on self-asserted talent is a resolver selected on a self-assertion, which is the escalation equivalent of letting the subject rule on its own appeal.
+
+Which yields a rule worth pinning:
+
+> **Resolver selection may read audited and witnessed dimensions. It may not read declared ones.**
+
+And it explains why `training:context-inspectable` is the right first rung: it is *audited*, available immediately, and independent of the subject's own claims about itself.
+
 ---
 
 ## 6. Gap summary
@@ -486,6 +565,7 @@ I would not guess these into the tree. Parent choice determines how the fold wei
 | canonical `Escalate` verdict survives | normative | yes | **no — collapsed to Deny** (`law_gate.rs:166`) |
 | agent capacity on the LCT | **absent from canonical** | no | miscategorised as a role |
 | role kinds (worker/admin/governance) | **absent from canonical** | no | no |
+| evidence CLASS on a trust score | **absent from canonical** — `weight`/`observation_count` are quantity, not kind | no | no |
 | T3 sub-dimension tree used | fractal, `sub_dimensions` ("anyone can extend") | no | **no — extension point unused** |
 | provisional-occupancy flag | **absent from canonical** (but `SovereignStrength::Placeholder` is the precedent) | no | **no — the placeholder is silent** |
 | reputation contextualized on the office | normative (*"no global reputation"*) | via `web4-core` | **no — keyed on capacity** |
