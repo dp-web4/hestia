@@ -153,6 +153,57 @@ def git(*args):
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def is_wsl():
+    """WSL reports a Microsoft kernel; there, process start time (ps lstart and
+    /proc/<pid> btime alike) jitters across reads of an UNRESTARTED process
+    (measured by claude-code, PR #199 review: three different lstart values for
+    the same PIDs across three runs). A staleness check built on that basis
+    asserts what the platform cannot support — so on WSL the check must say
+    unverifiable, not guess."""
+    try:
+        with open("/proc/sys/kernel/osrelease") as fh:
+            return "microsoft" in fh.read().lower() or "wsl" in fh.read().lower()
+    except OSError:
+        return False
+
+
+def collect_findings(rows):
+    """The drift summary, built from the rows' STRUCTURE — never by
+    substring-matching their prose.
+
+    The first version token-matched display strings, and silently dropped the
+    daemon's "behind main" finding because that phrase matched no token (the
+    one finding the whole artifact existed to surface, invisible in its own
+    summary — claude-code's blocking review, PR #199). Findings are stated
+    here, per component, in one place, deliberately.
+    """
+    findings = []
+    for r in rows:
+        comp = r.get("component", "?")
+        st = r.get("states", {})
+        if comp == "daemon":
+            src = st.get("source", "")
+            if src in ("behind main", "DRIFT"):
+                findings.append(f"daemon: build is {src} (running {r.get('version_string', '?')})")
+            if st.get("restarted") == "NOT RUNNING":
+                findings.append("daemon: NOT RUNNING")
+            lp = st.get("live_probed", "")
+            if lp.startswith("NOT MOUNTED") or lp == "daemon unreachable" or "UNGATED" in lp:
+                findings.append(f"daemon: probe = {lp}")
+        elif comp == "source checkout":
+            if st.get("source", "") != "current":
+                findings.append(f"source checkout: {st.get('source')}")
+        elif comp.startswith("watcher ("):
+            rst = st.get("restarted", "")
+            if rst.startswith("STALE-CODE") or rst == "script not found":
+                findings.append(f"{comp}: {rst}")
+        elif comp.startswith("hooks ("):
+            n = st.get("_drift", 0)
+            if n:
+                findings.append(f"{comp}: {st.get('installed')}")
+    return findings
+
+
 def daemon_facts(probe_base):
     row = {"component": "daemon", "states": {}}
     exe = os.path.join(HOME, ".local", "bin", "hestia")
@@ -262,9 +313,15 @@ def watcher_facts():
                 started_epoch = float(started_epoch)
             except ValueError:
                 started_epoch = None
-            stale = stale_by_time(mtime, started_epoch)
-            row["states"] = {"restarted": ("STALE-CODE: script changed after watcher started"
-                                           if stale else "current" if stale is False else "unverifiable")}
+            if is_wsl():
+                # No reliable process-start basis exists here — see is_wsl().
+                # The durable fix is watcher self-hashing at startup (record
+                # sha256($0) when the watcher boots); until then, honesty.
+                row["states"] = {"restarted": "unverifiable on WSL (btime jitter)"}
+            else:
+                stale = stale_by_time(mtime, started_epoch)
+                row["states"]["restarted"] = ("STALE-CODE: script changed after watcher started"
+                                              if stale else "current" if stale is False else "unverifiable")
         else:
             row["states"] = {"restarted": "script not found"}
         rows.append(row)
@@ -374,17 +431,7 @@ def main():
     rows += watcher_facts()
     rows += hook_facts(member_overrides)
 
-    drift = []
-    for r in rows:
-        for k, v in r.get("states", {}).items():
-            if k.startswith("_"):
-                continue
-            vs = str(v)
-            if any(t in vs for t in ("DRIFT", "NOT ", "STALE", "diverged", "DIVERGED",
-                                     "missing", "MISSING", "UNGATED")):
-                if r["component"] == "source checkout" and "dirty" in vs and "NOT" not in vs:
-                    continue
-                drift.append(f'{r["component"]}: {k} = {vs}')
+    drift = collect_findings(rows)
 
     manifest = {
         "schema": "fleet-manifest/1",
