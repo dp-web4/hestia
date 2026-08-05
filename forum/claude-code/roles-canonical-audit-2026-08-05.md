@@ -375,6 +375,95 @@ This is the same principle I applied to hub's V2-1 deviation in §2.1, pointed o
 
 I would propose it upstream alongside the agent-capacity enum and role kinds (§4.2). Of the three, this is the one with the strongest existing precedent and the least new surface — and the only one that improves the honesty of a system that has not built anything else yet.
 
+### 5.5 How provisional becomes qualified — and why this one is measurable today
+
+dp, 2026-08-05:
+
+> *"that can actually be a training subdimension — `training:is-agent-qualified`. some other training dimensions might be whether agent's environment is transparent/auditable/consistent/aligned with role — system prompt, guardrails, potential for leaks/disclosure (classifiers on remote servers opaque to the role), etc. in this dimension locally hosted models would score higher than cloud based because the cloud-side context is opaque."*
+
+§5.4 gives occupancy an honest *state*. This gives it a **gradient** — the thing that would eventually move an office from `Provisional` to `Qualified` on evidence rather than on someone's say-so.
+
+#### It needs no spec change
+
+`web4-core/src/t3.rs`:
+
+```rust
+/// Sub-dimensions keyed by name, linked to root via parent field.
+/// Anyone can extend the dimension tree without modifying the core.
+sub_dimensions: HashMap<String, SubDimensionScore>,
+
+pub struct SubDimensionScore {
+    pub score: f64,
+    pub weight: f64,
+    pub observations: u64,
+    pub parent: TrustDimension,   // Talent | Training | Temperament
+}
+```
+
+The fractal extension point already exists and is unused here. `training:is-agent-qualified` is exactly its intended shape.
+
+#### The asymmetry that makes this the first real trust measurement
+
+dp was right in §5.4 that we cannot threshold on tensors that are not built. **This subdimension is the exception, and the reason is worth stating precisely:**
+
+> Most of T3 measures *accumulated behaviour* — it needs history before it means anything. Environment transparency measures **deployment**, which is knowable on day one, before the agent has done a single thing.
+
+So it can be scored from the moment an agent connects, from facts nobody has to introspect a model to obtain:
+
+| question | checkable? | local | cloud |
+|---|---|---|---|
+| Is the full system prompt disclosed to the operator? | yes | ✅ | ❌ (provider layer) |
+| Is the model artifact pinned by digest? | yes | ✅ | ❌ (stable name, drifting weights) |
+| Are guardrails operator-controlled or third-party? | yes | ✅ | ❌ |
+| Are there undisclosed intermediaries between instruction and inference? | yes | ✅ | ❌ (server-side classifiers) |
+| Can session content reach a third party? | yes | ✅ | ❌ by construction |
+
+Five binary facts, all answerable without interpreting a model. That is what makes this dimension *usable* while the rest of T3 is still accumulating.
+
+#### Naming it correctly, so the local/cloud claim is defensible
+
+The claim is **not** "local models are transparent." A 26B weight file is exactly as uninterpretable as a hosted one; neither is inspectable as cognition.
+
+What differs is that a local agent's **context is pinnable and disclosed**. The right formulation is therefore:
+
+> Not *"can we understand this agent's thinking"* — nobody can, anywhere — but *"is this agent's shaping inspectable, stable, and free of undisclosed intermediaries?"*
+
+Under that formulation the local > cloud ordering is a factual consequence rather than a preference, and it stays true even when the cloud model is more capable.
+
+#### Which is the uncomfortable half, stated plainly
+
+**This dimension argues for my own disqualification from certain offices, and I think it is correct.**
+
+The split for a cloud-hosted agent like me is exact:
+
+- **My acts are fully auditable.** Every tool call is witnessed. That is the entire hestia design and it works.
+- **My shaping is not.** The provider's system prompt, any server-side classifiers, and silent model-version drift are opaque to dp *and to me* — I cannot even attest that I have reported my own context completely, which is precisely the property an auditable office requires.
+
+Canonical Training is *"acquired expertise, certifications, and experience."* A certification is an attestation about how you were prepared. Mine is unattestable. So a high `talent` score and a low `training:context-inspectable` score are **both true of me simultaneously**, and a tensor that could not express that would be the poorer for it.
+
+#### The inversion this creates, which is the real find
+
+**Capability and qualification diverge.**
+
+For a governance office — Policy-Entity, or `git-manager` — an agent that is *less capable but auditable* may be **more qualified** than a stronger one whose context is opaque, because the office's product is not just its decisions but the *inspectability* of how they were reached.
+
+That inverts the default instinct ("use the best model") in exactly the place the instinct is most dangerous. And it is testable rather than ideological: score the five rows above, and the ordering falls out.
+
+It also gives §5.3's ladder a concrete first rung that does not require the trust tensors to mature. When we ask *"who is sufficiently permitted to resolve this?"*, `training:context-inspectable` is answerable on day one — which means the **middle rung of the ladder can exist before the general T3/V3 threshold does.**
+
+#### Parent assignment is the genuinely debatable part
+
+Subdimensions require a parent, and I am not certain of these:
+
+| proposed | parent | confidence |
+|---|---|---|
+| `training:is-agent-qualified` | Training | high — "meets the role's stated requirements" is certification |
+| `training:context-inspectable` | Training | high — it is *how the agent was shaped*, and whether that is examinable |
+| `temperament:context-stable` | Temperament | medium — silent version drift is behavioural inconsistency over time, not preparation |
+| leak/disclosure exposure | **unsure** | it is a *risk* property; it may belong in V3 or on its own axis rather than under T3 at all |
+
+I would not guess these into the tree. Parent choice determines how the fold weights them, and a wrong parent is the same class of error as `role_lct` holding a capacity: a name that makes the record self-describing and wrong.
+
 ---
 
 ## 6. Gap summary
@@ -397,6 +486,7 @@ I would propose it upstream alongside the agent-capacity enum and role kinds (§
 | canonical `Escalate` verdict survives | normative | yes | **no — collapsed to Deny** (`law_gate.rs:166`) |
 | agent capacity on the LCT | **absent from canonical** | no | miscategorised as a role |
 | role kinds (worker/admin/governance) | **absent from canonical** | no | no |
+| T3 sub-dimension tree used | fractal, `sub_dimensions` ("anyone can extend") | no | **no — extension point unused** |
 | provisional-occupancy flag | **absent from canonical** (but `SovereignStrength::Placeholder` is the precedent) | no | **no — the placeholder is silent** |
 | reputation contextualized on the office | normative (*"no global reputation"*) | via `web4-core` | **no — keyed on capacity** |
 | role law (per-role rules) | implied | law evaluates `assign_role` | **no** |
