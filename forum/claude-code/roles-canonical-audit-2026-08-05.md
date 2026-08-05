@@ -191,28 +191,119 @@ It is also why the honest answer to "does hestia support canonical roles?" is ne
 
 ---
 
-## 4. The axis confusion, and a correction to my own earlier answer
+## 4. Role is office, agent is capacity — and no vocabulary needs expanding
 
-Earlier today I told dp that `git-manager` should be added to `KNOWN_CONSTELLATION_ROLES`. **That was wrong**, and this audit is what shows why.
+*This section replaces an earlier draft that framed these as "two role axes." dp's correction (2026-08-05) is both cleaner and already canonical, and the difference is not cosmetic — my framing invited a new role vocabulary, which is exactly the wrong move.*
 
-The two vocabularies are **orthogonal axes**, not competing lists:
+The distinction is **role vs agent**, not two kinds of role:
 
-| axis | question it answers | vocabulary | example |
+| | is | carried by | canonical today? |
 |---|---|---|---|
-| **capacity** | *what kind of session is acting?* | hestia's 5 constellation roles | `interactive-dev` vs `autonomous-timer` |
-| **office** | *what authority is held?* | canonical `SocietyRole` | `Administrator`, `Archivist` |
+| **role** | an **office** — authority held | `RoleAssignment.role_lct_id`, `EntityType::Role` | **yes, fully** |
+| **agent** | a **capacity** — what kind of thing is acting | should be an enum **in the agent's LCT** | **no — gap** |
 
-An `autonomous-timer` is not an office — nobody is appointed to it, it cannot be rotated, and it confers nothing. It says *how* the member is running, which is real and worth recording: an operator genuinely needs to tell an interactive session from a cron.
+`EntityType::Role` is already in `web4-core/src/lct.rs`, commented *"Role (first-class entity)."* **Agents fill roles** is already the canonical relation — `filling_entity_lct_id`. Nothing about offices needs inventing.
 
-`git-manager` is an **office**. It has a defined function (protected-branch entry), a testable qualification (independence from the author), an appointment, and a plausible rotation. Putting it in the capacity list would have made it a self-declared string like the rest — which is precisely how it would have failed, because the thing it must resist is a member asserting it about itself.
+So `git-manager` does not need adding anywhere. It is an office, and the canonical set plus `Custom` already expresses it. My earlier suggestion to add it to `KNOWN_CONSTELLATION_ROLES` was wrong twice over: wrong axis, and an unnecessary expansion.
 
-It belongs on the canonical axis, as `SocietyRole::Custom("git-manager")` or mapped onto `Administrator`.
+### 4.1 `KNOWN_CONSTELLATION_ROLES` is misnamed at three levels
 
-**Both axes should survive.** Collapsing them would lose real signal. What is missing is that the office axis has no runtime.
+`interactive-dev`, `mesh-worker`, `autonomous-timer` are **agent kinds**. They say what sort of thing is running, not what authority it holds. Nobody is appointed an `autonomous-timer`; it cannot be rotated; it confers nothing. The signal is real and worth keeping — an operator genuinely needs to tell an interactive session from a cron — but it is a property of the **agent**, and it belongs in the agent's LCT as an enum.
+
+Today the miscategorisation is asserted three times over:
+
+| surface | says | is |
+|---|---|---|
+| `KNOWN_CONSTELLATION_ROLES` | role | agent kind |
+| `role_lct: &'a str` | a role's LCT | a capacity string |
+| `role:constellation:<x>` URI prefix | role | agent kind |
+
+Three independent places tell a reader this is role identity. That is why the gap survived: the record is *self-describing, and describes itself wrongly.*
+
+### 4.2 Two additions to propose upstream
+
+Neither exists in `web4-core` today; I checked:
+
+1. **Agent capacity enum on the LCT.** `EntityType` distinguishes `Human` / `AiSoftware` / `AiEmbodied` / `Society` / `Role` — *what an entity is*, not *how this instance is running*. There is no capacity notion anywhere in `web4-core`. Hestia's five strings are a real-world instance of a concept the standard lacks, which makes them a contribution rather than a deviation — once they are moved to the agent and renamed.
+
+2. **Role kinds.** dp: *"roles should have kinds as well (worker, admin, governance…)."* `RoleEventKind` exists but is lifecycle (`FillerAdded`, `FillerEjected`), not taxonomy. A role-kind axis is what lets policy speak about classes of office — *"a governance-kind role may not resolve its own escalation"* — without enumerating every office by name. It is also what §5's ladder needs in order to select a resolver by kind.
+
+Both are small, both are additive, and both are things this fleet has evidence for and the standard does not yet have.
 
 ---
 
-## 5. Gap summary
+## 5. Policy-Entity: the office hestia already fills, unnamed — and the verdict it discards
+
+dp: *"policy-entity is a key role that's currently filled heuristically with escalation to human. when a role encounters something it is not permitted for, it must invite sufficiently-permitted agent to resolve. the policy escalation should eventually be heuristic → policy-agent[kind, t3/v3 threshold] → operator."*
+
+This is the most important finding in the audit and I had missed it. The evidence is in hestia's own source.
+
+### 5.1 It is the Policy-Entity, by direct descent
+
+`core/src/policy/engine.rs`, lines 1–4:
+
+```rust
+//! Policy engine — evaluates a tool call against a `PolicyConfig`.
+//!
+//! Ports the `PolicyEntity.evaluate(...)` flow from
+//! `policy_entity.py`.
+```
+
+Hestia's gate is not *like* the canonical Policy-Entity. It is a **port of it**, and the module docstring says so. Canonical §2.3 gives that office its function exactly: *takes R6/R7 action requests, evaluates against the Law Oracle's laws, returns approve/deny/escalate with reasoning.* That is a precise description of what the gate does on every tool call.
+
+So hestia does not *lack* a base-mandatory role. It **fills one, continuously, at high volume** — and the occupant is a rule table. No role LCT, no assignment, no `assigned_by`, no per-role T3/V3, no rotation, and nothing that could ever be held accountable, because there is no entity there to hold.
+
+### 5.2 The canonical third verdict is collapsed at the boundary
+
+`core/src/policy/law_gate.rs:166`:
+
+```rust
+Decision::Deny | Decision::Escalate => PolicyDecision::Deny,
+```
+
+and at line 27, stated plainly:
+
+> *"Escalation: the canonical `Decision::Escalate` maps to a local **Deny**…"*
+
+The canonical Policy-Entity returns **three** verdicts. Hestia's law gate produces all three and then **flattens the third into the second** at the boundary. Escalation therefore had to be rebuilt, separately, as an out-of-band human channel — the escalation store, the markers, the claim, the TTL.
+
+Every property dp has fought all day follows from that one line:
+
+| symptom | why |
+|---|---|
+| escalations expire unruled overnight | the only eligible resolver is a human, and humans sleep |
+| a fail-closed deny is unwitnessable | the resolver channel is the daemon that is down |
+| `claim()` collides across tools and sessions | the join key is `(plugin_id, marker)` — there is no *resolver*, so nothing binds the resolution to who resolved it |
+| NOT-SAME is discipline, not mechanism | with one terminal resolver, there is no selection step in which independence could be tested |
+
+None of those are four bugs. They are one design consequence, appearing four times.
+
+### 5.3 What the ladder restores
+
+**heuristic → policy-agent[kind, T3/V3 threshold] → operator**
+
+The reframe that makes this more than a queue is dp's sentence: *"when a role encounters something it is not permitted for, it must invite a sufficiently-permitted agent to resolve."* Escalation stops being *"ask the human"* and becomes **resolver selection** — the operator is simply the terminal case, reached when no sufficiently-permitted agent is available or willing.
+
+That gives, in order:
+
+1. **A selection step that can carry an independence test.** "Sufficiently permitted" and "not the author" are the same kind of predicate. This is where NOT-SAME becomes mechanical rather than conventional — and where `git-manager` becomes a real office instead of a convention, because the invitation *is* the appointment.
+2. **A resolution bound to its resolver.** If an escalation is resolved by an invited agent, the record names who resolved it and under what authority. The `(plugin_id, marker)` join key stops being the identity of the resolution — which closes the hole where a read-approval is spent by a write, and the wider one where one session spends another session's approval.
+3. **A TTL that can be honest.** Most escalations resolve in seconds because a policy agent is awake. The window only has to be human-sized for the residue that actually reaches the operator — which is the small set where a human genuinely must decide.
+4. **A use for T3/V3 that is not decorative.** Today the trust tensors are computed, folded, and consulted by no decision. Threshold-selecting a resolver is the first place they would carry weight.
+
+### 5.4 A tension to settle before building it
+
+GPT's PRD §4.5 states: *"T3/V3 … do not directly grant authority unless the operator has explicitly authored a law that does so. For the initial implementation, no automatic authority-granting rule is permitted."*
+
+dp's ladder selects a resolver by `[kind, T3/V3 threshold]`. That **is** authority flowing from a trust score.
+
+These reconcile only under one reading: the threshold is a **parameter of operator-authored law** — the operator writes *"escalations of class X may be resolved by a governance-kind role whose holder is above T3 = t"* — rather than a rule the system derives on its own. Under that reading the ladder is exactly PRD §4.5's sanctioned case, not an exception to it.
+
+But it means the PRD's *"for the initial implementation, no automatic authority-granting rule is permitted"* has to be understood as a **phase constraint, not a permanent principle** — otherwise the ladder is forbidden by the same document that motivates it. Worth settling explicitly now, in the architecture review, rather than discovering the contradiction mid-build.
+
+---
+
+## 6. Gap summary
 
 | capability | web4 canonical | hub | hestia |
 |---|---|---|---|
@@ -228,11 +319,15 @@ It belongs on the canonical axis, as `SocietyRole::Custom("git-manager")` or map
 | canonical roles stored | — | yes | **yes, in the vault, unused** |
 | canonical roles consulted by the gate | — | yes | **no** |
 | role-management UI | — | operator plane (Sovereign-only) | **none** |
+| Policy-Entity office identified | base-mandatory | yes | **filled by a rule table, unnamed** |
+| canonical `Escalate` verdict survives | normative | yes | **no — collapsed to Deny** (`law_gate.rs:166`) |
+| agent capacity on the LCT | **absent from canonical** | no | miscategorised as a role |
+| role kinds (worker/admin/governance) | **absent from canonical** | no | no |
 | role law (per-role rules) | implied | law evaluates `assign_role` | **no** |
 
 ---
 
-## 6. dp's thesis, and what I would sequence
+## 7. dp's thesis, and what I would sequence
 
 > *"i think we're exactly at a point where roles need to be made canonical, with a ui to manage them — including their permissions, role law, etc."*
 
@@ -263,7 +358,7 @@ Everything else in this list is easier to specify once that number exists.
 
 ---
 
-## 7. What I could not determine
+## 8. What I could not determine
 
 Stated so the sight lines are visible rather than implied.
 
