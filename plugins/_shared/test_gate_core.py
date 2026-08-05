@@ -274,10 +274,19 @@ def _workspace():
     return ws
 
 
-def _profile(tmp, scope):
+def _profile(tmp, scope, certified=True):
+    """A member identity file.
+
+    CERTIFIED BY DEFAULT after the #188 redesign: an uncertified replica now grants nothing,
+    so a fixture without a cert block would make every scope test assert the refusal path
+    instead of the logic it means to exercise. Pass `certified=False` to get the raw shape a
+    member writes for itself."""
     p = os.path.join(tmp, "identity.json")
+    mrh = {"in_scope": scope}
+    if certified:
+        mrh["replica"] = {"generation": 1, "expires_at": G.now_secs() + 3600}
     with open(p, "w", encoding="utf-8") as fh:
-        json.dump({"mrh": {"in_scope": scope}, "role": "role:constellation:member"}, fh)
+        json.dump({"mrh": mrh, "role": "role:constellation:member"}, fh)
     return G.HarnessProfile(member_id="test-member", identity_path=p,
                             home_markers=("~/.test-member",))
 
@@ -367,6 +376,210 @@ def test_shims_contain_no_policy():
           f"choice, add a HarnessProfile field instead of branching in the shim.")
 
 
+def test_unscoped_must_be_declared_never_inferred():
+    """dp's P0 ruling: per-agent modifications must be an EXPLICIT part of the one law.
+
+    An absent check is not explicit. claude-code had no MRH evaluation at all — measured
+    2026-08-03, a `dpx` path outside every workspace, invented by the member with no operator
+    involvement, passed both Read and Bash. Now the same reach requires `*` to have been
+    written into the vault, where it can be audited, revoked and expired.
+
+    Tested through `evaluate()`, not by reading the dataclass: the question is whether the GATE
+    behaves differently, not whether a field holds a string."""
+    ws = _workspace()
+    os.makedirs(os.path.join(ws, "granted"), exist_ok=True)
+    prof = _profile(ws, ["repo:granted"])
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/notgranted/x.md"], cwd=ws)
+
+    empty = G.AgentPolicy(member_id="m", scope=(), source="unresolved")
+    check("empty_scope_grants_nothing", G.evaluate(ev, prof, ws, policy=empty).blocks,
+          "an unresolvable policy must grant NOTHING — the old load_in_scope returned "
+          "['web4'] on failure, which is a guess that GRANTS")
+
+    unscoped = G.AgentPolicy(member_id="m", scope=("*",), source="vault")
+    check("declared_unscoped_allows", G.evaluate(ev, prof, ws, policy=unscoped).decision == "allow")
+
+    # AND `*` IS A SCOPE GRANT, NOT A LICENCE. The innate egress invariant binds every member
+    # equally; trust does not relax it, so unlimited reach must still not buy a credential.
+    secret = G.NormalizedEvent(tool="Read", paths=[f"{ws}/granted/.env"], cwd=ws)
+    v = G.evaluate(secret, prof, ws, policy=unscoped)
+    check("unscoped_still_cannot_reach_a_secret", v.blocks and v.rule == "egress.secret" and v.innate,
+          "`*` short-circuits MRH scope only, and must sit AFTER the innate egress gate")
+
+
+def test_a_member_cannot_grant_itself_blanket_allow_via_its_own_identity_file():
+    """kimi NOT-SAME review of #188, finding 1 — a privilege-escalation path I shipped inside
+    the file meant to close one.
+
+    `stale` was written in three places and read in NONE. No call passes a `vault_reader`
+    today, so every resolution came from `identity.json` — member-writable, as this module's
+    own docstring says — and was honoured in full INCLUDING `is_unscoped()`. A member could
+    write `"*"` into its own identity file and receive blanket ALLOW, while my audit block
+    claimed `the member cannot write its own authority`.
+
+    This is the exploit, written as the test: identity file says `*`, no vault reachable."""
+    ws = _workspace()
+    os.makedirs(os.path.join(ws, "granted"), exist_ok=True)
+    prof = _profile(ws, ["*"])          # the member writes the wildcard into its OWN file
+    pol = G.resolve_agent_policy(prof)  # no vault_reader — the situation in every call today
+
+    check("self_written_wildcard_is_marked_stale", pol.stale is True and pol.is_unscoped())
+
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/notgranted/x.md"], cwd=ws)
+    v = G.evaluate(ev, prof, ws, policy=pol)
+    check("stale_wildcard_does_not_grant_blanket_allow", v.blocks,
+          "a member wrote '*' into its own identity file and the gate allowed everything — "
+          "the audit block claimed the member cannot write its own authority")
+
+    # A VAULT-SOURCED wildcard still works: the fix must narrow the untrusted path only, not
+    # break the declared grant it exists to make explicit.
+    trusted = G.resolve_agent_policy(prof, vault_reader=lambda m: {"in_scope": ["*"]})
+    check("vault_wildcard_still_allows",
+          not trusted.stale and G.evaluate(ev, prof, ws, policy=trusted).decision == "allow")
+
+
+def _replica(tmp, scope, generation=1, ttl=3600):
+    """An identity file carrying a certified replica block."""
+    p = os.path.join(tmp, "identity.json")
+    cert = {"generation": generation, "expires_at": G.now_secs() + ttl}
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump({"mrh": {"in_scope": scope, "replica": cert}, "role": "role:x"}, fh)
+    return G.HarnessProfile(member_id="m", identity_path=p)
+
+
+def test_an_uncertified_replica_is_refused_not_honoured():
+    """codex/gpt audit of #188: **stale does not mean narrower.**
+
+    My design rested on "a replica can only be staler, and staler-standing is narrower." That
+    holds for grants ADDED since the copy and FAILS for grants REVOKED since it — a replica
+    still carrying a revoked grant is WIDER than current policy. Revocation is exactly the
+    operation an authority most needs to work, and exactly the one the fallback defeated.
+
+    So a replica is not trusted for being old. It is trusted for being certified, and only
+    within limits it carries itself."""
+    ws = _workspace()
+    # A plain identity file — no replica block. This is the shape a member writes itself.
+    plain = _profile(ws, ["repo:granted"], certified=False)
+    pol = G.resolve_agent_policy(plain)
+    check("uncertified_replica_grants_nothing", pol.scope == (),
+          f"an uncertified file was honoured: {pol.scope}")
+    check("uncertified_says_why", pol.source == "replica-uncertified", pol.source)
+
+    # Certified and live: honoured, and it says which policy it is.
+    good = _replica(_workspace(), ["repo:granted"])
+    pol = G.resolve_agent_policy(good)
+    check("certified_replica_is_honoured", "granted" in pol.scope)
+    check("certified_replica_carries_generation", pol.generation == 1)
+
+    # Certified but EXPIRED: refused. The longer the authority has been unreachable, the more
+    # likely a revocation this copy cannot know about — expiry bounds that unknowability.
+    old = _replica(_workspace(), ["repo:granted"], ttl=-1)
+    pol = G.resolve_agent_policy(old)
+    check("expired_replica_grants_nothing", pol.scope == () and pol.source == "replica-expired",
+          f"{pol.source} {pol.scope}")
+
+
+def test_a_replica_can_never_widen_to_unscoped():
+    """Even certified, the one value a member would write to escape must not come from here."""
+    ws = _workspace()
+    os.makedirs(os.path.join(ws, "granted"), exist_ok=True)
+    prof = _replica(_workspace(), ["*"])
+    pol = G.resolve_agent_policy(prof)
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/notgranted/x.md"], cwd=ws)
+    check("certified_wildcard_still_does_not_grant_everything",
+          G.evaluate(ev, prof, ws, policy=pol).blocks,
+          "a replica yielded blanket ALLOW — certification bounds staleness, it does not "
+          "confer the authority to remove the boundary entirely")
+
+
+def test_an_unknown_prefix_is_dropped_and_could_previously_grant():
+    """kimi #937 finding C, sharpened by probe before accepting it.
+
+    kimi read the doc-vs-code gap (comment: unknown prefix "dropped"; code: kept) as inert
+    and recommended fixing the DOC, on the basis that a colon-bearing entry can never equal a
+    first path segment. That holds only for the slash-bearing form they tested. `ssh:etc` has
+    no slash, so it is a legal single segment, and the kept entry GRANTED a workspace child
+    literally named that — finding 3's defect one shape over, in the granting direction. So
+    the code side moved, not the doc."""
+    ws = _workspace()
+    prof = G.HarnessProfile(member_id="m", identity_path="/nonexistent/identity.json")
+
+    check("unknown_prefix_with_slash_dropped", G._parse_scope_entries(["ssh:/etc"]) == ())
+    check("unknown_prefix_without_slash_dropped", G._parse_scope_entries(["ssh:etc"]) == (),
+          "the shape that could actually grant")
+
+    # The regression this closes: parsed-and-kept, it matched a real segment.
+    check("kept_unknown_prefix_would_have_granted",
+          G.path_in_scope(f"{ws}/ssh:etc/secret", ["ssh:etc"], ws, prof),
+          "if this is False the probe no longer demonstrates the risk — recheck path_in_scope")
+    check("dropped_unknown_prefix_grants_nothing",
+          not G.path_in_scope(f"{ws}/ssh:etc/secret",
+                              list(G._parse_scope_entries(["ssh:etc"])), ws, prof))
+
+    # The spellings that must survive: the drop is narrow, not a blanket colon ban on grants.
+    check("known_prefixes_still_parse",
+          G._parse_scope_entries(["repo:web4", "path:.git-inbox"]) == ("web4", ".git-inbox"))
+    check("legacy_bare_name_still_parses", G._parse_scope_entries(["web4"]) == ("web4",))
+    check("bare_wildcard_still_unscoped", G._parse_scope_entries(["*"]) == ("*",))
+    check("prefixed_wildcard_still_collapses_to_nothing",
+          G._parse_scope_entries(["repo:*", "path:*"]) == ())
+
+
+def test_malformed_vault_payload_fails_closed_instead_of_raising():
+    """kimi #188, finding 2. The reader call was wrapped; the PARSE was not. A non-string
+    element propagated an AttributeError out of the gate — and on a fail-open harness an
+    exception escaping the gate IS an allow, the same shape `_deny` was corrected for."""
+    ws = _workspace()
+    prof = G.HarnessProfile(member_id="x", identity_path="/nonexistent/identity.json")
+    try:
+        pol = G.resolve_agent_policy(prof, vault_reader=lambda m: {"in_scope": ["repo:a", 7, None]})
+    except Exception as e:
+        check("malformed_vault_never_raises", False, f"raised {e.__class__.__name__}")
+        return
+    check("malformed_vault_never_raises", True)
+    check("malformed_vault_grants_nothing", pol.scope == () and pol.source == "unresolved")
+
+
+def test_prefixed_wildcard_is_not_unscoped():
+    """kimi #188, finding 3. `split(":", 1)[-1]` collapsed `repo:*` to the bare wildcard, so an
+    operator writing what reads as "every repo" would have granted "no boundary at all" —
+    UNSCOPED by parser incidental rather than by decision."""
+    check("bare_wildcard_is_unscoped", G._parse_scope_entries(["*"]) == ("*",))
+    check("repo_wildcard_is_not_unscoped", "*" not in G._parse_scope_entries(["repo:*"]))
+    check("path_wildcard_is_not_unscoped", "*" not in G._parse_scope_entries(["path:*"]))
+    check("normal_entries_still_parse",
+          G._parse_scope_entries(["repo:web4", "path:.git-inbox", "legacy"])
+          == ("web4", ".git-inbox", "legacy"))
+
+
+def test_policy_resolution_names_its_source_and_fails_closed():
+    """A policy that cannot say where it came from is not auditable, and an unreachable vault
+    must narrow rather than widen."""
+    ws = _workspace()
+    prof = _profile(ws, ["repo:granted"])
+
+    # Vault wins, and says so.
+    pol = G.resolve_agent_policy(prof, vault_reader=lambda m: {"in_scope": ["repo:fromvault"]})
+    check("vault_is_the_authority", pol.scope == ("fromvault",) and pol.source == "vault")
+    check("vault_result_is_not_stale", pol.stale is False)
+
+    # Vault unreachable -> replica, MARKED STALE so a caller can refuse to honour grants from it.
+    def boom(_m):
+        raise RuntimeError("daemon unreachable")
+    pol = G.resolve_agent_policy(prof, vault_reader=boom)
+    check("falls_back_to_replica", pol.source == "local-replica" and "granted" in pol.scope)
+    check("replica_is_marked_stale", pol.stale is True,
+          "a replica can only be staler than the vault; the caller must be able to tell")
+
+    # Neither -> nothing granted. Not a narrow guess. Nothing.
+    nowhere = G.HarnessProfile(member_id="x", identity_path="/nonexistent/identity.json")
+    pol = G.resolve_agent_policy(nowhere, vault_reader=lambda m: None)
+    check("unresolvable_grants_nothing", pol.scope == () and pol.source == "unresolved")
+    check("unresolvable_is_not_unscoped", not pol.is_unscoped(),
+          "empty means NOTHING GRANTED; conflating it with '*' is how an absent check becomes "
+          "a silent permission")
+
+
 def test_egress_beats_scope():
     """Innate invariants dominate: a secret inside a GRANTED repo is still denied."""
     ws = _workspace()
@@ -438,6 +651,14 @@ ALL_TESTS = [
     "test_path_grant_reaches_a_sibling_of_the_repos",
     "test_temp_root_is_a_path_boundary_not_a_prefix",
     "test_shims_contain_no_policy",
+    "test_unscoped_must_be_declared_never_inferred",
+    "test_a_member_cannot_grant_itself_blanket_allow_via_its_own_identity_file",
+    "test_an_uncertified_replica_is_refused_not_honoured",
+    "test_a_replica_can_never_widen_to_unscoped",
+    "test_an_unknown_prefix_is_dropped_and_could_previously_grant",
+    "test_malformed_vault_payload_fails_closed_instead_of_raising",
+    "test_prefixed_wildcard_is_not_unscoped",
+    "test_policy_resolution_names_its_source_and_fails_closed",
     "test_egress_beats_scope",
     "test_missing_identity_fails_narrow_not_wide",
     "test_core_never_exits",
@@ -486,6 +707,14 @@ if __name__ == "__main__":
     test_path_grant_reaches_a_sibling_of_the_repos()
     test_temp_root_is_a_path_boundary_not_a_prefix()
     test_shims_contain_no_policy()
+    test_unscoped_must_be_declared_never_inferred()
+    test_a_member_cannot_grant_itself_blanket_allow_via_its_own_identity_file()
+    test_an_uncertified_replica_is_refused_not_honoured()
+    test_a_replica_can_never_widen_to_unscoped()
+    test_an_unknown_prefix_is_dropped_and_could_previously_grant()
+    test_malformed_vault_payload_fails_closed_instead_of_raising()
+    test_prefixed_wildcard_is_not_unscoped()
+    test_policy_resolution_names_its_source_and_fails_closed()
     test_egress_beats_scope()
     test_missing_identity_fails_narrow_not_wide()
     test_core_never_exits()

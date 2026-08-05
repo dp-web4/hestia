@@ -212,9 +212,103 @@ def remedy_tools() -> set:
 
 # ── The shim contract ────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
+class AgentPolicy:
+    """The PER-AGENT layer: what this member specifically may reach, beyond the common law.
+
+    dp, 2026-08-03: *"there should be one common gate, with syntax adapters per-harness, and any
+    exceptions/grants/restrictions per agent"* — and, immediately after: *"the latter should live
+    in the vault."*
+
+    Three layers, and keeping them apart is the whole design:
+
+        LAW            one, common, amendable only by due process. `REMEDIES` + `evaluate()`.
+        HARNESS        syntax only — event schema, exit codes, where the identity file sits.
+                       `HarnessProfile`. **No policy may live here.**
+        AGENT          this. Exceptions, grants, restrictions, for one member.
+
+    WHY THIS EXISTS AS A TYPE RATHER THAN AS A FILE READ. Today the per-agent layer is scattered
+    across three stores with different lifetimes and different authorities: `in_scope` in a
+    hand-edited `identity.json`, `instance_grants` in daemon memory, `scope_requests` in daemon
+    memory. And for `claude-code` it lives in a fourth place — **nowhere**. That member has no
+    MRH check at all, so its unlimited reach is not a grant anyone made; it is a question nobody
+    asks. Measured 2026-08-03: a `dpx` path outside every workspace, invented by the member
+    itself with no operator involvement, passed both the Read and Bash surfaces.
+
+    An absent check cannot be audited, cannot expire, and cannot be revoked. dp's P0 ruling
+    already forbids it — *"any per-agent or per-role modifications have to be an explicit part of
+    the one law"* — and an omission is not an explicit part of anything. So `scope` has **no
+    permissive default**: a member with unlimited reach must say so, in `UNSCOPED`, and that
+    declaration is a recorded grant rather than a silence.
+
+    THE VAULT IS THE AUTHORITY (dp, 2026-08-03). Not `identity.json`. That file is hand-edited,
+    lives beside the member's own config, and is writable by the member it governs — kimi
+    declined to edit its own `in_scope` on exactly that reasoning, which was right and should not
+    have depended on restraint. The vault is operator-controlled, sealed, and already holds the
+    instance overlays.
+
+    But the local gate must still decide when the daemon is down, or "stop the daemon, then act"
+    becomes the bypass. So: **vault is authority, the local file is a derived replica.**
+
+    **"STALE IS NARROWER" WAS FALSE, AND IT WAS THE PREMISE THIS DESIGN RESTED ON.** (codex/gpt
+    open-PR audit, 2026-08-04.) I argued a replica can only ever be staler, and staler-standing
+    is narrower, so honouring it fails safe. That holds for grants ADDED since the copy. It
+    fails for grants **REVOKED** since the copy: if the vault revoked `repo:private-context`, a
+    replica still carrying it is **WIDER** than current policy. Revocation and expiry are
+    precisely the operations a policy authority most needs to work, and precisely the ones the
+    fallback silently defeated.
+
+    So a replica is not trusted for being old. It is trusted for being **CERTIFIED**, and only
+    within limits it carries itself:
+
+      * `generation` — a monotonic counter issued by the authority. A replica with no
+        generation makes no claim about which policy it is and is refused outright.
+      * `expires_at` — a wall-clock horizon written by the authority. Past it, the replica is
+        refused rather than honoured, because the longer the daemon has been unreachable the
+        more likely a revocation has happened that this copy cannot know about. Bounded
+        staleness is the only kind that is safe.
+      * never widens — a replica may never yield `UNSCOPED` (see `evaluate`), so the one value
+        a member would write into its own file to escape cannot come from this path.
+
+    What is still NOT solved, stated because the audit was right that the last version claimed
+    more than it did: this module cannot verify a signature it has no key for, and a
+    member-writable file can forge a generation as easily as a scope. **Certification has to be
+    a MAC or signature the authority issues and the gate verifies**, and that needs a key
+    distribution this file does not own. Until then `generation`/`expires_at` bound the damage
+    and make the gap explicit; they do not close it. The honest summary is that a stale replica
+    is now *time-limited and self-describing*, not *authenticated*.
+    """
+
+    #: Sentinel for "this member is deliberately unscoped." Never inferred from an empty list —
+    #: empty means *nothing granted*, and conflating the two is how an absent check becomes a
+    #: silent permission.
+    UNSCOPED = "*"
+
+    member_id: str
+    #: Repo names and `path:` grants. `["*"]` = deliberately unscoped, and must be declared.
+    scope: tuple = ()
+    #: Where this policy was resolved from, carried so a reader never has to guess which store
+    #: won. A policy that cannot say where it came from is not auditable.
+    source: str = "unresolved"
+    #: True when the daemon could not be consulted and this is the on-disk replica.
+    stale: bool = False
+    #: Monotonic generation issued by the policy authority. A replica may only be honoured if
+    #: it carries one; `None` means the file made no claim about which policy it is.
+    generation: Optional[int] = None
+    #: Wall-clock second after which this replica must not be honoured at all.
+    expires_at: Optional[int] = None
+
+    def is_unscoped(self) -> bool:
+        return self.UNSCOPED in self.scope
+
+
+@dataclass(frozen=True)
 class HarnessProfile:
-    """Everything a harness may legitimately differ in. If a shim needs something not here,
-    the answer is a new field, not a branch in the shim."""
+    """Everything a harness may legitimately differ in — SYNTAX ONLY.
+
+    If a shim needs something not here, the answer is a new field, not a branch in the shim.
+    And if the thing it needs is a *policy* choice, it does not belong here at all: that is
+    `AgentPolicy`, and mixing the two is how five harnesses came to disagree about who may
+    touch what."""
 
     member_id: str                     # "kimi-code" — the plugin_id asserted to the daemon
     identity_path: str                 # the member's live identity.json
@@ -305,6 +399,138 @@ def detect_workspace(profile: HarnessProfile) -> str:
             break
         d = parent
     return os.path.expanduser("~/ai-workspace")
+
+
+#: Prefixes an `in_scope` entry may carry. Recognised DELIBERATELY rather than stripped by a
+#: blind `split(":", 1)[-1]` (kimi #188, finding 3): that form silently collapsed `repo:*` and
+#: `path:*` to the bare wildcard, so an operator writing what looks like "every repo" would
+#: have granted "everything, including outside the workspace" — UNSCOPED by emergent side
+#: effect rather than by decision. An unknown prefix is now dropped rather than guessed at.
+_SCOPE_PREFIXES = ("repo:", "path:")
+
+
+def now_secs() -> int:
+    """Wall clock, isolated so a test can bound expiry without patching the stdlib."""
+    import time
+    return int(time.time())
+
+
+def _parse_scope_entries(entries) -> tuple:
+    """`["repo:web4", "path:.git-inbox"]` -> `("web4", ".git-inbox")`.
+
+    Raises on a non-string element so the caller can fail closed rather than let an
+    AttributeError escape the gate. Only a BARE `"*"` yields the unscoped marker; a prefixed
+    wildcard is refused outright, because "every repo" and "no boundary at all" are different
+    grants and the difference must not turn on parser incidentals."""
+    out = []
+    for e in entries:
+        if not isinstance(e, str):
+            raise TypeError(f"scope entry is not a string: {e!r}")
+        e = e.strip()
+        if e == AgentPolicy.UNSCOPED:
+            out.append(AgentPolicy.UNSCOPED)
+            continue
+        for p in _SCOPE_PREFIXES:
+            if e.startswith(p):
+                rest = e[len(p):]
+                # A prefixed wildcard is NOT unscoped. Dropped, loudly-by-absence: the operator
+                # who meant "everything" writes a bare "*", which is auditable as such.
+                if rest and rest != AgentPolicy.UNSCOPED:
+                    out.append(rest)
+                break
+        else:
+            # An UNRECOGNISED prefix is dropped, not kept (kimi #937, finding C, sharpened by
+            # probe). The comment above claimed "dropped"; the code kept it, and kept was not
+            # inert: `ssh:/etc` cannot match a first path segment, but `ssh:etc` CAN — it
+            # grants a workspace child literally named that. That is finding 3's defect one
+            # shape over: a parser incidental producing a grant nobody wrote. Fails narrow —
+            # a legitimate entry misspelled this way is denied and asks for scope.
+            if ":" in e:
+                continue
+            # Unprefixed and not the wildcard: a bare repo name, the legacy spelling.
+            if e:
+                out.append(e)
+    return tuple(out)
+
+
+def resolve_agent_policy(profile: HarnessProfile,
+                         vault_reader=None) -> AgentPolicy:
+    """Resolve the per-agent layer, naming the store it came from.
+
+    PRECEDENCE, and the reason for it:
+
+      1. **vault** — the authority (dp, 2026-08-03). Operator-controlled, sealed, and not
+         writable by the member it governs.
+      2. **local replica** — the derived `identity.json`, used only when the vault cannot be
+         reached. Marked `stale=True` so a caller can refuse to honour *grants* from it while
+         still enforcing *standing scope*. A replica can only ever be staler than the vault, and
+         staler-standing is narrower, so enforcing it is the safe direction.
+      3. **nothing** — and nothing means NOTHING GRANTED, not everything permitted.
+
+    `vault_reader` is injected rather than imported so the core stays transport-free and
+    testable: the shim supplies a callable that returns this member's policy dict, or None when
+    the daemon is unreachable. The core must not know how to open a socket.
+
+    THE DEFAULT IS EMPTY, DELIBERATELY. The previous `load_in_scope` returned `["web4"]` on any
+    failure — a narrow guess, but still a guess, and a guess that GRANTS. Here an unresolvable
+    policy grants nothing and says so in `source`. A member that should be unscoped declares
+    `["*"]`; it is never inferred."""
+    # 1. Vault — the authority.
+    if vault_reader is not None:
+        try:
+            got = vault_reader(profile.member_id)
+        except Exception:
+            got = None
+        if isinstance(got, dict):
+            scope = got.get("in_scope")
+            if isinstance(scope, list):
+                # PARSE INSIDE THE GUARD (kimi #188, finding 2). The reader call was wrapped and
+                # the parse was not, so a non-string element in `in_scope` propagated an
+                # AttributeError out of the gate. On a fail-open harness an exception escaping
+                # the gate IS an allow — the exact shape `_deny` was corrected for earlier in
+                # this file. Bad data must resolve to "unresolved", never to a traceback.
+                try:
+                    parsed = _parse_scope_entries(scope)
+                except Exception:
+                    parsed = None
+                if parsed is not None:
+                    return AgentPolicy(
+                        member_id=profile.member_id, scope=parsed, source="vault",
+                    )
+
+    # 2. Local replica — fail-closed fallback, marked stale.
+    try:
+        with open(os.path.expanduser(profile.identity_path), encoding="utf-8") as fh:
+            mrh = json.load(fh).get("mrh", {})
+        scope = mrh.get("in_scope")
+        if isinstance(scope, list):
+            # A REPLICA MUST SAY WHICH POLICY IT IS AND HOW LONG IT IS GOOD FOR.
+            # Absent either, it is not a certified replica — it is just a file. Refused,
+            # because "old" was never the safety property; BOUNDED and DECLARED is.
+            cert = mrh.get("replica") if isinstance(mrh.get("replica"), dict) else {}
+            gen = cert.get("generation")
+            exp = cert.get("expires_at")
+            if not isinstance(gen, int) or not isinstance(exp, int):
+                return AgentPolicy(member_id=profile.member_id, scope=(),
+                                   source="replica-uncertified", stale=True)
+            if now_secs() >= exp:
+                # The longer the authority has been unreachable, the likelier a revocation
+                # this copy cannot know about. Expiry is the bound on that unknowability.
+                return AgentPolicy(member_id=profile.member_id, scope=(),
+                                   source="replica-expired", stale=True)
+            return AgentPolicy(
+                member_id=profile.member_id,
+                scope=_parse_scope_entries(scope),
+                source="local-replica",
+                stale=True,
+                generation=gen,
+                expires_at=exp,
+            )
+    except Exception:
+        pass
+
+    # 3. Nothing resolved. Grant nothing, and be legible about why.
+    return AgentPolicy(member_id=profile.member_id, scope=(), source="unresolved", stale=True)
 
 
 def load_in_scope(profile: HarnessProfile) -> list:
@@ -507,7 +733,8 @@ def forbidden_tokens(profile: HarnessProfile) -> tuple:
 
 # ── The decision ─────────────────────────────────────────────────────────────────────────
 def evaluate(event: NormalizedEvent, profile: HarnessProfile,
-             workspace: Optional[str] = None) -> Verdict:
+             workspace: Optional[str] = None,
+             policy: Optional[AgentPolicy] = None) -> Verdict:
     """The whole local policy, for every harness.
 
     Order is deliberate and is the O clause of the accountability audit: the innate egress
@@ -518,7 +745,11 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     Never calls sys.exit. A shim that gets no Verdict must deny; making that impossible to
     confuse with an allow is the reason this returns a value instead of exiting."""
     ws = workspace or detect_workspace(profile)
-    scopes = load_in_scope(profile) + launch_cwd_repo(profile, ws)
+    # THE PER-AGENT LAYER, resolved once and named. `policy` is passed by the shim when it can
+    # reach the vault; otherwise resolved here from the replica. Either way the gate consults
+    # ONE object rather than three stores and an absence.
+    pol = policy if policy is not None else resolve_agent_policy(profile)
+    scopes = list(pol.scope) + launch_cwd_repo(profile, ws)
     forbidden = forbidden_tokens(profile)
 
     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
@@ -532,6 +763,42 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
                     f"out-of-MRH private repo): '{f}'",
                     innate=True,
                 )
+
+    # A DELIBERATELY UNSCOPED MEMBER SKIPS 1b — AND ONLY 1b.
+    #
+    # Placed after gate 1a on purpose: `*` is a scope grant, not a licence, so it never buys a
+    # credential. The innate egress invariant above binds every member equally and is the one
+    # thing trust does not relax.
+    #
+    # This is what makes claude-code's unlimited reach a RECORDED GRANT instead of an absent
+    # check. Before, that member had no MRH evaluation at all — measured 2026-08-03, a dpx path
+    # outside every workspace passed both Read and Bash with no operator involvement. Now the
+    # same outcome requires someone to have written `*` into the vault, where it can be audited,
+    # revoked, and expired. Same behaviour, opposite accountability.
+    # ...AND ONLY FROM A TRUSTED SOURCE. `stale` was written in three places and read in NONE
+    # (kimi NOT-SAME review of #188, finding 1). `evaluate()` never inspected it, and no call
+    # passes a `vault_reader` today — so every resolution came from `identity.json`, the file
+    # this module's own docstring calls member-writable, and was honoured in full INCLUDING the
+    # unscoped bypass. **A member could write `"*"` into its own identity file and receive
+    # blanket ALLOW.** The audit block I shipped claimed the opposite on two lines
+    # (`W: the member cannot write its own authority`, `V: stale replica cannot add grants`),
+    # which per CLAUDE.md is itself an A violation: the block described the intent, not the
+    # build. Fourth time in this thread I verified the artifact rather than the behaviour — the
+    # field existed and the docstring explained it, and nothing read it.
+    #
+    # WHY `*` IS TREATED DIFFERENTLY FROM A STALE REPO LIST, since both come from the same
+    # untrusted file: a repo list widens to specific named directories and stays bounded by the
+    # workspace, so a compromised replica buys named, auditable reach. `*` removes the boundary
+    # entirely, and is precisely the value a member would write to escape. Different in kind,
+    # not degree. Standing scope from a stale replica is still honoured — that is what keeps a
+    # down daemon from bricking every member — but it can never widen to everything.
+    if pol.is_unscoped():
+        if not pol.stale:
+            return ALLOW
+        # Stale + unscoped: drop the wildcard so it cannot match downstream, and evaluate the
+        # remaining standing scope normally. Fails narrow, which is the direction a replica may
+        # move in.
+        scopes = [s for s in scopes if s != AgentPolicy.UNSCOPED]
 
     # Gate 1b — MRH scope. File paths use path-scope; shell commands use command-scope.
     for p in event.paths:
