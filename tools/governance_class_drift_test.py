@@ -483,26 +483,8 @@ def selftest():
     return 0
 
 
-def test_every_check_can_fire():
-    """The checks above are only worth their sabotages."""
-    assert selftest() == 0
-
-
-def test_governance_class_declaration():
-    """pytest entry point. The bare `python3 tools/...` invocation and this one must
-    fail together: a file that reds bare and greens under pytest has been seen in
-    this repo before."""
-    fails, out = audit()
-    assert not fails, "\n".join(["", *out, "", *(f"FAIL: {f}" for f in fails)])
-
-
-def main():
-    print(__doc__.strip().splitlines()[0])
-    print()
-    rc = selftest()
-    print()
-    if rc:
-        return rc
+def report():
+    """Print the derived class table and return the failures behind it."""
     fails, out = audit()
     for line in out:
         print(line)
@@ -511,7 +493,38 @@ def main():
         print(f"FAILED {len(fails)}:")
         for f in fails:
             print(f"  - {f}")
-        return 1
+    return fails
+
+
+def test_every_check_can_fire():
+    """The checks above are only worth their sabotages."""
+    assert selftest() == 0
+
+
+def test_governance_class_declaration():
+    """The matcher, the bar and the declaration agree."""
+    assert not report(), "see the failures printed above"
+
+
+# THE TWO INVOCATIONS MUST NOT BE ABLE TO DISAGREE. `main` derives its exit code by
+# calling the same two functions pytest collects, rather than re-implementing their
+# predicates -- a file that reds bare and greens under pytest has shipped in this
+# repo before, and `tools/ci_selfexec_test.py` exists because of it. Run both, then
+# fail: stopping at the first hides the second, and one visible failure reads as
+# "one thing to fix".
+def main():
+    print(__doc__.strip().splitlines()[0])
+    print()
+    rc = 0
+    for fn in (test_every_check_can_fire, test_governance_class_declaration):
+        try:
+            fn()
+        except AssertionError as exc:
+            print(f"\n{fn.__name__}: {exc}")
+            rc = 1
+        print()
+    if rc:
+        return rc
     print("the matcher, the bar and the declaration agree.")
     return 0
 
