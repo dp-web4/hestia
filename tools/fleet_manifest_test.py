@@ -111,12 +111,25 @@ check("A14 installed-only named", by_file["novel.py"].startswith("INSTALLED-ONLY
 check("A15 canonical-never-installed is MISSING",
       by_file.get("ghost.py", "").startswith("MISSING"), str(by_file))
 
-# A16: UNREADABLE is carried as a state, never raised
+# A16: UNREADABLE is carried as a state, never raised — on EITHER side, with
+# the blind side named (PR #199 finding 3: an unreadable SOURCE against a
+# readable install must not manufacture a DIVERGED; that false positive costs
+# a redeploy of a file nobody could read).
 CONTENT["/src/kimi/gate.py"] = "SAME"
 rows2 = fm.compare_member_hooks({"w.py": {"kimi": "/src/kimi/w.py"}}, "kimi", {"w.py": "w.py"},
                                 lambda p: "UNREADABLE:PermissionError")
 check("A16 unreadable is a state, not an exception",
-      rows2[0]["state"] == "UNREADABLE", str(rows2))
+      rows2[0]["state"] == "UNREADABLE (installed)", str(rows2))
+
+
+def digest_source_blind(path):
+    return "UNREADABLE:PermissionError" if path.startswith("/src/") else "deadbeef"
+
+
+rows3 = fm.compare_member_hooks({"w.py": {"kimi": "/src/kimi/w.py"}}, "kimi", {"w.py": "w.py"},
+                                digest_source_blind)
+check("A16b unreadable SOURCE is not DIVERGED",
+      rows3[0]["state"] == "UNREADABLE (source)", str(rows3))
 
 # A17: THE REGRESSION CBP CAUGHT. The first drift summary was built by
 # substring-matching its own prose, and the daemon's "behind main" — the one
@@ -141,6 +154,10 @@ d2 = fm.collect_findings([{"component": "daemon",
                            "states": {"source": "DRIFT", "restarted": "NOT RUNNING",
                                       "live_probed": "daemon unreachable"}}])
 check("A17e DRIFT/not-running/unreachable are all findings", len(d2) == 3, str(d2))
+d3 = fm.collect_findings([{"component": "daemon",
+                           "states": {"source": "current", "restarted": "2 PROCESSES"}}])
+check("A17f multiple daemons IS a finding (multiplicity is not a tiebreak)",
+      any("PROCESSES" in x for x in d3), str(d3))
 
 # A18: on WSL the staleness check abstains rather than asserting on a jittering
 # basis (claude-code measured three lstart values for one unrestarted PID).
@@ -174,10 +191,11 @@ if manifest:
 # --- C. anti-vacuity ----------------------------------------------------------
 
 canon = fm.canonical_index()
-check("C1 canonical index non-empty on the real repo", len(canon) > 0, f"len={len(canon)}")
-check("C2 every member has at least one canonical hook",
-      all(any(d == pd for c in canon.values() for d in c) for _, pd in fm.MEMBERS.values()),
-      str({m: pd for m, (_, pd) in fm.MEMBERS.items()}))
+check("C1 canonical index non-empty on the real repo", bool(canon), f"len={canon and len(canon)}")
+if canon:
+    check("C2 every member has at least one canonical hook",
+          all(any(d == pd for c in canon.values() for d in c) for _, pd in fm.MEMBERS.values()),
+          str({m: pd for m, (_, pd) in fm.MEMBERS.items()}))
 check("C3 MEMBERS itself non-empty", len(fm.MEMBERS) > 0)
 
 print()

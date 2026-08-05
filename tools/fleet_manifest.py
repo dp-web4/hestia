@@ -39,7 +39,9 @@ RULES IT LIVES BY:
   * measurement, not a gate: exit 0 always. Drift is data, not an exit code.
   * nothing it cannot verify is asserted. Unknown is a value.
   * privacy: no hostnames, no usernames beyond $HOME-relative paths (presence
-    over privacy — substance, not topology).
+    over privacy — substance, not topology). measured_by is the mesh plugin id
+    or "unknown", never $USER: a file that makes a point of this rule does not
+    get to break it.
 
 Usage:
   python3 tools/fleet_manifest.py [--out PATH] [--probe URL] [--member-dir NAME=PATH ...]
@@ -135,9 +137,14 @@ def compare_member_hooks(canon, plugin_dir, inst, digest):
             continue
         seen_sources.add(src)
         sd, idd = digest(src), digest(rel_installed)
-        # UNREADABLE first: two failing reads compare EQUAL, and equality must
-        # never manufacture a MATCH out of two refusals.
-        state = ("UNREADABLE" if str(idd).startswith("UNREADABLE") else
+        # UNREADABLE first, on BOTH sides: two failing reads compare EQUAL, and
+        # equality must never manufacture a MATCH out of two refusals — and an
+        # unreadable SOURCE against a readable install must not manufacture a
+        # DIVERGED either (PR #199 review finding 3: that false positive costs
+        # a redeploy of a file nobody could read). Same guard, both directions,
+        # and the state names which side is blind.
+        state = ("UNREADABLE (installed)" if str(idd).startswith("UNREADABLE") else
+                 "UNREADABLE (source)" if str(sd).startswith("UNREADABLE") else
                  "MATCH" if sd == idd else "DIVERGED")
         files.append({"file": rel_installed, "state": state})
     for base, candidates in sorted(canon.items()):
@@ -187,6 +194,9 @@ def collect_findings(rows):
                 findings.append(f"daemon: build is {src} (running {r.get('version_string', '?')})")
             if st.get("restarted") == "NOT RUNNING":
                 findings.append("daemon: NOT RUNNING")
+            rst = st.get("restarted", "")
+            if rst.endswith("PROCESSES"):
+                findings.append(f"daemon: {rst} — expected exactly one")
             lp = st.get("live_probed", "")
             if lp.startswith("NOT MOUNTED") or lp == "daemon unreachable" or "UNGATED" in lp:
                 findings.append(f"daemon: probe = {lp}")
@@ -241,18 +251,19 @@ def daemon_facts(probe_base):
 
     # Process: start time, RSS, and whether it predates the latest source change.
     ps = subprocess.run(["ps", "-eo", "pid,lstart,rss,cmd"], capture_output=True, text=True).stdout
-    proc = None
-    for line in ps.splitlines():
-        if "hestia serve" in line and "grep" not in line:
-            proc = line.strip()
-            break
-    if proc:
+    # ALL of them, not first-match-wins: two daemons are exactly the surprise
+    # this tool exists to catch, and first-match would report them as one
+    # (PR #199 review, minor finding). Multiplicity is a finding, not a tiebreak.
+    procs = [line.strip() for line in ps.splitlines()
+             if "hestia serve" in line and "grep" not in line]
+    row["processes"] = []
+    for proc in procs:
         parts = proc.split(None, 7)
-        row["process"] = {"pid": parts[0], "started": " ".join(parts[1:6]),
-                          "rss_mb": round(int(parts[6]) / 1024)}
-        row["states"]["restarted"] = "running"
+        row["processes"].append({"pid": parts[0], "started": " ".join(parts[1:6]),
+                                 "rss_mb": round(int(parts[6]) / 1024)})
+    if procs:
+        row["states"]["restarted"] = "running" if len(procs) == 1 else f"{len(procs)} PROCESSES"
     else:
-        row["process"] = None
         row["states"]["restarted"] = "NOT RUNNING"
 
     # Live probe: is the governance ledger route MOUNTED? 401/403 = mounted and
@@ -299,8 +310,17 @@ def watcher_facts():
     for proc in seen_procs:
         parts = proc.split(None, 7)
         started = " ".join(parts[1:6])
-        script = next((w for w in parts[-1].split() if w.endswith("hestia-watch-member.sh")), None)
-        member = parts[-1].split()[1] if len(parts[-1].split()) > 1 else "?"
+        toks = parts[-1].split()
+        script = next((w for w in toks if w.endswith("hestia-watch-member.sh")), None)
+        # The member is the token AFTER the script, however the watcher was
+        # invoked. The first cut assumed the `bash <script> <member>` form and
+        # indexed [1] — exec'd directly (shebang), that yields the watch-name
+        # instead of the member (PR #199 review, minor finding).
+        member = "?"
+        if script is not None:
+            i = toks.index(script)
+            if i + 1 < len(toks):
+                member = toks[i + 1]
         row = {"component": f"watcher ({member})", "pid": parts[0], "started": started}
         if script and os.path.exists(script):
             row["script"] = os.path.relpath(script, HOME) if script.startswith(HOME) else \
@@ -338,7 +358,11 @@ def watcher_facts():
 
 def canonical_index():
     """basename -> canonical source path, built from `git ls-files` so a hook
-    added tomorrow is indexed without editing this file.
+    added tomorrow is indexed without editing this file. None when git fails:
+    exit-0-always binds failure paths too, and an empty index is not an honest
+    fallback — it would misreport every installed file as INSTALLED-ONLY
+    (the first cut used check=True, so a git error RAISED and exited non-zero
+    against the measurement-not-a-gate rule — PR #199 review, minor finding).
 
     Resolution order when a basename is ambiguous (codex's hydrate exists in
     the marketplace copy too): the member's own hooks dir wins, then the
@@ -347,13 +371,15 @@ def canonical_index():
     Test files, caches, backups, and non-hook files (hooks.json et al.) are
     excluded: this compares enforcing artifacts, not their scaffolding.
     """
-    out = subprocess.run(["git", "-C", REPO, "ls-files",
-                          "plugins/*/hooks/*.py", "plugins/*/hooks/*.sh",
-                          "plugins/member-mesh/hestia-mesh.py",
-                          "plugins/member-mesh/session-mesh-inbox.sh"],
-                         capture_output=True, text=True, check=True).stdout.split()
+    r = subprocess.run(["git", "-C", REPO, "ls-files",
+                        "plugins/*/hooks/*.py", "plugins/*/hooks/*.sh",
+                        "plugins/member-mesh/hestia-mesh.py",
+                        "plugins/member-mesh/session-mesh-inbox.sh"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
     index = {}
-    for rel in out:
+    for rel in r.stdout.split():
         if any(t in rel for t in ("__pycache__", ".pytest_cache", "test_", ".bak", ".pre-")):
             continue
         base = os.path.basename(rel)
@@ -373,6 +399,10 @@ def hook_facts(member_overrides):
         row = {"component": f"hooks ({member})",
                "installed_dir": home_rel if not member_overrides.get(member) else inst_dir,
                "files": [], "states": {}}
+        if canon is None:
+            row["states"]["installed"] = "unverifiable — canonical index failed (git ls-files)"
+            rows.append(row)
+            continue
         if not os.path.isdir(inst_dir):
             row["states"]["installed"] = "UNREADABLE or absent from this seat"
             rows.append(row)
@@ -436,7 +466,7 @@ def main():
     manifest = {
         "schema": "fleet-manifest/1",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
-        "measured_by": os.environ.get("HESTIA_MESH_PLUGIN") or os.environ.get("USER") or "unknown",
+        "measured_by": os.environ.get("HESTIA_MESH_PLUGIN") or "unknown",
         "note": "single-host measurement. fleet-wide is out of scope for this artifact "
                 "and pretending otherwise is the failure it exists against.",
         "states_vocabulary": ["source fixed", "installed", "restarted", "live-probed", "fleet-wide"],
