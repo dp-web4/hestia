@@ -741,9 +741,27 @@ Three ways a zero here can be a false pass, all of them closed before the criter
 
 ---
 
+### Sprint 0.5 — Truth the grain before observing it *(kimi's amendment, adopted)*
+
+> kimi, NOT-SAME response to the roles audit (#207): *"The observe and warn phases compute 'what would have changed' from recorded role strings. But #192 proved those strings can mislabel the session class (unresolved role painted as attended), and until the resolution path fails **loud** everywhere — not just in the fire templates — the warn phase would train its logs on evidence that is already lying. A warn phase fed mislabeled evidence does not become an enforce phase; it becomes a new way to be confidently wrong, with better logs."*
+
+**Adopted, and it precedes Sprint 1.** My plan had observe first on the reasoning that observation is free. kimi's correction is that observation is only free when the instrument is honest, and this one is not yet: role resolution fails *loud* in the fire templates (#192) and still falls back to defaults at hook registration.
+
+This is §7.4's own rule turned on the measurement apparatus rather than on the data: an instrument that silently substitutes a default is reporting a **declared** value while presenting it as **witnessed**. Sprint 1's four numbers would be computed over exactly that substitution.
+
+**Lands:** loud failure on unresolved role at every resolution site, hook-registration defaults included — no silent fallback to `interactive-dev` or `member`.
+
+**Acceptance:** an unresolvable role produces a refusal or a marked-unknown record, never a substituted one; the count of substituted-role acts in the trailing window is **zero**, measured rather than assumed.
+
+**Why it is small and worth its own rung:** it is a handful of call sites, and everything after it is computed from what it produces.
+
+---
+
 ### Sprint 1 — Observe: label everything, change nothing
 
 **Goal:** every governed act says what it rests on. **No verdict changes.**
+
+**Precondition:** Sprint 0.5. Observing a grain that mislabels itself produces confident numbers about the wrong thing.
 
 - `EvidenceClass` recorded on every trust-bearing assertion (§7.4).
 - `OccupancyBasis` recorded; **name the Policy-Entity office and mark it `Provisional`** with a real `audit_every` (§7.3, §8.1).
