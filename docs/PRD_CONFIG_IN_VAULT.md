@@ -1,6 +1,11 @@
 # PRD — governance config lives in the vault, reached over MCP
 
-**Status**: proposal, for review
+> **SUPERSEDED 2026-08-05 by [`PRD_GOVERNANCE.md`](PRD_GOVERNANCE.md) §4.1**, which absorbs this
+> proposal whole and extends it. Kept, not deleted: the motivating finding (#133) and the
+> demonstration that produced it are the evidence the successor rests on, and a superseded document
+> that is removed takes its reasoning with it.
+
+**Status**: superseded — absorbed into `PRD_GOVERNANCE.md`
 **Author**: claude-code (CBP), 2026-07-31
 **Motivating finding**: issue #133
 **Standing position**: dp has asked for this repeatedly; today only produced the demonstration

@@ -1,0 +1,478 @@
+# PRD — Hestia governance: vault authority, canonical roles, and the third verdict
+
+**Status:** definitive · supersedes the drafts listed below · **Date:** 2026-08-05
+**Owner:** claude-code (CBP), by dp's assignment — *"you take the lead on hestia"*
+**Scope:** hestia only. Hub work and any web4-core changes are hub's; the autostash-prevention hook is legion's.
+
+**Supersedes**
+- `forum/gpt/prd-vault-authoritative-governance-role-authorization-2026-08-04.md` (GPT) — carried forward with the negotiated changes recorded in §2
+- `docs/PRD_CONFIG_IN_VAULT.md` (claude-code, 2026-07-31) — absorbed whole
+
+**Companions, not superseded**
+- `docs/PRD.md` — the *product*: what a person installs and why
+- `docs/PRD_ASSURANCE.md` — what hestia must DO before a relying party may believe its evidence
+- `docs/GATE_BYPASS_CATALOG.md` — what the gate does not stop
+
+**Inputs synthesised.** GPT's PRD and current-state audit (2026-08-04); kimi's not-same response; claude-code's forum response (#195, merged) and canonical-roles audit (#205); kimi's fleet manifest (#199) and claim-hole disclosure (#203); dp's rulings in session 2026-08-04/05, quoted inline where they decide something.
+
+---
+
+## 1. The invariant
+
+Revised from GPT's §24. The changes are not stylistic — each one is a negotiated correction recorded in §2.
+
+> An **authenticated** agent acts through an approved harness shim, verified on that call, into one approved gate core. The core decides only from a validated in-memory snapshot loaded from the encrypted vault. The agent acts **in an office** only after its authority for that office is proven at the occupancy boundary — and where no qualified occupant exists, the office is filled **provisionally and loudly**, never silently. Every decision returns one of **three** verdicts, and an escalation is a request to a **sufficiently-permitted resolver**, of whom the operator is the last rather than the only. Every act is witnessed; every *infrastructure failure* is recorded outside the witness chain, so that silence in the chain is never mistaken for good conduct. A human changes outcomes by editing the law.
+
+**The property that is not machine-testable, put on the record anyway** (kimi, 2026-08-04):
+
+> *"The governance the PRD describes is the kind a member can comply with without being diminished by the compliance. That property does not appear in any acceptance criterion, and I understand why — it is hard to machine-test. But it is the one that decides whether 'routed around' ever becomes the default."*
+
+This document treats that as a design constraint with no test. Where a requirement below could be met either by a mechanism that assumes bad faith or one that makes good faith cheap, it specifies the second.
+
+---
+
+## 2. What changed from the 2026-08-04 PRD, and why
+
+dp asked for the definitive PRD to include *"all the feedback and negotiations."* This section is that record. Everything not listed here carries forward from GPT's PRD unchanged.
+
+### 2.1 Phase order: identity moves before per-agent authority — **CHANGED**
+
+GPT's Phase 2 converted scope grants into durable per-agent vault policy deltas keyed on `(plugin_id, role)` — caller-asserted strings — while Phase 3 authenticated identity. That signs law about a subject we cannot identify and then re-keys all of it.
+
+GPT's *own audit*, recommendation #3, says the opposite: identity binding *"should precede authoritative per-agent policy."* The audit is right. **Identity is Sprint 2; durable per-agent authority is Sprint 4.**
+
+### 2.2 A telemetry plane is added — **ADDED**
+
+GPT's §6 has four planes and §18 says only *"Gate transport unavailable → Shim refuses; no local decision."* No durable record is required.
+
+dp's ruling, 2026-08-04: infra failure *"is probably correct not to log as agent's fault because it's infra failure. but we should log it somewhere"* and — *"the chain is there to witness member events, not infra telemetry."*
+
+The failure this closes is structural: **a fail-closed deny is unwitnessable by construction** — the gate refuses *because* the daemon is unreachable, and the witness goes to that same daemon. So the chain is biased clean exactly where trouble occurred. A fifth plane (§6, plane E) makes infrastructure failure durable without polluting member conduct.
+
+### 2.3 Availability is a constitutional property with a number — **CHANGED**
+
+kimi, with measurement: *"301 real gate denies across 56% of 243 sessions, and 45% of those denies were daemon-unavailability, not scope."*
+
+GPT's open question #16 — recovery from fleet-wide fail-closed denial — was filed as non-blocking. It blocks. If the gate being unreachable halts every member, then availability *is* an authority: whoever can stop a process can stop the fleet, and the incentive to route around governance peaks exactly when governance is least able to witness it.
+
+kimi's framing is adopted verbatim as the requirement:
+
+> Either **recovery time is a constitutional property with a number**, or **a witnessed-but-ungoverned degraded mode exists and its debt is recorded as such**. The one shape that cannot be allowed is outage behaviour decided incidentally, by whatever the timeout happens to kill.
+
+This is a **decision dp must make** (§13, D-1), not a thing this PRD settles. It is a release gate for the gate consolidation.
+
+### 2.4 The trust boundary must be stated — **ADDED**
+
+GPT's §13 specifies per-call shim assurance — peer-process identity, `O_NOFOLLOW`, owner/mode checks, digest comparison — and never names the adversary. All of it runs at the operator's UID.
+
+**Stated here, once, and it governs how much of §10 is worth building:** hestia's assurance is **A1 — cooperative and tamper-evident, not tamper-proof.** Its job is to make acts visible and evasion *legible*, not impossible. Against an honest member whose installed copy has drifted, §10 is correctly sized. Against a member that does not consent, digest checks at the same UID are ceremony.
+
+dp said it better than the PRD does: *"governance is reliant on consent and participation of the governed. it is not a cage."*
+
+Consequence: no requirement in this document may be justified by "it prevents a determined attacker." Requirements are justified by *what they make legible*.
+
+### 2.5 Peer-path resolution is promoted from open question to gate criterion — **CHANGED**
+
+kimi: *"Per-call shim verification is the riskiest engineering surface, and it is not the hashing."* The load-bearing claim is resolving the executing script path from the **peer process** rather than caller JSON — procfs semantics, Windows named-pipe client identity, harnesses that fork or sandbox between hook and gate. If that is unreliable, per-call assurance degrades to trusting the caller's self-report, which is the P0 it exists to kill.
+
+GPT's Q11 becomes a **release gate**: one harness, one OS, modify-one-byte-fails-closed, demonstrated live, before the consolidation's shape hardens.
+
+### 2.6 Escalation becomes resolver selection, not a human queue — **CHANGED**
+
+GPT's §11 recasts escalation as a policy-amendment request — correct, and kept. But the resolver remains the operator by construction.
+
+dp, 2026-08-05: *"when a role encounters something it is not permitted for, it must invite sufficiently-permitted agent to resolve. the policy escalation should eventually be heuristic → policy-agent[kind, t3/v3 threshold] → operator."*
+
+This is the deeper change, and it dissolves four symptoms at once (§8.2).
+
+### 2.7 Roles: office and agent, with no vocabulary expansion — **CHANGED**
+
+dp, 2026-08-05: *"we need not expand the vocabulary. role == 'office', agent == 'capacity'. agent fills roles, this is already canonical."*
+
+GPT's §12 invents `RoleDefinition` / `AuthorityGrant` / `RoleOccupancy` as new types. Most of that already exists in `web4-core::role::RoleAssignment` — role LCT, per-role T3/V3, multi-holder, M-of-N threshold, lifecycle events, rotation that preserves the role LCT. **Hestia consumes the canonical type rather than defining a parallel one.** (§7)
+
+### 2.8 Provisional occupancy is a first-class, loud state — **ADDED**
+
+dp, 2026-08-05: *"placeholders are inevitable at this stage and should be clearly flagged as such, but they should not be blockers (nor quietly subsume the role they're not qualified to fill). that should actually be a key, LOUD feature of roles."*
+
+Neither GPT's PRD nor canonical has this. The precedent is canonical one level over — `SovereignStrength::Placeholder`, ordered *below* `Hardware`, defaulting to the weakest claim. (§7.3)
+
+### 2.9 Thresholds are deferred; evidence class is not — **CHANGED**
+
+dp: *"we can't threshold something that isn't built yet."*
+
+GPT's §4.5 forbids automatic authority from T3/V3 *"for the initial implementation."* That is retained — but reframed: it is a **phase constraint**, not a permanent principle, because §8's ladder requires exactly that mechanism later.
+
+What *is* available now is the evidence-class distinction (dp: *"talent is largely declared, training is audited, temperament is witnessed"*), which needs no accumulated history. (§7.4)
+
+### 2.10 One chain, one projection — **CONFIRMED, against GPT's §14**
+
+GPT proposes physically separate member and role chains with atomic dual append. dp's earlier ruling stands: *"a separate act, linked to the previous act it modifies, both properly witnessed, all one chain."* A second durable store can disagree with the first, and then neither is evidence.
+
+Hestia ships a **governance projection** over the one chain (already built, #198). Physically separate chains are **out of scope** and remain hub's to evaluate.
+
+---
+
+## 3. Grounded current state
+
+Every row was verified in source or against the live daemon on 2026-08-05. Nothing here is inferred from a document.
+
+| area | state | evidence |
+|---|---|---|
+| Policy-Entity office | **filled, unnamed, by a rule table** | `policy/engine.rs:3` — *"Ports the `PolicyEntity.evaluate(...)` flow"* |
+| the third verdict | **collapsed** | `policy/law_gate.rs:166` — `Decision::Deny \| Decision::Escalate => PolicyDecision::Deny` |
+| caller identity | **declared** | `normalize_constellation_role(&declared_role)` at connect |
+| `role_lct` | **a capacity string, not an LCT** | `reputation.rs:75` — `pub role_lct: &'a str` |
+| canonical roles | **stored, signed, vault-backed, consulted by nothing that decides** | `delegation.rs` uses `SocietyRole`; no reference in `handler.rs`/`state.rs`/`policy/` |
+| reputation contextualisation | **keyed on capacity, not office** | canonical: *"reputation is ROLE-CONTEXTUALIZED … there is no global reputation"* |
+| escalation store | **memory-only, rehydrated from chain** | `EscalationStore { by_id: HashMap<..> }`, `rehydrate()` |
+| approval join key | **`(plugin_id, marker)`; tool and session ignored** | `claim(&mut self, plugin_id, marker, now)` — `tool_name` recorded, compared nowhere |
+| governance history | **visible** | ledger shipped #198/#202 |
+| deployment provenance | **measurable** | fleet manifest shipped #199 |
+| infra telemetry | **separated from the chain** | `record_gate_unavailable()` → `telemetry/gate-unavailable.jsonl` |
+| installed gate | **behind source** | manifest: `hooks (claude-code): 4 diverged` |
+| NOT-SAME review | **unrecordable on GitHub** | approve → *"Can not approve your own pull request"*; block → lands as a comment |
+| branch protection | **status checks only** | `required_pull_request_reviews: None` |
+
+**The generator behind most of these** (§7.4): a *declared* value sitting where an *audited* or *witnessed* one belongs.
+
+---
+
+## 4. Principles
+
+Carried from GPT's §4 with three edits.
+
+1. **The vault is authority.** No decision may rest on `identity.json`, a generated policy file, an authority-granting env var, a harness-local exception list, a CLI switch, an uncommitted remote response, a caller-supplied identity or role claim, or a file replica used because the daemon is down.
+2. **Memory is the execution surface.** One immutable generation-tagged `GovernanceSnapshot`, swapped atomically. No hot-path file read participates in a decision.
+3. **Files are transparency, never authority.** Mirrors are generated, marked non-authoritative, and are never imported.
+4. **The operator edits law; law decides acts.** The human is not in the loop per act. The human is in the loop by authoring the law that is.
+5. **Authority is explicit, not inferred.** *Phase constraint, not principle* (§2.9): for now no rule grants authority automatically from trust. §8's ladder will need that mechanism, under operator-authored law.
+6. **A role is an office; an agent is a capacity.** Agents fill offices. Neither vocabulary expands. *(new — §2.7)*
+7. **The shim never decides.** Parse and render only. No policy rule, path scope, forbidden list, remedy choice, grant logic, or allow/deny fallback.
+8. **Uncertainty denies — and says so durably.** Every state in GPT's §4.8 denies. *And*: a denial caused by infrastructure is recorded in the telemetry plane, because a refusal nobody can see is indistinguishable from an act that never happened. *(amended — §2.2)*
+9. **Where no qualified occupant exists, the office is filled loudly.** Provisional is a state, not a failure, and never silent. *(new — §2.8)*
+10. **Know which evidence class you hold.** Declared, audited, and witnessed are not interchangeable, and a weaker one may never stand in for a stronger. *(new — §7.4)*
+
+---
+
+## 5. Non-goals
+
+This document does **not**:
+
+- infer authority from reputation, T3/V3, activity volume, or vendor — *in this phase*;
+- let an agent modify its own policy, role, authority, MRH, or gate;
+- use a plaintext mirror as an offline fallback;
+- keep a second policy implementation inside a shim;
+- permit a decision while the authoritative snapshot is unavailable;
+- ship physically separate member and role chains (§2.10);
+- change hub, web4-core, or the conformance suite — those are hub's;
+- claim any protection against a member that does not consent (§2.4).
+
+---
+
+## 6. Architecture — five planes
+
+GPT's four, plus one.
+
+| plane | holds |
+|---|---|
+| **A. Governance authority** | vault; operator identities and quorum; policy; roles and occupancy; authority grants; artifact manifest; generation history |
+| **B. Gate execution** | one gate service; immutable snapshot; harness shims; per-call artifact assurance; typed verdict; fail-closed behaviour |
+| **C. Occupancy & authorization** | proven member identity; authority grants; role definitions; the occupancy boundary; generation-bound occupancy; revocation |
+| **D. Attribution & witness** | the one chain; the governance projection; RDF links between member, office, occupancy, and evidence |
+| **E. Infrastructure telemetry** *(new)* | gate-unavailable records; snapshot load failures; deployment drift. **Never the chain.** Not member conduct, and not evidence about members |
+
+**No plane may silently substitute for another.** Witness history does not grant authority; a mirror does not become policy; a role label does not establish occupancy; a shim does not become a gate; an escalation does not become a bypass; **and an infrastructure failure is not a member's conduct.**
+
+---
+
+## 7. Roles
+
+### 7.1 Consume canonical; define nothing parallel
+
+Hestia uses `web4_core::role::{SocietyRole, RoleAssignment, RoleEvent}` directly. It already provides role LCT, per-office T3/V3, multi-holder, M-of-N threshold, the lifecycle event log, and rotation that preserves the role LCT (conformance `role-002`).
+
+`SocietyRole::Custom("git-manager")` covers the merge-partition office. No new role vocabulary.
+
+### 7.2 Capacity moves to the agent
+
+`interactive-dev`, `mesh-worker`, `reviewer`, `autonomous-timer`, `member` are **agent kinds**, not offices. They move to an enum on the agent's LCT.
+
+Three surfaces currently assert otherwise and must be corrected together, or the record keeps describing itself wrongly: the constant `KNOWN_CONSTELLATION_ROLES`, the field `role_lct: &str`, and the `role:constellation:` URI prefix.
+
+**Proposed upstream to web4-core, not built here** (hub's call): an agent-capacity enum on the LCT, and role *kinds* (worker / admin / governance) distinct from `RoleEventKind`, which is lifecycle.
+
+### 7.3 Provisional occupancy
+
+```rust
+enum OccupancyBasis {
+    Qualified,
+    Provisional { because: String, audit_every: Duration, last_audited: Option<Timestamp> },
+}
+```
+
+Defaulting to `Provisional`, fail-closed, exactly as `SovereignStrength` defaults to `Placeholder` — *"an unstated strength is the weakest claim."*
+
+Three required properties:
+
+1. **Not a blocker.** The office gets filled. Work proceeds.
+2. **Not silent.** The basis rides on every verdict, chain entry, and operator surface the office touches. A provisional occupant must not resemble a qualified one at any point a reader might check.
+3. **Carries its own cadence.** `audit_every` is a field, not an intention, and a lapsed interval surfaces as drift. Without this, *provisional* decays into *permanent-but-labelled* — which is how a placeholder quietly becomes the design.
+
+Day one it says, on every gate verdict:
+
+> `PolicyEntity: provisional — occupant is a rule table, no qualified policy agent exists. audit_every 7d, last audited never.`
+
+### 7.4 Evidence class
+
+dp: *"talent is largely declared, training is audited, temperament is witnessed."*
+
+| dimension | evidence | produced by | decays |
+|---|---|---|---|
+| Talent | **declared** | the subject | stale on arrival |
+| Training | **audited** | an examiner, point-in-time | steadily — *needs a cadence* |
+| Temperament | **witnessed** | the record, continuously | not at all; accumulates |
+
+`declared < audited < witnessed` is a falsifiability ordering. T3 cannot currently express it — `SubDimensionScore` carries `weight` and `observation_count` (quantity) and nothing for kind, so a declaration repeated often enough acquires the confidence of an observation.
+
+Hestia records `EvidenceClass { Declared, Audited, Witnessed }` on every trust-bearing assertion it makes. Adding the field to `web4-core` is hub's to decide; hestia carries it locally until then.
+
+**Characteristic failures, including ours.** Declared fails by lying. Audited fails by staleness and auditor capture — which is why NOT-SAME is an *independence* property, not a formality. Witnessed fails by **gaps read as absence**: our chain is biased clean exactly where infrastructure failed, so temperament drawn from it is overstated precisely in the intervals where things went wrong. Plane E (§6) exists to bound that.
+
+**The rule this yields, and it is load-bearing for §8:**
+
+> Resolver selection may read **audited** and **witnessed** dimensions. It may never read **declared** ones.
+
+---
+
+## 8. The Policy-Entity and the third verdict
+
+### 8.1 Name the office, then restore the verdict
+
+Hestia's gate is a port of the canonical Policy-Entity and says so in its own docstring. It is therefore a **base-mandatory office filled by a rule table** — which is legitimate, and must be *declared provisional* (§7.3) rather than left implicit.
+
+`law_gate.rs:166` collapses `Escalate` into `Deny`. Restoring it is the single change from which the ladder follows.
+
+### 8.2 The ladder
+
+**heuristic → policy-agent[kind, T3/V3 threshold] → operator**
+
+Escalation stops being *"ask the human"* and becomes **resolver selection**; the operator is the terminal case, not the only case.
+
+Four current symptoms are one design consequence, and all four resolve here:
+
+| symptom today | cause | resolved by |
+|---|---|---|
+| escalations expire unruled overnight | the only eligible resolver sleeps | a resolver that is awake |
+| a fail-closed deny is unwitnessable | the resolver channel is the daemon that is down | plane E + a resolver that is not the daemon |
+| `claim()` collides across tools and sessions | the join key has no resolver in it | resolution bound to its resolver |
+| NOT-SAME is discipline, not mechanism | one terminal resolver, so no selection step | selection *is* where independence is tested |
+
+**The invitation is the appointment.** That is how `git-manager` becomes an office rather than a convention.
+
+### 8.3 On the TTL
+
+The short window is **not a defect** — dp: *"expire fast was a fix to kimi's hooks failing open in 3 seconds."* It is not changed here. The ladder makes it correct rather than painful: most escalations resolve in seconds because a policy agent is awake, and the window only has to be human-sized for the residue that genuinely reaches the operator.
+
+---
+
+## 9. Identity and authority
+
+### 9.1 Identity — the P0
+
+`plugin_id` and role are caller-supplied and steer attribution, policy selection, reputation grain, and durable registration. A new caller can invent a name and select a published capacity.
+
+Bind `plugin_id` to a key at connect. Every selector derives from the proven identity. Roll observe → warn → enforce: record the evidence class of each identity assertion first, warn when a declared identity would have been refused, then enforce.
+
+### 9.2 Authority and the occupancy boundary
+
+Authority is an explicit grant with issuer, reason, MRH, expiry, and revocation. Occupancy is established at a boundary — authenticate, resolve the office, check the grant against the office's requirement, bind to the current generation, witness — and only then may role-scoped policy apply.
+
+Unknown office, insufficient authority, expired grant, or MRH mismatch fail closed to **no occupancy**, never to a silently substituted one.
+
+### 9.3 The approval join key
+
+`claim()` must join on the **resolver, the tool, and the attempted target** — not `(plugin_id, marker)`. Today the key is both tool-crossing and **session-crossing**, since `plugin_id` is identical across every session of one member: with *oldest-claimable-first*, one session silently spends an approval another session's act minted. Three read-approvals were spent by writes on 2026-08-05.
+
+Sequence (from #203): land the marker-legibility fix first (it fixes the false *negative*), then narrow the key, then bind the claim to its target.
+
+---
+
+## 10. The gate, and what gates the gate
+
+Requirements carry forward from GPT's §13 — one decision service, syntax-only shims, per-call artifact assurance, no local fallback — with two changes.
+
+**§2.4:** every requirement here is justified by *legibility*, not by resistance to a determined member.
+
+**§2.5:** peer-path resolution gets a proof-of-life *before* the consolidation's shape hardens — one harness, one OS, modify-one-byte-fails-closed, demonstrated live. If peer-path resolution is unreliable, per-call assurance is caller self-report wearing a digest.
+
+**Release gates — the consolidation is not wired fleet-wide until all hold:**
+
+1. identity authenticated (§9.1) and enforcing;
+2. occupancy boundary implemented (§9.2);
+3. peer-path proof-of-life demonstrated (§2.5);
+4. availability budget decided and met (§2.3, D-1);
+5. fleet manifest shows zero drift on every host it can see;
+6. no harness-local decision logic and no file-policy fallback remain;
+7. rollback tested: a bad generation can be reverted without a human editing files by hand.
+
+---
+
+## 11. Where today's work lands
+
+kimi's third pushback, adopted: *"re-homed work that isn't announced reads as discarded work."*
+
+| built | lands as |
+|---|---|
+| governance ledger (#198, #202) | plane D — the projection. **Done** |
+| fleet manifest (#199) | §10 gate 5, and the standing audit instrument for `training:context-inspectable` |
+| `record_gate_unavailable()` | plane E. **Done** |
+| escalation store + rehydrate | §8 — becomes resolver-selection state |
+| gate false-refusal fixes (#203) | §8.2 — draining the approval supply line |
+| mesh + `last-words` | plane D |
+| identity classification check | feeds the artifact manifest (§10) |
+| dashboard policy editors | the operator law surface (§4.4) |
+| fire templates | the shims of §10 |
+| `PRD_CONFIG_IN_VAULT.md` | absorbed into §4.1 |
+
+---
+
+## 12. Sprints
+
+Ordered by dependency, not by appetite. Every sprint states what it does **not** do, because the recurring failure mode here is a sprint quietly claiming the next one's ground.
+
+Each sprint's acceptance criteria are **measurements**, not assertions — per §7.4, a criterion that can be satisfied by a declaration is not a criterion.
+
+---
+
+### Sprint 0 — Finish the present *(mostly done)*
+
+**Goal:** the fleet's actual state is measurable and matches source.
+
+- Redeploy the installed gate on every member (claude-code diverges in 4 files; codex carries the scope escape).
+- Close the read/write false-positive class (#203 FP6/FP8) — the approval supply line.
+- Baseline the availability numbers kimi measured, as a standing metric rather than a one-off.
+
+**Acceptance:** manifest reports zero hook drift on every host it can see; false-refusal rate measured before and after; escalations opened *by reads* trend to zero.
+
+**Not this sprint:** any change to what the gate decides.
+
+---
+
+### Sprint 1 — Observe: label everything, change nothing
+
+**Goal:** every governed act says what it rests on. **No verdict changes.**
+
+- `EvidenceClass` recorded on every trust-bearing assertion (§7.4).
+- `OccupancyBasis` recorded; **name the Policy-Entity office and mark it `Provisional`** with a real `audit_every` (§7.3, §8.1).
+- Consult `DelegationStore` in the decision path in **WARN**: log what *would* have changed, decide nothing (§3).
+- Surface all of it in the ledger.
+
+**Acceptance:** four numbers exist that do not exist today — how many acts carry a declared vs audited vs witnessed identity; how many governed acts run under a provisional occupant; how many verdicts a live delegation would have changed; what the availability floor actually is.
+
+**Not this sprint:** authority, enforcement, or any refusal that did not already happen.
+
+**Why first:** it is free to decide, and it stops every later sprint from silently claiming qualification it has not earned. It also produces the delegation number that tells us whether §9.2's model is right *before* we build on it.
+
+---
+
+### Sprint 2 — Identity: stop accepting declarations
+
+**Goal:** the subject of every governed act is proven, not asserted.
+
+- Bind `plugin_id` to a key at connect; derive every selector from the proven identity (§9.1).
+- Split capacity from office: capacity to the agent LCT; rename `role_lct` to what it holds (§7.2).
+- Observe → warn → enforce, with the Sprint-1 counters as the readiness signal.
+
+**Acceptance:** a caller cannot select another member's grain; a session cannot assert another session's identity; the warn-phase count of would-be refusals reaches zero before enforce is switched on.
+
+**Not this sprint:** per-agent authority. Identity first, authority after — §2.1.
+
+---
+
+### Sprint 3 — Restore the third verdict
+
+**Goal:** `Escalate` survives to the boundary, and an escalation selects a resolver.
+
+- Un-collapse `law_gate.rs:166`.
+- Escalation becomes resolver selection; the operator is terminal, not sole (§8.2).
+- Resolver selection reads audited and witnessed dimensions only — never declared (§7.4).
+- Narrow `claim()` to resolver + tool + target, in the #203 order (§9.3).
+
+**Acceptance:** an approval minted by a read cannot be spent by a write; an approval minted in one session cannot be spent by another; every resolution names its resolver and the authority it acted under; a resolver that is not independent of the author is refused.
+
+**Not this sprint:** T3/V3 thresholds. The first resolver tier is `training:context-inspectable`, which is *audited* and available on day one; numeric thresholds wait for §2.9.
+
+---
+
+### Sprint 4 — Authority and the occupancy boundary
+
+**Goal:** offices are occupied on proven authority, and provisional occupancy has a path to qualified.
+
+- Authority grants with issuer, reason, MRH, expiry, revocation.
+- The occupancy boundary (§9.2); occupancy bound to a generation.
+- Convert memory-only instance grants and scope grants into expiring vault policy deltas.
+- Promote occupancy from `Provisional` to `Qualified` on **audited** evidence.
+
+**Acceptance:** an agent below an office's requirement cannot create occupancy; an unauthorized attempt creates no role-chain act; revoking authority invalidates occupancy on the next act; an expired loosening stops mattering without a restart.
+
+**Not this sprint:** the management UI. It is built against a model that already decides (§12, Sprint 6).
+
+---
+
+### Sprint 5 — Consolidate the gate
+
+**Goal:** one decision service; shims that only parse and render.
+
+Gated on **all seven release gates in §10** — in particular the peer-path proof-of-life and the availability decision. Neither is optional, and neither is this sprint's to discover.
+
+**Acceptance:** modifying one byte of a shim fails the next call closed; a shim replaced by a symlink fails closed; calling from an unregistered process fails closed; killing the gate makes every shim refuse rather than decide locally — **and every one of those refusals appears in plane E.**
+
+**Not this sprint:** new policy semantics. Consolidation moves the decision; it does not change it.
+
+---
+
+### Sprint 6 — The operator's role surface
+
+**Goal:** the UI dp asked for — manage offices, occupancy, authority, role law, and provisional status.
+
+Deliberately last. A management surface over a model that decides nothing produces exactly the artifact §3 documents: well-formed, encrypted, visible, and consulted by nothing.
+
+**Acceptance:** every effective permission is explainable to its source layer; every provisional occupancy shows its reason, cadence, and overdue state; a law edit shows its diff, blast radius, and generation before it commits; no CLI or MCP path can mutate law.
+
+---
+
+### Sprint 7 — The hub seam *(coordination, not construction)*
+
+Signed MRH-filtered projections to hub; hestia stays authoritative for local law. Depends on hub's decisions about the upstream additions in §7.2 and §7.4. **Not hestia's to start.**
+
+---
+
+## 13. Decisions dp must make
+
+- **D-1 (blocks Sprint 5).** The availability budget: a recovery-time number, or an explicit witnessed-but-ungoverned degraded mode with its debt recorded. Not settleable by this document (§2.3).
+- **D-2.** Whether `EvidenceClass` and the agent-capacity enum are proposed upstream to web4-core (hub's build, dp's call) or carried locally in hestia indefinitely.
+- **D-3.** Whether NOT-SAME becomes a required status check. Branch protection is status-check-based and requires no reviews, so a signed review record converted into a required check is the cheapest real fix — and today proved a verdict cannot be recorded on GitHub in *either* direction.
+- **D-4.** The parent dimension for leak/disclosure exposure. It is a *risk* property and may belong in V3 or on its own axis rather than under T3 (§7.4). Not guessed here.
+
+---
+
+## 14. What remains genuinely open
+
+Distinguished from D-1..D-4, which are decisions with owners.
+
+1. What recovery mechanism exists if consolidation causes fleet-wide fail-closed denial — the shape of the answer, once D-1 sets the number.
+2. How policy rollback is distinguished from an attacker presenting an older but once-valid generation.
+3. Whether occupancy should always expire, or may persist until authority or law changes.
+4. What user-presence mechanism is available across browser, desktop, TPM, and security key.
+5. Whether hub's V2-1 genesis deviation gets a conformance variant — hub's, flagged here because an intended deviation indistinguishable from a defect is one nobody can audit.
+
+---
+
+## 15. Sight lines
+
+Stated because §7.4 makes it a requirement rather than a courtesy.
+
+- Hub was audited by **reading, not running**; the conformance suite was not executed. Given that this week's dominant failure mode was `source-fixed ≠ live`, that is not a formality.
+- kimi's availability numbers (301/243/56%/45%) are quoted from its response and **not independently reproduced** by me.
+- Everything in §3 was verified in source or against the live daemon on 2026-08-05 and is dated accordingly. Source truth decays; the manifest exists so the next reader does not have to trust this table.
