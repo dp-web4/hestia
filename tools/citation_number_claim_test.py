@@ -189,6 +189,57 @@ def test_g_an_unresolvable_baseline_falls_back_and_says_so():
         _census.BASELINE_FALLBACKS = saved
 
 
+def test_h_the_ref_population_pin_moves_when_the_population_does():
+    """`--doc-ref` pins what the census READS; this pins what it MEASURES AGAINST.
+
+    A count like `25/79` has a denominator that is not in the repository: it is the
+    caller's fetch and prune state. `test_g`'s CI case is the proof — 79 refs here,
+    0 under `actions/checkout`, identical SHA. And it is not stable across a sitting:
+    71 at `ad57091` (2026-08-05), 78 at 20:52Z on 2026-08-06, 79 at 21:15Z the same
+    hour, when another seat pushed a branch mid-run.
+
+    The case that decides whether the digest is worth anything is the THIRD one below:
+    the same number of refs pointing at different commits is a different population,
+    and a bare count cannot tell you so. A digest over names alone would pass the first
+    two assertions and be useless for exactly the failure it exists to catch.
+
+    Runs against a synthetic namespace, never `refs/remotes/origin`, so it neither
+    depends on nor disturbs this checkout's real population.
+    """
+    ns = "refs/remotes/censuspintest"
+    a = _census.git("rev-parse", "HEAD").strip()
+    b = _census.git("rev-parse", "HEAD~1").strip()
+    assert a != b, "fixture needs two distinct commits"
+    try:
+        _census.git("update-ref", f"{ns}/one", a)
+        n1, d1 = _census.ref_population_pin(ns)
+        n1b, d1b = _census.ref_population_pin(ns)
+        assert (n1, d1) == (1, d1b) and n1b == 1, \
+            f"the pin must be stable across runs on an unchanged population, got {d1} then {d1b}"
+
+        _census.git("update-ref", f"{ns}/two", a)
+        n2, d2 = _census.ref_population_pin(ns)
+        assert n2 == 2 and d2 != d1, f"adding a ref must move the pin, got {d2}"
+
+        # THE ONE THAT MATTERS. Count holds at 2; only the target moves.
+        _census.git("update-ref", f"{ns}/two", b)
+        n3, d3 = _census.ref_population_pin(ns)
+        assert n3 == 2, f"retargeting must not change the count, got {n3}"
+        assert d3 != d2, (
+            "same count, different targets — the pin MUST distinguish these, or a "
+            "reader quoting `n/2` cannot tell whether reproduction is expected"
+        )
+    finally:
+        for name in ("one", "two"):
+            # check=False: cleanup must run for refs that were never created, so a
+            # failure before the second update-ref does not leave the first behind.
+            subprocess.run(
+                ["git", "update-ref", "-d", f"{ns}/{name}"],
+                capture_output=True, text=True, check=False,
+            )
+    assert _census.remote_refs(ns) == [], "fixture refs must not survive the test"
+
+
 def main() -> int:
     """Call every test BY NAME.
 
@@ -209,6 +260,7 @@ def main() -> int:
         test_e_blind_fraction_excludes_citation_line_numbers,
         test_f_the_document_carries_no_underived_other_n,
         test_g_an_unresolvable_baseline_falls_back_and_says_so,
+        test_h_the_ref_population_pin_moves_when_the_population_does,
     ]
     fails = 0
     for fn in tests:

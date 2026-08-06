@@ -117,6 +117,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import hashlib
 import re
 import subprocess
 import sys
@@ -204,6 +205,28 @@ def blob_at(ref: str, path: str) -> str | None:
 
 def remote_refs(pattern: str) -> list[str]:
     return git("for-each-ref", "--format=%(refname:short)", pattern).split()
+
+
+def ref_population_pin(pattern: str) -> tuple[int, str]:
+    """Digest the set every `n/N` figure in this run is measured over.
+
+    `--doc-ref` pins what the census READS. Nothing pinned what it MEASURES AGAINST,
+    and that half is not a property of the repository at all: `refs/remotes/origin` is
+    whatever the caller last fetched and last pruned. The repo has this measured, not
+    argued -- `actions/checkout` fetches one commit and creates no remote-tracking refs,
+    so the same SHA that yields 78 refs on a developer box yields 0 in CI (9b927fe).
+    A figure like "17 of 71" is therefore pinned to a machine-hour, and no second reader
+    can re-derive it at any ref, ever.
+
+    The digest covers names AND targets, because 78 refs pointing somewhere else is a
+    different population wearing the same count. Quote it beside any figure taken from
+    this run: `17/78 @ refpop:ab12cd34ef56`. A reader whose digest differs knows
+    immediately that reproduction is not expected, instead of reporting a mismatch.
+    """
+    pairs = git("for-each-ref", "--format=%(refname:short) %(objectname)", pattern).split("\n")
+    pairs = sorted(p for p in pairs if p.strip())
+    digest = hashlib.sha256("\n".join(pairs).encode()).hexdigest()[:12]
+    return len(pairs), digest
 
 
 def resolve(path: str, tracked: set[str]) -> tuple[str | None, str]:
@@ -385,10 +408,14 @@ def main() -> int:
     total = sum(len(v) for v in cited.values())
     qualified = total - continuations + sum(n for n, _ in unresolved.values())
     print(f"{args.doc} @ {doc_pin}")
+    refpop_n, refpop = ref_population_pin(args.refs)
     print(f"  {qualified + continuations} live citations "
           f"({qualified} path-qualified + {continuations} bare `:NNN` continuations); "
           f"{total} resolved over {len(cited)} files, "
           f"against {len(refs)} refs under {args.refs}")
+    print(f"  ref population  : {refpop_n} refs @ refpop:{refpop} -- the denominator of every "
+          f"`n/{refpop_n}` below. NOT a property of this repo: it is the caller's fetch/prune "
+          "state, 0 under actions/checkout (9b927fe). Quote it with any figure taken from here.")
     # Name them, do not merely count them. The marker exempts whatever it abuts, so a
     # prose mention of the marker landing right after a real citation would exempt it
     # silently. Printing the spellings is the control that makes that visible.
