@@ -139,7 +139,13 @@ class Stub(http.server.BaseHTTPRequestHandler):
             cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=floor)
             shown = [d for d in DEBTS
                      if datetime.datetime.fromisoformat(d["queued_at"].replace("Z", "+00:00")) < cutoff]
-            payload = {"i_owe": shown, "owed_to_me": []}
+            # The daemon ECHOES the floor it APPLIED, not the one it was asked for.
+            # Measured against the live daemon 2026-08-06, same session, four cells:
+            #   older_than_secs=0 -> 0 | omitted -> 21600 | older_than_seconds=0 -> 21600
+            #   | older_than_secs=60 -> 60.  The misspelled cell reports the fallback,
+            # which is what makes the echo usable as an oracle rather than a mirror.
+            # `floor` here is post-fallback for exactly that reason.
+            payload = {"i_owe": shown, "owed_to_me": [], "older_than_secs": floor}
         else:
             payload = {}
         self._sse({"jsonrpc": "2.0", "id": body.get("id"),
@@ -324,6 +330,43 @@ def main():
     check("3c. with `older_than_secs` silently discarded, a young owed notice STILL fires "
           "(the verdict does not depend on the floor)",
           901 in got and not os.path.exists(os.path.join(primers, "notice-YOUNGY.json.discharged")),
+          f"fired ids={sorted(got)} dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
+
+    # ---- 5. A PROMPTLY-ANSWERED NOTICE IS RETIRABLE.
+    # The price of case 3's blanket min-age band was the modal case on this mesh: a
+    # notice answered within 6h could never be retired, so if its fire ever returned
+    # nonzero it re-fired to the attempt budget. Measured on CBP 2026-08-06: three
+    # retained claude-code primers, all absent from `i_owe` at floor 0, all held only
+    # by the band -- and the wake that found it was attempt 1 of 3 for notice 1208,
+    # answered 45 minutes earlier.
+    #
+    # The band now shrinks to the floor the fold ADMITS to. Same 30-minute notice as
+    # 3b/3c, one difference: nothing owes it. Red before the fix (the band alone fires).
+    got, primers, out = run_case(
+        tmp, ep, "young-discharged",
+        planted={"YNGDIS": [notice(910, 1800)]},
+        debts=[], want_ids=set())
+    check("5a. a notice answered inside the 6h default is retired, not re-fired, "
+          "when the fold reports it covered floor 0", got == set(),
+          f"fired ids={sorted(got)}\n{out[-1500:]}")
+    check("5b. and it is RETIRED rather than left for the next restart",
+          os.path.exists(os.path.join(primers, "notice-YNGDIS.json.discharged")),
+          f"dir={sorted(os.listdir(primers))}")
+
+    # ---- 6. THE ECHO IS AN ORACLE, NOT A MIRROR.
+    # 5 passes if the guard trusts the floor it REQUESTED; this one only passes if it
+    # trusts the floor the fold REPORTED. Identical to 5 except the stub discards the
+    # argument (#155) and says so in the echo. The notice is answered here, so absence
+    # from `i_owe` is real -- but at an admitted floor of 6h it is UNMEASURABLE, and a
+    # guard that cannot tell the two apart is one misspelling away from deleting a live
+    # work list. Gate on `args["older_than_secs"]` instead of the echo and this is red.
+    got, primers, out = run_case(
+        tmp, ep, "young-floor-ignored",
+        planted={"YNGIGN": [notice(911, 1800)]},
+        debts=[], want_ids={911}, ignore_floor_arg=True)
+    check("6. when the fold admits it applied the 6h default, a young notice is "
+          "unmeasurable and fires -- absence under a floor is not an answer",
+          911 in got and not os.path.exists(os.path.join(primers, "notice-YNGIGN.json.discharged")),
           f"fired ids={sorted(got)} dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
 
     # ---- 4. A REFUSAL IS NOT AN EMPTY DEBT.

@@ -404,13 +404,34 @@ migrate_flat_primers
 #     Under #155 (every tool is `additionalProperties: true` with zero declared
 #     properties) a misspelled `older_than_secs` is discarded into a success and
 #     MEMBER_UNANSWERED_DEFAULT_SECS (6h) applies without saying so — which would
-#     retire the primer of a notice stranded forty minutes ago. Refusing to judge
-#     anything younger than that same 6h makes the verdict independent of whether the
-#     argument was honoured at all: inside the window, both spellings return the same
-#     rows. The floor is not trusted; it is made irrelevant.               -> fire
+#     retire the primer of a notice stranded forty minutes ago.       -> fire, UNLESS
+#     the fold says out loud which floor it applied. See below.
 # Nothing above can produce a false "spent". That asymmetry is the whole design.
+#
+# THE FLOOR IS NOW VERIFIED RATHER THAN ASSUMED (2026-08-06).
+# The original min-age rule made the verdict "independent of whether the argument was
+# honoured at all" by refusing to judge anything younger than 6h. That is sound, and its
+# price is the modal case on this mesh: a notice answered PROMPTLY is never retirable,
+# because for its whole first 6h it sits in the unmeasurable band. Measured on CBP the
+# day this was written — three retained primers for claude-code (notices 1177/1178/1179,
+# 1199/1200/1201, 1208), every one of them absent from `i_owe` at floor 0, every one of
+# them blocked from retirement by this check alone, and the wake that found it was
+# re-fire attempt 1 of 3 for notice 1208, answered 45 minutes earlier.
+#
+# `hestia_member_unanswered` echoes `older_than_secs` in its response, and the echo is
+# the APPLIED floor, not the requested one. Measured against the live daemon, all four
+# cells, same session:
+#     older_than_secs=0            -> echo 0      i_owe 7 rows
+#     omitted                      -> echo 21600  i_owe 1 row
+#     older_than_seconds=0 (#155)  -> echo 21600  i_owe 1 row   <- the trap, reported
+#     older_than_secs=60           -> echo 60     i_owe 7 rows
+# The misspelled cell is the one that matters: the daemon does not parrot the request,
+# it reports the default it fell back to. So "was my floor honoured" is answerable
+# rather than assumable, and the min-age band shrinks to the floor the fold ADMITS to.
+# Every failure direction still fires: echo absent (an older daemon), echo non-integer,
+# or echo > 0 all fall back to the conservative 6h band unchanged.
 SPENT_MAX_AGE_SECS="${SPENT_MAX_AGE_SECS:-518400}"   # 6d — deliberately INSIDE the daemon's 7d inbox TTL
-SPENT_MIN_AGE_SECS="${SPENT_MIN_AGE_SECS:-21600}"    # 6h — MEMBER_UNANSWERED_DEFAULT_SECS, the floor we refuse to depend on
+SPENT_MIN_AGE_SECS="${SPENT_MIN_AGE_SECS:-21600}"    # 6h — MEMBER_UNANSWERED_DEFAULT_SECS, the fallback when the fold will not say
 
 # $1 = primer path, $2 = the `unanswered` fold, fetched once per pass. Exit 0 ONLY when
 # every notice in the primer is inside the measurable window and absent from `i_owe`.
@@ -429,6 +450,11 @@ if not isinstance(fold, dict) or not isinstance(fold.get("i_owe"), list):
     raise SystemExit(1)
 if not notices:
     raise SystemExit(1)                     # nothing to judge -> leave the old path alone
+# The fold's own statement of the window it covers. `unanswered_now` asks for 0; this
+# reads what was actually applied. A bool is not an int here on purpose (True == 1).
+applied = fold.get("older_than_secs")
+if isinstance(applied, int) and not isinstance(applied, bool) and 0 <= applied < min_age:
+    min_age = applied                       # the fold covers this band; trust it that far
 owed = {n.get("id") for n in fold["i_owe"] if isinstance(n, dict)}
 now = datetime.datetime.now(datetime.timezone.utc)
 for n in notices:
