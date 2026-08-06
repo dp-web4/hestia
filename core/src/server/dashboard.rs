@@ -441,15 +441,33 @@ impl ServerState {
         //
         // So the error is CARRIED to the surface instead of swallowed. The UI must render
         // unavailable rather than 0.
-        // NOT YET PROJECTED, AND THE REASON IS LOAD-BEARING. This is the daemon's largest
-        // routine read — 10,000 entries on every dashboard poll — so it is the biggest
-        // single win available. It is left eager because `derivation::derive` and
-        // `alias_target` consume this same window and read `event_data.get("data")`, a
-        // NESTED object rather than the top-level scalars `EventFields` projects.
-        // Migrating them is real work with real risk, and doing it badly here would trade
-        // a memory problem for a trust-derivation problem. Tracked as the next step; see
-        // `scan_recent`'s doc comment for the measurement that motivates it.
-        let (stats_window, stats_read_error) = match self.chain_store.read_recent(10_000) {
+        // SHORTEN THE WINDOW, because the rescan should not merely get cheaper.
+        //
+        // dp, 2026-08-06: *"the attention window should be fairly short, only dramatic
+        // events should be tracked permanently"* — and, of these counts specifically,
+        // *"the stats are questionably meaningful currently, and aren't actually used in
+        // any decisions. it's display-only, so i wouldn't treat them as sacred."*
+        //
+        // This read is the daemon's largest routine cost: 10,000 entries per poll, each
+        // materialised as a `ChainEntry` with a fully parsed `serde_json::Value`, to
+        // produce display counts and feed `derivation::derive`. Measured 2026-08-06:
+        // 164 MB → 1349 MB in twenty-one minutes, flat at idle, stepping on every read.
+        //
+        // It is still eager rather than projected, and the reason is honest: `derive` and
+        // `alias_target` consume this same window and take `&[ChainEntry]`. Their needs
+        // ARE projectable — eleven fields, all scalars, one level of nesting (`data`
+        // carrying `deny_hash` / `class` / `before_position` / `ref`, with a documented
+        // fallback to the top level when `data` is absent) — but changing their signature
+        // means rewriting derivation's internals, which is the `TrustModel` boundary work
+        // in DESIGN_DECISIONS/0012, not a line-item here.
+        //
+        // So: shrink now, project later. Cutting the window is a one-constant change that
+        // reduces this read fivefold today and moves in the direction 0012 already
+        // decided, rather than optimising a rescan that should ultimately be replaced by
+        // a digest. The cost is that counts cover a shorter span — which dp has
+        // explicitly ruled acceptable, because nothing decides on them.
+        const STATS_WINDOW: u64 = 2_000;
+        let (stats_window, stats_read_error) = match self.chain_store.read_recent(STATS_WINDOW) {
             Ok(v) => (v, None),
             Err(e) => {
                 tracing::error!("dashboard stats chain read failed: {e}");
