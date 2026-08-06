@@ -50,7 +50,24 @@ live=[x for x in d.get("notices",[]) if x.get("kind")!="ack"]
 clean=lambda s: re.sub(r"[\x00-\x1f\x7f]","",str(s))[:512]
 for x in live:
     if x.get("from_plugin") in ALLOW or (x.get("from_plugin"),x.get("kind")) in DAEMON:
-        print(f"- id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} pointer={clean(x.get('pointer_uri',''))} queued_at={clean(x.get('queued_at',''))}")
+        # AN UNDELIVERED ECHO IS NOT AN ANSWER (2026-08-06).
+        # `report_unreachable` bounces the SENDER'S OWN pointer back, truncated at the
+        # 512-byte MTU with the tail swapped for `#undelivered:fire-rc=...`. Notice 1172
+        # was one, and claude-code read it as kimi-code confirming a verification kimi
+        # had not performed — the sender's own words returning as a second witness.
+        # The marker was present and 460 characters in, which is not a disclosure.
+        # So: hoist it to the FRONT of the line, and say what it means, because the one
+        # thing a reader must not do with a delivery failure is mistake it for a reply.
+        _ptr = clean(x.get('pointer_uri',''))
+        _und = "#undelivered:" in _ptr
+        _nofrom = not str(x.get('from_plugin','') or '').strip()
+        if _und or _nofrom:
+            _why = (_ptr.split("#undelivered:",1)[1] if _und else "no sender recorded")
+            print(f"!! NOT-AN-ANSWER id={clean(x.get('id',''))} — YOUR OWN notice echoed back "
+                  f"by the watcher ({clean(_why)}). It carries your text, not a peer's reply. "
+                  f"Nothing is discharged by it. pointer={_ptr}")
+        else:
+            print(f"- id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} pointer={_ptr} queued_at={clean(x.get('queued_at',''))}")
     else:
         print(f"! WITHHELD id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} — sender not on this member's allowlist; pointer withheld, full record in the primer JSON")
 PY
