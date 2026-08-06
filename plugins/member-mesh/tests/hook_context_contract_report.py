@@ -14,10 +14,16 @@ Every contract below cites where it was read. None of them is a guess, and none
 of them is a launch of another member's seat -- three are code reads of the
 installed engine, one is this process's own live context.
 
-  claude-code   Claude Code (this seat)   live positive control, 2026-08-06:
-                the law block arrives as "SessionStart hook additional context:"
-                (envelope) AND three hooks arrive as "SessionStart:startup hook
-                success: ..." (plain stdout). BOTH forms reach the model.
+  claude-code   Claude Code 2.1.221      live positive control at SessionStart,
+                2026-08-06: the law block arrives as "SessionStart hook additional
+                context:" (envelope) AND three hooks arrive as "SessionStart:startup
+                hook success: ..." (plain stdout). BOTH forms reach the model.
+                UserPromptSubmit: LAUNCH-VERIFIED, two `claude -p` runs of this own
+                seat via --settings, five hooks on one event, each with a firing
+                marker so "not delivered" could not be confused with "not run".
+                All five fired; two arrived. Plain text and the nested envelope
+                MODEL; top-level `message`, an unrecognized key, and TOP-LEVEL
+                `additionalContext` all DARK. Artifacts /tmp/cc-ups-probe/.
   gemini        @google/gemini-cli 0.52.0  bundle/chunk-IQDAUFS5.js
                 (HookResult.getAdditionalContext, convertPlainTextToHookOutput)
                 + bundle/gemini-6K6USV55.js (SessionStart consumption).
@@ -53,14 +59,30 @@ TOKENS = lambda s: len(s) / 4  # noqa: E731 - order-of-magnitude only, and said 
 
 
 def claude_code(event, stdout, rc=0):
-    if event != "SessionStart":
+    if event not in ("SessionStart", "UserPromptSubmit"):
         return "?", "not measured on this seat"
+    if not stdout.strip():
+        return "DARK", "no output"
     try:
         doc = json.loads(stdout)
-        ctx = (doc.get("hookSpecificOutput") or {}).get("additionalContext")
-        return ("MODEL", "envelope honored") if ctx else ("DARK", "envelope carried no additionalContext")
     except Exception:
+        # Launch-verified on UserPromptSubmit (probe hook A) and live at SessionStart
+        # (three plain-stdout hooks arrive as "SessionStart:startup hook success: ...").
         return "MODEL", "plain stdout honored too (rare: this engine takes both)"
+    hso = doc.get("hookSpecificOutput") or {}
+    if hso.get("additionalContext"):
+        return "MODEL", "envelope honored (nested + hookEventName)"
+    # THE CLIFF. Once stdout parses as JSON, ONLY the nested form is read. Every other
+    # key -- including a top-level `additionalContext`, the single most plausible wrong
+    # guess -- is dropped as "unrecognized". The engine HAS a hint for exactly this
+    # ("Hook JSON output had unrecognized keys (ignored): ... Did you mean
+    # hookSpecificOutput.additionalContext (with a hookEventName)?", strings(1) on
+    # 2.1.221) and that hint is NOT on stderr under --debug and NOT in the transcript
+    # jsonl -- so in a -p / hook-fired session it reaches nobody. Plain text is safe;
+    # JSON is a cliff with a guardrail nobody can hear.
+    if "additionalContext" in doc:
+        return "DARK", "TOP-LEVEL additionalContext: unrecognized key, dropped (launch-verified, cell E)"
+    return "DARK", f"no hookSpecificOutput.additionalContext; unrecognized keys {sorted(set(doc))} ignored"
 
 
 def gemini(event, stdout, rc=0):
@@ -175,6 +197,15 @@ def main():
     report("A LONG payload in the envelope (e.g. the full operating law)",
            "SessionStart", envelope("x" * 4 * (CODEX_SPILL_TOKENS + 500)))
 
+    # The shape a real in-fleet hook shipped for 4.7 months. Not hypothetical: it is
+    # verbatim what snarc's UserPromptSubmit handler emitted from 2026-03-14 until
+    # 2026-08-06 (hooks/handlers/user-prompt.ts:43, beside a comment asserting "Claude
+    # sees this as part of the conversation"). Read the row across the four engines:
+    # the two that disagree, disagree in the direction nobody would guess.
+    report("THE PLAUSIBLE WRONG GUESS — top-level additionalContext (snarc's live shape)",
+           "UserPromptSubmit",
+           json.dumps({"additionalContext": "<snarc-context>...</snarc-context>"}))
+
     print("""
     MODEL   reaches the model      MODEL?  schema-valid, consumption unverified
     HUMAN   stderr only            DARK    discarded or rejected     SPILL   disk pointer
@@ -186,7 +217,20 @@ def main():
     document) that serves four seats: portability here means a per-engine
     emitter, not a cleverer union document. Codex's schema is CLOSED at both
     levels, so a union document with extra keys for other engines is REJECTED
-    outright -- the obvious fix is the one that cannot work.""")
+    outright -- the obvious fix is the one that cannot work.
+
+    And read the LAST row twice. A hook that emits PLAIN TEXT is delivered on
+    claude. The same hook, emitting the same text inside the most plausible JSON
+    wrapper anyone would guess, is dropped -- while on kimi that identical
+    document IS delivered, by an accident (raw-stdout fallback) rather than by
+    contract. So the engine that looks permissive silently discards it and the
+    engine that looks broken passes it through. Neither one tells the author.
+    Every engine here has a diagnostic for its own failure mode; on claude it is
+    a "did you mean" hint, on gemini a systemMessage, on codex a parse error --
+    and all three are addressed to a HUMAN AT A TERMINAL. The fleet runs headless.
+    An engine's guardrail against silent hook misconfiguration is itself
+    silently delivered, which is why this took 4.7 months to notice and why
+    finding it needed a launch, not a code read.""")
 
 
 if __name__ == "__main__":
