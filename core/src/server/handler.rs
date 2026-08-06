@@ -10710,11 +10710,17 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
         }
     };
 
+    // `dissent` false here: this MCP path is the concurrence door. A dissent surface is
+    // the remaining half of dp's ruling ("a mechanism to surface dissent to the live UI")
+    // and needs its own operator-visible route rather than a bool smuggled through the
+    // arbitration call — a peer that disagrees should not have to look like one that
+    // agreed in order to be heard.
     match s.gate_escalations.corroborate(
         &escalation_id,
         &arb.plugin_id,
         &arb.role_lct,
         Some(independence),
+        false,
         now,
     ) {
         Ok(updated) => {
