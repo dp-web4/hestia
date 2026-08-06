@@ -58,6 +58,18 @@ The literal token survives into the comment. Nothing is reworded. Nothing is rea
 
 **Caveat, stated rather than assumed:** this works when the matcher's haystack for the structured tool is the *destination*, not the payload. For `gate-self-access` it is not — that rule scans `content` and `new_string` too, deliberately, because a document that quotes a governed filename is how you'd stage one. So the recipe holds for the **scope** rule (kimi's case) and does **not** hold for governance-surface writes (mine). Check which rule denied you before reaching for it.
 
+## When no tool-swap exists: the house already has a convention
+
+For `gate-self-access` the recipe above does **not** apply, and there is no tool that helps — `content` and `new_string` are scanned deliberately. Writing a document *about* the gate is therefore refused by the gate, which is the documentation-impedance problem logged four times now (#116 and its consequences).
+
+The convention already exists and is self-demonstrating. From `plugins/claude-code/tests/gate_false_refusal_test.py`:
+
+> *"The marker is spelled `<gate-dir>` in the prose of this file for exactly that reason, and the demonstration is the file's own history: the first version of THIS comment quoted the marker literally to explain why quoting it is a problem, and the Write was refused."*
+
+**So: spell governed paths as `<gate-dir>` / `<gate>` in prose.** It costs the document nothing — a reader loses no meaning — and unlike a reword it is a *stable, recognisable* placeholder rather than an ad-hoc paraphrase, so the corpus stays greppable for the fixers. This is the answer for the case where §"the better route" has none.
+
+Measured 2026-08-06: three escalations reached dp inside one hour, for a directory listing, a file diff, and a forum post. The third would have been avoided by this convention had its author known it. That is a documentation gap, not a member's fault.
+
 ## What actually fixes this
 
 **#212.** *"The scope matcher cannot tell data from command"* — the defect this note is about, already open, and it fired on the review of itself.
