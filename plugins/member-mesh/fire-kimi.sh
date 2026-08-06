@@ -202,35 +202,37 @@ except Exception:
   # PAINTS the unresolved case as an attended session instead of leaving it blank. Silence
   # was load-bearing for a promise that no longer holds.
   if [[ -z "${HESTIA_ROLE:-}" ]]; then
-    # AND NOW REFUSE, RATHER THAN PROCEED. Warning was the 2026-08-05 fix and it worked —
-    # dp read the warning in the log. But the session fired anyway, and on 2026-08-06 one of
-    # them opened escalation 411bf87a against the gate's own directory with
-    # `ASKED_BY: unattributed` and `MAY_RULE: false`: an anonymous act, against a governance
-    # marker, that no peer was eligible to rule on.
+    # DECLARE PROVISIONALLY — do not paint, and do not block.
     #
-    # An act nobody can be held to is worth less than no act. Every link in that chain was
-    # visible and every one of them only warned — identity unhydrated, role unresolved,
-    # session started, acts unattributed, escalation reaching the operator with nobody to
-    # hold responsible. This is the link that stops warning.
+    # Three options and only one of them is right. (1) Leave it blank: the hook
+    # registration then supplies `interactive-dev`, painting an autonomous session as an
+    # ATTENDED one — the silent misattribution the 2026-08-05 warning was added to expose.
+    # (2) Refuse to fire: correct about attribution, catastrophic about availability. It
+    # stops the mesh — the fleet's only coordination channel — to prevent acts that were
+    # gated, witnessed and legitimate, and merely unattributed. dp, 2026-08-06: "how would
+    # effectively disabling mesh notifications be a good thing?" It would not, and the
+    # first draft of this branch did exactly that.
     #
-    # THE NOTICE IS ALREADY DRAINED BY THE TIME THIS RUNS — the watcher drains
-    # consume-once and hands us a primer. An earlier draft of this comment claimed the
-    # notice was left queued; that was FALSE and would have made this a data-loss bug.
-    # What preserves the work is exiting NONZERO, which makes the watcher KEEP the primer
-    # ("Success: primer is spent, remove it. Failure: KEEP it"). 70 is this file's
-    # existing convention for refuse-and-retain, already used by the unallowlisted-sender
-    # branch above; 3 is NOT free — `fire-rc=3` already carries a meaning in the
-    # undelivered vocabulary.
+    # (3) This. THE FIRE ITSELF IS THE EVIDENCE: a mesh fire is, definitionally, a
+    # mesh-worker session. We are not guessing — we are declaring what we actually know,
+    # and marking HOW we know it so a reader can weigh it. `HESTIA_ROLE_BASIS` travels with
+    # the role and says the difference between "hydrated from a signed identity file" and
+    # "asserted by the fire because the identity was never written".
     #
-    # A retained primer also emits the `#undelivered:` echo back to the sender. That is
-    # correct here — the sender should learn its work did not run — and it is legible
-    # rather than mistakable for an answer, since #216 hoists that marker to the front.
-    echo "[fire-kimi] REFUSING TO FIRE: role unresolved — no HESTIA_ROLE in the environment" \
-         "and no role readable from $_ident. A mesh session that cannot name its own role" \
-         "produces acts attributable to nobody (see escalation 411bf87a, 2026-08-06)." \
-         "The notice is left QUEUED, not consumed. Hydrate the identity file or export" \
-         "HESTIA_ROLE, and the next fire will pick it up." >&2
-    exit 70
+    # This is the fleet's own deficiency rule applied to session identity: proceed with the
+    # best available, never silently, always with the deficiency on the record — the same
+    # primitive as OccupancyBasis::Provisional, ReadBasis, and D-1's OnExceeded. An earlier
+    # draft of this branch reached for a block and got it wrong; the rule exists precisely
+    # because blocking feels like rigour.
+    export HESTIA_ROLE="role:constellation:mesh-worker"
+    export HESTIA_ROLE_BASIS="provisional:declared-by-fire; identity file absent or unreadable at $_ident"
+    echo "[fire-kimi] role unresolved — DECLARING role:constellation:mesh-worker PROVISIONALLY." \
+         "The fire is the evidence: this is a mesh-woken session, so mesh-worker is what it" \
+         "is, not a guess. Basis recorded in HESTIA_ROLE_BASIS. This is NOT a hydrated" \
+         "identity: nothing in the claude-code tree writes $_ident (codex, gemini and kimi" \
+         "ship identity.seed.json + hydrate.sh; claude-code ships neither). Acts will be" \
+         "attributed to mesh-worker with a provisional basis rather than painted as" \
+         "interactive-dev or lost to 'unattributed' (escalation 411bf87a, 2026-08-06)." >&2
   fi
 fi
 cd "${HESTIA_WORKSPACE:-$(cd "$HERE_DIR/../../.." && pwd)}" && "$HERE_DIR/with-member-lock.sh" kimi-code \
