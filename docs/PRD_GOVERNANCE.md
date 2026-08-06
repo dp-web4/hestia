@@ -670,10 +670,112 @@ Signed MRH-filtered projections to hub; hestia stays authoritative for local law
 
 ## 13. Decisions dp must make
 
-- **D-1 (blocks Sprint 5).** The availability budget: a recovery-time number, or an explicit witnessed-but-ungoverned degraded mode with its debt recorded. Not settleable by this document (§2.3).
-- **D-2.** Whether `EvidenceClass` and the agent-capacity enum are proposed upstream to web4-core (hub's build, dp's call) or carried locally in hestia indefinitely.
-- **D-3.** Whether NOT-SAME becomes a required status check. Branch protection is status-check-based and requires no reviews, so a signed review record converted into a required check is the cheapest real fix — and today proved a verdict cannot be recorded on GitHub in *either* direction.
-- **D-4.** The parent dimension for leak/disclosure exposure. It is a *risk* property and may belong in V3 or on its own axis rather than under T3 (§7.4). Not guessed here.
+**All four answered by dp, 2026-08-06.** Recorded here with what each decides; D-1 and D-3 turned out to be the same mechanism (§13.5).
+
+### D-1 — availability budget: **per-role, base law with overrides** ✅
+
+> dp: *"this should be per-role, or a base law with per-role overrides and granularity as needed. some roles can wait for perfect agent, others must do with what they can get and fail loudly when blocked."*
+
+A single fleet-wide recovery number was the wrong shape. Availability tolerance is a property **of the office**, because the cost of an office standing empty differs per office: an Archivist that pauses loses ordering; a Policy-Entity that pauses stops every member.
+
+```rust
+struct AvailabilityPolicy {
+    /// How long the office may stand unfilled/unreachable before the rule below fires.
+    grace: Duration,
+    /// What happens then.
+    on_exceeded: OnExceeded,
+}
+
+enum OnExceeded {
+    /// Wait for a qualified occupant. Acts requiring this office refuse — loudly, in plane E.
+    Refuse,
+    /// Proceed with the best available occupant, as Provisional (§7.3), and audit on that cadence.
+    ProceedProvisional { because: String, audit_every: Duration },
+}
+```
+
+Base law sets the default; each `RoleDefinition` may override; finer granularity is added where an office earns it rather than pre-emptively.
+
+**This is the same field family as `OccupancyBasis` (§7.3), not a parallel one.** "Can wait for a perfect agent" *is* `OnExceeded::Refuse`; "must do with what it can get" *is* `ProceedProvisional`. The availability budget and the occupancy basis are one decision seen from two sides — before the office is filled, and after.
+
+And the refusal half is not silent: *"fail loudly when blocked"* means a `Refuse` outcome is a plane-E record naming the office, the grace it exceeded, and what was blocked — not a timeout that kills something and leaves no account.
+
+**This retires kimi's "the current one" finding (§2.3):** outage behaviour stops being decided incidentally by whatever the timeout kills, because every office states its own answer in law.
+
+### D-2 — `EvidenceClass` and agent-capacity go to **core** ✅
+
+> dp: *"sounds like core is the right call."*
+
+Both are proposed upstream to `web4-core` (hub's build per the scope split). Hestia's local carry (§7.2, §7.4) is therefore **transitional with a named destination**, not a permanent fork — and the PRD says so, because a local type with no upstream plan is how a divergent vocabulary starts.
+
+Hestia consumes the canonical types when they land. Until then it records the same shapes locally, and the migration is a rename rather than a redesign.
+
+### D-3 — NOT-SAME is **per-request-class, three-valued** ✅
+
+> dp: *"that needs per-request-class granularity. some things require not-same, some prefer it but ok either way, some don't care."*
+
+A single repo-wide required check was the wrong shape for the same reason D-1 was:
+
+```rust
+enum NotSameRequirement { Required, Preferred, Indifferent }
+```
+
+- **Required** — merge/act refuses without an independent reviewer. Governance surfaces, law edits, authority grants.
+- **Preferred** — proceeds if no independent reviewer is available, **and the record says it proceeded without one.** This is the loud-placeholder shape again (§7.3): not blocked, not silent.
+- **Indifferent** — no independence claim made or implied, so none is recorded as missing.
+
+The existing arbiter tiers (`CrossVendor > CrossMember`) become the *strength* of a satisfied requirement, not a separate scale.
+
+**Mechanism.** Branch protection here is status-check-based and requires no reviews (verified 2026-08-05), so the fix is a required status check fed by a **signed review record** rather than by GitHub's review state — which cannot express a cross-vendor verdict in either direction on this repo (approve → *"Can not approve your own pull request"*; block → lands as a comment). The check reads the request class, looks for a signed not-same record at that head, and goes green for `Indifferent`, green-with-a-note for an unsatisfied `Preferred`, and red for an unsatisfied `Required`.
+
+### D-4 — leak/disclosure is **not a score at all; it is MRH** ✅
+
+> dp: *"tell me more about it."*
+
+I offered T3-subdimension vs V3 vs its-own-axis. Having looked properly, **all three are wrong**, and the reason is worth stating because it changes what gets built.
+
+**Why not T3.** T3 asks *"will this entity do right by me?"* A perfectly honest, perfectly trained, perfectly consistent cloud-hosted agent **still discloses everything it reads to its provider.** So a T3 score would penalise character for a structural fact — and worse, it would be *improvable by good conduct*, which it must never be. No amount of witnessed good behaviour reduces disclosure by one byte.
+
+**Why not V3.** `Valuation / Veracity / Validity` measure value *produced*. Exposure is a cost *borne by the relying party*. Wrong direction.
+
+**Why MRH.** The spec defines MRH as *"the context boundary for an entity — the set of all entities that are relevant to this LCT's operations."* For a cloud-hosted agent the provider **is** such an entity: present in every act, relevant to every operation, and **not removable by any grant.** That is not a score about the agent. It is a fact about the shape of its horizon.
+
+So disclosure exposure is expressed as an MRH fact — enumerable, auditable, and in the *audited* evidence class (§7.4) rather than as a number someone has to trust.
+
+#### The consequence that actually matters
+
+**MRH grants are subtractive for reach, but not for disclosure.**
+
+- *"Do not let this agent see X"* → **enforceable.** The gate refuses the read.
+- *"Let this agent see X, but do not let X leave"* → **not enforceable, ever, for a cloud-hosted agent.** The moment I read it, it is in the provider's context.
+
+Which yields a rule hestia needs now, not in a later sprint:
+
+> **For a cloud-hosted member, vault read policy *is* disclosure policy.** There is no separate confidentiality control to add later, because the disclosure happens at the read.
+
+This is also outside the A1 trust boundary (§2.4) in a way nothing else here is. A1 is about whether a member *complies*; disclosure happens even under perfect compliance. It is the one exposure in this document that cooperative assurance cannot touch, which is exactly why it must be structural rather than scored.
+
+#### And it composes, which a score would not
+
+MRH is a set, so an act's disclosure horizon is the **union** of its participants' horizons. If a local agent delegates to a cloud agent, the act's horizon expands to include that provider — automatically, and visibly. A per-agent risk score would have had to invent a propagation rule and would have got it wrong.
+
+#### What this does *not* change
+
+`training:context-inspectable` (§7.4) stays a Training subdimension. Inspectability — *can the shaping be examined* — and disclosure — *what escapes* — are correlated but distinct, and conflating them is why the fourth item looked like a sibling of the third. So the earlier proposal was right about three of four; the fourth was never a score.
+
+### 13.5 D-1 and D-3 are one mechanism
+
+Both answers have the same shape, and it is dp's rule from §7.3 applied twice:
+
+> When the qualified thing is unavailable: **do not block, do not silently substitute, proceed or refuse loudly with the deficiency recorded.**
+
+| | qualified thing | `Required`-equivalent | `Preferred`-equivalent |
+|---|---|---|---|
+| **D-1** availability | a qualified occupant | `OnExceeded::Refuse` | `ProceedProvisional` |
+| **D-3** independence | a not-same reviewer | `NotSameRequirement::Required` | `Preferred` — proceeds, records the absence |
+| **§7.3** occupancy | a qualified occupant | *(office stands empty)* | `OccupancyBasis::Provisional` |
+
+Three surfaces, one deficiency-handling primitive. **They should share an implementation**, or they will drift into three dialects of the same idea — and the fourth appearance of it will be written by someone who has not read the other three.
 
 ---
 
