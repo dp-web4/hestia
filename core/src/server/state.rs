@@ -1261,6 +1261,59 @@ mod tests {
         assert!(!a1.contains("alice") && !b.contains("bob"));
     }
 
+    /// THE ALIAS GUARD REACHES NOTHING ITS CALL SITES CLAIM. Measured 2026-08-06.
+    ///
+    /// Three surfaces decide "same entity wearing two names" by comparing
+    /// `member_lct(a) == member_lct(b)`, and each cites the same evidence: codex
+    /// acting as `codex` while its gate witnesses as `codex-cli`, "the measured case
+    /// on this fleet".
+    ///
+    ///   - `handler.rs` `select_arbiter` pool filter — drops same-entity candidates
+    ///   - `handler.rs` `tool_arbitrate_appeal`  — `same_entity` before eligibility
+    ///   - `handler.rs` `tool_open_appeals`      — `same_entity` in `you_may_rule`
+    ///
+    /// None of them can. `member_lct` is sha256 over the TRIMMED RAW STRING (note
+    /// `legacy_alias` is derivation provenance, label↔LCT — it does not relate two
+    /// members). So the comparison is true iff the two ids are equal after trimming,
+    /// which `arbiter::eligibility` clause 1 already refuses on, one line earlier. The
+    /// guard's entire reach beyond clause 1 is WHITESPACE, pinned below.
+    ///
+    /// THE ALIAS IS NOT MISSING — IT IS UNREAD. `derivation::alias_target` resolves
+    /// `IDENTITY_ALIAS_EVENT` records, and the chain carries one, witnessed by the
+    /// operator 2026-07-26, for precisely `codex-cli → codex`. Its only caller is the
+    /// dashboard, for display. So a ratified governance fact about who is one actor
+    /// governs nothing on the path whose comments cite it.
+    ///
+    /// AND THE OBVIOUS WIRING IS A NO-OP. `alias_target` scans a chain window; the
+    /// appeal path's is `APPEAL_CHAIN_WINDOW = 20_000`, which on 2026-08-06 reached
+    /// back only to 08-01 — the 07-26 alias record had already scrolled out. Passing
+    /// the existing window returns None and changes nothing while reviewing like a
+    /// fix. A correct repair needs a durable alias index rebuilt at load, as
+    /// `member_registry` and `role_registry` already are — not a window scan over a
+    /// chain that rotates past governance facts. Assert the EFFECT at the read.
+    ///
+    /// See `member_lct_is_stable_per_plugin_and_distinct_across_plugins`: the
+    /// invariant that makes this guard inert is itself a tested, deliberate property.
+    #[test]
+    fn the_member_lct_alias_guard_reaches_only_whitespace() {
+        let (_dir, state) = make_state();
+        let same_entity = |a: &str, b: &str| {
+            let (x, y) = (state.member_lct(a), state.member_lct(b));
+            x.is_some() && x == y
+        };
+        // The cited case. Distinct strings => distinct hashes => the guard is silent.
+        assert!(
+            !same_entity("codex", "codex-cli"),
+            "if this ever passes an alias map was added — update the three call-site \
+             comments, which have claimed this since before one existed"
+        );
+        // Nor any other two-names-one-actor shape a reader might assume is covered.
+        assert!(!same_entity("claude-code", "claude"));
+        assert!(!same_entity("kimi-code", "kimi"));
+        // What it DOES add over clause 1's `p.arbiter == p.appellant` string compare.
+        assert!(same_entity("codex", " codex "), "trim is the guard's whole reach");
+    }
+
     #[test]
     fn confer_citizenship_records_a_birth_cert_in_the_ledger_only_on_quorum() {
         let (_dir, state) = make_state();
