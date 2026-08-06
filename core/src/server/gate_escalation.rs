@@ -379,10 +379,35 @@ impl Escalation {
     }
 
     /// The instant after which an approval stops being claimable.
+    ///
+    /// Two ceilings, and BOTH have to hold — which is what makes this change monotone: no
+    /// input can ride longer than it could under the previous single ceiling.
+    ///
+    /// 1. **One window after the grant.** `APPROVAL_CLAIM_WINDOW_SECS` bounds how long a
+    ///    GRANTED approval stays spendable, so it is measured from the grant. Anchored at
+    ///    `opened_at` it quietly meant "the TTL remainder plus the window": measured on the
+    ///    live chain, median ride after a grant was 4160s against a documented 600s, 63/63
+    ///    escalations over it, and 15 of 18 cross-session relays — a permit opened by one
+    ///    session and spent by another — fit inside the slack.
+    /// 2. **One window after the record dies.** An approval must not outlive the escalation
+    ///    it belongs to by more than a window. Needed independently of (1): the replay path
+    ///    restores a decided entry carrying no `decided_at` as `decided_at = replay time`
+    ///    (`or(Some(now))` below), and a grant anchor alone would hand a restarted daemon a
+    ///    fresh window an arbitrary distance after the open. This reads `expires_at` rather
+    ///    than the DEFAULT ttl, which the hardcoded form got wrong for any escalation opened
+    ///    with a shorter one.
+    ///
+    /// Pinned by `the_claim_window_is_measured_from_the_grant_not_the_open` (the EVENT) and
+    /// `re_anchoring_the_claim_window_can_only_shorten_it` (the monotonicity, incl. the
+    /// replay input). `the_claim_window_stays_tight_even_though_the_decision_window_grew`
+    /// pins the constant and passes under any anchor — it is not a check on this.
     fn decided_horizon(&self) -> u64 {
-        self.opened_at
-            .saturating_add(DEFAULT_TTL_SECS)
-            .saturating_add(APPROVAL_CLAIM_WINDOW_SECS)
+        let one_window_after_grant = self
+            .decided_at
+            .unwrap_or(self.opened_at)
+            .saturating_add(APPROVAL_CLAIM_WINDOW_SECS);
+        let one_window_after_death = self.expires_at.saturating_add(APPROVAL_CLAIM_WINDOW_SECS);
+        one_window_after_grant.min(one_window_after_death)
     }
 }
 
@@ -1134,17 +1159,80 @@ mod tests {
     }
 
     #[test]
-    fn an_approval_stops_being_claimable_once_the_retry_window_closes() {
+    fn the_claim_window_is_measured_from_the_grant_not_the_open() {
+        // What the window bounds is how long a GRANTED approval stays spendable, so the
+        // grant is the only event it can be measured from. Anchored at `opened_at` it
+        // quietly meant "the TTL remainder PLUS the window": on the live chain the median
+        // ride after a grant was 4160s against a documented 600s, 63/63 escalations over,
+        // and 15 of 18 cross-session relays fell inside that slack (forum 2026-08-06;
+        // kimi-code reproduced it chain-only, notice 1175).
+        //
+        // This test pins the EVENT. The neighbouring guard
+        // `the_claim_window_stays_tight_even_though_the_decision_window_grew` pins the
+        // NUMBER, and passes under any anchor — which is how the drift stayed green.
+        //
+        // What this replaced asserted, for the record: with this same 120s fixture, that
+        // `claim` at T0+4199 was `is_some()`. A 120-second escalation, still spendable 68
+        // minutes after the record it belongs to had expired.
+        let granted_at = T0 + 90; // late in this fixture's 120s ttl, where the slack lived
         let (mut s, id) = store_with_one_simple_marker();
-        s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 5).unwrap();
-        let horizon = T0 + DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS;
-        assert!(s.claim("claude-code", "law_inject.py", horizon - 1).is_some());
+        s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), granted_at).unwrap();
+        assert!(
+            s.claim("claude-code", "law_inject.py", granted_at + APPROVAL_CLAIM_WINDOW_SECS - 1).is_some(),
+            "an approval must stay claimable through grant + window - 1"
+        );
 
         let (mut s2, id2) = store_with_one_simple_marker();
-        s2.decide(&id2, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 5).unwrap();
-        // A day later must not still be rideable.
-        assert!(s2.claim("claude-code", "law_inject.py", horizon).is_none());
-        assert!(s2.claim("claude-code", "law_inject.py", T0 + 86_400).is_none());
+        s2.decide(&id2, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), granted_at).unwrap();
+        for t in [granted_at + APPROVAL_CLAIM_WINDOW_SECS, T0 + 4_199, T0 + 86_400] {
+            assert!(
+                s2.claim("claude-code", "law_inject.py", t).is_none(),
+                "grant + window has closed; nothing at {t} may still ride it"
+            );
+        }
+    }
+
+    #[test]
+    fn re_anchoring_the_claim_window_can_only_shorten_it() {
+        // Re-anchoring is safe only if it tightens for EVERY input, including the ones
+        // nobody typed. The replay path restores a `gate_escalation_decided` entry that
+        // carries no `decided_at` as `decided_at = replay time` (`or(Some(now))`), so a
+        // grant anchor ALONE would hand a restarted daemon a brand-new window an
+        // arbitrary distance after the open. The record's own death is kept as a second
+        // ceiling for exactly that input, which is what makes the change monotone.
+        let ttl = 120;
+        let old_ceiling = T0 + DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS;
+        for grant in [T0, T0 + 1, T0 + 90, T0 + 119] {
+            let mut s = EscalationStore::default();
+            let e = s.open("claude-code", "r", "Edit", "gate.py", None, None, T0, ttl).unwrap();
+            s.decide(&e.id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), grant).unwrap();
+            let esc = s.get(&e.id).unwrap();
+            assert!(
+                esc.decided_horizon() <= old_ceiling,
+                "grant at {grant}: re-anchoring LENGTHENED the ride past what it was before"
+            );
+            assert!(
+                esc.decided_horizon() <= esc.expires_at + APPROVAL_CLAIM_WINDOW_SECS,
+                "grant at {grant}: an approval outlived its own record by more than one window"
+            );
+        }
+
+        // The synthesised grant, directly: bounded by the record, not by the timestamp
+        // the replay invented.
+        let mut s = EscalationStore::default();
+        let e = s.open("claude-code", "r", "Edit", "gate.py", None, None, T0, ttl).unwrap();
+        s.decide(&e.id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 1).unwrap();
+        let mut esc = s.get(&e.id).unwrap().clone();
+        esc.decided_at = Some(T0 + 1_000_000);
+        assert_eq!(
+            esc.decided_horizon(),
+            T0 + ttl + APPROVAL_CLAIM_WINDOW_SECS,
+            "a replay-synthesised decided_at must not mint a fresh claim window"
+        );
+        assert!(
+            !esc.is_claimable(T0 + 1_000_000),
+            "a replay-synthesised grant must not be claimable long after the record died"
+        );
     }
 
     #[test]
