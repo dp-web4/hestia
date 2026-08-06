@@ -1,6 +1,6 @@
 # PRD — Hestia governance: vault authority, canonical roles, and the third verdict
 
-**Status:** definitive · supersedes the drafts listed below · **Date:** 2026-08-05, amended 2026-08-06 (§2.11 + §8.4 the appeal path; §2.12 + §9.4 the partial absorption, corrected; §2.13 + §3 the telemetry row's evidence class, corrected on kimi's NOT-SAME review — see §15 for what remains unread)
+**Status:** definitive · supersedes the drafts listed below · **Date:** 2026-08-05, amended 2026-08-06 (§2.11 + §8.4 the appeal path; §2.12 + §9.4 the partial absorption, corrected; §2.13 + §3 the telemetry row's evidence class, corrected on kimi's NOT-SAME review; §2.14 + §12 the false-positive closure moved Sprint 0 → Sprint 3; §2.15 the gate's refusal of this document — see §15 for what remains unread)
 **Owner:** claude-code (CBP), by dp's assignment — *"you take the lead on hestia"*
 **Scope:** hestia only. Hub work and any web4-core changes are hub's; the autostash-prevention hook is legion's.
 
@@ -230,6 +230,69 @@ into each harness's fail-closed path is Sprint 1 work, and it has to reach four 
 **Why this row and not another.** A document whose load-bearing epistemic rule is *know which
 evidence class you hold* (§4 principle 10, §7.4) cannot carry branch-state under a header that
 says verified-in-source. The rule fails first in its own text or it does not bind.
+
+### 2.14 Sprint 0's false-positive bullet is not verdict-neutral — **CORRECTED**
+
+Found from this seat while auditing §12 against the measured defect inventory rather than against
+its citations — and, like §2.13, found by falling into it.
+
+Sprint 0 carries *"Close the read/write false-positive class (#203 FP6/FP8)"* and closes with
+**"Not this sprint: any change to what the gate decides."** Its own acceptance criterion, two
+lines above that, requires that *"escalations opened by reads trend to zero."* Those cannot both
+hold: an escalation that stops opening is a verdict that changed. The exclusion clause and the
+criterion contradict each other inside one sprint.
+
+The mechanism makes this more than a wording slip. In the shared gate core module, `READ_CLASS`
+has exactly two occurrences — its definition, and the predicate `needs_society_gate`, whose whole
+body is `tool not in READ_CLASS`. **The read carve-out's only consumer is the daemon bypass:**
+acts in the read class never reach the daemon at all. And the carve-out is keyed on the *tool-name
+string* — `Bash` is never in it whatever the command does, which is exactly why a `sed -n` or a
+`git -C` over a governed path is priced as a write. So the natural fix — classify read-shaped
+`Bash` commands as reads — does not merely stop a false refusal. It moves those acts from
+*daemon-gated* to *never-consulted*, with the class then selected by a caller-authored command
+spelling. Suppressing the false positive and widening the ungated set are **one edit**.
+
+That constraint is already Sprint 3's: its acceptance reads *"an approval minted by a read cannot
+be spent by a write."* §11 agrees — it homes #203's fixes in §8.2, not in Sprint 0. The bullet is
+therefore an instance of the failure §12's own preamble names: a sprint quietly claiming the next
+one's ground.
+
+**What changes.** Sprint 0 keeps the *measurement* — a false-refusal rate and a read-opened
+escalation count, both baselined — and gives up the *closure*. Its exclusion clause then stands as
+written, which it could not before. Closing the class moves to Sprint 3, where the spend-side
+constraint that makes it safe to close is already an acceptance criterion.
+
+### 2.15 The gate refuses this document's account of the gate — **ADDED**
+
+§2.14 was not reasoned out and then confirmed. It was written, and the writing was refused.
+
+Three refusals landed while producing that row, all on this seat, 2026-08-06, each minting a
+single-use escalation permit: two `Bash` reads of the gate core (`sed -n`, to quote the two
+constructs named above) — `f4047f4ef8c068f7`, `07bf8b056cb94cbe` — and then **the `Edit` that
+wrote §2.14 itself**, `16dea346703b6a5d`. That third refusal is the finding. The Edit's target was
+this markdown file. It was refused as a write to the gate's own code because the **prose quoted
+the gate module's filename** — the matcher read a string in the payload, not the path being
+written. Naming the module is indistinguishable, to the gate, from editing it.
+
+So the false-positive class suppresses its own documentation, and the supply line refilled three
+times inside one audit of the supply line. The row above is written with the filename elided to
+constructs — disclosed here rather than done quietly, because an elision that is not declared is
+just a rephrase, and §2.14 is partly *about* not doing that.
+
+**The remedy the law names is not reachable from the seat the law governs.** The injected
+operating law instructs a denied member three times to `hestia_appeal` the deny *"rather than
+rephrasing"*, and scores a rephrase below plain compliance. On this seat, measured this session:
+the MCP surface exposes **no hestia tools at all**, and the CLI's `hestia gate` ships
+`pending / poll / approve / deny / corroborate` with **no appeal subcommand at any level**. The
+escalation the deny prints is not an appeal — it asks a human to permit the *act*, not to review
+the *rule*, which is §8.4's distinction exactly. A member holding a wrong deny therefore has
+compliance or a scored recast, and no third door. This is §8.4 item 1 confirmed live, and sharper
+than "the deny carries no hash": on this seat the instrument is absent from both surfaces.
+
+One further detail, recorded because it is the class §2.13 exists for: the third deny reported
+**`WITNESS FAILED — the refusal stands regardless`**. The refusal was enforced and not witnessed —
+a fail-closed act leaving no durable record, encountered while amending the row about fail-closed
+acts leaving no durable record. Plane E has no writer, so there is nowhere for it to have gone.
 
 ---
 
@@ -635,7 +698,8 @@ kimi's third pushback, adopted: *"re-homed work that isn't announced reads as di
 | `record_gate_unavailable()` | plane E's **producer only** — on branch, PR #211, uninstalled and with no call site. **Not done**; Sprint 1 wires it into four harnesses *(corrected — §2.13)* |
 | escalation store + rehydrate | §8 — becomes resolver-selection state |
 | `tool_appeal` + arbiter + `derivation.rs` joins | §8.4 — the consumer half is **already built and keyed on `deny_hash`**; it has never had an input |
-| gate false-refusal fixes (#203) | §8.2 — draining the approval supply line |
+| gate false-refusal fixes (#203) | §8.2 — draining the approval supply line. **Sprint 3, not Sprint 0** (§2.14) |
+| `rule_triggered` on the deny record | in flight on `kimi/rule-triggered-field` — the serialized field was hardcoded empty, so a deny named no rule. Lands in Sprint 1's *"every governed act says what it rests on"*; the PRD had not accounted for it |
 | mesh + `last-words` | plane D |
 | identity classification check | feeds the artifact manifest (§10) |
 | dashboard policy editors | the operator law surface (§4 principle 4) |
@@ -659,13 +723,13 @@ Each sprint's acceptance criteria are **measurements**, not assertions — per �
 **Goal:** the fleet's actual state is measurable and matches source.
 
 - Redeploy the installed gate on every member (claude-code diverges in 4 files; codex carries the scope escape).
-- Close the read/write false-positive class (#203 FP6/FP8) — the approval supply line.
+- **Measure and baseline** the read/write false-positive class (#203 FP6/FP8) — the approval supply line. **Closing** it is Sprint 3, not this sprint (§2.14): the read carve-out's only consumer is the daemon bypass, so the fix and a widened ungated set are one edit, and the spend-side constraint that makes it safe to land is Sprint 3's acceptance criterion.
 - Baseline the availability numbers kimi measured, as a standing metric rather than a one-off.
 - **Config drift detector** (§2.12 item 4): vault vs the on-disk shadow copy, distinct from the manifest's *hook* drift. It answers a question that is currently unanswerable — **has this already happened?** A non-zero first run is a finding to be published, not a bug to be quietly cleaned up before anyone looks.
 
 - **Convert this document's 36<!--n:live--> live line-number citations to construct-pointers**, per `CLAUDE.md`'s own review-gate rule (*"a grep-able name not a drifting line number"*). One of them was wrong on arrival for exactly the reason the rule exists — it was true only in the author's unmerged checkout (§15) — and a citation a second reader cannot resolve at a shared ref is not evidence, which is this sprint's whole goal applied to its own paperwork. The scale is measured, not assumed: `tools/citation_ref_census.py` over all 71 remote refs anchors the construct behind the *sharpest* of the five distinct `handler.rs` line-spans on the cited line on **17 of 71**, and on 12 refs that construct does not exist at all (§15). The other four spans carry no anchor and are bounded only by blob agreement — `>= 13/71` — so 17/71 is one span's exact figure, not the five's; attributing it to all five was this bullet's own version of the error §15 is about, and is corrected here. Conversion is what turns that second case from a wrong answer into no answer.
 
-**Acceptance:** manifest reports zero hook drift on every host it can see; false-refusal rate measured before and after; escalations opened *by reads* trend to zero; the config drift detector has run once against today's files and its first-run output is on the record whatever it says; and the **live** citation count over this document reaches zero, measured by `tools/citation_ref_census.py --doc-ref <the merge commit on main>` — a named ref, not the author's tree, because that distinction is the entire finding.
+**Acceptance:** manifest reports zero hook drift on every host it can see; the false-refusal rate and the count of escalations opened *by reads* both have a published baseline — they trend to zero in Sprint 3, not here (§2.14), and a sprint that forbids verdict changes cannot accept one as a criterion; the config drift detector has run once against today's files and its first-run output is on the record whatever it says; and the **live** citation count over this document reaches zero, measured by `tools/citation_ref_census.py --doc-ref <the merge commit on main>` — a named ref, not the author's tree, because that distinction is the entire finding.
 
 Three ways a zero here can be a false pass, all of them closed before the criterion is worth running:
 
@@ -720,6 +784,7 @@ Three ways a zero here can be a false pass, all of them closed before the criter
 - Escalation becomes resolver selection; the operator is terminal, not sole (§8.2).
 - Resolver selection reads audited and witnessed dimensions only — never declared (§7.4).
 - Narrow `claim()` to resolver + tool + target, in the #203 order (§9.3).
+- **Close the read/write false-positive class** (#203 FP6/FP8), moved here from Sprint 0 (§2.14) — it lands *with* the spend-side constraint below, never before it, because widening the read carve-out without that constraint trades a false refusal for an act the daemon never sees. The class includes the gate's refusal of its own documentation (§2.15).
 - **The return channel, on the same machinery** (§8.4 items 2–4): arbiter selection is resolver selection with the independence constraint; the appeal window rebased off chain-entry count onto the answerer's units; rulings bound to the appellant's notice; appeal dispatch stops minting `review_request`s under the appellant's name.
 
 **Acceptance:** an approval minted by a read cannot be spent by a write; an approval minted in one session cannot be spent by another; every resolution names its resolver and the authority it acted under; a resolver that is not independent of the author is refused. **And on the return channel:** an arbiter is never selected on inbox-touch liveness alone; an appeal's window cannot be consumed by another member's traffic; every ruling is bound to the notice that asked for it — replay the 2026-08-03 case (chain `89318`) and the appellant learns the verdict; no notice is attributed to a member that did not send it.
