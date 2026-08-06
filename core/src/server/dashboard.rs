@@ -134,7 +134,55 @@ pub struct DashboardSnapshot {
     /// and absence is exactly the reading they would trust without checking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_unavailable: Option<String>,
+    /// HOW THESE NUMBERS WERE OBTAINED — so a relying party can decide whether the
+    /// compression is sufficient for its purpose, or whether to escalate to the chain.
+    ///
+    /// dp, 2026-08-06: *"the witness chain is sacred... how we leverage it is very much
+    /// context-dependent. there may be cases where full chain traversal is necessary. but
+    /// it is expensive... the caveat is that we should always be clear which is which so
+    /// the relying party can choose whether to escalate or accept compression as
+    /// sufficient for purpose."*
+    ///
+    /// This is the web4 posture applied to our own readings: produce checkable evidence
+    /// and let the caller decide, rather than smuggling a verdict. A compressed answer
+    /// that does not say it is compressed asks to be trusted as a complete one — which is
+    /// the same substitution `EvidenceClass` and `OccupancyBasis` exist to prevent, on a
+    /// third surface.
+    #[serde(default)]
+    pub basis: ReadBasis,
     pub generated_at: DateTime<Utc>,
+}
+
+/// A declaration of how a derived answer was obtained.
+///
+/// `complete` is the field that matters: `false` means the window may not cover
+/// everything the chain holds, so a reader needing certainty must traverse. It is
+/// deliberately not inferred from `window` — a window that happens to exceed the chain
+/// length is still a windowed read, and next week it will not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadBasis {
+    /// `"windowed-projection"` — bounded rows, pruned fields — or `"full-traversal"`.
+    pub mode: String,
+    /// Rows considered, when bounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<u64>,
+    /// True only when the answer rests on the whole chain.
+    pub complete: bool,
+    /// What a relying party should know before accepting this as sufficient.
+    pub note: String,
+}
+
+impl Default for ReadBasis {
+    /// Fail-closed, exactly as `SovereignStrength` defaults to `Placeholder`: an
+    /// unstated basis is the WEAKEST claim, never an implied complete one.
+    fn default() -> Self {
+        Self {
+            mode: "unstated".into(),
+            window: None,
+            complete: false,
+            note: "basis not declared; treat as compressed and escalate if certainty is required".into(),
+        }
+    }
 }
 
 /// Identity + macro state of this Hestia society.
@@ -441,33 +489,60 @@ impl ServerState {
         //
         // So the error is CARRIED to the surface instead of swallowed. The UI must render
         // unavailable rather than 0.
-        // SHORTEN THE WINDOW, because the rescan should not merely get cheaper.
+        // THE ATTENTION WINDOW — short by decision, and now also projected.
         //
         // dp, 2026-08-06: *"the attention window should be fairly short, only dramatic
         // events should be tracked permanently"* — and, of these counts specifically,
         // *"the stats are questionably meaningful currently, and aren't actually used in
         // any decisions. it's display-only, so i wouldn't treat them as sacred."*
         //
-        // This read is the daemon's largest routine cost: 10,000 entries per poll, each
+        // This read was the daemon's largest routine cost: 10,000 entries per poll, each
         // materialised as a `ChainEntry` with a fully parsed `serde_json::Value`, to
-        // produce display counts and feed `derivation::derive`. Measured 2026-08-06:
-        // 164 MB → 1349 MB in twenty-one minutes, flat at idle, stepping on every read.
+        // produce display counts AND feed `derivation::derive`. Measured 2026-08-06:
+        // 164 MB -> 1349 MB in twenty-one minutes, flat at idle, stepping on every read.
         //
-        // It is still eager rather than projected, and the reason is honest: `derive` and
-        // `alias_target` consume this same window and take `&[ChainEntry]`. Their needs
-        // ARE projectable — eleven fields, all scalars, one level of nesting (`data`
-        // carrying `deny_hash` / `class` / `before_position` / `ref`, with a documented
-        // fallback to the top level when `data` is absent) — but changing their signature
-        // means rewriting derivation's internals, which is the `TrustModel` boundary work
-        // in DESIGN_DECISIONS/0012, not a line-item here.
-        //
-        // So: shrink now, project later. Cutting the window is a one-constant change that
-        // reduces this read fivefold today and moves in the direction 0012 already
-        // decided, rather than optimising a rescan that should ultimately be replaced by
-        // a digest. The cost is that counts cover a shorter span — which dp has
-        // explicitly ruled acceptable, because nothing decides on them.
+        // #221 shortened the window and left the read eager, saying derivation's needs
+        // were "eleven fields". THAT COUNT WAS WRONG — it came from grepping the direct
+        // `event_data.get` calls and missed `entry_str`, which is most of them. The real
+        // inventory is TWENTY-EIGHT keys (`derivation::DERIVATION_KEYS`), and a
+        // projection built on the wrong number would not have failed: it would have
+        // derived a wrong trust value and looked fine. Corrected here rather than left
+        // standing, because a stale figure in a comment is exactly how the next author
+        // inherits it.
         const STATS_WINDOW: u64 = 2_000;
-        let (stats_window, stats_read_error) = match self.chain_store.read_recent(STATS_WINDOW) {
+
+        // TWO READS, EACH FETCHING ONLY WHAT ITS CONSUMER DECLARES.
+        //
+        // dp, 2026-08-06: the chain is sacred and full traversal stays available, but it
+        // is EXPENSIVE and should run only when context warrants. Dashboard stats are
+        // "cheap, transient situational awareness" that "do not influence anything of
+        // consequence" — so they take the cheap read, and say so (`stats_basis`).
+        //
+        // Previously ONE eager `read_recent(10_000)` served both display counts and trust
+        // derivation, materialising ten thousand full documents per poll to harvest a few
+        // dozen fields. Measured 164 MB -> 1349 MB in twenty-one minutes.
+        //
+        // Now: display counts project to `RecentEntry` (fourteen scalars), and derivation
+        // gets its own SQL-filtered, key-pruned window built from what the model declares
+        // it reads. Neither materialises a document nobody folds.
+        let (deriv_window, deriv_read_error) = match self.chain_store.scan_recent(
+            None,
+            Some(crate::derivation::DERIVATION_EVENT_TYPES),
+            STATS_WINDOW,
+            crate::derivation::project_row,
+        ) {
+            Ok(v) => (v, None),
+            Err(e) => {
+                tracing::error!("dashboard derivation chain read failed: {e}");
+                (Vec::new(), Some(e.to_string()))
+            }
+        };
+        let (stats_window, stats_read_error) = match self.chain_store.scan_recent(
+            None,
+            None,
+            STATS_WINDOW,
+            |r| Some(flatten_row(r)),
+        ) {
             Ok(v) => (v, None),
             Err(e) => {
                 tracing::error!("dashboard stats chain read failed: {e}");
@@ -513,8 +588,8 @@ impl ServerState {
             // Track per-(instance, role) last-seen across any event that carries a
             // plugin_id. Outcomes are the main signal now that session_started is
             // no longer written; historical chains may still contain older entries.
-            if let Some(pid) = e.event_data.get("plugin_id").and_then(|v| v.as_str()) {
-                let role = e.event_data.get("role_lct").and_then(|v| v.as_str())
+            if let Some(pid) = e.plugin_id.as_deref() {
+                let role = e.role_lct.as_deref()
                     .unwrap_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE);
                 let key = self.trust_entity_key(pid, role);
                 let entry = active_entities.entry(key).or_insert((
@@ -529,10 +604,10 @@ impl ServerState {
             // A policy denial blocks the tool before it runs, so it never
             // produces an `outcome`. Count it separately (not as a failure).
             if e.event_type == "policy_decision"
-                && e.event_data.get("decision").and_then(|v| v.as_str()) == Some("deny")
+                && e.decision.as_deref() == Some("deny")
             {
                 denied += 1;
-                if let Some(pid) = e.event_data.get("plugin_id").and_then(|v| v.as_str()) {
+                if let Some(pid) = e.plugin_id.as_deref() {
                     per_plugin.entry(pid.to_string()).or_default().3 += 1;
                 }
             }
@@ -541,7 +616,7 @@ impl ServerState {
             // warn and deny INDEPENDENTLY so frequent warns can't crowd out the
             // rarer denies — a single shared cap made the deny list look empty.
             if e.event_type == "policy_decision" {
-                let dec = e.event_data.get("decision").and_then(|v| v.as_str());
+                let dec = e.decision.as_deref();
                 let keep = match dec {
                     Some("deny") if deny_kept < 300 => {
                         deny_kept += 1;
@@ -554,7 +629,7 @@ impl ServerState {
                     _ => false,
                 };
                 if keep {
-                    policy_decisions.push(flatten_entry(e.clone()));
+                    policy_decisions.push(e.clone());
                 }
             }
             if e.event_type != "outcome" {
@@ -574,19 +649,19 @@ impl ServerState {
                 continue;
             }
             total += 1;
-            let success = e.event_data.get("success").and_then(|v| v.as_bool())
+            let success = e.success
                 .unwrap_or(false);
             if success {
                 succ += 1;
             } else {
                 fail += 1;
             }
-            let tname = e.event_data.get("tool_name").and_then(|v| v.as_str());
+            let tname = e.tool_name.as_deref();
             if let Some(tname) = tname {
                 *by_tool.entry(tname.to_string()).or_insert(0) += 1;
             }
             // Same slice, per plugin.
-            if let Some(pid) = e.event_data.get("plugin_id").and_then(|v| v.as_str()) {
+            if let Some(pid) = e.plugin_id.as_deref() {
                 let p = per_plugin.entry(pid.to_string()).or_default();
                 p.0 += 1;
                 if success {
@@ -669,7 +744,7 @@ impl ServerState {
                 // v3-derived-v1: the DISPLAYED level comes from derived
                 // evidence (adjudications + governance conduct) — never from
                 // the self-report scalar. Unmeasured renders as unmeasured.
-                let derived = crate::derivation::derive(pid, _role, &stats_window);
+                let derived = crate::derivation::derive(pid, _role, &deriv_window);
                 TrustView {
                     plugin_id: pid.clone(),
                     entity_id: t.entity_id.clone(),
@@ -698,7 +773,7 @@ impl ServerState {
                     // Everything in this view flows from update_from_outcome's
                     // self-reported scalar until Stage 3 of the T3-from-V3 arc.
                     derivation: "legacy-lockstep-v1".to_string(),
-                    aliased_to: crate::derivation::alias_target(pid, &stats_window),
+                    aliased_to: crate::derivation::alias_target(pid, &deriv_window),
                 }
             })
             .collect();
@@ -977,6 +1052,19 @@ impl ServerState {
                 // between polls. HashMap iteration order is not an ordering a UI should inherit.
                 v.sort_by(|a, b| a["plugin_id"].as_str().cmp(&b["plugin_id"].as_str()));
                 v
+            },
+            // Declared, not inferred. These counts come from a bounded, projected read;
+            // saying so is what lets a reader decide the compression is sufficient — or
+            // escalate to the chain, which remains available and authoritative.
+            basis: ReadBasis {
+                mode: "windowed-projection".into(),
+                window: Some(STATS_WINDOW),
+                complete: false,
+                note: format!(
+                    "counts and trust derive from the most recent {STATS_WINDOW} chain rows, \
+                     field-pruned; display-grade situational awareness, not evidence. \
+                     The witness chain is authoritative — traverse it when certainty is required."
+                ),
             },
             generated_at: Utc::now(),
         }
