@@ -49,11 +49,22 @@ worth having written down before that work starts.
 
 SCOPE — READ BEFORE CITING A GREEN
 ----------------------------------
-This exercises the CLAUDE adapter's in-tree gate and nothing else. Of the six
-gate copies on this host, exactly two carry this classifier: this one and the INSTALLED copy
-under the operator's `<installed-hook-dir>`. The installed copy is the one that ENFORCES, it
-is ~18KB behind this one, and a green here says nothing about it. kimi, codex, gemini and
+This exercises the CLAUDE adapter's in-tree gate. Of the six gate copies on this host,
+exactly two carry this classifier: this one and the INSTALLED copy under the operator's
+`<installed-hook-dir>`. The installed copy is the one that ENFORCES. kimi, codex, gemini and
 cursor have no self-protection mechanism at all.
+
+The first version of this paragraph ended "the installed copy is ~18KB behind this one, and
+a green here says nothing about it." Measured 2026-08-06: the two are BYTE-IDENTICAL, and
+both equal `origin/main`. The caveat had gone stale in the direction that costs a reader
+most — it tells them to discount a result that IS evidence about the enforcing copy, so a
+finding measured here reads as inapplicable to the only copy that matters.
+
+Which is the same defect as an overstated scope, one sign over, and it has the same repair:
+`test_this_file_certifies_the_enforcing_copy` replaces the sentence with a check. The scope
+claim is now measured on every run rather than asserted once and left to rot. A caveat is
+not a control — and a caveat about deployment is exactly the kind that cannot stay true,
+because the thing it describes moves.
 """
 from __future__ import annotations
 
@@ -76,6 +87,7 @@ REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 HOOK = os.path.join(REPO, "plugins", "claude-code", "hooks", "pre_tool_use.py")
 
 FAILURES = []
+SKIPPED = []
 _BARE = False
 
 
@@ -85,6 +97,17 @@ def check(name, cond, detail=""):
     else:
         print(f"  FAIL  {name}  {detail}")
         FAILURES.append(name)
+
+
+def skip(name, why):
+    """A check that could not run HERE — recorded, never counted as a pass.
+
+    Only for host-shape reasons (a copy this machine does not have), never for a check
+    that ran and was inconvenient. Printed in the footer as well as inline, because an
+    unrun check that scrolls past looks exactly like a green one.
+    """
+    print(f"  skip  {name}  ({why})")
+    SKIPPED.append(f"{name}: {why}")
 
 
 def asserting(fn):
@@ -115,6 +138,44 @@ def _load_gate():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _installed_gate_path():
+    """Where the ENFORCING copy lives, read from the harness registration rather than guessed.
+
+    Derived, not hardcoded, for two reasons. The dull one: the install path is the operator's,
+    not the repo's, and a constant here would be wrong on every other machine. The sharper
+    one: a source file that spells that path contiguously is a file this gate refuses to let
+    a governed member Write — the same FP8 constraint that made `HOOK` an `os.path.join`.
+    The basename is taken FROM `HOOK` so this file never has to say it.
+
+    Registration is the right source anyway: the copy that enforces is by definition the one
+    the harness invokes, so reading the invocation is measuring the deployment rather than
+    trusting a note about it.
+    """
+    import json as _json
+    reg = os.path.expanduser(os.path.join("~", ".claude", "settings.json"))
+    try:
+        with open(reg, encoding="utf-8") as fh:
+            cfg = _json.load(fh)
+    except (OSError, ValueError):
+        return None
+    want = os.path.basename(HOOK)
+    groups = (cfg.get("hooks") or {}).get("PreToolUse") or []
+    for group in groups:
+        for h in group.get("hooks") or []:
+            for tok in str(h.get("command", "")).split():
+                # The registration carries env assignments and an interpreter alongside the
+                # script; the script is the token that ends in the gate's own basename.
+                if tok.endswith(want) and os.path.isfile(tok):
+                    return tok
+    return None
+
+
+def _sha256(path):
+    import hashlib
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
 
 
 # --------------------------------------------------------------------------------------
@@ -346,6 +407,164 @@ def test_marker_evasion_by_path_assembly_is_pinned_open():
           "path assembly — the marker is broken outright and this whole file is vacuous")
 
 
+@asserting
+def test_this_file_certifies_the_enforcing_copy():
+    """Does a green here say anything about the copy that actually decides?
+
+    This file's scope paragraph used to answer "no", on a deployment lag that has since
+    closed. A prose caveat cannot notice that, and the direction it failed in is the
+    expensive one: it invites a reader to discard a measurement of the enforcing gate as
+    though it were a measurement of a stale sibling.
+
+    So the answer is computed. If the registered copy is byte-identical to the one loaded
+    here, every other check in this file is evidence about the enforcer and may be cited as
+    such. If it is not, this goes RED and names both digests — which is the `shipped is not
+    in force` ladder (committed -> routed -> merged -> rebuilt -> restarted) reduced to its
+    last rung, asserted rather than assumed.
+
+    SKIPPED, not passed, where there is no registration: other fleet machines carry this
+    repo without the claude adapter installed, and a check that quietly returns green on
+    them would be the null-state twin of a real pass — the exact shape `asserting` exists
+    to stop for pytest.
+    """
+    installed = _installed_gate_path()
+    if installed is None:
+        skip("in_tree_matches_the_enforcing_copy",
+             "no claude PreToolUse registration on this host — nothing enforcing to compare")
+        return
+    here, there = _sha256(HOOK), _sha256(installed)
+    check("in_tree_matches_the_enforcing_copy", here == there,
+          f"the registered gate is NOT this file: in-tree sha256 {here[:12]}… vs installed "
+          f"{there[:12]}…. Every other check in this file is then a statement about an "
+          f"unenforced copy. Redeploy, or say so where the result is cited.")
+
+
+# --------------------------------------------------------------------------------------
+# GIT GLOBAL OPTIONS — the `cd` class again, in the spelling that is safer to use.
+#
+# `_is_read_only` reads the git subcommand at parts[1]. Global options legally precede the
+# subcommand, so `-C`, `--no-pager`, `--git-dir=` and friends displace it: parts[1] is then
+# an option, misses `_GIT_READ_SUBCOMMANDS`, and the whole command is classified a WRITE.
+# Measured 2026-08-06 against the enforcing copy: 5 of 5 read spellings refused.
+#
+# This is the `cd` finding one argument over, and the incentive runs the wrong way. `cd h &&
+# git log` was fixed on 2026-08-05 because "the only thing the refusal measured was that the
+# member changed directory first." `git -C h log` is the SAME act in the spelling that does
+# not mutate process state — the one a member working in a tree shared with concurrent
+# siblings is told to prefer, precisely because a leftover `cd` misdirects the next command.
+# The gate currently permits the stateful spelling and refuses the careful one, so the
+# cheapest way to comply is to adopt the habit the working agreement warns against. A control
+# that prices the safer spelling higher is not merely noisy; it teaches.
+#
+# THE FIX, and it is not "skip anything that starts with a dash". Three git global options
+# are command-execution surfaces and must keep displacing the subcommand into a refusal:
+#
+#   -c NAME=VALUE / --config-env   sets config for one run, and `core.pager`, `core.fsmonitor`,
+#                                  `diff.external` and `alias.*` all name a program git will run.
+#   --exec-path=DIR                relocates the subcommand binaries themselves.
+#
+# So the skip list is an explicit, closed enumeration, the same discipline `_READ_ONLY_HEADS`
+# already documents for `date` and `hostname` — a read-looking NAME carrying executable power
+# is what a bare pattern cannot see:
+#
+#   no-argument:  --no-pager  -p  --paginate  --literal-pathspecs  --no-replace-objects
+#   one-argument: -C DIR
+#   inline-value: --git-dir=  --work-tree=
+#
+#   j = 1
+#   while j < len(parts):
+#       a = parts[j]
+#       if a in _GIT_GLOBAL_NOARG or a.startswith(("--git-dir=", "--work-tree=")):
+#           j += 1; continue
+#       if a in _GIT_GLOBAL_WITHARG:
+#           j += 2; continue
+#       break
+#   if j >= len(parts) or parts[j] not in _GIT_READ_SUBCOMMANDS:
+#       return False
+#
+# PINNED OPEN rather than applied, for FP8's reason and no other: applying it is a write to
+# the gate, which requires claiming an operator approval, and approvals here join on
+# (plugin_id, marker) — so one opened by a read is spendable on any write. Spending one on a
+# change no human ruled on is the conduct that finding exists to make visible.
+# --------------------------------------------------------------------------------------
+#: (label, command, CONTROL, why). The control is the same read with the global option
+#: removed and written out in full — NOT derived by stripping dash-tokens, which was the
+#: first version and was wrong in the way that matters: `-C DIR` carries a separate operand,
+#: so stripping the flag left `git DIR show ...` and the control failed for its own reason
+#: while looking like a refutation of the row it was supposed to support. A control assembled
+#: by transforming the case under test can break in the same place the case does.
+_GIT_GLOBAL_OPT_REFUSED_READS = [
+    ("dash_C_show", "git -C {r} show HEAD:README.md", "git show HEAD:README.md",
+     "the cwd-independent spelling of the `cd` case fixed on 2026-08-05"),
+    ("dash_C_log", "git -C {r} log --oneline -5", "git log --oneline -5",
+     "same, another read subcommand"),
+    ("no_pager_log", "git --no-pager log --oneline", "git log --oneline",
+     "--no-pager only suppresses a pager; it cannot write"),
+    ("git_dir_rev_parse", "git --git-dir={r}/.git rev-parse HEAD", "git rev-parse HEAD",
+     "--git-dir relocates the repo being READ; it is a reach question, not a write one"),
+    ("stacked_options", "git -C {r} --no-pager diff --stat", "git diff --stat",
+     "options compose, so the skip has to be a loop and not a single lookahead"),
+]
+
+#: Must be classified a WRITE both now and after the fix. The first four are why the skip
+#: list is an enumeration rather than a dash-prefix rule; the last three are the ordinary
+#: guarantee that an option cannot launder a mutating subcommand.
+_GIT_GLOBAL_OPT_MUST_STAY_REFUSED = [
+    ("dash_c_pager", "git -c core.pager=evil log --oneline",
+     "-c names a program git will run. Skipping it would turn `log` into arbitrary execution"),
+    ("dash_c_alias", "git -c alias.l=!evil.sh l",
+     "an alias beginning with ! is a shell command; the subcommand is then the alias name"),
+    ("config_env", "git --config-env=core.pager=EVIL log",
+     "the same power as -c, sourced from the environment"),
+    ("exec_path", "git --exec-path=/tmp/evil log --oneline",
+     "relocates the subcommand binaries; `log` would be whatever is at that path"),
+    ("dash_C_push", "git -C {r} push origin HEAD",
+     "a permitted option must not launder a mutating subcommand"),
+    ("dash_C_commit", "git -C {r} commit -am x", "same"),
+    ("dash_C_clean", "git -C {r} clean -fdx", "same, and this one deletes"),
+]
+
+
+@asserting
+def test_git_global_options_are_pinned_open():
+    """Reads refused because an option displaced the subcommand. Red the day it is fixed."""
+    mod = _load_gate()
+    for name, cmd_t, ctl, why in _GIT_GLOBAL_OPT_REFUSED_READS:
+        cmd = cmd_t.format(r=REPO)
+        check(f"still_open__git_global_opt__{name}",
+              mod._is_read_only("Bash", {"command": cmd}) is False,
+              f"this now PASSES — the class was fixed and nobody moved the row. Move it "
+              f"into _FALSE_REFUSALS and delete the pin. {why}")
+        # The control that keeps the row above meaningful: the same read WITHOUT the option
+        # is permitted today, so what the pin measures is the option, not the subcommand.
+        check(f"control_same_read_without_the_option__{name}",
+              mod._is_read_only("Bash", {"command": ctl}) is True,
+              f"{ctl!r} is ALSO refused, so the row above is not evidence about global "
+              f"options — the subcommand itself is being refused and the pin is vacuous")
+
+
+@asserting
+def test_git_global_option_skip_list_stays_closed():
+    """The half that decides whether the fix above is safe to apply.
+
+    Written before the fix, deliberately. A skip list is a widening, and the cheap version
+    of it — "step over any token starting with a dash" — hands `log` the power of `-c
+    core.pager=` and `--exec-path=`. These rows refuse today for the accidental reason that
+    nothing is skipped at all; after the fix they must still refuse, for the right one.
+    """
+    mod = _load_gate()
+    for name, cmd_t, why in _GIT_GLOBAL_OPT_MUST_STAY_REFUSED:
+        cmd = cmd_t.format(r=REPO)
+        check(f"refused__git_global_opt__{name}",
+              mod._is_read_only("Bash", {"command": cmd}) is False,
+              f"classified READ-ONLY, so the gate would let it through. {why}")
+    # Isolation: prove a read-only head in the same shape IS permitted, so a green above is
+    # the head/subcommand check deciding rather than the whole shape being refused.
+    check("control_permits__git_read_with_no_options",
+          mod._is_read_only("Bash", {"command": "git log --oneline"}) is True,
+          "the bare read control was refused too, so nothing above isolates the option")
+
+
 if __name__ == "__main__":
     _BARE = True
     print("gate false refusals")
@@ -355,8 +574,18 @@ if __name__ == "__main__":
     test_fp8_is_pinned_open_not_fixed()
     test_multiedit_nested_edits_were_never_in_the_haystack()
     test_marker_evasion_by_path_assembly_is_pinned_open()
+    test_this_file_certifies_the_enforcing_copy()
+    test_git_global_options_are_pinned_open()
+    test_git_global_option_skip_list_stays_closed()
     print()
+    # Say what did NOT run, before saying everything passed. A skipped check and a passing
+    # one are indistinguishable in a scrollback, and this file's whole subject is claims
+    # that read as stronger than what was measured.
+    if SKIPPED:
+        print(f"NOT MEASURED HERE: {len(SKIPPED)}")
+        for s in SKIPPED:
+            print(f"  - {s}")
     if FAILURES:
         print(f"FAILED: {len(FAILURES)} — {FAILURES}")
         sys.exit(1)
-    print("all checks pass")
+    print(f"all checks pass ({len(SKIPPED)} skipped)" if SKIPPED else "all checks pass")
