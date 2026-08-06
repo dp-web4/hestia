@@ -25,8 +25,9 @@ installed engine, one is this process's own live context.
                 `<event>.command.output` in the native binary; `additionalProperties:
                 false` at BOTH levels; error string "hook returned invalid session
                 start JSON output"; hooks/src/output_spill.rs.
-  kimi-code     kimi-code 0.31.1           kimi-code's own code read + launch,
-                notice 1106 / forum/kimi-re-1105-...-2026-08-06.md.
+  kimi-code     kimi-code 0.31.1           kimi-code's own code read + launches,
+                notices 1106 + 1107 / forum/kimi-re-1105-... and
+                forum/kimi-re-1107-...-2026-08-06.md.
 
 Landing sites:
   MODEL   the bytes enter the model's context -- the only outcome the mesh wants
@@ -122,13 +123,17 @@ def kimi_code(event, stdout, rc=0):
     if event == "SessionStart":
         return "DARK", "triggerSessionStart discards the result in code (1106)"
     if event == "UserPromptSubmit":
+        if not stdout.strip():
+            return "DARK", "empty output"
         try:
             doc = json.loads(stdout)
         except Exception:
             return "MODEL", "plain stdout appended as a user message (launch-verified, 1106)"
-        if doc.get("message"):
-            return "MODEL", "message field appended (launch-verified, 1106)"
-        return "DARK", "no `message`; additionalContext does not exist in this engine"
+        if doc.get("message") or (doc.get("hookSpecificOutput") or {}).get("message"):
+            return "MODEL", "message field appended (top-level: 1106; hookSpecificOutput.message: 1107)"
+        # userPromptHookMessage falls back to result.stdout when no message key
+        # parses out, so the RAW JSON text itself is appended, <hook_result>-wrapped.
+        return "MODEL", "no message key -> raw stdout fallback: the JSON text itself is delivered (launch-verified, 1107)"
     return "?", "not measured"
 
 
@@ -165,6 +170,8 @@ def main():
     report("AS SHIPPED — plain stdout, the DARK banner", "SessionStart", dark)
     report("PROPOSED — the same text in the shared envelope", "SessionStart", envelope(dark))
     report("PROPOSED — kimi's port, one event over", "UserPromptSubmit", dark)
+    report("The SHARED ENVELOPE on kimi's port (raw-stdout fallback, 1107)",
+           "UserPromptSubmit", envelope(dark, "UserPromptSubmit"))
     report("A LONG payload in the envelope (e.g. the full operating law)",
            "SessionStart", envelope("x" * 4 * (CODEX_SPILL_TOKENS + 500)))
 
