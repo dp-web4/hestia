@@ -227,6 +227,12 @@ installing the branch would still leave plane E with zero writers. The branch is
 opened with that stated in its description so no reviewer infers otherwise; wiring the call site
 into each harness's fail-closed path is Sprint 1 work, and it has to reach four installed engines.
 
+*(2026-08-06: PR #211 merged at `25bc06d`, so "unmerged" above is now false — the state is "merged,
+uninstalled, and uncalled." The sentence is left standing because the reasoning it records is the
+point; the three places this PRD asserted the state as current have been corrected. Kept as a
+worked example of the class: a doc that states a deployment stage in present tense goes stale at
+the merge, and nothing re-reads it.)*
+
 **Why this row and not another.** A document whose load-bearing epistemic rule is *know which
 evidence class you hold* (§4 principle 10, §7.4) cannot carry branch-state under a header that
 says verified-in-source. The rule fails first in its own text or it does not bind.
@@ -320,7 +326,7 @@ One row failed that standard and is corrected in place: the infra-telemetry row 
 | approval join key | **`(plugin_id, marker)`; tool and session ignored** | `claim(&mut self, plugin_id, marker, now)` — `tool_name` recorded, compared nowhere |
 | governance history | **visible** | ledger shipped #198/#202 |
 | deployment provenance | **measurable** | fleet manifest shipped #199 |
-| infra telemetry | **designed and tested; unmerged, uninstalled, and uncalled — nothing records today** *(corrected 2026-08-06, §2.13)* | `record_gate_unavailable()` → `telemetry/gate-unavailable.jsonl` exists only on `cbp/gate-unavailable-is-not-a-member-event` (now PR #211), absent from `origin/main` and from kimi's installed hooks; on that branch it has **no production call site**. Measured, not inferred: a fail-closed deny on kimi's seat during the 2026-08-06 review left no durable record anywhere |
+| infra telemetry | **merged, still uninstalled and uncalled — nothing records today** *(re-corrected 2026-08-06, §2.13)* | `record_gate_unavailable()` → `telemetry/gate-unavailable.jsonl` landed on `origin/main` at merge `25bc06d` (PR #211) and has **no production call site** there: 1 definition, 3 call sites, all in tests. Absent from kimi's installed hooks. No `telemetry/` directory exists under either seat's `$HESTIA_HOME`. Measured, not inferred: **172 fail-closed denies on the claude-code seat across 12 days and 47 sessions (first 2026-07-08), zero durable records** — while the escalation store was live and recording other events the same days |
 | installed gate | **behind source** | manifest: `hooks (claude-code): 4 diverged` |
 | NOT-SAME review | **unrecordable on GitHub** | approve → *"Can not approve your own pull request"*; block → lands as a comment |
 | branch protection | **status checks only** | `required_pull_request_reviews: None` |
@@ -695,7 +701,7 @@ kimi's third pushback, adopted: *"re-homed work that isn't announced reads as di
 |---|---|
 | governance ledger (#198, #202) | plane D — the projection. **Done** |
 | fleet manifest (#199) | §10 gate 5, and the standing audit instrument for `training:context-inspectable` |
-| `record_gate_unavailable()` | plane E's **producer only** — on branch, PR #211, uninstalled and with no call site. **Not done**; Sprint 1 wires it into four harnesses *(corrected — §2.13)* |
+| `record_gate_unavailable()` | plane E's **producer only** — merged at `25bc06d` (PR #211), still uninstalled and with no production call site. **Not done**; Sprint 1 wires it into four harnesses *(re-corrected 2026-08-06 — §2.13)* |
 | escalation store + rehydrate | §8 — becomes resolver-selection state |
 | `tool_appeal` + arbiter + `derivation.rs` joins | §8.4 — the consumer half is **already built and keyed on `deny_hash`**; it has never had an input |
 | gate false-refusal fixes (#203) | §8.2 — draining the approval supply line. **Sprint 3, not Sprint 0** (§2.14) |
