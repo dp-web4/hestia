@@ -59,6 +59,36 @@ in a hand count, with no run to disagree with it. So every per-file block now le
 with `spellings`, and a prose claim about how often a document points into a file is
 re-derivable rather than asserted.
 
+AND THAT RULE WAS ITSELF PROSE, so it failed the way prose fails. The sentence above
+was written into this docstring, and in the same document the bullet it is about says
+"Re-checking the other 34 is the wrong remedy". 34 was correct exactly once: at
+`aafe898`, where the doc claimed 35 citations and one of them was the caught one. The
+base was then corrected twice -- 35 -> 38 at `ad57091`, 38 live + 3 quoted at
+`2b46a21` -- and the number DERIVED from it never moved, because pinning a number
+pins the number, not the arithmetic downstream of it. Worse, the census header prints
+"36 live ...; 34 resolved over 6 files": a reader spot-checking 34 against the run
+finds a 34 that measures something else entirely. The coincidence MANUFACTURES
+corroboration. So the rule is now enforced instead of stated:
+
+  * `<!--n:NAME-->` abutting a number in the prose declares that the number IS the
+    quantity the run computes under NAME (`live`, `qualified`, `continuations`,
+    `quoted`, `resolved`, `files`, `spellings:<path>`). Same abutment discipline, and
+    for the same reason, as `<!--cite:quoted-->`.
+  * Every run re-derives every marked number and prints OK or MISMATCH. There is no
+    flag to turn this on: a check that a caller can decline is a check whose absence
+    looks identical to a pass, which is the defect one layer up.
+  * A mismatch exits 3. This does not contradict "it never fails" below -- that
+    applies to the ref census, whose output is a DISTRIBUTION with no single correct
+    value. A document's claim about its own contents has exactly one correct value.
+  * The run prints its own BLIND FRACTION: how many numeric tokens in the document
+    carry no marker. "0 mismatches" over 2 marked numbers and 130 unmarked ones is not
+    "the numbers check out", and the instrument says so rather than letting the reader
+    supply the wrong denominator.
+
+A number this cannot re-derive should not be pinned but DELETED: "the other 34" does no
+work that "the other citations" does not, and a derived constant that carries no
+information is a liability with no offsetting benefit.
+
 A QUOTED CITATION IS NOT A CITATION. A document that describes its own citation defect
 must spell the broken citation to describe it -- `presets.rs:94-98` appears in the
 PRD's own post-mortem bullet. A regex cannot tell a claim from a report of a claim, so
@@ -100,6 +130,13 @@ CONTINUATION = re.compile(r"`:(\d+)(?:-(\d+))?`")
 # A citation immediately followed by this marker is being quoted, not made. It abuts
 # what it exempts on purpose -- see the docstring.
 QUOTED = "<!--cite:quoted-->"
+# A number immediately followed by this marker claims to BE the named quantity, and
+# every run re-derives it. Abuts for the same reason the quoted marker does: an
+# assertion held anywhere but against its subject drifts away from it.
+CLAIM = re.compile(r"(\d+)<!--n:([A-Za-z0-9_.:/-]+)-->")
+# For the blind fraction: every run of digits, once citations are masked out, is a
+# number the prose asserts and this tool cannot check.
+NUMERIC = re.compile(r"\d+")
 
 
 def git(*args: str) -> str:
@@ -142,6 +179,44 @@ def resolve(path: str, tracked: set[str]) -> tuple[str | None, str]:
     if len(tail) == 1:
         return tail[0], "suffix"
     return None, ("ambiguous: " + ", ".join(tail)) if tail else "no such path"
+
+
+def check_claims(text: str, quantities: dict[str, int]) -> bool:
+    """Re-derive every `N<!--n:NAME-->` in the document. True iff all agree.
+
+    Also prints the blind fraction. A marked number is checked; every other numeric
+    token in the prose is not, and the difference between "no mismatches" and "the
+    numbers are right" is exactly that ratio. Reporting only the former is how an
+    instrument's silence gets read as its endorsement.
+    """
+    claims = list(CLAIM.finditer(text))
+    # Mask citations before counting bare numerals: `presets.rs:89-93` is a citation,
+    # already measured by the census proper, and counting its line numbers as unchecked
+    # prose claims would inflate the blind fraction with the one thing that is checked.
+    masked = CONTINUATION.sub(" ", CITATION.sub(" ", text))
+    masked = CLAIM.sub(" ", masked)
+    unchecked = len(NUMERIC.findall(masked))
+
+    print("\n  numeric self-claims -- every marked number re-derived by this run")
+    if not claims:
+        print("    none marked. No number in this document is checked by anything.")
+    ok = True
+    for m in claims:
+        stated, name = int(m.group(1)), m.group(2)
+        if name not in quantities:
+            ok = False
+            print(f"    {stated} <!--n:{name}-->  UNKNOWN QUANTITY -- known: "
+                  + ", ".join(sorted(quantities)))
+        elif quantities[name] == stated:
+            print(f"    {stated} <!--n:{name}-->  OK")
+        else:
+            ok = False
+            print(f"    {stated} <!--n:{name}-->  MISMATCH -- the run computes "
+                  f"{quantities[name]}")
+    total_numbers = len(claims) + unchecked
+    print(f"    blind fraction: {len(claims)} of {total_numbers} numeric tokens carry "
+          f"a marker; {unchecked} are unchecked by this instrument")
+    return ok
 
 
 def main() -> int:
@@ -315,7 +390,26 @@ def main() -> int:
         print(f"    construct ABSENT  : {absent}/{len(refs)}  "
               "(conversion makes this legible, not correct)")
 
-    return 0
+    quantities = {
+        "live": qualified + continuations,
+        "qualified": qualified,
+        "continuations": continuations,
+        "quoted": quoted,
+        "resolved": total,
+        "files": len(cited),
+    }
+    for path in cited:
+        quantities[f"spellings:{path}"] = len(cited[path])
+    # The document writes short spellings (`handler.rs`), so accept them -- but only
+    # where unambiguous, the same rule resolve() applies to citations. Binding a short
+    # name to one of two cited files would answer a question the document did not ask.
+    bases = collections.Counter(p.rpartition("/")[2] for p in cited)
+    for path in cited:
+        base = path.rpartition("/")[2]
+        if bases[base] == 1:
+            quantities[f"spellings:{base}"] = len(cited[path])
+
+    return 0 if check_claims(text, quantities) else 3
 
 
 if __name__ == "__main__":
