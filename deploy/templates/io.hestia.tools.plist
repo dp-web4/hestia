@@ -27,6 +27,8 @@
   <dict>
     <key>HESTIA_HOME</key>
     <string>__HESTIA_HOME__</string>
+    <key>HESTIA_CURRENT_BUILD_FILE</key>
+    <string>__HESTIA_HOME__/current-build.json</string>
     <key>RUST_LOG</key>
     <string>warn</string>
     <key>HOME</key>

@@ -33,6 +33,7 @@ const FG: Color = Color::Rgb(230, 232, 238);
 const FG_DIM: Color = Color::Rgb(154, 160, 172);
 const FG_FAINT: Color = Color::Rgb(91, 96, 104);
 const SUCCESS: Color = Color::Rgb(74, 222, 128);
+const WARNING: Color = Color::Rgb(251, 191, 36);
 const FAILURE: Color = Color::Rgb(248, 113, 113);
 const BG_ELEV: Color = Color::Rgb(21, 23, 28);
 
@@ -163,8 +164,16 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState) {
         Span::raw("  "),
         Span::styled("local-first Web4 trust layer", Style::default().fg(FG_DIM)),
     ]);
+    let deployment = state.snapshot.as_ref().map(|s| &s.deployment);
+    let deployment_span = match deployment.map(|d| d.state.as_str()) {
+        Some("current") => Span::styled("● deployment current", Style::default().fg(SUCCESS)),
+        Some("stale") => Span::styled("! deployment stale", Style::default().fg(WARNING)),
+        _ => Span::styled("● deployment unknown", Style::default().fg(FG_FAINT)),
+    };
     let right = Line::from(vec![
         status,
+        Span::raw("  "),
+        deployment_span,
         Span::raw("  "),
         Span::styled(
             format!("ticks {}", state.fetch_count),
