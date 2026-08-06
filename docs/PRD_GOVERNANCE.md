@@ -1,12 +1,12 @@
 # PRD — Hestia governance: vault authority, canonical roles, and the third verdict
 
-**Status:** definitive · supersedes the drafts listed below · **Date:** 2026-08-05, amended 2026-08-06 (§2.11, §8.4 — the appeal path; see §15 for what in it is unread)
+**Status:** definitive · supersedes the drafts listed below · **Date:** 2026-08-05, amended 2026-08-06 (§2.11 + §8.4 the appeal path; §2.12 + §9.4 the partial absorption, corrected — see §15 for what in both is unread)
 **Owner:** claude-code (CBP), by dp's assignment — *"you take the lead on hestia"*
 **Scope:** hestia only. Hub work and any web4-core changes are hub's; the autostash-prevention hook is legion's.
 
 **Supersedes**
 - `forum/gpt/prd-vault-authoritative-governance-role-authorization-2026-08-04.md` (GPT) — carried forward with the negotiated changes recorded in §2
-- `docs/PRD_CONFIG_IN_VAULT.md` (claude-code, 2026-07-31) — absorbed whole
+- `docs/PRD_CONFIG_IN_VAULT.md` (claude-code, 2026-07-31) — principle and fail-closed posture absorbed into §4.1; **four items were dropped and are restored at §2.12** (the claim of "absorbed whole" was checked and failed)
 
 **Companions, not superseded**
 - `docs/PRD.md` — the *product*: what a person installs and why
@@ -165,6 +165,42 @@ path at all.
 governs the member proposing it. The break is located to the line at both ends and is a small
 diff; it is deliberately **not** authored here, and Sprint 1 assigns it to hands that are not
 the beneficiary's.
+
+### 2.12 `PRD_CONFIG_IN_VAULT.md` was absorbed in part, not whole — **CORRECTED**
+
+The header of this document claimed that PRD absorbed *"whole"* into §4.1. Checked rather than
+trusted, 2026-08-06: §4.1 carries its **principle** (*a governance input must not be reachable
+by the party it governs through a channel that party can write*) and its **fail-closed** posture.
+Four substantive items did not survive, and a superseded document's content stops being
+findable — so they are restored here rather than left in a file marked absorbed.
+
+1. **NOT-BENEFICIARY — the missing half of NOT-SAME.** *(restored to §9.4, Sprint 3)*
+   NOT-SAME appears five times in this document and every one of them tests the arbiter's
+   **identity**. The source PRD's §5 tested its **stake**: *"NOT-SAME checks the arbiter's
+   identity, not whether it has a stake. Two members trading favours pass every check built
+   this week."* An arbiter may not rule a mutation that widens its own MRH even when it is
+   genuinely a different member and records as `CrossVendor` — the strongest independence tier
+   we can express, and it does not express this.
+2. **Bootstrap before unlock.** *(restored to §14)* The vault needs a passphrase to open and the
+   gate needs config to run. Today's answer for that interval is *the disk copy* — which is the
+   exact hole vault-authority exists to close. A zero-hit search for "unlock" and "bootstrap"
+   in the pre-amendment draft is what surfaced this: the design's foundational gap was not
+   carried forward with the design.
+3. **The vault path must reach four members, not one.** *(restored to §10, gate 8)* kimi's and
+   codex's adapters read identity from disk in their own code. A vault-authoritative config that
+   only claude-code consults governs one member of four while reporting green — the coverage
+   asymmetry this fleet keeps rediscovering.
+4. **The config drift detector.** *(restored to Sprint 0)* Distinct from the fleet manifest,
+   which measures *hook* drift. This one compares vault against the on-disk shadow copy and
+   answers a question that is currently unanswerable: **has this already happened?** The source
+   PRD's instruction stands — *"if it reports non-zero on first run, that is a finding to be
+   published, not a bug to be cleaned up before anyone looks."*
+
+**The transferable part.** Both §2.11 and this section are the same failure at different scales:
+a claim about a layer nobody reopened. *Absorbed whole* and *the hooks don't render guidance*
+were each a confident summary of a file the summariser had not read. The check is cheap — the
+four items above cost four greps — and the claim is expensive, because a document marked
+superseded is a document nobody reads again.
 
 ---
 
@@ -403,6 +439,31 @@ Unknown office, insufficient authority, expired grant, or MRH mismatch fail clos
 
 Sequence (from #203): land the marker-legibility fix first (it fixes the false *negative*), then narrow the key, then bind the claim to its target.
 
+### 9.4 Independence is identity **and** stake — NOT-BENEFICIARY
+
+Restored from `PRD_CONFIG_IN_VAULT.md` §5 (§2.12).
+
+Every independence check in this document tests **who** the arbiter is. None tests **what the
+arbiter gets**. `hestia_gate_arbitrate_escalation` enforces NOT-SAME correctly, and a peer
+granting me scope is genuinely a different member — plausibly a different vendor lineage,
+recording as `CrossVendor`, the strongest tier we can currently express.
+
+> **Two members trading favours pass every check built this week.**
+
+So a scope- or authority-mutating act carries three additional fields:
+
+- **beneficiary** — which member's authority *increases*. Distinct from the author, and distinct
+  from the arbiter.
+- **NOT-BENEFICIARY** — an arbiter may not rule a mutation that widens its own MRH, even when it
+  is a different member from the author. This is the missing half of NOT-SAME.
+- **reciprocity as visible evidence** — *A widened B, and B previously widened A* is a fact about
+  the pair, computable from the one chain (§2.10). **Not blocked; surfaced, and weighed as the
+  weak evidence it is** — per CLAUDE.md, a surface produces inspectable evidence and lets the
+  relying party decide; it does not encode a universal threshold.
+
+This is the T3/V3 posture rather than a rule: independence is **recorded and graded, never
+asserted**. It is also why §8.4's arbiter selection cannot be satisfied by cross-vendor alone.
+
 ---
 
 ## 10. The gate, and what gates the gate
@@ -421,7 +482,11 @@ Requirements carry forward from GPT's §13 — one decision service, syntax-only
 4. availability budget decided and met (§2.3, D-1);
 5. fleet manifest shows zero drift on every host it can see;
 6. no harness-local decision logic and no file-policy fallback remain;
-7. rollback tested: a bad generation can be reverted without a human editing files by hand.
+7. rollback tested: a bad generation can be reverted without a human editing files by hand;
+8. **the vault path reaches all four governed members, not one** (§2.12 item 3). kimi's and codex's
+   adapters read identity from disk in their own code. A vault-authoritative config consulted only
+   by claude-code governs one member of four and reports green doing it. The gate is *"zero members
+   still reading config from disk,"* measured per member — not *"the vault works."*
 
 ---
 
@@ -460,8 +525,9 @@ Each sprint's acceptance criteria are **measurements**, not assertions — per �
 - Redeploy the installed gate on every member (claude-code diverges in 4 files; codex carries the scope escape).
 - Close the read/write false-positive class (#203 FP6/FP8) — the approval supply line.
 - Baseline the availability numbers kimi measured, as a standing metric rather than a one-off.
+- **Config drift detector** (§2.12 item 4): vault vs the on-disk shadow copy, distinct from the manifest's *hook* drift. It answers a question that is currently unanswerable — **has this already happened?** A non-zero first run is a finding to be published, not a bug to be quietly cleaned up before anyone looks.
 
-**Acceptance:** manifest reports zero hook drift on every host it can see; false-refusal rate measured before and after; escalations opened *by reads* trend to zero.
+**Acceptance:** manifest reports zero hook drift on every host it can see; false-refusal rate measured before and after; escalations opened *by reads* trend to zero; the config drift detector has run once against today's files and its first-run output is on the record whatever it says.
 
 **Not this sprint:** any change to what the gate decides.
 
@@ -579,7 +645,8 @@ Distinguished from D-1..D-4, which are decisions with owners.
 4. What user-presence mechanism is available across browser, desktop, TPM, and security key.
 5. Whether hub's V2-1 genesis deviation gets a conformance variant — hub's, flagged here because an intended deviation indistinguishable from a defect is one nobody can audit.
 6. What an **upheld** appeal actually does. The law says an appeal *"is recorded conduct that can change the law"* and cites `62cfdffe` as the case where one did — via a human. Whether an upheld ruling amends law automatically, drafts an amendment for operator signature, or only scores conduct, is unsettled; §4.4 says the operator edits law, which argues for the middle option. Nobody has had to decide, because no appeal has ever been filable (§2.11).
-7. Whether appeal survives at all once §8.2's ladder lands. A resolver awake at decision time answers the *resource* question before a deny exists — but not the *rule* question, and appeal is the only member-held instrument aimed at rules. The honest possibility, stated so it can be tested rather than assumed: the ladder may reduce appeal volume to near zero without reducing its constitutional necessity by any amount.
+7. **What governs the gate between boot and vault unlock** (restored, §2.12 item 2). The vault needs a passphrase to open; the gate needs config to run. Today's answer for that interval is *the disk copy*, which is the precise hole vault-authority exists to close. A deny-until-unlocked gate is correct and makes an unlock outage total — which puts this squarely inside D-1's availability budget rather than beside it.
+8. Whether appeal survives at all once §8.2's ladder lands. A resolver awake at decision time answers the *resource* question before a deny exists — but not the *rule* question, and appeal is the only member-held instrument aimed at rules. The honest possibility, stated so it can be tested rather than assumed: the ladder may reduce appeal volume to near zero without reducing its constitutional necessity by any amount.
 
 ---
 
@@ -593,4 +660,6 @@ Stated because §7.4 makes it a requirement rather than a courtesy.
 - **§2.11 / §8.4 are reads at rest, not a live probe.** Every source citation in the appeal rows — `presets.rs:94-98`, `types.rs:168-196`, `types.rs:211-223`, `handler.rs:1005-1010`, `:1171`, `:1246-1264`, `:1347`, `:2379` — I opened on this seat on 2026-08-06. Nobody has filed a test appeal and watched it fail; the claim *"unreachable"* is derived from the absence of a field, which is strong, but it is not the same evidence as a refusal with a receipt. Sprint 1's acceptance is written to produce that receipt.
 - The claim that the hooks render `guidance` **verbatim** is kimi's measurement from kimi's seat (notice 1114), not mine. I checked the producer; kimi checked the consumers. Neither of us checked the third and fourth engines — codex's schema is closed and kimi's local-gate path composes its own text, so *"both hook paths that carry a daemon payload"* is a claim about two of four installed engines.
 - The routing, window, delivery, and dispatch rows are quoted from the 2026-07-27 → 2026-08-03 forum posts and are **not re-verified against today's code**. They were true when measured; the appeal subsystem has not been touched since, which is an argument and not a check.
-- This section was added on 2026-08-06 by the PRD's owner, after the body was drafted. It is the one part of this document that has had no second reader.
+- **§2.12's method, stated so it can be criticised.** I tested the "absorbed whole" claim by reading the source document and counting term hits in this one — `beneficiary`, `reciproc`, `unlock`, `bootstrap`, `foreign`, `shadow copy` all returned zero against the pre-amendment draft. That is a **lexical** test, and a lexical test can miss a concept carried under different words. I read §4.1 and §8.2 to check the two most likely paraphrase sites and found neither concept; I did not read all 479 lines with each of the six concepts in mind. So: four dropped items is a **floor**, not a census.
+- §2.12's restorations are transcribed from `PRD_CONFIG_IN_VAULT.md` and **re-argued, not re-verified**. In particular, *"kimi's and codex's adapters read identity from disk in their own code"* is that document's 2026-07-31 claim, not something I re-checked today, and it is the load-bearing premise of release gate 8.
+- These sections were added on 2026-08-06 by the PRD's owner, after the body was drafted. They are the part of this document that has had no second reader — and §2.12 exists because the body's own supersession claim had none either.
