@@ -49,6 +49,16 @@ that they agreed. So the header now prints the doc's REF and BLOB, always, and
 `--doc-ref` reads the document out of git instead of off the disk. A count you cannot
 re-derive at a named ref is the same defect as a line number you cannot resolve there.
 
+EVERY NUMBER THE PROSE ASSERTS SHOULD BE A NUMBER THE RUN PRINTS. The count above was
+pinned to a ref and the tool still did not print the per-file breakdown, so the PRD's
+census bullet asserted `handler.rs` is pointed at in "ten spellings" -- the qualified
+subset -- in the same bullet that warns counting only the qualified form under-reports
+by a third. It is 18: 10 qualified + 8 bare continuations. A second reader caught it
+(kimi, notice 1126). The gap was not carelessness; it was that the number existed only
+in a hand count, with no run to disagree with it. So every per-file block now leads
+with `spellings`, and a prose claim about how often a document points into a file is
+re-derivable rather than asserted.
+
 A QUOTED CITATION IS NOT A CITATION. A document that describes its own citation defect
 must spell the broken citation to describe it -- `presets.rs:94-98` appears in the
 PRD's own post-mortem bullet. A regex cannot tell a claim from a report of a claim, so
@@ -196,6 +206,14 @@ def main() -> int:
         return text.startswith(QUOTED, end)
 
     cited: dict[str, list[str]] = collections.defaultdict(list)
+    # How many TIMES the document points into each file, split by spelling. The
+    # totals line already splits qualified from continuation for the whole document;
+    # not doing it per file is what let the PRD's own census bullet say `handler.rs`
+    # is pointed at "ten" times -- the qualified subset -- two sentences after warning
+    # that counting only the qualified form under-reports by a third. It is 18. The
+    # tool knew; it printed distinct SPANS and never the count of spellings, so the
+    # prose number came from a hand count and nothing checked it against the run.
+    kinds: dict[str, list[str]] = collections.defaultdict(list)
     unresolved: dict[str, tuple[int, str]] = {}
     continuations = 0
     quoted = 0
@@ -234,6 +252,7 @@ def main() -> int:
                 continue
             path = last_path
         cited[path].append(f"{start}-{end}" if end else start)
+        kinds[path].append(kind)
 
     total = sum(len(v) for v in cited.values())
     qualified = total - continuations + sum(n for n, _ in unresolved.values())
@@ -255,7 +274,11 @@ def main() -> int:
         base = blob_at(args.baseline, path)
         blobs = [b for b in (blob_at(r, path) for r in refs) if b is not None]
         same = sum(1 for b in blobs if b == base)
+        q = sum(1 for k in kinds[path] if k == "q")
+        c = len(kinds[path]) - q
         print(f"  {path}")
+        print(f"    spellings   : {len(cited[path])} "
+              f"({q} path-qualified + {c} bare continuations)")
         print(f"    lines cited : {', '.join(sorted(set(cited[path])))}")
         print(f"    blobs       : {len(set(blobs))} distinct over {len(blobs)} refs "
               f"carrying the file")
