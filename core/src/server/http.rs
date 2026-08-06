@@ -1820,34 +1820,39 @@ async fn chain_query(
     // not blank, it was LYING, and a 119MB witness.db is what made the failure ordinary. Fixing
     // one call site and not the class is why it came back; this is the call site the history view
     // actually uses.
-    let (raw, read_error) = match s.chain_store.read_recent_window(cutoff_str.as_deref(), limit) {
+    // PROJECT AND FILTER INSIDE THE SCAN. Two wins over the old read-then-filter:
+    // no `Vec<ChainEntry>` of parsed documents is ever built, and a row the caller
+    // filters out costs nothing at all — previously every row was parsed in full and
+    // then discarded by the `event_type` / `tool` predicates below.
+    //
+    // The event-type filter is applied by the SCAN where it can be, so it becomes an
+    // indexed SQL predicate rather than a post-hoc `!=`. The tool filter stays here
+    // because it is a substring match on a projected field, which SQL cannot do for us
+    // without reaching into the JSON.
+    let type_filter: Option<Vec<&str>> = q.event_type.as_deref().map(|t| vec![t]);
+    let (entries, read_error) = match s.chain_store.scan_recent(
+        cutoff_str.as_deref(),
+        type_filter.as_deref(),
+        limit,
+        |r| {
+            let e = super::dashboard::flatten_row(r);
+            if let Some(ref tf) = q.tool {
+                match e.tool_name {
+                    Some(ref tn) if tn.contains(tf.as_str()) => {}
+                    // A row with no tool_name cannot match a tool filter. Dropping it
+                    // here is the same verdict the old post-filter reached.
+                    _ => return None,
+                }
+            }
+            Some(e)
+        },
+    ) {
         Ok(v) => (v, None),
         Err(e) => {
             tracing::error!("chain query read failed: {e}");
             (Vec::new(), Some(e.to_string()))
         }
     };
-    let entries: Vec<super::dashboard::RecentEntry> = raw
-        .into_iter()
-        .map(super::dashboard::flatten_entry)
-        .filter(|e| {
-            if let Some(ref et) = q.event_type {
-                if e.event_type != *et {
-                    return false;
-                }
-            }
-            if let Some(ref tf) = q.tool {
-                if let Some(ref tn) = e.tool_name {
-                    if !tn.contains(tf.as_str()) {
-                        return false;
-                    }
-                } else {
-                    return false;
-                }
-            }
-            true
-        })
-        .collect();
     Json(serde_json::json!({ "entries": entries, "read_error": read_error }))
 }
 

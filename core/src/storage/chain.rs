@@ -26,6 +26,35 @@ pub struct ChainEntry {
     pub chain_position: u64,
 }
 
+/// One chain row, borrowed for the lifetime of a [`SqliteChainStore::scan_recent`]
+/// projection callback.
+///
+/// `event_data` is deliberately the **raw JSON text**, not a parsed `serde_json::Value`.
+/// The whole point of this type is that the caller decides what — if anything — to parse,
+/// so a window of ten thousand rows costs ten thousand *projections* rather than ten
+/// thousand documents.
+#[derive(Debug, Clone, Copy)]
+pub struct ChainRowRef<'a> {
+    pub chain_position: u64,
+    pub hash: &'a str,
+    pub prev_hash: &'a str,
+    pub event_type: &'a str,
+    pub event_data: &'a str,
+    pub signer_lct: &'a str,
+    pub timestamp: &'a str,
+}
+
+impl ChainRowRef<'_> {
+    /// Deserialise `event_data` into a projection struct naming only the fields wanted.
+    ///
+    /// Returns `None` on malformed JSON rather than failing the scan: one unparseable
+    /// entry must not cost the other 9,999. A caller that needs to know the difference
+    /// should project `Option`-typed fields and count the misses.
+    pub fn project<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
+        serde_json::from_str(self.event_data).ok()
+    }
+}
+
 /// Witness chain persisted to SQLite. Locking is internal so the store
 /// is `Send + Sync` from the caller's perspective.
 pub struct SqliteChainStore {
@@ -263,6 +292,98 @@ impl SqliteChainStore {
     /// An empty `event_types` returns no rows rather than everything: a caller that computed an
     /// empty type list is asking for nothing, and widening that to the whole chain would be the
     /// same silent-widening failure the ledger's status filter refuses.
+    /// Stream a window and let the caller PROJECT each row, without ever building a
+    /// `Vec<ChainEntry>` — which is to say, without holding N parsed `serde_json::Value`
+    /// trees alive at once.
+    ///
+    /// # Why this exists
+    ///
+    /// `ChainEntry.event_data` is a fully parsed `serde_json::Value`. `row_to_entry`
+    /// parses it for every row, so a caller that wants three scalars out of ten thousand
+    /// entries pays for ten thousand JSON trees and keeps them all until it drops the Vec.
+    ///
+    /// Measured on this fleet, 2026-08-06: a single dashboard poll issued
+    /// `read_recent(10_000)` for stats plus a windowed read for the feed, and the stats
+    /// loop's entire use of `event_data` was `.get("plugin_id")`, `.get("decision")` and
+    /// two siblings — top-level scalars. The daemon grew 164 MB → 1.35 GB in twenty-one
+    /// minutes of ordinary use, `Anonymous: 1364 MB` of `Rss: 1382 MB`, flat at idle and
+    /// stepping on every heavy read. Not a leak by reference: retention by allocator,
+    /// driven by materialising trees nobody wanted.
+    ///
+    /// # What the caller gets
+    ///
+    /// `event_data` arrives as `&str`, borrowed from the sqlite row and valid only for
+    /// the duration of the closure. Deserialise it into a **small struct naming just the
+    /// fields you need** — serde skips unknown keys without allocating them, so peak
+    /// memory becomes O(projection) per row instead of O(whole document). Returning
+    /// `None` drops the row entirely, so a filter costs nothing downstream.
+    ///
+    /// Prefer this over `read_recent*` for anything windowed. The eager readers remain
+    /// for callers that genuinely need whole entries (chain replay, derivation), where
+    /// the parse is the point rather than an accident.
+    pub fn scan_recent<T>(
+        &self,
+        cutoff_rfc3339: Option<&str>,
+        event_types: Option<&[&str]>,
+        limit: u64,
+        mut project: impl FnMut(ChainRowRef<'_>) -> Option<T>,
+    ) -> Result<Vec<T>> {
+        // An empty type list asks for nothing. Same rule as `read_recent_by_types`:
+        // widening it to the whole chain would answer a question nobody posed.
+        if matches!(event_types, Some(t) if t.is_empty()) {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut where_parts: Vec<String> = Vec::new();
+        if let Some(types) = event_types {
+            where_parts.push(format!("event_type IN ({})", vec!["?"; types.len()].join(",")));
+        }
+        if cutoff_rfc3339.is_some() {
+            where_parts.push("timestamp >= ?".to_string());
+        }
+        let where_sql = if where_parts.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_parts.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+             FROM chain_entries {where_sql}
+             ORDER BY chain_position DESC LIMIT ?"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(types) = event_types {
+            for t in types {
+                binds.push(Box::new(t.to_string()));
+            }
+        }
+        if let Some(c) = cutoff_rfc3339 {
+            binds.push(Box::new(c.to_string()));
+        }
+        binds.push(Box::new(limit as i64));
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(std::convert::AsRef::as_ref).collect();
+
+        let mut rows = stmt.query(refs.as_slice())?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let row_ref = ChainRowRef {
+                chain_position: row.get::<_, i64>(0)? as u64,
+                hash: row.get_ref(1)?.as_str()?,
+                prev_hash: row.get_ref(2)?.as_str()?,
+                event_type: row.get_ref(3)?.as_str()?,
+                event_data: row.get_ref(4)?.as_str()?,
+                signer_lct: row.get_ref(5)?.as_str()?,
+                timestamp: row.get_ref(6)?.as_str()?,
+            };
+            if let Some(v) = project(row_ref) {
+                out.push(v);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn read_recent_by_types(
         &self,
         cutoff_rfc3339: Option<&str>,
@@ -603,6 +724,56 @@ mod tests {
             SqliteChainStore::open(&path, [9u8; 32]).is_err(),
             "wrong key must fail"
         );
+    }
+
+    #[test]
+    fn scan_recent_projects_without_materialising_and_matches_the_eager_read() {
+        // The optimisation is only safe if it is INVISIBLE. Same rows, same order, same
+        // field values as the eager path — the difference must be memory, never meaning.
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(&dir.path().join("w.db"), TEST_KEY).unwrap();
+        let signer = "lct:web4:hestia:sovereign:test";
+        for i in 0..5 {
+            store
+                .append(
+                    if i % 2 == 0 { "outcome" } else { "policy_decision" },
+                    json!({"plugin_id": format!("m{i}"), "success": i % 2 == 0,
+                           "big": "x".repeat(4096), "nested": {"a": {"b": [1,2,3]}}}),
+                    signer,
+                )
+                .unwrap();
+        }
+
+        #[derive(serde::Deserialize)]
+        struct Proj { plugin_id: Option<String>, success: Option<bool> }
+
+        let eager = store.read_recent(10).unwrap();
+        let projected = store
+            .scan_recent(None, None, 10, |r| {
+                let f: Proj = r.project().unwrap_or(Proj { plugin_id: None, success: None });
+                Some((r.chain_position, r.event_type.to_string(), f.plugin_id, f.success))
+            })
+            .unwrap();
+
+        assert_eq!(eager.len(), projected.len(), "same row count");
+        for (e, p) in eager.iter().zip(projected.iter()) {
+            assert_eq!(e.chain_position, p.0, "same order");
+            assert_eq!(e.event_type, p.1);
+            assert_eq!(e.event_data.get("plugin_id").and_then(|v| v.as_str()).map(String::from), p.2);
+            assert_eq!(e.event_data.get("success").and_then(|v| v.as_bool()), p.3);
+        }
+
+        // Unparseable event_data must drop to the projection default rather than killing
+        // the scan: one bad row must not cost the other 9,999.
+        let n = store
+            .scan_recent(None, Some(&["outcome"]), 10, |r| {
+                r.project::<Proj>().map(|f| f.plugin_id)
+            })
+            .unwrap();
+        assert_eq!(n.len(), 3, "type filter still applies inside the scan");
+
+        // An empty type list asks for nothing — same rule as read_recent_by_types.
+        assert!(store.scan_recent(None, Some(&[]), 10, |_| Some(())).unwrap().is_empty());
     }
 
     #[test]

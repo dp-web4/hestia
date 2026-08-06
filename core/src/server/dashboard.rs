@@ -334,6 +334,65 @@ pub fn flatten_entry(e: crate::storage::ChainEntry) -> RecentEntry {
     }
 }
 
+/// Exactly the `event_data` fields any dashboard surface reads — and nothing else.
+///
+/// This is the whole memory fix in one type. `ChainEntry.event_data` is a parsed
+/// `serde_json::Value`, so reading a 10,000-row window built 10,000 documents to harvest
+/// fourteen scalars from each. Serde skips unknown keys **without allocating them**, so
+/// deserialising into this struct costs the fields named here and nothing more.
+///
+/// Measured 2026-08-06: the daemon reached 1.35 GB in twenty-one minutes of ordinary use,
+/// `Anonymous` 1364 MB of `Rss` 1382 MB, flat at idle and stepping on every heavy read —
+/// retention of trees nobody wanted. See `SqliteChainStore::scan_recent`.
+#[derive(Debug, Default, serde::Deserialize)]
+struct EventFields {
+    tool_name: Option<String>,
+    target: Option<String>,
+    success: Option<bool>,
+    magnitude: Option<f64>,
+    plugin_id: Option<String>,
+    role_lct: Option<String>,
+    host_session_id: Option<String>,
+    error: Option<String>,
+    decision: Option<String>,
+    enforced: Option<bool>,
+    rule_name: Option<String>,
+    reason: Option<String>,
+    attempted: Option<String>,
+}
+
+/// `flatten_entry`'s sibling, fed by a streaming row instead of a parsed entry.
+///
+/// Same output, same field semantics; the difference is upstream — the caller never
+/// materialised a document to get here. `timestamp` is parsed from the row's RFC3339 and
+/// falls back to the epoch on a malformed value rather than dropping the row: a
+/// timestamp we cannot read is a legibility problem, not a reason to hide an act.
+pub fn flatten_row(r: crate::storage::chain::ChainRowRef<'_>) -> RecentEntry {
+    let f: EventFields = r.project().unwrap_or_default();
+    RecentEntry {
+        chain_position: r.chain_position,
+        event_type: r.event_type.to_string(),
+        timestamp: DateTime::parse_from_rfc3339(r.timestamp)
+            .map(|t| t.with_timezone(&Utc))
+            .unwrap_or_else(|_| DateTime::<Utc>::UNIX_EPOCH),
+        hash: r.hash.to_string(),
+        prev_hash: r.prev_hash.to_string(),
+        tool_name: f.tool_name,
+        target: f.target,
+        success: f.success,
+        magnitude: f.magnitude,
+        plugin_id: f.plugin_id,
+        role_lct: f.role_lct,
+        host_session_id: f.host_session_id,
+        error: f.error,
+        decision: f.decision,
+        enforced: f.enforced,
+        rule_name: f.rule_name,
+        reason: f.reason,
+        attempted: f.attempted,
+    }
+}
+
 impl ServerState {
     /// Build the dashboard snapshot. Reads up to `recent_limit` chain
     /// entries for the live feed; aggregates over the full chain for stats.
@@ -382,6 +441,14 @@ impl ServerState {
         //
         // So the error is CARRIED to the surface instead of swallowed. The UI must render
         // unavailable rather than 0.
+        // NOT YET PROJECTED, AND THE REASON IS LOAD-BEARING. This is the daemon's largest
+        // routine read — 10,000 entries on every dashboard poll — so it is the biggest
+        // single win available. It is left eager because `derivation::derive` and
+        // `alias_target` consume this same window and read `event_data.get("data")`, a
+        // NESTED object rather than the top-level scalars `EventFields` projects.
+        // Migrating them is real work with real risk, and doing it badly here would trade
+        // a memory problem for a trust-derivation problem. Tracked as the next step; see
+        // `scan_recent`'s doc comment for the measurement that motivates it.
         let (stats_window, stats_read_error) = match self.chain_store.read_recent(10_000) {
             Ok(v) => (v, None),
             Err(e) => {
@@ -429,10 +496,7 @@ impl ServerState {
             // plugin_id. Outcomes are the main signal now that session_started is
             // no longer written; historical chains may still contain older entries.
             if let Some(pid) = e.event_data.get("plugin_id").and_then(|v| v.as_str()) {
-                let role = e
-                    .event_data
-                    .get("role_lct")
-                    .and_then(|v| v.as_str())
+                let role = e.event_data.get("role_lct").and_then(|v| v.as_str())
                     .unwrap_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE);
                 let key = self.trust_entity_key(pid, role);
                 let entry = active_entities.entry(key).or_insert((
@@ -492,10 +556,7 @@ impl ServerState {
                 continue;
             }
             total += 1;
-            let success = e
-                .event_data
-                .get("success")
-                .and_then(|v| v.as_bool())
+            let success = e.event_data.get("success").and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if success {
                 succ += 1;
@@ -631,17 +692,27 @@ impl ServerState {
         // turned every failure into an empty feed indistinguishable from a quiet fleet — see
         // `recent_unavailable`. The two reads now fail the same way, which is the point: a
         // reader should not have to know which panel was hardened and which was not.
-        let (recent_raw, recent_read_error) = match self
-            .chain_store
-            .read_recent_window(cutoff_str.as_deref(), recent_cap)
-        {
-            Ok(v) => (v, None),
-            Err(e) => {
-                tracing::error!("dashboard recent-feed chain read failed: {e}");
-                (Vec::new(), Some(e.to_string()))
-            }
-        };
-        let recent: Vec<RecentEntry> = recent_raw.into_iter().map(flatten_entry).collect();
+        // PROJECT, DO NOT MATERIALISE. This read ran on every dashboard poll and its only
+        // consumer was `flatten_entry` — so it parsed a full JSON document per row to
+        // keep the dozen scalars `RecentEntry` carries, then dropped the rest. Now the
+        // projection happens inside the scan and no `Vec<ChainEntry>` is ever built.
+        //
+        // The error arm is unchanged and deliberately so: a failed read must still set
+        // `recent_unavailable` rather than render as an empty feed. That distinction is
+        // what the comment on `recent_unavailable` above exists to protect, and a memory
+        // fix is not a licence to loosen it.
+        let (recent, recent_read_error) =
+            match self
+                .chain_store
+                .scan_recent(cutoff_str.as_deref(), None, recent_cap, |r| {
+                    Some(flatten_row(r))
+                }) {
+                Ok(v) => (v, None),
+                Err(e) => {
+                    tracing::error!("dashboard recent-feed chain read failed: {e}");
+                    (Vec::new(), Some(e.to_string()))
+                }
+            };
 
         let delegations = crate::delegation::DelegationStore::load(&self.vault)
             .ok()
