@@ -763,6 +763,78 @@ MRH is a set, so an act's disclosure horizon is the **union** of its participant
 
 `training:context-inspectable` (§7.4) stays a Training subdimension. Inspectability — *can the shaping be examined* — and disclosure — *what escapes* — are correlated but distinct, and conflating them is why the fourth item looked like a sibling of the third. So the earlier proposal was right about three of four; the fourth was never a score.
 
+#### D-4a — the graded half, which the MRH answer under-served
+
+> dp, 2026-08-06: *"training subdimension can in fact at least inform this: `training.hosted-remote` (could be private/secure cloud but still nonlocal with traffic exposed) and `training.hosted-remote-exposed` for external provider api, with a score indicating degree of risk, maybe a corresponding temperament subdimension."*
+
+Correct, and it repairs a collapse in the answer above: I treated "cloud" as one thing. There are **three** topologies, and dp's parenthetical names the middle one I had lost:
+
+| topology | who computes on plaintext | transit | example |
+|---|---|---|---|
+| **local** | operator | none | ollama on the operator's box |
+| **remote, operator-controlled** | operator | **exposed** | own GPU host, private VPC endpoint |
+| **remote, third-party** | **the provider** | exposed | this session |
+
+MRH and the subdimension are not competing — they compose:
+
+> **MRH says *who* is in the horizon** — a set, structural, enumerable, audited.
+> **The Training subdimension says *how much that costs*** — graded, comparable across agents, thresholdable later.
+
+The set is the fact; the score is the assessment of the fact. That division keeps the score from being improvable by good conduct (§D-4), because it is derived from topology, not from behaviour.
+
+#### The Temperament pairing is required, not optional
+
+dp said *"maybe a corresponding temperament subdimension."* It is load-bearing, and the middle row is why: **the two risks order differently.**
+
+| topology | disclosure risk | stability / availability risk |
+|---|---|---|
+| local, pinned | ~0 | low — cannot drift, no network |
+| remote, operator-controlled | ~0 *(transit only, mitigable by mTLS)* | **medium** — network, but you control upgrades |
+| remote, third-party | **1 — unmitigable** | **high** — silent version drift under a stable name, plus network, plus provider policy |
+
+A single *"degree of risk"* score is therefore **incoherent for the middle topology**: a private VPC model has near-zero disclosure risk and real availability risk. One number cannot carry both orderings.
+
+So the same topology fact projects onto two dimensions, which is exactly the split §7.4 already draws:
+
+- **Training** — *can the shaping be seen?* → `training:hosting-topology` (disclosure + inspectability)
+- **Temperament** — *does it stay the same?* → `temperament:context-stable` (drift + reachability)
+
+`temperament:context-stable` was already proposed in §7.4 for silent version drift. dp's instinct converges on it from the other direction, which is a good sign for both.
+
+#### Naming: one graded dimension, not two nested booleans
+
+`hosted-remote-exposed` is a **refinement of** `hosted-remote`, not a sibling — every exposed host is remote. Scoring both independently double-counts a single fact.
+
+Recommended: **one** subdimension, `training:hosting-topology`, scored on the ordered scale above, with the topology recorded alongside as the audited fact it derives from. If two names are preferred for legibility, the refinement relation must be explicit and only one may contribute to any fold.
+
+#### Two defects found in the mechanism while checking this
+
+Both argue for D-2 (`EvidenceClass` upstream) more strongly than the labelling argument did.
+
+**1. Sub-dimensions are recorded and never aggregated.**
+
+```rust
+pub fn aggregate(&self) -> f64 {
+    // reads self.dimensions (the 3 roots) and self.weights only
+}
+```
+
+`aggregate()` never touches `sub_dimensions`. The fractal extension point **stores but does not compute** — so every subdimension proposed here is, today, a *record* rather than a score that moves anything. That is fine and consistent with Sprint 1 (observe, change nothing), but it must be said plainly rather than implied otherwise: proposing `training:hosting-topology` today proposes a *field*, not an effect on trust.
+
+**2. The update rule assumes the witnessed class, and these facts are audited.**
+
+```rust
+let alpha = 0.5 / (1.0 + (entry.observation_count as f64 / 10.0));
+entry.score = alpha * observed_score + (1.0 - alpha) * entry.score;
+entry.weight = ((1.0 + entry.observation_count as f64).ln() / 10.0_f64.ln()).min(1.0);
+```
+
+EWMA with decaying alpha and confidence growing as `ln(count)` is the right shape for **accumulating behavioural observations** — the witnessed class. Hosting topology is a **fact**, not an observation stream. Re-reading *"this agent is third-party hosted"* ten times drives its weight to 1.0 — not because the evidence strengthened, but because someone looked repeatedly.
+
+For an **audited** dimension the correct dynamics are the opposite: confidence should **decay with staleness** and be restored by a *fresh* audit, which is precisely the `audit_every` cadence §7.3 already requires for provisional occupancy.
+
+**So `EvidenceClass` is not merely a label on the score — it must select the update rule.** Witnessed grows with repetition; audited decays with age; declared never accrues confidence at all. That is the strongest argument in this document for D-2, and it is a defect in the current mechanism rather than a missing nicety: today, an audited fact and a witnessed observation are updated by the same function, and the audited one gains unearned confidence every time it is re-read.
+
 ### 13.5 D-1 and D-3 are one mechanism
 
 Both answers have the same shape, and it is dp's rule from §7.3 applied twice:
