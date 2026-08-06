@@ -709,6 +709,44 @@ def test_policy_resolution_names_its_source_and_fails_closed():
     check("unresolvable_is_not_unscoped", not pol.is_unscoped(),
           "empty means NOTHING GRANTED; conflating it with '*' is how an absent check becomes "
           "a silent permission")
+def test_gate_unavailability_is_recorded_outside_the_chain():
+    """dp, 2026-08-04: a fail-closed deny is infra failure, not the agent's fault — *"we should
+    log it somewhere"*, and *"the chain is there to witness member events, not infra telemetry"*.
+
+    The event that could not be witnessed (because the daemon was unreachable) now lands in a
+    local file the watcher reads, carrying the cause the member must respond to."""
+    home = _workspace()
+    ok = G.record_gate_unavailable("kimi-code", "Edit", "timeout", "budget exceeded", home=home)
+    check("telemetry_written", ok)
+
+    path = os.path.join(home, G.GATE_TELEMETRY_RELPATH)
+    check("telemetry_file_exists", os.path.exists(path))
+    rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+    check("one_row", len(rows) == 1, f"{len(rows)} rows")
+    if not rows:
+        return
+    r = rows[0]
+    check("names_the_member", r["member"] == "kimi-code")
+    check("carries_the_cause", r["cause"] == "timeout",
+          "timeout and refused want OPPOSITE responses — back off vs stop and escalate")
+    # THE LOAD-BEARING PROPERTY: this must never be mistaken for a member act. If these were
+    # scored, ~135 of 301 measured denies would count against members for an infra fault.
+    check("declares_it_is_not_a_member_act", r["kind"] == "gate_unavailable" and "conduct" in r["note"])
+
+    # An unrecognised cause degrades to "unknown" rather than being echoed — a wrong cause
+    # sends the member to the wrong response (a peer sat parked 4 minutes on 2026-07-28).
+    G.record_gate_unavailable("m", "Bash", "banana", home=home)
+    rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+    check("unrecognised_cause_becomes_unknown", rows[-1]["cause"] == "unknown")
+    check("appends_rather_than_replaces", len(rows) == 2)
+
+
+def test_telemetry_never_raises_on_the_failure_path():
+    """It runs when the system is ALREADY degraded. A telemetry writer that can throw turns an
+    infra hiccup into a gate crash — and on a fail-open harness a gate crash is an ALLOW."""
+    ok = G.record_gate_unavailable("m", "Edit", "timeout", home="/proc/nonexistent/cannot/write")
+    check("unwritable_returns_false_not_raises", ok is False,
+          "must report failure, never propagate it into the gate")
 
 
 def test_egress_beats_scope():
@@ -790,6 +828,8 @@ ALL_TESTS = [
     "test_malformed_vault_payload_fails_closed_instead_of_raising",
     "test_prefixed_wildcard_is_not_unscoped",
     "test_policy_resolution_names_its_source_and_fails_closed",
+    "test_gate_unavailability_is_recorded_outside_the_chain",
+    "test_telemetry_never_raises_on_the_failure_path",
     "test_egress_beats_scope",
     "test_missing_identity_fails_narrow_not_wide",
     "test_core_never_exits",
@@ -863,6 +903,8 @@ if __name__ == "__main__":
     test_malformed_vault_payload_fails_closed_instead_of_raising()
     test_prefixed_wildcard_is_not_unscoped()
     test_policy_resolution_names_its_source_and_fails_closed()
+    test_gate_unavailability_is_recorded_outside_the_chain()
+    test_telemetry_never_raises_on_the_failure_path()
     test_egress_beats_scope()
     test_missing_identity_fails_narrow_not_wide()
     test_core_never_exits()
