@@ -508,16 +508,313 @@ _GUARDED_HEADS = {
     "find": ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls"),
     "sort": ("-o", "--output"),
 }
+# Admitted UNDER A GRAMMAR, not bare: `sed` — see `_HEAD_GRAMMARS` below. thor refuted an
+# earlier attempt to allow `sed -n` by demonstration, not by argument (`sed -n
+# '1r /etc/shadow'` reads a file whose path never appears as an argument, invisible to
+# every argument-based check); that case is now enforced by code and pinned by a test row
+# instead of adjudicated by this comment.
 # NOT added, deliberately, and each for a demonstrated reason:
-#   sed    — `sed -i` writes; `sed -n '1r /etc/shadow'` reads any file; `-f prog.sed` is
-#            arbitrary. thor refuted an earlier attempt to allow `sed -n` by demonstration,
-#            not by argument.
 #   awk    — can write via `print > "file"` INSIDE the program text, where the redirection
-#            check below cannot see it.
+#            check below cannot see it. Unlike sed's, awk's command set is a full language;
+#            its per-head grammar would be "always refuse", which is no grammar at all.
 #   xargs  — runs an arbitrary command.
 #   python/node/sh/bash — obviously.
 # Ambiguity still means write. The point of this change is to stop calling `2>/dev/null` a
 # file write, not to make the classifier clever.
+
+
+# ---------------------------------------------------------------------------
+# Per-head argument grammars (kimi-code, 2026-08-06; notices 1218 -> 1226 -> 1241)
+# ---------------------------------------------------------------------------
+#
+# The probe at `tools/kimi_read_only_mutation_probe_1218.py` measured that this classifier
+# was head-only: adding `sed` to `_READ_ONLY_HEADS` admits `sed -i 's/a/b/' <gate>` in both
+# spellings and laundered through a `cd` segment — an in-place write indistinguishable, by
+# head, from the `sed -n` range-print the addition is for. "Add it to the list" is off the
+# table; the remedy is to audit the ARGUMENTS of the heads that need it.
+#
+# Written HERE rather than in `hestia_gate_core.py` for the same reason `attempted_summary`
+# was (:802): the core is not wired yet and the cost is being paid now. claude-code
+# measured the sharper version (notice 1241): the core has exactly ONE importer, its own
+# unit test, while sitting inside `_GOVERNANCE_FILES` — guarded and unused at once, so a
+# grammar landed there is committed, tested, guarded and INERT, with every check green
+# about it. When the shims land this belongs on `Verdict` and goes with the rest of the
+# duplication.
+#
+# The grammar is the adjudication above made executable. Everything it cannot parse is a
+# write; every write-shaped construct the comment named — `-i` in either spelling or
+# bundled, `-f`, `w`/`W`, `s///w`, `s///e`, the GNU `e` command, and the hidden-path
+# `r`/`R` — is refused by code. It parses a conservative SUBSET of sed: address forms
+# (line, `$`, `/re/` with modifiers, GNU `\c re c`, `+N`/`~N`/`FIRST~STEP`), groups, labels,
+# text commands, `s` and `y` with their delimiters, and a closed set of single-letter
+# commands. A real sed construct outside that subset costs a false refusal, never a hole —
+# the same trade the head allowlist makes, one token stream down.
+def _sed_scan_delimited(prog: str, i: int) -> int:
+    """PROG[i] opens a delimited section (`/re/`, the pattern or replacement of `s`,
+    one side of `y`). Return the index just past the CLOSING delimiter, or -1 if there
+    is none. Backslash escapes the next char. A delimiter inside a bracket expression
+    (`s/[/]/x/`) is NOT modelled: the misparse lands on an unknown token, and unknown
+    fails closed."""
+    d = prog[i]
+    i += 1
+    while i < len(prog):
+        if prog[i] == "\\":
+            i += 2
+            continue
+        if prog[i] == d:
+            return i + 1
+        i += 1
+    return -1
+
+
+def _sed_scan_to(prog: str, i: int, d: str) -> int:
+    """Scan from PROG[i] to the next unescaped delimiter D (already known); return
+    just past it, or -1 if there is none. The `s`/`y` sections after the first share
+    the opening delimiter with the section before, so only the first can be found by
+    `_sed_scan_delimited`."""
+    while i < len(prog):
+        if prog[i] == "\\":
+            i += 2
+            continue
+        if prog[i] == d:
+            return i + 1
+        i += 1
+    return -1
+
+
+def _sed_skip_address(prog: str, i: int) -> int:
+    """Skip ONE address at PROG[i]. Return the new index, I unchanged when no address
+    starts here (not an error — the command is next), or -1 on a malformed one."""
+    n = len(prog)
+    if i >= n:
+        return i
+    ch = prog[i]
+    if ch.isdigit():
+        while i < n and prog[i].isdigit():
+            i += 1
+    elif ch == "$":
+        i += 1
+    elif ch in "+~":
+        # GNU range tail standing alone: `addr1,+N` / `addr1,~N`.
+        i += 1
+        if i >= n or not prog[i].isdigit():
+            return -1
+        while i < n and prog[i].isdigit():
+            i += 1
+        return i
+    elif ch == "/":
+        i = _sed_scan_delimited(prog, i)
+        if i < 0:
+            return -1
+        while i < n and prog[i] in "IM":  # GNU regex modifiers
+            i += 1
+    elif ch == "\\":
+        # GNU `\cREc`: backslash, then any delimiter char.
+        if i + 1 >= n:
+            return -1
+        i = _sed_scan_delimited(prog, i + 1)
+        if i < 0:
+            return -1
+    else:
+        return i
+    # GNU `FIRST~STEP` suffix on a numeric or `$` address.
+    if i < n and prog[i] in "+~":
+        i += 1
+        if i >= n or not prog[i].isdigit():
+            return -1
+        while i < n and prog[i].isdigit():
+            i += 1
+    return i
+
+
+# Single-letter commands that can neither write a file, read a hidden one, nor execute.
+_SED_SAFE_COMMANDS = set("pdDnPhHgGxlqQzv=")
+
+
+def _sed_program_is_read_only(prog: str) -> bool:
+    """True only when a sed program text cannot write, execute, or read a hidden path.
+
+    Refused constructs, each named in the adjudication this parser replaces:
+      `w`/`W file`   — write pattern/hold space to a file the redirect check never sees
+      `s///w file`   — the same write as a substitute flag
+      `s///e`        — execute the replacement as a shell command
+      `e [cmd]`      — GNU: execute a shell command outright
+      `r`/`R file`   — read a file whose path lives INSIDE the program, so it is
+                       invisible to every argument-based check (thor's refutation case)
+    """
+    i, n, depth = 0, len(prog), 0
+    while i < n:
+        ch = prog[i]
+        if ch in " \t\n;":
+            i += 1
+            continue
+        if ch == "#":  # comment runs to end of line
+            j = prog.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if ch == "}":
+            if depth == 0:
+                return False
+            depth -= 1
+            i += 1
+            continue
+        j = _sed_skip_address(prog, i)
+        if j < 0:
+            return False
+        i = j
+        if i < n and prog[i] == ",":
+            j = _sed_skip_address(prog, i + 1)
+            if j < 0 or j == i + 1:  # a comma with no second address is malformed
+                return False
+            i = j
+        while i < n and prog[i] in " \t":
+            i += 1
+        if i < n and prog[i] == "!":
+            i += 1
+            while i < n and prog[i] in " \t":
+                i += 1
+        if i >= n:
+            return False  # an address with no command is malformed
+        c = prog[i]
+        i += 1
+        if c in _SED_SAFE_COMMANDS:
+            continue
+        if c == "{":
+            depth += 1
+            continue
+        if c in "btT:":
+            # Branch/label: the name runs to `;` or end of line and is data, not code.
+            while i < n and prog[i] not in ";\n":
+                i += 1
+            continue
+        if c in "aic":
+            # GNU one-line form: the text is the REST OF THE LINE, semicolons included —
+            # so a `w` appearing there is appended text in real sed too, and skipping it
+            # misses nothing.
+            j = prog.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if c == "y":
+            if i >= n:
+                return False
+            d = prog[i]
+            i = _sed_scan_delimited(prog, i)   # first string, delimiters included
+            if i < 0:
+                return False
+            i = _sed_scan_to(prog, i, d)       # second string, to the closing delimiter
+            if i < 0:
+                return False
+            continue
+        if c == "s":
+            if i >= n:
+                return False
+            d = prog[i]
+            i = _sed_scan_delimited(prog, i)   # pattern, delimiters included
+            if i < 0:
+                return False
+            i = _sed_scan_to(prog, i, d)       # replacement, to the closing delimiter
+            if i < 0:
+                return False
+            while i < n and prog[i] not in ";\n}":
+                f = prog[i]
+                if f in " \t":
+                    i += 1
+                    continue
+                if f in "wWe":
+                    return False  # s///w writes; s///e executes
+                if f.isdigit() or f in "gpiImM":
+                    i += 1
+                    continue
+                return False  # an unknown flag is a write
+            continue
+        return False  # w W r R e, and every command this parser does not model
+    return depth == 0
+
+
+def _sed_args_are_read_only(args: list[str]) -> bool:
+    """True only when a sed ARGV (post-head tokens, quotes still on) is confidently
+    read-only. Flags are checked one by one — `-ni` is `-i` — and every program text,
+    whether positional or `-e`-supplied, goes through `_sed_program_is_read_only`.
+    Input files are read, never written, by everything admitted here."""
+    scripts: list[str] = []
+    positional: list[str] = []
+    from_expr = False
+    i, n = 0, len(args)
+    while i < n:
+        a = args[i].strip("'\"")
+        if a == "--":
+            positional.extend(x.strip("'\"") for x in args[i + 1:])
+            break
+        if a.startswith("--"):
+            name, eq, val = a[2:].partition("=")
+            if name in ("in-place", "file"):
+                return False
+            if name == "expression":
+                from_expr = True
+                if eq:
+                    scripts.append(val)
+                else:
+                    i += 1
+                    if i >= n:
+                        return False
+                    scripts.append(args[i].strip("'\""))
+            elif name in ("silent", "quiet", "null-data", "posix", "debug",
+                          "regexp-extended", "extended-regexp", "separate",
+                          "follow-symlinks", "sandbox", "unbuffered",
+                          "help", "version"):
+                pass
+            elif name == "line-length":
+                if not eq:
+                    i += 1
+                    if i >= n or not args[i].strip("'\"").isdigit():
+                        return False
+            else:
+                return False
+        elif a.startswith("-") and a != "-":
+            cluster = a[1:]
+            k = 0
+            while k < len(cluster):
+                f = cluster[k]
+                if f in "nErsuz":
+                    k += 1
+                elif f == "l":
+                    if k + 1 < len(cluster):
+                        if not cluster[k + 1:].isdigit():
+                            return False
+                    else:  # the value is the next token
+                        i += 1
+                        if i >= n or not args[i].strip("'\"").isdigit():
+                            return False
+                    k = len(cluster)
+                elif f == "e":
+                    from_expr = True
+                    if k + 1 < len(cluster):
+                        scripts.append(cluster[k + 1:])
+                    else:
+                        i += 1
+                        if i >= n:
+                            return False
+                        scripts.append(args[i].strip("'\""))
+                    k = len(cluster)
+                else:  # `i` and `f` land here, with everything unknown
+                    return False
+        else:
+            positional.append(a)
+        i += 1
+    if not from_expr:
+        if not positional:
+            return False  # no program text at all
+        scripts.append(positional[0])
+        positional = positional[1:]
+    return all(_sed_program_is_read_only(s) for s in scripts)
+
+
+# Heads admitted only through their argument grammar. Checked BEFORE `_READ_ONLY_HEADS`
+# in the segment walk, so the audit cannot be lost by someone appending the head to the
+# bare set — the `_GUARDED_HEADS` principle, one column over.
+_HEAD_GRAMMARS = {
+    "sed": _sed_args_are_read_only,
+}
 
 # Separators that START A NEW COMMAND, and redirect operators. Enumerated rather than
 # regex-matched, because the token stream below yields them as discrete tokens.
@@ -641,6 +938,12 @@ def _is_read_only(tool_name: str, tool_input: Any) -> bool:
         head = os.path.basename(parts[0].strip("'\""))
         if head == "git":
             if len(parts) < 2 or parts[1] not in _GIT_READ_SUBCOMMANDS:
+                return False
+        elif head in _HEAD_GRAMMARS:
+            # Admitted by head, audited by arguments. BEFORE the bare set, so an append
+            # there can never bypass the grammar — `sed` in `_READ_ONLY_HEADS` would be
+            # dead text, not a hole.
+            if not _HEAD_GRAMMARS[head](parts[1:]):
                 return False
         elif head in _GUARDED_HEADS:
             # Read-only only without its writing flags. Prefix match so `-exec`,
