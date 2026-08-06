@@ -634,7 +634,15 @@ async fn trust_derivation_json(
     let role = q.role.unwrap_or_else(|| "role:constellation:interactive-dev".to_string());
     let window = s
         .chain_store
-        .read_recent(crate::derivation::DERIVATION_SCAN)
+        // Fetch what the model DECLARES it reads, projected — not the whole window.
+        // `DERIVATION_EVENT_TYPES` filters in SQL (indexed) and `project_row` retains
+        // only `DERIVATION_KEYS`, so this stops materialising documents nobody folds.
+        .scan_recent(
+            None,
+            Some(crate::derivation::DERIVATION_EVENT_TYPES),
+            crate::derivation::DERIVATION_SCAN,
+            crate::derivation::project_row,
+        )
         .unwrap_or_default();
     let derived = crate::derivation::derive(&q.plugin_id, &role, &window);
     drop(s);
@@ -657,7 +665,15 @@ async fn trust_graph_turtle(
     let role = q.role.unwrap_or_else(|| "role:constellation:interactive-dev".to_string());
     let window = s
         .chain_store
-        .read_recent(crate::derivation::DERIVATION_SCAN)
+        // Fetch what the model DECLARES it reads, projected — not the whole window.
+        // `DERIVATION_EVENT_TYPES` filters in SQL (indexed) and `project_row` retains
+        // only `DERIVATION_KEYS`, so this stops materialising documents nobody folds.
+        .scan_recent(
+            None,
+            Some(crate::derivation::DERIVATION_EVENT_TYPES),
+            crate::derivation::DERIVATION_SCAN,
+            crate::derivation::project_row,
+        )
         .unwrap_or_default();
     let derived = crate::derivation::derive(&q.plugin_id, &role, &window);
     // The DURABLE member LCT, never the caller-supplied plugin_id — emitting the label here

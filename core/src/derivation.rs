@@ -118,6 +118,74 @@ fn ema_fold(scores: &[f64]) -> Option<f64> {
     Some(value)
 }
 
+/// Every `event_data` key derivation reads, and the event types it reads them from.
+///
+/// These two lists ARE the model's declared evidence needs — the seam dp asked for on
+/// 2026-08-06 ("trust calculation modular so we can improve/evolve it with only impact
+/// being dashboard display"). A future `TrustModel` trait returns exactly these; today
+/// they let the reader fetch what derivation uses and nothing else.
+///
+/// Derived by walking every `entry_str(e, "k")` and `event_data.get("k")` in this file,
+/// not by recollection — an earlier pass counted eleven because it looked only at the
+/// direct `.get` calls and missed the `entry_str` helper, which is most of them.
+/// A projection that silently omits a key does not fail; it derives a WRONG number and
+/// looks fine, so this list is load-bearing and belongs next to the code that reads it.
+pub const DERIVATION_KEYS: &[&str] = &[
+    "about_deny_hash", "alias", "alias_of", "answers_deny", "attempted", "axis", "data",
+    "decision", "deny_hash", "enforced", "escalation_id", "method", "plugin_id", "reason",
+    "ref", "requested_by", "role_lct", "score", "session_id", "status",
+    "subject_plugin_id", "subject_role", "success", "target", "tool_name", "upheld",
+    "verdict", "verdict_available",
+];
+
+/// Event types derivation folds. Lets the reader filter in SQL rather than scanning the
+/// whole window — `IDENTITY_ALIAS_EVENT` is included because `alias_target` and
+/// `aliased_identities` need it even though no dimension folds it.
+pub const DERIVATION_EVENT_TYPES: &[&str] = &[
+    "adjudication", "amnesty", "appeal", "exoneration", "gate_escalation_decided",
+    "gate_escalation_opened", "outcome", "policy_decision", "scope_attestation",
+    IDENTITY_ALIAS_EVENT,
+];
+
+/// Build a `ChainEntry` carrying ONLY the keys in [`DERIVATION_KEYS`].
+///
+/// The parse is transient — one document alive at a time, dropped as soon as its keys
+/// are copied — so peak memory is one document while RETAINED memory is one pruned map
+/// per row. That is the whole fix: the daemon was keeping ten thousand full documents to
+/// read a few dozen fields from each (164 MB to 1349 MB in twenty-one minutes, measured
+/// 2026-08-06, flat at idle and stepping on every heavy read).
+///
+/// Deliberately returns a `ChainEntry` rather than a new projection type: derivation's
+/// 1258 lines are left completely untouched, so this change cannot alter a trust verdict.
+/// The memory moves; the arithmetic does not. When the `TrustModel` boundary lands it can
+/// take a narrower type — but a signature change and a memory fix in one commit would
+/// make a regression in either indistinguishable from the other.
+///
+/// `data` is kept whole: it is a small sub-object and amnesty reads it with a documented
+/// fallback to the top level, so pruning inside it would need that rule duplicated here.
+pub fn project_row(r: crate::storage::chain::ChainRowRef<'_>) -> Option<ChainEntry> {
+    let full: Value = serde_json::from_str(r.event_data).ok()?;
+    let mut pruned = serde_json::Map::new();
+    if let Value::Object(m) = full {
+        for k in DERIVATION_KEYS {
+            if let Some(v) = m.get(*k) {
+                pruned.insert((*k).to_string(), v.clone());
+            }
+        }
+    }
+    Some(ChainEntry {
+        hash: r.hash.to_string(),
+        prev_hash: String::new(), // unread by derivation; not carried
+        timestamp: chrono::DateTime::parse_from_rfc3339(r.timestamp)
+            .ok()?
+            .with_timezone(&chrono::Utc),
+        event_type: r.event_type.to_string(),
+        event_data: Value::Object(pruned),
+        signer_lct: String::new(), // unread by derivation; not carried
+        chain_position: r.chain_position,
+    })
+}
+
 fn entry_str<'a>(e: &'a ChainEntry, key: &str) -> Option<&'a str> {
     e.event_data.get(key).and_then(Value::as_str)
 }
