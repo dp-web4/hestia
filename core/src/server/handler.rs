@@ -10602,14 +10602,39 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
                                   SECOND-PARTY REVIEW, not an enforced boundary.",
                 }),
             );
+            // The bar and whether this decision met it go to the DECIDER, not only to the
+            // chain. They were recorded above and withheld here, and the asymmetry had a
+            // measured cost: across the whole chain, 66 `sovereign_plus_peer` escalations
+            // have been decided and `bar_met` was true on ZERO of them, while 63 of those
+            // came back `status: approved`. `is_claimable` (gate_escalation.rs, `bar_met`)
+            // refuses every one, so each of those approvals authorised nothing — and the
+            // only reply the decider got was `approved` plus a note saying to re-issue the
+            // write. An approver who cannot see that the bar is unmet cannot know they have
+            // granted nothing, and 63 times nobody did. (claude-code, 2026-08-06, re-1207.)
+            let bar_met = decided.bar_met();
             Ok(json!({
                 "escalation_id": decided.id,
                 "status": decided.stored_status(),
                 "decided_by": decided.decided_by,
                 "decided_role": decided.decided_role,
                 "independence": independence,
+                "bar": decided.bar,
+                "bar_met": bar_met,
+                // The same conjunction `is_claimable` enforces, answered here rather than
+                // left for the caller to re-derive — two places deciding what "permits the
+                // write" means is how they come to disagree.
+                "permits_write":
+                    decided.stored_status() == crate::server::gate_escalation::Status::Approved
+                    && bar_met,
                 "witnessEntryHash": entry.ok().map(|e| e.hash),
-                "note": "the asker must RE-ISSUE the write to claim this; approvals are single use",
+                "note": if bar_met {
+                    "the asker must RE-ISSUE the write to claim this; approvals are single use"
+                } else {
+                    "this decision does NOT permit the write: the stated bar is UNMET. It is \
+                     recorded, and re-issuing the write will still be refused. Decisions are \
+                     single-shot, so this escalation can no longer accumulate the missing \
+                     factor — a new one must be opened."
+                },
             }))
         }
         Err(e) => Err(anyhow::anyhow!("{e}")),

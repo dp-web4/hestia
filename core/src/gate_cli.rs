@@ -304,7 +304,34 @@ pub fn arbitrate(
         }),
     )?;
     println!("{}", serde_json::to_string_pretty(&r)?);
+    // `poll` has always ended with this line; the decide path never did, which is backwards.
+    // Polling is a question, and the asker reads the answer; approving FEELS like a grant, so
+    // silence there reads as success. Say it on the surface where the mistake is expensive.
+    if let Some(w) = hollow_approval_warning(approve, &r) {
+        eprintln!("\n{w}");
+    }
     Ok(())
+}
+
+/// The warning text for an approval that permits nothing, or `None` if there is nothing to
+/// warn about. Split out from `arbitrate` so it can be tested without a daemon — the whole
+/// point is that this fires, and a warning nothing exercises is just a claim.
+///
+/// Absent `permits_write` is treated as NOT permitting: an older daemon that does not send
+/// the field must not be able to make a hollow approval look sound by staying quiet.
+fn hollow_approval_warning(approve: bool, r: &Value) -> Option<String> {
+    if !approve {
+        return None; // a deny permits nothing by design; that is not news.
+    }
+    if r.get("permits_write").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let bar = r.get("bar").and_then(Value::as_str).unwrap_or("the stated bar");
+    Some(format!(
+        "WARNING: this approval does NOT permit the write — {bar} is UNMET.\n\
+         It is recorded, but re-issuing the write will still be refused, and decisions\n\
+         are single-shot: this escalation cannot accumulate the missing factor now."
+    ))
 }
 
 /// Add evidence WITHOUT deciding. #122 made approval accumulate as factors rather than
@@ -342,6 +369,50 @@ mod tests {
         let raw = "data: \nid: 0\nretry: 3000\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n";
         let v = parse_sse_frame(raw).expect("must decode past the empty frame");
         assert_eq!(v.pointer("/result/ok"), Some(&json!(true)));
+    }
+
+    /// The shape the daemon actually returned for daea09fc2106dd7b on 2026-08-06: a
+    /// `sovereign_plus_peer` bar decided by the operator alone, 15s into the window. This is
+    /// the majority case, not a corner — 63 approvals on the chain look exactly like this,
+    /// and every one of them was reported to the approver as a bare `approved`.
+    #[test]
+    fn an_approval_short_of_the_bar_warns_that_it_permits_nothing() {
+        let r = json!({
+            "escalation_id": "daea09fc2106dd7b",
+            "status": "approved",
+            "decided_by": "operator",
+            "bar": "sovereign_plus_peer",
+            "bar_met": false,
+            "permits_write": false,
+        });
+        let w = hollow_approval_warning(true, &r).expect("an unmet bar must warn");
+        assert!(w.contains("does NOT permit the write"), "{w}");
+        assert!(w.contains("sovereign_plus_peer"), "name the bar that went unmet: {w}");
+    }
+
+    /// The negative half: a sound approval must stay quiet, or the warning is noise that
+    /// gets tuned out before it ever matters.
+    #[test]
+    fn an_approval_that_meets_the_bar_is_silent() {
+        let r = json!({"status": "approved", "bar": "single_approver",
+                       "bar_met": true, "permits_write": true});
+        assert!(hollow_approval_warning(true, &r).is_none());
+    }
+
+    /// A daemon too old to send `permits_write` must not buy silence by omission — the
+    /// #135 class again, an absent field reading as a favourable answer.
+    #[test]
+    fn a_missing_permits_write_field_is_not_taken_as_permission() {
+        let r = json!({"status": "approved", "decided_by": "operator"});
+        assert!(hollow_approval_warning(true, &r).is_some(),
+                "absent permits_write must warn, not reassure");
+    }
+
+    /// A deny already permits nothing; saying so would train the reader to ignore the line.
+    #[test]
+    fn a_deny_does_not_warn() {
+        let r = json!({"status": "denied", "permits_write": false});
+        assert!(hollow_approval_warning(false, &r).is_none());
     }
 
     #[test]
