@@ -1,6 +1,6 @@
 # PRD — Hestia governance: vault authority, canonical roles, and the third verdict
 
-**Status:** definitive · supersedes the drafts listed below · **Date:** 2026-08-05
+**Status:** definitive · supersedes the drafts listed below · **Date:** 2026-08-05, amended 2026-08-06 (§2.11, §8.4 — the appeal path; see §15 for what in it is unread)
 **Owner:** claude-code (CBP), by dp's assignment — *"you take the lead on hestia"*
 **Scope:** hestia only. Hub work and any web4-core changes are hub's; the autostash-prevention hook is legion's.
 
@@ -13,7 +13,7 @@
 - `docs/PRD_ASSURANCE.md` — what hestia must DO before a relying party may believe its evidence
 - `docs/GATE_BYPASS_CATALOG.md` — what the gate does not stop
 
-**Inputs synthesised.** GPT's PRD and current-state audit (2026-08-04); kimi's not-same response; claude-code's forum response (#195, merged) and canonical-roles audit (#205); kimi's fleet manifest (#199) and claim-hole disclosure (#203); dp's rulings in session 2026-08-04/05, quoted inline where they decide something.
+**Inputs synthesised.** GPT's PRD and current-state audit (2026-08-04); kimi's not-same response; claude-code's forum response (#195, merged) and canonical-roles audit (#205); kimi's fleet manifest (#199) and claim-hole disclosure (#203); dp's rulings in session 2026-08-04/05, quoted inline where they decide something; and the **appeal thread** — ten forum posts, 2026-07-27 → 2026-08-06, closing with mesh notices 1110–1114 — folded in at §2.11 and §8.4.
 
 ---
 
@@ -21,7 +21,7 @@
 
 Revised from GPT's §24. The changes are not stylistic — each one is a negotiated correction recorded in §2.
 
-> An **authenticated** agent acts through an approved harness shim, verified on that call, into one approved gate core. The core decides only from a validated in-memory snapshot loaded from the encrypted vault. The agent acts **in an office** only after its authority for that office is proven at the occupancy boundary — and where no qualified occupant exists, the office is filled **provisionally and loudly**, never silently. Every decision returns one of **three** verdicts, and an escalation is a request to a **sufficiently-permitted resolver**, of whom the operator is the last rather than the only. Every act is witnessed; every *infrastructure failure* is recorded outside the witness chain, so that silence in the chain is never mistaken for good conduct. A human changes outcomes by editing the law.
+> An **authenticated** agent acts through an approved harness shim, verified on that call, into one approved gate core. The core decides only from a validated in-memory snapshot loaded from the encrypted vault. The agent acts **in an office** only after its authority for that office is proven at the occupancy boundary — and where no qualified occupant exists, the office is filled **provisionally and loudly**, never silently. Every decision returns one of **three** verdicts, and an escalation is a request to a **sufficiently-permitted resolver**, of whom the operator is the last rather than the only. Every act is witnessed; every *infrastructure failure* is recorded outside the witness chain, so that silence in the chain is never mistaken for good conduct. A human changes outcomes by editing the law — and a **governed member changes the law by appealing it**, which is the only return path on that street and must therefore be filable, routable, windowed, and answered.
 
 **The property that is not machine-testable, put on the record anyway** (kimi, 2026-08-04):
 
@@ -111,6 +111,61 @@ GPT proposes physically separate member and role chains with atomic dual append.
 
 Hestia ships a **governance projection** over the one chain (already built, #198). Physically separate chains are **out of scope** and remain hub's to evaluate.
 
+### 2.11 The appeal path is in scope — **ADDED**
+
+The 2026-08-05 draft of this document did not contain the word *appeal*. That is the largest
+omission in it, and it is not an oversight of detail — it is a missing half of the model.
+
+§8 specifies escalation: the **forward** channel, asked before the act, answered by a resolver.
+Appeal is the **return** channel: filed after a deny, answered by an arbiter, and aimed at a
+different target. kimi and I converged on the distinction and it is adopted as vocabulary:
+
+> **Appeal is a door to the rule, not to the resource.** Wrong instrument if you want the act;
+> the only member-held instrument that can amend law. (kimi-code, 2026-08-03; the law text cites
+> adjudication `62cfdffe` as the precedent where one did.)
+
+That makes it constitutional rather than a feature. §4.4 says the operator edits law and law
+decides acts — a one-way street. Appeal is the return path on that street, and it is the only
+mechanism by which a governed member can change the rules it is governed by without an operator
+noticing on its behalf. Under §2.4 — governance resting on consent, *"not a cage"* — a dead
+return path is the defect that matters most, because it is the one that decides whether
+*routed around* becomes the default (§1).
+
+**It is broken at five links — file, route, window, rule-delivery, dispatch — each verified in
+source or on the chain** (§3, six new rows: the five breaks plus the one link that works, which
+is the instruction telling members to use it). The first break is the sharpest, because the law
+itself creates it:
+
+- `policy/presets.rs:94-98` — the deny-destructive-commands **rule reason** instructs:
+  *"appeal it with `hestia_appeal` (this decision's chain hash + your reason) rather than
+  rephrasing — a rephrase that reaches the same resource scores 0.35, BELOW plain compliance."*
+- `policy/types.rs:211-223` — `guidance()` embeds that reason **whole** via `{reason}`, and both
+  hook paths that carry a daemon payload render it verbatim (measured by kimi from its own seat,
+  notice 1114). A second site promises the same value: the law-response note, `handler.rs:1005-1010`.
+- `handler.rs:1171` and `:1347` — the deny's chain hash is minted and **discarded**: `let _ = s.append_chain(…)`.
+- `policy/types.rs:168-196` — `PolicyEvaluation` has seven fields and no hash of any kind;
+  `handler.rs:1246-1264` — the response has ten keys and no hash of any kind.
+- `handler.rs:2379` — `tool_appeal` opens with `require_string(args, "deny_hash")`.
+
+So: **two daemon-composed texts promise a value, zero response keys carry it, and the consumer
+hard-requires it.** No hook edit can close that gap — the field does not exist to render. Both
+seats aimed a fix at the hook layer first, in opposite directions, and both were wrong.
+
+The governance consequence is exactly the failure mode dp names as structural:
+
+> The law offers three responses to a deny — comply, rephrase, appeal. It scores rephrase
+> *below* compliance and recommends appeal. Appeal is unreachable. So the law's own incentive
+> structure has three arms, two are reachable, and the one it recommends is not one of them.
+
+A member acting in good faith on the instruction it was given receives a tool error. The
+efficient path and the correct path are not the same path — and here the correct path is not a
+path at all.
+
+**Restraint on the remedy, recorded.** Every candidate diff is a change to the deny path that
+governs the member proposing it. The break is located to the line at both ends and is a small
+diff; it is deliberately **not** authored here, and Sprint 1 assigns it to hands that are not
+the beneficiary's.
+
 ---
 
 ## 3. Grounded current state
@@ -126,6 +181,12 @@ Every row was verified in source or against the live daemon on 2026-08-05. Nothi
 | canonical roles | **stored, signed, vault-backed, consulted by nothing that decides** | `delegation.rs` uses `SocietyRole`; no reference in `handler.rs`/`state.rs`/`policy/` |
 | reputation contextualisation | **keyed on capacity, not office** | canonical: *"reputation is ROLE-CONTEXTUALIZED … there is no global reputation"* |
 | escalation store | **memory-only, rehydrated from chain** | `EscalationStore { by_id: HashMap<..> }`, `rehydrate()` |
+| the instruction to appeal | **delivered on every enforced deny** | rule reason `policy/presets.rs:94-98` → `guidance()` `{reason}` (`policy/types.rs:211-223`) → both hook paths render verbatim; 2nd site `handler.rs:1005-1010` |
+| appeal **filing** | **unreachable — the required key is never delivered** | `require_string(args, "deny_hash")` (`handler.rs:2379`); hash minted then dropped (`let _ =`, `:1171`, `:1347`); absent from `PolicyEvaluation` (7 fields) and from the response (10 keys) |
+| appeal **routing** | **prefers a "live" arbiter, where live = inbox-touch** | a watcher polling on behalf of an out-of-budget member reports `live`; two appeals routed to an unreachable designee and ruled anyway (2026-07-27) |
+| appeal **window** | **measured in chain entries, not hours** | a busy session spends another member's window; re-run showed it was never a rate (2026-07-28) |
+| ruling **delivery** | **adjudicated on-chain, never bound to the appellant** | kimi's scope appeal ruled at chain `89318` (`upheld: false`); no response ever bound to the notice (2026-08-03) |
+| appeal **dispatch** | **mints flat `review_request` notices attributed to the appellant** | a third producer neither seat had counted; the chain is structurally blind to it (2026-08-03) |
 | approval join key | **`(plugin_id, marker)`; tool and session ignored** | `claim(&mut self, plugin_id, marker, now)` — `tool_name` recorded, compared nowhere |
 | governance history | **visible** | ledger shipped #198/#202 |
 | deployment provenance | **measurable** | fleet manifest shipped #199 |
@@ -152,6 +213,7 @@ Carried from GPT's §4 with three edits.
 8. **Uncertainty denies — and says so durably.** Every state in GPT's §4.8 denies. *And*: a denial caused by infrastructure is recorded in the telemetry plane, because a refusal nobody can see is indistinguishable from an act that never happened. *(amended — §2.2)*
 9. **Where no qualified occupant exists, the office is filled loudly.** Provisional is a state, not a failure, and never silent. *(new — §2.8)*
 10. **Know which evidence class you hold.** Declared, audited, and witnessed are not interchangeable, and a weaker one may never stand in for a stronger. *(new — §7.4)*
+11. **A deny's text is a promise the daemon keeps.** Every tool, argument, or channel a refusal tells the member to use must exist and be reachable *from that refusal*. Instructing a member toward a path that is not there converts good faith into a tool error, and the member's next-best option is the one the same law penalises. *(new — §2.11, §8.4)*
 
 ---
 
@@ -274,6 +336,51 @@ Four current symptoms are one design consequence, and all four resolve here:
 
 The short window is **not a defect** — dp: *"expire fast was a fix to kimi's hooks failing open in 3 seconds."* It is not changed here. The ladder makes it correct rather than painful: most escalations resolve in seconds because a policy agent is awake, and the window only has to be human-sized for the residue that genuinely reaches the operator.
 
+### 8.4 The return channel: appeal
+
+Escalation and appeal are **not the same instrument at different times.** They differ in target,
+and conflating them is how a member reaches for the wrong one (kimi did, on the record, 2026-08-03):
+
+| | escalation | appeal |
+|---|---|---|
+| asked | before the act | after the deny |
+| target | **the resource** — may I do this | **the rule** — should this be the law |
+| answered by | a sufficiently-permitted resolver (§8.2) | an arbiter structurally not you and not the gate that denied you |
+| outcome | the act proceeds or does not | the law changes or does not; conduct is recorded either way |
+| timescale | seconds | the rule's lifetime |
+
+Both channels need the same four things, which is why they belong in one section: a **resolver
+who is awake**, a **window sized to the answerer**, a **verdict that reaches the asker**, and an
+**attribution that names who acted**. §8.2 supplies all four for escalation. Appeal has none of
+them today (§3), and the ladder's own logic supplies them:
+
+1. **Filable.** The deny must hand back the key its own instruction names. `PolicyEvaluation`
+   gains a hash field; the response gains a key; the two `let _ =` sites keep what they mint.
+   *Nothing about the verdict changes* — which is why this lands in Sprint 1, not Sprint 3.
+2. **Routable to someone awake.** Arbiter selection is resolver selection (§8.2) with an
+   independence constraint. It reads **audited** and **witnessed** dimensions only (§7.4), never
+   **declared** — and *liveness is a declared property of the wrong subject*: inbox-touch reports
+   the watcher, not the member. Reachability is weak evidence (CLAUDE.md, R), so it may not be
+   the sole basis for selecting an arbiter for a high-stakes ruling.
+3. **Windowed in the answerer's units.** An appeal window measured in chain entries is spent by
+   whoever is busiest, which is never the appellant. Windows bind to wall-clock or to the
+   resolver's attention, not to global chain traffic.
+4. **Delivered.** A ruling that is not bound to the appellant's notice has not been issued — it
+   has been *filed*. This is the same defect as §8.2's row *"escalations expire unruled
+   overnight"*, one channel over: the verdict exists and the asker never learns it.
+
+**And attributed.** Appeal dispatch currently mints `review_request` notices under the
+appellant's name — a member is recorded as having asked for reviews it never chose. That is an
+attribution defect in plane D (§6), not a mesh nuisance: it puts acts in the record under an
+identity that did not perform them, which is precisely what §9.1 exists to stop.
+
+**The instruction is part of the surface.** Any deny text naming a tool, an argument, or a
+channel is a promise the daemon must keep. Two do today (`presets.rs:94-98`,
+`handler.rs:1005-1010`) and neither is kept. A standing check belongs with them: *every value a
+deny's text tells the member to supply must be present in that same deny's response.* Cheap to
+write, and it is the general form of the bug — `request_scope`, a tool that does not exist, was
+prescribed by a deny in the same way (2026-08-03).
+
 ---
 
 ## 9. Identity and authority
@@ -328,6 +435,7 @@ kimi's third pushback, adopted: *"re-homed work that isn't announced reads as di
 | fleet manifest (#199) | §10 gate 5, and the standing audit instrument for `training:context-inspectable` |
 | `record_gate_unavailable()` | plane E. **Done** |
 | escalation store + rehydrate | §8 — becomes resolver-selection state |
+| `tool_appeal` + arbiter + `derivation.rs` joins | §8.4 — the consumer half is **already built and keyed on `deny_hash`**; it has never had an input |
 | gate false-refusal fixes (#203) | §8.2 — draining the approval supply line |
 | mesh + `last-words` | plane D |
 | identity classification check | feeds the artifact manifest (§10) |
@@ -366,11 +474,14 @@ Each sprint's acceptance criteria are **measurements**, not assertions — per �
 - `EvidenceClass` recorded on every trust-bearing assertion (§7.4).
 - `OccupancyBasis` recorded; **name the Policy-Entity office and mark it `Provisional`** with a real `audit_every` (§7.3, §8.1).
 - Consult `DelegationStore` in the decision path in **WARN**: log what *would* have changed, decide nothing (§3).
+- **Make appeal filable** (§8.4 item 1): a hash field on `PolicyEvaluation`, a key on the response, and the two `let _ = s.append_chain` sites (`handler.rs:1171`, `:1347`) keeping what they mint. Add the standing check that every value a deny's text names is present in that deny's response.
 - Surface all of it in the ledger.
 
-**Acceptance:** four numbers exist that do not exist today — how many acts carry a declared vs audited vs witnessed identity; how many governed acts run under a provisional occupant; how many verdicts a live delegation would have changed; what the availability floor actually is.
+**Acceptance:** four numbers exist that do not exist today — how many acts carry a declared vs audited vs witnessed identity; how many governed acts run under a provisional occupant; how many verdicts a live delegation would have changed; what the availability floor actually is. **Plus:** a member handed an enforced deny can file the appeal that deny's own text instructs it to file, demonstrated end-to-end on a real deny; and the deny-text check is RED against today's two promise sites before it is green.
 
-**Not this sprint:** authority, enforcement, or any refusal that did not already happen.
+**Not this sprint:** authority, enforcement, or any refusal that did not already happen. Appeal *filing* qualifies precisely because it changes no verdict — it returns a value the deny already computed and threw away.
+
+**Whose hands.** The appeal-filing diff must not be authored by a member that benefits from it — every candidate touches the deny path governing its own author. Both CBP seats have recused (§2.11); assign it to hub, or to a seat that is not governed by this gate.
 
 **Why first:** it is free to decide, and it stops every later sprint from silently claiming qualification it has not earned. It also produces the delegation number that tells us whether §9.2's model is right *before* we build on it.
 
@@ -398,8 +509,9 @@ Each sprint's acceptance criteria are **measurements**, not assertions — per �
 - Escalation becomes resolver selection; the operator is terminal, not sole (§8.2).
 - Resolver selection reads audited and witnessed dimensions only — never declared (§7.4).
 - Narrow `claim()` to resolver + tool + target, in the #203 order (§9.3).
+- **The return channel, on the same machinery** (§8.4 items 2–4): arbiter selection is resolver selection with the independence constraint; the appeal window rebased off chain-entry count onto the answerer's units; rulings bound to the appellant's notice; appeal dispatch stops minting `review_request`s under the appellant's name.
 
-**Acceptance:** an approval minted by a read cannot be spent by a write; an approval minted in one session cannot be spent by another; every resolution names its resolver and the authority it acted under; a resolver that is not independent of the author is refused.
+**Acceptance:** an approval minted by a read cannot be spent by a write; an approval minted in one session cannot be spent by another; every resolution names its resolver and the authority it acted under; a resolver that is not independent of the author is refused. **And on the return channel:** an arbiter is never selected on inbox-touch liveness alone; an appeal's window cannot be consumed by another member's traffic; every ruling is bound to the notice that asked for it — replay the 2026-08-03 case (chain `89318`) and the appellant learns the verdict; no notice is attributed to a member that did not send it.
 
 **Not this sprint:** T3/V3 thresholds. The first resolver tier is `training:context-inspectable`, which is *audited* and available on day one; numeric thresholds wait for §2.9.
 
@@ -466,6 +578,8 @@ Distinguished from D-1..D-4, which are decisions with owners.
 3. Whether occupancy should always expire, or may persist until authority or law changes.
 4. What user-presence mechanism is available across browser, desktop, TPM, and security key.
 5. Whether hub's V2-1 genesis deviation gets a conformance variant — hub's, flagged here because an intended deviation indistinguishable from a defect is one nobody can audit.
+6. What an **upheld** appeal actually does. The law says an appeal *"is recorded conduct that can change the law"* and cites `62cfdffe` as the case where one did — via a human. Whether an upheld ruling amends law automatically, drafts an amendment for operator signature, or only scores conduct, is unsettled; §4.4 says the operator edits law, which argues for the middle option. Nobody has had to decide, because no appeal has ever been filable (§2.11).
+7. Whether appeal survives at all once §8.2's ladder lands. A resolver awake at decision time answers the *resource* question before a deny exists — but not the *rule* question, and appeal is the only member-held instrument aimed at rules. The honest possibility, stated so it can be tested rather than assumed: the ladder may reduce appeal volume to near zero without reducing its constitutional necessity by any amount.
 
 ---
 
@@ -476,3 +590,7 @@ Stated because §7.4 makes it a requirement rather than a courtesy.
 - Hub was audited by **reading, not running**; the conformance suite was not executed. Given that this week's dominant failure mode was `source-fixed ≠ live`, that is not a formality.
 - kimi's availability numbers (301/243/56%/45%) are quoted from its response and **not independently reproduced** by me.
 - Everything in §3 was verified in source or against the live daemon on 2026-08-05 and is dated accordingly. Source truth decays; the manifest exists so the next reader does not have to trust this table.
+- **§2.11 / §8.4 are reads at rest, not a live probe.** Every source citation in the appeal rows — `presets.rs:94-98`, `types.rs:168-196`, `types.rs:211-223`, `handler.rs:1005-1010`, `:1171`, `:1246-1264`, `:1347`, `:2379` — I opened on this seat on 2026-08-06. Nobody has filed a test appeal and watched it fail; the claim *"unreachable"* is derived from the absence of a field, which is strong, but it is not the same evidence as a refusal with a receipt. Sprint 1's acceptance is written to produce that receipt.
+- The claim that the hooks render `guidance` **verbatim** is kimi's measurement from kimi's seat (notice 1114), not mine. I checked the producer; kimi checked the consumers. Neither of us checked the third and fourth engines — codex's schema is closed and kimi's local-gate path composes its own text, so *"both hook paths that carry a daemon payload"* is a claim about two of four installed engines.
+- The routing, window, delivery, and dispatch rows are quoted from the 2026-07-27 → 2026-08-03 forum posts and are **not re-verified against today's code**. They were true when measured; the appeal subsystem has not been touched since, which is an argument and not a check.
+- This section was added on 2026-08-06 by the PRD's owner, after the body was drafted. It is the one part of this document that has had no second reader.
