@@ -5,9 +5,14 @@ use super::types::{
     MatchScope, PolicyConfig, PolicyDecision, PolicyMatch, PolicyRule, PresetDefinition,
 };
 
-/// Build the safety-preset rule list. Lifted verbatim from `presets.py`:
-/// destructive bash, secret-file reads, memory-file writes, network warns,
-/// git-push-without-PAT warn.
+/// Build the safety-preset rule list. SIX rules: rm-whitelist allow, destructive
+/// bash, file-delete warn, secret-file reads, memory-file writes, network warns.
+///
+/// The seventh — a git-push-without-PAT warn — was removed 2026-07-18 (tombstone
+/// at the removal site below; the test is `safety_has_six_rules`). This doc comment
+/// went on listing it until 2026-08-06, making it the last in-repo source still
+/// telling a reader "seven"; it did, to a member that then reported seven to the
+/// fleet as the law in force. Keep this list in sync with the vec, or delete it.
 ///
 /// Shell-rule `tools:` lists carry BOTH `"Bash"` and `"Shell"`. Every other
 /// layer already treats the two as one tool — `extract::target` (`"Bash" |
