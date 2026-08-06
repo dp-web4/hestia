@@ -76,17 +76,33 @@ for x in live:
         # 512-byte MTU with the tail swapped for `#undelivered:fire-rc=...`. Notice 1172
         # was one, and claude-code read it as kimi-code confirming a verification kimi
         # had not performed — the sender's own words returning as a second witness.
-        # The marker was present and 460 characters in, which is not a disclosure.
+        # The marker was present and 456 characters in, which is not a disclosure.
         # So: hoist it to the FRONT of the line, and say what it means, because the one
         # thing a reader must not do with a delivery failure is mistake it for a reply.
+        #
+        # `from=` STAYS ON THE LABEL (kimi review of PR #216, finding 5). The predicate is
+        # a substring match, so a genuine peer pointer that happens to carry
+        # `#undelivered:` would be mislabelled — and `from=` is the field that lets a
+        # reader doubt the label. It is also the field that MISLEADS: on a real echo the
+        # attribution is the WATCHER'S, naming the member it could not reach, which is
+        # precisely why 1172 read as a reply. So it is printed and then contradicted in
+        # the same breath, rather than dropped.
+        #
+        # There is no `_nofrom` arm. The first cut of this repair had one, justified by
+        # "the 1172 record has from=None" — a misread of the artefact: the record carries
+        # `from_plugin: 'kimi-code'`, and what is absent is `to_plugin`. The arm was also
+        # unreachable on its own terms, since an empty sender fails both `in ALLOW` and
+        # the DAEMON pair and renders `! WITHHELD` above this branch. Citing a misread
+        # artefact as evidence is the same failure shape this hunk exists to remove, one
+        # layer up, so it is gone rather than re-justified.
         _ptr = clean(x.get('pointer_uri',''))
-        _und = "#undelivered:" in _ptr
-        _nofrom = not str(x.get('from_plugin','') or '').strip()
-        if _und or _nofrom:
-            _why = (_ptr.split("#undelivered:",1)[1] if _und else "no sender recorded")
-            print(f"!! NOT-AN-ANSWER id={clean(x.get('id',''))} — YOUR OWN notice echoed back "
-                  f"by the watcher ({clean(_why)}). It carries your text, not a peer's reply. "
-                  f"Nothing is discharged by it. pointer={_ptr}")
+        if "#undelivered:" in _ptr:
+            print(f"!! NOT-AN-ANSWER id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} "
+                  f"from={clean(x.get('from_plugin',''))} queued_at={clean(x.get('queued_at',''))} "
+                  f"— YOUR OWN notice echoed back by the watcher "
+                  f"({clean(_ptr.split('#undelivered:',1)[1])}). That `from=` is the watcher's "
+                  f"attribution, not a sender's: this carries your text, not a peer's reply, "
+                  f"and nothing is discharged by it. pointer={_ptr}")
         else:
             print(f"- id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} pointer={_ptr} queued_at={clean(x.get('queued_at',''))}")
     else:
@@ -94,7 +110,24 @@ for x in live:
 PY
 )
 [ -n "$DIGEST" ] || { echo "[fire-codex] ack-only batch — not firing"; exit 0; }
-FIREWORTHY=$(printf '%s\n' "$DIGEST" | grep -c '^- ')
+# FIREWORTHINESS IS DERIVED BY EXCLUSION (2026-08-06, kimi review of PR #216).
+# This counted `^- `: an enumeration of the line prefixes that existed the day it was
+# written. The NOT-AN-ANSWER label above starts `!! `, which matches neither that nor
+# the `^! ` withheld count, so an echo-only batch scored FIREWORTHY=0 and took the
+# refusal branch below — `exit 70`, primer retained, retried to STALE_MAX_ATTEMPTS,
+# set aside `.exhausted`, member never woken. Notice 1172 WAS alone in its batch: the
+# repair for a misread would have shipped as "never deliver the mail", and the refusal
+# would have libelled an allowlisted sender on its way out.
+#
+# That inverts branch 4's contract (hestia-watch-member.sh:604-611) — the report is a
+# `reply` SO THAT the failure sits in the sender's debt row until it acks, "and the
+# decision is witnessed". A member that never wakes witnesses nothing.
+#
+# So: everything that is not an explicit `! WITHHELD` disclosure wakes the member. A
+# line kind added later inherits "deliver" instead of silently emptying the batch, and
+# because FIREWORTHY=0 now holds exactly when every line is withheld, the refusal
+# message below is true by construction rather than by coincidence.
+FIREWORTHY=$(printf '%s\n' "$DIGEST" | grep -vc '^! ')
 WITHHELD=$(printf '%s\n' "$DIGEST" | grep -c '^! ')
 if [ "$FIREWORTHY" -eq 0 ]; then
   echo "[fire-codex] REFUSING: $WITHHELD notice(s) from unallowlisted sender(s), and nothing else to fire." >&2
