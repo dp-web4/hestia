@@ -2456,15 +2456,26 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
     let adjudicator = deny.event_data.get("adjudicator").and_then(Value::as_str);
     // ROUTE THROUGH THE SAME IDENTITY TEST THE RULING PATH USES.
     //
-    // `select_arbiter` compares plugin_id STRINGS. `tool_arbitrate_appeal` additionally
-    // refuses an arbiter whose member LCT equals the appellant's, because two plugin_ids can
-    // be one entity — codex acting as `codex` while its gate witnessed as `codex-cli` is the
+    // `select_arbiter` compares plugin_id STRINGS. This filter was added to additionally drop
+    // an arbiter whose member LCT equals the appellant's, because two plugin_ids can be one
+    // entity — codex acting as `codex` while its gate witnessed as `codex-cli` is the
     // measured case on this fleet. Filtering only downstream meant an appeal could route to
     // the appellant's own alter ego: the receipt would say "routed to a not-same arbiter",
-    // and the designee would then be refused at ruling time. Bounded harm, since the appeal
-    // stays open for anyone else — but the routing evidence would overstate what routing
-    // established, which is the same shape as the `agent-inventory` misroute fixed one clause
-    // later in this file (kimi-code, reviewing).
+    // and the designee would then be refused at ruling time.
+    //
+    // IT DOES NOT REACH THAT CASE, and this comment claimed it did until 2026-08-06.
+    // `member_lct` is sha256 over the trimmed raw string, so `codex` and `codex-cli` hash
+    // apart and the filter is silent on exactly the pair it cites. Its whole reach beyond
+    // the string compare is whitespace — pinned by
+    // `state::tests::the_member_lct_alias_guard_reaches_only_whitespace`. Kept because it is
+    // correct and fails closed (an unmappable candidate is NOT dropped), but a routing
+    // receipt must not be read as evidence that entity resolution happened.
+    //
+    // The alias record it wants EXISTS: `derivation::alias_target` over the operator's
+    // 2026-07-26 `identity_alias` (`codex-cli` → `codex`). Wiring it here is not the
+    // one-liner it looks like — that resolver scans a window, and `APPEAL_CHAIN_WINDOW`
+    // (20_000) had already scrolled past 07-26 by 08-01. See the test above for the
+    // measurement and the shape of a real repair (a durable index rebuilt at load).
     let appellant_lct = s.member_lct(&appellant.plugin_id);
     let pool: Vec<String> = s
         .member_registry
@@ -2650,8 +2661,15 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         arbiter: &arbiter.plugin_id,
     };
     // Instance-level identity check too, mirroring `tool_witness_adjudication`: two
-    // plugin_ids that resolve to the same member LCT are the same entity wearing two names,
-    // and the codex/codex-cli split proved that is not hypothetical on this fleet.
+    // plugin_ids that resolve to the same member LCT are the same entity wearing two names.
+    //
+    // The codex/codex-cli split it was written for is NOT among them. `member_lct` hashes
+    // the trimmed raw string, so this is true only when the two ids are already equal —
+    // which `arbiter::eligibility` clause 1 refuses one line below. Measured 2026-08-06;
+    // see `state::tests::the_member_lct_alias_guard_reaches_only_whitespace`. Left in place
+    // (it costs nothing and catches the whitespace variant clause 1 misses), but it supplies
+    // no independence evidence beyond the string compare, and the `why` it renders below
+    // should not be read as "two names resolved to one entity".
     let same_entity = {
         let a = s.member_lct(&arbiter.plugin_id);
         let b = s.member_lct(appellant);
@@ -2839,6 +2857,12 @@ async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
         // Same two checks, same order, same functions as the ruling path (see clause 3
         // above). Anything else here is a second implementation of NOT-SAME, and two
         // implementations of a rule are one rule and one future contradiction.
+        //
+        // Inherits the ruling path's limit exactly, which is the point of sharing it: the
+        // `same_entity` arm resolves no aliases (`member_lct` hashes the raw string), so the
+        // `why` it renders — "different plugin_ids, same entity" — can only ever fire on ids
+        // that differ by whitespace. Measured 2026-08-06,
+        // `state::tests::the_member_lct_alias_guard_reaches_only_whitespace`.
         let eligibility = caller.as_ref().map(|c| {
             let same_entity = {
                 let a = s.member_lct(&c.plugin_id);

@@ -34,9 +34,18 @@
 //!   registry**. It returns `Some` for any non-empty non-synthetic string,
 //!   including a member that has never connected. A call site of a naming
 //!   function is never a presence consumer, so this table cannot see the
-//!   #80 defect class; what it pins is attribution hygiene — every place an
-//!   identity is minted into a chain entry, an emit path, or the appeal
-//!   self-filter. A red here asks "does this change who gets named?"
+//!   #80 defect class. What it pins comes in TWO classes, marked per site in
+//!   the table's third column (`SiteClass`, added 2026-08-06, re-1190):
+//!   `Naming` sites record or emit an identity (attribution hygiene — a red
+//!   asks "does this change who gets named?"), and `Predicate` sites COMPARE
+//!   two derived names to decide control flow — a gate that gates on a name
+//!   (a red asks "is a name doing a gate's work?"). The split exists because
+//!   neither pre-split table could flag the second class: the registry table
+//!   can't see it (no registry access) and this table saw it but was
+//!   documented as the not-a-gate table, so a refusal predicate
+//!   (`tool_witness_adjudication`'s `adjudication_self`) sat filed as
+//!   hygiene. Predicate sites additionally pin their comparison lines in
+//!   `MEMBER_LCT_PREDICATE_CENSUS`.
 //!
 //! The first version of this test keyed on `member_lct` alone and claimed to
 //! schedule judgment on presence. It could not; the keying was refuted before
@@ -133,10 +142,19 @@ use std::path::{Path, PathBuf};
 /// of truth that only drifts. Removed rather than corrected: the assertion is
 /// exactness against the source, and the table below IS the count.)
 ///
-/// Every entry here was read by a person and judged a non-gating use
-/// (attribution / emit-path identity resolution) on 2026-07-27. Editing this
-/// table without performing that judgment on the delta is the one move this
-/// test exists to make expensive.
+/// Every entry here was read by a person and carries that judgment as its
+/// third column (`SiteClass`, 2026-08-06). The 2026-07-27 reading judged
+/// every site a NON-GATING use — attribution / emit-path identity resolution
+/// — and that judgment was wrong for four of them: `tool_appeal`,
+/// `tool_arbitrate_appeal`, `tool_open_appeals` and
+/// `tool_witness_adjudication` each COMPARE two member_lct-derived names to
+/// decide control flow (a pool filter, two refusals, one eligibility
+/// verdict). Found in the re-1177 thread (claude-code, re-1190): a refusal
+/// predicate had been filed as attribution hygiene, and both pre-split
+/// tables were structurally unable to say so — the registry table can't see
+/// a name-gate (no registry access) and this table saw it but was documented
+/// as the not-a-gate table. Editing this table without performing the class
+/// judgment on the delta is the one move this test exists to make expensive.
 ///
 /// Delta readings, recorded as the header requires:
 /// - 2026-07-28 (kimi-code), merge with `main` at `bc24d82` (PR #67) added
@@ -146,39 +164,71 @@ use std::path::{Path, PathBuf};
 ///   advisory (`you_may_rule`). It names two existing identities to compare
 ///   them; it does not change who gets named, and it does not read the
 ///   registry (the presence table stayed green over the same merge).
-const MEMBER_LCT_CENSUS: &[(&str, &[&str])] = &[
+///   RECLASSIFIED 2026-08-06: that reading answered the naming question and
+///   stopped; the equality comparison it describes IS a predicate, and the
+///   entry is now tagged `SiteClass::Predicate`. The reading was correct
+///   about naming and incomplete about gating — the two questions are
+///   independent, which is why the class is a column and not a conclusion.
+
+/// What a `.member_lct(` consumer DOES with the name it derives.
+///
+/// - `Naming`: the derived LCT is recorded or emitted — attribution inside a
+///   chain entry, a response field, a graph URI, a trust key. It names
+///   someone, and no control-flow decision turns on two such names agreeing.
+/// - `Predicate`: the derived LCT is COMPARED against another
+///   member_lct-derived value and the comparison decides control flow — a
+///   refusal, a pool filter, an eligibility verdict. A gate that gates on a
+///   NAME is exactly where an inert alias bites: a name comparison silently
+///   answers "different" for two spellings of one entity. Every Predicate
+///   site must also pin its comparison line(s) verbatim in
+///   `MEMBER_LCT_PREDICATE_CENSUS`, so weakening the comparison goes as red
+///   as writing it did — the line census cannot hold those lines, because
+///   they consume the DERIVED variables and contain no `.member_lct(`.
+///
+/// The column is a column — not a separate list — so that adding a site
+/// forces the author to write one of the two words at the site, at compile
+/// time. A class an author can omit is a class that will be omitted, and an
+/// omitted Predicate reads green as hygiene: the failure this split exists
+/// to close.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SiteClass {
+    Naming,
+    Predicate,
+}
+
+const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/handler.rs::gate_direct_tool", &[
         "let instance_lct = s.member_lct(&who.plugin_id);",
-    ]),
+    ], SiteClass::Naming),
     ("server/handler.rs::tool_appeal", &[
         "let appellant_lct = s.member_lct(&appellant.plugin_id);",
         "match (&appellant_lct, s.member_lct(id)) {",
-    ]),
+    ], SiteClass::Predicate),
     ("server/handler.rs::tool_arbitrate_appeal", &[
         "let a = s.member_lct(&arbiter.plugin_id);",
         "let b = s.member_lct(appellant);",
-    ]),
+    ], SiteClass::Predicate),
     ("server/handler.rs::tool_open_appeals", &[
         "let a = s.member_lct(&c.plugin_id);",
         "let b = s.member_lct(appellant);",
-    ]),
+    ], SiteClass::Predicate),
     ("server/handler.rs::tool_query_policy", &[
         "let instance_lct = s.member_lct(&plugin_id_for_chain);",
         "let instance_lct = s.member_lct(&plugin_id_for_chain);",
-    ]),
+    ], SiteClass::Naming),
     ("server/handler.rs::tool_record_outcome", &[
         "let instance_lct = s.member_lct(&plugin_id);",
-    ]),
+    ], SiteClass::Naming),
     ("server/handler.rs::tool_record_reversal", &[
         "let subject_instance_lct = s.member_lct(&subject_plugin_id);",
-    ]),
+    ], SiteClass::Naming),
     ("server/handler.rs::tool_witness_adjudication", &[
         "let adjudicator_instance_lct = s.member_lct(&adjudicator.plugin_id);",
         "let subject_instance_lct = s.member_lct(&subject_plugin_id);",
-    ]),
+    ], SiteClass::Predicate),
     ("server/handler.rs::tool_witness_decision", &[
         "let instance_lct = s.member_lct(&plugin_id);",
-    ]),
+    ], SiteClass::Naming),
     // ADDED 2026-07-28 (claude-code, #84 — the RDF projection). The census went red on this
     // site the moment it was written, which is the instrument working: it scheduled the
     // judgment call on the author, at write time, before the PR merged.
@@ -196,10 +246,10 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str])] = &[
     // second place that stays true.
     ("server/http.rs::trust_graph_turtle", &[
         ".member_lct(&q.plugin_id)",
-    ]),
+    ], SiteClass::Naming),
     ("server/http.rs::operator_adjudicate", &[
         "let subject_instance_lct = s.member_lct(&a.subject_plugin_id);",
-    ]),
+    ], SiteClass::Naming),
     // ADDED 2026-07-30 (claude-code). #114 (stage 2 of the governance-write escalation) landed
     // this site and the census went red — on `main`, not on the PR, because the merge did not
     // wait for its own checks. The instrument worked; nothing was listening. See the companion
@@ -221,7 +271,7 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str])] = &[
     // governance surface.
     ("server/http.rs::operator_gate_escalation", &[
         "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
-    ]),
+    ], SiteClass::Naming),
     // Per-member policy grants (2026-08-01). Same property as the escalation record above and
     // for the same reason: `member_lct` asserts a NAME, not attendance, so the subject of a
     // grant may be a plugin_id no member has ever registered under. That is tolerable here
@@ -232,19 +282,19 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str])] = &[
     // nothing.
     ("server/http.rs::policy_set_instance_grant", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
-    ]),
+    ], SiteClass::Naming),
     ("server/http.rs::policy_revoke_instance_grant", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
-    ]),
+    ], SiteClass::Naming),
     ("server/state.rs::apply_adjudication_ctx", &[
         "if let Some(subject_lct) = self.member_lct(subject_plugin_id) {",
-    ]),
+    ], SiteClass::Naming),
     ("server/state.rs::apply_judgment_ctx", &[
         "if let Some(subject_lct) = self.member_lct(plugin_id) {",
-    ]),
+    ], SiteClass::Naming),
     ("server/state.rs::apply_outcome_ctx", &[
         "if let Some(subject_lct) = self.member_lct(plugin_id) {",
-    ]),
+    ], SiteClass::Naming),
     // ── ADDED 2026-08-02 (claude-code). FOUR OF THESE FIVE ARE NOT NEW CODE. ──
     //
     // They became visible when `production_lines` replaced `prod_prefix` (see its doc comment):
@@ -278,24 +328,59 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str])] = &[
     // grant that matches nothing and is inert. Read deliberately, not discovered later.
     ("server/handler.rs::tool_gate_escalation_open", &[
         "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
-    ]),
+    ], SiteClass::Naming),
     ("server/handler.rs::tool_gate_escalation_claim", &[
         "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
         "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
-    ]),
+    ], SiteClass::Naming),
     ("server/handler.rs::tool_gate_arbitrate_escalation", &[
         "\"subject_instance_lct\": s.member_lct(&decided.plugin_id),",
-    ]),
+    ], SiteClass::Naming),
     ("server/handler.rs::tool_request_scope", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
-    ]),
+    ], SiteClass::Naming),
     // The operator's answer to a scope request. Widens what a member may reach, memory-only and
     // time-bounded; this line names the subject in the `scope_granted`/`scope_refused` entry.
     ("server/http.rs::scope_decide", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
-    ]),
+    ], SiteClass::Naming),
     ("server/state.rs::trust_entity_key", &[
         "match self.member_lct(plugin_id) {",
+    ], SiteClass::Naming),
+];
+
+/// The comparison lines of every `SiteClass::Predicate` site, pinned verbatim
+/// against the named fn's production text. These lines cannot live in the
+/// line census above: they consume the DERIVED variables, so they contain no
+/// `.member_lct(` and the scanner never sees them. Without this table a gate
+/// weakened below the variable level (an `==` becoming an `!=`, a
+/// `same_entity` arm deleted) stays green while its inputs remain pinned —
+/// the substitution Sabotage B demonstrated at line level, one level down.
+/// Keyed on the exact site set the main table tags Predicate; the test
+/// asserts the two agree, so a new Predicate site without a pinned
+/// comparison — or a pinned comparison at a Naming site — is red on arrival.
+const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
+    // The arbiter pool filter: a candidate whose member LCT equals the
+    // appellant's is dropped. Documents its own reach in `handler.rs`
+    // (whitespace only — `the_member_lct_alias_guard_reaches_only_whitespace`).
+    ("server/handler.rs::tool_appeal", &[
+        "(Some(a), Some(b)) => a != &b,",
+    ]),
+    // The `same_entity` arm feeding `hestia.arbitration_self`.
+    ("server/handler.rs::tool_arbitrate_appeal", &[
+        "a.is_some() && a == b",
+    ]),
+    // The same arm, advisory here (`you_may_rule: false`). An advisory
+    // predicate is still a predicate: it is the answer a member acts on when
+    // deciding whether to file a ruling.
+    ("server/handler.rs::tool_open_appeals", &[
+        "a.is_some() && a == b",
+    ]),
+    // The `hestia.adjudication_self` refusal. The first conjunct compares
+    // plugin_id strings (not this census's symbol); the second is the
+    // name-gate, pinned.
+    ("server/handler.rs::tool_witness_adjudication", &[
+        "|| (subject_instance_lct.is_some() && subject_instance_lct == adjudicator_instance_lct)",
     ]),
 ];
 
@@ -521,19 +606,94 @@ fn expected(table: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
         .collect()
 }
 
+/// Trimmed production lines of one named fn in one file under `src`, using
+/// the same item-position fn tracking as `census`. Matching is on the base
+/// name (a `#N` suffix, if the key carries one, is stripped): no file in the
+/// pinned sets currently needs the suffix, and if one ever does, the line
+/// census goes red first and schedules the human this helper would need.
+fn fn_production_lines(rel: &str, want_fn: &str) -> Vec<String> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let text = fs::read_to_string(src.join(rel))
+        .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+    let want = want_fn.split('#').next().unwrap_or(want_fn);
+    let mut current_fn = "(top-level)".to_string();
+    let mut out = Vec::new();
+    for line in production_lines(&text) {
+        if let Some(name) = fn_item_name(line) {
+            current_fn = name;
+        }
+        if current_fn == want {
+            out.push(line.trim().to_string());
+        }
+    }
+    out
+}
+
 #[test]
 fn member_lct_consumer_census_is_exact() {
     let found = census(&[".member_lct("], false);
-    let expected = expected(MEMBER_LCT_CENSUS);
+    let projected: Vec<(&str, &[&str])> = MEMBER_LCT_CENSUS
+        .iter()
+        .map(|(k, v, _)| (*k, *v))
+        .collect();
+    let expected = expected(&projected);
     assert_eq!(
         found, expected,
         "\n\nCENSUS RED — the naming-function consumer set changed.\n\
-         This table pins ATTRIBUTION hygiene, not presence (see header).\n\
-         Before editing it, read the delta and answer: does this change who\n\
-         gets named? Then record that reading in the header.\n\
+         This table pins ATTRIBUTION hygiene AND name-gates, not presence\n\
+         (see header). Before editing it, read the delta and answer BOTH\n\
+         questions: does this change who gets named, and does any derived\n\
+         name get COMPARED to decide control flow? Assign the site's\n\
+         SiteClass accordingly — a Predicate also pins its comparison in\n\
+         MEMBER_LCT_PREDICATE_CENSUS — then record the reading in the header.\n\
          found:    {found:?}\n\
          expected: {expected:?}\n"
     );
+}
+
+/// The class column and the comparison-pin table must describe the same site
+/// set, and every pinned comparison must exist verbatim in the named fn.
+/// This is the assertion that makes a NEW refusal-on-a-name go red as a
+/// gate: the author who tags a site `Predicate` is compile-compelled to pin
+/// its comparison, and the author who weakens a comparison without touching
+/// any `.member_lct(` line is caught here, where the line census is blind.
+#[test]
+fn member_lct_predicate_sites_pin_their_comparison() {
+    let tagged: std::collections::BTreeSet<&str> = MEMBER_LCT_CENSUS
+        .iter()
+        .filter(|(_, _, c)| *c == SiteClass::Predicate)
+        .map(|(k, _, _)| *k)
+        .collect();
+    let pinned: std::collections::BTreeSet<&str> =
+        MEMBER_LCT_PREDICATE_CENSUS.iter().map(|(k, _)| *k).collect();
+    assert_eq!(
+        tagged, pinned,
+        "\n\nCENSUS RED — the Predicate class column and the comparison-pin table\n\
+         disagree. Every site that gates on a name must pin its comparison line,\n\
+         and only those sites may appear in MEMBER_LCT_PREDICATE_CENSUS.\n\
+         tagged: {tagged:?}\n\
+         pinned: {pinned:?}\n"
+    );
+    for (site, lines) in MEMBER_LCT_PREDICATE_CENSUS {
+        let (file, f) = site.rsplit_once("::").expect("site key is file::fn");
+        let body = fn_production_lines(file, f);
+        assert!(
+            !body.is_empty(),
+            "\n\nCENSUS RED — predicate site {site} resolves to no production lines:\n\
+             the fn was renamed, moved, or deleted. Re-key or re-classify the site.\n"
+        );
+        for want in *lines {
+            assert!(
+                body.iter().any(|l| l == want),
+                "\n\nCENSUS RED — the comparison this site is classified on was edited\n\
+                 or removed.\nsite: {site}\nmissing line: {want}\n\
+                 If the gate moved, re-pin it. If it was deleted, the site is no\n\
+                 longer a Predicate and the class column must change DELIBERATELY —\n\
+                 a name-gate quietly becoming hygiene is the defect this table\n\
+                 exists to catch.\n"
+            );
+        }
+    }
 }
 
 #[test]
