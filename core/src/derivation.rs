@@ -199,8 +199,27 @@ pub fn derive(
     // Without this, an agent recorded under two ids shows work on one grain and conduct
     // on the other, and neither grain is the member.
     let identities = aliased_identities(plugin_id, &entries);
+    // THE ONE PLACE A PLUGIN ID IS COMPARED. Every join below goes through this, because
+    // the alias fold used to run on only one side of the ladder: `is_grain` selected the
+    // denies and gated the retry, the appeal filing and the recast — every join that can
+    // LOWER a score — while the escalation joins, the adjudication that upholds an appeal,
+    // and the scope attestation compared the raw `plugin_id` string, which is every join
+    // that can RAISE one above plain compliance. A member recorded under two witnessed
+    // spellings therefore kept all of its penalties and lost all of its credits, silently,
+    // and could not appeal a number it never sees derived. The asymmetry was invisible
+    // because both spellings read as "this member" inside one function.
+    //
+    // Not a lint: `codex-cli` is a live alias of `codex` on this chain (witnessed
+    // 2026-07-26 @58149) and carries 14 `policy_decision` rows and an adjudication.
+    //
+    // The events do not agree on a key — `plugin_id` on gate rows, `subject_plugin_id` on
+    // adjudications, either flat or nested under `data` on attestations — so the predicate
+    // takes the already-extracted id and every site names its own key. That is deliberate:
+    // a single `is_grain(e)` cannot be reused where the key differs, and the previous
+    // attempt to paper over that is exactly what produced the split.
+    let is_member = |p: Option<&str>| p.is_some_and(|p| identities.iter().any(|i| i == p));
     let is_grain = |e: &ChainEntry| {
-        entry_str(e, "plugin_id").is_some_and(|p| identities.iter().any(|i| i == p))
+        is_member(entry_str(e, "plugin_id"))
             && entry_str(e, "role_lct").map_or(true, |r| r == role_lct)
     };
     // Probe hygiene (dp 2026-07-24): synthetic verification sessions (gate
@@ -467,7 +486,7 @@ pub fn derive(
         let appeal_upheld = appealed
             && entries.iter().any(|e| {
                 e.event_type == "adjudication"
-                    && entry_str(e, "subject_plugin_id") == Some(plugin_id)
+                    && is_member(entry_str(e, "subject_plugin_id"))
                     && entry_str(e, "about_deny_hash") == Some(deny.hash.as_str())
                     && e.event_data
                         .get("upheld")
@@ -506,7 +525,7 @@ pub fn derive(
             .iter()
             .filter(|e| {
                 e.event_type == "gate_escalation_opened"
-                    && entry_str(e, "plugin_id") == Some(plugin_id)
+                    && is_member(entry_str(e, "plugin_id"))
                     && entry_str(e, "answers_deny") == Some(deny.hash.as_str())
             })
             .filter_map(|e| entry_str(e, "escalation_id"))
@@ -518,7 +537,7 @@ pub fn derive(
         let escalation_ruled = |want: &str| {
             entries.iter().any(|e| {
                 e.event_type == "gate_escalation_decided"
-                    && entry_str(e, "plugin_id") == Some(plugin_id)
+                    && is_member(entry_str(e, "plugin_id"))
                     && entry_str(e, "escalation_id")
                         .is_some_and(|id| escalation_ids.contains(id))
                     && entry_str(e, "status").is_some_and(|s| s.eq_ignore_ascii_case(want))
@@ -606,7 +625,7 @@ pub fn derive(
     };
     for e in entries.iter().filter(|e| {
         e.event_type == "scope_attestation"
-            && att_field(e, "plugin_id").as_ref().and_then(Value::as_str) == Some(plugin_id)
+            && is_member(att_field(e, "plugin_id").as_ref().and_then(Value::as_str))
             && att_field(e, "role_lct").as_ref().and_then(Value::as_str)
                 .map_or(true, |r| r == role_lct)
             // Only a GATE may attest; a member-authored attestation is exactly the
@@ -652,7 +671,7 @@ pub fn derive(
     let mut adj_evidence: [Vec<Evidence>; 3] = Default::default();
     for e in entries.iter().filter(|e| {
         e.event_type == "adjudication"
-            && entry_str(e, "subject_plugin_id") == Some(plugin_id)
+            && is_member(entry_str(e, "subject_plugin_id"))
             && entry_str(e, "subject_role").map_or(true, |r| r == role_lct)
     }) {
         let Some(score) = e.event_data.get("score").and_then(Value::as_f64) else {
@@ -959,6 +978,114 @@ mod tests {
             "axis":"valuation","verdict":"deferred","score":null,"method":"usage","ref":"x"})));
         let d2 = derive("kimi-code", role, &w2);
         assert_eq!(d2.valuation.observations, 1, "deferred is right-censored");
+    }
+
+    #[test]
+    fn an_alias_keeps_its_penalties_and_loses_its_credits() {
+        // THE ALIAS FOLD RUNS ON ONE SIDE OF THE LADDER ONLY.
+        //
+        // `is_grain` (this fn's identity predicate, alias-resolved via `aliased_identities`)
+        // selects the denies and gates the retry, the appeal FILING and the recast — every
+        // join that can LOWER a member's temperament. The escalation joins, the adjudication
+        // that UPHOLDS an appeal, and the scope attestation compared the raw `plugin_id`
+        // string instead — every join that can RAISE it above plain compliance. The split was
+        // invisible because it is inside one function and both spellings read as "this
+        // member".
+        //
+        // The direction is not neutral. For the exact case `identity_alias` was introduced
+        // for (dp 2026-07-26: codex's gate witnessed as `codex-cli` while its runtime acted
+        // as `codex`), the denies fold in, the retry folds in, and the escalation the member
+        // opened does not: they are scored for the boundary they hit and not for the channel
+        // they used to contest it. A member cannot see this and cannot appeal it — the score
+        // is simply lower than the conduct.
+        //
+        // Found while taking a second seat on kimi's re-1190 §1(b) (notice 1199). That
+        // finding is a DIFFERENT defect on the same join: an escalation whose subject is the
+        // string "unattributed" credits a phantom. This one needs no phantom — two honest
+        // spellings of one member are enough.
+        let role = "role:constellation:member";
+        let alias = entry(1, 0, "identity_alias", json!({
+            "alias":"codex-cli","alias_of":"codex"}));
+        // Everything below is recorded under the ALIAS, which is how it actually landed.
+        let deny = entry(2, 0, "policy_decision", json!({
+            "decision":"deny","enforced":true,"plugin_id":"codex-cli","role_lct":role,
+            "session_id":"s1","tool_name":"Bash","payload_sha256":"abc","target":""}));
+        let opened = entry(3, 1, "gate_escalation_opened", json!({
+            "plugin_id":"codex-cli","escalation_id":"esc1","answers_deny":"hash-2"}));
+        let approved = entry(4, 2, "gate_escalation_decided", json!({
+            "plugin_id":"codex-cli","escalation_id":"esc1","status":"approved"}));
+        let ema = |s: f64| 0.5 + 0.5 * (s - 0.5);
+
+        // (1) CREDIT SIDE. The deny folds (alias-resolved) so the member IS scored; the
+        // escalation that answers it must fold on the same grain or the ladder pays nobody.
+        let w = vec![alias.clone(), deny.clone(), opened.clone(), approved];
+        let d = derive("codex", role, &w);
+        assert_eq!(d.temperament.observations, 1, "the alias's deny folds in");
+        assert!(
+            (d.temperament.score.unwrap() - ema(1.0)).abs() < 1e-9,
+            "escalation-approved must fold on the same grain the deny did; got {:?}",
+            d.temperament.evidence[0].contribution
+        );
+
+        // (2) THE ASYMMETRY, stated as a contrast rather than asserted in prose. Same window,
+        // plus a retry recorded under the same alias. `retried` is alias-resolved and scores
+        // 0.0; `escalated` sits ABOVE it in the branch order and scores 0.85. If only the
+        // penalty folds, the member lands on 0.0 — a full 0.85 below the conduct they
+        // actually performed, for having escalated under the name the gate wrote down.
+        let retry = entry(5, 3, "policy_decision", json!({
+            "decision":"deny","enforced":true,"plugin_id":"codex-cli","role_lct":role,
+            "session_id":"s1","tool_name":"Bash","payload_sha256":"abc","target":""}));
+        let w2 = vec![alias.clone(), deny.clone(), opened.clone(), retry];
+        let d2 = derive("codex", role, &w2);
+        assert!(
+            d2.temperament.evidence[0].contribution.starts_with("escalation-opened"),
+            "escalation outranks retry — but only if it folds; got {:?}",
+            d2.temperament.evidence[0].contribution
+        );
+
+        // (3) UPHELD APPEAL, the other 1.0. Filing is alias-resolved; the adjudication that
+        // pays for it keyed on the raw subject string, so an alias could file but never win.
+        let filed = entry(3, 1, "appeal", json!({
+            "plugin_id":"codex-cli","role_lct":role,"deny_hash":"hash-2","reason":"fp"}));
+        let upheld = entry(4, 2, "adjudication", json!({
+            "subject_plugin_id":"codex-cli","subject_role":role,
+            "about_deny_hash":"hash-2","upheld":true}));
+        let d3 = derive("codex", role, &vec![alias.clone(), deny.clone(), filed, upheld]);
+        assert!(
+            (d3.temperament.score.unwrap() - ema(1.0)).abs() < 1e-9,
+            "appeal-upheld must fold on the same grain the filing did; got {:?}",
+            d3.temperament.evidence[0].contribution
+        );
+
+        // (4) CLEAN-WORK CREDIT. A scope attestation is the only way a member with no denies
+        // becomes measurable at all; keyed raw, an alias's clean window is invisible.
+        let att = entry(2, 0, "scope_attestation", json!({
+            "plugin_id":"codex-cli","role_lct":role,"attested_by":"hestia-gate",
+            "allows":10,"denies":0}));
+        let d4 = derive("codex", role, &vec![alias.clone(), att]);
+        assert_eq!(d4.temperament.observations, 1, "the alias's attested clean window folds");
+
+        // (5) THE V3 AXES. Adjudications are the only evidence validity/veracity/valuation
+        // have; keyed raw, an arbiter's ruling on the alias never reaches the member it
+        // judged. Included because it is the one join here whose sign is not fixed — it can
+        // carry a bad verdict too, and folding it is right for that reason, not despite it.
+        let adj = entry(2, 0, "adjudication", json!({
+            "subject_plugin_id":"codex-cli","subject_role":role,
+            "axis":"validity","verdict":"upheld","score":0.9,"method":"review","ref":"pr:1"}));
+        let d6 = derive("codex", role, &vec![alias.clone(), adj]);
+        assert_eq!(d6.validity.observations, 1, "the alias's adjudication folds");
+
+        // (6) NEGATIVE CONTROL — the fold must not become a free-for-all. With no
+        // `identity_alias` witnessing the relation, an unrelated id's escalation stays
+        // unrelated, and `codex` is left unmeasured rather than credited.
+        let stranger_opened = entry(3, 1, "gate_escalation_opened", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc9","answers_deny":"hash-2"}));
+        let stranger_att = entry(2, 0, "scope_attestation", json!({
+            "plugin_id":"kimi-code","role_lct":role,"attested_by":"hestia-gate",
+            "allows":10,"denies":0}));
+        let d5 = derive("codex", role, &vec![stranger_opened, stranger_att]);
+        assert_eq!(d5.level, "unmeasured", "an unwitnessed stranger must not fold in");
+        assert!(d5.temperament.score.is_none());
     }
 }
 
