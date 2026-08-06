@@ -445,7 +445,26 @@ def test_this_file_certifies_the_enforcing_copy():
 # `_is_read_only` reads the git subcommand at parts[1]. Global options legally precede the
 # subcommand, so `-C`, `--no-pager`, `--git-dir=` and friends displace it: parts[1] is then
 # an option, misses `_GIT_READ_SUBCOMMANDS`, and the whole command is classified a WRITE.
-# Measured 2026-08-06 against the enforcing copy: 5 of 5 read spellings refused.
+# Measured 2026-08-06 against the enforcing copy: 5 of 5 read spellings misclassified.
+#
+# BOUND THE BLAST RADIUS, because the classifier is not the consumer. `_is_read_only` runs
+# ONLY after `_touches_self` has fired, so a misclassification costs a refusal only for a
+# command that carries a global option AND spells the governance surface. `git -C <repo> log`
+# on an ordinary repo never enters this branch. That is narrower than "`git -C` is refused",
+# which is how it had been recorded as folklore — and it is a worse defect, not a lesser one:
+# the whole class falls on READING YOUR OWN LAW WITH GIT. `show` of a historical version of
+# the gate, `blame`, `log -p` — the verification work that the 2026-07-28 decision to permit
+# reads exists to protect ("a refused read is a member who cannot check its own governance")
+# is exactly and only what this still denies.
+#
+# NOTES, from the same probe, because they invalidate three workarounds this member was
+# carrying. Against the enforcing copy, ALL of these are permitted-and-witnessed reads of the
+# gate today: `ls`, `grep`, `wc`, `stat`, `sha256sum`, a PIPE (`grep … | head`), and `2>&1`.
+# They were writes before the 2026-08-02 and 2026-08-05 widenings; a note saying so survived
+# the fix, and paths were being elided to route around refusals that no longer happen.
+# A workaround outlives the defect that justified it, silently, because it keeps succeeding —
+# and nothing in the fleet tells a member that what it learned to avoid was repaired. The
+# rows below are the antidote in miniature: a claim about the gate that re-runs.
 #
 # This is the `cd` finding one argument over, and the incentive runs the wrong way. `cd h &&
 # git log` was fixed on 2026-08-05 because "the only thing the refusal measured was that the
