@@ -219,10 +219,35 @@ except Exception:
   # PAINTS the unresolved case as an attended session instead of leaving it blank. Silence
   # was load-bearing for a promise that no longer holds.
   if [[ -z "${HESTIA_ROLE:-}" ]]; then
-    echo "[fire-codex] WARNING: role unresolved — no HESTIA_ROLE in the environment and no" \
-         "role readable from $_ident. This session's acts will land under whatever default" \
-         "the member's hook registration supplies, which is NOT a declared autonomous role." \
-         "Hydrate the identity file or export HESTIA_ROLE before the fire."
+    # AND NOW REFUSE, RATHER THAN PROCEED. Warning was the 2026-08-05 fix and it worked —
+    # dp read the warning in the log. But the session fired anyway, and on 2026-08-06 one of
+    # them opened escalation 411bf87a against the gate's own directory with
+    # `ASKED_BY: unattributed` and `MAY_RULE: false`: an anonymous act, against a governance
+    # marker, that no peer was eligible to rule on.
+    #
+    # An act nobody can be held to is worth less than no act. Every link in that chain was
+    # visible and every one of them only warned — identity unhydrated, role unresolved,
+    # session started, acts unattributed, escalation reaching the operator with nobody to
+    # hold responsible. This is the link that stops warning.
+    #
+    # THE NOTICE IS ALREADY DRAINED BY THE TIME THIS RUNS — the watcher drains
+    # consume-once and hands us a primer. An earlier draft of this comment claimed the
+    # notice was left queued; that was FALSE and would have made this a data-loss bug.
+    # What preserves the work is exiting NONZERO, which makes the watcher KEEP the primer
+    # ("Success: primer is spent, remove it. Failure: KEEP it"). 70 is this file's
+    # existing convention for refuse-and-retain, already used by the unallowlisted-sender
+    # branch above; 3 is NOT free — `fire-rc=3` already carries a meaning in the
+    # undelivered vocabulary.
+    #
+    # A retained primer also emits the `#undelivered:` echo back to the sender. That is
+    # correct here — the sender should learn its work did not run — and it is legible
+    # rather than mistakable for an answer, since #216 hoists that marker to the front.
+    echo "[fire-codex] REFUSING TO FIRE: role unresolved — no HESTIA_ROLE in the environment" \
+         "and no role readable from $_ident. A mesh session that cannot name its own role" \
+         "produces acts attributable to nobody (see escalation 411bf87a, 2026-08-06)." \
+         "The notice is left QUEUED, not consumed. Hydrate the identity file or export" \
+         "HESTIA_ROLE, and the next fire will pick it up." >&2
+    exit 70
   fi
 fi
 cd "${HESTIA_WORKSPACE:-$(cd "$HERE_DIR/../../.." && pwd)}" && "$HERE_DIR/with-member-lock.sh" codex \
