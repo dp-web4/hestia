@@ -32,7 +32,7 @@ Today every routine read is a **rescan of history**:
 
 Measured 2026-08-06: the daemon went 164 MB → 1349 MB in twenty-one minutes of ordinary use, `Anonymous` 1364 MB of `Rss` 1382 MB, **flat at idle and stepping on every heavy read**. The previous instance reached 1774 MB and was still climbing when a crash took it. All of it heap retained from parsing documents to harvest a dozen scalars.
 
-The projection work (`scan_recent`, PR #217) makes each of those reads *cheaper*. **This decision says most of them should not happen at all.**
+The projection work (`scan_recent`, PR #218) makes each of those reads *cheaper*. **This decision says most of them should not happen at all.**
 
 That distinction matters, because optimising a rescan makes the rescan look affordable, which is how it becomes permanent.
 
