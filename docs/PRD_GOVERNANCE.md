@@ -374,6 +374,109 @@ Hestia records `EvidenceClass { Declared, Audited, Witnessed }` on every trust-b
 
 ---
 
+### 7.5 The fold: declared, modified by audited, modified by witnessed
+
+> dp, 2026-08-06: *"the way a full t3 score folds is talent (declared) modified by training (audited) modified by temperament (witnessed). the exact nature of 'modified by' we can experiment with."*
+
+This is a **structural** change, not a parameter, and it is the reason the current mechanism could not express anything in §7.4.
+
+**Today** (`web4-core/src/t3.rs::aggregate`): a weighted geometric mean of three co-equal roots. Talent, Training and Temperament contribute symmetrically, so a high *declaration* compensates for weak *conduct*. The evidence-class ordering exists in the doc comments and nowhere in the arithmetic.
+
+**Proposed:** an ordered chain in which each stage *conditions* the one before it.
+
+```
+claim      = talent        (declared)
+corrected  = claim      ⊗ training      (audited)
+settled    = corrected  ⊗ temperament   (witnessed)
+```
+
+You assert capability; an examiner corroborates or discounts the assertion; conduct over time confirms or refutes the result. That is how trust actually forms, and the chain makes the falsifiability ordering `declared < audited < witnessed` **arithmetic rather than editorial**.
+
+#### The shape is fixed; the operator is the experiment
+
+Per dp, `⊗` stays open. What must *not* stay open is the set of properties any candidate has to satisfy — otherwise "modified by" is decoration and we will not be able to tell a good operator from a bad one.
+
+**P1 — Non-commutativity is the whole point.**
+> Swapping the training and temperament stages **must** change the result.
+
+This single test eliminates the obvious first implementation: plain multiplication `t · r · m` is commutative and associative, so it expresses **no ordering at all** — it is the current geometric mean wearing a chain's clothes. Any candidate that passes P1 is at least *attempting* what dp specified. Any that fails it is not a fold, it is a product.
+
+**P2 — A declaration alone cannot buy trust.** With no audit and no witness, the result must sit low, not at the neutral 0.5 a mean returns for "no observations." An unexamined claim is an unexamined claim.
+
+**P3 — Witnessed evidence can destroy.** Conduct near zero must drive the total near zero regardless of how high the declared talent is. (The current geometric mean does zero out — that property is worth keeping.)
+
+**P4 — Monotone in each stage.** Raising any stage's observed value must never lower the total. A fold that can be gamed by scoring *worse* is not a trust function.
+
+**P5 — Absence and zero are different.** No audit ≠ a failed audit. A missing stage should widen uncertainty; a failing stage should lower the score. Collapsing them is the evidence-class error one level up.
+
+#### Two candidate operators, offered as starting points
+
+**A — corrective pull.** Each stage draws the running value toward its own observation, with strength given by that stage's confidence weight (fields that already exist):
+
+```
+s0 = talent
+s1 = s0 + w_training    · (training    − s0)
+s2 = s1 + w_temperament · (temperament − s1)
+```
+
+Passes P1 (order changes the interpolation path), P2 (zero weights leave the bare claim), P4. Handles P5 naturally, since an absent stage has weight 0 and simply does not move the value. Needs care on P3 — a low-confidence witness cannot pull far enough to zero, which may be right (one bad act is not a verdict) or wrong (some acts *are*), and that is precisely the sort of thing to experiment on.
+
+**B — asymmetric corrective pull.** As A, but downward corrections apply at full weight and upward corrections at a discount. Encodes "trust is easier to lose than to gain" — which this fleet already asserts elsewhere in the temperament ladder, where a rephrase-after-deny scores *below* plain compliance while an upheld appeal earns full credit. B makes that asymmetry structural instead of per-rule.
+
+#### What this fixes, and what it costs
+
+**Fixes:** it gives the sub-dimension tree an actual computation. §D-4a records that `aggregate()` never touches `sub_dimensions` — they store and do not compute. Under a chain fold the natural shape is: sub-dimensions roll into their parent root first, then the three roots chain. `training:hosting-topology` and `temperament:context-stable` then *mean* something rather than sitting inert.
+
+**Costs, stated plainly:** changing the fold changes the meaning of every T3 score ever computed. Scores from before and after are not comparable, and any stored aggregate is invalidated.
+
+**That cost is unusually low right now, and it will not stay low.** Today's reputation deltas are keyed on *capacity* rather than *office* (§3) — already indexed on the wrong axis — and sub-dimensions never aggregated. There is very little correct history to invalidate. Every month this waits, that stops being true.
+
+#### Propagation — and the direction is not the obvious one
+
+> dp, 2026-08-06: *"this might need to propagate to trust-core."*
+
+Checked. Three surfaces, and only one of them is a real duplicate:
+
+**1. `web4/web4-trust-core` — already safe by construction.** It *re-exports* the tensor rather than reimplementing it (`pub use web4_core::t3::{TrustDimension, T3}`), and hestia's `Cargo.toml` pins both to one path with the reason stated: *"single web4-core source across the dependency graph (no duplicate tensor types)."* A fold change propagates here automatically. This was solved on purpose, earlier, by someone who saw the hazard.
+
+**2. The standalone `web4-trust-core` repo — a zero-dependency reference port** (`eval.rs`, `jcs.rs`, `nquads.rs`, `sha256.rs`) with its own **conformance vectors**. This is a deliberate second implementation, which is exactly right for a spec — and it means a fold change that does not reach it makes the reference and the implementation disagree, with the vectors as the only instrument that would notice.
+
+**3. And this is the finding: the reference port already implements semantics `web4-core::t3::aggregate` does not.** From `vectors/scores/expected-output.txt`:
+
+```
+V2 (member-bucket: 14 self-reports)
+  -> null (self-reports match no evidence rule)
+
+V3 (adjudicator capture)
+  harsh default (unmeasured weight 0.0) -> null
+  epsilon variant (weight 0.1)          -> 0.600 ± 0.262, strength 0.5
+```
+
+**Self-reports produce `null`, not a low score. Unmeasured produces `null`, not neutral.** Scores carry `± uncertainty` and a separate `strength`, and aggregation is fractal over *named evidence rules* (`w4td:BoundaryResponse`, `CorrectionAcceptance`, `EscalationProportional`).
+
+That is dp's evidence-class ordering **already encoded** — and it satisfies two of the five properties above that the live implementation fails:
+
+| property | `web4-core::t3::aggregate` | reference port |
+|---|---|---|
+| **P2** a declaration alone cannot buy trust | ✗ — returns neutral `0.5` for no observations | ✓ — self-reports → `null` |
+| **P5** absence ≠ zero | ✗ — collapsed into the same neutral | ✓ — unmeasured → `null`, distinct from a low score |
+
+**So "propagate to trust-core" may be backwards.** The reference port is not behind the implementation here; on evidence semantics it is **ahead of it**, and the live `aggregate()` is the outlier. The right first move is a reconciliation — read `eval.rs`'s semantics-1 evaluator properly and decide which of the two is the intended model — *before* designing a new fold that might duplicate work already done and vector-tested.
+
+**Sight line:** I read the vectors' `expected-output.txt`, not the evaluator. The claims above are about what the vectors *assert*; I have not verified how `eval.rs` computes them, and the reconciliation is the task, not the conclusion.
+
+#### Ownership
+
+This is a change to `web4-core::t3`, so it is **hub's build** under the same split as D-2 — with the reconciliation above as its first step rather than the fold design. Hestia's ask is narrow and specific:
+
+1. the chain shape, with `⊗` pluggable behind a trait so candidates can be swapped;
+2. P1–P5 as conformance tests, so a proposed operator can be *rejected* on evidence rather than debated;
+3. `EvidenceClass` selecting the **update rule** as well as the fold position (§D-4a defect 2) — witnessed grows with repetition, audited decays with staleness, declared never accrues confidence.
+
+Hestia records the inputs in the meantime (Sprint 1) and consumes the fold when it lands. **Hestia does not implement a local fold** — two folds would disagree, and then neither is evidence.
+
+---
+
 ## 8. The Policy-Entity and the third verdict
 
 ### 8.1 Name the office, then restore the verdict
