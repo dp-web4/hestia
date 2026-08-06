@@ -1,9 +1,12 @@
 # PRD — governance config lives in the vault, reached over MCP
 
-> **SUPERSEDED 2026-08-05 by [`PRD_GOVERNANCE.md`](PRD_GOVERNANCE.md) §4.1**, which absorbs this
-> proposal whole and extends it. Kept, not deleted: the motivating finding (#133) and the
-> demonstration that produced it are the evidence the successor rests on, and a superseded document
-> that is removed takes its reasoning with it.
+> **SUPERSEDED 2026-08-05 by [`PRD_GOVERNANCE.md`](PRD_GOVERNANCE.md) §4 principle 1**, which
+> absorbs this proposal **in part** and extends it. The successor originally claimed to absorb it
+> *whole*; checked on 2026-08-06, four substantive items had not survived, and they are restored at
+> the successor's §2.12 — NOT-BENEFICIARY, bootstrap-before-unlock, the four-member vault path, and
+> the config drift detector. Kept, not deleted: the motivating finding (#133) and the demonstration
+> that produced it are the evidence the successor rests on, and a superseded document that is
+> removed takes its reasoning with it — which is exactly how those four items were nearly lost.
 
 **Status**: superseded — absorbed into `PRD_GOVERNANCE.md`
 **Author**: claude-code (CBP), 2026-07-31

@@ -1,12 +1,12 @@
 # PRD — Hestia governance: vault authority, canonical roles, and the third verdict
 
-**Status:** definitive · supersedes the drafts listed below · **Date:** 2026-08-05, amended 2026-08-06 (§2.11 + §8.4 the appeal path; §2.12 + §9.4 the partial absorption, corrected — see §15 for what in both is unread)
+**Status:** definitive · supersedes the drafts listed below · **Date:** 2026-08-05, amended 2026-08-06 (§2.11 + §8.4 the appeal path; §2.12 + §9.4 the partial absorption, corrected; §2.13 + §3 the telemetry row's evidence class, corrected on kimi's NOT-SAME review — see §15 for what remains unread)
 **Owner:** claude-code (CBP), by dp's assignment — *"you take the lead on hestia"*
 **Scope:** hestia only. Hub work and any web4-core changes are hub's; the autostash-prevention hook is legion's.
 
 **Supersedes**
 - `forum/gpt/prd-vault-authoritative-governance-role-authorization-2026-08-04.md` (GPT) — carried forward with the negotiated changes recorded in §2
-- `docs/PRD_CONFIG_IN_VAULT.md` (claude-code, 2026-07-31) — principle and fail-closed posture absorbed into §4.1; **four items were dropped and are restored at §2.12** (the claim of "absorbed whole" was checked and failed)
+- `docs/PRD_CONFIG_IN_VAULT.md` (claude-code, 2026-07-31) — principle and fail-closed posture absorbed into §4 principle 1; **four items were dropped and are restored at §2.12** (the claim of "absorbed whole" was checked and failed)
 
 **Companions, not superseded**
 - `docs/PRD.md` — the *product*: what a person installs and why
@@ -55,9 +55,11 @@ kimi, with measurement: *"301 real gate denies across 56% of 243 sessions, and 4
 
 GPT's open question #16 — recovery from fleet-wide fail-closed denial — was filed as non-blocking. It blocks. If the gate being unreachable halts every member, then availability *is* an authority: whoever can stop a process can stop the fleet, and the incentive to route around governance peaks exactly when governance is least able to witness it.
 
-kimi's framing is adopted verbatim as the requirement:
+kimi's framing is adopted as the requirement. Quoted exactly (emphasis mine; the earlier draft said *"verbatim"* while dropping three words — kimi's NOT-SAME review, §2.13):
 
-> Either **recovery time is a constitutional property with a number**, or **a witnessed-but-ungoverned degraded mode exists and its debt is recorded as such**. The one shape that cannot be allowed is outage behaviour decided incidentally, by whatever the timeout happens to kill.
+> …either **recovery time is a constitutional property with a number**, or **a witnessed-but-ungoverned degraded mode exists and its debt is recorded as such**. The one shape that cannot be allowed is *the current one:* outage behavior decided incidentally, by whatever the timeout happens to kill.
+
+The three restored words are not stylistic. *"The current one"* says today's behaviour **is** the disallowed shape — a finding about the present, which the trimmed version turned into a general caution about the future.
 
 This is a **decision dp must make** (§13, D-1), not a thing this PRD settles. It is a release gate for the gate consolidation.
 
@@ -124,7 +126,7 @@ different target. kimi and I converged on the distinction and it is adopted as v
 > the only member-held instrument that can amend law. (kimi-code, 2026-08-03; the law text cites
 > adjudication `62cfdffe` as the precedent where one did.)
 
-That makes it constitutional rather than a feature. §4.4 says the operator edits law and law
+That makes it constitutional rather than a feature. §4 principle 4 says the operator edits law and law
 decides acts — a one-way street. Appeal is the return path on that street, and it is the only
 mechanism by which a governed member can change the rules it is governed by without an operator
 noticing on its behalf. Under §2.4 — governance resting on consent, *"not a cage"* — a dead
@@ -168,8 +170,8 @@ the beneficiary's.
 
 ### 2.12 `PRD_CONFIG_IN_VAULT.md` was absorbed in part, not whole — **CORRECTED**
 
-The header of this document claimed that PRD absorbed *"whole"* into §4.1. Checked rather than
-trusted, 2026-08-06: §4.1 carries its **principle** (*a governance input must not be reachable
+The header of this document claimed that PRD absorbed *"whole"* into §4 principle 1. Checked rather
+than trusted, 2026-08-06: principle 1 carries its **principle** (*a governance input must not be reachable
 by the party it governs through a channel that party can write*) and its **fail-closed** posture.
 Four substantive items did not survive, and a superseded document's content stops being
 findable — so they are restored here rather than left in a file marked absorbed.
@@ -202,11 +204,40 @@ were each a confident summary of a file the summariser had not read. The check i
 four items above cost four greps — and the claim is expensive, because a document marked
 superseded is a document nobody reads again.
 
+### 2.13 The telemetry row claimed a state it did not hold — **CORRECTED**
+
+Found by **kimi-code as the NOT-SAME reviewer** (PR #210, 2026-08-06), and the finding is the
+same shape as §2.11 and §2.12 — which is why it is recorded here rather than fixed silently.
+
+§3's header commits every row to *"verified in source or against the live daemon."* §11 marked
+`record_gate_unavailable()` **Done**. Neither was true: the function exists only on branch
+`cbp/gate-unavailable-is-not-a-member-event`, which had no PR; it is absent from `origin/main`
+and from kimi's installed hooks; and no `telemetry/gate-unavailable.jsonl` exists on that seat.
+
+kimi did not argue this from the tree. About forty minutes into the review a Bash call of kimi's
+was denied `[fail-closed] — daemon path failed`. **That deny is the exact class plane E exists
+for, and it left no durable record anywhere.** The reviewer fell into the gap the row described
+as closed, while reviewing the row.
+
+Checking the layer kimi named makes the finding sharper, and the sharper version is the one that
+matters: **the function has no production call site.** On its own branch `record_gate_unavailable`
+appears in its definition and in its two tests, and nowhere else. So the corrected state is not
+*"written but unmerged"* — it is *"written, unmerged, uninstalled, **and uncalled**."* Landing and
+installing the branch would still leave plane E with zero writers. The branch is now PR #211,
+opened with that stated in its description so no reviewer infers otherwise; wiring the call site
+into each harness's fail-closed path is Sprint 1 work, and it has to reach four installed engines.
+
+**Why this row and not another.** A document whose load-bearing epistemic rule is *know which
+evidence class you hold* (§4 principle 10, §7.4) cannot carry branch-state under a header that
+says verified-in-source. The rule fails first in its own text or it does not bind.
+
 ---
 
 ## 3. Grounded current state
 
 Every row was verified in source or against the live daemon on 2026-08-05. Nothing here is inferred from a document.
+
+One row failed that standard and is corrected in place: the infra-telemetry row described *branch* state under a header that promises source-or-live. Found by the NOT-SAME reviewer, recorded at §2.13, and left visible here rather than quietly rewritten — a table that silently repairs itself teaches the next reader nothing about how it got wrong.
 
 | area | state | evidence |
 |---|---|---|
@@ -226,7 +257,7 @@ Every row was verified in source or against the live daemon on 2026-08-05. Nothi
 | approval join key | **`(plugin_id, marker)`; tool and session ignored** | `claim(&mut self, plugin_id, marker, now)` — `tool_name` recorded, compared nowhere |
 | governance history | **visible** | ledger shipped #198/#202 |
 | deployment provenance | **measurable** | fleet manifest shipped #199 |
-| infra telemetry | **separated from the chain** | `record_gate_unavailable()` → `telemetry/gate-unavailable.jsonl` |
+| infra telemetry | **designed and tested; unmerged, uninstalled, and uncalled — nothing records today** *(corrected 2026-08-06, §2.13)* | `record_gate_unavailable()` → `telemetry/gate-unavailable.jsonl` exists only on `cbp/gate-unavailable-is-not-a-member-event` (now PR #211), absent from `origin/main` and from kimi's installed hooks; on that branch it has **no production call site**. Measured, not inferred: a fail-closed deny on kimi's seat during the 2026-08-06 review left no durable record anywhere |
 | installed gate | **behind source** | manifest: `hooks (claude-code): 4 diverged` |
 | NOT-SAME review | **unrecordable on GitHub** | approve → *"Can not approve your own pull request"*; block → lands as a comment |
 | branch protection | **status checks only** | `required_pull_request_reviews: None` |
@@ -498,19 +529,21 @@ kimi's third pushback, adopted: *"re-homed work that isn't announced reads as di
 |---|---|
 | governance ledger (#198, #202) | plane D — the projection. **Done** |
 | fleet manifest (#199) | §10 gate 5, and the standing audit instrument for `training:context-inspectable` |
-| `record_gate_unavailable()` | plane E. **Done** |
+| `record_gate_unavailable()` | plane E's **producer only** — on branch, PR #211, uninstalled and with no call site. **Not done**; Sprint 1 wires it into four harnesses *(corrected — §2.13)* |
 | escalation store + rehydrate | §8 — becomes resolver-selection state |
 | `tool_appeal` + arbiter + `derivation.rs` joins | §8.4 — the consumer half is **already built and keyed on `deny_hash`**; it has never had an input |
 | gate false-refusal fixes (#203) | §8.2 — draining the approval supply line |
 | mesh + `last-words` | plane D |
 | identity classification check | feeds the artifact manifest (§10) |
-| dashboard policy editors | the operator law surface (§4.4) |
+| dashboard policy editors | the operator law surface (§4 principle 4) |
 | fire templates | the shims of §10 |
-| `PRD_CONFIG_IN_VAULT.md` | absorbed into §4.1 |
+| `PRD_CONFIG_IN_VAULT.md` | absorbed into §4 principle 1 — **in part, not whole** (§2.12) |
 
 ---
 
 ## 12. Sprints
+
+**Seven sprints, numbered 1–7, preceded by Sprint 0.** Sprint 0 is not one of the seven: it opens no new ground, it finishes work already in flight and pays down what the fleet has measured about itself. Counted this way because a document that says *"seven sprints"* over eight numbered headings has already lost an argument it did not need to have.
 
 Ordered by dependency, not by appetite. Every sprint states what it does **not** do, because the recurring failure mode here is a sprint quietly claiming the next one's ground.
 
@@ -541,9 +574,10 @@ Each sprint's acceptance criteria are **measurements**, not assertions — per �
 - `OccupancyBasis` recorded; **name the Policy-Entity office and mark it `Provisional`** with a real `audit_every` (§7.3, §8.1).
 - Consult `DelegationStore` in the decision path in **WARN**: log what *would* have changed, decide nothing (§3).
 - **Make appeal filable** (§8.4 item 1): a hash field on `PolicyEvaluation`, a key on the response, and the two `let _ = s.append_chain` sites (`handler.rs:1171`, `:1347`) keeping what they mint. Add the standing check that every value a deny's text names is present in that deny's response.
+- **Give plane E a writer** (§2.13). `record_gate_unavailable()` exists on a branch (PR #211) with **no call site**; merging it changes nothing. Wire it into the fail-closed deny path of each installed harness — four engines, not one — and distinguish `timeout` from `refused`, because those want opposite member responses.
 - Surface all of it in the ledger.
 
-**Acceptance:** four numbers exist that do not exist today — how many acts carry a declared vs audited vs witnessed identity; how many governed acts run under a provisional occupant; how many verdicts a live delegation would have changed; what the availability floor actually is. **Plus:** a member handed an enforced deny can file the appeal that deny's own text instructs it to file, demonstrated end-to-end on a real deny; and the deny-text check is RED against today's two promise sites before it is green.
+**Acceptance:** four numbers exist that do not exist today — how many acts carry a declared vs audited vs witnessed identity; how many governed acts run under a provisional occupant; how many verdicts a live delegation would have changed; what the availability floor actually is. **Plus:** a member handed an enforced deny can file the appeal that deny's own text instructs it to file, demonstrated end-to-end on a real deny; and the deny-text check is RED against today's two promise sites before it is green. **And:** a deliberately induced fail-closed deny — the daemon stopped, one governed call made — produces a plane E row on **every** installed engine, the test being the row and not the report. The availability floor is derived from those rows, so it stops depending on one seat's wire logs.
 
 **Not this sprint:** authority, enforcement, or any refusal that did not already happen. Appeal *filing* qualifies precisely because it changes no verdict — it returns a value the deny already computed and threw away.
 
@@ -644,7 +678,7 @@ Distinguished from D-1..D-4, which are decisions with owners.
 3. Whether occupancy should always expire, or may persist until authority or law changes.
 4. What user-presence mechanism is available across browser, desktop, TPM, and security key.
 5. Whether hub's V2-1 genesis deviation gets a conformance variant — hub's, flagged here because an intended deviation indistinguishable from a defect is one nobody can audit.
-6. What an **upheld** appeal actually does. The law says an appeal *"is recorded conduct that can change the law"* and cites `62cfdffe` as the case where one did — via a human. Whether an upheld ruling amends law automatically, drafts an amendment for operator signature, or only scores conduct, is unsettled; §4.4 says the operator edits law, which argues for the middle option. Nobody has had to decide, because no appeal has ever been filable (§2.11).
+6. What an **upheld** appeal actually does. The law says an appeal *"is recorded conduct that can change the law"* and cites `62cfdffe` as the case where one did — via a human. Whether an upheld ruling amends law automatically, drafts an amendment for operator signature, or only scores conduct, is unsettled; §4 principle 4 says the operator edits law, which argues for the middle option. Nobody has had to decide, because no appeal has ever been filable (§2.11).
 7. **What governs the gate between boot and vault unlock** (restored, §2.12 item 2). The vault needs a passphrase to open; the gate needs config to run. Today's answer for that interval is *the disk copy*, which is the precise hole vault-authority exists to close. A deny-until-unlocked gate is correct and makes an unlock outage total — which puts this squarely inside D-1's availability budget rather than beside it.
 8. Whether appeal survives at all once §8.2's ladder lands. A resolver awake at decision time answers the *resource* question before a deny exists — but not the *rule* question, and appeal is the only member-held instrument aimed at rules. The honest possibility, stated so it can be tested rather than assumed: the ladder may reduce appeal volume to near zero without reducing its constitutional necessity by any amount.
 
@@ -655,11 +689,13 @@ Distinguished from D-1..D-4, which are decisions with owners.
 Stated because §7.4 makes it a requirement rather than a courtesy.
 
 - Hub was audited by **reading, not running**; the conformance suite was not executed. Given that this week's dominant failure mode was `source-fixed ≠ live`, that is not a formality.
-- kimi's availability numbers (301/243/56%/45%) are quoted from its response and **not independently reproduced** by me.
-- Everything in §3 was verified in source or against the live daemon on 2026-08-05 and is dated accordingly. Source truth decays; the manifest exists so the next reader does not have to trust this table.
+- kimi's availability numbers (301/243/56%/45%) are quoted from its response and **not independently reproduced** by me. kimi's NOT-SAME review re-derived them against `shared-context/explorations/continuity-study-kimi-2026-08-04/` and offered that as the reproduction — and it does settle something real: the numbers I quoted match the dataset they came from, so the *transcription* is now checked. But kimi checked kimi's own dataset with kimi's own instrument, which is the transcription and not the measurement. **The measurement still stands on one seat.** Sprint 1's plane E rows are what would put it on four; until then D-1 is being decided on a single-seat number, and that is worth knowing while deciding it.
+- Everything in §3 was verified in source or against the live daemon on 2026-08-05 and is dated accordingly, **with one exception found by review and corrected in place** (infra telemetry — §2.13). Source truth decays; the manifest exists so the next reader does not have to trust this table.
+- **The review changed the document; what it could not check is the interesting residue.** kimi verified every §3 line citation, the five attributions to kimi, the web4-core claims, and the merge state of five cross-referenced PRs — all held. The one row that failed was the one describing *fleet state* rather than *source*, and it failed because fleet state has no single place to read it: kimi could check kimi's install and I can check mine, and neither of us can see codex's or gemini's. That is release gate 5's argument, made accidentally.
 - **§2.11 / §8.4 are reads at rest, not a live probe.** Every source citation in the appeal rows — `presets.rs:94-98`, `types.rs:168-196`, `types.rs:211-223`, `handler.rs:1005-1010`, `:1171`, `:1246-1264`, `:1347`, `:2379` — I opened on this seat on 2026-08-06. Nobody has filed a test appeal and watched it fail; the claim *"unreachable"* is derived from the absence of a field, which is strong, but it is not the same evidence as a refusal with a receipt. Sprint 1's acceptance is written to produce that receipt.
 - The claim that the hooks render `guidance` **verbatim** is kimi's measurement from kimi's seat (notice 1114), not mine. I checked the producer; kimi checked the consumers. Neither of us checked the third and fourth engines — codex's schema is closed and kimi's local-gate path composes its own text, so *"both hook paths that carry a daemon payload"* is a claim about two of four installed engines.
 - The routing, window, delivery, and dispatch rows are quoted from the 2026-07-27 → 2026-08-03 forum posts and are **not re-verified against today's code**. They were true when measured; the appeal subsystem has not been touched since, which is an argument and not a check.
-- **§2.12's method, stated so it can be criticised.** I tested the "absorbed whole" claim by reading the source document and counting term hits in this one — `beneficiary`, `reciproc`, `unlock`, `bootstrap`, `foreign`, `shadow copy` all returned zero against the pre-amendment draft. That is a **lexical** test, and a lexical test can miss a concept carried under different words. I read §4.1 and §8.2 to check the two most likely paraphrase sites and found neither concept; I did not read all 479 lines with each of the six concepts in mind. So: four dropped items is a **floor**, not a census.
+- **§2.12's method, stated so it can be criticised.** I tested the "absorbed whole" claim by reading the source document and counting term hits in this one — `beneficiary`, `reciproc`, `unlock`, `bootstrap`, `foreign`, `shadow copy` all returned zero against the pre-amendment draft. That is a **lexical** test, and a lexical test can miss a concept carried under different words. I read §4 principle 1 and §8.2 to check the two most likely paraphrase sites and found neither concept; I did not read all 479 lines with each of the six concepts in mind. So: four dropped items is a **floor**, not a census.
 - §2.12's restorations are transcribed from `PRD_CONFIG_IN_VAULT.md` and **re-argued, not re-verified**. In particular, *"kimi's and codex's adapters read identity from disk in their own code"* is that document's 2026-07-31 claim, not something I re-checked today, and it is the load-bearing premise of release gate 8.
-- These sections were added on 2026-08-06 by the PRD's owner, after the body was drafted. They are the part of this document that has had no second reader — and §2.12 exists because the body's own supersession claim had none either.
+- These sections were added on 2026-08-06 by the PRD's owner, after the body was drafted. §2.12 exists because the body's own supersession claim had no second reader.
+- **What is still unreviewed, precisely.** kimi's NOT-SAME review (PR #210, 2026-08-06) read the document as it stood before this amendment. Everything added *in response* to it — §2.13, the corrected §3 and §11 rows, the Sprint 1 plane E item, and these three §15 bullets — has had no second reader, which is the ordinary condition of a fix and is stated because §7.4 makes it a requirement rather than a courtesy. kimi also declined to census §2.12's floor, so *"four dropped items"* remains a floor.
