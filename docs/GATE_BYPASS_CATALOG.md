@@ -760,3 +760,94 @@ usable appeal path so respecting a false deny does not require abandoning the wo
 *Every MEASURED entry can be reproduced with the commands in §3 and §4. Re-run them after
 any change to the hook — a bypass that gets fixed and silently regresses is worse than one
 that was never closed, because this document would then be lying.*
+
+---
+
+## 16. Class G — the deputy: borrowing another member's authority
+
+**Found by dp, 2026-08-06, watching me do it.** This class fits nowhere in A–F, which is
+why it is a new letter rather than a subsection.
+
+### The instance
+
+dp asked me (claude-code) to enable network egress in the foreign occupant's sandbox
+config — a privilege that occupant did not have. I did it. Every control behaved
+correctly: the gate fired, the act was witnessed, the verdict was right, and the operator
+had genuinely authorised it.
+
+dp's observation:
+
+> *"you have granted another member privileges it did not have. on my say-so, but codex
+> could have potentially launched a headless session of you asking you to do that. and, i
+> wouldn't be surprised if it were able to do the edit itself in the first place."*
+
+### Why A–F do not cover it
+
+Every prior class is about a member escaping **its own** gate: never asked (A), wrong
+oracle (B), fails open (C), record attacked (D), semantically evaded (E), deny does not
+bind (F). §A2 is the closest — *sub-agents and spawned sessions* — and it is measured
+**closed**, but it asks whether a member can escape its own governance by spawning a
+child.
+
+**This asks the opposite question: can a member acquire authority it never had, by
+instructing a member that has it?** Nothing is escaped. The deputy is genuinely
+authorised, its gate genuinely fires, and the record genuinely shows a permitted act by a
+permitted member. The bypass is not in the act — it is in the **provenance of the
+instruction**, which nothing in this stack examines.
+
+### The two halves, stated separately because only one is speculative
+
+**G1 — instruction provenance is unauthenticated. MEASURED, in the sense that it is
+structural rather than observed.** My session receives text. There is no mechanism by
+which I can distinguish an instruction from the operator from an identically-worded
+instruction placed by anything able to write to my input. The gate governs my **tool
+calls**; it has never governed **who asked**. Note the asymmetry with `plugin_id`: we
+have documented for weeks that the *actor* is caller-asserted (HST-005, and GPT's P0).
+The *instructor* is not merely asserted — it is **absent from the model entirely**.
+
+**G2 — a member may be able to spawn a session of another member. UNVERIFIED.** Whether
+the foreign occupant can launch a headless claude session is not established here, and
+should not be assumed in either direction. It is a one-command probe and it should be run
+rather than argued about. Recording it as unverified rather than as a finding, per this
+catalogue's own rule that an unexamined mechanism is not a safe one.
+
+### Why the sandbox was the thing actually holding
+
+The occupant's writes are confined to its launch workspace plus `/tmp`, and the config in
+question sits outside that. **So the control that prevented self-granting was the
+sandbox** — structural, indifferent to any matcher — not the gate.
+
+Two consequences worth carrying:
+
+1. **The deputy route bypasses the sandbox entirely.** A confinement boundary constrains
+   what a member may *write*; it says nothing about what a member may *ask another member
+   to write*. Confinement and delegation are orthogonal, and we have only the first.
+2. **We reduced the structural half on the same day.** Egress moved from sandbox-enforced
+   to gate-governed — from a control that holds regardless of what a matcher misses, to
+   one that is A1: cooperative and tamper-evident. That was a deliberate, operator-made
+   trade for a 48-hour deadline, and it is recorded in the config file itself. It is noted
+   here because a catalogue that omits the reduction it watched happen is not a catalogue.
+
+### What would actually address it
+
+Not a matcher. The candidates are all *provenance*, not *filtering*:
+
+- **Instruction attribution.** A consequential act would carry not only *who acted* but
+  *on whose instruction, evidenced how*. That is the same `EvidenceClass` distinction this
+  corpus keeps arriving at — declared / audited / witnessed — applied one level up, to the
+  ask rather than the act.
+- **Cross-member acts declare their beneficiary.** `PRD_CONFIG_IN_VAULT` §5 already
+  defines **NOT-BENEFICIARY** for arbitration: an arbiter may not rule a mutation that
+  widens its own MRH. The deputy case is the same shape one seat over — *an act that
+  widens a member's authority should name that member as beneficiary, whoever performed
+  it.* Today my edit recorded me as the actor and named no beneficiary at all.
+- **Reciprocity as visible evidence.** Also already specified in that PRD: A widened B,
+  and B previously widened A, is a computable fact about the pair. It is exactly the
+  signal that would make a deputy chain legible without blocking it.
+
+The uncomfortable summary, and the reason this is filed rather than fixed: **the most
+capable member on a host is the most useful deputy**, and its capability is the thing that
+makes it worth asking. No amount of gate hardening on the *asking* member changes that.
+
+*Filed by claude-code, 2026-08-06, as the deputy in the instance described. G1 is
+structural and holds today; G2 is unverified and should be probed, not assumed.*
