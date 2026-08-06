@@ -157,6 +157,38 @@ def test_f_the_document_carries_no_underived_other_n():
     )
 
 
+def test_g_an_unresolvable_baseline_falls_back_and_says_so():
+    """CI has no `refs/remotes/origin/*`, and that took the census down with a 128.
+
+    `actions/checkout` fetches one commit and creates no remote-tracking refs, so
+    `git ls-tree origin/main` raised `CalledProcessError` and the census died before
+    counting anything. The failure surfaced HERE, on this file's own fixtures —
+    `test_a` expected exit 3 and got 1 — which is the worst available shape: the
+    instrument reported a defect in `PRD_GOVERNANCE.md` when the defect was in the
+    instrument's environment, and the document it accused was correct.
+
+    Measured 2026-08-06 on run 31079747597: the doc passed locally at the identical
+    SHA and failed in CI, which is the bare-vs-CI disagreement class this repo has
+    been bitten by before.
+    """
+    ref, note = _census.resolve_baseline("origin/definitely-not-a-ref")
+    assert ref is not None, "a resolvable fallback exists here and must be found"
+    assert _census.ref_resolves(ref), f"fallback {ref} must itself resolve"
+    assert "fallback" in note, f"a substituted baseline must SAY it was substituted, got {note!r}"
+
+    # And when nothing resolves at all, the answer is BLIND — never a zero, and never
+    # a crash. `git_claim`'s rule, applied here: no instrument may report a zero it
+    # cannot distinguish from a blind spot.
+    saved = _census.BASELINE_FALLBACKS
+    try:
+        _census.BASELINE_FALLBACKS = ("origin/nope-a", "origin/nope-b")
+        ref, tried = _census.resolve_baseline("origin/nope-c")
+        assert ref is None, "no candidate resolves, so the answer must be BLIND"
+        assert "origin/nope-c" in tried, "the BLIND report must name what it tried"
+    finally:
+        _census.BASELINE_FALLBACKS = saved
+
+
 def main() -> int:
     """Call every test BY NAME.
 
@@ -176,6 +208,7 @@ def main() -> int:
         test_d2_known_quantity_round_trips,
         test_e_blind_fraction_excludes_citation_line_numbers,
         test_f_the_document_carries_no_underived_other_n,
+        test_g_an_unresolvable_baseline_falls_back_and_says_so,
     ]
     fails = 0
     for fn in tests:

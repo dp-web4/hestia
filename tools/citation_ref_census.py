@@ -145,6 +145,47 @@ def git(*args: str) -> str:
     ).stdout
 
 
+#: Baselines tried, in order, when the requested one does not resolve.
+#:
+#: `actions/checkout` fetches a single commit and creates NO `refs/remotes/origin/*`,
+#: so `origin/main` — the correct default on a developer clone — raises 128 in CI and
+#: took the whole census down with it. The test then failed on its OWN fixtures
+#: (`test_a` expected exit 3 and got 1), which is the worst shape available: the
+#: instrument reported a defect in the document when the defect was in the instrument's
+#: environment, and the document it accused was correct.
+#:
+#: Order matters. `origin/main` is the shared ref a second reader would use and stays
+#: first. `main` catches a local clone with no remote. `HEAD` is last and is honest for
+#: a PR checkout — it is what a reader AT THIS REF sees, which is exactly the question
+#: a citation census asks. The chosen ref is PRINTED whenever it is not the requested
+#: one, because a baseline substituted silently is a different measurement wearing the
+#: same header.
+BASELINE_FALLBACKS = ("origin/main", "main", "HEAD")
+
+
+def ref_resolves(ref: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "rev-parse", "--verify", "-q", f"{ref}^{{commit}}"],
+            capture_output=True,
+            text=True,
+        ).returncode
+        == 0
+    )
+
+
+def resolve_baseline(requested: str) -> tuple[str | None, str]:
+    """First resolvable baseline, and a note naming what was tried.
+
+    Returns `(None, tried)` when nothing resolves — a BLIND state, never a zero.
+    """
+    candidates = [requested] + [r for r in BASELINE_FALLBACKS if r != requested]
+    for ref in candidates:
+        if ref_resolves(ref):
+            return ref, "requested" if ref == requested else f"fallback after {requested}"
+    return None, ", ".join(candidates)
+
+
 def blob_at(ref: str, path: str) -> str | None:
     """Blob hash of `path` at `ref`, or None when the ref does not carry it.
 
@@ -241,7 +282,19 @@ def main() -> int:
     args = ap.parse_args()
 
     refs = remote_refs(args.refs)
-    tracked = set(git("ls-tree", "-r", "--name-only", args.baseline).split("\n"))
+    baseline, baseline_note = resolve_baseline(args.baseline)
+    if baseline is None:
+        print(
+            f"{args.doc}: BLIND -- no baseline ref resolves (tried {baseline_note}). "
+            "A citation census with no baseline cannot tell 'the path does not exist' "
+            "from 'I could not look', and those read alike. Refusing to report either.",
+            file=sys.stderr,
+        )
+        return 3
+    if baseline != args.baseline:
+        print(f"  baseline: {args.baseline} does not resolve here; using {baseline} ({baseline_note})")
+    tracked = set(git("ls-tree", "-r", "--name-only", baseline).split("\n"))
+    args.baseline = baseline
 
     # Pin the document the same way the tool demands citations be pinned. `--doc-ref`
     # reads it out of git; without one the read is the author's working tree and the
