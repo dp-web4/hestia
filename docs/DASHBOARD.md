@@ -9,6 +9,27 @@ Both poll the same JSON endpoint (`GET /api/dashboard`) every 1–2s and
 re-render with whatever the daemon currently has in its witness chain
 and trust store. There's no separate UI database to fall out of sync.
 
+## Deployment freshness
+
+The dashboard header reports whether the running daemon matches the artifact selected by the
+deployment supervisor. Set `HESTIA_CURRENT_BUILD_FILE` in the daemon's environment to a
+supervisor-owned JSON manifest containing the current build identity. The `build_id` must be the
+exact `git describe` provenance string in parentheses in the deployed binary's `hestia --version`
+output; do not substitute a short commit prefix or normalize a `-dirty` suffix:
+
+```json
+{"build_id":"app-v0.1.2-607-ge720d0a","updated_at":"2026-08-06T20:00:00Z"}
+```
+
+The daemon's own build identity is baked in at compile time. The dashboard shows **current** in
+green when the identities match, **stale** in amber when they differ, and **unknown** when the
+authority is missing, unreadable, or malformed. Unknown is intentionally not treated as healthy:
+the daemon cannot prove freshness from its own version string. A stale result tells the operator to
+relaunch through the supervisor; Hestia does not self-upgrade or mutate deployment state. A
+supervisor should generate this manifest at install time from the artifact it is about to start,
+so the comparison is true by construction at deployment and turns stale only when a newer
+artifact is selected.
+
 ## Web view
 
 ![dashboard](screenshots/dashboard-web.png)

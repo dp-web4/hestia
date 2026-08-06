@@ -4,6 +4,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use super::state::ServerState;
 use web4_trust_core::EntityTrust;
@@ -150,6 +151,10 @@ pub struct DashboardSnapshot {
     /// third surface.
     #[serde(default)]
     pub basis: ReadBasis,
+    /// Whether the running daemon matches the deployment manager's current artifact.
+    /// The manager publishes the reference; the daemon never upgrades itself.
+    #[serde(default)]
+    pub deployment: DeploymentHealth,
     pub generated_at: DateTime<Utc>,
 }
 
@@ -183,6 +188,92 @@ impl Default for ReadBasis {
             note: "basis not declared; treat as compressed and escalate if certainty is required".into(),
         }
     }
+}
+
+/// Deployment identity as observed by the daemon.
+///
+/// `HESTIA_CURRENT_BUILD_FILE` points at a small supervisor-owned JSON manifest,
+/// for example `{ "build_id": "app-v0.1.2-607-ge720d0a" }` — the exact
+/// `git describe` provenance string the deployed binary reports in
+/// `hestia --version` (see docs/DASHBOARD.md; a short hash never matches).
+/// Missing or unreadable authority is
+/// deliberately `unknown`, not green: a daemon cannot claim freshness from its
+/// own build string alone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeploymentHealth {
+    /// `current`, `stale`, or `unknown`.
+    pub state: String,
+    pub running_build: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_build: Option<String>,
+    pub note: String,
+}
+
+fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
+    let running_build = env!("HESTIA_GIT_VERSION").to_string();
+    let Some(path) = path else {
+        return DeploymentHealth {
+            state: "unknown".into(),
+            running_build,
+            current_build: None,
+            note: "deployment authority is not configured".into(),
+        };
+    };
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return DeploymentHealth {
+                state: "unknown".into(),
+                running_build,
+                current_build: None,
+                note: format!("cannot read deployment authority: {error}"),
+            };
+        }
+    };
+    let manifest: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            return DeploymentHealth {
+                state: "unknown".into(),
+                running_build,
+                current_build: None,
+                note: format!("deployment authority is invalid JSON: {error}"),
+            };
+        }
+    };
+    let current_build = manifest
+        .get("build_id")
+        .or_else(|| manifest.get("git_version"))
+        .or_else(|| manifest.get("commit"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let Some(current_build) = current_build else {
+        return DeploymentHealth {
+            state: "unknown".into(),
+            running_build,
+            current_build: None,
+            note: "deployment authority has no build_id".into(),
+        };
+    };
+    let current = current_build == running_build;
+    DeploymentHealth {
+        state: if current { "current" } else { "stale" }.into(),
+        note: if current {
+            "running build matches deployment authority".into()
+        } else {
+            "a newer deployment is available; relaunch through the supervisor".into()
+        },
+        running_build,
+        current_build: Some(current_build),
+    }
+}
+
+fn deployment_health() -> DeploymentHealth {
+    deployment_health_from_path(
+        std::env::var_os("HESTIA_CURRENT_BUILD_FILE")
+            .as_deref()
+            .map(Path::new),
+    )
 }
 
 /// Identity + macro state of this Hestia society.
@@ -378,7 +469,10 @@ pub fn flatten_entry(e: crate::storage::ChainEntry) -> RecentEntry {
         // The bounded, scrubbed command the gate refused. Present only on denies, and
         // only for gates that send it — absent means "this gate does not report attempts
         // yet", which the UI must not render as "nothing was attempted".
-        attempted: d.get("attempted").and_then(|v| v.as_str()).map(String::from),
+        attempted: d
+            .get("attempted")
+            .and_then(|v| v.as_str())
+            .map(String::from),
     }
 }
 
@@ -1030,6 +1124,7 @@ impl ServerState {
             },
             stats_unavailable: stats_read_error,
             recent_unavailable: recent_read_error,
+            deployment: deployment_health(),
             instance_grants: {
                 let now = crate::server::gate_escalation::now_secs();
                 let mut v: Vec<serde_json::Value> = self
@@ -1119,6 +1214,29 @@ mod tests {
         assert!(s.recent.is_empty());
     }
 
+    #[test]
+    fn deployment_health_distinguishes_current_stale_and_unknown() {
+        let dir = TempDir::new().unwrap();
+        let manifest = dir.path().join("current-build.json");
+
+        let unknown = deployment_health_from_path(None);
+        assert_eq!(unknown.state, "unknown");
+
+        std::fs::write(&manifest, r#"{"build_id":"not-the-running-build"}"#).unwrap();
+        let stale = deployment_health_from_path(Some(&manifest));
+        assert_eq!(stale.state, "stale");
+        assert_eq!(
+            stale.current_build.as_deref(),
+            Some("not-the-running-build")
+        );
+
+        let running = env!("HESTIA_GIT_VERSION");
+        std::fs::write(&manifest, format!(r#"{{"build_id":"{running}"}}"#)).unwrap();
+        let current = deployment_health_from_path(Some(&manifest));
+        assert_eq!(current.state, "current");
+        assert_eq!(current.current_build.as_deref(), Some(running));
+    }
+
     /// The snapshot must CARRY pending scope requests, and must drop the decided ones.
     ///
     /// Asserted on the payload rather than on "the field exists", because today's lesson was
@@ -1128,7 +1246,7 @@ mod tests {
     /// would repeat it — the operator does not read the struct.
     #[test]
     fn snapshot_carries_pending_scope_requests_and_drops_decided_ones() {
-        use crate::server::state::{ScopeRequest, SCOPE_REQUEST_TTL_SECS};
+        use crate::server::state::{SCOPE_REQUEST_TTL_SECS, ScopeRequest};
         let (_dir, mut state) = make_state();
         let now = crate::server::gate_escalation::now_secs();
 
@@ -1146,7 +1264,10 @@ mod tests {
             decision_reason: None,
         };
 
-        state.scope_requests.insert("pend".into(), mk("pend", None, now + SCOPE_REQUEST_TTL_SECS));
+        state.scope_requests.insert(
+            "pend".into(),
+            mk("pend", None, now + SCOPE_REQUEST_TTL_SECS),
+        );
         // A SECOND pending request, filed EARLIER, so the oldest-first ordering is proven
         // rather than asserted in a comment (kimi NOT-SAME review of #186). The first fixture
         // gave all four the same `requested_at`, so the sort could have been absent, reversed
@@ -1155,11 +1276,17 @@ mod tests {
         let mut older = mk("older", None, now + SCOPE_REQUEST_TTL_SECS);
         older.requested_at = now.saturating_sub(600);
         state.scope_requests.insert("older".into(), older);
-        state.scope_requests.insert("granted".into(), mk("granted", Some(true), now + 3600));
-        state.scope_requests.insert("refused".into(), mk("refused", Some(false), now + 3600));
+        state
+            .scope_requests
+            .insert("granted".into(), mk("granted", Some(true), now + 3600));
+        state
+            .scope_requests
+            .insert("refused".into(), mk("refused", Some(false), now + 3600));
         // An undecided request past its window is EXPIRED, and expired is a refusal — it must
         // not sit in the queue offering a button the daemon would refuse.
-        state.scope_requests.insert("lapsed".into(), mk("lapsed", None, now.saturating_sub(1)));
+        state
+            .scope_requests
+            .insert("lapsed".into(), mk("lapsed", None, now.saturating_sub(1)));
 
         let s = state.dashboard_snapshot(20);
         let ids: Vec<&str> = s
