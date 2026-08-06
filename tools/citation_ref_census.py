@@ -38,6 +38,27 @@ grep returns nothing, instead of a line number resolving to plausible adjacent c
 That is the argument for grep-able pointers, and it is stronger than "line numbers
 drift".
 
+THE COUNT IS A CLAIM ABOUT A REF TOO -- and the first version of this tool did not
+pin it. It read the document with `open()`, from the working tree, while measuring the
+cited files across 71 refs: rigorous about the citations, single-seat about the number
+of them. The consequence landed immediately. The commit that added the "a line number
+is a claim about a ref" bullet recorded its producer as `... | wc -l  # 35 at this
+commit's parent`; the parent holds 31, and 35 is the count at the commit itself. The
+number came from a tree and the ref came from prose, and nothing in between checked
+that they agreed. So the header now prints the doc's REF and BLOB, always, and
+`--doc-ref` reads the document out of git instead of off the disk. A count you cannot
+re-derive at a named ref is the same defect as a line number you cannot resolve there.
+
+A QUOTED CITATION IS NOT A CITATION. A document that describes its own citation defect
+must spell the broken citation to describe it -- `presets.rs:94-98` appears in the
+PRD's own post-mortem bullet. A regex cannot tell a claim from a report of a claim, so
+"convert every citation" would be unmeetable while the finding is written down. Append
+`<!--cite:quoted-->` directly after such a citation and it is counted separately. The
+marker ABUTS what it exempts, deliberately, and at the grain of one citation: an
+exemption held anywhere else -- a doc line number in a flag, a list in a config -- can
+drift away from its subject, which is the failure this file exists to measure. Line
+granularity was tried and rejected for a narrower reason, recorded at `quoted_at`.
+
 WHAT IT DOES NOT DO. It reads refs, not installed copies -- a seat may run a build
 from none of them (see the PRD's plane on installed-vs-committed). It never fails; a
 census that goes red on a fleet where every seat lives on an unmerged branch would be
@@ -46,6 +67,7 @@ reader decides what share is tolerable for the claim being cited.
 
 USAGE
     tools/citation_ref_census.py docs/PRD_GOVERNANCE.md
+    tools/citation_ref_census.py docs/PRD_GOVERNANCE.md --doc-ref origin/main
     tools/citation_ref_census.py docs/PRD_GOVERNANCE.md \
         --anchor 'core/src/policy/presets.rs:89=If the act is legitimate' \
         --anchor 'core/src/server/handler.rs:2379=require_string\(args, "deny_hash"\)'
@@ -65,6 +87,9 @@ CITATION = re.compile(r"`([A-Za-z0-9_./-]+\.(?:rs|py|toml|json|md|sh)):(\d+)(?:-
 # undercounts the document's exposure by a third (24 vs 35 in PRD_GOVERNANCE.md), so
 # both are counted, and the continuation inherits the file it continues.
 CONTINUATION = re.compile(r"`:(\d+)(?:-(\d+))?`")
+# A citation immediately followed by this marker is being quoted, not made. It abuts
+# what it exempts on purpose -- see the docstring.
+QUOTED = "<!--cite:quoted-->"
 
 
 def git(*args: str) -> str:
@@ -115,6 +140,13 @@ def main() -> int:
     ap.add_argument("--baseline", default="origin/main")
     ap.add_argument("--refs", default="refs/remotes/origin")
     ap.add_argument(
+        "--doc-ref",
+        default=None,
+        metavar="REF",
+        help="read the document at REF instead of from the working tree, so the "
+        "count is re-derivable by a second reader",
+    )
+    ap.add_argument(
         "--anchor",
         action="append",
         default=[],
@@ -126,12 +158,48 @@ def main() -> int:
     refs = remote_refs(args.refs)
     tracked = set(git("ls-tree", "-r", "--name-only", args.baseline).split("\n"))
 
-    with open(args.doc, encoding="utf-8") as fh:
-        text = fh.read()
+    # Pin the document the same way the tool demands citations be pinned. `--doc-ref`
+    # reads it out of git; without one the read is the author's working tree and the
+    # header says so, loudly, next to the blob a second reader would need to reproduce
+    # the count.
+    if args.doc_ref:
+        blob = blob_at(args.doc_ref, args.doc)
+        if blob is None:
+            print(
+                f"{args.doc}: ABSENT at {args.doc_ref}. A count of zero here would "
+                "mean 'no such file', not 'no citations' -- the two read alike and "
+                "only one is a result.",
+                file=sys.stderr,
+            )
+            return 2
+        text = git("cat-file", "blob", blob)
+        doc_pin = f"{args.doc_ref} blob {blob[:7]}"
+    else:
+        with open(args.doc, encoding="utf-8") as fh:
+            text = fh.read()
+        blob = git("hash-object", "--", args.doc).strip()
+        dirty = bool(git("status", "--porcelain", "--", args.doc).strip())
+        doc_pin = (
+            f"WORKING TREE blob {blob[:7]}"
+            f"{' (uncommitted)' if dirty else ''} -- pass --doc-ref to pin it"
+        )
+
+    def quoted_at(end: int) -> bool:
+        """The marker must abut the citation it exempts -- no gap, same line.
+
+        Line granularity was tried first and is wrong here: the PRD's post-mortem
+        bullet is one paragraph on one line and carries BOTH the citation it is
+        reporting as broken and a live pointer to the corrected lines. A per-line
+        exemption would have hidden the live one, which is how a caveat becomes a
+        blanket. Per-citation is the grain the claim is made at.
+        """
+        return text.startswith(QUOTED, end)
 
     cited: dict[str, list[str]] = collections.defaultdict(list)
     unresolved: dict[str, tuple[int, str]] = {}
     continuations = 0
+    quoted = 0
+    quoted_spellings: list[str] = []
     last_path: str | None = None
     # One pass over both spellings, in document order, so a continuation inherits the
     # path that precedes it the way a reader would read it.
@@ -140,6 +208,16 @@ def main() -> int:
         + [(m.start(), "c", m) for m in CONTINUATION.finditer(text)]
     )
     for _, kind, m in events:
+        if quoted_at(m.end()):
+            # Still resolve the path so a later live continuation keeps its anchor;
+            # just do not count a report of a citation as one.
+            quoted += 1
+            quoted_spellings.append(m.group(0))
+            if kind == "q":
+                path, _ = resolve(m.group(1), tracked)
+                if path is not None:
+                    last_path = path
+            continue
         if kind == "q":
             raw, start, end = m.group(1), m.group(2), m.group(3)
             path, why = resolve(raw, tracked)
@@ -159,10 +237,17 @@ def main() -> int:
 
     total = sum(len(v) for v in cited.values())
     qualified = total - continuations + sum(n for n, _ in unresolved.values())
-    print(f"{args.doc}: {qualified + continuations} citations "
+    print(f"{args.doc} @ {doc_pin}")
+    print(f"  {qualified + continuations} live citations "
           f"({qualified} path-qualified + {continuations} bare `:NNN` continuations); "
           f"{total} resolved over {len(cited)} files, "
           f"against {len(refs)} refs under {args.refs}")
+    # Name them, do not merely count them. The marker exempts whatever it abuts, so a
+    # prose mention of the marker landing right after a real citation would exempt it
+    # silently. Printing the spellings is the control that makes that visible.
+    print(f"  {quoted} quoted, not counted (each marked {QUOTED}) -- a document "
+          "reporting a broken citation must spell it"
+          + (": " + ", ".join(quoted_spellings) if quoted_spellings else ""))
     print(f"  qualified regex : {CITATION.pattern}")
     print(f"  continuation    : {CONTINUATION.pattern}\n")
 
