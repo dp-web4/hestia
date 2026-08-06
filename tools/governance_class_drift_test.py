@@ -148,10 +148,21 @@ DECLARED = (
              "the approval system keys on the marker string with exact equality, "
              "so one approval to edit <gate> is spendable on this file and vice "
              "versa -- and this is the copy that actually parked a member. Two "
-             "files, two owners, one price and one permit. DECIDE: whether the "
-             "matcher should resolve the longest match rather than the first (cost: "
-             "one python line, and it makes the bar reachable), or whether one "
-             "approval covering both files is the intended scope."),
+             "files, two owners, one price and one permit. WHAT THE FIX WOULD AND "
+             "WOULD NOT DO, measured rather than assumed (2026-08-06): un-shadowing "
+             "changes the PERMIT POOL and nothing else. It changes the price of "
+             "NONE of the seven -- this file already reaches two-factor under either "
+             "name, because the bar's test is `contains` and this basename ends with "
+             "the one the bar names. So the open question is not how expensive this "
+             "surface should be; it is only whether an approval issued for one file "
+             "may be spent on the other. EVIDENCE FOR THAT DECISION, cited and not "
+             "adjudicated: the claim filter's own doc comment states an intent -- it "
+             "matches on member AND marker, not on the member alone, so that "
+             "approving a change to one governance file must not silently authorise "
+             "a change to another. The shadowing makes precisely that happen for "
+             "this pair. DECIDE: longest match in the matcher, or one approval "
+             "covering both files as intended scope -- noting that the second "
+             "reading contradicts a sentence already written at the filter."),
 
     dict(key="hestia_", label="<policy-core>", intended=AWAITING, via=UNNAMED, tracked=True,
          why="One approver today. Added to the matcher 2026-08-03, after the bar's "
@@ -444,6 +455,40 @@ def audit(matcher_text=None, bar_text=None, declared=DECLARED):
                 "prices a surface that never escalates, so the branch is dead and "
                 "reads as coverage")
 
+    # --- I. every clause in the bar is one an escalation can actually REACH.
+    #
+    # This closes the gap the note above E describes, which this file documented and
+    # did not check. E asks whether a bar clause names a governed name. I asks the
+    # question that decides whether the clause can ever fire: is it the clause that
+    # WINS for some marker the matcher can actually emit? A clause naming a shadowed
+    # governed name passes E and is dead -- nothing will ever be priced by it.
+    #
+    # This matters right now, not hypothetically. The remedy proposed for the shadowed
+    # row was "add one clause to the bar for that name". Measured, that clause would be
+    # dead on arrival: the matcher never emits the name, so no escalation can be handed
+    # it. Un-shadowing changes the PERMIT POOL, not the price -- the shadowed name
+    # already prices two-factor by the bar's own substring test, whichever name reaches
+    # it. Without this check the no-op remedy lands green and reads as a fix.
+    #
+    # I SUBSUMES E, and that is said here rather than discovered later. Every emitted
+    # marker is itself a governed name, so a clause deciding some marker is necessarily
+    # contained in a governed name and E cannot have fired on it; contrapositively,
+    # anything E catches, I catches. E is kept anyway: its message names the specific
+    # condition (a clause for a surface that never escalates at all), and collapsing two
+    # distinct diagnoses into one broader one costs the reader the reason. Both fire on
+    # the E sabotage; the sabotage asserts E's own text.
+    emitted = {_emitted_marker(g, governed) for g in governed} - {None}
+    deciding = {hit[0] for hit in ([s for s in strong if s in e] for e in emitted)
+                if hit}
+    for s in strong:
+        if s not in deciding:
+            bad("`bar_for` carries a clause NO ESCALATION CAN EVER REACH: no marker "
+                "the matcher can emit is decided by it, either because the name it "
+                "prices is shadowed by an earlier tuple entry or because an earlier "
+                "clause wins on every marker it would match. The branch is dead and "
+                "reads as coverage -- pricing written for acts that will never be "
+                "handed to it.")
+
     # --- F. the marker tuple's directory elements.
     # The escalation carries the MATCHED MARKER, not the act's path, and a marker
     # that names no file cannot match a bar testing for filenames -- so every
@@ -599,6 +644,14 @@ def selftest():
 
         ("the DECLARATION mis-states the mechanism (the 8552e4e row, restored)",
          mt, bt, was_substring, "DIFFERENT mechanism"),
+
+        # The proposed remedy for the shadowed row, applied. It must red, and that is
+        # the point of the check it trips: the fix is a no-op and the test says so
+        # instead of greening on it.
+        ("the 'one rust line' remedy: a bar clause for the SHADOWED name",
+         mt, _insert_before(bt, 'contains("',
+                            f'        || marker.contains("{shadow_name}")\n'),
+         DECLARED, "NO ESCALATION CAN EVER REACH"),
     ]
 
     base_fails, _ = audit()
