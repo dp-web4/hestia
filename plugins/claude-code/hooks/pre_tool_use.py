@@ -891,6 +891,7 @@ _CONTROL_FLOW_BODY = {"do", "then", "else"}        # the remainder is the body c
 _CONTROL_FLOW_COND = {"if", "elif", "while", "until"}  # the remainder EXECUTES (the condition)
 _CONTROL_FLOW_CLOSE = {"done", "fi", "esac"}       # a segment of closers runs nothing
 _FOR_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 
 
 def _control_flow_remainder(parts):
@@ -927,6 +928,36 @@ def _control_flow_remainder(parts):
             return [] if len(p) == 3 and p[2] == "in" else None
         return p
     return []
+
+
+def _assignment_remainder(parts):
+    """Consume leading NAME=VALUE assignment prefixes from one segment.
+
+    FP13 (claude-code, notice 1474 §1): the head check read `G=<path>` as a COMMAND —
+    basename(`G=<gate>`) is the gate's own filename, which sits in no head list, so a
+    member spelling a read of its own law through a variable was refused as a WRITE
+    and minted an escalation (the matched pair: `grep … <gate>` permitted,
+    `G=<gate>; grep … "$G"` refused). In shell grammar a leading NAME=VALUE token is a
+    PREFIX, not the command — it runs nothing by itself. So consume leading
+    assignments and head-check what follows; the empty case (`G=x` alone) runs
+    nothing and is read-only.
+
+    A prefix is only free when it is INERT. A command substitution inside the value
+    EXECUTES — `G=`rm -rf …`` runs the rm — and the tokeniser's substitution guard
+    catches a LEADING backtick and `$(` anywhere, but not a backtick mid-token. A
+    value carrying one fails closed here rather than being consumed.
+
+    A consume, NOT a merge into `_control_flow_remainder` (1474 §1): `for` and
+    `NAME=` have different arities, and one shared strip is how `do rm -rf /` gets
+    freed. The red arm is `assignment_does_not_launder` in `_SURVIVE`; the control
+    proves the sed grammar still decides what follows the prefix.
+    """
+    p = list(parts)
+    while p and _ASSIGNMENT.match(p[0]):
+        if "`" in p[0] or "$(" in p[0]:
+            return None  # a substitution in the VALUE runs; fail closed
+        p.pop(0)
+    return p
 
 
 def _is_read_only(tool_name: str, tool_input: Any) -> bool:
@@ -1013,6 +1044,9 @@ def _is_read_only(tool_name: str, tool_input: Any) -> bool:
         if not parts:
             continue
         parts = _control_flow_remainder(parts)
+        if parts is None:
+            return False
+        parts = _assignment_remainder(parts)
         if parts is None:
             return False
         if not parts:
