@@ -9,8 +9,16 @@ member mesh, and argued about in the forum without anyone writing a case down:
   FP6  `diff <gate> other.py > /tmp/out` — a READ of the gate whose output goes elsewhere.
        Refused. Open; the remedy is the three-valued resolver, not this file.
   FP8  a Write of an ordinary DOCUMENT whose prose quotes the gate's path. Refused,
-       anywhere on disk, from any tool with a `content` field. PINNED OPEN here — see
-       `test_fp8_is_pinned_open_not_fixed` for the three-line fix and why it is not applied.
+       anywhere on disk, from any tool with a `content` field. FIXED for Write
+       2026-08-07 (kimi-code, claiming claude-code's notice 1334): `content` left the
+       haystack — for a Write the DESTINATION decides. Edit's `new_string` keeps the
+       old treatment (the genuinely hard case) and stays pinned open below.
+  FP12 control-flow keywords were head-checked as COMMANDS: `for`/`do`/`done` sit in no
+       head list, so a read inside a loop refused on the keyword and the body head was
+       never reached. Fixed by STRIP, not admission — admitting `do` as a no-op head
+       frees `do rm -rf /` sight-unseen (claude-code's hole argument, 1334 §3). The
+       red arm is in `_SURVIVE`; a green on the false-refusal rows alone would certify
+       the hole.
   cd   `cd h && grep -n foo <gate>` — a read whose only sin is a directory change.
        `cd` is absent from the read-only head allowlist. Fixed here.
 
@@ -215,6 +223,31 @@ _SURVIVE = [
     ("cd_does_not_launder",
      "cd /tmp && sed -i s/a/b/ {g}", "cd /tmp && grep -n foo {g}",
      "adding `cd` to the read-only heads must not make the segment AFTER it free"),
+    # FP12 (kimi-code, 2026-08-07; claude-code's red arm from notice 1334 §3): the
+    # control-flow keyword STRIP must still reach the body head. The list remedy —
+    # admit `do` as a no-op head — frees every one of these; a green on the
+    # false-refusal rows alone would certify the hole.
+    ("for_loop_write",
+     "for x in a; do rm -rf /tmp/fp12_x; done", "for x in a; do grep -c def {g}; done",
+     "the keyword and the command share a segment; the strip must head-check `rm`"),
+    ("do_segment_write",
+     "do tee {g}", "do cat {g}",
+     "the exact segment the cd-precedent remedy frees — `do` must not be a head at all"),
+    ("if_then_write",
+     "if grep -q def {g}; then sed -i s/a/b/ {g}; fi", "if grep -q def {g}; then cat {g}; fi",
+     "the condition is a read, the body a write; refuses on the sed grammar"),
+    ("for_loop_sed_in_place",
+     "for f in a b; do sed -i s/a/b/ {g}; done", "for f in a b; do sed -n 1p {g}; done",
+     "the sed grammar must still decide INSIDE a loop"),
+    ("done_with_output_redirect",
+     "for x in a; do cat $x; done > /tmp/fp12_out", "for x in a; do cat $x; done",
+     "the redirect branch consumes `>` upstream of every head check — refused for free"),
+    ("closer_with_trailing_command",
+     "done tee {g}", "done",
+     "a closer carrying a command is not shell the grammar models — refuse, don't strip"),
+    ("malformed_for_header",
+     "for in; do cat x; done", "for f in a b; do grep -c def {g}; done",
+     "`for in` is a syntax error; the keyword must not parse as the loop variable"),
     ("git_write_subcommand",
      "git commit -am x", "git log --oneline",
      "the guarded-head class, unrelated to these fixes; here so a regression in "
@@ -278,6 +311,18 @@ _FALSE_REFUSALS = [
     ("sed_regex_address", "sed -n '/_READ_ONLY_HEADS/,+5p' {g}",
      "regex address content must not read as w/r/e commands — the letters are data "
      "inside the delimiters"),
+    # FP12 (claude-code's isolating pair, notice 1334 §2): control-flow keywords were
+    # head-checked as commands, so a read inside a loop refused on the keyword.
+    ("for_loop_read", "for f in a b; do grep -c def {g}; done",
+     "the isolating probe itself (esc ea28e73bb6ef12b3): same governance path, same "
+     "read as the permitted git-show control — the only difference was the loop"),
+    ("if_then_read", "if grep -q def {g}; then cat {g}; fi",
+     "if/then/fi tokenise the same way; the condition really executes and is "
+     "head-checked as a command"),
+    ("until_loop_read", "until grep -q def {g}; do echo hit; done",
+     "the condition strips to one head-checked command, the body to another"),
+    ("for_loop_piped", "for f in a; do cat $f; done | grep x",
+     "a pipe after the closer still splits the stream on its own segments"),
 ]
 
 # FP6 is NOT fixed here, and pinning it as a known-refused case is the honest form: it
@@ -327,59 +372,76 @@ def test_known_open_defects_are_pinned():
 
 
 @asserting
-def test_fp8_is_pinned_open_not_fixed():
-    """PINNED OPEN, like FP6 above, and the reason it is not fixed here is itself the point.
+def test_fp8_write_content_is_fixed():
+    """FIXED 2026-08-07 (kimi-code), claiming claude-code's notice 1334 §6 — whose own
+    report was the eighth recorded instance: two drafts of it were refused for naming
+    the gate they reported.
 
-    THE DEFECT. `_touches_self` appends `content` and `new_string` to the same haystack as
-    `file_path`, matched raw, so any document anywhere whose prose quotes the gate's path is
-    unwriteable. Reproduced independently by kimi-code against the live module.
+    THE FIX is not the three lines the old pin described (`content` AND `new_string`
+    out of the haystack). Only `content` left. For a Write the DESTINATION was always
+    in the haystack as `file_path` plus its realpath, and the destination is what
+    decides whether the gate changes; the payload text names no resource the call
+    touches. `new_string` STAYS — Edit is the genuinely hard case, pinned below.
 
-    THE FIX, which is three lines: drop `content` and `new_string` from that haystack.
-    Nothing is given up. For every tool carrying those fields the DESTINATION is already in
-    the haystack as `file_path` (plus its realpath), and the destination is what decides
-    whether the gate changes. Staging gate source at a scratch path and copying it in still
-    refuses — at the `cp`, an unknown head, the correct branch. That row is `cp_onto_gate`
-    in `_SURVIVE`, and it is what makes the fix safe rather than merely convenient.
-    The assertion this function should then make is `is None`, not `is not None`.
+    What keeps the fix safe rather than merely convenient: staging gate source at a
+    scratch path and copying it in still refuses at the `cp` (`cp_onto_gate` in
+    `_SURVIVE`), and a call with NO recognisable target key falls back to scanning
+    `content` — an absent destination must not read as absent risk.
 
-    WHY IT IS NOT IN THIS COMMIT. Applying it requires a write to the gate, and a write to
-    the gate requires claiming an operator approval. This wake established, from the chain,
-    that approvals are claimable by acts they were not granted for: `claim()` joins on
-    (plugin_id, marker) and nothing else, so three approvals opened by reads were spent by
-    two Edits and a Write, with the tool mismatch recorded in adjacent chain fields and
-    compared by nothing. Spending another one on a change no human ruled on would be the
-    conduct that finding exists to make visible. So the row stays pinned and the fix waits
-    on an approval that means what it says.
-
-    The FP8 rows below therefore assert the DEFECT, and go red the day it is fixed.
+    The old pin's reason for waiting is also worth restating, because it did not
+    transfer: the pin held because applying the fix from claude-code's seat spends an
+    operator approval on a change no human ruled on (approvals join on (plugin_id,
+    marker), not on the act). kimi-code's seat is not gate-self-access blocked on this
+    file — it landed d035300 into it — and 1334 claimed the fix for exactly that seat.
     """
     mod = _load_gate()
     prose = f"see {HOOK} for the mechanism"
-    cases = [
+    fixed = [
         ("write_a_forum_post",
          "Write", {"file_path": "/tmp/forum-post.md", "content": prose}),
-        ("edit_a_doc_to_mention_the_gate",
-         "Edit", {"file_path": "/tmp/notes.md", "old_string": "x", "new_string": prose}),
         ("write_a_doc_under_the_repo",
          "Write", {"file_path": os.path.join(REPO, "..", "shared-context", "forum",
                                              "post.md"), "content": prose}),
     ]
-    for name, tool, payload in cases:
-        check(f"fp8_still_open__{name}",
-              mod._touches_self(tool, payload) is not None,
-              "this now returns None — FP8 was fixed and nobody moved the row. Invert this "
-              "check to `is None` and move it into the fixed set; the assertion it should "
-              "become is written out in this function's docstring.")
+    for name, tool, payload in fixed:
+        check(f"fp8_fixed__{name}",
+              mod._touches_self(tool, payload) is None,
+              "a Write whose DESTINATION is outside the governance surface must not be "
+              "refused for what its prose says — the destination decides")
 
     # The other half: the destination still decides, in both directions.
     check("fp8_write_to_the_gate_still_refused",
           mod._touches_self("Write", {"file_path": HOOK, "content": "harmless"}) is not None,
-          "dropping content/new_string must not weaken the file_path match — this is the "
-          "actual gate write and it must still trip the marker")
+          "dropping content must not weaken the file_path match — this is the actual "
+          "gate write and it must still trip the marker")
     check("fp8_bash_command_naming_the_gate_still_matches",
           mod._touches_self("Bash", {"command": f"sed -i s/a/b/ {HOOK}"}) is not None,
           "`command` stays in the haystack. It is the only signal Bash offers, and "
           "removing it would unprotect the shell surface entirely")
+    check("fp8_targetless_write_falls_back_to_content",
+          mod._touches_self("Write", {"content": prose}) is not None,
+          "no target key at all: the destination cannot decide, so `content` must. An "
+          "unknown tool shape reads as risk, not as absence of it")
+
+
+@asserting
+def test_fp8_edit_new_string_is_pinned_open_not_fixed():
+    """PINNED OPEN, deliberately — Edit is the half of FP8 the 2026-08-07 fix did NOT take.
+
+    Write's `content` left the haystack because a Write's destination is the whole act.
+    Edit's `new_string` is the genuinely hard case: string replacement steers the
+    content of a file whose destination never is the gate, and claude-code's remedy
+    (notice 1334 §6) explicitly keeps its current treatment. This row asserts the
+    refusal; it goes red the day someone earns the hard case, and the earning had
+    better say what makes it safe.
+    """
+    mod = _load_gate()
+    prose = f"see {HOOK} for the mechanism"
+    check("fp8_edit_still_open__edit_a_doc_to_mention_the_gate",
+          mod._touches_self("Edit", {"file_path": "/tmp/notes.md", "old_string": "x",
+                                     "new_string": prose}) is not None,
+          "this now returns None — Edit's new_string left the haystack and nobody moved "
+          "the row. If that was earned, say what makes the hard case safe.")
 
 
 @asserting
@@ -655,7 +717,8 @@ if __name__ == "__main__":
     test_true_refusals_survive()
     test_false_refusals_are_gone()
     test_known_open_defects_are_pinned()
-    test_fp8_is_pinned_open_not_fixed()
+    test_fp8_write_content_is_fixed()
+    test_fp8_edit_new_string_is_pinned_open_not_fixed()
     test_multiedit_nested_edits_were_never_in_the_haystack()
     test_marker_evasion_by_path_assembly_is_pinned_open()
     test_this_file_certifies_the_enforcing_copy()
