@@ -9984,8 +9984,21 @@ mod authority_attribution_tests {
 // NOT witnessed. Witnessing every poll would bury the chain under one member's wait loop and make
 // the interesting entries — opened, decided — impossible to find. The wait is not an act.
 
+/// How many seats one invitation may reach.
+///
+/// Plural because dp said so — asked whether the invitation should go to more than one peer:
+/// *"i think yes."* One invited seat that happens to be asleep is an availability accident;
+/// three invited seats that all declined to look is a finding, and only a list tells those
+/// apart. Bounded because the registry is unbounded: a fleet that grows to fifty members must
+/// not turn one governance write into fifty mailbox writes per escalation.
+///
+/// When the admissible pool exceeds this, the overflow is RECORDED (`invitation_passed_over`
+/// on the chain entry), never silently dropped — a truncated invitation that reads as a
+/// complete one would make "three never looked" unfalsifiable.
+const MAX_INVITED_PEERS: usize = 8;
+
 async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolResult {
-    use crate::server::gate_escalation::{now_secs, DEFAULT_TTL_SECS};
+    use crate::server::gate_escalation::{now_secs, Bar, DEFAULT_TTL_SECS};
 
     let plugin_id = require_string(args, "plugin_id")?;
     let tool_name = require_string(args, "tool_name")?;
@@ -10042,6 +10055,89 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         }
     };
 
+    // ---- THE INVITATION HALF ----------------------------------------------------------
+    //
+    // #226 shipped dp's ruling that the two-bar is *"an invitation to participate, not a
+    // blocker"* — and shipped only the removal. `bar_met` for `SovereignPlusPeer` stopped
+    // requiring the peer conjunct; the peer half was to survive *as evidence* through
+    // `invited_peers`/`peer_participation()`. Nothing wrote it. Censused over 111,620 chain
+    // entries (`tools/cbp_invitation_census_1304.py`): 0 of 317 `gate_escalation_opened`
+    // payloads carried any key naming a peer, and all 72 `sovereign_plus_peer` escalations
+    // had `bar_met` false. So what landed was a blocker's removal with nothing standing where
+    // the invitation was, and a record that cannot distinguish INVITED-AND-ABSENT from
+    // NEVER-ASKED — the one distinction the ruling turns on. This is the writer.
+    //
+    // Only `SovereignPlusPeer` invites. `SingleApprover` names no peer conjunct, so an empty
+    // list there is the honest answer, not a gap — and the key is emitted either way, because
+    // a census over PAYLOAD KEYS cannot read a field that is sometimes absent.
+    //
+    // NOT A GATE. Nothing below can refuse the open, delay it, or change `bar_met`. An
+    // invitation that could block would re-create the blocker #226 removed, one layer out.
+    let (invited, invitation_evidence, invitation_passed_over) = if esc.bar
+        == Bar::SovereignPlusPeer
+    {
+        // Same identity test the appeal router uses, and it has the same measured reach:
+        // `member_lct` hashes the trimmed id, so it separates `codex` from `codex-cli` only
+        // by whitespace (`state::tests::the_member_lct_alias_guard_reaches_only_whitespace`).
+        // Kept because it fails CLOSED — an unmappable candidate is invited rather than
+        // dropped — but this receipt must not be read as evidence that entity resolution
+        // happened. An invitation is cheap to over-issue and expensive to under-issue.
+        let asker_lct = s.member_lct(&esc.plugin_id);
+        // Liveness is read from the member's own ACTS, never from its mailbox: a watcher
+        // queues notices under a member's id whether or not the member ever woke, so a
+        // mailbox signal would let the doorbell certify the member. Same window as the appeal
+        // router so both routing receipts on this daemon are cut from the same depth of
+        // evidence.
+        let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
+        let mut pool: Vec<(String, crate::arbiter::Liveness)> = s
+            .member_registry
+            .iter_sorted()
+            .into_iter()
+            .map(|(id, _)| id.clone())
+            .filter(|id| id != &esc.plugin_id)
+            .filter(|id| match (&asker_lct, s.member_lct(id)) {
+                (Some(a), Some(b)) => a != &b,
+                _ => true,
+            })
+            .map(|id| {
+                let l = actor_liveness(&window, &id);
+                (id, l)
+            })
+            .collect();
+        // Live first, then dormant, then unknown; the id breaks ties so the order — and
+        // therefore who survives the cap — is deterministic and not a function of HashMap
+        // iteration. Ordering is a REACHABILITY preference, not a merit one: a seat that has
+        // acted this hour is likelier to read the notice in time to corroborate.
+        pool.sort_by_key(|(id, l)| {
+            (
+                match l {
+                    crate::arbiter::Liveness::Live => 0u8,
+                    crate::arbiter::Liveness::Dormant => 1,
+                    crate::arbiter::Liveness::Unknown => 2,
+                },
+                id.clone(),
+            )
+        });
+        let over = pool.split_off(pool.len().min(MAX_INVITED_PEERS));
+        (
+            pool.iter().map(|(id, _)| id.clone()).collect::<Vec<String>>(),
+            pool.iter()
+                .map(|(id, l)| json!({"peer": id, "liveness_at_invite": l}))
+                .collect::<Vec<Value>>(),
+            over.iter()
+                .map(|(id, l)| json!({"peer": id, "liveness_at_invite": l}))
+                .collect::<Vec<Value>>(),
+        )
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+    // Written to the store BEFORE the witness, so the entry below records the invitation that
+    // actually exists rather than one this call intends to make. `invite` returns false only
+    // for an unknown id, which cannot happen here — `open` just inserted it — and is not
+    // worth branching on: a lost invitation would show up as an empty list in the entry,
+    // which is exactly what a reader should then see.
+    s.gate_escalations.invite(&esc.id, invited.clone());
+
     let entry = s.append_chain(
         "gate_escalation_opened",
         json!({
@@ -10051,6 +10147,21 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
             "role": esc.role,
             "tool_name": esc.tool_name,
             "marker": esc.marker,
+            // WHO WAS ASKED. The field whose absence made "invited and absent" and "never
+            // asked" the same row. Empty is a real answer here and means one of two things
+            // the `bar` alongside it disambiguates: a `single_approver` bar asks for no peer,
+            // while an empty list under `sovereign_plus_peer` says this box knows no
+            // admissible peer to ask.
+            "invited_peers": invited,
+            // The evidence the invitation was issued ON — liveness AT INVITE, per seat.
+            // Without it, an absent peer six hours later cannot be told from a seat that was
+            // already dark when it was asked, and `peer_participation().absent` would carry
+            // an accusation it has no basis for.
+            "invitation_evidence": invitation_evidence,
+            // Admissible peers the cap dropped. Recorded rather than truncated silently: a
+            // bounded invitation that reads as an exhaustive one makes "nobody looked"
+            // unfalsifiable.
+            "invitation_passed_over": invitation_passed_over,
             // The act this one answers. Null when the caller did not supply it — an absent
             // link reads as absent, never as inferred.
             "answers_deny": answers_deny,
@@ -10066,6 +10177,37 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         }),
     )?;
 
+    // DELIVER IT. An invitation nobody is told about is a label, and a label on a record is
+    // the shape this subsystem keeps producing: `invited_peers` existed as a field for a
+    // fortnight and named nobody. The notice is a WAKE, not a vote — the peer still has to
+    // read the escalation and choose to corroborate or dissent, and `hestia_gate_escalation_
+    // corroborate` is the only door that adds its factor.
+    //
+    // Failure to queue does not void the invitation. The peer was asked; the mesh dropped it.
+    // Recording the queue error keeps those two apart, which is the same reason `absent` is
+    // derived rather than stored.
+    let mut invitations: Vec<Value> = Vec::new();
+    let pointer = format!("hestia://escalation/{}#corroborate-or-dissent", esc.id);
+    for peer in &invited {
+        match s.inbox_store.enqueue_member(
+            peer,
+            &esc.plugin_id,
+            &esc.role,
+            "review_request",
+            Some(pointer.as_str()),
+            &entry.hash,
+            None,
+        ) {
+            Ok(qid) => invitations.push(json!({"peer": peer, "queued_id": qid})),
+            Err(e) => {
+                tracing::warn!(peer = %peer, escalation = %esc.id, error = %e,
+                               "escalation invitation issued but dispatch failed");
+                invitations.push(json!({"peer": peer, "queued_id": null,
+                                        "dispatch_error": e.to_string()}));
+            }
+        }
+    }
+
     Ok(json!({
         "escalation_id": esc.id,
         "status": esc.stored_status(),
@@ -10073,11 +10215,29 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         "expires_at": esc.expires_at,
         "ttl_secs": DEFAULT_TTL_SECS,
         "witnessEntryHash": entry.hash,
+        // Told to the ASKER too, not only written to the chain. #219's finding was that a
+        // decider was handed a bare `approved` while the entry two lines up carried the
+        // criterion; the same asymmetry here would have the asker believe a peer is looking
+        // when the registry knows none.
+        "invited_peers": invited,
+        "invitations": invitations,
         "how_to_decide": format!(
             "hestia gate approve {id}   (or: hestia gate deny {id} --reason '...')",
             id = esc.id
         ),
         "on_timeout": "DENIED — no decision within the window is a refusal, not a retry",
+        // Say plainly when nobody was asked. Silence would read as "asked, and they agreed".
+        "invitation_note": match (esc.bar, invited.is_empty()) {
+            (Bar::SingleApprover, _) =>
+                "this bar names no peer conjunct — no invitation was issued, and none was due",
+            (Bar::SovereignPlusPeer, true) =>
+                "this bar invites a peer and this box knows no admissible one to ask. The \
+                 sovereign may still decide (#226: the two-bar invites, it does not block) — \
+                 the record will say the peer half was never asked, not that it declined",
+            (Bar::SovereignPlusPeer, false) =>
+                "peers were invited and woken. Their participation is EVIDENCE, never a veto: \
+                 a sovereign decision stands whether they concur, dissent, or never look",
+        },
     }))
 }
 

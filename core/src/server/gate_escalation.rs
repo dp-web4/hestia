@@ -616,7 +616,24 @@ impl EscalationStore {
                         id.clone(),
                         Escalation {
                             id,
-                            invited_peers: Vec::new(),
+                            // RESTORE THE INVITATION, not just the ask. Exactly the defect
+                            // `factors_present` below was written to close, one field over: an
+                            // escalation restored with an empty invitation reads `absent: 0`
+                            // and `peer_participation()` reports "nobody was asked" about a
+                            // decision where three seats WERE asked and none looked. That is
+                            // the finding the invitation exists to produce, and a daemon
+                            // restart would erase it — silently, and in the direction that
+                            // flatters the record.
+                            //
+                            // Absent key restores empty, which is honest for every escalation
+                            // opened before this writer existed (all 317 of them) and for
+                            // every `SingleApprover` open, whose bar asks for no peer.
+                            invited_peers: d
+                                .get("invited_peers")
+                                .and_then(|v| {
+                                    serde_json::from_value::<Vec<String>>(v.clone()).ok()
+                                })
+                                .unwrap_or_default(),
                             plugin_id,
                             role: s(d, "role").unwrap_or_default(),
                             tool_name: s(d, "tool_name").unwrap_or_default(),
@@ -763,6 +780,43 @@ impl EscalationStore {
         };
         self.by_id.insert(id, esc.clone());
         Ok(esc)
+    }
+
+    /// Record which seats were INVITED to participate — the production writer the invitation
+    /// half never had.
+    ///
+    /// #226 implemented dp's ruling that the two-bar is *"an invitation to participate, not a
+    /// blocker"*: `bar_met` for `SovereignPlusPeer` stopped requiring the peer conjunct, and
+    /// the peer half was retained *as evidence* through `invited_peers` /
+    /// `peer_participation()`. The removal shipped. The evidence did not. Censused over
+    /// 111,620 chain entries (`tools/cbp_invitation_census_1304.py`): `invited_peers` had NO
+    /// production writer — `open()` and `rehydrate()` both set `Vec::new()`, and the only
+    /// assignment in the crate was inside a test — and **0 of 317 `gate_escalation_opened`
+    /// payloads carried any key naming a peer**. So the record could not tell *invited and
+    /// absent* from *never asked*, which is the one distinction the ruling says it preserves.
+    ///
+    /// Separate from `open` on purpose. `open` is pure over the store and takes no view of the
+    /// society; resolving a peer pool needs the member registry and a chain window, which live
+    /// a layer up (`handler::tool_gate_escalation_open`). Keeping the resolution there and the
+    /// recording here means this store never has to know what a member is — and it means the
+    /// invitation is written by the same call that witnesses it, not by a background sweep
+    /// that could disagree with the chain.
+    ///
+    /// Idempotent by overwrite: the last invitation wins. There is no accumulate semantics
+    /// because a second invitation to a different set is a different fact, not more of the
+    /// same one, and `absent` is derived from this list — appending would inflate it.
+    ///
+    /// Returns false for an unknown id rather than synthesising a shell. An invitation
+    /// attached to an escalation this store cannot describe is a record of nothing, and
+    /// `rehydrate` already refuses to invent shells for the same reason.
+    pub fn invite(&mut self, id: &str, peers: Vec<String>) -> bool {
+        match self.by_id.get_mut(id) {
+            Some(e) => {
+                e.invited_peers = peers;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Spend an existing approval for this exact (member, governance file), if one is live.
@@ -1026,6 +1080,110 @@ mod tests {
         assert_eq!(s5.rehydrate(&[opened("eee5")], T0 + 7200), 0);
     }
 
+    /// A restart must not erase WHO WAS ASKED.
+    ///
+    /// The same defect `factors_present` above was written to close, one field over, and it
+    /// fails in the flattering direction: an escalation restored with an empty invitation
+    /// reports `absent: 0`, so `peer_participation()` says "nobody was asked" about a decision
+    /// where three seats were asked and none looked — which is precisely the finding the
+    /// invitation exists to produce (dp: one asleep is an availability accident, three that
+    /// never looked is a finding).
+    ///
+    /// RED ARM: with `invited_peers` restored as `Vec::new()` — what `rehydrate` did until
+    /// this commit — the first `absent` assertion below reads 0 and fails.
+    #[test]
+    fn replay_restores_who_was_invited_not_only_who_answered() {
+        let opened_with = |id: &str, invited: serde_json::Value| {
+            chain_entry(
+                "gate_escalation_opened",
+                serde_json::json!({
+                    "escalation_id": id, "plugin_id": "claude-code",
+                    "role": "role:constellation:member", "tool_name": "Edit",
+                    "marker": "pre_tool_use.py",
+                    "opened_at": T0, "expires_at": T0 + 3600,
+                    "invited_peers": invited,
+                }),
+            )
+        };
+
+        let mut s = EscalationStore::default();
+        assert_eq!(
+            s.rehydrate(
+                &[opened_with("f001", serde_json::json!(["kimi-code", "codex", "thor"]))],
+                T0 + 20
+            ),
+            1
+        );
+        let p = s.get("f001").unwrap().peer_participation();
+        assert_eq!(
+            p.invited,
+            vec!["kimi-code".to_string(), "codex".to_string(), "thor".to_string()],
+            "the invitation is part of the record, not a runtime detail — a restart that \
+             drops it turns 'three were asked and none looked' into 'nobody was asked'"
+        );
+        assert_eq!(
+            p.absent, 3,
+            "absent is DERIVED from the invitation; an erased invitation reports 0 absent, \
+             which is the same number a never-invited escalation reports"
+        );
+        assert_eq!(p.concurred, 0);
+
+        // And it survives a peer answering after the replay — the arithmetic still refers to
+        // the restored list rather than to whoever happened to show up.
+        s.corroborate("f001", "kimi-code", "role:constellation:member", None, false, T0 + 30)
+            .expect("an invited peer may participate");
+        let p2 = s.get("f001").unwrap().peer_participation();
+        assert_eq!(p2.concurred, 1);
+        assert_eq!(p2.absent, 2, "two of the three invited seats still have not looked");
+
+        // A pre-invitation entry — every one of the 317 opens on this chain before this
+        // commit — restores empty. That is honest, not a gap: nobody was asked.
+        let mut s2 = EscalationStore::default();
+        s2.rehydrate(
+            &[chain_entry(
+                "gate_escalation_opened",
+                serde_json::json!({
+                    "escalation_id": "f002", "plugin_id": "claude-code", "role": "r",
+                    "tool_name": "Edit", "marker": "pre_tool_use.py",
+                    "opened_at": T0, "expires_at": T0 + 3600,
+                }),
+            )],
+            T0 + 20,
+        );
+        assert!(s2.get("f002").unwrap().peer_participation().invited.is_empty());
+
+        // A malformed value must not poison the replay. Fail closed to "nobody asked" rather
+        // than dropping the escalation: an unrulable governance record is worse than an
+        // unattributed one, and `invited_peers` is evidence, never a gate.
+        let mut s3 = EscalationStore::default();
+        assert_eq!(
+            s3.rehydrate(&[opened_with("f003", serde_json::json!("kimi-code"))], T0 + 20),
+            1,
+            "the escalation still restores"
+        );
+        assert!(s3.get("f003").unwrap().peer_participation().invited.is_empty());
+    }
+
+    /// `invite` refuses an id the store cannot describe.
+    ///
+    /// `rehydrate` already refuses to synthesise shells for unknown ids, for the reason its
+    /// doc gives: a governance record no witnessed act supports must not reach an operator.
+    /// An invitation attached to nothing is the same object, and returning `true` here would
+    /// let the caller witness "we asked three peers about escalation X" where X does not
+    /// exist.
+    #[test]
+    fn an_invitation_to_an_unknown_escalation_is_refused() {
+        let (mut s, id) = store_with_one();
+        assert!(!s.invite("deadbeefdeadbeef", vec!["kimi-code".into()]));
+        assert!(s.invite(&id, vec!["kimi-code".into()]));
+
+        // Overwrite, not append: a second invitation to a different set is a different fact,
+        // and appending would inflate `absent` with seats counted twice.
+        assert!(s.invite(&id, vec!["codex".into()]));
+        assert_eq!(s.get(&id).unwrap().peer_participation().invited, vec!["codex".to_string()]);
+        assert_eq!(s.get(&id).unwrap().peer_participation().absent, 1);
+    }
+
     /// Opens on `law_inject.py` — the SingleApprover surface. Claim-mechanics tests live
     /// here because their subject is the claim, not the bar; bar semantics have their own
     /// module (bar_factor_tests).
@@ -1105,8 +1263,12 @@ mod tests {
 
         // Invited seats, plural — dp: "should invitation go out to more than one peer?
         // i think yes."
-        s.by_id.get_mut(&id).unwrap().invited_peers =
-            vec!["kimi-code".to_string(), "codex".to_string()];
+        //
+        // Through `invite()`, the production writer. This line used to reach into `by_id`
+        // directly, and that WAS the whole population of writers: `invited_peers` was set
+        // nowhere else in the crate, so this assertion passed on an invitation no escalation
+        // outside a test could ever have.
+        assert!(s.invite(&id, vec!["kimi-code".to_string(), "codex".to_string()]));
 
         let after = s
             .corroborate(&id, "kimi-code", "role:constellation:member", None, true, T0 + 90)
