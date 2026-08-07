@@ -495,6 +495,25 @@ def audit(matcher_text=None, bar_text=None, declared=DECLARED):
     # directory element in that tuple routes to the single-approver branch by
     # construction, however precisely the bar is written. Pinned so a new one is a
     # reviewed diff rather than a widening nobody sees.
+    #
+    # PIN MOVED 2 -> 4 (PR #275, reviewed in shared-context forum "Two reds in a
+    # queue of ten", 2026-08-07): the two installer markers
+    # (`plugins/claude-code/install.sh`, `deploy/install-members.sh`) join the two
+    # hook-directory markers. The review's rationale, which this bump must carry:
+    # (1) both price at SingleApprover -- `bar_for` (gate_escalation.rs:228-237)
+    #     escalates only markers containing `pre_tool_use.py`, `post_tool_use.py`
+    #     or `witness.py`, and neither installer path contains one, so the act
+    #     that REWRITES the gate is escalatable at one approver while editing the
+    #     gate needs two. Priced, not uncontrollable.
+    # (2) reachable, not shadowed -- the matcher returns the FIRST tuple entry
+    #     that is a substring of the tool input, and no earlier entry is a
+    #     substring of either installer path, so the markers are emitted as
+    #     themselves: a live clause, two lines in `bar_for` from a higher bar.
+    # (3) this move is a TIGHTENING, not the widening the failure message below
+    #     asserts: the prior state of `bash <installer>` was ALLOWED outright
+    #     (no set), so the diff moves ungoverned -> weak, not strong -> weak.
+    #     The message conflates the two; fixing it is follow-up against main,
+    #     not a blocker here.
     if markers is None:
         bad("the marker tuple is unreadable; the directory-element pin below could "
             "not be checked and a silent widening would not show up here")
@@ -506,8 +525,8 @@ def audit(matcher_text=None, bar_text=None, declared=DECLARED):
                    f"({computed} computed from __file__, {len(lits)} literal); "
                    f"{len(dir_lits)} literal element(s) name no governed file and "
                    f"therefore price at one approver whatever the bar says")
-        if len(dir_lits) != 2 or computed != 2:
-            bad(f"the marker tuple's shape moved (expected 2 computed + 2 literal "
+        if len(dir_lits) != 4 or computed != 2:
+            bad(f"the marker tuple's shape moved (expected 2 computed + 4 literal "
                 f"directory elements, measured {computed} computed + "
                 f"{len(dir_lits)} literal). Every directory element is an act that "
                 f"cannot reach the two-factor bar; adding one widens the weak set "
