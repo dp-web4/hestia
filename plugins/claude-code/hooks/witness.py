@@ -48,7 +48,7 @@ PLUGIN_ID = os.environ.get("HESTIA_PLUGIN_ID", "claude-code")
 HOST_AGENT = os.environ.get("HESTIA_HOST_AGENT", PLUGIN_ID)
 PROTOCOL_VERSION = "2024-11-05"
 TIMEOUT_S = 2.0
-HOOK_VERSION = "0.0.2"
+HOOK_VERSION = "0.0.3"
 
 STATE_DIR = Path(
     os.environ.get("HESTIA_STATE_DIR")
@@ -297,6 +297,16 @@ def run() -> int:
         role = os.environ.get("HESTIA_ROLE")
         if role:
             connect_args["role"] = role
+        # Optional basis for that role — HOW it was established (e.g.
+        # "provisional:declared-by-fire; identity file absent or unreadable
+        # at …"). Exported by the member-mesh fire scripts alongside
+        # HESTIA_ROLE when the identity file could not be hydrated. The daemon
+        # carries it onto outcome chain entries so a provisional role is
+        # distinguishable from a hydrated one — the role string alone cannot
+        # separate them. Absent env → omit.
+        role_basis = os.environ.get("HESTIA_ROLE_BASIS")
+        if role_basis:
+            connect_args["role_basis"] = role_basis
         connect_resp = client.call_tool("hestia_connect", connect_args)
         connect = unwrap_tool_result(connect_resp)
         if "_hestia_error" in connect:
