@@ -1,4 +1,16 @@
 {
-  "gate": ["PreToolUse"],
-  "observe": ["PostToolUse"]
+  "gate": [
+    "PreToolUse"
+  ],
+  "install": {
+    "dest": "~/.claude/hooks/hestia",
+    "files": [
+      "hooks/pre_tool_use.py",
+      "hooks/witness.py",
+      "hooks/law_inject.py"
+    ]
+  },
+  "observe": [
+    "PostToolUse"
+  ]
 }

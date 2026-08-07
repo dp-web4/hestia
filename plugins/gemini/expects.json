@@ -1,4 +1,16 @@
 {
-  "gate": ["BeforeTool"],
-  "observe": ["AfterTool"]
+  "gate": [
+    "BeforeTool"
+  ],
+  "install": {
+    "dest": "~/.gemini/hooks",
+    "files": [
+      "hooks/before_tool.py",
+      "hooks/observe.sh",
+      "hooks/hydrate.sh"
+    ]
+  },
+  "observe": [
+    "AfterTool"
+  ]
 }

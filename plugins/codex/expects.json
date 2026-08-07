@@ -1,4 +1,17 @@
 {
-  "gate": ["PreToolUse"],
-  "observe": ["PostToolUse"]
+  "gate": [
+    "PreToolUse"
+  ],
+  "install": {
+    "dest": "~/.codex/hooks",
+    "files": [
+      "hooks/pre_tool_use.py",
+      "hooks/witness.py",
+      "hooks/observe.sh",
+      "hooks/hydrate.sh"
+    ]
+  },
+  "observe": [
+    "PostToolUse"
+  ]
 }
