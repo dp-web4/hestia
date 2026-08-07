@@ -28,6 +28,14 @@
 //! an `escalation queued:` reason (gate profile §5 — the immediate effect of an
 //! escalate is a blocking deny-with-reason; the sovereign-review queue is a
 //! follow-on, never the hot path).
+//!
+//! **And it carries the chosen resolver as data** (#264): an escalating evaluation adds an
+//! `escalate_to:<who>` token to `constraints` — the trigger's named resolver, or `sovereign`
+//! when a norm escalates without naming one. Previously that value reached only the reason
+//! sentence, so resolver-selection could recover it only by parsing English. The verdict is
+//! deliberately unchanged: `Escalate` stays a Deny until a policy-agent exists to rule one
+//! (PRD §8.2's ladder), because a permissive verdict with no awake resolver behind it widens
+//! the gate for nothing. What changes here is that the refusal is now *routable*.
 
 use std::path::Path;
 
@@ -92,12 +100,15 @@ impl LawGate {
     /// `PolicyEvaluation` suitable for `fold_strictest` alongside the base and
     /// role-overlay evaluations.
     pub fn evaluate(&self, pa: &PolicyAction<'_>, role: &str) -> PolicyEvaluation {
-        let (decision, rule_id, rule_name, reason) = match self {
+        let (decision, rule_id, rule_name, reason, escalate_target) = match self {
             LawGate::Invalid { error } => (
                 PolicyDecision::Deny,
                 Some("law:invalid".to_string()),
                 Some("Hub law unparseable".to_string()),
                 format!("hub law present but invalid (fail-closed): {error}"),
+                // No resolver: unparseable law names nobody, and inventing a default here
+                // would route a refusal to a resolver the law never chose.
+                None,
             ),
             LawGate::Active { law, .. } => {
                 let req = R6Request {
@@ -108,15 +119,43 @@ impl LawGate {
                 };
                 let outcome = law.evaluate_outcome(&req);
                 let norm = outcome.winning_norm.clone();
+                // THE RESOLVER SURVIVES AS DATA, not only as prose (#264, PRD §8.1/§8.2).
+                //
+                // `outcome.escalate_to` names WHO hub law wants to resolve this. It was
+                // interpolated into the reason sentence and nowhere else, so the one fact the
+                // ladder needs — which resolver — could only be recovered by parsing English.
+                // A structured fact demoted to a declared string is this repo's recurring
+                // defect; here it was the reason the resolver pool has exactly one member in
+                // it (measured: 215 of 215 escalation decisions `decided_by: operator`).
+                //
+                // Carried on `constraints` rather than as a new field on `PolicyEvaluation`:
+                // that vector is already this type's machine-readable channel (`decision:`,
+                // `rule:`, `policy:` tokens), so consumers that already tokenise it get this
+                // for free, and 12 construction sites across 4 files stay untouched.
+                let mut escalate_to: Option<String> = None;
                 let (decision, reason) = match outcome.decision {
-                    Decision::Escalate => (
-                        PolicyDecision::Deny,
-                        format!(
-                            "escalation queued: hub law escalates to '{}' (norm {})",
-                            outcome.escalate_to.as_deref().unwrap_or("sovereign"),
-                            norm.as_deref().unwrap_or("escalation-trigger"),
-                        ),
-                    ),
+                    Decision::Escalate => {
+                        let to = outcome
+                            .escalate_to
+                            .clone()
+                            .unwrap_or_else(|| "sovereign".to_string());
+                        escalate_to = Some(to.clone());
+                        (
+                            // STAYS DENY, DELIBERATELY. Fail-closed is not what is wrong here —
+                            // an escalation with no awake resolver must refuse, and until a
+                            // policy-agent exists to rule one, promoting this to a distinct
+                            // permissive verdict would widen the gate with nothing behind it.
+                            // What was wrong is that the routing was unreadable. Restoring
+                            // `Escalate` as a true verdict is the step AFTER a driver exists
+                            // (#264 step 3), not before it.
+                            PolicyDecision::Deny,
+                            format!(
+                                "escalation queued: hub law escalates to '{}' (norm {})",
+                                to,
+                                norm.as_deref().unwrap_or("escalation-trigger"),
+                            ),
+                        )
+                    }
                     d => {
                         let mapped = map_decision(d);
                         let reason = match (&mapped, &norm) {
@@ -132,14 +171,21 @@ impl LawGate {
                     norm.map(|id| format!("law:{id}")),
                     Some("Hub law".to_string()),
                     reason,
+                    escalate_to,
                 )
             }
         };
-        let constraints = vec![
+        let mut constraints = vec![
             "policy:hub-law".to_string(),
             format!("decision:{}", decision.as_str()),
             format!("rule:{}", rule_id.as_deref().unwrap_or("law:default")),
         ];
+        // Present ONLY when hub law actually escalated. Its absence is a fact — "this deny
+        // was not an escalation" — so a resolver-selection step can tell a refusal it may
+        // route from one it may not, without reading the reason prose.
+        if let Some(to) = escalate_target {
+            constraints.push(format!("escalate_to:{to}"));
+        }
         PolicyEvaluation {
             decision,
             rule_id,
@@ -278,6 +324,98 @@ norms:
         let eval = gate.evaluate(&pa(), "role:any");
         assert_eq!(eval.decision, PolicyDecision::Deny);
         assert!(eval.reason.starts_with("escalation queued:"));
+    }
+
+    /// The NAMED resolver must be readable without parsing prose (#264).
+    ///
+    /// Uses an `escalation[]` trigger, which is the only path that carries a chosen
+    /// resolver: per the canonical engine, a winning norm with `decision: escalate`
+    /// leaves `escalate_to: None` and defaults to `sovereign`, while a trigger names one.
+    /// The trigger case is therefore the one where routing information exists to lose —
+    /// and losing it is what this asserts against. It failed on the old code, where
+    /// `escalate_to` reached `reason` and nothing else, so resolver-selection could only
+    /// recover it by parsing an English sentence — one wording change from routing nothing.
+    #[test]
+    fn a_named_resolver_is_carried_as_data_not_only_prose() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_law(
+            tmp.path(),
+            r#"
+version: "1.0.0"
+norms: []
+escalation:
+  - condition: "r6.request.action == Bash"
+    escalate_to: policy-agent
+"#,
+        );
+        let gate = LawGate::load(tmp.path()).unwrap();
+        let eval = gate.evaluate(&pa(), "role:any");
+
+        assert_eq!(eval.decision, PolicyDecision::Deny, "fail-closed is unchanged");
+        assert!(
+            eval.constraints.iter().any(|c| c == "escalate_to:policy-agent"),
+            "the named resolver must appear as a constraint token, not only inside the \
+             reason sentence: {:?}",
+            eval.constraints
+        );
+    }
+
+    /// A norm-level `escalate` names nobody, so the default is what must be carried — and
+    /// carried EXPLICITLY. `sovereign` here is a real routing answer ("the operator"), not
+    /// a placeholder, and a consumer must not have to infer it from the token's absence.
+    #[test]
+    fn a_norm_level_escalate_carries_the_sovereign_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_law(
+            tmp.path(),
+            r#"
+version: "1.0.0"
+norms:
+  - id: escalate-bash
+    selector: r6.request.action
+    operator: "=="
+    value: Bash
+    decision: escalate
+    priority: 10
+"#,
+        );
+        let gate = LawGate::load(tmp.path()).unwrap();
+        let eval = gate.evaluate(&pa(), "role:any");
+        assert_eq!(eval.decision, PolicyDecision::Deny);
+        assert!(
+            eval.constraints.iter().any(|c| c == "escalate_to:sovereign"),
+            "{:?}",
+            eval.constraints
+        );
+    }
+
+    /// The ABSENCE of the token is also a fact: a deny that is not an escalation must not
+    /// look routable. Without this, a resolver-selection step cannot tell "no resolver
+    /// named" from "token not implemented yet", which is the null-state twin one layer up.
+    #[test]
+    fn a_plain_deny_carries_no_escalate_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_law(
+            tmp.path(),
+            r#"
+version: "1.0.0"
+norms:
+  - id: deny-bash
+    selector: r6.request.action
+    operator: "=="
+    value: Bash
+    decision: deny
+    priority: 10
+"#,
+        );
+        let gate = LawGate::load(tmp.path()).unwrap();
+        let eval = gate.evaluate(&pa(), "role:any");
+        assert_eq!(eval.decision, PolicyDecision::Deny);
+        assert!(
+            !eval.constraints.iter().any(|c| c.starts_with("escalate_to:")),
+            "a non-escalating deny must name no resolver: {:?}",
+            eval.constraints
+        );
     }
 
     #[test]
