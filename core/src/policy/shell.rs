@@ -772,6 +772,21 @@ mod tests {
     // (commit/tag -F -)", explicitly NOT adding `git` to the head-level allowlist.
 
     #[test]
+    fn adding_git_to_the_head_allowlist_would_be_dead_code_so_say_so() {
+        // Found by sabotaging this diff's own controls. `treats_content_as_data` matches
+        // `Some("git")` BEFORE consulting the list, so a future editor who "widens the
+        // allowlist" the documented way — add a name, in a reviewed diff — changes
+        // nothing at all, and every test here stays green about it. That is the exact
+        // failure mode this module's doc comment warns about in the other direction, so
+        // make the shadow loud instead of silent.
+        assert!(
+            !INERT_CONTENT_HEADS.contains(&"git"),
+            "git in INERT_CONTENT_HEADS is unreachable — the Some(\"git\") arm in \
+             Segment::treats_content_as_data decides first. Change git_stdin_is_data."
+        );
+    }
+
+    #[test]
     fn the_commit_message_that_started_this() {
         // Deny 9199c25e… verbatim in shape: the `-c` flags are the ones that were on it.
         let cmd = "git -c user.name=\"Dennis Palatov\" -c user.email=\"dp@dpcars.net\" \
