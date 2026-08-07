@@ -40,10 +40,13 @@ fn version_parenthesized_substring_is_the_dashboard_running_build() {
 /// permanently-amber failure this file exists to keep loud.
 ///
 /// Scope, stated so the guard is not over-trusted: the bare-`g<hash>`
-/// assertion below guards the *known landmine*, not the value's format
+/// assertions below guard the *known landmine*, not the value's format
 /// generally — a regression to some other non-`git describe` string
 /// (`v0.1.2`, `607-ge720d0a`) still passes, and narrowing that is deliberate
-/// (claude-code review of #239, note 1).
+/// (claude-code review of #239, note 1). Two passes: a structured scan of
+/// every readable `"build_id"` example, and a whole-doc scan for a bare
+/// `g<hex>` token, because the structured scan can only check spellings it
+/// can parse (claude-code re-measure of the arm-C fix, arm G).
 #[test]
 fn dashboard_doc_recipe_points_at_version_self_report() {
     let doc = include_str!("../../docs/DASHBOARD.md");
@@ -75,12 +78,42 @@ fn dashboard_doc_recipe_points_at_version_self_report() {
              `git describe` never emits, so the recipe cannot produce it"
         );
     }
-    // Without this, a doc that stops showing a build_id example at all — or a
-    // spelling this scanner cannot read — reports the same green as a doc that
-    // passed on the merits.
+    // Without this, a doc that stops showing a readable build_id example at
+    // all reports the same green as a doc that passed on the merits.
     assert!(
         examples > 0,
         "DASHBOARD.md must carry at least one `build_id` example for this guard to check; \
          found none, so the bare-g<hash> assertion above never ran"
     );
+    // But examples>0 proves the scanner read AT LEAST ONE example, not ALL
+    // of them: a landmine in a spelling the loop above cannot parse (single
+    // quotes, YAML, an unquoted value) sat green beside one readable good
+    // example — arm G, claude-code re-measure of the arm-C fix. The
+    // landmine's own signature is spelling-independent, so close the hole
+    // where the value actually lives: scan the WHOLE doc for a bare
+    // `g<hex>` token — a string `git describe --tags --always --dirty`
+    // never emits on its own (its hash always rides a `<tag>-<n>-` prefix,
+    // which is why the left boundary below excludes '-', sparing the
+    // `-ge720d0a` inside a real describe string). However the example is
+    // spelled, the value itself cannot hide.
+    let bytes = doc.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] != b'g' {
+            continue;
+        }
+        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'-') {
+            continue; // hash inside a real describe string, or an ordinary word
+        }
+        let hex_run = bytes[i + 1..]
+            .iter()
+            .take_while(|b| b.is_ascii_hexdigit())
+            .count();
+        assert!(
+            hex_run < 7,
+            "DASHBOARD.md carries a bare g<hash> token (`{}…`) — a format \
+             `git describe` never emits on its own, so a supervisor copying \
+             it produces a manifest that can never match",
+            &doc[i..doc.len().min(i + 12)]
+        );
+    }
 }
