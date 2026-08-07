@@ -182,4 +182,71 @@ for label, tool, ti in [
 ]:
     check(f"WRITE refused: {label}", G._is_read_only(tool, ti) is False)
 
+print("the heredoc carve-out — the law text a member READS is the code that REFUSES")
+# kimi-code, 2026-08-07, claiming claude-code notice 1529 §7. The daemon's destructive
+# preset tells the member "a quoted heredoc body under cat/tee does not trip it"
+# (presets.rs, backed by policy::shell) — but this hook runs FIRST and matched raw, so a
+# report ABOUT the gate written by heredoc was refused by code the quoted law does not
+# describe (the FP8 shape through the Bash door). `_blank_inert_heredoc_bodies` blanks
+# quoted heredoc bodies — stdin content, the one span that can never name a destination —
+# under inert heads only, failing closed on anything it cannot parse. Every case below
+# was confirmed against the intent in the daemon's own shell.rs test suite.
+GATE = "plugins/claude-code/hooks/pre_tool_use.py"
+
+for label, cmd in [
+    ("a heredoc REPORT naming the gate is allowed",
+     f"cat > /tmp/report.md <<'EOF'\nthe gate lives at {GATE}\nEOF"),
+    ("tee holding the pen is the same shape",
+     f"tee /tmp/r.md <<'EOF'\nsee witness.py and hestia_gate_core.py\nEOF"),
+    ("a heredoc body piped to an inert consumer is allowed",
+     f"cat <<'EOF' | grep hooks\n{GATE}\nEOF"),
+    ("an assignment prefix does not confuse head detection",
+     f"LC_ALL=C cat > /tmp/r.md <<'EOF'\n{GATE} mention\nEOF"),
+    ("the tab-stripping <<- form is honoured",
+     f"cat > /tmp/r.md <<-'EOF'\n\t{GATE}\n\tEOF"),
+]:
+    check(f"ALLOWED: {label}", not denied("Bash", {"command": cmd}))
+
+for label, cmd in [
+    # the destination always sits OUTSIDE the body, in executable position
+    ("a heredoc INTO the gate is refused (redirect target)",
+     f"cat > {GATE} <<'EOF'\nx\nEOF"),
+    ("tee onto the gate is refused (argument position)",
+     f"tee {GATE} <<'EOF'\nx\nEOF"),
+    # quoted argument spans are NOT blanked here — this gate matches paths, and a path
+    # can sit at argument position; blanking it would be a one-word evasion
+    ("a QUOTED destination stays refused (no quoted-span blanking)",
+     f"cat > \"{GATE}\" <<'EOF'\nx\nEOF"),
+    # nothing downstream may re-interpret the body
+    ("a body piped INTO a shell keeps its teeth",
+     f"cat <<'EOF' | sh\ntouch {GATE}\nEOF"),
+    # an interpreter head is not on the inert list
+    ("python3's heredoc is code, not data",
+     f"python3 <<'EOF'\nopen('{GATE}','w')\nEOF"),
+    ("sh -c wrapping the heredoc stays refused",
+     f"sh -c \"cat <<'EOF'\n{GATE}\nEOF\""),
+    # an UNQUOTED delimiter can expand $(...) — not literal, stays visible
+    ("an unquoted heredoc delimiter can expand, so stays refused",
+     f"cat <<EOF\n{GATE}\nEOF"),
+    # fail closed: what the parser cannot read confidently is matched in full
+    ("an unterminated heredoc fails closed",
+     f"cat <<'EOF'\n{GATE}"),
+    ("an unterminated quote fails closed",
+     f"cat > /tmp/r.md <<'EOF\n{GATE}\nEOF"),
+]:
+    check(f"REFUSED: {label}", denied("Bash", {"command": cmd}))
+
+check("the projection preserves length and newlines",
+      (lambda c: (lambda p: p is not None and len(p) == len(c)
+                  and p.count("\n") == c.count("\n"))(G._blank_inert_heredoc_bodies(c)))(
+          f"cat <<'X'\n{GATE}\nX"))
+check("an unbalanced $( in executable position fails closed",
+      G._blank_inert_heredoc_bodies("echo $(ls /tmp") is None)
+check("a trailing backslash fails closed",
+      G._blank_inert_heredoc_bodies("echo x\\") is None)
+
+print()
+if FAILS:
+    print(f"FAILED ({len(FAILS)}): " + ", ".join(FAILS))
+    sys.exit(1)
 print("all gate self-protection checks passed")

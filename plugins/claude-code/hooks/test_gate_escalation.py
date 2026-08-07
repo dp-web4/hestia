@@ -183,6 +183,81 @@ if _old_p is None:
 else:
     os.environ["HESTIA_MESH_PLUGIN"] = _old_p
 
+# --- the claim threads a session when one connects (asker_basis: "session") ------------
+# kimi-code, 2026-08-07, claiming the 1530 remainder: the claim path used to send a bare
+# initialize with no hestia_connect, so every auto-opened escalation landed
+# `asker_basis: "asserted"` and the invitation RECORDED peers but woke nobody. The hook
+# now connects first and threads `session_id` — the daemon refuses a claim whose
+# plugin_id disagrees with the session's, so the two MUST be one value, asserted here.
+class _SessionStub(BaseHTTPRequestHandler):
+    seen: list = []
+
+    def log_message(self, *_a):
+        pass
+
+    def do_POST(self):  # noqa: N802
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)) or 0)
+        try:
+            req = json.loads(body or b"{}")
+        except ValueError:
+            req = {}
+        _SessionStub.seen.append(req)
+        params = req.get("params") or {}
+        if params.get("name") == "hestia_connect":
+            payload = {"sessionId": "sess-test-1529"}
+        else:
+            payload = dict(REFUSED)
+        out = json.dumps({
+            "jsonrpc": "2.0", "id": req.get("id", 1),
+            "result": {"content": [{"type": "text", "text": json.dumps(payload)}]},
+        }).encode()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("mcp-session-id", "stub")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+        except Exception:
+            pass
+
+
+_SessionStub.seen = []
+_srv = HTTPServer(("127.0.0.1", 0), _SessionStub)
+threading.Thread(target=_srv.serve_forever, daemon=True).start()
+_old_ep2 = os.environ.pop("HESTIA_ENDPOINT", None)
+os.environ["HESTIA_ENDPOINT"] = f"http://127.0.0.1:{_srv.server_port}/mcp"
+try:
+    _v, _ = ptu.request_self_write("pre_tool_use.py", "Edit")
+    _calls = [r for r in _SessionStub.seen if (r.get("params") or {}).get("name")]
+    _connect = [r for r in _calls if r["params"]["name"] == "hestia_connect"]
+    _claim = [r for r in _calls if r["params"]["name"] == "hestia_gate_escalation_claim"]
+    check("a session was connected before the claim", len(_connect) == 1,
+          f"{len(_connect)} connects in {len(_calls)} tool calls")
+    check("the claim went out", len(_claim) == 1)
+    if _claim:
+        check("the claim threads the session it connected",
+              _claim[0]["params"]["arguments"].get("session_id") == "sess-test-1529",
+              json.dumps(_claim[0]["params"]["arguments"])[:200])
+    if _connect and _claim:
+        check("connect and claim assert ONE plugin_id (the asker-mismatch binding)",
+              _connect[0]["params"]["arguments"].get("plugin_id")
+              == _claim[0]["params"]["arguments"].get("plugin_id"),
+              f"{_connect[0]['params']['arguments'].get('plugin_id')} vs "
+              f"{_claim[0]['params']['arguments'].get('plugin_id')}")
+    check("the verdict path is unchanged by threading", _v == "escalated", _v)
+finally:
+    threading.Thread(target=_srv.shutdown, daemon=True).start()
+    if _old_ep2 is None:
+        os.environ.pop("HESTIA_ENDPOINT", None)
+    else:
+        os.environ["HESTIA_ENDPOINT"] = _old_ep2
+
+# The existing _Stub answers every call with the same payload — so `hestia_connect` above
+# got APPROVED/REFUSED-shaped answers with no sessionId, and the claim still proceeded
+# (all verdict checks up top). That IS the degrade test: no session -> asserted basis,
+# never a dark channel.
+
 # --- envelope handling ----------------------------------------------------------------------------
 check("_dig reads a bare object", ptu._dig({"claimed": True}, "claimed") is True)
 check("_dig reaches into result.result.content[0].text (the real envelope)",

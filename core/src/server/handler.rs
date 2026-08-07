@@ -10594,11 +10594,14 @@ fn resolve_invitation(
     // `invitation_withheld` so a reader can still see who WOULD have been asked, which is a
     // different and honestly-labelled fact.
     //
-    // On the claim path this branch is currently ALWAYS taken, and that is the honest state
-    // rather than a bug in this function: the gate hook opens its escalation client with a
-    // bare `initialize` and sends no `session_id`, so there is no attributed caller to
-    // resolve. Half the remedy lives in a file this member is refused write access to; see
-    // the `session_id` note on `tool_gate_escalation_claim`.
+    // On the claim path this branch WAS always taken, and that was the honest state
+    // rather than a bug in this function: the gate hook opened its escalation client with a
+    // bare `initialize` and sent no `session_id`, so there was no attributed caller to
+    // resolve. The other half landed 2026-08-07 (kimi-code, claiming claude-code notices
+    // 1529/1530): the hook now connects its own session and threads it through, so this
+    // branch is taken only when that connect failed or the hook predates the fix — a
+    // degrade of the RECORD, never of the channel; see the `session_id` note on
+    // `tool_gate_escalation_claim`.
     let (invited, evidence, withheld) = if asker_is_proven {
         (invited, evidence, Vec::new())
     } else {
@@ -11156,14 +11159,13 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // message sent on behalf of an identity, so an unproven asker gets its peers RECORDED and
     // nobody woken.
     //
-    // HALF THIS REMEDY IS NOT IN THIS FILE, and saying so is the point. The <gate-hook> opens a
-    // second MCP client for this call with a bare `initialize` and no `hestia_connect`, so it
-    // sends no session_id, and every claim-path escalation will keep resolving to
-    // `asker_basis: "asserted"` until it threads one through. It ALREADY holds a session —
-    // `ask_daemon` connects and keeps `sessionId` earlier in the same hook invocation — so this
-    // is a thread-it-through, not a new handshake, and not a second round trip in a hook that
-    // must never wait. It is not done in the same change because that file is the gate's own
-    // code and this member is refused write access to it.
+    // THE HOOK HALF LANDED 2026-08-07 (kimi-code, claiming claude-code notices 1529/1530).
+    // The <gate-hook> opens a second MCP client for this call and now does its own
+    // `hestia_connect` on it, threading the session through below. This note previously said
+    // the hook could reuse the session `ask_daemon` "already holds" — wrong ordering: the
+    // hook's self-protection runs BEFORE its first daemon call, by design ("before the
+    // daemon, and never conditional on it"), so at escalation time no session exists yet and
+    // the connect is a real second round trip, priced inside the escalation budget.
     //
     // (The path of that file is redacted to `<gate-hook>` above, deliberately and disclosed:
     // the gate matches path strings appearing ANYWHERE in a write payload, not the act's
