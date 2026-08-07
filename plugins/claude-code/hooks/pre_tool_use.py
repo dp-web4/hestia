@@ -254,10 +254,21 @@ def _touches_self(tool_name: str, tool_input: Any) -> Optional[str]:
     # first operator who sees it, which is exactly the burial the block above
     # gave its own event type to avoid.
     #
-    # Nothing is lost by matching text raw: `../hooks/pre_tool_use.py` in a shell
-    # command still contains both `hooks/` and a governance filename. What IS
+    # Nothing is lost by matching `command` text raw: `../hooks/pre_tool_use.py` in a
+    # shell command still contains both `hooks/` and a governance filename. What IS
     # given up is a symlinked alias inside a command string — admitted, and no
     # worse than the Bash surface's other known gaps.
+    #
+    # `content` LEFT the haystack 2026-08-07 (FP8/FP13, kimi-code; claimed from
+    # claude-code's notice 1334). For a Write the DESTINATION is already below as
+    # `file_path` plus its realpath, and the destination is what decides whether the
+    # gate changes — the payload text names no resource this call touches. Scanning it
+    # refused every document ABOUT the gate: eight recorded instances of a finding that
+    # names the gate being unwriteable anywhere on disk, including drafts of the report
+    # itself. Staging gate source at a scratch path and copying it in still refuses —
+    # at the `cp`, an unknown head (`cp_onto_gate` in `_SURVIVE`). `new_string` STAYS:
+    # Edit is the genuinely hard case (string replacement steers a file whose destination
+    # never is the gate), and it keeps the old treatment until that case is earned.
     resolved = []
     for key in ("file_path", "path", "notebook_path"):
         v = tool_input.get(key)
@@ -267,8 +278,14 @@ def _touches_self(tool_name: str, tool_input: Any) -> Optional[str]:
                 resolved.append(os.path.realpath(v))
             except (OSError, ValueError):
                 pass
-    for key in ("command", "content", "new_string"):
+    for key in ("command", "new_string"):
         v = tool_input.get(key)
+        if isinstance(v, str) and v:
+            resolved.append(v)
+    if not resolved:
+        # No target key and no command we recognised — an unknown tool shape. Scan
+        # `content` after all: an absent destination must not read as absent risk.
+        v = tool_input.get("content")
         if isinstance(v, str) and v:
             resolved.append(v)
     for h in resolved:
@@ -857,6 +874,60 @@ _GIT_READ_SUBCOMMANDS = {"show", "diff", "log", "cat-file", "blame", "status", "
 # `-w` bundled or separated is caught alike.
 _GIT_GUARDED_SUBCOMMANDS = {"hash-object": ("-w",)}
 
+# Control-flow keywords, modelled 2026-08-07 (FP12, kimi-code; found by claude-code's
+# isolating pair: `for f in a b; do grep -c def <gate>; done` REFUSED while
+# `git show <rev>:<gate> | grep -c ""` ALLOWED — same governance path, same read, the
+# only difference the loop). The mechanism: `for`/`do`/`done` are in no head list, so
+# the segment walk returned False on the keyword and never reached the body head.
+#
+# The `cd` precedent does NOT transfer, and this is the load-bearing part. `cd` frees
+# its own segment only, because the next segment is head-checked on its own head. `do`
+# SHARES its segment with the body: admit `do` as a no-op head and
+# `for x in a; do rm -rf /; done` is `[do, rm, -rf, /]`, head `do`, ALLOWED — the `rm`
+# is never seen. The safe shape is a STRIP, not an admission: remove leading keywords,
+# then head-check what remains. The red arm (`do rm`, `then tee`, `done > f`) is in
+# `_SURVIVE`; a green on the false-refusal rows alone would certify the hole.
+_CONTROL_FLOW_BODY = {"do", "then", "else"}        # the remainder is the body command
+_CONTROL_FLOW_COND = {"if", "elif", "while", "until"}  # the remainder EXECUTES (the condition)
+_CONTROL_FLOW_CLOSE = {"done", "fi", "esac"}       # a segment of closers runs nothing
+_FOR_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _control_flow_remainder(parts):
+    """Strip leading shell control-flow keywords from one segment.
+
+    Returns the remaining command tokens to head-check; [] for a segment that carries
+    NO command (a bare closer, or a `for VAR [in WORDS]` / `case WORD in` header —
+    the words are data, globbed at most, never executed); or None for a keyword shape
+    this grammar does not model, which the caller must treat as a WRITE, because
+    unparseable input is a write.
+
+    `if`/`while`/`until`/`elif` strip to their CONDITION, not past it: the condition
+    really runs, so `if rm -rf /; then ...; fi` refuses on `rm`. `case` arms
+    (`pattern) body ;;`) stay unmodelled and refuse on their own segments — fail
+    closed, not a hole: the header skip runs nothing by itself.
+    """
+    p = list(parts)
+    while p:
+        w = p[0]
+        if w in _CONTROL_FLOW_BODY or w in _CONTROL_FLOW_COND:
+            p.pop(0)
+            continue
+        if w in _CONTROL_FLOW_CLOSE:
+            return [] if len(p) == 1 else None
+        if w == "for":
+            if (len(p) >= 2 and _FOR_NAME.match(p[1])
+                    and p[1] not in _CONTROL_FLOW_BODY
+                    and p[1] not in _CONTROL_FLOW_COND
+                    and p[1] not in _CONTROL_FLOW_CLOSE and p[1] != "in"
+                    and (len(p) == 2 or p[2] == "in")):
+                return []
+            return None
+        if w == "case":
+            return [] if len(p) == 3 and p[2] == "in" else None
+        return p
+    return []
+
 
 def _is_read_only(tool_name: str, tool_input: Any) -> bool:
     """True only when the call is CONFIDENTLY read-only. Ambiguity means write.
@@ -880,9 +951,9 @@ def _is_read_only(tool_name: str, tool_input: Any) -> bool:
          separators will keep alternating false denial and bypass."
 
     So the grammar is explicit and CLOSED: enumerated separators, enumerated redirects,
-    enumerated heads. Unparseable input is a write. Unknown syntax is a write. Command
-    substitution is a write. The aim is to stop calling `2>/dev/null` a file write — not to
-    make the classifier clever.
+    enumerated control-flow keywords, enumerated heads. Unparseable input is a write.
+    Unknown syntax is a write. Command substitution is a write. The aim is to stop
+    calling `2>/dev/null` a file write — not to make the classifier clever.
     """
     if tool_name in _READ_ONLY_TOOLS:
         return True
@@ -939,6 +1010,11 @@ def _is_read_only(tool_name: str, tool_input: Any) -> bool:
         i += 1
 
     for parts in segments:
+        if not parts:
+            continue
+        parts = _control_flow_remainder(parts)
+        if parts is None:
+            return False
         if not parts:
             continue
         head = os.path.basename(parts[0].strip("'\""))
