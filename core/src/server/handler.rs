@@ -1075,6 +1075,42 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         full_command,
     };
 
+    // EVALUABILITY — did the matcher actually SEE a command, or was it handed nothing?
+    //
+    // `begin_action` stores `parameters` unvalidated, and the block above reads the
+    // command back from exactly `parameters.command`. Spell the envelope any other way
+    // — `tool_input.command` (the Claude Code hook's OWN field name for the same thing),
+    // a misspelled inner key, a bare string, nothing at all — and `full_command` is None,
+    // the Bash `target` fallback is None too, and the destructive matcher has no input.
+    // It answers Allow with "Default policy: allow", and the witness block below appends
+    // nothing because the decision is Allow. On the wire and on the chain that is
+    // BYTE-IDENTICAL to genuinely evaluating a command and permitting it.
+    //
+    // Measured against the live daemon 2026-08-07
+    // (`tools/claude_evaluator_reachability_ladder.py`, controls both ways):
+    // `rm -rf / --no-preserve-root` is DENIED at `parameters.command` and ALLOWED at
+    // `tool_input.command`. Same string, same binary, same vault, same rules — the
+    // verdict decided by the spelling of the envelope around it.
+    //
+    // The cost is forensic and it has already been paid: reconstructing whether a given
+    // destructive command was ever evaluated is impossible when "evaluated and allowed"
+    // and "never reached the matcher" leave the same trace, which is no trace.
+    //
+    // So: record it, and do not change the verdict. Denying here would refuse a payload
+    // shape that has always been accepted, on the strength of one day's reading, and an
+    // unevaluable action is not by itself a dangerous one — the danger is that nobody can
+    // tell. The repair is legibility on both surfaces: `evaluated` in the reply, so a
+    // caller catches its own malformed probe on the spot rather than publishing the Allow
+    // as a finding; and a witnessed entry, so the chain can still answer the question
+    // when the probe that asked it is long gone.
+    //
+    // The entry gets its OWN kind rather than joining `policy_decision`. Every existing
+    // reader of that kind counts it as "an action the gate acted on"; quietly adding rows
+    // that mean the opposite would change what all of them report. A new kind is additive
+    // — readers that filter by kind simply do not see it until they ask.
+    let expects_a_command = matches!(action.tool_name.as_str(), "Bash" | "Shell");
+    let unevaluable = expects_a_command && target.is_none();
+
     // Role-scoped law (#403): evaluate the base policy, then fold in the session's
     // constellation-role overlay by STRICTEST verdict. A self-declared role can
     // only ever tighten the base (Deny > Warn > Allow), never loosen it — so
@@ -1183,6 +1219,36 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
             );
         }
     }
+    if unevaluable {
+        let instance_lct = s.member_lct(&plugin_id_for_chain);
+        let _ = s.append_chain(
+            "policy_unevaluable",
+            json!({
+                "action_id": action_id_str,
+                "tool_name": action.tool_name,
+                "plugin_id": plugin_id_for_chain,
+                "instance_lct": instance_lct,
+                "role_lct": role_lct,
+                "session_id": action.session_id,
+                "host_session_id": action.host_session_id,
+                "intent": action.intent,
+                // The verdict that was actually returned, so this row is readable on its
+                // own: it says "allow was reported, and it meant nothing".
+                "reported_decision": evaluation.decision.as_str(),
+                // WHICH keys did arrive, so the sender can find their own bug without a
+                // second run. Never the values — an unevaluable payload is still a payload
+                // and may carry anything.
+                "parameter_keys": action
+                    .parameters
+                    .as_ref()
+                    .and_then(|p| p.as_object())
+                    .map(|o| o.keys().cloned().collect::<Vec<_>>()),
+                "reason": "no command reached the matcher: a shell action arrived with \
+                           neither parameters.command nor target",
+            }),
+        );
+    }
+
     if evaluation.decision != crate::policy::PolicyDecision::Allow {
         // A deny blocks before execution, so this is the ONLY witnessed record of a
         // denied action — carry the full accountability WHO (instance + role +
@@ -1266,7 +1332,20 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
 
     Ok(json!({
         "decision": evaluation.decision.as_str(),
-        "reason": evaluation.reason,
+        // Did the matcher see a command at all? False means this verdict is about an
+        // EMPTY action, not about whatever the caller thought it was asking. A client
+        // reading `decision` alone cannot tell, which is the whole point of the field.
+        "evaluated": !unevaluable,
+        "reason": if unevaluable {
+            serde_json::Value::String(
+                "not evaluated: this shell action carried no command (expected it at \
+                 parameters.command, or as target). The allow below is the default for \
+                 an empty action and says nothing about any command you intended to send."
+                    .to_string(),
+            )
+        } else {
+            json!(evaluation.reason)
+        },
         // Steering text for the agent that was blocked (deny-as-redirect,
         // thread hestia-lct-concord 2026-07-10). Null except on enforced deny.
         // Clients surface it verbatim on their deny channel and never parse
@@ -6222,6 +6301,128 @@ mod accountability_tests {
         assert!(
             q["guidance"].is_null(),
             "allow must not carry steering text"
+        );
+    }
+
+    /// An Allow that saw NOTHING must be distinguishable from an Allow that saw
+    /// the command and permitted it.
+    ///
+    /// `begin_action` takes `parameters` unvalidated and `query_policy` reads the
+    /// command back from exactly `parameters.command`. Spell the envelope any other
+    /// way and the matcher is handed nothing, yet the reply is `allow` / "Default
+    /// policy: allow" and the chain gets no entry — identical, on both surfaces, to
+    /// a real Allow. That ambiguity is not hypothetical: it made "was rung E ever
+    /// evaluated?" unanswerable after the fact, because absence of a deny record is
+    /// exactly what both worlds produce.
+    ///
+    /// The three arms hold the COMMAND FIXED where it matters and vary only the
+    /// spelling, because the verdict is not supposed to depend on that axis.
+    #[tokio::test]
+    async fn an_allow_that_saw_nothing_is_distinguishable_from_an_allow_that_saw_the_command() {
+        const RUNG_E: &str = "rm -rf / --no-preserve-root";
+        let (_dir, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            s.policy_engine = crate::policy::PolicyEngine::new(
+                crate::policy::get_preset("safety").unwrap().config,
+            );
+        }
+        let connect = tool_connect(
+            &state,
+            &json!({"plugin_id": "claude-code", "host_agent": "test"}),
+        )
+        .await
+        .unwrap();
+        let sid = connect["sessionId"].as_str().unwrap().to_string();
+
+        let verdict = |args: serde_json::Value| {
+            let state = state.clone();
+            async move {
+                let begin = tool_begin_action(&state, &args).await.unwrap();
+                let aid = begin["actionId"].as_str().unwrap().to_string();
+                tool_query_policy(&state, &json!({"action_id": aid}))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Arm 1 — POSITIVE CONTROL: correct spelling. The matcher can see this string.
+        let seen_and_denied = verdict(json!({
+            "tool_name": "Bash",
+            "parameters": {"command": RUNG_E},
+            "session_id": sid,
+        }))
+        .await;
+        assert_eq!(
+            seen_and_denied["decision"], "deny",
+            "precondition: at parameters.command the matcher sees rung E and denies it"
+        );
+        assert_eq!(
+            seen_and_denied["evaluated"], true,
+            "a verdict rendered against a real command is an evaluation"
+        );
+
+        // Arm 2 — the SAME string under the Claude Code hook's own field name.
+        let never_seen = verdict(json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": RUNG_E},
+            "session_id": sid,
+        }))
+        .await;
+        assert_eq!(
+            never_seen["decision"], "allow",
+            "unchanged behaviour: an unevaluable action is still permitted, not denied"
+        );
+        assert_eq!(
+            never_seen["evaluated"], false,
+            "THE POINT: the same string, allowed — and the reply says the matcher never saw it"
+        );
+
+        // Arm 3 — NEGATIVE CONTROL: correct spelling, benign command. Also an allow,
+        // and this is the one arm 2 must not be confusable with.
+        let seen_and_allowed = verdict(json!({
+            "tool_name": "Bash",
+            "parameters": {"command": "echo hello"},
+            "session_id": sid,
+        }))
+        .await;
+        assert_eq!(seen_and_allowed["decision"], "allow");
+        assert_eq!(
+            seen_and_allowed["evaluated"], true,
+            "a real command that no rule matches WAS evaluated — that is a different fact"
+        );
+
+        // The decisions alone cannot separate arms 2 and 3. That is the defect; the
+        // `evaluated` flag is the repair.
+        assert_eq!(
+            never_seen["decision"], seen_and_allowed["decision"],
+            "both are 'allow' — which is precisely why the verdict cannot carry this"
+        );
+        assert_ne!(
+            never_seen["evaluated"], seen_and_allowed["evaluated"],
+            "the flag must be what distinguishes them"
+        );
+
+        // And the chain has to answer it too, months later, with no reply to hand.
+        let s = state.lock().await;
+        let unevaluable: Vec<_> = s
+            .recent_chain(50)
+            .into_iter()
+            .filter(|e| e.event_type == "policy_unevaluable")
+            .collect();
+        assert_eq!(
+            unevaluable.len(),
+            1,
+            "exactly the one unevaluable action is witnessed — not the two that were evaluated"
+        );
+        assert_eq!(
+            unevaluable[0].event_data["tool_name"].as_str().unwrap(),
+            "Bash"
+        );
+        assert_eq!(
+            unevaluable[0].event_data["plugin_id"].as_str().unwrap(),
+            "claude-code",
+            "the record names who sent the unevaluable payload"
         );
     }
 
