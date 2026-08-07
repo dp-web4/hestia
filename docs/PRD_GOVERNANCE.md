@@ -789,6 +789,23 @@ We hold consolidation's costs — a nominal single core everyone is said to depe
 
 **Deployment location, decided (dp, 2026-08-07): `$HESTIA_HOME/shared`**, not under any harness's home. Installing the core beneath one member's directory would make that member the custodian of every member's policy — the same defect as a hardcoded per-member marker, one layer down. `$HESTIA_HOME` is already the member-agnostic path every hook resolves and where plane-E telemetry lives, for the identical reason. A shim must resolve the core **there**, not by walking up from its own location: that walk is precisely what made #243 a silent no-op.
 
+**Resolver contract, from codex's review of this section (2026-08-07).** The location is accepted — codex's hook engine imposes no constraint requiring the core to sit beside a shim, and codex loaded a module by explicit file path from the shared location in an isolated probe. Two corrections, both adopted:
+
+1. **A shim must not require `HESTIA_HOME` to be set.** Codex's installed hook exports the *workspace* variable, not the home variable, and the live hook environment carries no home variable at all. A shim that reads it and stops has resolved nothing. The contract is the one codex's witness hook already uses: **environment value when present, otherwise the standard home**, then the core artifact's basename. Prefer the fallback in the shim even if the installer also injects the variable — defence against launcher drift, which is exactly the class of failure this whole section is about.
+2. **Explicit file-path load, never `sys.path` mutation.** Load by path (`spec_from_file_location`) and fail closed when the file is absent, unreadable, fails its integrity check, or fails to execute. Mutating `sys.path` additionally accepts a same-named module from any unrelated entry that happens to precede it — a policy core selected by search order is not a policy core.
+
+**And the criterion those corrections rescue is currently unsatisfiable.** §12.0's Sprint 5 acceptance ends "*and every one of those refusals appears in plane E*". Both shims that emit plane E do so by importing the recorder **from the core**, inside the failure branch, wrapped in a bare `except: pass`. Measured on CBP, 2026-08-07:
+
+| shim | walk-up target at the installed layout | exists |
+|---|---|---|
+| codex | `~/_shared` | no |
+| claude-code | `~/.claude/_shared` | no |
+| — | the decided shared location | not yet created |
+
+So on both installed members the recorder cannot be imported, the import error is swallowed, and **no plane-E file exists anywhere on this machine outside the core's own unit-test tmpdirs** — every `gate-unavailable.jsonl` on disk was written by a test that injects its own home. The emptiness therefore carries *no* information about whether gate-unavailable events occurred: the instrument could not have written either way. An acceptance criterion measured by an instrument that cannot fire is a declaration, which is the thing §7.4 exists to forbid.
+
+**Therefore:** the minimal plane-E emission path must not itself live behind the core import. Sprint 5 lands it in the shim, or in a module whose absence is impossible, and its acceptance test is *core deleted → refusal still appears in plane E* — not *core present → record written*, which is the case that already passes.
+
 **What consolidation must carry on day one**, because these are the defects otherwise fixed five times:
 
 - Self-protection, and with it the **payload-key correction**: path keys say *where* a call writes; the content/replacement keys say *what*. Scanning the latter refused ~15 legitimate acts in one night against one true positive — and *permitted* a gate edit whose diff happened to name no protected file. Both directions of that error live in one place after consolidation.
@@ -917,12 +934,13 @@ Gated on **all seven release gates in §10** — in particular the peer-path pro
 
 **Lands, per §12.0:**
 
-- The core installed at **`$HESTIA_HOME/shared`** and resolved there explicitly. Not under a harness home; not by walking up from a shim's own path.
+- The core installed at **`$HESTIA_HOME/shared`** and resolved there explicitly — by explicit file-path load, environment value when set and the standard home otherwise, failing closed on absent / unreadable / integrity-fail / exec-fail. Not under a harness home; not by walking up from a shim's own path; not via `sys.path` (§12.0, resolver contract).
+- **The plane-E emission path out from behind the core import.** Today both emitting shims import the recorder from the core inside the failure branch under a bare `except: pass`, and at the installed layout that import cannot succeed — so the acceptance line below is presently unmeasurable rather than unmet (§12.0).
 - Every harness reduced to a shim that parses its engine's event shape and renders its engine's verdict. Today the largest gate is **1800 lines against a 989-line core**, and two of five engines do not reference the core at all.
 - Self-protection **in the core**, so it stops being one member's property. It currently exists in exactly one gate; the member with the loudest compliance record is the only one carrying the check, and the member with a clean sheet has no rule.
 - The payload-key correction, integrity detection, and identity-from-process (§12.0).
 
-**Acceptance:** modifying one byte of a shim fails the next call closed; a shim replaced by a symlink fails closed; calling from an unregistered process fails closed; killing the gate makes every shim refuse rather than decide locally — **and every one of those refusals appears in plane E.**
+**Acceptance:** modifying one byte of a shim fails the next call closed; a shim replaced by a symlink fails closed; calling from an unregistered process fails closed; killing the gate makes every shim refuse rather than decide locally — **and every one of those refusals appears in plane E.** That last clause is tested with the **core deleted**, not present: the case where the core loads is the case that already passes, and the case that matters is the one in which the recorder's own dependency is the thing that is missing (§12.0).
 
 Plus, from §12.0 and measured rather than asserted: a policy change lands in **one** file and every member's next call reflects it, demonstrated by making one; and the escalation distribution across members stops being explainable by *which gate implements what*.
 
