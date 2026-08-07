@@ -81,6 +81,10 @@ def fire(script, stub, sender, *, identity=None, preset_role=None):
         # decides whether the daemon defaults the grain or takes a declaration.
         f.write('#!/usr/bin/env bash\n'
                 f'printf %s "${{HESTIA_ROLE-<unset>}}" > "{seen}"\n'
+                # The BASIS travels beside the role and is asserted separately: a
+                # provisional declaration without a recorded basis is indistinguishable
+                # from a hydrated one, and that indistinguishability is the whole defect.
+                f'printf %s "${{HESTIA_ROLE_BASIS-<unset>}}" > "{seen}.basis"\n'
                 'exit 0\n')
     os.chmod(os.path.join(bindir, stub), 0o755)
 
@@ -107,7 +111,8 @@ def fire(script, stub, sender, *, identity=None, preset_role=None):
                        capture_output=True, text=True)
     out = p.stdout + p.stderr
     role_seen = open(seen).read() if os.path.exists(seen) else None
-    return out, role_seen
+    basis_seen = open(seen + ".basis").read() if os.path.exists(seen + ".basis") else ""
+    return out, role_seen, basis_seen
 
 
 for script, stub, iddir, sender in MEMBERS:
@@ -115,7 +120,7 @@ for script, stub, iddir, sender in MEMBERS:
     declared = "role:constellation:mesh-worker"
 
     # --- A: nothing to resolve from. The one that was silent on CBP. ----------
-    out, seen = fire(script, stub, sender)
+    out, seen, basis = fire(script, stub, sender)
     check(f"A {script}: an unresolved role is announced",
           WARNING in out, f"no {WARNING!r} in output:\n{out[-1200:]}")
     check(f"A {script}: the warning names the file it could not read",
@@ -123,11 +128,33 @@ for script, stub, iddir, sender in MEMBERS:
     check(f"A {script}: the stub CLI ran (the case is not vacuous)",
           seen is not None,
           "the fire never reached the CLI, so nothing here was actually exercised")
-    check(f"A {script}: with nothing to resolve, no role is invented",
-          seen in (None, "<unset>", ""), f"CLI saw HESTIA_ROLE={seen!r}")
+    # SUPERSEDED 2026-08-06. This assertion used to read "no role is invented",
+    # `seen in (None, "<unset>", "")`. Its intent was right and is preserved below by a
+    # STRONGER mechanism; the absence itself was the weak part.
+    #
+    # WHY IT CHANGED. Leaving the role blank did not stay blank: the hook registration
+    # supplies `interactive-dev`, so "invent nothing" became "let something else paint it
+    # attended" — the exact misattribution this file documents. The first repair refused to
+    # fire at all, which stopped the mesh; dp, 2026-08-06: "how would effectively disabling
+    # mesh notifications be a good thing?" It would not.
+    #
+    # So the fire now DECLARES what it actually knows — a mesh fire is definitionally a
+    # mesh-worker session — and marks HOW it knows via HESTIA_ROLE_BASIS.
+    #
+    # THE ORIGINAL CONCERN SURVIVES AND IS WHY THE BASIS ASSERTION IS MANDATORY: a declared
+    # role could paper over the missing hydration, and a gap nobody can see is a gap nobody
+    # fixes. The basis marker is what keeps it visible — provisional must not decay into
+    # permanent-but-labelled. Assert the declaration AND its basis, never one alone.
+    check(f"A {script}: the fire declares what it knows rather than leaving it to be painted",
+          seen == declared, f"CLI saw HESTIA_ROLE={seen!r}, expected {declared!r}")
+    check(f"A {script}: and the declaration carries its basis, so the gap stays visible",
+          "provisional" in basis.lower() and "declared-by-fire" in basis.lower(),
+          f"CLI saw HESTIA_ROLE_BASIS={basis!r} — a provisional role without a recorded "
+          "basis is indistinguishable from a hydrated one, which is the papering-over this "
+          "assertion replaced 'no role is invented' to prevent")
 
     # --- B: POSITIVE CONTROL. The branch can resolve, and reaches the CLI. ----
-    out, seen = fire(script, stub, sender, identity=(idpath, {"role": declared}))
+    out, seen, basis = fire(script, stub, sender, identity=(idpath, {"role": declared}))
     check(f"B {script}: a readable role reaches the CLI's environment",
           seen == declared, f"CLI saw HESTIA_ROLE={seen!r}, expected {declared!r} — "
                             "case A's warning would then be proving the branch is broken, "
@@ -136,7 +163,7 @@ for script, stub, iddir, sender in MEMBERS:
           WARNING not in out, f"spurious warning:\n{out[-1200:]}")
 
     # --- C: an operator override must survive untouched. ---------------------
-    out, seen = fire(script, stub, sender, preset_role="role:constellation:reviewer",
+    out, seen, basis = fire(script, stub, sender, preset_role="role:constellation:reviewer",
                      identity=(idpath, {"role": declared}))
     check(f"C {script}: a preset HESTIA_ROLE is not clobbered by the identity file",
           seen == "role:constellation:reviewer", f"CLI saw HESTIA_ROLE={seen!r}")
@@ -144,11 +171,14 @@ for script, stub, iddir, sender in MEMBERS:
           WARNING not in out, f"spurious warning:\n{out[-1200:]}")
 
     # --- D: readable is not resolved. ----------------------------------------
-    out, seen = fire(script, stub, sender, identity=(idpath, {"entity": "x"}))
+    out, seen, basis = fire(script, stub, sender, identity=(idpath, {"entity": "x"}))
     check(f"D {script}: a readable identity with no role still warns",
           WARNING in out, f"no {WARNING!r} in output:\n{out[-1200:]}")
-    check(f"D {script}: and still invents nothing",
-          seen in (None, "<unset>", ""), f"CLI saw HESTIA_ROLE={seen!r}")
+    check(f"D {script}: declares provisionally, same as A — readable is not resolved",
+          seen == declared, f"CLI saw HESTIA_ROLE={seen!r}, expected {declared!r}")
+    check(f"D {script}: and the basis says so",
+          "provisional" in basis.lower(),
+          f"CLI saw HESTIA_ROLE_BASIS={basis!r}")
 
 print(f"\nfailures={len(failures)}")
 for f in failures:

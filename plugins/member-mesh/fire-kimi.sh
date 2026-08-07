@@ -187,6 +187,15 @@ echo "[fire-kimi] firing kimi -p ($FIREWORTHY notice(s)) -> $LOG_DIR/kimi-$STAMP
 # honest state and is now reported by the derivation.
 if [[ -z "${HESTIA_ROLE:-}" ]]; then
   _ident="~/.kimi-code/hestia-instance/identity.json"
+  # The unresolved-role diagnosis DIFFERS PER MEMBER, so it lives beside the member's own
+  # identity path and not in the shared block below (see fire-claude.sh for the full note).
+  # kimi's gap is OPERATIONAL, not structural: the plugin DOES ship the seed and the
+  # hydrator, so an absent file means hydrate never ran on this box — which is fixable here,
+  # unlike claude-code's. Note the asymmetry the paths encode: the member fires as
+  # `kimi-code` and hydrates from `plugins/kimi/`.
+  _ident_diagnosis="the kimi plugin DOES ship instance/identity.seed.json and \
+hooks/hydrate.sh, so an absent file means hydrate has never run on this box. \
+REMEDY: run plugins/kimi/hooks/hydrate.sh, or export HESTIA_ROLE before the fire."
   if [[ -r "${_ident/#\~/$HOME}" ]]; then
     _role=$(python3 -c 'import json,sys
 try:
@@ -202,10 +211,36 @@ except Exception:
   # PAINTS the unresolved case as an attended session instead of leaving it blank. Silence
   # was load-bearing for a promise that no longer holds.
   if [[ -z "${HESTIA_ROLE:-}" ]]; then
-    echo "[fire-kimi] WARNING: role unresolved — no HESTIA_ROLE in the environment and no" \
-         "role readable from $_ident. This session's acts will land under whatever default" \
-         "the member's hook registration supplies, which is NOT a declared autonomous role." \
-         "Hydrate the identity file or export HESTIA_ROLE before the fire."
+    # DECLARE PROVISIONALLY — do not paint, and do not block.
+    #
+    # Three options and only one of them is right. (1) Leave it blank: the hook
+    # registration then supplies `interactive-dev`, painting an autonomous session as an
+    # ATTENDED one — the silent misattribution the 2026-08-05 warning was added to expose.
+    # (2) Refuse to fire: correct about attribution, catastrophic about availability. It
+    # stops the mesh — the fleet's only coordination channel — to prevent acts that were
+    # gated, witnessed and legitimate, and merely unattributed. dp, 2026-08-06: "how would
+    # effectively disabling mesh notifications be a good thing?" It would not, and the
+    # first draft of this branch did exactly that.
+    #
+    # (3) This. THE FIRE ITSELF IS THE EVIDENCE: a mesh fire is, definitionally, a
+    # mesh-worker session. We are not guessing — we are declaring what we actually know,
+    # and marking HOW we know it so a reader can weigh it. `HESTIA_ROLE_BASIS` travels with
+    # the role and says the difference between "hydrated from a signed identity file" and
+    # "asserted by the fire because the identity was never written".
+    #
+    # This is the fleet's own deficiency rule applied to session identity: proceed with the
+    # best available, never silently, always with the deficiency on the record — the same
+    # primitive as OccupancyBasis::Provisional, ReadBasis, and D-1's OnExceeded. An earlier
+    # draft of this branch reached for a block and got it wrong; the rule exists precisely
+    # because blocking feels like rigour.
+    export HESTIA_ROLE="role:constellation:mesh-worker"
+    export HESTIA_ROLE_BASIS="provisional:declared-by-fire; identity file absent or unreadable at $_ident"
+    echo "[fire-kimi] role unresolved — DECLARING role:constellation:mesh-worker PROVISIONALLY." \
+         "The fire is the evidence: this is a mesh-woken session, so mesh-worker is what it" \
+         "is, not a guess. Basis recorded in HESTIA_ROLE_BASIS. This is NOT a hydrated" \
+         "identity — $_ident: $_ident_diagnosis Acts will be" \
+         "attributed to mesh-worker with a provisional basis rather than painted as" \
+         "interactive-dev or lost to 'unattributed' (escalation 411bf87a, 2026-08-06)." >&2
   fi
 fi
 cd "${HESTIA_WORKSPACE:-$(cd "$HERE_DIR/../../.." && pwd)}" && "$HERE_DIR/with-member-lock.sh" kimi-code \
