@@ -850,6 +850,12 @@ _INPUT_REDIRECTS = {"<", "<<", "<<<", "<&"}
 # FLAG is exactly what a name allowlist cannot see.
 _GIT_READ_SUBCOMMANDS = {"show", "diff", "log", "cat-file", "blame", "status", "rev-parse",
                          "describe", "ls-files", "ls-tree", "rev-list", "show-ref"}
+# Read-BY-DEFAULT subcommands carrying a mutating flag get the _GUARDED_HEADS treatment one
+# column over, rather than a bare-set append (claude-code §5.1, notice 1471, escalation
+# 10fb8aa5c095c085): `git hash-object` only hashes, but `git hash-object -w` writes the blob
+# into the object database. The flag, not the name, decides. Prefix match, same as there, so
+# `-w` bundled or separated is caught alike.
+_GIT_GUARDED_SUBCOMMANDS = {"hash-object": ("-w",)}
 
 
 def _is_read_only(tool_name: str, tool_input: Any) -> bool:
@@ -937,7 +943,12 @@ def _is_read_only(tool_name: str, tool_input: Any) -> bool:
             continue
         head = os.path.basename(parts[0].strip("'\""))
         if head == "git":
-            if len(parts) < 2 or parts[1] not in _GIT_READ_SUBCOMMANDS:
+            if len(parts) < 2:
+                return False
+            if parts[1] in _GIT_GUARDED_SUBCOMMANDS:
+                if any(a.startswith(f) for a in parts[2:] for f in _GIT_GUARDED_SUBCOMMANDS[parts[1]]):
+                    return False
+            elif parts[1] not in _GIT_READ_SUBCOMMANDS:
                 return False
         elif head in _HEAD_GRAMMARS:
             # Admitted by head, audited by arguments. BEFORE the bare set, so an append

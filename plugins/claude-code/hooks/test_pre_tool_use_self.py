@@ -159,6 +159,10 @@ for label, tool, ti in [
     ("sha256sum verifies byte-identity", "Bash", {"command": f"sha256sum {GATE_PATH}"}),
     ("git show reads history", "Bash", {"command": f"git show HEAD:{GATE_PATH}"}),
     ("chained read-only heads", "Bash", {"command": f"grep def {GATE_PATH} && wc -l {GATE_PATH}"}),
+    # claude-code §5.1 (notice 1471, escalation 10fb8aa5c095c085): hash-object is a
+    # read-by-default subcommand the closed _GIT_READ_SUBCOMMANDS set did not name.
+    ("git hash-object verifies a blob hash", "Bash", {"command": f"git hash-object {GATE_PATH}"}),
+    ("git hash-object --stdin", "Bash", {"command": "git hash-object --stdin"}),
 ]:
     check(f"READ allowed: {label}", G._is_read_only(tool, ti) is True)
 
@@ -172,6 +176,8 @@ for label, tool, ti in [
     # a read HEAD with a redirect is a write — the case that makes head-matching alone unsafe
     ("cat piped INTO the gate", "Bash", {"command": f"cat /tmp/x > {GATE_PATH}"}),
     ("git checkout -- overwrites", "Bash", {"command": f"git checkout -- {GATE_PATH}"}),
+    # the mutating FLAG on a read-looking subcommand — the case the guard exists for
+    ("git hash-object -w writes a blob", "Bash", {"command": f"git hash-object -w {GATE_PATH}"}),
     ("unrecognised head fails closed", "Bash", {"command": f"vim {GATE_PATH}"}),
 ]:
     check(f"WRITE refused: {label}", G._is_read_only(tool, ti) is False)
