@@ -2716,6 +2716,23 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
             ))
         }
         crate::arbiter::Eligibility::Eligible { independence } => independence,
+        // UNREACHABLE THROUGH THIS ENTRY POINT, refused anyway. `eligibility` is the
+        // direction-blind wrapper and always asks about the granting direction, so clause 1
+        // returns `Refused` here and never `SelfWithdrawal`. Handled as a refusal rather
+        // than `unreachable!()`: if someone later points this call at `eligibility_for`, the
+        // failure should be an appellant being told no, not a daemon panic on a governance
+        // path. Withdrawing an APPEAL is a verb this surface does not have (see
+        // `ref_appeal_verb_absent`) and inventing one silently here is not the way to get it.
+        crate::arbiter::Eligibility::SelfWithdrawal { note } => {
+            return Ok(hestia_error_envelope(
+                "hestia.arbitration_ineligible",
+                &format!(
+                    "{note}. This surface rules on appeals; it has no withdraw verb, and a \
+                     self-directed refusal is not a ruling"
+                ),
+                Some(json!({"appellant": appellant, "arbiter": arbiter.plugin_id})),
+            ))
+        }
     };
 
     if window.iter().any(|e| {
@@ -2912,6 +2929,15 @@ async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
                 crate::arbiter::Eligibility::Refused { reason } => json!({
                     "you_may_rule": false,
                     "why": reason,
+                }),
+                // Unreachable through the direction-blind wrapper (see the sibling arm in
+                // `tool_arbitrate_appeal`). Rendered as `you_may_rule: false` so the count
+                // below still classifies it: an unclassified row would read as "no
+                // eligibility concerns", the absent-is-not-implied defect this reply already
+                // guards against elsewhere.
+                crate::arbiter::Eligibility::SelfWithdrawal { note } => json!({
+                    "you_may_rule": false,
+                    "why": note,
                 }),
             }
         });
@@ -8608,6 +8634,108 @@ mod tests {
         );
     }
 
+    /// THE ASKER MAY DROP ITS OWN ASK — AND STILL MAY NOT GRANT IT.
+    ///
+    /// `tool_gate_arbitrate_escalation` parsed `approve` and then decided eligibility without
+    /// it, so both verbs a member can aim at its own escalation hit clause 1 and came back
+    /// "A member cannot grant its own governance write" — true of one of them. The other is
+    /// the member giving up a request, which authorises nothing.
+    ///
+    /// THE COST WAS PAID, NOT PREDICTED. 2026-08-07: claude-code could not deny its own two
+    /// escalations (`5b53e9b5f4704a7b`, `29622e19db86a304`) and asked kimi-code to do it
+    /// (notice 1474). kimi woke after the operator had approved both, reason "k"; decisions
+    /// are single-shot, so the withdrawal window was gone and two `permits_write: true`
+    /// permits entered force for writes their asker had already abandoned. Requiring a peer
+    /// for self-restraint makes restraint lose a race it should not have been running.
+    ///
+    /// This path had NO handler-level test before this one, in either direction.
+    #[tokio::test]
+    async fn the_asker_may_withdraw_its_own_escalation_but_not_approve_it() {
+        let (_dir, shared) = make_shared_state();
+        let mut sid = String::new();
+        for id in ["claude-code", "kimi-code"] {
+            let out = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            if id == "claude-code" {
+                sid = out["sessionId"].as_str().expect("a session to rule from").to_string();
+            }
+        }
+
+        let open_one = |marker: &'static str| {
+            let shared = shared.clone();
+            async move {
+                let c = tool_gate_escalation_claim(
+                    &shared,
+                    &json!({
+                        "plugin_id": "claude-code",
+                        "tool_name": "Edit",
+                        "marker": marker,
+                        "reason": "Edit -> a governance file",
+                    }),
+                )
+                .await
+                .unwrap();
+                c["escalation_id"].as_str().expect("an id to rule on").to_string()
+            }
+        };
+
+        // THE GRANT DIRECTION STAYS SHUT. Asserted first: if this ever opens, the withdrawal
+        // arm below is worthless, and a test that only proved the permissive half would read
+        // as a pass while the boundary was gone.
+        let to_approve = open_one("pre_tool_use.py").await;
+        let denied_self_grant = tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({
+                "escalation_id": to_approve, "approve": true,
+                "reason": "because I want it", "session_id": sid,
+            }),
+        )
+        .await;
+        assert!(
+            denied_self_grant.is_err(),
+            "a member approving its own governance write is the one act this path exists to \
+             refuse: {denied_self_grant:?}"
+        );
+
+        // THE WITHDRAWAL DIRECTION OPENS.
+        let to_withdraw = open_one("witness.py").await;
+        tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({
+                "escalation_id": &to_withdraw, "approve": false, "session_id": sid,
+            }),
+        )
+        .await
+        .expect("refusing your own request must not need a peer to be awake");
+
+        // AND IT IS NOT RECORDED AS A RULING. Every field a later reader or reputation
+        // derivation would consult must say "nobody reviewed this".
+        let s = shared.lock().await;
+        let w = s
+            .recent_chain(30)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_withdrawn")
+            .expect("a withdrawal must have its OWN event kind — filed as `..._decided` it is \
+                    indistinguishable from a peer's deny");
+        let d = &w.event_data;
+        assert_eq!(d["escalation_id"], to_withdraw.as_str());
+        assert_eq!(d["decided_via"], "self_withdrawn", "not `peer_member`: {d}");
+        assert!(
+            d["independence"].is_null(),
+            "there is no independence between a member and itself; grading one would be a \
+             lie in the field a relying party weighs: {d}"
+        );
+        assert_eq!(d["bar_met"], false, "a withdrawal clears no bar: {d}");
+        assert!(
+            d["assurance"].as_str().unwrap().starts_with("NONE"),
+            "the assurance string must not claim SECOND-PARTY REVIEW: {d}"
+        );
+        // The request is gone, so nothing is left pending for a human — which is the cost
+        // this act pays, and why the chain entry above has to be legible.
+        assert_eq!(d["status"], "denied", "{d}");
+    }
+
     /// THE DOOR THE GATE ACTUALLY WALKS THROUGH.
     ///
     /// Everything above tests `tool_gate_escalation_open`. The gate hook calls
@@ -11404,7 +11532,7 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
 }
 
 async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> ToolResult {
-    use crate::arbiter::{eligibility, AppealParties, Eligibility};
+    use crate::arbiter::{eligibility_for, AppealParties, Disposition, Eligibility};
     use crate::server::gate_escalation::{now_secs, Channel};
 
     let escalation_id = require_string(args, "escalation_id")?;
@@ -11438,12 +11566,31 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
 
     // NOT-SAME, server-side, reusing the appeal arbiter's own rules rather than a second
     // implementation that could drift from them.
-    let independence = match eligibility(&AppealParties {
+    //
+    // TOLD WHICH WAY IT IS RULING. `approve` was parsed at the top of this function and then
+    // never consulted here, so the two acts a member can direct at its own escalation —
+    // granting itself the write, and dropping the request — reached one refusal under one
+    // message about granting. Only the first is self-dealing. The second is the member
+    // narrowing its own authority, and making it wait on a peer is what put two unwanted
+    // `permits_write: true` permits into force on 2026-08-07: the peer asked to deny them
+    // (kimi-code, notice 1474) woke after the operator had already approved both, and
+    // decisions are single-shot.
+    let parties = AppealParties {
         appellant: &esc.plugin_id,
         deny_adjudicator: None,
         arbiter: &arb.plugin_id,
-    }) {
-        Eligibility::Eligible { independence } => independence,
+    };
+    let disposition = if approve {
+        Disposition::ForAppellant
+    } else {
+        Disposition::AgainstAppellant
+    };
+    let independence = match eligibility_for(&parties, disposition) {
+        Eligibility::Eligible { independence } => Some(independence),
+        // THE ASKER DROPPING ITS OWN ASK. Recorded, but not as a ruling: no independence to
+        // grade, its own channel, and its own chain event below — a reader must not be able
+        // to mistake this for a second party having looked.
+        Eligibility::SelfWithdrawal { .. } => None,
         other => {
             let _ = s.append_chain(
                 "gate_escalation_arbiter_refused",
@@ -11473,19 +11620,35 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
         }
     }
 
+    // A withdrawal is filed under its own channel and its own event kind. `independence:
+    // None` alone would not be enough — an absent field reads as "not computed", and the
+    // channel is what `is_sovereign`/`bar_met` actually consult.
+    let withdrawn = independence.is_none();
+    let via = if withdrawn { Channel::SelfWithdrawn } else { Channel::PeerMember };
+    // Belt and braces on the one invariant that matters: `SelfWithdrawal` is returned only in
+    // the AgainstAppellant direction, so this cannot fire. If a later edit to `eligibility_for`
+    // breaks that, it must break loudly here rather than mint a self-approved permit.
+    if withdrawn && approve {
+        return Err(anyhow::anyhow!(
+            "internal: a self-directed APPROVAL was admitted as a withdrawal — refusing. A \
+             member granting itself a governance write is the one thing this path exists to \
+             prevent"
+        ));
+    }
+
     match s.gate_escalations.decide(
         &escalation_id,
         approve,
         &arb.plugin_id,
         &arb.role_lct,
-        Channel::PeerMember,
-        Some(independence),
+        via,
+        independence,
         Some(reason.as_str()),
         now,
     ) {
         Ok(decided) => {
             let entry = s.append_chain(
-                "gate_escalation_decided",
+                if withdrawn { "gate_escalation_withdrawn" } else { "gate_escalation_decided" },
                 json!({
                     "escalation_id": decided.id,
                     "plugin_id": decided.plugin_id,
@@ -11505,8 +11668,14 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
                     "bar": decided.bar,
                     "factors_present": decided.factors,
                     "bar_met": decided.bar_met(),
-                    "assurance": "A1 — the peer shares this UID. This is recorded \
-                                  SECOND-PARTY REVIEW, not an enforced boundary.",
+                    "assurance": if withdrawn {
+                        "NONE — the asker refused its own request. Nobody reviewed this and \
+                         nothing was authorised; it is recorded so the attempt and its \
+                         abandonment both stay visible."
+                    } else {
+                        "A1 — the peer shares this UID. This is recorded \
+                         SECOND-PARTY REVIEW, not an enforced boundary."
+                    },
                 }),
             );
             // The bar and whether this decision met it go to the DECIDER, not only to the

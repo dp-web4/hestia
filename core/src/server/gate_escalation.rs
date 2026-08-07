@@ -174,6 +174,17 @@ pub enum Channel {
     /// approval was looked at by something that is not the asker, and the record says how
     /// different that something is.
     PeerMember,
+    /// THE ASKER ITSELF, refusing its own request. Not a review of any kind — the weakest
+    /// thing in this enum, and deliberately its own name rather than a `PeerMember` with an
+    /// absent `independence`.
+    ///
+    /// It can only ever accompany a DENY (`arbiter::eligibility_for` returns
+    /// `SelfWithdrawal` solely in the AgainstAppellant direction), so nothing recorded under
+    /// this channel ever authorised a write. `is_sovereign` excludes it and `bar_met`
+    /// therefore counts it toward no bar; that is the point of a separate variant. A
+    /// withdrawal filed as `PeerMember` would read, correctly in every field, as though a
+    /// second party had looked at it.
+    SelfWithdrawn,
 }
 
 /// A stated evidence threshold — the bar an approval must clear, RECORDED on the escalation

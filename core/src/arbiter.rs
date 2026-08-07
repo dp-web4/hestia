@@ -46,6 +46,34 @@ pub enum Eligibility {
     Eligible { independence: Independence },
     /// Structurally inadmissible. Fails closed.
     Refused { reason: String },
+    /// NOT A RULING. The would-be arbiter IS the appellant, and the direction proposed goes
+    /// AGAINST itself — dropping its own request. Admissible, because it authorises nothing
+    /// and can only narrow what the asker may do, but it must never be recorded as
+    /// arbitration: there is no independence to grade, and a reader who saw this filed as a
+    /// peer's deny would be looking at self-restraint wearing second-party review's clothes.
+    SelfWithdrawal { note: String },
+}
+
+/// Which DIRECTION a would-be arbiter proposes to rule — because the risk in
+/// self-arbitration is not symmetric, and the code refusing it was.
+///
+/// `eligibility` had no way to ask this. It took the parties and nothing else, so a member
+/// proposing to GRANT itself a governance write and a member proposing to DROP its own
+/// request reached the identical refusal, under a message about granting. See
+/// `a_member_may_withdraw_its_own_request_but_never_grant_it` for the measured cost.
+///
+/// The sign is NOT global. Clause 1's safe direction is `AgainstAppellant`; clause 2's is
+/// `ForAppellant` (a gate conceding admits error; a gate refusing buries the dispute). Read
+/// each clause's own comment rather than assuming one direction is "the safe one".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Disposition {
+    /// The ruling would GRANT what the appellant asked for — uphold the appeal, or approve
+    /// the refused governance write. This is the direction that hands out authority.
+    ForAppellant,
+    /// The ruling would REFUSE it. Nothing is authorised; the asker ends with strictly less
+    /// than it asked for.
+    AgainstAppellant,
 }
 
 /// How different is "different"? Recorded, never thresholded here.
@@ -159,9 +187,47 @@ fn is_recognised_reasoner(plugin_id: &str) -> bool {
 ///
 /// Fails closed on every ambiguity. The refusals are structural facts, not judgements
 /// about quality — a competent arbiter that happens to be the appellant is still refused.
+/// DIRECTION-BLIND ENTRY POINT — assumes the dangerous direction, which is the right
+/// default for a caller that does not know which way it is ruling.
+///
+/// Every call site written before `Disposition` existed keeps its exact previous behaviour
+/// through here. The relaxation in `eligibility_for` is opted INTO by naming a direction; it
+/// is never inherited by a caller that was not written with the distinction in view. That is
+/// deliberate: a widened admission that arrives by default is the shape where a diff reads as
+/// plumbing and changes who may authorise what.
 pub fn eligibility(p: &AppealParties<'_>) -> Eligibility {
-    // 1. NOT THE APPELLANT. The whole point.
+    eligibility_for(p, Disposition::ForAppellant)
+}
+
+/// `eligibility`, told which way the would-be arbiter proposes to rule.
+pub fn eligibility_for(p: &AppealParties<'_>, disposition: Disposition) -> Eligibility {
+    // 1. NOT THE APPELLANT — IN THE GRANTING DIRECTION. The whole point.
+    //
+    // The refusal is about self-DEALING, not self-reference: what may not happen is a member
+    // handing itself the thing it asked for. Refusing your own request is the opposite act.
+    // It authorises nothing, it is available to nobody else's benefit, and requiring a peer
+    // for it makes a member's own restraint depend on another member being awake — which is
+    // how two unwanted permits went live on 2026-08-07 while the peer who was asked slept.
+    //
+    // WHAT THIS COSTS, STATED. A withdrawal takes the row out of the operator's pending
+    // queue, which is a visibility surface. So it is recorded as its own act and not as a
+    // decision — see `Eligibility::SelfWithdrawal` and the `gate_escalation_withdrawn` chain
+    // event. The attempt stays in the chain; what changes is that it no longer reads as
+    // awaiting a human.
+    //
+    // The reasoning floor (clause 3) is deliberately NOT applied to this branch: dropping
+    // your own ask is not a ruling and needs no capacity to reason about one.
     if p.arbiter == p.appellant {
+        if disposition == Disposition::AgainstAppellant {
+            return Eligibility::SelfWithdrawal {
+                note: format!(
+                    "'{}' is refusing its OWN request — a withdrawal, not an arbitration. It \
+                     authorises nothing, grades no independence, and must not be recorded as a \
+                     peer's ruling",
+                    p.arbiter
+                ),
+            };
+        }
         return Eligibility::Refused {
             reason: format!(
                 "'{}' cannot arbitrate its own appeal — an appeal upheld by its filer is an \
@@ -174,6 +240,18 @@ pub fn eligibility(p: &AppealParties<'_>) -> Eligibility {
     //    reviewing itself one layer up. Weaker than (1) — the gate is not the appellant —
     //    but the same shape, and today's evidence says a system does not find its own
     //    defects.
+    //
+    //    ITS SIGN IS THE OPPOSITE OF CLAUSE 1'S, so do not "finish the job" by wiring
+    //    `disposition` in here the same way. For clause 1 the safe direction is
+    //    AgainstAppellant. Here the safe direction is FOR the appellant: a gate that
+    //    CONCEDES an appeal against its own deny admits error and costs itself authority,
+    //    while a gate that REFUSES one confirms its own decision and buries the dispute
+    //    under something shaped like review. The direction clause 1 admits is the one this
+    //    clause must most refuse.
+    //
+    //    Both stay closed. Conceding is arguably safe, but nothing on this fleet needs it,
+    //    and an admission path with no caller is one nobody exercises and nobody tests —
+    //    the `CrossSession` tier removed above is what that becomes.
     if let Some(adj) = p.deny_adjudicator {
         let gate_owner = adj.strip_prefix("plugin-gate:").unwrap_or(adj);
         if gate_owner == p.arbiter {
@@ -318,6 +396,84 @@ mod tests {
         let e = eligibility(&parties("codex", "codex", None));
         assert!(matches!(e, Eligibility::Refused { .. }),
                 "self-arbitration must be structurally impossible, not merely discouraged");
+    }
+
+    /// THE ASYMMETRY. Clause 1 guards against a member GRANTING itself what it asked for.
+    /// Applied to the other direction it forbids a member from dropping its OWN request —
+    /// an act that authorises nothing and can only narrow what the member may do.
+    ///
+    /// Measured cost of the symmetric version, 2026-08-07: claude-code asked kimi-code
+    /// (notice 1474) to deny escalations `5b53e9b5f4704a7b` and `29622e19db86a304` on its
+    /// behalf, because it could not deny its own. kimi's wake fired after the operator had
+    /// already approved both (reason "k"); decisions are single-shot, so the window was
+    /// closed and two `permits_write: true` permits went live for writes the asker no longer
+    /// wanted. The round trip the symmetry forces is not free — it is a latency race against
+    /// approval, and it lost.
+    #[test]
+    fn a_member_may_withdraw_its_own_request_but_never_grant_it() {
+        let p = parties("claude-code", "claude-code", None);
+        assert!(
+            matches!(
+                eligibility_for(&p, Disposition::AgainstAppellant),
+                Eligibility::SelfWithdrawal { .. }
+            ),
+            "refusing your own request authorises nothing; it must not need a peer"
+        );
+        assert!(
+            matches!(
+                eligibility_for(&p, Disposition::ForAppellant),
+                Eligibility::Refused { .. }
+            ),
+            "the grant direction is the whole reason clause 1 exists"
+        );
+    }
+
+    /// NO SILENT RELAXATION. Every pre-existing caller keeps the strict behaviour; the new
+    /// admission is opted into by naming the direction, never inherited by a caller that
+    /// was written before the distinction existed.
+    #[test]
+    fn the_default_entry_point_still_refuses_self_arbitration_in_both_directions() {
+        assert!(matches!(
+            eligibility(&parties("codex", "codex", None)),
+            Eligibility::Refused { .. }
+        ));
+    }
+
+    /// CLAUSE 2'S SIGN RUNS THE OTHER WAY, so the clause-1 relaxation must not reach it.
+    ///
+    /// For clause 1 the safe direction is AGAINST the appellant (dropping your own ask).
+    /// For clause 2 it is FOR them: a gate CONCEDING an appeal against its own deny admits
+    /// error, while a gate REFUSING one confirms itself and buries the dispute — the
+    /// dangerous direction is the one clause 1 calls safe. Both stay closed here; a
+    /// direction nothing needs is better closed than admitted untested.
+    #[test]
+    fn the_gate_that_denied_is_refused_in_both_directions() {
+        let p = parties("claude-code", "codex", Some("plugin-gate:codex"));
+        for d in [Disposition::ForAppellant, Disposition::AgainstAppellant] {
+            assert!(matches!(eligibility_for(&p, d), Eligibility::Refused { .. }),
+                    "clause 2 does not inherit clause 1's asymmetry, got {d:?}");
+        }
+    }
+
+    /// Withdrawal is not arbitration, so the reasoning floor does not apply to it: a cron
+    /// whose gate opened an escalation on its behalf may still drop it. What it may not do
+    /// is rule — on its own request or anyone's.
+    #[test]
+    fn withdrawal_does_not_require_a_reasoning_lineage_but_ruling_still_does() {
+        let own = parties("agent-inventory", "agent-inventory", None);
+        assert!(matches!(
+            eligibility_for(&own, Disposition::AgainstAppellant),
+            Eligibility::SelfWithdrawal { .. }
+        ));
+        assert!(matches!(
+            eligibility_for(&own, Disposition::ForAppellant),
+            Eligibility::Refused { .. }
+        ));
+        let other = parties("claude-code", "agent-inventory", None);
+        for d in [Disposition::ForAppellant, Disposition::AgainstAppellant] {
+            assert!(matches!(eligibility_for(&other, d), Eligibility::Refused { .. }),
+                    "clause 3 binds every direction of a ruling on somebody ELSE's ask");
+        }
     }
 
     /// A gate ruling on a dispute about its own deny is self-review one layer up.
