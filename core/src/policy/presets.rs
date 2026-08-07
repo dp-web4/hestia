@@ -22,6 +22,12 @@ use super::types::{
 /// *narrow* fix — the alternative, lying in the adapter's lineage map by
 /// reporting `run_shell_command` as `"Bash"`, would hide what the member
 /// actually ran. See `shell_rules_judge_shell_like_bash` below.
+/// Raw block-device path shapes, keyed by device NAME rather than by `/dev/`.
+/// `/dev/null`, `/dev/stderr` and `/dev/urandom` are ordinary redirect targets;
+/// a destructive rule that swallowed the whole of `/dev/` would deny
+/// `echo x > /dev/null` and teach members to route around it.
+const BLOCK_DEVICE: &str = r"/dev/(sd[a-z]|nvme\d+n\d+|vd[a-z]|hd[a-z]|mmcblk\d+|xvd[a-z])";
+
 fn safety_rules() -> Vec<PolicyRule> {
     vec![
         // Whitelist: allow `rm` (incl. -rf) when EVERY target is an absolute
@@ -78,9 +84,15 @@ fn safety_rules() -> Vec<PolicyRule> {
             priority: 1,
             decision: PolicyDecision::Deny,
             reason: Some(
-                "Destructive command blocked by the safety preset. rm is allowed ONLY \
-                 standing alone against absolute /tmp paths (see the allow rule); anything \
-                 chained, relative, path-escaping (..) or outside /tmp lands here. This \
+                "Destructive command blocked by the safety preset. Two classes land here. \
+                 (1) Destroying a FILESYSTEM: rm is allowed ONLY standing alone against \
+                 absolute /tmp paths (see the allow rule); anything chained, relative, \
+                 path-escaping (..) or outside /tmp lands here, as does mkfs. (2) Writing \
+                 raw bytes at a BLOCK DEVICE (/dev/sdX, nvme, vd, hd, mmcblk, xvd) — via \
+                 `of=`, a `>` redirect, `tee`, or any other spelling of the write position \
+                 — plus `shred`. READING a device is not destroying it: `dd if=/dev/sda \
+                 of=/tmp/backup.img` is allowed, and so is any redirect to /dev/null or \
+                 /dev/stderr. This \
                  matches where the command could EXECUTE, not where the text appears: \
                  quoting the token as data (a grep pattern, a quoted heredoc body under \
                  cat/tee, a non-expanding double-quoted string) does not trip it — but \
@@ -95,7 +107,27 @@ fn safety_rules() -> Vec<PolicyRule> {
             ),
             r#match: PolicyMatch {
                 tools: Some(vec!["Bash".into(), "Shell".into()]),
-                target_patterns: Some(vec![r"rm\s+-".into(), r"mkfs\.".into()]),
+                // Two classes. `rm -` and `mkfs.` destroy a FILESYSTEM; the four
+                // below destroy the BLOCK DEVICE under it. Until 2026-08-07 only
+                // the first class was covered, so `dd if=/dev/zero of=/dev/sda`,
+                // `shred` and `cat /dev/zero > /dev/sda` all evaluated ALLOW
+                // (kimi-code notice 1486, residue confirmed on two seats).
+                //
+                // The device patterns key on the WRITE POSITION — `of=`, a `>`
+                // redirect, a `tee` argument — not on the tool name. Keying on
+                // `dd`/`cat`/`tee` would deny `dd if=/dev/sda of=/tmp/backup.img`,
+                // which reads the device and destroys nothing; keying on the
+                // position is what lets the read stay allowed. It also covers
+                // spellings nobody enumerated: any future tool that writes with
+                // `of=` or `>` lands here without a new pattern.
+                target_patterns: Some(vec![
+                    r"rm\s+-".into(),
+                    r"mkfs\.".into(),
+                    r"\bshred\s+-".into(),
+                    format!(r"\bof={BLOCK_DEVICE}"),
+                    format!(r">\s*{BLOCK_DEVICE}"),
+                    format!(r"\btee\s+(-[A-Za-z-]+\s+)*{BLOCK_DEVICE}"),
+                ]),
                 target_patterns_are_regex: true,
                 // Judge the act, not the mention. `handler.rs` hands the whole command in
                 // as `target`, so without this the rule denies `grep "rm -rf" log` — a
@@ -390,5 +422,97 @@ mod tests {
         assert_eq!(v.decision, PolicyDecision::Deny);
         assert_eq!(v.rule_id.as_deref(), Some("deny-destructive-commands"));
         assert!(v.enforced);
+    }
+
+    /// Raw-block-device writes. Until 2026-08-07 `deny-destructive-commands`
+    /// carried exactly two patterns — `rm\s+-` and `mkfs\.` — so the preset
+    /// covered two spellings of "destroy a filesystem" and none of the ways to
+    /// destroy the device underneath it. Reported by kimi-code (notice 1486),
+    /// refuted in its original form, and re-established as this residue on two
+    /// seats: `dd if=/dev/zero of=/dev/sda`, `shred -uz …` and
+    /// `cat /dev/zero > /dev/sda` all evaluated ALLOW.
+    ///
+    /// The class is the ACT — writing raw bytes at a block device — not the
+    /// tool that performs it, so the patterns key on the write POSITION
+    /// (`of=`, `>`, a `tee` argument) rather than on `dd`/`cat`/`tee`. That is
+    /// what makes the negative arm below possible: reading the same device is
+    /// not destructive and must stay allowed.
+    #[test]
+    fn block_device_writes_are_denied() {
+        use crate::policy::{PolicyAction, PolicyEngine};
+
+        let e = PolicyEngine::new(get_preset("safety").unwrap().config);
+        let judge = |cmd: &str| {
+            e.evaluate(&PolicyAction {
+                tool_name: "Bash",
+                category: "command",
+                target: Some(cmd),
+                full_command: Some(cmd),
+            })
+        };
+
+        for cmd in [
+            // the three shapes measured as ALLOW on both seats
+            "dd if=/dev/zero of=/dev/sda",
+            "shred -uz /home/dp/secret.key",
+            "cat /dev/zero > /dev/sda",
+            // same act, other spellings of the same write position
+            "sudo dd if=/dev/urandom of=/dev/nvme0n1 bs=1M",
+            "tee /dev/sda < image.img",
+            "cat image.img >/dev/mmcblk0",
+            // quoting is not an escape hatch when an interpreter re-reads it:
+            // `sh` is not an inert head, so the projection scans the raw text
+            "sh -c 'dd if=/dev/zero of=/dev/sda'",
+        ] {
+            let v = judge(cmd);
+            assert_eq!(
+                v.decision,
+                PolicyDecision::Deny,
+                "`{cmd}` should be denied, got {:?}",
+                v.decision
+            );
+            assert_eq!(
+                v.rule_id.as_deref(),
+                Some("deny-destructive-commands"),
+                "`{cmd}` denied by the wrong rule: {:?}",
+                v.rule_id
+            );
+        }
+    }
+
+    /// The negative arm, and the reason the patterns key on write position.
+    /// A rule that fired on the device path alone would deny a backup and a
+    /// log search — the FP family that cost one member ten denies on
+    /// 2026-07-27 and that `MatchScope::ExecutablePositions` exists to stop.
+    #[test]
+    fn block_device_reads_and_mentions_stay_allowed() {
+        use crate::policy::{PolicyAction, PolicyEngine};
+
+        let e = PolicyEngine::new(get_preset("safety").unwrap().config);
+        for cmd in [
+            // reading a device is not destroying it
+            "dd if=/dev/sda of=/tmp/backup.img bs=4M",
+            "head -c 512 /dev/sda | xxd",
+            "ls -l /dev/sda",
+            // ordinary redirects to character devices
+            "echo hello > /dev/null",
+            "./build.sh > /dev/stderr",
+            // the act named as DATA under an inert head — must not deny
+            "grep 'dd if=/dev/zero of=/dev/sda' /var/log/history",
+            "echo 'shred -uz secrets'",
+        ] {
+            let v = e.evaluate(&PolicyAction {
+                tool_name: "Bash",
+                category: "command",
+                target: Some(cmd),
+                full_command: Some(cmd),
+            });
+            assert_ne!(
+                v.decision,
+                PolicyDecision::Deny,
+                "`{cmd}` should not be denied (matched {:?})",
+                v.rule_id
+            );
+        }
     }
 }
