@@ -959,17 +959,20 @@ def record_gate_unavailable(member_id: str, tool: str, cause: str,
         try:
             now = rec["ts"]
             state = {}
-            with open(state_path, encoding="utf-8") as sf:
-                loaded = json.load(sf)
-                if isinstance(loaded, dict):
-                    state = loaded
+            try:
+                with open(state_path, encoding="utf-8") as sf:
+                    loaded = json.load(sf)
+                    if isinstance(loaded, dict):
+                        state = loaded
+            except (FileNotFoundError, json.JSONDecodeError):
+                state = {}
             same = state.get("cause") == rec["cause"] and now - int(state.get("last_ts", 0)) < 300
             if same:
                 state["count"] = int(state.get("count", 0)) + 1
             else:
                 state = {"first_ts": now, "count": 1, "cause": rec["cause"]}
             state["last_ts"] = now
-            tmp = state_path + ".tmp"
+            tmp = state_path + f".{os.getpid()}.tmp"
             with open(tmp, "w", encoding="utf-8") as sf:
                 json.dump(state, sf, sort_keys=True)
             os.replace(tmp, state_path)

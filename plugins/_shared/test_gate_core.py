@@ -743,7 +743,7 @@ def test_gate_unavailability_is_recorded_outside_the_chain():
     check("unrecognised_cause_becomes_unknown", rows[-1]["cause"] == "unknown")
     check("appends_rather_than_replaces", len(rows) == 2)
     state = json.load(open(state_path, encoding="utf-8"))
-    check("outage_summary_coalesces_same_window", state["count"] == 1,
+    check("outage_summary_starts_new_window_on_cause_change", state["count"] == 1,
           "a changed cause starts a new outage window rather than inflating the prior one")
 
 
