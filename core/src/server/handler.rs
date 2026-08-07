@@ -10738,31 +10738,18 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
             // only reply the decider got was `approved` plus a note saying to re-issue the
             // write. An approver who cannot see that the bar is unmet cannot know they have
             // granted nothing, and 63 times nobody did. (claude-code, 2026-08-06, re-1207.)
-            let bar_met = decided.bar_met();
-            Ok(json!({
-                "escalation_id": decided.id,
-                "status": decided.stored_status(),
-                "decided_by": decided.decided_by,
-                "decided_role": decided.decided_role,
-                "independence": independence,
-                "bar": decided.bar,
-                "bar_met": bar_met,
-                // The same conjunction `is_claimable` enforces, answered here rather than
-                // left for the caller to re-derive — two places deciding what "permits the
-                // write" means is how they come to disagree.
-                "permits_write":
-                    decided.stored_status() == crate::server::gate_escalation::Status::Approved
-                    && bar_met,
-                "witnessEntryHash": entry.ok().map(|e| e.hash),
-                "note": if bar_met {
-                    "the asker must RE-ISSUE the write to claim this; approvals are single use"
-                } else {
-                    "this decision does NOT permit the write: the stated bar is UNMET. It is \
-                     recorded, and re-issuing the write will still be refused. Decisions are \
-                     single-shot, so this escalation can no longer accumulate the missing \
-                     factor — a new one must be opened."
-                },
-            }))
+            //
+            // The shared answer now lives on `Escalation::decision_reply`, because the fix
+            // above was applied HERE and nowhere else: the operator HTTP path
+            // (`http::operator_gate_escalation`) kept returning a bare `{escalation_id,
+            // status, witnessEntryHash}` and it is the path that decides — 207 of 210 rulings
+            // on this chain. This call site keeps only what is specific to it.
+            let mut reply = decided.decision_reply();
+            if let Some(o) = reply.as_object_mut() {
+                o.insert("independence".into(), json!(independence));
+                o.insert("witnessEntryHash".into(), json!(entry.ok().map(|e| e.hash)));
+            }
+            Ok(reply)
         }
         Err(e) => Err(anyhow::anyhow!("{e}")),
     }

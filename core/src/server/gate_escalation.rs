@@ -447,6 +447,60 @@ impl Escalation {
         }
     }
 
+    /// What a DECIDER is told about the decision they just made — built once, for every
+    /// surface that can rule.
+    ///
+    /// WHY THIS IS A FUNCTION AND NOT A JSON LITERAL AT EACH CALL SITE, measured. #219 found
+    /// that `gate_escalation_decided` recorded `bar`/`bar_met` to the CHAIN while the reply
+    /// withheld both from the decider, so 63 approvals were granted by someone who could not
+    /// see they had authorised nothing. The fix was applied to `tool_gate_arbitrate_escalation`
+    /// — and only there. The other writer, `http::operator_gate_escalation`, kept returning
+    /// `{escalation_id, status, witnessEntryHash}`.
+    ///
+    /// That is the surface that decides. Censused over 111,620 chain entries
+    /// (`tools/cbp_invitation_census_1304.py`): of 210 decided escalations, **207 came through
+    /// `operator_session` and 3 through `peer_member`**. So the remedy landed on the path used
+    /// 3 times and skipped the path used 207 times, and every `sovereign_plus_peer` decision on
+    /// the chain — 72 of them, `bar_met` true on ZERO — was reported to its decider as a bare
+    /// `approved`. A control certifies only the surface it ran on.
+    ///
+    /// The MCP handler already carried the comment *"two places deciding what 'permits the
+    /// write' means is how they come to disagree."* It was right, and they disagreed anyway,
+    /// one layer up. So the answer moves here and both callers read it.
+    pub fn decision_reply(&self) -> serde_json::Value {
+        let bar_met = self.bar_met();
+        let permits_write = self.stored_status() == Status::Approved && bar_met;
+        serde_json::json!({
+            "escalation_id": self.id,
+            "status": self.stored_status(),
+            "decided_by": self.decided_by,
+            "decided_role": self.decided_role,
+            "bar": self.bar,
+            "bar_met": bar_met,
+            // The same conjunction `is_claimable` enforces, answered here rather than left for
+            // each caller to re-derive.
+            "permits_write": permits_write,
+            // The invitation half of the bar, reported as a RECORD (#226). Under blocker
+            // semantics an absent peer showed up as `bar_met: false`; now that the sovereign
+            // conjunct decides alone, nothing on any surface would say whether a peer was ever
+            // asked. `invited` is empty on every escalation this daemon has ever opened —
+            // `open()` sets `Vec::new()` and no production path writes it — so this currently
+            // reports, truthfully, that no invitation was issued. That is the point: it must
+            // read as "nobody was asked", never as "asked and they agreed".
+            "peer_participation": self.peer_participation(),
+            "note": if permits_write {
+                "the asker must RE-ISSUE the write to claim this; approvals are single use"
+            } else if bar_met {
+                "this decision does not permit the write: it is a DENY, recorded as one"
+            } else {
+                "this decision does NOT permit the write: the stated bar is UNMET. It is \
+                 recorded, and re-issuing the write will still be refused. Decisions are \
+                 single-shot, so this escalation can no longer accumulate the missing \
+                 factor — a new one must be opened."
+            },
+        })
+    }
+
     /// The instant after which an approval stops being claimable.
     ///
     /// Two ceilings, and BOTH have to hold — which is what makes this change monotone: no
@@ -1087,6 +1141,168 @@ mod tests {
         assert_eq!(p.concurred, 0);
         assert_eq!(p.dissented, 0);
         assert_eq!(p.absent, 0, "nobody was invited, so nobody is absent — absent is DERIVED");
+    }
+
+    /// The two deciding surfaces must answer the same question, because the last time they
+    /// did not, the fix went to the wrong one.
+    ///
+    /// #219 added `bar`/`bar_met`/`permits_write` to the MCP arbitrate reply. The operator
+    /// HTTP reply kept returning `{escalation_id, status, witnessEntryHash}` — and that is
+    /// the surface that rules: 207 of 210 decided escalations on this chain came through
+    /// `operator_session`, 3 through `peer_member` (`tools/cbp_invitation_census_1304.py`).
+    ///
+    /// This exercises `decision_reply` directly. It does NOT drive the axum route, so it
+    /// proves the shared answer is correct, not that the route calls it —
+    /// `the_operator_route_still_reads_the_shared_answer` covers that half, differently and
+    /// more weakly.
+    #[test]
+    fn one_answer_serves_both_deciding_surfaces() {
+        let mut s = EscalationStore::default();
+        let e = s
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        let id = e.id.clone();
+        let decided = s
+            .decide(&id, true, "operator", "role:constellation:sovereign",
+                    Channel::OperatorSession, None, Some("proceed"), T0 + 5)
+            .unwrap();
+
+        let r = decided.decision_reply();
+        // The three fields the operator surface has never carried.
+        assert!(r.get("bar").is_some(), "name the criterion: {r}");
+        assert_eq!(r.get("bar_met").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(
+            r.get("permits_write").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "an approval that IS claimable must say so: {r}"
+        );
+        // The reply must agree with the enforcement, not merely resemble it.
+        assert_eq!(
+            r.get("permits_write").and_then(serde_json::Value::as_bool).unwrap(),
+            decided.is_claimable(T0 + 6),
+            "the reported answer and `is_claimable` are one predicate or they will diverge"
+        );
+    }
+
+    /// An approval short of the bar must say it permits nothing — the class #219 found, kept
+    /// under test after #226 narrowed it.
+    ///
+    /// #226 made `SovereignPlusPeer` read the sovereign conjunct alone, so an operator's own
+    /// approval now meets it and this class is CLOSED for that bar going forward. It is not
+    /// closed retroactively and it was not closed on the box: the daemon serving this fleet
+    /// was still built from a pre-#226 commit 42 minutes after #226 merged, and four more
+    /// `sovereign_plus_peer` approvals were granted in that gap with `bar_met: false`. So the
+    /// warning path stays pinned against a bar that genuinely is not met.
+    #[test]
+    fn an_approval_that_meets_no_bar_reports_that_it_permits_nothing() {
+        let mut s = EscalationStore::default();
+        let e = s
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        let id = e.id.clone();
+        s.decide(&id, true, "operator", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("proceed"), T0 + 5)
+            .unwrap();
+        // Strip the evidence, keeping the grant: the shape a replay restores when the
+        // `factors_present` array is missing, and the shape `is_claimable` refuses.
+        let hollow = {
+            let x = s.by_id.get_mut(&id).unwrap();
+            x.factors.clear();
+            x.clone()
+        };
+        let r = hollow.decision_reply();
+        assert_eq!(r.get("bar_met").and_then(serde_json::Value::as_bool), Some(false));
+        assert_eq!(r.get("permits_write").and_then(serde_json::Value::as_bool), Some(false));
+        assert!(
+            r.get("note").and_then(serde_json::Value::as_str).unwrap().contains("does NOT permit"),
+            "silence here is what cost 63 approvals: {r}"
+        );
+        assert!(!hollow.is_claimable(T0 + 6), "and the enforcement agrees");
+    }
+
+    /// "Nobody was invited" must be VISIBLE, not inferred from an absent field.
+    ///
+    /// #226 retained the peer conjunct as evidence via `peer_participation()`, on the
+    /// reasoning that the bar "still shapes WHO IS ASKED and what is recorded". Neither half
+    /// is true yet: `invited_peers` has no production writer (`open` and `rehydrate` both set
+    /// `Vec::new()`), and before this change `peer_participation()` had no production reader
+    /// at all. Censused over 111,620 chain entries: NO key on any `gate_escalation_opened` or
+    /// `_decided` payload names an invited peer, across 317 opens.
+    ///
+    /// So this asserts the honest current state and guards the direction of the lie. An empty
+    /// `invited` with `absent: 0` reads "nobody was asked". The failure to guard against is a
+    /// future writer populating `invited` from a roster WITHOUT sending anything — that would
+    /// make the record assert an invitation that was never issued.
+    #[test]
+    fn an_uninvited_peer_reads_as_uninvited_not_as_agreement() {
+        let mut s = EscalationStore::default();
+        let e = s
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        assert!(
+            e.invited_peers.is_empty(),
+            "no production path invites anyone yet — if this fails, an invitation is being \
+             RECORDED and the test that must accompany it is 'a notice was sent'"
+        );
+        let id = e.id.clone();
+        let decided = s
+            .decide(&id, true, "operator", "role:constellation:sovereign",
+                    Channel::OperatorSession, None, Some("proceed"), T0 + 5)
+            .unwrap();
+
+        let p = decided.decision_reply();
+        let part = p.get("peer_participation").expect("participation must be ON the reply");
+        assert_eq!(part.get("invited").and_then(serde_json::Value::as_array).unwrap().len(), 0);
+        assert_eq!(part.get("concurred").and_then(serde_json::Value::as_u64), Some(0));
+        assert_eq!(
+            part.get("absent").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "absent is derived from invited — nobody asked means nobody absent, NOT nobody \
+             missing"
+        );
+    }
+
+    /// The weak half of the parity check, and labelled weak on purpose.
+    ///
+    /// `operator_gate_escalation` is an axum handler over `SharedState`; driving it here would
+    /// need a daemon fixture this module does not have. So this reads the source and asserts
+    /// the operator route still routes through the shared answer. It is LEXICAL: it proves a
+    /// call is written, not that it is reached, and a rename defeats it.
+    ///
+    /// It earns its place by being the only assertion in this file that goes RED on `main`
+    /// today — the others cannot even compile there, and a compile error is not a measurement
+    /// of the defect.
+    ///
+    /// IT COMMENTS OUT THE COMMENTS FIRST, and that line is the whole reason this test is
+    /// trustworthy. The first version matched `contains("decision_reply")` against the raw
+    /// source. Sabotaged — call deleted, route rebuilt as the bare pre-#219 literal — it
+    /// still passed, because the explanatory comment ABOVE the call says the word
+    /// `decision_reply`. The guard was certifying that someone had written *about* the shared
+    /// answer, which is exactly the property a drifting reimplementation would preserve: a
+    /// future author who rebuilds the literal will almost certainly leave the comment
+    /// explaining why they shouldn't. Match the CALL, on comment-free source.
+    #[test]
+    fn the_operator_route_still_reads_the_shared_answer() {
+        let src = include_str!("http.rs");
+        let start = src
+            .find("async fn operator_gate_escalation")
+            .expect("the operator decide route must still exist under this name");
+        let body = &src[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let code: String = body[..end]
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains(".decision_reply()"),
+            "the operator decide route builds its own reply again. That is the exact drift \
+             #219 left behind: the chain records `bar`/`bar_met` and the decider is told \
+             neither, on the path that rules 207 of 210 escalations."
+        );
     }
 
     #[test]
