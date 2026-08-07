@@ -2024,15 +2024,27 @@ async fn operator_gate_escalation(
                     "secs_into_window": now.saturating_sub(esc.opened_at),
                 }),
             );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "escalation_id": esc.id,
-                    "status": esc.stored_status(),
-                    "witnessEntryHash": entry.ok().map(|e| e.hash),
-                })),
-            )
-                .into_response()
+            // THE DECIDER SEES THE BAR — on this surface too.
+            //
+            // This reply used to be `{escalation_id, status, witnessEntryHash}`. #219 measured
+            // what that costs: the chain entry directly above records `bar` and `bar_met`, and
+            // the operator who just ruled was told neither, so an approval that `is_claimable`
+            // would refuse came back looking identical to one that works. The remedy shipped
+            // in `tool_gate_arbitrate_escalation` and stopped there — and THAT path has ruled
+            // 3 escalations, lifetime, against 207 through this one
+            // (`tools/cbp_invitation_census_1304.py`, 111,620 entries). The fix landed on the
+            // surface nobody uses.
+            //
+            // `decision_reply` is now the single answer both callers read, so the next field
+            // added to one cannot silently miss the other.
+            let mut body = esc.decision_reply();
+            if let Some(o) = body.as_object_mut() {
+                o.insert(
+                    "witnessEntryHash".into(),
+                    serde_json::json!(entry.ok().map(|e| e.hash)),
+                );
+            }
+            (StatusCode::OK, Json(body)).into_response()
         }
         // Every failure mode here leaves the write refused, which is why none of them is a 500.
         Err(e) => (
