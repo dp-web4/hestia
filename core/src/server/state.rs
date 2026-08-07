@@ -44,6 +44,14 @@ pub struct Session {
     /// chain entries so a *provisional* `mesh-worker` is distinguishable from a
     /// *hydrated* one — the normalized role string alone cannot separate them
     /// (both are the same `&'static str` by construction).
+    ///
+    /// Captured AT MINT: under Guard A session reuse, the basis is whatever the
+    /// FIRST connect for a given `host_session_id` supplied, and a later reuse
+    /// carrying a different basis is refused adoption (the minted value is
+    /// echoed, not replaced). So `None` records "absent at mint", NOT "the
+    /// caller never had a basis" — a session whose first connect raced the
+    /// fire's exports reads `null` even if every later connect supplied one
+    /// (claude-code review of #238, point 2).
     pub role_basis: Option<String>,
     pub soft_lct: String,
     pub connected_at: DateTime<Utc>,
