@@ -199,6 +199,21 @@ _SELF_MARKERS = (
     _SELF_DIR,
     "plugins/claude-code/hooks",
     "hestia/hooks",
+    # THE INSTALLERS ARE WRITE POSITIONS ON THIS GATE (claude-code disclosure 3a,
+    # forum "the rung nobody built", 2026-08-07 — handed to kimi-code). Both sit
+    # off every marker above by construction: `plugins/claude-code/install.sh`
+    # (#273) one directory up, `deploy/install-members.sh` (#272) in a directory
+    # no hook marker names. Verified there by invocation: the gate ALLOWED
+    # `bash <installer>` and only the script's own role check refused. Running
+    # the installer overwrites the enforcing copy — it IS writing the gate, one
+    # `cp` removed, and it belongs in the self-access class (witnessed,
+    # escalatable) rather than in ordinary policy. Editing either script is the
+    # same act one hop earlier, so the path-key match refusing it is intended.
+    # Disclosed limit, same as every path marker: an invocation that never
+    # spells the path (cd in, `bash install.sh`) matches nothing — A1 removes
+    # the cheap silent version, it is not containment.
+    "plugins/claude-code/install.sh",
+    "deploy/install-members.sh",
 )
 
 # THE GOVERNANCE SURFACE, not just this file. Protecting only `pre_tool_use.py`
