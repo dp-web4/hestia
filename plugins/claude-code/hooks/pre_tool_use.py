@@ -202,8 +202,11 @@ _SELF_MARKERS = (
     # THE INSTALLERS ARE WRITE POSITIONS ON THIS GATE (claude-code disclosure 3a,
     # forum "the rung nobody built", 2026-08-07 — handed to kimi-code). Both sit
     # off every marker above by construction: `plugins/claude-code/install.sh`
-    # (#273) one directory up, `deploy/install-members.sh` (#272) in a directory
-    # no hook marker names. Verified there by invocation: the gate ALLOWED
+    # one directory up, `deploy/install-members.sh` (#272) in a directory
+    # no hook marker names. (#273, which carried install.sh, was CLOSED
+    # unmerged in favour of #272 — the file lives only on that branch; the
+    # marker pre-positions for its return, it names nothing on main today.)
+    # Verified there by invocation: the gate ALLOWED
     # `bash <installer>` and only the script's own role check refused. Running
     # the installer overwrites the enforcing copy — it IS writing the gate, one
     # `cp` removed, and it belongs in the self-access class (witnessed,

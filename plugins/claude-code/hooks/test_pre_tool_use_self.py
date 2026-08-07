@@ -296,7 +296,9 @@ for label, cmd in [
 
 print("the installers are write positions on the gate — self-access, not ordinary policy")
 # kimi-code, 2026-08-07, claiming claude-code's disclosure 3a (forum "the rung nobody
-# built"): `plugins/claude-code/install.sh` (#273) and `deploy/install-members.sh` (#272)
+# built"): `plugins/claude-code/install.sh` (#273, CLOSED unmerged — the file exists
+# only on that branch; the marker pre-positions for its return) and
+# `deploy/install-members.sh` (#272)
 # both overwrite the enforcing copy and matched no marker — the gate allowed
 # `bash <installer>` and only the script's own role check refused. These pins fail
 # against the pre-marker gate and pass after it, which is the disclosure made
