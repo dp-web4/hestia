@@ -171,6 +171,23 @@ def discover_endpoint() -> Optional[str]:
 # `python -c`, `tee` and a heredoc all reach this file by different syntax, and
 # an executable-position parse would have to be right about all of them.
 #
+# ONE SCOPED EXCEPTION (2026-08-07, kimi-code, claiming claude-code notice 1529):
+# the daemon's destructive preset tells the member, in its reason string, that "a
+# quoted heredoc body under cat/tee does not trip it" (presets.rs, backed by
+# policy::shell) — but this hook runs FIRST and matched raw, so a report ABOUT the
+# gate written by heredoc was refused by code the quoted law does not describe
+# (FP8 through the Bash door; the Write door was carved out below when `content`
+# left the haystack). `_blank_inert_heredoc_bodies` is that carve-out, here. It is
+# deliberately NARROWER than policy::shell: only heredoc bodies are blanked, never
+# quoted argument spans, because this gate matches PATHS and a path can sit at
+# argument position — `tee "hooks/pre_tool_use.py"` must keep matching, while
+# `rm "-rf"` shapes are the destructive preset's problem, not this one's. A
+# heredoc body is stdin content: it can never name the destination, so blanking
+# it cannot hide a write to the gate — the destination always sits in executable
+# position (`> PATH`, `tee PATH`), where matching stays raw. Everything the parser
+# cannot read confidently returns None and None means "match the raw command" —
+# the fail-closed edge, unchanged.
+#
 # WHAT THIS IS NOT: containment. A determined agent can still reach the file by
 # a path this misses, or kill the hook process. This is A1 — cooperative. What it
 # removes is the CHEAP, SILENT version, and it removes "I didn't know" as an
@@ -227,6 +244,283 @@ _GOVERNANCE_FILES = (
     # it free — an aspirational claim a reader would have trusted.
     "gate_self_protection_test.py",
 )
+
+
+# Commands whose arguments and stdin are DATA, never shell code — the same
+# allowlist policy::shell uses, kept in sync with it deliberately. An allowlist,
+# never a denylist: an unrecognised head is treated as interpreting, so
+# `sh -c`, `eval`, `sed`, `awk`, `python3 -` and everything nobody has vetted keep
+# their heredoc bodies fully scanned. Adding a name widens the gate; it belongs in
+# a reviewed diff with the reason stated.
+_INERT_CONTENT_HEADS = frozenset({
+    # byte movers
+    "cat", "tee", "head", "tail", "rev", "nl",
+    # pattern search — none of these can execute a match
+    "grep", "egrep", "fgrep", "rg",
+    # output
+    "echo", "printf",
+    # text filters
+    "wc", "sort", "uniq", "cut", "tr", "comm", "diff", "column", "fold", "paste",
+    "join",
+    # structured filters
+    "jq",
+    # path arithmetic
+    "basename", "dirname",
+})
+
+
+def _blank_inert_heredoc_bodies(cmd: str) -> Optional[str]:
+    """A copy of `cmd` with QUOTED heredoc bodies blanked to spaces, else None.
+
+    The scoped port of policy::shell's `executable_positions` for this gate —
+    scoped because the two gates match different things. The destructive preset
+    matches COMMAND TOKENS (`rm -`, `dd `), so it can blank any inert quoted
+    span; this gate matches PATHS, and a path can sit at argument position, so
+    blanking quoted arguments would open `tee "hooks/pre_tool_use.py"` as a
+    one-word evasion. A heredoc BODY is the only span that can never name a
+    destination — it is stdin content — so it is the only span blanked here.
+
+    The three safety conditions are the daemon's, unchanged in kind:
+
+    1. The body cannot expand: only a QUOTED delimiter (`<<'X'`, `<<"X"`,
+       `<<\\X`) qualifies. `cat <<X` can carry `$(...)` and stays visible.
+    2. The command governing the body treats stdin as data: the owning
+       segment's head must be in `_INERT_CONTENT_HEADS`.
+    3. Nothing downstream re-interprets it: inertness propagates backwards
+       along pipes, so `cat <<'X' | sh` keeps its body visible.
+
+    Returns None on anything the parser cannot resolve — unterminated quote,
+    heredoc whose delimiter never arrives, unbalanced `$(`, trailing backslash —
+    and None means "match the raw command" (fail closed, today's behaviour).
+    Length and newlines are preserved in the projection, so a report against it
+    still lines up with the original.
+    """
+    n = len(cmd)
+    # (head, sep) per segment; sep is 'pipe', 'break' or 'end'.
+    segs: list = [[None, "end"]]
+    inert_spans: list = []  # (seg_idx, start, end) of candidate bodies
+    pending: list = []      # heredocs opened on this line: dicts
+    seg = 0
+    word: list = []
+    word_quoted = False
+    head_done = False
+    expect_redir_target = False
+    subst_depth = 0
+
+    def flush_word() -> None:
+        nonlocal word_quoted, head_done, expect_redir_target
+        if not word:
+            word_quoted = False
+            return
+        w = "".join(word)
+        if expect_redir_target:
+            expect_redir_target = False
+        elif not head_done:
+            if not word_quoted and _is_shell_assignment(w):
+                pass  # `FOO=bar cmd …` — keep looking for the head
+            else:
+                segs[seg][0] = w.rsplit("/", 1)[-1]
+                head_done = True
+        word.clear()
+        word_quoted = False
+
+    def find_unescaped(start: int, close: str, honour_backslash: bool) -> Optional[int]:
+        j = start
+        while j < n:
+            if honour_backslash and cmd[j] == "\\":
+                j += 2
+                continue
+            if cmd[j] == close:
+                return j
+            j += 1
+        return None  # unterminated — fail closed
+
+    def read_delimiter(i: int) -> Optional[Tuple[str, bool, int]]:
+        delim: list = []
+        quoted = False
+        while i < n:
+            c = cmd[i]
+            if c in "'\"":
+                quoted = True
+                end = find_unescaped(i + 1, c, c == '"')
+                if end is None:
+                    return None
+                delim.extend(cmd[i + 1:end])
+                i = end + 1
+            elif c == "\\":
+                if i + 1 >= n:
+                    return None
+                quoted = True
+                delim.append(cmd[i + 1])
+                i += 2
+            elif c.isspace() or c in ";&|<>()":
+                break
+            else:
+                delim.append(c)
+                i += 1
+        if not delim:
+            return None
+        return "".join(delim), quoted, i
+
+    def consume_body(i: int, hd: dict) -> Optional[Tuple[int, int, int]]:
+        body_start = i
+        line_start = i
+        while i <= n:
+            if i == n or cmd[i] == "\n":
+                line = cmd[line_start:i]
+                if hd["strip_tabs"]:
+                    line = line.lstrip("\t")
+                if line.rstrip("\r") == hd["delim"]:
+                    return body_start, line_start, (i if i == n else i + 1)
+                if i == n:
+                    return None  # ran out of input before the terminator
+                line_start = i + 1
+            i += 1
+        return None
+
+    i = 0
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            if i + 1 >= n:
+                return None  # trailing backslash: unresolved
+            word.extend((c, cmd[i + 1]))
+            word_quoted = True
+            i += 2
+        elif c == "'":
+            end = find_unescaped(i + 1, "'", False)
+            if end is None:
+                return None
+            word.extend(cmd[i + 1:end])
+            word_quoted = True
+            i = end + 1
+        elif c == '"':
+            end = find_unescaped(i + 1, '"', True)
+            if end is None:
+                return None
+            word.extend(cmd[i + 1:end])
+            word_quoted = True
+            i = end + 1
+        elif c == "$" and i + 1 < n and cmd[i + 1] == "(":
+            subst_depth += 1
+            word.extend("$(")
+            i += 2
+        elif c == "`":
+            end = find_unescaped(i + 1, "`", True)
+            if end is None:
+                return None
+            word_quoted = True
+            i = end + 1
+        elif c == "<" and i + 1 < n and cmd[i + 1] == "<":
+            flush_word()
+            if i + 2 < n and cmd[i + 2] == "<":
+                i += 3  # herestring: the following word is ordinary data
+            else:
+                i += 2
+                strip_tabs = i < n and cmd[i] == "-"
+                if strip_tabs:
+                    i += 1
+                while i < n and cmd[i] in " \t":
+                    i += 1
+                got = read_delimiter(i)
+                if got is None:
+                    return None
+                delim, quoted, i = got
+                pending.append({"delim": delim, "quoted": quoted,
+                                "strip_tabs": strip_tabs, "seg": seg})
+        elif c in "><":
+            if word and all(ch.isdigit() for ch in word):
+                word.clear()
+                word_quoted = False
+            flush_word()
+            i += 1
+            while i < n and cmd[i] in "><&|":
+                i += 1
+            expect_redir_target = True
+        elif c in "|;&({}":
+            if c == "(" and subst_depth > 0:
+                word.append(c)
+                i += 1
+                continue
+            flush_word()
+            is_pipe = c == "|" and not (i + 1 < n and cmd[i + 1] == "|")
+            segs[seg][1] = "pipe" if is_pipe else "break"
+            segs.append([None, "end"])
+            seg += 1
+            head_done = False
+            expect_redir_target = False
+            i += 1
+            if i < n and cmd[i] == c and c in "&|":
+                i += 1
+        elif c == ")":
+            if subst_depth > 0:
+                subst_depth -= 1
+                word.append(c)
+                i += 1
+            else:
+                flush_word()
+                segs[seg][1] = "break"
+                segs.append([None, "end"])
+                seg += 1
+                head_done = False
+                expect_redir_target = False
+                i += 1
+        elif c == "\n":
+            flush_word()
+            i += 1
+            for hd in pending:
+                got = consume_body(i, hd)
+                if got is None:
+                    return None
+                body_start, body_end, i = got
+                if hd["quoted"] and subst_depth == 0:
+                    inert_spans.append((hd["seg"], body_start, body_end))
+            pending.clear()
+            segs[seg][1] = "break"
+            segs.append([None, "end"])
+            seg += 1
+            head_done = False
+            expect_redir_target = False
+        elif c in " \t\r":
+            flush_word()
+            i += 1
+        else:
+            word.append(c)
+            i += 1
+
+    if subst_depth != 0:
+        return None  # unbalanced `$(`
+    if pending:
+        return None  # heredoc opened, body never arrived
+    flush_word()
+
+    # Conditions 2 + 3 together, walking backwards so a segment is inert only
+    # if the segment it pipes into is inert too.
+    inert_seg = [False] * len(segs)
+    for k in range(len(segs) - 1, -1, -1):
+        head_ok = segs[k][0] in _INERT_CONTENT_HEADS
+        if segs[k][1] == "pipe":
+            inert_seg[k] = head_ok and (inert_seg[k + 1] if k + 1 < len(segs) else False)
+        else:
+            inert_seg[k] = head_ok
+
+    out = list(cmd)
+    for s, start, end in inert_spans:
+        if 0 <= s < len(inert_seg) and inert_seg[s]:
+            for slot in range(start, end):
+                if out[slot] != "\n":
+                    out[slot] = " "
+    return "".join(out)
+
+
+def _is_shell_assignment(word: str) -> bool:
+    """`FOO=bar` — a variable assignment prefix, not the segment's head."""
+    eq = word.find("=")
+    if eq <= 0:
+        return False
+    name = word[:eq]
+    return (name[0].isalpha() or name[0] == "_") and all(
+        ch.isalnum() or ch == "_" for ch in name)
 
 
 def _touches_self(tool_name: str, tool_input: Any) -> Optional[Tuple[str, str, str]]:
@@ -286,29 +580,46 @@ def _touches_self(tool_name: str, tool_input: Any) -> Optional[Tuple[str, str, s
     # at the `cp`, an unknown head (`cp_onto_gate` in `_SURVIVE`). `new_string` STAYS:
     # Edit is the genuinely hard case (string replacement steers a file whose destination
     # never is the gate), and it keeps the old treatment until that case is earned.
+    #
+    # `command` got the SAME disease through the Bash door, one day later (claude-code
+    # notice 1529 §7): a report about the gate written by heredoc is the FP8 shape
+    # with `cat`/`tee` holding the pen. The fix is NOT to drop `command` from the
+    # haystack — the destination of a shell write lives IN the command text, so raw
+    # matching is the only thing standing over `> PATH` and `tee PATH`. Instead the
+    # command is matched against `_blank_inert_heredoc_bodies`: quoted heredoc bodies
+    # (the only span that can never name a destination) are blanked before matching;
+    # everything else, quoted or not, is matched raw. The entries below are
+    # (report_text, match_text, key) so the deny and the escalation still quote what
+    # the member actually wrote, not the projection.
     resolved = []
     for key in ("file_path", "path", "notebook_path"):
         v = tool_input.get(key)
         if isinstance(v, str) and v:
-            resolved.append((v, key))
+            resolved.append((v, v, key))
             try:
-                resolved.append((os.path.realpath(v), key))
+                rp = os.path.realpath(v)
+                resolved.append((rp, rp, key))
             except (OSError, ValueError):
                 pass
     for key in ("command", "new_string"):
         v = tool_input.get(key)
         if isinstance(v, str) and v:
-            resolved.append((v, key))
+            match = v
+            if key == "command":
+                proj = _blank_inert_heredoc_bodies(v)
+                if proj is not None:
+                    match = proj
+            resolved.append((v, match, key))
     if not resolved:
         # No target key and no command we recognised — an unknown tool shape. Scan
         # `content` after all: an absent destination must not read as absent risk.
         v = tool_input.get("content")
         if isinstance(v, str) and v:
-            resolved.append((v, "content"))
-    for h, key in resolved:
+            resolved.append((v, v, "content"))
+    for report, match, key in resolved:
         for marker in _SELF_MARKERS:
-            if marker and marker in h:
-                return (marker, h, key)
+            if marker and marker in match:
+                return (marker, report, key)
         # Governance files by name, ANYWHERE by default. `_HOOKS_DIR_ONLY` carves out the
         # names common enough that matching them everywhere would fire on ordinary work.
         #
@@ -323,14 +634,14 @@ def _touches_self(tool_name: str, tool_input: Any) -> Optional[Tuple[str, str, s
         # also remembered where it lives. Weakening is now an explicit, visible second edit
         # into `_HOOKS_DIR_ONLY`, and the subset test keeps that list from drifting away from
         # the list it weakens.
-        low = h.replace("\\", "/")
+        low = match.replace("\\", "/")
         in_hooks = "hooks/" in low or "/hooks" in low
         for fname in _GOVERNANCE_FILES:
             if fname not in low:
                 continue
             if fname in _HOOKS_DIR_ONLY and not in_hooks:
                 continue
-            return (fname, h, key)
+            return (fname, report, key)
     return None
 
 
@@ -1347,9 +1658,57 @@ def _credential_shaped(text: str) -> bool:
     return any(shape in low for shape in _CREDENTIAL_SHAPES)
 
 
+def _connect_session(client: "McpHttp", host_session_id: Optional[str]) -> Optional[str]:
+    """A live daemon session id for the escalation claim, or None — never raises.
+
+    WHO is asking, provable. The claim path accepts an optional `session_id`
+    (handler.rs `tool_gate_escalation_claim`): a session that resolves turns
+    `asker_basis` from "asserted" into "session", and a proven asker is what lets
+    the invitation actually WAKE the peers it records — until now every
+    claim-path escalation recorded peers and woke nobody (kimi-code census over
+    the full 114,819-entry chain: `asker_basis` on 0 of 362, claude-code notice
+    1530's remainder).
+
+    The daemon's own note said to thread the session `ask_daemon` "already
+    holds" — but self-protection runs BEFORE `ask_daemon` in `main`, by design
+    ("before the daemon, and never conditional on it"), so at this point in the
+    invocation no session exists. This is therefore a real connect, one extra
+    loopback round trip inside the escalation budget — not a thread-through.
+
+    `plugin_id` is `_escalation_plugin_id()`, the same value the claim asserts:
+    the daemon refuses a claim whose plugin_id disagrees with the session's
+    (asker mismatch is the forgery the binding exists to catch), so the two must
+    be one value. `host_session_id` keeps connect idempotent across hook
+    invocations — one Claude session, one hestia session — matching ask_daemon.
+
+    None means "proceed unproven": session_id is optional on the claim and an
+    asserted escalation is paperwork, while a missing one is silence. Failure
+    here must degrade the RECORD, never the channel.
+    """
+    try:
+        args: dict[str, Any] = {
+            "plugin_id": _escalation_plugin_id(),
+            "plugin_version": HOOK_VERSION,
+            "host_agent": HOST_AGENT,
+            "requested_role": "citizen",
+            "protocol_version": PROTOCOL_VERSION,
+        }
+        role = os.environ.get("HESTIA_ROLE")
+        if role:
+            args["role"] = role
+        if host_session_id:
+            args["host_session_id"] = host_session_id
+        conn = unwrap_tool_result(client.call_tool("hestia_connect", args))
+        sid = conn.get("sessionId")
+        return sid if isinstance(sid, str) and sid else None
+    except Exception:  # noqa: BLE001 — see the docstring: degrade the record, not the channel
+        return None
+
+
 def request_self_write(marker: str, tool_name: str, attempted: str = "",
                        resource: Optional[str] = None, key: Optional[str] = None,
-                       dest: Optional[str] = None) -> Tuple[str, str]:
+                       dest: Optional[str] = None,
+                       host_session_id: Optional[str] = None) -> Tuple[str, str]:
     """One round trip. Returns (verdict, detail); only 'approved' permits the write.
 
     `marker` is what the daemon keys the approval on and is NOT the human-facing
@@ -1375,7 +1734,7 @@ def request_self_write(marker: str, tool_name: str, attempted: str = "",
         client = McpHttp(endpoint, deadline=time.monotonic() + ESCALATION_RPC_TIMEOUT_S)
         client.initialize()
         client.initialized()
-        r = client.call_tool("hestia_gate_escalation_claim", {
+        claim_args: dict[str, Any] = {
             "plugin_id": _escalation_plugin_id(),
             "role": os.environ.get("HESTIA_ROLE", ""),
             "tool_name": tool_name,
@@ -1396,7 +1755,13 @@ def request_self_write(marker: str, tool_name: str, attempted: str = "",
                 "Auto-opened by the gate on a refused write; the member stated no rationale "
                 "because it did not choose to escalate. Approving authorises this one write."
             ),
-        })
+        }
+        # WHO is asking, provable — see `_connect_session`. Absent on any failure:
+        # the claim accepts its absence and records `asker_basis: "asserted"`.
+        sid = _connect_session(client, host_session_id)
+        if sid:
+            claim_args["session_id"] = sid
+        r = client.call_tool("hestia_gate_escalation_claim", claim_args)
     except Exception as e:  # noqa: BLE001
         return "unreachable", f"no answer from the daemon ({type(e).__name__}) -- refused"
 
@@ -1948,6 +2313,7 @@ def main() -> int:
             verdict, detail = request_self_write(
                 _self_marker, tool_name, _attempted_summary(tool_name, tool_input),
                 resource=_self_resource, key=_self_key, dest=_self_dest,
+                host_session_id=host_session_id,
             )
             if verdict != "approved":
                 debug_log(f"gate-self-write {verdict}: {detail}")
