@@ -187,6 +187,15 @@ echo "[fire-kimi] firing kimi -p ($FIREWORTHY notice(s)) -> $LOG_DIR/kimi-$STAMP
 # honest state and is now reported by the derivation.
 if [[ -z "${HESTIA_ROLE:-}" ]]; then
   _ident="~/.kimi-code/hestia-instance/identity.json"
+  # The unresolved-role diagnosis DIFFERS PER MEMBER, so it lives beside the member's own
+  # identity path and not in the shared block below (see fire-claude.sh for the full note).
+  # kimi's gap is OPERATIONAL, not structural: the plugin DOES ship the seed and the
+  # hydrator, so an absent file means hydrate never ran on this box — which is fixable here,
+  # unlike claude-code's. Note the asymmetry the paths encode: the member fires as
+  # `kimi-code` and hydrates from `plugins/kimi/`.
+  _ident_diagnosis="the kimi plugin DOES ship instance/identity.seed.json and \
+hooks/hydrate.sh, so an absent file means hydrate has never run on this box. \
+REMEDY: run plugins/kimi/hooks/hydrate.sh, or export HESTIA_ROLE before the fire."
   if [[ -r "${_ident/#\~/$HOME}" ]]; then
     _role=$(python3 -c 'import json,sys
 try:
@@ -229,8 +238,7 @@ except Exception:
     echo "[fire-kimi] role unresolved — DECLARING role:constellation:mesh-worker PROVISIONALLY." \
          "The fire is the evidence: this is a mesh-woken session, so mesh-worker is what it" \
          "is, not a guess. Basis recorded in HESTIA_ROLE_BASIS. This is NOT a hydrated" \
-         "identity: nothing in the claude-code tree writes $_ident (codex, gemini and kimi" \
-         "ship identity.seed.json + hydrate.sh; claude-code ships neither). Acts will be" \
+         "identity — $_ident: $_ident_diagnosis Acts will be" \
          "attributed to mesh-worker with a provisional basis rather than painted as" \
          "interactive-dev or lost to 'unattributed' (escalation 411bf87a, 2026-08-06)." >&2
   fi

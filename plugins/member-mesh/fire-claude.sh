@@ -225,6 +225,15 @@ echo "[fire-claude] firing claude -p ($FIREWORTHY notice(s)) -> $LOG_DIR/claude-
 # honest state and is now reported by the derivation.
 if [[ -z "${HESTIA_ROLE:-}" ]]; then
   _ident="~/.claude/hestia-instance/identity.json"
+  # The unresolved-role diagnosis DIFFERS PER MEMBER, so it lives beside the member's own
+  # identity path and not in the shared block below. Getting this wrong is not cosmetic: it
+  # is the line an operator reads at 3am, and it names the remedy. claude-code's gap is
+  # STRUCTURAL — the plugin ships neither `instance/identity.seed.json` nor
+  # `hooks/hydrate.sh` (codex, gemini and kimi ship both), so nothing in the tree writes the
+  # file this reads and no amount of re-running will produce one.
+  _ident_diagnosis="nothing in the claude-code tree writes it: the plugin ships no \
+instance/identity.seed.json and no hooks/hydrate.sh (codex, gemini and kimi ship both). \
+REMEDY: export HESTIA_ROLE before the fire, or ship claude-code the seed+hydrate pair."
   if [[ -r "${_ident/#\~/$HOME}" ]]; then
     _role=$(python3 -c 'import json,sys
 try:
@@ -277,8 +286,7 @@ except Exception:
     echo "[fire-claude] role unresolved — DECLARING role:constellation:mesh-worker PROVISIONALLY." \
          "The fire is the evidence: this is a mesh-woken session, so mesh-worker is what it" \
          "is, not a guess. Basis recorded in HESTIA_ROLE_BASIS. This is NOT a hydrated" \
-         "identity: nothing in the claude-code tree writes $_ident (codex, gemini and kimi" \
-         "ship identity.seed.json + hydrate.sh; claude-code ships neither). Acts will be" \
+         "identity — $_ident: $_ident_diagnosis Acts will be" \
          "attributed to mesh-worker with a provisional basis rather than painted as" \
          "interactive-dev or lost to 'unattributed' (escalation 411bf87a, 2026-08-06)." >&2
   fi
