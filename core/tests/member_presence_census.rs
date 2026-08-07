@@ -238,7 +238,20 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
         "let a = s.member_lct(&c.plugin_id);",
         "let b = s.member_lct(appellant);",
     ], SiteClass::Predicate),
+    // THIRD LINE ADDED 2026-08-07 (claude-code, #268 — the `policy_unevaluable` entry). The
+    // census went red on it the moment it was written, which is the instrument working.
+    //
+    // READING, answering both questions this table schedules. (1) Does it change who gets
+    // named? No — it names the SAME `plugin_id_for_chain` the two sites above it already
+    // name, on a new entry kind rather than a new subject; a call the matcher could not
+    // read is now recorded against exactly the member that made it. (2) Is any derived
+    // name COMPARED to decide control flow? No: `instance_lct` is serialised into the
+    // payload and read by nothing. The decision (`unevaluable`) is computed upstream from
+    // `tool_name` and `target`, never from this value, and the verdict is deliberately
+    // unchanged either way — so a registry miss yields a `null` in the record and alters
+    // no outcome. Naming, not Predicate, same class as its two siblings.
     ("server/handler.rs::tool_query_policy", &[
+        "let instance_lct = s.member_lct(&plugin_id_for_chain);",
         "let instance_lct = s.member_lct(&plugin_id_for_chain);",
         "let instance_lct = s.member_lct(&plugin_id_for_chain);",
     ], SiteClass::Naming),
