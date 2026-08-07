@@ -8,14 +8,21 @@
 #
 #   copy          a cherry-pick of a branch commit (author date preserved)
 #   squash-merge  `git merge --squash` landed on main with a (#N) subject
-#   RE-DERIVED    a second seat authoring identical content at a fresh date,
+#   FRESH-AUTHOR-DUPLICATE
+#                 a second seat authoring identical content at a fresh date,
 #                 never merged -- the shape whose real-world count is the finding
 #
 # It also exercises the ALREADY-in-main path: the cherry-pick is committed after
 # the squash landed, so its content was in main when it was written.
 #
-# Exit 0 = the instrument can tell the four shapes apart. Exit 1 = the zero it
-# reports on real repos is uninterpretable.
+# Shape 5 (added 2026-08-07) exercises the REF SURFACE report: one commit is
+# parked in refs/pull/9/head with no branch pointing at it, so the census must
+# report exactly 1 commit reachable only from refs/pull/*.  Without this arm the
+# surface report is an unfired claim -- and a false zero from an empty ref set is
+# precisely the defect that motivated adding it.
+#
+# Exit 0 = the instrument can tell the shapes apart AND sees its own surface.
+# Exit 1 = the zero it reports on real repos is uninterpretable.
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -57,6 +64,17 @@ export GIT_AUTHOR_DATE="2026-01-01T05:00:00" GIT_COMMITTER_DATE="2026-01-01T05:0
 echo cee > c.txt && git add c.txt && git commit -q -m "feat: add c again, a second seat authored it fresh"
 git checkout -q main
 
+# --- shape 5: a commit reachable ONLY from refs/pull/*, no branch on it -------
+# This is the surface the census must notice it is holding.  Content is unique,
+# so it adds no duplicate group -- it moves the surface report and nothing else.
+git checkout -q -b parked main
+export GIT_AUTHOR_DATE="2026-01-01T06:00:00" GIT_COMMITTER_DATE="2026-01-01T06:00:00"
+echo dee > d.txt && git add d.txt && git commit -q -m "feat: parked in a pull ref only"
+PARKED=$(git rev-parse HEAD)
+git checkout -q main
+git update-ref refs/pull/9/head "$PARKED"
+git branch -q -D parked
+
 OUT="$(python3 "$CENSUS" "$WORK" main 2>&1)"
 echo "$OUT"
 echo
@@ -72,12 +90,31 @@ check() {  # check <label> <grep-pattern>
 }
 check "copy bucket fires"                 '^ *copy *: *[1-9]'
 check "squash-merge bucket fires"         '^ *squash-merge *: *[1-9]'
-check "RE-DERIVED bucket fires"           '^ *RE-DERIVED *: *[1-9]'
-check "the re-derivation is named"        'a second seat authored it fresh'
+check "fresh-author-duplicate bucket fires" '^ *FRESH-AUTHOR-DUPLICATE *: *[1-9]'
+check "the fresh-author duplicate is named" 'a second seat authored it fresh'
 check "ALREADY-in-main path fires"        'ALREADY in main at commit time: [1-9]'
 check "copy discriminator is unambiguous" 'ambiguous \(commit_ts == author_ts\): 0 of'
+check "ref surface is reported"           '^ *ref surface *: *[1-9][0-9]* refs = '
+check "pull-only surface is counted"      'commits reachable ONLY from refs/pull/\* : 1'
+
+# Inverted checks: written out rather than passed to check(), because check()
+# only asserts PRESENCE and an ERE has no negative lookahead.
+if grep -q 'BUCKETS DO NOT SUM' <<<"$OUT"; then
+  echo "  FAIL  bucket-sum guard tripped on a well-formed repo"
+  rc=1
+else
+  echo "  PASS  bucket-sum guard did not trip"
+fi
+
+# The surface report must not claim independence when a parked commit exists.
+if grep -q 'surface-independent' <<<"$OUT"; then
+  echo "  FAIL  surface-independent claimed while refs/pull/9/head holds a unique commit"
+  rc=1
+else
+  echo "  PASS  surface-independence is not claimed when a namespace is exclusive"
+fi
 
 echo
-[ $rc -eq 0 ] && echo "CONTROL PASSED - RE-DERIVED is reachable, so a real-repo zero is a measurement" \
-              || echo "CONTROL FAILED - do not interpret RE-DERIVED == 0 on real repos"
+[ $rc -eq 0 ] && echo "CONTROL PASSED - the duplicate shapes and the ref surface are both reachable" \
+              || echo "CONTROL FAILED - do not interpret a real-repo zero from this instrument"
 exit $rc

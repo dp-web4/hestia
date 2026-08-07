@@ -24,9 +24,36 @@ duplicate content came to exist:
                 copying bytes, not a seat authoring them.
   squash-merge  fresh author timestamp, but the commit is on main's first-parent
                 chain or its subject ends in `(#N)` -- the GitHub squash of a PR.
-  RE-DERIVED    fresh author timestamp and neither of the above: somebody sat down
-                and produced content that already existed.  THIS is the cost the
-                claim asserts.
+  FRESH-AUTHOR-DUPLICATE
+                fresh author timestamp and neither of the above: content that
+                already existed, authored again at a new date.  This is the
+                CANDIDATE population for the cost claim, not proof of it.
+
+Naming (codex, 2026-08-07): this bucket was called RE-DERIVED, which named an
+actor's REASON.  The discriminator observes a fresh-author duplicate; it cannot
+see whether a seat redid work, force-pushed a rewritten branch, or had a pull ref
+move after merge.  Codex's ripgrep specimen `16268dba` is exactly that ambiguity:
+a genuine fresh-author duplicate whose nearer account is a post-merge branch
+rewrite.  Establishing the redo REASON needs event evidence this instrument does
+not have.  The name now stops where the evidence stops.
+
+Ref acquisition surface
+-----------------------
+"Reachable from ANY ref" means any ref THIS object store happened to fetch, not
+every ref the forge retains.  Codex measured the gap on ripgrep: a default clone
+sees 2265 commits and reports 0 fresh-author duplicates; a `--mirror` of the same
+tip sees 4272 and reports 24.  So the census prints its own surface, and reports
+per-namespace how many commits exist ONLY there -- if every namespace's exclusive
+count is 0 the surface question is moot, and otherwise that count bounds how much
+the answer could move under a wider fetch.
+
+The bucket counts are asserted to sum to the unfiltered ref total.  That guard
+exists because measuring this by hand produced a FALSE ZERO: `git for-each-ref
+'refs/pull/*'` matches 0 refs (git's `*` does not cross `/`), `git rev-list --not`
+over an empty positive set prints nothing, and every command exits 0.  The
+hand-measured "0 commits exist only in pull refs" was a zero computed over an
+empty population; the true figure on hestia is 67.  A bucket sum that does not
+reach the total is the cheap detector for a pattern that is silently eating refs.
 
 Independently, we reconstruct when each patch-id first became reachable from main
 (walking main's first-parent chain and dating each commit by the merge that
@@ -36,10 +63,10 @@ done damage at all.
 
 Reading the output
 ------------------
-RE-DERIVED == 0 means the cost clause is unobserved in this repo, NOT that the
-logical correction is wrong -- ancestry-NO still proves nothing.  It means the
-class's real cost is elsewhere: duplicate shas that invalidate sha-based
-citations.
+FRESH-AUTHOR-DUPLICATE == 0 means the cost clause is unobserved in this repo, NOT
+that the logical correction is wrong -- ancestry-NO still proves nothing.  It
+means the class's real cost is elsewhere: duplicate shas that invalidate sha-based
+citations.  A non-zero is a candidate list to READ, not a redo count to quote.
 
 The `copy` discriminator degrades if two seats independently commit within the
 same second (author timestamps would collide by coincidence).  The script reports
@@ -55,9 +82,41 @@ import subprocess
 import sys
 
 
-def sh(repo, cmd):
-    return subprocess.run(cmd, shell=True, cwd=repo,
+def sh(repo, cmd, stdin=None):
+    return subprocess.run(cmd, shell=True, cwd=repo, input=stdin,
                           capture_output=True, text=True).stdout
+
+
+def ref_surface(repo):
+    """Report the ref namespaces this object store actually holds.
+
+    Returns (total, buckets, exclusive, sum_ok).  `exclusive[ns]` is the number
+    of non-merge commits reachable from refs/<ns>/... and from NO other
+    namespace -- i.e. what a fetch that skipped that namespace would have missed.
+
+    Refs are passed to rev-list on stdin, never as argv: a mirror can hold
+    thousands, and they are never matched with a glob, because a glob is how the
+    hand measurement this guard replaces produced its false zero.
+    """
+    refs = [r for r in sh(repo, "git for-each-ref --format='%(refname)'").split() if r]
+    total = len(refs)
+    by_ns = collections.defaultdict(list)
+    for r in refs:
+        parts = r.split('/')
+        by_ns['/'.join(parts[:2]) if len(parts) > 2 else '<other>'].append(r)
+    buckets = {ns: len(v) for ns, v in by_ns.items()}
+    sum_ok = sum(buckets.values()) == total
+
+    exclusive = {}
+    for ns, own in by_ns.items():
+        if len(by_ns) < 2:
+            exclusive[ns] = 0
+            continue
+        others = [r for o, v in by_ns.items() if o != ns for r in v]
+        spec = '\n'.join(own + ['^' + r for r in others]) + '\n'
+        out = sh(repo, 'git rev-list --no-merges --stdin', stdin=spec)
+        exclusive[ns] = len([l for l in out.split() if l])
+    return total, buckets, exclusive, sum_ok
 
 
 def census(repo, main='origin/main'):
@@ -116,7 +175,7 @@ def census(repo, main='origin/main'):
             elif later in first_parent or re.search(r'\(#\d+\)$', m['subj']):
                 kind = 'squash-merge'
             else:
-                kind = 'RE-DERIVED'
+                kind = 'FRESH-AUTHOR-DUPLICATE'
                 rederived.append((later, m['subj']))
             kinds[kind] += 1
             lt = pid_landed.get(pid)
@@ -133,12 +192,26 @@ def main():
         sys.exit(__doc__)
     repo = sys.argv[1]
     ref = sys.argv[2] if len(sys.argv) > 2 else 'origin/main'
+    total, buckets, exclusive, sum_ok = ref_surface(repo)
     r = census(repo, ref)
     print(f"repo={repo}  main={ref}")
+    surface = '  '.join(f"{ns}/*:{n}" for ns, n in sorted(buckets.items(),
+                                                          key=lambda kv: -kv[1]))
+    print(f"  ref surface      : {total} refs = {surface}")
+    if not sum_ok:
+        print(f"  !! BUCKETS DO NOT SUM TO {total} — a ref pattern is eating refs; "
+              f"the population below is NOT the full surface")
+    dependent = {ns: n for ns, n in exclusive.items() if n}
+    if dependent:
+        for ns, n in sorted(dependent.items(), key=lambda kv: -kv[1]):
+            print(f"    commits reachable ONLY from {ns}/* : {n}"
+                  f"  ({100.0 * n / max(r['population'], 1):.1f}% of population)")
+    else:
+        print("    surface-independent: no namespace holds a commit the others lack")
     print(f"  population       : {r['population']} non-merge commits reachable from all refs")
     print(f"  duplicate groups : {r['groups']}   later-twins: {r['later_twins']}")
-    for k in ('copy', 'squash-merge', 'RE-DERIVED'):
-        print(f"    {k:14s}: {r['kinds'][k]}")
+    for k in ('copy', 'squash-merge', 'FRESH-AUTHOR-DUPLICATE'):
+        print(f"    {k:22s}: {r['kinds'][k]}")
     print(f"  copy discriminator ambiguous (commit_ts == author_ts): "
           f"{len(r['ambiguous'])} of {r['kinds']['copy']}")
     print(f"  later-twins whose content was ALREADY in main at commit time: "
@@ -146,7 +219,7 @@ def main():
     for sha, kind, subj in r['already']:
         print(f"      {sha[:8]} [{kind}] {subj[:60]}")
     if r['rederived']:
-        print("  RE-DERIVED detail:")
+        print("  FRESH-AUTHOR-DUPLICATE detail (candidates to READ, not a redo count):")
         for sha, subj in r['rederived']:
             print(f"      {sha[:8]} {subj[:70]}")
 
