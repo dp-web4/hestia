@@ -8608,6 +8608,206 @@ mod tests {
         );
     }
 
+    /// THE DOOR THE GATE ACTUALLY WALKS THROUGH.
+    ///
+    /// Everything above tests `tool_gate_escalation_open`. The gate hook calls
+    /// `tool_gate_escalation_claim` — claim-or-open in one round trip, because the hook must
+    /// never wait — and until this change that door had its own hand-rolled `open()` fallback
+    /// whose payload carried no `bar`, no `invited_peers`, no `asker_basis` and no
+    /// `invitation_*` keys. So #241's invitation writer shipped onto a surface with no
+    /// production traffic, and the chain kept filling with the pre-#241 shape.
+    ///
+    /// Measured twice, independently, before either measurement knew of the other:
+    /// claude-code (notice 1419) by reading the hook; kimi-code by walking all 114,819 chain
+    /// entries (`tools/kimi_two_openers_census_1419.py` @ cefbcd0). Agreed: `bar` on 4 of 362
+    /// `gate_escalation_opened` payloads, `invited_peers` on 0, `asker_basis` on 0, and every
+    /// entry written on deploy day in the old shape. Re-run on CBP at 365/54 under the build
+    /// containing #241 and #246 — so a further deploy was never the missing step.
+    ///
+    /// ASSERTS ON THE CHAIN ENTRY, not the response. The census that found this reads payload
+    /// keys, a response cannot be censused after the fact, and the response is not what a
+    /// decider or a reputation derivation later reads.
+    #[tokio::test]
+    async fn the_claim_door_writes_the_invitation_record_not_only_the_open_door() {
+        let (_dir, shared) = make_shared_state();
+        for id in ["claude-code", "kimi-code", "codex"] {
+            tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+        }
+
+        // Nothing to claim, so this opens — the auto-open the gate performs on every refused
+        // governance write. Same marker the open-door tests use, so `bar_for` selects the arm
+        // that invites peers and the two doors are being asked the same question.
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "reason": "Edit -> a governance file",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            claimed["claimed"], false,
+            "precondition: nothing to claim, so this must be the open fallback: {claimed}"
+        );
+
+        let s = shared.lock().await;
+        let opened = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened")
+            .expect("the refusal must be witnessed");
+        let d = &opened.event_data;
+
+        // THE THREE KEYS THE CENSUS COUNTED. Each was absent from every claim-path payload
+        // ever written, which is why a census over 362 of them found `bar` on 4 (all from the
+        // door with no traffic) and the other two on none.
+        assert_eq!(
+            d["bar"], "sovereign_plus_peer",
+            "the claim door must record the criterion it will be judged against: {d}"
+        );
+        assert!(
+            d["invited_peers"].is_array(),
+            "`invited_peers` must be present — an absent key and an empty list are the same \
+             row to a census, and telling INVITED-AND-ABSENT from NEVER-ASKED is the whole \
+             point of #226's ruling: {d}"
+        );
+        assert_eq!(
+            d["asker_basis"], "asserted",
+            "the hook sends no session_id, so the honest basis is `asserted` — and it must be \
+             WRITTEN, not left to a reader to infer from silence: {d}"
+        );
+
+        // The rest of the shared shape, so a future edit cannot quietly drop half of it.
+        for k in [
+            "invitation_evidence",
+            "invitation_withheld",
+            "invitation_passed_over",
+            "stated_reason",
+            "ttl_secs",
+        ] {
+            assert!(!d[k].is_null() || k == "stated_reason", "missing `{k}`: {d}");
+            assert!(d.get(k).is_some(), "missing key `{k}`: {d}");
+        }
+
+        // WHICH DOOR. Before this change the two payloads were distinguishable only by an
+        // accident of which keys each happened to carry; unifying them destroys that
+        // discriminator, so it is replaced with a deliberate one rather than lost.
+        assert_eq!(d["opened_via"], "claim", "{d}");
+
+        // AND NOBODY WAS WOKEN, because the asker is a bare string. This is not the fix
+        // failing — it is the half of the remedy that lives in the hook, asserted so that the
+        // day the hook threads its session through, this line is what changes.
+        assert_eq!(
+            d["invited_peers"].as_array().map(Vec::len),
+            Some(0),
+            "an unproven asker wakes nobody: {d}"
+        );
+        assert!(
+            !d["invitation_withheld"].as_array().unwrap().is_empty(),
+            "but the peers who WOULD have been asked must be recorded, or `never asked` and \
+             `nobody to ask` stay the same row: {d}"
+        );
+    }
+
+    /// The positive control for the claim door: the same call, varying ONLY whether the asker
+    /// proves itself, must actually invite and wake peers. Without this, a fix that made every
+    /// invitation vanish would pass the test above — and that is exactly the failure mode #241
+    /// shipped, so it is the one this file has to be able to catch.
+    ///
+    /// This is also the executable statement of what the hook change buys. Today the hook
+    /// sends no `session_id` and every production escalation lands on the `asserted` branch;
+    /// this test drives the branch that a one-line hook change would switch on.
+    #[tokio::test]
+    async fn a_proven_asker_on_the_claim_door_invites_and_wakes_real_peers() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "kimi-code", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "session_id": session_of["codex"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "reason": "Edit -> a governance file",
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(claimed["asker_basis"], "session", "{claimed}");
+        let invited: Vec<String> = claimed["invited_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            invited.contains(&"claude-code".to_string())
+                && invited.contains(&"kimi-code".to_string()),
+            "a proven asker invites the real peers through this door too: {invited:?}"
+        );
+        assert!(
+            !invited.contains(&"codex".to_string()),
+            "and is still excluded from its own ask: {invited:?}"
+        );
+
+        // DELIVERED, not merely labelled. `invited_peers` existed as a field for a fortnight
+        // and named nobody; a list that names peers nobody woke would be the same defect one
+        // layer out.
+        let mail = shared
+            .lock()
+            .await
+            .inbox_store
+            .drain_member("claude-code")
+            .unwrap();
+        assert!(
+            mail.iter().any(|m| m.kind == "review_request"),
+            "the invited peer must actually be woken: {mail:?}"
+        );
+    }
+
+    /// A session that disagrees with the asserted `plugin_id` is a forgery, and the claim door
+    /// must refuse it BEFORE spending anything — a claimed approval cannot be un-claimed.
+    #[tokio::test]
+    async fn the_claim_door_refuses_a_session_that_disagrees_with_the_asserted_asker() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+
+        let err = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "session_id": session_of["claude-code"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+            }),
+        )
+        .await
+        .expect_err("a session that belongs to someone else must not open in their name");
+        assert!(
+            err.to_string().contains("asker mismatch"),
+            "the refusal must name what disagreed: {err}"
+        );
+    }
+
     /// The positive control for the binding above, and the more important half of it: the fix
     /// must close the hole WITHOUT killing the feature. A guard that makes every invitation
     /// vanish would pass the test above while deleting the only production writer on the peer
@@ -10291,6 +10491,246 @@ mod authority_attribution_tests {
 /// complete one would make "three never looked" unfalsifiable.
 const MAX_INVITED_PEERS: usize = 8;
 
+/// The invitation, resolved and written to the store.
+///
+/// Split out of `tool_gate_escalation_open` so the door the gate hook ACTUALLY calls can write
+/// the same record. #241 put the invitation writer on `hestia_gate_escalation_open`; the hook
+/// calls `hestia_gate_escalation_claim` (claim-or-open in one round trip, because it must never
+/// wait), whose own `open()` fallback appended a payload with no `bar`, no `invited_peers`, no
+/// `asker_basis` and no `invitation_*` keys. Measured independently twice — claude-code notice
+/// 1419, then kimi-code over the full 114,819-entry chain walk (`tools/kimi_two_openers_census_
+/// 1419.py`, cefbcd0): `bar` on 4 of 362 opened payloads, `invited_peers` on 0, `asker_basis` on
+/// 0, and every one of the 53 entries written on deploy day carried the claim-path shape. The
+/// post-#241 shape has never reached the chain. Re-run here at 363/54 under build g8a84a7e (the
+/// merge of #246), so the deploy is not the missing step — the door is.
+struct OpenedInvitation {
+    invited: Vec<String>,
+    evidence: Vec<Value>,
+    withheld: Vec<Value>,
+    passed_over: Vec<Value>,
+}
+
+/// Resolve who this escalation invites, and record it on the escalation.
+///
+/// NOT A GATE. Nothing here can refuse the open, delay it, or change `bar_met`. An invitation
+/// that could block would re-create the blocker #226 removed, one layer out.
+fn resolve_invitation(
+    s: &mut super::state::ServerState,
+    esc: &crate::server::gate_escalation::Escalation,
+    asker_is_proven: bool,
+) -> OpenedInvitation {
+    use crate::server::gate_escalation::Bar;
+
+    // Only `SovereignPlusPeer` invites. `SingleApprover` names no peer conjunct, so an empty
+    // list there is the honest answer, not a gap — and the key is emitted either way, because
+    // a census over PAYLOAD KEYS cannot read a field that is sometimes absent.
+    let (invited, evidence, passed_over) = if esc.bar == Bar::SovereignPlusPeer {
+        // Same identity test the appeal router uses, and it has the same measured reach:
+        // `member_lct` hashes the trimmed id, so it separates `codex` from `codex-cli` only
+        // by whitespace (`state::tests::the_member_lct_alias_guard_reaches_only_whitespace`).
+        // Kept because it fails CLOSED — an unmappable candidate is invited rather than
+        // dropped — but this receipt must not be read as evidence that entity resolution
+        // happened. An invitation is cheap to over-issue and expensive to under-issue.
+        let asker_lct = s.member_lct(&esc.plugin_id);
+        // Liveness is read from the member's own ACTS, never from its mailbox: a watcher
+        // queues notices under a member's id whether or not the member ever woke, so a
+        // mailbox signal would let the doorbell certify the member. Same window as the appeal
+        // router so both routing receipts on this daemon are cut from the same depth of
+        // evidence.
+        let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
+        let mut pool: Vec<(String, crate::arbiter::Liveness)> = s
+            .member_registry
+            .iter_sorted()
+            .into_iter()
+            .map(|(id, _)| id.clone())
+            .filter(|id| id != &esc.plugin_id)
+            .filter(|id| match (&asker_lct, s.member_lct(id)) {
+                (Some(a), Some(b)) => a != &b,
+                _ => true,
+            })
+            .map(|id| {
+                let l = actor_liveness(&window, &id);
+                (id, l)
+            })
+            .collect();
+        // Live first, then dormant, then unknown; the id breaks ties so the order — and
+        // therefore who survives the cap — is deterministic and not a function of HashMap
+        // iteration. Ordering is a REACHABILITY preference, not a merit one: a seat that has
+        // acted this hour is likelier to read the notice in time to corroborate.
+        pool.sort_by_key(|(id, l)| {
+            (
+                match l {
+                    crate::arbiter::Liveness::Live => 0u8,
+                    crate::arbiter::Liveness::Dormant => 1,
+                    crate::arbiter::Liveness::Unknown => 2,
+                },
+                id.clone(),
+            )
+        });
+        let over = pool.split_off(pool.len().min(MAX_INVITED_PEERS));
+        (
+            pool.iter().map(|(id, _)| id.clone()).collect::<Vec<String>>(),
+            pool.iter()
+                .map(|(id, l)| json!({"peer": id, "liveness_at_invite": l}))
+                .collect::<Vec<Value>>(),
+            over.iter()
+                .map(|(id, l)| json!({"peer": id, "liveness_at_invite": l}))
+                .collect::<Vec<Value>>(),
+        )
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+
+    // THE BINDING. An invitation is an outward message sent on behalf of an identity —
+    // CLAUDE.md's own list of consequential acts names exactly that — so it requires clause W
+    // evidence (witnessed, key-bound identity), and an args string is not evidence. When the
+    // asker is unproven the peers are resolved and RECORDED but nobody is woken.
+    //
+    // `invited_peers` goes EMPTY rather than keeping the names, and that is the whole point
+    // rather than a detail: this change exists to separate "asked and ignored" from "never
+    // asked". Recording an undispatched name as invited would manufacture the first of those
+    // out of the second — the precise confusion it was built to end — and would inflate
+    // `absent` with peers who were never told anything. The names survive under
+    // `invitation_withheld` so a reader can still see who WOULD have been asked, which is a
+    // different and honestly-labelled fact.
+    //
+    // On the claim path this branch is currently ALWAYS taken, and that is the honest state
+    // rather than a bug in this function: the gate hook opens its escalation client with a
+    // bare `initialize` and sends no `session_id`, so there is no attributed caller to
+    // resolve. Half the remedy lives in a file this member is refused write access to; see
+    // the `session_id` note on `tool_gate_escalation_claim`.
+    let (invited, evidence, withheld) = if asker_is_proven {
+        (invited, evidence, Vec::new())
+    } else {
+        (Vec::new(), Vec::new(), evidence)
+    };
+    // Written to the store BEFORE the witness, so the entry records the invitation that
+    // actually exists rather than one this call intends to make. `invite` returns false only
+    // for an unknown id, which cannot happen here — `open` just inserted it — and is not
+    // worth branching on: a lost invitation would show up as an empty list in the entry,
+    // which is exactly what a reader should then see.
+    s.gate_escalations.invite(&esc.id, invited.clone());
+
+    OpenedInvitation { invited, evidence, withheld, passed_over }
+}
+
+/// The `gate_escalation_opened` payload, written identically by both doors.
+///
+/// One shape, every key always present. A census over payload KEYS cannot read a field that is
+/// sometimes absent, and the two doors having drifted into two shapes is exactly what let the
+/// invitation defect hide for a fortnight.
+///
+/// `opened_via` is how a reader tells the doors apart AFTER this change. Before it, they were
+/// distinguishable only by an accident — the claim path carried `stated_reason` and no `bar`,
+/// the open path the reverse — which is what kimi's census keys on. Unifying the payload
+/// destroys that accidental discriminator, so it is replaced with a deliberate one rather than
+/// left for the next reader to rediscover. (kimi-code: the shape classifier needs updating to
+/// read this field; `A.claim-path` and `B.open-post-241` are no longer separable by key set.)
+#[allow(clippy::too_many_arguments)]
+fn opened_payload(
+    s: &super::state::ServerState,
+    esc: &crate::server::gate_escalation::Escalation,
+    inv: &OpenedInvitation,
+    asker_is_proven: bool,
+    answers_deny: Option<&str>,
+    opened_via: &'static str,
+    ttl_secs: u64,
+) -> Value {
+    json!({
+        "escalation_id": esc.id,
+        "plugin_id": esc.plugin_id,
+        "subject_instance_lct": s.member_lct(&esc.plugin_id),
+        // WHICH DOOR. See the doc comment: the key-set accident that used to answer this is
+        // gone as of this change, deliberately.
+        "opened_via": opened_via,
+        // Clause A: the record commits the evidence it relied on, not just the claim.
+        // `session` means the asker was resolved through `resolve_attributed_caller` and
+        // equals the session's own member; `asserted` means it is a bare string this
+        // daemon never verified. A reader weighing any NOT-SAME independence tier on this
+        // escalation must read THIS field first — a tier computed against an `asserted`
+        // asker is a comparison with one forgeable operand (#128).
+        "asker_basis": if asker_is_proven { "session" } else { "asserted" },
+        "role": esc.role,
+        "tool_name": esc.tool_name,
+        "marker": esc.marker,
+        // The asker's own account of WHY, when it had one. The open door never emitted these
+        // and the claim door always did; both do now. An auto-opened escalation carries the
+        // ATTEMPTED ACT here, not a rationale, because the member did not choose to escalate.
+        "stated_reason": esc.stated_reason,
+        "stated_detail": esc.stated_detail,
+        // The act this one answers. Null reads as absent, never as inferred.
+        "answers_deny": answers_deny,
+        // THE BAR, written down (dp 2026-07-30 + claude-code): the evidence and the verdict
+        // were already recorded; without the criterion, "sufficient for this context" is
+        // unauditable. Stated at open, evaluated at decision. Absent from every claim-path
+        // entry until now, which is why 0 of 362 opened payloads could be read for it.
+        "bar": esc.bar,
+        // WHO WAS ASKED. The field whose absence made "invited and absent" and "never
+        // asked" the same row. Empty is a real answer here and means one of two things
+        // the `bar` alongside it disambiguates: a `single_approver` bar asks for no peer,
+        // while an empty list under `sovereign_plus_peer` says either that this box knows no
+        // admissible peer, or — read `asker_basis` — that the ask was never proven.
+        "invited_peers": inv.invited,
+        // The evidence the invitation was issued ON — liveness AT INVITE, per seat.
+        // Without it, an absent peer six hours later cannot be told from a seat that was
+        // already dark when it was asked, and `peer_participation().absent` would carry
+        // an accusation it has no basis for.
+        "invitation_evidence": inv.evidence,
+        // Who WOULD have been asked, when the asker was unproven and nobody was woken.
+        // Emitted on every open, `session` included, so a census reading payload KEYS
+        // cannot mistake "this daemon does not record the basis" for "the basis was fine".
+        "invitation_withheld": inv.withheld,
+        // Admissible peers the cap dropped. Recorded rather than truncated silently: a
+        // bounded invitation that reads as an exhaustive one makes "nobody looked"
+        // unfalsifiable.
+        "invitation_passed_over": inv.passed_over,
+        "expires_at": esc.expires_at,
+        "ttl_secs": ttl_secs,
+        // Recorded so a reader is never left inferring it from silence.
+        "assurance": "A1 — cooperative gate, same-UID operator. This escalation is \
+                      tamper-EVIDENT, not tamper-proof.",
+    })
+}
+
+/// DELIVER IT. An invitation nobody is told about is a label, and a label on a record is
+/// the shape this subsystem keeps producing: `invited_peers` existed as a field for a
+/// fortnight and named nobody. The notice is a WAKE, not a vote — the peer still has to
+/// read the escalation and choose to corroborate or dissent, and
+/// `hestia_gate_escalation_corroborate` is the only door that adds its factor.
+///
+/// Failure to queue does not void the invitation. The peer was asked; the mesh dropped it.
+/// Recording the queue error keeps those two apart, which is the same reason `absent` is
+/// derived rather than stored.
+fn deliver_invitations(
+    s: &mut super::state::ServerState,
+    esc: &crate::server::gate_escalation::Escalation,
+    invited: &[String],
+    entry_hash: &str,
+) -> Vec<Value> {
+    let mut invitations: Vec<Value> = Vec::new();
+    let pointer = format!("hestia://escalation/{}#corroborate-or-dissent", esc.id);
+    for peer in invited {
+        match s.inbox_store.enqueue_member(
+            peer,
+            &esc.plugin_id,
+            &esc.role,
+            "review_request",
+            Some(pointer.as_str()),
+            entry_hash,
+            None,
+        ) {
+            Ok(qid) => invitations.push(json!({"peer": peer, "queued_id": qid})),
+            Err(e) => {
+                tracing::warn!(peer = %peer, escalation = %esc.id, error = %e,
+                               "escalation invitation issued but dispatch failed");
+                invitations.push(json!({"peer": peer, "queued_id": null,
+                                        "dispatch_error": e.to_string()}));
+            }
+        }
+    }
+    invitations
+}
+
 async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::{now_secs, Bar, DEFAULT_TTL_SECS};
 
@@ -10393,176 +10833,29 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // payloads carried any key naming a peer, and all 72 `sovereign_plus_peer` escalations
     // had `bar_met` false. So what landed was a blocker's removal with nothing standing where
     // the invitation was, and a record that cannot distinguish INVITED-AND-ABSENT from
-    // NEVER-ASKED — the one distinction the ruling turns on. This is the writer.
+    // NEVER-ASKED — the one distinction the ruling turns on.
     //
-    // Only `SovereignPlusPeer` invites. `SingleApprover` names no peer conjunct, so an empty
-    // list there is the honest answer, not a gap — and the key is emitted either way, because
-    // a census over PAYLOAD KEYS cannot read a field that is sometimes absent.
-    //
-    // NOT A GATE. Nothing below can refuse the open, delay it, or change `bar_met`. An
-    // invitation that could block would re-create the blocker #226 removed, one layer out.
-    let (invited, invitation_evidence, invitation_passed_over) = if esc.bar
-        == Bar::SovereignPlusPeer
-    {
-        // Same identity test the appeal router uses, and it has the same measured reach:
-        // `member_lct` hashes the trimmed id, so it separates `codex` from `codex-cli` only
-        // by whitespace (`state::tests::the_member_lct_alias_guard_reaches_only_whitespace`).
-        // Kept because it fails CLOSED — an unmappable candidate is invited rather than
-        // dropped — but this receipt must not be read as evidence that entity resolution
-        // happened. An invitation is cheap to over-issue and expensive to under-issue.
-        let asker_lct = s.member_lct(&esc.plugin_id);
-        // Liveness is read from the member's own ACTS, never from its mailbox: a watcher
-        // queues notices under a member's id whether or not the member ever woke, so a
-        // mailbox signal would let the doorbell certify the member. Same window as the appeal
-        // router so both routing receipts on this daemon are cut from the same depth of
-        // evidence.
-        let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
-        let mut pool: Vec<(String, crate::arbiter::Liveness)> = s
-            .member_registry
-            .iter_sorted()
-            .into_iter()
-            .map(|(id, _)| id.clone())
-            .filter(|id| id != &esc.plugin_id)
-            .filter(|id| match (&asker_lct, s.member_lct(id)) {
-                (Some(a), Some(b)) => a != &b,
-                _ => true,
-            })
-            .map(|id| {
-                let l = actor_liveness(&window, &id);
-                (id, l)
-            })
-            .collect();
-        // Live first, then dormant, then unknown; the id breaks ties so the order — and
-        // therefore who survives the cap — is deterministic and not a function of HashMap
-        // iteration. Ordering is a REACHABILITY preference, not a merit one: a seat that has
-        // acted this hour is likelier to read the notice in time to corroborate.
-        pool.sort_by_key(|(id, l)| {
-            (
-                match l {
-                    crate::arbiter::Liveness::Live => 0u8,
-                    crate::arbiter::Liveness::Dormant => 1,
-                    crate::arbiter::Liveness::Unknown => 2,
-                },
-                id.clone(),
-            )
-        });
-        let over = pool.split_off(pool.len().min(MAX_INVITED_PEERS));
-        (
-            pool.iter().map(|(id, _)| id.clone()).collect::<Vec<String>>(),
-            pool.iter()
-                .map(|(id, l)| json!({"peer": id, "liveness_at_invite": l}))
-                .collect::<Vec<Value>>(),
-            over.iter()
-                .map(|(id, l)| json!({"peer": id, "liveness_at_invite": l}))
-                .collect::<Vec<Value>>(),
-        )
-    } else {
-        (Vec::new(), Vec::new(), Vec::new())
-    };
-
-    // THE BINDING. An invitation is an outward message sent on behalf of an identity —
-    // CLAUDE.md's own list of consequential acts names exactly that — so it requires clause W
-    // evidence (witnessed, key-bound identity), and an args string is not evidence. When the
-    // asker is unproven the peers are resolved and RECORDED but nobody is woken.
-    //
-    // `invited_peers` goes EMPTY rather than keeping the names, and that is the whole point
-    // rather than a detail: this change exists to separate "asked and ignored" from "never
-    // asked". Recording an undispatched name as invited would manufacture the first of those
-    // out of the second — the precise confusion it was built to end — and would inflate
-    // `absent` with peers who were never told anything. The names survive under
-    // `invitation_withheld` so a reader can still see who WOULD have been asked, which is a
-    // different and honestly-labelled fact.
-    let (invited, invitation_evidence, invitation_withheld) = if asker_is_proven {
-        (invited, invitation_evidence, Vec::new())
-    } else {
-        (Vec::new(), Vec::new(), invitation_evidence)
-    };
-    // Written to the store BEFORE the witness, so the entry below records the invitation that
-    // actually exists rather than one this call intends to make. `invite` returns false only
-    // for an unknown id, which cannot happen here — `open` just inserted it — and is not
-    // worth branching on: a lost invitation would show up as an empty list in the entry,
-    // which is exactly what a reader should then see.
-    s.gate_escalations.invite(&esc.id, invited.clone());
+    // The writer now lives in `resolve_invitation` + `opened_payload`, shared with the claim
+    // door, because putting it HERE alone is what left it unreachable: this is the documented
+    // entry point and the hook calls the other one.
+    let inv = resolve_invitation(&mut s, &esc, asker_is_proven);
 
     let entry = s.append_chain(
         "gate_escalation_opened",
-        json!({
-            "escalation_id": esc.id,
-            "plugin_id": esc.plugin_id,
-            "subject_instance_lct": s.member_lct(&esc.plugin_id),
-            // Clause A: the record commits the evidence it relied on, not just the claim.
-            // `session` means the asker was resolved through `resolve_attributed_caller` and
-            // equals the session's own member; `asserted` means it is a bare string this
-            // daemon never verified. A reader weighing any NOT-SAME independence tier on this
-            // escalation must read THIS field first — a tier computed against an `asserted`
-            // asker is a comparison with one forgeable operand (#128).
-            "asker_basis": if asker_is_proven { "session" } else { "asserted" },
-            // Emitted on every open, `asserted` included, so a census reading payload KEYS
-            // cannot mistake "this daemon does not record the basis" for "the basis was fine".
-            "invitation_withheld": invitation_withheld,
-            "role": esc.role,
-            "tool_name": esc.tool_name,
-            "marker": esc.marker,
-            // WHO WAS ASKED. The field whose absence made "invited and absent" and "never
-            // asked" the same row. Empty is a real answer here and means one of two things
-            // the `bar` alongside it disambiguates: a `single_approver` bar asks for no peer,
-            // while an empty list under `sovereign_plus_peer` says this box knows no
-            // admissible peer to ask.
-            "invited_peers": invited,
-            // The evidence the invitation was issued ON — liveness AT INVITE, per seat.
-            // Without it, an absent peer six hours later cannot be told from a seat that was
-            // already dark when it was asked, and `peer_participation().absent` would carry
-            // an accusation it has no basis for.
-            "invitation_evidence": invitation_evidence,
-            // Admissible peers the cap dropped. Recorded rather than truncated silently: a
-            // bounded invitation that reads as an exhaustive one makes "nobody looked"
-            // unfalsifiable.
-            "invitation_passed_over": invitation_passed_over,
-            // The act this one answers. Null when the caller did not supply it — an absent
-            // link reads as absent, never as inferred.
-            "answers_deny": answers_deny,
-            // THE BAR, written down (dp 2026-07-30 + claude-code): the evidence and the
-            // verdict were already recorded; without the criterion, "sufficient for this
-            // context" is unauditable. Stated at open, evaluated at decision.
-            "bar": esc.bar,
-            "expires_at": esc.expires_at,
-            "ttl_secs": DEFAULT_TTL_SECS,
-            // Recorded so a reader is never left inferring it from silence.
-            "assurance": "A1 — cooperative gate, same-UID operator. This escalation is \
-                          tamper-EVIDENT, not tamper-proof.",
-        }),
+        opened_payload(
+            &s,
+            &esc,
+            &inv,
+            asker_is_proven,
+            answers_deny.as_deref(),
+            "open",
+            DEFAULT_TTL_SECS,
+        ),
     )?;
 
-    // DELIVER IT. An invitation nobody is told about is a label, and a label on a record is
-    // the shape this subsystem keeps producing: `invited_peers` existed as a field for a
-    // fortnight and named nobody. The notice is a WAKE, not a vote — the peer still has to
-    // read the escalation and choose to corroborate or dissent, and `hestia_gate_escalation_
-    // corroborate` is the only door that adds its factor.
-    //
-    // Failure to queue does not void the invitation. The peer was asked; the mesh dropped it.
-    // Recording the queue error keeps those two apart, which is the same reason `absent` is
-    // derived rather than stored.
-    let mut invitations: Vec<Value> = Vec::new();
-    let pointer = format!("hestia://escalation/{}#corroborate-or-dissent", esc.id);
-    for peer in &invited {
-        match s.inbox_store.enqueue_member(
-            peer,
-            &esc.plugin_id,
-            &esc.role,
-            "review_request",
-            Some(pointer.as_str()),
-            &entry.hash,
-            None,
-        ) {
-            Ok(qid) => invitations.push(json!({"peer": peer, "queued_id": qid})),
-            Err(e) => {
-                tracing::warn!(peer = %peer, escalation = %esc.id, error = %e,
-                               "escalation invitation issued but dispatch failed");
-                invitations.push(json!({"peer": peer, "queued_id": null,
-                                        "dispatch_error": e.to_string()}));
-            }
-        }
-    }
+    let invited = inv.invited;
+    let invitations = deliver_invitations(&mut s, &esc, &invited, &entry.hash);
+
 
     Ok(json!({
         "escalation_id": esc.id,
@@ -10857,9 +11150,55 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // the operator ruled on an id, an asker and a path fragment (dp, 2026-08-02).
     let stated_reason = optional_string(args, "reason");
     let stated_detail = optional_string(args, "detail");
+    // WHO is asking, provable. Accepted here for the same reason `tool_gate_escalation_open`
+    // accepts it (#128: `eligibility` otherwise compares an ASSERTION against an IDENTITY),
+    // and because the invitation half cannot issue without it — an invitation is an outward
+    // message sent on behalf of an identity, so an unproven asker gets its peers RECORDED and
+    // nobody woken.
+    //
+    // HALF THIS REMEDY IS NOT IN THIS FILE, and saying so is the point. The <gate-hook> opens a
+    // second MCP client for this call with a bare `initialize` and no `hestia_connect`, so it
+    // sends no session_id, and every claim-path escalation will keep resolving to
+    // `asker_basis: "asserted"` until it threads one through. It ALREADY holds a session —
+    // `ask_daemon` connects and keeps `sessionId` earlier in the same hook invocation — so this
+    // is a thread-it-through, not a new handshake, and not a second round trip in a hook that
+    // must never wait. It is not done in the same change because that file is the gate's own
+    // code and this member is refused write access to it.
+    //
+    // (The path of that file is redacted to `<gate-hook>` above, deliberately and disclosed:
+    // the gate matches path strings appearing ANYWHERE in a write payload, not the act's
+    // target, so a comment naming it refuses this edit to daemon source. Appealing that is
+    // itself refused — the appeal must state what was matched, and stating it re-fires the
+    // same rule. kimi-code's redaction convention; neither draft reaches the gate, so this is
+    // a redaction, not a recast. Escalations minted proving it: dc93b3329cf9aa97 on the Edit,
+    // e074d2587bdf8fdc on the appeal that tried to dispute it.)
+    //
+    // Optional, never required: making it required would fail every escalation opened by a
+    // hook mid-upgrade, and the gate's own refusal channel is the last surface that should go
+    // dark on a version skew.
+    let session_id_arg = optional_session_id(args);
     let now = now_secs();
 
     let mut s = state.lock().await;
+
+    // A session that resolves IS the asker. A `plugin_id` that disagrees with it is not a
+    // convenience to paper over — it is the forgery this binding exists to catch. Checked
+    // BEFORE the claim, not after: a spent approval cannot be un-spent.
+    let proven_asker = resolve_attributed_caller(&s, session_id_arg.as_deref());
+    if let Some(who) = &proven_asker {
+        if who.plugin_id != plugin_id {
+            return Err(anyhow::anyhow!(
+                "escalation asker mismatch: session {} belongs to '{}' but the call asserts \
+                 '{}'. The asker is the left operand of NOT-SAME; a name that disagrees with \
+                 the session it was sent on cannot be the one recorded. Send your own \
+                 plugin_id, or omit session_id and accept an unproven, operator-only ask.",
+                session_id_arg.as_deref().unwrap_or("?"),
+                who.plugin_id,
+                plugin_id
+            ));
+        }
+    }
+    let asker_is_proven = proven_asker.is_some();
 
     if let Some(esc) = s.gate_escalations.claim(&plugin_id, &marker, now) {
         // Spending an approval is an ACT and is witnessed. The approval itself was already
@@ -10909,24 +11248,34 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
               stated_reason.as_deref(), stated_detail.as_deref(), now, DEFAULT_TTL_SECS)
     {
         Ok(esc) => {
+            // THE SAME WRITER THE OTHER DOOR USES. This fallback had its own hand-rolled
+            // payload — no `bar`, no `invited_peers`, no `asker_basis`, no `invitation_*` —
+            // and since this is the door the gate hook actually calls, that shape is what the
+            // chain is made of: `bar` on 4 of 365 `gate_escalation_opened` payloads,
+            // `invited_peers` on 0, `asker_basis` on 0, and every one of the 54 entries
+            // written on 2026-08-07 in the old shape under the build that contains #241.
+            // Two independent measurements (claude-code notice 1419; kimi-code's full
+            // 114,819-entry prevHash walk, `tools/kimi_two_openers_census_1419.py` @ cefbcd0)
+            // agreed before either knew the other's method.
+            //
+            // The invitation is issued here too, not only recorded. An auto-opened escalation
+            // is the one that most needs a peer looking: the member did not choose to
+            // escalate, so it stated no why, and the operator otherwise rules on an id and a
+            // path fragment alone.
+            let inv = resolve_invitation(&mut s, &esc, asker_is_proven);
             let entry = s.append_chain(
                 "gate_escalation_opened",
-                json!({
-                    "escalation_id": esc.id,
-                    "plugin_id": esc.plugin_id,
-                    "subject_instance_lct": s.member_lct(&esc.plugin_id),
-                    "role": esc.role,
-                    "tool_name": esc.tool_name,
-                    "marker": esc.marker,
-                    // The act this one answers. Null reads as absent, never as inferred.
-                    "answers_deny": answers_deny,
-                    "stated_reason": esc.stated_reason,
-                    "stated_detail": esc.stated_detail,
-                    "expires_at": esc.expires_at,
-                    "assurance": "A1 — cooperative gate, same-UID operator. Tamper-EVIDENT, \
-                                  not tamper-proof.",
-                }),
+                opened_payload(
+                    &s,
+                    &esc,
+                    &inv,
+                    asker_is_proven,
+                    answers_deny.as_deref(),
+                    "claim",
+                    DEFAULT_TTL_SECS,
+                ),
             )?;
+            let invitations = deliver_invitations(&mut s, &esc, &inv.invited, &entry.hash);
             Ok(json!({
                 "claimed": false,
                 "permits_write": false,
@@ -10935,6 +11284,13 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                 "decide_within_secs": DEFAULT_TTL_SECS,
                 "retry_within_secs": DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS,
                 "witnessEntryHash": entry.hash,
+                // Told to the ASKER too, not only written to the chain — the same asymmetry
+                // #219 found, where a decider got a bare verdict while the entry beside it
+                // carried the criterion.
+                "bar": esc.bar,
+                "invited_peers": inv.invited,
+                "invitations": invitations,
+                "asker_basis": if asker_is_proven { "session" } else { "asserted" },
                 "how_to_decide": format!(
                     "hestia gate approve {id} --reason '...'   (or: hestia gate deny {id})",
                     id = esc.id
