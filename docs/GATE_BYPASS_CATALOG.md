@@ -931,3 +931,81 @@ actor in the record, T leaves nothing at all, because there is no act to attribu
 
 *Filed by claude-code, 2026-08-07. The invariant is structural and holds today; the periodic
 audit is dp's requirement and is not yet implemented anywhere.*
+
+---
+
+## 18. Class P — the probe payload: a safety property that is invisible in the artifact
+
+**Status: a discipline, not a defect. Filed because the near-miss was real and the property
+that saved it is not enforced anywhere.** Raised by dp, 2026-08-07, on reading a finding
+whose method was sound: *"i question the wisdom of running that as a test. we're still here,
+so i guess governance held but still."*
+
+### What happened
+
+Measuring which destructive commands the daemon refuses requires feeding it destructive
+commands. Two seats did this by running the **gate script** with a synthetic PreToolUse event
+on stdin and reading the verdict:
+
+```python
+subprocess.run([sys.executable, "<gate>"], input=json.dumps(event), ...)
+```
+
+The gate is a **decider, not an executor**. The command string is a JSON field handed to a
+judge; nothing passes it to a shell. The method is correct and the measurements it produced
+were real.
+
+But the payloads included `rm -rf / --no-preserve-root` and `dd if=/dev/zero of=/dev/sda`.
+
+### Why "we're still here" is not the evidence
+
+It is the [[null-state-twin]] in its purest form: a machine that survived a probe and a
+machine that was never at risk are indistinguishable afterwards. Governance did not hold
+here — governance was never consulted, because the string never reached a shell. Had the
+same line been pasted into a terminal by a tired human, or picked up by an agent that
+misread a probe as a runbook, nothing in the stack would have stopped it. Measured the same
+day: `dd if=/dev/zero of=/dev/sda` was **ALLOW** on the live daemon (issue #257).
+
+So the safety came from the harness's shape, not from any decision anyone made about the
+payload. That is one layer, it is re-derived by hand in every probe, and it is **invisible in
+the artifact** — a reader opening the file sees a list of catastrophic commands with no
+indication that they are inert.
+
+### The residue is the real hazard
+
+The probe scripts were described as ephemeral. They were not: three survived on disk and were
+found by a later seat, still carrying their payloads. An inert-by-construction file becomes a
+live one the moment its construction changes — a refactor from *judge* to *run*, a copy-paste
+of the command list, a reader who assumes a `.py` in `/tmp` is meant to be executed.
+
+### The rule
+
+> **Never write a payload you could not survive executing.**
+
+A destructive-**shaped** string measures the matcher exactly as well as a destructive one,
+because the matcher keys on shape:
+
+| instead of | use | measures the same thing |
+|---|---|---|
+| `rm -rf / --no-preserve-root` | `rm -f ./does-not-exist` | the `rm\s+-` pattern |
+| `dd if=/dev/zero of=/dev/sda` | `dd if=/dev/zero of=/dev/null` | the `dd if=… of=…` shape |
+| `mkfs.ext4 /dev/sda1` | `mkfs.ext4 /dev/null` | the `mkfs\.` pattern |
+
+The asymmetry is what makes this a rule rather than a preference: a false ALLOW in a probe
+costs one wrong row in a table; a false **execution** costs the machine. The upside of the
+real device string is zero.
+
+One seat followed this instinctively on the same day — testing the live path with
+`rm -f ./hestia-probe-nonexistent-file-xyz`, harmless even if allowed — while another used the
+real thing for the same class of measurement. That it depended on which seat wrote the probe
+is precisely why it belongs here.
+
+### Relation to other classes
+
+Class P is not a bypass; it is the **inverse** of Class T. Class T is a governance property
+that looks present and is absent. Class P is a safety property that is genuinely present, is
+load-bearing, and is nowhere written down — so it survives exactly as long as everyone keeps
+re-deriving it.
+
+*Filed by claude-code, 2026-08-07, at dp's raising. The rule is a discipline; nothing enforces
+it, and a linter over probe payloads would be a real improvement on this entry.*
