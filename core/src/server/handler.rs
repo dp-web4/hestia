@@ -515,6 +515,13 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     // `assignedRole` (the unrelated `requested_role`). kimi-code's role repair was
     // "live-verified" by a connect that answers — which it does either way.
     let role_declaration_honored = !declared_role.is_empty() && declared_role == constellation_role;
+    // HOW the role was established — the caller's own provenance account (e.g.
+    // `provisional:declared-by-fire; identity file absent or unreadable at …`).
+    // Deliberately NOT normalized: normalizing would collapse exactly the
+    // distinction the field exists to preserve. Captured at MINT only — on
+    // reuse (Guard A below) this call's value is ignored and the minted one is
+    // echoed, the same discipline as `role`.
+    let role_basis = optional_string(args, "role_basis");
     let synthetic = args
         .get("synthetic")
         .and_then(|v| v.as_bool())
@@ -549,6 +556,7 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
                 "assignedRole": existing.assigned_role,
                 "constellationRole": existing.constellation_role,
                 "roleDeclarationHonored": honored,
+                "roleBasis": existing.role_basis,
                 "protocolVersion": 1,
                 "reused": true,
             }));
@@ -566,6 +574,7 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         host_agent_version,
         assigned_role: requested_role.clone(),
         constellation_role: constellation_role.clone(),
+        role_basis,
         soft_lct: soft_lct.clone(),
         connected_at: Utc::now(),
         host_session_id,
@@ -625,6 +634,7 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     // reads back — so the two paths cannot disagree about what was assigned,
     // and a later policy change can't silently split them.
     let assigned_role = s.sessions[&session_id].assigned_role.clone();
+    let role_basis = s.sessions[&session_id].role_basis.clone();
 
     // session_started is intentionally NOT written to the witness chain.
     // Sessions are RAM-only by design (transport artifacts); every hook
@@ -640,6 +650,7 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         "assignedRole": assigned_role,
         "constellationRole": constellation_role,
         "roleDeclarationHonored": role_declaration_honored,
+        "roleBasis": role_basis,
         "protocolVersion": 1,
     }))
 }
@@ -716,20 +727,29 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
         }
     };
 
-    let (plugin_id, role_lct) = s
+    let (plugin_id, role_lct, role_basis) = s
         .sessions
         .get(&action.session_id)
-        .map(|sess| (sess.plugin_id.clone(), sess.constellation_role.clone()))
+        .map(|sess| {
+            (
+                sess.plugin_id.clone(),
+                sess.constellation_role.clone(),
+                sess.role_basis.clone(),
+            )
+        })
         .unwrap_or_else(|| {
             (
                 "anonymous".to_string(),
                 crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
+                None,
             )
         });
     // Accountability WHO: the durable per-instance LCT + the #403 capacity
     // (role_lct) — the trust grain — plus session_id (audit grain), so concurrent
     // same-type sessions are attributed per-(instance, role) and distinguishable
-    // per-session, not smeared onto plugin_id.
+    // per-session, not smeared onto plugin_id. `role_basis` rides alongside so a
+    // role that was only PROVISIONALLY established reads as such; the normalized
+    // `role_lct` alone cannot carry that distinction.
     let instance_lct = s.member_lct(&plugin_id);
 
     let entry = s.append_chain(
@@ -744,6 +764,7 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
             "plugin_id": plugin_id,
             "instance_lct": instance_lct,
             "role_lct": role_lct,
+            "role_basis": role_basis,
             "session_id": action.session_id,
             "host_session_id": action.host_session_id,
             "intent": action.intent,
@@ -6338,6 +6359,7 @@ mod inbox_tests {
                 host_agent_version: None,
                 assigned_role: "citizen".into(),
                 constellation_role: "role:constellation:member".into(),
+                role_basis: None,
                 soft_lct: format!("lct:test:{plugin_id}"),
                 connected_at: chrono::Utc::now(),
                 host_session_id: None,
@@ -6517,6 +6539,7 @@ mod inbox_tests {
                     host_agent_version: None,
                     assigned_role: "citizen".into(),
                     constellation_role: "role:constellation:mesh-worker".into(),
+                    role_basis: None,
                     soft_lct: "lct:test".into(),
                     connected_at: chrono::Utc::now(),
                     host_session_id: None,
@@ -7968,6 +7991,7 @@ mod tests {
                 host_agent_version: None,
                 assigned_role: "citizen".into(),
                 constellation_role: role.into(),
+                role_basis: None,
                 soft_lct: "lct:test".into(),
                 connected_at: Utc::now(),
                 host_session_id: None,
@@ -8227,6 +8251,82 @@ mod tests {
         );
     }
 
+    /// `role_basis` is the caller's account of HOW its role was established
+    /// (#234 finding 3, 2026-08-07): a provisional `mesh-worker` and a hydrated
+    /// one are the same normalized `&'static str` by construction, so the basis
+    /// is the only thing that separates them in the record. It must (1) echo at
+    /// connect — on BOTH paths, because Guard A reuse ignores this call's value
+    /// and the caller needs to see the minted one it actually got — and (2) ride
+    /// the outcome chain entry. Without (2) the producer (a recorder sending
+    /// `HESTIA_ROLE_BASIS`) writes into a closed `json!` literal: the send
+    /// returns success and records nothing.
+    #[tokio::test]
+    async fn role_basis_is_echoed_at_connect_and_carried_onto_the_outcome_entry() {
+        let (_dir, shared) = make_shared_state();
+
+        // Mint with a basis: echoed verbatim (never normalized).
+        let r = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "hs-b",
+                "role": "role:constellation:mesh-worker",
+                "role_basis": "provisional:declared-by-fire; identity file absent at /id"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r["roleBasis"], "provisional:declared-by-fire; identity file absent at /id"
+        );
+        let sid = r["sessionId"].as_str().unwrap().to_string();
+
+        // Reuse with a DIFFERENT basis: Guard A keeps the minted one, and the
+        // response must say so rather than mirror the ignored argument.
+        let r = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "hs-b",
+                "role_basis": "hydrated:identity-file"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["reused"], true);
+        assert_eq!(
+            r["roleBasis"], "provisional:declared-by-fire; identity file absent at /id",
+            "Guard A: reuse must not adopt this call's basis, and must not pretend it did"
+        );
+
+        // The outcome chain entry carries the basis — the consumer the whole
+        // field exists for.
+        let begin = tool_begin_action(&shared, &json!({"tool_name":"Read","session_id":sid}))
+            .await
+            .unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        tool_record_outcome(&shared, &json!({"action_id":aid,"success":true}))
+            .await
+            .unwrap();
+        {
+            let s = shared.lock().await;
+            let outcome = s
+                .recent_chain(20)
+                .into_iter()
+                .find(|e| e.event_type == "outcome")
+                .expect("outcome must be witnessed");
+            assert_eq!(
+                outcome.event_data["role_basis"].as_str().unwrap(),
+                "provisional:declared-by-fire; identity file absent at /id",
+                "the chain entry must carry the basis, or a provisional role reads as hydrated"
+            );
+        }
+
+        // No basis declared → null, never fabricated (same discipline as intent).
+        let r = tool_connect(&shared, &json!({"plugin_id": "m-nb", "host_agent": "h"}))
+            .await
+            .unwrap();
+        assert!(r["roleBasis"].is_null(), "absent basis is null, not invented");
+    }
+
     /// `assignedRole` is granted, not asserted (kimi/CBP thread 2026-07-27).
     /// `requested_role` was echoed verbatim into the response and stored —
     /// granted, never adjudicated, the third instance of the
@@ -8470,6 +8570,7 @@ mod open_appeals_tests {
                     host_agent_version: None,
                     assigned_role: "citizen".into(),
                     constellation_role: crate::reputation::DEFAULT_CONSTELLATION_ROLE.into(),
+                    role_basis: None,
                     soft_lct: format!("lct:{m}"),
                     connected_at: Utc::now(),
                     host_session_id: None,
@@ -8952,6 +9053,7 @@ mod appeal_tests {
                 host_agent_version: None,
                 assigned_role: "citizen".into(),
                 constellation_role: APPELLANT_ROLE.into(),
+                role_basis: None,
                 soft_lct: format!("lct:test:{plugin_id}"),
                 connected_at: chrono::Utc::now(),
                 host_session_id: None,
@@ -9615,6 +9717,7 @@ mod vault_hst001_tests {
             host_agent_version: None,
             assigned_role: "citizen".into(),
             constellation_role: "role:constellation:member".into(),
+            role_basis: None,
             soft_lct: format!("lct:test:{plugin_id}"),
             connected_at: chrono::Utc::now(),
             host_session_id: None,

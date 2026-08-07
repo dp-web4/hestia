@@ -37,6 +37,14 @@ pub struct Session {
     /// from the published set), used as `role_lct` on witnessed events + emitted
     /// reputation deltas. Declared at `connect`, normalized fail-closed.
     pub constellation_role: String,
+    /// HOW the constellation role was established (e.g.
+    /// `provisional:declared-by-fire; identity file absent or unreadable at …`),
+    /// supplied by the caller at `connect` as `role_basis`. Never normalized:
+    /// it is the caller's own account of its provenance, carried onto outcome
+    /// chain entries so a *provisional* `mesh-worker` is distinguishable from a
+    /// *hydrated* one — the normalized role string alone cannot separate them
+    /// (both are the same `&'static str` by construction).
+    pub role_basis: Option<String>,
     pub soft_lct: String,
     pub connected_at: DateTime<Utc>,
     /// The caller's stable host-session id (e.g. Claude Code's `session_id`), if supplied. A
@@ -1550,6 +1558,7 @@ mod tests {
                 host_agent_version: None,
                 assigned_role: "citizen".into(),
                 constellation_role: "role:constellation:member".into(),
+                role_basis: None,
                 soft_lct: "lct:test:a".into(),
                 connected_at: Utc::now(),
                 host_session_id: None,
@@ -1565,6 +1574,7 @@ mod tests {
                 host_agent_version: None,
                 assigned_role: "citizen".into(),
                 constellation_role: "role:constellation:member".into(),
+                role_basis: None,
                 soft_lct: "lct:test:b".into(),
                 connected_at: Utc::now() + chrono::Duration::seconds(1),
                 host_session_id: None,
