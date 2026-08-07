@@ -77,10 +77,39 @@ def base_blobs():
     return _BASE_BLOBS
 
 
+def cherry_landed(commit):
+    """kimi's probe 1: is every patch on this head ALREADY on BASE by patch-id?
+
+    `git cherry BASE head` marks each commit '-' when BASE already contains an
+    equivalent patch and '+' when it does not. Patch-id ignores the commit hash,
+    so it sees straight through the rebase/cherry-pick class -- exactly the class
+    ancestry gets wrong for the same reason it gets squash-merges wrong. It does
+    NOT launder squash-merges: squashing N commits into one changes the patch, so
+    the parts still read '+'.
+
+    Returns (all_landed, detail) or (None, reason) when there is nothing to compare.
+    """
+    out = git("cherry", BASE, commit)
+    marks = [ln.split()[0] for ln in out.splitlines() if ln.strip()]
+    if not marks:
+        return None, "no patches to compare"
+    have = marks.count("-")
+    return have == len(marks), f"{have}/{len(marks)} patches already on {BASE} by patch-id"
+
+
 def classify(commit):
     """Return (verdict, detail) for one commit against origin/main."""
     if is_ancestor(commit):
         return "ON-MAIN", "reachable from " + BASE
+
+    # probe 1 (kimi, notice 1259) -- run BEFORE the path/line tests. Those tests ask
+    # "is this content on main"; patch-id equality answers it outright and with less
+    # inference, so letting them run first would only invite them to disagree with a
+    # stronger instrument. This is the single largest correction to the sweep: it is
+    # the rebase/cherry-pick class, which nothing else here could see.
+    landed, cdetail = cherry_landed(commit)
+    if landed:
+        return "CHERRY-LANDED", cdetail
 
     # A merge commit has no single diff. Without -m, diff-tree prints nothing and the
     # commit would fall through to "EMPTY" -- silently untested and invisible in a sweep
@@ -103,17 +132,33 @@ def classify(commit):
     # a file whose content did land (kimi F1). So for each absent path, ask the
     # path-independent question -- did this exact blob ever appear in main's history?
     absent = []
+    relocated = []  # blob landed on BASE, just not at this path
     for p in paths:
         if subprocess.run(["git", "cat-file", "-e", f"{BASE}:{p}"],
                           capture_output=True).returncode == 0:
             continue
         blob = git("rev-parse", f"{commit}:{p}").strip()
         if blob and blob in base_blobs():
-            continue  # content landed under some other path -- not stranded
+            relocated.append(p)  # content landed under some other path -- not stranded
+            continue
         absent.append(p)
     if absent:
         return "STRANDED", (f"{len(absent)} added path(s) whose content is on no {BASE} "
                             f"commit (blob-level): {absent[0]}" + merge_note)
+
+    # A relocated path must be WITHDRAWN from the line test below, not merely spared the
+    # hard-positive verdict. Test 3 reads `BASE:<path>`, which is empty for a path main
+    # does not carry -- so every added line would read missing and the commit would come
+    # back STRANDED anyway, with a different reason and the same wrong answer. That is
+    # kimi's F1 one layer down, and it is invisible on this repo because the class is
+    # empty here; caseA in tools/stranded_controls.sh is the instance that shows it.
+    if relocated:
+        paths = [p for p in paths if p not in relocated]
+        merge_note = (f" [{len(relocated)} path(s) landed under another name on {BASE}, "
+                      f"withdrawn from the line test: {relocated[0]}]" + merge_note)
+        if not paths:
+            return "CONTENT-LANDED", (f"all {len(relocated)} path(s) landed on {BASE} under "
+                                      f"another name (blob-level){merge_note}")
 
     # test 3 -- modify-only: are the added lines in main's version OF THE FILE THEY WERE
     # ADDED TO? Matching against the union of all touched blobs (the original) counts a
@@ -169,13 +214,22 @@ def main():
     else:
         targets = args or ["HEAD"]
 
+    tally = {}
     for c in targets:
         verdict, detail = classify(c)
+        tally[verdict] = tally.get(verdict, 0) + 1
         if verdict == "ON-MAIN":
             continue
         subject = git("log", "-1", "--format=%h %ad %s", "--date=short", c).strip()
         print(f"{verdict:14} {subject}")
         print(f"{'':14} {detail}")
+
+    # Print the base the run was pinned to alongside the counts: the bound decays as
+    # main advances, so a tally without its base is not a reproducible number.
+    base_sha = git("rev-parse", "--short", BASE).strip()
+    print(f"\n-- tally ({len(targets)} refs, BASE={BASE}@{base_sha}) --")
+    for k in sorted(tally):
+        print(f"{tally[k]:4}  {k}")
 
 
 if __name__ == "__main__":
