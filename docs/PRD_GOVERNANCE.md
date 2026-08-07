@@ -575,6 +575,34 @@ Four current symptoms are one design consequence, and all four resolve here:
 
 The short window is **not a defect** — dp: *"expire fast was a fix to kimi's hooks failing open in 3 seconds."* It is not changed here. The ladder makes it correct rather than painful: most escalations resolve in seconds because a policy agent is awake, and the window only has to be human-sized for the residue that genuinely reaches the operator.
 
+> **Correction of record (CBP, 2026-08-07): the "3 seconds" above is wrong, and it was
+> load-bearing.** Verified against the Kimi engine binary, which resolves a hook's deadline as
+> `timeout: hook.timeout ?? DEFAULT_HOOK_TIMEOUT_SECONDS` with the default at **30 s** — and the
+> `[[hooks]]` entry's own `timeout` **is** honoured. Kimi's PreToolUse gate is configured at
+> `timeout = 15`, so the real fail-open ceiling is **15 s**, not 3 s.
+>
+> The sentence above is retained rather than edited away, because *how* the error propagated is
+> the more useful artifact: it entered as a recollection in conversation, was quoted into this
+> PRD as sourced fact, and was then cited back as authority — including by me, to argue against a
+> change that was in fact safe. Nobody measured it for weeks. It sized hestia's Kimi gate budget
+> at 800 ms, which put the gate's per-request cap (500 ms) below the daemon's p99 (681 ms under
+> chain-census load) and produced intermittent `no policy verdict (daemon path failed)` denies —
+> denies that **cannot appear in the witness chain**, because recording one requires the daemon
+> path that just failed. kimi's own measurement, §2 of this document: *"45% of those denies were
+> daemon-unavailability, not scope."*
+>
+> This is the document's own defect class turned on itself: a **declared** value standing where an
+> **audited** one belongs. Budget now 14 000 ms (`timeout` − 1 s); per-request 5 s.
+>
+> **And the pair is a bypass surface, not just a tuning knob.** The engine fails *open* past
+> `timeout`, so the invariant `gate budget < hook timeout` is what keeps a fail-closed member
+> governed at all. Push the budget above the timeout and every gate call overruns, the engine
+> allows, and nothing is logged — no deny to notice, and a clean chain, because nothing was
+> refused. It presents exactly as a well-behaved member. Either number can be edited alone, and
+> neither edit looks dangerous by itself, so **this pair should be audited periodically rather
+> than trusted once** (dp, 2026-08-07). Same shape for every fail-open-engine member; see
+> `GATE_BYPASS_CATALOG.md` and the per-agent entries in `agent-atlas/talk-to/*/descriptor.md`.
+
 ### 8.4 The return channel: appeal
 
 Escalation and appeal are **not the same instrument at different times.** They differ in target,

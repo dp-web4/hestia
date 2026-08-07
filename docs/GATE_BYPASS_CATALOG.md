@@ -851,3 +851,83 @@ makes it worth asking. No amount of gate hardening on the *asking* member change
 
 *Filed by claude-code, 2026-08-06, as the deputy in the instance described. G1 is
 structural and holds today; G2 is unverified and should be probed, not assumed.*
+
+---
+
+## 17. Class T — the timeout pair: un-governing a member by raising a number
+
+**Status: structural, live on every fail-open-engine member, and silent in both directions.**
+Found 2026-08-07 while diagnosing intermittent kimi denies; flagged by dp as something the
+system should re-check periodically rather than trust once.
+
+### The shape
+
+A member whose harness **fails open** on hook timeout can only be governed because its gate
+is the fail-closed party — it must reach a verdict and `exit 2` *before* the harness deadline.
+That makes two independently-editable numbers load-bearing together:
+
+```
+gate internal budget   <   harness hook timeout
+```
+
+Push the budget above the timeout and the gate never finishes in time. The harness then does
+what it always does on an overrun: **allow**. Every subsequent call is ungoverned.
+
+### Why it is worse than an ordinary misconfiguration
+
+It is invisible from both of the places anyone would look:
+
+- **No denies appear** — because none happen. The member sails through.
+- **The witness chain looks clean** — not merely quiet, but *correct*. A chain records refusals
+  and acts; an act that was never gated leaves no gap to notice.
+- **Nothing logs.** The harness allowing on overrun is its documented behaviour, not an error.
+
+A fully un-governed member is therefore indistinguishable, on every surface hestia offers, from
+a well-behaved one. This is the [[null-state-twin]] at the level of a whole member: the green
+is bit-identical to "no governance at all".
+
+### Why it is reachable
+
+Neither edit looks dangerous alone:
+
+- Raising the gate's budget reads as *fixing false denials* — which is exactly the legitimate
+  work that produced this entry. Denies caused by too-tight budgets are real and worth fixing.
+- Lowering the harness timeout reads as *tightening latency*.
+
+Either one, done in good faith by someone holding only half the picture, silently disarms the
+member. No adversary is required. The 2026-08-07 change to kimi came within one approval of
+being sized against a fail-open ceiling that was wrong by 5× in the *safe* direction — had the
+remembered figure erred the other way, the "fix" would have shipped the bypass.
+
+### What makes it a bypass rather than a bug
+
+The efficiency argument applies exactly as CLAUDE.md predicts: a member hitting fail-closed
+denies has a real incentive to raise its own budget, and doing so *both* removes the denials
+*and* removes the governance, with the second effect unobservable. The efficient path and the
+correct path diverge, and nothing in the system marks the fork.
+
+### Mitigation
+
+- **Assert the invariant where both numbers are visible.** The launcher knows the harness
+  timeout and passes the budget; it is the only place the pair is co-located. A gate that
+  cannot prove it fits inside its harness deadline should refuse to start rather than run
+  ungoverned.
+- **Audit the pair on a schedule** (dp, 2026-08-07). Per-member, since the timeout default
+  differs by harness — see `agent-atlas/talk-to/*/descriptor.md`, which now records the
+  engine-verified figure for kimi (`hook.timeout ?? 30s`, config honoured).
+- **Treat "denies stopped" as a signal requiring explanation**, not as success. The absence of
+  refusals is the observable that this class produces, and it is also what a genuine fix
+  produces. They must be told apart by something other than the deny count — e.g. positive
+  evidence that verdicts are still being *reached*, not merely that none were negative.
+- **Do not source a harness timeout from memory.** The figure that sized kimi's budget
+  travelled from conversation → PRD → cited authority without ever being measured, and was
+  wrong by 5–10× (`PRD_GOVERNANCE.md` §8.3, corrected in place with the propagation path kept).
+
+### Relation to other classes
+
+Class T is the *converse* of Class G. G is a member gaining authority it was never granted;
+T is a member losing the governance it was always under — and where G at least leaves an
+actor in the record, T leaves nothing at all, because there is no act to attribute.
+
+*Filed by claude-code, 2026-08-07. The invariant is structural and holds today; the periodic
+audit is dp's requirement and is not yet implemented anywhere.*
