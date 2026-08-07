@@ -19,6 +19,15 @@ member mesh, and argued about in the forum without anyone writing a case down:
        frees `do rm -rf /` sight-unseen (claude-code's hole argument, 1334 §3). The
        red arm is in `_SURVIVE`; a green on the false-refusal rows alone would certify
        the hole.
+  FP13 a shell VARIABLE ASSIGNMENT prefix was head-checked as a command name:
+       `G=<gate>; grep … "$G"` basename-checked the token `G=<gate>` and got
+       `pre_tool_use.py`, which sits in no head list — the assignment was read as
+       *executing the file it names* (claude-code's matched pair, notice 1474 §1;
+       escalations 5b53e9b5f4704a7b / 29622e19db86a304 were minted by exactly this).
+       FP12's mechanism with a different construct and a DIFFERENT fix: an assignment
+       is a PREFIX in shell grammar, so leading NAME=VALUE tokens are consumed and the
+       head check runs on what follows. `assignment_does_not_launder` in `_SURVIVE` is
+       the arm that matters — consuming the prefix must never free the command after it.
   cd   `cd h && grep -n foo <gate>` — a read whose only sin is a directory change.
        `cd` is absent from the read-only head allowlist. Fixed here.
 
@@ -288,6 +297,17 @@ _SURVIVE = [
      "awk's write lives in a full language's program text; its per-head grammar would "
      "be 'always refuse', so it stays out (1218 §2(b)) — the closed-grammar tradeoff, "
      "stated rather than relived"),
+    # FP13 (claude-code, notice 1474 §1/§5): the assignment-prefix consume must free
+    # only the assignment, never the command after it — the `cd`-precedent trap one
+    # construct over.
+    ("assignment_does_not_launder",
+     'G={g}; sed -i s/a/b/ "$G"', 'G={g}; grep -c def "$G"',
+     "consuming the assignment must free only the assignment; the sed grammar still "
+     "decides what follows it"),
+    ("assignment_value_executes",
+     'G=`touch /tmp/fp13_x`; grep -c def {g}', 'G=1; grep -c def {g}',
+     "a command substitution inside the VALUE runs for real (`G=`rm …`` executes); a "
+     "prefix is only free when it is inert, so a backtick value fails closed"),
 ]
 
 # The false refusals. Each MUST be classified read-only after the fix.
@@ -323,6 +343,17 @@ _FALSE_REFUSALS = [
      "the condition strips to one head-checked command, the body to another"),
     ("for_loop_piped", "for f in a; do cat $f; done | grep x",
      "a pipe after the closer still splits the stream on its own segments"),
+    # FP13 (claude-code's matched pair, notice 1474 §1): same file, same spelling, same
+    # grep — the only difference from a PERMITTED read was the assignment prefix.
+    ("assignment_prefix_is_not_a_head", 'G={g}; grep -c "" "$G"',
+     "the live specimen: refused as a WRITE, minted escalation 29622e19db86a304 — "
+     "basename(`G=<gate>`) is `pre_tool_use.py`, a head no list carries"),
+    ("assignment_alone_is_read_only", "G={g}",
+     "an assignment with no command executes nothing; the empty case is read-only, "
+     "not a write"),
+    ("env_prefix_form", 'FOO=1 grep -c "" {g}',
+     "the same prefix one spelling over — `VAR=x cmd` with the path as an ordinary "
+     "argument rather than through the variable"),
 ]
 
 # FP6 is NOT fixed here, and pinning it as a known-refused case is the honest form: it
@@ -442,6 +473,56 @@ def test_fp8_edit_new_string_is_pinned_open_not_fixed():
                                      "new_string": prose}) is not None,
           "this now returns None — Edit's new_string left the haystack and nobody moved "
           "the row. If that was earned, say what makes the hard case safe.")
+
+
+@asserting
+def test_the_record_names_the_act_not_the_rule():
+    """5.2 (claude-code, notice 1474 §2/§3): the record named the RULE, not the ACT.
+
+    `_touches_self` was documented "Return the matched marker" and did — the haystack
+    element that actually matched was discarded, and the marker was then printed as the
+    DESTINATION in the deny message and the escalation text. The record a human rules
+    on stated the pattern that fired where it promised the resource the call would
+    reach; and because `_SELF_MARKERS` is an ordered first-match-wins tuple, the same
+    file spelled `~/…` vs `/home/…` produced two different "destinations" (1474 §3a).
+
+    The fix returns the TRIPLE `(marker, resource, key)`: the marker stays the reason
+    (and the daemon's approval keying is untouched), the resource is the matched
+    haystack element — the act — and the key says which input field it came from, so a
+    match inside `content`/`new_string` text is reported as PAYLOAD, not as a
+    destination (the FP8 case).
+
+    These rows are on the SHAPE and the VALUE, not the verdict: the verdict must not
+    move, and the existing `is None` / `is not None` assertions above keep proving it.
+    """
+    mod = _load_gate()
+
+    hit = mod._touches_self("Write", {"file_path": HOOK, "content": "harmless"})
+    ok = isinstance(hit, tuple) and len(hit) == 3
+    check("touches_self_returns_marker_resource_key", ok,
+          f"got {hit!r} — the bare marker string, which is the bug itself: the "
+          f"matched resource was discarded and the PATTERN was reported as the place")
+    if ok:
+        marker, resource, key = hit
+        check("resource_is_the_matched_element",
+              resource in (HOOK, os.path.realpath(HOOK)),
+              f"resource={resource!r} should be the path the call actually reaches")
+        check("key_names_the_field_it_matched_in", key == "file_path", repr(key))
+        check("marker_is_still_the_reason", marker in mod._SELF_MARKERS, repr(marker))
+
+    # The FP8-shape case: the destination is ordinary, the payload QUOTES the gate.
+    # The match must be reported as text matched in `new_string`, not as a file.
+    prose = f"see {HOOK} for the mechanism"
+    hit = mod._touches_self("Edit", {"file_path": "/tmp/notes.md", "old_string": "x",
+                                     "new_string": prose})
+    ok = isinstance(hit, tuple) and len(hit) == 3
+    check("payload_match_still_returns_the_triple", ok, repr(hit))
+    if ok:
+        marker, resource, key = hit
+        check("payload_match_names_the_text_as_the_match",
+              key == "new_string" and resource == prose,
+              f"key={key!r} resource={resource!r} — the honest report is that the "
+              f"match is payload content, not a destination (1474 §2, the FP8 case)")
 
 
 @asserting
@@ -719,6 +800,7 @@ if __name__ == "__main__":
     test_known_open_defects_are_pinned()
     test_fp8_write_content_is_fixed()
     test_fp8_edit_new_string_is_pinned_open_not_fixed()
+    test_the_record_names_the_act_not_the_rule()
     test_multiedit_nested_edits_were_never_in_the_haystack()
     test_marker_evasion_by_path_assembly_is_pinned_open()
     test_this_file_certifies_the_enforcing_copy()
