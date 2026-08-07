@@ -169,6 +169,19 @@ use std::path::{Path, PathBuf};
 ///   entry is now tagged `SiteClass::Predicate`. The reading was correct
 ///   about naming and incomplete about gating — the two questions are
 ///   independent, which is why the class is a column and not a conclusion.
+/// - 2026-08-07 (claude-code), the #226 invitation writer added a pool
+///   filter to `tool_gate_escalation_open`, RECLASSIFYING it Naming →
+///   Predicate. Full reading at the site. Two notes belong up here because
+///   they are about the INSTRUMENT, not that one site: (a) it is the first
+///   MIXED site — one naming line and one gate under a column that holds a
+///   single word — so `Predicate` here means "contains a gate", not "is
+///   only a gate", and a mostly-hygiene site with one buried comparison
+///   will look identical in this column; (b) a Predicate is not necessarily
+///   a refusal. This one selects an invitation pool and fails OPEN, so its
+///   harm runs opposite to the four refusal predicates above: a false
+///   "same entity" withholds an invitation, and the peer then reads as
+///   ABSENT rather than as never-asked — the precise conflation #226 was
+///   meant to end.
 
 /// What a `.member_lct(` consumer DOES with the name it derives.
 ///
@@ -326,9 +339,37 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     // (`http.rs::scope_decide`) is the one that widens reach, and it is keyed on the same
     // asserted `plugin_id`. As with `policy_set_instance_grant`, a typo yields a live-looking
     // grant that matches nothing and is inert. Read deliberately, not discovered later.
+    // RECLASSIFIED 2026-08-07 (claude-code, the #226 invitation writer). This site was
+    // `Naming` on one line and now carries three: the original attribution line, plus a
+    // pool filter that compares the asker's derived name against each candidate's to
+    // decide who is invited. That comparison decides control flow, so the site is
+    // `Predicate` and pins its comparison below.
+    //
+    // Two things about this reading, because the honest answer is not the flattering one:
+    //
+    // 1. The class is per-SITE and the classes are per-LINE. This is the first genuinely
+    //    MIXED site in the table — `"subject_instance_lct"` names, the filter gates, and
+    //    the column can hold only one word. `Predicate` is the correct choice because it
+    //    is the stronger claim and forces the comparison pin; tagging `Naming` would have
+    //    made the red go away while leaving the gate unpinned, which is the exact move
+    //    the class column exists to make expensive. Recorded as an instrument limit: a
+    //    future site that is mostly hygiene with one buried comparison will look, in this
+    //    column, identical to a pure gate.
+    // 2. This predicate is NOT a refusal and must not be read as one. Nothing it decides
+    //    can block the open, delay it, or move `bar_met` — it selects an invitation pool,
+    //    and it fails OPEN (an unmappable candidate is invited, not dropped). What makes
+    //    it a Predicate is that a name comparison chooses who is asked; what makes that
+    //    consequential is the inverse of a refusal — a peer wrongly judged "same entity"
+    //    is never invited, and then reads as ABSENT in `peer_participation()`. The
+    //    alias-guard reach is whitespace only
+    //    (`state::tests::the_member_lct_alias_guard_reaches_only_whitespace`), so
+    //    `codex` vs `codex-cli` are two invitees, not one — over-inviting, the safe
+    //    direction here, and the reason the fail-open was chosen deliberately.
     ("server/handler.rs::tool_gate_escalation_open", &[
         "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
-    ], SiteClass::Naming),
+        ".filter(|id| match (&asker_lct, s.member_lct(id)) {",
+        "let asker_lct = s.member_lct(&esc.plugin_id);",
+    ], SiteClass::Predicate),
     ("server/handler.rs::tool_gate_escalation_claim", &[
         "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
         "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
@@ -370,6 +411,16 @@ const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
     ("server/handler.rs::tool_arbitrate_appeal", &[
         "a.is_some() && a == b",
     ]),
+    // The escalation INVITATION pool filter (#226's missing writer): a candidate whose
+    // member LCT equals the asker's is not invited. Byte-identical to `tool_appeal`'s
+    // arm above and deliberately so — one comparison, two pools, so a future repair to
+    // the alias reach lands on both or is visibly missing from one. The direction of
+    // harm inverts between them: at `tool_appeal` a false "different" admits an arbiter
+    // who should not rule; here a false "same" withholds an invitation and the peer then
+    // reads as absent. Same line, opposite failure — which is why the pin is per site.
+    ("server/handler.rs::tool_gate_escalation_open", &[
+        "(Some(a), Some(b)) => a != &b,",
+    ]),
     // The same arm, advisory here (`you_may_rule: false`). An advisory
     // predicate is still a predicate: it is the answer a member acts on when
     // deciding whether to file a ruling.
@@ -388,7 +439,6 @@ const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
 /// `member_registry` / `load_members(` / `ensure_member(` /
 /// `attach_citizenship(` / `MemberRegistry::` / `.iter_sorted(`, minus the
 /// three registry fns' own definition lines, keyed `(file, enclosing fn)`.
-/// 8 keys, 9 lines.
 ///
 /// Every entry here was read by a person on 2026-07-27 and judged: one
 /// producer (`tool_connect`'s mint), one boot load, three operator surfaces,
@@ -418,6 +468,31 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ]),
     ("server/handler.rs::tool_connect", &[
         "crate::member_registry::ensure_member(",
+    ]),
+    // Added 2026-08-07 (claude-code, the #226 invitation writer). READING, answering the
+    // question this table schedules — **is this a safety use of presence?**
+    //
+    // NOT a gate, and structurally cannot become one: this read happens after the
+    // escalation is opened, and nothing it produces is consulted by `bar_met` or can
+    // refuse, delay or alter the open. A registry that returned zero members yields an
+    // empty invitation list and an escalation that proceeds exactly as it does today.
+    //
+    // But it is CONSEQUENTIAL in the same shape as `tool_appeal`'s pool — hestia#80 — and
+    // for the same reason, so it is logged here rather than waved through: presence
+    // decides WHO IS ASKED. A member absent from the registry is never invited, and the
+    // record then shows it as not-invited rather than as unreachable. That is the fail-
+    // open direction (the escalation stands; the pool silently shrinks), which is the
+    // #80 degradation exactly: the pool quietly narrows and the entry that results still
+    // looks complete. The mitigation is that the invitation is RECORDED with its
+    // evidence — `invited_peers` plus `invitation_evidence` (liveness at invite) plus
+    // `invitation_passed_over` (cap overflow) — so a reader can tell an empty pool from
+    // an unasked one. That is a record that makes the narrowing visible; it is not a
+    // check that prevents it. The unclosed half: nothing distinguishes "registry holds
+    // no other member" from "registry failed to load", because `state::open` fails open
+    // to an empty registry. If that distinction ever matters, it is measured HERE.
+    ("server/handler.rs::tool_gate_escalation_open", &[
+        ".iter_sorted()",
+        ".member_registry",
     ]),
     ("server/state.rs::open", &[
         "let member_registry = crate::member_registry::load_members(&vault);",
