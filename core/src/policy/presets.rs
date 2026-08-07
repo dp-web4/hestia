@@ -87,12 +87,16 @@ fn safety_rules() -> Vec<PolicyRule> {
                 "Destructive command blocked by the safety preset. Two classes land here. \
                  (1) Destroying a FILESYSTEM: rm is allowed ONLY standing alone against \
                  absolute /tmp paths (see the allow rule); anything chained, relative, \
-                 path-escaping (..) or outside /tmp lands here, as does mkfs. (2) Writing \
-                 raw bytes at a BLOCK DEVICE (/dev/sdX, nvme, vd, hd, mmcblk, xvd) — via \
-                 `of=`, a `>` redirect, `tee`, or any other spelling of the write position \
-                 — plus `shred`. READING a device is not destroying it: `dd if=/dev/sda \
-                 of=/tmp/backup.img` is allowed, and so is any redirect to /dev/null or \
-                 /dev/stderr. This \
+                 path-escaping (..) or outside /tmp lands here, as does mkfs in any \
+                 spelling (`mkfs`, `mkfs.ext4`). (2) Writing raw bytes at a BLOCK DEVICE \
+                 (/dev/sdX, nvme, vd, hd, mmcblk, xvd) — via `of=`, a `>` redirect, a \
+                 `tee` target, or a `cp`/`mv`/`install` destination — plus `shred` with or \
+                 without flags. That list is EXHAUSTIVE, not illustrative: a write whose \
+                 position carries no such marker (a shell function, a tool whose \
+                 destination is merely its last argument) is not matched, so do not read \
+                 this as blanket device protection. READING a device is not destroying it: \
+                 `dd if=/dev/sda of=/tmp/backup.img` and `cp /dev/sda /tmp/backup.img` are \
+                 allowed, and so is any redirect to /dev/null or /dev/stderr. This \
                  matches where the command could EXECUTE, not where the text appears: \
                  quoting the token as data (a grep pattern, a quoted heredoc body under \
                  cat/tee, a non-expanding double-quoted string) does not trip it — but \
@@ -117,16 +121,32 @@ fn safety_rules() -> Vec<PolicyRule> {
                 // redirect, a `tee` argument — not on the tool name. Keying on
                 // `dd`/`cat`/`tee` would deny `dd if=/dev/sda of=/tmp/backup.img`,
                 // which reads the device and destroys nothing; keying on the
-                // position is what lets the read stay allowed. It also covers
-                // spellings nobody enumerated: any future tool that writes with
-                // `of=` or `>` lands here without a new pattern.
+                // position is what lets the read stay allowed.
+                //
+                // What "write position" CANNOT do on its own is catch a tool
+                // whose destination carries no marker at all — `cp img /dev/sda`
+                // has no `of=`, no `>`, no `tee`. The original comment here
+                // claimed the position-keying "covers spellings nobody
+                // enumerated"; that generalization was false, and because it was
+                // also written into the published `reason`, every member read a
+                // protection the engine did not implement (measured ALLOW on the
+                // claude-code seat, 2026-08-07). For that family the destination
+                // has to be located structurally: last operand before end-of-
+                // command, with the device preceded by whitespace so a path that
+                // merely contains `/dev/sdX` does not match.
+                //
+                // `mkfs\.` and `\bshred\s+-` were likewise narrower than the law
+                // text that named them ("as does mkfs", "plus `shred`"): both
+                // required punctuation the text never mentioned, so `mkfs -t
+                // ext4` and a bare `shred` evaluated ALLOW. Widened to the token.
                 target_patterns: Some(vec![
                     r"rm\s+-".into(),
-                    r"mkfs\.".into(),
-                    r"\bshred\s+-".into(),
+                    r"\bmkfs\b".into(),
+                    r"\bshred\b".into(),
                     format!(r"\bof={BLOCK_DEVICE}"),
                     format!(r">\s*{BLOCK_DEVICE}"),
                     format!(r"\btee\s+(-[A-Za-z-]+\s+)*{BLOCK_DEVICE}"),
+                    format!(r"\b(cp|mv|install)\s+[^|;&]*\s{BLOCK_DEVICE}\s*($|[|;&])"),
                 ]),
                 target_patterns_are_regex: true,
                 // Judge the act, not the mention. `handler.rs` hands the whole command in
@@ -507,6 +527,82 @@ mod tests {
                 target: Some(cmd),
                 full_command: Some(cmd),
             });
+            assert_ne!(
+                v.decision,
+                PolicyDecision::Deny,
+                "`{cmd}` should not be denied (matched {:?})",
+                v.rule_id
+            );
+        }
+    }
+
+    /// The `reason` string is law text published to every member at session
+    /// start, so each token it names is a promise the engine has to keep. On
+    /// 2026-08-07 three of them did not survive being read literally, measured
+    /// live through the claude-code seat's gate against absent devices in a
+    /// root-owned `/dev` (uid 1000 cannot create there, so blast radius zero):
+    ///
+    /// | shape | law text says | gate said |
+    /// |---|---|---|
+    /// | `mkfs -t ext4 /dev/sdz` | "as does mkfs" | ALLOW (`mkfs\.` needs the dot) |
+    /// | `shred /dev/sdz` | "plus `shred`" | ALLOW (`\bshred\s+-` needs a flag) |
+    /// | `cp img /dev/sdz` | "any other spelling of the write position" | ALLOW |
+    ///
+    /// `shred` did not merely evaluate ALLOW — it executed and opened the
+    /// target for writing; only the absent device stopped it.
+    ///
+    /// These fail in the OPPOSITE direction from the carve-out contradiction
+    /// kimi-code reported the same day (where the text promises a permission
+    /// the engine does not grant). There the honest fix is the text; here it is
+    /// the rule, because "the law over-promised protection" is not repaired by
+    /// writing the gap into law.
+    #[test]
+    fn law_text_names_are_enforced_as_written() {
+        use crate::policy::{PolicyAction, PolicyEngine};
+
+        let e = PolicyEngine::new(get_preset("safety").unwrap().config);
+        let judge = |cmd: &str| {
+            e.evaluate(&PolicyAction {
+                tool_name: "Bash",
+                category: "command",
+                target: Some(cmd),
+                full_command: Some(cmd),
+            })
+        };
+
+        for cmd in [
+            // "as does mkfs" — the bare spelling, no `.ext4` suffix
+            "mkfs -t ext4 /dev/sda",
+            "mkfs.ext4 /dev/sda",
+            // "plus `shred`" — shred is destructive with or without a flag
+            "shred /dev/sda",
+            "shred -uz /home/dp/secret.key",
+            // a write position whose only marker is "last argument"
+            "cp ubuntu.img /dev/sda",
+            "mv ubuntu.img /dev/nvme0n1",
+            "install -m 644 img /dev/mmcblk0",
+            "cp img /dev/sda | tee /tmp/log",
+        ] {
+            let v = judge(cmd);
+            assert_eq!(
+                v.decision,
+                PolicyDecision::Deny,
+                "`{cmd}` is named in the rule's own law text but got {:?}",
+                v.decision
+            );
+        }
+
+        // The negative arm for the newly-keyed tools: a device in SOURCE
+        // position is a read, and reads must stay allowed. This is the FP the
+        // position-keying exists to avoid, now that three tool names are keyed.
+        for cmd in [
+            "cp /dev/sda /tmp/backup.img",
+            "mv /tmp/a /tmp/b",
+            // a path that merely CONTAINS a device spelling is not a device
+            "cp -r /etc /mnt/backup/dev/sda",
+            "echo 'cp img /dev/sda'",
+        ] {
+            let v = judge(cmd);
             assert_ne!(
                 v.decision,
                 PolicyDecision::Deny,
