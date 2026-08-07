@@ -182,6 +182,19 @@ use std::path::{Path, PathBuf};
 ///   "same entity" withholds an invitation, and the peer then reads as
 ///   ABSENT rather than as never-asked — the precise conflation #226 was
 ///   meant to end.
+/// - 2026-08-07 (claude-code), hours later: the mixed site above no longer
+///   exists. Factoring the invitation writer into `resolve_invitation` +
+///   `opened_payload` — done because the CLAIM door had a hand-rolled
+///   `open()` carrying none of #241's keys, not to fix this table — split
+///   the gate away from the naming line, so `tool_gate_escalation_open` is
+///   gone from all three tables and its two classes are stated separately.
+///   Grep for either new name to find what used to be under the old one.
+///   The instrument limit in note (a) is NOT thereby repaired: it was
+///   un-mixed by a coincidence of refactoring, nothing stops the next mixed
+///   site, and a re-inlining would go red on the rename alone — recoverable
+///   to green by re-tagging one site, which is the cheap move the class
+///   column exists to make expensive. What actually holds the gate is its
+///   pinned comparison in `MEMBER_LCT_PREDICATE_CENSUS`, not the split.
 
 /// What a `.member_lct(` consumer DOES with the name it derives.
 ///
@@ -365,13 +378,43 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     //    (`state::tests::the_member_lct_alias_guard_reaches_only_whitespace`), so
     //    `codex` vs `codex-cli` are two invitees, not one — over-inviting, the safe
     //    direction here, and the reason the fail-open was chosen deliberately.
-    ("server/handler.rs::tool_gate_escalation_open", &[
-        "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
+    // SPLIT 2026-08-07, hours after the reading above was written, by the factoring that
+    // moved the invitation writer to the door the gate actually walks through. The mixed
+    // site is GONE, and not because the instrument improved: a production refactor done
+    // for an unrelated reason (the claim path had a hand-rolled `open()` whose payload
+    // carried none of #241's keys) happened to put the naming line and the gate in
+    // separate functions. `opened_payload` is the attribution; `resolve_invitation` is the
+    // pool filter. Both classes are now stated at their own site and the column holds one
+    // word honestly.
+    //
+    // Two things this does NOT establish. (a) The instrument limit recorded above stands
+    // unrepaired — nothing stops the next mixed site, and this one was un-mixed by luck,
+    // so the limit is still the right thing to have written down. (b) Nothing prevents a
+    // future re-inlining from silently re-mixing it: the census would go red on the
+    // rename and an author could restore green by re-tagging one site `Predicate`, which
+    // is exactly the cheap move the class column was built to make expensive. The
+    // protection is the pinned comparison in `MEMBER_LCT_PREDICATE_CENSUS`, not the split.
+    //
+    // The reading itself is unchanged and carries over verbatim: still a pool filter,
+    // still NOT a refusal, still fails OPEN, still the whitespace-only alias reach
+    // (`state::tests::the_member_lct_alias_guard_reaches_only_whitespace`), so
+    // over-inviting remains the safe direction it errs in.
+    ("server/handler.rs::resolve_invitation", &[
         ".filter(|id| match (&asker_lct, s.member_lct(id)) {",
         "let asker_lct = s.member_lct(&esc.plugin_id);",
     ], SiteClass::Predicate),
-    ("server/handler.rs::tool_gate_escalation_claim", &[
+    // The shared attribution line, now emitted once for BOTH doors. Naming, unchanged in
+    // class from when it sat inline in each. The HST-005 caveat is load-bearing here and
+    // is now carried on one line instead of three: `esc.plugin_id` is caller-asserted, so
+    // `subject_instance_lct` is a well-formed name derived from a self-reported id, not
+    // evidence of membership.
+    ("server/handler.rs::opened_payload", &[
         "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
+    ], SiteClass::Naming),
+    // Was two identical lines; the duplicate was the hand-rolled fallback payload this
+    // change deleted in favour of `opened_payload`. The remaining line is the claim
+    // response's own attribution, which is not the chain entry and did not move.
+    ("server/handler.rs::tool_gate_escalation_claim", &[
         "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
     ], SiteClass::Naming),
     ("server/handler.rs::tool_gate_arbitrate_escalation", &[
@@ -418,7 +461,7 @@ const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
     // harm inverts between them: at `tool_appeal` a false "different" admits an arbiter
     // who should not rule; here a false "same" withholds an invitation and the peer then
     // reads as absent. Same line, opposite failure — which is why the pin is per site.
-    ("server/handler.rs::tool_gate_escalation_open", &[
+    ("server/handler.rs::resolve_invitation", &[
         "(Some(a), Some(b)) => a != &b,",
     ]),
     // The same arm, advisory here (`you_may_rule: false`). An advisory
@@ -462,15 +505,15 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("server/dashboard.rs::dashboard_snapshot_window", &[
         "member_entities: self.member_registry.len(),",
     ]),
-    ("server/handler.rs::tool_appeal", &[
-        ".iter_sorted()",
-        ".member_registry",
-    ]),
-    ("server/handler.rs::tool_connect", &[
-        "crate::member_registry::ensure_member(",
-    ]),
     // Added 2026-08-07 (claude-code, the #226 invitation writer). READING, answering the
     // question this table schedules — **is this a safety use of presence?**
+    //
+    // RENAMED 2026-08-07, same day, by the factoring that moved the writer to the door the
+    // gate actually walks through: this site was `tool_gate_escalation_open` and is now
+    // `resolve_invitation`, a helper both doors call. The lines are byte-identical and the
+    // reading below is unchanged — but the site is now reached from the CLAIM path too,
+    // which is where the production traffic was all along, so the reading went from
+    // describing a surface with no callers to describing the live one.
     //
     // NOT a gate, and structurally cannot become one: this read happens after the
     // escalation is opened, and nothing it produces is consulted by `bar_met` or can
@@ -490,9 +533,16 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     // check that prevents it. The unclosed half: nothing distinguishes "registry holds
     // no other member" from "registry failed to load", because `state::open` fails open
     // to an empty registry. If that distinction ever matters, it is measured HERE.
-    ("server/handler.rs::tool_gate_escalation_open", &[
+    ("server/handler.rs::resolve_invitation", &[
         ".iter_sorted()",
         ".member_registry",
+    ]),
+    ("server/handler.rs::tool_appeal", &[
+        ".iter_sorted()",
+        ".member_registry",
+    ]),
+    ("server/handler.rs::tool_connect", &[
+        "crate::member_registry::ensure_member(",
     ]),
     ("server/state.rs::open", &[
         "let member_registry = crate::member_registry::load_members(&vault);",
