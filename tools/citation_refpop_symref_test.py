@@ -164,9 +164,13 @@ def test_filter_is_inert_without_a_symbolic_ref():
 
 def _main():
     failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_") or not callable(fn):
-            continue
+    # Enumerate, don't discover. A `sorted(globals().items())` loop runs the same
+    # functions, but no Name ever loads them, and tools/ci_selfexec_test.py's
+    # inert-function guard -- an AST scan for references, correctly unable to see a
+    # globals() dispatch -- flags them as dead code. Name them.
+    for fn in (test_symref_does_not_split_identical_clones,
+               test_filter_is_inert_without_a_symbolic_ref):
+        name = fn.__name__
         try:
             fn()
             print(f"PASS {name}")
