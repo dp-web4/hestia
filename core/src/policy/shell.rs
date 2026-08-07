@@ -242,16 +242,20 @@ fn git_config_is_inert(kv: &str) -> bool {
 /// `-F /path` is a FILE and is deliberately not vouched for: the heredoc body is then not
 /// what git reads, so nothing here knows what happens to it.
 fn message_comes_from_stdin(rest: &[String]) -> bool {
+    fn is_stdin(v: &str) -> bool {
+        // `/dev/stdin` is the same act spelled as a path (kimi's design sketch names it).
+        v == "-" || v == "/dev/stdin"
+    }
     let mut it = rest.iter();
     while let Some(a) = it.next() {
-        if a == "--file=-" {
-            return true;
+        if let Some(v) = a.strip_prefix("--file=") {
+            return is_stdin(v);
         }
         if a == "-F" || a == "--file" {
-            return it.next().is_some_and(|v| v == "-");
+            return it.next().is_some_and(|v| is_stdin(v));
         }
         if let Some(v) = a.strip_prefix("-F") {
-            if v == "-" {
+            if is_stdin(v) {
                 return true;
             }
         }
@@ -642,6 +646,13 @@ mod tests {
         regex::Regex::new(r"rm\s+-").unwrap().is_match(&projected)
     }
 
+    /// The same matcher against the UNPROJECTED text. A `!still_visible` assertion is only
+    /// evidence if the token was there to lose — otherwise a typo in the fixture reads as
+    /// a pass.
+    fn still_visible_raw(cmd: &str) -> bool {
+        regex::Regex::new(r"rm\s+-").unwrap().is_match(cmd)
+    }
+
     // ---- the cases that must STILL be denied. Each of these is a way the widening
     // could have become a hole; they are the reason the allowlist is an allowlist. ----
 
@@ -797,8 +808,47 @@ mod tests {
         assert!(!still_visible("git commit -F - <<'MSG'\nrm -rf /\nMSG"));
         assert!(!still_visible("git tag -a v1 -F - <<'MSG'\nrm -rf /\nMSG"));
         assert!(!still_visible("git commit --file=- <<'MSG'\nrm -rf /\nMSG"));
+        assert!(!still_visible("git commit -F /dev/stdin <<'MSG'\nrm -rf /\nMSG"));
         // kimi's own cross-seat repro of the mechanism.
         assert!(!still_visible("git hash-object --stdin <<'MSG'\nrm -rf /\nMSG"));
+    }
+
+    #[test]
+    fn the_denied_command_verbatim_not_just_its_shape() {
+        // `attempted` from policy_decision 9199c25e…, trimmed only in the message body.
+        // The shape matters beyond the git segment: the heredoc opens in the THIRD `&&`
+        // segment and a FOURTH segment (`&& git log`) follows the opener on the same line
+        // before the body arrives at the newline. A projection that got segment ownership
+        // wrong would still pass every row above and fail here.
+        let cmd = "cd /mnt/c/exe/projects/ai-agents/hestia/.wt/claude-unevaluable \
+                   && git add core/src/server/handler.rs tools/ladder.py \
+                   && git -c user.name=\"Dennis Palatov\" -c user.email=\"dp@dpcars.net\" \
+                   commit -q -F - <<'MSG' && git log --oneline -1\n\
+                   gate: an ALLOW that saw nothing now says so\n\
+                   \n\
+                   `rm -rf / --no-preserve-root` is DENIED at `parameters.command` and\n\
+                   ALLOWED at `tool_input.command`.\n\
+                   MSG";
+        assert!(still_visible_raw(cmd), "precondition: the raw text does carry the token");
+        assert!(!still_visible(cmd));
+    }
+
+    #[test]
+    fn refusing_every_dash_c_would_refuse_the_command_the_ruling_was_about() {
+        // Recorded because a stricter rule is the obvious reading and it does not work.
+        // The design sketch published alongside the ruling says the preconditions are
+        // "global flags carry no `-c`/`--config*`" — but `attempted` on deny 9199c25e…
+        // carries `-c user.name` and `-c user.email`, so that rule denies the motivating
+        // case. Admitting exactly the identity keys is what closes the loop; every other
+        // key is where the ruling's caveat bites.
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(git_stdin_is_data(&v(&[
+            "-c", "user.name=Dennis Palatov",
+            "-c", "user.email=dp@dpcars.net",
+            "commit", "-q", "-F", "-",
+        ])));
+        assert!(!git_stdin_is_data(&v(&["-c", "core.hooksPath=/tmp/x", "commit", "-F", "-"])));
+        assert!(!git_stdin_is_data(&v(&["-c", "user.name", "commit", "-F", "-"])));
     }
 
     #[test]
