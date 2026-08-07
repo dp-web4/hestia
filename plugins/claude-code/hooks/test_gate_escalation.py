@@ -186,6 +186,74 @@ check("_dig reaches into result.result.content[0].text (the real envelope)",
       ptu._dig({"result": {"content": [{"text": json.dumps({"claimed": True})}]}}, "claimed") is True)
 check("_dig on a missing key is None, not a crash", ptu._dig({"a": 1}, "claimed") is None)
 
+# --- the record names the ACT, not the rule that fired (5.2, notice 1474 §2/§3) --------------------
+# The deny message and the escalation text printed the MARKER (the pattern that matched)
+# where they promised the resource the call would reach. A human rules on those strings;
+# the verdict was never the defective part. Red-first: the resource=/key= kwargs do not
+# exist yet, and the old message prints the marker as the destination.
+import contextlib
+import io
+
+_old_ep = os.environ.pop("HESTIA_ENDPOINT", None)
+os.environ["HESTIA_ENDPOINT"] = "http://127.0.0.1:1/mcp"  # dead: witness fails fast, refusal stands
+try:
+    # A PATH-key match: the message must name the file the call would reach, with the
+    # marker as the REASON it matched.
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(buf):
+            rc = ptu.deny_self_access("plugins/claude-code/hooks", "Write",
+                                      resource="/x/hooks/pre_tool_use.py", key="file_path")
+        msg = buf.getvalue()
+        check("deny still returns 2", rc == 2, f"rc={rc}")
+        check("the deny names the resource the call would reach",
+              "/x/hooks/pre_tool_use.py" in msg, msg[:160])
+        check("the marker is reported as the REASON, not the place",
+              "plugins/claude-code/hooks" in msg and "marker" in msg, msg[:160])
+    except TypeError as e:
+        check("deny names the resource, not the marker", False,
+              f"deny_self_access has no resource/key yet — the marker IS the reported "
+              f"destination today ({e})")
+
+    # A TEXT-key match with an ordinary destination (the FP8 shape): the message must
+    # name the destination AND say the match is payload content, not the destination.
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(buf):
+            ptu.deny_self_access("plugins/claude-code/hooks", "Edit",
+                                 resource="see hooks/pre_tool_use.py for the mechanism",
+                                 key="new_string", dest="/tmp/forum-post.md")
+        msg = buf.getvalue()
+        check("a payload match names the call's destination", "/tmp/forum-post.md" in msg,
+              msg[:160])
+        check("a payload match says it is payload, not a destination",
+              "payload" in msg, msg[:160])
+    except TypeError as e:
+        check("a payload match names the destination and says so", False, str(e))
+
+    # The escalation text is the other human-facing string on this path: same property.
+    _Stub.payload = dict(REFUSED)
+    srv = HTTPServer(("127.0.0.1", 0), _Stub)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    os.environ["HESTIA_ENDPOINT"] = f"http://127.0.0.1:{srv.server_port}/mcp"
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(buf):
+            ptu.request_self_write("plugins/claude-code/hooks", "Write",
+                                   resource="/x/hooks/pre_tool_use.py", key="file_path")
+        msg = buf.getvalue()
+        check("the escalation record names the resource, not the rule",
+              "/x/hooks/pre_tool_use.py" in msg, msg[:200])
+    except TypeError as e:
+        check("the escalation record names the resource, not the rule", False, str(e))
+    finally:
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+finally:
+    if _old_ep is None:
+        os.environ.pop("HESTIA_ENDPOINT", None)
+    else:
+        os.environ["HESTIA_ENDPOINT"] = _old_ep
+
 print()
 if FAILS:
     print(f"ESCALATION TESTS FAILED: {len(FAILS)} of {len(RAN)}: {', '.join(FAILS)}")
