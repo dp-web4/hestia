@@ -1433,15 +1433,25 @@ def request_self_write(marker: str, tool_name: str, attempted: str = "",
 def _escalation_plugin_id() -> str:
     """Who to record as asking. Caller-asserted (HST-005) and named as such.
 
-    Falls back to a literal 'unattributed' rather than to any member id: guessing would
-    file one member's escalation under another's name, which is the defect #108 closed one
-    layer over.
+    The env vars stay the override -- a mesh fire sets HESTIA_MESH_PLUGIN so the escalation
+    names the member being fired, which may differ from this file's own.
+
+    The fallback is PLUGIN_ID, not a literal 'unattributed' (#244). The 'unattributed'
+    fallback was defended by #108's rationale -- guessing one member's id under another's
+    name -- but PLUGIN_ID is not a guess: it is the module constant this same file already
+    asserts as its identity at hestia_connect. Worse than a provenance gap, the literal
+    collapsed claim()'s (plugin_id, marker) join key to a constant: every escalation from
+    an interactive session (which exports HESTIA_ROLE but no plugin id) was filed under the
+    SAME 'unattributed', so an operator's approval was claimable by any interactive session
+    resolving to the same marker -- and, once the claim path threads a session through, the
+    proven session ('claude-code') disagrees with the asserted 'unattributed' and every
+    such approval is REFUSED as an asker mismatch. One literal, both failure directions.
     """
     for var in ("HESTIA_MESH_PLUGIN", "HESTIA_PLUGIN_ID"):
         v = os.environ.get(var, "").strip()
         if v:
             return v
-    return "unattributed"
+    return PLUGIN_ID
 
 
 def _dig(result: Any, key: str, _depth: int = 0) -> Any:
