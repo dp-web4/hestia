@@ -904,6 +904,7 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
 #: Under `$HESTIA_HOME` because that is shared across members on a box and the watcher already
 #: knows it — a per-member path would need discovery the watcher does not have.
 GATE_TELEMETRY_RELPATH = "telemetry/gate-unavailable.jsonl"
+GATE_TELEMETRY_STATE_RELPATH = "telemetry/gate-unavailable.state.json"
 
 #: Refuse to grow without bound. Telemetry that fills a disk becomes an outage of its own, and
 #: this file is written on exactly the path where the system is already unwell.
@@ -952,6 +953,28 @@ def record_gate_unavailable(member_id: str, tool: str, cause: str,
         # other. Several harnesses write this file at once, by design.
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        # Maintain a bounded outage summary beside the per-act evidence. Consumers can
+        # alert once per outage window without turning contention into an escalation storm.
+        state_path = os.path.join(root, GATE_TELEMETRY_STATE_RELPATH)
+        try:
+            now = rec["ts"]
+            state = {}
+            with open(state_path, encoding="utf-8") as sf:
+                loaded = json.load(sf)
+                if isinstance(loaded, dict):
+                    state = loaded
+            same = state.get("cause") == rec["cause"] and now - int(state.get("last_ts", 0)) < 300
+            if same:
+                state["count"] = int(state.get("count", 0)) + 1
+            else:
+                state = {"first_ts": now, "count": 1, "cause": rec["cause"]}
+            state["last_ts"] = now
+            tmp = state_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as sf:
+                json.dump(state, sf, sort_keys=True)
+            os.replace(tmp, state_path)
+        except Exception:
+            pass
         return True
     except Exception:
         return False

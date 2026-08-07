@@ -732,6 +732,9 @@ def test_gate_unavailability_is_recorded_outside_the_chain():
     # THE LOAD-BEARING PROPERTY: this must never be mistaken for a member act. If these were
     # scored, ~135 of 301 measured denies would count against members for an infra fault.
     check("declares_it_is_not_a_member_act", r["kind"] == "gate_unavailable" and "conduct" in r["note"])
+    state_path = os.path.join(home, G.GATE_TELEMETRY_STATE_RELPATH)
+    state = json.load(open(state_path, encoding="utf-8"))
+    check("outage_summary_starts_at_one", state["count"] == 1 and state["cause"] == "timeout")
 
     # An unrecognised cause degrades to "unknown" rather than being echoed — a wrong cause
     # sends the member to the wrong response (a peer sat parked 4 minutes on 2026-07-28).
@@ -739,6 +742,9 @@ def test_gate_unavailability_is_recorded_outside_the_chain():
     rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
     check("unrecognised_cause_becomes_unknown", rows[-1]["cause"] == "unknown")
     check("appends_rather_than_replaces", len(rows) == 2)
+    state = json.load(open(state_path, encoding="utf-8"))
+    check("outage_summary_coalesces_same_window", state["count"] == 1,
+          "a changed cause starts a new outage window rather than inflating the prior one")
 
 
 def test_telemetry_never_raises_on_the_failure_path():

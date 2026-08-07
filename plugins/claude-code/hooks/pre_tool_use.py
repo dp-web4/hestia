@@ -1582,6 +1582,18 @@ def fail_closed() -> bool:
     return os.environ.get("HESTIA_PRE_FAIL_CLOSED") == "1"
 
 
+def _record_plane_e(cause: str, detail: str) -> None:
+    """Persist an infrastructure refusal without scoring it as member conduct."""
+    try:
+        shared = Path(__file__).resolve().parents[2] / "_shared"
+        if str(shared) not in sys.path:
+            sys.path.insert(0, str(shared))
+        from hestia_gate_core import record_gate_unavailable  # type: ignore
+        record_gate_unavailable(PLUGIN_ID, "unknown", cause, detail, home=str(DEFAULT_HESTIA_HOME))
+    except Exception:
+        pass
+
+
 def deny_no_verdict(why: str, *, cause: str = "unknown") -> int:
     """Fail-closed refusal: no daemon verdict → the tool does not run.
 
@@ -1632,6 +1644,7 @@ def deny_no_verdict(why: str, *, cause: str = "unknown") -> int:
         f"This is a boundary, not a tool failure: do not re-run the same call "
         f"immediately. {remedy}\n"
     )
+    _record_plane_e(cause, why)
     debug_log(f"fail-closed deny: {why} cause={cause}")
     return 2
 
