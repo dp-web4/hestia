@@ -1582,7 +1582,19 @@ def fail_closed() -> bool:
     return os.environ.get("HESTIA_PRE_FAIL_CLOSED") == "1"
 
 
-def deny_no_verdict(why: str, *, cause: str = "unknown") -> int:
+def _record_plane_e(cause: str, detail: str, tool_name: str = "unknown") -> None:
+    """Persist an infrastructure refusal without scoring it as member conduct."""
+    try:
+        shared = Path(__file__).resolve().parents[2] / "_shared"
+        if str(shared) not in sys.path:
+            sys.path.insert(0, str(shared))
+        from hestia_gate_core import record_gate_unavailable  # type: ignore
+        record_gate_unavailable(PLUGIN_ID, tool_name, cause, detail, home=str(DEFAULT_HESTIA_HOME))
+    except Exception:
+        pass
+
+
+def deny_no_verdict(why: str, *, cause: str = "unknown", tool_name: str = "unknown") -> int:
     """Fail-closed refusal: no daemon verdict → the tool does not run.
 
     Composed locally (the daemon is exactly what we couldn't reach), so this
@@ -1632,6 +1644,7 @@ def deny_no_verdict(why: str, *, cause: str = "unknown") -> int:
         f"This is a boundary, not a tool failure: do not re-run the same call "
         f"immediately. {remedy}\n"
     )
+    _record_plane_e(cause, why, tool_name)
     debug_log(f"fail-closed deny: {why} cause={cause}")
     return 2
 
@@ -1757,7 +1770,11 @@ def main() -> int:
     # daemon is the law: no verdict → no tool (GPT review HST-004; governed /
     # unattended roles must not degrade to fail-open heuristics silently).
     if fail_closed():
-        return deny_no_verdict(f"daemon path failed for {tool_name}", cause=_LAST_FAILURE)
+        return deny_no_verdict(
+            f"daemon path failed for {tool_name}",
+            cause=_LAST_FAILURE,
+            tool_name=tool_name,
+        )
     debug_log(f"daemon path failed; falling back to legacy for {tool_name}")
     return invoke_legacy_fallback(raw)
 

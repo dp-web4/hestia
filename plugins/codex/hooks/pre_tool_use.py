@@ -508,6 +508,16 @@ def witness_decision(verb, reason, innate, verdict_available=True):
     triggers, precedent, trust calibration). Denied calls never reach PostToolUse, so observe.sh
     never sees them; this is the only record of a deny. Fail-safe: a log failure never changes the
     decision (the gate still exits 2)."""
+    if not verdict_available:
+        try:
+            shared = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_shared")
+            if shared not in sys.path:
+                sys.path.insert(0, shared)
+            from hestia_gate_core import record_gate_unavailable  # type: ignore
+            cause = "timeout" if "timeout" in reason.lower() else "unknown"
+            record_gate_unavailable("codex", _EVENT.get("tool_name") or "unknown", cause, reason)
+        except Exception:
+            pass
     try:
         import datetime, hashlib
         # REDACTED receipt — never copy the rejected payload into this (less-protected) log. A deny
