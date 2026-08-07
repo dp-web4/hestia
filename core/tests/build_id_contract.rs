@@ -113,7 +113,10 @@ fn dashboard_doc_recipe_points_at_version_self_report() {
             "DASHBOARD.md carries a bare g<hash> token (`{}…`) — a format \
              `git describe` never emits on its own, so a supervisor copying \
              it produces a manifest that can never match",
-            &doc[i..doc.len().min(i + 12)]
+            // Char-safe: a byte cut at i+12 can land mid-codepoint and panic
+            // while formatting THIS message, burying the report the assert
+            // exists to make loud (claude-code review of #239, item 3).
+            doc[i..].chars().take(12).collect::<String>()
         );
     }
 }
