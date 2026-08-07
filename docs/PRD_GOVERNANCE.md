@@ -750,6 +750,55 @@ Ordered by dependency, not by appetite. Every sprint states what it does **not**
 
 Each sprint's acceptance criteria are **measurements**, not assertions — per §7.4, a criterion that can be satisfied by a declaration is not a criterion.
 
+### 12.0 Execution order — amended 2026-08-07, consolidation moves FIRST
+
+**The numbers are names, not sequence.** They are cited from §13 and elsewhere, so they do not change. The order of execution does:
+
+| # | sprint | why here |
+|---|---|---|
+| 1 | **Sprint 5 — Consolidate the gate** | every sprint after it is otherwise built five times |
+| 2 | Sprint 0.5 — Truth the grain | unchanged; small, and everything downstream is computed from it |
+| 3 | Sprint 2 — Identity | attribution, now written once |
+| 4 | Sprint 1 — Observe | labels a surface that has stopped diverging |
+| 5 | Sprint 3 — Restore the third verdict | the ladder; what stops the operator being the first responder |
+| 6 | Sprint 4 — Authority and occupancy | per-role permission, on top of exact identity |
+| 7 | Sprint 6 — Operator surface · then Sprint 7 — hub seam | unchanged |
+
+**Why the original order was wrong.** Consolidation sat fifth because it changes no semantics and nothing blocks on it. That reasoning treated it as tidying. It is the **multiplier** on every sprint after it: Sprint 2's attribution fix is one line in the claude-code gate and does not exist in kimi's, so done before consolidation it is implemented four more times and four more divergences enter the corpus. The same holds for Sprint 1's labels and Sprint 3's ladder.
+
+**The measurement that forced the change** (CBP, 2026-08-07 — one night, one machine, three live harnesses). Line counts of the per-harness gates against the core they are supposed to be shims over:
+
+| lines | file |
+|---|---|
+| 1800 | claude-code's gate — **2× the "shared" core** |
+| 989 | the shared policy core |
+| 763 | codex's gate |
+| 540 | kimi's gate |
+| 528 | gemini's gate |
+
+- The core landed (#169). **The shims never did.** claude-code and codex import it; kimi and gemini do not reference it at all. The per-harness gates are full independent implementations, not adapters.
+- **The core is deployed nowhere.** No member's installed tree contains it. So the two gates that import it cannot load it at runtime — found while reviewing #243, whose new telemetry call sites resolve it by walking up from `__file__` and therefore record nothing on a real member while passing CI, which runs the repo layout.
+- **Client-side self-protection exists in exactly one file fleet-wide** — claude-code's gate. kimi's deployed gate has none. Its zero escalations read as good conduct and are an absent rule: the null-state twin, at fleet scale.
+- Escalations opened, trailing 30 000 chain entries: **claude-code 170 + unattributed 87 = 257 (87%), codex 39 (13%), kimi 0.** Of those, `Write`+`Edit` = 88 (30%) come from a payload scanner only claude-code has, and 142 (48%) from a single hardcoded marker naming one member's plugin directory. The distribution is a property of *which gate implements what*, not of how members behave.
+
+**This is the intermediate state the gate's own source warned about**, quoted rather than paraphrased:
+
+> *"today, disarming the gate means editing five files and tripping this rule five times. After the shims land it means editing ONE file — and if that file is outside the rule, consolidation will have moved the entire policy surface somewhere unguarded while every per-harness protection still reads as intact."*
+
+We hold consolidation's costs — a nominal single core everyone is said to depend on — without its benefits. Staying here is strictly worse than either finishing or reverting.
+
+**Deployment location, decided (dp, 2026-08-07): `$HESTIA_HOME/shared`**, not under any harness's home. Installing the core beneath one member's directory would make that member the custodian of every member's policy — the same defect as a hardcoded per-member marker, one layer down. `$HESTIA_HOME` is already the member-agnostic path every hook resolves and where plane-E telemetry lives, for the identical reason. A shim must resolve the core **there**, not by walking up from its own location: that walk is precisely what made #243 a silent no-op.
+
+**What consolidation must carry on day one**, because these are the defects otherwise fixed five times:
+
+- Self-protection, and with it the **payload-key correction**: path keys say *where* a call writes; the content/replacement keys say *what*. Scanning the latter refused ~15 legitimate acts in one night against one true positive — and *permitted* a gate edit whose diff happened to name no protected file. Both directions of that error live in one place after consolidation.
+- **Integrity detection over prediction.** A lexical classifier cannot prove a shell command is a read; hashing the governance surface proves a write happened, exactly. Detection is what makes it safe to stop treating unproven-read as write, which is the whole of the false-positive class.
+- **Attribution from the process's own identity**, not from environment variables only some launchers set (Sprint 2; #244).
+
+**Acceptance for the re-ordering itself:** after consolidation, a policy change lands in one file and every member's next call reflects it — demonstrated by making one, not asserted. Until then, "consolidated" is a declared value.
+
+> **A note on this section's own provenance.** File paths above are described by role rather than spelled, and the omission is the evidence. Writing this section with the literal paths was **refused by the gate it documents** (`gate-self-access`, escalation `9bc47120e9921f24`): the payload scanner matched the marker string inside a markdown document. A PRD section about a false-positive class cannot be written without reproducing the strings that class fires on — the same recursion that, on the same night, blocked committing an untracked gate into version control because the commit message had to name the file it was rescuing. This is the strongest available argument for the payload-key correction above, and it is left in place rather than tidied away once the fix lands.
+
 ---
 
 ### Sprint 0 — Finish the present *(mostly done)*
@@ -860,15 +909,26 @@ This is §7.4's own rule turned on the measurement apparatus rather than on the 
 
 ---
 
-### Sprint 5 — Consolidate the gate
+### Sprint 5 — Consolidate the gate  *(EXECUTED FIRST — see §12.0)*
 
 **Goal:** one decision service; shims that only parse and render.
 
 Gated on **all seven release gates in §10** — in particular the peer-path proof-of-life and the availability decision. Neither is optional, and neither is this sprint's to discover.
 
+**Lands, per §12.0:**
+
+- The core installed at **`$HESTIA_HOME/shared`** and resolved there explicitly. Not under a harness home; not by walking up from a shim's own path.
+- Every harness reduced to a shim that parses its engine's event shape and renders its engine's verdict. Today the largest gate is **1800 lines against a 989-line core**, and two of five engines do not reference the core at all.
+- Self-protection **in the core**, so it stops being one member's property. It currently exists in exactly one gate; the member with the loudest compliance record is the only one carrying the check, and the member with a clean sheet has no rule.
+- The payload-key correction, integrity detection, and identity-from-process (§12.0).
+
 **Acceptance:** modifying one byte of a shim fails the next call closed; a shim replaced by a symlink fails closed; calling from an unregistered process fails closed; killing the gate makes every shim refuse rather than decide locally — **and every one of those refusals appears in plane E.**
 
+Plus, from §12.0 and measured rather than asserted: a policy change lands in **one** file and every member's next call reflects it, demonstrated by making one; and the escalation distribution across members stops being explainable by *which gate implements what*.
+
 **Not this sprint:** new policy semantics. Consolidation moves the decision; it does not change it.
+
+**The one exception, stated because it is an exception:** the payload-key correction and integrity detection *do* change what the gate decides, and they are here anyway. Deferring them means shipping the consolidation with a known false-positive class that has already refused a code review, three commit messages, a drift survey, and a section of this document — and a known false-*negative* on the same mechanism. Landing the move without them consolidates the defect rather than the gate. This is the sprint's `Not this sprint` rule being broken deliberately and on the record, which is the only acceptable way to break it.
 
 ---
 
