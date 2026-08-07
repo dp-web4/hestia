@@ -218,6 +218,42 @@ _SURVIVE = [
      "git commit -am x", "git log --oneline",
      "the guarded-head class, unrelated to these fixes; here so a regression in "
      "segment walking cannot hide"),
+    # The per-head sed grammar (notices 1218 -> 1226 -> 1241): every write-shaped
+    # construct the old comment adjudicated must now be refused by CODE.
+    ("sed_in_place_long",
+     "sed --in-place s/a/b/ {g}", "sed -n 1p {g}",
+     "the long spelling of the write the grammar exists to refuse"),
+    ("sed_in_place_bundled",
+     "sed -ni s/a/b/ {g}", "sed -n 1p {g}",
+     "the flag hides in a bundle; per-head means per-flag"),
+    ("sed_program_write",
+     "sed -n '1w /tmp/sed_w_out' {g}", "sed -n '1p' {g}",
+     "`w` writes INSIDE the program text, where the redirect check cannot see it — "
+     "the awk shape, decidable here because sed's command set is closed"),
+    ("sed_program_read_hidden_path",
+     "sed -n '1r /etc/shadow'", "sed -n '1p' {g}",
+     "thor's refutation of bare `sed -n`, enforced rather than adjudicated: the path "
+     "lives inside the program, invisible to every argument-based check"),
+    ("sed_subst_write_flag",
+     "sed 's/a/b/w /tmp/sed_w_out' {g}", "sed 's/a/b/' {g}",
+     "the `w` flag on `s` is the same write one token deeper"),
+    ("sed_subst_exec_flag",
+     "sed 's/a/b/e' {g}", "sed 's/a/b/' {g}",
+     "the `e` flag executes the replacement as a shell command"),
+    ("sed_exec_command",
+     "sed -n '1e id' {g}", "sed -n '1p' {g}",
+     "GNU `e` executes a shell command outright"),
+    ("sed_script_file",
+     "sed -f /tmp/evil.sed {g}", "sed -n 1p {g}",
+     "`-f` sources an arbitrary program file"),
+    ("sed_grouped_write",
+     "sed -n '1{{ p; w /tmp/sed_w_out }}' {g}", "sed -n '1{{ p; }}' {g}",
+     "a `w` inside a group is still a `w`"),
+    ("awk_stays_closed",
+     "awk 'NR>=469' {g}", "grep -n foo {g}",
+     "awk's write lives in a full language's program text; its per-head grammar would "
+     "be 'always refuse', so it stays out (1218 §2(b)) — the closed-grammar tradeoff, "
+     "stated rather than relived"),
 ]
 
 # The false refusals. Each MUST be classified read-only after the fix.
@@ -230,6 +266,17 @@ _FALSE_REFUSALS = [
      "a herestring names no file at all"),
     ("cd_bare", "cd /tmp",
      "a directory change cannot write"),
+    # The false refusals the per-head sed grammar removes (kimi-code, notice 1241 §1).
+    ("sed_range_print", "sed -n '469,480p' {g}",
+     "the FP the grammar is FOR — this shape, reading the gate to quote it, opened "
+     "escalation aa56cd57a94f9c57 on claude-code (1241 §3)"),
+    ("sed_range_print_piped", "sed -n '795,815p' {g} | grep -n hook",
+     "the exact command in that escalation: a read of the gate, piped to a read"),
+    ("sed_substitute_to_stdout", "sed 's/foo/bar/' {g}",
+     "a substitute that writes nothing writes nothing"),
+    ("sed_regex_address", "sed -n '/_READ_ONLY_HEADS/,+5p' {g}",
+     "regex address content must not read as w/r/e commands — the letters are data "
+     "inside the delimiters"),
 ]
 
 # FP6 is NOT fixed here, and pinning it as a known-refused case is the honest form: it
