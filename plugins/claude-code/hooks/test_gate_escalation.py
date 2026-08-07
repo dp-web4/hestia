@@ -167,12 +167,15 @@ check("the hook does not sleep while waiting for a human",
 
 # --- attribution --------------------------------------------------------------------------------
 _old_p = os.environ.pop("HESTIA_MESH_PLUGIN", None)
+_old_q = os.environ.pop("HESTIA_PLUGIN_ID", None)
 try:
-    check("unset identity is 'unattributed', never a guessed member",
-          ptu._escalation_plugin_id() == "unattributed", ptu._escalation_plugin_id())
+    check("unset identity falls back to this file's own PLUGIN_ID (#244), never 'unattributed'",
+          ptu._escalation_plugin_id() == ptu.PLUGIN_ID, ptu._escalation_plugin_id())
 finally:
     if _old_p is not None:
         os.environ["HESTIA_MESH_PLUGIN"] = _old_p
+    if _old_q is not None:
+        os.environ["HESTIA_PLUGIN_ID"] = _old_q
 os.environ["HESTIA_MESH_PLUGIN"] = "kimi-code"
 check("a set identity is used as given", ptu._escalation_plugin_id() == "kimi-code")
 if _old_p is None:
