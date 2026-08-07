@@ -34,6 +34,10 @@
 //!    treated as interpreting, so `sh -c 'rm -rf /'`, `eval '…'` and every command nobody
 //!    has vetted stay fully scanned. Widening the gate requires *adding* a name, which is
 //!    a reviewable act; forgetting one costs a false positive, not a hole.
+//!
+//!    ONE HEAD IS NOT A DECISION BY ITSELF: `git`. See [`git_stdin_is_data`] — for `git`
+//!    the answer depends on the argv, because `git commit -F -` and
+//!    `git -c alias.x='!sh' x` differ nowhere in the head.
 //! 3. **Nothing downstream re-interprets it.** `cat <<'X' … X | sh` has an allowlisted
 //!    head and a shell one pipe later. Inertness therefore propagates *backwards* along a
 //!    pipeline: a segment is inert only if every segment it feeds is also inert.
@@ -61,6 +65,10 @@ use super::types::MatchScope;
 /// `find` (`-exec`), `xargs`, `env`, `git`, `make`, `ssh`, `docker` and every `-c`-taking
 /// interpreter are **absent**. Adding a name to this list widens the gate; it belongs in a
 /// reviewed diff with the reason stated, not in a convenience edit.
+///
+/// `git` STAYS ABSENT and that is still correct — see [`git_stdin_is_data`], which is the
+/// other half of condition 2 rather than an entry here. A name in this list is a promise
+/// about every invocation of it, and `git` cannot make that promise.
 const INERT_CONTENT_HEADS: &[&str] = &[
     // byte movers
     "cat", "tee", "head", "tail", "rev", "nl",
@@ -87,10 +95,168 @@ enum Sep {
     End,
 }
 
-/// One simple command: its head (executable basename) and how it joins the next.
+/// One simple command: its head (executable basename), the words after it, and how it
+/// joins the next. `args` excludes assignment prefixes and redirection targets — it is the
+/// argv the head would actually receive.
 struct Segment {
     head: Option<String>,
+    args: Vec<String>,
     sep: Sep,
+}
+
+impl Segment {
+    /// Condition 2: does this command treat its arguments and stdin as data?
+    fn treats_content_as_data(&self) -> bool {
+        match self.head.as_deref() {
+            Some("git") => git_stdin_is_data(&self.args),
+            Some(h) => INERT_CONTENT_HEADS.contains(&h),
+            None => false,
+        }
+    }
+}
+
+/// `git` config keys that a command may set inline (`-c KEY=VALUE`) without changing what
+/// git will *execute*. Deliberately two entries: an inline config is the documented way to
+/// hand git new code (`core.hooksPath`, `core.pager`, `alias.*`, `core.fsmonitor`,
+/// `diff.*.textconv`, `credential.helper` …), so the default for an unlisted key must be
+/// "this might introduce an interpreter". Identity is the one thing a member routinely
+/// sets on a commit that cannot run anything.
+const GIT_INERT_CONFIG_KEYS: &[&str] = &["user.name", "user.email"];
+
+/// `git` global options taking no value that cannot re-point it at code.
+const GIT_INERT_GLOBAL_FLAGS: &[&str] = &[
+    "--no-pager",
+    "--bare",
+    "--literal-pathspecs",
+    "--no-replace-objects",
+    "--no-optional-locks",
+];
+
+/// `git` global options taking a value (`--git-dir=X` or `--git-dir X`) that select WHERE
+/// git works, never WHAT it runs. `--exec-path` and `--config-env` are absent on purpose:
+/// both name code or config the command text itself chose.
+const GIT_INERT_GLOBAL_VALUE_OPTS: &[&str] = &["-C", "--git-dir", "--work-tree", "--namespace"];
+
+/// Is this `git` invocation one whose **stdin is data**, so a quoted heredoc body fed to it
+/// can never be executed?
+///
+/// WHY THIS EXISTS RATHER THAN A NEW ENTRY IN [`INERT_CONTENT_HEADS`]. Adjudication
+/// `a96b79c4…` (kimi-code, cross-vendor arbiter, UPHELD) on deny `9199c25e…`: an identical
+/// quoted-delimiter heredoc body carrying the same token was ALLOWED under `cat` and
+/// DENIED under `git commit -F -`, because the head basename alone decided. The ruling
+/// names both the gap and the shape of the repair, and rules OUT the obvious one:
+///
+/// > the remedy is NOT adding git to the head-level allowlist — the very denied command
+/// > carried `-c` flags, the capability that justifies git's exclusion, and a head-only
+/// > list cannot distinguish `git commit -F -` from `git -c core.hooksPath=… commit`.
+/// > […] argv-position-aware inertness for stdin consumers (commit/tag -F -).
+///
+/// So this walks the argv and vouches only for a shape, failing closed at the first thing
+/// it does not recognise — the same discipline as the head allowlist, one level finer:
+///
+/// 1. Every **global option** before the subcommand must be one that cannot introduce an
+///    interpreter. `-c` is admitted only for [`GIT_INERT_CONFIG_KEYS`]; `--exec-path`,
+///    `--config-env` and anything unlisted stop the walk.
+/// 2. The **subcommand** must be one whose stdin is content, and it must be a git builtin.
+///    That second clause is load-bearing and is enforced by git itself rather than here:
+///    git refuses to let an alias shadow an existing command, so `commit`, `tag` and
+///    `hash-object` cannot be redefined — while clause 1 keeps a *new* alias off the
+///    command line, which is the `git -c alias.x='!sh' x <<'X'` bypass.
+/// 3. Something in the argv must actually **declare stdin to be that content** — `-F -`,
+///    `--file=-`, `--stdin`. `git commit -m x <<'X'` is not vouched for: nothing says the
+///    body is message bytes, and unknown means scanned.
+///
+/// WHAT THIS DOES NOT CLAIM. It does not say the *repository* is safe — a `commit-msg`
+/// hook already on disk can do anything with the message, and this function cannot see the
+/// filesystem. It says the **command text** introduces no interpreter for its own stdin,
+/// which is the only question a text matcher can answer, and the same standard already
+/// applied to `cat > f` (whose target is likewise executed later by something else — see
+/// the module note on what this deliberately does not fix).
+fn git_stdin_is_data(args: &[String]) -> bool {
+    let mut i = 0usize;
+
+    // ---- 1. global options, up to the subcommand ----
+    let subcommand = loop {
+        let Some(a) = args.get(i).map(String::as_str) else {
+            return false; // `git` with no subcommand at all
+        };
+        if !a.starts_with('-') {
+            i += 1;
+            break a;
+        }
+        i += 1;
+
+        if a == "-c" {
+            let Some(kv) = args.get(i) else { return false };
+            i += 1;
+            if !git_config_is_inert(kv) {
+                return false;
+            }
+            continue;
+        }
+        if let Some(kv) = a.strip_prefix("-c") {
+            // git's glued form, `-ckey=value`.
+            if !git_config_is_inert(kv) {
+                return false;
+            }
+            continue;
+        }
+        if GIT_INERT_GLOBAL_FLAGS.contains(&a) {
+            continue;
+        }
+        let name = a.split('=').next().unwrap_or(a);
+        if GIT_INERT_GLOBAL_VALUE_OPTS.contains(&name) {
+            if !a.contains('=') {
+                // the value is the next word
+                if args.get(i).is_none() {
+                    return false;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        return false; // unrecognised global option: unknown means scanned
+    };
+
+    // ---- 2 + 3. subcommand, and the flag that declares stdin to be content ----
+    let rest = &args[i..];
+    match subcommand {
+        "commit" | "tag" => message_comes_from_stdin(rest),
+        "hash-object" => rest.iter().any(|a| a == "--stdin"),
+        _ => false,
+    }
+}
+
+/// `-c KEY=VALUE` where KEY cannot change what git executes.
+fn git_config_is_inert(kv: &str) -> bool {
+    let Some(eq) = kv.find('=') else {
+        // `-c key` with no `=` sets it to true. No listed key is a boolean, so this is
+        // always some other key: refuse.
+        return false;
+    };
+    let key = &kv[..eq];
+    GIT_INERT_CONFIG_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k))
+}
+
+/// Does this argv say "read the message from stdin"? `-F -`, `-F-`, `--file=-`, `--file -`.
+/// `-F /path` is a FILE and is deliberately not vouched for: the heredoc body is then not
+/// what git reads, so nothing here knows what happens to it.
+fn message_comes_from_stdin(rest: &[String]) -> bool {
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        if a == "--file=-" {
+            return true;
+        }
+        if a == "-F" || a == "--file" {
+            return it.next().is_some_and(|v| v == "-");
+        }
+        if let Some(v) = a.strip_prefix("-F") {
+            if v == "-" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Project `cmd` onto the regions where a destructive token could actually *execute*,
@@ -106,7 +272,7 @@ pub fn executable_positions(cmd: &str) -> Option<String> {
     let ch: Vec<char> = cmd.chars().collect();
     let n = ch.len();
 
-    let mut segs: Vec<Segment> = vec![Segment { head: None, sep: Sep::End }];
+    let mut segs: Vec<Segment> = vec![Segment { head: None, args: Vec::new(), sep: Sep::End }];
     // (segment index, start, end) of every span that passed condition 1.
     let mut inert_spans: Vec<(usize, usize, usize)> = Vec::new();
     // Heredocs opened on the current line, consumed in order at the next newline.
@@ -226,7 +392,7 @@ pub fn executable_positions(cmd: &str) -> Option<String> {
                 flush_word(&mut word, &mut word_quoted, &mut head_done, &mut expect_redir_target, &mut segs, seg);
                 let is_pipe = c == '|' && !(i + 1 < n && ch[i + 1] == '|');
                 segs[seg].sep = if is_pipe { Sep::Pipe } else { Sep::Break };
-                segs.push(Segment { head: None, sep: Sep::End });
+                segs.push(Segment { head: None, args: Vec::new(), sep: Sep::End });
                 seg += 1;
                 head_done = false;
                 expect_redir_target = false;
@@ -244,7 +410,7 @@ pub fn executable_positions(cmd: &str) -> Option<String> {
                 } else {
                     flush_word(&mut word, &mut word_quoted, &mut head_done, &mut expect_redir_target, &mut segs, seg);
                     segs[seg].sep = Sep::Break;
-                    segs.push(Segment { head: None, sep: Sep::End });
+                    segs.push(Segment { head: None, args: Vec::new(), sep: Sep::End });
                     seg += 1;
                     head_done = false;
                     expect_redir_target = false;
@@ -264,7 +430,7 @@ pub fn executable_positions(cmd: &str) -> Option<String> {
                     i = after;
                 }
                 segs[seg].sep = Sep::Break;
-                segs.push(Segment { head: None, sep: Sep::End });
+                segs.push(Segment { head: None, args: Vec::new(), sep: Sep::End });
                 seg += 1;
                 head_done = false;
                 expect_redir_target = false;
@@ -295,10 +461,7 @@ pub fn executable_positions(cmd: &str) -> Option<String> {
     // if the segment it pipes into is inert too.
     let mut inert_seg = vec![false; segs.len()];
     for k in (0..segs.len()).rev() {
-        let head_ok = segs[k]
-            .head
-            .as_deref()
-            .is_some_and(|h| INERT_CONTENT_HEADS.contains(&h));
+        let head_ok = segs[k].treats_content_as_data();
         inert_seg[k] = head_ok
             && match segs[k].sep {
                 Sep::Pipe => inert_seg.get(k + 1).copied().unwrap_or(false),
@@ -423,7 +586,9 @@ fn consume_heredoc_body(ch: &[char], from: usize, hd: &PendingHeredoc) -> Option
 }
 
 /// Close off the current word, assigning the segment head the first time a word appears
-/// that is neither a variable assignment nor a redirection target.
+/// that is neither a variable assignment nor a redirection target. Every later word is
+/// recorded as an argument, because condition 2 is not always answerable from the head
+/// alone (see [`git_stdin_is_data`]).
 fn flush_word(
     word: &mut String,
     word_quoted: &mut bool,
@@ -445,6 +610,8 @@ fn flush_word(
             segs[seg].head = Some(basename(word).to_string());
             *head_done = true;
         }
+    } else {
+        segs[seg].args.push(word.clone());
     }
     word.clear();
     *word_quoted = false;
@@ -595,5 +762,75 @@ mod tests {
     fn raw_scope_is_the_identity() {
         let cmd = "grep 'rm -rf' f";
         assert_eq!(project(cmd, MatchScope::Raw), cmd);
+    }
+
+    // ---- `git`: the head is not enough, in BOTH directions ----
+    //
+    // Adjudication a96b79c4… (kimi-code, cross-vendor, UPHELD) on deny 9199c25e…: the same
+    // quoted heredoc body was ALLOWED under `cat` and DENIED under `git commit -F -`, and
+    // the ruling names the remedy — "argv-position-aware inertness for stdin consumers
+    // (commit/tag -F -)", explicitly NOT adding `git` to the head-level allowlist.
+
+    #[test]
+    fn the_commit_message_that_started_this() {
+        // Deny 9199c25e… verbatim in shape: the `-c` flags are the ones that were on it.
+        let cmd = "git -c user.name=\"Dennis Palatov\" -c user.email=\"dp@dpcars.net\" \
+                   commit -q -F - <<'MSG'\n\
+                   the preset denies rm -rf / and that is what this documents\n\
+                   MSG";
+        assert!(!still_visible(cmd));
+        assert!(!still_visible("git commit -F - <<'MSG'\nrm -rf /\nMSG"));
+        assert!(!still_visible("git tag -a v1 -F - <<'MSG'\nrm -rf /\nMSG"));
+        assert!(!still_visible("git commit --file=- <<'MSG'\nrm -rf /\nMSG"));
+        // kimi's own cross-seat repro of the mechanism.
+        assert!(!still_visible("git hash-object --stdin <<'MSG'\nrm -rf /\nMSG"));
+    }
+
+    #[test]
+    fn git_globals_that_can_introduce_an_interpreter_stay_visible() {
+        // The ruling's caveat, as a test: a head-only list cannot tell these apart, so the
+        // argv walk must. `-c` with an unvetted key, and `--exec-path`, both re-point git
+        // at code the command text itself chose.
+        assert!(still_visible(
+            "git -c core.hooksPath=/tmp/evil commit -F - <<'MSG'\nrm -rf /\nMSG"
+        ));
+        assert!(still_visible(
+            "git --exec-path=/tmp/evil commit -F - <<'MSG'\nrm -rf /\nMSG"
+        ));
+        assert!(still_visible(
+            "git --config-env=core.pager=EV commit -F - <<'MSG'\nrm -rf /\nMSG"
+        ));
+        // An alias defined on the command line makes the subcommand arbitrary code, and
+        // the heredoc becomes that code's stdin.
+        assert!(still_visible("git -c alias.msg='!sh -s' msg <<'MSG'\nrm -rf /\nMSG"));
+    }
+
+    #[test]
+    fn git_subcommands_that_do_not_take_stdin_as_data_stay_visible() {
+        // No `-F -`: nothing declares the body to be message bytes, so it is not vouched
+        // for. Unknown-shape means scanned, exactly as an unknown head does.
+        assert!(still_visible("git commit -m x <<'MSG'\nrm -rf /\nMSG"));
+        assert!(still_visible("git filter-branch --tree-filter <<'MSG'\nrm -rf /\nMSG"));
+        assert!(still_visible("git bisect run <<'MSG'\nrm -rf /\nMSG"));
+        // `-F` naming a FILE is not stdin: the body is not what git reads.
+        assert!(still_visible("git commit -F /tmp/msg <<'MSG'\nrm -rf /\nMSG"));
+    }
+
+    #[test]
+    fn an_inert_git_piped_into_a_shell_is_not_inert() {
+        // Condition 3 must hold for the new head exactly as it does for `cat`.
+        assert!(still_visible("git commit -F - <<'MSG' | sh\nrm -rf /\nMSG"));
+    }
+
+    #[test]
+    fn a_vouched_git_treats_its_quoted_arguments_as_data_too() {
+        // Deliberate and stated: once the argv walk has vouched for the SHAPE, this
+        // function's existing rule applies unchanged — a quoted span under an inert
+        // segment is data. `git commit -m 'rm -rf /'` writes a commit message, exactly as
+        // `echo 'rm -rf /'` writes a line. The vouching is what is narrow, not the
+        // treatment afterwards.
+        assert!(!still_visible("git commit -F - -m 'rm -rf /'"));
+        // …and one token further out, it is visible again, because the shape is not vouched.
+        assert!(still_visible("git bisect run 'rm -rf /'"));
     }
 }
