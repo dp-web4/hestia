@@ -1337,12 +1337,26 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         // reading `decision` alone cannot tell, which is the whole point of the field.
         "evaluated": !unevaluable,
         "reason": if unevaluable {
-            serde_json::Value::String(
-                "not evaluated: this shell action carried no command (expected it at \
-                 parameters.command, or as target). The allow below is the default for \
-                 an empty action and says nothing about any command you intended to send."
-                    .to_string(),
-            )
+            // Note (a) of #268's review (accepted, open): the overwrite must not
+            // assert an allow that did not happen. An overlay that decides without
+            // a command — a category rule on the action itself, e.g. law denying
+            // `command` for a role — folds to deny/warn with `target` still None,
+            // and the reply then carried "The allow below" under a deny verdict.
+            match evaluation.decision {
+                crate::policy::PolicyDecision::Allow => serde_json::Value::String(
+                    "not evaluated: this shell action carried no command (expected it at \
+                     parameters.command, or as target). The allow below is the default for \
+                     an empty action and says nothing about any command you intended to send."
+                        .to_string(),
+                ),
+                _ => serde_json::Value::String(format!(
+                    "not evaluated: this shell action carried no command (expected it at \
+                     parameters.command, or as target). The {} below came from a rule that \
+                     decides without one, not from evaluating any command you intended \
+                     to send.",
+                    evaluation.decision.as_str()
+                )),
+            }
         } else {
             json!(evaluation.reason)
         },
@@ -6449,6 +6463,87 @@ mod accountability_tests {
             unevaluable[0].event_data["plugin_id"].as_str().unwrap(),
             "claude-code",
             "the record names who sent the unevaluable payload"
+        );
+    }
+
+    /// Note (a) of #268's review (accepted there, open): when an overlay folds an
+    /// unevaluable action to deny — a category rule decides without needing the
+    /// command — the reply's `reason` must not assert "The allow below" under a
+    /// deny verdict. The overwrite was allow-shaped text regardless of decision.
+    #[tokio::test]
+    async fn unevaluable_deny_reason_names_the_verdict_not_an_allow() {
+        let (_dir, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            s.role_policy_engines.insert(
+                "role:constellation:mesh-worker".into(),
+                deny_overlay_for(&["command"]),
+            );
+        }
+        let connect = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"t","role":"role:constellation:mesh-worker"}),
+        )
+        .await
+        .unwrap();
+        let sid = connect["sessionId"].as_str().unwrap().to_string();
+        let begin = tool_begin_action(
+            &state,
+            &json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo never-seen"},
+                "session_id": sid,
+            }),
+        )
+        .await
+        .unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        let q = tool_query_policy(&state, &json!({"action_id": aid}))
+            .await
+            .unwrap();
+        assert_eq!(
+            q["decision"], "deny",
+            "precondition: the overlay folds to deny even with no command visible"
+        );
+        assert_eq!(
+            q["evaluated"], false,
+            "the matcher still saw nothing — the flag and the verdict are independent facts"
+        );
+        let reason = q["reason"].as_str().unwrap();
+        assert!(
+            !reason.contains("allow below"),
+            "a deny verdict must not carry allow-shaped reason text: {reason}"
+        );
+        assert!(
+            reason.contains("deny"),
+            "the reason must name the verdict that actually happened: {reason}"
+        );
+
+        // The allow half is unchanged: same unevaluable shape, no overlay in the fold.
+        let plain = tool_connect(&state, &json!({"plugin_id":"claude-code","host_agent":"t"}))
+            .await
+            .unwrap();
+        let sid2 = plain["sessionId"].as_str().unwrap().to_string();
+        let begin2 = tool_begin_action(
+            &state,
+            &json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo never-seen"},
+                "session_id": sid2,
+            }),
+        )
+        .await
+        .unwrap();
+        let aid2 = begin2["actionId"].as_str().unwrap().to_string();
+        let q2 = tool_query_policy(&state, &json!({"action_id": aid2}))
+            .await
+            .unwrap();
+        assert_eq!(q2["decision"], "allow");
+        assert_eq!(q2["evaluated"], false);
+        assert!(
+            q2["reason"].as_str().unwrap().contains("allow below"),
+            "the allow case keeps the text #268 shipped: {}",
+            q2["reason"]
         );
     }
 
