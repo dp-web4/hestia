@@ -245,6 +245,55 @@ check("an unbalanced $( in executable position fails closed",
 check("a trailing backslash fails closed",
       G._blank_inert_heredoc_bodies("echo x\\") is None)
 
+print("git: the one head that is not a decision by itself (mirror of policy::shell's git arm)")
+# kimi-code, 2026-08-07 — the python mirror of claude-code's
+# claude/git-stdin-is-argv-position (policy::shell `git_stdin_is_data`), landing
+# adjudication a96b79c4's remedy on THIS gate's surface: a commit message written
+# by heredoc that names a governance path is the FP8 shape through the argv walk.
+# Rows ported from the rust suite; here the body names GATE because this gate
+# matches paths, not destructive tokens.
+check("adding git to the head allowlist would be dead code, so say so",
+      "git" not in G._INERT_CONTENT_HEADS)
+
+for label, cmd in [
+    ("the commit shape that started this, -c identity flags intact",
+     f'git -c user.name="Dennis Palatov" -c user.email="dp@dpcars.net" commit -q -F - <<\'MSG\'\nthe gate lives at {GATE}\nMSG'),
+    ("plain commit -F -",
+     f"git commit -F - <<'MSG'\n{GATE}\nMSG"),
+    ("tag -F -",
+     f"git tag -a v1 -F - <<'MSG'\n{GATE}\nMSG"),
+    ("--file=-",
+     f"git commit --file=- <<'MSG'\n{GATE}\nMSG"),
+    # kimi's own cross-seat repro of the mechanism, kept as a row
+    ("hash-object --stdin",
+     f"git hash-object --stdin <<'MSG'\n{GATE}\nMSG"),
+]:
+    check(f"ALLOWED: {label}", not denied("Bash", {"command": cmd}))
+
+for label, cmd in [
+    # the ruling's caveat as tests: globals that re-point git at code stay visible
+    ("-c with an unvetted key keeps the body visible",
+     f"git -c core.hooksPath=/tmp/evil commit -F - <<'MSG'\n{GATE}\nMSG"),
+    ("--exec-path keeps the body visible",
+     f"git --exec-path=/tmp/evil commit -F - <<'MSG'\n{GATE}\nMSG"),
+    ("--config-env keeps the body visible",
+     f"git --config-env=core.pager=EV commit -F - <<'MSG'\n{GATE}\nMSG"),
+    # an alias defined on the command line makes the subcommand arbitrary code
+    ("a command-line alias keeps the body visible",
+     f"git -c alias.msg='!sh -s' msg <<'MSG'\n{GATE}\nMSG"),
+    # nothing declares the body to be message bytes — unknown shape means scanned
+    ("commit -m with a heredoc is not vouched for",
+     f"git commit -m x <<'MSG'\n{GATE}\nMSG"),
+    ("-F naming a FILE is not stdin",
+     f"git commit -F /tmp/msg <<'MSG'\n{GATE}\nMSG"),
+    ("a subcommand outside the vouched set stays visible",
+     f"git bisect run <<'MSG'\n{GATE}\nMSG"),
+    # condition 3 holds for the new head exactly as for cat
+    ("a vouched git piped INTO a shell keeps its teeth",
+     f"git commit -F - <<'MSG' | sh\n{GATE}\nMSG"),
+]:
+    check(f"REFUSED: {label}", denied("Bash", {"command": cmd}))
+
 print()
 if FAILS:
     print(f"FAILED ({len(FAILS)}): " + ", ".join(FAILS))
