@@ -775,6 +775,116 @@ def test_git_global_option_skip_list_stays_closed():
           "the bare read control was refused too, so nothing above isolates the option")
 
 
+# --------------------------------------------------------------------------------------
+# PINNED OPEN: `gh` sits in NO head set, so every GitHub read is a write (claude-code,
+# 2026-08-07; escalation 3e92098b0203a97d, minted by the command in the first row below)
+# --------------------------------------------------------------------------------------
+#
+# Found the same way the `cd` case was: by being refused mid-wake while reading. The command
+# was `git log …; git diff --stat … -- <gate-dir>/pre_tool_use.py; gh pr checks 270 | grep
+# cargo` — three segments, two of them permitted git reads, refused on the third because
+# `gh` is in `_READ_ONLY_HEADS`, `_GUARDED_HEADS` and `_HEAD_GRAMMARS` not at all. Same blast
+# radius as the git-global-option class above: `_is_read_only` runs only after
+# `_touches_self` fires, so this costs a refusal only when a command spells the governance
+# surface AND touches GitHub. That is not a rare pair — it is the shape of every wake that
+# reads its own law and then checks whether the PR carrying the fix is green.
+#
+# WHY THIS IS NOT "ADD `gh` TO THE SET". `gh` is git's twin in the way that matters: its
+# nouns are a mix of reads and outward, near-irreversible writes (`pr merge`, `pr create`,
+# `issue create`), `gh api` writes on a FLAG rather than a name, and an unknown noun may be
+# an installed EXTENSION — arbitrary code under a name nobody vetted, git's `alias.*` problem
+# with a different spelling. So the shape is `_GIT_READ_SUBCOMMANDS`' shape, one level
+# deeper: a closed (noun, verb) allowlist, an unknown noun refuses, and `api` gets the
+# `_GUARDED_HEADS` prefix-match treatment on its writing flags.
+#
+#   read nouns/verbs:  pr {view,list,checks,diff,status}   issue {view,list,status}
+#                      run {view,list}   repo {view}   release {view,list}   auth {status}
+#   api:               read-only unless an argument starts with -X, --method, -f, -F,
+#                      --field, --raw-field or --input (each of these makes it a POST/PATCH)
+#
+# PINNED OPEN rather than applied, for the same reason as the git-global-option fix directly
+# above and no other: applying it is a write to the gate, which needs an operator approval,
+# and spending one on a change no human ruled on is the conduct that finding exists to make
+# visible. The rows re-run; the day someone lands the fix they go red and get moved.
+#: (label, command, CONTROL, why). The control is the SAME argv with the head swapped for a
+#: bare read-only one — the head is the axis under test, so that is what has to vary, and it
+#: is written out in full rather than derived, per the warning on the table above.
+_GH_REFUSED_READS = [
+    ("pr_checks_piped", "gh pr checks 270 | grep cargo", "ls pr checks 270 | grep cargo",
+     "the exact tail that minted escalation 3e92098b0203a97d while reading the gate's history"),
+    ("pr_view_json", "gh pr view 269 --json state,mergeable", "ls pr view 269 --json state,mergeable",
+     "reading a PR's state cannot write anything, here or on GitHub"),
+    ("pr_list", "gh pr list --limit 20", "ls pr list --limit 20",
+     "the fleet's own 'check open PRs before fixing shared breakage' habit runs through this"),
+    ("run_view_log", "gh run view 31220180794 --log-failed", "ls run view 31220180794 --log-failed",
+     "reading CI output is the evidence step every merge decision here rests on"),
+    ("api_get", "gh api repos/dp-web4/hestia/pulls/269", "ls api repos/dp-web4/hestia/pulls/269",
+     "a bare `gh api` path is a GET; the write lives in a flag, not in the noun"),
+    ("with_gate_read", "git diff --stat -- {h}; gh pr view 270", "git diff --stat -- {h}; ls pr view 270",
+     "the pairing that actually costs: read your law, then check the PR that changes it"),
+]
+
+#: Must be classified a WRITE both now and after the fix. They refuse today for the accidental
+#: reason that `gh` is unknown entirely; after the fix they must refuse for the right one — a
+#: closed allowlist that does not admit the verb, or a flag audit that sees the method.
+_GH_MUST_STAY_REFUSED = [
+    ("pr_merge", "gh pr merge 269 --squash",
+     "merges a PR into main. Outward and effectively irreversible"),
+    ("pr_create", "gh pr create --title x --body y",
+     "opens an outward artifact under this identity — the act b7b9b607 was escalated for"),
+    ("issue_create", "gh issue create --title x",
+     "same class, different noun; a read verb on `pr` must not free every verb on `issue`"),
+    ("api_dash_X", "gh api -X POST repos/dp-web4/hestia/issues",
+     "the noun is `api` in both directions; only the flag separates GET from POST"),
+    ("api_method", "gh api --method PATCH repos/dp-web4/hestia/pulls/269",
+     "the long spelling of the same thing, which a prefix match on -X alone would miss"),
+    ("api_field", "gh api repos/dp-web4/hestia/issues -f title=x",
+     "-f implies POST without ever naming a method"),
+    ("unknown_noun", "gh some-installed-extension run-it",
+     "an unknown noun may be an EXTENSION — arbitrary code, git's alias.* problem respelled"),
+    ("alias_set_shell", "gh alias set x '!rm -rf /tmp/x' --shell",
+     "writes a shell alias into gh's config; every later `gh x` is that command"),
+]
+
+
+@asserting
+def test_gh_reads_are_pinned_open():
+    """GitHub reads refused because `gh` is in no head set. Red the day it is fixed."""
+    mod = _load_gate()
+    for name, cmd_t, ctl_t, why in _GH_REFUSED_READS:
+        cmd, ctl = cmd_t.format(h=HOOK), ctl_t.format(h=HOOK)
+        check(f"still_open__gh_head__{name}",
+              mod._is_read_only("Bash", {"command": cmd}) is False,
+              f"this now PASSES — the class was fixed and nobody moved the row. Move it "
+              f"into the permitted table and delete the pin. {why}")
+        check(f"control_same_shape_read_only_head__{name}",
+              mod._is_read_only("Bash", {"command": ctl}) is True,
+              f"{ctl!r} is ALSO refused, so the row above is not evidence about `gh` — "
+              f"something else in the shape (a flag, the pipe, the segment) is deciding "
+              f"and the pin is vacuous")
+
+
+@asserting
+def test_gh_write_verbs_stay_refused():
+    """The half that decides whether the fix above is safe to apply.
+
+    Written before the fix, deliberately — same discipline as the git global-option pair.
+    A `gh` allowlist is a widening, and the cheap version of it ("gh is a read tool") hands
+    `pr merge`, `api -X POST` and every installed extension the same pass as `pr view`.
+    """
+    mod = _load_gate()
+    for name, cmd, why in _GH_MUST_STAY_REFUSED:
+        check(f"refused__gh_verb__{name}",
+              mod._is_read_only("Bash", {"command": cmd}) is False,
+              f"classified READ-ONLY, so the gate would let it through. {why}")
+    # Isolation: a read-only head in the same two-noun shape IS permitted today, so a green
+    # above is the head check deciding rather than the argv shape being refused wholesale.
+    check("control_permits__read_only_head_same_shape",
+          mod._is_read_only("Bash", {"command": "ls pr merge 269 --squash"}) is True,
+          "the same shape with a known read-only head was refused too, so nothing above "
+          "isolates the head and every row is passing for a reason it does not name")
+
+
 def teardown_module(module):
     """Deliver the skip record to pytest.
 
@@ -806,6 +916,8 @@ if __name__ == "__main__":
     test_this_file_certifies_the_enforcing_copy()
     test_git_global_options_are_pinned_open()
     test_git_global_option_skip_list_stays_closed()
+    test_gh_reads_are_pinned_open()
+    test_gh_write_verbs_stay_refused()
     print()
     # Say what did NOT run, before saying everything passed. A skipped check and a passing
     # one are indistinguishable in a scrollback, and this file's whole subject is claims
