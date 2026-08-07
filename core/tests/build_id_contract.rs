@@ -38,6 +38,12 @@ fn version_parenthesized_substring_is_the_dashboard_running_build() {
 /// `git describe --tags --always --dirty` can never emit, so a supervisor
 /// following the doc produced a manifest that could never match — the
 /// permanently-amber failure this file exists to keep loud.
+///
+/// Scope, stated so the guard is not over-trusted: the bare-`g<hash>`
+/// assertion below guards the *known landmine*, not the value's format
+/// generally — a regression to some other non-`git describe` string
+/// (`v0.1.2`, `607-ge720d0a`) still passes, and narrowing that is deliberate
+/// (claude-code review of #239, note 1).
 #[test]
 fn dashboard_doc_recipe_points_at_version_self_report() {
     let doc = include_str!("../../docs/DASHBOARD.md");
@@ -45,10 +51,21 @@ fn dashboard_doc_recipe_points_at_version_self_report() {
         doc.contains("hestia --version"),
         "DASHBOARD.md must name `hestia --version` as the build_id authority"
     );
-    let needle = "\"build_id\":\"";
-    for (i, _) in doc.match_indices(needle) {
-        let rest = &doc[i + needle.len()..];
-        let value = &rest[..rest.find('"').expect("build_id example must terminate")];
+    // Scan every `build_id` example, tolerating whitespace around the colon:
+    // the literal needle `"build_id":"` matched the doc's spelling of the day
+    // only, so a JSON reformat (one space after the colon) dropped this loop
+    // to zero iterations and the test passed with the original `g8c44e7a`
+    // landmine restored — measured, claude-code review of #239, arm C.
+    let mut examples = 0usize;
+    for (i, _) in doc.match_indices("\"build_id\"") {
+        let rest = &doc[i + "\"build_id\"".len()..];
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix(':') else { continue };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('"') else { continue };
+        let Some(end) = rest.find('"') else { continue };
+        let value = &rest[..end];
+        examples += 1;
         let bare_g_hash = value.len() > 1
             && value.starts_with('g')
             && value[1..].chars().all(|c| c.is_ascii_hexdigit());
@@ -58,4 +75,12 @@ fn dashboard_doc_recipe_points_at_version_self_report() {
              `git describe` never emits, so the recipe cannot produce it"
         );
     }
+    // Without this, a doc that stops showing a build_id example at all — or a
+    // spelling this scanner cannot read — reports the same green as a doc that
+    // passed on the merits.
+    assert!(
+        examples > 0,
+        "DASHBOARD.md must carry at least one `build_id` example for this guard to check; \
+         found none, so the bare-g<hash> assertion above never ran"
+    );
 }
