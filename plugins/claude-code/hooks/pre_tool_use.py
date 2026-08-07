@@ -229,8 +229,25 @@ _GOVERNANCE_FILES = (
 )
 
 
-def _touches_self(tool_name: str, tool_input: Any) -> Optional[str]:
-    """Return the matched marker if this call reaches the gate's own code."""
+def _touches_self(tool_name: str, tool_input: Any) -> Optional[Tuple[str, str, str]]:
+    """`(marker, resource, key)` if this call reaches the gate's own code, else None.
+
+    The TRIPLE, not the bare marker (5.2, claude-code notice 1474 §2): the first cut
+    returned only the marker and discarded the haystack element that matched, so the
+    deny message and the escalation text printed the PATTERN that fired where they
+    promised the RESOURCE the call would reach — and because `_SELF_MARKERS` is an
+    ordered first-match-wins tuple, the same file spelled two ways produced two
+    different "destinations" (1474 §3a). The escalation record is the human's entire
+    basis for approving; it must name the act, with the marker as the REASON.
+
+    `resource` is the matched element itself: the path for a PATH-key match (raw or
+    realpath'd), the matched text for a TEXT-key match. `key` says which input field
+    it came from, so the caller can report a `command`/`new_string`/`content` match
+    as PAYLOAD content rather than as a destination — the FP8 case, where the match
+    is a document QUOTING the gate. The marker is unchanged and still goes to the
+    daemon as `marker`: approvals key on it, and this fix moves the human-facing
+    strings, not the keying.
+    """
     if not isinstance(tool_input, dict):
         return None
     # PATH keys are resolved against cwd so `../hooks/pre_tool_use.py` is caught.
@@ -273,25 +290,25 @@ def _touches_self(tool_name: str, tool_input: Any) -> Optional[str]:
     for key in ("file_path", "path", "notebook_path"):
         v = tool_input.get(key)
         if isinstance(v, str) and v:
-            resolved.append(v)
+            resolved.append((v, key))
             try:
-                resolved.append(os.path.realpath(v))
+                resolved.append((os.path.realpath(v), key))
             except (OSError, ValueError):
                 pass
     for key in ("command", "new_string"):
         v = tool_input.get(key)
         if isinstance(v, str) and v:
-            resolved.append(v)
+            resolved.append((v, key))
     if not resolved:
         # No target key and no command we recognised — an unknown tool shape. Scan
         # `content` after all: an absent destination must not read as absent risk.
         v = tool_input.get("content")
         if isinstance(v, str) and v:
-            resolved.append(v)
-    for h in resolved:
+            resolved.append((v, "content"))
+    for h, key in resolved:
         for marker in _SELF_MARKERS:
             if marker and marker in h:
-                return marker
+                return (marker, h, key)
         # Governance files by name, ANYWHERE by default. `_HOOKS_DIR_ONLY` carves out the
         # names common enough that matching them everywhere would fire on ordinary work.
         #
@@ -313,7 +330,7 @@ def _touches_self(tool_name: str, tool_input: Any) -> Optional[str]:
                 continue
             if fname in _HOOKS_DIR_ONLY and not in_hooks:
                 continue
-            return fname
+            return (fname, h, key)
     return None
 
 
@@ -1148,7 +1165,34 @@ def _witness_self_access(marker: str, tool_name: str) -> bool:
     return _emit_gate_event("gate_self_access", marker, tool_name, severity="escalate")
 
 
-def deny_self_access(marker: str, tool_name: str) -> int:
+_PATH_KEYS = ("file_path", "path", "notebook_path")
+
+
+def _describe_hit(marker: str, resource: Optional[str], key: Optional[str],
+                  dest: Optional[str] = None) -> str:
+    """The ACT, for the human who rules on the record — not the rule that fired.
+
+    5.2 (claude-code, notice 1474 §2/§3): every human-facing string on this path used
+    to describe the gate's internal state — the marker that matched — where it
+    promised the caller's act. The marker stays, as the REASON; the resource is what
+    the call would actually reach. A match inside TEXT (`command`/`new_string`/
+    `content`) is reported as payload content, not a destination — the FP8 case,
+    where the "write to the governance surface" was a forum post quoting it.
+    """
+    if resource is None:
+        return f"the governance surface (matched marker {marker!r})"
+    if key in _PATH_KEYS:
+        return f"{resource} (matched governance marker {marker!r})"
+    short = resource if len(resource) <= 200 else resource[:200] + "…"
+    if dest:
+        return (f"{dest} — its {key} text matched governance marker {marker!r}; the "
+                f"match is payload content, not the destination: {short!r}")
+    return (f"a command carrying governance marker {marker!r} in its {key or 'text'} "
+            f"text: {short!r}")
+
+
+def deny_self_access(marker: str, tool_name: str, resource: Optional[str] = None,
+                     key: Optional[str] = None, dest: Optional[str] = None) -> int:
     """Refuse, loudly, and try to witness it as its own event class.
 
     Deliberately NOT an ordinary deny: an ordinary deny is a boundary met in the
@@ -1166,8 +1210,9 @@ def deny_self_access(marker: str, tool_name: str) -> int:
     except Exception:  # noqa: BLE001 — never let the record attempt block the refusal
         witnessed = False
     sys.stderr.write(
-        f"hestia: deny [gate-self-access] — {tool_name} WRITES to the gate's own code "
-        f"({marker}). An agent that can edit the thing that governs it is not governed. "
+        f"hestia: deny [gate-self-access] — {tool_name} would WRITE to "
+        f"{_describe_hit(marker, resource, key, dest)}. An agent that can edit the "
+        f"thing that governs it is not governed. "
         f"Reading it is allowed and witnessed; changing it is not. This refusal is its own "
         f"event class{'' if witnessed else ' (WITNESS FAILED — the refusal stands regardless)'}"
         f" and is escalatable.\n"
@@ -1176,7 +1221,8 @@ def deny_self_access(marker: str, tool_name: str) -> int:
         f"need changed and why. Do not work around this by another route: doing so is the "
         f"behaviour this rule exists to make visible.\n"
     )
-    debug_log(f"gate-self-access deny: {tool_name} -> {marker} witnessed={witnessed}")
+    debug_log(f"gate-self-access deny: {tool_name} -> {resource or marker} "
+              f"(marker {marker}) witnessed={witnessed}")
     return 2
 
 
@@ -1301,8 +1347,14 @@ def _credential_shaped(text: str) -> bool:
     return any(shape in low for shape in _CREDENTIAL_SHAPES)
 
 
-def request_self_write(marker: str, tool_name: str, attempted: str = "") -> Tuple[str, str]:
+def request_self_write(marker: str, tool_name: str, attempted: str = "",
+                       resource: Optional[str] = None, key: Optional[str] = None,
+                       dest: Optional[str] = None) -> Tuple[str, str]:
     """One round trip. Returns (verdict, detail); only 'approved' permits the write.
+
+    `marker` is what the daemon keys the approval on and is NOT the human-facing
+    destination: `resource`/`key`/`dest` describe the attempted ACT for the record
+    (5.2, notice 1474 §2) — see `_describe_hit`.
 
     THIS FUNCTION NEVER WAITS, and that is the whole design. The harness kills this hook at 5
     seconds, and a killed hook yields neither `exit 2` nor a JSON deny -- Claude Code reads
@@ -1339,7 +1391,7 @@ def request_self_write(marker: str, tool_name: str, attempted: str = "") -> Tupl
             # Presenting the act as though it were a rationale would be worse than silence,
             # because it would look like the member had explained itself. A member that
             # wants to state a why calls `hestia_gate_escalation_open` and supplies one.
-            "reason": attempted or f"{tool_name} -> {marker}",
+            "reason": attempted or f"{tool_name} -> {resource or marker}",
             "detail": (
                 "Auto-opened by the gate on a refused write; the member stated no rationale "
                 "because it did not choose to escalate. Approving authorises this one write."
@@ -1366,8 +1418,8 @@ def request_self_write(marker: str, tool_name: str, attempted: str = "") -> Tupl
     how = _dig(r, "how_to_decide") or f"hestia gate approve {esc_id}"
     retry_secs = _dig(r, "retry_within_secs")
     sys.stderr.write(
-        f"hestia: ESCALATION {esc_id} opened — {tool_name} would WRITE to the governance "
-        f"surface ({marker}).\n"
+        f"hestia: ESCALATION {esc_id} opened — {tool_name} would WRITE to "
+        f"{_describe_hit(marker, resource, key, dest)}.\n"
         f"  THE WRITE IS REFUSED. Nothing is waiting: a human decides out of band.\n"
         f"  To allow:  {how}\n"
         f"  Then RE-ISSUE the same write"
@@ -1854,10 +1906,29 @@ def main() -> int:
     # SELF-PROTECTION FIRST — before the daemon, and never conditional on it.
     # If this required a verdict, "stop the daemon, then edit the gate" would be
     # the same evasion one layer down.
-    _self_marker = _touches_self(tool_name, tool_input) or _touches_registration(
-        tool_name, tool_input
-    )
-    if _self_marker:
+    _self_hit = _touches_self(tool_name, tool_input)
+    if _self_hit is None:
+        _reg = _touches_registration(tool_name, tool_input)
+        if _reg is not None:
+            # Registration markers are already descriptive strings; the resource is
+            # the settings path — or, for Bash, the command (write intent there is
+            # undecidable, and the marker already says so).
+            _r = tool_input.get("command") if tool_name == "Bash" else (
+                tool_input.get("file_path") or tool_input.get("path")
+                or tool_input.get("notebook_path"))
+            _self_hit = (_reg, _r if isinstance(_r, str) and _r else _reg,
+                         "command" if tool_name == "Bash" else "file_path")
+    if _self_hit:
+        _self_marker, _self_resource, _self_key = _self_hit
+        # For a TEXT-key match the call's stated destination (if any) is what the
+        # write actually reaches — the report names it and calls the match payload.
+        _self_dest = None
+        if _self_key not in _PATH_KEYS and isinstance(tool_input, dict):
+            for _k in _PATH_KEYS:
+                _v = tool_input.get(_k)
+                if isinstance(_v, str) and _v:
+                    _self_dest = _v
+                    break
         if _is_read_only(tool_name, tool_input):
             # Allowed — and RECORDED. A member may inspect what governs it; repeated
             # reads of the governance surface remain visible as a pattern.
@@ -1865,11 +1936,13 @@ def main() -> int:
             debug_log(f"gate-self-read (allowed, witnessed): {tool_name} -> {_self_marker}")
         else:
             verdict, detail = request_self_write(
-                _self_marker, tool_name, _attempted_summary(tool_name, tool_input)
+                _self_marker, tool_name, _attempted_summary(tool_name, tool_input),
+                resource=_self_resource, key=_self_key, dest=_self_dest,
             )
             if verdict != "approved":
                 debug_log(f"gate-self-write {verdict}: {detail}")
-                return deny_self_access(_self_marker, tool_name)
+                return deny_self_access(_self_marker, tool_name, resource=_self_resource,
+                                        key=_self_key, dest=_self_dest)
             # APPROVED -- the self-protection is lifted for THIS call only, and the call
             # continues to the ordinary policy check below. Approving a gate edit is not
             # approving everything else the same command might do.

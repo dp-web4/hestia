@@ -233,6 +233,7 @@ try:
 
     # The escalation text is the other human-facing string on this path: same property.
     _Stub.payload = dict(REFUSED)
+    _Stub.stall_s = 0.0  # the budget probe above left 10s behind; a stall reads as "unreachable"
     srv = HTTPServer(("127.0.0.1", 0), _Stub)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     os.environ["HESTIA_ENDPOINT"] = f"http://127.0.0.1:{srv.server_port}/mcp"
