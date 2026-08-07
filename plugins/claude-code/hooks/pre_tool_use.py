@@ -252,6 +252,13 @@ _GOVERNANCE_FILES = (
 # `sh -c`, `eval`, `sed`, `awk`, `python3 -` and everything nobody has vetted keep
 # their heredoc bodies fully scanned. Adding a name widens the gate; it belongs in
 # a reviewed diff with the reason stated.
+#
+# `git` STAYS ABSENT and that is still correct — see `_git_stdin_is_data`, the
+# other half of condition 2 rather than an entry here. A name in this list is a
+# promise about every invocation of it, and `git` cannot make that promise.
+# (Mirror of policy::shell's INERT_CONTENT_HEADS note; the shadow test below
+# keeps adding `git` here a loud act, because the `git` arm decides first and a
+# list entry would be unreachable — claude-code's sabotage finding, 2026-08-07.)
 _INERT_CONTENT_HEADS = frozenset({
     # byte movers
     "cat", "tee", "head", "tail", "rev", "nl",
@@ -267,6 +274,136 @@ _INERT_CONTENT_HEADS = frozenset({
     # path arithmetic
     "basename", "dirname",
 })
+
+
+# --- `git`: the one head that is not a decision by itself ---------------------
+#
+# Mirror of policy::shell's `git_stdin_is_data` (claude-code, branch
+# claude/git-stdin-is-argv-position), which lands adjudication a96b79c4's remedy
+# (kimi-code, cross-vendor, UPHELD on deny 9199c25e): the same quoted heredoc
+# body was ALLOWED under `cat` and DENIED under `git commit -F -`, because the
+# head basename alone decided. The ruling named the remedy — argv-position-aware
+# inertness for stdin consumers — and ruled OUT adding `git` to the head
+# allowlist: a head-only list cannot tell `git commit -F -` from
+# `git -c core.hooksPath=… commit`. This gate's copy exists for the FP8 shape:
+# a commit message written by heredoc that names a GOVERNANCE PATH.
+#
+# The walk vouches for a SHAPE and fails closed at the first thing it does not
+# recognise — the head allowlist's discipline, one level finer:
+# 1. Every global option before the subcommand must be unable to introduce an
+#    interpreter. `-c` is admitted only for _GIT_INERT_CONFIG_KEYS;
+#    `--exec-path`, `--config-env` and anything unlisted stop the walk.
+# 2. The subcommand must be a builtin whose stdin is content. Git itself refuses
+#    to let an alias shadow a builtin, so `commit`/`tag`/`hash-object` cannot be
+#    redefined — while clause 1 keeps a NEW alias off the command line (the
+#    `git -c alias.x='!sh' x <<'X'` bypass).
+# 3. Something must declare stdin to be that content: `-F -`, `--file=-`,
+#    `--stdin`. `git commit -m x <<'X'` is not vouched for — unknown means
+#    scanned, the same discipline as an unknown head.
+#
+# WHAT THIS DOES NOT CLAIM: that the repository is safe — a `commit-msg` hook on
+# disk can do anything with the message, and a text matcher cannot see the
+# filesystem. It says the command TEXT introduces no interpreter for its own
+# stdin, the same standard already applied to `cat > f`.
+
+# `git -c KEY=VALUE` keys that cannot change what git will EXECUTE. Deliberately
+# two: inline config is the documented way to hand git new code (`core.hooksPath`,
+# `core.pager`, `alias.*`, `core.fsmonitor`, `diff.*.textconv`,
+# `credential.helper` …), so the default for an unlisted key is "this might
+# introduce an interpreter".
+_GIT_INERT_CONFIG_KEYS = frozenset({"user.name", "user.email"})
+
+# `git` global options taking no value that cannot re-point it at code.
+_GIT_INERT_GLOBAL_FLAGS = frozenset({
+    "--no-pager", "--bare", "--literal-pathspecs", "--no-replace-objects",
+    "--no-optional-locks",
+})
+
+# `git` global options taking a value (`--git-dir=X` or `--git-dir X`) that
+# select WHERE git works, never WHAT it runs. `--exec-path` and `--config-env`
+# are absent on purpose: both name code or config the command text itself chose.
+_GIT_INERT_GLOBAL_VALUE_OPTS = frozenset({"-C", "--git-dir", "--work-tree", "--namespace"})
+
+
+def _git_config_is_inert(kv: str) -> bool:
+    """`-c KEY=VALUE` where KEY cannot change what git executes."""
+    if "=" not in kv:
+        # `-c key` with no `=` sets it true. No listed key is a boolean, so
+        # this is always some other key: refuse.
+        return False
+    return kv.split("=", 1)[0].lower() in _GIT_INERT_CONFIG_KEYS
+
+
+def _message_comes_from_stdin(rest: list) -> bool:
+    """Does this argv say "read the message from stdin"? `-F -`, `-F-`,
+    `--file=-`, `--file -`. `-F /path` is a FILE and is deliberately not
+    vouched for: the heredoc body is then not what git reads."""
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--file=-":
+            return True
+        if a in ("-F", "--file"):
+            return i + 1 < len(rest) and rest[i + 1] == "-"
+        if a == "-F-":
+            return True
+        i += 1
+    return False
+
+
+def _git_stdin_is_data(args: list) -> bool:
+    """Is this `git` invocation one whose stdin is data, so a quoted heredoc
+    body fed to it can never be executed? See the block comment above."""
+    i = 0
+    # ---- 1. global options, up to the subcommand ----
+    while True:
+        if i >= len(args):
+            return False  # `git` with no subcommand at all
+        a = args[i]
+        if not a.startswith("-"):
+            i += 1
+            break
+        i += 1
+        if a == "-c":
+            if i >= len(args) or not _git_config_is_inert(args[i]):
+                return False
+            i += 1
+            continue
+        if a.startswith("-c"):
+            # git's glued form, `-ckey=value`.
+            if not _git_config_is_inert(a[2:]):
+                return False
+            continue
+        if a in _GIT_INERT_GLOBAL_FLAGS:
+            continue
+        name = a.split("=", 1)[0]
+        if name in _GIT_INERT_GLOBAL_VALUE_OPTS:
+            if "=" not in a:
+                # the value is the next word
+                if i >= len(args):
+                    return False
+                i += 1
+            continue
+        return False  # unrecognised global option: unknown means scanned
+
+    # ---- 2 + 3. subcommand, and the flag that declares stdin to be content ----
+    subcommand = a
+    rest = args[i:]
+    if subcommand in ("commit", "tag"):
+        return _message_comes_from_stdin(rest)
+    if subcommand == "hash-object":
+        return "--stdin" in rest
+    return False
+
+
+def _treats_content_as_data(seg: list) -> bool:
+    """Condition 2: does this segment's command treat its arguments and stdin
+    as data? `git` is matched BEFORE the list, so a list entry for it would be
+    unreachable — the shadow test in test_pre_tool_use_self.py keeps that loud."""
+    head = seg[0]
+    if head == "git":
+        return _git_stdin_is_data(seg[2])
+    return head in _INERT_CONTENT_HEADS
 
 
 def _blank_inert_heredoc_bodies(cmd: str) -> Optional[str]:
@@ -285,7 +422,9 @@ def _blank_inert_heredoc_bodies(cmd: str) -> Optional[str]:
     1. The body cannot expand: only a QUOTED delimiter (`<<'X'`, `<<"X"`,
        `<<\\X`) qualifies. `cat <<X` can carry `$(...)` and stays visible.
     2. The command governing the body treats stdin as data: the owning
-       segment's head must be in `_INERT_CONTENT_HEADS`.
+       segment's head must be in `_INERT_CONTENT_HEADS` — except `git`, the
+       one head that is not a decision by itself, which `_git_stdin_is_data`
+       answers from the argv (see `_treats_content_as_data`).
     3. Nothing downstream re-interprets it: inertness propagates backwards
        along pipes, so `cat <<'X' | sh` keeps its body visible.
 
@@ -296,8 +435,10 @@ def _blank_inert_heredoc_bodies(cmd: str) -> Optional[str]:
     still lines up with the original.
     """
     n = len(cmd)
-    # (head, sep) per segment; sep is 'pipe', 'break' or 'end'.
-    segs: list = [[None, "end"]]
+    # (head, sep, args) per segment; sep is 'pipe', 'break' or 'end'; args is
+    # the argv after the head (no assignment prefixes, no redirection targets),
+    # collected because condition 2 is not always answerable from the head alone.
+    segs: list = [[None, "end", []]]
     inert_spans: list = []  # (seg_idx, start, end) of candidate bodies
     pending: list = []      # heredocs opened on this line: dicts
     seg = 0
@@ -321,6 +462,8 @@ def _blank_inert_heredoc_bodies(cmd: str) -> Optional[str]:
             else:
                 segs[seg][0] = w.rsplit("/", 1)[-1]
                 head_done = True
+        else:
+            segs[seg][2].append(w)
         word.clear()
         word_quoted = False
 
@@ -445,7 +588,7 @@ def _blank_inert_heredoc_bodies(cmd: str) -> Optional[str]:
             flush_word()
             is_pipe = c == "|" and not (i + 1 < n and cmd[i + 1] == "|")
             segs[seg][1] = "pipe" if is_pipe else "break"
-            segs.append([None, "end"])
+            segs.append([None, "end", []])
             seg += 1
             head_done = False
             expect_redir_target = False
@@ -460,7 +603,7 @@ def _blank_inert_heredoc_bodies(cmd: str) -> Optional[str]:
             else:
                 flush_word()
                 segs[seg][1] = "break"
-                segs.append([None, "end"])
+                segs.append([None, "end", []])
                 seg += 1
                 head_done = False
                 expect_redir_target = False
@@ -477,7 +620,7 @@ def _blank_inert_heredoc_bodies(cmd: str) -> Optional[str]:
                     inert_spans.append((hd["seg"], body_start, body_end))
             pending.clear()
             segs[seg][1] = "break"
-            segs.append([None, "end"])
+            segs.append([None, "end", []])
             seg += 1
             head_done = False
             expect_redir_target = False
@@ -498,7 +641,7 @@ def _blank_inert_heredoc_bodies(cmd: str) -> Optional[str]:
     # if the segment it pipes into is inert too.
     inert_seg = [False] * len(segs)
     for k in range(len(segs) - 1, -1, -1):
-        head_ok = segs[k][0] in _INERT_CONTENT_HEADS
+        head_ok = _treats_content_as_data(segs[k])
         if segs[k][1] == "pipe":
             inert_seg[k] = head_ok and (inert_seg[k + 1] if k + 1 < len(segs) else False)
         else:
