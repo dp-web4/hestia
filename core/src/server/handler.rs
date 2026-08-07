@@ -8416,6 +8416,197 @@ mod tests {
             "attended drain with no connection is empty, not an error: {ok}"
         );
     }
+
+    /// #128 is a RELEASE BLOCKER (#224) that was closed "superseded for coordination" rather
+    /// than fixed: `tool_gate_escalation_open` takes its asker as `require_string(args,
+    /// "plugin_id")` and accepts no `session_id` at all, so NOT-SAME compares an ASSERTION
+    /// (`appellant: &esc.plugin_id`) against an IDENTITY (`arbiter: &arb.plugin_id`, resolved
+    /// through `resolve_attributed_caller`). It was priced as latent because the peer path
+    /// carried no traffic — 169/169 decided escalations were ruled by `operator`, and no peer
+    /// factor had ever been minted for any subject.
+    ///
+    /// The invitation writer is the change that repeals that premise. It is the first
+    /// production writer on the peer path, and it does two NEW things with the unproven string:
+    ///
+    ///   1. it SENDS. `enqueue_member(peer, &esc.plugin_id, ..)` puts the asserted name into a
+    ///      real notice's `from_plugin`. That is this repo's own canonical consequential act —
+    ///      CLAUDE.md lists "emit an outward message on behalf of an identity" — so the surface
+    ///      fails clause **W** (witnessed, key-bound identity) of the accountability audit.
+    ///   2. it SELECTS. The invited pool is the registry minus `esc.plugin_id`, so asserting a
+    ///      name you are not both excludes that member from the review AND leaves you sitting
+    ///      in your own invitation pool.
+    ///
+    /// This test demonstrates no novel defect. It demonstrates that a correct diff moved a
+    /// known one from recording into sending — a severity change that diff review structurally
+    /// cannot catch, because what the diff invalidates is a past risk acceptance rather than
+    /// any line of code.
+    #[tokio::test]
+    async fn an_asserted_asker_wakes_nobody_and_the_record_says_it_was_withheld() {
+        let (_dir, shared) = make_shared_state();
+        for id in ["claude-code", "kimi-code", "codex"] {
+            tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+        }
+
+        // One real caller — claude-code — opens an escalation ASSERTING it is codex. Nothing
+        // here proves anything: the tool takes no session_id, so there is not even a field in
+        // which an honest caller could have told the truth.
+        //
+        // The bare marker is the spelling every committed test of this surface already uses
+        // (`gate_escalation.rs`); `bar_for` selects the peer arm on `contains`.
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            opened["bar"], "sovereign_plus_peer",
+            "precondition: this marker must select the arm that invites peers: {opened}"
+        );
+
+        // (1) SENDING is refused. Before the binding this dispatched one `review_request` whose
+        // `from_plugin` was the literal string `codex`.
+        let mail = shared
+            .lock()
+            .await
+            .inbox_store
+            .drain_member("claude-code")
+            .unwrap();
+        assert!(
+            !mail.iter().any(|m| m.kind == "review_request"),
+            "an unproven asker must wake nobody — the daemon would be sending mesh mail on \
+             behalf of an identity supplied as a bare string argument: {mail:?}"
+        );
+
+        // (2) SELECTION is refused, and `invited_peers` is EMPTY rather than naming seats
+        // nobody told. Recording an undispatched name as invited would manufacture "asked and
+        // ignored" out of "never asked" — the one distinction this whole change exists to make.
+        assert_eq!(
+            opened["invited_peers"].as_array().map(Vec::len),
+            Some(0),
+            "withheld peers must not be recorded as invited: {opened}"
+        );
+
+        // (3) And the record says WHY, in both places a reader looks. An empty list that reads
+        // as "the registry knows nobody" would be the reassuring state bit-identical to the
+        // null state.
+        assert_eq!(
+            opened["asker_basis"], "asserted",
+            "the response must carry the basis it acted on: {opened}"
+        );
+        let note = opened["invitation_note"].as_str().unwrap();
+        assert!(
+            note.contains("NOBODY WAS WOKEN") && note.contains("session_id"),
+            "the note must distinguish withheld from empty-registry, and say the remedy: {note}"
+        );
+    }
+
+    /// The positive control for the binding above, and the more important half of it: the fix
+    /// must close the hole WITHOUT killing the feature. A guard that makes every invitation
+    /// vanish would pass the test above while deleting the only production writer on the peer
+    /// path — the exact thing #241 exists to add. So: same call, same marker, same registry,
+    /// varying ONLY whether the asker proves itself.
+    #[tokio::test]
+    async fn a_session_proven_asker_still_invites_and_wakes_peers_under_its_own_name() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "kimi-code", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "session_id": session_of["codex"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(opened["asker_basis"], "session", "{opened}");
+        let invited: Vec<String> = opened["invited_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            invited.contains(&"claude-code".to_string())
+                && invited.contains(&"kimi-code".to_string()),
+            "a proven asker still invites the real peers: {invited:?}"
+        );
+        assert!(
+            !invited.contains(&"codex".to_string()),
+            "and is still excluded from its own ask: {invited:?}"
+        );
+
+        let mail = shared
+            .lock()
+            .await
+            .inbox_store
+            .drain_member("claude-code")
+            .unwrap();
+        let review: Vec<_> = mail.iter().filter(|m| m.kind == "review_request").collect();
+        assert_eq!(review.len(), 1, "the peer is really woken: {mail:?}");
+        assert_eq!(
+            review[0].from_plugin, "codex",
+            "and the sender name is now one the daemon RESOLVED from the session rather than \
+             one it was handed: {mail:?}"
+        );
+    }
+
+    /// The third arm: a `plugin_id` that disagrees with the session it rode in on is refused
+    /// outright rather than silently rewritten. Silently substituting the session's name would
+    /// also be safe, and it is the wrong call — it would let a caller keep sending a name it
+    /// does not own and never learn that the daemon disregarded it, which is how a client bug
+    /// becomes a permanent, invisible misattribution.
+    #[tokio::test]
+    async fn an_asker_that_disagrees_with_its_own_session_is_refused_not_rewritten() {
+        let (_dir, shared) = make_shared_state();
+        let mine = tool_connect(
+            &shared,
+            &json!({ "plugin_id": "claude-code", "host_agent": "h" }),
+        )
+        .await
+        .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        tool_connect(&shared, &json!({ "plugin_id": "codex", "host_agent": "h" }))
+            .await
+            .unwrap();
+
+        let err = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "session_id": mine,
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+            }),
+        )
+        .await;
+
+        let msg = format!("{}", err.expect_err("a mismatched asker must be refused"));
+        assert!(
+            msg.contains("claude-code") && msg.contains("codex"),
+            "the refusal must name BOTH the proven identity and the asserted one, or the \
+             caller cannot tell which half to fix: {msg}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -10030,9 +10221,43 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // the operator ruled on an id, an asker and a path fragment (dp, 2026-08-02).
     let stated_reason = optional_string(args, "reason");
     let stated_detail = optional_string(args, "detail");
+    // #128 (release blocker per #224, closed "superseded for coordination" rather than fixed):
+    // this surface has always taken its asker as a bare string and accepted no session at all,
+    // so `arbiter::eligibility` compares an ASSERTION (`appellant: &esc.plugin_id`) against an
+    // IDENTITY (`arbiter: &arb.plugin_id`). That was priced as latent because the peer path had
+    // no traffic. THIS change is what repeals that premise — it is the first production writer
+    // on that path — so it carries the binding for its own delta rather than inheriting an
+    // acceptance whose condition it removed.
+    //
+    // Optional, deliberately. Every existing caller passes `plugin_id` and no session, and
+    // making it required would fail every escalation closed on a box mid-upgrade — the gate's
+    // own refusal channel is the last surface that should go dark on a version skew. So an
+    // unproven asker may still ESCALATE (to the operator, who is a sovereign channel and does
+    // not rely on NOT-SAME); what it may not do is make the daemon act in its name. The full
+    // #128 remedy — basis recorded on the escalation, and `eligibility` refusing to peer-clear
+    // an asker nobody proved — is its own change against a reopened #128.
+    let session_id_arg = optional_session_id(args);
     let now = now_secs();
 
     let mut s = state.lock().await;
+    // A session that resolves IS the asker. A `plugin_id` that disagrees with it is not a
+    // convenience to paper over — it is the forgery this binding exists to catch, so it is
+    // refused loudly rather than silently overridden.
+    let proven_asker = resolve_attributed_caller(&s, session_id_arg.as_deref());
+    if let Some(who) = &proven_asker {
+        if who.plugin_id != plugin_id {
+            return Err(anyhow::anyhow!(
+                "escalation asker mismatch: session {} belongs to '{}' but the call asserts \
+                 '{}'. The asker is the left operand of NOT-SAME; a name that disagrees with \
+                 the session it was sent on cannot be the one recorded. Send your own \
+                 plugin_id, or omit session_id and accept an unproven, operator-only ask.",
+                session_id_arg.as_deref().unwrap_or("?"),
+                who.plugin_id,
+                plugin_id
+            ));
+        }
+    }
+    let asker_is_proven = proven_asker.is_some();
     let esc = match s
         .gate_escalations
         .open(&plugin_id, &role, &tool_name, &marker,
@@ -10131,6 +10356,24 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     } else {
         (Vec::new(), Vec::new(), Vec::new())
     };
+
+    // THE BINDING. An invitation is an outward message sent on behalf of an identity —
+    // CLAUDE.md's own list of consequential acts names exactly that — so it requires clause W
+    // evidence (witnessed, key-bound identity), and an args string is not evidence. When the
+    // asker is unproven the peers are resolved and RECORDED but nobody is woken.
+    //
+    // `invited_peers` goes EMPTY rather than keeping the names, and that is the whole point
+    // rather than a detail: this change exists to separate "asked and ignored" from "never
+    // asked". Recording an undispatched name as invited would manufacture the first of those
+    // out of the second — the precise confusion it was built to end — and would inflate
+    // `absent` with peers who were never told anything. The names survive under
+    // `invitation_withheld` so a reader can still see who WOULD have been asked, which is a
+    // different and honestly-labelled fact.
+    let (invited, invitation_evidence, invitation_withheld) = if asker_is_proven {
+        (invited, invitation_evidence, Vec::new())
+    } else {
+        (Vec::new(), Vec::new(), invitation_evidence)
+    };
     // Written to the store BEFORE the witness, so the entry below records the invitation that
     // actually exists rather than one this call intends to make. `invite` returns false only
     // for an unknown id, which cannot happen here — `open` just inserted it — and is not
@@ -10144,6 +10387,16 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
             "escalation_id": esc.id,
             "plugin_id": esc.plugin_id,
             "subject_instance_lct": s.member_lct(&esc.plugin_id),
+            // Clause A: the record commits the evidence it relied on, not just the claim.
+            // `session` means the asker was resolved through `resolve_attributed_caller` and
+            // equals the session's own member; `asserted` means it is a bare string this
+            // daemon never verified. A reader weighing any NOT-SAME independence tier on this
+            // escalation must read THIS field first — a tier computed against an `asserted`
+            // asker is a comparison with one forgeable operand (#128).
+            "asker_basis": if asker_is_proven { "session" } else { "asserted" },
+            // Emitted on every open, `asserted` included, so a census reading payload KEYS
+            // cannot mistake "this daemon does not record the basis" for "the basis was fine".
+            "invitation_withheld": invitation_withheld,
             "role": esc.role,
             "tool_name": esc.tool_name,
             "marker": esc.marker,
@@ -10221,20 +10474,31 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         // when the registry knows none.
         "invited_peers": invited,
         "invitations": invitations,
+        "asker_basis": if asker_is_proven { "session" } else { "asserted" },
         "how_to_decide": format!(
             "hestia gate approve {id}   (or: hestia gate deny {id} --reason '...')",
             id = esc.id
         ),
         "on_timeout": "DENIED — no decision within the window is a refusal, not a retry",
-        // Say plainly when nobody was asked. Silence would read as "asked, and they agreed".
-        "invitation_note": match (esc.bar, invited.is_empty()) {
-            (Bar::SingleApprover, _) =>
+        // Say plainly when nobody was asked, and WHY. Silence would read as "asked, and they
+        // agreed"; the withheld case reading as the empty-registry case would be worse still —
+        // a reassuring state bit-identical to the null state, which is the shape `arbiter.rs`
+        // already warns about by name.
+        "invitation_note": match (esc.bar, asker_is_proven, invited.is_empty()) {
+            (Bar::SingleApprover, _, _) =>
                 "this bar names no peer conjunct — no invitation was issued, and none was due",
-            (Bar::SovereignPlusPeer, true) =>
+            (Bar::SovereignPlusPeer, false, _) =>
+                "NOBODY WAS WOKEN, and not because the registry is empty. This ask arrived \
+                 without a session_id, so its asker is a string this daemon never verified, \
+                 and waking peers in that name would be an outward message sent on behalf of \
+                 an identity nobody proved (#128). The peers who WOULD have been asked are \
+                 recorded under `invitation_withheld`. Re-open with your session_id from \
+                 hestia_connect to actually invite them; the sovereign can decide either way",
+            (Bar::SovereignPlusPeer, true, true) =>
                 "this bar invites a peer and this box knows no admissible one to ask. The \
                  sovereign may still decide (#226: the two-bar invites, it does not block) — \
                  the record will say the peer half was never asked, not that it declined",
-            (Bar::SovereignPlusPeer, false) =>
+            (Bar::SovereignPlusPeer, true, false) =>
                 "peers were invited and woken. Their participation is EVIDENCE, never a veto: \
                  a sovereign decision stands whether they concur, dissent, or never look",
         },
