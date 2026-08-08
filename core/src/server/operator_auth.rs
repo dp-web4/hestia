@@ -179,6 +179,46 @@ pub fn canonical_session_transcript(
     out
 }
 
+/// Public evidence retained on the session-open record. None of these values is
+/// secret; retaining them lets a later reader reconstruct the transcript and
+/// verify the daemon's authentication claim rather than inheriting its verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorSessionProof {
+    pub actor_public_key: String,
+    pub device_public_key: String,
+    pub principal_signature: String,
+    pub actor_signature: String,
+    pub device_signature: String,
+    pub transcript_sha256: String,
+}
+
+impl OperatorSessionProof {
+    pub fn new(
+        challenge: &str,
+        provenance: &OperatorProvenance,
+        actor_public_key: &str,
+        device_public_key: &str,
+        principal_signature: &str,
+        actor_signature: &str,
+        device_signature: &str,
+    ) -> Self {
+        let transcript = canonical_session_transcript(
+            challenge,
+            provenance,
+            actor_public_key,
+            device_public_key,
+        );
+        Self {
+            actor_public_key: actor_public_key.to_string(),
+            device_public_key: device_public_key.to_string(),
+            principal_signature: principal_signature.to_string(),
+            actor_signature: actor_signature.to_string(),
+            device_signature: device_signature.to_string(),
+            transcript_sha256: web4_core::crypto::sha256_hex(&transcript),
+        }
+    }
+}
+
 /// Existing dashboard sessions prove one operator directly; app sessions carry the
 /// complete harness composition. The legacy variant keeps the browser dashboard live
 /// while making it impossible for an app session to lose fields once admitted.
@@ -270,7 +310,10 @@ impl SessionStore {
 
 /// Canonical chain payload for a composed session. One helper is shared by the
 /// endpoint and tests so adding a field to the type without recording it fails.
-pub fn operator_session_opened_record(provenance: &OperatorProvenance) -> serde_json::Value {
+pub fn operator_session_opened_record(
+    provenance: &OperatorProvenance,
+    proof: &OperatorSessionProof,
+) -> serde_json::Value {
     json!({
         "actor": provenance.actor,
         "principal": provenance.principal,
@@ -282,6 +325,14 @@ pub fn operator_session_opened_record(provenance: &OperatorProvenance) -> serde_
         "device_evidence": "self-issued-app-vault-key",
         "authority_evidence": "principal-signature-over-session-composition",
         "transcript": SESSION_TRANSCRIPT_DOMAIN,
+        "proof": {
+            "actor_public_key": proof.actor_public_key,
+            "device_public_key": proof.device_public_key,
+            "principal_signature": proof.principal_signature,
+            "actor_signature": proof.actor_signature,
+            "device_signature": proof.device_signature,
+            "transcript_sha256": proof.transcript_sha256,
+        },
     })
 }
 
@@ -722,7 +773,16 @@ mod tests {
             .expect("fresh session must resolve");
         assert_eq!(resolved, &provenance);
 
-        let record = operator_session_opened_record(resolved);
+        let proof = OperatorSessionProof::new(
+            "abc",
+            resolved,
+            &"11".repeat(32),
+            &"22".repeat(32),
+            &"aa".repeat(64),
+            &"bb".repeat(64),
+            &"cc".repeat(64),
+        );
+        let record = operator_session_opened_record(resolved, &proof);
         for (field, expected) in [
             ("actor", provenance.actor.as_str()),
             ("principal", provenance.principal.as_str()),
@@ -738,6 +798,11 @@ mod tests {
         }
         assert_eq!(record["session_ref"], provenance.authority);
         assert_eq!(record["evidence"], "principal+harness+device-signatures:v1");
+        assert_eq!(
+            record["proof"]["transcript_sha256"],
+            proof.transcript_sha256
+        );
+        assert_eq!(record["proof"]["actor_signature"], proof.actor_signature);
 
         let later = attach_operator_provenance(
             json!({"act": "POST /api/operator/gate-escalation"}),

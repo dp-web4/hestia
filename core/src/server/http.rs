@@ -59,7 +59,8 @@ async fn operator_session(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     use super::operator_auth::{
-        OperatorProvenance, SESSION_TRANSCRIPT_DOMAIN, operator_session_opened_record,
+        OperatorProvenance, OperatorSessionProof, SESSION_TRANSCRIPT_DOMAIN,
+        operator_session_opened_record,
     };
 
     let composed = [
@@ -175,10 +176,19 @@ async fn operator_session(
     match authed {
         Some(op) => {
             let (token, record, session_ref) = match proof {
-                Some((provenance, ..)) => {
+                Some((provenance, actor_key, device_key, actor_sig, device_sig)) => {
                     // Authentication above proved every identity named in the tuple.
                     debug_assert_eq!(provenance.principal, op);
-                    let record = operator_session_opened_record(&provenance);
+                    let session_proof = OperatorSessionProof::new(
+                        challenge,
+                        &provenance,
+                        &actor_key,
+                        &device_key,
+                        signature,
+                        &actor_sig,
+                        &device_sig,
+                    );
+                    let record = operator_session_opened_record(&provenance, &session_proof);
                     let session_ref = Some(provenance.authority.clone());
                     (
                         s.operator_sessions.open(provenance, now),
