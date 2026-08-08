@@ -17,13 +17,17 @@ see [Hub membership](#hub-membership).
 
 **On the headline.** This README used to open *"Universal Web4 presence — for humans and
 AI."* That is the destination and the project is not there. What exists today and is
-exercised daily is the governance layer above; the human-presence half (cross-platform
-app, credential issuance, device constellation) is **built but thinly exercised**, and
-federation is not started. The tables below separate *measured*, *plumbed but unexercised*
+exercised daily is the governance layer above; the human-presence half (Tauri source,
+credential issuance, device constellation) is **plumbed but thinly exercised**, only an
+older Android APK is publicly released, and federation is not started. The tables below separate *measured*, *plumbed but unexercised*
 and *not built*, because a status page that flattens those three is the same defect this
 codebase keeps finding in itself: a check that reports success while measuring nothing.
 
-> **Status:** Phase 2 (connected presence). The core (vault, policy engine, witness chain, delegation, plugin SDK) and the cross-platform app are built and working. Hub integration works end-to-end: join a hub, push your profile, open an encrypted member↔hub channel, prove your device constellation, and exchange **end-to-end-sealed member↔member messages** through the hub with a **durable, crash-safe inbox** (accept-and-defer). EUDI-compatible credential issuance is wired. See [Honest Status](#honest-status) below.
+> **Status:** Phase 2 (connected presence), active development. The reference daemon is running
+> current source, but the public daemon and Android releases are older and there is no public
+> desktop app artifact. Hub, constellation, messaging, and credential-issuance source paths exist;
+> newcomer, second-device, wallet, and current-release-pair evidence remains incomplete. See
+> [Honest Status](#honest-status) and the [2026-08-08 audit](docs/STATUS_AUDIT_2026-08-08.md).
 
 > ### ⚠️ The gate stops accidents, not adversaries
 >
@@ -44,10 +48,11 @@ codebase keeps finding in itself: a check that reports success while measuring n
 
 ### For humans
 
-**The app is the front door** — a cross-platform desktop app (Tauri 2) with
+**The app is the intended front door** — a Tauri 2 source implementation with
 dashboard, vault, witness chain, delegations, hubs, policy, fleet, and
-settings views. Everything below is also available in the app; the CLI is the
-same engine for terminal people:
+settings views. The only public app artifact today is an older Android APK; desktop bundles are
+not published, and compatibility with the current daemon is not continuously tested. The CLI and
+web dashboard are the currently exercised surfaces:
 
 - `hestia init` → encrypted vault + Web4 LCT identity on your machine
 - `hestia vault add` → store API keys, tokens, secrets (ChaCha20-Poly1305 + Argon2id)
@@ -114,8 +119,9 @@ have one yet.
 
 ## Honest status
 
-*Audited against the running system on 2026-08-01 — method and evidence in
-[`docs/STATUS_AUDIT_2026-08-01.md`](docs/STATUS_AUDIT_2026-08-01.md). Three tiers, kept
+*Reconciled against source, the current reference daemon, public artifacts, and open issues on
+2026-08-08 — method and evidence in
+[`docs/STATUS_AUDIT_2026-08-08.md`](docs/STATUS_AUDIT_2026-08-08.md). Three tiers, kept
 apart on purpose:*
 
 - **Measured** — exercised on a live system, with chain entries or a live probe behind it.
@@ -129,14 +135,14 @@ This is the part that runs every day and has the scars to prove it.
 
 | Component | Status | Evidence |
 |-----------|--------|----------|
-| **Policy gate, multi-vendor** | Measured | One gate, six vendor surfaces (`claude-code`, `codex`, `kimi`, `gemini`, `cursor`, `openclaw`). Claude-lineage hook engines fail OPEN on error, so each adapter is fail-closed by construction. |
-| **Witness chain** | Measured | Hash-linked SQLCipher; every tool call lands. ~86k entries on the reference box. |
+| **Policy gate, multi-vendor** | Measured, divergent | Six vendor surfaces operate under the same intended law, but the shared decision core is **not wired** and harnesses retain independent classifiers. Fail-closed behavior and recovery affordances are not yet parity-tested (#225). |
+| **Witness chain** | Measured | Hash-linked SQLCipher and live event production. Infrastructure failures require the separate Plane-E path because the normal chain may be unavailable. |
 | **Human escalation** | Measured | A refused governance write is offered to a human: dashboard notice, `hestia gate approve/deny`, or an operator-authenticated HTTP decision. Single-use, expiring, witnessed both ends. Store is **rehydrated from the chain**, so a deploy no longer destroys a ruling. |
-| **Peer arbitration** | Measured | A NOT-SAME peer can rule an escalation; `arbiter::eligibility` enforces independence server-side, cross-vendor ranked above cross-member. |
+| **Peer arbitration** | Built, manually exercised | A NOT-SAME peer can rule an escalation and eligibility is checked server-side. No autonomous driver should ship until appeals bind to one recorded act and NOT-BENEFICIARY is enforced. |
 | **Per-member policy** | Measured | Loosen or tighten ONE agent without moving the society. Tightening persists (vault); loosening is memory-only and dies with the daemon. Operator-only — no MCP tool can set it, asserted by test. |
 | **Trust derivation (T3/V3)** | Measured | Pure read-time function over the chain, versioned, ships its receipts. Temperament scores conduct after a deny: re-running 0.0, adapting 0.85, escalating and being upheld 1.0. Unmeasured renders *unmeasured*, never a default prior. |
 | **Vault** | Measured | ChaCha20-Poly1305 + Argon2id, passphrase-first. |
-| **MCP server** | Measured | **29 tools** over rmcp + Axum. (This table said 12 for months; it was stale, which is why this audit exists.) |
+| **MCP server** | Measured | Registered tools over rmcp + Axum, with source and live use. Exact tool count is intentionally read from `tools/list`, not frozen into this README. |
 | **Web dashboard** | Measured | Served by the daemon at `/`; the interface actually used daily. Operator-gated behind an Ed25519 challenge-signed session. |
 | **Delegation** | Measured | Scoped by role+action, signed, revocable. |
 | **Plugin SDK** | Measured | Rust, TypeScript, Python — same interface. |
@@ -154,7 +160,7 @@ uptime.
 
 | Component | Status | What is untested |
 |-----------|--------|------------------|
-| **Cross-platform app (Tauri 2)** | Plumbed | 374 source files, last substantive commit 2026-07-24. The README called it "the primary human interface"; in practice the **web dashboard is what gets used**, and the app has not been exercised alongside recent daemon changes. |
+| **Cross-platform app (Tauri 2)** | Plumbed | Current source includes the principal UI and remote/operator paths. In practice the **web dashboard is what gets used**; live contract tests remain ignored, the public app is an older Android APK, and no desktop app bundle is released. |
 | **Device constellation** | Plumbed | 1,183 lines, 21 unit tests, wired into the hub handshake as multi-device proof. **Zero constellation events in the live chain window** — the path has never been driven on a real second device. |
 | **Credential issuance (OID4VCI / SD-JWT-VC)** | Plumbed | Endpoints exist and are gated; no wallet has completed a round trip here. |
 | **Member↔member sealed channels + durable inbox** | Plumbed | Exercised in tests and in fleet mesh traffic; not under adversarial or multi-hub conditions. |

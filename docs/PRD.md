@@ -1,9 +1,28 @@
 # Hestia — Product Requirements Document
 
-**Status**: draft v4 (v3 + Nomad's seventh review, Legion's crit-1 evidence run, and kimi's v3 response; open items for dp and HUB — see §12) · **Date**: 2026-07-25 · **Owner**: dp
-**Companions**: `ARCHITECTURE.md` (how it works) · `APP_BUILD_PLAN.md` (how/when it's built) · `PROTOCOL.md` (the wire) · this doc is the *what & why*.
+**Status**: draft v5 (current-source reconciliation at `9a6a5c2`; requirements remain normative, implementation status is evidence-ranked below) · **Date**: 2026-08-08 · **Owner**: dp
+**Companions**: `STATUS_AUDIT_2026-08-08.md` (current evidence) · `PRD_GOVERNANCE.md` (the governance design) · `ARCHITECTURE.md` (how it works) · `APP_BUILD_PLAN.md` (app implementation and release state) · `PROTOCOL.md` (the wire) · this doc is the *what & why*.
 
 ---
+
+## 0. How to read implementation status
+
+This PRD contains historical findings because the corrections are part of the product's evidence.
+They must not be mistaken for current source status. Status claims use this ladder:
+
+`source → merged → installed → restarted → live → observed → publicly released`
+
+One rung never proves the next. The 2026-08-08 snapshot is:
+
+- **Current source and reference daemon:** `origin/main` and the running reference daemon both
+  identify `9a6a5c2`; the supervisor manifest names the same full build id.
+- **Harness parity:** not fully re-proven by that daemon match. The shared gate core remains unwired.
+- **Public daemon:** still `v0.0.3`, 324 `core/` commits behind this source baseline.
+- **Public app:** still `app-v0.1.2`, Android APK only. No desktop app artifact is public.
+- **User evidence:** no clean-machine nontechnical cold run, owner-seat correct-deny transcript, or
+  second-device constellation run yet.
+
+The reproducible matrix and issue dispositions live in `STATUS_AUDIT_2026-08-08.md`.
 
 ## 1. One-line
 
@@ -40,7 +59,7 @@ happen is the inverse — presenting an unearned rung as earned. **Climb, don't 
 ## 4. Product principles
 
 1. **Secure as possible, but never brittle.** Security must not cost seamlessness. A safety fix that breaks legitimate use (e.g. denies a user their own credential) has failed the product, not just annoyed the user. **Fail *secure*, never fail *fragile*.**
-2. **Invisible security.** The accountability model (RWOA + S + V — see `CLAUDE.md`) is load-bearing and always on, but the non-technical user should never have to reason about it. Defaults must be safe; depth is opt-in. *Stated as a requirement, not a description: the shipping vault read path currently violates it — see §5.5 and §8.*
+2. **Invisible security.** The accountability model (RWOA + S + V — see `CLAUDE.md`) is load-bearing and always on, but the non-technical user should never have to reason about it. Defaults must be safe; depth is opt-in. *Stated as a requirement, not a blanket description: current source contains the worst new-entry vault exposure, while legacy exposure, asserted transport identity, and the absent two-axis entitlement model remain — see §5.5 and §8.*
 3. **Local-first, user-sovereign.** The vault, the witness chain, and policy live on the user's device by default. The cloud/hub is something you *reach*, not something you *depend on*.
 4. **One app, every surface.** A single binary → desktop (Linux/macOS/Windows) + mobile (iOS/Android), in Sovereign (full node) or Mirror (thin client) mode. (See `APP_BUILD_PLAN.md`.)
 5. **Trust is evidence, not a verdict.** Hestia produces inspectable, unforgeable evidence and lets the relying party decide, scaled to stakes; it never smuggles in a universal admit/exclude ruling (web4 LCT §1.2). **The relying parties are named, at three scales** — evidence with no reader is a dashboard, not a trust layer:
@@ -83,19 +102,30 @@ Each capability lists the user-facing job and the requirement. "Built" reflects 
 - Store and release credentials to the right agents only, with approval where it matters.
 - **R (the invariant, in one sentence):** **a credential is released only to a caller entitled to it, attributed to a transport-authenticated identity — never to a caller-supplied, replayable claim.** Entitlement is defined by issuance, not by a list. The full rule (release axis, presentation axis, custody) is §7; §5.5 is the capability, §7 is the law.
 - **R (fail direction):** the vault must fail *secure* (deny/escalate) without failing *fragile* (never deny a user their own secret). §9 rows 2 and 3 are the two directions of this one rule (§4.1) and are passed or failed together.
-- **Current state, named — the defaults are fail-*open*, on the primary persona's own path.** This is not a coverage gap; the deny branch is absent:
-  - `handler.rs:823` skips the entitlement check entirely when `allowed_consumers` is empty (`!entry.allowed_consumers.is_empty() && !entry.allows(...)`), inverting the deny-by-default the type documents at `vault/entry.rs:65-69`.
-  - Empty is the default everywhere it is created: `VaultEntry::new` (`entry.rs:44`), `hestia vault add` without `--allowed-consumers`, `POST /api/vault` with the key omitted, and the app's Vault page when the free-text consumers box is left blank — **which is exactly what the non-technical owner will do**, because §3 says they should never need to know what a plugin id is.
-  - `matches_scope` (`entry.rs:71-79`) returns `true` on an empty scope — unrecorded scope is open, not closed.
-  - `resolve_plugin_id` (`state.rs:703-716`) falls back to the *most recently connected session* when no `session_id` is supplied — ambient authority, and it races.
-  So the least-informed user, following the guided path, creates a credential any caller can read, attributed to whoever connected last. Closing this is cheaper than the work fix1 is blocked on and gated on nothing (§8). Note the fail-*fragile* hazard in the other direction: making empty mean deny breaks every existing entry, so it needs a migration or a named grandfather window — that is §9 criterion 3's corpus doing its job.
-  (Finding: McNugget, 2026-07-24; independently re-verified at `912ca56`.)
+- **Current source state — contained, not complete.** The 2026-07-24 finding was correct at its
+  baseline and drove three concrete repairs:
+  - vault reads and writes now require the caller's explicit, live session; the
+    most-recently-connected fallback is gone from this authority-bearing path;
+  - a new entry whose attributed creator supplies no consumer list is bound to that creator, so
+    the ordinary UI default no longer creates a world-readable credential;
+  - every release is witnessed, and legacy empty-consumer entries are marked `exposed`, warned,
+    and visible on the operator surface.
+  Compatibility deliberately leaves existing exposed entries readable to an attributed caller.
+  The full invariant therefore remains open: connect identity is still caller-asserted rather than
+  transport-authenticated; legacy entries need an explicit migration; empty scope semantics remain
+  broader than the final model; and `VaultEntry` still has no issuance-bound release-rule and
+  presentation-rule fields. This is a successful containment of HST-001, not completion of §7.
 
 ### 5.6 Governance / the conscience — *"do the right thing, quietly"*
 - Every consequential act (sign, admit, assign role, amend law, read/release a secret, spend, mutate governed state, message outward) passes a policy gate that is preflight, atomic, and self-witnessing.
 - **R:** the RWOA + S + V self-audit (`CLAUDE.md`) governs every surface. CRISIS changes accountability, not strictness. The user experiences this as "it asked me before doing something risky," nothing more.
 - **R:** widening a credential's presentation rule — including deriving a presentation from a stored secret for the first time — is a **privilege-widening act**, gate-governed and witnessed. It is the obvious way to launder a bearer secret into something presentable.
-- **Current state, named — one shipped surface causes a consequential act with no gate at all.** `POST /credential` (`http.rs:263`, handler at `:643`) is mounted on the outer router, *outside* the `route_layer(operator_gate)` that covers `operator_surface` (`:225-247`). For any caller it: consumes a `c_nonce` that same caller freely obtained from the equally ungated `POST /nonce`; verifies possession of **the caller's own** holder key (all `verify_holder_proof` proves); reads `ai_identity_secret` out of the vault; and returns a `Web4Presence` SD-JWT disclosing the owner's constellation assurance level, **signed with the owner's identity key**, bound to the requester's key. No policy-gate call, no owner consent, no chain append — `tool_vault_set` witnesses the write of a *name*, while minting a signed claim about the owner witnesses nothing. `DEFAULT_BIND` is loopback, so the blast radius is every local process. (Finding: Nomad, 2026-07-24; verified by kimi at `c6d202e` and by CBP at `c03837b`.) This is the §7.1 issuance rule's live counterexample and the §7.3 second honest floor.
+- **Current source state — the issuance stopgap is closed.** `POST /credential` is now mounted
+  behind the challenge-signed operator gate and appends a `credential_issued` chain event. Public
+  metadata and nonce issuance remain unauthenticated by design because neither grants authority.
+  This closes the arbitrary-local-caller minting hole found on 2026-07-24. It does **not** settle
+  the full wallet flow: which delegation authorizes issuance, how consent is represented, and how
+  presentation rules bind the result remain product work under §7.1.
 
 ### 5.7 Session coordination — *"my agents don't step on each other"*
 - Multiple sessions on one machine — interactive, autonomous/mesh-launched, same or different agent family, eventually a local model — coordinate so they act as one coherent whole, not colliding.
@@ -229,7 +259,12 @@ OAuth on-behalf-of token, the local session is a courier and the consumer is rem
 
 - **Attribution before capability.** Any credential or consequential act binds to a *non-forgeable* identity (transport-authenticated session), not a caller-asserted argument. A caller may hold its *own* capability, never enumerate or replay a peer's.
 - **Names confer nothing only in composition.** A published name confers nothing **only where no surface accepts it as a lookup key** — that is a whole-API property, enforced structurally (a name type no lookup accepts), never asserted per surface. *v2 stated the per-surface form, which HUB had formally retracted hours earlier* (`host_session_id` is published in the clear by `siblings` and accepted as a connect-reuse key — the name *is* the claim-check). The retraction is the point: two independent reviewers read that composition and called it safe, because each surface is defensible alone.
-- **The honest floor — there are two of them.** Where the identity chain bottoms out at something self-declared, that is **named** (advisory, guarded by a tripwire test) — never silently treated as authenticated. The first floor is the unauthenticated *connect*; closing it (attested connect) is on the roadmap. **The second is unauthenticated *issuance*** (§5.6's `/credential`): an issuance endpoint no one authorizes is self-declared authority over the owner's key, and it is a floor we did not know we were standing on until Nomad read the router. Until then the product does not pretend — but note the asymmetry: the connect floor is *named and tripwired*, the issuance floor was *unnamed and live*. Naming it here is not closing it (§8).
+- **The honest floor must be named wherever it occurs.** The live remaining floor is the
+  unauthenticated *connect*; closing it with key-bound identity is on the governance roadmap. The
+  2026-07-24 audit found a second floor at unauthenticated `/credential` issuance. Current source
+  now operator-gates and witnesses that endpoint, closing the arbitrary-caller stopgap. The final
+  wallet/delegation authorization remains unsettled, so the repair must not be over-read as a
+  complete issuance model.
 - **No security-relevant meaning may attach to a value the type cannot distinguish from absence.** This is the structural rule under both shipped defects and one near-miss, stated so it can be checked mechanically rather than intended (kimi, narrowing v3's "compositional"): `Vec::is_empty()` carried "unset" vs "explicitly nobody" and the handler read unset as allow-all (§5.5); a `String` carried "display label" vs "lookup key" and publisher and consumer honored different ones (§5.7); `operator_live.rs`'s `Option<Path>` carried "no key" and the skip path returned green (§6). The fixes follow from the rule, not from taste: `Option<NonEmpty<Vec>>`, a name type no lookup accepts, skip-as-`Err`. The audit question for any boundary-crossing type is exact — *what does empty/absent/default mean on the producing side, and is the receiving side forced by the type to mean the same thing?*
 - **A guard applied to a collection does not cover what is added beside the collection.** The second enumerable mechanism (kimi, from Nomad's finding): `/credential` inherits `/nonce`'s deliberate unauthenticated exemption purely by adjacency in the router (§5.6). Every surface mounted outside an existing gate is greppable (`.route(` outside the gated router), and every such surface is either deliberately exempt *and said so*, or a defect.
 - **Declared-but-unread thresholds are the honest floor's mirror image, and are forbidden.** A validated, documented, never-consulted trust threshold is a hidden gate waiting for someone to wire it in good faith. Live instance: `hub-lib/src/law.rs:123` (`min_trust_score`, 11 references, all inside `law.rs`, nothing reads it at admission). Wire it with escalate-not-deny semantics, or delete it. *(Disposition is HUB's call — see §12.)*
@@ -239,19 +274,31 @@ OAuth on-behalf-of token, the local session is a courier and the consumer is rem
 ## 8. Current workstreams mapped to the PRD
 
 - **Session-coordinator (§5.7):** read side shipped (`session/own` fail-closed, `session/siblings` + redaction, connect-idempotency), all RWOA-audited; write side (work-claims + `repo-worktree` + reaper + CLI seam) next.
-- **Vault fail-open defaults (§5.5) — new, and ahead of fix1 in cost order.** Empty `allowed_consumers` must mean deny, not skip; empty scope must mean closed, not open. One-line changes, gated on nothing, no transport attestation required — but they need a migration or a named grandfather window for the existing corpus, because flipping them naively is a mass false-deny (§4.1).
+- **Vault default containment (§5.5) — landed in source; migration remains.** New attributed writes
+  with no consumer list bind to their creator; anonymous writes and reads are refused; reads are
+  witnessed. Legacy empty-consumer entries remain exposed for compatibility and are flagged to the
+  operator. Migrate or explicitly grandfather that corpus before removing the compatibility path.
 - **Vault credential-boundary / fix1 (§5.5, §7):** bind `hestia_vault_get` attribution to the transport-authenticated session, not `?session_id=`. **Release-gated by HUB alongside the connect-idempotency stopgap — fix1 is not unblocked.** What remains is empirical, not definitional: enumerate the actual `hestia_vault_get` callers and whether each establishes an attested session on its transport, so the fix closes replay **without** denying a user their own secret. Guessing on a credential surface remains forbidden; the rule tells us what to verify, not what to assume.
 - **Vault schema v2 (§7.1) — the workstream §7 presumes and v2 never named.** `VaultEntry` has no field for either axis and `hestia_vault_set` takes no such parameter, so §7's rule has nowhere to be recorded and §9 criterion 2's presentation half has no system under test. Add release-rule and presentation-rule fields, recorded at issuance/upsert. **Backfilling the existing corpus is a prerequisite of the rule going live, not a follow-up** — on day one every existing credential is unrecorded. **The backfill must author *both* axes, explicitly.** A backfill that records only the release axis leaves every legacy credential with no presentation rule, and §7.1's escalate-on-unrecorded then fires on every presentation of every legacy object from day one. That is McNugget's mass false-deny reflected onto the human surface: an owner who gets forty prompts a day learns to click yes, and the safe default becomes a trained allow-all **inside the primary persona's head, where no corpus test can see it** (kimi). §9 row 1b's steady-state ask-count is the instrument that catches it.
 - **Presentation-rule ownership (§7.1) — currently unassigned and reads as assigned.** The two planes do not line up: `allowed_consumers` lives on the *entry* plane (`vault/entry.rs`), which holds no presentables; the one real in-vault presentable (`presence/profile`, per-link `Visibility` tiers, `profile.rs:90-121`) lives on the *document* plane (`vault/document.rs:41-49`), which has **no consumer gate at all** (`Protection::Master` = readable on the outer unlock). The presentable branch has a working *rule model* and no *enforcement point*. Name the owning component before criterion 2's presentation suite is scheduled.
 - **Single-use presentations need state nobody has named.** "Single-use" in §7.1 and §9 row 2 requires a durable nullifier set — where it lives, what it does offline (§6 is offline-capable), what a constellation does when two devices present concurrently. Name that state as a requirement or drop the clause; as written it is unenforceable law sitting in a criterion.
-- **Ungated issuance (§5.6, §7.1) — new, live, and not a doc edit.** `POST /credential` mints an owner-signed presentation for any local caller with no gate, no consent, no witness. Two separable pieces: (a) put the issuance path behind the policy gate and append to the chain — the act is *already* classifiable under `CLAUDE.md`'s RWOA block; (b) decide what authorization an OID4VCI issuance should require, given that the metadata and nonce endpoints legitimately are unauthenticated. **(a) is the fail-closed stopgap and does not wait on (b).** *Disposition — fix1 batch, or ahead of it — is dp's call (§12).*
+- **Credential issuance (§5.6, §7.1) — fail-closed stopgap landed; authorization design remains.**
+  `POST /credential` is operator-gated and appends `credential_issued`. The remaining work is to
+  define the wallet/delegation authorization and presentation-rule contract rather than treating
+  operator presence as the final product flow.
 - **The two-mechanism sweep (§7.3, §9 row 5) — run once cold; two further instances, neither previously named.** Both are *latent*, which is the point: the mechanism finds them before the composition that makes them live.
   1. **Guard-exemption adjacency: `POST /callback/`** (`callback.rs:227`, nested at `http.rs:269` when `serve --callback` is used) is an **unauthenticated signing oracle** outside the operator gate. It signs caller-supplied `signing_bytes_hex` for any `event_kind` in an allowlist (`genesis`, `member_added`, `role_assigned`, `member_skill_declared`, `law_amended`) with **no intent-binding for four of the five** — only `oid4vci_credential` validates that the bytes match the intent (`validate_issuance`). `hub_id` is a caller-supplied field nothing verifies. It is survivable today **only because the key is `KeyPair::generate()` per run** (`cli.rs:851`) — an unattested ephemeral no hub can have pinned, which also makes the feature non-functional as designed. **The obvious fix — wire the real Sovereign identity — is precisely what converts this into `/credential` with `law_amended` in scope.** Its own module doc claims Hestia "evaluates authority + need-to-know, optionally prompts the operator"; none of the three exists in the handler, making this also a *declared-but-unimplemented gate* — §7.3's forbidden-threshold rule in its second form.
   2. **Sentinel-carried semantics: `DelegationScope`.** `create_delegation` maps *no roles and no actions* to `DelegationScope::unrestricted()` (`delegation.rs:40`), and the sentinel is baked into the shared type — `covers()` in `web4-core/src/delegation.rs:69` reads `roles.is_empty() || contains`, i.e. **empty means all**. `hestia delegate grant <agent>` with the optional `--role`/`--action` flags omitted takes that branch and prints `id / agent / expires` with **no scope line**, so the user is not told what they granted. Dormant only because nothing in hestia authorizes on delegations yet (the CLI grants, lists, revokes; no consumer reads them). The fix is the rule's: absence must not be expressible as authority — `Option<NonEmpty<...>>`, or an explicit `Unrestricted` variant someone has to type.
   - *Sweep coverage, stated so it is not over-read:* axum route mounts across `core/src/` are exhaustive; the sentinel grep covered `is_empty()` and absence-as-default on security-named fields and was **not** exhaustive — `member_registry.rs:227` / `role_registry.rs:165` (`!sovereign_lct_id.is_empty()`) were seen and not chased.
 - **Attested connect (§7 "honest floor"):** the eventual invariant that makes release rules fully load-bearing.
 - **App-contract CI (§6):** the silent skip is gone (2026-07-25); the job that boots a daemon and runs the `--ignored` tests is not built. Daemon-in-CI is the real cost — pay it or keep row 6 marked partial.
-- **Release cadence (§9 row 1a) — the largest promise-to-artifact gap in this document, and until v4 it owned no section.** The installable daemon (`v0.0.3`, 2026-05-16) is **161 `core/` commits** behind `main` (`git rev-list --count v0.0.3..HEAD -- core/`, at `c03837b`; 157 when Legion measured it 69 days in, so the gap is still widening). `hub`, `constellation`, `lct`, `witness`, `profile`, `delegate` — every command §5.2 and §5.4 promise — exist on `main` and **not in any artifact a user can obtain**. All three `app-*` releases ship an Android APK and nothing else, so the only installable pairing is a 2026-06-13 APK against a 2026-05-16 daemon that nothing has ever version-matched — §6's contract failure, recurring at the release boundary. This is a release gap, not a build gap: the cheapest class of defect in the PRD and currently the most consequential. **Owner: unassigned — needs dp's assignment (§12).** The one-line `strip = true` (§6) belongs with the same owner, on the same pass.
+- **Release cadence (§9 row 1a) — still the largest promise-to-artifact gap.** At the 2026-08-08
+  baseline, the public daemon (`v0.0.3`, 2026-05-17) is **324 `core/` commits** behind
+  `origin/main`. The reference installation now runs current source, which proves deployability but
+  does not help an external user acquire it. All public `app-*` releases still contain one Android
+  APK and no desktop app artifact. Release the current daemon and a version-matched app, or narrow
+  the public promise to the artifact that actually exists. The absent release-profile strip setting
+  remains part of that release pass.
 
 ## 9. Success criteria
 
@@ -266,11 +313,11 @@ same gap §11's last risk names, stated where the coverage claim is made.
 | 1a | The crit-1 path exists *mechanically* — no config file, no key handling. | **RUN, AND IT FAILS — the first criterion in this table with a real artifact and a real verdict.** Legion ran it cold (fresh `HOME`, release binary only, 2026-07-24): step 0 acquire ✅; step 1 `init` ✅ with a pty (empty vault, no identity — §5.1); **step 2 join a hub ❌ no such command in the shipped binary**; step 3 add a device ❌ likewise; step 4 not reached. **The blocker is upstream of the persona entirely: a release gap (§8), not a build gap and not a usability gap.** The run stands as this rung's artifact and confirms its design: run by a **fleet peer who did not build hestia** — a builder cannot see what a non-builder trips over, and the runner's contamination is the variable this rung controls (PUB). Re-run per release candidate. It is not the persona test and must never be claimed as one. *Remaining human gate for the full walk: a disposable hub, or dp's go-ahead to join the live one as a throwaway member.* |
 | 1b | A non-technical user does it, one sitting. | A recorded cold-run on a **fresh machine** by someone **genuinely non-technical who has never seen the repo** (every fleet member and dp is contaminated). Pass bar: **zero questions that required a builder to answer** — questions answered by in-app text are the product working. The run ends when they finish **or when they would have quit**; a four-hour success still fails §6's "seamless." Re-run per release candidate. **Run 1 is graded on the absolute bar, not a trend: it passes iff builder-answered asks = 0. If there are any, run 1 is not a pass, and every ask must resolve to a *filed, named product gap* before the next non-technical tester is spent.** This closes the deviation v4 carried on the record — a trend cannot grade the first run, and the first run is the one that matters when each subject is single-use (Sprout). It also makes the run-1 metric the right one: not *how many* asks, but *is every ask convertible* — an ask the product cannot articulate a fix for is the real run-1 failure, and a raw count hides it. From run 2 on — the first run where a trend exists — the ask-count is the metric and must be monotone decreasing. **The same metric applies in steady state, not only in the cold run:** once schema v2 lands (§8), **owner escalation prompts per day, monotone decreasing across release candidates** — that is the only instrument that would catch escalation fatigue before the owner does, and fatigue is how §7.1's safe default converts into a trained allow-all (kimi). **1a's blockers are burned down first** — a peer's goodwill renews, a first impression does not; each non-technical person is single-use as evidence, so spending one on a blocker 1a would have caught is a wasted rung (PUB), and 1a's run has now produced exactly such a blocker. **No artifact yet for either half — the largest evidential gap in this PRD** (and 1a now shows it is not the *nearest* one). |
 | 1c | The ratchet survives the owner's seat: they are *correctly denied an unearned rung* and it does not feel like a wall. | An owner-seat transcript of a correct deny. Without it, "climb, don't fake" is asserted but never demonstrated from the primary persona's seat. **No artifact yet.** |
-| 2 | No credential is served to a party not entitled to it under §7 — tested on **both axes and on custody**. | *Release:* a replay-attempt suite — a caller asks for a credential it does not consume, and for a peer's, from attested and unattested transports. *Presentation:* disclosure beyond the rules, presentation to an audience outside the permitted set, re-use of a single-use presentation — all fail closed. *Custody:* a cross-device transfer without co-sign fails; with co-sign succeeds and is witnessed. **Status: one tripwire test. The release suite's deny branch is *absent*, not merely uncovered (§5.5). The presentation suite is blocked on vault schema v2 and on naming the enforcing component (§8) — until those land, this half is an intention, and is marked as one.** |
+| 2 | No credential is served to a party not entitled to it under §7 — tested on **both axes and on custody**. | *Release:* current source refuses unattributed reads and mismatched explicit consumer lists, binds new default entries to the creator, and witnesses releases. The full replay suite over transport-authenticated identities is still absent, and legacy exposed entries remain. *Presentation:* disclosure beyond the rules, presentation outside the permitted set, and single-use nullification remain blocked on vault schema v2 and an enforcing component. *Custody:* a cross-device transfer without co-sign fails; with co-sign succeeds and is witnessed. **Status: containment exists; the two-axis criterion is not yet demonstrated.** |
 | 3 | No legitimate credential read is ever wrongly denied (fail-secure, not fragile). | A regression corpus built from *real* false-denies — the primer-path and scope-lag cases are the seed; the empty-`allowed_consumers` migration will generate more. Every new false-deny lands here as a case before it is fixed. **Rows 2 and 3 are one principle seen from both sides (§4.1) and are scheduled, funded, and passed together — splitting them is the decoupling §4.1 exists to prevent.** |
 | 4 | Concurrent sessions never clobber each other's work or misattribute an action. | The two-caller harness (Legion) run against each coordinator batch; fail-closed-under-concurrency assertions in `session/own`. |
 | 5 | Every consequential surface has a passing RWOA audit on the record. | **Marked gap.** "Grep the commit history for the audit block" is a process hope, not an artifact, and it cannot fail on the defect class the fleet has actually hit twice: the connect-idempotency composition satisfied crit 5 *completely* — both commits carried passing audits — and still shipped, because the defect lived *between* them. Owed: a CI check for the audit block **and** a cross-surface invariant test. **The audit block gains one clause with a defined miss condition, aimed at the two mechanisms we have actually shipped (§7.3):** *the block names every boundary-crossing default the commit introduces or changes — both sides' reading of it — and every surface the commit adds outside an existing guard. A commit that changes a default or adds an unguarded surface without naming it fails the block.* That is checkable and can fail, which "grep the history" cannot. Until both the CI check and the invariant test exist, this row is an intention. |
-| 6 | The app runs identically on laptop, phone, and Jetson. | **Partial, and v3 understated it.** CI builds all targets, but **every asset of every `app-*` release is an Android APK** — so Android is the only *shipped* client. Desktop is **built and never released**, which is a different defect from iOS's unbuilt and has a different fix (§8 release cadence, not app work). The live client-contract test (§6) no longer passes while checking nothing, but **still does not run in CI** — this row's "demonstrated by" claims a check that nothing automatic invokes. The one shipped pairing (APK 2026-06-13 ↔ daemon 2026-05-16) has never been version-matched by anything. |
+| 6 | The app runs identically on laptop, phone, and Jetson. | **Partial.** Current source contains a Tauri/React app and Android release automation. Every public `app-*` release asset is an Android APK; there is no public desktop app bundle and no iOS artifact. The live client-contract tests remain `#[ignore]` and no workflow runs them, so current daemon/app compatibility is not automatically demonstrated. The public APK and daemon releases are from different dates and have no recorded version-match run. |
 
 ## 10. Non-goals (for now)
 
@@ -280,18 +327,41 @@ same gap §11's last risk names, stated where the coverage claim is made.
 
 ## 11. Open questions / risks
 
-- **The vault's shipping defaults are fail-open (§5.5).** Highest-severity known gap; on the primary persona's own path; cheaper to close than fix1.
+- **The vault containment is not the final entitlement model (§5.5).** New-entry exposure and
+  ambient attribution are repaired in source, but caller identity is still asserted at connect,
+  legacy exposed entries remain, and the release/presentation axes are not represented in schema.
 - **Vault-caller enumeration (fix1):** definition resolved (§7); the empirical survey of actual callers and their transports is still owed, and fix1 remains release-gated (§8).
 - **Per-commit audits are blind to compositions — and the class has narrowed to two enumerable mechanisms.** The defects the fleet has shipped lived *between* individually-defensible surfaces, and every review regime we have is per-surface. v3 called the class "compositional," which is true and too wide to act on. It is now two mechanisms, both mechanically greppable (§7.3): **sentinel-carried semantics** (a security-relevant meaning attached to a value the receiving type cannot distinguish from absence) and **guard-exemption adjacency** (a surface added beside a gated collection inherits the exemption of its neighbours). Crit 5's audit-block clause targets exactly these two. **The narrowing has been tested rather than agreed with: the enumeration was run once, cold, and found two further instances in about fifteen minutes** (CBP, 2026-07-25, at `c03837b` — details in §8). That is the evidence for the claim that matters, which is not that the mechanisms are real but that they are *cheap to sweep*. **The honest boundary:** ordering and timing compositions fit neither mechanism, and if we ship one, the class widens again. Audit for the class you have shipped; keep the standing risk for the class you have not. (kimi, narrowing.)
 - **Escalation fatigue is the fail-open the corpus tests cannot see.** §7.1 makes unrecorded-presentation escalate to the owner, which is right — but volume is now the migration hazard (§8), and an owner trained by forty prompts a day to click yes has become a fail-open that lives in a person, not in a type. Row 1b's prompts-per-day metric is the only instrument aimed at it.
-- **Release cadence — the largest gap between what this document promises and what a user can obtain**, and the one this review round nearly missed: eight reviewers argued the credential taxonomy; the tree's answer was that you cannot install the thing. 161 unreleased `core/` commits, desktop built and never shipped, no owner until dp assigns one (§8, §9 rows 1a/6).
+- **Release cadence — the largest gap between what this document promises and what a user can obtain.**
+  Current reference deployment is green, but the public daemon is 324 `core/` commits behind and
+  the public app remains Android-only. Internal deployability is not external acquisition (§8,
+  §9 rows 1a/6).
 - **Attested connect** without hurting seamlessness for non-technical users (§7). This is the honest floor's exit, and the ratchet's first hard rung.
 - **Version skew across a constellation** — how the app guides upgrades so a mixed-version constellation stays safe (§5.4).
 - **Mirror-mode trust** — how a thin client safely relays policy from a sovereign node it doesn't fully control.
 - **How a relying party actually consults the evidence (§4.5) — downgraded from *unsolved* to *mechanism exists, owner-facing rendering owed*.** Escalation is the mechanism and it has been exercised on the fleet plane. What is missing is the owner-facing *rendering* of an escalation: presenting "should I trust this?" without the machinery and without collapsing evidence into a verdict. A far smaller and more fundable gap than v2 claimed. The first shippable instance may be per-relationship disclosure tiering (the `trusted` visibility tier), because the user's mental model — "who sees my phone number" — already exists and carries no machinery.
 - **The primary persona is unevidenced.** Every capability we have shipped was driven by the tertiary persona (the agents). That is a legitimate consequence of where we started climbing — but the roadmap will keep being argued from a persona we have never watched use the product. Criteria 1a/1b/1c exist to close this; until they do, weigh owner-facing claims accordingly.
 
-## 12. Revision note — what v4 changed, and what needs a ruling
+## 12. Revision notes
+
+### v5 (2026-08-08) — source, deployment, and release are separate facts
+
+This amendment was audited from a clean worktree at `9a6a5c2` after the reference daemon was
+rebuilt and restarted at that same commit. It corrects current-state claims without erasing the
+historical findings that produced the repairs:
+
+1. §5.5 now records the landed vault containment: attributed reads/writes, creator-bound defaults,
+   witnessed releases, and visible legacy exposure. It retains transport authentication, migration,
+   and schema v2 as open work.
+2. §5.6 records `/credential` behind the operator gate with a `credential_issued` witness, while
+   keeping wallet/delegation authorization open.
+3. §8, §9, and §11 distinguish the current reference deployment from the public release. The
+   daemon deployed internally is current; the public daemon and app remain stale and unmatched.
+4. Row 2 no longer says the credential deny branch is absent. It names the containment that exists
+   and the two-axis proof that does not.
+5. `STATUS_AUDIT_2026-08-08.md` becomes the current evidence matrix. Earlier measurements remain
+   pinned to their historical baselines rather than being silently refreshed in prose.
 
 ### v4 (2026-07-25) — three posts that landed after v3 was pushed
 
@@ -324,10 +394,9 @@ the release lag (161 `core/` commits, up from Legion's 157).
 6. **§5.1 decides what it was**: a user-facing requirement, currently failed by the shipped
    artifact — not a description of `hestia_first_run` (Legion).
 
-**One item added to dp's queue:** the disposition of ungated `/credential` (§8) — fix1
-batch, or ahead of it. kimi and Nomad both leave it there; CBP concurs, with the note that
-the fail-closed half (gate + witness the act) is separable from the design half (what
-authorization OID4VCI issuance should require) and does not wait on it.
+**Historical v4 queue item, resolved in source before v5:** the disposition of ungated
+`/credential` (§8). The fail-closed half (operator gate + witness the act) landed. The design half
+— what authorization an OID4VCI issuance should require — remains open.
 
 ### v3 (2026-07-25) — six reviews of v2
 

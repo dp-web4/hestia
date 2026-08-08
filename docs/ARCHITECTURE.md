@@ -1,6 +1,17 @@
 # Hestia Architecture
 
-Phase 0 working architecture. Will refine as Phase 1 implementation reveals real constraints.
+**Status:** historical Phase-0 shape with current implementation notes · reconciled 2026-08-08 at
+`9a6a5c2`.
+
+This document explains the intended component boundaries; it is not the current feature ledger.
+Use `STATUS_AUDIT_2026-08-08.md` for source/deployment/release status and
+`PRD_GOVERNANCE.md` for the active governance architecture. In particular:
+
+- the Tauri source exists, but only an older Android APK is publicly released;
+- the web dashboard, not the Tauri app, is the routinely exercised operator surface;
+- the intended shared gate core exists but is **not wired** into syntax-only harness shims;
+- session/plugin identity is not yet transport-authenticated at connect;
+- the MCP table below is an illustrative Phase-0 subset, not the current tool registry.
 
 ## The shape, top-down
 
