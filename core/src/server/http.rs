@@ -162,6 +162,7 @@ async fn operator_session(
                 now,
                 super::operator_auth::CHALLENGE_TTL_SECS,
             )
+            .map(|(lct_id, principal_public_key)| (lct_id, Some(principal_public_key)))
         }
         None => super::operator_auth::authenticate_operator(
             &law,
@@ -171,10 +172,11 @@ async fn operator_session(
             signature,
             now,
             super::operator_auth::CHALLENGE_TTL_SECS,
-        ),
+        )
+        .map(|lct_id| (lct_id, None)),
     };
     match authed {
-        Some(op) => {
+        Some((op, principal_public_key)) => {
             let (token, record, session_ref) = match proof {
                 Some((provenance, actor_key, device_key, actor_sig, device_sig)) => {
                     // Authentication above proved every identity named in the tuple.
@@ -182,6 +184,9 @@ async fn operator_session(
                     let session_proof = OperatorSessionProof::new(
                         challenge,
                         &provenance,
+                        principal_public_key
+                            .as_deref()
+                            .expect("composed authentication returns its authorized key"),
                         &actor_key,
                         &device_key,
                         signature,

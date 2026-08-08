@@ -184,6 +184,7 @@ pub fn canonical_session_transcript(
 /// verify the daemon's authentication claim rather than inheriting its verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorSessionProof {
+    pub principal_public_key: String,
     pub actor_public_key: String,
     pub device_public_key: String,
     pub principal_signature: String,
@@ -196,6 +197,7 @@ impl OperatorSessionProof {
     pub fn new(
         challenge: &str,
         provenance: &OperatorProvenance,
+        principal_public_key: &str,
         actor_public_key: &str,
         device_public_key: &str,
         principal_signature: &str,
@@ -209,6 +211,7 @@ impl OperatorSessionProof {
             device_public_key,
         );
         Self {
+            principal_public_key: principal_public_key.to_string(),
             actor_public_key: actor_public_key.to_string(),
             device_public_key: device_public_key.to_string(),
             principal_signature: principal_signature.to_string(),
@@ -326,6 +329,7 @@ pub fn operator_session_opened_record(
         "authority_evidence": "principal-signature-over-session-composition",
         "transcript": SESSION_TRANSCRIPT_DOMAIN,
         "proof": {
+            "principal_public_key": proof.principal_public_key,
             "actor_public_key": proof.actor_public_key,
             "device_public_key": proof.device_public_key,
             "principal_signature": proof.principal_signature,
@@ -420,7 +424,7 @@ pub fn authenticate_composed_operator(
     device_signature_hex: &str,
     now: u64,
     ttl_secs: u64,
-) -> Option<String> {
+) -> Option<(String, String)> {
     provenance.validate_for_challenge(challenge).ok()?;
     if !canonical_lower_hex(actor_public_key_hex, 32)
         || !canonical_lower_hex(device_public_key_hex, 32)
@@ -458,7 +462,10 @@ pub fn authenticate_composed_operator(
     actor_key.verify(&transcript, &actor_signature).ok()?;
     device_key.verify(&transcript, &device_signature).ok()?;
     law.authorize_operator(&provenance.principal, &transcript, &principal_signature)
-        .map(|op| op.lct_id.clone())
+        .and_then(|op| {
+            op.public_key()
+                .map(|key| (op.lct_id.clone(), hex::encode(key.to_bytes())))
+        })
 }
 
 fn decode_signature(value: &str) -> Option<web4_core::crypto::SignatureBytes> {
@@ -792,6 +799,7 @@ mod tests {
         let proof = OperatorSessionProof::new(
             "abc",
             resolved,
+            &"33".repeat(32),
             &"11".repeat(32),
             &"22".repeat(32),
             &"aa".repeat(64),
@@ -817,6 +825,10 @@ mod tests {
         assert_eq!(
             record["proof"]["transcript_sha256"],
             proof.transcript_sha256
+        );
+        assert_eq!(
+            record["proof"]["principal_public_key"],
+            proof.principal_public_key
         );
         assert_eq!(record["proof"]["actor_signature"], proof.actor_signature);
 
@@ -966,7 +978,14 @@ mod tests {
             1_000,
             CHALLENGE_TTL_SECS,
         );
-        assert_eq!(authenticated.as_deref(), Some(principal.as_str()));
+        assert_eq!(
+            authenticated.as_ref().map(|(lct, _)| lct.as_str()),
+            Some(principal.as_str())
+        );
+        assert_eq!(
+            authenticated.as_ref().map(|(_, key)| key.as_str()),
+            Some(law.operator_access[0].public_key_hex.as_str())
+        );
 
         // Each semantic field is changed only AFTER all signatures were made.
         // Every mutation must fail, including fields the policy engine does not
