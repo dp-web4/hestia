@@ -367,8 +367,8 @@ One row failed that standard and is corrected in place: the infra-telemetry row 
 | act digest | **absent** | `policy_decision.attempted` is redacted and truncated at 400 bytes; canonical serialization, digest domain, and plugin-to-daemon wire are new work |
 | governance history | **visible** | ledger shipped #198/#202 |
 | deployment provenance | **measurable** | fleet manifest shipped #199 |
-| infra telemetry | **source producer merged; fleet wiring/deployment still unproven** | #243/#211 landed producer work; #272/#273 address member-agnostic installation and current-build authority. Plane E has never recorded at the measured seat; a green source check is not evidence of installed writers or live rows |
-| deployment authority | **installer path is in review, not yet a fleet-wide live fact** | #272 generic installer and #273 Claude-specific installer are both open; converge on one `$HESTIA_HOME/shared` path and verify restart/live behavior |
+| infra telemetry | **source producer merged; fleet wiring/deployment still unproven** | #243/#211 landed producer work; #272 plus its stacked follow-up #285 address member-agnostic installation and current-build authority. Plane E has never recorded at the measured seat; a green source check is not evidence of installed writers or live rows |
+| deployment authority | **installer path is in review, not yet a fleet-wide live fact** | #273's Claude-specific installer was closed in favour of #272; #285 folds its registration-derived destination, registration-based skip, and governed-session refusal into the generic installer. Land both, then run `deploy/install-members.sh` from an operator shell and verify restart/live behavior |
 | installed gate | **must be measured per member** | deployment manifest/current-build file is the authority; distinguish source, merged, installed, restarted, live, and observed |
 | NOT-SAME review | **unrecordable on GitHub** | approve → *"Can not approve your own pull request"*; block → lands as a comment |
 | branch protection | **status checks only** | `required_pull_request_reviews: None` |
@@ -838,7 +838,7 @@ kimi's third pushback, adopted: *"re-homed work that isn't announced reads as di
 | escalation store + rehydrate | §8 — becomes resolver-selection state |
 | `tool_appeal` + arbiter + `derivation.rs` joins | §8.4 — old `deny_hash` consumer is compatibility debt; #283 / decision 0013 is the act-bound replacement, pending review/implementation |
 | gate false-refusal fixes (#203) | §8.2 — draining the approval supply line. **Sprint 3, not Sprint 0** (§2.14) |
-| current-build authority + installers | #272 generic and #273 Claude-specific are open; converge before claiming deployment, then verify install/restart/live/observed separately |
+| current-build authority + installers | #273 was closed in favour of #272; stacked follow-up #285 carries the three parts its disposition required to survive. Land #272 + #285, run `deploy/install-members.sh` from an operator shell, then verify install/restart/live/observed separately |
 | act provenance and beneficiary | design target from the 2026-08-07 re-audit; no implementation claim until actor, instructor, delegation, beneficiary, and originating-chain delivery are recorded |
 | mesh + `last-words` | plane D |
 | identity classification check | feeds the artifact manifest (§10) |
@@ -864,14 +864,15 @@ Each sprint's acceptance criteria are **measurements**, not assertions — per �
 
 | # | sprint | why here |
 |---|---|---|
-| 1 | **Sprint 5 — Consolidate the gate** | every sprint after it is otherwise built five times |
-| 2 | Sprint 0.5 — Truth the grain | unchanged; small, and everything downstream is computed from it |
-| 3 | Sprint 2 — Identity and signing | attribution and signed origin, now written once |
-| 4 | Sprint 1 — Observe | labels a surface that has stopped diverging |
-| 5 | **Sprint 2.5 — Bind appeals to acts** | decision 0013 replaces the portable claim before any machine-rate resolver exists |
-| 6 | Sprint 3 — Restore the third verdict | the arbitration driver starts only after 0013 is enforceable |
-| 7 | Sprint 4 — Authority and occupancy | per-role permission, on top of exact identity |
-| 8 | Sprint 6 — Operator surface · then Sprint 7 — hub seam | unchanged |
+| 1 | **Deployment preflight — land #272 + #285, then run `deploy/install-members.sh` from an operator shell** | the per-member installer in closed #273 is not coming to `main`; #285 preserves its required registration-derived destination, registration-based skip, and governed-session refusal in the generic path |
+| 2 | **Sprint 5 — Consolidate the gate** | every sprint after it is otherwise built five times |
+| 3 | Sprint 0.5 — Truth the grain | unchanged; small, and everything downstream is computed from it |
+| 4 | Sprint 2 — Identity and signing | attribution and signed origin, now written once |
+| 5 | Sprint 1 — Observe | labels a surface that has stopped diverging |
+| 6 | **Sprint 2.5 — Bind appeals to acts** | decision 0013 replaces the portable claim before any machine-rate resolver exists |
+| 7 | Sprint 3 — Restore the third verdict | the arbitration driver starts only after 0013 is enforceable |
+| 8 | Sprint 4 — Authority and occupancy | per-role permission, on top of exact identity |
+| 9 | Sprint 6 — Operator surface · then Sprint 7 — hub seam | unchanged |
 
 The dependency between Sprint 2 and Sprint 2.5 is asymmetric. Sprint 2.5's **scope** slice —
 canonical act digest, act link, and cross-act mismatch refusal — may land before signing. Its
@@ -920,8 +921,10 @@ We hold consolidation's costs — a nominal single core everyone is said to depe
 
 **Goal:** the fleet's actual state is measurable and matches source.
 
-- Converge #272's generic installer and #273's Claude-specific lessons into one member-agnostic
-  deployment path at `$HESTIA_HOME/shared`; install, restart, and observe every governed member.
+- Land #272's generic installer with stacked follow-up #285, which folds in the three parts of closed
+  #273 that the operator required to survive. Run `deploy/install-members.sh` from an operator shell;
+  install, restart, and observe every governed member. Do not revive or cite #273's per-member
+  installer as the deployment rung.
 - Treat the current-build authority file and `HESTIA_CURRENT_BUILD_FILE` as deployment evidence,
   not as proof that a daemon has restarted. Record source/merged/installed/restarted/live/observed
   separately and surface stale state to the operator.
