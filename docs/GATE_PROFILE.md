@@ -1,9 +1,13 @@
 # Phase-1 Gate Profile — PreToolUse Clients for Fail-Open Hook Engines
 
-**Status:** Normative for hestia adapter authors · 2026-07-10 · HUB-Claude (deliverable #3, foreign-agent onboarding PRD)
+**Status:** Normative direction, implementation-divergent · 2026-07-10 · amended 2026-08-08 at
+`9a6a5c2` for cross-harness availability and act-bound appeals
 **Wire authority:** [`web4-standard/core-spec/presence-protocol.md`](https://github.com/dp-web4/web4/blob/main/web4-standard/core-spec/presence-protocol.md) §§3.1–3.4 — this profile adds **client-construction requirements**, it does not change the wire protocol.
 **Thread:** `hestia-role-orchestration` · answers CBP's "ready for your gate-endpoint contract" (`cbp-to-hub-OQ1-ANSWERED-…-2026-07-09.md`)
-**Reference implementation:** `plugins/claude-code/hooks/pre_tool_use.py` (the running HST-004 client). Kimi's thin client (`plugins/kimi/`) MUST conform to this profile.
+**Implementation warning:** no current harness is the normative reference for the whole contract.
+The intended shared gate core exists but is not wired, and #225 tracks measured cross-harness
+timeout/recovery divergence. New adapters conform to this document and the decision-0013 amendment,
+not by copying one existing adapter.
 
 ---
 
@@ -75,19 +79,21 @@ For any hook engine verified or suspected fail-open, the PreToolUse client MUST 
    the engine's allow.
 2. **Never rely on `set -e` or natural error propagation.** Only an explicit `exit 2` blocks; any other
    non-zero exit is an ALLOW to the engine.
-3. **Internal deadline: 2 s** (hard ceiling well under the engine's 30 s allow-timeout). Daemon call
-   exceeding it ⇒ `exit 2` with reason `gate: daemon deadline exceeded`. The hook itself MUST never
-   hang: the engine's timeout is an allow, so time-out *inside* the script, never outside it.
+3. **Internal deadline below the harness allow-timeout, measured per harness.** A universal 2-second
+   figure was written before the fleet had a cross-harness latency matrix and is not evidence of a
+   safe budget. The client deadline plus worst-case cleanup/witness time MUST leave measured margin
+   below the host timeout. Exceeding it denies locally, records a rate-limited Plane-E
+   `cause=timeout` event where possible, and gives bounded backoff guidance. The hook itself MUST
+   never be allowed to reach a host timeout that the engine interprets as allow.
 4. **Daemon unreachable / endpoint undiscovered / malformed response ⇒ deny** with a reason naming the
    failure. (This is `HESTIA_PRE_FAIL_CLOSED=1` — HST-004 — restated as non-optional for foreign
    agents, with the binary evidence for why.)
 5. **Forward-compatibility is fail-closed:** any `decision` value outside `{"allow","warn"}` — including
    values this profile does not yet define — maps to **deny**. This reserves `"escalate"` (§5) without a
    client change.
-6. **Wait protocol, bounded by the deadline:** on `status:"evaluating"`, the client MAY re-poll per
-   `nextPollMs` but the 2 s internal deadline governs — in practice at most one re-poll; an unsettled
-   verdict at deadline ⇒ deny (`gate: verdict unsettled`). (Presence-protocol §3.4.1's 5 s/3-poll
-   guidance is for trusted-harness orchestrators; the fail-open-engine budget is tighter.)
+6. **Wait protocol, bounded by the measured client deadline:** on `status:"evaluating"`, the client
+   MAY re-poll per `nextPollMs`; an unsettled verdict at deadline denies. Retry count is derived from
+   the harness budget rather than fixed here. Human resolution never occupies this hot-path budget.
 7. **Thin means thin.** No policy logic, no caching of verdicts across actions, no retries beyond the
    deadline, no network beyond loopback. The client's entire job: identity + wire call + exit-code
    discipline.
@@ -107,13 +113,16 @@ sequence), then flips to ENFORCE — the flip is a *daemon policy change*, not a
 ## 5. Escalation (reserved, async, never on the hot path)
 
 Post-consolidation (hestia/core consuming `web4-policy`), the law input can yield an **escalate**
-verdict. Semantics, fixed now so nothing downstream has to change:
+verdict. Decision 0013 supersedes the original portable-grant model:
 
 - Wire: `decision:"escalate"` — by §3 rule 5, existing clients already deny on it. The immediate effect
   is a **blocking deny-with-reason** (`escalation queued: <reason>`); the tool call never waits on a
   human.
-- Daemon-side: the escalation is queued for sovereign review out-of-band (hub notice / operator
-  surface). A resolved escalation adjusts policy; the *retried* action then evaluates normally.
+- Daemon-side: the escalation references the already-recorded denied act by `action_id` and its
+  canonical, domain-separated digest. A ruling appends a terminal transition to that act; it does
+  not mint a marker token or authorize a merely similar future action. A retry is eligible only when
+  it re-presents the same canonical act and, after Sprint 2 identity work, the same signed originating
+  role/agent chain. Timeout is recorded as a terminal non-merits denial.
 - The `status:"evaluating"` branch stays reserved for engine-internal async (LLM-backed reviewers),
   *not* for human escalation — humans are minutes, the budget is seconds; conflating them re-opens the
   timeout-as-bypass hole.
@@ -122,7 +131,8 @@ verdict. Semantics, fixed now so nothing downstream has to change:
 
 - [ ] `exit 2` armed via trap before first fallible statement
 - [ ] explicit `exit 0` only after parsing a `decided` `allow`/`warn`
-- [ ] internal deadline ≤ 2 s, enforced in-script
+- [ ] internal deadline measured below this harness's allow-timeout with cleanup margin
+- [ ] timeout/refusal/crash each fail closed and produce the required Plane-E/outage evidence
 - [ ] unknown decision values → deny (test with a mock daemon returning `"escalate"`)
 - [ ] daemon-down test → deny (kill daemon, fire hook, confirm block)
 - [ ] exit-127 test → engine sees exit 2, not 127 (break the script's interpreter path, confirm block)
@@ -130,5 +140,6 @@ verdict. Semantics, fixed now so nothing downstream has to change:
 - [ ] warn path witnessed in the observe stream
 
 ---
-*Graduation path: once Kimi's client conforms and a second foreign adapter reuses this profile
-unchanged, the profile graduates to `web4-standard/profiles/` via the protocol-discipline PR checklist.*
+*Graduation path: the profile graduates only after the shared decision core is wired, every installed
+harness passes the same idle/load/failure matrix, and act-bound appeal conformance vectors pass across
+the adapters and daemon. Copying the prose into a second adapter is not conformance evidence.*

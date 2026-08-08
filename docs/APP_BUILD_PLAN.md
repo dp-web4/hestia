@@ -1,10 +1,43 @@
 # Hestia App — Cross-Platform Build Plan
 
-**Date**: 2026-05-23
-**Author**: Legion (Opus 4.7)
-**Status**: Built. Desktop (Linux .deb/.rpm/AppImage) + Android (APK/AAB) complete.
-**Binary size**: 17MB desktop, 18MB APK, 8.2MB AAB
-**Build time**: ~55s desktop (Rust release), ~90s Android (cross-compile + Gradle)
+**Date**: 2026-05-23 · **Status reconciled**: 2026-08-08 at `9a6a5c2`
+**Author**: Legion (Opus 4.7); current-state reconciliation by Codex
+**Status**: source prototype built; Android APK publicly released; desktop/mobile parity and
+public desktop packaging are **not demonstrated**.
+
+The original size and build-time figures were development measurements, not release guarantees.
+They are not repeated as current because the repository has no automated artifact-budget check.
+
+## Current verified state
+
+This file began as a one-session implementation plan. Its unchecked boxes were never maintained,
+while its header was changed to “Built,” producing two contradictory status systems in one file.
+The table below is the current authority; the sprint list is retained as historical design context.
+
+| capability | source | CI/release | honest status |
+|---|---|---|---|
+| React/Tauri app shell | dashboard, vault, policy, chain, fleet, hubs, delegation, settings, and operator-session code exist | frontend build is exercised indirectly; no full live-client job | **built in source, thinly exercised** |
+| Android | generated target and tag workflow exist | `app-v0.1.2` publishes one APK | **released, stale relative to current daemon** |
+| Windows desktop app | Tauri bundle config targets desktop | no app workflow publishes MSI; no MSI release asset | **source/bundle-capable, not publicly released** |
+| Linux desktop app | Tauri bundle config targets desktop | no app workflow publishes AppImage/deb/rpm | **source/bundle-capable, not publicly released** |
+| macOS desktop app | Tauri bundle config targets desktop | no app workflow publishes dmg/app bundle | **source/bundle-capable, not publicly released** |
+| iOS | product requirement and mobile design exist | no public artifact or release workflow | **not demonstrated** |
+| daemon/app contract | two live Rust integration tests exist | both are `#[ignore]`; no workflow boots a daemon and runs them | **not continuously enforced** |
+| Sovereign mode | daemon/core and UI paths exist | no clean-device end-to-end artifact | **plumbed** |
+| Mirror/fleet mode | remote client and fleet UI code exist | no current multi-device release-pair run | **plumbed** |
+| secure mobile key storage | design names platform keystores | no acceptance artifact located | **requirement, not demonstrated** |
+
+### Release contract
+
+A release may claim a platform only when all four are attached to the same release candidate:
+
+1. a downloadable, integrity-addressed artifact for that platform;
+2. a current compatible daemon or an embedded daemon with the same build contract;
+3. a clean-device install/connect transcript;
+4. a live client-contract run against the shipping pair.
+
+Current public state satisfies the artifact rung for Android only. The current reference daemon
+deployment proves that `main` can run; it is not a public app release.
 
 ## What we're building
 
@@ -141,7 +174,11 @@ React UI ─── Tauri IPC ───► Rust commands ─┬─► local hesti
 
 ---
 
-# Sprint Plan
+# Historical sprint plan
+
+The checkboxes below describe the original intended decomposition. They are **not** a current
+completion ledger. Current work should update the verified-state table above and
+`STATUS_AUDIT_2026-08-08.md`, not infer completion from source-file presence.
 
 ## Sprint 1: Tauri scaffold + dashboard mirror
 **Goal**: App launches, shows live dashboard data from local daemon.

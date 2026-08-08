@@ -1,7 +1,7 @@
 # Hestia — Assurance & Evidence PRD
 
-**Status**: draft v1 · **Date**: 2026-07-27 · **Stage**: research / R&D, not production
-**Companions**: [`PRD.md`](PRD.md) (the product — what a person installs and why) · [`ARCHITECTURE.md`](ARCHITECTURE.md) (how it works) · [`PROTOCOL.md`](PROTOCOL.md) (the wire) · [`GATE_BYPASS_CATALOG.md`](GATE_BYPASS_CATALOG.md) (what the gate does not stop)
+**Status**: draft v1, current-state reconciled at `9a6a5c2` · **Date**: 2026-08-08 · **Stage**: research / R&D, not production
+**Companions**: [`PRD.md`](PRD.md) (the product — what a person installs and why) · [`PRD_GOVERNANCE.md`](PRD_GOVERNANCE.md) (current governance target) · [`STATUS_AUDIT_2026-08-08.md`](STATUS_AUDIT_2026-08-08.md) (current evidence) · [`ARCHITECTURE.md`](ARCHITECTURE.md) (how it works) · [`PROTOCOL.md`](PROTOCOL.md) (the wire) · [`GATE_BYPASS_CATALOG.md`](GATE_BYPASS_CATALOG.md) (what the gate does not stop)
 
 > `PRD.md` answers *what Hestia is for a person*. **This document answers a narrower question:
 > what must Hestia actually DO before a relying party is entitled to believe its evidence?**
@@ -87,15 +87,14 @@ The standard path for an agent to use a secret should not be to receive the secr
 - Credential **release is witnessed**, with the reader and the basis recorded and the secret
   value never written to the record.
 
-*Current state, stated plainly — and measured against `main`, not against a branch*: an empty
-consumer list means "readable by any caller", contradicting the type's own documentation. On
-**merged `main` today, credential release is still unwitnessed and the empty-list default is
-still open**. Containment — binding new entries to their creator, witnessing every release,
-and an operator-visible exposure list — is written and tested but sits in an **open PR**; it
-is not landed, and this document does not get to count it. Pre-existing entries with empty
-consumer lists will still release under that containment, with a warning, because breaking
-live agents mid-run was judged worse than a disclosed exposure. **Fail-closed migration of
-existing entries is a gate on any production claim** — see §6.
+*Current state, stated plainly — measured against `9a6a5c2`*: the containment is merged and
+running on the reference installation. Vault reads and writes require an explicit live session;
+new entries with an omitted consumer list bind to the attributed creator; releases are witnessed;
+and legacy empty-consumer entries are exposed on the operator surface and warned when read.
+Pre-existing empty-consumer entries remain readable to an attributed caller for compatibility.
+Transport identity is still asserted at connect, and the schema still overloads an empty vector
+instead of representing the typed release/presentation model above. **Fail-closed migration plus
+transport-established identity remain gates on any production claim** — see §6.
 
 ### FR-3 — Decisions are portable and independently verifiable *(state: not started)*
 
@@ -153,9 +152,9 @@ exposed — without reading source.
 - Startup and dashboard state the current assurance profile, including **degraded**.
 - Published policy distinguishes **enforced** rules from rules that are recorded but consumed
   by no evaluation path. Publishing an unenforced rule as if it stops an action is a defect.
-- Unmeasured is reported as **absence of evidence**, never as a low score. *(On `main` an
-  unmeasured grain still ranks below the lowest trust level in the roll-up; the fix is an
-  open PR.)*
+- Unmeasured is reported as **absence of evidence**, never as a low score. The dashboard now derives
+  this from per-dimension observation counts and renders an unmeasured grain as unmeasured; retain a
+  regression test so a later display refactor cannot resurrect the default-prior behavior.
 - Experimental surfaces are enumerable at runtime.
 
 ### FR-7 — Buildability and conformance *(state: partial)*

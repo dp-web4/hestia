@@ -1,6 +1,6 @@
 # PRD — Hestia governance: vault authority, canonical roles, and the third verdict
 
-**Status:** definitive · supersedes the drafts listed below · **Date:** 2026-08-05, amended 2026-08-08 (fresh `origin/main` baseline `c487d0a`; current-state re-audit; act-bound appeals, instruction provenance, deployment-stage distinctions, and sprint refresh)
+**Status:** definitive · supersedes the drafts listed below · **Date:** 2026-08-05, amended 2026-08-08 (fresh `origin/main` baseline `9a6a5c2`; reference daemon restarted at that exact build; act-bound appeals, instruction provenance, deployment-stage distinctions, and sprint refresh)
 **Owner:** claude-code (CBP), by dp's assignment — *"you take the lead on hestia"*
 **Decision-0013 amendment author:** codex (CBP) · **designated NOT-SAME reviewer:** kimi-code
 **Scope:** hestia only. Hub work and any web4-core changes are hub's; the autostash-prevention hook is legion's.
@@ -362,7 +362,7 @@ opens, so the chain contains the plumbing but not evidence that the return path 
 
 ## 3. Grounded current state
 
-Every row was re-audited against fresh `origin/main` (`c487d0a`) and the open-PR queue on 2026-08-08. A source merge is not an install, restart, or live observation; those stages are named separately below.
+Every row was reconciled against fresh `origin/main` (`9a6a5c2`) and the open-PR queue on 2026-08-08. At the audit point Hestia had no open PRs. The reference daemon was then rebuilt, restarted, and reported the same commit, with a matching supervisor manifest. That closes those deployment rungs for one installation only: a daemon match does not prove every installed harness adapter matches source. Source, merged, installed, restarted, live, observed, and publicly released remain separate states.
 
 One row failed that standard and is corrected in place: the infra-telemetry row described *branch* state under a header that promises source-or-live. Found by the NOT-SAME reviewer, recorded at §2.13, and left visible here rather than quietly rewritten — a table that silently repairs itself teaches the next reader nothing about how it got wrong.
 
@@ -385,11 +385,27 @@ One row failed that standard and is corrected in place: the infra-telemetry row 
 | act digest | **absent** | `policy_decision.attempted` is redacted and truncated at 400 bytes; canonical serialization, digest domain, and plugin-to-daemon wire are new work |
 | governance history | **visible** | ledger shipped #198/#202 |
 | deployment provenance | **measurable** | fleet manifest shipped #199 |
-| infra telemetry | **source producer merged; fleet wiring/deployment still unproven** | #243/#211 landed producer work; #272 plus its stacked follow-up #285 address member-agnostic installation and current-build authority. Plane E has never recorded at the measured seat; a green source check is not evidence of installed writers or live rows |
-| deployment authority | **installer path is in review, not yet a fleet-wide live fact** | #273's Claude-specific installer was closed in favour of #272; #285 folds its registration-derived destination, registration-based skip, and governed-session refusal into the generic installer. Land both, then run `deploy/install-members.sh` from an operator shell and verify restart/live behavior |
-| installed gate | **must be measured per member** | deployment manifest/current-build file is the authority; distinguish source, merged, installed, restarted, live, and observed |
+| infra telemetry | **source producer merged; per-harness live rows still unproven** | #243/#211 landed producer work and #272/#285 landed the member-agnostic installer. The reference daemon is current, but no induced-failure matrix yet proves that every installed harness writes Plane E |
+| deployment authority | **implemented and current on the reference installation; fleet proof open** | `hestia --version` and the supervisor manifest both name `app-v0.1.2-761-g9a6a5c2`; this proves the reference daemon's install/restart rung, not every harness file or every other installation |
+| installed gate | **must still be measured per member** | the current-build authority proves the daemon artifact. Installed adapter hashes and one observed decision/availability row per harness are separate acceptance evidence |
 | NOT-SAME review | **unrecordable on GitHub** | approve → *"Can not approve your own pull request"*; block → lands as a comment |
 | branch protection | **status checks only** | `required_pull_request_reviews: None` |
+
+### 3.1 Open-issue map at this baseline
+
+Nine issues are open. They are not nine independent projects:
+
+- **#225** is the release-blocking cross-harness availability/recovery contract.
+- **#242** is a live, narrowly scoped false-positive defect in the deletion-pattern anchoring.
+- **#244, #261, and #263** are migration evidence for Sprint 2/Sprint 2.5: attribution improved,
+  but the current appeal/grant model remains portable and some prescribed remedies are unreachable.
+- **#259** is partially covered by mismatch-refusal tests; the live positive claim contract remains.
+- **#260** is fixed in source and awaits installed/live verification before closure.
+- **#264** is deliberately blocked until act-bound appeals and NOT-BENEFICIARY exist.
+- **#224** is a stale coordination index and must be refreshed around this set rather than treated
+  as an additional implementation requirement.
+
+The detailed disposition and product/demo implications are in `STATUS_AUDIT_2026-08-08.md`.
 
 **The generator behind most of these** (§7.4): a *declared* value sitting where an *audited* or *witnessed* one belongs.
 
@@ -855,9 +871,9 @@ kimi's third pushback, adopted: *"re-homed work that isn't announced reads as di
 | fleet manifest (#199) | §10 gate 5, and the standing audit instrument for `training:context-inspectable` |
 | `record_gate_unavailable()` | plane E producer merged (#211/#243 lineage); **fleet wiring and live evidence not done** until each installed harness emits a row under induced failure |
 | escalation store + rehydrate | §8 — becomes resolver-selection state |
-| `tool_appeal` + arbiter + `derivation.rs` joins | §8.4 — old `deny_hash` consumer is compatibility debt; #283 / decision 0013 is the act-bound replacement, pending review/implementation |
+| `tool_appeal` + arbiter + `derivation.rs` joins | §8.4 — old `deny_hash` consumer is compatibility debt; #283 / decision 0013 is merged design, with act-bound implementation pending |
 | gate false-refusal fixes (#203) | §8.2 — draining the approval supply line. **Sprint 3, not Sprint 0** (§2.14) |
-| current-build authority + installers | #273 was closed in favour of #272; stacked follow-up #285 carries the three parts its disposition required to survive. Land #272 + #285, run `deploy/install-members.sh` from an operator shell, then verify install/restart/live/observed separately |
+| current-build authority + installers | #272/#285 merged. The reference daemon and manifest now match `9a6a5c2`; installed-harness parity and induced live evidence remain separate checks |
 | act provenance and beneficiary | design target from the 2026-08-07 re-audit; no implementation claim until actor, instructor, delegation, beneficiary, and originating-chain delivery are recorded |
 | mesh + `last-words` | plane D |
 | identity classification check | feeds the artifact manifest (§10) |
@@ -883,7 +899,7 @@ Each sprint's acceptance criteria are **measurements**, not assertions — per �
 
 | # | sprint | why here |
 |---|---|---|
-| 1 | **Deployment preflight — land #272 + #285, then run `deploy/install-members.sh` from an operator shell** | the per-member installer in closed #273 is not coming to `main`; #285 preserves its required registration-derived destination, registration-based skip, and governed-session refusal in the generic path |
+| 1 | **Deployment preflight — reference daemon complete; finish per-harness and fleet evidence** | #272/#285 are merged and the reference daemon + supervisor manifest match `9a6a5c2`; now prove installed adapter parity, restart/live behavior, and Plane-E output per harness |
 | 2 | **Sprint 5 — Consolidate the gate** | every sprint after it is otherwise built five times |
 | 3 | Sprint 0.5 — Truth the grain | unchanged; small, and everything downstream is computed from it |
 | 4 | Sprint 2 — Identity and signing | attribution and signed origin, now written once |
@@ -911,8 +927,12 @@ enforce or report shipped until Sprint 2 supplies signed origin. The table place
 | 540 | kimi's gate |
 | 528 | gemini's gate |
 
-- The core landed (#169). **The shims never did.** claude-code and codex import it; kimi and gemini do not reference it at all. The per-harness gates are full independent implementations, not adapters.
-- **The core is deployed nowhere.** No member's installed tree contains it. So the two gates that import it cannot load it at runtime — found while reviewing #243, whose new telemetry call sites resolve it by walking up from `__file__` and therefore record nothing on a real member while passing CI, which runs the repo layout.
+- The core landed (#169). **The shims never did.** Its own current README says `NOT WIRED`, and
+  no harness imports it as its decision core. The per-harness gates remain independent
+  implementations, not syntax-only adapters.
+- The reference daemon is now current, but that does not change the preceding source fact or prove
+  a shared runtime is installed and used by every harness. #243's telemetry producer and the
+  installer are inputs to that transition, not evidence that the decision core is in force.
 - **Client-side self-protection exists in exactly one file fleet-wide** — claude-code's gate. kimi's deployed gate has none. Its zero escalations read as good conduct and are an absent rule: the null-state twin, at fleet scale.
 - Escalations opened, trailing 30 000 chain entries: **claude-code 170 + unattributed 87 = 257 (87%), codex 39 (13%), kimi 0.** Of those, `Write`+`Edit` = 88 (30%) come from a payload scanner only claude-code has, and 142 (48%) from a single hardcoded marker naming one member's plugin directory. The distribution is a property of *which gate implements what*, not of how members behave.
 
@@ -936,14 +956,14 @@ We hold consolidation's costs — a nominal single core everyone is said to depe
 
 ---
 
-### Sprint 0 — Finish the present *(source work largely merged; deployment proof remains)*
+### Sprint 0 — Finish the present *(reference daemon deployed; fleet/harness proof remains)*
 
 **Goal:** the fleet's actual state is measurable and matches source.
 
-- Land #272's generic installer with stacked follow-up #285, which folds in the three parts of closed
-  #273 that the operator required to survive. Run `deploy/install-members.sh` from an operator shell;
-  install, restart, and observe every governed member. Do not revive or cite #273's per-member
-  installer as the deployment rung.
+- #272's generic installer and #285's registration-derived follow-up are merged. The reference
+  daemon has been installed and restarted at `9a6a5c2`, with a matching supervisor manifest.
+  Complete the same evidence ladder for every governed harness: installed file, restarted process,
+  live decision, and observed normal/Plane-E record. Do not infer those from the daemon version.
 - Treat the current-build authority file and `HESTIA_CURRENT_BUILD_FILE` as deployment evidence,
   not as proof that a daemon has restarted. Record source/merged/installed/restarted/live/observed
   separately and surface stale state to the operator.
@@ -951,7 +971,7 @@ We hold consolidation's costs — a nominal single core everyone is said to depe
 - Baseline the availability numbers kimi measured, as a standing metric rather than a one-off.
 - **Config drift detector** (§2.12 item 4): vault vs the on-disk shadow copy, distinct from the manifest's *hook* drift. It answers a question that is currently unanswerable — **has this already happened?** A non-zero first run is a finding to be published, not a bug to be quietly cleaned up before anyone looks.
 
-- **Convert this document's 36<!--n:live--> live line-number citations to construct-pointers**, per `CLAUDE.md`'s own review-gate rule (*"a grep-able name not a drifting line number"*). One of them was wrong on arrival for exactly the reason the rule exists — it was true only in the author's unmerged checkout (§15) — and a citation a second reader cannot resolve at a shared ref is not evidence, which is this sprint's whole goal applied to its own paperwork. The scale is measured, not assumed: `tools/citation_ref_census.py` over all 71 remote refs anchors the construct behind the *sharpest* of the five distinct `handler.rs` line-spans on the cited line on **17 of 71**, and on 12 refs that construct does not exist at all (§15). The other four spans carry no anchor and are bounded only by blob agreement — `>= 13/71` — so 17/71 is one span's exact figure, not the five's; attributing it to all five was this bullet's own version of the error §15 is about, and is corrected here. Conversion is what turns that second case from a wrong answer into no answer.
+- **Convert this document's 34<!--n:live--> live line-number citations to construct-pointers**, per `CLAUDE.md`'s own review-gate rule (*"a grep-able name not a drifting line number"*). One of them was wrong on arrival for exactly the reason the rule exists — it was true only in the author's unmerged checkout (§15) — and a citation a second reader cannot resolve at a shared ref is not evidence, which is this sprint's whole goal applied to its own paperwork. The scale is measured, not assumed: `tools/citation_ref_census.py` over all 71 remote refs anchors the construct behind the *sharpest* of the five distinct `handler.rs` line-spans on the cited line on **17 of 71**, and on 12 refs that construct does not exist at all (§15). The other four spans carry no anchor and are bounded only by blob agreement — `>= 13/71` — so 17/71 is one span's exact figure, not the five's; attributing it to all five was this bullet's own version of the error §15 is about, and is corrected here. Conversion is what turns that second case from a wrong answer into no answer.
 
 **Acceptance:** manifest reports zero hook drift on every host it can see; the false-refusal rate and the count of escalations opened *by reads* both have a published baseline — they trend to zero in Sprint 3, not here (§2.14), and a sprint that forbids verdict changes cannot accept one as a criterion; the config drift detector has run once against today's files and its first-run output is on the record whatever it says; and the **live** citation count over this document reaches zero, measured by `tools/citation_ref_census.py --doc-ref <the merge commit on main>` — a named ref, not the author's tree, because that distinction is the entire finding.
 
@@ -1398,7 +1418,7 @@ Stated because §7.4 makes it a requirement rather than a courtesy.
 - **§2.12's method, stated so it can be criticised.** I tested the "absorbed whole" claim by reading the source document and counting term hits in this one — `beneficiary`, `reciproc`, `unlock`, `bootstrap`, `foreign`, `shadow copy` all returned zero against the pre-amendment draft. That is a **lexical** test, and a lexical test can miss a concept carried under different words. I read §4 principle 1 and §8.2 to check the two most likely paraphrase sites and found neither concept; I did not read all 479 lines with each of the six concepts in mind. So: four dropped items is a **floor**, not a census.
 - §2.12's restorations are transcribed from `PRD_CONFIG_IN_VAULT.md` and **re-argued, not re-verified**. In particular, *"kimi's and codex's adapters read identity from disk in their own code"* is that document's 2026-07-31 claim, not something I re-checked today, and it is the load-bearing premise of release gate 8.
 - These sections were added on 2026-08-06 by the PRD's owner, after the body was drafted. §2.12 exists because the body's own supersession claim had no second reader.
-- **One citation was true only on the seat that wrote it — and the repo already had a rule against that.** kimi's second read flagged `presets.rs:94-98`<!--cite:quoted--> as pointing at the wrong lines; the appeal instruction is at `:89-93`. Both numbers are correct — at different refs. `:94-98`<!--cite:quoted--> is right in my working tree, which sits on the unmerged branch `cbp/stale-primer-discharge-check`; its commit `2ccb1a5` rewrites the doc comment above the cited region — 8 lines added and 3 removed in one hunk, **net +5**, which is exactly the 89→94 shift the finding rests on. ("Inserts eight lines" was literally true of the diff and did not name the mechanism; the shift is the net, and a reader checking 8 against 5 would have found the sentence not to reconcile.) On `origin/main` and on this PR's branch — the refs any reader will use — it is `:89-93`. **The citation was verified, by me, against a tree that exists on exactly one seat and nowhere in the shared history**, and every check available from that seat would have passed. Only a reader at a different ref could catch it, which is what happened. The generalisable part is not "check your line numbers" — it is that a line number is a claim about a *ref*, and the writer's checkout is not the reader's. `CLAUDE.md` says this already, in the review-gate block: *"a construct-pointer per line, grep-able name not a drifting line number."* This document carries 36<!--n:live--> live such citations as of this amendment, plus 3<!--n:quoted--> quoted (fenced `path:line` spans; the count is produced by `tools/citation_ref_census.py`, which prints its own regex, its own input's blob, and reconciles the live total as 26<!--n:qualified--> path-qualified + 10<!--n:continuations--> bare `:NNN` continuations — it was 31 at `f41e595` and 35 at `aafe898`, and rose because these very bullets cite lines, which is the habit, not an exception to it — the refs are named because "two commits ago" was what this said, and a relative offset re-points itself on every commit, which is the same defect measured in absolute-vs-relative coordinates), ignored its own repo's convention for all of them, and got caught on the one file that moved. Re-checking the others one at a time is the wrong remedy; converting them is the right one, and it is now a Sprint 0 item.
+- **One citation was true only on the seat that wrote it — and the repo already had a rule against that.** kimi's second read flagged `presets.rs:94-98`<!--cite:quoted--> as pointing at the wrong lines; the appeal instruction is at `:89-93`. Both numbers are correct — at different refs. `:94-98`<!--cite:quoted--> is right in my working tree, which sits on the unmerged branch `cbp/stale-primer-discharge-check`; its commit `2ccb1a5` rewrites the doc comment above the cited region — 8 lines added and 3 removed in one hunk, **net +5**, which is exactly the 89→94 shift the finding rests on. ("Inserts eight lines" was literally true of the diff and did not name the mechanism; the shift is the net, and a reader checking 8 against 5 would have found the sentence not to reconcile.) On `origin/main` and on this PR's branch — the refs any reader will use — it is `:89-93`. **The citation was verified, by me, against a tree that exists on exactly one seat and nowhere in the shared history**, and every check available from that seat would have passed. Only a reader at a different ref could catch it, which is what happened. The generalisable part is not "check your line numbers" — it is that a line number is a claim about a *ref*, and the writer's checkout is not the reader's. `CLAUDE.md` says this already, in the review-gate block: *"a construct-pointer per line, grep-able name not a drifting line number."* This document carries 34<!--n:live--> live such citations in the v5 reconciliation, plus 3<!--n:quoted--> quoted (fenced `path:line` spans; the count is produced by `tools/citation_ref_census.py`, which prints its own regex, its own input's blob, and reconciles the live total as 27<!--n:qualified--> path-qualified + 7<!--n:continuations--> bare `:NNN` continuations — it was 31 at `f41e595`, 35 at `aafe898`, and 36 in the decision-0013 amendment. The count moves when editorial changes add or replace line citations, which is the habit being measured, not an invariant), ignored its own repo's convention for all of them, and got caught on the one file that moved. Re-checking the others one at a time is the wrong remedy; converting them is the right one, and it is now a Sprint 0 item.
 - **The closure I claimed for that finding was computed from the same seat as the finding — and is refuted.** The bullet above originally ended: *"the class is bounded and now closed — `presets.rs` is the only cited file whose blob differs between my tree and main; `types.rs` and `handler.rs` are byte-identical across my tree, main, and this branch, so no other citation here can have drifted this way."* Each clause is true. The inference is not: three refs, two of which are the same blob by construction, is not a population — it is the same one-checkout error one level up, made in the sentence diagnosing it. Run instead over **all 71 refs under `refs/remotes/origin`** (`tools/citation_ref_census.py`, added with this bullet, which reproduces every number here). **Every figure in the five sub-bullets below is measured at `ad57091`, over a 71-ref population that no longer exists and cannot be reconstructed — see "the denominator was never a property of this repository" below; they are left as written, at their ref, rather than refreshed:**
   - `handler.rs` carries **27 distinct blobs**; only 13 refs hold main's. The census anchors `require_string(args, "deny_hash")` — the construct cited as `handler.rs:2379` — on the **cited line on 17 of 71 refs**, on some *other* line on 42, and absent on 12. Five distinct line-spans of this document point into that file, in **18 spellings** — 10 path-qualified plus 8 bare continuations (the census now prints that split per file; the parenthetical here said "ten" until a second reader counted, see below). They are correct on **fewer refs than the citation kimi called broken**, and I declared them incapable of drifting.
   - `presets.rs:89-93` — the fix — holds on **38 of 71**, up from 1 before it. That is a real improvement and not a closure.

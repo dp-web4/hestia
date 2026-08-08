@@ -30,6 +30,12 @@ supervisor should generate this manifest at install time from the artifact it is
 so the comparison is true by construction at deployment and turns stale only when a newer
 artifact is selected.
 
+**Evidence boundary:** a green daemon build comparison proves the selected daemon artifact is
+running. It does not prove that separately installed harness hooks match their source, that every
+harness has emitted a live decision since restart, or that this build has been publicly released.
+Those are separate rows in `STATUS_AUDIT_2026-08-08.md`. At that audit baseline the reference
+daemon and manifest both named `app-v0.1.2-761-g9a6a5c2`; installed-harness parity remained open.
+
 ## Web view
 
 ![dashboard](screenshots/dashboard-web.png)
