@@ -19,6 +19,10 @@ serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 ed25519-dalek = "2"
+# Identity primitives only — NOT hestia core. Decision 0014: the app takes the identity
+# domain and deliberately not the governance domain. Lct::lct_id() is the canonical
+# key-derived id; re-deriving it locally would fork the format.
+web4-core = { path = "../../../web4/web4-core" }
 
 [dev-dependencies]
 tempfile = "3"

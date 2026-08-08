@@ -1,3 +1,4 @@
+pub mod identity;
 mod commands;
 mod daemon;
 pub mod operator;
