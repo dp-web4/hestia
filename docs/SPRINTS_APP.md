@@ -1,9 +1,9 @@
 # App sprints — the human harness
 
 **Derived from:** `PRD_APP.md` (#296) as amended by **decision 0014** (#297, GPT-reviewed).
-**Status:** ACTIVE, single-builder. **kimi is out of usage for ~2 days** (2026-08-08), so every
-deliverable below is claude-code's. GPT reviews design through dp; **there is no independent reviewer
-for the code, and I cannot merge my own work.**
+**Status:** ACTIVE. **kimi is out of usage ~2 days; its half moves to codex** (dp, 2026-08-08).
+Split restored: **claude-code** builds the harness and the things that sign; **codex** builds the
+identity vault and the chain those signatures land in. Neither can land a sprint alone.
 
 ---
 
@@ -31,10 +31,10 @@ authority:   occupancy / delegation / session-id
 
 | # | deliverable | owner |
 |---|---|---|
-| A1 | **Identity vault** in the app — encrypted at rest, holds the root credential. Replaces the plaintext Ed25519 seed at `app/src-tauri/src/operator.rs`. | claude *(was kimi)* |
+| A1 | **Identity vault** in the app — encrypted at rest, holds the root credential. Replaces the plaintext Ed25519 seed at `app/src-tauri/src/operator.rs`. | **codex** *(was kimi)* |
 | A2 | **App-instance harness LCT** — created on first run, persisted, distinct from the principal. | **claude** |
 | A3 | **Composed operator session** — daemon binds actor + principal + device + office, returns a session that later acts resolve through. | **claude** |
-| A4 | **The record carries all five fields** — and a test proves none is dropped. | claude *(was kimi)* |
+| A4 | **The record carries all five fields** — and a test proves none is dropped. | **codex** *(was kimi)* |
 
 **Acceptance, measured not asserted:**
 - a chain entry from an app act names **actor and principal distinctly**;
@@ -53,9 +53,9 @@ authority:   occupancy / delegation / session-id
 | # | deliverable | owner |
 |---|---|---|
 | B1 | Wire `witness_act::sign_act` / `verify_witness` — **currently zero callers**. | **claude** |
-| B2 | Chain gains a signature column; **archive the experimental chain, start signed at genesis** (0014 §6, dp's ruling). | claude *(was kimi)* |
+| B2 | Chain gains a signature column; **archive the experimental chain, start signed at genesis** (0014 §6, dp's ruling). | **codex** *(was kimi)* |
 | B3 | App acts signed by the **harness** LCT, per A's composition. | **claude** |
-| B4 | Verification path + a test that an unsigned or wrongly-signed act is rejected. | claude *(was kimi)* |
+| B4 | Verification path + a test that an unsigned or wrongly-signed act is rejected. | **codex** *(was kimi)* |
 
 **Acceptance:** every entry in the new chain verifies; the archived chain is reachable and labelled
 as the unsigned era; **a forged signer fails a test.**
@@ -70,8 +70,8 @@ constellation` ships 12 verbs and the app reaches none.
 | # | deliverable | owner |
 |---|---|---|
 | C1 | Device list with the **four states** distinguished: known / enrolled / **consenting** / revoked (`PRD_APP` §5.2). | **claude** |
-| C2 | Guided add — and the app states **which custody model** is in use (`add` holds a key locally; `add-remote` holds none). | claude *(was kimi)* |
-| C3 | `serve-owner` as an explicit, **device-side** consent moment (R2 — being a factor is a separate grant from pairing). | claude *(was kimi)* |
+| C2 | Guided add — and the app states **which custody model** is in use (`add` holds a key locally; `add-remote` holds none). | **codex** *(was kimi)* |
+| C3 | `serve-owner` as an explicit, **device-side** consent moment (R2 — being a factor is a separate grant from pairing). | **codex** *(was kimi)* |
 | C4 | Assurance tier visible, and **what the next tier requires**. Revocation one action, reachable while panicking. | **claude** |
 
 **Acceptance:** a device can be added, enrolled, consented, and revoked entirely from the app; the
@@ -91,7 +91,7 @@ and four things change the build:
 - **C6 — enrollment status must be read from the hub, never from the local roster.** `constellation
   revoke` touches only the hub (`cli.rs:2713-2731`), so a revoked device still reads `Active` in the
   local vault. The local `status` field is a latent mirror production never writes. **This is a bug
-  that is easy to write and hard to see.** *(owner: claude — was kimi)*
+  that is easy to write and hard to see.** *(owner: codex — was kimi)*
 - **C7 — revoked is a tombstone, not a disappearance.** The hub keeps the record and still lists it,
   and **re-enrollment reactivates** (rotating key/class, bumping `enrollment_version`). Render
   revoked-and-present, not gone, and surface re-enrollment as the way back — owner-signed, so a
@@ -101,7 +101,7 @@ and four things change the build:
   consent field and there is no owner-side query for *"do you serve me?"*. So the app can show the
   **evidence** (a co-sign outcome — and the refusal names its own cause) but not the **state**. Two
   honest options: render from evidence, or spec a peer query over the pair channel. **R2 as written
-  implies the app can show the state; the code says it can only show the evidence.** *(owner: claude — was kimi; pick one and say which)*
+  implies the app can show the state; the code says it can only show the evidence.** *(owner: codex — was kimi; pick one and say which)*
 
 **And the panic path is settled by this** (kimi): the lost-phone action is **enrollment revocation**,
 not consent withdrawal. Revocation is owner-side, authoritative, and works from any of the owner's
@@ -119,8 +119,8 @@ design target; the salience rule.
 |---|---|---|
 | D1 | Three-place shell; bottom tabs on mobile, rail on desktop. | **claude** |
 | D2 | Default surface = **things awaiting the owner**, usually empty and looking correct when empty. | **claude** |
-| D3 | Three disclosure depths (plain / evidence / raw), owner-chosen. | claude *(was kimi)* |
-| D4 | **Visual convergence on `BRAND.md`** — both surfaces to canon, tokens from one source (`PRD_APP` §8.5). | claude *(was kimi)* |
+| D3 | Three disclosure depths (plain / evidence / raw), owner-chosen. | **codex** *(was kimi)* |
+| D4 | **Visual convergence on `BRAND.md`** — both surfaces to canon, tokens from one source (`PRD_APP` §8.5). | **codex** *(was kimi)* |
 
 **Acceptance:** every function reachable in ≤2 taps on a phone; **no non-salient datum on a default
 path**; app and dashboard indistinguishable in identity.
@@ -131,7 +131,7 @@ path**; app and dashboard indistinguishable in identity.
 
 | # | deliverable | owner |
 |---|---|---|
-| E1 | Guided join; **pending is a first-class state** (hub law escalates every non-trivial join). | claude *(was kimi)* |
+| E1 | Guided join; **pending is a first-class state** (hub law escalates every non-trivial join). | **codex** *(was kimi)* |
 | E2 | Invitation-first discovery: URL / QR / deep link. | **claude** |
 | E3 | Federated gossip — *pending* codex/GPT's answer on whether hub-side peer exposure exists. | **blocked** |
 
@@ -161,12 +161,16 @@ The line is deliberate — **the seat that builds the identity vault is not the 
 thing that signs with it.** Neither of us can land a whole sprint alone, so each sprint has a
 built-in NOT-SAME reviewer.
 
-> **Review capacity — the property this plan lost.** The split existed so that the seat building the
-> identity vault was not the seat building the thing that signs with it: every sprint carried its own
-> NOT-SAME reviewer. With kimi out, **that guarantee is gone**, and codex/GPT are one entity, so the
-> independent pool for *code* is empty.
+> **Review capacity — restored in part, with one residual caveat that must not be forgotten.**
+> The split exists so that the seat building the identity vault is not the seat building the thing
+> that signs with it. With codex taking kimi's half that property is back: **claude and codex are
+> NOT-SAME to each other and each reviews the other's code.**
 >
-> **Compensation, in force from Sprint A:**
+> **The caveat: codex and GPT are one entity.** GPT reviewed the design (0014) and codex now builds
+> half the implementation, so *design review and half the build share an author*. That is weaker than
+> the original arrangement and stronger than a single builder. It is recorded rather than resolved.
+>
+> **Compensation, in force from Sprint A and kept even with the split restored:**
 > 1. **Red before green.** Every guard test is committed *failing*, in its own commit, before the
 >    implementation exists. A test written after the code can be shaped to fit it; one committed red
 >    cannot.
