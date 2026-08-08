@@ -73,6 +73,13 @@ jobs:
         with:
           workspaces: hestia/core
 
+      # `hestia-wire` is a separate crate. Core and app compile it as a
+      # dependency, but Cargo does not run dependency-crate unit tests; invoke
+      # its golden-vector and framing controls explicitly.
+      - name: Test shared wire formats
+        working-directory: hestia/wire
+        run: cargo test --locked
+
       - name: Test
         working-directory: hestia/core
         run: cargo test --locked
