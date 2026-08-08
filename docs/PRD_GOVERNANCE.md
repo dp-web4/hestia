@@ -311,10 +311,23 @@ implementation status explicit.
 
 An appeal is a transition on **one previously recorded denied act**, not a token authorising a future
 act. The target record is identified by `action_id` and a versioned, domain-separated digest of a
-canonical serialisation of the original request, of which only the digest is persisted. That digest
-wire does **not** exist today: the chain carries a redacted, 400-byte-bounded `attempted` value, not
-the act digest. A retry must re-present the original bytes and the daemon must verify the new digest
-before re-evaluating it. The target state is an append-only fold of transitions:
+canonical serialisation of the original request, of which only the digest is persisted. The
+canonicalisation authority is [RFC 8785 JCS](https://www.rfc-editor.org/rfc/rfc8785) over a
+strict, versioned Hestia `ActEnvelope`; v1 enumerates tool, target, structured arguments, working
+directory, session, actor role/agent chain, instruction/delegation provenance, and beneficiary.
+Its digest is lowercase-hex SHA-256 over ASCII `hestia.act.v1`, one `0x00` byte, then the UTF-8
+JCS bytes. The schema rejects duplicate/unknown fields and values outside I-JSON rather than
+coercing them.
+
+JCS removes representation ambiguity; it does not guess operating-system semantics. Strings are
+preserved as received, with no Unicode, path, or command-text normalisation. JSON member order,
+inter-token whitespace, and permitted number spellings may converge; two path spellings or command
+strings that the host might happen to interpret alike remain different acts. Here, "the same act"
+means equality of the typed envelope values, not human judgement that two commands are equivalent.
+That digest wire does **not** exist today: the chain carries a redacted, 400-byte-bounded `attempted`
+value, not the act digest. A retry must re-present values that produce the recorded envelope digest,
+and the daemon must verify it before re-evaluating the act. The target state is an append-only fold
+of transitions:
 `appealed → granted` or `appealed → denied`, including `denied on appeal — reason: timeout`; a late
 ruling must lose a compare-and-swap against an already-terminal state.
 
@@ -326,8 +339,13 @@ refusal may enforce only after attribution is **installed and observed**, not me
 old name join can and does deliver grants to the literal `unattributed`: Kimi's 2026-08-08
 full-genesis census found **44 of 108 claimed grants** joined under that non-identity; all 108 claims
 joined to approved rows. A daemon-unreachable deny is not silently dropped: the target design
-requires a durable Plane-E record containing the action digest and enough provenance for later
-reconciliation. Plane E has never produced such a row at the measured seat, so this is a build
+requires the thin shim to pass its typed envelope through the one canonicalizer installed at
+`$HESTIA_HOME/shared` before the daemon round trip. On failure, Plane E durably records that digest
+and enough provenance for later reconciliation, never the raw request. Canonicalisation does **not**
+wait for reconciliation: redaction would make an all-argument digest unrecoverable, while retaining
+the raw denied payload in infrastructure telemetry would cross the privacy boundary. This makes the
+fallback an explicit dependency on Sprint 5's shared runtime rather than five implementations in
+five shims. Plane E has never produced such a row at the measured seat, so this is a build
 dependency, not an existing fallback.
 
 The design is deliberately staged. #281's marker-legibility work is an interim compatibility repair;
@@ -684,7 +702,7 @@ them today (§3), and the ladder's own logic supplies them:
 1. **Filable and act-bound.** The denied act is recorded before an appeal can open, with an
    `action_id` and versioned, domain-separated digest over its canonical serialization. The appeal
    references that record, never a marker or reusable claim token; a retry is accepted only when its
-   verbatim request hashes to the recorded digest. The state transition is append-only
+   typed envelope values hash to the recorded digest. The state transition is append-only
    (`appealed → granted|denied`), with timeout recorded under a non-merits reason class. Unattributed
    acts become explicitly non-appealable only after attribution is installed and observed, and
    daemon-unreachable denies require a durable Plane-E fallback record. #283 / decision 0013 is the
@@ -801,7 +819,8 @@ artifact assurance, no local fallback — plus the decision-0013 transition cont
 
 - Every governed act has a stable `action_id`, versioned canonical digest, actor role/agent chain,
    instruction/delegation provenance, and beneficiary. The digest is privacy-preserving but the
-   retry must re-present and match the original act verbatim.
+   retry must re-present the same typed `ActEnvelope` values; JCS removes JSON representation
+   variance, not path, Unicode, or command-string distinctions.
 - Appeals reference only that recorded act and originating chain. They append a terminal transition
     (`granted`, `denied`, or `denied on appeal — reason: timeout`); expiry is not silent and late
     rulings cannot overwrite a terminal state.
@@ -1051,13 +1070,20 @@ originating chain. The old marker path is removed after migration, not retained 
 
 **Five acceptance contracts from decision 0013:**
 
-1. **Canonical, domain-separated digest.** One versioned serialization produces the same digest for
-   semantically identical acts, rejects ambiguous encodings, and cannot collide by domain with a
-   witness digest or chain hash. A changed tool, target, argument, or provenance field fails the
-   retry. The test is red before the new plugin-to-daemon digest wire exists.
+1. **Canonical, domain-separated digest.** The v1 `ActEnvelope` schema plus RFC 8785 JCS and
+   `sha256(ascii("hestia.act.v1") || 0x00 || jcs_bytes)` is the authority. A shared
+   conformance-vector corpus is run through every engine adapter and the daemon: JSON member order,
+   JSON whitespace, and allowed number spellings converge; duplicate/unknown fields, non-I-JSON
+   values, and invalid Unicode are refused; Unicode normalization, path aliases, and command
+   whitespace do not converge. A changed tool, target, argument, working directory, session, actor,
+   instruction/delegation, or beneficiary field fails the retry. The test is red before the new
+   plugin-to-daemon digest wire exists.
 2. **Durable unavailable-daemon fallback.** Stop the daemon, trigger a governed denial through each
-   installed engine, restart both sides, and recover a Plane-E action record sufficient to open the
-   same act-bound appeal. An in-process buffer or a report without a row fails.
+   installed engine, restart both sides, and recover a Plane-E action record containing the digest
+   produced at act time by `$HESTIA_HOME/shared` plus sufficient provenance to open the same
+   act-bound appeal. Its digest must match the independent v1 conformance vector and the digest the
+   restarted daemon computes for the retry. A digest first invented at reconciliation, an in-process
+   buffer, a raw request in Plane E, or a report without a row fails.
 3. **Compare-and-swap terminal transition.** Race timeout against a late ruling on one appealed act.
    Exactly one terminal transition wins while the loser is appended as a rejected transition; no
    operator result is overwritten and no act acquires two terminal verdicts.
@@ -1127,6 +1153,10 @@ Gated on **all eight release gates in §10** — in particular the peer-path pro
 
 - The core installed at **`$HESTIA_HOME/shared`** and resolved there explicitly. Not under a harness home; not by walking up from a shim's own path.
 - Every harness reduced to a shim that parses its engine's event shape and renders its engine's verdict. Today the largest gate is **1800 lines against a 989-line core**, and two of five engines do not reference the core at all.
+- The versioned `ActEnvelope` builder and RFC 8785 canonicalizer installed in that shared runtime.
+  Shims supply typed engine fields to it; they do not implement canonicalization themselves. It is
+  callable without the decision daemon so a fail-closed act can still acquire the same digest that
+  normal-chain recording and retry verification use.
 - Self-protection **in the core**, so it stops being one member's property. It currently exists in exactly one gate; the member with the loudest compliance record is the only one carrying the check, and the member with a clean sheet has no rule.
 - The payload-key correction, integrity detection, and identity-from-process (§12.0).
 
