@@ -354,15 +354,16 @@ One row failed that standard and is corrected in place: the infra-telemetry row 
 | reputation contextualisation | **keyed on capacity, not office** | canonical: *"reputation is ROLE-CONTEXTUALIZED … there is no global reputation"* |
 | escalation store | **memory-only, rehydrated from chain** | `EscalationStore { by_id: HashMap<..> }`, `rehydrate()` |
 | the instruction to appeal | **delivered on every enforced deny** — but the text delivered is ref-dependent | rule reason `policy/presets.rs:89-93` → `guidance()` `{reason}` (`policy/types.rs:211-223`) → both hook paths render verbatim; 2nd site `handler.rs:1005-1010`. The *delivery* holds unconditionally: `{reason}` is rendered whatever it says. What varies is the reason — the sentence naming `hestia_appeal` is on 38 of 71 remote refs and **absent on 12**, whose older text names no tool (§15) |
-| appeal **filing** | **design updated, implementation pending** | #283 / decision 0013 binds an appeal to `action_id` + canonical act digest; historical `answers_deny` remains empty for 314/314 escalations |
+| appeal **filing** | **design updated, implementation pending** | #283 / decision 0013 binds an appeal to `action_id` + canonical act digest; historical `answers_deny` remains empty for 425/425 escalation opens |
 | appeal **routing** | **prefers a "live" arbiter, where live = inbox-touch** | a watcher polling on behalf of an out-of-budget member reports `live`; two appeals routed to an unreachable designee and ruled anyway (2026-07-27) |
 | appeal **window** | **measured in chain entries, not hours** | a busy session spends another member's window; re-run showed it was never a rate (2026-07-28) |
 | ruling **delivery** | **adjudicated on-chain, never bound to the appellant** | kimi's scope appeal ruled at chain `89318` (`upheld: false`); no response ever bound to the notice (2026-08-03) |
 | appeal **dispatch** | **mints flat `review_request` notices attributed to the appellant** | a third producer neither seat had counted; the chain is structurally blind to it (2026-08-03) |
 | approval join key | **marker compatibility path remains; act-bound target is pending** | #281 improves marker legibility; #283 replaces portable grants with a verdict on one recorded act |
+| act digest | **absent** | `policy_decision.attempted` is redacted and truncated at 400 bytes; canonical serialization, digest domain, and plugin-to-daemon wire are new work |
 | governance history | **visible** | ledger shipped #198/#202 |
 | deployment provenance | **measurable** | fleet manifest shipped #199 |
-| infra telemetry | **source producer merged; fleet wiring/deployment still unproven** | #243/#211 landed producer work; #272/#273 address member-agnostic installation and current-build authority. A green source check is not evidence of installed writers or live Plane-E rows |
+| infra telemetry | **source producer merged; fleet wiring/deployment still unproven** | #243/#211 landed producer work; #272/#273 address member-agnostic installation and current-build authority. Plane E has never recorded at the measured seat; a green source check is not evidence of installed writers or live rows |
 | deployment authority | **installer path is in review, not yet a fleet-wide live fact** | #272 generic installer and #273 Claude-specific installer are both open; converge on one `$HESTIA_HOME/shared` path and verify restart/live behavior |
 | installed gate | **must be measured per member** | deployment manifest/current-build file is the authority; distinguish source, merged, installed, restarted, live, and observed |
 | NOT-SAME review | **unrecordable on GitHub** | approve → *"Can not approve your own pull request"*; block → lands as a comment |
