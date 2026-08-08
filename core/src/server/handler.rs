@@ -1394,6 +1394,60 @@ fn resolve_attributed_caller(
     })
 }
 
+/// Witness a detected asker forgery, and return the refusal both doors send back.
+///
+/// A detected forgery is the most consequential thing either escalation door can conclude,
+/// and until this function existed it was the only refusal on either path that left NO row.
+/// Both arms returned a bare `Err`, which `call_tool` maps to `hestia.internal_error` — so
+/// "someone asserted a name they do not own" was indistinguishable, to every reader of the
+/// chain, from the server having crashed. That fails clause A of the accountability norm (the
+/// act and the evidence relied upon commit together), and it contradicts the rule the sibling
+/// arms state outright: *a refusal is a deny of the write, so it is witnessed rather than
+/// returned as a bare error the caller might log and forget.* The open path made that visible
+/// — its forgery refusal sat twenty lines above a `gate_escalation_refused` append it did not
+/// use.
+///
+/// One function for both doors deliberately. The guard was copied rather than shared, and the
+/// copy is why a census of "the claim path's three append sites" could be exactly right and
+/// still miss half the population.
+///
+/// The row carries BOTH names: one carrying only the asserted name cannot be told apart from
+/// an ordinary open. The session is recorded as an 8-char prefix — evidence that a session was
+/// presented and resolved, without keeping a live capability in a broadly-readable chain.
+fn refuse_asker_mismatch(
+    s: &super::state::ServerState,
+    plugin_id: &str,
+    tool_name: &str,
+    marker: &str,
+    who: &CallerWho,
+    session_id_arg: Option<&str>,
+) -> anyhow::Error {
+    let session = session_id_arg.unwrap_or("?");
+    let session_prefix: String = session.chars().take(8).collect();
+    let _ = s.append_chain(
+        "gate_escalation_refused",
+        json!({
+            "plugin_id": plugin_id,
+            "tool_name": tool_name,
+            "marker": marker,
+            "why": "asker mismatch",
+            "asserted_plugin_id": plugin_id,
+            "proven_plugin_id": who.plugin_id,
+            "session_prefix": session_prefix,
+            "spent": false,
+        }),
+    );
+    anyhow::anyhow!(
+        "escalation asker mismatch: session {} belongs to '{}' but the call asserts \
+         '{}'. The asker is the left operand of NOT-SAME; a name that disagrees with \
+         the session it was sent on cannot be the one recorded. Send your own \
+         plugin_id, or omit session_id and accept an unproven, operator-only ask.",
+        session,
+        who.plugin_id,
+        plugin_id
+    )
+}
+
 // NOTE: `resolve_caller` — the latest-session-fallback resolver — was deleted
 // 2026-07-28 when its last call site (tool_vault_get) was converted to
 // `resolve_attributed_caller`. Every authority-bearing surface now PROVES its caller;
@@ -9135,6 +9189,117 @@ mod tests {
             err.to_string().contains("asker mismatch"),
             "the refusal must name what disagreed: {err}"
         );
+
+        // The error text above only reaches the caller — and the caller, on a detected
+        // forgery, is the party with the least interest in reporting it. The refusal is only
+        // accountable if it survives in the chain, so the row is asserted here rather than
+        // left as a claim about what the code "would" record.
+        let rows = shared.lock().await.recent_chain(50);
+        let row = rows
+            .iter()
+            .find(|e| {
+                e.event_type == "gate_escalation_refused"
+                    && e.event_data["why"] == "asker mismatch"
+            })
+            .expect("a detected forgery must leave a row, not just an error string");
+        // BOTH names, or the row cannot be told apart from an ordinary refused open.
+        assert_eq!(row.event_data["asserted_plugin_id"], "codex");
+        assert_eq!(row.event_data["proven_plugin_id"], "claude-code");
+        assert_eq!(row.event_data["spent"], false);
+        // The chain is broadly readable; the session id is a live capability.
+        let prefix = row.event_data["session_prefix"].as_str().unwrap();
+        assert_eq!(prefix.len(), 8, "a prefix, not the whole session: {prefix}");
+        assert!(
+            !rows.iter().any(|e| e
+                .event_data
+                .to_string()
+                .contains(&session_of["claude-code"])),
+            "no row may carry the full session id"
+        );
+    }
+
+    /// The same forgery, at the OPEN door. Both doors carry a copy of this guard, and the
+    /// copy is the finding: a census of the claim path's append sites can be exactly right
+    /// and still describe half the population. Neither seat's audit had counted this arm —
+    /// it sat twenty lines above a `gate_escalation_refused` append it did not use.
+    #[tokio::test]
+    async fn the_open_door_records_a_session_that_disagrees_with_the_asserted_asker() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+
+        let err = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "session_id": session_of["claude-code"],
+                "role": "role:constellation:member",
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+            }),
+        )
+        .await
+        .expect_err("the open door must refuse a name the session does not own");
+        assert!(err.to_string().contains("asker mismatch"), "{err}");
+
+        let rows = shared.lock().await.recent_chain(50);
+        let row = rows
+            .iter()
+            .find(|e| {
+                e.event_type == "gate_escalation_refused"
+                    && e.event_data["why"] == "asker mismatch"
+            })
+            .expect("the open door's forgery refusal must leave a row too");
+        assert_eq!(row.event_data["asserted_plugin_id"], "codex");
+        assert_eq!(row.event_data["proven_plugin_id"], "claude-code");
+        // O: a denied act leaves state bit-identical — nothing was opened.
+        assert!(
+            !rows.iter().any(|e| e.event_type == "gate_escalation_opened"),
+            "a refused open must not also open: {rows:?}"
+        );
+    }
+
+    /// Negative control for both tests above. A row that appears no matter what the guard
+    /// concluded carries no information — `Result` was a constant `success` in this repo's
+    /// audit store once already. So: the same door, the same marker, an asker that PROVES
+    /// its own name, and the mismatch row must be absent.
+    #[tokio::test]
+    async fn a_proven_asker_writes_no_mismatch_row() {
+        let (_dir, shared) = make_shared_state();
+        let r = tool_connect(&shared, &json!({ "plugin_id": "codex", "host_agent": "h" }))
+            .await
+            .unwrap();
+        let session = r["sessionId"].as_str().unwrap().to_string();
+
+        tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "session_id": session,
+                "role": "role:constellation:member",
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+            }),
+        )
+        .await
+        .expect("a proven asker opening under its own name must succeed");
+
+        let rows = shared.lock().await.recent_chain(50);
+        assert!(
+            !rows
+                .iter()
+                .any(|e| e.event_data["why"] == "asker mismatch"),
+            "the mismatch row must depend on the mismatch: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|e| e.event_type == "gate_escalation_opened"),
+            "and the door must still work: {rows:?}"
+        );
     }
 
     /// The positive control for the binding above, and the more important half of it: the fix
@@ -11117,18 +11282,18 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     let mut s = state.lock().await;
     // A session that resolves IS the asker. A `plugin_id` that disagrees with it is not a
     // convenience to paper over — it is the forgery this binding exists to catch, so it is
-    // refused loudly rather than silently overridden.
+    // refused loudly rather than silently overridden. "Loudly" was a claim about the caller's
+    // error text only until `refuse_asker_mismatch` gave the refusal a row of its own.
     let proven_asker = resolve_attributed_caller(&s, session_id_arg.as_deref());
     if let Some(who) = &proven_asker {
         if who.plugin_id != plugin_id {
-            return Err(anyhow::anyhow!(
-                "escalation asker mismatch: session {} belongs to '{}' but the call asserts \
-                 '{}'. The asker is the left operand of NOT-SAME; a name that disagrees with \
-                 the session it was sent on cannot be the one recorded. Send your own \
-                 plugin_id, or omit session_id and accept an unproven, operator-only ask.",
-                session_id_arg.as_deref().unwrap_or("?"),
-                who.plugin_id,
-                plugin_id
+            return Err(refuse_asker_mismatch(
+                &s,
+                &plugin_id,
+                &tool_name,
+                &marker,
+                who,
+                session_id_arg.as_deref(),
             ));
         }
     }
@@ -11518,14 +11683,13 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     let proven_asker = resolve_attributed_caller(&s, session_id_arg.as_deref());
     if let Some(who) = &proven_asker {
         if who.plugin_id != plugin_id {
-            return Err(anyhow::anyhow!(
-                "escalation asker mismatch: session {} belongs to '{}' but the call asserts \
-                 '{}'. The asker is the left operand of NOT-SAME; a name that disagrees with \
-                 the session it was sent on cannot be the one recorded. Send your own \
-                 plugin_id, or omit session_id and accept an unproven, operator-only ask.",
-                session_id_arg.as_deref().unwrap_or("?"),
-                who.plugin_id,
-                plugin_id
+            return Err(refuse_asker_mismatch(
+                &s,
+                &plugin_id,
+                &tool_name,
+                &marker,
+                who,
+                session_id_arg.as_deref(),
             ));
         }
     }
