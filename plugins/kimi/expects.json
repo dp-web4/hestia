@@ -4,6 +4,13 @@
   ],
   "install": {
     "dest": "~/.kimi-code/hooks",
+    "registration": {
+      "reader": "toml-hook-commands",
+      "path": [
+        ".kimi-code",
+        "config.toml"
+      ]
+    },
     "files": [
       "hooks/pre_tool_use.py",
       "hooks/observe.sh",

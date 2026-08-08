@@ -4,6 +4,13 @@
   ],
   "install": {
     "dest": "~/.codex/hooks",
+    "registration": {
+      "reader": "toml-hook-commands",
+      "path": [
+        ".codex",
+        "config.toml"
+      ]
+    },
     "files": [
       "hooks/pre_tool_use.py",
       "hooks/witness.py",

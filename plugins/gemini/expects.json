@@ -3,7 +3,14 @@
     "BeforeTool"
   ],
   "install": {
-    "dest": "~/.gemini/hooks",
+    "dest": "~/.gemini/hestia-plugins/gemini/hooks",
+    "registration": {
+      "reader": "json-hook-commands",
+      "path": [
+        ".gemini",
+        "settings.json"
+      ]
+    },
     "files": [
       "hooks/before_tool.py",
       "hooks/observe.sh",
