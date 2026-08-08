@@ -1,6 +1,6 @@
 # PRD — Hestia governance: vault authority, canonical roles, and the third verdict
 
-**Status:** definitive · supersedes the drafts listed below · **Date:** 2026-08-05, amended 2026-08-06 (§2.11 + §8.4 the appeal path; §2.12 + §9.4 the partial absorption, corrected; §2.13 + §3 the telemetry row's evidence class, corrected on kimi's NOT-SAME review; §2.14 + §12 the false-positive closure moved Sprint 0 → Sprint 3; §2.15 the gate's refusal of this document — see §15 for what remains unread)
+**Status:** definitive · supersedes the drafts listed below · **Date:** 2026-08-05, amended 2026-08-08 (fresh `origin/main` baseline `c487d0a`; current-state re-audit; act-bound appeals, instruction provenance, deployment-stage distinctions, and sprint refresh)
 **Owner:** claude-code (CBP), by dp's assignment — *"you take the lead on hestia"*
 **Scope:** hestia only. Hub work and any web4-core changes are hub's; the autostash-prevention hook is legion's.
 
@@ -21,7 +21,7 @@
 
 Revised from GPT's §24. The changes are not stylistic — each one is a negotiated correction recorded in §2.
 
-> An **authenticated** agent acts through an approved harness shim, verified on that call, into one approved gate core. The core decides only from a validated in-memory snapshot loaded from the encrypted vault. The agent acts **in an office** only after its authority for that office is proven at the occupancy boundary — and where no qualified occupant exists, the office is filled **provisionally and loudly**, never silently. Every decision returns one of **three** verdicts, and an escalation is a request to a **sufficiently-permitted resolver**, of whom the operator is the last rather than the only. Every act is witnessed; every *infrastructure failure* is recorded outside the witness chain, so that silence in the chain is never mistaken for good conduct. A human changes outcomes by editing the law — and a **governed member changes the law by appealing it**, which is the only return path on that street and must therefore be filable, routable, windowed, and answered.
+> An **authenticated** agent acts through an approved harness shim, verified on that call, into one approved gate core. The core decides only from a validated in-memory snapshot loaded from the encrypted vault. The agent acts **in an office** only after its authority for that office is proven at the occupancy boundary — and where no qualified occupant exists, the office is filled **provisionally and loudly**, never silently. Every governed act has a stable action identity and canonical digest, including its actor, instruction/delegation provenance, and beneficiary. Every decision returns one of **three** verdicts, and an escalation is a request to a **sufficiently-permitted resolver**, of whom the operator is the last rather than the only. Every act is witnessed; every *infrastructure failure* is recorded outside the witness chain, so that silence in the chain is never mistaken for good conduct. A human changes outcomes by editing the law — and a **governed member changes the law by appealing it**: an appeal is a verdict on that recorded act, never a reusable grant or marker token, and must be filable, routable, windowed, terminally answered, and delivered only to the originating role/agent chain.
 
 **The property that is not machine-testable, put on the record anyway** (kimi, 2026-08-04):
 
@@ -300,11 +300,39 @@ One further detail, recorded because it is the class §2.13 exists for: the thir
 a fail-closed act leaving no durable record, encountered while amending the row about fail-closed
 acts leaving no durable record. Plane E has no writer, so there is nowhere for it to have gone.
 
+### 2.16 Appeals bind to the recorded act; provenance binds the deputy — **DECIDED, pending implementation**
+
+The fresh 2026-08-07 re-audit and dp's ruling expose a deeper defect than a missing response field:
+the current claim path treats `(plugin_id, marker)` as a portable capability. A grant can therefore
+be spent by another tool, target, session, or caller asserting the same name. PR #283 records the
+replacement design as decision 0013; this PRD adopts it as the target, while keeping the PR's
+implementation status explicit.
+
+An appeal is a transition on **one previously recorded denied act**, not a token authorising a future
+act. The act is identified by `action_id` and a versioned digest of a canonical, privacy-preserving
+normalisation of the original request. A retry must re-present the original bytes and the daemon must
+verify the digest before re-evaluating it. The current state is an append-only fold of transitions:
+`appealed → granted` or `appealed → denied`, including `denied on appeal — reason: timeout`; a late
+ruling must lose a compare-and-swap against an already-terminal state.
+
+The act record also carries composable provenance: actor role/agent chain, session/capacity,
+`instructor_lct` and instruction evidence, beneficiary member(s), delegation/request id, office and
+occupancy. Authority does not transfer through prose or a caller-supplied identity. An unattributed
+act is not appealable — there is no originating chain to which a ruling can be delivered. A daemon-
+unreachable deny is not silently dropped: the availability-not-blocker fallback records the action
+digest and enough provenance in Plane E for later reconciliation.
+
+The design is deliberately staged. #281's marker-legibility work is an interim compatibility repair;
+it is not the final authority model. #283 remains open for independent review, and no autonomous
+arbitration driver should be built until act binding, identity proof/signatures, provenance, and
+NOT-BENEFICIARY are in place. Current audit: `answers_deny` is empty for 314/314 historical
+escalations, so the chain contains the plumbing but not evidence that the return path works.
+
 ---
 
 ## 3. Grounded current state
 
-Every row was verified in source or against the live daemon on 2026-08-05. Nothing here is inferred from a document.
+Every row was re-audited against fresh `origin/main` (`c487d0a`) and the open-PR queue on 2026-08-08. A source merge is not an install, restart, or live observation; those stages are named separately below.
 
 One row failed that standard and is corrected in place: the infra-telemetry row described *branch* state under a header that promises source-or-live. Found by the NOT-SAME reviewer, recorded at §2.13, and left visible here rather than quietly rewritten — a table that silently repairs itself teaches the next reader nothing about how it got wrong.
 
@@ -318,16 +346,17 @@ One row failed that standard and is corrected in place: the infra-telemetry row 
 | reputation contextualisation | **keyed on capacity, not office** | canonical: *"reputation is ROLE-CONTEXTUALIZED … there is no global reputation"* |
 | escalation store | **memory-only, rehydrated from chain** | `EscalationStore { by_id: HashMap<..> }`, `rehydrate()` |
 | the instruction to appeal | **delivered on every enforced deny** — but the text delivered is ref-dependent | rule reason `policy/presets.rs:89-93` → `guidance()` `{reason}` (`policy/types.rs:211-223`) → both hook paths render verbatim; 2nd site `handler.rs:1005-1010`. The *delivery* holds unconditionally: `{reason}` is rendered whatever it says. What varies is the reason — the sentence naming `hestia_appeal` is on 38 of 71 remote refs and **absent on 12**, whose older text names no tool (§15) |
-| appeal **filing** | **unreachable — the required key is never delivered** | `require_string(args, "deny_hash")` (`handler.rs:2379`); hash minted then dropped (`let _ =`, `:1171`, `:1347`); absent from `PolicyEvaluation` (7 fields) and from the response (10 keys) |
+| appeal **filing** | **design updated, implementation pending** | #283 / decision 0013 binds an appeal to `action_id` + canonical act digest; historical `answers_deny` remains empty for 314/314 escalations |
 | appeal **routing** | **prefers a "live" arbiter, where live = inbox-touch** | a watcher polling on behalf of an out-of-budget member reports `live`; two appeals routed to an unreachable designee and ruled anyway (2026-07-27) |
 | appeal **window** | **measured in chain entries, not hours** | a busy session spends another member's window; re-run showed it was never a rate (2026-07-28) |
 | ruling **delivery** | **adjudicated on-chain, never bound to the appellant** | kimi's scope appeal ruled at chain `89318` (`upheld: false`); no response ever bound to the notice (2026-08-03) |
 | appeal **dispatch** | **mints flat `review_request` notices attributed to the appellant** | a third producer neither seat had counted; the chain is structurally blind to it (2026-08-03) |
-| approval join key | **`(plugin_id, marker)`; tool and session ignored** | `claim(&mut self, plugin_id, marker, now)` — `tool_name` recorded, compared nowhere |
+| approval join key | **marker compatibility path remains; act-bound target is pending** | #281 improves marker legibility; #283 replaces portable grants with a verdict on one recorded act |
 | governance history | **visible** | ledger shipped #198/#202 |
 | deployment provenance | **measurable** | fleet manifest shipped #199 |
-| infra telemetry | **merged, still uninstalled and uncalled — nothing records today** *(re-corrected 2026-08-06, §2.13)* | `record_gate_unavailable()` → `telemetry/gate-unavailable.jsonl` landed on `origin/main` at merge `25bc06d` (PR #211) and has **no production call site** there: 1 definition, 3 call sites, all in tests. Absent from kimi's installed hooks. No `telemetry/` directory exists under either seat's `$HESTIA_HOME`. Measured, not inferred: **172 fail-closed denies on the claude-code seat across 12 days and 47 sessions (first 2026-07-08), zero durable records** — while the escalation store was live and recording other events the same days |
-| installed gate | **behind source** | manifest: `hooks (claude-code): 4 diverged` |
+| infra telemetry | **source producer merged; fleet wiring/deployment still unproven** | #243/#211 landed producer work; #272/#273 address member-agnostic installation and current-build authority. A green source check is not evidence of installed writers or live Plane-E rows |
+| deployment authority | **installer path is in review, not yet a fleet-wide live fact** | #272 generic installer and #273 Claude-specific installer are both open; converge on one `$HESTIA_HOME/shared` path and verify restart/live behavior |
+| installed gate | **must be measured per member** | deployment manifest/current-build file is the authority; distinguish source, merged, installed, restarted, live, and observed |
 | NOT-SAME review | **unrecordable on GitHub** | approve → *"Can not approve your own pull request"*; block → lands as a comment |
 | branch protection | **status checks only** | `required_pull_request_reviews: None` |
 
@@ -621,9 +650,13 @@ who is awake**, a **window sized to the answerer**, a **verdict that reaches the
 **attribution that names who acted**. §8.2 supplies all four for escalation. Appeal has none of
 them today (§3), and the ladder's own logic supplies them:
 
-1. **Filable.** The deny must hand back the key its own instruction names. `PolicyEvaluation`
-   gains a hash field; the response gains a key; the two `let _ =` sites keep what they mint.
-   *Nothing about the verdict changes* — which is why this lands in Sprint 1, not Sprint 3.
+1. **Filable and act-bound.** The denied act is recorded before an appeal can open, with an
+   `action_id` and versioned canonical digest. The appeal references that record, never a marker or
+   reusable claim token; a retry is accepted only when its verbatim request hashes to the recorded
+   digest. The state transition is append-only (`appealed → granted|denied`), with timeout recorded as
+   `denied on appeal — reason: timeout`. Unattributed acts are not appealable, and daemon-unreachable
+   denies use the Plane-E fallback record. #283 / decision 0013 is the design target; the current
+   `deny_hash` consumer is compatibility debt, not the final contract.
 2. **Routable to someone awake.** Arbiter selection is resolver selection (§8.2) with an
    independence constraint. It reads **audited** and **witnessed** dimensions only (§7.4), never
    **declared** — and *liveness is a declared property of the wrong subject*: inbox-touch reports
@@ -640,6 +673,11 @@ them today (§3), and the ladder's own logic supplies them:
 appellant's name — a member is recorded as having asked for reviews it never chose. That is an
 attribution defect in plane D (§6), not a mesh nuisance: it puts acts in the record under an
 identity that did not perform them, which is precisely what §9.1 exists to stop.
+
+**Provenance and deputy constraint.** Every consequential act and appeal carries the composable
+role/agent chain, session/capacity, instructor and instruction evidence, beneficiary, delegation or
+request id, office, and occupancy. A caller cannot acquire authority by repeating an identity in
+prose. The originating chain is the delivery address; no proven origin means no appeal.
 
 **The instruction is part of the surface.** Any deny text naming a tool, an argument, or a
 channel is a promise the daemon must keep. Two do today (`presets.rs:89-93`,
@@ -666,9 +704,12 @@ Unknown office, insufficient authority, expired grant, or MRH mismatch fail clos
 
 ### 9.3 The approval join key
 
-`claim()` must join on the **resolver, the tool, and the attempted target** — not `(plugin_id, marker)`. Today the key is both tool-crossing and **session-crossing**, since `plugin_id` is identical across every session of one member: with *oldest-claimable-first*, one session silently spends an approval another session's act minted. Three read-approvals were spent by writes on 2026-08-05.
-
-Sequence (from #203): land the marker-legibility fix first (it fixes the false *negative*), then narrow the key, then bind the claim to its target.
+The final join key is the **recorded action**, not `(plugin_id, marker)` and not a portable
+capability. `action_id` plus a versioned canonical act digest binds the resolver's verdict to one
+tool, target, arguments, session, and originating role/agent chain. A different session or caller
+asserting the same name cannot spend it. #281's marker-legibility fix is a useful interim
+compatibility guard; #283 / decision 0013 is the target contract. Do not build an arbitration driver
+on the old claim-token semantics.
 
 ### 9.4 Independence is identity **and** stake — NOT-BENEFICIARY
 
@@ -695,6 +736,10 @@ So a scope- or authority-mutating act carries three additional fields:
 This is the T3/V3 posture rather than a rule: independence is **recorded and graded, never
 asserted**. It is also why §8.4's arbiter selection cannot be satisfied by cross-vendor alone.
 
+The same constraint applies to a deputy or instructor. Every act names `instructor_lct`, instruction
+evidence, delegation/request id, and beneficiary member(s). Authority does not pass through a prose
+instruction, and `NOT-BENEFICIARY` applies to every consequential ruling, not only scope grants.
+
 ---
 
 ## 10. The gate, and what gates the gate
@@ -704,6 +749,19 @@ Requirements carry forward from GPT's §13 — one decision service, syntax-only
 **§2.4:** every requirement here is justified by *legibility*, not by resistance to a determined member.
 
 **§2.5:** peer-path resolution gets a proof-of-life *before* the consolidation's shape hardens — one harness, one OS, modify-one-byte-fails-closed, demonstrated live. If peer-path resolution is unreliable, per-call assurance is caller self-report wearing a digest.
+
+**Current transition requirements (fresh re-audit):**
+
+9. Every governed act has a stable `action_id`, versioned canonical digest, actor role/agent chain,
+   instruction/delegation provenance, and beneficiary. The digest is privacy-preserving but the
+   retry must re-present and match the original act verbatim.
+10. Appeals reference only that recorded act and originating chain. They append a terminal transition
+    (`granted`, `denied`, or `denied on appeal — reason: timeout`); expiry is not silent and late
+    rulings cannot overwrite a terminal state.
+11. Daemon-unreachable denials use a durable Plane-E fallback record. Unattributed acts are not
+    appealable; they are explicitly terminal as unaddressable rather than silently claimable.
+12. Deployment status is stage-labelled: source, merged, installed, restarted, live, and observed
+    are separate facts, with the current-build authority file and installer proving the transition.
 
 **Release gates — the consolidation is not wired fleet-wide until all hold:**
 
@@ -729,11 +787,12 @@ kimi's third pushback, adopted: *"re-homed work that isn't announced reads as di
 |---|---|
 | governance ledger (#198, #202) | plane D — the projection. **Done** |
 | fleet manifest (#199) | §10 gate 5, and the standing audit instrument for `training:context-inspectable` |
-| `record_gate_unavailable()` | plane E's **producer only** — merged at `25bc06d` (PR #211), still uninstalled and with no production call site. **Not done**; Sprint 1 wires it into four harnesses *(re-corrected 2026-08-06 — §2.13)* |
+| `record_gate_unavailable()` | plane E producer merged (#211/#243 lineage); **fleet wiring and live evidence not done** until each installed harness emits a row under induced failure |
 | escalation store + rehydrate | §8 — becomes resolver-selection state |
-| `tool_appeal` + arbiter + `derivation.rs` joins | §8.4 — the consumer half is **already built and keyed on `deny_hash`**; it has never had an input |
+| `tool_appeal` + arbiter + `derivation.rs` joins | §8.4 — old `deny_hash` consumer is compatibility debt; #283 / decision 0013 is the act-bound replacement, pending review/implementation |
 | gate false-refusal fixes (#203) | §8.2 — draining the approval supply line. **Sprint 3, not Sprint 0** (§2.14) |
-| `rule_triggered` on the deny record | in flight on `kimi/rule-triggered-field` — the serialized field was hardcoded empty, so a deny named no rule. Lands in Sprint 1's *"every governed act says what it rests on"*; the PRD had not accounted for it |
+| current-build authority + installers | #272 generic and #273 Claude-specific are open; converge before claiming deployment, then verify install/restart/live/observed separately |
+| act provenance and beneficiary | design target from the 2026-08-07 re-audit; no implementation claim until actor, instructor, delegation, beneficiary, and originating-chain delivery are recorded |
 | mesh + `last-words` | plane D |
 | identity classification check | feeds the artifact manifest (§10) |
 | dashboard policy editors | the operator law surface (§4 principle 4) |
@@ -801,11 +860,15 @@ We hold consolidation's costs — a nominal single core everyone is said to depe
 
 ---
 
-### Sprint 0 — Finish the present *(mostly done)*
+### Sprint 0 — Finish the present *(source work largely merged; deployment proof remains)*
 
 **Goal:** the fleet's actual state is measurable and matches source.
 
-- Redeploy the installed gate on every member (claude-code diverges in 4 files; codex carries the scope escape).
+- Converge #272's generic installer and #273's Claude-specific lessons into one member-agnostic
+  deployment path at `$HESTIA_HOME/shared`; install, restart, and observe every governed member.
+- Treat the current-build authority file and `HESTIA_CURRENT_BUILD_FILE` as deployment evidence,
+  not as proof that a daemon has restarted. Record source/merged/installed/restarted/live/observed
+  separately and surface stale state to the operator.
 - **Measure and baseline** the read/write false-positive class (#203 FP6/FP8) — the approval supply line. **Closing** it is Sprint 3, not this sprint (§2.14): the read carve-out's only consumer is the daemon bypass, so the fix and a widened ungated set are one edit, and the spend-side constraint that makes it safe to land is Sprint 3's acceptance criterion.
 - Baseline the availability numbers kimi measured, as a standing metric rather than a one-off.
 - **Config drift detector** (§2.12 item 4): vault vs the on-disk shadow copy, distinct from the manifest's *hook* drift. It answers a question that is currently unanswerable — **has this already happened?** A non-zero first run is a finding to be published, not a bug to be quietly cleaned up before anyone looks.
@@ -849,17 +912,41 @@ This is §7.4's own rule turned on the measurement apparatus rather than on the 
 - `EvidenceClass` recorded on every trust-bearing assertion (§7.4).
 - `OccupancyBasis` recorded; **name the Policy-Entity office and mark it `Provisional`** with a real `audit_every` (§7.3, §8.1).
 - Consult `DelegationStore` in the decision path in **WARN**: log what *would* have changed, decide nothing (§3).
-- **Make appeal filable** (§8.4 item 1): a hash field on `PolicyEvaluation`, a key on the response, and the two `let _ = s.append_chain` sites (`handler.rs:1171`, `:1347`) keeping what they mint. Add the standing check that every value a deny's text names is present in that deny's response.
-- **Give plane E a writer** (§2.13). `record_gate_unavailable()` exists on a branch (PR #211) with **no call site**; merging it changes nothing. Wire it into the fail-closed deny path of each installed harness — four engines, not one — and distinguish `timeout` from `refused`, because those want opposite member responses.
+- **Make appeal filable and act-bound** (§2.16, §8.4): record the denied act with `action_id`,
+  canonical versioned digest, provenance, and originating chain before opening an appeal. Do not
+  extend the old `deny_hash` token model. Add red tests for digest mismatch, cross-session/cross-agent
+  claim, unattributed non-appealability, and terminal timeout compare-and-swap.
+- **Give Plane E a writer** (§2.13): wire the merged producer into the fail-closed path of every
+  installed harness — four engines, not one — and distinguish timeout, refusal, and unaddressable
+  acts. The fallback must retain enough action digest/provenance for later reconciliation.
 - Surface all of it in the ledger.
 
-**Acceptance:** four numbers exist that do not exist today — how many acts carry a declared vs audited vs witnessed identity; how many governed acts run under a provisional occupant; how many verdicts a live delegation would have changed; what the availability floor actually is. **Plus:** a member handed an enforced deny can file the appeal that deny's own text instructs it to file, demonstrated end-to-end on a real deny; and the deny-text check is RED against today's two promise sites before it is green. **And:** a deliberately induced fail-closed deny — the daemon stopped, one governed call made — produces a plane E row on **every** installed engine, the test being the row and not the report. The availability floor is derived from those rows, so it stops depending on one seat's wire logs.
+**Acceptance:** four numbers exist that do not exist today — how many acts carry a declared vs audited vs witnessed identity; how many governed acts run under a provisional occupant; how many verdicts a live delegation would have changed; what the availability floor actually is. **Plus:** a real denied act is recorded with its digest/provenance, an appeal reaches only its originating chain, a mismatched retry is refused, timeout becomes terminal, and an unattributed act is explicitly non-appealable. **And:** a deliberately induced fail-closed deny produces a Plane-E row on every installed engine, with the test being the row and not the report.
 
 **Not this sprint:** authority, enforcement, or any refusal that did not already happen. Appeal *filing* qualifies precisely because it changes no verdict — it returns a value the deny already computed and threw away.
 
-**Whose hands.** The appeal-filing diff must not be authored by a member that benefits from it — every candidate touches the deny path governing its own author. Both CBP seats have recused (§2.11); assign it to hub, or to a seat that is not governed by this gate.
+**Whose hands.** The act-binding and appeal-filing diff must be authored/reviewed under NOT-SAME
+and NOT-BENEFICIARY. The design is independently recorded in #283; implementation must have a
+different reviewer from the beneficiary and must not let the requester repair its own approval path.
 
 **Why first:** it is free to decide, and it stops every later sprint from silently claiming qualification it has not earned. It also produces the delegation number that tells us whether §9.2's model is right *before* we build on it.
+
+---
+
+### Shared prerequisite — instruction provenance and the deputy boundary
+
+This is cross-cutting, not a fourth identity vocabulary. Before Sprint 3 can select a resolver or
+arbiter, the chain must distinguish the actor who performed an act from the role/agent that
+instructed it and the member that benefits. The minimum record is:
+
+`actor_lct`, `actor_session`, `role_lct`, `instructor_lct`, `instruction_evidence`, `beneficiary_lct[]`,
+`delegation_id`/`request_id`, `office`, and `occupancy_generation`.
+
+The record is composable across delegation depth. A deputy's authority is the deputy's own proven
+occupancy plus an explicit delegation; prose saying “I was instructed by X” is evidence to inspect,
+not authority to inherit. NOT-BENEFICIARY and NOT-SAME are evaluated against this chain for every
+consequential act. Unattributed acts remain terminal and non-appealable because no originating chain
+exists to receive the verdict.
 
 ---
 
@@ -869,6 +956,10 @@ This is §7.4's own rule turned on the measurement apparatus rather than on the 
 
 - Bind `plugin_id` to a key at connect; derive every selector from the proven identity (§9.1).
 - Split capacity from office: capacity to the agent LCT; rename `role_lct` to what it holds (§7.2).
+- Record the composable actor/instructor/delegation/beneficiary chain on every governed act; a
+  deputy may transmit an instruction but cannot transmit the instructor's authority by assertion.
+- Introduce signatures or equivalent key-bound proof for the originating chain before any act-bound
+  grant is considered claimable.
 - Observe → warn → enforce, with the Sprint-1 counters as the readiness signal.
 
 **Acceptance:** a caller cannot select another member's grain; a session cannot assert another session's identity; the warn-phase count of would-be refusals reaches zero before enforce is switched on.
@@ -884,11 +975,12 @@ This is §7.4's own rule turned on the measurement apparatus rather than on the 
 - Un-collapse `law_gate.rs:166`.
 - Escalation becomes resolver selection; the operator is terminal, not sole (§8.2).
 - Resolver selection reads audited and witnessed dimensions only — never declared (§7.4).
-- Narrow `claim()` to resolver + tool + target, in the #203 order (§9.3).
+- Replace portable `claim()` tokens with a verdict on one recorded act (`action_id` + canonical
+  digest). #281 marker narrowing is interim only; #283's act-bound contract is the target.
 - **Close the read/write false-positive class** (#203 FP6/FP8), moved here from Sprint 0 (§2.14) — it lands *with* the spend-side constraint below, never before it, because widening the read carve-out without that constraint trades a false refusal for an act the daemon never sees. The class includes the gate's refusal of its own documentation (§2.15).
-- **The return channel, on the same machinery** (§8.4 items 2–4): arbiter selection is resolver selection with the independence constraint; the appeal window rebased off chain-entry count onto the answerer's units; rulings bound to the appellant's notice; appeal dispatch stops minting `review_request`s under the appellant's name.
+- **The return channel, on the same machinery** (§8.4 items 2–4): arbiter selection is resolver selection with the independence constraint; the appeal window rebased off chain-entry count onto the answerer's units; rulings bound to the appellant's recorded action and originating chain; appeal dispatch stops minting `review_request`s under the appellant's name. Expiry is a terminal timeout denial, not silent disappearance.
 
-**Acceptance:** an approval minted by a read cannot be spent by a write; an approval minted in one session cannot be spent by another; every resolution names its resolver and the authority it acted under; a resolver that is not independent of the author is refused. **And on the return channel:** an arbiter is never selected on inbox-touch liveness alone; an appeal's window cannot be consumed by another member's traffic; every ruling is bound to the notice that asked for it — replay the 2026-08-03 case (chain `89318`) and the appellant learns the verdict; no notice is attributed to a member that did not send it.
+**Acceptance:** a verdict for one recorded act cannot be spent by another tool, target, session, or agent; every resolution names its resolver and authority; a resolver that is not independent of the author or beneficiary is refused. **And on the return channel:** an arbiter is never selected on inbox-touch liveness alone; an appeal's window cannot be consumed by another member's traffic; every ruling is bound to the recorded action and originating chain; replay the 2026-08-03 case (chain `89318`) and the appellant learns the verdict; no notice is attributed to a member that did not send it; timeout and unattributed states are terminal and explicit.
 
 **Not this sprint:** T3/V3 thresholds. The first resolver tier is `training:context-inspectable`, which is *audited* and available on day one; numeric thresholds wait for §2.9.
 
