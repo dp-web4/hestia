@@ -336,9 +336,9 @@ The act record also carries composable provenance: actor role/agent chain, sessi
 occupancy. Authority does not transfer through prose or a caller-supplied identity. An unattributed
 act is not appealable — there is no originating chain to which a ruling can be delivered — but that
 refusal may enforce only after attribution is **installed and observed**, not merely merged. Today the
-old name join can and does deliver grants to the literal `unattributed`: Kimi's 2026-08-08
-full-genesis census found **44 of 108 claimed grants** joined under that non-identity; all 108 claims
-joined to approved rows. A daemon-unreachable deny is not silently dropped: the target design
+old name join can and does deliver grants to the literal `unattributed`: in the 2026-08-08
+full-genesis census, **44 of the 90 approved escalations opened under the literal `unattributed`
+`plugin_id` were claimed**. A daemon-unreachable deny is not silently dropped: the target design
 requires the thin shim to pass its typed envelope through the one canonicalizer installed at
 `$HESTIA_HOME/shared` before the daemon round trip. On failure, Plane E durably records that digest
 and enough provenance for later reconciliation, never the raw request. Canonicalisation does **not**
