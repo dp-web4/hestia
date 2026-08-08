@@ -125,8 +125,16 @@ mod tests {
     /// The property the length prefixes exist for.
     #[test]
     fn field_boundaries_cannot_be_shifted() {
-        let a = SessionTranscriptFields { actor: "xy", actor_public_key: "z", ..sample() };
-        let b = SessionTranscriptFields { actor: "x", actor_public_key: "yz", ..sample() };
+        let a = SessionTranscriptFields {
+            actor: "xy",
+            actor_public_key: "z",
+            ..sample()
+        };
+        let b = SessionTranscriptFields {
+            actor: "x",
+            actor_public_key: "yz",
+            ..sample()
+        };
         assert_ne!(
             canonical_session_transcript("c", &a),
             canonical_session_transcript("c", &b),
