@@ -1,4 +1,16 @@
 {
-  "gate": ["PreToolUse"],
-  "observe": ["PostToolUse"]
+  "gate": [
+    "PreToolUse"
+  ],
+  "install": {
+    "dest": "~/.kimi-code/hooks",
+    "files": [
+      "hooks/pre_tool_use.py",
+      "hooks/observe.sh",
+      "hooks/hydrate.sh"
+    ]
+  },
+  "observe": [
+    "PostToolUse"
+  ]
 }
