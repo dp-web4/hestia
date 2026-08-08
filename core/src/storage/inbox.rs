@@ -984,17 +984,30 @@ impl SqliteInboxStore {
         let before = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
-        let placeholders = (0..kinds.len())
-            .map(|i| format!("?{}", i + 3))
+        // `kinds` are ROOTS, not names (mesh-vocabulary migration step 1, as
+        // amended by kimi-code notice 718 §3). A row matches a root exactly, or
+        // as a dotted specialization of it — `review.request.security` is
+        // counted under the root `review.request` with no edit here.
+        //
+        // NOT `LIKE ?root || '.%'`: SQLite's LIKE reads `_` as a
+        // single-character wildcard, and the legacy roots that need matching
+        // during the migration window (`review_request`, `review_done`) all
+        // contain one. `substr` compares bytes, so a root's `_` stays a literal
+        // underscore — see `a_roots_underscore_is_a_literal_not_a_like_wildcard`.
+        let root_clauses = (0..kinds.len())
+            .map(|i| {
+                let p = i + 3;
+                format!("n.kind = ?{p} OR substr(n.kind, 1, length(?{p}) + 1) = ?{p} || '.'")
+            })
             .collect::<Vec<_>>()
-            .join(",");
+            .join(" OR ");
         let sql = format!(
             "SELECT id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at
              FROM member_notices n
              WHERE (n.to_plugin = ?1 OR n.from_plugin = ?1)
                AND n.dest_peer IS NULL
                AND n.queued_at < ?2
-               AND n.kind IN ({placeholders})
+               AND ({root_clauses})
                AND NOT EXISTS (SELECT 1 FROM member_notices r
                                WHERE r.in_reply_to = n.id
                                  AND (r.pointer_uri IS NULL
@@ -1555,6 +1568,83 @@ mod tests {
                 .unwrap().is_empty(),
             "a genuine reply still discharges the notice"
         );
+    }
+
+    /// ACCEPTANCE TEST for the mesh-vocabulary migration, step 1 as AMENDED by
+    /// kimi-code's review (notice 718,
+    /// `shared-context/forum/kimi-review-mesh-migration-accepted-classifiers-must-move-2026-08-03.md`
+    /// §3). RED before the root-aware predicate below it landed.
+    ///
+    /// The migration moves flat kinds to dotted roots (`review_request` →
+    /// `review.request`), and the step as I originally drafted it moved only
+    /// what the daemon ACCEPTS. This query is one layer downstream of
+    /// acceptance and matched `n.kind IN (...)` — exact. So the first sender to
+    /// emit the dotted spelling would produce notices that are accepted,
+    /// delivered, and never counted as awaiting: `i_owe`/`owed_to_me` go blind
+    /// in the reassuring direction, from a hole the migration itself dug.
+    /// Absence-read-as-pass, one layer up — this fleet's signature bug, which
+    /// the migration must not ship an instance of.
+    ///
+    /// Root-awareness also *gains* what the flat form could not express:
+    /// `review.request.security` is counted with no further edit.
+    #[test]
+    fn unanswered_counts_dotted_specializations_of_a_counted_root() {
+        let (_tmp, store) = fresh();
+        let counted: &[&str] = &["review.request", "reply"];
+        let exact = store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "review.request",
+                            Some("pr/1"), "h1", None)
+            .unwrap();
+        let deeper = store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "review.request.security",
+                            Some("pr/2"), "h2", None)
+            .unwrap();
+        // A sibling of the root, NOT a child of it: a segment boundary is
+        // required, or the allowlist quietly becomes a suffix wildcard.
+        store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "review.requested",
+                            Some("pr/3"), "h3", None)
+            .unwrap();
+        let owed = store.member_unanswered("kimi-code", counted, -1).unwrap();
+        let ids: Vec<u64> = owed.iter().map(|n| n.id).collect();
+        assert_eq!(ids, vec![exact, deeper],
+                   "the root and its specializations are counted; a sibling is not");
+    }
+
+    /// The over-match twin of the test above, and the reason the predicate is
+    /// `substr(...)` rather than the obvious `LIKE ?root || '.%'`.
+    ///
+    /// SQLite's LIKE treats `_` as a SINGLE-CHARACTER WILDCARD, and every kind
+    /// in this vocabulary that needs a root match during the migration window
+    /// contains one (`review_request`, `review_done`). Under LIKE — with no
+    /// ESCAPE clause — the legacy root `review_request` would also silently
+    /// count `reviewXrequest.*`: a classifier that over-matches on exactly the
+    /// names it exists to classify, in the direction that manufactures rows
+    /// nobody sent.
+    ///
+    /// GREEN BEFORE AND AFTER this change — it is a regression guard on the
+    /// implementation, not an acceptance test for the amendment, and it is
+    /// listed as such. Its teeth were verified by sabotage rather than
+    /// asserted: swapping the predicate for `n.kind LIKE ?root || '.%'` makes
+    /// it fail `left: [1, 2] right: [1]` (CBP, 2026-08-03). A guard that has
+    /// never been observed to fire is a claim about a guard.
+    #[test]
+    fn a_roots_underscore_is_a_literal_not_a_like_wildcard() {
+        let (_tmp, store) = fresh();
+        let real = store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "review_request",
+                            Some("pr/1"), "h1", None)
+            .unwrap();
+        store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "reviewXrequest.pr",
+                            Some("pr/2"), "h2", None)
+            .unwrap();
+        let owed = store
+            .member_unanswered("kimi-code", &["review_request"], -1)
+            .unwrap();
+        let ids: Vec<u64> = owed.iter().map(|n| n.id).collect();
+        assert_eq!(ids, vec![real],
+                   "`_` in a root is a literal underscore, not a LIKE wildcard");
     }
 
     /// ACCEPTANCE TEST for the git-manager increment (CBP 2026-07-28, re: notice 305;

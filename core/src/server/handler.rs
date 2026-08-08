@@ -3230,13 +3230,27 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
 /// entry, PR). Every send is a witnessed `member_notice` chain event BEFORE it is
 /// queued (O: witness precedes delivery), carrying sender WHO + recipient + kind +
 /// pointer — never a payload.
+/// These are ROOTS, matched by [`member_kind_in_class`]: a dotted
+/// specialization of any entry is admitted with no edit here.
+///
+/// Both spellings of each migrating kind are listed during the migration window
+/// (step 1, mesh-vocabulary thread) so senders can flip one kind at a time
+/// without a receiver restart. What is deliberately NOT listed is a bare
+/// `review` root: it would admit `review.escalation` — a kind neither
+/// [`MEMBER_KINDS_AWAIT_RESPONSE`] nor [`MEMBER_KINDS_ARE_DISPOSITIONS`]
+/// classifies, so it would be accepted, delivered, and silently uncounted.
+/// Widening the vocabulary is a vocabulary decision; it must not arrive as a
+/// side effect of making the matcher fractal.
 const MEMBER_NOTICE_KINDS: &[&str] = &[
     "coordination",
     "review_request",
+    "review.request",
     "review_done",
+    "review.done",
     "reply",
     "handoff",
     "forum-note",
+    "forum.note",
     "ack",
 ];
 
@@ -3269,7 +3283,7 @@ const DAEMON_NOTICE_KIND_UNREACHABLE: &str = "unreachable";
 /// Kinds that ARE a disposition: sending one is answering something, so it
 /// should name what. Expected here, optional everywhere else — never enforced,
 /// only reported (see `unbound_notice`).
-const MEMBER_KINDS_ARE_DISPOSITIONS: &[&str] = &["reply", "ack", "review_done"];
+const MEMBER_KINDS_ARE_DISPOSITIONS: &[&str] = &["reply", "ack", "review_done", "review.done"];
 
 /// Kinds that AWAIT a disposition: one of these with nothing bound to it is
 /// genuinely unanswered. `forum-note`, `coordination` and especially `handoff`
@@ -3278,7 +3292,51 @@ const MEMBER_KINDS_ARE_DISPOSITIONS: &[&str] = &["reply", "ack", "review_done"];
 /// mesh), so counting them would manufacture a standing false-positive class:
 /// the opposite-direction twin of the absence-read-as-pass bug this row exists
 /// to fix. `ack` is terminal and closes what it binds to.
-const MEMBER_KINDS_AWAIT_RESPONSE: &[&str] = &["review_request", "reply"];
+///
+/// ROOTS, matched by [`member_kind_in_class`] — and this list moving with the
+/// acceptance list is the whole of kimi-code's required amendment to step 1
+/// (notice 718 §3). Left flat while acceptance went fractal, the first sender
+/// to emit `review.request` would produce notices that are accepted,
+/// delivered, and never counted as awaiting: `i_owe` and `owed_to_me` go
+/// blind, quietly, in the reassuring direction — the same absence-read-as-pass
+/// bug this constant exists to fix, recreated one layer up by the migration
+/// meant to fix it.
+const MEMBER_KINDS_AWAIT_RESPONSE: &[&str] = &["review_request", "reply", "review.request"];
+
+/// Membership in a kind CLASS, not equality with a kind NAME.
+///
+/// Kinds are fractal (dp, 2026-07-24): each dotted segment NARROWS the one
+/// before it, so `review.request.security` belongs to the class `review.request`
+/// and every list above is a list of ROOTS. Both spellings of a migrating kind
+/// sit in those lists during the window — the flat legacy atom has no children,
+/// the dotted root has all of them.
+///
+/// A segment boundary is required. Matching on a bare string prefix turns a
+/// narrowing rule into a substring rule, which is how an allowlist quietly
+/// becomes a suffix wildcard: `reviewer` is NOT a child of `review`. Same rule,
+/// same reason, as the hub mesh's `cli.rs::validate_mesh_kind_in` and
+/// `hub-watch.sh`'s `kind_allowed` — three gates, one predicate.
+fn member_kind_in_class(kind: &str, roots: &[&str]) -> bool {
+    roots
+        .iter()
+        .any(|r| kind == *r || kind.strip_prefix(*r).is_some_and(|rest| rest.starts_with('.')))
+}
+
+/// Is a kind well-formed enough to be prefix-matched at all?
+///
+/// Mirrors the receive end's shape gate (`hub-watch.sh`: charset, then no empty
+/// leading/trailing/interior segment). Without it `review.` prefix-matches
+/// `review` and is admitted — a malformed kind that every downstream renderer
+/// and classifier would then have to special-case.
+fn member_kind_well_formed(kind: &str) -> bool {
+    !kind.is_empty()
+        && kind
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        && !kind.starts_with('.')
+        && !kind.ends_with('.')
+        && !kind.contains("..")
+}
 
 /// Default staleness before an unbound notice is worth announcing.
 const MEMBER_UNANSWERED_DEFAULT_SECS: i64 = 6 * 3600;
@@ -3371,10 +3429,20 @@ const MEMBER_NOTIFY_WINDOW_MS: u64 = 600_000;
 async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     let to_plugin = require_string(args, "to_plugin_id")?;
     let kind = require_string(args, "kind")?;
-    if !MEMBER_NOTICE_KINDS.contains(&kind.as_str()) {
+    // Shape gate BEFORE the root match — see `member_kind_well_formed`.
+    //
+    // The pair rule is unaffected by making this root-aware: `unreachable` is
+    // unmintable by members because it is absent from MEMBER_NOTICE_KINDS, and
+    // it is a child of nothing in that list. Adding a root that CONTAINED it
+    // would break the property, which is why the test pins the daemon-only kind
+    // against this gate directly.
+    if !member_kind_well_formed(&kind) || !member_kind_in_class(&kind, MEMBER_NOTICE_KINDS) {
         return Ok(hestia_error_envelope(
             "hestia.member_notify_unknown_kind",
-            &format!("kind '{}' not in {:?}", kind, MEMBER_NOTICE_KINDS),
+            &format!(
+                "kind '{}' is not a root in {:?} nor a dotted specialization of one",
+                kind, MEMBER_NOTICE_KINDS
+            ),
             Some(json!({"kind": kind})),
         ));
     }
@@ -3664,7 +3732,7 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     // unbound send is what leaves the sender's notice sitting "unanswered"
     // forever. Refusing it would be worse — a member with something to say and
     // a lost id would be silenced by the bookkeeping.
-    if in_reply_to.is_none() && MEMBER_KINDS_ARE_DISPOSITIONS.contains(&kind.as_str()) {
+    if in_reply_to.is_none() && member_kind_in_class(&kind, MEMBER_KINDS_ARE_DISPOSITIONS) {
         out["unbound_notice"] = json!(format!(
             "kind '{kind}' is a disposition — pass in_reply_to:<notice id> so the notice \
              it answers stops counting as unanswered"
@@ -4114,6 +4182,10 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
         "plugin_id": who.plugin_id,
         "older_than_secs": older_than_secs,
         "kinds_counted": MEMBER_KINDS_AWAIT_RESPONSE,
+        "kinds_counted_scope": "ROOTS, not names: a kind is counted if it equals a root or is a \
+                                dotted specialization of one (`review.request.security` counts \
+                                under `review.request`). Both spellings of a migrating kind are \
+                                listed during the vocabulary migration window",
         // Notices addressed to me that I never answered: my own debt.
         "i_owe": mine,
         // Notices I sent that nobody answered: did my wake land?
@@ -6375,6 +6447,71 @@ mod member_mesh_tests {
             .await
             .unwrap();
         c["sessionId"].as_str().unwrap().to_string()
+    }
+
+    /// Step 1 of the mesh-vocabulary migration: the RECEIVE gate admits a
+    /// dotted specialization of a root it already knows, exactly as the hub
+    /// mesh's sender gate does (`cli.rs::validate_mesh_kind_in`, cfb54d8) and
+    /// as `hub-watch.sh`'s `kind_allowed` does. Kinds are fractal: each dotted
+    /// segment NARROWS the one before it, so a vocabulary edit is needed only
+    /// at roots.
+    ///
+    /// The shape gate is what keeps a narrowing rule from decaying into a
+    /// substring rule: `reviewer` is not a child of `review`, and `review.`
+    /// must be refused before prefix matching ever sees it.
+    #[tokio::test]
+    async fn the_member_gate_admits_a_specialization_but_not_a_sibling() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "claude-code").await;
+        async fn send(state: &SharedState, sid: &str, kind: &str) -> Value {
+            tool_member_notify(state, &json!({
+                "session_id": sid, "to_plugin_id": "kimi-code",
+                "kind": kind, "pointer_uri": "forum/a.md#t",
+            })).await.unwrap()
+        }
+        for good in ["review_request", "review.request", "review.request.security"] {
+            let r = send(&state, &sid, good).await;
+            assert!(r.get("_hestia_error").is_none(),
+                    "'{good}' must be admitted: {r}");
+        }
+        for bad in ["reviewer", "review.", ".review", "review..pr", "review request"] {
+            let r = send(&state, &sid, bad).await;
+            assert_eq!(r["_hestia_error"]["code"], "hestia.member_notify_unknown_kind",
+                       "'{bad}' must be refused: {r}");
+        }
+        // THE PAIR RULE HOLDS. `unreachable` is unforgeable by construction
+        // precisely because it is absent from MEMBER_NOTICE_KINDS, and making
+        // acceptance root-aware must not create a root that reaches it. It is
+        // a child of nothing in the member vocabulary.
+        let r = send(&state, &sid, DAEMON_NOTICE_KIND_UNREACHABLE).await;
+        assert_eq!(r["_hestia_error"]["code"], "hestia.member_notify_unknown_kind",
+                   "the daemon-only kind stays unmintable by members: {r}");
+    }
+
+    /// The classifier half of the amendment (kimi-code, notice 718 §3): the two
+    /// constants downstream of acceptance are class membership, not name
+    /// equality. `MEMBER_KINDS_ARE_DISPOSITIONS` drives the `unbound_notice`
+    /// nudge — under a flat list, `review.done` sends would silently stop being
+    /// expected to bind.
+    #[tokio::test]
+    async fn the_disposition_nudge_follows_the_class_not_the_spelling() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "claude-code").await;
+        for disposition in ["review_done", "review.done", "reply", "ack"] {
+            let r = tool_member_notify(&state, &json!({
+                "session_id": sid, "to_plugin_id": "kimi-code",
+                "kind": disposition, "pointer_uri": "forum/a.md#t",
+            })).await.unwrap();
+            assert!(r.get("unbound_notice").is_some(),
+                    "'{disposition}' is a disposition and an unbound send must be nudged: {r}");
+        }
+        // `handoff` is deliberately not a disposition — the pickup IS the
+        // response, and it happens in a repo, not on the mesh.
+        let r = tool_member_notify(&state, &json!({
+            "session_id": sid, "to_plugin_id": "kimi-code",
+            "kind": "handoff", "pointer_uri": "repo/state",
+        })).await.unwrap();
+        assert!(r.get("unbound_notice").is_none(), "handoff is not a disposition: {r}");
     }
 
     /// G4 (thor, PR #44 hop 2): ATTRIBUTION IS NOT AUTHORIZATION.
