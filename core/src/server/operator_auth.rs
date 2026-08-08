@@ -940,6 +940,7 @@ mod tests {
         use web4_core::{crypto::KeyPair, lct::derive_lct_id};
 
         let principal_key = KeyPair::generate();
+        let wrong_principal_key = KeyPair::generate();
         let actor_key = KeyPair::generate();
         let device_key = KeyPair::generate();
         let principal = "lct:web4:operator:dp".to_string();
@@ -948,6 +949,13 @@ mod tests {
         let actor_public = hex::encode(actor_key.public_key_bytes());
         let device_public = hex::encode(device_key.public_key_bytes());
         let mut law = VaultPolicyState::default();
+        // A repeated LCT can exist during a policy/key transition. Evidence must
+        // retain the key that actually verified, not merely the first label match.
+        law.operator_access.push(OperatorIdentity {
+            lct_id: principal.clone(),
+            public_key_hex: hex::encode(wrong_principal_key.public_key_bytes()),
+            label: "stale key".into(),
+        });
         law.operator_access.push(OperatorIdentity {
             lct_id: principal.clone(),
             public_key_hex: hex::encode(principal_key.public_key_bytes()),
@@ -984,7 +992,7 @@ mod tests {
         );
         assert_eq!(
             authenticated.as_ref().map(|(_, key)| key.as_str()),
-            Some(law.operator_access[0].public_key_hex.as_str())
+            Some(law.operator_access[1].public_key_hex.as_str())
         );
 
         // Each semantic field is changed only AFTER all signatures were made.
