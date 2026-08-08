@@ -2542,6 +2542,95 @@ fn actor_liveness(window: &[crate::storage::chain::ChainEntry], plugin_id: &str)
     }
 }
 
+/// The refusal shapes an appeal may be filed against. A constant because the refusal message
+/// quotes it — a member told "not a deny" with no list has to guess which door it wanted.
+const APPEALABLE_EVENT_TYPES: [&str; 2] = ["policy_decision", "gate_self_access"];
+
+/// Who a refusal landed on, or `None` if this entry is not an appealable refusal.
+///
+/// TWO SHAPES, because a refusal is recorded two different ways and this door only ever
+/// recognised one of them.
+///
+/// 1. `policy_decision` + `decision: "deny"` — an ordinary boundary met in the course of
+///    work, written by `tool_witness_decision`, `plugin_id` flat.
+/// 2. `gate_self_access` — a refused WRITE to the governance surface, emitted by the harness
+///    gate's `deny_self_access`. It is deliberately NOT an ordinary deny: an ordinary deny is
+///    a boundary met while working, this is an attempt to reach the mechanism that draws the
+///    boundaries, so it gets its own event class an operator can alert on separately. That
+///    separation is right, and it silently cost the class its appeal — the class most likely
+///    to be a false positive is the one class that could not be disputed.
+///
+/// Measured on the live CBP chain 2026-08-08: 11 `gate_self_access` entries in a 500-entry
+/// window, none with a `policy_decision` twin. `hestia_appeal` against a real one (the deny
+/// this very change first tripped, `3f91fc3b…`) returned `appeal_not_a_deny` — the arm run,
+/// not inferred.
+///
+/// WHICH FIELD NAMES THE SUBJECT is the half that would have made a one-line widening land on
+/// nothing. `gate_self_access` is written through `tool_request_witness`, which wraps the
+/// caller's payload as `{requested_by, data}` — so `event_data.plugin_id` is ABSENT (verified
+/// on-chain, not inferred), and widening the type test alone would fall straight through to
+/// `appeal_not_yours` against an empty string. Two filters in series: repairing the visible
+/// one greens a zero.
+///
+/// So the subject is read from `requested_by.plugin_id`, and deliberately NEVER from
+/// `data.plugin_id`. `requested_by` is stamped by the daemon from the caller's live session
+/// (see `tool_request_witness`); `data` is whatever the caller sent. Reading the nested
+/// caller-authored copy would let a member name a PEER as the subject of a refusal and appeal
+/// in its name — the exact forgery the `{requested_by, data}` wrapper exists to prevent.
+///
+/// SCOPE, stated because the gap outlives this change: opening the door does not confer the
+/// credit. `derivation.rs` builds its Temperament population from `policy_decision` denies
+/// alone, so an appeal filed here is queued, ruled and witnessed, but scores no
+/// ask-after-deny. Whether a refused governance write should also move conduct is a posture
+/// decision for the operator — it would put ~11 refusals per 500 entries into the scored
+/// population — and is deliberately NOT smuggled in here. Pinned by
+/// `an_appealed_gate_self_refusal_scores_no_temperament_credit`.
+fn appealable_subject(e: &crate::storage::chain::ChainEntry) -> Option<&str> {
+    match e.event_type.as_str() {
+        "policy_decision" => {
+            if e.event_data.get("decision").and_then(Value::as_str) != Some("deny") {
+                return None;
+            }
+            e.event_data.get("plugin_id").and_then(Value::as_str)
+        }
+        // The daemon-stamped identity, never the caller's copy. See above.
+        "gate_self_access" => e
+            .event_data
+            .pointer("/requested_by/plugin_id")
+            .and_then(Value::as_str),
+        _ => None,
+    }
+    .filter(|s| !s.is_empty())
+}
+
+/// WHAT was refused, copied onto the appeal so an arbiter can rule from the appeal entry
+/// alone rather than needing the deny to still be inside ITS window.
+///
+/// A `policy_decision` carries `attempted` flat. A `gate_self_access` carries nothing by that
+/// name: its detail is nested under `data` (`tool_name`, `marker`, `gate_path`). Reading only
+/// the flat key would have filed every governance-write appeal with `about_attempted: null` —
+/// a door that opens onto a blank page, which an arbiter cannot rule on and would have looked
+/// like the appeal working.
+///
+/// The nested read here is safe where the subject read was not: this is DESCRIPTIVE text for
+/// a human arbiter, not the identity any decision keys on.
+fn appealed_act(e: &crate::storage::chain::ChainEntry) -> Value {
+    if let Some(attempted) = e.event_data.get("attempted") {
+        return attempted.clone();
+    }
+    if e.event_type == "gate_self_access" {
+        if let Some(d) = e.event_data.get("data") {
+            let f = |k: &str| d.get(k).and_then(Value::as_str).unwrap_or("?").to_string();
+            return json!({
+                "refused_write": f("tool_name"),
+                "governance_marker": f("marker"),
+                "gate_path": f("gate_path"),
+            });
+        }
+    }
+    Value::Null
+}
+
 /// File an appeal against a deny that landed on you.
 async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
     let deny_hash = require_string(args, "deny_hash")?;
@@ -2583,16 +2672,23 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
             Some(json!({"deny_hash": deny_hash, "window": APPEAL_CHAIN_WINDOW})),
         ));
     };
-    let is_deny = deny.event_type == "policy_decision"
-        && deny.event_data.get("decision").and_then(Value::as_str) == Some("deny");
-    if !is_deny {
+    let Some(subject) = appealable_subject(deny) else {
         return Ok(hestia_error_envelope(
             "hestia.appeal_not_a_deny",
-            &format!("entry {deny_hash} is a '{}', not a deny", deny.event_type),
-            Some(json!({"event_type": deny.event_type})),
+            &format!(
+                "entry {deny_hash} is a '{}', which is not a refusal this door accepts. \
+                 Appealable: a 'policy_decision' with decision='deny', or a \
+                 'gate_self_access' (a refused write to the governance surface). An \
+                 escalation is NOT appealable — 'gate_escalation_opened' is the paperwork \
+                 attached to a refusal, so appeal the refusal it answers, not the paperwork",
+                deny.event_type
+            ),
+            Some(json!({
+                "event_type": deny.event_type,
+                "appealable_event_types": APPEALABLE_EVENT_TYPES,
+            })),
         ));
-    }
-    let subject = deny.event_data.get("plugin_id").and_then(Value::as_str).unwrap_or_default();
+    };
     if subject != appellant.plugin_id {
         return Ok(hestia_error_envelope(
             "hestia.appeal_not_yours",
@@ -2695,7 +2791,7 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
             "reason": reason,
             // The disputed command, copied forward so an arbiter can rule from the appeal
             // entry alone rather than needing the deny to still be in ITS window.
-            "about_attempted": deny.event_data.get("attempted").cloned().unwrap_or(Value::Null),
+            "about_attempted": appealed_act(deny),
             "about_adjudicator": adjudicator,
             "routed_to": picked.as_ref().map(|(id, ..)| id.clone()),
             "routed_independence": picked.as_ref().map(|(_, i, ..)| i),
@@ -10178,6 +10274,138 @@ mod appeal_tests {
         assert!(score > filed_score,
                 "upholding an appeal must pay MORE than filing it ({filed_score} -> {score}), \
                  otherwise there is no reason for an arbiter to exist");
+    }
+
+    /// A refused governance write, recorded by THE REAL WRITER, not hand-authored.
+    ///
+    /// The row is minted through `tool_request_witness` — the same door the harness gate
+    /// uses — precisely because a hand-built `json!` here would certify my own belief about
+    /// the shape rather than the shape. That is the defect this thread already produced once
+    /// (a battery authored alongside the fix it was meant to test); the cure is to let the
+    /// producer produce the row.
+    async fn witness_gate_self_access(
+        state: &SharedState,
+        sid: Uuid,
+        subject_in_payload: &str,
+    ) -> String {
+        let out = tool_request_witness(state, &json!({
+            "session_id": sid.to_string(),
+            "event_type": "gate_self_access",
+            // Verbatim the payload the claude-code gate sends from `deny_self_access`.
+            "event_data": {
+                "plugin_id": subject_in_payload,
+                "tool_name": "Edit",
+                "marker": "<governance-surface marker>",
+                "gate_path": "/home/dp/.claude/hooks/<gate>",
+                "severity": "escalate",
+            },
+        })).await.unwrap();
+        out.get("witnessEntryHash").and_then(Value::as_str).unwrap().to_string()
+    }
+
+    /// THE DOOR. A refused write to the governance surface is appealable.
+    ///
+    /// Measured on the live CBP chain before this change: `hestia_appeal` against a real
+    /// `gate_self_access` (`3f91fc3b…`, the deny this very change first tripped) returned
+    /// `appeal_not_a_deny`. The class most likely to be a false positive was the one class
+    /// that could not be disputed.
+    #[tokio::test]
+    async fn a_refused_governance_write_can_be_appealed() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat(&state, "claude-code").await;
+        let hash = witness_gate_self_access(&state, sid, "claude-code").await;
+
+        // THE SECOND FILTER, pinned. `request_witness` nests the caller's payload, so the
+        // flat `plugin_id` the ownership check used to read is ABSENT. If this assertion ever
+        // fails, the writer started flattening and the subject read below wants revisiting —
+        // which is the drift that would otherwise pass silently.
+        {
+            let s = state.lock().await;
+            let e = s.recent_chain(50).into_iter().find(|e| e.hash == hash).unwrap();
+            assert!(e.event_data.get("plugin_id").is_none(),
+                    "flat plugin_id appeared — the nested-subject read is now the wrong one: {}",
+                    e.event_data);
+        }
+
+        let filed = tool_appeal(&state, &json!({
+            "deny_hash": hash, "session_id": sid.to_string(),
+            "reason": "the marker matched payload CONTENT, not the write destination — the \
+                       target is daemon source, not a governance surface",
+        })).await.unwrap();
+        assert!(filed.get("witnessEntryHash").is_some(),
+                "a refused governance write must be appealable: {filed}");
+
+        // The arbiter must be able to rule from the appeal entry alone. Reading only the flat
+        // `attempted` key would have filed this with `about_attempted: null`.
+        let s = state.lock().await;
+        let appeal = s.recent_chain(50).into_iter()
+            .find(|e| e.event_type == "appeal").expect("appeal witnessed");
+        let about = &appeal.event_data["about_attempted"];
+        assert_eq!(about["refused_write"], json!("Edit"),
+                   "the appeal must carry WHAT was refused, not a blank page: {about}");
+    }
+
+    /// THE FORGERY THE WRAPPER EXISTS TO PREVENT. `data.plugin_id` is caller-authored; if the
+    /// subject were read from there, any member could name a PEER as the subject of a refusal
+    /// and file in its name. The subject is the daemon-stamped `requested_by.plugin_id`.
+    ///
+    /// A positive control sits on the other side of the same row: the member who actually
+    /// tripped the gate CAN appeal it, so this test cannot pass by refusing everyone.
+    #[tokio::test]
+    async fn the_subject_of_a_refusal_is_the_daemon_stamp_not_the_callers_copy() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let claude = seat(&state, "claude-code").await;
+        let kimi = seat(&state, "kimi-code").await;
+        // claude trips the gate, but writes a PEER's id into the payload it controls.
+        let hash = witness_gate_self_access(&state, claude, "kimi-code").await;
+
+        let stolen = tool_appeal(&state, &json!({
+            "deny_hash": hash, "session_id": kimi.to_string(),
+            "reason": "filing against a refusal that names me in a payload I did not write",
+        })).await.unwrap();
+        assert!(format!("{stolen}").contains("appeal_not_yours"),
+                "the caller's own copy must not decide whose refusal this is: {stolen}");
+
+        let own = tool_appeal(&state, &json!({
+            "deny_hash": hash, "session_id": claude.to_string(),
+            "reason": "this refusal landed on me regardless of what the payload says",
+        })).await.unwrap();
+        assert!(own.get("witnessEntryHash").is_some(),
+                "positive control: the member the daemon stamped must still be able to \
+                 appeal, or the guard above passes by refusing everybody: {own}");
+    }
+
+    /// SCOPE, PINNED RATHER THAN DECLARED RED. Opening the door does not confer the credit:
+    /// `derivation.rs` builds its Temperament population from `policy_decision` denies alone,
+    /// so an appeal against a refused governance write is queued, ruled and witnessed and
+    /// moves no conduct score.
+    ///
+    /// This asserts the CURRENT behaviour deliberately. Whether a refused governance write
+    /// should also be scored conduct is a posture decision for the operator — on the measured
+    /// rate it would add ~11 refusals per 500 entries to the scored population — and a test
+    /// that failed to state the open question would block its own change from landing.
+    #[tokio::test]
+    async fn an_appealed_gate_self_refusal_scores_no_temperament_credit() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat(&state, "claude-code").await;
+        let hash = witness_gate_self_access(&state, sid, "claude-code").await;
+        let filed = tool_appeal(&state, &json!({
+            "deny_hash": hash, "session_id": sid.to_string(),
+            "reason": "the marker matched payload content, not the write destination",
+        })).await.unwrap();
+        assert!(filed.get("witnessEntryHash").is_some(), "appeal must file: {filed}");
+
+        let window = { state.lock().await.recent_chain(500) };
+        let d = crate::derivation::derive("claude-code", APPELLANT_ROLE, &window);
+        assert!(
+            d.temperament.evidence.iter().all(|e| !e.contribution.contains("appeal")),
+            "the credit gap closed without this test being updated — if a refused governance \
+             write now scores, that is a posture change and wants saying out loud: {:?}",
+            d.temperament.evidence
+        );
     }
 
     /// The constraint that is not a stub, enforced where it counts: server-side.
