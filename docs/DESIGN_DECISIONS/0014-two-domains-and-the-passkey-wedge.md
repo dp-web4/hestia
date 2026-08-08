@@ -263,10 +263,19 @@ constraint and proposed a `signed_from_position` boundary. That is no longer req
 - no era where signed and unsigned coexist and a reader must know which;
 - no boundary marker to explain, mis-read, or forget.
 
-**Measured state of signing, unchanged as of `4d4cad6`:** `sign_act` / `verify_witness` have **zero
+**Measured state of *chain* signing, as of `4d4cad6`:** `sign_act` / `verify_witness` have **zero
 callers** outside `witness_act.rs`, and `chain.rs` contains **zero occurrences of "signature"** —
 there is no column to hold one. The primitive is correct (N marks verify against one digest with
 `witnesses` cleared) and entirely unwired.
+
+> **Freshness, `#298` (Sprint A, merged 2026-08-08).** That measurement is about the **witness
+> chain**, and it still holds there. It is no longer true of the app: `#298` shipped encrypted
+> custody (Argon2id + ChaCha20-Poly1305) and a **triply signed five-field session transcript** —
+> principal, harness and device each signing the same domain-separated bytes — with the wire format
+> since consolidated into the `hestia-wire` crate (`#300`). So the *reference implementation this
+> section calls for exists*; what remains unwired is the chain column that would carry a signature
+> onto a witnessed entry. This document stays architectural: read the sections below as the design
+> the implementation now instantiates, not as a claim that nothing is built.
 
 > **The app should be the first signer.** It is a new surface with no legacy, its acts are
 > consequential (they fill the sovereign role), and it already depends on `ed25519-dalek`. Making the
@@ -275,7 +284,13 @@ there is no column to hold one. The primitive is correct (N marks verify against
 
 ---
 
-## 7. First cut: move the operator key out of a plaintext file
+## 7. First cut: move the operator key out of a plaintext file — **built in `#298`**
+
+> **Status, recorded so this section is not read as pending work.** The increment argued for below
+> landed in `#298` on 2026-08-08: the plaintext seed is gone, replaced by an Argon2id-derived,
+> ChaCha20-Poly1305 vault with a `LegacyOperatorKey` migration for existing installs. The reasoning
+> is kept in full because it is *why* the shape is what it is — and because the measured "before"
+> is what makes the change legible to a reader who arrives after it.
 
 dp: *"initially, just providing the sign-in key for the dashboard which would be easier and would
 move the key from plaintext file into the identity vault."*
@@ -292,8 +307,11 @@ Moving that seed into the identity vault:
 
 - **removes a plaintext private key from disk** — a real security improvement independent of
   everything else in this document;
-- makes the app's **first governance act** *"I hold the sovereign's key and I sign as them"*, which
-  is §2's human-harness relationship exercised end to end;
+- makes the app's **first governance act** *"I prove custody of the principal's key, and I sign the
+  composed transcript as a distinct actor"* — the app remains the **harness**, never the principal
+  (§2.1, §7.1). Custody is not impersonation: the app holds the key and signs *alongside* it as
+  itself, so the record names principal, harness and device separately. This is §2's human-harness
+  relationship exercised end to end;
 - proves app → daemon role occupancy with **one credential and no new protocol**, before the
   dashboard-rendering question is settled at all.
 
@@ -323,17 +341,26 @@ still bounded.
 **Decided:**
 1. Governance vault and identity vault are separate stores with different scopes and lifetimes.
 2. The app is a member with an LCT that fills roles; it does not bundle the daemon.
-3. Sovereignty is a profile (device / node / mirror), not a boolean.
+3. **Sovereign is an office**, occupied and revocable — not a property of a machine. *Presence*
+   is the profile (device / node / mirror): what a participant can host, which is a separate axis
+   from what authority it holds. §4. (This item previously read *"Sovereignty is a profile"*,
+   which reintroduced the exact category error §4 removes; corrected before ratification.)
 4. The adoption wedge is WebAuthn, with m-of-n as hestia-side policy above it.
 5. The chain is archived and re-created signed, rather than migrated.
-6. First increment is the operator key into the identity vault.
+6. First increment is the operator key into the identity vault — **done, `#298`** (encrypted
+   custody + triply signed five-field session; wire format consolidated in `#300`). §7.
 
 **Open, and genuinely undecided:**
 - **Where the m-of-n threshold is authored.** Per-relying-party? Per-act-class? Owner-set globally?
   This is policy authorship and the answer determines whether it is a setting or a law.
-- **What happens when m cannot be reached** — travelling with one device, others at home. The
-  availability-not-blocker principle says degrade rather than lock out, but the degraded path for
-  *authentication* is exactly where an attacker aims.
+- **What happens when m cannot be reached** — travelling with one device, others at home. §5.6 is
+  the constraint: service may degrade, **identity assurance may not silently degrade**, so "relax
+  the threshold because the user is stuck" is *not* on the menu. The genuinely open question is
+  which of the remaining exits to build: **refuse** the act and say so; a **separate recovery
+  path** with its own (higher, slower) evidence bar; or a **separately declared lower-assurance
+  credential** whose reduced assurance is visible to the relying party at use time. The degraded
+  path for *authentication* is exactly where an attacker aims, which is why the choice is
+  enumerated rather than left to whatever the implementation does under pressure.
 - **Whether the identity vault syncs across the constellation, and how.** It must survive device
   loss, which implies replication; replication implies a sync protocol nobody has specified.
 - **Whether a hub can be an identity witness** for recovery — dp raised witnessing across hubs as a
