@@ -455,6 +455,43 @@ mod tests {
         assert_eq!(sessions.operator(&tok, 1500, SESSION_TTL_SECS), None);
     }
 
+    /// Sprint A / A4 RED guard. A session is not merely "the operator": it is the
+    /// authority chain through which a distinct harness acts for a principal. If any
+    /// field disappears here, later chain records cannot reconstruct it.
+    #[test]
+    fn operator_session_preserves_the_full_provenance_tuple() {
+        let provenance = OperatorProvenance {
+            actor: "lct:web4:app:test-instance".into(),
+            principal: "lct:web4:human:test-principal".into(),
+            via_device: "lct:web4:device:test-phone".into(),
+            office: "role:constellation:sovereign".into(),
+            authority: "occupancy:test-session-authority".into(),
+        };
+        assert_ne!(provenance.actor, provenance.principal);
+
+        let mut sessions = SessionStore::default();
+        let token = sessions.open(provenance.clone(), 1_000);
+        let resolved = sessions
+            .provenance(&token, 1_001, SESSION_TTL_SECS)
+            .expect("fresh session must resolve");
+        assert_eq!(resolved, &provenance);
+
+        let record = operator_session_opened_record(resolved);
+        for (field, expected) in [
+            ("actor", provenance.actor.as_str()),
+            ("principal", provenance.principal.as_str()),
+            ("via_device", provenance.via_device.as_str()),
+            ("office", provenance.office.as_str()),
+            ("authority", provenance.authority.as_str()),
+        ] {
+            assert_eq!(
+                record.get(field).and_then(|v| v.as_str()),
+                Some(expected),
+                "operator session record dropped {field}"
+            );
+        }
+    }
+
     #[test]
     fn challenge_store_is_single_use_and_time_bounded() {
         let mut s = ChallengeStore::default();
