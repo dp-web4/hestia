@@ -3,7 +3,9 @@
 **Status:** decided (dp, 2026-08-07). Supersedes the claim-token model.
 **Supersedes in flight:** #244 fix (2) as proposed in-thread; #281's visibility approach (which
 remains useful as an interim, but is not the repair).
-**Composes with:** the signature premise (dp, same session) — orthogonal, both required.
+**Composes with:** the signature premise (dp, same session). The dependency is **asymmetric** —
+this decision's *scope* closure stands alone; its *identity* clause requires signing. See
+[How this composes with signatures](#how-this-composes-with-signatures).
 
 ---
 
