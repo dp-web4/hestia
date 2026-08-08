@@ -311,10 +311,10 @@ implementation status explicit.
 
 An appeal is a transition on **one previously recorded denied act**, not a token authorising a future
 act. The target record is identified by `action_id` and a versioned, domain-separated digest of a
-canonical, privacy-preserving serialisation of the original request. That digest wire does **not**
-exist today: the chain carries a redacted, 400-byte-bounded `attempted` value, not the act digest.
-A retry must re-present the original bytes and the daemon must verify the new digest before
-re-evaluating it. The target state is an append-only fold of transitions:
+canonical serialisation of the original request, of which only the digest is persisted. That digest
+wire does **not** exist today: the chain carries a redacted, 400-byte-bounded `attempted` value, not
+the act digest. A retry must re-present the original bytes and the daemon must verify the new digest
+before re-evaluating it. The target state is an append-only fold of transitions:
 `appealed → granted` or `appealed → denied`, including `denied on appeal — reason: timeout`; a late
 ruling must lose a compare-and-swap against an already-terminal state.
 
@@ -323,11 +323,12 @@ The act record also carries composable provenance: actor role/agent chain, sessi
 occupancy. Authority does not transfer through prose or a caller-supplied identity. An unattributed
 act is not appealable — there is no originating chain to which a ruling can be delivered — but that
 refusal may enforce only after attribution is **installed and observed**, not merely merged. Today the
-old name join can and does deliver grants to the literal `unattributed`: 44 of 90 approved historical
-rows were claimed. A daemon-unreachable deny is not silently dropped: the target design requires a
-durable Plane-E record containing the action digest and enough provenance for later reconciliation.
-Plane E has never produced such a row at the measured seat, so this is a build dependency, not an
-existing fallback.
+old name join can and does deliver grants to the literal `unattributed`: Kimi's 2026-08-08
+full-genesis census found **44 of 108 claimed grants** joined under that non-identity; all 108 claims
+joined to approved rows. A daemon-unreachable deny is not silently dropped: the target design
+requires a durable Plane-E record containing the action digest and enough provenance for later
+reconciliation. Plane E has never produced such a row at the measured seat, so this is a build
+dependency, not an existing fallback.
 
 The design is deliberately staged. #281's marker-legibility work is an interim compatibility repair;
 it is not the final authority model. Kimi's independent review says decision 0013 should stand and
@@ -615,11 +616,14 @@ Four current symptoms meet here, but resolver selection is no longer their first
 | `claim()` collides across tools and sessions | a marker token authorises a future act | decision 0013 binds the verdict to the recorded act |
 | NOT-SAME is discipline, not mechanism | one terminal resolver, so no selection step | selection *is* where independence is tested |
 
-**Hard prerequisite:** do not build the arbitration driver on the current claim path. Every one of
-the 215 measured escalation decisions was made by the operator; automating the resolver would turn a
-low-rate portable-token defect into a machine-rate deputy. Decision 0013 must land first, including
-signed origin for its identity clause, and NOT-BENEFICIARY still applies at resolver selection. The
-ordering changed: NOT-BENEFICIARY remains necessary, but it is no longer the first necessary repair.
+**Hard prerequisite:** do not build the arbitration driver on the current claim path. Issue #264's
+sample closed with **215 of 215** measured escalation decisions made by the operator. By Kimi's
+2026-08-08 full-genesis review census, the population had grown to 302: **297 operator and 5 peer**
+(3 kimi-code, 2 claude-code). Automating the resolver without the prerequisite would turn a low-rate
+portable-token defect into a machine-rate deputy; the five early peer rulings strengthen rather than
+relax that warning. Decision 0013 must land first, including signed origin for its identity clause,
+and NOT-BENEFICIARY still applies at resolver selection. The ordering changed: NOT-BENEFICIARY
+remains necessary, but it is no longer the first necessary repair.
 
 **The invitation is the appointment.** That is how `git-manager` becomes an office rather than a convention.
 
