@@ -11283,11 +11283,27 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     let invited = inv.invited;
     let invitations = deliver_invitations(&mut s, &esc, &invited, &entry.hash);
 
+    // WILL AN APPROVAL AGAINST THIS MARKER EVER BE CLAIMABLE? (dp, 2026-08-04: "yes, that's a
+    // problem - fix it".) `claim()` joins on (plugin_id, marker) and a member filing here picks
+    // that string itself, with no way to learn what its gate presents. One was filed with a
+    // human-readable marker, approved by dp, and was permanently unclaimable — indistinguishable
+    // from "not approved yet". Answered at OPEN, when it is still free to fix.
+    let marker_recognised = s.gate_escalations.marker_is_recognised(&plugin_id, &marker);
+    let known_markers = s.gate_escalations.known_gate_markers(&plugin_id);
 
     Ok(json!({
         "escalation_id": esc.id,
         "status": esc.stored_status(),
         "bar": esc.bar,
+        // null = nothing known yet (say so, do not reassure); false = gates have used OTHER
+        // spellings for this member and not this one.
+        "marker_recognised": marker_recognised,
+        "known_gate_markers": known_markers,
+        "marker_note": match marker_recognised {
+            Some(true) => "this marker matches one your gate has presented; an approval will be claimable",
+            Some(false) => "WARNING: your gate has never presented this marker. An approval against it                             will very likely be UNCLAIMABLE — the marker is a join key, not a label.                             Re-file using one of known_gate_markers.",
+            None => "no gate has claimed for this member yet, so nothing is known about this marker                      — this is 'unknown', not 'fine'",
+        },
         "expires_at": esc.expires_at,
         "ttl_secs": DEFAULT_TTL_SECS,
         "witnessEntryHash": entry.hash,
