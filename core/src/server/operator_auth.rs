@@ -82,30 +82,221 @@ impl ChallengeStore {
 /// strong evidence given at establishment is sufficient for the reversible
 /// majority; the irreversible tail always re-collects evidence).
 pub const SESSION_TTL_SECS: u64 = 3600;
+pub const SESSION_TRANSCRIPT_DOMAIN: &str = "hestia:operator-session:v1";
+pub const SOVEREIGN_OFFICE: &str = "role:constellation:sovereign";
+const MAX_COMPOSITION_FIELD_BYTES: usize = 512;
 
-/// Established operator sessions: opaque token → (operator lct_id, issued_at).
+/// The identity/authority composition carried by an app-originated operator session.
+///
+/// `principal` proves the challenge; `actor` is the harness that sent the request.
+/// The remaining fields say through which anchor, office, and authority it acts. Keeping
+/// this typed in the session store prevents later request records from reconstructing a
+/// weaker story from only the principal LCT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorProvenance {
+    pub actor: String,
+    pub principal: String,
+    pub via_device: String,
+    pub office: String,
+    pub authority: String,
+}
+
+impl OperatorProvenance {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        for (name, value) in [
+            ("actor", self.actor.as_str()),
+            ("principal", self.principal.as_str()),
+            ("via_device", self.via_device.as_str()),
+            ("office", self.office.as_str()),
+            ("authority", self.authority.as_str()),
+        ] {
+            if value.trim().is_empty() || value.trim() != value {
+                return Err(match name {
+                    "actor" => "actor must be non-empty and trimmed",
+                    "principal" => "principal must be non-empty and trimmed",
+                    "via_device" => "via_device must be non-empty and trimmed",
+                    "office" => "office must be non-empty and trimmed",
+                    _ => "authority must be non-empty and trimmed",
+                });
+            }
+            if value.len() > MAX_COMPOSITION_FIELD_BYTES || value.chars().any(char::is_control) {
+                return Err("composition fields must be bounded printable strings");
+            }
+        }
+        if self.actor == self.principal {
+            return Err("actor and principal must be distinct identities");
+        }
+        if self.actor == self.via_device || self.principal == self.via_device {
+            return Err("actor, principal, and via_device must be distinct identities");
+        }
+        if !self.actor.starts_with("lct:web4:")
+            || !self.principal.starts_with("lct:web4:")
+            || !self.via_device.starts_with("lct:web4:")
+        {
+            return Err("actor, principal, and via_device must be canonical Web4 LCT ids");
+        }
+        if self.office != SOVEREIGN_OFFICE {
+            return Err("operator sessions must exercise the sovereign office");
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_challenge(&self, challenge: &str) -> Result<(), &'static str> {
+        self.validate()?;
+        let expected = format!("operator-session:{challenge}");
+        if self.authority != expected {
+            return Err("authority must name the daemon-issued operator session challenge");
+        }
+        Ok(())
+    }
+}
+
+/// Length-delimited, domain-separated bytes signed by the principal, app
+/// harness, and device anchor. This is duplicated in the app identity domain;
+/// pinned test vectors on both sides make drift fail closed.
+pub fn canonical_session_transcript(
+    challenge: &str,
+    provenance: &OperatorProvenance,
+    actor_public_key: &str,
+    device_public_key: &str,
+) -> Vec<u8> {
+    let fields = [
+        ("challenge", challenge),
+        ("actor", provenance.actor.as_str()),
+        ("actor_public_key", actor_public_key),
+        ("principal", provenance.principal.as_str()),
+        ("via_device", provenance.via_device.as_str()),
+        ("device_public_key", device_public_key),
+        ("office", provenance.office.as_str()),
+        ("authority", provenance.authority.as_str()),
+    ];
+    let mut out = format!("{SESSION_TRANSCRIPT_DOMAIN}\n").into_bytes();
+    for (name, value) in fields {
+        out.extend_from_slice(format!("{name}:{}\n", value.len()).as_bytes());
+        out.extend_from_slice(value.as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Public evidence retained on the session-open record. None of these values is
+/// secret; retaining them lets a later reader reconstruct the transcript and
+/// verify the daemon's authentication claim rather than inheriting its verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorSessionProof {
+    pub principal_public_key: String,
+    pub actor_public_key: String,
+    pub device_public_key: String,
+    pub principal_signature: String,
+    pub actor_signature: String,
+    pub device_signature: String,
+    pub transcript_sha256: String,
+}
+
+impl OperatorSessionProof {
+    pub fn new(
+        challenge: &str,
+        provenance: &OperatorProvenance,
+        principal_public_key: &str,
+        actor_public_key: &str,
+        device_public_key: &str,
+        principal_signature: &str,
+        actor_signature: &str,
+        device_signature: &str,
+    ) -> Self {
+        let transcript = canonical_session_transcript(
+            challenge,
+            provenance,
+            actor_public_key,
+            device_public_key,
+        );
+        Self {
+            principal_public_key: principal_public_key.to_string(),
+            actor_public_key: actor_public_key.to_string(),
+            device_public_key: device_public_key.to_string(),
+            principal_signature: principal_signature.to_string(),
+            actor_signature: actor_signature.to_string(),
+            device_signature: device_signature.to_string(),
+            transcript_sha256: web4_core::crypto::sha256_hex(&transcript),
+        }
+    }
+}
+
+/// Existing dashboard sessions prove one operator directly; app sessions carry the
+/// complete harness composition. The legacy variant keeps the browser dashboard live
+/// while making it impossible for an app session to lose fields once admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorSessionIdentity {
+    DirectOperator(String),
+    Composed(OperatorProvenance),
+}
+
+impl From<String> for OperatorSessionIdentity {
+    fn from(value: String) -> Self {
+        Self::DirectOperator(value)
+    }
+}
+
+impl From<&str> for OperatorSessionIdentity {
+    fn from(value: &str) -> Self {
+        Self::DirectOperator(value.to_string())
+    }
+}
+
+impl From<OperatorProvenance> for OperatorSessionIdentity {
+    fn from(value: OperatorProvenance) -> Self {
+        Self::Composed(value)
+    }
+}
+
+impl OperatorSessionIdentity {
+    fn principal(&self) -> &str {
+        match self {
+            Self::DirectOperator(operator) => operator,
+            Self::Composed(provenance) => &provenance.principal,
+        }
+    }
+
+    fn provenance(&self) -> Option<&OperatorProvenance> {
+        match self {
+            Self::DirectOperator(_) => None,
+            Self::Composed(provenance) => Some(provenance),
+        }
+    }
+}
+
+/// Established operator sessions: opaque token → (identity composition, issued_at).
 #[derive(Debug, Default)]
 pub struct SessionStore {
-    sessions: HashMap<String, (String, u64)>,
+    sessions: HashMap<String, (OperatorSessionIdentity, u64)>,
 }
 
 impl SessionStore {
     /// Open a session for an already-authenticated operator; returns the opaque
     /// bearer token (32 random bytes hex) the client presents on later requests.
-    pub fn open(&mut self, operator_lct: &str, now: u64) -> String {
+    pub fn open(&mut self, identity: impl Into<OperatorSessionIdentity>, now: u64) -> String {
         use rand::RngCore;
         let mut buf = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut buf);
         let token = hex::encode(buf);
-        self.sessions
-            .insert(token.clone(), (operator_lct.to_string(), now));
+        self.sessions.insert(token.clone(), (identity.into(), now));
         token
     }
 
     /// Resolve a session token to its operator lct_id iff present and unexpired.
     pub fn operator(&self, token: &str, now: u64, ttl_secs: u64) -> Option<&str> {
-        self.sessions.get(token).and_then(|(op, issued)| {
-            (now.saturating_sub(*issued) <= ttl_secs).then_some(op.as_str())
+        self.sessions.get(token).and_then(|(identity, issued)| {
+            (now.saturating_sub(*issued) <= ttl_secs).then(|| identity.principal())
+        })
+    }
+
+    /// Resolve the complete provenance tuple for an app session. A direct browser
+    /// session deliberately returns `None`; it must never be dressed up as an app.
+    pub fn provenance(&self, token: &str, now: u64, ttl_secs: u64) -> Option<&OperatorProvenance> {
+        self.sessions.get(token).and_then(|(identity, issued)| {
+            (now.saturating_sub(*issued) <= ttl_secs)
+                .then(|| identity.provenance())
+                .flatten()
         })
     }
 
@@ -118,6 +309,56 @@ impl SessionStore {
         self.sessions
             .retain(|_, (_, issued)| now.saturating_sub(*issued) <= ttl_secs);
     }
+}
+
+/// Canonical chain payload for a composed session. One helper is shared by the
+/// endpoint and tests so adding a field to the type without recording it fails.
+pub fn operator_session_opened_record(
+    provenance: &OperatorProvenance,
+    proof: &OperatorSessionProof,
+) -> serde_json::Value {
+    json!({
+        "actor": provenance.actor,
+        "principal": provenance.principal,
+        "via_device": provenance.via_device,
+        "office": provenance.office,
+        "authority": provenance.authority,
+        "session_ref": provenance.authority,
+        "evidence": "principal+harness+device-signatures:v1",
+        "device_evidence": "self-issued-app-vault-key",
+        "authority_evidence": "principal-signature-over-session-composition",
+        "transcript": SESSION_TRANSCRIPT_DOMAIN,
+        "proof": {
+            "principal_public_key": proof.principal_public_key,
+            "actor_public_key": proof.actor_public_key,
+            "device_public_key": proof.device_public_key,
+            "principal_signature": proof.principal_signature,
+            "actor_signature": proof.actor_signature,
+            "device_signature": proof.device_signature,
+            "transcript_sha256": proof.transcript_sha256,
+        },
+    })
+}
+
+/// Attach the composed identity to an app act's existing evidence record.
+pub fn attach_operator_provenance(
+    mut record: serde_json::Value,
+    provenance: Option<&OperatorProvenance>,
+) -> serde_json::Value {
+    let (Some(object), Some(provenance)) = (record.as_object_mut(), provenance) else {
+        return record;
+    };
+    object.insert("actor".into(), json!(provenance.actor));
+    object.insert("principal".into(), json!(provenance.principal));
+    object.insert("via_device".into(), json!(provenance.via_device));
+    object.insert("office".into(), json!(provenance.office));
+    object.insert("authority".into(), json!(provenance.authority));
+    object.insert("session_ref".into(), json!(provenance.authority));
+    object.insert(
+        "composition_evidence".into(),
+        json!("principal+harness+device-signatures:v1"),
+    );
+    record
 }
 
 /// Request-level gate (clause O, at the middleware). Given the operator resolved
@@ -164,6 +405,85 @@ pub fn authenticate_operator(
     let sig = web4_core::crypto::SignatureBytes::from_bytes(sig_bytes);
     law.authorize_operator(lct_id, challenge.as_bytes(), &sig)
         .map(|op| op.lct_id.clone())
+}
+
+/// Authenticate a composed app session. All semantic fields and both local
+/// public keys are covered by three signatures: the authorized principal,
+/// the app harness, and the device anchor. The daemon re-derives actor/device
+/// LCT ids from their keys rather than accepting caller labels.
+#[allow(clippy::too_many_arguments)]
+pub fn authenticate_composed_operator(
+    law: &VaultPolicyState,
+    store: &mut ChallengeStore,
+    provenance: &OperatorProvenance,
+    challenge: &str,
+    actor_public_key_hex: &str,
+    device_public_key_hex: &str,
+    principal_signature_hex: &str,
+    actor_signature_hex: &str,
+    device_signature_hex: &str,
+    now: u64,
+    ttl_secs: u64,
+) -> Option<(String, String)> {
+    provenance.validate_for_challenge(challenge).ok()?;
+    if !canonical_lower_hex(actor_public_key_hex, 32)
+        || !canonical_lower_hex(device_public_key_hex, 32)
+        || !canonical_lower_hex(principal_signature_hex, 64)
+        || !canonical_lower_hex(actor_signature_hex, 64)
+        || !canonical_lower_hex(device_signature_hex, 64)
+    {
+        return None;
+    }
+
+    // Preserve the legacy endpoint's anti-replay property: any cryptographic
+    // attempt consumes the nonce, even when a later proof is invalid.
+    if !store.consume(challenge, now, ttl_secs) {
+        return None;
+    }
+
+    let actor_key = decode_public_key(actor_public_key_hex)?;
+    let device_key = decode_public_key(device_public_key_hex)?;
+    if web4_core::lct::derive_lct_id(&actor_key) != provenance.actor
+        || web4_core::lct::derive_lct_id(&device_key) != provenance.via_device
+    {
+        return None;
+    }
+
+    let transcript = canonical_session_transcript(
+        challenge,
+        provenance,
+        actor_public_key_hex,
+        device_public_key_hex,
+    );
+    let principal_signature = decode_signature(principal_signature_hex)?;
+    let actor_signature = decode_signature(actor_signature_hex)?;
+    let device_signature = decode_signature(device_signature_hex)?;
+
+    actor_key.verify(&transcript, &actor_signature).ok()?;
+    device_key.verify(&transcript, &device_signature).ok()?;
+    law.authorize_operator(&provenance.principal, &transcript, &principal_signature)
+        .and_then(|op| {
+            op.public_key()
+                .map(|key| (op.lct_id.clone(), hex::encode(key.to_bytes())))
+        })
+}
+
+fn decode_signature(value: &str) -> Option<web4_core::crypto::SignatureBytes> {
+    let bytes: [u8; 64] = hex::decode(value.trim()).ok()?.try_into().ok()?;
+    Some(web4_core::crypto::SignatureBytes::from_bytes(bytes))
+}
+
+fn decode_public_key(value: &str) -> Option<web4_core::crypto::PublicKey> {
+    let bytes: [u8; 32] = hex::decode(value.trim()).ok()?.try_into().ok()?;
+    web4_core::crypto::PublicKey::from_bytes(&bytes).ok()
+}
+
+fn canonical_lower_hex(value: &str, decoded_bytes: usize) -> bool {
+    value.len() == decoded_bytes * 2
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
 /// Consequence + reversibility of an operator act (clause S). The gradient:
@@ -455,6 +775,72 @@ mod tests {
         assert_eq!(sessions.operator(&tok, 1500, SESSION_TTL_SECS), None);
     }
 
+    /// Sprint A / A4 RED guard. A session is not merely "the operator": it is the
+    /// authority chain through which a distinct harness acts for a principal. If any
+    /// field disappears here, later chain records cannot reconstruct it.
+    #[test]
+    fn operator_session_preserves_the_full_provenance_tuple() {
+        let provenance = OperatorProvenance {
+            actor: "lct:web4:app:test-instance".into(),
+            principal: "lct:web4:human:test-principal".into(),
+            via_device: "lct:web4:device:test-phone".into(),
+            office: "role:constellation:sovereign".into(),
+            authority: "occupancy:test-session-authority".into(),
+        };
+        assert_ne!(provenance.actor, provenance.principal);
+
+        let mut sessions = SessionStore::default();
+        let token = sessions.open(provenance.clone(), 1_000);
+        let resolved = sessions
+            .provenance(&token, 1_001, SESSION_TTL_SECS)
+            .expect("fresh session must resolve");
+        assert_eq!(resolved, &provenance);
+
+        let proof = OperatorSessionProof::new(
+            "abc",
+            resolved,
+            &"33".repeat(32),
+            &"11".repeat(32),
+            &"22".repeat(32),
+            &"aa".repeat(64),
+            &"bb".repeat(64),
+            &"cc".repeat(64),
+        );
+        let record = operator_session_opened_record(resolved, &proof);
+        for (field, expected) in [
+            ("actor", provenance.actor.as_str()),
+            ("principal", provenance.principal.as_str()),
+            ("via_device", provenance.via_device.as_str()),
+            ("office", provenance.office.as_str()),
+            ("authority", provenance.authority.as_str()),
+        ] {
+            assert_eq!(
+                record.get(field).and_then(|v| v.as_str()),
+                Some(expected),
+                "operator session record dropped {field}"
+            );
+        }
+        assert_eq!(record["session_ref"], provenance.authority);
+        assert_eq!(record["evidence"], "principal+harness+device-signatures:v1");
+        assert_eq!(
+            record["proof"]["transcript_sha256"],
+            proof.transcript_sha256
+        );
+        assert_eq!(
+            record["proof"]["principal_public_key"],
+            proof.principal_public_key
+        );
+        assert_eq!(record["proof"]["actor_signature"], proof.actor_signature);
+
+        let later = attach_operator_provenance(
+            json!({"act": "POST /api/operator/gate-escalation"}),
+            Some(&provenance),
+        );
+        assert_eq!(later["session_ref"], provenance.authority);
+        assert_eq!(later["actor"], provenance.actor);
+        assert_eq!(later["principal"], provenance.principal);
+    }
+
     #[test]
     fn challenge_store_is_single_use_and_time_bounded() {
         let mut s = ChallengeStore::default();
@@ -547,6 +933,181 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn composed_session_requires_all_three_signers_and_binds_every_field() {
+        use web4_core::{crypto::KeyPair, lct::derive_lct_id};
+
+        let principal_key = KeyPair::generate();
+        let wrong_principal_key = KeyPair::generate();
+        let actor_key = KeyPair::generate();
+        let device_key = KeyPair::generate();
+        let principal = "lct:web4:operator:dp".to_string();
+        let actor = derive_lct_id(&actor_key.verifying_key());
+        let device = derive_lct_id(&device_key.verifying_key());
+        let actor_public = hex::encode(actor_key.public_key_bytes());
+        let device_public = hex::encode(device_key.public_key_bytes());
+        let mut law = VaultPolicyState::default();
+        // A repeated LCT can exist during a policy/key transition. Evidence must
+        // retain the key that actually verified, not merely the first label match.
+        law.operator_access.push(OperatorIdentity {
+            lct_id: principal.clone(),
+            public_key_hex: hex::encode(wrong_principal_key.public_key_bytes()),
+            label: "stale key".into(),
+        });
+        law.operator_access.push(OperatorIdentity {
+            lct_id: principal.clone(),
+            public_key_hex: hex::encode(principal_key.public_key_bytes()),
+            label: String::new(),
+        });
+        let mut store = ChallengeStore::default();
+
+        let challenge = store.issue(1_000);
+        let provenance = OperatorProvenance {
+            actor: actor.clone(),
+            principal: principal.clone(),
+            via_device: device.clone(),
+            office: "role:constellation:sovereign".into(),
+            authority: format!("operator-session:{challenge}"),
+        };
+        let transcript =
+            canonical_session_transcript(&challenge, &provenance, &actor_public, &device_public);
+        let authenticated = authenticate_composed_operator(
+            &law,
+            &mut store,
+            &provenance,
+            &challenge,
+            &actor_public,
+            &device_public,
+            &principal_key.sign(&transcript).to_hex(),
+            &actor_key.sign(&transcript).to_hex(),
+            &device_key.sign(&transcript).to_hex(),
+            1_000,
+            CHALLENGE_TTL_SECS,
+        );
+        assert_eq!(
+            authenticated.as_ref().map(|(lct, _)| lct.as_str()),
+            Some(principal.as_str())
+        );
+        assert_eq!(
+            authenticated.as_ref().map(|(_, key)| key.as_str()),
+            Some(law.operator_access[1].public_key_hex.as_str())
+        );
+
+        // Each semantic field is changed only AFTER all signatures were made.
+        // Every mutation must fail, including fields the policy engine does not
+        // otherwise interpret (office and authority).
+        for field in ["actor", "principal", "via_device", "office", "authority"] {
+            let challenge = store.issue(2_000);
+            let mut changed = OperatorProvenance {
+                actor: actor.clone(),
+                principal: principal.clone(),
+                via_device: device.clone(),
+                office: "role:constellation:sovereign".into(),
+                authority: format!("operator-session:{challenge}"),
+            };
+            let transcript =
+                canonical_session_transcript(&challenge, &changed, &actor_public, &device_public);
+            let principal_sig = principal_key.sign(&transcript).to_hex();
+            let actor_sig = actor_key.sign(&transcript).to_hex();
+            let device_sig = device_key.sign(&transcript).to_hex();
+            match field {
+                "actor" => changed.actor.push('x'),
+                "principal" => changed.principal.push('x'),
+                "via_device" => changed.via_device.push('x'),
+                "office" => changed.office.push('x'),
+                "authority" => changed.authority.push('x'),
+                _ => unreachable!(),
+            }
+            assert!(
+                authenticate_composed_operator(
+                    &law,
+                    &mut store,
+                    &changed,
+                    &challenge,
+                    &actor_public,
+                    &device_public,
+                    &principal_sig,
+                    &actor_sig,
+                    &device_sig,
+                    2_000,
+                    CHALLENGE_TTL_SECS,
+                )
+                .is_none(),
+                "changing {field} after signing was accepted"
+            );
+        }
+
+        for missing in ["principal", "actor", "device"] {
+            let challenge = store.issue(3_000);
+            let provenance = OperatorProvenance {
+                actor: actor.clone(),
+                principal: principal.clone(),
+                via_device: device.clone(),
+                office: SOVEREIGN_OFFICE.into(),
+                authority: format!("operator-session:{challenge}"),
+            };
+            let transcript = canonical_session_transcript(
+                &challenge,
+                &provenance,
+                &actor_public,
+                &device_public,
+            );
+            let mut principal_sig = principal_key.sign(&transcript).to_hex();
+            let mut actor_sig = actor_key.sign(&transcript).to_hex();
+            let mut device_sig = device_key.sign(&transcript).to_hex();
+            match missing {
+                "principal" => principal_sig.clear(),
+                "actor" => actor_sig.clear(),
+                "device" => device_sig.clear(),
+                _ => unreachable!(),
+            }
+            assert!(
+                authenticate_composed_operator(
+                    &law,
+                    &mut store,
+                    &provenance,
+                    &challenge,
+                    &actor_public,
+                    &device_public,
+                    &principal_sig,
+                    &actor_sig,
+                    &device_sig,
+                    3_000,
+                    CHALLENGE_TTL_SECS,
+                )
+                .is_none(),
+                "session opened without the {missing} signature"
+            );
+        }
+    }
+
+    #[test]
+    fn composed_session_transcript_matches_the_app_vector() {
+        let provenance = OperatorProvenance {
+            actor: "lct:web4:mb32:bactor".into(),
+            principal: "lct:web4:mb32:bprincipal".into(),
+            via_device: "lct:web4:mb32:bdevice".into(),
+            office: "role:constellation:sovereign".into(),
+            authority: "operator-session:abc".into(),
+        };
+        let transcript =
+            canonical_session_transcript("abc", &provenance, &"11".repeat(32), &"22".repeat(32));
+        assert_eq!(
+            web4_core::crypto::sha256_hex(&transcript),
+            "0524720396a6a9be07c5fa62e9e736e1d1302d59e37d7daf3609d8f87bd492a1",
+            "app/daemon transcript drifted; bump the domain version"
+        );
+    }
+
+    #[test]
+    fn composed_proof_hex_is_bounded_and_canonical() {
+        assert!(canonical_lower_hex(&"0a".repeat(32), 32));
+        assert!(!canonical_lower_hex(&"0A".repeat(32), 32));
+        assert!(!canonical_lower_hex(&"0a".repeat(31), 32));
+        assert!(!canonical_lower_hex(&"0a".repeat(33), 32));
+        assert!(!canonical_lower_hex(&format!("{}g0", "0a".repeat(31)), 32));
     }
 
     #[test]

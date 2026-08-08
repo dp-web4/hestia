@@ -77,6 +77,60 @@ jobs:
         working-directory: hestia/core
         run: cargo test --locked
 
+  # The app is a separate Rust crate plus a TypeScript frontend. Core green says
+  # nothing about either: Sprint A demonstrated the gap when an app-only helper
+  # passed its tests while the production sign-in path never called it.
+  app-tests:
+    name: app tests and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hestia
+
+      # app/src-tauri consumes the sibling identity crate by path, matching the
+      # development layout and the core job above.
+      - uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          path: web4
+
+      - uses: actions/setup-node@v4
+        with:
+          # react-router 8.3 declares >=22.22; Node 20 produces an unsupported
+          # engine warning even when the bundle happens to complete.
+          node-version: 22.22.0
+          cache: npm
+          cache-dependency-path: hestia/app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hestia/app/src-tauri -> target
+
+      - name: Install Tauri Linux test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev
+
+      - name: Install frontend dependencies
+        working-directory: hestia/app
+        run: npm ci
+
+      - name: Test Rust shell
+        working-directory: hestia/app/src-tauri
+        run: cargo test --locked
+
+      - name: Build frontend
+        working-directory: hestia/app
+        run: npm run build
+
   # ADDITION, 2026-07-29 (CBP): `cargo test` was the whole gate, and the Rust crate is
   # not the whole repo. Three plugin directories hold real behavioural tests — member-mesh
   # runs the actual watcher and fire scripts against a stub daemon, plus claude-code's law

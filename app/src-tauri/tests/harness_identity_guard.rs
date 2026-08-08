@@ -35,18 +35,38 @@
 //! as separate fields. They do **not** prove the daemon records both — that is A3/A4 and
 //! needs a daemon-side counterpart. A green here is necessary, not sufficient.
 
-use hestia_app_lib::identity;
+use std::fs;
+
+use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
+use hestia_app_lib::{identity, identity_vault::migrate_plaintext_operator_key};
+
+const PRINCIPAL: &str = "lct:web4:test:the-human-principal";
+const PASSPHRASE: &str = "test-only-passphrase";
+
+fn vault(dir: &std::path::Path) -> hestia_app_lib::identity_vault::IdentityVault {
+    let legacy = dir.join("operator.key");
+    fs::write(
+        &legacy,
+        serde_json::json!({
+            "lct_id": PRINCIPAL,
+            "secret_key_hex": hex::encode([0x5a; 32]),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    migrate_plaintext_operator_key(&legacy, dir.join("identity.vault"), PASSPHRASE).unwrap()
+}
 
 /// The harness must exist at all. Today there is no app-instance identity anywhere in the
 /// crate — the app borrows the principal's and presents it as its own.
 #[test]
 fn the_app_has_a_harness_identity() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let h = identity::harness_identity(dir.path()).expect("harness identity must be creatable");
+    let opened = vault(dir.path());
     assert!(
-        h.lct_id.starts_with("lct:"),
+        opened.harness_lct().starts_with("lct:"),
         "harness LCT must be an LCT id, got {:?}",
-        h.lct_id
+        opened.harness_lct()
     );
 }
 
@@ -56,11 +76,11 @@ fn the_app_has_a_harness_identity() {
 #[test]
 fn the_harness_is_not_the_principal() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let harness = identity::harness_identity(dir.path()).expect("harness identity");
-    let principal = "lct:web4:test:the-human-principal";
+    let opened = vault(dir.path());
 
     assert_ne!(
-        harness.lct_id, principal,
+        opened.harness_lct(),
+        PRINCIPAL,
         "the app must act as itself, never as its principal"
     );
 }
@@ -71,11 +91,18 @@ fn the_harness_is_not_the_principal() {
 #[test]
 fn the_harness_identity_survives_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let first = identity::harness_identity(dir.path()).expect("first run");
-    let second = identity::harness_identity(dir.path()).expect("second run — same app, restarted");
+    let first = vault(dir.path());
+    let first_lct = first.harness_lct().to_string();
+    drop(first);
+    let second = hestia_app_lib::identity_vault::IdentityVault::open(
+        dir.path().join("identity.vault"),
+        PASSPHRASE,
+    )
+    .expect("second run — same app, restarted");
 
     assert_eq!(
-        first.lct_id, second.lct_id,
+        first_lct,
+        second.harness_lct(),
         "the harness identity must be durable, not per-process"
     );
 }
@@ -86,15 +113,50 @@ fn the_harness_identity_survives_restart() {
 #[test]
 fn the_session_request_names_actor_and_principal_separately() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let harness = identity::harness_identity(dir.path()).expect("harness identity");
-    let principal = "lct:web4:test:the-human-principal";
+    let opened = vault(dir.path());
 
-    let body = identity::session_request_body(&harness, principal, "test-challenge", "deadbeef");
+    let body = identity::session_request_body(&opened, "test-challenge").unwrap();
 
     let actor = body.get("actor").and_then(|v| v.as_str());
     let princ = body.get("principal").and_then(|v| v.as_str());
 
-    assert_eq!(actor, Some(harness.lct_id.as_str()), "actor must be the harness");
-    assert_eq!(princ, Some(principal), "principal must be the human");
-    assert_ne!(actor, princ, "actor and principal must not be the same identity");
+    assert_eq!(
+        actor,
+        Some(opened.harness_lct()),
+        "actor must be the harness"
+    );
+    assert_eq!(princ, Some(PRINCIPAL), "principal must be the human");
+    assert_ne!(
+        actor, princ,
+        "actor and principal must not be the same identity"
+    );
+    assert_eq!(
+        body.get("via_device").and_then(|v| v.as_str()),
+        Some(opened.device_lct())
+    );
+
+    let composition = identity::SessionComposition::from_vault(&opened, "test-challenge");
+    let transcript = identity::canonical_session_transcript("test-challenge", &composition);
+    let verify = |public_hex: &str, signature_field: &str| {
+        let public: [u8; 32] = hex::decode(public_hex).unwrap().try_into().unwrap();
+        let signature: [u8; 64] =
+            hex::decode(body.get(signature_field).and_then(|v| v.as_str()).unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+        VerifyingKey::from_bytes(&public)
+            .unwrap()
+            .verify(&transcript, &Signature::from_bytes(&signature))
+            .unwrap();
+    };
+    verify(
+        &hex::encode(
+            SigningKey::from_bytes(&[0x5a; 32])
+                .verifying_key()
+                .to_bytes(),
+        ),
+        "signature",
+    );
+    verify(&opened.harness_public_key_hex(), "actor_signature");
+    verify(&opened.device_public_key_hex(), "device_signature");
 }

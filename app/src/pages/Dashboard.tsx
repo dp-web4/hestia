@@ -36,8 +36,8 @@ export function Dashboard() {
           <p>Daemon reachable — operator sign-in required</p>
           <p className="connect-hint">
             Every daemon API is behind the operator gate. Use <strong>Sign in</strong>{" "}
-            in the sidebar; it reads <code>~/.hestia/operator.key</code> and signs a
-            challenge. The key never leaves the app shell.
+            in the sidebar; it unlocks the app identity vault and signs a challenge.
+            The key never leaves the app shell.
           </p>
         </div>
       </div>

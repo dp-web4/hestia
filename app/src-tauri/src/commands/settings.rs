@@ -24,7 +24,9 @@ pub async fn set_mode(
             crate::persist_config(&app, &state);
             Ok(serde_json::json!({ "mode": mode }))
         }
-        _ => Err(format!("invalid mode: {mode}. expected sovereign|mirror|hybrid")),
+        _ => Err(format!(
+            "invalid mode: {mode}. expected sovereign|mirror|hybrid"
+        )),
     }
 }
 

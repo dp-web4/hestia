@@ -58,33 +58,166 @@ async fn operator_session(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let (lct_id, challenge, signature) = (
-        body.get("lct_id").and_then(|v| v.as_str()).unwrap_or(""),
+    use super::operator_auth::{
+        OperatorProvenance, OperatorSessionProof, SESSION_TRANSCRIPT_DOMAIN,
+        operator_session_opened_record,
+    };
+
+    let composed = [
+        "actor",
+        "principal",
+        "via_device",
+        "office",
+        "authority",
+        "actor_public_key",
+        "device_public_key",
+        "actor_signature",
+        "device_signature",
+    ]
+    .iter()
+    .any(|field| body.get(field).is_some());
+    let proof = if composed {
+        let required = |field: &str| {
+            body.get(field)
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let Some(actor) = required("actor") else {
+            return bad_operator_session("composed session is missing actor");
+        };
+        let Some(principal) = required("principal") else {
+            return bad_operator_session("composed session is missing principal");
+        };
+        let Some(via_device) = required("via_device") else {
+            return bad_operator_session("composed session is missing via_device");
+        };
+        let Some(office) = required("office") else {
+            return bad_operator_session("composed session is missing office");
+        };
+        let Some(authority) = required("authority") else {
+            return bad_operator_session("composed session is missing authority");
+        };
+        let candidate = OperatorProvenance {
+            actor,
+            principal,
+            via_device,
+            office,
+            authority,
+        };
+        if let Err(reason) = candidate.validate() {
+            return bad_operator_session(reason);
+        }
+        if body.get("lct_id").and_then(|v| v.as_str()) != Some(candidate.principal.as_str()) {
+            return bad_operator_session("lct_id must exactly equal principal");
+        }
+        if body.get("transcript").and_then(|v| v.as_str()) != Some(SESSION_TRANSCRIPT_DOMAIN) {
+            return bad_operator_session("unsupported or missing operator-session transcript");
+        }
+        let Some(actor_public_key) = required("actor_public_key") else {
+            return bad_operator_session("composed session is missing actor_public_key");
+        };
+        let Some(device_public_key) = required("device_public_key") else {
+            return bad_operator_session("composed session is missing device_public_key");
+        };
+        let Some(actor_signature) = required("actor_signature") else {
+            return bad_operator_session("composed session is missing actor_signature");
+        };
+        let Some(device_signature) = required("device_signature") else {
+            return bad_operator_session("composed session is missing device_signature");
+        };
+        Some((
+            candidate,
+            actor_public_key,
+            device_public_key,
+            actor_signature,
+            device_signature,
+        ))
+    } else {
+        None
+    };
+    let (principal, challenge, signature) = (
+        proof
+            .as_ref()
+            .map(|p| p.0.principal.as_str())
+            .unwrap_or_else(|| body.get("lct_id").and_then(|v| v.as_str()).unwrap_or("")),
         body.get("challenge").and_then(|v| v.as_str()).unwrap_or(""),
         body.get("signature").and_then(|v| v.as_str()).unwrap_or(""),
     );
     let now = super::state::unix_now();
     let mut s = state.lock().await;
     let law = s.vault.policy().clone();
-    let authed = super::operator_auth::authenticate_operator(
-        &law,
-        &mut s.operator_challenges,
-        lct_id,
-        challenge,
-        signature,
-        now,
-        super::operator_auth::CHALLENGE_TTL_SECS,
-    );
+    let authed = match proof.as_ref() {
+        Some((provenance, actor_key, device_key, actor_sig, device_sig)) => {
+            super::operator_auth::authenticate_composed_operator(
+                &law,
+                &mut s.operator_challenges,
+                provenance,
+                challenge,
+                actor_key,
+                device_key,
+                signature,
+                actor_sig,
+                device_sig,
+                now,
+                super::operator_auth::CHALLENGE_TTL_SECS,
+            )
+            .map(|(lct_id, principal_public_key)| (lct_id, Some(principal_public_key)))
+        }
+        None => super::operator_auth::authenticate_operator(
+            &law,
+            &mut s.operator_challenges,
+            principal,
+            challenge,
+            signature,
+            now,
+            super::operator_auth::CHALLENGE_TTL_SECS,
+        )
+        .map(|lct_id| (lct_id, None)),
+    };
     match authed {
-        Some(op) => {
-            let token = s.operator_sessions.open(&op, now);
-            let _ = s.append_chain(
-                "operator_session_opened",
-                serde_json::json!({ "operator": op, "evidence": "operator-lct-signature" }),
-            );
+        Some((op, principal_public_key)) => {
+            let (token, record, session_ref) = match proof {
+                Some((provenance, actor_key, device_key, actor_sig, device_sig)) => {
+                    // Authentication above proved every identity named in the tuple.
+                    debug_assert_eq!(provenance.principal, op);
+                    let session_proof = OperatorSessionProof::new(
+                        challenge,
+                        &provenance,
+                        principal_public_key
+                            .as_deref()
+                            .expect("composed authentication returns its authorized key"),
+                        &actor_key,
+                        &device_key,
+                        signature,
+                        &actor_sig,
+                        &device_sig,
+                    );
+                    let record = operator_session_opened_record(&provenance, &session_proof);
+                    let session_ref = Some(provenance.authority.clone());
+                    (
+                        s.operator_sessions.open(provenance, now),
+                        record,
+                        session_ref,
+                    )
+                }
+                None => (
+                    s.operator_sessions.open(op.clone(), now),
+                    serde_json::json!({
+                        "operator": op,
+                        "evidence": "operator-lct-signature",
+                    }),
+                    None,
+                ),
+            };
+            let _ = s.append_chain("operator_session_opened", record);
             (
                 StatusCode::OK,
-                Json(serde_json::json!({ "token": token, "operator": op })),
+                Json(serde_json::json!({
+                    "token": token,
+                    "operator": op,
+                    "session_ref": session_ref,
+                })),
             )
         }
         None => (
@@ -92,6 +225,13 @@ async fn operator_session(
             Json(serde_json::json!({ "error": "operator authentication failed" })),
         ),
     }
+}
+
+fn bad_operator_session(reason: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": reason })),
+    )
 }
 
 /// The operator-surface preflight (RWOA O): resolve the request's operator from
@@ -143,7 +283,7 @@ async fn operator_gate(
     }
 
     let now = super::state::unix_now();
-    let outcome = {
+    let (outcome, provenance) = {
         let s = state.lock().await;
         let law = s.vault.policy();
         let operator = bearer
@@ -153,7 +293,17 @@ async fn operator_gate(
                     .operator(t, now, super::operator_auth::SESSION_TTL_SECS)
             })
             .map(str::to_string);
-        gate_session_request(law, operator.as_deref(), stakes)
+        let provenance = bearer
+            .as_deref()
+            .and_then(|t| {
+                s.operator_sessions
+                    .provenance(t, now, super::operator_auth::SESSION_TTL_SECS)
+            })
+            .cloned();
+        (
+            gate_session_request(law, operator.as_deref(), stakes),
+            provenance,
+        )
     };
 
     // Self-witness the authorization decision (A) for consequential acts (skip the
@@ -162,7 +312,10 @@ async fn operator_gate(
         let mut s = state.lock().await;
         let _ = s.append_chain(
             "operator_gate",
-            outcome.evidence_record(&format!("{method} {path}")),
+            super::operator_auth::attach_operator_provenance(
+                outcome.evidence_record(&format!("{method} {path}")),
+                provenance.as_ref(),
+            ),
         );
     }
 
@@ -227,7 +380,10 @@ pub async fn serve_with_callback(
         .route("/api/trust/derivation", get(trust_derivation_json))
         .route("/api/trust/graph", get(trust_graph_turtle))
         .route("/api/operator/adjudicate", post(operator_adjudicate))
-        .route("/api/operator/gate-escalation", post(operator_gate_escalation))
+        .route(
+            "/api/operator/gate-escalation",
+            post(operator_gate_escalation),
+        )
         .route("/api/operator/alias", post(operator_alias))
         .route("/api/operator/amnesty", post(operator_amnesty))
         .route("/api/failures", get(failures_json))
@@ -414,7 +570,7 @@ struct OperatorIdentityAlias {
 struct OperatorAdjudication {
     subject_plugin_id: String,
     subject_role: String,
-    axis: String,    // validity | valuation (veracity stays daemon-computed via the plugin tool)
+    axis: String, // validity | valuation (veracity stays daemon-computed via the plugin tool)
     verdict: String, // upheld | partial | refuted | deferred
     #[serde(rename = "ref")]
     evidence_ref: String,
@@ -454,19 +610,32 @@ async fn operator_alias(
     Json(a): Json<OperatorIdentityAlias>,
 ) -> impl IntoResponse {
     if a.alias.trim().is_empty() || a.alias_of.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "alias and alias_of are both required"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+            "error": "alias and alias_of are both required"})),
+        )
+            .into_response();
     }
     if a.alias == a.alias_of {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "an identity cannot be an alias of itself"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+            "error": "an identity cannot be an alias of itself"})),
+        )
+            .into_response();
     }
-    if a.evidence_ref.is_empty() || a.evidence_ref.len() > 512
+    if a.evidence_ref.is_empty()
+        || a.evidence_ref.len() > 512
         || a.evidence_ref.chars().any(char::is_control)
     {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
             "error": "'ref' must be a single-line evidence pointer (<=512 bytes) — \
-                      joining two identities' evidence needs a stated basis"}))).into_response();
+                      joining two identities' evidence needs a stated basis"})),
+        )
+            .into_response();
     }
     let mut s = state.lock().await;
     let entry = match s.append_chain(
@@ -481,16 +650,23 @@ async fn operator_alias(
     ) {
         Ok(e) => e,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("witnessing: {e}")}))).into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("witnessing: {e}")})),
+            )
+                .into_response();
         }
     };
-    (StatusCode::OK, Json(serde_json::json!({
-        "alias": a.alias,
-        "alias_of": a.alias_of,
-        "witnessEntryHash": entry.hash,
-        "note": "evidence folds at READ time; nothing was rewritten"
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "alias": a.alias,
+            "alias_of": a.alias_of,
+            "witnessEntryHash": entry.hash,
+            "note": "evidence folds at READ time; nothing was rewritten"
+        })),
+    )
+        .into_response()
 }
 
 async fn operator_adjudicate(
@@ -498,20 +674,36 @@ async fn operator_adjudicate(
     Json(a): Json<OperatorAdjudication>,
 ) -> impl IntoResponse {
     if !matches!(a.axis.as_str(), "validity" | "valuation") {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
             "error": "operator adjudications cover axis validity|valuation \
-                      (veracity is daemon-computed calibration; temperament is conduct-derived)"}))).into_response();
+                      (veracity is daemon-computed calibration; temperament is conduct-derived)"})),
+        )
+            .into_response();
     }
-    if !matches!(a.verdict.as_str(), "upheld" | "partial" | "refuted" | "deferred") {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "verdict must be upheld|partial|refuted|deferred"}))).into_response();
+    if !matches!(
+        a.verdict.as_str(),
+        "upheld" | "partial" | "refuted" | "deferred"
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+            "error": "verdict must be upheld|partial|refuted|deferred"})),
+        )
+            .into_response();
     }
-    if a.evidence_ref.is_empty() || a.evidence_ref.len() > 512
+    if a.evidence_ref.is_empty()
+        || a.evidence_ref.len() > 512
         || a.evidence_ref.chars().any(char::is_control)
     {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
             "error": "'ref' must be a single-line evidence pointer (<=512 bytes) — \
-                      no pointer, no adjudication"}))).into_response();
+                      no pointer, no adjudication"})),
+        )
+            .into_response();
     }
     let role = crate::reputation::normalize_constellation_role(&a.subject_role);
     let score = match a.verdict.as_str() {
@@ -527,26 +719,32 @@ async fn operator_adjudicate(
     };
     let s = state.lock().await;
     let subject_instance_lct = s.member_lct(&a.subject_plugin_id);
-    let entry = match s.append_chain("adjudication", serde_json::json!({
-        "subject_plugin_id": a.subject_plugin_id,
-        "subject_instance_lct": subject_instance_lct,
-        "subject_role": role,
-        "axis": a.axis,
-        "verdict": a.verdict,
-        "score": score,
-        "method": a.method.clone().unwrap_or_else(|| "review".to_string()),
-        "ref": a.evidence_ref,
-        "reason": a.reason,
-        "adjudicated_by": {
-            "operator": true,
-            "sovereign_lct_id": s.sovereign.lct_id(),
-            "role_lct": s.sovereign.sovereign_role_id(),
-        },
-    })) {
+    let entry = match s.append_chain(
+        "adjudication",
+        serde_json::json!({
+            "subject_plugin_id": a.subject_plugin_id,
+            "subject_instance_lct": subject_instance_lct,
+            "subject_role": role,
+            "axis": a.axis,
+            "verdict": a.verdict,
+            "score": score,
+            "method": a.method.clone().unwrap_or_else(|| "review".to_string()),
+            "ref": a.evidence_ref,
+            "reason": a.reason,
+            "adjudicated_by": {
+                "operator": true,
+                "sovereign_lct_id": s.sovereign.lct_id(),
+                "role_lct": s.sovereign.sovereign_role_id(),
+            },
+        }),
+    ) {
         Ok(e) => e,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("witnessing: {e}")}))).into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("witnessing: {e}")})),
+            )
+                .into_response();
         }
     };
     let mut updated = None;
@@ -563,9 +761,12 @@ async fn operator_adjudicate(
         match s.apply_adjudication_ctx(&a.subject_plugin_id, dimension, score, &rep_ctx) {
             Ok(t) => updated = Some(t.entity_id),
             Err(e) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR,
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": format!("applying: {e}"),
-                        "witnessEntryHash": entry.hash}))).into_response()
+                        "witnessEntryHash": entry.hash})),
+                )
+                    .into_response();
             }
         }
     }
@@ -573,7 +774,8 @@ async fn operator_adjudicate(
         "witnessEntryHash": entry.hash,
         "axis": a.axis, "verdict": a.verdict, "score": score,
         "adjudicatedEntity": updated,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -598,31 +800,46 @@ async fn operator_amnesty(
     Json(a): Json<AmnestyRequest>,
 ) -> impl IntoResponse {
     if a.class != "deny" {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "only class 'deny' is amnestiable in v1"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+            "error": "only class 'deny' is amnestiable in v1"})),
+        )
+            .into_response();
     }
     if a.reason.trim().is_empty() || a.evidence_ref.is_empty() || a.evidence_ref.len() > 512 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "amnesty requires a reason and a single-line evidence ref"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+            "error": "amnesty requires a reason and a single-line evidence ref"})),
+        )
+            .into_response();
     }
     let s = state.lock().await;
-    match s.append_chain("amnesty", serde_json::json!({
-        "data": {
-            "class": a.class,
-            "before_position": a.before_position,
-            "reason": a.reason,
-            "ref": a.evidence_ref,
-        },
-        "declared_by": {
-            "operator": true,
-            "sovereign_lct_id": s.sovereign.lct_id(),
-            "role_lct": s.sovereign.sovereign_role_id(),
-        },
-    })) {
+    match s.append_chain(
+        "amnesty",
+        serde_json::json!({
+            "data": {
+                "class": a.class,
+                "before_position": a.before_position,
+                "reason": a.reason,
+                "ref": a.evidence_ref,
+            },
+            "declared_by": {
+                "operator": true,
+                "sovereign_lct_id": s.sovereign.lct_id(),
+                "role_lct": s.sovereign.sovereign_role_id(),
+            },
+        }),
+    ) {
         Ok(e) => Json(serde_json::json!({"witnessEntryHash": e.hash,
-            "excludes": format!("denies before #{}", a.before_position)})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("witnessing: {e}")}))).into_response(),
+            "excludes": format!("denies before #{}", a.before_position)}))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("witnessing: {e}")})),
+        )
+            .into_response(),
     }
 }
 
@@ -631,7 +848,9 @@ async fn trust_derivation_json(
     Query(q): Query<DerivationQuery>,
 ) -> impl IntoResponse {
     let s = state.lock().await;
-    let role = q.role.unwrap_or_else(|| "role:constellation:interactive-dev".to_string());
+    let role = q
+        .role
+        .unwrap_or_else(|| "role:constellation:interactive-dev".to_string());
     let window = s
         .chain_store
         // Fetch what the model DECLARES it reads, projected — not the whole window.
@@ -662,7 +881,9 @@ async fn trust_graph_turtle(
     Query(q): Query<DerivationQuery>,
 ) -> impl IntoResponse {
     let s = state.lock().await;
-    let role = q.role.unwrap_or_else(|| "role:constellation:interactive-dev".to_string());
+    let role = q
+        .role
+        .unwrap_or_else(|| "role:constellation:interactive-dev".to_string());
     let window = s
         .chain_store
         // Fetch what the model DECLARES it reads, projected — not the whole window.
@@ -684,7 +905,13 @@ async fn trust_graph_turtle(
         .unwrap_or_else(|| format!("urn:hestia:unmapped:{}", q.plugin_id));
     drop(s);
     let ttl = crate::rdf::trust_to_turtle(&derived, &entity_lct);
-    ([(axum::http::header::CONTENT_TYPE, "text/turtle; charset=utf-8")], ttl)
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/turtle; charset=utf-8",
+        )],
+        ttl,
+    )
 }
 
 async fn dashboard_json(
@@ -1051,7 +1278,8 @@ async fn policy_set_instance_grant(
             .trim()
             .to_string()
     };
-    let (plugin_id, role, preset, reason) = (sv("plugin_id"), sv("role"), sv("preset"), sv("reason"));
+    let (plugin_id, role, preset, reason) =
+        (sv("plugin_id"), sv("role"), sv("preset"), sv("reason"));
     if plugin_id.is_empty() || role.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -1214,10 +1442,7 @@ async fn scope_list_requests(State(state): State<SharedState>) -> impl IntoRespo
             })
         })
         .collect();
-    let pending = items
-        .iter()
-        .filter(|i| i["status"] == "pending")
-        .count();
+    let pending = items.iter().filter(|i| i["status"] == "pending").count();
     (
         StatusCode::OK,
         Json(serde_json::json!({"requests": items, "pending": pending})),
@@ -1248,7 +1473,7 @@ async fn scope_decide(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "granted must be explicitly true or false"})),
-            )
+            );
         }
     };
     let reason = body
@@ -1296,7 +1521,11 @@ async fn scope_decide(
         );
     }
     let (plugin_id, path, ask) = (req.plugin_id.clone(), req.path.clone(), req.reason.clone());
-    let expires_at = if granted { now + window } else { req.expires_at };
+    let expires_at = if granted {
+        now + window
+    } else {
+        req.expires_at
+    };
 
     // ORDER: WITNESS, THEN WIDEN.
     //
@@ -1310,7 +1539,11 @@ async fn scope_decide(
     // recorded-but-unapplied grant is not reachable either. The residual failure is a panic in
     // between, which leaves a record of a grant that is not live: safe direction, and legible.
     let entry = s.append_chain(
-        if granted { "scope_granted" } else { "scope_refused" },
+        if granted {
+            "scope_granted"
+        } else {
+            "scope_refused"
+        },
         serde_json::json!({
             "request_id": request_id,
             "plugin_id": plugin_id,
@@ -1338,7 +1571,7 @@ async fn scope_decide(
                 Json(serde_json::json!({
                     "error": format!("witness append failed, decision NOT applied: {e}")
                 })),
-            )
+            );
         }
     };
 
@@ -1346,7 +1579,11 @@ async fn scope_decide(
         req.granted = Some(granted);
         req.decided_by = Some("operator".to_string());
         req.decided_at = Some(now);
-        req.decision_reason = if reason.is_empty() { None } else { Some(reason.clone()) };
+        req.decision_reason = if reason.is_empty() {
+            None
+        } else {
+            Some(reason.clone())
+        };
         req.expires_at = expires_at;
     }
 
@@ -1656,9 +1893,23 @@ fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
             .to_string());
     }
     let mut out = Vec::new();
-    for rec in inv.get("detail").and_then(|d| d.as_array()).into_iter().flatten() {
-        let agent = rec.get("agent").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-        for t in rec.get("hook_targets").and_then(|d| d.as_array()).into_iter().flatten() {
+    for rec in inv
+        .get("detail")
+        .and_then(|d| d.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let agent = rec
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
+        for t in rec
+            .get("hook_targets")
+            .and_then(|d| d.as_array())
+            .into_iter()
+            .flatten()
+        {
             // Gate-role hooks only. An observe hook that vanishes loses evidence; a GATE
             // that vanishes fails open, and that is what an integrity check is for.
             if t.get("is_gate").and_then(|v| v.as_bool()) != Some(true) {
@@ -1760,11 +2011,15 @@ async fn gates_ratify(State(state): State<SharedState>) -> impl IntoResponse {
     let discovered = match discovered_gate_paths() {
         Ok(d) if !d.is_empty() => d,
         Ok(_) => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": "refusing to ratify: no gate-role hooks discovered. Ratifying an \
-                          empty set would record 'this machine's gates are correct' on the \
-                          basis of having found none.",
-            }))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "refusing to ratify: no gate-role hooks discovered. Ratifying an \
+                              empty set would record 'this machine's gates are correct' on the \
+                              basis of having found none.",
+                })),
+            )
+                .into_response();
         }
         Err(reason) => {
             return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
@@ -1775,29 +2030,45 @@ async fn gates_ratify(State(state): State<SharedState>) -> impl IntoResponse {
     for (plugin_id, path) in discovered {
         match crate::vault::gate_integrity::hash_file(std::path::Path::new(&path)) {
             Ok(sha256) => {
-                recorded.push(serde_json::json!({"path": path, "plugin_id": plugin_id, "sha256": sha256}));
-                exp.insert(path, GateExpectation {
-                    sha256,
-                    plugin_id,
-                    ratified_at: chrono::Utc::now(),
-                    note: "operator ratification".into(),
-                });
+                recorded.push(
+                    serde_json::json!({"path": path, "plugin_id": plugin_id, "sha256": sha256}),
+                );
+                exp.insert(
+                    path,
+                    GateExpectation {
+                        sha256,
+                        plugin_id,
+                        ratified_at: chrono::Utc::now(),
+                        note: "operator ratification".into(),
+                    },
+                );
             }
             Err(e) => {
-                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                    "error": format!("refusing to ratify: {path} unreadable ({e}). \
-                                      Ratifying a gate you could not read would launder the \
-                                      tampering this is meant to catch."),
-                }))).into_response();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("refusing to ratify: {path} unreadable ({e}). \
+                                          Ratifying a gate you could not read would launder the \
+                                          tampering this is meant to catch."),
+                    })),
+                )
+                    .into_response();
             }
         }
     }
     if let Err(e) = s.vault.set_gate_expectations(exp) {
-        return (StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()}))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
     }
     let _ = s.append_chain("gate_ratified", serde_json::json!({"gates": recorded}));
-    (StatusCode::OK, Json(serde_json::json!({"ok": true, "ratified": recorded}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "ratified": recorded})),
+    )
+        .into_response()
 }
 
 // --- Chain endpoints ---
@@ -1846,29 +2117,27 @@ async fn chain_query(
     // because it is a substring match on a projected field, which SQL cannot do for us
     // without reaching into the JSON.
     let type_filter: Option<Vec<&str>> = q.event_type.as_deref().map(|t| vec![t]);
-    let (entries, read_error) = match s.chain_store.scan_recent(
-        cutoff_str.as_deref(),
-        type_filter.as_deref(),
-        limit,
-        |r| {
-            let e = super::dashboard::flatten_row(r);
-            if let Some(ref tf) = q.tool {
-                match e.tool_name {
-                    Some(ref tn) if tn.contains(tf.as_str()) => {}
-                    // A row with no tool_name cannot match a tool filter. Dropping it
-                    // here is the same verdict the old post-filter reached.
-                    _ => return None,
+    let (entries, read_error) =
+        match s
+            .chain_store
+            .scan_recent(cutoff_str.as_deref(), type_filter.as_deref(), limit, |r| {
+                let e = super::dashboard::flatten_row(r);
+                if let Some(ref tf) = q.tool {
+                    match e.tool_name {
+                        Some(ref tn) if tn.contains(tf.as_str()) => {}
+                        // A row with no tool_name cannot match a tool filter. Dropping it
+                        // here is the same verdict the old post-filter reached.
+                        _ => return None,
+                    }
                 }
+                Some(e)
+            }) {
+            Ok(v) => (v, None),
+            Err(e) => {
+                tracing::error!("chain query read failed: {e}");
+                (Vec::new(), Some(e.to_string()))
             }
-            Some(e)
-        },
-    ) {
-        Ok(v) => (v, None),
-        Err(e) => {
-            tracing::error!("chain query read failed: {e}");
-            (Vec::new(), Some(e.to_string()))
-        }
-    };
+        };
     Json(serde_json::json!({ "entries": entries, "read_error": read_error }))
 }
 
@@ -1967,7 +2236,7 @@ async fn operator_gate_escalation(
     State(state): State<SharedState>,
     Json(d): Json<GateEscalationDecision>,
 ) -> impl IntoResponse {
-    use crate::server::gate_escalation::{now_secs, Channel};
+    use crate::server::gate_escalation::{Channel, now_secs};
 
     // A DENY needs no justification; an APPROVE of a governance write does. The asymmetry is the
     // point: refusing is the default and costs nothing to explain, while permitting is the act

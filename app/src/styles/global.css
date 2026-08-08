@@ -1044,6 +1044,10 @@ input::placeholder {
   margin-bottom: 0.5rem;
   font-size: 0.75rem;
 }
+.operator-bar > input[type="password"] {
+  width: 100%; min-width: 0; font-size: 0.7rem; padding: 0.3rem;
+  background: #0f172a; color: #e2e8f0; border: 1px solid #334155; border-radius: 3px;
+}
 .operator-signin {
   background: var(--color-accent, #ff8b3d);
   color: #1a1a1a;

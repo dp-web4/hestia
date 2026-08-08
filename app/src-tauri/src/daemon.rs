@@ -7,16 +7,16 @@
 //! held in `AppState`.
 //!
 //! Auto-reauth: an operator session can expire while the app is open. On a
-//! 401 with a known key path we re-run the handshake once and retry. The
-//! webview never sees the token either way — it just sees data or an error
-//! saying "sign in".
+//! 401, the still-unlocked identity vault re-runs the handshake once and
+//! retries. The webview never sees the token or credential either way — it
+//! just sees data or an error saying "sign in".
 
 use serde_json::Value;
 
 use crate::AppState;
 
 fn needs_signin() -> String {
-    "not signed in — open Settings and sign in with your operator key".to_string()
+    "not signed in — open Settings and unlock your identity vault".to_string()
 }
 
 /// GET a daemon path, authed. `path` starts with `/`.
@@ -50,13 +50,13 @@ async fn request(
         return finish(first);
     }
 
-    // Session expired (or was revoked). Re-authenticate once from the key
-    // path we already used, then retry exactly one time.
-    let Some(key_path) = state.operator_key_path() else {
+    // Session expired (or was revoked). Re-authenticate once from the unlocked
+    // vault already held by the Rust shell, then retry exactly one time.
+    let Some(vault) = state.operator_vault() else {
         state.clear_operator();
         return Err(needs_signin());
     };
-    match crate::operator::authenticate(&state.daemon_url(), &key_path).await {
+    match crate::operator::authenticate(&state.daemon_url(), vault).await {
         Ok(session) => {
             let token = session.token.clone();
             state.set_operator(session);

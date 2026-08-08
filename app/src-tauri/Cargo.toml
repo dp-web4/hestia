@@ -18,8 +18,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
-ed25519-dalek = "2"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+hex = "0.4"
+rand = "=0.8.6"
+tempfile = "3"
+zeroize = "1"
+# Canonical key-derived LCT identifiers. The app consumes identity primitives,
+# not the Hestia governance crate (decision 0014's domain split).
+web4-core = { path = "../../../web4/web4-core" }
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

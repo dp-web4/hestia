@@ -1,8 +1,11 @@
 mod commands;
 mod daemon;
+pub mod identity;
+pub mod identity_vault;
 pub mod operator;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -62,15 +65,19 @@ impl AppState {
     // ---- operator session (shell-side only) ----
 
     pub fn operator_token(&self) -> Option<String> {
-        self.operator.lock().unwrap().as_ref().map(|o| o.token.clone())
-    }
-
-    pub fn operator_key_path(&self) -> Option<String> {
         self.operator
             .lock()
             .unwrap()
             .as_ref()
-            .and_then(|o| o.key_path.clone())
+            .map(|o| o.token.clone())
+    }
+
+    pub fn operator_vault(&self) -> Option<Arc<identity_vault::IdentityVault>> {
+        self.operator
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|o| Arc::clone(&o.vault))
     }
 
     pub fn set_operator(&self, session: operator::OperatorSession) {
@@ -88,13 +95,16 @@ impl AppState {
             Some(o) => operator::OperatorStatus {
                 signed_in: true,
                 lct_id: Some(o.lct_id.clone()),
-                key_path: o.key_path.clone(),
+                vault_path: Some(o.vault.path().to_string_lossy().to_string()),
+                vault_exists: true,
+                migration_available: false,
             },
             None => operator::OperatorStatus {
                 signed_in: false,
                 lct_id: None,
-                key_path: operator::default_key_path()
-                    .map(|p| p.to_string_lossy().to_string()),
+                vault_path: None,
+                vault_exists: false,
+                migration_available: false,
             },
         }
     }

@@ -13,28 +13,46 @@
 //! noticed, because nothing was checking"; a check that reports success while
 //! checking nothing is that same failure one layer up.
 
-use hestia_app_lib::operator;
+use std::sync::Arc;
+
+use hestia_app_lib::{identity_vault, operator};
 
 const DAEMON: &str = "http://127.0.0.1:7711";
 
-fn key_path() -> Option<String> {
-    operator::default_key_path().map(|p| p.to_string_lossy().to_string())
+fn test_vault_from_legacy(
+    source: &std::path::Path,
+) -> (tempfile::TempDir, Arc<identity_vault::IdentityVault>) {
+    let dir = tempfile::tempdir().expect("temporary live-test vault directory");
+    let copied_source = dir.path().join("operator.key");
+    let encrypted = dir.path().join("identity.vault");
+    std::fs::copy(source, &copied_source).expect("copy legacy key into isolated test directory");
+    let vault = identity_vault::migrate_plaintext_operator_key(
+        &copied_source,
+        &encrypted,
+        "operator-live-test-only",
+    )
+    .expect("migrate isolated copy into a test identity vault");
+    (dir, Arc::new(vault))
 }
 
 #[tokio::test]
 #[ignore]
 async fn authenticate_opens_a_session_and_the_token_reads_the_gated_api() {
-    let path = key_path().expect(
+    let path = operator::default_legacy_key_path().expect(
         "no ~/.hestia/operator.key on this machine — this test was invoked explicitly \
          (--ignored), so an absent key is a failure to run the check, not a reason to \
          pass. Mint an operator key, or don't invoke it.",
     );
 
-    let session = operator::authenticate(DAEMON, &path)
+    let (_dir, vault) = test_vault_from_legacy(&path);
+    let session = operator::authenticate(DAEMON, vault)
         .await
         .expect("operator handshake should succeed against the live daemon");
     assert!(!session.token.is_empty(), "session carried no token");
-    assert!(session.lct_id.starts_with("lct:"), "unexpected operator lct");
+    assert!(
+        session.lct_id.starts_with("lct:"),
+        "unexpected operator lct"
+    );
 
     // The token must actually open the gate: an unauthed GET is 401.
     let client = reqwest::Client::new();
@@ -113,7 +131,9 @@ async fn authenticate_opens_a_session_and_the_token_reads_the_gated_api() {
 #[tokio::test]
 #[ignore]
 async fn a_bad_key_is_refused() {
-    let bogus = std::env::temp_dir().join("hestia-bogus-operator.key");
+    let dir = tempfile::tempdir().unwrap();
+    let bogus = dir.path().join("operator.key");
+    let encrypted = dir.path().join("identity.vault");
     std::fs::write(
         &bogus,
         serde_json::json!({
@@ -124,8 +144,13 @@ async fn a_bad_key_is_refused() {
     )
     .unwrap();
 
-    let result = operator::authenticate(DAEMON, &bogus.to_string_lossy()).await;
-    let _ = std::fs::remove_file(&bogus);
+    let vault = identity_vault::migrate_plaintext_operator_key(
+        &bogus,
+        &encrypted,
+        "operator-live-test-only",
+    )
+    .unwrap();
+    let result = operator::authenticate(DAEMON, Arc::new(vault)).await;
     let why = result.expect_err("an unauthorized key must NOT open an operator session");
 
     // `is_err()` alone is green when the daemon is simply down — the refusal we
