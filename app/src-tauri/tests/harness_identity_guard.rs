@@ -94,7 +94,14 @@ fn the_session_request_names_actor_and_principal_separately() {
     let actor = body.get("actor").and_then(|v| v.as_str());
     let princ = body.get("principal").and_then(|v| v.as_str());
 
-    assert_eq!(actor, Some(harness.lct_id.as_str()), "actor must be the harness");
+    assert_eq!(
+        actor,
+        Some(harness.lct_id.as_str()),
+        "actor must be the harness"
+    );
     assert_eq!(princ, Some(principal), "principal must be the human");
-    assert_ne!(actor, princ, "actor and principal must not be the same identity");
+    assert_ne!(
+        actor, princ,
+        "actor and principal must not be the same identity"
+    );
 }

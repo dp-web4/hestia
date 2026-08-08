@@ -83,29 +83,122 @@ impl ChallengeStore {
 /// majority; the irreversible tail always re-collects evidence).
 pub const SESSION_TTL_SECS: u64 = 3600;
 
-/// Established operator sessions: opaque token → (operator lct_id, issued_at).
+/// The identity/authority composition carried by an app-originated operator session.
+///
+/// `principal` proves the challenge; `actor` is the harness that sent the request.
+/// The remaining fields say through which anchor, office, and authority it acts. Keeping
+/// this typed in the session store prevents later request records from reconstructing a
+/// weaker story from only the principal LCT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorProvenance {
+    pub actor: String,
+    pub principal: String,
+    pub via_device: String,
+    pub office: String,
+    pub authority: String,
+}
+
+impl OperatorProvenance {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        for (name, value) in [
+            ("actor", self.actor.as_str()),
+            ("principal", self.principal.as_str()),
+            ("via_device", self.via_device.as_str()),
+            ("office", self.office.as_str()),
+            ("authority", self.authority.as_str()),
+        ] {
+            if value.trim().is_empty() || value.trim() != value {
+                return Err(match name {
+                    "actor" => "actor must be non-empty and trimmed",
+                    "principal" => "principal must be non-empty and trimmed",
+                    "via_device" => "via_device must be non-empty and trimmed",
+                    "office" => "office must be non-empty and trimmed",
+                    _ => "authority must be non-empty and trimmed",
+                });
+            }
+        }
+        if self.actor == self.principal {
+            return Err("actor and principal must be distinct identities");
+        }
+        Ok(())
+    }
+}
+
+/// Existing dashboard sessions prove one operator directly; app sessions carry the
+/// complete harness composition. The legacy variant keeps the browser dashboard live
+/// while making it impossible for an app session to lose fields once admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorSessionIdentity {
+    DirectOperator(String),
+    Composed(OperatorProvenance),
+}
+
+impl From<String> for OperatorSessionIdentity {
+    fn from(value: String) -> Self {
+        Self::DirectOperator(value)
+    }
+}
+
+impl From<&str> for OperatorSessionIdentity {
+    fn from(value: &str) -> Self {
+        Self::DirectOperator(value.to_string())
+    }
+}
+
+impl From<OperatorProvenance> for OperatorSessionIdentity {
+    fn from(value: OperatorProvenance) -> Self {
+        Self::Composed(value)
+    }
+}
+
+impl OperatorSessionIdentity {
+    fn principal(&self) -> &str {
+        match self {
+            Self::DirectOperator(operator) => operator,
+            Self::Composed(provenance) => &provenance.principal,
+        }
+    }
+
+    fn provenance(&self) -> Option<&OperatorProvenance> {
+        match self {
+            Self::DirectOperator(_) => None,
+            Self::Composed(provenance) => Some(provenance),
+        }
+    }
+}
+
+/// Established operator sessions: opaque token → (identity composition, issued_at).
 #[derive(Debug, Default)]
 pub struct SessionStore {
-    sessions: HashMap<String, (String, u64)>,
+    sessions: HashMap<String, (OperatorSessionIdentity, u64)>,
 }
 
 impl SessionStore {
     /// Open a session for an already-authenticated operator; returns the opaque
     /// bearer token (32 random bytes hex) the client presents on later requests.
-    pub fn open(&mut self, operator_lct: &str, now: u64) -> String {
+    pub fn open(&mut self, identity: impl Into<OperatorSessionIdentity>, now: u64) -> String {
         use rand::RngCore;
         let mut buf = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut buf);
         let token = hex::encode(buf);
-        self.sessions
-            .insert(token.clone(), (operator_lct.to_string(), now));
+        self.sessions.insert(token.clone(), (identity.into(), now));
         token
     }
 
     /// Resolve a session token to its operator lct_id iff present and unexpired.
     pub fn operator(&self, token: &str, now: u64, ttl_secs: u64) -> Option<&str> {
-        self.sessions.get(token).and_then(|(op, issued)| {
-            (now.saturating_sub(*issued) <= ttl_secs).then_some(op.as_str())
+        self.sessions.get(token).and_then(|(identity, issued)| {
+            (now.saturating_sub(*issued) <= ttl_secs).then(|| identity.principal())
+        })
+    }
+
+    /// Resolve the complete provenance tuple for an app session. A direct browser
+    /// session deliberately returns `None`; it must never be dressed up as an app.
+    pub fn provenance(&self, token: &str, now: u64, ttl_secs: u64) -> Option<&OperatorProvenance> {
+        self.sessions.get(token).and_then(|(identity, issued)| {
+            (now.saturating_sub(*issued) <= ttl_secs)
+                .then(|| identity.provenance())
+                .flatten()
         })
     }
 
@@ -118,6 +211,35 @@ impl SessionStore {
         self.sessions
             .retain(|_, (_, issued)| now.saturating_sub(*issued) <= ttl_secs);
     }
+}
+
+/// Canonical chain payload for a composed session. One helper is shared by the
+/// endpoint and tests so adding a field to the type without recording it fails.
+pub fn operator_session_opened_record(provenance: &OperatorProvenance) -> serde_json::Value {
+    json!({
+        "actor": provenance.actor,
+        "principal": provenance.principal,
+        "via_device": provenance.via_device,
+        "office": provenance.office,
+        "authority": provenance.authority,
+        "evidence": "principal-lct-signature",
+    })
+}
+
+/// Attach the composed identity to an app act's existing evidence record.
+pub fn attach_operator_provenance(
+    mut record: serde_json::Value,
+    provenance: Option<&OperatorProvenance>,
+) -> serde_json::Value {
+    let (Some(object), Some(provenance)) = (record.as_object_mut(), provenance) else {
+        return record;
+    };
+    object.insert("actor".into(), json!(provenance.actor));
+    object.insert("principal".into(), json!(provenance.principal));
+    object.insert("via_device".into(), json!(provenance.via_device));
+    object.insert("office".into(), json!(provenance.office));
+    object.insert("authority".into(), json!(provenance.authority));
+    record
 }
 
 /// Request-level gate (clause O, at the middleware). Given the operator resolved
