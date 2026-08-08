@@ -2,6 +2,7 @@
 
 **Status:** definitive · supersedes the drafts listed below · **Date:** 2026-08-05, amended 2026-08-08 (fresh `origin/main` baseline `c487d0a`; current-state re-audit; act-bound appeals, instruction provenance, deployment-stage distinctions, and sprint refresh)
 **Owner:** claude-code (CBP), by dp's assignment — *"you take the lead on hestia"*
+**Decision-0013 amendment author:** codex (CBP) · **designated NOT-SAME reviewer:** kimi-code
 **Scope:** hestia only. Hub work and any web4-core changes are hub's; the autostash-prevention hook is legion's.
 
 **Supersedes**
@@ -329,9 +330,11 @@ Plane E has never produced such a row at the measured seat, so this is a build d
 existing fallback.
 
 The design is deliberately staged. #281's marker-legibility work is an interim compatibility repair;
-it is not the final authority model. #283 remains open for independent review, and no autonomous
-arbitration driver should be built until act binding, identity proof/signatures, provenance, and
-NOT-BENEFICIARY are in place. The scope half can land before signing; the identity half — delivery
+it is not the final authority model. Kimi's independent review says decision 0013 should stand and
+corrects its current-state evidence; this PRD carries those corrections rather than inheriting the
+three prose-ahead-of-mechanism claims. No autonomous arbitration driver should be built until act
+binding, identity proof/signatures, provenance, and NOT-BENEFICIARY are in place. The scope half can
+land before signing; the identity half — delivery
 only to the originating role/agent chain — cannot be called enforced until signed acts make that
 origin non-assertible. Current audit: `answers_deny` is empty for **425/425** historical escalation
 opens, so the chain contains the plumbing but not evidence that the return path works.
@@ -354,12 +357,12 @@ One row failed that standard and is corrected in place: the infra-telemetry row 
 | reputation contextualisation | **keyed on capacity, not office** | canonical: *"reputation is ROLE-CONTEXTUALIZED … there is no global reputation"* |
 | escalation store | **memory-only, rehydrated from chain** | `EscalationStore { by_id: HashMap<..> }`, `rehydrate()` |
 | the instruction to appeal | **delivered on every enforced deny** — but the text delivered is ref-dependent | rule reason `policy/presets.rs:89-93` → `guidance()` `{reason}` (`policy/types.rs:211-223`) → both hook paths render verbatim; 2nd site `handler.rs:1005-1010`. The *delivery* holds unconditionally: `{reason}` is rendered whatever it says. What varies is the reason — the sentence naming `hestia_appeal` is on 38 of 71 remote refs and **absent on 12**, whose older text names no tool (§15) |
-| appeal **filing** | **design updated, implementation pending** | #283 / decision 0013 binds an appeal to `action_id` + canonical act digest; historical `answers_deny` remains empty for 425/425 escalation opens |
+| appeal **filing** | **current path unreachable; replacement designed, not implemented** | #283 / decision 0013 binds an appeal to `action_id` + canonical act digest; historical `answers_deny` remains empty for 425/425 escalation opens |
 | appeal **routing** | **prefers a "live" arbiter, where live = inbox-touch** | a watcher polling on behalf of an out-of-budget member reports `live`; two appeals routed to an unreachable designee and ruled anyway (2026-07-27) |
 | appeal **window** | **measured in chain entries, not hours** | a busy session spends another member's window; re-run showed it was never a rate (2026-07-28) |
 | ruling **delivery** | **adjudicated on-chain, never bound to the appellant** | kimi's scope appeal ruled at chain `89318` (`upheld: false`); no response ever bound to the notice (2026-08-03) |
 | appeal **dispatch** | **mints flat `review_request` notices attributed to the appellant** | a third producer neither seat had counted; the chain is structurally blind to it (2026-08-03) |
-| approval join key | **marker compatibility path remains; act-bound target is pending** | #281 improves marker legibility; #283 replaces portable grants with a verdict on one recorded act |
+| approval join key | **portable marker path remains live; act-bound target is pending** | #281 improves marker legibility; #283 replaces portable grants with a verdict on one recorded act |
 | act digest | **absent** | `policy_decision.attempted` is redacted and truncated at 400 bytes; canonical serialization, digest domain, and plugin-to-daemon wire are new work |
 | governance history | **visible** | ledger shipped #198/#202 |
 | deployment provenance | **measurable** | fleet manifest shipped #199 |
@@ -419,6 +422,11 @@ GPT's four, plus one.
 | **E. Infrastructure telemetry** *(new)* | gate-unavailable records; snapshot load failures; deployment drift. **Never the chain.** Not member conduct, and not evidence about members |
 
 **No plane may silently substitute for another.** Witness history does not grant authority; a mirror does not become policy; a role label does not establish occupancy; a shim does not become a gate; an escalation does not become a bypass; **and an infrastructure failure is not a member's conduct.**
+
+**The operator has no one-off exception surface.** Plane A changes law; it does not mint a bypass
+for one act. An upheld appeal against a working rule therefore follows
+`appeal → fix rule → grant → re-evaluate`; if the rule should remain, the appeal is denied. This
+is the operator-facing consequence of decision 0013, not an implementation detail of Plane B.
 
 ---
 
@@ -785,7 +793,7 @@ artifact assurance, no local fallback — plus the decision-0013 transition cont
 
 **§2.5:** peer-path resolution gets a proof-of-life *before* the consolidation's shape hardens — one harness, one OS, modify-one-byte-fails-closed, demonstrated live. If peer-path resolution is unreliable, per-call assurance is caller self-report wearing a digest.
 
-**Current transition requirements (fresh re-audit):**
+**Decision-0013 target transition requirements (fresh re-audit):**
 
 - Every governed act has a stable `action_id`, versioned canonical digest, actor role/agent chain,
    instruction/delegation provenance, and beneficiary. The digest is privacy-preserving but the
@@ -967,7 +975,8 @@ This is §7.4's own rule turned on the measurement apparatus rather than on the 
 
 **Acceptance:** four numbers exist that do not exist today — how many acts carry a declared vs audited vs witnessed identity; how many governed acts run under a provisional occupant; how many verdicts a live delegation would have changed; what the availability floor actually is. **Plus:** a deliberately induced fail-closed deny produces a Plane-E row on every installed engine, with the test being the row and not the report; the observed count of unattributed appeal opens is published without changing their verdict.
 
-**Not this sprint:** authority, enforcement, or any refusal that did not already happen. Appeal *filing* qualifies precisely because it changes no verdict — it returns a value the deny already computed and threw away.
+**Not this sprint:** authority, act-binding enforcement, or any refusal that did not already happen.
+Sprint 1 records the facts and would-refuse result; Sprint 2.5 changes the appeal state machine.
 
 **Whose hands.** The appeal-record preparation must be authored/reviewed under NOT-SAME and
 NOT-BENEFICIARY. The design is independently recorded in #283; implementation must have a different
@@ -989,8 +998,9 @@ instructed it and the member that benefits. The minimum record is:
 The record is composable across delegation depth. A deputy's authority is the deputy's own proven
 occupancy plus an explicit delegation; prose saying “I was instructed by X” is evidence to inspect,
 not authority to inherit. NOT-BENEFICIARY and NOT-SAME are evaluated against this chain for every
-consequential act. Unattributed acts remain terminal and non-appealable because no originating chain
-exists to receive the verdict.
+consequential act. Once attribution is installed and observed, unattributed acts are terminal and
+non-appealable because no originating chain exists to receive the verdict; before that prerequisite,
+the would-refuse result is observation only.
 
 ---
 
