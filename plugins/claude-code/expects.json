@@ -4,6 +4,13 @@
   ],
   "install": {
     "dest": "~/.claude/hooks/hestia",
+    "registration": {
+      "reader": "json-hook-commands",
+      "path": [
+        ".claude",
+        "settings.json"
+      ]
+    },
     "files": [
       "hooks/pre_tool_use.py",
       "hooks/witness.py",
