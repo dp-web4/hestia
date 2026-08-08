@@ -58,8 +58,21 @@ async fn operator_session(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // A3: read the composition BEFORE authenticating, and refuse a self-contradicting
+    // request rather than resolving it (decision 0014 §2.1; dp's match requirement).
+    // Additive — a legacy `{lct_id}` body composes to principal-with-no-actor and is
+    // unaffected.
+    let composition = match super::session_composition::compose(&body) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.reason() })),
+            )
+        }
+    };
     let (lct_id, challenge, signature) = (
-        body.get("lct_id").and_then(|v| v.as_str()).unwrap_or(""),
+        composition.principal.as_str(),
         body.get("challenge").and_then(|v| v.as_str()).unwrap_or(""),
         body.get("signature").and_then(|v| v.as_str()).unwrap_or(""),
     );
@@ -80,7 +93,15 @@ async fn operator_session(
             let token = s.operator_sessions.open(&op, now);
             let _ = s.append_chain(
                 "operator_session_opened",
-                serde_json::json!({ "operator": op, "evidence": "operator-lct-signature" }),
+                // Both identities, distinctly. `actor: null` is the honest record for a
+                // legacy caller — it says "this caller did not name a harness", which a
+                // reader must not read as "the principal acted directly".
+                serde_json::json!({
+                    "operator": op,
+                    "principal": composition.principal,
+                    "actor": composition.actor,
+                    "evidence": "operator-lct-signature",
+                }),
             );
             (
                 StatusCode::OK,

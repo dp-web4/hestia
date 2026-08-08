@@ -10,6 +10,7 @@ pub mod governance_ledger;
 mod handler;
 mod http;
 pub mod operator_auth;
+pub mod session_composition;
 mod state;
 
 pub use dashboard::{
