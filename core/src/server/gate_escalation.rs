@@ -379,10 +379,16 @@ impl Escalation {
     }
 
     /// The instant after which an approval stops being claimable.
-    fn decided_horizon(&self) -> u64 {
-        self.opened_at
-            .saturating_add(DEFAULT_TTL_SECS)
-            .saturating_add(APPROVAL_CLAIM_WINDOW_SECS)
+    ///
+    /// Derived from THIS row's `expires_at`, not from `DEFAULT_TTL_SECS`. It used to re-derive
+    /// the deadline from the constant, which is correct only while every caller passes the
+    /// default — and `open` takes the TTL as a parameter. A row opened with a shorter TTL got a
+    /// claim window of `4200 - ttl` instead of 600s (at the 120s TTL the tests already use:
+    /// 4080s, nearly 7x). That is precisely the number the constant's own doc comment says
+    /// "must stay tight, because that one bounds how long a GRANTED approval can be ridden."
+    /// Behaviour is unchanged at the default TTL, which is what the one live caller passes.
+    pub fn decided_horizon(&self) -> u64 {
+        self.expires_at.saturating_add(APPROVAL_CLAIM_WINDOW_SECS)
     }
 }
 
@@ -1133,17 +1139,39 @@ mod tests {
         assert!(s.claim("claude-code", "pre_tool_use.py", T0 + 500).is_none(), "expired");
     }
 
+    /// The retry window is `APPROVAL_CLAIM_WINDOW_SECS` after THIS row's expiry.
+    ///
+    /// This test used to compute `horizon` as `T0 + DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS`
+    /// — the same expression `decided_horizon` used — while the fixture opens with a **120-second**
+    /// TTL. So it asserted an approval on a 2-minute escalation was still rideable 4199 seconds
+    /// later: a 4080s retry window, on the one constant whose doc comment says it "must stay tight,
+    /// because that one bounds how long a GRANTED approval can be ridden." Test and implementation
+    /// re-derived the deadline from the same two constants, so the pair agreed with each other and
+    /// neither was checking the row. The horizon is now anchored to `expires_at`, and this test
+    /// derives its expectation the same way the fixture states it — from the TTL that was actually
+    /// passed. Unchanged for a default-TTL row, which is what the one live caller opens.
     #[test]
     fn an_approval_stops_being_claimable_once_the_retry_window_closes() {
+        // The fixture's own TTL, not the default — see above.
+        const FIXTURE_TTL: u64 = 120;
+        let horizon = T0 + FIXTURE_TTL + APPROVAL_CLAIM_WINDOW_SECS;
+
         let (mut s, id) = store_with_one_simple_marker();
         s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 5).unwrap();
-        let horizon = T0 + DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS;
         assert!(s.claim("claude-code", "law_inject.py", horizon - 1).is_some());
 
         let (mut s2, id2) = store_with_one_simple_marker();
         s2.decide(&id2, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 5).unwrap();
-        // A day later must not still be rideable.
         assert!(s2.claim("claude-code", "law_inject.py", horizon).is_none());
+        // And the window must not silently reopen at the DEFAULT-TTL horizon, which is where a
+        // constant-derived deadline would still have been letting this row through.
+        assert!(
+            s2.claim("claude-code", "law_inject.py",
+                     T0 + DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS - 1).is_none(),
+            "a 120s escalation must not be rideable an hour later because the deadline was keyed \
+             to DEFAULT_TTL_SECS instead of to this row's expiry"
+        );
+        // A day later must not still be rideable.
         assert!(s2.claim("claude-code", "law_inject.py", T0 + 86_400).is_none());
     }
 

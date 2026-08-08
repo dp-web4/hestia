@@ -10262,11 +10262,33 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         // recorded but permits nothing. The mismatch is a visible state, never an implicit
         // sufficient. (dp 2026-07-30 + claude-code: the record must carry the bar, not just
         // the evidence and the verdict.)
-        "permits_write": status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false),
+        //
+        // DELEGATED to `is_claimable`, never re-derived. This field used to be its own
+        // expression — `status.permits_write() && bar_met()` — which is a TWO-conjunct
+        // approximation of a FOUR-conjunct predicate, and the two it dropped
+        // (`consumed_at.is_none()`, `now < decided_horizon()`) are exactly the ones that change
+        // after decision time. So a spent approval and a past-horizon approval both read
+        // `permits_write: true`, and because `status_at` expires only `Pending` rows, an
+        // Approved row never decays — the misreport is permanent, not transient. `claim` at
+        // `gate_escalation.rs:684` is the only enforcement site and it filters on
+        // `is_claimable`; this surface now answers that same question by asking it, so the two
+        // cannot drift again. (kimi-code named the mechanism and the one-line repair, notice
+        // 1054; measured on live rows `0d481b63` consumed / `d7bbb714` past-window.)
+        "permits_write": esc.map(|e| e.is_claimable(now)).unwrap_or(false),
         "bar": esc.map(|e| e.bar),
         "bar_met": esc.map(|e| e.bar_met()),
         "factors_present": esc.map(|e| e.factors.clone()),
+        // TWO clocks, because the surface runs two and used to label only one. `secs_remaining`
+        // counts down the OPEN TTL — the window for DECIDING — and hits 0 a full
+        // `APPROVAL_CLAIM_WINDOW_SECS` before the approval stops being claimable. A reader
+        // crossing `status: approved` with `secs_remaining: 0` concluded "window closed" and was
+        // wrong by up to 600s; that reading cost two forum posts. The claim horizon is the clock
+        // `permits_write` actually gates on, so it is now shown rather than left to be
+        // re-derived by hand.
         "secs_remaining": esc.map(|e| e.secs_remaining(now)).unwrap_or(0),
+        "secs_until_claim_horizon": esc
+            .map(|e| e.decided_horizon().saturating_sub(now))
+            .unwrap_or(0),
         "decided_by": esc.and_then(|e| e.decided_by.clone()),
         "decided_via": esc.and_then(|e| e.decided_via),
         "reason": esc.and_then(|e| e.reason.clone()),
@@ -10276,7 +10298,11 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
             "unknown escalation_id — treated as expired (a restart drops the store, and an \
              in-flight escalation must then read as denied)"
         } else {
-            "authoritative as of now; only `approved` WITH the stated bar met permits the write"
+            "authoritative as of now. Read `permits_write`, not the parts: the write needs \
+             `approved` AND the stated bar met AND the approval unspent AND `now` inside the \
+             claim horizon — and `secs_remaining` is the DECIDE clock, which reaches 0 while \
+             the approval is still claimable. Restating the rule as any subset of those is how \
+             this field came to lie."
         },
     }))
 }
@@ -10698,3 +10724,184 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
         Err(e) => Err(anyhow::anyhow!("{e}")),
     }
 }
+
+#[cfg(test)]
+mod gate_escalation_poll_tests {
+    //! The poll must answer the SAME question the enforcer asks.
+    //!
+    //! `Store::claim` (`gate_escalation.rs:684`) is the only site that spends an approval, and it
+    //! filters on `is_claimable`. The poll's `permits_write` used to re-derive that answer with a
+    //! weaker expression, so the surface a caller reads and the surface that enforces disagreed —
+    //! silently, and only for rows that had already been decided. Every test here drives the real
+    //! tool and cross-checks its answer against what `claim` actually does.
+    use super::*;
+    use super::inbox_tests::{open_state, seeded_home};
+
+    fn make_shared_state() -> (tempfile::TempDir, SharedState) {
+        let (dir, _kp) = seeded_home();
+        let state = open_state(&dir);
+        (dir, state)
+    }
+
+    // ------------------------------------------------ the poll must answer the SPEND predicate
+    //
+    // `permits_write` is what a caller — including `hestia gate poll`, which prints "this
+    // escalation does NOT permit the write" only when the field is false — reads to decide
+    // whether an approval is still good. It was computed as `Approved ∧ bar_met`, a two-conjunct
+    // approximation of the four-conjunct `is_claimable` that `Store::claim` actually enforces.
+    // Both tests below construct a row the store would REFUSE to spend and assert the poll says
+    // so; both fail against the pre-fix expression.
+    //
+    // The clock is supplied by backdating `opened_at`, because the handler reads the real
+    // `now_secs()` and there is no seam to inject a fake one.
+
+    /// Backdate an approved, bar-met escalation into the past and return its id.
+    /// `age` is how long ago it was opened; the decision lands 10s after the open, while the
+    /// row is still Pending (a later decide would be refused as `Expired`).
+    /// Each caller passes a DISTINCT marker. `claim` selects by (plugin_id, marker) and spends
+    /// the oldest claimable match — so two rows sharing a marker would let a test "prove" a dead
+    /// approval is unclaimable while `claim` was really looking at a live sibling.
+    async fn approved_escalation_opened_secs_ago(
+        shared: &SharedState,
+        marker: &str,
+        age: u64,
+    ) -> String {
+        use crate::server::gate_escalation::{now_secs, Channel, DEFAULT_TTL_SECS};
+        let opened = now_secs().saturating_sub(age);
+        let mut s = shared.lock().await;
+        // A directory-spelled marker: `bar_for` gives it SingleApprover, so one PeerMember
+        // factor meets the bar and `bar_met` is true — isolating the conjuncts under test.
+        let esc = s
+            .gate_escalations
+            .open("claude-code", "role:constellation:member", "Bash", marker,
+                  None, None, opened, DEFAULT_TTL_SECS)
+            .expect("open");
+        s.gate_escalations
+            .decide(&esc.id, true, "kimi-code", "role:constellation:interactive-dev",
+                    Channel::PeerMember, None, Some("test"), opened + 10)
+            .expect("decide");
+        esc.id
+    }
+
+    /// A SPENT approval must not read as permitting a write. `claim` sets `consumed_at` and
+    /// filters on it forever after; the poll dropped that conjunct, so a consumed approval
+    /// reported `permits_write: true` — and since `status_at` expires only `Pending` rows, an
+    /// Approved row never decays and the misreport is permanent. Measured live on `0d481b63`,
+    /// which the chain shows CLAIMED while the poll still called it a permit.
+    #[tokio::test]
+    async fn poll_says_a_spent_approval_permits_nothing() {
+        use crate::server::gate_escalation::now_secs;
+        let (_dir, shared) = make_shared_state();
+        let id = approved_escalation_opened_secs_ago(&shared, "spent/dir", 60).await;
+
+        // Before spending: genuinely claimable, so the field is true for the right reason.
+        let r = tool_gate_escalation_poll(&shared, &json!({"escalation_id": id})).await.unwrap();
+        assert_eq!(r["permits_write"], json!(true), "unspent + in-window + bar met: {r}");
+
+        // Spend it exactly as the enforcement path does.
+        {
+            let mut s = shared.lock().await;
+            assert!(
+                s.gate_escalations.claim("claude-code", "spent/dir", now_secs()).is_some(),
+                "the approval must be claimable once, or this test is not exercising a spend"
+            );
+        }
+
+        let r = tool_gate_escalation_poll(&shared, &json!({"escalation_id": id})).await.unwrap();
+        assert_eq!(
+            r["permits_write"], json!(false),
+            "a CONSUMED approval permits nothing — `claim` will refuse it, and a poll that says \
+             otherwise invites a caller to proceed on a spent permit: {r}"
+        );
+        // The store agrees, and it is the one that decides.
+        {
+            let mut s = shared.lock().await;
+            assert!(
+                s.gate_escalations.claim("claude-code", "spent/dir", now_secs()).is_none(),
+                "single-use: the second claim must find nothing"
+            );
+        }
+    }
+
+    /// An approval PAST its claim horizon must not read as permitting a write, and the poll must
+    /// show the clock that governs. `secs_remaining` counts the OPEN TTL and hits 0 a full
+    /// `APPROVAL_CLAIM_WINDOW_SECS` earlier — the gap that made "secs 0 → window closed" a wrong
+    /// reading of live row `d7bbb714`.
+    #[tokio::test]
+    async fn poll_distinguishes_the_decide_clock_from_the_claim_horizon() {
+        use crate::server::gate_escalation::{
+            now_secs, APPROVAL_CLAIM_WINDOW_SECS, DEFAULT_TTL_SECS,
+        };
+        let (_dir, shared) = make_shared_state();
+
+        // Opened just past the DECIDE deadline: the countdown reads 0, but the approval is
+        // still inside its claim window. "secs_remaining == 0" must NOT imply "closed".
+        let id =
+            approved_escalation_opened_secs_ago(&shared, "in-window/dir", DEFAULT_TTL_SECS + 30)
+                .await;
+        let r = tool_gate_escalation_poll(&shared, &json!({"escalation_id": id})).await.unwrap();
+        assert_eq!(r["secs_remaining"], json!(0), "the decide clock has run out: {r}");
+        assert!(
+            r["secs_until_claim_horizon"].as_u64().unwrap() > 0,
+            "the claim horizon is the clock `permits_write` gates on and it is still open — a \
+             surface that shows only the expired one is read as 'closed': {r}"
+        );
+        assert_eq!(
+            r["permits_write"], json!(true),
+            "still claimable: the decide window closing does not revoke a granted approval: {r}"
+        );
+
+        // Now past the horizon itself. `status` is still `approved` — `status_at` expires only
+        // Pending rows — so the status word cannot carry this and the field must.
+        let id = approved_escalation_opened_secs_ago(
+            &shared, "past-horizon/dir", DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS + 30).await;
+        let r = tool_gate_escalation_poll(&shared, &json!({"escalation_id": id})).await.unwrap();
+        assert_eq!(r["status"], json!("approved"), "an Approved row never decays: {r}");
+        assert_eq!(r["bar_met"], json!(true), "the bar is still met — that is not what expired: {r}");
+        assert_eq!(r["secs_until_claim_horizon"], json!(0), "the horizon has passed: {r}");
+        assert_eq!(
+            r["permits_write"], json!(false),
+            "past the claim horizon the approval is dead; `claim` filters it out and the poll \
+             must not keep calling it a permit forever: {r}"
+        );
+        {
+            let mut s = shared.lock().await;
+            assert!(
+                s.gate_escalations.claim("claude-code", "past-horizon/dir", now_secs()).is_none(),
+                "the store refuses to spend it — the poll's answer must match the enforcer's"
+            );
+        }
+    }
+
+    /// The claim horizon must track THIS row's TTL, not the default constant. Latent today (the
+    /// one live caller passes `DEFAULT_TTL_SECS`) and cheap to hold: `open` takes the TTL as a
+    /// parameter, and re-deriving the deadline from the constant hands a short-TTL row a claim
+    /// window of `4200 - ttl` instead of 600s — silently loosening the one bound the constant's
+    /// doc comment says must stay tight.
+    #[tokio::test]
+    async fn the_claim_window_is_600s_after_this_rows_expiry_not_after_the_default() {
+        use crate::server::gate_escalation::{now_secs, Channel, APPROVAL_CLAIM_WINDOW_SECS};
+        let (_dir, shared) = make_shared_state();
+        let short_ttl = 120;
+        let opened = now_secs().saturating_sub(short_ttl + APPROVAL_CLAIM_WINDOW_SECS + 30);
+        let id = {
+            let mut s = shared.lock().await;
+            let esc = s
+                .gate_escalations
+                .open("claude-code", "role:constellation:member", "Bash", "some/dir",
+                      None, None, opened, short_ttl)
+                .expect("open");
+            s.gate_escalations
+                .decide(&esc.id, true, "kimi-code", "role:constellation:interactive-dev",
+                        Channel::PeerMember, None, Some("test"), opened + 10)
+                .expect("decide");
+            esc.id
+        };
+
+        let r = tool_gate_escalation_poll(&shared, &json!({"escalation_id": id})).await.unwrap();
+        assert_eq!(
+            r["permits_write"], json!(false),
+            "a 120s-TTL approval is dead {APPROVAL_CLAIM_WINDOW_SECS}s after ITS expiry. Keyed \
+             to the default TTL it would stay claimable for over an hour: {r}"
+        );
+    }}
