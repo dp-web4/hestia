@@ -28,6 +28,17 @@ member mesh, and argued about in the forum without anyone writing a case down:
        is a PREFIX in shell grammar, so leading NAME=VALUE tokens are consumed and the
        head check runs on what follows. `assignment_does_not_launder` in `_SURVIVE` is
        the arm that matters — consuming the prefix must never free the command after it.
+  FP14 a grep PATTERN containing `$(` — double-quoted, backslash-escaped, where bash
+       passes it as literal data — refused as a command substitution (claude-code,
+       escalation c80e4a2557df241b, 2026-08-08). The guard was a substring test on
+       posix=False tokens: the tokenizer had already preserved the quoting that
+       separates data from syntax, and the check never read it. Fixed by walking
+       quoting as STATE over the raw command text (`_has_live_substitution`). The
+       same verification found the old guard's two live bypasses — `a$(id)b`, whose
+       `$(` punctuation_chars splits across two tokens, and a backtick hidden behind
+       a leading quote — both now refused, pinned in `_SURVIVE`. The one FP its own
+       search cannot find: grepping the gate for `$(` trips the check being searched
+       for, which is how it outlived FP8, FP12 and FP13.
   cd   `cd h && grep -n foo <gate>` — a read whose only sin is a directory change.
        `cd` is absent from the read-only head allowlist. Fixed here.
 
@@ -308,6 +319,33 @@ _SURVIVE = [
      'G=`touch /tmp/fp13_x`; grep -c def {g}', 'G=1; grep -c def {g}',
      "a command substitution inside the VALUE runs for real (`G=`rm …`` executes); a "
      "prefix is only free when it is inert, so a backtick value fails closed"),
+    # FP14's red arm (claude-code, escalation c80e4a2557df241b; fix is the quoting-state
+    # walk over the raw command). The carve-out frees DATA only — these must stay
+    # refused. The first three were LIVE BYPASSES under the old substring guard, found
+    # while verifying FP14: the guard needed `$(` contiguous inside one token, and a
+    # backtick at token start.
+    ("fp14_double_quoted_substitution_executes",
+     'grep -c def "$(cat {g})"', 'grep -c def {g}',
+     "double quotes do not neutralise $( — bash runs it. The old guard ALLOWED this "
+     "(no single token carried `$(` contiguous); the carve-out is for \\$ and single "
+     "quotes ONLY"),
+    ("fp14_backtick_in_double_quotes_executes",
+     'grep -c def "`cat {g}`"', 'grep -c def {g}',
+     "backticks are live inside double quotes; the old guard tested startswith('`'), "
+     "so a leading quote hid them outright"),
+    ("fp14_midtoken_substitution_executes",
+     'cat x$(cat {g})y', 'cat {g}',
+     "punctuation_chars splits `$(` across tokens (x$ then (), so no per-token test "
+     "sees it whole; the raw-text walk does"),
+    ("fp14_empty_quotes_do_not_launder",
+     "grep -c def ''$(id)'' {g}", "grep -c def {g}",
+     "adjacent empty quotes quote nothing; the substitution between them is unquoted "
+     "and runs"),
+    ("fp14_escaped_quotes_do_not_launder",
+     "grep -c def \\'$(id)\\' {g}", "grep -c def {g}",
+     "an escaped quote is a literal CHARACTER, not an opener — the substitution "
+     "between two of them is unquoted and bash runs it (measured against bash "
+     "2026-08-08). A mask that blanks quoted spans before escapes frees it"),
 ]
 
 # The false refusals. Each MUST be classified read-only after the fix.
@@ -354,6 +392,25 @@ _FALSE_REFUSALS = [
     ("env_prefix_form", 'FOO=1 grep -c "" {g}',
      "the same prefix one spelling over — `VAR=x cmd` with the path as an ordinary "
      "argument rather than through the variable"),
+    # FP14 (claude-code, escalation c80e4a2557df241b, forum
+    # claude-re-1676-1677-fp14-and-own-row-dated-2026-08-08 §2): the substitution guard
+    # was a substring test on tokens whose quoting posix=False had preserved, so a
+    # pattern NAMING `$(` refused like a live substitution. Quoting is now walked as
+    # state; these are the data shapes that must read as data.
+    ("fp14_escaped_dollar_in_double_quotes",
+     'grep -n "assignment\\|ASSIGN\\|=\\$(\\|substitution" {g} | head -40',
+     "the live specimen itself: \\$ inside double quotes is a literal dollar to "
+     "bash — the pattern names the construct it searches for"),
+    ("fp14_single_quoted_substitution_text",
+     "grep -n '$(whoami)' {g}",
+     "single quotes neutralise everything inside; the whole span is pattern data"),
+    ("fp14_assignment_value_escaped_backticks",
+     r"G=\`id\`; grep -c def {g}",
+     "escaped backticks are literal characters to bash; the old substring guard "
+     "refused the value anyway. The single-quoted twin (G='$(id)') never reaches "
+     "the guard — shlex's punctuation_chars mode raises 'No closing quotation' on a "
+     "mid-token quote and the classifier fails closed in the tokenizer, one layer "
+     "below this fix"),
 ]
 
 # FP6 is NOT fixed here, and pinning it as a known-refused case is the honest form: it

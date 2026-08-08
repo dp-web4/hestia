@@ -1383,6 +1383,54 @@ _FOR_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 
 
+def _has_live_substitution(text: str) -> bool:
+    """True when `text` carries a command substitution bash would EXECUTE.
+
+    FP14 (claude-code, escalation c80e4a2557df241b, 2026-08-08): the guard this
+    replaces was a substring test on posix=False tokens — `"$(" in t` — so a grep
+    PATTERN that names substitution (`grep -n "=\\$(\\|…" <gate>`, where `\\$` is a
+    literal dollar to bash) refused exactly like a live one. posix=False had already
+    preserved the quoting that separates the two; the check just never read it. It
+    is also the one FP its own search cannot find: grepping the gate for `$(` trips
+    the check being searched for.
+
+    Quoting is a STATE, not a substring, so walk it. Inert by bash's rules: anything
+    inside single quotes, and a backslash-escaped character (any character unquoted;
+    inside double quotes only before $ ` " \\ or newline). Live everywhere else,
+    INCLUDING inside double quotes — `"$(id)"` runs. The walk runs on raw text, not
+    on tokens: punctuation splitting puts the `$(` of `a$(id)b` across two tokens,
+    where no per-token test can see it whole, and a leading quote hid a backtick
+    from the old startswith test. Both were live bypasses; the walk closes them.
+
+    Unterminated quoting cannot reach here — the caller's tokenizer has already
+    failed closed on it — but the walk answers True for it anyway: an unresolved
+    quote means the quoting was never decided, and undecided means write.
+    """
+    state = ""  # "", "'" or '"' — the quoting the walk is inside
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if state == "'":
+            if c == "'":
+                state = ""
+        elif state == '"':
+            if c == '"':
+                state = ""
+            elif c == "\\" and text[i + 1:i + 2] in ('$', '`', '"', "\\", "\n"):
+                i += 1
+            elif c == "`" or text[i:i + 2] == "$(":
+                return True
+        else:
+            if c == "'" or c == '"':
+                state = c
+            elif c == "\\":
+                i += 1
+            elif c == "`" or text[i:i + 2] == "$(":
+                return True
+        i += 1
+    return state != ""
+
+
 def _control_flow_remainder(parts):
     """Strip leading shell control-flow keywords from one segment.
 
@@ -1432,9 +1480,13 @@ def _assignment_remainder(parts):
     nothing and is read-only.
 
     A prefix is only free when it is INERT. A command substitution inside the value
-    EXECUTES — `G=`rm -rf …`` runs the rm — and the tokeniser's substitution guard
-    catches a LEADING backtick and `$(` anywhere, but not a backtick mid-token. A
-    value carrying one fails closed here rather than being consumed.
+    EXECUTES — `G=`rm -rf …`` runs the rm — so a value carrying a LIVE one fails
+    closed here rather than being consumed. Liveness is `_has_live_substitution`'s
+    call, not a substring test: an escaped or quoted substitution SPELLING in the
+    value is data (FP14), and `G=\`id\`` must not refuse the read that follows it.
+    (The single-quoted `$(` twin never reaches this check: shlex's punctuation_chars
+    mode raises "No closing quotation" on a mid-token quote and the classifier fails
+    closed in the tokenizer — safe, and one layer below this one.)
 
     A consume, NOT a merge into `_control_flow_remainder` (1474 §1): `for` and
     `NAME=` have different arities, and one shared strip is how `do rm -rf /` gets
@@ -1443,7 +1495,7 @@ def _assignment_remainder(parts):
     """
     p = list(parts)
     while p and _ASSIGNMENT.match(p[0]):
-        if "`" in p[0] or "$(" in p[0]:
+        if _has_live_substitution(p[0]):
             return None  # a substitution in the VALUE runs; fail closed
         p.pop(0)
     return p
@@ -1499,6 +1551,15 @@ def _is_read_only(tool_name: str, tool_input: Any) -> bool:
     if not tokens:
         return False
 
+    # Command substitution runs arbitrary code and its contents are never walked below.
+    # Checked on the RAW command, with quoting walked as a state — not as a substring
+    # test on tokens (FP14): posix=False preserves the quoting, so `grep -n "=\$(\|…"
+    # <gate>` is data bash passes through, and the old test could not tell it from the
+    # live case. The raw walk also sees what no per-token test can: `a$(id)b`, split
+    # across tokens by punctuation_chars, and a backtick behind a leading quote.
+    if _has_live_substitution(cmd):
+        return False
+
     segments: list[list[str]] = [[]]
     i = 0
     while i < len(tokens):
@@ -1522,9 +1583,6 @@ def _is_read_only(tool_name: str, tool_input: Any) -> bool:
             if nxt == "/dev/null":
                 i += 2
                 continue
-            return False
-        # Command substitution runs arbitrary code and its contents are never walked below.
-        if t == "$" or t.startswith("`") or "$(" in t:
             return False
         segments[-1].append(t)
         i += 1
