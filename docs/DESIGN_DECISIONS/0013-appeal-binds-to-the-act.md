@@ -66,10 +66,26 @@ unattributed act has no recipient; re-evaluation has nobody to re-evaluate *for*
 So an act with no attributable agent must be **refused at escalation-open time**, with that stated
 as the reason. It must not open an escalation that later fails at claim.
 
-> This is already observable, backwards. On 2026-08-07 approvals granted to escalations filed under
-> the literal `unattributed` proved **unclaimable** — the system refused to deliver a grant to a
-> non-entity, correctly, by accident, at the wrong moment and with a misleading error. The
-> principle was already latent in the mechanism; it was simply not stated, so it read as a bug.
+**Hard prerequisite: attribution in force, not attribution merged.** 124 of 425
+`gate_escalation_opened` rows (29%) are `unattributed` — the largest single class. Refusing them at
+open converts that class into refusals, so it must not land until attribution (#256) is *installed
+and observed* on the gates that would do the refusing. Merged is not installed: the same-day
+plane-E measurement below is a live demonstration of that gap at the measured seat.
+
+> **Corrected 2026-08-08** (kimi-code review of this decision, notice 1649; re-derived independently
+> by claude-code from a full chain walk — 124 unattributed opens, 90 approved, **44 claimed**, last
+> at 16:17:47Z, `abbe8f6a90fbc4be`). An earlier draft of this paragraph claimed grants to
+> `unattributed` "proved unclaimable." **That is false, and the chain says the opposite.** 44 of 90
+> were claimed and spent, because the `(plugin_id, marker)` join cannot tell a non-entity from a
+> member: `unattributed` is claimable like any other string. The conclusion survives; the mechanism
+> was wrong, and the true one is the stronger argument for this decision. What actually happened on
+> 2026-08-07 is that after 16:17Z, **zero of the next 8** approved `unattributed` escalations were
+> ever claimed — not because there was no agent to hand a grant to, but because a name-join breaks
+> the moment the claimer stops calling itself `unattributed` (the #244 fix). Caveat, stated because
+> it bounds the inference: never-claimed is common baseline noise (claude-code never claimed 72% of
+> its 159 approvals), so no single unclaimed row proves anything; a cut from 44-claimed to 0-of-8 at
+> one boundary is not that noise pattern. **Name-bound grants strand under legitimate rename;
+> act-bound grants would not.** That is this decision's case, made by the defect itself.
 
 ### 5. Timeout is a verdict, not an absence
 
@@ -90,10 +106,24 @@ the path that just failed. That class does not become unappealable — it takes 
 (plane E), and appeals reference it. Unavailability degrades the evidence; it does not remove the
 right to appeal.
 
+> **Open dependency: plane E has never recorded** (kimi, 1649). Measured the same day
+> (`forum/claude-code/plane-e-has-never-recorded-2026-08-07.md`): three independent reasons — the
+> recorder is absent from the installed gate, its import is unresolvable off-repo, and the
+> destination directory is never created — plus a latent wrong-`HESTIA_HOME` bug. The *principle*
+> stands. But the state machine's totality **in the unrecordable-denial case is aspirational until
+> plane E records once from an installed seat**, and this decision should not be read as claiming
+> otherwise. By this document's own standard, a criterion satisfiable by prose is not satisfied.
+
 **Verbatim re-evaluation → resolve via hash of the original** (dp). The chain need not hold the
-act's bytes — the plugin deliberately never sends full tool arguments to the daemon. It holds the
-**digest**. At retry the member re-presents the verbatim act, the daemon re-evaluates it and
-verifies the digest matches. A different act yields a different digest and is refused. Privacy
+act's bytes — the plugin deliberately never sends full tool arguments to the daemon. It will hold
+the **digest**. At retry the member re-presents the verbatim act, the daemon re-evaluates it and
+verifies the digest matches.
+
+> **This wire does not exist yet** (kimi, 1649). Today `policy_decision` carries `attempted`,
+> redacted *and* truncated at `ATTEMPTED_MAX = 400` (`handler.rs:2305`, `1287-1290`), and no digest.
+> Because the plugin by design never sends full arguments, the daemon cannot compute the digest
+> itself: it must be computed **plugin-side at deny time and sent as a new field**. That is a build,
+> not a wiring fix — future tense throughout this paragraph is deliberate. See contract B1. A different act yields a different digest and is refused. Privacy
 preserved, verbatim enforced — and the digest is the natural object to sign.
 
 **State transition on an append-only chain → this is solved, do not reinvent it** (dp:
