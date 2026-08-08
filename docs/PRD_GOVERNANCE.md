@@ -733,14 +733,16 @@ Authority is an explicit grant with issuer, reason, MRH, expiry, and revocation.
 
 Unknown office, insufficient authority, expired grant, or MRH mismatch fail closed to **no occupancy**, never to a silently substituted one.
 
-### 9.3 The approval join key
+### 9.3 The approval join key is superseded by an act-bound verdict
 
 The final join key is the **recorded action**, not `(plugin_id, marker)` and not a portable
 capability. `action_id` plus a versioned canonical act digest binds the resolver's verdict to one
 tool, target, arguments, session, and originating role/agent chain. A different session or caller
-asserting the same name cannot spend it. #281's marker-legibility fix is a useful interim
-compatibility guard; #283 / decision 0013 is the target contract. Do not build an arbitration driver
-on the old claim-token semantics.
+asserting the same name cannot spend it **once the origin is signed**. Before signing, the digest
+still closes cross-act scope, but the originating identity remains declared and impersonable. #281's
+marker-legibility fix is a useful interim compatibility guard; #283 / decision 0013 is the target
+contract. Do not build an arbitration driver on the old claim-token semantics, and do not report the
+identity half shipped when only digest matching is enforced.
 
 ### 9.4 Independence is identity **and** stake — NOT-BENEFICIARY
 
@@ -775,7 +777,8 @@ instruction, and `NOT-BENEFICIARY` applies to every consequential ruling, not on
 
 ## 10. The gate, and what gates the gate
 
-Requirements carry forward from GPT's §13 — one decision service, syntax-only shims, per-call artifact assurance, no local fallback — with two changes.
+Requirements carry forward from GPT's §13 — one decision service, syntax-only shims, per-call
+artifact assurance, no local fallback — plus the decision-0013 transition contracts below.
 
 **§2.4:** every requirement here is justified by *legibility*, not by resistance to a determined member.
 
@@ -783,15 +786,15 @@ Requirements carry forward from GPT's §13 — one decision service, syntax-only
 
 **Current transition requirements (fresh re-audit):**
 
-9. Every governed act has a stable `action_id`, versioned canonical digest, actor role/agent chain,
+- Every governed act has a stable `action_id`, versioned canonical digest, actor role/agent chain,
    instruction/delegation provenance, and beneficiary. The digest is privacy-preserving but the
    retry must re-present and match the original act verbatim.
-10. Appeals reference only that recorded act and originating chain. They append a terminal transition
+- Appeals reference only that recorded act and originating chain. They append a terminal transition
     (`granted`, `denied`, or `denied on appeal — reason: timeout`); expiry is not silent and late
     rulings cannot overwrite a terminal state.
-11. Daemon-unreachable denials use a durable Plane-E fallback record. Unattributed acts are not
+- Daemon-unreachable denials use a durable Plane-E fallback record. Unattributed acts are not
     appealable; they are explicitly terminal as unaddressable rather than silently claimable.
-12. Deployment status is stage-labelled: source, merged, installed, restarted, live, and observed
+- Deployment status is stage-labelled: source, merged, installed, restarted, live, and observed
     are separate facts, with the current-build authority file and installer proving the transition.
 
 **Release gates — the consolidation is not wired fleet-wide until all hold:**
