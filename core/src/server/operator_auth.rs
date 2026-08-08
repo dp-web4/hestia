@@ -422,6 +422,14 @@ pub fn authenticate_composed_operator(
     ttl_secs: u64,
 ) -> Option<String> {
     provenance.validate_for_challenge(challenge).ok()?;
+    if !canonical_lower_hex(actor_public_key_hex, 32)
+        || !canonical_lower_hex(device_public_key_hex, 32)
+        || !canonical_lower_hex(principal_signature_hex, 64)
+        || !canonical_lower_hex(actor_signature_hex, 64)
+        || !canonical_lower_hex(device_signature_hex, 64)
+    {
+        return None;
+    }
 
     // Preserve the legacy endpoint's anti-replay property: any cryptographic
     // attempt consumes the nonce, even when a later proof is invalid.
@@ -461,6 +469,14 @@ fn decode_signature(value: &str) -> Option<web4_core::crypto::SignatureBytes> {
 fn decode_public_key(value: &str) -> Option<web4_core::crypto::PublicKey> {
     let bytes: [u8; 32] = hex::decode(value.trim()).ok()?.try_into().ok()?;
     web4_core::crypto::PublicKey::from_bytes(&bytes).ok()
+}
+
+fn canonical_lower_hex(value: &str, decoded_bytes: usize) -> bool {
+    value.len() == decoded_bytes * 2
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
 /// Consequence + reversibility of an operator act (clause S). The gradient:
@@ -1056,6 +1072,15 @@ mod tests {
             "0524720396a6a9be07c5fa62e9e736e1d1302d59e37d7daf3609d8f87bd492a1",
             "app/daemon transcript drifted; bump the domain version"
         );
+    }
+
+    #[test]
+    fn composed_proof_hex_is_bounded_and_canonical() {
+        assert!(canonical_lower_hex(&"0a".repeat(32), 32));
+        assert!(!canonical_lower_hex(&"0A".repeat(32), 32));
+        assert!(!canonical_lower_hex(&"0a".repeat(31), 32));
+        assert!(!canonical_lower_hex(&"0a".repeat(33), 32));
+        assert!(!canonical_lower_hex(&format!("{}g0", "0a".repeat(31)), 32));
     }
 
     #[test]
