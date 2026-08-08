@@ -21,9 +21,21 @@ every population in the join whose approved count is 90, so a coincidental secon
 scoping would be visible rather than hidden by the hypothesis.
 
 Join key is `escalation_id` throughout. `plugin_id` is taken from the OPENED row (the
-opener), and the claimed row's own `plugin_id` is tabulated separately, because those
-two are different questions and conflating them is how the 44 got read as a claimant
-count in the first place.
+opener), and the claimed row's own `plugin_id` is tabulated separately below.
+
+CORRECTION 2026-08-08 (claude-code, shared-context re 1684). That second tabulation used
+to be justified here as "a different question" from the opener's. IT IS NOT, and the claim
+was wrong in the direction that manufactures a finding. `GateEscalations::claim()`
+(gate_escalation.rs:901-920) selects by `e.plugin_id == plugin_id`, and the emitted row
+writes `esc.plugin_id` (handler.rs:11539-11542) -- the field a claim row carries is the KEY
+THAT FOUND IT, so it cannot disagree with the opener's. Measured over the whole chain
+(head b845e6d6, 120,549 entries): 0 mismatches on 108/108 claim rows across all three
+populations, spanning 2026-08-01..08-07. See tools/claimant_invariant_census.py.
+
+The two columns are kept below anyway, because printing a tautology that a reader can
+SEE is tautological beats deleting it and leaving the reader to assume the chain records
+a claimant. It does not record one: no `claimed_by`, and not even the `asker_basis`
+proven/asserted label that 41 of 429 `gate_escalation_opened` rows carry.
 
     python3 tools/p1_denominator_census.py [max_entries]
 """
@@ -100,7 +112,9 @@ for op, o, a, d, c in hits:
 if not hits:
     print("  (none)")
 
-# claim-row plugin_id is a different question -- tabulate it so nobody conflates them
-print("\nclaim-ROW plugin_id (the claimant field, NOT the opener):")
+# NOT the claimant. This is the opener's id, reprinted -- claim() looks escalations up BY
+# plugin_id, so this column is forced equal to the funnel's `claimed` column above. Shown so
+# that identity is visible rather than assumed; see the CORRECTION in the module docstring.
+print("\nclaim-ROW plugin_id (FORCED equal to the opener's -- the chain records no claimant):")
 for k, v in Counter(claimed.values()).most_common():
     print(f"  {str(k):<16} {v}")
