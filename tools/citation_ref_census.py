@@ -203,8 +203,29 @@ def blob_at(ref: str, path: str) -> str | None:
     return r.stdout.strip() if r.returncode == 0 else None
 
 
+def _nonsymbolic(pattern: str, fmt: str) -> list[str]:
+    """`for-each-ref` over PATTERN, dropping symbolic refs, formatted by FMT.
+
+    `refs/remotes/origin` matches `refs/remotes/origin/HEAD`, which is not a member of
+    the population -- it is an ALIAS for one, and `%(refname:short)` renders it as the
+    bare `origin`. Counting it measures the same blob twice, so a clone that carries it
+    reports N+1 refs and one extra hit on every anchor the default branch satisfies,
+    with no commit anywhere. Measured: two clones of one remote, identical in every
+    non-symbolic ref, differ in both N and `refpop`
+    (`tools/citation_refpop_symref_test.py`).
+
+    That is a defect in this instrument, not drift in the world, and it is the one part
+    of the denominator that IS a property of the repository -- so it is the one part
+    that can be fixed here rather than pinned. The rest still cannot: see
+    `ref_population_pin`.
+    """
+    out = git("for-each-ref", f"--format=%(symref)\t{fmt}", pattern).split("\n")
+    return [line.split("\t", 1)[1] for line in out
+            if line.strip() and not line.split("\t", 1)[0]]
+
+
 def remote_refs(pattern: str) -> list[str]:
-    return git("for-each-ref", "--format=%(refname:short)", pattern).split()
+    return _nonsymbolic(pattern, "%(refname:short)")
 
 
 def ref_population_pin(pattern: str) -> tuple[int, str]:
@@ -222,9 +243,14 @@ def ref_population_pin(pattern: str) -> tuple[int, str]:
     different population wearing the same count. Quote it beside any figure taken from
     this run: `17/78 @ refpop:ab12cd34ef56`. A reader whose digest differs knows
     immediately that reproduction is not expected, instead of reporting a mismatch.
+
+    Symbolic refs are excluded (`_nonsymbolic`) BEFORE digesting, and that ordering is
+    the point. A pin that fires on `origin/HEAD` tells a reader "not the same
+    population" about two clones holding identical content -- inverting the one thing
+    the pin exists to do. Manufacturing disagreement is worse than the bare count it
+    replaced, because it is disagreement wearing a proof.
     """
-    pairs = git("for-each-ref", "--format=%(refname:short) %(objectname)", pattern).split("\n")
-    pairs = sorted(p for p in pairs if p.strip())
+    pairs = sorted(_nonsymbolic(pattern, "%(refname:short) %(objectname)"))
     digest = hashlib.sha256("\n".join(pairs).encode()).hexdigest()[:12]
     return len(pairs), digest
 

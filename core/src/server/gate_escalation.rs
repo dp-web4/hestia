@@ -237,6 +237,12 @@ pub struct Factor {
     pub role: Option<String>,
     pub independence: Option<crate::arbiter::Independence>,
     pub at: u64,
+    /// A peer that looked and DISAGREED. Under invitation semantics this is evidence for
+    /// review, never a veto — dp: dissent is *"surfaced to the live UI"*, and a sovereign
+    /// decision stands regardless. Defaults false so every existing factor reads as
+    /// concurrence, which is what it was.
+    #[serde(default)]
+    pub dissent: bool,
 }
 
 impl Channel {
@@ -252,6 +258,12 @@ impl Channel {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Escalation {
     pub id: String,
+    /// Seats invited to participate in this decision. Plural: dp, on whether the
+    /// invitation should reach more than one peer — *"i think yes."* One invited seat
+    /// asleep is an availability accident; three that never looked is a finding, and only
+    /// a list can tell those apart.
+    #[serde(default)]
+    pub invited_peers: Vec<String>,
     /// The member asking. Recorded as claimed — `plugin_id` is caller-asserted (HST-005), and
     /// this field inherits that weakness rather than laundering it.
     pub plugin_id: String,
@@ -367,14 +379,71 @@ impl Escalation {
                 .factors
                 .iter()
                 .any(|f| f.channel.is_sovereign() || f.channel == Channel::PeerMember),
-            Bar::SovereignPlusPeer => {
-                let sov = self.factors.iter().any(|f| f.channel.is_sovereign());
-                let peer = self
-                    .factors
-                    .iter()
-                    .any(|f| f.channel == Channel::PeerMember);
-                sov && peer
-            }
+            // TWO-BAR IS AN INVITATION TO PARTICIPATE, NOT A BLOCKER.
+            //
+            // dp, decision of record 2026-08-06: *"On sovereign decisions, two-bar is an
+            // invitation to participate, not a blocker. It should have a liveness timeout
+            // that's fairly short, and a mechanism to surface dissent to the live UI."*
+            // And on the bar's continuing value: *"that doesn't invalidate the bar — the
+            // invitation is valuable, and if acted on, so is the feedback. but it's the
+            // same 'go with best we can get' — if none accept the invitation, that cannot
+            // become a block."*
+            //
+            // WHY IT HAD TO CHANGE, measured (#219): `sovereign_plus_peer` was **0 of 66
+            // bar-met, lifetime**. Decisions are single-shot, `corroborate` refused decided
+            // escalations, and the median ruling landed 69s after opening — faster than a
+            // mesh round trip. The peer factor could not arrive in time, ever. A bar that
+            // has never once been satisfiable is not a standard; it is an outage wearing
+            // a standard's clothes, and it spent this fleet's attention for weeks.
+            //
+            // So the sovereign conjunct decides. The peer conjunct is retained as
+            // EVIDENCE, not as a gate: `peer_participation()` reports whether the invited
+            // seats accepted, dissented, or were absent, and that record is what makes the
+            // invitation worth issuing. The bar still shapes WHO IS ASKED and what is
+            // recorded — it no longer shapes whether a sovereign may act.
+            //
+            // This is the same primitive as `OccupancyBasis::Provisional`, D-1's
+            // `OnExceeded`, D-3's `NotSameRequirement::Preferred`, and `ReadBasis`:
+            // proceed with the best available, never silently, always with the deficiency
+            // on the record.
+            Bar::SovereignPlusPeer => self.factors.iter().any(|f| f.channel.is_sovereign()),
+        }
+    }
+
+    /// What the invited peers actually did — the half of the bar that survives.
+    ///
+    /// Under blocker semantics a missing peer was indistinguishable from a peer that
+    /// looked and declined, because both rendered as `bar_met: false`. Under invitation
+    /// semantics those are different facts about different seats, and only one of them
+    /// says anything about the decision.
+    ///
+    /// Reported rather than enforced, and reported for MORE THAN ONE PEER — dp, on whether
+    /// the invitation should go to several seats: *"i think yes."* One invited seat that
+    /// happens to be asleep is an availability accident; three invited seats that all
+    /// declined to look is a finding.
+    pub fn peer_participation(&self) -> PeerParticipation {
+        let concurred = self
+            .factors
+            .iter()
+            .filter(|f| f.channel == Channel::PeerMember && !f.dissent)
+            .count();
+        let dissented = self
+            .factors
+            .iter()
+            .filter(|f| f.channel == Channel::PeerMember && f.dissent)
+            .count();
+        PeerParticipation {
+            invited: self.invited_peers.clone(),
+            concurred,
+            dissented,
+            // Absent is derived, never stored: a seat that has not answered YET is not the
+            // same as one that declined, and storing "absent" would freeze a moment as a
+            // verdict. Post-decision participation is expressly allowed, so this number
+            // can fall after a decision — which is the mechanism working, not drift.
+            absent: self
+                .invited_peers
+                .len()
+                .saturating_sub(concurred + dissented),
         }
     }
 
@@ -474,6 +543,19 @@ impl std::fmt::Display for OpenError {
 }
 
 #[derive(Default)]
+/// The outcome of an invitation, as a record rather than a gate.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerParticipation {
+    /// Seats invited to participate. Plural by design (dp: *"should invitation go out to
+    /// more than one peer? i think yes."*).
+    pub invited: Vec<String>,
+    pub concurred: usize,
+    pub dissented: usize,
+    /// Invited and not yet heard from. Derived, not stored — see `peer_participation`.
+    pub absent: usize,
+}
+
+#[derive(Default)]
 pub struct EscalationStore {
     by_id: HashMap<String, Escalation>,
     /// Monotonic, so two escalations opened in the same second still differ.
@@ -534,6 +616,7 @@ impl EscalationStore {
                         id.clone(),
                         Escalation {
                             id,
+                            invited_peers: Vec::new(),
                             plugin_id,
                             role: s(d, "role").unwrap_or_default(),
                             tool_name: s(d, "tool_name").unwrap_or_default(),
@@ -655,6 +738,7 @@ impl EscalationStore {
 
         let esc = Escalation {
             id: id.clone(),
+            invited_peers: Vec::new(),
             plugin_id: plugin_id.to_string(),
             role: role.trim().to_string(),
             tool_name: tool_name.to_string(),
@@ -768,6 +852,8 @@ impl EscalationStore {
             by: decided_by.trim().to_string(),
             role: esc.decided_role.clone(),
             independence,
+            // A decision is concurrence with itself. Dissent is a PEER verb.
+            dissent: false,
             at: now,
         });
         Ok(esc.clone())
@@ -788,24 +874,33 @@ impl EscalationStore {
         by: &str,
         role: &str,
         independence: Option<crate::arbiter::Independence>,
+        // A peer that looked and DISAGREED. Recorded, surfaced, and never a veto — dp's
+        // ruling makes dissent evidence for review rather than a brake on the sovereign.
+        dissent: bool,
         now: u64,
     ) -> Result<Escalation, DecideError> {
         if by.trim().is_empty() {
             return Err(DecideError::AnonymousDecider);
         }
         let esc = self.by_id.get_mut(id).ok_or(DecideError::Unknown)?;
-        match esc.status_at(now) {
-            Status::Expired => return Err(DecideError::Expired),
-            s @ (Status::Approved | Status::Denied) => {
-                return Err(DecideError::AlreadyDecided(s))
-            }
-            Status::Pending => {}
+        // PARTICIPATION MAY LAND AFTER THE DECISION. Under blocker semantics, refusing a
+        // decided escalation was right: a late factor could have flipped an outcome. Under
+        // invitation semantics it is wrong, and kimi's decision-of-record says so directly
+        // — the sovereign has already ruled, nothing here can reopen it, and a peer that
+        // looked afterwards is exactly the feedback the invitation was issued to collect.
+        //
+        // Expired still refuses. That is not a decision the peer is commenting on; it is a
+        // record whose window closed, and a factor arriving after it would attach evidence
+        // to something the hook already denied for a different reason.
+        if esc.status_at(now) == Status::Expired {
+            return Err(DecideError::Expired);
         }
         esc.factors.push(Factor {
             channel: Channel::PeerMember,
             by: by.trim().to_string(),
             role: Some(role.trim().to_string()).filter(|r| !r.is_empty()),
             independence,
+            dissent,
             at: now,
         });
         Ok(esc.clone())
@@ -958,6 +1053,70 @@ mod tests {
         for s in [Status::Pending, Status::Denied, Status::Expired] {
             assert!(!s.permits_write(), "{s:?} must not permit a governance write");
         }
+    }
+
+    #[test]
+    fn a_sovereign_may_rule_a_two_bar_alone_and_the_absent_peer_is_recorded() {
+        // dp, decision of record 2026-08-06: "On sovereign decisions, two-bar is an
+        // invitation to participate, not a blocker."
+        //
+        // The measurement that forced it (#219): sovereign_plus_peer was 0 of 66 bar-met,
+        // LIFETIME. Decisions are single-shot, corroborate refused decided escalations,
+        // and the median ruling landed 69s after opening — faster than a mesh round trip.
+        // This test is the arithmetic of that ruling: it FAILS on the old semantics.
+        let mut s = EscalationStore::default();
+        let e = s
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        let id = e.id.clone();
+        assert_eq!(s.get(&id).unwrap().bar, Bar::SovereignPlusPeer);
+
+        let decided = s
+            .decide(&id, true, "operator", "role:constellation:sovereign",
+                    Channel::OperatorSession, None, Some("deploy the merged hook"), T0 + 10)
+            .unwrap();
+
+        assert!(decided.bar_met(), "a sovereign decision meets a two-bar alone");
+        assert!(
+            decided.is_claimable(T0 + 20),
+            "and it PERMITS — the whole defect was an approval that granted nothing"
+        );
+
+        // The peer half survives as evidence, not as a gate.
+        let p = decided.peer_participation();
+        assert_eq!(p.concurred, 0);
+        assert_eq!(p.dissented, 0);
+        assert_eq!(p.absent, 0, "nobody was invited, so nobody is absent — absent is DERIVED");
+    }
+
+    #[test]
+    fn dissent_is_recorded_and_does_not_veto() {
+        // "a mechanism to surface dissent to the live UI" — evidence for review, never a
+        // brake on the sovereign. A dissent that could block would make the invitation a
+        // blocker again by the back door.
+        let mut s = EscalationStore::default();
+        let e = s
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        let id = e.id.clone();
+        s.decide(&id, true, "operator", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("proceed"), T0 + 5)
+            .unwrap();
+
+        // Invited seats, plural — dp: "should invitation go out to more than one peer?
+        // i think yes."
+        s.by_id.get_mut(&id).unwrap().invited_peers =
+            vec!["kimi-code".to_string(), "codex".to_string()];
+
+        let after = s
+            .corroborate(&id, "kimi-code", "role:constellation:member", None, true, T0 + 90)
+            .expect("a peer may participate AFTER the decision — that is what invitation means");
+
+        assert!(after.is_claimable(T0 + 95), "dissent records; it does not veto");
+        let p = after.peer_participation();
+        assert_eq!(p.dissented, 1, "the disagreement is on the record");
+        assert_eq!(p.concurred, 0);
+        assert_eq!(p.absent, 1, "codex was invited and has not answered — not the same as declining");
     }
 
     #[test]
@@ -1365,23 +1524,27 @@ mod bar_factor_tests {
     }
 
     #[test]
-    fn an_approval_short_of_the_bar_is_recorded_but_permits_nothing() {
-        // THE POINT of the whole change: operator alone on an operator+peer surface. The
-        // approval is real, the record shows it, and it still must not permit the write —
-        // the mismatch is visible, never silently sufficient.
+    fn a_sovereign_alone_on_a_two_bar_surface_permits_and_records_the_absent_peer() {
+        // REPLACES `an_approval_short_of_the_bar_is_recorded_but_permits_nothing`, which
+        // pinned the pre-ruling semantics: operator-alone was recorded but permitted
+        // nothing. dp's decision of record (2026-08-06) inverts that — "two-bar is an
+        // invitation to participate, not a blocker" — after #219 censused the old rule at
+        // 0 of 66 bar-met, lifetime. The old test was not wrong; it is superseded, and it
+        // is rewritten rather than deleted so the change of law stays legible here.
         let (mut s, id) = open_with("pre_tool_use.py");
         let e = s
             .decide(&id, true, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, None, T0 + 5)
             .expect("approve is recorded even when short of the bar");
         assert_eq!(e.stored_status(), Status::Approved);
-        assert!(!e.bar_met(), "one factor cannot meet a two-factor bar");
+        assert!(e.bar_met(), "the sovereign conjunct decides; the peer one invites");
         assert!(
-            !e.is_claimable(T0 + 6),
-            "an approval short of the stated bar must not be claimable"
+            e.is_claimable(T0 + 6),
+            "an approval that permits nothing was the defect, not the safeguard"
         );
-        // And a retry at the daemon level agrees: status_of reports approved, but the write
-        // still cannot proceed — the two answers are different and both recorded.
         assert_eq!(s.status_of(&id, T0 + 6), Status::Approved);
+        let p = e.peer_participation();
+        assert_eq!(p.concurred + p.dissented, 0, "no peer spoke");
+        assert_eq!(p.absent, 0, "and none was invited — absent is derived from the invite list");
     }
 
     #[test]
@@ -1390,7 +1553,7 @@ mod bar_factor_tests {
         // and the set — never the first answer — is what the bar evaluates.
         let (mut s, id) = open_with("witness.py");
         let e = s
-            .corroborate(&id, "kimi-code", "role:constellation:member", None, T0 + 3)
+            .corroborate(&id, "kimi-code", "role:constellation:member", None, false, T0 + 3)
             .expect("peer corroboration lands while pending");
         assert_eq!(e.factors.len(), 1);
         assert_eq!(e.factors[0].channel, Channel::PeerMember);
@@ -1407,21 +1570,32 @@ mod bar_factor_tests {
     }
 
     #[test]
-    fn corroboration_freezes_at_decision() {
+    fn post_decision_participation_is_recorded_and_cannot_dress_up_a_ruling() {
+        // REPLACES `corroboration_freezes_at_decision`. Its concern was real and is worth
+        // stating: evidence after the fact could let a weak ruling be dressed up as a
+        // strong one. Under invitation semantics that risk is structurally gone rather
+        // than merely accepted — `bar_met` now reads ONLY the sovereign conjunct, so a
+        // late peer factor cannot move it. Participation is recorded beside the decision,
+        // never folded into its authority.
         let (mut s, id) = open_with("law_inject.py");
         s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, None, T0 + 5)
             .expect("decided");
-        let err = s
-            .corroborate(&id, "kimi-code", "r", None, T0 + 6)
-            .expect_err("evidence after the fact would let a weak ruling be dressed up");
-        assert_eq!(err, DecideError::AlreadyDecided(Status::Approved));
+        let before = s.get(&id).unwrap().bar_met();
+
+        let after = s
+            .corroborate(&id, "kimi-code", "r", None, false, T0 + 6)
+            .expect("a peer may participate after the ruling — that is the invitation");
+
+        assert_eq!(after.bar_met(), before, "a late factor MUST NOT change the bar verdict");
+        assert_eq!(after.peer_participation().concurred, 1, "but it is on the record");
+        assert_eq!(after.stored_status(), Status::Approved, "and the ruling is untouched");
     }
 
     #[test]
     fn corroboration_requires_a_named_peer() {
         let (mut s, id) = open_with("law_inject.py");
         let err = s
-            .corroborate(&id, "  ", "r", None, T0 + 3)
+            .corroborate(&id, "  ", "r", None, false, T0 + 3)
             .expect_err("anonymous evidence in an attribution record is worse than none");
         assert_eq!(err, DecideError::AnonymousDecider);
     }
@@ -1430,7 +1604,7 @@ mod bar_factor_tests {
     fn an_expired_escalation_takes_no_more_evidence() {
         let (mut s, id) = open_with("law_inject.py");
         let err = s
-            .corroborate(&id, "kimi-code", "r", None, T0 + 121)
+            .corroborate(&id, "kimi-code", "r", None, false, T0 + 121)
             .expect_err("expired is expired");
         assert_eq!(err, DecideError::Expired);
     }

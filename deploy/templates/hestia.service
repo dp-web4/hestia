@@ -78,6 +78,9 @@ Type=simple
 # replaces this with TPM unsealing.
 ExecStart=/bin/sh -c 'HESTIA_PASSPHRASE="$(cat %h/.hestia/.passphrase)" exec %h/.local/bin/hestia serve --bind 127.0.0.1:7711'
 Environment=HESTIA_HOME=%h/.hestia
+# Supervisor-owned build identity; the dashboard turns amber when this differs
+# from the build actually running.
+Environment=HESTIA_CURRENT_BUILD_FILE=%h/.hestia/current-build.json
 Environment=RUST_LOG=warn
 # Workspace handed to agent-inventory for the dashboard read list. Unset => the
 # inventory guesses, notices it guessed, and degrades the report to UNKNOWN.

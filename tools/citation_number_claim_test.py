@@ -53,6 +53,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 CENSUS = REPO / "tools" / "citation_ref_census.py"
+#: The well-known empty-tree id. git resolves it without the object existing, which
+#: makes it the one tree a depth-1 CI checkout is guaranteed to have.
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 _spec = importlib.util.spec_from_file_location("citation_ref_census", CENSUS)
 _census = importlib.util.module_from_spec(_spec)
@@ -208,7 +211,25 @@ def test_h_the_ref_population_pin_moves_when_the_population_does():
     """
     ns = "refs/remotes/censuspintest"
     a = _census.git("rev-parse", "HEAD").strip()
-    b = _census.git("rev-parse", "HEAD~1").strip()
+    # `HEAD~1` was the second commit, but `actions/checkout` fetches depth 1, so in CI
+    # there IS no HEAD~1 -- rev-parse exits 128, the same shallow-clone class 9b927fe
+    # fixed in the census, one layer down. The docstring above already promises this
+    # test "neither depends on nor disturbs this checkout's real population"; borrowing
+    # its HISTORY violated that. The fixture needs a second distinct commit object, not
+    # history -- mint one. git resolves the empty-tree id without the object existing.
+    #
+    # THIRD LAYER (2026-08-07, cbp). The empty tree was never the problem: minting a
+    # commit needs an AUTHOR, and `actions/checkout` sets no `user.name`/`user.email`,
+    # so `commit-tree` exits 128 with "empty ident name" -- byte-identical in CI and
+    # under `HOME=<empty> GIT_CONFIG_GLOBAL=/dev/null`. The fix above stopped borrowing
+    # the checkout's HISTORY and started borrowing its git IDENTITY CONFIG instead; the
+    # sibling fixtures already say so in `tools/conflict_marker_test.py::scratch` --
+    # "keep a CI runner's global config out of these repos". State the identity here.
+    b = _census.git("-c", "user.name=hestia-fixture",
+                    "-c", "user.email=fixture@hestia.invalid",
+                    "-c", "commit.gpgsign=false",
+                    "commit-tree", EMPTY_TREE,
+                    "-m", "synthetic second commit for the pin fixture").strip()
     assert a != b, "fixture needs two distinct commits"
     try:
         _census.git("update-ref", f"{ns}/one", a)
