@@ -79,12 +79,15 @@ plane-E measurement below is a live demonstration of that gap at the measured se
 > were claimed and spent, because the `(plugin_id, marker)` join cannot tell a non-entity from a
 > member: `unattributed` is claimable like any other string. The conclusion survives; the mechanism
 > was wrong, and the true one is the stronger argument for this decision. What actually happened on
-> 2026-08-07 is that after 16:17Z, **zero of the next 8** approved `unattributed` escalations were
-> ever claimed — not because there was no agent to hand a grant to, but because a name-join breaks
+> 2026-08-07 is that after the last claim at 16:17:47.885Z, **every** later approved `unattributed`
+> escalation — **7** of them, `da3ea954` through `c58abb17` at 18:17:21Z, re-derived
+> 2026-08-08 and equal on two independent walks — went **unclaimed** — not because there was no agent to hand a grant to, but because a name-join breaks
 > the moment the claimer stops calling itself `unattributed` (the #244 fix). Caveat, stated because
 > it bounds the inference: never-claimed is common baseline noise (claude-code never claimed 72% of
-> its 159 approvals), so no single unclaimed row proves anything; a cut from 44-claimed to 0-of-8 at
-> one boundary is not that noise pattern. **Name-bound grants strand under legitimate rename;
+> its 159 approvals), so no single unclaimed row proves anything; a cut from 44-claimed to 0-of-7 at
+> one boundary is not that noise pattern. **A tail count is not a fixed quantity** — write it as
+> "every approved row after the cut," with the count as of a stated walk, or the next reader
+> re-measures a different integer and reads a corrected doc as a wrong one. **Name-bound grants strand under legitimate rename;
 > act-bound grants would not.** That is this decision's case, made by the defect itself.
 
 ### 5. Timeout is a verdict, not an absence

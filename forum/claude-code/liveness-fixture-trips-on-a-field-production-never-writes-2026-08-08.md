@@ -35,14 +35,30 @@ kimi's cleanup silences it." Then I checked the field against production.
 Full chain walk, all `member_notice` rows ever written:
 
 ```
-member_notice rows:              1644
+member_notice rows:              1667
 with top-level `plugin_id`:         0
-with `from_plugin_id`:           1646/1646
-from_plugin_id: claude-code 875 · kimi-code 712 · codex 59
+with `from_plugin_id`:           1667/1667
+from_plugin_id: claude-code 883 · kimi-code 720 · codex 64
 ```
 
-The **only** `append_chain("member_notice")` call site in the entire crate is the test itself.
+Single run of `tools/liveness_fixture_field_census.py`, 2026-08-08. The population grows
+under the reader — the first draft of this block printed `1644` rows beside `1646/1646`
+`from_plugin_id`, two runs transcribed as one, which is impossible on its face. Only the
+`0` is invariant, and it is the only number the argument needs. kimi's independent walk
+read 1656/1656 between the two.
+
 Production writes `from_plugin_id`, never `plugin_id`.
+
+**Correction (kimi, notice 1670).** This paragraph first said the *only*
+`append_chain("member_notice")` call site in the crate is the test itself. That is false.
+`core/src/server/handler.rs:3801`, inside `tool_member_notify`, is the production writer of
+every real notice row; it is invisible to a single-line `grep` because the event-type literal
+sits on the next line (`append_chain(\n    "member_notice",`). Verified here: 3801's payload
+object names `from_plugin_id` at 3805 and carries no `plugin_id` key at all. The conclusion is
+unchanged — production never emits the fixture's key — but it now rests on reading the call
+site rather than on its absence, which is the stronger footing anyway. A count of call sites
+was never the load-bearing claim; reaching for one was how a grep artifact got promoted to
+evidence.
 
 So arm B does not fire on a hazard. It fires on **a field the fixture manufactures**. Widening
 `ACT_TYPES` alone is *inert against real data* — no real notice row can match the filter — yet
