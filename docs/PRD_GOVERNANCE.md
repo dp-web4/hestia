@@ -956,22 +956,22 @@ This is §7.4's own rule turned on the measurement apparatus rather than on the 
 - `EvidenceClass` recorded on every trust-bearing assertion (§7.4).
 - `OccupancyBasis` recorded; **name the Policy-Entity office and mark it `Provisional`** with a real `audit_every` (§7.3, §8.1).
 - Consult `DelegationStore` in the decision path in **WARN**: log what *would* have changed, decide nothing (§3).
-- **Make appeal filable and act-bound** (§2.16, §8.4): record the denied act with `action_id`,
-  canonical versioned digest, provenance, and originating chain before opening an appeal. Do not
-  extend the old `deny_hash` token model. Add red tests for digest mismatch, cross-session/cross-agent
-  claim, unattributed non-appealability, and terminal timeout compare-and-swap.
+- **Prepare the act record for Sprint 2.5** (§2.16, §8.4): surface the existing `action_id`,
+  composed identity, and `answers_deny` slot without claiming the absent digest wire or act link.
+  Record would-refuse results for unattributed opens; do not enforce them before attribution is
+  installed and observed.
 - **Give Plane E a writer** (§2.13): wire the merged producer into the fail-closed path of every
   installed harness — four engines, not one — and distinguish timeout, refusal, and unaddressable
   acts. The fallback must retain enough action digest/provenance for later reconciliation.
 - Surface all of it in the ledger.
 
-**Acceptance:** four numbers exist that do not exist today — how many acts carry a declared vs audited vs witnessed identity; how many governed acts run under a provisional occupant; how many verdicts a live delegation would have changed; what the availability floor actually is. **Plus:** a real denied act is recorded with its digest/provenance, an appeal reaches only its originating chain, a mismatched retry is refused, timeout becomes terminal, and an unattributed act is explicitly non-appealable. **And:** a deliberately induced fail-closed deny produces a Plane-E row on every installed engine, with the test being the row and not the report.
+**Acceptance:** four numbers exist that do not exist today — how many acts carry a declared vs audited vs witnessed identity; how many governed acts run under a provisional occupant; how many verdicts a live delegation would have changed; what the availability floor actually is. **Plus:** a deliberately induced fail-closed deny produces a Plane-E row on every installed engine, with the test being the row and not the report; the observed count of unattributed appeal opens is published without changing their verdict.
 
 **Not this sprint:** authority, enforcement, or any refusal that did not already happen. Appeal *filing* qualifies precisely because it changes no verdict — it returns a value the deny already computed and threw away.
 
-**Whose hands.** The act-binding and appeal-filing diff must be authored/reviewed under NOT-SAME
-and NOT-BENEFICIARY. The design is independently recorded in #283; implementation must have a
-different reviewer from the beneficiary and must not let the requester repair its own approval path.
+**Whose hands.** The appeal-record preparation must be authored/reviewed under NOT-SAME and
+NOT-BENEFICIARY. The design is independently recorded in #283; implementation must have a different
+reviewer from the beneficiary and must not let the requester repair its own approval path.
 
 **Why first:** it is free to decide, and it stops every later sprint from silently claiming qualification it has not earned. It also produces the delegation number that tells us whether §9.2's model is right *before* we build on it.
 
@@ -994,9 +994,9 @@ exists to receive the verdict.
 
 ---
 
-### Sprint 2 — Identity: stop accepting declarations
+### Sprint 2 — Identity and signing: stop accepting declarations
 
-**Goal:** the subject of every governed act is proven, not asserted.
+**Goal:** the subject and originating chain of every governed act are proven, not asserted.
 
 - Bind `plugin_id` to a key at connect; derive every selector from the proven identity (§9.1).
 - Split capacity from office: capacity to the agent LCT; rename `role_lct` to what it holds (§7.2).
@@ -1006,7 +1006,11 @@ exists to receive the verdict.
   grant is considered claimable.
 - Observe → warn → enforce, with the Sprint-1 counters as the readiness signal.
 
-**Acceptance:** a caller cannot select another member's grain; a session cannot assert another session's identity; the warn-phase count of would-be refusals reaches zero before enforce is switched on.
+**Acceptance:** a caller cannot select another member's grain; a session cannot assert another
+session's identity; every newly appended governed act carries a signature verified against its
+recorded origin; tampering with the digest, role/agent composition, or session binding makes
+verification fail; and the warn-phase count of would-be refusals reaches zero before enforce is
+switched on. A zero-caller signing primitive does not satisfy this criterion.
 
 **Not this sprint:** per-agent authority. Identity first, authority after — §2.1.
 
