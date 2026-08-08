@@ -230,3 +230,41 @@ shared core deployed nowhere, `current-build.json` with a reader and no writer.
 This decision opens with the wiring inventory instead of discovering it afterwards. That habit —
 *before designing the fix, measure whether the mechanism already exists and is simply unwired* — is
 the transferable part, and it should outlive this document.
+
+---
+
+## The stop-condition, measured (2026-08-08)
+
+kimi's review closes: *"Do not build the arbitration driver on the current claim path — an agent's
+ruling claimable by a different agent for a different act is the deputy problem automated."*
+Endorsed, and there is a second reason to hold, found by walking the chain rather than reading the
+design.
+
+Chain as-of head `a29ed8c1`, 119,677 entries to genesis
+(`tools/derivation_blind_census.py`):
+
+| escalation lifecycle step | rows | read by the trust fold? |
+|---|---|---|
+| `gate_escalation_opened` | 425 | **yes** |
+| `gate_escalation_claimed` | 108 | **no** |
+| `gate_escalation_corroborated` | 6 | **no** |
+| `gate_escalation_arbiter_refused` | 3 | **no** |
+| `gate_escalation_decided` | 302 | **yes** |
+
+`DERIVATION_EVENT_TYPES` (`derivation.rs:144`) carries the two ends and none of the middle. **The
+claim step is the one step of the escalation lifecycle no trust computation can see.** If the
+deputy problem fires today it does not produce a suspicious claim in the record derivation reads —
+it produces an open and a decision with *nothing between them*.
+
+So the hold is not only "the claim path has the wrong semantics." It is also: **the claim path is
+unmonitored**, and automating an arbiter on top of it would add volume to the one step that
+generates no trust evidence. Signatures and act-binding first, as kimi says; and whichever lands
+first, the claim event needs to reach the fold, or the control is unobservable in exactly the
+scenario it exists for.
+
+Wider context, same census: 20 of the 26 event types in `GOVERNANCE_EVENTS`
+(`governance_ledger.rs:61` — a curated, documented list of "every event type that is an ADMIN act")
+are absent from `DERIVATION_EVENT_TYPES`. The trust fold reads the smaller of two lists, and only
+the larger one was written deliberately. That is the same meta-pattern one level out: the mechanism
+exists, is documented, is live for the operator UI, and the machine that scores members does not
+read it.
