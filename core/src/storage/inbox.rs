@@ -373,6 +373,41 @@ impl SqliteInboxStore {
         Ok(n as u64)
     }
 
+    fn ensure_erasure_schema(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS member_debt_erasures (
+                plugin_id     TEXT PRIMARY KEY,
+                erased        INTEGER NOT NULL,
+                first_erasure TEXT NOT NULL,
+                last_erasure  TEXT NOT NULL
+             );",
+        )
+        .context("initializing member_debt_erasures schema")?;
+        Ok(())
+    }
+
+    /// How many genuinely-unanswered notices involving `plugin_id` — in either
+    /// direction — were destroyed by the TTL prune rather than answered.
+    ///
+    /// This is the number `member_unanswered` cannot express: after the prune the
+    /// row is gone, and "nobody ever answered me" and "the debt was settled" are
+    /// the same empty result. Same caveat as [`Self::member_evictions`], and it
+    /// matters more here because the prune has been running far longer than the
+    /// counter: zero means "none since this shipped", never "none ever".
+    ///
+    /// Reported, never gated on — a member that lost evidence is owed the fact,
+    /// not a penalty.
+    pub fn member_debt_erasures(&self, plugin_id: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_erasure_schema(&conn)?;
+        let n: i64 = conn.query_row(
+            "SELECT COALESCE((SELECT erased FROM member_debt_erasures WHERE plugin_id = ?1), 0)",
+            params![plugin_id],
+            |row| row.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
     /// Record that `plugin_id` read its own mailbox, now. Idempotent-by-upsert;
     /// never fails a read (a heartbeat that could break a drain would be a
     /// control wearing a mark's coat).
@@ -598,6 +633,68 @@ impl SqliteInboxStore {
         // report path (attempt counter → dead-letter → report home), which lives in
         // CBP's WIP. See the branch's PR: not landable alone, by design rather than by
         // omission.
+        // COUNT THE DEBTS THIS IS ABOUT TO ERASE, before erasing them (CBP 2026-07-28,
+        // git-manager thread, answering Kimi notice 308 §2 limit 2).
+        //
+        // Kimi's limit — "consume-once must be a MARK, not a deletion, because a deleted
+        // pending duty reads identically to 'nothing was owed'" — was offered as a design
+        // constraint for the git-manager's future duty queue, with `drained_at` cited as
+        // the precedent already fixed. Half fixed: `drained_at` made DELIVERY a mark, and
+        // RETENTION is still a DELETE. The predicate below is age-only on the local plane
+        // (every local row satisfies `dest_peer IS NULL`), so a `review_request` nobody
+        // ever answered is erased at the TTL exactly like one that was answered, and
+        // `member_unanswered` — whose whole job is telling those two apart — then reports
+        // the same thing for both. The erasure is triggered by an unrelated third party's
+        // send; neither the debtor nor the creditor is a party to it.
+        //
+        // Retention itself is NOT the defect and is deliberately unchanged here: unbounded
+        // growth is the worse failure, and which debts deserve to outlive the TTL is a
+        // policy question for the thread, not a decision to smuggle into a prune. What is
+        // fixed is that the amnesia is now RECORDED. Same shape, same file, 60 lines down:
+        // the queue cap's evictions are counted in `member_queue_evictions` and surfaced
+        // on every drain with an honest "counted since" caveat. The TTL path had no such
+        // counter, so the cheaper and louder of the two silent DELETEs was the observable
+        // one. This is that precedent applied to its twin.
+        //
+        // Booked under BOTH parties: `member_unanswered` returns a row to
+        // `to_plugin OR from_plugin`, so when it goes, both the debtor's `i_owe` and the
+        // creditor's `owed_to_me` lose the same evidence, and each should be able to learn
+        // that its own view got shorter. Only genuinely-unanswered await-kinds are counted
+        // — an erased row that was answered, or that awaits nothing, lost no evidence.
+        Self::ensure_erasure_schema(&conn)?;
+        {
+            let mut stmt = conn.prepare(
+                "SELECT to_plugin, from_plugin FROM member_notices n
+                  WHERE n.queued_at < ?1
+                    AND n.dest_peer IS NULL
+                    AND n.kind IN ('review_request', 'reply')
+                    AND NOT EXISTS (SELECT 1 FROM member_notices r WHERE r.in_reply_to = n.id)",
+            )?;
+            let doomed = stmt
+                .query_map(params![cutoff], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let stamp = now.to_rfc3339();
+            for (to_plugin, from_plugin) in doomed {
+                // Deduped: a member that somehow addressed itself is ONE party losing
+                // ONE row, and double-booking it would overstate the only number here.
+                let parties: std::collections::BTreeSet<String> =
+                    [to_plugin, from_plugin].into_iter().collect();
+                for party in parties {
+                    conn.execute(
+                        "INSERT INTO member_debt_erasures
+                             (plugin_id, erased, first_erasure, last_erasure)
+                         VALUES (?1, 1, ?2, ?2)
+                         ON CONFLICT(plugin_id) DO UPDATE SET
+                             erased       = erased + 1,
+                             last_erasure = ?2",
+                        params![party, stamp],
+                    )
+                    .context("recording unanswered-debt erasure")?;
+                }
+            }
+        }
         conn.execute(
             "DELETE FROM member_notices
               WHERE queued_at < ?1 AND (dest_peer IS NULL OR drained_at IS NOT NULL)",
@@ -1834,6 +1931,124 @@ mod tests {
             "a retirement path now exists — replace this test with one asserting it \
              reports home, do not simply delete it"
         );
+    }
+
+    /// FALSIFIER (CBP 2026-07-28, git-manager thread, re: Kimi notice 308 §2 limit 2).
+    ///
+    /// Kimi's limit: "consume-once must be a MARK, not a deletion — a reviewer session
+    /// that wakes, crashes, and never records a disposition must leave the duty visibly
+    /// pending, because a deleted pending duty reads identically to 'nothing was owed'."
+    /// Stated as a design constraint for the git-manager's future duty queue, with the
+    /// mesh's own `drained_at` offered as the fixed precedent to copy.
+    ///
+    /// The precedent is only half fixed. `drained_at` made DELIVERY a mark. RETENTION is
+    /// still a DELETE, and on the local plane it is age-only: the prune predicate is
+    /// `queued_at < cutoff AND (dest_peer IS NULL OR drained_at IS NOT NULL)`, and every
+    /// local row satisfies the left disjunct whether or not anyone answered it. So an
+    /// unanswered `review_request` is hard-deleted at INBOX_TTL_SECS, by an unrelated
+    /// third party's send, and `member_unanswered` then reports exactly what it reports
+    /// for a debt that was paid: nothing.
+    ///
+    /// `member_unanswered`'s doc calls this "lookback is bounded by the TTL prune (7d)",
+    /// which reads as a QUERY bound — widen the window, see the row. It is a STORE bound:
+    /// the row is gone and no widening recovers it. This test pins which one it is.
+    ///
+    /// Not a regression test — retention is deliberate and unbounded growth is worse.
+    /// It is the evidence that the ledger cannot distinguish answered from aged-out, so
+    /// any duty queue built on this store inherits the failure mode Kimi's limit 2 names.
+    #[test]
+    fn falsifier_ttl_prune_erases_an_unanswered_debt_rather_than_marking_it() {
+        let (_tmp, store) = fresh();
+        // kimi owes claude-code an answer, and never gives one.
+        let owed = store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "review_request",
+                            Some("forum/nobody-answered-this.md#thread=t"), "hash-owed", None)
+            .unwrap();
+        assert_eq!(
+            store.member_unanswered("claude-code", &["review_request"], -1).unwrap().len(),
+            1,
+            "precondition: the debt is visible while it is fresh"
+        );
+
+        // Age it just past the TTL. Nothing else about it changes: still undrained,
+        // still unbound, still genuinely owed.
+        let past_ttl =
+            (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS + 60)).to_rfc3339();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE member_notices SET queued_at = ?1 WHERE id = ?2",
+                     params![past_ttl, owed as i64])
+            .unwrap();
+
+        // A THIRD PARTY sends unrelated local mail. Neither the debtor nor the creditor
+        // is a party to this send; it is what runs the prune.
+        store
+            .enqueue_member("codex-cli", "thor", "role:r", "coordination",
+                            Some("forum/unrelated.md#t"), "hash-unrelated", None)
+            .unwrap();
+
+        // The erasure itself is deliberate — retention is not the defect, and this
+        // assertion documents the cost rather than complaining about it.
+        assert!(
+            !row_exists(&store, owed),
+            "retention changed: if unanswered debts now survive the TTL, replace this \
+             test with one asserting THAT, do not simply delete it"
+        );
+        assert_eq!(
+            store.member_unanswered("claude-code", &["review_request"], -1).unwrap().len(),
+            0,
+            "and the ledger is now silent about a debt that was never paid"
+        );
+
+        // ...so the fact has to survive somewhere. BOTH parties lost the same evidence.
+        assert_eq!(
+            store.member_debt_erasures("claude-code").unwrap(), 1,
+            "the creditor's `owed_to_me` got shorter and nothing recorded that it did — \
+             this is the queue cap's `member_queue_evictions` precedent, unapplied to the \
+             louder of the two silent DELETEs"
+        );
+        assert_eq!(
+            store.member_debt_erasures("kimi-code").unwrap(), 1,
+            "the debtor's `i_owe` got shorter too: a debt can be discharged by waiting"
+        );
+        // An uninvolved member lost nothing and must not be booked for it.
+        assert_eq!(store.member_debt_erasures("codex-cli").unwrap(), 0);
+    }
+
+    /// The counter must not fire for rows that lost no evidence: an ANSWERED debt
+    /// aging out is retention working, and counting it would turn the number into
+    /// noise at exactly the volume that makes it unreadable.
+    #[test]
+    fn ttl_erasure_counter_ignores_debts_that_were_actually_answered() {
+        let (_tmp, store) = fresh();
+        let asked = store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "review_request",
+                            Some("forum/answered.md#t"), "hash-a", None)
+            .unwrap();
+        store
+            .enqueue_member("claude-code", "kimi-code", "role:r", "review_done",
+                            Some("forum/answered.md#done"), "hash-b", Some(asked))
+            .unwrap();
+        let past_ttl =
+            (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS + 60)).to_rfc3339();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE member_notices SET queued_at = ?1", params![past_ttl])
+            .unwrap();
+        store
+            .enqueue_member("codex-cli", "thor", "role:r", "coordination",
+                            Some("forum/unrelated.md#t"), "hash-c", None)
+            .unwrap();
+        assert!(!row_exists(&store, asked), "precondition: it did age out");
+        assert_eq!(
+            store.member_debt_erasures("claude-code").unwrap(), 0,
+            "an answered debt aging out is retention, not amnesia"
+        );
+        assert_eq!(store.member_debt_erasures("kimi-code").unwrap(), 0);
     }
 
     /// A local member must not be able to claim it answered mail addressed to a

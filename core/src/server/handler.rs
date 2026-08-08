@@ -3842,10 +3842,30 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
             row
         })
         .collect();
+    // How much of this ledger has already been destroyed by the TTL prune. Both lists
+    // above are bounded by retention, and a pruned debt leaves an empty result
+    // indistinguishable from a settled one — so the one honest thing the report can say
+    // about its own blind spot is how big it is. Same contract as the drain's `evicted`:
+    // reported, never gated on, and a 0 means "none since this counter shipped".
+    let erased = s
+        .inbox_store
+        .member_debt_erasures(&who.plugin_id)
+        .map_err(|e| anyhow::anyhow!("reading erased member debts: {e}"))?;
     Ok(json!({
         "plugin_id": who.plugin_id,
         "older_than_secs": older_than_secs,
         "kinds_counted": MEMBER_KINDS_AWAIT_RESPONSE,
+        "erased_by_retention": erased,
+        "erased_note": if erased > 0 {
+            json!(format!(
+                "{erased} unanswered notice(s) involving you were DESTROYED by the 7d \
+                 retention prune, not answered — they are absent from both lists below \
+                 and unrecoverable. Counted since 2026-07-28 only; the prune is older."
+            ))
+        } else {
+            json!("none since this counter shipped (2026-07-28) — the prune is older, so \
+                   this is not a statement about erasures before that date")
+        },
         // Notices addressed to me that I never answered: my own debt.
         "i_owe": mine,
         // Notices I sent that nobody answered: did my wake land?
