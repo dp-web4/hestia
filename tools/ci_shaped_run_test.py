@@ -64,10 +64,17 @@ import os, pathlib, subprocess, sys
 refs = subprocess.run(["git", "for-each-ref", "refs/remotes"],
                       capture_output=True, text=True).stdout.strip()
 home = pathlib.Path(os.environ["HOME"])
+here = pathlib.Path.cwd().resolve()
 leftovers = sorted(p.name for p in home.iterdir()) if home.is_dir() else ["<missing>"]
-print("remote refs=%r home=%s contents=%r" % (refs, home, leftovers))
+print("remote refs=%r home=%s contents=%r cwd=%s" % (refs, home, leftovers, here))
 assert refs == "", "shaped checkout carries remote-tracking refs: %r" % refs
 assert leftovers == [], "HOME was not empty: %r" % leftovers
+# The harness's own first-sweep defect, as a live check rather than a comment:
+# /tmp is a carve-out in the operating law, so a checkout built there measures a
+# different law than CI does and reds two gate tests that CI reports green.
+tmp = pathlib.Path("/tmp")
+assert tmp not in here.parents, "shaped checkout is under /tmp: %s" % here
+assert tmp not in home.resolve().parents, "shaped HOME is under /tmp: %s" % home
 sys.exit(0)
 """
 

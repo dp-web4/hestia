@@ -39,6 +39,21 @@ version, installed packages, network reachability, and anything the runner
 image provides that this machine also provides. A green here is evidence about
 the checkout, not about the machine.
 
+WHY THE SHAPED ROOT IS NOT UNDER `/tmp`, which is where the first version put
+it. `/tmp` is a CARVE-OUT in the operating law -- the safety preset permits
+against absolute `/tmp` paths what it denies everywhere else -- and the gate
+tests are written against that boundary. With the shaped `$HOME` at `/tmp/...`,
+`plugins/gemini/tests/channel_contract_test.py` and
+`plugins/_shared/test_gate_core.py` both went RED here while CI reported them
+green, because their scratch directories hang off `~/.cache` and so landed
+inside the carve-out: `live policy deny -> runner denies` returned `allow`.
+Two false positives produced by the harness's own LOCATION, on its first full
+sweep -- the class this tool exists to catch, caught in the tool. Measured, not
+reasoned: both files pass at an empty `$HOME` that is not under `/tmp` and fail
+at one that is. `actions/checkout` puts the workspace under `$HOME`
+(`/home/runner/work/...`), so that is what this mirrors, and a `--root` under
+`/tmp` is REFUSED rather than warned about.
+
 Usage:
     python3 tools/ci_shaped_run.py              # whole `bare` sweep, shaped
     python3 tools/ci_shaped_run.py --only tools/citation_number_claim_test.py
@@ -64,6 +79,10 @@ REPO = pathlib.Path(
         capture_output=True, text=True, check=True,
     ).stdout.strip()
 )
+
+#: Not `tempfile.gettempdir()`. See the docstring: `/tmp` is governed differently
+#: from everywhere else, so a checkout built there is not a simulation of CI.
+DEFAULT_ROOT = pathlib.Path.home() / ".cache" / "hestia-ci-shaped"
 
 #: Handed to every command inside the shaped checkout. `/dev/null` is git's
 #: documented spelling for "this config file is empty" -- unsetting the vars
@@ -198,7 +217,7 @@ def describe() -> None:
     print("environment:")
     for k, v in sorted(SHAPED_GIT_CONFIG.items()):
         print(f"  {k}={v}")
-    print("  HOME=<fresh empty directory>")
+    print(f"  HOME=<fresh empty directory under {DEFAULT_ROOT}, never /tmp>")
     print(f"  unset: {', '.join(DROPPED_VARS)}")
     print("NOT shaped: OS, python version, installed packages, network.")
 
@@ -213,13 +232,22 @@ def main() -> int:
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--keep", action="store_true",
                     help="leave the shaped checkout on disk and print its path")
+    ap.add_argument("--root", default=str(DEFAULT_ROOT),
+                    help="where to build the shaped checkout (must not be under /tmp)")
     args = ap.parse_args()
 
     if args.describe:
         describe()
         return 0
 
-    root = pathlib.Path(tempfile.mkdtemp(prefix="ci-shaped-"))
+    parent = pathlib.Path(args.root).expanduser().resolve()
+    if parent == pathlib.Path("/tmp") or pathlib.Path("/tmp") in parent.parents:
+        print(f"refusing --root {parent}: /tmp is a carve-out in the operating law, and a "
+              "shaped checkout inside it measures a different law than CI does (see the "
+              "module docstring -- this cost two false positives).")
+        return 2
+    parent.mkdir(parents=True, exist_ok=True)
+    root = pathlib.Path(tempfile.mkdtemp(prefix="ci-shaped-", dir=str(parent)))
     dest, home = root / "checkout", root / "home"
     home.mkdir()
     try:
