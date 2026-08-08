@@ -102,13 +102,27 @@ appended and current state is a fold. The projection machinery already exists (#
 
 ## How this composes with signatures
 
-Orthogonal, and both required:
+**The dependency is ASYMMETRIC, and the first draft of this section got it wrong** (corrected on
+kimi's review of #283; codex's review reaches the same place from the other side).
 
-- **This decision closes the SCOPE hole** — a grant cannot travel to a different act.
-- **Signatures close the IDENTITY hole** — a grant cannot be presented by a different member.
+- **Scope closure is independent.** A grant cannot travel to a *different act*, because the digest
+  of the re-presented act must match the recorded one. That holds no matter who presents it, under
+  today's declared identity, with no signatures anywhere.
+- **Identity closure is NOT independent.** *"Only the originating role/agent chain"* is checked by
+  comparing the claimant's identity against the recorded act's — and `tool_connect` authenticates
+  nobody, so any member can assert the originating identity. **That clause is unenforceable until
+  acts are signed.** It is a hard dependency, not a parallel track.
 
-Neither substitutes for the other. Both are independently valuable: act-binding holds under
-declared identity, and signing holds under today's join key. They can proceed in parallel.
+kimi's framing is the precise one: the digest is **half the credential**. Under this decision alone
+an attacker must possess the act bytes *and* assert the identity; signatures close the second half.
+
+So: signatures do not need this decision (they are independently valuable — codex's reading).
+This decision's identity clause does need signatures (kimi's reading). Both are true; the arrow
+points one way.
+
+**Do not ship the identity clause as enforced before signing lands.** Declare it, record what it
+*would* have refused, and say plainly that it is not yet enforceable — otherwise it becomes exactly
+the defect this repo keeps finding: a declared control read as an audited one.
 
 ---
 
@@ -140,3 +154,77 @@ never carried a value.
   changed in between, the verbatim act may be refused again, and that is correct.
 - **The originating role/agent chain is part of the binding.** The same agent acting in a different
   role is not the same appellant.
+
+---
+
+## Amendments from peer review (2026-08-07)
+
+Reviewed independently by **kimi-code** and **codex** on #283. Both accepted the model; between
+them they found one error and eight precisions. Recorded here rather than silently folded in,
+because the corrections are the evidence that the review happened.
+
+### The error: signatures are not a parallel track
+
+Corrected in *How this composes with signatures* above. The first draft claimed orthogonality in
+both directions; the identity clause is a hard dependency on signing. Left visible because "these
+two things are independent" is the kind of claim that gets quoted onward.
+
+### From kimi
+
+**A1 — there is no exception mechanism, and the doc must say so.** A grant re-evaluates the act
+under *current law*. If the rule that denied it still stands, re-evaluation denies again. So an
+appeal against a working rule resolves only by **fixing the rule** or **denying the appeal** —
+there is no "approve this once" any more.
+
+The operator flow becomes: **appeal → fix rule → grant → re-evaluate.**
+
+Endorsed as a forcing function, and worth stating why it is an improvement rather than a cost:
+one-off approvals are precisely how the same false-positive class got re-approved all day on
+2026-08-07 without ever being fixed. Requiring a law change to resolve an appeal means the *class*
+gets fixed once instead of the *instance* getting waved through repeatedly. But it must be written
+down, or someone rediscovers hollow approvals in their newly-correct form.
+
+**A2 — the timeout verdict carries a reason-class.** `denied on appeal — reason: timeout` must be
+distinguishable, in the record and in any trust computation, from a denial on the merits. Nobody
+looked is not the same as the appeal was wrong, and scoring them alike would penalise a member for
+the resolver's absence. (The #211 lesson, one level up.)
+
+**A3 — a side effect worth claiming: the appeal-refusal trap dissolves.** Appeals reference an
+`action_id`, not a marker string, so the self-access predicate's haystack has nothing to match.
+The whole "escalations minted by documenting the defect" class — which on 2026-08-07 refused a
+code review, three commit messages, a drift survey, and a section of the governance PRD — closes as
+a *consequence* of act-binding rather than needing its own fix.
+
+### From codex
+
+**B1 — canonical act serialization and a digest domain.** Two encodings of the same act must
+produce the same digest, and the digest must be domain-separated so an act digest can never be
+confused with a witness digest or a chain hash. Without a canonical form, "verbatim" is a wish.
+
+**B2 — the fallback record must be DURABLE.** dp's fallback for daemon-unreachable denials is only
+worth having if it survives the condition that created it. A fallback that lives in the process
+that just failed is not a fallback.
+
+**B3 — compare-and-swap on the terminal transition.** Timeout and a late ruling are both terminal
+transitions on the same act and *they race*. Without CAS an act can receive two terminal verdicts,
+or a human decision can be silently overwritten by an expiry that fired first. The state
+transition must be conditional on the act still being `appealed`, and the loser of the race must be
+recorded as having lost rather than dropped.
+
+**B4 — append-only transitions, never mutation of historical rows.** dp's *"blockchains do this all
+the time"* is the right precedent and this is its precise reading: state moves by **appending** a
+transition that references the act; current state is a fold. No historical row is rewritten.
+
+**B5 — a red test: every opened escalation links to its recorded act.** `answers_deny` is populated
+in 0 of 314 escalations today, so the test starts red and its going green *is* the wiring landing.
+A test that cannot fail on the current code would prove nothing.
+
+### The meta-pattern, now observed from three seats
+
+kimi's summary, independently reached: **this system builds correct mechanisms and under-connects
+them.** The alias ruling, the signing primitive with zero callers, `answers_deny` at 0 of 314, the
+shared core deployed nowhere, `current-build.json` with a reader and no writer.
+
+This decision opens with the wiring inventory instead of discovering it afterwards. That habit —
+*before designing the fix, measure whether the mechanism already exists and is simply unwired* — is
+the transferable part, and it should outlive this document.
