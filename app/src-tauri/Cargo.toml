@@ -28,6 +28,8 @@ zeroize = "1"
 # Canonical key-derived LCT identifiers. The app consumes identity primitives,
 # not the Hestia governance crate (decision 0014's domain split).
 web4-core = { path = "../../../web4/web4-core" }
+# Wire formats shared byte-for-byte with the daemon (session transcript).
+hestia-wire = { path = "../../wire" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

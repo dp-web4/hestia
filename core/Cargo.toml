@@ -67,6 +67,9 @@ x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 
 # Web4 primitives
 web4-core = { path = "../../web4/web4-core" }
+# Wire formats shared byte-for-byte with the app (session transcript). One source
+# consumed twice — see wire/src/lib.rs for why this is not in web4-core.
+hestia-wire = { path = "../wire" }
 # The generic plugin seam — shared with the hub (public open-core crate) instead
 # of maintaining a near-identical copy here. `crate::plugin` re-exports it.
 hub-plugin = { path = "../../web4/hub/hub-plugin" }

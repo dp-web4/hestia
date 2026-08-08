@@ -82,7 +82,7 @@ impl ChallengeStore {
 /// strong evidence given at establishment is sufficient for the reversible
 /// majority; the irreversible tail always re-collects evidence).
 pub const SESSION_TTL_SECS: u64 = 3600;
-pub const SESSION_TRANSCRIPT_DOMAIN: &str = "hestia:operator-session:v1";
+pub use hestia_wire::SESSION_TRANSCRIPT_DOMAIN;
 pub const SOVEREIGN_OFFICE: &str = "role:constellation:sovereign";
 const MAX_COMPOSITION_FIELD_BYTES: usize = 512;
 
@@ -160,23 +160,21 @@ pub fn canonical_session_transcript(
     actor_public_key: &str,
     device_public_key: &str,
 ) -> Vec<u8> {
-    let fields = [
-        ("challenge", challenge),
-        ("actor", provenance.actor.as_str()),
-        ("actor_public_key", actor_public_key),
-        ("principal", provenance.principal.as_str()),
-        ("via_device", provenance.via_device.as_str()),
-        ("device_public_key", device_public_key),
-        ("office", provenance.office.as_str()),
-        ("authority", provenance.authority.as_str()),
-    ];
-    let mut out = format!("{SESSION_TRANSCRIPT_DOMAIN}\n").into_bytes();
-    for (name, value) in fields {
-        out.extend_from_slice(format!("{name}:{}\n", value.len()).as_bytes());
-        out.extend_from_slice(value.as_bytes());
-        out.push(b'\n');
-    }
-    out
+    // ONE SOURCE CONSUMED TWICE. These bytes were implemented here and in the app; both are
+    // now thin calls into `hestia-wire`, so the format cannot drift between them. The golden
+    // vector moved with the code and is asserted in that crate.
+    hestia_wire::canonical_session_transcript(
+        challenge,
+        &hestia_wire::SessionTranscriptFields {
+            actor: provenance.actor.as_str(),
+            actor_public_key,
+            principal: provenance.principal.as_str(),
+            via_device: provenance.via_device.as_str(),
+            device_public_key,
+            office: provenance.office.as_str(),
+            authority: provenance.authority.as_str(),
+        },
+    )
 }
 
 /// Public evidence retained on the session-open record. None of these values is
