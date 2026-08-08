@@ -8,7 +8,7 @@
 use std::fs;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
-use hestia_app_lib::identity_vault::{IdentityVault, migrate_plaintext_operator_key};
+use hestia_app_lib::identity_vault::{migrate_plaintext_operator_key, IdentityVault};
 
 const PRINCIPAL: &str = "lct:web4:human:test-principal";
 const PASSPHRASE: &str = "correct horse battery staple";
@@ -19,15 +19,52 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn write_legacy_key(path: &std::path::Path) {
+    write_legacy_seed(path, SEED);
+}
+
+fn write_legacy_seed(path: &std::path::Path, seed: [u8; 32]) {
     fs::write(
         path,
         serde_json::json!({
             "lct_id": PRINCIPAL,
-            "secret_key_hex": hex(&SEED),
+            "secret_key_hex": hex(&seed),
         })
         .to_string(),
     )
     .unwrap();
+}
+
+#[test]
+fn matching_destination_resumes_and_retires_a_leftover_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join("operator.key");
+    let encrypted = dir.path().join("identity.vault");
+    write_legacy_key(&legacy);
+    migrate_plaintext_operator_key(&legacy, &encrypted, PASSPHRASE).unwrap();
+
+    // Model a crash after the encrypted file became durable but before the
+    // plaintext directory entry was retired.
+    write_legacy_key(&legacy);
+    let resumed = migrate_plaintext_operator_key(&legacy, &encrypted, PASSPHRASE).unwrap();
+    assert_eq!(resumed.principal_lct(), PRINCIPAL);
+    assert!(!legacy.exists(), "resumed migration left plaintext live");
+}
+
+#[test]
+fn mismatched_destination_never_retires_the_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join("operator.key");
+    let encrypted = dir.path().join("identity.vault");
+    write_legacy_key(&legacy);
+    migrate_plaintext_operator_key(&legacy, &encrypted, PASSPHRASE).unwrap();
+
+    write_legacy_seed(&legacy, [0x6b; 32]);
+    let result = migrate_plaintext_operator_key(&legacy, &encrypted, PASSPHRASE);
+    assert!(
+        result.is_err(),
+        "mismatched credentials were treated as one"
+    );
+    assert!(legacy.exists(), "mismatch destroyed the plaintext source");
 }
 
 #[test]
@@ -40,7 +77,10 @@ fn migration_leaves_only_an_encrypted_reopenable_credential() {
     let opened = migrate_plaintext_operator_key(&legacy, &encrypted, PASSPHRASE)
         .expect("legacy credential should migrate");
     assert_eq!(opened.principal_lct(), PRINCIPAL);
-    assert!(encrypted.exists(), "encrypted identity vault was not written");
+    assert!(
+        encrypted.exists(),
+        "encrypted identity vault was not written"
+    );
     assert!(
         !legacy.exists(),
         "successful migration left the plaintext operator key behind"
@@ -100,8 +140,14 @@ fn failed_import_does_not_destroy_the_only_plaintext_copy() {
     fs::write(&legacy, r#"{"lct_id":"lct:test","secret_key_hex":"abcd"}"#).unwrap();
 
     assert!(migrate_plaintext_operator_key(&legacy, &encrypted, PASSPHRASE).is_err());
-    assert!(legacy.exists(), "failed import destroyed the source credential");
-    assert!(!encrypted.exists(), "failed import left a vault-shaped artifact");
+    assert!(
+        legacy.exists(),
+        "failed import destroyed the source credential"
+    );
+    assert!(
+        !encrypted.exists(),
+        "failed import left a vault-shaped artifact"
+    );
 }
 
 #[cfg(unix)]
@@ -115,5 +161,8 @@ fn identity_vault_is_owner_only() {
     write_legacy_key(&legacy);
     migrate_plaintext_operator_key(&legacy, &encrypted, PASSPHRASE).unwrap();
 
-    assert_eq!(fs::metadata(encrypted).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(encrypted).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }

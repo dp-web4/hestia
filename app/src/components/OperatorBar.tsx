@@ -6,9 +6,9 @@ import type { OperatorStatus } from "../lib/types";
  * Operator sign-in, sidebar-resident.
  *
  * Every `/api/*` route on the daemon is behind the operator gate, so without
- * a session the app can read nothing at all. One click signs in from
- * ~/.hestia/operator.key (dp: "I'd rather just click login"); a path box
- * covers a key kept elsewhere.
+ * a session the app can read nothing at all. The passphrase unlocks an
+ * app-owned encrypted identity vault; first use imports and retires the
+ * legacy plaintext operator credential only after the vault verifies.
  *
  * The key bytes and the bearer token never enter this webview — the Rust
  * shell holds both. This component only moves intent in and status out.
@@ -19,6 +19,7 @@ export function OperatorBar({ onChange }: { onChange?: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [showPath, setShowPath] = useState(false);
   const [path, setPath] = useState("");
+  const [passphrase, setPassphrase] = useState("");
 
   const apply = (s: OperatorStatus) => {
     setStatus(s);
@@ -30,15 +31,16 @@ export function OperatorBar({ onChange }: { onChange?: () => void }) {
     operatorStatus()
       .then((s) => {
         setStatus(s);
-        setPath(s.key_path ?? "");
+        setPath(s.vault_path ?? "");
       })
       .catch((e) => setError(String(e)));
   }, []);
 
-  const signIn = async (keyPath?: string) => {
+  const signIn = async (vaultPath?: string) => {
     setBusy(true);
     try {
-      apply(await operatorSignIn(keyPath));
+      apply(await operatorSignIn(passphrase, vaultPath));
+      setPassphrase("");
       setShowPath(false);
     } catch (e) {
       setError(String(e));
@@ -76,24 +78,43 @@ export function OperatorBar({ onChange }: { onChange?: () => void }) {
 
   return (
     <div className="operator-bar">
+      <input
+        type="password"
+        autoComplete="current-password"
+        value={passphrase}
+        placeholder="Identity vault passphrase"
+        aria-label="Identity vault passphrase"
+        onChange={(e) => setPassphrase(e.target.value)}
+      />
       <button
         className="operator-signin"
         onClick={() => signIn(undefined)}
-        disabled={busy || !status.key_path}
+        disabled={
+          busy ||
+          !passphrase ||
+          (!status.vault_exists && !status.migration_available)
+        }
       >
-        {busy ? "signing in…" : "Sign in"}
+        {busy
+          ? "signing in…"
+          : status.vault_exists
+            ? "Sign in"
+            : "Create vault & sign in"}
       </button>
       <button className="operator-link" onClick={() => setShowPath((v) => !v)}>
-        {status.key_path ? "other key…" : "choose key…"}
+        other vault…
       </button>
       {showPath && (
         <div className="operator-path">
           <input
             value={path}
-            placeholder="/path/to/operator.key"
+            placeholder="/path/to/identity.vault"
             onChange={(e) => setPath(e.target.value)}
           />
-          <button onClick={() => signIn(path)} disabled={busy || !path.trim()}>
+          <button
+            onClick={() => signIn(path)}
+            disabled={busy || !passphrase || !path.trim()}
+          >
             go
           </button>
         </div>

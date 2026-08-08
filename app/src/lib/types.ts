@@ -91,7 +91,9 @@ export interface DerivationReceipt {
 export interface OperatorStatus {
   signed_in: boolean;
   lct_id: string | null;
-  key_path: string | null;
+  vault_path: string | null;
+  vault_exists: boolean;
+  migration_available: boolean;
 }
 
 export interface RecentEntry {

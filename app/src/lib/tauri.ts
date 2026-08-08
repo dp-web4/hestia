@@ -95,9 +95,15 @@ export async function operatorStatus(): Promise<OperatorStatus> {
   return invoke("operator_status");
 }
 
-/** Sign in. Omit keyPath to use ~/.hestia/operator.key (one-click). */
-export async function operatorSignIn(keyPath?: string): Promise<OperatorStatus> {
-  return invoke("operator_sign_in", { keyPath: keyPath ?? null });
+/** Unlock the app-owned identity vault; first use imports the legacy key. */
+export async function operatorSignIn(
+  passphrase: string,
+  vaultPath?: string,
+): Promise<OperatorStatus> {
+  return invoke("operator_sign_in", {
+    passphrase,
+    vaultPath: vaultPath ?? null,
+  });
 }
 
 export async function operatorSignOut(): Promise<OperatorStatus> {
