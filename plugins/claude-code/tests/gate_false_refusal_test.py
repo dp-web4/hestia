@@ -308,6 +308,33 @@ _SURVIVE = [
      'G=`touch /tmp/fp13_x`; grep -c def {g}', 'G=1; grep -c def {g}',
      "a command substitution inside the VALUE runs for real (`G=`rm …`` executes); a "
      "prefix is only free when it is inert, so a backtick value fails closed"),
+    # THE NEWLINE HOLE (claude-code, 2026-08-08). These rows are RED against the gate as
+    # it stands, on the installed revision and on main alike, and they are written red on
+    # purpose: they are the declaration that the defect is open, not a record that it is
+    # fixed. `_SEPARATORS` has carried "\n" since it was written, but shlex counts a
+    # newline as whitespace and never emits one, so no newline has ever split a segment —
+    # every line after the first arrived as ARGUMENTS to the first head. The fix is
+    # `_command_lines`; it cannot be applied by the member that found this, because
+    # writing the gate is refused (escalation 4a3e6f6838acabad, awaiting a human).
+    #
+    # The sign is what makes these different from every other row above. Three wakes went
+    # into the false-refusal class — the gate refusing reads. This is the same defect
+    # under-refusing: a write to the gate's own code classified as a witnessed READ.
+    ("newline_hides_cp_onto_gate",
+     "echo checking\ncp evil.py {g}", "echo checking\ndiff evil.py {g}",
+     "`cp_onto_gate` with a newline in front of it. The staged-copy attack that row "
+     "exists to refuse, spelled so the head check never sees the `cp`"),
+    ("newline_hides_sed_in_place",
+     "echo checking\nsed -i s/a/b/ {g}", "echo checking\nsed -n 1p {g}",
+     "the motivating example of the whole per-head sed grammar, freed by one newline"),
+    ("newline_hides_interpreter",
+     "echo checking\nsh evil.sh", "echo checking\ncat evil.sh",
+     "the head allowlist is where the interpreter danger lives (see "
+     "`shell_reads_a_script`); after a newline it is not consulted at all"),
+    ("comment_does_not_eat_the_separator",
+     "echo a # note\ncp evil.py {g}", "echo a # note\ndiff evil.py {g}",
+     "shlex skips a comment by consuming THROUGH the end of line, separator included — "
+     "which is why the fix splits the TEXT and cannot be done on the token stream"),
 ]
 
 # The false refusals. Each MUST be classified read-only after the fix.
@@ -354,6 +381,31 @@ _FALSE_REFUSALS = [
     ("env_prefix_form", 'FOO=1 grep -c "" {g}',
      "the same prefix one spelling over — `VAR=x cmd` with the path as an ordinary "
      "argument rather than through the variable"),
+    # Multi-line reads. These two are GREEN today, and green FOR THE WRONG REASON — which
+    # is the only reason they are worth carrying. With no newline separator, line two is
+    # argv to line one's head, so `grep … \n grep …` is permitted because the second grep
+    # is an ARGUMENT to the first, not because anything classified it as a read. They pass
+    # by absorption before the fix and on their own merits after it; the pair that tells
+    # the two apart is the `newline_hides_*` rows in `_SURVIVE`, where absorption is the
+    # bug. Do not read a green here as evidence the newline is handled.
+    ("multiline_reads", "grep -c def {g}\ngrep -c class {g}",
+     "two reads on two lines is the ordinary shape of every forensic command in this "
+     "repo; it must not depend on whether the author used `;` or Enter"),
+    ("multiline_loop_then_read", 'for f in a b; do\n  cat "$f"\ndone\necho after',
+     "`done` and the next command are separate segments only if the newline separates "
+     "them; joined, `done echo after` is a closer carrying a command and refuses"),
+    # The unlisted-git-read-subcommand class (kimi-code notice 1745 §3, measured in BOTH
+    # revisions; fixed nowhere — not installed, not in tree, not on main, not in the queue).
+    ("git_merge_base_is_a_read", "git merge-base --is-ancestor 0513661 main",
+     "the ancestry probe two members ran all wake, classified WRITE while `git rev-list` "
+     "beside it read fine. `merge-base` has no writing mode in any spelling"),
+    ("git_branch_contains_is_a_read", "git branch -a --contains 0513661",
+     "the condemning segment of escalation 3d38341a. `branch` cannot go in the bare set "
+     "— `git branch <name>` CREATES from a positional — so it needs a grammar"),
+    ("git_branch_bare_lists", "git branch",
+     "with no arguments `git branch` lists and nothing else"),
+    ("git_for_each_ref", "git for-each-ref refs/heads",
+     "same class, plumbing spelling"),
 ]
 
 # FP6 is NOT fixed here, and pinning it as a known-refused case is the honest form: it
@@ -362,7 +414,16 @@ _FALSE_REFUSALS = [
 # move up into _FALSE_REFUSALS, by the person who earned the right to move it.
 _STILL_OPEN = [
     ("fp6_read_with_output_elsewhere", "diff {g} other.py > /tmp/out",
-     "FP6. Refused today. Needs KNOWN/UNKNOWN target resolution, not a wider allowlist"),
+     "FP6. Refused today. Needs KNOWN/UNKNOWN target resolution, not a wider allowlist. "
+     "Hit live 2026-08-08 (escalation 9cdb9bec0fe7a04d): generating a unified diff of the "
+     "gate INTO a proposals/ file is this exact shape, so FP6 blocks a member from "
+     "preparing a fix for the gate. The class is not hypothetical"),
+    ("quote_opened_mid_token_around_parens", "git log --format='%(refname)' -1",
+     "shlex(punctuation_chars=True) splits on the `(` while inside the quote, so the "
+     "whole command raises `No closing quotation` and fails closed. Only bites when the "
+     "quote opens MID-token after `--flag=`: `grep -c \"foo(bar)\" {g}` tokenises fine. "
+     "Found 2026-08-08 while grammar-checking `git branch --format`; NOT fixed there, "
+     "because it is a tokeniser class that predates and outlives that grammar"),
 ]
 
 
