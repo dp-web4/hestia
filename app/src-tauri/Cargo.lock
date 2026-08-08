@@ -1398,6 +1398,7 @@ dependencies = [
  "argon2",
  "chacha20poly1305",
  "ed25519-dalek",
+ "hestia-wire",
  "hex",
  "rand 0.8.6",
  "reqwest 0.12.28",
@@ -1411,6 +1412,10 @@ dependencies = [
  "web4-core",
  "zeroize",
 ]
+
+[[package]]
+name = "hestia-wire"
+version = "0.1.0"
 
 [[package]]
 name = "hex"

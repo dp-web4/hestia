@@ -1,0 +1,12 @@
+[package]
+name = "hestia-wire"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Wire formats that the Hestia daemon and the Hestia app must produce byte-identically."
+
+[dependencies]
+
+[dev-dependencies]
+sha2 = "0.10"
+hex = "0.4"

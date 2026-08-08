@@ -906,6 +906,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "globset",
+ "hestia-wire",
  "hex",
  "hub-plugin",
  "rand 0.8.6",
@@ -932,6 +933,10 @@ dependencies = [
  "x25519-dalek",
  "zeroize",
 ]
+
+[[package]]
+name = "hestia-wire"
+version = "0.1.0"
 
 [[package]]
 name = "hex"

@@ -7,7 +7,7 @@
 
 use crate::identity_vault::IdentityVault;
 
-pub const SESSION_TRANSCRIPT_DOMAIN: &str = "hestia:operator-session:v1";
+pub use hestia_wire::SESSION_TRANSCRIPT_DOMAIN;
 pub const SOVEREIGN_OFFICE: &str = "role:constellation:sovereign";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,23 +40,20 @@ impl SessionComposition {
 /// Length-delimited, domain-separated bytes shared with the daemon verifier.
 /// Field order and spelling are the wire contract; changing either requires v2.
 pub fn canonical_session_transcript(challenge: &str, composition: &SessionComposition) -> Vec<u8> {
-    let fields = [
-        ("challenge", challenge),
-        ("actor", composition.actor.as_str()),
-        ("actor_public_key", composition.actor_public_key.as_str()),
-        ("principal", composition.principal.as_str()),
-        ("via_device", composition.via_device.as_str()),
-        ("device_public_key", composition.device_public_key.as_str()),
-        ("office", composition.office.as_str()),
-        ("authority", composition.authority.as_str()),
-    ];
-    let mut out = format!("{SESSION_TRANSCRIPT_DOMAIN}\n").into_bytes();
-    for (name, value) in fields {
-        out.extend_from_slice(format!("{name}:{}\n", value.len()).as_bytes());
-        out.extend_from_slice(value.as_bytes());
-        out.push(b'\n');
-    }
-    out
+    // ONE SOURCE CONSUMED TWICE. Implemented here and in the daemon; both are now thin calls
+    // into `hestia-wire`, so the format cannot drift. The golden vector moved with the code.
+    hestia_wire::canonical_session_transcript(
+        challenge,
+        &hestia_wire::SessionTranscriptFields {
+            actor: composition.actor.as_str(),
+            actor_public_key: composition.actor_public_key.as_str(),
+            principal: composition.principal.as_str(),
+            via_device: composition.via_device.as_str(),
+            device_public_key: composition.device_public_key.as_str(),
+            office: composition.office.as_str(),
+            authority: composition.authority.as_str(),
+        },
+    )
 }
 
 /// Produce the complete, jointly signed request body. The legacy `lct_id`
