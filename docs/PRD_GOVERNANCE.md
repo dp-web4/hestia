@@ -838,13 +838,15 @@ kimi's third pushback, adopted: *"re-homed work that isn't announced reads as di
 
 ## 12. Sprints
 
-**Seven sprints, numbered 1–7, preceded by Sprint 0.** Sprint 0 is not one of the seven: it opens no new ground, it finishes work already in flight and pays down what the fleet has measured about itself. Counted this way because a document that says *"seven sprints"* over eight numbered headings has already lost an argument it did not need to have.
+Sprint numbers are stable names, not cardinality or execution order. Sprint 0 finishes measured work
+already in flight; Sprint 0.5 and Sprint 2.5 are dependency insertions whose names preserve all
+existing cross-references.
 
 Ordered by dependency, not by appetite. Every sprint states what it does **not** do, because the recurring failure mode here is a sprint quietly claiming the next one's ground.
 
 Each sprint's acceptance criteria are **measurements**, not assertions — per §7.4, a criterion that can be satisfied by a declaration is not a criterion.
 
-### 12.0 Execution order — amended 2026-08-07, consolidation moves FIRST
+### 12.0 Execution order — amended 2026-08-08 for decision 0013
 
 **The numbers are names, not sequence.** They are cited from §13 and elsewhere, so they do not change. The order of execution does:
 
@@ -852,11 +854,18 @@ Each sprint's acceptance criteria are **measurements**, not assertions — per �
 |---|---|---|
 | 1 | **Sprint 5 — Consolidate the gate** | every sprint after it is otherwise built five times |
 | 2 | Sprint 0.5 — Truth the grain | unchanged; small, and everything downstream is computed from it |
-| 3 | Sprint 2 — Identity | attribution, now written once |
+| 3 | Sprint 2 — Identity and signing | attribution and signed origin, now written once |
 | 4 | Sprint 1 — Observe | labels a surface that has stopped diverging |
-| 5 | Sprint 3 — Restore the third verdict | the ladder; what stops the operator being the first responder |
-| 6 | Sprint 4 — Authority and occupancy | per-role permission, on top of exact identity |
-| 7 | Sprint 6 — Operator surface · then Sprint 7 — hub seam | unchanged |
+| 5 | **Sprint 2.5 — Bind appeals to acts** | decision 0013 replaces the portable claim before any machine-rate resolver exists |
+| 6 | Sprint 3 — Restore the third verdict | the arbitration driver starts only after 0013 is enforceable |
+| 7 | Sprint 4 — Authority and occupancy | per-role permission, on top of exact identity |
+| 8 | Sprint 6 — Operator surface · then Sprint 7 — hub seam | unchanged |
+
+The dependency between Sprint 2 and Sprint 2.5 is asymmetric. Sprint 2.5's **scope** slice —
+canonical act digest, act link, and cross-act mismatch refusal — may land before signing. Its
+**identity** slice — delivery only to the originating role/agent chain — may observe but may not
+enforce or report shipped until Sprint 2 supplies signed origin. The table places completed Sprint
+2.5 after Sprint 2; it does not forbid the independent scope slice from landing earlier.
 
 **Why the original order was wrong.** Consolidation sat fifth because it changes no semantics and nothing blocks on it. That reasoning treated it as tidying. It is the **multiplier** on every sprint after it: Sprint 2's attribution fix is one line in the claude-code gate and does not exist in kimi's, so done before consolidation it is implemented four more times and four more divergences enter the corpus. The same holds for Sprint 1's labels and Sprint 3's ladder.
 
