@@ -1016,15 +1016,66 @@ switched on. A zero-caller signing primitive does not satisfy this criterion.
 
 ---
 
+### Sprint 2.5 — Bind appeals to recorded acts
+
+**Goal:** remove the grant token. An appeal resolves exactly one recorded denied act; re-evaluation
+is possible only for the same canonical act and, once Sprint 2 is complete, the same signed
+originating role/agent chain.
+
+**Preconditions:** the denied act is recordable in the normal chain; daemon-unreachable denials have
+a durable Plane-E writer on every installed engine; attribution is installed and observed before
+unattributed opens are refused. The scope slice may land without signatures. The identity slice may
+only observe until Sprint 2's signed-origin acceptance is green.
+
+**Lands:** populate `answers_deny`; replace marker claims with append-only transitions on
+`action_id`; re-present and digest-check the original act; record `appealed`, `granted-on-appeal`,
+`denied-on-appeal`, and timeout with a non-merits reason class; deliver the result to the signed
+originating chain. The old marker path is removed after migration, not retained as fallback.
+
+**Five acceptance contracts from decision 0013:**
+
+1. **Canonical, domain-separated digest.** One versioned serialization produces the same digest for
+   semantically identical acts, rejects ambiguous encodings, and cannot collide by domain with a
+   witness digest or chain hash. A changed tool, target, argument, or provenance field fails the
+   retry. The test is red before the new plugin-to-daemon digest wire exists.
+2. **Durable unavailable-daemon fallback.** Stop the daemon, trigger a governed denial through each
+   installed engine, restart both sides, and recover a Plane-E action record sufficient to open the
+   same act-bound appeal. An in-process buffer or a report without a row fails.
+3. **Compare-and-swap terminal transition.** Race timeout against a late ruling on one appealed act.
+   Exactly one terminal transition wins while the loser is appended as a rejected transition; no
+   operator result is overwritten and no act acquires two terminal verdicts.
+4. **Append-only history.** Every state change appends a transition referring to the action and
+   prior state; a before/after chain comparison proves no historical row was mutated. Current state
+   is derived by fold.
+5. **Every escalation links to its act.** A census test asserts that every newly opened escalation
+   has a non-empty, resolvable `answers_deny` reference to its recorded act. It is deliberately red
+   against the historical baseline — **0 of 425** links populated — and green only when the wiring
+   lands; exempting old rows must be explicit by schema/version, never by dropping them from the
+   denominator.
+
+**Additional acceptance:** a digest match may close scope before signing; the test report labels
+origin enforcement **not enforceable** in that state. After Sprint 2, a different signer asserting
+the same member name cannot receive or re-evaluate the verdict. Unattributed opens are refused only
+after an installed-gate census shows attributable identity on the governed path. Timeout records
+`resolver_unavailable` (or an equivalent typed non-merits reason) and is excluded from member-merits
+scoring.
+
+**Not this sprint:** resolver automation. Sprint 3 consumes this state machine only after every
+criterion above is green.
+
+---
+
 ### Sprint 3 — Restore the third verdict
 
 **Goal:** `Escalate` survives to the boundary, and an escalation selects a resolver.
 
+**Hard precondition:** Sprint 2.5 is complete. NOT-BENEFICIARY alone does not make the current
+portable claim path safe for an arbitration driver.
+
 - Un-collapse `law_gate.rs:166`.
 - Escalation becomes resolver selection; the operator is terminal, not sole (§8.2).
 - Resolver selection reads audited and witnessed dimensions only — never declared (§7.4).
-- Replace portable `claim()` tokens with a verdict on one recorded act (`action_id` + canonical
-  digest). #281 marker narrowing is interim only; #283's act-bound contract is the target.
+- Consume Sprint 2.5's act-bound verdict state; do not recreate a resolver-scoped token beside it.
 - **Close the read/write false-positive class** (#203 FP6/FP8), moved here from Sprint 0 (§2.14) — it lands *with* the spend-side constraint below, never before it, because widening the read carve-out without that constraint trades a false refusal for an act the daemon never sees. The class includes the gate's refusal of its own documentation (§2.15).
 - **The return channel, on the same machinery** (§8.4 items 2–4): arbiter selection is resolver selection with the independence constraint; the appeal window rebased off chain-entry count onto the answerer's units; rulings bound to the appellant's recorded action and originating chain; appeal dispatch stops minting `review_request`s under the appellant's name. Expiry is a terminal timeout denial, not silent disappearance.
 
@@ -1053,7 +1104,7 @@ switched on. A zero-caller signing primitive does not satisfy this criterion.
 
 **Goal:** one decision service; shims that only parse and render.
 
-Gated on **all seven release gates in §10** — in particular the peer-path proof-of-life and the availability decision. Neither is optional, and neither is this sprint's to discover.
+Gated on **all eight release gates in §10** — in particular the peer-path proof-of-life and the availability decision. Neither is optional, and neither is this sprint's to discover.
 
 **Lands, per §12.0:**
 
