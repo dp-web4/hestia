@@ -17,6 +17,7 @@ use chacha20poly1305::{
 use ed25519_dalek::{Signer, SigningKey};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use web4_core::{crypto::PublicKey, lct::derive_lct_id};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAGIC: &[u8; 4] = b"HSTI";
@@ -45,12 +46,16 @@ impl Drop for LegacyOperatorKey {
 struct StoredCredential {
     principal_lct: String,
     secret_key: [u8; 32],
+    harness_secret_key: [u8; 32],
+    device_secret_key: [u8; 32],
 }
 
 impl Drop for StoredCredential {
     fn drop(&mut self) {
         self.principal_lct.zeroize();
         self.secret_key.zeroize();
+        self.harness_secret_key.zeroize();
+        self.device_secret_key.zeroize();
     }
 }
 
@@ -60,7 +65,11 @@ impl Drop for StoredCredential {
 pub struct IdentityVault {
     path: PathBuf,
     principal_lct: String,
-    signing_key: SigningKey,
+    principal_key: SigningKey,
+    harness_key: SigningKey,
+    device_key: SigningKey,
+    harness_lct: String,
+    device_lct: String,
 }
 
 impl IdentityVault {
@@ -118,10 +127,19 @@ impl IdentityVault {
             .map_err(|_| "identity vault payload is invalid".to_string())?;
         validate_lct(&stored.principal_lct)?;
 
+        let harness_key = SigningKey::from_bytes(&stored.harness_secret_key);
+        let device_key = SigningKey::from_bytes(&stored.device_secret_key);
+        let harness_lct = lct_for_key(&harness_key)?;
+        let device_lct = lct_for_key(&device_key)?;
+
         Ok(Self {
             path: path.to_path_buf(),
             principal_lct: stored.principal_lct.clone(),
-            signing_key: SigningKey::from_bytes(&stored.secret_key),
+            principal_key: SigningKey::from_bytes(&stored.secret_key),
+            harness_key,
+            device_key,
+            harness_lct,
+            device_lct,
         })
     }
 
@@ -133,13 +151,37 @@ impl IdentityVault {
         &self.path
     }
 
+    pub fn harness_lct(&self) -> &str {
+        &self.harness_lct
+    }
+
+    pub fn device_lct(&self) -> &str {
+        &self.device_lct
+    }
+
+    pub fn harness_public_key_hex(&self) -> String {
+        hex::encode(self.harness_key.verifying_key().to_bytes())
+    }
+
+    pub fn device_public_key_hex(&self) -> String {
+        hex::encode(self.device_key.verifying_key().to_bytes())
+    }
+
     /// Sign in the Rust shell. Only the encoded signature leaves this module.
     pub fn sign_hex(&self, message: &[u8]) -> Result<String, String> {
-        Ok(hex::encode(self.signing_key.sign(message).to_bytes()))
+        Ok(hex::encode(self.principal_key.sign(message).to_bytes()))
+    }
+
+    pub fn sign_harness_hex(&self, message: &[u8]) -> String {
+        hex::encode(self.harness_key.sign(message).to_bytes())
+    }
+
+    pub fn sign_device_hex(&self, message: &[u8]) -> String {
+        hex::encode(self.device_key.sign(message).to_bytes())
     }
 
     fn verifying_key_bytes(&self) -> [u8; 32] {
-        self.signing_key.verifying_key().to_bytes()
+        self.principal_key.verifying_key().to_bytes()
     }
 }
 
@@ -233,7 +275,21 @@ fn load_legacy(source: &Path) -> Result<StoredCredential, String> {
     Ok(StoredCredential {
         principal_lct: legacy.lct_id.clone(),
         secret_key,
+        harness_secret_key: random_seed(),
+        device_secret_key: random_seed(),
     })
+}
+
+fn random_seed() -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    OsRng.fill_bytes(&mut seed);
+    seed
+}
+
+fn lct_for_key(key: &SigningKey) -> Result<String, String> {
+    let public = PublicKey::from_bytes(&key.verifying_key().to_bytes())
+        .map_err(|e| format!("derive identity LCT from public key: {e}"))?;
+    Ok(derive_lct_id(&public))
 }
 
 fn retire_plaintext_source(source: &Path) -> Result<(), String> {

@@ -58,39 +58,87 @@ async fn operator_session(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    use super::operator_auth::{OperatorProvenance, operator_session_opened_record};
+    use super::operator_auth::{
+        OperatorProvenance, SESSION_TRANSCRIPT_DOMAIN, operator_session_opened_record,
+    };
 
-    let composed = ["actor", "principal", "via_device", "office", "authority"]
-        .iter()
-        .any(|field| body.get(field).is_some());
-    let provenance = if composed {
-        let value = |field: &str| {
+    let composed = [
+        "actor",
+        "principal",
+        "via_device",
+        "office",
+        "authority",
+        "actor_public_key",
+        "device_public_key",
+        "actor_signature",
+        "device_signature",
+    ]
+    .iter()
+    .any(|field| body.get(field).is_some());
+    let proof = if composed {
+        let required = |field: &str| {
             body.get(field)
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let Some(actor) = required("actor") else {
+            return bad_operator_session("composed session is missing actor");
+        };
+        let Some(principal) = required("principal") else {
+            return bad_operator_session("composed session is missing principal");
+        };
+        let Some(via_device) = required("via_device") else {
+            return bad_operator_session("composed session is missing via_device");
+        };
+        let Some(office) = required("office") else {
+            return bad_operator_session("composed session is missing office");
+        };
+        let Some(authority) = required("authority") else {
+            return bad_operator_session("composed session is missing authority");
         };
         let candidate = OperatorProvenance {
-            actor: value("actor"),
-            principal: value("principal"),
-            via_device: value("via_device"),
-            office: value("office"),
-            authority: value("authority"),
+            actor,
+            principal,
+            via_device,
+            office,
+            authority,
         };
         if let Err(reason) = candidate.validate() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": reason })),
-            );
+            return bad_operator_session(reason);
         }
-        Some(candidate)
+        if body.get("lct_id").and_then(|v| v.as_str()) != Some(candidate.principal.as_str()) {
+            return bad_operator_session("lct_id must exactly equal principal");
+        }
+        if body.get("transcript").and_then(|v| v.as_str()) != Some(SESSION_TRANSCRIPT_DOMAIN) {
+            return bad_operator_session("unsupported or missing operator-session transcript");
+        }
+        let Some(actor_public_key) = required("actor_public_key") else {
+            return bad_operator_session("composed session is missing actor_public_key");
+        };
+        let Some(device_public_key) = required("device_public_key") else {
+            return bad_operator_session("composed session is missing device_public_key");
+        };
+        let Some(actor_signature) = required("actor_signature") else {
+            return bad_operator_session("composed session is missing actor_signature");
+        };
+        let Some(device_signature) = required("device_signature") else {
+            return bad_operator_session("composed session is missing device_signature");
+        };
+        Some((
+            candidate,
+            actor_public_key,
+            device_public_key,
+            actor_signature,
+            device_signature,
+        ))
     } else {
         None
     };
     let (principal, challenge, signature) = (
-        provenance
+        proof
             .as_ref()
-            .map(|p| p.principal.as_str())
+            .map(|p| p.0.principal.as_str())
             .unwrap_or_else(|| body.get("lct_id").and_then(|v| v.as_str()).unwrap_or("")),
         body.get("challenge").and_then(|v| v.as_str()).unwrap_or(""),
         body.get("signature").and_then(|v| v.as_str()).unwrap_or(""),
@@ -98,23 +146,45 @@ async fn operator_session(
     let now = super::state::unix_now();
     let mut s = state.lock().await;
     let law = s.vault.policy().clone();
-    let authed = super::operator_auth::authenticate_operator(
-        &law,
-        &mut s.operator_challenges,
-        principal,
-        challenge,
-        signature,
-        now,
-        super::operator_auth::CHALLENGE_TTL_SECS,
-    );
+    let authed = match proof.as_ref() {
+        Some((provenance, actor_key, device_key, actor_sig, device_sig)) => {
+            super::operator_auth::authenticate_composed_operator(
+                &law,
+                &mut s.operator_challenges,
+                provenance,
+                challenge,
+                actor_key,
+                device_key,
+                signature,
+                actor_sig,
+                device_sig,
+                now,
+                super::operator_auth::CHALLENGE_TTL_SECS,
+            )
+        }
+        None => super::operator_auth::authenticate_operator(
+            &law,
+            &mut s.operator_challenges,
+            principal,
+            challenge,
+            signature,
+            now,
+            super::operator_auth::CHALLENGE_TTL_SECS,
+        ),
+    };
     match authed {
         Some(op) => {
-            let (token, record) = match provenance {
-                Some(provenance) => {
-                    // Authentication above proved the principal named in the tuple.
+            let (token, record, session_ref) = match proof {
+                Some((provenance, ..)) => {
+                    // Authentication above proved every identity named in the tuple.
                     debug_assert_eq!(provenance.principal, op);
                     let record = operator_session_opened_record(&provenance);
-                    (s.operator_sessions.open(provenance, now), record)
+                    let session_ref = Some(provenance.authority.clone());
+                    (
+                        s.operator_sessions.open(provenance, now),
+                        record,
+                        session_ref,
+                    )
                 }
                 None => (
                     s.operator_sessions.open(op.clone(), now),
@@ -122,12 +192,17 @@ async fn operator_session(
                         "operator": op,
                         "evidence": "operator-lct-signature",
                     }),
+                    None,
                 ),
             };
             let _ = s.append_chain("operator_session_opened", record);
             (
                 StatusCode::OK,
-                Json(serde_json::json!({ "token": token, "operator": op })),
+                Json(serde_json::json!({
+                    "token": token,
+                    "operator": op,
+                    "session_ref": session_ref,
+                })),
             )
         }
         None => (
@@ -135,6 +210,13 @@ async fn operator_session(
             Json(serde_json::json!({ "error": "operator authentication failed" })),
         ),
     }
+}
+
+fn bad_operator_session(reason: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": reason })),
+    )
 }
 
 /// The operator-surface preflight (RWOA O): resolve the request's operator from

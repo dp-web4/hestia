@@ -25,6 +25,9 @@ hex = "0.4"
 rand = "=0.8.6"
 tempfile = "3"
 zeroize = "1"
+# Canonical key-derived LCT identifiers. The app consumes identity primitives,
+# not the Hestia governance crate (decision 0014's domain split).
+web4-core = { path = "../../../web4/web4-core" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

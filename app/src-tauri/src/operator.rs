@@ -9,9 +9,10 @@
 //!
 //! Flow (matches `core/src/server/http.rs` operator_challenge/operator_session):
 //!   1. POST /api/operator/challenge      -> {challenge}
-//!   2. ask the unlocked identity vault to sign the challenge bytes
-//!   3. POST /api/operator/session {lct_id, challenge, signature} -> {token}
-//!   4. every /api/* request carries `Authorization: Bearer <token>`
+//!   2. construct the five-field composition in the Rust shell
+//!   3. principal, harness, and device sign one canonical transcript
+//!   4. POST the composed request and receive an opaque session token
+//!   5. every /api/* request carries `Authorization: Bearer <token>`
 //!
 //! The challenge is single-use (the daemon burns the nonce even on a failed
 //! attempt), so a re-auth always fetches a fresh one.
@@ -21,7 +22,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::identity_vault::IdentityVault;
+use crate::{identity, identity_vault::IdentityVault};
 
 /// What the UI is allowed to know about the operator session: whether it
 /// exists and which LCT it belongs to. Never the token.
@@ -67,8 +68,8 @@ pub fn default_legacy_key_path() -> Option<PathBuf> {
 }
 
 /// Run the full challenge -> sign -> session handshake against `daemon_url`.
-/// Returns the session on success. The signature is over the raw challenge
-/// bytes, matching `authenticate_operator` in the daemon.
+/// Returns the session on success. All identity/authority fields are covered by
+/// the same principal, harness, and device signatures.
 pub async fn authenticate(
     daemon_url: &str,
     vault: Arc<IdentityVault>,
@@ -88,15 +89,11 @@ pub async fn authenticate(
         .ok_or("daemon returned no challenge")?
         .to_string();
 
-    let signature = vault.sign_hex(challenge.as_bytes())?;
+    let request = identity::session_request_body(&vault, &challenge)?;
 
     let resp = client
         .post(format!("{daemon_url}/api/operator/session"))
-        .json(&serde_json::json!({
-            "lct_id": vault.principal_lct(),
-            "challenge": challenge,
-            "signature": signature,
-        }))
+        .json(&request)
         .send()
         .await
         .map_err(|e| format!("session request failed: {e}"))?;

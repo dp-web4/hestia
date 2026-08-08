@@ -77,6 +77,11 @@ fn migration_leaves_only_an_encrypted_reopenable_credential() {
     let opened = migrate_plaintext_operator_key(&legacy, &encrypted, PASSPHRASE)
         .expect("legacy credential should migrate");
     assert_eq!(opened.principal_lct(), PRINCIPAL);
+    let harness_lct = opened.harness_lct().to_string();
+    let device_lct = opened.device_lct().to_string();
+    assert_ne!(harness_lct, PRINCIPAL);
+    assert_ne!(device_lct, PRINCIPAL);
+    assert_ne!(harness_lct, device_lct);
     assert!(
         encrypted.exists(),
         "encrypted identity vault was not written"
@@ -100,6 +105,8 @@ fn migration_leaves_only_an_encrypted_reopenable_credential() {
     let reopened = IdentityVault::open(&encrypted, PASSPHRASE)
         .expect("encrypted vault should survive app restart");
     assert_eq!(reopened.principal_lct(), PRINCIPAL);
+    assert_eq!(reopened.harness_lct(), harness_lct);
+    assert_eq!(reopened.device_lct(), device_lct);
 
     let message = b"daemon challenge";
     let sig_bytes: [u8; 64] = hex::decode(reopened.sign_hex(message).unwrap())

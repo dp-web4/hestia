@@ -1,5 +1,6 @@
 mod commands;
 mod daemon;
+pub mod identity;
 pub mod identity_vault;
 pub mod operator;
 

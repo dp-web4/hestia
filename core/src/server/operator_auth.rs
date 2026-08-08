@@ -82,6 +82,9 @@ impl ChallengeStore {
 /// strong evidence given at establishment is sufficient for the reversible
 /// majority; the irreversible tail always re-collects evidence).
 pub const SESSION_TTL_SECS: u64 = 3600;
+pub const SESSION_TRANSCRIPT_DOMAIN: &str = "hestia:operator-session:v1";
+pub const SOVEREIGN_OFFICE: &str = "role:constellation:sovereign";
+const MAX_COMPOSITION_FIELD_BYTES: usize = 512;
 
 /// The identity/authority composition carried by an app-originated operator session.
 ///
@@ -116,12 +119,64 @@ impl OperatorProvenance {
                     _ => "authority must be non-empty and trimmed",
                 });
             }
+            if value.len() > MAX_COMPOSITION_FIELD_BYTES || value.chars().any(char::is_control) {
+                return Err("composition fields must be bounded printable strings");
+            }
         }
         if self.actor == self.principal {
             return Err("actor and principal must be distinct identities");
         }
+        if self.actor == self.via_device || self.principal == self.via_device {
+            return Err("actor, principal, and via_device must be distinct identities");
+        }
+        if !self.actor.starts_with("lct:web4:")
+            || !self.principal.starts_with("lct:web4:")
+            || !self.via_device.starts_with("lct:web4:")
+        {
+            return Err("actor, principal, and via_device must be canonical Web4 LCT ids");
+        }
+        if self.office != SOVEREIGN_OFFICE {
+            return Err("operator sessions must exercise the sovereign office");
+        }
         Ok(())
     }
+
+    pub fn validate_for_challenge(&self, challenge: &str) -> Result<(), &'static str> {
+        self.validate()?;
+        let expected = format!("operator-session:{challenge}");
+        if self.authority != expected {
+            return Err("authority must name the daemon-issued operator session challenge");
+        }
+        Ok(())
+    }
+}
+
+/// Length-delimited, domain-separated bytes signed by the principal, app
+/// harness, and device anchor. This is duplicated in the app identity domain;
+/// pinned test vectors on both sides make drift fail closed.
+pub fn canonical_session_transcript(
+    challenge: &str,
+    provenance: &OperatorProvenance,
+    actor_public_key: &str,
+    device_public_key: &str,
+) -> Vec<u8> {
+    let fields = [
+        ("challenge", challenge),
+        ("actor", provenance.actor.as_str()),
+        ("actor_public_key", actor_public_key),
+        ("principal", provenance.principal.as_str()),
+        ("via_device", provenance.via_device.as_str()),
+        ("device_public_key", device_public_key),
+        ("office", provenance.office.as_str()),
+        ("authority", provenance.authority.as_str()),
+    ];
+    let mut out = format!("{SESSION_TRANSCRIPT_DOMAIN}\n").into_bytes();
+    for (name, value) in fields {
+        out.extend_from_slice(format!("{name}:{}\n", value.len()).as_bytes());
+        out.extend_from_slice(value.as_bytes());
+        out.push(b'\n');
+    }
+    out
 }
 
 /// Existing dashboard sessions prove one operator directly; app sessions carry the
@@ -222,7 +277,11 @@ pub fn operator_session_opened_record(provenance: &OperatorProvenance) -> serde_
         "via_device": provenance.via_device,
         "office": provenance.office,
         "authority": provenance.authority,
-        "evidence": "principal-lct-signature",
+        "session_ref": provenance.authority,
+        "evidence": "principal+harness+device-signatures:v1",
+        "device_evidence": "self-issued-app-vault-key",
+        "authority_evidence": "principal-signature-over-session-composition",
+        "transcript": SESSION_TRANSCRIPT_DOMAIN,
     })
 }
 
@@ -239,6 +298,11 @@ pub fn attach_operator_provenance(
     object.insert("via_device".into(), json!(provenance.via_device));
     object.insert("office".into(), json!(provenance.office));
     object.insert("authority".into(), json!(provenance.authority));
+    object.insert("session_ref".into(), json!(provenance.authority));
+    object.insert(
+        "composition_evidence".into(),
+        json!("principal+harness+device-signatures:v1"),
+    );
     record
 }
 
@@ -286,6 +350,66 @@ pub fn authenticate_operator(
     let sig = web4_core::crypto::SignatureBytes::from_bytes(sig_bytes);
     law.authorize_operator(lct_id, challenge.as_bytes(), &sig)
         .map(|op| op.lct_id.clone())
+}
+
+/// Authenticate a composed app session. All semantic fields and both local
+/// public keys are covered by three signatures: the authorized principal,
+/// the app harness, and the device anchor. The daemon re-derives actor/device
+/// LCT ids from their keys rather than accepting caller labels.
+#[allow(clippy::too_many_arguments)]
+pub fn authenticate_composed_operator(
+    law: &VaultPolicyState,
+    store: &mut ChallengeStore,
+    provenance: &OperatorProvenance,
+    challenge: &str,
+    actor_public_key_hex: &str,
+    device_public_key_hex: &str,
+    principal_signature_hex: &str,
+    actor_signature_hex: &str,
+    device_signature_hex: &str,
+    now: u64,
+    ttl_secs: u64,
+) -> Option<String> {
+    provenance.validate_for_challenge(challenge).ok()?;
+
+    // Preserve the legacy endpoint's anti-replay property: any cryptographic
+    // attempt consumes the nonce, even when a later proof is invalid.
+    if !store.consume(challenge, now, ttl_secs) {
+        return None;
+    }
+
+    let actor_key = decode_public_key(actor_public_key_hex)?;
+    let device_key = decode_public_key(device_public_key_hex)?;
+    if web4_core::lct::derive_lct_id(&actor_key) != provenance.actor
+        || web4_core::lct::derive_lct_id(&device_key) != provenance.via_device
+    {
+        return None;
+    }
+
+    let transcript = canonical_session_transcript(
+        challenge,
+        provenance,
+        actor_public_key_hex,
+        device_public_key_hex,
+    );
+    let principal_signature = decode_signature(principal_signature_hex)?;
+    let actor_signature = decode_signature(actor_signature_hex)?;
+    let device_signature = decode_signature(device_signature_hex)?;
+
+    actor_key.verify(&transcript, &actor_signature).ok()?;
+    device_key.verify(&transcript, &device_signature).ok()?;
+    law.authorize_operator(&provenance.principal, &transcript, &principal_signature)
+        .map(|op| op.lct_id.clone())
+}
+
+fn decode_signature(value: &str) -> Option<web4_core::crypto::SignatureBytes> {
+    let bytes: [u8; 64] = hex::decode(value.trim()).ok()?.try_into().ok()?;
+    Some(web4_core::crypto::SignatureBytes::from_bytes(bytes))
+}
+
+fn decode_public_key(value: &str) -> Option<web4_core::crypto::PublicKey> {
+    let bytes: [u8; 32] = hex::decode(value.trim()).ok()?.try_into().ok()?;
+    web4_core::crypto::PublicKey::from_bytes(&bytes).ok()
 }
 
 /// Consequence + reversibility of an operator act (clause S). The gradient:
@@ -612,6 +736,16 @@ mod tests {
                 "operator session record dropped {field}"
             );
         }
+        assert_eq!(record["session_ref"], provenance.authority);
+        assert_eq!(record["evidence"], "principal+harness+device-signatures:v1");
+
+        let later = attach_operator_provenance(
+            json!({"act": "POST /api/operator/gate-escalation"}),
+            Some(&provenance),
+        );
+        assert_eq!(later["session_ref"], provenance.authority);
+        assert_eq!(later["actor"], provenance.actor);
+        assert_eq!(later["principal"], provenance.principal);
     }
 
     #[test]
@@ -705,6 +839,157 @@ mod tests {
                 CHALLENGE_TTL_SECS,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn composed_session_requires_all_three_signers_and_binds_every_field() {
+        use web4_core::{crypto::KeyPair, lct::derive_lct_id};
+
+        let principal_key = KeyPair::generate();
+        let actor_key = KeyPair::generate();
+        let device_key = KeyPair::generate();
+        let principal = "lct:web4:operator:dp".to_string();
+        let actor = derive_lct_id(&actor_key.verifying_key());
+        let device = derive_lct_id(&device_key.verifying_key());
+        let actor_public = hex::encode(actor_key.public_key_bytes());
+        let device_public = hex::encode(device_key.public_key_bytes());
+        let mut law = VaultPolicyState::default();
+        law.operator_access.push(OperatorIdentity {
+            lct_id: principal.clone(),
+            public_key_hex: hex::encode(principal_key.public_key_bytes()),
+            label: String::new(),
+        });
+        let mut store = ChallengeStore::default();
+
+        let challenge = store.issue(1_000);
+        let provenance = OperatorProvenance {
+            actor: actor.clone(),
+            principal: principal.clone(),
+            via_device: device.clone(),
+            office: "role:constellation:sovereign".into(),
+            authority: format!("operator-session:{challenge}"),
+        };
+        let transcript =
+            canonical_session_transcript(&challenge, &provenance, &actor_public, &device_public);
+        let authenticated = authenticate_composed_operator(
+            &law,
+            &mut store,
+            &provenance,
+            &challenge,
+            &actor_public,
+            &device_public,
+            &principal_key.sign(&transcript).to_hex(),
+            &actor_key.sign(&transcript).to_hex(),
+            &device_key.sign(&transcript).to_hex(),
+            1_000,
+            CHALLENGE_TTL_SECS,
+        );
+        assert_eq!(authenticated.as_deref(), Some(principal.as_str()));
+
+        // Each semantic field is changed only AFTER all signatures were made.
+        // Every mutation must fail, including fields the policy engine does not
+        // otherwise interpret (office and authority).
+        for field in ["actor", "principal", "via_device", "office", "authority"] {
+            let challenge = store.issue(2_000);
+            let mut changed = OperatorProvenance {
+                actor: actor.clone(),
+                principal: principal.clone(),
+                via_device: device.clone(),
+                office: "role:constellation:sovereign".into(),
+                authority: format!("operator-session:{challenge}"),
+            };
+            let transcript =
+                canonical_session_transcript(&challenge, &changed, &actor_public, &device_public);
+            let principal_sig = principal_key.sign(&transcript).to_hex();
+            let actor_sig = actor_key.sign(&transcript).to_hex();
+            let device_sig = device_key.sign(&transcript).to_hex();
+            match field {
+                "actor" => changed.actor.push('x'),
+                "principal" => changed.principal.push('x'),
+                "via_device" => changed.via_device.push('x'),
+                "office" => changed.office.push('x'),
+                "authority" => changed.authority.push('x'),
+                _ => unreachable!(),
+            }
+            assert!(
+                authenticate_composed_operator(
+                    &law,
+                    &mut store,
+                    &changed,
+                    &challenge,
+                    &actor_public,
+                    &device_public,
+                    &principal_sig,
+                    &actor_sig,
+                    &device_sig,
+                    2_000,
+                    CHALLENGE_TTL_SECS,
+                )
+                .is_none(),
+                "changing {field} after signing was accepted"
+            );
+        }
+
+        for missing in ["principal", "actor", "device"] {
+            let challenge = store.issue(3_000);
+            let provenance = OperatorProvenance {
+                actor: actor.clone(),
+                principal: principal.clone(),
+                via_device: device.clone(),
+                office: SOVEREIGN_OFFICE.into(),
+                authority: format!("operator-session:{challenge}"),
+            };
+            let transcript = canonical_session_transcript(
+                &challenge,
+                &provenance,
+                &actor_public,
+                &device_public,
+            );
+            let mut principal_sig = principal_key.sign(&transcript).to_hex();
+            let mut actor_sig = actor_key.sign(&transcript).to_hex();
+            let mut device_sig = device_key.sign(&transcript).to_hex();
+            match missing {
+                "principal" => principal_sig.clear(),
+                "actor" => actor_sig.clear(),
+                "device" => device_sig.clear(),
+                _ => unreachable!(),
+            }
+            assert!(
+                authenticate_composed_operator(
+                    &law,
+                    &mut store,
+                    &provenance,
+                    &challenge,
+                    &actor_public,
+                    &device_public,
+                    &principal_sig,
+                    &actor_sig,
+                    &device_sig,
+                    3_000,
+                    CHALLENGE_TTL_SECS,
+                )
+                .is_none(),
+                "session opened without the {missing} signature"
+            );
+        }
+    }
+
+    #[test]
+    fn composed_session_transcript_matches_the_app_vector() {
+        let provenance = OperatorProvenance {
+            actor: "lct:web4:mb32:bactor".into(),
+            principal: "lct:web4:mb32:bprincipal".into(),
+            via_device: "lct:web4:mb32:bdevice".into(),
+            office: "role:constellation:sovereign".into(),
+            authority: "operator-session:abc".into(),
+        };
+        let transcript =
+            canonical_session_transcript("abc", &provenance, &"11".repeat(32), &"22".repeat(32));
+        assert_eq!(
+            web4_core::crypto::sha256_hex(&transcript),
+            "0524720396a6a9be07c5fa62e9e736e1d1302d59e37d7daf3609d8f87bd492a1",
+            "app/daemon transcript drifted; bump the domain version"
         );
     }
 
