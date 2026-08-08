@@ -294,6 +294,29 @@ for label, cmd in [
 ]:
     check(f"REFUSED: {label}", denied("Bash", {"command": cmd}))
 
+print("the installers are write positions on the gate — self-access, not ordinary policy")
+# kimi-code, 2026-08-07, claiming claude-code's disclosure 3a (forum "the rung nobody
+# built"): `plugins/claude-code/install.sh` (#273, CLOSED unmerged — the file exists
+# only on that branch; the marker pre-positions for its return) and
+# `deploy/install-members.sh` (#272)
+# both overwrite the enforcing copy and matched no marker — the gate allowed
+# `bash <installer>` and only the script's own role check refused. These pins fail
+# against the pre-marker gate and pass after it, which is the disclosure made
+# executable. The marker is a path substring, so the spelling variants below are
+# the surface it actually covers; `cd`-then-invoke names nothing and stays a
+# disclosed limit, as with every path marker.
+for label, tool, ti in [
+    ("bash runs the per-seat installer",
+     "Bash", {"command": "bash plugins/claude-code/install.sh"}),
+    ("direct exec of the per-seat installer",
+     "Bash", {"command": "./plugins/claude-code/install.sh"}),
+    ("the all-member installer",
+     "Bash", {"command": "bash deploy/install-members.sh"}),
+    ("editing the installer is editing what overwrites the gate",
+     "Write", {"file_path": "plugins/claude-code/install.sh", "content": "x"}),
+]:
+    check(f"SELF-ACCESS: {label}", G._touches_self(tool, ti) is not None)
+
 print()
 if FAILS:
     print(f"FAILED ({len(FAILS)}): " + ", ".join(FAILS))

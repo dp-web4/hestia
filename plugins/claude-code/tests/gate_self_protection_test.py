@@ -5,8 +5,9 @@ WHY THIS EXISTS
 ---------------
 PR #169 landed `plugins/_shared/hestia_gate_core.py` — the shared policy core that is to
 become the single gate for all five harnesses, with the per-harness hooks reduced to adapter
-shims. The gate's self-protection rule matches two hook DIRECTORIES (`_SELF_MARKERS`) and
-five FILENAMES (`_GOVERNANCE_FILES`). The core matched neither, so the entire PR was written
+shims. The gate's self-protection rule matches hook DIRECTORIES plus the installer paths
+that overwrite them (`_SELF_MARKERS`) and the governance FILENAMES (`_GOVERNANCE_FILES`).
+The core matched neither, so the entire PR was written
 with no escalation. Verified by writing it, and disclosed in the PR rather than used.
 
 **Consolidation is what makes this sharp.** Today, disarming the gate means editing five
