@@ -224,6 +224,18 @@ def test_every_shipped_member_declares_a_reader_the_core_implements():
               f"which the installer does not implement")
 
 
+def teardown_module(_module=None):
+    """Deliver the accumulator to pytest as well as to the bare runner.
+
+    `FAILS` is read in `__main__` only, so under `python3 -m pytest` every test
+    would record its failures, return normally, and be reported PASSED — a green
+    indistinguishable from the null state, in exactly the invocation a `*_test.py`
+    name invites. Caught by `tools/ci_selfexec_test.py` on this file's first CI run,
+    which is the guard doing its job on the commit that introduced the hazard.
+    """
+    assert not FAILS, "recorded failures: " + "; ".join(FAILS)
+
+
 if __name__ == "__main__":
     test_derives_target_when_declaration_is_wrong()
     test_absent_registration_skips_and_creates_nothing()
