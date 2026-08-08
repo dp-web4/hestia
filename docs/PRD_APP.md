@@ -2,6 +2,10 @@
 
 **Status:** draft for review. Lead: claude-code (CBP), at dp's direction 2026-08-08.
 **Reviewers owed:** kimi, codex (out of usage), legion, GPT. **Not ratified.**
+**Amended by decision 0014** (#297, GPT-reviewed): the app is a *member with its own harness
+LCT*, not a dashboard on a daemon; identity and governance are separate domains; presence is a
+profile and Sovereign remains an office. Sections below are updated where 0014 rules.
+
 **Scope:** the owner-facing application. Does not restate `PRD.md` (product) or `PRD_GOVERNANCE.md`
 (society); both are assumed and cited.
 
@@ -25,13 +29,20 @@ makes the evidence more complete but the owner less able to act on it, the decis
 | | daemon web dashboard | Tauri app (`app/`) |
 |---|---|---|
 | size | **2,816 lines** (`core/src/server/dashboard/index.html`) | 38 source files |
-| approve / deny escalations | **116 references** | **none** |
+| approve / deny escalations | **~100-107** (kimi's word-bounded count; my 116 used a looser tokenisation) | **none** |
 | constellation | — | **none** |
 | hubs | — | read-only list (126 lines) |
 | in practice | **this is what dp uses** | not released, not used |
 
-The app makes **14 `invoke` calls; twelve are reads.** The two that are not are operator sign-in/out
-and `add_remote` — which adds a remote *host to monitor*, not a device to a constellation.
+The app's API module (`app/src/lib/tauri.ts`) defines **21 invoke call sites: 12 reads and 9 writes**
+(kimi, verified at `a745180`). My first count said 14/12/2 — I grepped components with `sort -u`,
+which deduped and missed the module's full surface. The writes are `operator_sign_in`/`_out`,
+`add_remote`, `remove_remote`, `vault_set`, `vault_delete`, `set_preset`, `set_mode`,
+`set_daemon_url`.
+
+**The conclusion is unchanged and the characterisation is not:** none of the 21 touches
+constellation or hub. But "a monitor" was kinder than the truth — it is a monitor **plus
+scattered config writes**, which is a worse starting point, not a better one.
 
 **So the app is today a strictly weaker duplicate of the dashboard, plus a fleet view.** That is the
 most important fact in this assessment, and it sets the shape of the work: the app's problem is not
@@ -300,7 +311,7 @@ containing `#2d2d2d`, `#383838`, `#424242`, `#565656`, `#509982`, `Inter`, and t
 | dim / muted | `--fg-dim: #a8aeac` | `--text-dim: #a8aeac` | `#a8aeac` — agree |
 | faint | `--fg-faint: #7b817f` | `--text-muted: #7b817f` | agree |
 | warning | `--warning: #facc15` | `--warn: #facc15` | agree |
-| accent | `#509982` ✅ | *(not set)* | `#509982` |
+| accent | `#509982` ✅ | `--hearth: #509982` ✅ *(I read this as absent — see below)* | `#509982` |
 | background | `#1b1c1e` ❌ | `#2d2d2d` ✅ | `#2d2d2d` |
 | border | `#45484c` ❌ | `#565656` ✅ | `#565656` |
 | logo | **none shipped** ❌ | `hestia-mark-white-64.png` ✅ | logotype defined |
@@ -310,6 +321,13 @@ carries the logo and the canonical greys; the dashboard carries the canonical ac
 at all. Neither is complete.
 
 ### Requirements
+
+> **Correction, and it argues R17 better than R17 does** (kimi): the app **already carries the
+> canonical accent** as `--hearth: #509982` (`global.css:4`). So **five of seven** values agree,
+> not four, and only the *name* diverges. I read a renamed token as an absent one — while
+> measuring carefully, in the very section arguing that renamed tokens cause drift. **The fork
+> eats reviewers too.** That is the case for one source consumed twice, made by this document's
+> own mistake rather than by its argument.
 
 - **R16 — both surfaces converge on `BRAND.md`, not on each other.** The dashboard adopts the
   canonical background and border; the app adopts the canonical accent. Consistency is achieved by
@@ -347,7 +365,8 @@ Named so reviewers can supply what I should not invent:
   specified — see §8.5; it turned out to be a convergence requirement, not an open question.)
 - **Mirror-mode trust boundary** (`PRD.md` §11) — how a thin client safely relays policy from a
   sovereign node. Architectural, unresolved, and it constrains mobile.
-- **Whether the app replaces the web dashboard or complements it.** My assessment is that they must
+- **~~Whether the app replaces the web dashboard or complements it.~~ PARTLY RULED by 0014:** the app is a *member*, not a presentation layer — it has its own LCT and fills a role, so it is a peer of the daemon rather than a second view of it. What remains open is narrower: whether the app *also* renders the daemon's dashboard (embedded browser), or simply supplies the sovereign session and leaves the dashboard where it is. 0014 §7 takes the second as the first cut. Original framing kept below because the reasoning still applies to the narrower question.
+- **(original)** **Whether the app replaces the web dashboard or complements it.** My assessment is that they must
   not diverge — two surfaces with two behaviours is the divergence problem this fleet has fought all
   week — but *which* becomes authoritative is a decision I should not make alone. The honest options
   are: app subsumes the dashboard; dashboard stays the operator/debug surface with the app as the
