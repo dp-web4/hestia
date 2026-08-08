@@ -309,24 +309,32 @@ replacement design as decision 0013; this PRD adopts it as the target, while kee
 implementation status explicit.
 
 An appeal is a transition on **one previously recorded denied act**, not a token authorising a future
-act. The act is identified by `action_id` and a versioned digest of a canonical, privacy-preserving
-normalisation of the original request. A retry must re-present the original bytes and the daemon must
-verify the digest before re-evaluating it. The current state is an append-only fold of transitions:
+act. The target record is identified by `action_id` and a versioned, domain-separated digest of a
+canonical, privacy-preserving serialisation of the original request. That digest wire does **not**
+exist today: the chain carries a redacted, 400-byte-bounded `attempted` value, not the act digest.
+A retry must re-present the original bytes and the daemon must verify the new digest before
+re-evaluating it. The target state is an append-only fold of transitions:
 `appealed → granted` or `appealed → denied`, including `denied on appeal — reason: timeout`; a late
 ruling must lose a compare-and-swap against an already-terminal state.
 
 The act record also carries composable provenance: actor role/agent chain, session/capacity,
 `instructor_lct` and instruction evidence, beneficiary member(s), delegation/request id, office and
 occupancy. Authority does not transfer through prose or a caller-supplied identity. An unattributed
-act is not appealable — there is no originating chain to which a ruling can be delivered. A daemon-
-unreachable deny is not silently dropped: the availability-not-blocker fallback records the action
-digest and enough provenance in Plane E for later reconciliation.
+act is not appealable — there is no originating chain to which a ruling can be delivered — but that
+refusal may enforce only after attribution is **installed and observed**, not merely merged. Today the
+old name join can and does deliver grants to the literal `unattributed`: 44 of 90 approved historical
+rows were claimed. A daemon-unreachable deny is not silently dropped: the target design requires a
+durable Plane-E record containing the action digest and enough provenance for later reconciliation.
+Plane E has never produced such a row at the measured seat, so this is a build dependency, not an
+existing fallback.
 
 The design is deliberately staged. #281's marker-legibility work is an interim compatibility repair;
 it is not the final authority model. #283 remains open for independent review, and no autonomous
 arbitration driver should be built until act binding, identity proof/signatures, provenance, and
-NOT-BENEFICIARY are in place. Current audit: `answers_deny` is empty for 314/314 historical
-escalations, so the chain contains the plumbing but not evidence that the return path works.
+NOT-BENEFICIARY are in place. The scope half can land before signing; the identity half — delivery
+only to the originating role/agent chain — cannot be called enforced until signed acts make that
+origin non-assertible. Current audit: `answers_deny` is empty for **425/425** historical escalation
+opens, so the chain contains the plumbing but not evidence that the return path works.
 
 ---
 
@@ -589,14 +597,20 @@ Hestia's gate is a port of the canonical Policy-Entity and says so in its own do
 
 Escalation stops being *"ask the human"* and becomes **resolver selection**; the operator is the terminal case, not the only case.
 
-Four current symptoms are one design consequence, and all four resolve here:
+Four current symptoms meet here, but resolver selection is no longer their first prerequisite:
 
 | symptom today | cause | resolved by |
 |---|---|---|
 | escalations expire unruled overnight | the only eligible resolver sleeps | a resolver that is awake |
 | a fail-closed deny is unwitnessable | the resolver channel is the daemon that is down | plane E + a resolver that is not the daemon |
-| `claim()` collides across tools and sessions | the join key has no resolver in it | resolution bound to its resolver |
+| `claim()` collides across tools and sessions | a marker token authorises a future act | decision 0013 binds the verdict to the recorded act |
 | NOT-SAME is discipline, not mechanism | one terminal resolver, so no selection step | selection *is* where independence is tested |
+
+**Hard prerequisite:** do not build the arbitration driver on the current claim path. Every one of
+the 215 measured escalation decisions was made by the operator; automating the resolver would turn a
+low-rate portable-token defect into a machine-rate deputy. Decision 0013 must land first, including
+signed origin for its identity clause, and NOT-BENEFICIARY still applies at resolver selection. The
+ordering changed: NOT-BENEFICIARY remains necessary, but it is no longer the first necessary repair.
 
 **The invitation is the appointment.** That is how `git-manager` becomes an office rather than a convention.
 
@@ -634,6 +648,10 @@ The short window is **not a defect** — dp: *"expire fast was a fix to kimi's h
 
 ### 8.4 The return channel: appeal
 
+**Decision 0013 supersedes the claim-token model in this section; it does not amend that model.**
+Marker, tool, and target cease to be a grant join rather than becoming a stricter grant join. #281
+remains useful only as an interim visibility repair while the old path exists.
+
 Escalation and appeal are **not the same instrument at different times.** They differ in target,
 and conflating them is how a member reaches for the wrong one (kimi did, on the record, 2026-08-03):
 
@@ -651,12 +669,13 @@ who is awake**, a **window sized to the answerer**, a **verdict that reaches the
 them today (§3), and the ladder's own logic supplies them:
 
 1. **Filable and act-bound.** The denied act is recorded before an appeal can open, with an
-   `action_id` and versioned canonical digest. The appeal references that record, never a marker or
-   reusable claim token; a retry is accepted only when its verbatim request hashes to the recorded
-   digest. The state transition is append-only (`appealed → granted|denied`), with timeout recorded as
-   `denied on appeal — reason: timeout`. Unattributed acts are not appealable, and daemon-unreachable
-   denies use the Plane-E fallback record. #283 / decision 0013 is the design target; the current
-   `deny_hash` consumer is compatibility debt, not the final contract.
+   `action_id` and versioned, domain-separated digest over its canonical serialization. The appeal
+   references that record, never a marker or reusable claim token; a retry is accepted only when its
+   verbatim request hashes to the recorded digest. The state transition is append-only
+   (`appealed → granted|denied`), with timeout recorded under a non-merits reason class. Unattributed
+   acts become explicitly non-appealable only after attribution is installed and observed, and
+   daemon-unreachable denies require a durable Plane-E fallback record. #283 / decision 0013 is the
+   design target; the current `deny_hash` consumer is compatibility debt, not the final contract.
 2. **Routable to someone awake.** Arbiter selection is resolver selection (§8.2) with an
    independence constraint. It reads **audited** and **witnessed** dimensions only (§7.4), never
    **declared** — and *liveness is a declared property of the wrong subject*: inbox-touch reports
@@ -677,7 +696,19 @@ identity that did not perform them, which is precisely what §9.1 exists to stop
 **Provenance and deputy constraint.** Every consequential act and appeal carries the composable
 role/agent chain, session/capacity, instructor and instruction evidence, beneficiary, delegation or
 request id, office, and occupancy. A caller cannot acquire authority by repeating an identity in
-prose. The originating chain is the delivery address; no proven origin means no appeal.
+prose. The originating chain is the delivery address; no proven origin means no appeal. Digest
+matching closes scope under today's declared identity; delivery to the originating chain remains
+observe-only until signatures make that origin provable.
+
+**There is no exception mechanism.** Re-evaluation uses current law. If the rule that denied the
+act still stands, a grant cannot wave one instance through; the operator flow is:
+
+`appeal → fix rule → grant → re-evaluate`
+
+The only other honest outcome is denial. This is intentionally more expensive per appeal: the
+same false-positive class cannot be approved repeatedly without repairing the rule that creates it.
+A timeout is terminal too, but its `resolver_unavailable` reason class must never be folded into
+member trust as a merits denial. Nobody looked is not evidence that the appeal was wrong.
 
 **The instruction is part of the surface.** Any deny text naming a tool, an argument, or a
 channel is a promise the daemon must keep. Two do today (`presets.rs:89-93`,
