@@ -737,6 +737,27 @@
   /* connected but idle: live + wired, just no tool calls in the last hour */
   .orch-idle { color: var(--fg-faint); font-size: 0.7rem; margin-left: 0.35rem; }
 .trust-alias { font-size:0.7rem; color:#94a3b8; font-style:italic; margin:0.15rem 0 0.3rem; }
+  /* Web4 hub card */
+  .hub-card { margin-top: 1rem; }
+  .hub-state { font-size: 0.72rem; color: var(--fg-dim); }
+  .hub-state.ok { color: var(--green, #2a8a3e); }
+  .hub-state.err { color: var(--coral, #c0392b); }
+  .hub-meta { font-size: 0.78rem; color: var(--fg-dim); margin: 0.3rem 0 0.6rem; word-break: break-all; }
+  .hub-join, .hub-compose { display: flex; gap: 0.4rem; align-items: center; margin: 0.4rem 0; flex-wrap: wrap; }
+  .hub-join input, .hub-compose input, .hub-reply input {
+    flex: 1 1 14rem; font: inherit; font-size: 0.82rem; color: var(--fg);
+    background: transparent; border: 1px solid var(--border); border-radius: 6px; padding: 0.35rem 0.5rem; }
+  .hub-note { font-size: 0.72rem; color: var(--fg-dim); flex-basis: 100%; white-space: pre-wrap; }
+  .hub-note.ok { color: var(--green, #2a8a3e); }
+  .hub-note.warn { color: var(--amber, #b26a00); }
+  .hub-note.err { color: var(--coral, #c0392b); }
+  .hub-topics { margin-top: 0.6rem; }
+  .hub-topic-title { font-size: 0.9rem; font-weight: 600; margin: 0.9rem 0 0.1rem; }
+  .hub-topic-by { font-size: 0.68rem; color: var(--fg-faint); margin-bottom: 0.3rem; }
+  .hub-post { border-left: 3px solid var(--border); padding: 0.15rem 0 0.15rem 0.7rem; margin: 0.45rem 0; }
+  .hub-post pre { white-space: pre-wrap; margin: 0; font: inherit; font-size: 0.85rem; }
+  .hub-post .hub-topic-by { margin: 0.1rem 0 0; }
+  .hub-reply { display: flex; gap: 0.4rem; align-items: center; margin: 0.3rem 0 0; flex-wrap: wrap; }
 </style>
 </head>
 <body>
@@ -873,6 +894,35 @@
         <div class="feed" id="feed">
           <div class="empty">Waiting for the first chain entry…</div>
         </div>
+      </div>
+    </div>
+
+    <!-- WEB4 HUB (2026-08-08, hackathon). The community surface: this hestia joins a
+         public governance hub and participates as a member. Everything below is
+         DAEMON-driven (/api/hub/*): the daemon discovers, signs with the vault
+         identity (the same ai_identity the CLI uses), and proxies — the browser
+         holds no keys and makes no cross-origin call, so the card works against a
+         hub behind any tunnel. Full-width below the live grid: it is a different
+         kind of surface (outward community, not local governance), and posts want
+         the horizontal room. -->
+    <div class="card hub-card" id="hub-card">
+      <div class="card-head">
+        <h2>Web4 hub</h2>
+        <span class="hub-state" id="hub-state">checking…</span>
+      </div>
+      <p class="hub-meta" id="hub-meta"></p>
+      <div class="hub-join" id="hub-join" hidden>
+        <input id="hub-join-name" placeholder="display name (optional)" maxlength="60">
+        <button class="policy-btn" id="hub-join-btn">join hub</button>
+        <span class="hub-note" id="hub-join-note"></span>
+      </div>
+      <div class="hub-compose">
+        <input id="hub-topic-title" placeholder="open a new topic…" maxlength="200">
+        <button class="policy-btn" id="hub-topic-btn">open</button>
+        <span class="hub-note" id="hub-topic-note"></span>
+      </div>
+      <div class="hub-topics" id="hub-topics">
+        <div class="empty">Loading discussion…</div>
       </div>
     </div>
   </main>
@@ -2825,6 +2875,159 @@
 
   tick();
   setInterval(tick, REFRESH_MS);
+})();
+</script>
+<script>
+// ---- Web4 hub card (2026-08-08) -------------------------------------------
+// Drives the daemon's /api/hub/* endpoints (operator-gated; `apiFetch` is the
+// page's top-level authed wrapper). The daemon signs with the vault identity
+// and talks to the hub; a deny from hub law comes back verbatim and is shown,
+// not hidden — a refusal is a governance decision, which is the point.
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const short = (u) => esc(String(u ?? '').slice(0, 8)) + '…';
+  const HUB_POLL_MS = 30000;
+  let joined = false;
+
+  function note(id, cls, msg) { const e = $(id); e.className = 'hub-note ' + cls; e.textContent = msg; }
+
+  async function hubStatus() {
+    try {
+      const r = await apiFetch('/api/hub/status', { cache: 'no-store' });
+      const d = await r.json();
+      const st = $('hub-state');
+      if (d.reachable) {
+        st.className = 'hub-state ok';
+        const name = (d.hubs && d.hubs[0] && d.hubs[0].name) || 'hub';
+        st.textContent = name + ' — live';
+      } else {
+        st.className = 'hub-state err';
+        st.textContent = 'unreachable';
+      }
+      $('hub-meta').innerHTML = esc(d.url)
+        + (d.member_lct
+           ? ' · member identity <b>' + short(d.member_lct) + '</b> (vault)'
+           : ' · no member identity yet');
+      $('hub-join').hidden = false;
+      $('hub-join-btn').textContent = d.member_lct ? 'join / re-sync' : 'join hub';
+      return d;
+    } catch (e) {
+      $('hub-state').className = 'hub-state err';
+      $('hub-state').textContent = 'daemon error';
+      return null;
+    }
+  }
+
+  async function hubTopics() {
+    try {
+      const r = await apiFetch('/api/hub/topics', { cache: 'no-store' });
+      if (!r.ok) { throw new Error('HTTP ' + r.status); }
+      const d = await r.json();
+      const box = $('hub-topics');
+      // Don't clobber a reply mid-composition: skip this render if the operator
+      // is typing in (or has text in) any reply box. The next poll catches up.
+      if (box.contains(document.activeElement) ||
+          [...box.querySelectorAll('input')].some(i => i.value.trim())) return;
+      const topics = d.topics || [];
+      if (!topics.length) {
+        box.innerHTML = '<div class="empty">No topics yet — open the first one.</div>';
+        return;
+      }
+      let html = '';
+      for (const t of topics) {
+        const tid = t.topic_id || t.id || '';
+        html += '<div class="hub-topic-title">' + esc(t.title) + '</div>'
+              + '<div class="hub-topic-by">by ' + short(t.created_by) + '</div>';
+        for (const p of (t.posts || [])) {
+          html += '<div class="hub-post"><pre>' + esc(p.body) + '</pre>'
+                + '<div class="hub-topic-by">' + short(p.posted_by)
+                + (p.entry_index != null ? ' · ledger #' + esc(p.entry_index) : '')
+                + '</div></div>';
+        }
+        const iid = 'hub-r-' + tid.replace(/[^a-zA-Z0-9]/g, '');
+        const nid = 'hub-n-' + tid.replace(/[^a-zA-Z0-9]/g, '');
+        html += '<div class="hub-reply"><input id="' + iid + '" placeholder="reply…" maxlength="8000">'
+              + '<button class="policy-btn" data-hub-reply="' + esc(tid) + '" data-input="' + iid
+              + '" data-note="' + nid + '">reply</button>'
+              + '<span class="hub-note" id="' + nid + '"></span></div>';
+      }
+      box.innerHTML = html;
+    } catch (e) {
+      $('hub-topics').innerHTML = '<div class="empty">Discussion unavailable: ' + esc(e.message) + '</div>';
+    }
+  }
+
+  async function hubAct(path, body, noteId, okMsg) {
+    try {
+      const r = await apiFetch(path, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok) {
+        note(noteId, 'ok', okMsg + (d.entry_index != null ? ' (ledger #' + d.entry_index + ')' : ''));
+        hubTopics();
+        return true;
+      }
+      // 403 = hub law refused; 401 = not (yet) an admitted member. Both are
+      // decisions, shown as such.
+      const msg = d.error || d.message || JSON.stringify(d);
+      note(noteId, r.status === 403 ? 'warn' : 'err',
+        (r.status === 403 ? 'refused by hub law: ' : 'HTTP ' + r.status + ': ') + msg);
+      return false;
+    } catch (e) { note(noteId, 'err', e.message); return false; }
+  }
+
+  $('hub-join-btn').addEventListener('click', async () => {
+    note('hub-join-note', '', 'joining…');
+    try {
+      const name = $('hub-join-name').value.trim();
+      const r = await apiFetch('/api/hub/join', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(name ? { name } : {}),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && d.status === 'admitted') {
+        joined = true;
+        note('hub-join-note', 'ok', 'admitted — member ' + (d.member_lct || '').slice(0, 8) + '…');
+      } else if (r.ok && d.status === 'pending') {
+        note('hub-join-note', 'warn',
+          'queued for the Sovereign’s review (closed admission). Posts stay refused until admitted; press join again later to re-sync.');
+      } else {
+        note('hub-join-note', 'err', d.error || ('HTTP ' + r.status));
+      }
+      hubStatus();
+    } catch (e) { note('hub-join-note', 'err', e.message); }
+  });
+
+  $('hub-topic-btn').addEventListener('click', async () => {
+    const title = $('hub-topic-title').value.trim();
+    if (!title) { note('hub-topic-note', 'warn', 'enter a title'); return; }
+    note('hub-topic-note', '', 'opening…');
+    if (await hubAct('/api/hub/topic', { title }, 'hub-topic-note', 'opened')) {
+      $('hub-topic-title').value = '';
+    }
+  });
+
+  // Reply buttons are re-rendered with the list; one delegated listener.
+  $('hub-topics').addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('[data-hub-reply]');
+    if (!btn) return;
+    const input = $(btn.dataset.input);
+    const body = (input.value || '').trim();
+    if (!body) { note(btn.dataset.note, 'warn', 'write something'); return; }
+    note(btn.dataset.note, '', 'posting…');
+    if (await hubAct('/api/hub/post', { topic_id: btn.dataset.hubReply, body }, btn.dataset.note, 'posted')) {
+      input.value = '';
+    }
+  });
+
+  hubStatus();
+  hubTopics();
+  setInterval(() => { hubStatus(); hubTopics(); }, HUB_POLL_MS);
 })();
 </script>
 </body>
