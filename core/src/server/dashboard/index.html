@@ -2879,12 +2879,27 @@
 </script>
 <script>
 // ---- Web4 hub card (2026-08-08) -------------------------------------------
-// Drives the daemon's /api/hub/* endpoints (operator-gated; `apiFetch` is the
-// page's top-level authed wrapper). The daemon signs with the vault identity
-// and talks to the hub; a deny from hub law comes back verbatim and is shown,
-// not hidden — a refusal is a governance decision, which is the point.
+// Drives the daemon's /api/hub/* endpoints (operator-gated). The daemon signs
+// with the vault identity and talks to the hub; a deny from hub law comes back
+// verbatim and is shown, not hidden — a refusal is a governance decision,
+// which is the point.
+//
+// The main dashboard script is one big IIFE, so its `apiFetch` (sign-in +
+// bearer + 401-retry) is NOT visible here. This card uses its own minimal
+// authed fetch: the bearer token the dashboard sign-in stores in
+// sessionStorage. A 401 here means "not signed in yet" — the card says so and
+// the next poll picks the token up after the operator signs in.
 (() => {
   const $ = (id) => document.getElementById(id);
+  async function hubFetch(path, opts = {}) {
+    const t = sessionStorage.getItem('hestia_op_token');
+    const res = await fetch(path, {
+      ...opts,
+      headers: { ...(opts.headers || {}), ...(t ? { authorization: 'Bearer ' + t } : {}) },
+    });
+    if (res.status === 401) throw new Error('sign in on the dashboard first');
+    return res;
+  }
   const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
   const short = (u) => esc(String(u ?? '').slice(0, 8)) + '…';
   const HUB_POLL_MS = 30000;
@@ -2894,7 +2909,7 @@
 
   async function hubStatus() {
     try {
-      const r = await apiFetch('/api/hub/status', { cache: 'no-store' });
+      const r = await hubFetch('/api/hub/status', { cache: 'no-store' });
       const d = await r.json();
       const st = $('hub-state');
       if (d.reachable) {
@@ -2921,7 +2936,7 @@
 
   async function hubTopics() {
     try {
-      const r = await apiFetch('/api/hub/topics', { cache: 'no-store' });
+      const r = await hubFetch('/api/hub/topics', { cache: 'no-store' });
       if (!r.ok) { throw new Error('HTTP ' + r.status); }
       const d = await r.json();
       const box = $('hub-topics');
@@ -2960,7 +2975,7 @@
 
   async function hubAct(path, body, noteId, okMsg) {
     try {
-      const r = await apiFetch(path, {
+      const r = await hubFetch(path, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
@@ -2984,7 +2999,7 @@
     note('hub-join-note', '', 'joining…');
     try {
       const name = $('hub-join-name').value.trim();
-      const r = await apiFetch('/api/hub/join', {
+      const r = await hubFetch('/api/hub/join', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(name ? { name } : {}),
