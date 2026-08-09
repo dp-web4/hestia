@@ -377,6 +377,11 @@ pub async fn serve_with_callback(
     // for the operator to sign in at all. All *data* lives behind the gate.
     let operator_surface = axum::Router::new()
         .route("/api/dashboard", get(dashboard_json))
+        .route("/api/hub/status", get(super::hub_tab::hub_status))
+        .route("/api/hub/join", post(super::hub_tab::hub_join))
+        .route("/api/hub/topics", get(super::hub_tab::hub_topics))
+        .route("/api/hub/topic", post(super::hub_tab::hub_topic_create))
+        .route("/api/hub/post", post(super::hub_tab::hub_post))
         .route("/api/trust/derivation", get(trust_derivation_json))
         .route("/api/trust/graph", get(trust_graph_turtle))
         .route("/api/operator/adjudicate", post(operator_adjudicate))

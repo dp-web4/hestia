@@ -9,6 +9,7 @@ pub mod gate_escalation;
 pub mod governance_ledger;
 mod handler;
 mod http;
+mod hub_tab;
 pub mod operator_auth;
 mod state;
 
