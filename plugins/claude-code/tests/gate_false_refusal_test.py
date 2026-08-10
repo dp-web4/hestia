@@ -491,6 +491,12 @@ _FALSE_REFUSALS = [
      "a blank starts one and eats the `;` and the `cp` with it (measured) — so this must "
      "stay PERMITTED. A fix that refuses anything containing `#` passes the refusal row "
      "and fails this one; that pair is the whole content of the claim"),
+    ("redirect_then_hash_is_kept_not_dropped", "grep -c def {g} # >out",
+     "the boundary `_COMMENT_OPENS_AFTER` deliberately does NOT carry. Bash treats `#` "
+     "after `<`, `>`, `(`, `)` as a comment too (measured 2026-08-10, correcting this "
+     "fix's first justification), and the set omits them anyway — text it keeps is text "
+     "it still classifies, so the omission adds refusals and never drops a command. This "
+     "row is the ordinary shape that must not be caught by that decision"),
     ("comment_line_between_reads", "grep -c def {g}\n# note\ngrep -c class {g}",
      "a whole-line comment between two reads. The line survives the split as an empty "
      "line, not as a segment whose head is `#`"),

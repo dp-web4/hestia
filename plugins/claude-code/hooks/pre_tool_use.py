@@ -1524,13 +1524,28 @@ def _assignment_remainder(parts):
 # (measured against bash 2026-08-10), because `a#b` is one literal word and the `;` after it
 # is a real separator.
 #
-# DELIBERATELY NARROWER THAN BASH, which also breaks a word at a redirection operator. The
-# asymmetry is the safe direction and it is worth stating why: a `#` this set fails to
-# recognise is text that is KEPT, tokenised and head-checked, so a miss can only ADD a
-# refusal — never drop a command from the walk. A `#` recognised too eagerly discards the
-# rest of the line unclassified, which is the bypass shape. `>` is the concrete case left
-# out: `echo hi >#f` redirects into a file literally named `#f`, so calling that `#` a
-# comment would drop a real write target on the floor.
+# DELIBERATELY NARROWER THAN BASH: `<`, `>`, `(` and `)` are word boundaries to bash and are
+# NOT in this set. Measured 2026-08-10, and the measurement corrected the reason this comment
+# first gave. The first draft claimed `echo hi >#f` redirects into a file literally named
+# `#f`, so that treating the `#` as a comment would drop a real write target. That is false:
+# bash comments there too, and `echo hi >#f`, `cat <#x`, `echo hi|#w` and `(echo hi)#z` all
+# behave as comments (the first three become a syntax error, having lost the operand the
+# operator needed). So the honest justification is not fidelity, it is DIRECTION:
+#
+#   a `#` this set fails to recognise is text that is KEPT, tokenised and head-checked, so
+#   the miss can only ADD a refusal — never drop a command from the walk. A `#` recognised
+#   too eagerly discards the rest of the line UNCLASSIFIED, which is the bypass shape.
+#
+# And the omission is measured to cost nothing real: a `#` immediately after a redirection
+# operator leaves that operator with no operand, so bash rejects the whole command anyway —
+# there is no valid command this set refuses and bash accepts. Widening it to match bash
+# exactly means dropping MORE text on the security boundary, which is the dangerous
+# direction and wants its own claim and its own review, not a quiet edit here.
+#
+# NOMAD, working the same claim independently on 2026-08-10, wrote `set(" \t\n;&|()<>")` —
+# the faithful spelling. Two parsers, one narrower and one more faithful, neither a bypass.
+# Whichever survives, this paragraph is the record that the difference was deliberate and
+# measured rather than an oversight in the loser.
 _COMMENT_OPENS_AFTER = frozenset(" \t\r\f\v;&|")
 
 
