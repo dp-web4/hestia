@@ -137,6 +137,39 @@ Three consequences, all cheap, none deferrable to a later increment:
    rather than quietly carried, because an acceptance criterion no increment can satisfy is the
    same defect one layer up.
 
+#### 4b. Correction to rev 3: the horizon is not a wall, it is this decision's free parameter
+
+Rev 3 filed the 1-hour TTL as a hard constant to design around and asked dp whether escalations
+are *"really meant to die in an hour."* **That question is answered in the source, and the answer
+inverts the conclusion.** `DEFAULT_TTL_SECS`' own docstring (`gate_escalation.rs:76-104`):
+
+- It **was 120s**, from dp's *"deny on timeout of a couple minutes"* — a bound on how long a
+  member sat *frozen*, under a blocking design that no longer exists.
+- It was raised to 3600 for **precisely this decision's problem**: *"a peer is ASYNCHRONOUS —
+  another agent on another schedule, reached by a mesh notice it will see when it next drains.
+  Two minutes means it essentially never arrives in time."* Measured 2026-07-30: escalation
+  `8bb08a85` opened, kimi-code notified over the mesh, **expired unruled** — *"not a failure of
+  the peer; a window sized for someone already watching."*
+- And the cost of widening is stated as nil: *"a pending escalation permits NOTHING, so a longer
+  window widens no permission — it only widens the chance that somebody answers. What must stay
+  tight is `APPROVAL_CLAIM_WINDOW_SECS`"* (600s — it bounds how long a **granted** approval can
+  be ridden, and 0015 must not touch it).
+
+So starvation is not vacuous by nature. It is vacuous **at the current value of a knob whose own
+documentation says widening it is free, and which has already been moved 30× in this exact
+direction for this exact reason.** THOR quoted my 07-31 line back at me — *"the window width is
+the last free parameter"* — and on this surface it is literally true.
+
+4. **0015 ships a TTL proposal alongside its threshold, rather than marking §10 provisional and
+   waiting.** The one-hour horizon is the same defect as the 120s one, one order of magnitude up:
+   a window sized for a decider who is already watching, on a fleet whose deciders wake on notices.
+
+**And the dependency runs the other way from how rev 3 had it.** The only real cost of a longer
+TTL is that the operator's pending queue holds more rows for longer — a *visibility* cost. A
+board that ranks, annotates and reports its omissions is exactly the instrument that makes a
+longer queue readable. **0015 is not blocked by the TTL; 0015 is the precondition for raising it
+safely.** That is the argument to put to dp, in place of rev 3's question.
+
 ---
 
 ## 5. NOT-SAME is checked twice, because state moves
@@ -159,8 +192,10 @@ load-bearing rather than pedantic:
 |---|---|---|
 | discovery — `tool_gate_pending_escalations` (`handler.rs:11972`) | `eligibility(p)` | **blind** — `arbiter.rs:198` is a wrapper for `eligibility_for(p, ForAppellant)` |
 | ruling — `tool_gate_arbitrate_escalation` (`handler.rs:12056`) | `eligibility_for(p, disposition)` | **told**, from the caller's `approve` |
+| corroboration — `tool_gate_escalation_corroborate` (`handler.rs:12216`) | `eligibility(p)` | **blind** — correct today, and §5b is why that is not the same as safe |
 
-One module, one rule set, no drift — but **two predicates**, and they disagree on exactly one
+Three call sites, not two — THOR's §5.1 correction, adopted. One module, one rule set, no drift
+— but **two predicates**, and they disagree on exactly one
 enumerable case: `p.arbiter == p.appellant` under `AgainstAppellant` returns `SelfWithdrawal`
 (permitted) from the direction-aware entry and `Refused` from the direction-blind one. The
 blindness is deliberate and correct at its own site: `arbiter.rs` states that the relaxation
@@ -203,6 +238,59 @@ So eviction **is** the third window, it just is not a TOCTOU race at all: it is 
 runs during the lease and needs no act by any party — THOR's structural point, intact. The board
 must therefore carry each item's `secs_remaining` and treat expiry as a first-class outcome, and
 §5's two checks bracket a lease that can die between them from the clock alone.
+
+### 5b. Corroboration: the third site, where the blind entry is right for a reason that is about to expire
+
+THOR asked for the site §5 omitted — *"add corroborate to the set or say explicitly why it is out
+of scope."* It is in the set. Measured at `ba8993d`:
+
+`tool_gate_escalation_corroborate` (`handler.rs:12190`) calls `crate::arbiter::eligibility` at
+`handler.rs:12216` and treats anything but `Eligible` as a hard refusal. So it is **not a copy** —
+THOR's anti-copy concern is a forward risk about the CLI, not a present defect; all three
+escalation sites route through `arbiter.rs`.
+
+**And the blind entry is the correct choice here, which the other two sites cannot say.** A
+corroboration has no disposition to name: it is evidence, not a verdict, and this door is
+concurrence-only — the call passes `dissent: false` as a literal
+(`gate_escalation.rs:1053`'s fifth parameter). Concurring with your own ask *is* self-dealing in
+the granting direction, which is exactly clause 1's `Refused`. Blind = assume `ForAppellant` =
+right answer.
+
+**The correctness is contingent, and the contingency is two lines away from a feature the code
+already promises.** `dissent` is not hypothetical: it is a live field with its own test
+(`dissent_is_recorded_and_does_not_veto`, `gate_escalation.rs:1541`), it is counted in `bar_met`
+(`:439-449`), and the peer notice already advertises the act — the pointer is
+`hestia://escalation/{id}#corroborate-or-dissent` (`handler.rs:11303`), while `:11291` records
+that corroborate *"is the only door that adds its factor."* **The fleet is invited to dissent
+through an API that has no dissent door.** When that door is built — one bool, most cheaply
+threaded through this same handler — it inherits this `eligibility` call, and the inheritance is
+wrong in exactly one case: a member entering evidence **against its own** escalation is
+`SelfWithdrawal` under `eligibility_for(p, AgainstAppellant)` and `Refused` under the blind
+entry. It would be refused with *"Evidence about your own gate write is not a second factor — it
+is the first one wearing a hat"* — a true sentence about concurrence and a false one about
+dissent.
+
+The cost is low and stated as low: a member wanting to drop its own ask already has the ruling
+path's `SelfWithdrawal`. This is a **latent** defect, not a live one. What is worth carrying is
+the shape, because it is the third instance this week:
+
+> `arbiter.rs:190-197` justifies the blind default as protection against a **widened** admission
+> arriving by default — *"a diff reads as plumbing and changes who may authorise what."* That
+> guard is **one-directional.** It is aimed at inherited over-permission, which is loud and
+> self-correcting, and it says nothing about inherited over-**restriction**, which THOR's §1
+> establishes is the silent one: the member sees nothing for it and reads that as no work.
+
+So §5's rule, restated to cover all three: **name the direction at every surface that renders or
+acts on eligibility, and where a surface genuinely has no direction, say so at the call site** —
+because the next caller inherits the silence, not the reasoning.
+
+*Scoped:* all three escalation sites pass `deny_adjudicator: None`, so clause 2 — *the gate that
+issued the deny cannot arbitrate the dispute about it* — has no caller on this surface and is
+exercised only by the appeal path (`handler.rs:2826`, `:3067`, which pass a real adjudicator).
+That is correct by construction here (an escalation's denier is the gate itself, not a member,
+so there is no adjudicator identity to pass), but it means the escalation surface's independence
+is a **three-clause** predicate, and any claim that "the escalation and appeal surfaces run the
+same check" is false in one more way than §5 originally admitted.
 
 **A claim confers no authority.** It is a lease: *"I am working this."* It prevents duplicate work
 and makes intent visible. It does not pre-authorise the ruling, and the ruling is refused on the
