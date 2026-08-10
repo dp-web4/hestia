@@ -9988,6 +9988,7 @@ mod operating_law_surface_tests {
 #[cfg(test)]
 mod preamble_tests {
     use super::*;
+    use super::appeal_tests::seat;
     use super::inbox_tests::{open_state, seeded_home};
 
     async fn law_for(state: &SharedState, sid: Uuid) -> Value {
@@ -10146,7 +10147,10 @@ mod appeal_tests {
     /// unidentified flake. kimi-code found it from the other end while reviewing.
     /// A deterministic id removes the lottery; the reader-side fix (delimited markers)
     /// removes the bug.
-    async fn seat(state: &SharedState, plugin_id: &str) -> Uuid {
+    // `pub(super)` so `preamble_tests` seats a member the same way, rather than growing a
+    // second fixture. Two seat helpers would drift, and this one carries a hard-won
+    // property (a DERIVED id, free of probe markers) that a copy would silently lose.
+    pub(super) async fn seat(state: &SharedState, plugin_id: &str) -> Uuid {
         // Deterministic from the plugin_id: stable across runs, and provably free of
         // any probe marker (asserted below, so a future edit cannot silently reintroduce
         // the lottery).
