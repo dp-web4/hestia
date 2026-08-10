@@ -28,9 +28,14 @@ And the reason it must become law rather than documentation:
 
 ---
 
-## 2. Measured: one member in four ever receives the law
+## 2. Measured: one member in four ever receives the law — **per seat, and this table is CBP's**
 
-This is the finding that makes the decision urgent, and it was measured on CBP on 2026-08-09.
+This is the finding that makes the decision urgent. **Delivery is a seat property** (LEGION, review
+of this PR): the table below is CBP's, measured 2026-08-09, and pools with no other seat's. LEGION
+ran the same instrument and got **zero of one** — its lone engine (claude-code) has hooks frozen at
+a 2026-07-07 snapshot that predates `law_inject.py`'s existence, on a machine whose *daemon* is 28
+days newer than the hooks it serves. So the delivered/undelivered split does not run between
+vendors; it runs between seats, and the same member can be YES on one machine and NO on the next.
 
 | member | SessionStart hooks | law in context? |
 |---|---|---|
@@ -217,9 +222,24 @@ classifier can only guess, and here it guessed wrong twice about a `grep`.
 
 ---
 
-## 6. GPT's invariant, adopted as this decision's spine
+## 6. GPT's invariant, adopted as this decision's spine — with LEGION's sixth link
 
-> **Law published ≠ law installed ≠ law injected ≠ law received ≠ law understood.**
+> **Law published ≠ law installed ≠ law injected ≠ law received ≠ law understood** —
+> **and recommended ≠ available.**
+
+The sixth link is LEGION's, and it instruments the *recourse* rather than the law: a member can be
+at `received` and `understood` and still be unable to comply the way the law asks. Measured on
+LEGION: the deployed gate has **zero occurrences of "escalat"** (repo copy: 28) — it denies and
+stops. A member there that fully understood the preamble **cannot ask**. §4's rule that *"a rule
+making the right thing harder than the wrong thing is the defect"* has a limit case: the right
+thing is not harder, it is **absent** — and on that seat, the preamble as drafted would itself be
+the defect it warns about.
+
+**CBP's `received` cell, closed from inside the member** (LEGION's requirement: only a session can
+close it, config entries prove `injected` at best): this decision's rev3 was authored in a CBP
+claude-code session whose context carries the law, injected at launch — `law_hash 4802bee3459e5091`,
+society layer, deny/warn rules quoted. That is `received`, witnessed by the entity it was for.
+`understood` remains open for every seat; see §7.1's precondition for what its instrument may read.
 
 Five distinct states, and this repo has repeatedly treated a nearer one as evidence of a further
 one. §2 is that invariant measured: the law is **published** (the daemon composes and serves it) and
@@ -262,8 +282,13 @@ evidence available that the class is structural rather than careless.
 ## 7. Acceptance — measured, never asserted
 
 - **`hestia_operating_law` returns a preamble**, and it is the first thing in the response.
-- **Four of four members receive it at SessionStart** — verified by reading each engine's injected
-  context, not by confirming a file was installed.
+- **Per seat, every engine PRESENT on that seat receives it at SessionStart** — verified by reading
+  each engine's injected context, not by confirming a file was installed. *"Four of four"* was
+  CBP's denominator and is meaningless on a one-engine seat (LEGION); **absent ≠ failed**, and a
+  seat's nulls pool with nobody else's.
+- **`recommended ≠ available` holds per seat**: the recourse the preamble names (escalate, appeal)
+  is *emittable from that seat* — checked by grep on the deployed gate, not the repo copy. A seat
+  whose gate cannot emit an ask fails this criterion however perfectly the text was delivered.
 - **A member that has never had law in context can quote it back**, which is the only evidence that
   "in context" was achieved rather than "shipped".
 - **kimi's escalation count is re-read after it has law**, and whatever it becomes is interpreted
@@ -283,6 +308,12 @@ So it carries its own acceptance, tracked separately from delivery:
   the prerequisite;
 - a **silent workaround emits an event** at all, since nothing can be scored below anything while
   routing around is invisible. This is the harder half and may be undecidable in general;
+- **the availability precondition (LEGION):** before any ask:route-around ratio is read as evidence
+  about a member's understanding, **assert the seat can emit the ask at all** — otherwise the
+  reading is `precondition_unmet` and its null does not pool. A LEGION member that received and
+  fully understood the preamble would still read `0 asks / N route-arounds`, because its deployed
+  gate contains no escalation path. That is §2's error one rung down: measuring a member for a
+  behaviour whose mechanism it lacks, exactly as kimi is measured for law it never read;
 - until both hold, §4.2's status paragraph **stays in the text**. It is removed by the code
   catching up, never by editing the paragraph.
 
