@@ -50,3 +50,8 @@ app/src-tauri/gen/android/local.properties
 .hardbound/signing.key
 
 .hardbound/actors/claude/signing.key
+
+# Build worktrees (DEPLOY.md §0). The `web4` symlink beside them is tracked on
+# purpose — see docs/deployment/DEPLOY.md §0.
+/.wt/*
+!/.wt/web4
