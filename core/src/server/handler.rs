@@ -945,6 +945,15 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         .collect();
 
     let body = json!({
+        // FIRST, and above every layer. Constitutional text: what this community is, before
+        // what it forbids. It is a constant rather than a `PolicyConfig` field precisely
+        // because an operator grant SUBSTITUTES the local layers — a preamble held per-layer
+        // would disappear for the members running under an exception, who most need to read
+        // that the exception is disclosed and what the community expects regardless.
+        //
+        // Inside the hashed body on purpose: amending the constitution MOVES `law_hash`, so a
+        // member pinning the hash learns it changed instead of having to re-read carefully.
+        "preamble": crate::policy::LAW_PREAMBLE,
         "identity": {"plugin_id": who.plugin_id, "role": who.role_lct},
         "layer_modes": layer_modes,
         "layers": layers.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
@@ -1002,6 +1011,12 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         o.insert("society_policy_hash".into(), json!(s.policy_engine.content_hash()));
     }
     Ok(json!({
+        // FOURTH instance of the shape the comment below names, caught while adding this
+        // very field. The preamble went into `body` — so it was hashed, and `law_hash`
+        // moved — and would have been dropped here, because this projection is an
+        // allowlist. The member would have received a law with no constitution while the
+        // digest proved it had read one. That is worse than omitting it outright.
+        "preamble": out.get("preamble").cloned().unwrap_or(Value::Null),
         "identity": out.get("identity").cloned().unwrap_or(Value::Null),
         "layer_modes": out.get("layer_modes").cloned().unwrap_or(Value::Null),
         "layers": out.get("layers").cloned().unwrap_or(Value::Null),
@@ -10067,6 +10082,133 @@ mod operating_law_surface_tests {
 /// the handler/derivation boundary: the bug they exist to prevent is the two halves
 /// agreeing in isolation and disagreeing about the shape they exchange.
 #[cfg(test)]
+mod preamble_tests {
+    use super::*;
+    use super::appeal_tests::seat;
+    use super::inbox_tests::{open_state, seeded_home};
+
+    async fn law_for(state: &SharedState, sid: Uuid) -> Value {
+        tool_operating_law(state, &json!({"session_id": sid.to_string()}))
+            .await
+            .expect("law composes")
+    }
+
+    /// The law a member reads begins with what the community IS, not with what it forbids.
+    #[tokio::test]
+    async fn the_law_opens_with_the_preamble() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat(&state, "claude-code").await;
+        let law = law_for(&state, sid).await;
+
+        let p = law.pointer("/preamble").and_then(Value::as_str).unwrap_or_default();
+        assert!(!p.is_empty(), "no preamble in the composed law: {law}");
+        assert_eq!(p, crate::policy::LAW_PREAMBLE, "the served text must be the one source");
+        assert!(
+            p.contains("THE RULE IS THE DEFECT"),
+            "the preamble must tell a member that a rule making the right thing harder is the \
+             bug — that sentence is the whole decision"
+        );
+    }
+
+    /// **THE CASE THAT REFUTED THE DESIGN.** Decision 0016 proposed holding the preamble in
+    /// `PolicyConfig`. An operator grant SUBSTITUTES the local layers — `tool_operating_law`
+    /// pushes `operator-grant` INSTEAD OF society/role/instance — so a per-layer preamble
+    /// would vanish for exactly the members running under an exception.
+    ///
+    /// Those members need it most: they are operating under a disclosed loosening, and the
+    /// preamble is where the community says the exception is disclosed rather than secret.
+    ///
+    /// This asserts the preamble survives substitution. It fails against the design as
+    /// written in the decision, which is why the decision was corrected rather than the test
+    /// relaxed.
+    #[tokio::test]
+    async fn an_operator_grant_cannot_substitute_the_constitution_away() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat(&state, "claude-code").await;
+
+        {
+            let mut s = state.lock().await;
+            let who = resolve_attributed_caller(&s, Some(&sid.to_string()))
+                .expect("seated session resolves");
+            s.instance_grants.insert(
+                (who.plugin_id.clone(), who.role_lct.clone()),
+                crate::server::state::InstanceGrant {
+                    preset: "permissive".into(),
+                    granted_by: "operator".into(),
+                    granted_at: 0,
+                    reason: "test: the widest possible exception".into(),
+                    expires_at: None,
+                },
+            );
+        }
+
+        let law = law_for(&state, sid).await;
+        assert!(
+            law.pointer("/operator_grant").map(|v| !v.is_null()).unwrap_or(false),
+            "fixture did not actually install the grant, so this proves nothing: {law}"
+        );
+        assert_eq!(
+            law.pointer("/preamble").and_then(Value::as_str).unwrap_or_default(),
+            crate::policy::LAW_PREAMBLE,
+            "the preamble disappeared under an operator grant — a member running on the widest \
+             exception was told what it may do and never told what the community expects"
+        );
+    }
+
+    /// **THE PROJECTION TRAP, pinned.** The response is an allowlist projection of the hashed
+    /// body, so a field can be covered by `law_hash` and still never reach the member. That
+    /// has now happened three times in this file by its own comment's count — and a fourth
+    /// time here, caught while adding the preamble.
+    ///
+    /// A law whose digest proves the member read a constitution it was never sent is worse
+    /// than one with no constitution at all, so both halves are asserted together: the text
+    /// is SERVED, and amending it MOVES the hash.
+    #[tokio::test]
+    async fn the_preamble_is_both_served_and_covered_by_the_law_hash() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat(&state, "claude-code").await;
+        let law = law_for(&state, sid).await;
+
+        // Served — not merely present in the internal body.
+        assert_eq!(
+            law.pointer("/preamble").and_then(Value::as_str),
+            Some(crate::policy::LAW_PREAMBLE),
+            "the preamble was dropped by the response projection: {law}"
+        );
+
+        // Covered — recompute the digest the handler computes, over a tampered preamble.
+        let hash = law.pointer("/law_hash").and_then(Value::as_str).expect("law carries a hash");
+        let digest_of = |v: &Value| {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(serde_json::to_string(v).unwrap_or_default().as_bytes());
+            format!("{:x}", h.finalize())
+        };
+        let mut a = law.clone();
+        let mut b = law.clone();
+        for v in [&mut a, &mut b] {
+            if let Some(o) = v.as_object_mut() {
+                o.remove("law_hash");
+                o.remove("society_policy_hash");
+                o.remove("note");
+            }
+        }
+        if let Some(o) = b.as_object_mut() {
+            o.insert("preamble".into(), json!("a friendlier constitution"));
+        }
+        assert_ne!(
+            digest_of(&a), digest_of(&b),
+            "editing the preamble did not move the digest — a constitutional amendment would \
+             be invisible to a member that pins the hash"
+        );
+        assert!(!hash.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod appeal_tests {
     use super::*;
     use super::inbox_tests::{open_state, seeded_home};
@@ -10101,7 +10243,10 @@ mod appeal_tests {
     /// unidentified flake. kimi-code found it from the other end while reviewing.
     /// A deterministic id removes the lottery; the reader-side fix (delimited markers)
     /// removes the bug.
-    async fn seat(state: &SharedState, plugin_id: &str) -> Uuid {
+    // `pub(super)` so `preamble_tests` seats a member the same way, rather than growing a
+    // second fixture. Two seat helpers would drift, and this one carries a hard-won
+    // property (a DERIVED id, free of probe markers) that a copy would silently lose.
+    pub(super) async fn seat(state: &SharedState, plugin_id: &str) -> Uuid {
         // Deterministic from the plugin_id: stable across runs, and provably free of
         // any probe marker (asserted below, so a future edit cannot silently reintroduce
         // the lottery).
