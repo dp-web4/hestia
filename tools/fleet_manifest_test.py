@@ -178,6 +178,42 @@ d4 = fm.collect_findings([{"component": "source checkout",
 check("A17i dirty-only checkout is a finding via its own field (policy: keep)",
       any("2 dirty" in x for x in d4), str(d4))
 
+# A19: LEGION's finding (2026-08-10, thread hackathon-2026-08-08). A seat whose
+# gate is registered outside the convention path reported "UNREADABLE or absent
+# from this seat" — the same words as a legitimate privacy refusal — and the
+# summary read as clean while a gate frozen 2026-07-07 was enforcing. Three
+# facts had one name. They must now be three, and a registered-and-present hook
+# that no comparison covered must be loud.
+reg1 = fm.collect_findings([{"component": "registered hooks (claude-code)",
+                             "hooks": [{"path": ".claude/plugins/hestia/hooks/pre_tool_use.py",
+                                        "exists": True, "sha256": "d9", "audited": False}],
+                             "states": {"registered": "1 registered", "_unaudited": 1,
+                                        "_unaudited_dirs": ["/h/.claude/plugins/hestia/hooks"]}}])
+check("A19a registered-but-uncompared is ENFORCING BUT UNAUDITED",
+      any("ENFORCING BUT UNAUDITED" in x for x in reg1), str(reg1))
+check("A19b the finding names the dir, so the re-run is derivable",
+      any("/h/.claude/plugins/hestia/hooks" in x for x in reg1), str(reg1))
+reg2 = fm.collect_findings([{"component": "registered hooks (codex)", "hooks": [],
+                             "states": {"registered": "no registration parser for this "
+                                                      "member — unverified"}}])
+check("A19c no parser is unverified, never 'none registered'",
+      any("unverified" in x for x in reg2), str(reg2))
+reg3 = fm.collect_findings([{"component": "registered hooks (claude-code)",
+                             "hooks": [{"path": ".claude/x.py", "exists": False,
+                                        "sha256": "MISSING", "audited": False}],
+                             "states": {"registered": "1 registered", "_unaudited": 0,
+                                        "_unaudited_dirs": []}}])
+check("A19d registered-but-absent on disk is its own finding",
+      any("registered but MISSING on disk" in x for x in reg3), str(reg3))
+reg4 = fm.collect_findings([{"component": "registered hooks (claude-code)", "hooks":
+                             [{"path": ".claude/hooks/g.py", "exists": True,
+                               "sha256": "aa", "audited": True}],
+                             "states": {"registered": "1 registered", "_unaudited": 0,
+                                        "_unaudited_dirs": []}}])
+check("A19e fully-audited registration is quiet (no wolf)", reg4 == [], str(reg4))
+check("A19f a member with a registration parser is declared, not assumed",
+      set(fm.REGISTRATION_FILES) <= set(fm.MEMBERS), str(fm.REGISTRATION_FILES))
+
 # A18: on WSL the staleness check abstains rather than asserting on a jittering
 # basis (claude-code measured three lstart values for one unrestarted PID).
 check("A18 WSL detected on this box (else the abstention path is dead code here)",
@@ -204,6 +240,9 @@ if manifest:
           cost.get("source") in ("current", "NOT at origin/main")
           and isinstance(cost.get("dirty"), int), str(cost))
     hook_rows = [c for c in comps if c.startswith("hooks (")]
+    check("B5c one registered-hooks row per MEMBERS entry (absence of a parser is a row, "
+          "not a silence)",
+          all(f"registered hooks ({m})" in comps for m in fm.MEMBERS), str(comps))
     check("B6 one hooks row per MEMBERS entry",
           len(hook_rows) == len(fm.MEMBERS), f"{hook_rows} vs {list(fm.MEMBERS)}")
     check("B7 drift_summary exists even if empty",

@@ -70,6 +70,15 @@ MEMBERS = {  # member -> (installed hooks dir under $HOME, plugins/ dir name)
     "codex":       (".codex/hooks",     "codex"),
     "gemini":      (".gemini/hooks",    "gemini"),
 }
+
+# Where each member DECLARES what it runs. The convention paths above are a
+# guess about layout; these files are the member's own answer, and they are the
+# only ones the engine actually executes. Parsing is implemented per member —
+# an unparsed member says so rather than being reported as having nothing
+# registered (LEGION, 2026-08-10: absence of a parser is not absence of a gate).
+REGISTRATION_FILES = {
+    "claude-code": [".claude/settings.json", ".claude/settings.local.json"],
+}
 WATCH_GLOB = "plugins/member-mesh/hestia-watch-member.sh"
 FIRE_GLOB_PREFIX = "plugins/member-mesh/fire-"
 
@@ -215,6 +224,17 @@ def collect_findings(rows):
             rst = st.get("restarted", "")
             if rst.startswith("STALE-CODE") or rst == "script not found":
                 findings.append(f"{comp}: {rst}")
+        elif comp.startswith("registered hooks ("):
+            if st.get("registered", "").endswith("unverified"):
+                findings.append(f"{comp}: {st['registered']}")
+            elif st.get("_unaudited"):
+                findings.append(
+                    f"{comp}: {st['_unaudited']} ENFORCING BUT UNAUDITED — registered and "
+                    f"present, in no compared dir ({', '.join(st.get('_unaudited_dirs') or [])}); "
+                    f"re-run with --member-dir")
+            for h in r.get("hooks", []):
+                if not h.get("exists"):
+                    findings.append(f"{comp}: registered but MISSING on disk — {h['path']}")
         elif comp.startswith("hooks ("):
             n = st.get("_drift")
             if n is None:
@@ -421,6 +441,87 @@ def canonical_index():
 SHARED_DIR = "member-mesh"  # canonical home of cross-member mesh tools
 
 
+def _registered_commands(member):
+    """Hook command paths a member's OWN config registers, or None if this
+    member has no registration parser here. Absence of a parser and absence of
+    a registration are different answers and are never spelled the same."""
+    files = REGISTRATION_FILES.get(member)
+    if files is None:
+        return None
+    cmds, read_any = [], False
+    for rel in files:
+        path = os.path.join(HOME, rel)
+        try:
+            with open(path) as fh:
+                cfg = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        read_any = True
+        for _event, entries in (cfg.get("hooks") or {}).items():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                for hook in (entry or {}).get("hooks") or []:
+                    cmd = (hook or {}).get("command")
+                    if not isinstance(cmd, str) or not cmd.strip():
+                        continue
+                    # First token is the program; args are not artifacts.
+                    prog = cmd.split()[0]
+                    prog = os.path.expanduser(os.path.expandvars(prog))
+                    if os.path.isabs(prog):
+                        cmds.append(prog)
+    return cmds if read_any else []
+
+
+def registration_facts(compared_dirs):
+    """What each member's own config says will run, and whether the manifest's
+    hook comparison actually covered it.
+
+    WHY (LEGION, 2026-08-10, thread hackathon-2026-08-08): on a seat whose
+    claude-code gate is registered at `.claude/plugins/hestia/hooks/` — frozen
+    since 2026-07-07 and enforcing on every tool call — the default run of this
+    file reported `hooks (claude-code): UNREADABLE or absent from this seat`,
+    contributed nothing to drift_summary, and read as "nothing to see". The
+    convention table was wrong for that seat, and the miss was spelled in the
+    same words as a legitimate privacy refusal. One --member-dir flag turned
+    the same seat into `2 diverged, 1 missing` — including `law_inject.py`,
+    which is decision 0016's entire claim, produced without a human reading a
+    single sha256 by hand.
+
+    A drift detector that reports a blind spot as a clean seat is the muted
+    gauge this file exists against, so the registration is measured directly:
+    ENFORCING BUT UNAUDITED is a first-class finding, and pointing at it is
+    strictly better than widening the comparison, which would diff unrelated
+    plugins that merely share a basename with a canonical hook.
+    """
+    rows = []
+    compared = {os.path.realpath(d) for d in compared_dirs}
+    for member in MEMBERS:
+        cmds = _registered_commands(member)
+        row = {"component": f"registered hooks ({member})", "hooks": [], "states": {}}
+        if cmds is None:
+            row["states"]["registered"] = "no registration parser for this member — unverified"
+            rows.append(row)
+            continue
+        unaudited = []
+        for prog in sorted(set(cmds)):
+            entry = {
+                "path": os.path.relpath(prog, HOME) if prog.startswith(HOME) else prog,
+                "exists": os.path.exists(prog),
+                "sha256": sha256_or(prog) if os.path.exists(prog) else "MISSING",
+                "audited": os.path.realpath(os.path.dirname(prog)) in compared,
+            }
+            if entry["exists"] and not entry["audited"]:
+                unaudited.append(os.path.dirname(prog))
+            row["hooks"].append(entry)
+        row["states"]["registered"] = f"{len(row['hooks'])} registered" \
+            if row["hooks"] else "none registered"
+        row["states"]["_unaudited"] = len(unaudited)
+        row["states"]["_unaudited_dirs"] = sorted(set(unaudited))
+        rows.append(row)
+    return rows
+
+
 def hook_facts(member_overrides):
     rows = []
     canon = canonical_index()
@@ -434,9 +535,23 @@ def hook_facts(member_overrides):
             rows.append(row)
             continue
         if not os.path.isdir(inst_dir):
-            row["states"]["installed"] = "UNREADABLE or absent from this seat"
+            # These were one string until 2026-08-10, and the conflation cost a
+            # real finding: a seat whose gate lives outside the convention path
+            # reported the same words as a seat that legitimately refused the
+            # read. "I looked in the wrong place" is not "I was not allowed to
+            # look" and neither is "it is not installed".
+            if os.path.exists(inst_dir):
+                row["states"]["installed"] = ("UNREADABLE from this seat — a sight line, "
+                                              "not evidence of absence")
+            elif member_overrides.get(member):
+                row["states"]["installed"] = "NOT FOUND at the path given by --member-dir"
+            else:
+                row["states"]["installed"] = (
+                    "NOT FOUND at the convention path — this seat's layout may differ; "
+                    f"see `registered hooks ({member})` for what it actually runs")
             rows.append(row)
             continue
+        row["installed_dir_abs"] = inst_dir
 
         inst = {}  # basename -> installed rel path (install layouts vary: kimi
         # and codex are flat, claude nests by topic; the rel path is evidence,
@@ -499,7 +614,10 @@ def main():
 
     rows = [daemon_facts(probe), checkout_facts()]
     rows += watcher_facts()
-    rows += hook_facts(member_overrides)
+    hooks = hook_facts(member_overrides)
+    rows += hooks
+    rows += registration_facts([r["installed_dir_abs"] for r in hooks
+                                if "installed_dir_abs" in r])
 
     drift = collect_findings(rows)
 
