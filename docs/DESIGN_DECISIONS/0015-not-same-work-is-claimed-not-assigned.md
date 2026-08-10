@@ -4,9 +4,10 @@
 **Date:** 2026-08-09
 **Author:** claude-code (CBP), at dp's direction
 **Supersedes nothing. Answers:** `#264` (the third verdict), and the standing review bottleneck.
-**Revision 2 (2026-08-09)** — amended from fleet review: §5 corrected (THOR), §6/§7 answered and
-sharpened (NOMAD), §11 given a measured defect it would otherwise have shipped on. All new
-figures measured against `hestia@ba8993d`. `acting_on: 5c66a16c-5b27-432a-a68a-bf50285a3774`
+**Revision 3 (2026-08-09)** — amended from fleet review: §5/§5a corrected (THOR), §4a added,
+§6/§7 answered and sharpened (NOMAD), §11a given two measured defects it would otherwise have
+shipped on. All new figures measured against `hestia@ba8993d`, cited by file and line.
+`acting_on: 5c66a16c-5b27-432a-a68a-bf50285a3774`
 
 ---
 
@@ -104,6 +105,38 @@ well is a T3 signal. It is *not* wired into scoring by this decision — recordi
 later, deliberately, because a preference signal that feeds reputation immediately creates an
 incentive to claim what is easy to rule.
 
+### 4a. Starvation and the horizon are adversarial, and on this surface starvation cannot occur
+
+THOR's §3, accepted: **age-rank promotes an item toward the top of the board at the same rate it
+promotes it toward unrulability.** The starvation rule exists to keep an item visible until
+someone rules it; past the horizon, visibility and rulability part company, and `starved` stops
+being distinguishable from `nobody could rule it` — collapsing §10's acceptance criterion in
+exactly the regime it was written for.
+
+Measured (§5a), the composition on increment 1's source is worse than adversarial — it is
+**vacuous**:
+
+> Gate escalations expire on a **1-hour wall-clock TTL** and drop out of `pending()`. Any
+> starvation threshold worth the name is measured in days. **No escalation can ever be rendered
+> `starved`: it is `Expired` and gone from the board first.**
+
+So §4's starvation rule is not merely at risk on this surface — it is **unobservable**, and
+§10's "a starved item reaches dp labelled as starved" cannot be satisfied by increment 1 at all.
+Three consequences, all cheap, none deferrable to a later increment:
+
+1. **The starvation threshold must be read against each source's own horizon, not set as a
+   constant.** Per source: escalations, 1h TTL; appeals, `APPEAL_CHAIN_WINDOW = 20_000` entries
+   — a *write-volume* horizon that halved in two days (4.65d → 2.25d, kimi). Different units,
+   so one number cannot serve both. The threshold must be strictly less than the horizon, in
+   whatever units that source measures.
+2. **Expiry is an outcome, not an absence.** An item that ages out must be *recorded as expired
+   unruled* and reach dp on that basis. Today it simply stops appearing, which is the
+   `ruled` / `expired unrulable` / `still open` conflation this fleet already documented on
+   08-03 — the instrument built to detect the hazard cannot distinguish the hazard from success.
+3. **§10's starved criterion is provisional until a source exists that can starve.** Stated here
+   rather than quietly carried, because an acceptance criterion no increment can satisfy is the
+   same defect one layer up.
+
 ---
 
 ## 5. NOT-SAME is checked twice, because state moves
@@ -136,7 +169,40 @@ with the distinction in view."
 
 So the requirement is not "call the same function" — it is **name the direction at every
 surface that renders or acts on eligibility**, and treat a direction-blind render as a floor,
-never as the board. THOR's third window (eviction) is accepted separately; this is the second.
+never as the board.
+
+### 5a. The third window is real, but it is not the one anyone modelled
+
+THOR's review argued a third window: eligibility decays with **unrelated chain write volume**,
+because the 20 000-entry tail evicts lineage evidence — measured horizon 4.65 days on 08-06,
+2.25 days on 08-08, halving in two days. THOR flagged the inference to this surface as
+unconfirmed and assigned the check to whoever holds `handler.rs`. Ran, at `ba8993d`:
+
+**1. Eligibility does not decay. It never reads the chain.** `eligibility_for` (`arbiter.rs:203`)
+is a *pure function* of `(appellant, arbiter, deny_adjudicator, disposition)`: clause 1 compares
+two strings, clause 2 compares two strings, clause 3 is `is_recognised_reasoner` (a `starts_with`
+prefix match in `lineage()`), clause 4 grades by comparing those prefixes. No `recent_chain`, no
+store access, no I/O. The mechanism THOR proposed is **refuted for this predicate**: unrelated
+write volume cannot flip `you_may_rule`.
+
+**2. THOR's conclusion survives anyway, on a different constant that is ~54× harsher.** The
+board's items are not chain-resident. `gate_escalations` is an in-memory `EscalationStore` with
+a **wall-clock TTL**: `DEFAULT_TTL_SECS = 3600`, `Status::Pending if now >= expires_at =>
+Expired`, and `pending()` returns `Status::Pending` only (`gate_escalation.rs:103,355,1093`).
+
+> **The horizon on increment 1's own source is one hour of wall clock, not 2.25 days of write
+> volume — and it is immune to how quiet the fleet is.**
+
+**3. The shared-constant inference is wrong in the reassuring direction.** The escalation
+surface does not inherit `APPEAL_CHAIN_WINDOW = 20_000`. Restart replay uses its own
+`ESCALATION_REPLAY_SCAN = 5_000` (`state.rs:223`) — a quarter of the appeal depth. Anyone
+reasoning about this surface from the appeal window is off by 4× on replay and by the wrong
+*units* on liveness.
+
+So eviction **is** the third window, it just is not a TOCTOU race at all: it is a deadline that
+runs during the lease and needs no act by any party — THOR's structural point, intact. The board
+must therefore carry each item's `secs_remaining` and treat expiry as a first-class outcome, and
+§5's two checks bracket a lease that can die between them from the clock alone.
 
 **A claim confers no authority.** It is a lease: *"I am working this."* It prevents duplicate work
 and makes intent visible. It does not pre-authorise the ruling, and the ruling is refused on the
@@ -345,6 +411,23 @@ So increment 1 ships with two corrections, both cheap:
    rulings, so "nobody claimed" is separable from "nobody was shown anything". Without that
    counter the experiment cannot distinguish its own two causes, and §11's whole value is that
    it is a *readable* experiment.
+
+   §4's "no silent caps" applies to **filtering**, not only display truncation. THOR's field
+   set, with the units corrected to what this surface actually measures (§5a):
+
+   ```
+   shown: N
+   omitted_display: N        # truncated for screen
+   omitted_not_eligible: N   # direction-blind refusal — MUST also state the direction used
+   expired_unruled: N        # aged past the 1h TTL with nobody ruling  <- not "out of window"
+   horizon: "3600s wall clock (DEFAULT_TTL_SECS)"   # per source, in that source's own units
+   ```
+
+   `0 claimable / 0 omitted` and `0 claimable / 12 expired_unruled` are completely different
+   findings about the fleet, and only the first one means *"the problem was never routing."*
+   Note the field is **not** `omitted_out_of_window`: on this source nothing is evicted by write
+   volume, and naming it that way would import the appeal surface's units and mislead the next
+   reader — the same mistake §5a caught.
 
 This is a defect on the surface increment 1 lands on, found before it shipped, by the reviewer
 who was asked the right question and the seat that held the source.
