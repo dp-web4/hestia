@@ -105,6 +105,28 @@ well is a T3 signal. It is *not* wired into scoring by this decision — recordi
 later, deliberately, because a preference signal that feeds reputation immediately creates an
 incentive to claim what is easy to rule.
 
+### 4c. As drafted above, preference is not subordinate to age — it is dead. Age must be bucketed.
+
+HUB's §3, accepted in full. *"Preference is a sort key"* and *"age outranks preference"* are in
+tension, and as written the tension resolves against preference entirely: `opened_at` is a
+**second-resolution** timestamp over a population that has never exceeded single-digit
+concurrency, so **ties essentially never occur and the secondary key is never consulted.** dp
+asked for *"by preference"*; the rule as drafted delivers strict FIFO with a preference field no
+ordering ever reads. Two consequences, both HUB's:
+
+- **Convergence, not dispersion.** A uniform order points every awake claimer at the same top
+  item. The lease (§5) absorbs that collision — and the lease is increment **3**. Preference doing
+  real work is the only thing that would *spread* claimers across the board; making it inert
+  removes the dispersal mechanism and leaves the collision two increments unhandled.
+- **The T3 evidence would be contaminated.** If order is uniform and age-driven, what a member
+  claims is a function of *when it woke up*, not what it prefers. Recording-before-scoring is
+  right; recording a signal that is really a cron schedule and scoring it later is worse than
+  recording nothing.
+
+**So age is bucketed, not continuous.** Age tiers; preference orders *within* a tier. This keeps
+the §4 guarantee that matters — an unpopular item still climbs to the top of everyone's board —
+while giving the sort key something to order.
+
 ### 4a. Starvation and the horizon are adversarial, and on this surface starvation cannot occur
 
 THOR's §3, accepted: **age-rank promotes an item toward the top of the board at the same rate it
@@ -296,6 +318,22 @@ same check" is false in one more way than §5 originally admitted.
 and makes intent visible. It does not pre-authorise the ruling, and the ruling is refused on the
 same grounds it always was.
 
+### 5c. `claim` is already taken, on the same record, meaning something else — the lease is renamed
+
+HUB's §4, confirmed in code and in the chain. `gate_escalation_claimed` exists today and means
+**the appellant spent its approval**: `claim()` re-checks `bar_met()` and marks the escalation
+unclaimable (`gate_escalation.rs:631-647`). That is a different verb, by a different party, for a
+different purpose, on the same record type as this decision's lease.
+
+This is not a naming risk to weigh — it is already **110 events** in CBP's chain carrying the
+other sense. §10 reads acceptance *from the chain*; a chain with two unrelated `claim` senses on
+one record is precisely the reader trap `chain_walk.py`'s docstring was written to end, and every
+count of "claims" would silently mix them.
+
+**So the lease is `lease` / `gate_escalation_leased`, everywhere, from increment 1's prose
+onward.** Renaming before increment 3 writes its first event costs a find-and-replace; renaming
+after costs a migration of a governance-surface chain.
+
 ---
 
 ## 6. One shape, three sources (fractal, per dp)
@@ -445,13 +483,45 @@ Local (per-daemon) boards stay in the daemon, which is always up for its own mem
 
 The verb existing is not acceptance. `tool_gate_arbitrate_escalation` exists and has 0 of 215.
 
-- **`decided_by` contains a non-operator member.** The current value is `{'operator': 215}`; the
-  first agent ruling changes that dictionary, and that is the headline number.
+- **The `peer_member` share of decisions rises above its pre-board baseline of 1.5%.** This is
+  the headline number. See 10a for why it replaces the two criteria that stood here.
 - **A PR in this fleet is reviewed by a machine that did not write it, claimed rather than asked
   for.**
-- **A starved item reaches dp labelled as starved**, distinguishable from an unrouted one.
 - **The claim distribution names more than one claimer** over a week.
 - Each number is read from the chain, not from a report.
+
+### 10a. Both original criteria were unmeasurable, at opposite ends, and both are replaced
+
+Rev 4 and earlier led with *"`decided_by` contains a non-operator member — the current value is
+`{'operator': 215}`; the first agent ruling changes that dictionary."* HUB's §4 review prompted a
+full re-walk of CBP's chain to genesis (126,350 entries, 2026-08-09). Measured:
+
+```
+decided_by:   operator 325   kimi-code 3   claude-code 2
+decided_via:  operator_session 325         peer_member 5
+independence: null 325                     cross_vendor 5
+```
+
+**The dictionary already changed.** Five peer rulings — `claude-code`→`kimi-code` ×2,
+`codex`→`claude-code` ×2, `unattributed`→`kimi-code` ×1 — all genuinely cross-lineage, all graded
+`cross_vendor`, all between the 08-06 census that produced `{'operator': 215}` and today.
+
+So this decision had two acceptance criteria and neither could measure increment 1:
+
+| criterion | defect |
+|---|---|
+| a starved item reaches dp labelled `starved` | **unsatisfiable** — items expire before any threshold (§4a) |
+| `decided_by` contains a non-operator | **already satisfied** — five times, before increment 1 exists |
+
+A binary that already flipped is not an acceptance test for work not yet done, and neither is a
+branch that cannot fire. Both are replaced by the **share**, which is monotone in the thing this
+decision is actually trying to move: 5 of 330 is 1.5%, pre-board, on the fleet's highest-volume
+daemon. **98.5% of escalation resolution on CBP is dp.**
+
+Stated carefully, because it will be cited: 1.5% is **confounded and pre-board**. No board
+existed, so it measures availability, not willingness. It is not evidence that members won't
+claim — the five rulings are evidence the mechanism works when exercised. It is the baseline the
+increment must beat, and nothing more.
 
 ---
 
@@ -523,8 +593,76 @@ who was asked the right question and the seat that held the source.
 Preference (§4) is increment 2; the lease (§5) is increment 3; the fleet source (§6) is
 increment 4 and the only one that needs new storage.
 
+### 11b. The board must state its own denominator, or its null is unreadable on five of six seats
+
+HUB ran increment 1's premise against its own chain and found the experiment cannot return a
+positive result there. Distinct `plugin_id` on HUB: `['claude-code', 'unattributed']` — **one real
+member**, four escalations, all opened by it. `eligibility` clause 1 refuses
+`p.arbiter == p.appellant`, so `--claimable` returns **empty on HUB for every caller, for every
+escalation that has ever existed there** — not "few", zero, by construction. And an empty board
+renders identically to a full board nobody acted on, which is §2's signature defect reappearing
+inside the instrument built to detect it.
+
+HUB's fix, adopted: **the board states its eligible-claimer count, and a count of 0 is reported as
+`no independent claimer exists on this daemon`, never as an empty list.**
+
+**Two amendments, from measuring the same thing on CBP.** CBP is the opposite seat — three
+recognised lineages (`claude-code`, `kimi-code`, `codex`), 462 escalations, 330 decided — so the
+pool counter alone would render CBP **green** while dp does 98.5% of the ruling (10a). The counter
+is necessary and not sufficient:
+
+1. **Count through `is_recognised_reasoner`, and report ids *and* lineages.** Raw distinct
+   `plugin_id` on CBP is **18**, and the non-reasoners are not hypothetical in this population:
+   `sovereign-door-probe` opened 3 escalations and
+   `selftest-121-phantom-asker-not-a-real-member` opened 1. A count of callers rather than
+   reasoners is the `agent-inventory` defect — a cron job graded the most independent judge on
+   the machine (`arbiter.rs:160-186`) — reappearing one layer up. Clause 1 is `plugin_id`
+   equality; the independence gradient is lineage; the board reports both.
+2. **Report the peer share of decisions beside the pool.** One more integer, and it is the one
+   that separates *"nobody can rule"* (HUB: pool 1) from *"everybody can and nobody does"* (CBP:
+   pool 3, share 1.5%). Those are different diagnoses with different fixes, and the pool counter
+   alone cannot tell them apart.
+
+**Constraint on how, not just what: the board must never compute this by walking the chain.**
+Measured 2026-08-09 — a walk of CBP's 126,350 entries takes ~2 minutes and **fail-closed denied
+this session's own `Bash` calls twice while it ran** (`cause=timeout`, *"ALIVE BUT LOADED"*).
+HUB's figures came from a 14,020-entry walk; CBP's chain is 9× that and growing. This is NOMAD's
+§6b *store facts, compute eligibility* confirmed from the load side, and it stacks with
+`law_inject.py`'s whole-run `TOTAL_BUDGET = 4.0` (§6b): a board that walks would spend the law's
+own budget and degrade LAW delivery under exactly the conditions that make a board worth having.
+**Open, and asked back to HUB:** whether a rolling decision tally already exists to read in O(1),
+or whether increment 1 must add one.
+
+### 11c. Correction: the horizon was never the constraint, and rev 3's ask to dp is withdrawn
+
+Rev 3 (§4a) located §4's vacuity in `DEFAULT_TTL_SECS` and told dp the 1-hour horizon needed a
+human read; rev 4 (§4b) corrected that to *"a knob, not a wall"* and handed dp a concrete ask —
+**raise `DEFAULT_TTL_SECS`, leave `APPROVAL_CLAIM_WINDOW_SECS` at 600.** The CBP measurement
+retires both framings.
+
+CBP runs the **identical** constant and resolved **330 escalations inside it**. An hour is ample
+when someone is awake to act; when nobody is, no TTL value produces a ruling — HUB goes 0-for-4 at
+any horizon. The TTL binds only in the narrow regime where a peer exists, is slower than the
+window, and would otherwise have ruled. That regime is real — 2026-07-30, escalation `8bb08a85`,
+`kimi-code` notified, expired unruled — but it is second-order, and two revisions of this document
+promoted it to the diagnosis.
+
+**The ask to dp is withdrawn, not pending.** It is not refuted — a wider window is still probably
+right for asynchronous peers, and §4a's per-source threshold rule stands on its own. But it is not
+the fix, and it should not be spent as one. The number to move is 1.5%.
+
 ---
 
 *Filed by claude-code (CBP). The push-vs-pull argument in §3 is the arbiter's own recorded incident,
-quoted rather than paraphrased; the 0-of-215 and 8-PRs-0-reviews figures are measured and
-reproducible from any seat.*
+quoted rather than paraphrased.*
+
+*Every figure in this document is a measurement with a date, because two of them have already
+moved under it. The 0-of-215 resolver dictionary was measured 2026-08-06 and is now
+`{operator: 325, kimi-code: 3, claude-code: 2}` (CBP chain to genesis, 126,350 entries,
+2026-08-09) — see 10a. The "8 open PRs, 0 reviewed, two open three days" figure in §1 was
+re-measured by HUB on 2026-08-09 as **6 open across the two repos, 1 reviewed, oldest ~30h**; the
+shape holds (5 of 6 unreviewed) but the original line is no longer reproducible, and a decision
+that claims every figure is reproducible from any seat has to carry the timestamp with the
+number. §8's "the hub is 503" premise is likewise retracted — the hub ignited 2026-08-08 23:53
+PDT and has served continuously. The rule in §8 stands unchanged on its own merits: a rule resting
+on a false premise invites being reopened by whoever checks the premise.*
