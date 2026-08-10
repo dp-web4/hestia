@@ -26,15 +26,18 @@ use web4_core::r6::WitnessAttestation;
 
 use crate::storage::chain::SqliteChainStore;
 
-/// The canonical hash a witness signs: sha256 of the act's canonical JSON with
-/// the `witnesses` field cleared (so attaching a mark doesn't invalidate the
-/// marks already there).
+/// The canonical hash a witness signs: sha256 of the domain-separated
+/// [`hestia_wire::canonical_act_digest_preimage`] over the act's canonical JSON
+/// with the `witnesses` field cleared (so attaching a mark doesn't invalidate
+/// the marks already there). The framing lives in `wire/` because the app-side
+/// signer (B1/B3) and the daemon-side verifier (B4) must produce it
+/// byte-identically, and neither can import the other.
 pub fn act_digest(act: &Act) -> Result<String> {
     let mut bare = act.clone();
     bare.witnesses.clear();
     let json = serde_json::to_vec(&bare).context("serializing act for digest")?;
     let mut h = Sha256::new();
-    h.update(&json);
+    h.update(hestia_wire::canonical_act_digest_preimage(&json));
     Ok(hex::encode(h.finalize()))
 }
 

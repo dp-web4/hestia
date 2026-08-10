@@ -80,6 +80,35 @@ pub fn canonical_session_transcript(challenge: &str, f: &SessionTranscriptFields
     out
 }
 
+/// Domain separator for the act-digest preimage (Sprint B1).
+///
+/// Same contract as [`SESSION_TRANSCRIPT_DOMAIN`]: changing this string or the framing below
+/// is a **v2 wire change**. Once B2's chain holds signatures over v1 digests, editing v1
+/// silently unverifies every recorded act — bump the version instead.
+pub const ACT_DIGEST_DOMAIN: &str = "hestia:act-digest:v1";
+
+/// The exact bytes an act signature's digest covers — the B1 half of the signing contract
+/// that B2's chain column and B4's verifier build against.
+///
+/// The caller supplies the act's canonical JSON **with the `witnesses` field cleared** (so N
+/// independent marks on one act all cover the same bytes — the rule `witness_act::act_digest`
+/// established). That clearing has to happen where the `Act` type lives; this crate stays
+/// dependency-free and frames only the bytes it is handed. **Domain-separated** so a
+/// signature over an act digest cannot be replayed as a signature over a session transcript
+/// or anything else, and **length-delimited** for the same reason the transcript is: the
+/// frame states how many bytes it covers instead of trusting the payload to end where the
+/// signer thought it did.
+///
+/// The digest itself is sha256 of these bytes, hex-encoded — the hashing stays with the
+/// callers (as with [`canonical_session_transcript`]) so this crate remains encoding only.
+pub fn canonical_act_digest_preimage(act_json_without_witnesses: &[u8]) -> Vec<u8> {
+    let mut out = format!("{ACT_DIGEST_DOMAIN}\n").into_bytes();
+    out.extend_from_slice(format!("act:{}\n", act_json_without_witnesses.len()).as_bytes());
+    out.extend_from_slice(act_json_without_witnesses);
+    out.push(b'\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +179,26 @@ mod tests {
             canonical_session_transcript("aa", &sample()),
             canonical_session_transcript("ab", &sample()),
         );
+    }
+
+    /// **The B1↔B2 vector.** Pinned when the format was defined; the app's signer, the
+    /// daemon's verifier, and any independent implementation must all reproduce it. If this
+    /// fails, the format changed — bump [`ACT_DIGEST_DOMAIN`] to v2 deliberately, never edit
+    /// this constant, because B2's chain holds signatures over the old bytes from genesis.
+    #[test]
+    fn the_act_digest_golden_vector() {
+        let act_json = br#"{"act_id":"b1","actor_lct":"lct:web4:mb32:bactor","witnesses":[]}"#;
+        assert_eq!(
+            sha256_hex(&canonical_act_digest_preimage(act_json)),
+            "9f3f64f491602844e5158ae2d213a6ef39be5087915216327c5445985a9051ac",
+        );
+    }
+
+    #[test]
+    fn the_act_preimage_is_domain_separated_and_length_delimited() {
+        let text = String::from_utf8(canonical_act_digest_preimage(b"xyz")).unwrap();
+        assert_eq!(text, "hestia:act-digest:v1\nact:3\nxyz\n");
+        // A signature over an act digest can never be a signature over a transcript.
+        assert_ne!(ACT_DIGEST_DOMAIN, SESSION_TRANSCRIPT_DOMAIN);
     }
 }
