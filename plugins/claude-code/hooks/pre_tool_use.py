@@ -1355,7 +1355,17 @@ _INPUT_REDIRECTS = {"<", "<<", "<<<", "<&"}
 # `git remote add` rewrites repository config. A read-looking SUBCOMMAND with a mutating
 # FLAG is exactly what a name allowlist cannot see.
 _GIT_READ_SUBCOMMANDS = {"show", "diff", "log", "cat-file", "blame", "status", "rev-parse",
-                         "describe", "ls-files", "ls-tree", "rev-list", "show-ref"}
+                         "describe", "ls-files", "ls-tree", "rev-list", "show-ref",
+                         # Added 2026-08-10 (Sprint 5, the `_STILL_OPEN` git-read rows,
+                         # kimi-code notice 1745 §3). Both are plumbing READS with no
+                         # mutating spelling in any form — `merge-base` computes ancestry
+                         # (`--is-ancestor` is the exit-status probe two members ran every
+                         # wake and had refused beside a `rev-list` that read fine), and
+                         # `for-each-ref` enumerates refs. A bare-set add is correct BECAUSE
+                         # neither has a writing mode a flag could hide, unlike `branch`
+                         # (creates from a positional) and `hash-object -w` (writes a blob),
+                         # which is why those two stay OUT of this set and need a grammar.
+                         "merge-base", "for-each-ref"}
 # Read-BY-DEFAULT subcommands carrying a mutating flag get the _GUARDED_HEADS treatment one
 # column over, rather than a bare-set append (claude-code §5.1, notice 1471, escalation
 # 10fb8aa5c095c085): `git hash-object` only hashes, but `git hash-object -w` writes the blob
