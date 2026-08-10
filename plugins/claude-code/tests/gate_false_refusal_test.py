@@ -424,6 +424,15 @@ _FALSE_REFUSALS = [
      "the guard — shlex's punctuation_chars mode raises 'No closing quotation' on a "
      "mid-token quote and the classifier fails closed in the tokenizer, one layer "
      "below this fix"),
+    # Closed 2026-08-10 (Sprint 5), moved up from _STILL_OPEN. Pure-read git plumbing with
+    # no mutating spelling — bare-set adds to `_GIT_READ_SUBCOMMANDS`. The `--is-ancestor`
+    # exit-status probe is the one two members ran every wake and had refused beside a
+    # `git rev-list` that read fine.
+    ("git_merge_base_is_a_read", "git merge-base --is-ancestor 0513661 main",
+     "the ancestry probe two members ran all wake, classified WRITE while `git rev-list` "
+     "beside it read fine. `merge-base` has no writing mode in any spelling"),
+    ("git_for_each_ref", "git for-each-ref refs/heads",
+     "plumbing enumeration of refs; no mutating spelling exists"),
 ]
 
 # FP6 is NOT fixed here, and pinning it as a known-refused case is the honest form: it
@@ -442,20 +451,18 @@ _STILL_OPEN = [
      "quote opens MID-token after `--flag=`: `grep -c \"foo(bar)\" {g}` tokenises fine. "
      "Found 2026-08-08 while grammar-checking `git branch --format`; NOT fixed there, "
      "because it is a tokeniser class that predates and outlives that grammar"),
-    # The unlisted-git-read-subcommand class (kimi-code notice 1745 §3, measured in BOTH
-    # revisions; fixed nowhere — not installed, not in tree, not on main, not in the queue).
-    # Refused today, must be permitted after the fix, at which point these move up into
-    # `_FALSE_REFUSALS`.
-    ("git_merge_base_is_a_read", "git merge-base --is-ancestor 0513661 main",
-     "the ancestry probe two members ran all wake, classified WRITE while `git rev-list` "
-     "beside it read fine. `merge-base` has no writing mode in any spelling"),
+    # The unlisted-git-read-subcommand class (kimi-code notice 1745 §3). PARTIALLY closed
+    # 2026-08-10 (Sprint 5): `merge-base` and `for-each-ref` moved to `_FALSE_REFUSALS`
+    # below — both are pure reads with no mutating spelling, safe as bare-set adds. The two
+    # `branch` rows STAY here: `git branch <name>` creates from a positional and `git branch
+    # -d` deletes, so `branch` needs a grammar (mutating-flag + positional guard), which is
+    # the next increment and is deliberately not rushed in beside the safe pair.
     ("git_branch_contains_is_a_read", "git branch -a --contains 0513661",
      "the condemning segment of escalation 3d38341a. `branch` cannot go in the bare set "
      "— `git branch <name>` CREATES from a positional — so it needs a grammar"),
     ("git_branch_bare_lists", "git branch",
-     "with no arguments `git branch` lists and nothing else"),
-    ("git_for_each_ref", "git for-each-ref refs/heads",
-     "same class, plumbing spelling"),
+     "with no arguments `git branch` lists and nothing else — but only a grammar can tell "
+     "that from `git branch <name>`, so it waits on the same increment as the row above"),
 ]
 
 # THE NEWLINE HOLE (claude-code, 2026-08-08). Same purpose as `_STILL_OPEN` — pin an open
