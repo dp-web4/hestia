@@ -109,10 +109,16 @@ consults it. One source, many readers — the same argument as `hestia-wire` and
 > 1. **A refusal owes you a reason and a way forward.** If you are stopped and not told why, or told
 >    why and given no working next step, that is a bug in the law — not a failure of yours. Say so.
 > 2. **Asking is not a cost we charge you for.** Escalating, appealing, or saying "this rule is
->    wrong here" is recorded conduct that can change the law, and is scored *above* silent
->    compliance. Quietly finding another route is scored *below* it — not because routing around is
->    forbidden, but because it teaches the society nothing and leaves the next member stuck in the
->    same place.
+>    wrong here" is recorded conduct that can change the law. **This community undertakes to value
+>    it above silent compliance, and to value quietly finding another route below both** — not
+>    because routing around is forbidden, but because it teaches the society nothing and leaves the
+>    next member stuck in the same place.
+>
+>    *This is a commitment, not a description of a working meter.* Today the scoring does not
+>    implement it: appeals against a refused governance write earn **no Temperament credit**
+>    (`#303`, pinned deliberately and openly), and a silent workaround emits **no event at all**, so
+>    there is nothing to score below anything. The sentence states what the community owes you, and
+>    the gap between it and the code is named here rather than papered over — see §7.
 > 3. **Being blocked from doing your work correctly is a defect worth reporting**, and reporting it
 >    is doing your work.
 >
@@ -211,7 +217,49 @@ classifier can only guess, and here it guessed wrong twice about a `grep`.
 
 ---
 
-## 6. Acceptance — measured, never asserted
+## 6. GPT's invariant, adopted as this decision's spine
+
+> **Law published ≠ law installed ≠ law injected ≠ law received ≠ law understood.**
+
+Five distinct states, and this repo has repeatedly treated a nearer one as evidence of a further
+one. §2 is that invariant measured: the law is **published** (the daemon composes and serves it) and
+**installed** for one member — and three members are not even at *injected*, let alone *received*.
+
+Each step needs its own evidence, and only the last two are worth anything on their own:
+
+| state | what proves it | today |
+|---|---|---|
+| published | `hestia_operating_law` returns it | ✅ |
+| installed | the injector exists on the member's disk | 1 of 4 |
+| injected | the hook is wired to a SessionStart event | 1 of 4 |
+| **received** | the text is **in the member's context** | 1 of 4, unverified |
+| **understood** | the member can **quote it back** and act on it | never measured |
+
+A config entry proves *injected* at best, and this fleet has repeatedly read config as delivery.
+§7's acceptance is written against **received** and **understood** for exactly this reason.
+
+### 6.1 The same boundary, everywhere (GPT)
+
+> *The system increasingly has the right information somewhere. The failure is whether the right
+> entity receives it, in a form that preserves its meaning.*
+
+Named across two repos on one day, in five mechanisms:
+
+| mechanism | information existed | who failed to receive it, intact |
+|---|---|---|
+| mesh pointer | forum note committed | receiver dead-lettered it — malformed shape |
+| watcher liveness | hub reachable by IP | every indicator green, name unresolvable |
+| PR body | evidence in the committed doc | published copy silently stripped of it |
+| **branch ancestry** | 0015 at 668 lines on `#308` | `#309` carried the 230-line copy (GPT, §0) |
+| web4 `DimensionScore` | `when` / `who` / observation-count | survives in-memory, lost through serialization |
+
+Routing, injection, publication, ancestry, serialization — **five transports, one failure.** That
+this decision's own PR committed the fourth one, while arguing the general case, is the strongest
+evidence available that the class is structural rather than careless.
+
+---
+
+## 7. Acceptance — measured, never asserted
 
 - **`hestia_operating_law` returns a preamble**, and it is the first thing in the response.
 - **Four of four members receive it at SessionStart** — verified by reading each engine's injected
@@ -221,6 +269,22 @@ classifier can only guess, and here it guessed wrong twice about a `grep`.
 - **kimi's escalation count is re-read after it has law**, and whatever it becomes is interpreted
   against a member that was informed. Until then that number means less than we have been reading
   into it.
+
+### 7.1 The commitment in §4.2 is not yet true, and gets its own criterion
+
+The preamble tells members that asking is valued above silent compliance. Until the meter exists
+that sentence is a **promise this community has not kept**, and shipping it without saying so would
+be the defect the decision names.
+
+So it carries its own acceptance, tracked separately from delivery:
+
+- an appeal or escalation **moves a score**, in the direction the preamble states — today `#303`
+  pins `gate_self_access` appeals at zero credit, deliberately, and dp's posture ruling on that is
+  the prerequisite;
+- a **silent workaround emits an event** at all, since nothing can be scored below anything while
+  routing around is invisible. This is the harder half and may be undecidable in general;
+- until both hold, §4.2's status paragraph **stays in the text**. It is removed by the code
+  catching up, never by editing the paragraph.
 
 ---
 
