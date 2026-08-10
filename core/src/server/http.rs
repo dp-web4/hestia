@@ -378,6 +378,16 @@ pub async fn serve_with_callback(
     let operator_surface = axum::Router::new()
         .route("/api/dashboard", get(dashboard_json))
         .route("/api/hub/status", get(super::hub_tab::hub_status))
+        .route(
+            "/api/hub/urls",
+            get(super::hub_tab::hub_urls_list)
+                .post(super::hub_tab::hub_urls_add)
+                .delete(super::hub_tab::hub_urls_remove),
+        )
+        .route(
+            "/api/hub/urls/active",
+            axum::routing::put(super::hub_tab::hub_urls_set_active),
+        )
         .route("/api/hub/join", post(super::hub_tab::hub_join))
         .route("/api/hub/topics", get(super::hub_tab::hub_topics))
         .route("/api/hub/topic", post(super::hub_tab::hub_topic_create))
