@@ -673,6 +673,30 @@ enum VaultCmd {
         /// Plugins allowed to read this credential
         #[arg(long = "consumer")]
         allowed_consumers: Vec<String>,
+
+        /// Record the release rule as ConsumerOnly (§7.1: only the consuming mechanism, in a
+        /// live session). Mutually exclusive with --consumer, which records an explicit holder
+        /// set instead.
+        #[arg(long, conflicts_with = "allowed_consumers")]
+        consumer_only: bool,
+
+        /// Record a presentation rule: a verifier this credential may be shown to (§7.1 axis 2).
+        /// Repeat for several. Given ONCE it is a verifier fixed at issuance; MORE THAN once it
+        /// is a presentation-time choice among them. Omitted entirely leaves the presentation
+        /// rule UNRECORDED — presenting the credential then escalates to the owner, by design.
+        #[arg(long = "present-to")]
+        present_to: Vec<String>,
+
+        /// What a presentation discloses: `nothing`, `derived` (a value derived from the secret,
+        /// never the secret — the default when --present-to is given), or `full` (the secret
+        /// itself; a bearer presented directly).
+        #[arg(long = "present-disclose")]
+        present_disclose: Option<String>,
+
+        /// Cap the number of presentations (single-use = 1). Recorded only; single-use
+        /// enforcement needs the durable nullifier that is a later increment.
+        #[arg(long = "present-max-uses")]
+        present_max_uses: Option<u32>,
     },
 
     /// Remove a credential from the vault
@@ -718,7 +742,14 @@ pub fn run() -> AnyResult<()> {
                 scope,
                 tag,
                 allowed_consumers,
-            } => cmd_vault_add(&home, &name, scope, tag, allowed_consumers),
+                consumer_only,
+                present_to,
+                present_disclose,
+                present_max_uses,
+            } => cmd_vault_add(
+                &home, &name, scope, tag, allowed_consumers, consumer_only,
+                present_to, present_disclose, present_max_uses,
+            ),
             VaultCmd::Remove { name } => cmd_vault_remove(&home, &name),
         },
         Command::Policy(p) => match p {
@@ -1062,21 +1093,82 @@ fn cmd_vault_get(home: &std::path::Path, name: &str) -> AnyResult<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_vault_add(
     home: &std::path::Path,
     name: &str,
     scope: Vec<String>,
     tag: Vec<String>,
     allowed_consumers: Vec<String>,
+    consumer_only: bool,
+    present_to: Vec<String>,
+    present_disclose: Option<String>,
+    present_max_uses: Option<u32>,
 ) -> AnyResult<()> {
+    use hestia::vault::rules::{Disclosure, PresentationAudience, PresentationRule, ReleaseRule};
+
+    // §7.1 axis 1 — release rule, recorded at issuance. `--consumer-only` is the default rule;
+    // `--consumer x` records an explicit holder set; neither leaves the legacy list to decide.
+    let release = if consumer_only {
+        Some(ReleaseRule::ConsumerOnly)
+    } else if !allowed_consumers.is_empty() {
+        Some(ReleaseRule::Holders { principals: allowed_consumers.clone() })
+    } else {
+        None
+    };
+
+    // §7.1 axis 2 — presentation rule. Built ONLY when --present-to is given; otherwise it stays
+    // unrecorded, which means "escalate on presentation", which is the safe default we do not
+    // silently overwrite.
+    let presentation = if present_to.is_empty() {
+        if present_disclose.is_some() || present_max_uses.is_some() {
+            anyhow::bail!(
+                "--present-disclose / --present-max-uses require --present-to; without a stated \
+                 audience the presentation rule stays unrecorded (presenting escalates to you)"
+            );
+        }
+        None
+    } else {
+        let audience = if present_to.len() == 1 {
+            PresentationAudience::Fixed { verifier: present_to[0].clone() }
+        } else {
+            PresentationAudience::AnyOf { verifiers: present_to.clone() }
+        };
+        let disclose = match present_disclose.as_deref() {
+            None | Some("derived") => Disclosure::Derived, // sensible default for a presentable
+            Some("nothing") => Disclosure::Nothing,
+            Some("full") => Disclosure::FullSecret,
+            Some(other) => anyhow::bail!(
+                "--present-disclose must be nothing|derived|full, got '{other}'"
+            ),
+        };
+        Some(PresentationRule { audience, disclose, max_uses: present_max_uses })
+    };
+
     let mut vault = open_vault(home)?;
     let secret = prompt_secret()?;
-    let entry = VaultEntry::new(name, secret)
+    let mut entry = VaultEntry::new(name, secret)
         .with_scope(scope)
         .with_tags(tag)
         .with_consumers(allowed_consumers);
+    if let Some(r) = release {
+        entry = entry.with_release_rule(r);
+    }
+    if let Some(p) = presentation {
+        entry = entry.with_presentation_rule(p);
+    }
+    let recorded_release = entry.release.is_some();
+    let recorded_present = entry.presentation.is_some();
     vault.add(entry)?;
     println!("✓ Added '{name}' to vault");
+    println!(
+        "  release rule:      {}",
+        if recorded_release { "recorded" } else { "unrecorded (legacy consumer list decides)" }
+    );
+    println!(
+        "  presentation rule: {}",
+        if recorded_present { "recorded" } else { "UNRECORDED — presenting escalates to you (§7.1)" }
+    );
     Ok(())
 }
 
