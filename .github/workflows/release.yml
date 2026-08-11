@@ -44,9 +44,22 @@ jobs:
             os: macos-14
             archive: tar.gz
     steps:
+      # Two repos as SIBLING subdirs of the workspace — the pattern ci.yml proved
+      # green. hestia/core has four path deps into ../../web4/... and the release
+      # runner is a lone clone, which is why every release since v0.0.3 failed at
+      # dependency resolution. Naming BOTH checkouts puts them at <ws>/hestia and
+      # <ws>/web4, which is exactly what `../../web4` from hestia/core resolves to.
+      # web4 tracks main deliberately (a live integration seam; a web4 break should
+      # red the release). Reproducibility note: hestia does not pin the web4 rev —
+      # a durable release must record it; filed as follow-up.
       - uses: actions/checkout@v4
         with:
+          path: hestia
           ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          path: web4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -54,7 +67,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build hestia
-        working-directory: core
+        working-directory: hestia/core
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Stage artifacts (unix)
@@ -65,8 +78,8 @@ jobs:
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           STAGE="hestia-${TAG}-${{ matrix.target }}"
           mkdir -p "dist/${STAGE}"
-          cp "core/target/${{ matrix.target }}/release/hestia" "dist/${STAGE}/"
-          cp README.md LICENSE "dist/${STAGE}/" 2>/dev/null || true
+          cp "hestia/core/target/${{ matrix.target }}/release/hestia" "dist/${STAGE}/"
+          cp hestia/README.md hestia/LICENSE "dist/${STAGE}/" 2>/dev/null || true
           (cd dist && tar -czf "${STAGE}.tar.gz" "${STAGE}")
           (cd dist && sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256")
           ls -la dist/
@@ -78,9 +91,9 @@ jobs:
           $tag = "${{ github.event.inputs.tag || github.ref_name }}"
           $stage = "hestia-$tag-${{ matrix.target }}"
           New-Item -ItemType Directory -Path "dist/$stage" | Out-Null
-          Copy-Item "core/target/${{ matrix.target }}/release/hestia.exe" "dist/$stage/"
-          if (Test-Path "README.md") { Copy-Item "README.md" "dist/$stage/" }
-          if (Test-Path "LICENSE") { Copy-Item "LICENSE" "dist/$stage/" }
+          Copy-Item "hestia/core/target/${{ matrix.target }}/release/hestia.exe" "dist/$stage/"
+          if (Test-Path "hestia/README.md") { Copy-Item "hestia/README.md" "dist/$stage/" }
+          if (Test-Path "hestia/LICENSE") { Copy-Item "hestia/LICENSE" "dist/$stage/" }
           Compress-Archive -Path "dist/$stage" -DestinationPath "dist/$stage.zip"
           Get-ChildItem dist
 
