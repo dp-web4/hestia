@@ -32,6 +32,17 @@ happening in their own daemon. Orchestrators (Claude Code, etc.) do
 NOT use these; they use the MCP path at `/mcp`. A conforming
 presence layer is NOT required to implement these.
 
+### `public-identity.json` — locked-tier identity *claim*, never proof
+
+`~/.hestia/public-identity.json` holds the node's shareable sovereign LCT id so
+a LOCKED node can answer "who are you?" without a passphrase. It is a
+projection, never identity authority: the daemon rewrites it from the sealed
+vault on every open and never reads identity back from it. **Between serves the
+file is a claim, not a proof** — any local writer can replace it while the
+daemon is down, and it only re-heals on the next open. A relying party (hub,
+peer, tooling) that needs proof must challenge the key-bound identity; do not
+treat this file as evidence of anything but what the node currently claims.
+
 ## Connected messaging (implemented)
 
 Two connected-presence protocols are live in this daemon. Both are the

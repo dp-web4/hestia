@@ -920,22 +920,39 @@ fn cmd_init(home: &std::path::Path, force: bool, ai: bool) -> AnyResult<()> {
     // identity serve will later load — eager, never divergent.
     let anchor = "lct:web4:hestia:sovereign:phase1-placeholder";
     let sovereign = hestia::sovereign::Sovereign::load_or_mint(&mut vault, anchor);
-    let _ = hestia::role_registry::load_or_mint_registry(&mut vault, anchor, &sovereign.lct_id());
-    println!("✓ Local society + sovereign identity minted");
-    println!("  Sovereign LCT: {}", sovereign.lct_id());
+    hestia::role_registry::load_or_mint_registry(&mut vault, anchor, &sovereign.lct_id());
 
-    // A CLEARTEXT, public-only identity artifact so a LOCKED node can self-identify —
-    // `info` reads it without the vault passphrase, and it is what a hub needs to answer
-    // `/.well-known` before unlock (the dev-hub "clear tier-0 public-identity.json" wrinkle).
-    // PUBLIC DATA ONLY: the LCT id is a shareable identifier derived from the public key; the
-    // keypair stays sealed in the vault and never touches this file.
-    let pub_identity = serde_json::json!({
-        "sovereign_lct": sovereign.lct_id(),
-        "minted_by": concat!("hestia ", env!("CARGO_PKG_VERSION")),
-    });
-    let pub_path = home.join("public-identity.json");
-    std::fs::write(&pub_path, serde_json::to_vec_pretty(&pub_identity)?)
-        .with_context(|| format!("writing {}", pub_path.display()))?;
+    // "✓ minted" below is a ROUND-TRIP fact, not an intent: both mint paths
+    // warn-and-continue on a failed vault write, so re-read the sovereign doc and
+    // only announce (and project into the clear) an identity the vault actually
+    // holds. On failure the node still works — the first `serve` re-mints the
+    // durable identity and heals the projection — but init must not print a
+    // durable-sounding claim, or write a public artifact, for an ephemeral one.
+    if hestia::sovereign::Sovereign::persisted_lct_id(&vault).as_deref()
+        == Some(sovereign.lct_id().as_str())
+    {
+        println!("✓ Local society + sovereign identity minted");
+        println!("  Sovereign LCT: {}", sovereign.lct_id());
+
+        // A CLEARTEXT, public-only identity artifact so a LOCKED node can self-identify —
+        // `info` reads it without the vault passphrase, and it is what a hub needs to answer
+        // `/.well-known` before unlock (the dev-hub "clear tier-0 public-identity.json" wrinkle).
+        // PUBLIC DATA ONLY: the LCT id is a shareable identifier derived from the public key; the
+        // keypair stays sealed in the vault and never touches this file.
+        let pub_identity = serde_json::json!({
+            "sovereign_lct": sovereign.lct_id(),
+            "minted_by": concat!("hestia ", env!("CARGO_PKG_VERSION")),
+        });
+        let pub_path = home.join("public-identity.json");
+        std::fs::write(&pub_path, serde_json::to_vec_pretty(&pub_identity)?)
+            .with_context(|| format!("writing {}", pub_path.display()))?;
+    } else {
+        eprintln!(
+            "[init] WARNING: sovereign identity did not persist to the vault — \
+             ephemeral this run; the first `hestia serve` mints the durable identity \
+             and publishes the public projection"
+        );
+    }
 
     if ai {
         let kp = web4_core::crypto::KeyPair::generate();
@@ -1062,7 +1079,10 @@ fn cmd_info(home: &std::path::Path) -> AnyResult<()> {
             Err(_) => println!("sovereign identity: (public-identity.json unreadable)"),
         },
         Err(_) if path.exists() => {
-            println!("sovereign identity: (none — this vault predates identity-at-init; re-run `hestia init` or serve once to mint)")
+            // Do NOT advise re-running `init` here: it refuses an existing vault
+            // (and --force is destructive). The identity may already live sealed in
+            // the vault; one `serve` publishes it via the self-healing projection.
+            println!("sovereign identity: (not yet published — serve once to project it from the vault)")
         }
         Err(_) => println!("sovereign identity: (none — run `hestia init`)"),
     }
