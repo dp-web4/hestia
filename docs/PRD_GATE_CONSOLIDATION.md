@@ -47,7 +47,7 @@ Same bug **classes** the core's comments already document as fixed, still live i
 - **kimi cannot distinguish a real deny from an infra fail-closed** (codex can), so it mis-scores infrastructure failure as member conduct.
 
 ### 3.4 Genuinely harness-specific (stays in the shim)
-Engine exit contract / fail-open reality (all Claude-lineage engines fail OPEN on timeout → each gate is the fail-closed party, but the *rendering* differs); stdin event schema + parse (codex also sees `apply_patch` and MCP calls); identity-*location* facts. The decision **topology** difference (claude-code daemon round-trip vs codex/kimi local-decide-then-witness-and-delegate) is real, but becomes a *parameter to the core*, not a fork.
+Engine exit contract / fail-open reality (all Claude-lineage engines fail OPEN on timeout → each gate is the fail-closed party, but the *rendering* differs); stdin event schema + parse (codex also sees `apply_patch` and MCP calls); identity-*location* facts. The decision **topology** difference (claude-code daemon round-trip vs codex/kimi local-decide-then-witness-and-delegate) is real, but becomes a parameter/injected callback of the **shared-mechanism** module — never a parameter of LAW, which stays transport-free (GPT 2nd pass, wording) — not a fork.
 
 ### 3.5 Repo-integrity flags
 `society_pre_tool_use.py` is referenced by claude-code's self-protection and by codex/kimi's `CLAUDE_PRE` default but is **absent from the repo** — it exists only as an installed copy, so the guard protects a filename the tree lacks and the delegation target disagrees with the protected filename. Reconcile before §6.G.
@@ -78,9 +78,9 @@ This is **step B** below, and it must be true for an adopting harness *before* t
 
 **B. Extend the governance closure to every adopting harness.** Before any non-Claude harness imports the core, give it (and the shared-mechanism module, the loader/digest path, the registration/installer surface) the same self-access refusal the Claude adapter already has for the core. Acceptance: a write to the core *or to the loader that selects it* is refused and escalatable from every adopting harness, asserted by a cross-harness test.
 
-**C. Migrate one predicate, with cross-harness differential tests.** Point kimi's `path_in_scope`/`command_in_scope`/`_under_temp_root` at the core. This **closes the three live scope bypasses for kimi** with no exit-contract change. Gate it on a differential test that drives the §3.3 offending inputs through *each* harness and requires identical deny.
+**C. Migrate one predicate family — single-harness acceptance.** Point kimi's `path_in_scope`/`command_in_scope`/`_under_temp_root` at the core. This **closes the three live scope bypasses for kimi** with no exit-contract change. Acceptance is scoped to **kimi's shim == core** on the §3.3 inputs (kimi now denies them) plus no regression on safe inputs — NOT cross-harness identical deny (GPT 2nd pass #2): codex is deliberately still pre-hardening until F, so a "all harnesses agree" test at this point *should* fail against the measured current state. Cross-harness identical-verdict convergence is asserted at G, once every shim has migrated. (Alternative considered and rejected as bigger-bang: migrate this predicate family atomically across all adopting harnesses in C. Chosen the incremental path; the convergence proof simply moves to G.)
 
-**D. Migrate remaining local law by import.** `FORBIDDEN`, `READ_CLASS`, member-address list, `identity_role`, `launch_cwd_repo`, and replace inline deny sentences with `_deny(rule)` + `REMEDIES` (kills the `request_scope` phantom and unifies the message everywhere at once). **Do NOT consolidate `load_in_scope` — delete/deprecate it (GPT #4):** it is the legacy identity-file path with a permissive `web4` fallback, and `AgentPolicy`/`resolve_agent_policy` is its intended replacement; sharing it would standardize the old authority model instead of removing it.
+**D. Migrate remaining local law by import — pure predicates only.** Centralize `FORBIDDEN`, `READ_CLASS`, the member-address list, and the pure scope predicates, and replace inline deny sentences with `_deny(rule)` + `REMEDIES` (kills the `request_scope` phantom and unifies the message everywhere at once). **Delete/replace the authority-bearing legacy inputs rather than share them (GPT 2nd pass #1):** `load_in_scope` (permissive `web4` fallback), and equally `launch_cwd_repo` and `identity_role` — these read harness/local identity and cwd state to *derive authority*, which the ratified target says must come from the authenticated policy/occupancy path (`AgentPolicy`/`resolve_agent_policy` and an explicit launch-cwd grant, per §4). Centralizing them would standardize the old authority model; they get removed, not shared. D shares only common predicates/constants/remedies.
 
 **E. Shared transport/mechanism module.** Move the witness/attestation + mini-MCP client and the budget/timeout contract into one shared module all three import — giving kimi codex's real-deny-vs-infra discrimination for free.
 
@@ -110,7 +110,7 @@ Source consolidation is not deployment consolidation: one source file copied int
 Today "update the gate" means find which of N copies, edit it, notice the others didn't get it, hand-patch each installed copy out-of-band (the in-session path is walled by self-access), and hope nothing drifts. After this: edit the core, tests pin it, the deploy installs one core + thin shims and **measures digest convergence**, and the shim is too thin to hold a decision — so a fix cannot land in one harness and miss another. The cheap path (edit one file) becomes the correct path (fix every seat, provably).
 
 ## 9. Non-goals
-Not re-designing the daemon protocol, the vault, or Decision 0017's authority model — this consumes them. Not adding a new harness. Not changing what the gate decides, only where the decision lives and how many times.
+Not re-designing the daemon protocol, the vault, or Decision 0017's authority model — this consumes them. Not adding a new harness. **No *new* policy semantics** — but this is not "no verdict changes" (GPT 2nd pass #3): converging every harness on the already-ratified common semantics **will change current live decisions wherever a stale copy was weaker** (that is the point of closing the §3.3 bypasses). The non-goal is inventing new law, not preserving the weaker verdicts the drift produced.
 
 ## 10. Open questions
 - **Disclosure.** The §3.3 bypasses are exploitable in codex/kimi now. If the repo is public, the specific inputs are tracked privately, not in an issue; this PRD names bug *classes* the core already documents, not fresh strings. Step C fixes them for kimi immediately.
@@ -130,3 +130,11 @@ GPT endorsed the direction (one logical LAW, syntax shims, agent authority from 
 7. **Protect the closure, not only the core** — folded into §5/§7.3.
 
 The one framing I want to keep foregrounded, because it is the whole point: **one implementation is necessary; one authority path is the goal.** GPT's sequencing (A–G) is adopted verbatim as §6.
+
+**Second pass (GPT, on the revised text).** No architecture objection; three internal contradictions and one wording nit, all resolved:
+1. **`launch_cwd_repo`/`identity_role` are authority-bearing, not shared-law helpers** — §6.D now deletes/replaces them alongside `load_in_scope` rather than centralizing them; D shares only pure predicates/constants/remedies.
+2. **§6.C's acceptance couldn't hold in sequence** — codex is still pre-hardening until F, so a cross-harness "identical deny" test at C would fail against the measured state. C's acceptance is now **kimi == core**; cross-harness convergence moves to G.
+3. **§9 non-goal corrected** — this is "no *new* semantics," not "no verdict changes": closing the §3.3 bypasses **does** change current live decisions where a stale copy was weaker, by design.
+4. **Wording** — §3.4 topology is a **shared-mechanism** parameter/callback, not a core parameter, keeping LAW transport-free in both §3.4 and §4.
+
+GPT's closing invariant, adopted: **one source is not enough; one authority path + one observed deployed generation is the actual invariant.**
