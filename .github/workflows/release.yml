@@ -2,8 +2,16 @@ name: release
 
 # Builds prebuilt hestia binaries for the four primary targets and
 # attaches them to a GitHub Release. Trigger by pushing a tag matching
-# v*.*.* (e.g. v0.0.3). The dashboard HTML is baked into the binary
+# v*.*.* (e.g. v0.0.4). The dashboard HTML is baked into the binary
 # via include_str!, so the single executable is the entire artifact.
+#
+# RELEASE INPUTS ARE PART OF THE ARTIFACT. Hestia currently consumes Web4
+# crates through sibling path dependencies, which Cargo.lock cannot pin.
+# Integration CI intentionally tracks Web4 main; releases MUST NOT. Bump
+# WEB4_REF deliberately before creating each release tag. The workflow stored
+# at that tag then records the exact cross-repo source that produced its bytes.
+env:
+  WEB4_REF: 9958fc6a37279a8fad2872fec1a07ea3ec92224b
 
 on:
   push:
@@ -12,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g. v0.0.3). Must already exist.'
+        description: 'Tag to release (e.g. v0.0.4). Must already exist.'
         required: true
         type: string
 
@@ -45,13 +53,9 @@ jobs:
             archive: tar.gz
     steps:
       # Two repos as SIBLING subdirs of the workspace — the pattern ci.yml proved
-      # green. hestia/core has four path deps into ../../web4/... and the release
-      # runner is a lone clone, which is why every release since v0.0.3 failed at
-      # dependency resolution. Naming BOTH checkouts puts them at <ws>/hestia and
-      # <ws>/web4, which is exactly what `../../web4` from hestia/core resolves to.
-      # web4 tracks main deliberately (a live integration seam; a web4 break should
-      # red the release). Reproducibility note: hestia does not pin the web4 rev —
-      # a durable release must record it; filed as follow-up.
+      # green. hestia/core has path deps into ../../web4/..., so the release must
+      # materialize the same layout. Unlike integration CI, Web4 is pinned above:
+      # rebuilding one Hestia tag later must not silently produce different bytes.
       - uses: actions/checkout@v4
         with:
           path: hestia
@@ -60,6 +64,15 @@ jobs:
         with:
           repository: dp-web4/web4
           path: web4
+          ref: ${{ env.WEB4_REF }}
+
+      - name: Record release inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "hestia_ref=${{ github.event.inputs.tag || github.ref_name }}"
+          echo "web4_ref=${WEB4_REF}"
+          test "$(git -C web4 rev-parse HEAD)" = "$WEB4_REF"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -95,6 +108,8 @@ jobs:
           if (Test-Path "hestia/README.md") { Copy-Item "hestia/README.md" "dist/$stage/" }
           if (Test-Path "hestia/LICENSE") { Copy-Item "hestia/LICENSE" "dist/$stage/" }
           Compress-Archive -Path "dist/$stage" -DestinationPath "dist/$stage.zip"
+          $hash = (Get-FileHash "dist/$stage.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $stage.zip" | Set-Content "dist/$stage.zip.sha256"
           Get-ChildItem dist
 
       - name: Upload artifact
@@ -103,7 +118,9 @@ jobs:
           name: hestia-${{ matrix.target }}
           path: |
             dist/hestia-*.tar.gz
+            dist/hestia-*.tar.gz.sha256
             dist/hestia-*.zip
+            dist/hestia-*.zip.sha256
           if-no-files-found: error
           retention-days: 7
 
@@ -112,10 +129,6 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
-
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -133,6 +146,8 @@ jobs:
           body: |
             Prebuilt `hestia` daemon binaries for the four primary targets.
 
+            Build provenance: Web4 `${{ env.WEB4_REF }}`.
+
             Install (Linux / macOS):
             ```sh
             curl -L https://github.com/dp-web4/hestia/releases/download/${{ github.event.inputs.tag || github.ref_name }}/hestia-${{ github.event.inputs.tag || github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz | tar -xz
@@ -140,8 +155,6 @@ jobs:
             ```
 
             The dashboard HTML is baked into the binary; nothing else is required to run.
-
-            Also available via `cargo install hestia` from crates.io.
           draft: false
           prerelease: false
           fail_on_unmatched_files: true
@@ -149,3 +162,4 @@ jobs:
             dist/hestia-*.tar.gz
             dist/hestia-*.tar.gz.sha256
             dist/hestia-*.zip
+            dist/hestia-*.zip.sha256
