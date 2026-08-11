@@ -11,6 +11,7 @@ mod handler;
 mod http;
 mod hub_tab;
 pub mod operator_auth;
+mod public_identity;
 mod state;
 
 pub use dashboard::{
@@ -31,5 +32,15 @@ use crate::vault::Vault;
 /// SQLite witness chain and the file-backed trust store rooted at `home`.
 pub fn build_state(vault: Vault, home: &Path, passphrase: &str) -> Result<SharedState> {
     let state = ServerState::open(vault, home, passphrase)?;
+
+    // `public-identity.json` is a convenience projection for the LOCKED tier,
+    // never identity authority. Every successful authoritative open therefore
+    // heals a missing/stale/corrupt projection from the vault-backed Society.
+    // Failure to write the projection is loud but must not make the daemon
+    // unavailable: transparency cannot silently become an execution gate.
+    if let Err(e) = public_identity::project(home, &state.sovereign.lct_id()) {
+        tracing::warn!("failed to project public identity from authoritative vault state: {e:#}");
+    }
+
     Ok(Arc::new(Mutex::new(state)))
 }
