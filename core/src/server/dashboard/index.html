@@ -1618,12 +1618,16 @@
   function aggregateHarnessTrust(trust) {
     const byId = {};
     const get = id => byId[id] || (byId[id] =
-      { plugin_id: id, level: null, action_count: 0, roles: 0, measured: 0 });
+      { plugin_id: id, level: null, action_count: 0, roles: 0, measured: 0, freshest: null });
     for (const t of trust) {
       if (t.aliased_to) { get(t.aliased_to).action_count += t.action_count; continue; }
       const cur = get(t.plugin_id);
       cur.action_count += t.action_count;
       cur.roles += 1;
+      // Freshest grain = smallest days_since_last, so the row reports how recently this
+      // harness last acted — the "even if it's days or months old" signal (dp).
+      if (typeof t.days_since_last === 'number')
+        cur.freshest = cur.freshest == null ? t.days_since_last : Math.min(cur.freshest, t.days_since_last);
       const rank = LEVEL_ORDER.indexOf(t.level);
       if (rank < 0) continue;   // unmeasured/unknown: coverage, not a level
       cur.measured += 1;
@@ -1649,9 +1653,14 @@
       // Only a currently-connected harness (idle counts) is drillable: selecting a GONE one
       // would be cleared by renderOrchBar's guard on the same tick and read as a dead click.
       const drillable = connected.has(r.plugin_id);
+      // "idle Nd" when the freshest grain is a day or more old — so a member last seen days
+      // or months ago reads as stale-but-present, not active (dp).
+      const idle = (r.freshest != null && r.freshest >= 1)
+        ? ` · idle ${r.freshest >= 60 ? Math.floor(r.freshest / 30) + 'mo' : Math.floor(r.freshest) + 'd'}`
+        : '';
       const cover = `${r.roles} role${r.roles === 1 ? '' : 's'}`
         + (r.measured < r.roles ? ` · ${r.roles - r.measured} unmeasured` : '')
-        + ` · ${fmt.int(r.action_count)} action${r.action_count === 1 ? '' : 's'}`;
+        + ` · ${fmt.int(r.action_count)} action${r.action_count === 1 ? '' : 's'}${idle}`;
       return `
       <div class="trust-row${drillable ? ' trust-row-harness' : ''}"${drillable
           ? ` data-harness="${escapeHtml(r.plugin_id)}" role="button" tabindex="0" title="click to see this harness’s role trust"`
