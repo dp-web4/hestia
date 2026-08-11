@@ -2,8 +2,16 @@ name: release
 
 # Builds prebuilt hestia binaries for the four primary targets and
 # attaches them to a GitHub Release. Trigger by pushing a tag matching
-# v*.*.* (e.g. v0.0.3). The dashboard HTML is baked into the binary
+# v*.*.* (e.g. v0.0.4). The dashboard HTML is baked into the binary
 # via include_str!, so the single executable is the entire artifact.
+#
+# RELEASE INPUTS ARE PART OF THE ARTIFACT. Hestia currently consumes Web4
+# crates through sibling path dependencies, which Cargo.lock cannot pin.
+# Integration CI intentionally tracks Web4 main; releases MUST NOT. Bump
+# WEB4_REF deliberately before creating each release tag. The workflow stored
+# at that tag then records the exact cross-repo source that produced its bytes.
+env:
+  WEB4_REF: 9958fc6a37279a8fad2872fec1a07ea3ec92224b
 
 on:
   push:
@@ -12,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g. v0.0.3). Must already exist.'
+        description: 'Tag to release (e.g. v0.0.4). Must already exist.'
         required: true
         type: string
 
@@ -37,16 +45,36 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             archive: tar.gz
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
-          - target: aarch64-apple-darwin
-            os: macos-14
-            archive: tar.gz
+          # Windows + macOS are TEMPORARILY OUT (2026-08-11). The daemon links
+          # `rusqlite` with `bundled-sqlcipher`, whose C build needs a crypto
+          # backend (OpenSSL/SQLCipher) that the windows-latest and macos-14
+          # runners do not provide out of the box — libsqlite3-sys fails its
+          # build command there while both Linux targets build clean. This is a
+          # per-runner crypto-toolchain task, filed as follow-up; shipping the
+          # Linux targets now beats shipping nothing (no release since v0.0.3).
+          # Restore these two once the runners have the SQLCipher crypto backend.
     steps:
+      # Two repos as SIBLING subdirs of the workspace — the pattern ci.yml proved
+      # green. hestia/core has path deps into ../../web4/..., so the release must
+      # materialize the same layout. Unlike integration CI, Web4 is pinned above:
+      # rebuilding one Hestia tag later must not silently produce different bytes.
       - uses: actions/checkout@v4
         with:
+          path: hestia
           ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          path: web4
+          ref: ${{ env.WEB4_REF }}
+
+      - name: Record release inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "hestia_ref=${{ github.event.inputs.tag || github.ref_name }}"
+          echo "web4_ref=${WEB4_REF}"
+          test "$(git -C web4 rev-parse HEAD)" = "$WEB4_REF"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -54,7 +82,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build hestia
-        working-directory: core
+        working-directory: hestia/core
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Stage artifacts (unix)
@@ -65,8 +93,8 @@ jobs:
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           STAGE="hestia-${TAG}-${{ matrix.target }}"
           mkdir -p "dist/${STAGE}"
-          cp "core/target/${{ matrix.target }}/release/hestia" "dist/${STAGE}/"
-          cp README.md LICENSE "dist/${STAGE}/" 2>/dev/null || true
+          cp "hestia/core/target/${{ matrix.target }}/release/hestia" "dist/${STAGE}/"
+          cp hestia/README.md hestia/LICENSE "dist/${STAGE}/" 2>/dev/null || true
           (cd dist && tar -czf "${STAGE}.tar.gz" "${STAGE}")
           (cd dist && sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256")
           ls -la dist/
@@ -78,10 +106,12 @@ jobs:
           $tag = "${{ github.event.inputs.tag || github.ref_name }}"
           $stage = "hestia-$tag-${{ matrix.target }}"
           New-Item -ItemType Directory -Path "dist/$stage" | Out-Null
-          Copy-Item "core/target/${{ matrix.target }}/release/hestia.exe" "dist/$stage/"
-          if (Test-Path "README.md") { Copy-Item "README.md" "dist/$stage/" }
-          if (Test-Path "LICENSE") { Copy-Item "LICENSE" "dist/$stage/" }
+          Copy-Item "hestia/core/target/${{ matrix.target }}/release/hestia.exe" "dist/$stage/"
+          if (Test-Path "hestia/README.md") { Copy-Item "hestia/README.md" "dist/$stage/" }
+          if (Test-Path "hestia/LICENSE") { Copy-Item "hestia/LICENSE" "dist/$stage/" }
           Compress-Archive -Path "dist/$stage" -DestinationPath "dist/$stage.zip"
+          $hash = (Get-FileHash "dist/$stage.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $stage.zip" | Set-Content "dist/$stage.zip.sha256"
           Get-ChildItem dist
 
       - name: Upload artifact
@@ -90,7 +120,9 @@ jobs:
           name: hestia-${{ matrix.target }}
           path: |
             dist/hestia-*.tar.gz
+            dist/hestia-*.tar.gz.sha256
             dist/hestia-*.zip
+            dist/hestia-*.zip.sha256
           if-no-files-found: error
           retention-days: 7
 
@@ -99,10 +131,6 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
-
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -120,6 +148,8 @@ jobs:
           body: |
             Prebuilt `hestia` daemon binaries for the four primary targets.
 
+            Build provenance: Web4 `${{ env.WEB4_REF }}`.
+
             Install (Linux / macOS):
             ```sh
             curl -L https://github.com/dp-web4/hestia/releases/download/${{ github.event.inputs.tag || github.ref_name }}/hestia-${{ github.event.inputs.tag || github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz | tar -xz
@@ -127,12 +157,11 @@ jobs:
             ```
 
             The dashboard HTML is baked into the binary; nothing else is required to run.
-
-            Also available via `cargo install hestia` from crates.io.
           draft: false
           prerelease: false
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false  # windows .zip absent while win/mac are out (SQLCipher runner toolchain); tolerate the missing pattern
           files: |
             dist/hestia-*.tar.gz
             dist/hestia-*.tar.gz.sha256
             dist/hestia-*.zip
+            dist/hestia-*.zip.sha256
