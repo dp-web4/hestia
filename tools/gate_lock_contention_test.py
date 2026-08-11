@@ -89,17 +89,29 @@ def handshake(url: str, role: str, plugin_id: str) -> dict:
     aid = begin.get("actionId") if isinstance(begin, dict) else None
     if not aid:
         raise RuntimeError(f"no actionId: {begin}")
+    # From here the action is resident in s.actions -- a later error must not
+    # take that fact out of the accounting (#316 third pass, Finding 1).
+    steps["_begun"] = True
 
-    t = time.monotonic()
-    unwrap(c.call_tool("hestia_query_policy",
-                       {"action_id": aid, **({"session_id": sid} if sid else {})}))
-    steps["query_policy"] = (time.monotonic() - t) * 1000
-    steps["total"] = (time.monotonic() - t0) * 1000
+    err = None
+    try:
+        t = time.monotonic()
+        unwrap(c.call_tool("hestia_query_policy",
+                           {"action_id": aid, **({"session_id": sid} if sid else {})}))
+        steps["query_policy"] = (time.monotonic() - t) * 1000
+        steps["total"] = (time.monotonic() - t0) * 1000
+    except Exception as e:  # noqa: BLE001
+        # Caught HERE, not in the worker: a query_policy timeout after a
+        # successful begin_action is the exact fail-closed class under study,
+        # and its error row must keep carrying the open action.
+        err = f"query_policy: {type(e).__name__}: {e}"
 
-    # Close the action (untimed, after `total`; see docstring). Best-effort:
-    # a failed close must not turn a successful measurement into an error row.
-    # A daemon rejection arrives as a parsed error envelope, not an exception,
-    # so count closes by the witness entry hash that proves them.
+    # Close the action (untimed, after `total`; see docstring). Runs even when
+    # query_policy errored -- begin_action succeeded, so the action sits in
+    # the in-flight map either way. Best-effort: a failed close must not turn
+    # a successful measurement into an error row. A daemon rejection arrives
+    # as a parsed error envelope, not an exception, so count closes by the
+    # witness entry hash that proves them.
     try:
         res = unwrap(c.call_tool("hestia_record_outcome",
                                  {"action_id": aid, "success": True, "magnitude": 0.0}))
@@ -107,6 +119,8 @@ def handshake(url: str, role: str, plugin_id: str) -> dict:
     except Exception:  # noqa: BLE001
         steps["_closed"] = False
 
+    if err:
+        return {"error": err, "_begun": True, "_closed": steps["_closed"]}
     return steps
 
 
@@ -136,8 +150,14 @@ def arm(url: str, role: str, plugin_id: str, concurrency: int, per_worker: int) 
 def summarize(rows, budget=800):
     ok = [r for r in rows if "error" not in r]
     errs = len(rows) - len(ok)
+    # Over ALL rows, not just ok: an error row that got past begin_action
+    # carries `_begun`/`_closed`, and dropping it from the denominator would
+    # print unclosed=0 while the arm leaked (#316 third pass, Finding 1).
+    # Present even in the all-errors early return, where the leak is largest.
+    begun = [r for r in rows if r.get("_begun", False)]
+    unclosed = sum(1 for r in begun if not r.get("_closed", False))
     if not ok:
-        return {"n": 0, "errors": errs}
+        return {"n": 0, "errors": errs, "begun": len(begun), "unclosed": unclosed}
     tot = sorted(r["total"] for r in ok)
     n = len(tot)
 
@@ -150,10 +170,11 @@ def summarize(rows, budget=800):
         "p99": round(pct(tot, 99), 1), "max": round(tot[-1], 1),
         "over_budget": sum(1 for x in tot if x > budget),
         "stalls_gt_100ms": sum(1 for x in tot if x > 100),
-        # actions this arm began but could not close -- each one is left
-        # resident in the daemon's in-flight map (the Note A leak); 0 or the
-        # cleanup is not doing its job
-        "unclosed": sum(1 for r in ok if not r.get("_closed", False)),
+        # actions this arm began but could not close (error rows included) --
+        # each one is left resident in the daemon's in-flight map (the Note A
+        # leak); 0 or the cleanup is not doing its job
+        "begun": len(begun),
+        "unclosed": unclosed,
     }
     for step in ("initialize", "connect", "begin_action", "query_policy"):
         v = sorted(r[step] for r in ok)
@@ -181,16 +202,25 @@ def main():
         s["wall_ms"] = round(wall, 1)
         s["concurrency"] = c
         results[c] = s
-        print(f"C={c:2d}  n={s['n']:4d}  p50={s['p50']:7.1f}  p90={s['p90']:7.1f}  "
-              f"p99={s['p99']:8.1f}  max={s['max']:8.1f}  >800ms={s['over_budget']:3d}  "
-              f">100ms={s['stalls_gt_100ms']:3d}  errors={s['errors']}  "
-              f"unclosed={s['unclosed']}")
+        if s["n"] == 0:
+            # every handshake errored -- exactly where the leak is largest,
+            # so the close accounting must still print (#316 third pass)
+            print(f"C={c:2d}  n=   0  ALL ERRORS  errors={s['errors']}  "
+                  f"begun={s['begun']}  unclosed={s['unclosed']}")
+        else:
+            print(f"C={c:2d}  n={s['n']:4d}  p50={s['p50']:7.1f}  p90={s['p90']:7.1f}  "
+                  f"p99={s['p99']:8.1f}  max={s['max']:8.1f}  >800ms={s['over_budget']:3d}  "
+                  f">100ms={s['stalls_gt_100ms']:3d}  errors={s['errors']}  "
+                  f"unclosed={s['unclosed']}/{s['begun']}")
         time.sleep(1.0)  # let the daemon settle between arms
 
     print("\nper-step p99 (ms) — initialize is the unlocked control:")
     print(f"{'C':>3} {'initialize':>11} {'connect':>9} {'begin_action':>13} {'query_policy':>13}")
     for c in arms:
         s = results[c]
+        if s["n"] == 0:
+            print(f"{c:>3}  (all errors -- no step timings)")
+            continue
         print(f"{c:>3} {s['initialize_p99']:>11.1f} {s['connect_p99']:>9.1f} "
               f"{s['begin_action_p99']:>13.1f} {s['query_policy_p99']:>13.1f}")
 

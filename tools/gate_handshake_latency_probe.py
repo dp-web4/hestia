@@ -153,29 +153,41 @@ def one_run(url: str, role: str, plugin_id: str) -> dict:
     action_id = begin.get("actionId") if isinstance(begin, dict) else None
     if not action_id:
         return {"error": f"begin_action gave no actionId: {begin}", "steps": steps}
+    # From here the action is resident in s.actions. Whatever happens next --
+    # including the query_policy timeout this instrument exists to study --
+    # the run's accounting must say so (#316 third pass, Finding 1).
+    steps["_action_begun"] = True
 
-    t = time.monotonic()
-    polls = 0
+    err = None
+    total = None
     decision = None
-    while polls < 4:
-        polls += 1
-        body = unwrap(c.call_tool("hestia_query_policy", {
-            "action_id": action_id,
-            **({"session_id": session_id} if session_id else {}),
-        }))
-        status = body.get("status", "decided") if isinstance(body, dict) else "decided"
-        if status != "evaluating":
-            decision = body
-            break
-        time.sleep(0.05)
-    steps["query_policy"] = (time.monotonic() - t) * 1000
-    steps["_polls"] = polls
-
-    total = (time.monotonic() - t_all) * 1000
+    try:
+        t = time.monotonic()
+        polls = 0
+        while polls < 4:
+            polls += 1
+            body = unwrap(c.call_tool("hestia_query_policy", {
+                "action_id": action_id,
+                **({"session_id": session_id} if session_id else {}),
+            }))
+            status = body.get("status", "decided") if isinstance(body, dict) else "decided"
+            if status != "evaluating":
+                decision = body
+                break
+            time.sleep(0.05)
+        steps["query_policy"] = (time.monotonic() - t) * 1000
+        steps["_polls"] = polls
+        total = (time.monotonic() - t_all) * 1000
+    except (urllib.error.URLError, socket.timeout, OSError) as e:
+        # Caught HERE, not in the caller: an error row must carry its open
+        # action's accounting instead of dropping out of the denominator.
+        err = f"query_policy: {type(e).__name__}: {e}"
 
     # Close the action (untimed -- cleanup is not part of the gate sequence
-    # under test, so it lands after `total` is taken). Best-effort: a failed
-    # close must not turn a successful measurement into an error row.
+    # under test, so it lands after `total` is taken). Runs even when
+    # query_policy errored: begin_action succeeded, so the action sits in the
+    # in-flight map either way and the close is both the drain attempt and
+    # the observable. Best-effort: a failed close must not raise.
     try:
         res = unwrap(c.call_tool("hestia_record_outcome", {
             "action_id": action_id, "success": True, "magnitude": 0.0,
@@ -186,6 +198,8 @@ def one_run(url: str, role: str, plugin_id: str) -> dict:
     except Exception:  # noqa: BLE001
         steps["_outcome_recorded"] = False
 
+    if err:
+        return {"error": err, "steps": steps}
     return {
         "total_ms": total,
         "steps": steps,
@@ -213,7 +227,9 @@ def main():
             r = {"error": f"{type(e).__name__}: {e}"}
         rows.append(r)
         if "error" in r:
-            print(f"run {i+1}: ERROR {r['error']}")
+            leaked = (r.get("steps", {}).get("_action_begun")
+                      and not r["steps"].get("_outcome_recorded", False))
+            print(f"run {i+1}: ERROR {r['error']}" + ("  UNCLOSED" if leaked else ""))
         else:
             s = r["steps"]
             print(f"run {i+1}: total={r['total_ms']:7.1f}ms  "
@@ -234,10 +250,17 @@ def main():
         for step in ("initialize", "initialized", "connect", "begin_action", "query_policy"):
             vals = sorted(r["steps"][step] for r in ok)
             print(f"  {step:>13}: median {vals[len(vals)//2]:7.1f}ms  max {vals[-1]:7.1f}ms")
-        # 0 or the cleanup is not doing its job — same observable the
-        # contention test prints as `unclosed=` (#316 Note A).
-        unclosed = sum(1 for r in ok if not r["steps"].get("_outcome_recorded", False))
-        print(f"unclosed actions (left in the daemon's in-flight map): {unclosed}/{len(ok)}")
+    # 0 or the cleanup is not doing its job — same observable the contention
+    # test prints as `unclosed=` (#316 Note A). Counted over EVERY row that
+    # got past begin_action, error rows included: a query_policy timeout
+    # after a successful begin leaves its action in s.actions, and dropping
+    # error rows from the denominator prints unclosed=0 while leaking (#316
+    # third pass, Finding 1). Printed outside the ok-block so an all-error
+    # run reports the leak instead of omitting the line.
+    begun = [r for r in rows if r.get("steps", {}).get("_action_begun")]
+    unclosed = sum(1 for r in begun if not r["steps"].get("_outcome_recorded", False))
+    print(f"unclosed actions (left in the daemon's in-flight map): "
+          f"{unclosed}/{len(begun)} begun")
     print(f"errors: {len(rows) - len(ok)}/{len(rows)}")
 
 
