@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// One entry in the witness chain. Identical shape to the in-memory
 /// `state::ChainEntry`; re-exported via the storage module.
@@ -60,6 +61,34 @@ impl ChainRowRef<'_> {
 pub struct SqliteChainStore {
     conn: Mutex<Connection>,
     path: PathBuf,
+    /// Cached entry count, so `len()` is O(1) instead of an O(n) `COUNT(*)`.
+    ///
+    /// WHY THIS IS NOT A MICRO-OPTIMISATION. `len()` sits on the hot path of every
+    /// governed tool call: `tool_begin_action` (handler.rs) calls `s.chain_len()` while
+    /// holding the daemon's GLOBAL `state.lock()`, purely to fill in the advisory
+    /// `chainPosition` echoed back to the caller. So every member's tool call paid a full
+    /// index scan of an encrypted 163MB chain — with every page decrypted — before any
+    /// other member could get a policy verdict.
+    ///
+    /// Measured on CBP 2026-08-08 against the live daemon
+    /// (`tools/gate_handshake_latency_probe.py`, `tools/gate_lock_contention_test.py`,
+    /// 120,789 entries): `begin_action` p50 **18ms** versus `query_policy` p50 **3.2ms** —
+    /// counting the ledger cost 5.6x more than evaluating the policy that is the point of
+    /// the call. Because the lock serialises members, median handshake latency scaled
+    /// linearly with concurrency (29.9 / 52.2 / 101.3 / 202.4 ms at C=1/2/4/8) and at C=8
+    /// **19/320 calls exceeded the harness gate's 800ms budget**, each one a fail-closed
+    /// deny with `cause=timeout`. That matches the observed refusal class exactly: 73/73
+    /// carried `timeout`, `refused` never once occurred.
+    ///
+    /// EXACT, NOT APPROXIMATE. The count is initialised from `COUNT(*)` at open and
+    /// incremented only after a committed append. That is sound because the chain is
+    /// strictly append-only: `chain_position` is `INTEGER PRIMARY KEY`, `append()` derives
+    /// the next position from the tail row, and there is no `DELETE FROM chain_entries`,
+    /// `DROP TABLE` or `VACUUM` anywhere in the crate — a hash chain that dropped rows
+    /// would fail its own verification. `chain_len_cache_matches_count` pins that
+    /// invariant against the real `COUNT(*)`, so the cache cannot drift silently if a
+    /// deletion path is ever added.
+    len: AtomicU64,
 }
 
 const GENESIS_PREV_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -137,9 +166,12 @@ impl SqliteChainStore {
              CREATE INDEX IF NOT EXISTS idx_chain_event_type ON chain_entries(event_type);
              CREATE INDEX IF NOT EXISTS idx_chain_timestamp  ON chain_entries(timestamp);",
         )?;
+        // Pay the O(n) count exactly once, at open, then track it incrementally.
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM chain_entries", [], |row| row.get(0))?;
         Ok(Self {
             conn: Mutex::new(conn),
             path,
+            len: AtomicU64::new(n as u64),
         })
     }
 
@@ -147,11 +179,13 @@ impl SqliteChainStore {
         &self.path
     }
 
-    /// Number of entries currently in the chain.
+    /// Number of entries currently in the chain. O(1) — see [`SqliteChainStore::len`]'s
+    /// field docs for why this being a `COUNT(*)` cost every member a fail-closed deny.
+    ///
+    /// Still returns `Result` so the 14 call sites are untouched by the change; the
+    /// error arm is now unreachable, which is the point.
     pub fn len(&self) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM chain_entries", [], |row| row.get(0))?;
-        Ok(n as u64)
+        Ok(self.len.load(Ordering::Acquire))
     }
 
     pub fn is_empty(&self) -> Result<bool> {
@@ -215,6 +249,9 @@ impl SqliteChainStore {
             ],
         )?;
         tx.commit()?;
+        // Only after the row is durably committed. Serialised by the `conn` mutex we still
+        // hold, so no two appends race; `Release` pairs with the `Acquire` in `len()`.
+        self.len.fetch_add(1, Ordering::Release);
 
         Ok(ChainEntry {
             hash,
@@ -669,6 +706,64 @@ mod tests {
         assert_eq!(store.len().unwrap(), 0);
         assert!(store.is_empty().unwrap());
         assert_eq!(store.tail_hash().unwrap(), GENESIS_PREV_HASH);
+    }
+
+    /// `len()` is a CACHE now, so it can lie in a way a `COUNT(*)` could not. This pins it
+    /// against the ground truth it replaced, at every step and across a reopen.
+    ///
+    /// The negative control is the last block: it deletes a row behind the cache's back and
+    /// asserts the two DISAGREE. That is deliberate — it proves this test can fail. Without
+    /// it, the assertions above pass just as happily against an implementation that computed
+    /// both sides the same way, and the guard would certify nothing. If a deletion path is
+    /// ever added to the chain, that control is the thing that goes red first.
+    #[test]
+    fn chain_len_cache_matches_count() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let signer = "lct:web4:hestia:sovereign:test";
+
+        let true_count = |store: &SqliteChainStore| -> u64 {
+            let conn = store.conn.lock().unwrap();
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM chain_entries", [], |r| r.get(0))
+                .unwrap();
+            n as u64
+        };
+
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        assert_eq!(store.len().unwrap(), true_count(&store), "empty store");
+
+        for i in 0..25u64 {
+            store
+                .append("policy_decision", json!({ "n": i }), signer)
+                .unwrap();
+            assert_eq!(
+                store.len().unwrap(),
+                true_count(&store),
+                "cache drifted after append {i}"
+            );
+            assert_eq!(store.len().unwrap(), i + 1);
+        }
+        drop(store);
+
+        // Reopen: the cache must be re-seeded from disk, not restarted at zero.
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        assert_eq!(store.len().unwrap(), 25, "cache lost across reopen");
+        assert_eq!(store.len().unwrap(), true_count(&store));
+
+        // NEGATIVE CONTROL — make the cache wrong on purpose and prove we would see it.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("DELETE FROM chain_entries WHERE chain_position = 0", [])
+                .unwrap();
+        }
+        assert_eq!(store.len().unwrap(), 25, "cache should be stale by construction");
+        assert_ne!(
+            store.len().unwrap(),
+            true_count(&store),
+            "control failed: a row vanished and the cache still agreed — this test cannot fail, \
+             so it certifies nothing"
+        );
     }
 
     #[test]

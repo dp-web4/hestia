@@ -21,6 +21,15 @@
 # relaxing it so CI can pass would delete what it checks. Run it on the fleet.
 tools/workspace_root_test.py
 
+# Live measurement probe, not a hermetic test. It intentionally opens concurrent
+# gate-equivalent handshakes against the running Hestia daemon and reads
+# ~/.hestia/endpoint. A GitHub runner has neither the fleet daemon nor that
+# endpoint; treating absence as PASS would turn "not measured" into green.
+# Keep the test-shaped name because the probe's companion/documentation already
+# refers to it, but declare the environment dependency here so CI says why it
+# cannot run rather than crashing on FileNotFoundError.
+tools/gate_lock_contention_test.py
+
 # Needs the SDK importable (`pip install -e plugin-sdk/python`). Bare python3
 # gives ModuleNotFoundError: hestia_plugin_sdk. Wiring it means adding an
 # install step to a job that deliberately has no dependencies -- worth doing,
