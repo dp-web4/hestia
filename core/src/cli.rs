@@ -906,15 +906,38 @@ fn cmd_init(home: &std::path::Path, force: bool, ai: bool) -> AnyResult<()> {
     }
     let passphrase = prompt_passphrase_with_confirmation()?;
 
-    if force {
-        Vault::init_force(path.clone(), passphrase)?;
+    let mut vault = if force {
+        Vault::init_force(path.clone(), passphrase)?
     } else {
-        Vault::init(path.clone(), passphrase)?;
-    }
+        Vault::init(path.clone(), passphrase)?
+    };
+
+    // §5.1 — the FIRST RUN mints the local society + sovereign identity, so `init`
+    // produces a WORKING node rather than an empty vault. Legion's cold run
+    // (2026-07-24) ran `init` then `info` and saw NO identity, because the society was
+    // minted lazily on first `serve`. `load_or_mint` is idempotent and uses the SAME
+    // anchor the daemon uses at serve (`server/state.rs`), so this mints exactly the
+    // identity serve will later load — eager, never divergent.
+    let anchor = "lct:web4:hestia:sovereign:phase1-placeholder";
+    let sovereign = hestia::sovereign::Sovereign::load_or_mint(&mut vault, anchor);
+    let _ = hestia::role_registry::load_or_mint_registry(&mut vault, anchor, &sovereign.lct_id());
+    println!("✓ Local society + sovereign identity minted");
+    println!("  Sovereign LCT: {}", sovereign.lct_id());
+
+    // A CLEARTEXT, public-only identity artifact so a LOCKED node can self-identify —
+    // `info` reads it without the vault passphrase, and it is what a hub needs to answer
+    // `/.well-known` before unlock (the dev-hub "clear tier-0 public-identity.json" wrinkle).
+    // PUBLIC DATA ONLY: the LCT id is a shareable identifier derived from the public key; the
+    // keypair stays sealed in the vault and never touches this file.
+    let pub_identity = serde_json::json!({
+        "sovereign_lct": sovereign.lct_id(),
+        "minted_by": concat!("hestia ", env!("CARGO_PKG_VERSION")),
+    });
+    let pub_path = home.join("public-identity.json");
+    std::fs::write(&pub_path, serde_json::to_vec_pretty(&pub_identity)?)
+        .with_context(|| format!("writing {}", pub_path.display()))?;
 
     if ai {
-        let mut vault = Vault::open(path.clone(), std::env::var("HESTIA_PASSPHRASE")
-            .unwrap_or_default())?;
         let kp = web4_core::crypto::KeyPair::generate();
         let lct_id = uuid::Uuid::new_v4();
         let pub_hex = kp.verifying_key().to_hex();
@@ -1025,6 +1048,23 @@ fn cmd_info(home: &std::path::Path) -> AnyResult<()> {
     if path.exists() {
         let meta = std::fs::metadata(&path).context("reading vault metadata")?;
         println!("vault size:  {} bytes", meta.len());
+    }
+    // Identity from the cleartext public artifact — no passphrase, no unlock. Legion's cold
+    // run (2026-07-24) read this command's output as "no identity" because there was nothing
+    // to read; `init` now writes `public-identity.json` and this surfaces it.
+    let pub_path = home.join("public-identity.json");
+    match std::fs::read(&pub_path) {
+        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(v) => match v.get("sovereign_lct").and_then(|x| x.as_str()) {
+                Some(lct) => println!("sovereign identity: {lct}"),
+                None => println!("sovereign identity: (public-identity.json present but unparseable)"),
+            },
+            Err(_) => println!("sovereign identity: (public-identity.json unreadable)"),
+        },
+        Err(_) if path.exists() => {
+            println!("sovereign identity: (none — this vault predates identity-at-init; re-run `hestia init` or serve once to mint)")
+        }
+        Err(_) => println!("sovereign identity: (none — run `hestia init`)"),
     }
     Ok(())
 }
