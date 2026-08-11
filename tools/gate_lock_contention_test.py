@@ -30,6 +30,13 @@ than the pre-cleanup probe: biased AGAINST the improvement #316 claims, which is
 the safe direction. Sessions connect `synthetic: true` under a hardcoded probe id
 so nothing reaches member reputation or the hub; see the latency probe's docstring
 for why that id must never be a real member's.
+
+Known residue (#316 re-review): the SESSIONS this run opens cannot be drained from
+here — `s.sessions` has one insert and no remover daemon-side (#320) — so a default
+run leaves 600 of them resident until daemon restart. They lengthen the O(n)
+host_session_id reuse scan real gate handshakes pay under the global lock (this
+probe skips that scan: it sends no host_session_id). Until the daemon drains, the
+probe self-identifies via `host_agent` so the leaked seats are attributable.
 """
 import json
 import statistics
@@ -62,8 +69,11 @@ def handshake(url: str, role: str, plugin_id: str) -> dict:
 
     t = time.monotonic()
     connect = unwrap(c.call_tool("hestia_connect", {
-        "plugin_id": plugin_id, "plugin_version": "probe", "host_agent": "claude-code",
-        "host_agent_version": "claude-code", "requested_role": "citizen",
+        # Own name, not "claude-code": sessions have no daemon-side remover
+        # (#320), so a default run leaves 600 seats on session/siblings — they
+        # must render as probe seats. Descriptive-only field; no fidelity cost.
+        "plugin_id": plugin_id, "plugin_version": "probe", "host_agent": plugin_id,
+        "host_agent_version": "probe", "requested_role": "citizen",
         "protocol_version": PROTOCOL_VERSION, "role": role, "synthetic": True,
     }))
     steps["connect"] = (time.monotonic() - t) * 1000

@@ -28,7 +28,14 @@ purpose -- `synthetic: true` durably persists a synthetic exclusion for whatever
 rides with, so it must never be paired with a real member id like "claude-code". One
 fidelity cost, stated: a synthetic connect persists that exclusion doc (a vault write)
 on every connect, so `connect` reads heavier here than the real gate's member-registry
-short-circuit; initialize/begin_action/query_policy are unchanged in shape.
+short-circuit (#321); initialize/begin_action/query_policy are unchanged in shape.
+
+What the probe canNOT drain: the session itself. `s.sessions` has one insert and no
+remover daemon-side (#320), so every run's session outlives the run. Until that drain
+exists, the probe carries its own name in `host_agent` (not "claude-code", the value
+the real hook sends): a leaked seat on hestia://session/siblings must render as the
+probe it is, not as an anonymous claude-code seat. host_agent is descriptive-only in
+the daemon (stored and echoed, never branched on), so this costs no handshake fidelity.
 """
 import json
 import os
@@ -121,8 +128,12 @@ def one_run(url: str, role: str, plugin_id: str) -> dict:
     connect = unwrap(c.call_tool("hestia_connect", {
         "plugin_id": plugin_id,
         "plugin_version": "probe",
-        "host_agent": "claude-code",
-        "host_agent_version": "claude-code",
+        # The probe's own name, not "claude-code": sessions have no remover
+        # daemon-side (#320), so every run's session outlives it — on
+        # hestia://session/siblings it must render as the probe seat it is,
+        # not as an anonymous claude-code seat (#316 re-review).
+        "host_agent": plugin_id,
+        "host_agent_version": "probe",
         "requested_role": "citizen",
         "protocol_version": PROTOCOL_VERSION,
         "role": role,
@@ -209,7 +220,8 @@ def main():
                   f"init={s['initialize']:6.1f} inited={s['initialized']:6.1f} "
                   f"conn={s['connect']:6.1f} begin={s['begin_action']:6.1f} "
                   f"policy={s['query_policy']:6.1f} (polls={s['_polls']}) "
-                  f"-> {r['decision']}")
+                  f"-> {r['decision']}"
+                  + ("" if s.get("_outcome_recorded") else "  UNCLOSED"))
     ok = [r for r in rows if "error" not in r]
     if ok:
         totals = sorted(r["total_ms"] for r in ok)
@@ -222,6 +234,10 @@ def main():
         for step in ("initialize", "initialized", "connect", "begin_action", "query_policy"):
             vals = sorted(r["steps"][step] for r in ok)
             print(f"  {step:>13}: median {vals[len(vals)//2]:7.1f}ms  max {vals[-1]:7.1f}ms")
+        # 0 or the cleanup is not doing its job — same observable the
+        # contention test prints as `unclosed=` (#316 Note A).
+        unclosed = sum(1 for r in ok if not r["steps"].get("_outcome_recorded", False))
+        print(f"unclosed actions (left in the daemon's in-flight map): {unclosed}/{len(ok)}")
     print(f"errors: {len(rows) - len(ok)}/{len(rows)}")
 
 
