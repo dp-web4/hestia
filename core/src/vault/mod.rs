@@ -7,10 +7,12 @@
 pub mod crypto;
 pub mod document;
 pub mod entry;
+pub mod rules;
 pub mod storage;
 
 pub use document::{Document, ItemRef, Protection};
 pub use entry::VaultEntry;
+pub use rules::{Disclosure, PresentationAudience, PresentationRule, ReleaseRule};
 pub use policy_state::{OperatorIdentity, PolicyOverride, VaultPolicyState};
 pub mod policy_lists;
 pub mod gate_integrity;
