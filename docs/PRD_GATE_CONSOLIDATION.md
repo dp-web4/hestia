@@ -92,7 +92,7 @@ This is **step B** below, and it must be true for an adopting harness *before* t
 
 ### 7.1 Source + behaviour
 1. **One implementation** of each scope/egress predicate, the forbidden/member-address lists, and the fail-closed message — grep finds it once, in the core/shared module. A second copy anywhere is a red test.
-2. The three live bypasses (§3.3) **change no verdict from any harness** — the differential test denies from every shim.
+2. The three live bypasses (§3.3) **leave no divergent verdict across harnesses** — after migration the differential test gets an identical deny from every shim. This is *not* "no verdict changes" (see §9): the stale harnesses change from their weaker verdict to the common deny, which is the point — the criterion is **convergence**, not preservation.
 3. A refusal from any harness names a **tool that exists**, asserted by resolving the named tool.
 4. `load_in_scope` and the permissive `web4` fallback are **gone**, not shared.
 5. In enforce mode, `evaluate()` **never decides from an unauthenticated policy** — it receives a certified snapshot or takes the defined degraded path; asserted by a test that injects `policy=None` and requires degraded-mode, not allow.
@@ -103,7 +103,7 @@ Source consolidation is not deployment consolidation: one source file copied int
 7. **Fleet digest convergence is observed:** a fleet check reports every seat's enforcing-core digest and asserts they match the ratified one. gemini/cursor get an explicit **migrate-or-retire** decision if still supported. The criterion is the running gate, not the repo file.
 
 ### 7.3 Closure
-8. A write to the core, the shared-mechanism module, or the loader/digest-selection path is **refused and escalatable from every adopting harness** (step B), asserted before step C lands.
+8. A write to **any element of the effective governance closure defined in §5** — the core, the shared-mechanism module, the loader/digest-selection path, **the registration/config that selects the shim, the installers/manifests that put it in force, and any exemption ledger** — is **refused and escalatable from every adopting harness** (step B), asserted before step C lands. A criterion that covers only core + mechanism + loader still leaves a path to redirect *which* law executes; it must cover the whole closure §5 names.
 
 ## 8. The procedure fix — make the correct path the easy path
 
@@ -138,3 +138,7 @@ The one framing I want to keep foregrounded, because it is the whole point: **on
 4. **Wording** — §3.4 topology is a **shared-mechanism** parameter/callback, not a core parameter, keeping LAW transport-free in both §3.4 and §4.
 
 GPT's closing invariant, adopted: **one source is not enough; one authority path + one observed deployed generation is the actual invariant.**
+
+**Third pass (GPT) — two acceptance-text defects, both fixed:**
+1. **§7.1 criterion 2 was backwards** — it said the bypasses "change no verdict from any harness," which contradicts §9 (the stale harnesses are *supposed* to change to the common deny). Reworded to **"leave no divergent verdict across harnesses"**: the criterion is convergence, not preservation.
+2. **§7.3 criterion 8 under-covered the closure** — it tested only core + shared-mechanism + loader, while §5 defines the closure to also include registration/config, installers/manifests, and any exemption ledger. Criterion 8 now covers the **whole** closure §5 names, so no test-passing path can redirect *which* law executes. With these, GPT has no further objection to ratification.
