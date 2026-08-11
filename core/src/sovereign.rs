@@ -250,6 +250,22 @@ impl Society {
         }
     }
 
+    /// Read-only probe: the sovereign LCT id the vault currently PERSISTS, if any.
+    ///
+    /// Never mints and never heals — both mint paths warn-and-continue on a failed
+    /// vault write, so a caller about to announce or project an identity can use
+    /// this to require round-trip evidence that the vault actually holds it.
+    pub fn persisted_lct_id(vault: &crate::vault::Vault) -> Option<String> {
+        crate::vault::load_doc::<Option<PersistedSociety>>(
+            vault,
+            SOVEREIGN_NAMESPACE,
+            SOVEREIGN_DOC,
+            SOVEREIGN_LEGACY_FILE,
+        )
+        .unwrap_or(None)
+        .map(|p| p.lct.lct_id())
+    }
+
     /// The society's canonical, key-derived LCT id (`lct:web4:mb32:…`).
     pub fn lct_id(&self) -> String {
         self.lct.lct_id()
@@ -317,6 +333,21 @@ mod tests {
             "sovereign role id stable too"
         );
         assert!(id1.starts_with("lct:web4:mb32:b"));
+    }
+
+    #[test]
+    fn persisted_probe_round_trips_the_minted_identity_and_is_empty_before_mint() {
+        let (_dir, path) = fresh_vault();
+        let mut v = crate::vault::Vault::init(path, "p".into()).unwrap();
+        // Before any mint the probe must report nothing — a probe that reads the
+        // wrong doc slot would instead make every fresh init look non-persisted.
+        assert_eq!(Society::persisted_lct_id(&v), None);
+        let s = Society::load_or_mint(&mut v, "lct:web4:hestia:sovereign:phase1-placeholder");
+        assert_eq!(
+            Society::persisted_lct_id(&v).as_deref(),
+            Some(s.lct_id().as_str()),
+            "the probe reads the SAME doc slot load_or_mint persists"
+        );
     }
 
     #[test]
