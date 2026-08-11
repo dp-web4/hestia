@@ -84,7 +84,7 @@ web4-trust-core = { path = "../../web4/web4-trust-core", features = ["file-store
 web4-policy = { path = "../../web4/web4-policy" }
 # serde_yaml: the web4-policy law payload type (R6Request.payload)
 serde_yaml = "0.9"
-rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
 
 # TUI dashboard
 ratatui = "0.28"
