@@ -135,6 +135,7 @@ Each capability lists the user-facing job and the requirement. "Built" reflects 
 ### 5.8 Trust & identity — *"who is who, provable"*
 - Each user, device, agent, and hub has a witnessed, key-bound identity (LCT) with a trust tensor (T3/V3) built from an append-only witness chain.
 - **R:** identity is surfaced as human trust ("this device is yours, verified"), the machinery inspectable on demand. Session-plane identity **never auto-promotes** to fleet-plane identity.
+- **R (persistence, 2026-08-11):** derived trust is **persisted in the vault as a situational cache** and read from there for display — the deliberate law-following recompute writes the cache; between recomputes the cache is the source of truth; the display path re-derives nothing per poll. Specified in **[`PRD_TRUST_CACHE.md`](PRD_TRUST_CACHE.md)**. (The chain stays the sacred, expensive source; the cache is the cheap situational read the dashboard already declares itself to be.)
 
 ## 6. Non-functional requirements
 
@@ -344,6 +345,29 @@ same gap §11's last risk names, stated where the coverage claim is made.
 - **The primary persona is unevidenced.** Every capability we have shipped was driven by the tertiary persona (the agents). That is a legitimate consequence of where we started climbing — but the roadmap will keep being argued from a persona we have never watched use the product. Criteria 1a/1b/1c exist to close this; until they do, weigh owner-facing claims accordingly.
 
 ## 12. Revision notes
+
+### v6 (2026-08-11) — the dashboard splits agents from hubs, and trust becomes a cached quantity
+
+Recorded from `v0.0.4-29` (the reference daemon rebuilt and restarted at that commit). This
+amendment adds two things and corrects none — the prior current-state claims still hold:
+
+1. **§5.8** gains a persistence requirement: derived trust is **persisted in the vault as a
+   situational cache** and read from there for display. The deliberate, law-following recompute writes
+   the cache; between recomputes the cache is authoritative; the display path re-derives nothing per
+   poll. Full specification in the new **[`PRD_TRUST_CACHE.md`](PRD_TRUST_CACHE.md)**. This reconciles
+   with the standing "the number is the one the law uses" ruling: the law still authors the number, at
+   recompute time — the cache moves *when* it is computed, not *what*.
+2. **`PRD_APP.md` §2.4** records what shipped on the daemon dashboard since `a745180`: two top-level
+   views (Agents / Hubs) with a masthead switch and a smart default (`#348`/`#349`), a trust box that
+   is contextual to the harness selection, idle-but-known harnesses surfaced with a staleness marker,
+   and operator banners kept global above both views. The dashboard has moved *toward* the app's own
+   three-places IA (§4.1), reaching the Activity/Communities split from the other end — so it is now a
+   working reference for the app to instrument, not re-invent.
+
+The kimi observation that motivated all of this — a two-day-idle member vanishing from the trust box —
+is the productive failure: it exposed that display re-derived trust from a volatile window every poll,
+which is the wrong hot path and the wrong source of truth. The cache is the durable answer; the
+idle-harness seed (`v0.0.4-29`) is the bridge, and its removal is part of the cache PRD's done-ness.
 
 ### v5 (2026-08-08) — source, deployment, and release are separate facts
 
