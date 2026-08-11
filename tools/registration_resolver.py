@@ -17,7 +17,10 @@ Machine result states are deliberately not collapsed:
   unparseable     registration / relevant command syntax cannot be parsed
   unknown_reader  expects.json names an unsupported reader
 
-Only `ok` means the resolver actually inspected the registration.
+Only `ok` means the resolver actually inspected the registration. An `ok` result
+also carries `complete`: false means at least one registered command could not be
+classified without guessing, so a consumer must not treat the returned target set
+as exhaustive.
 """
 from __future__ import annotations
 
@@ -27,7 +30,6 @@ import os
 import re
 import shlex
 import stat
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +48,10 @@ _INTERPRETERS = {
     "python", "python2", "python3", "python.exe", "python3.exe",
     "node", "node.exe", "bash", "sh", "zsh", "ruby", "perl",
 }
+_PY_NO_VALUE_FLAGS = {
+    "-B", "-E", "-I", "-O", "-OO", "-P", "-q", "-s", "-S", "-u", "-v",
+}
+_PY_VALUE_FLAGS = {"-W", "-X"}
 
 
 def _result(state: str, **extra: Any) -> dict[str, Any]:
@@ -108,52 +114,72 @@ def _strip_env_prefix(tokens: list[str]) -> list[str]:
     return tokens[i:]
 
 
-def _interpreter_script(tokens: list[str]) -> str | None:
-    """Return the script operand for a small fail-closed interpreter grammar.
+def _python_script(args: list[str]) -> str | None:
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return args[i + 1] if i + 1 < len(args) else None
+        if a in {"-c", "-m"}:
+            return None
+        if a in _PY_VALUE_FLAGS:
+            i += 2
+            continue
+        # Attached forms such as `-Wignore` / `-Xdev` consume themselves.
+        if (a.startswith("-W") and len(a) > 2) or (a.startswith("-X") and len(a) > 2):
+            i += 1
+            continue
+        if a in _PY_NO_VALUE_FLAGS:
+            i += 1
+            continue
+        if a.startswith("-"):
+            # Python's option surface evolves. Guessing whether an unknown option
+            # consumes the next token can turn its value into a phantom hook.
+            return None
+        return a
+    return None
 
-    The old installer scanned every absolute token, which correctly found
-    `python3 /abs/hook.py` but also mistook `/workspace` option values for hooks.
-    Here an argument becomes a target only when it occupies executable/script
-    position. Unknown wrapper syntax is reported as unclassified instead of guessed.
-    """
+
+def _node_script(args: list[str]) -> str | None:
+    if not args:
+        return None
+    for i, a in enumerate(args):
+        if a == "--":
+            return args[i + 1] if i + 1 < len(args) else None
+        if a.startswith("-"):
+            # Node has many options whose values may be separate path-like tokens
+            # (`--require X`, `--loader X`, ...). Until that grammar is explicitly
+            # modelled, any pre-script option is unclassified rather than guessed.
+            return None
+        return a
+    return None
+
+
+def _simple_script_interpreter(args: list[str]) -> str | None:
+    if not args:
+        return None
+    if args[0] == "--":
+        return args[1] if len(args) > 1 else None
+    # bash/ruby/perl all have value-taking options. The common registered-hook
+    # shape is simply `<interpreter> /abs/script`; anything more complex needs a
+    # reviewed grammar before it can be called complete.
+    if args[0].startswith("-"):
+        return None
+    return args[0]
+
+
+def _interpreter_script(tokens: list[str]) -> str | None:
+    """Return a script operand only for interpreter shapes we can classify exactly."""
     if not tokens:
         return None
     head = os.path.basename(tokens[0]).lower()
     args = tokens[1:]
-
     if head in {"python", "python2", "python3", "python.exe", "python3.exe"}:
-        i = 0
-        while i < len(args):
-            a = args[i]
-            if a in {"-c", "-m"}:
-                return None
-            if a in {"-W", "-X"}:
-                i += 2
-                continue
-            if a.startswith("-"):
-                i += 1
-                continue
-            return a
-        return None
-
+        return _python_script(args)
     if head in {"node", "node.exe"}:
-        for a in args:
-            if a in {"-e", "--eval", "-p", "--print"}:
-                return None
-            if a.startswith("-"):
-                continue
-            return a
-        return None
-
+        return _node_script(args)
     if head in {"bash", "sh", "zsh", "ruby", "perl"}:
-        for a in args:
-            if a == "-c":
-                return None
-            if a.startswith("-"):
-                continue
-            return a
-        return None
-
+        return _simple_script_interpreter(args)
     return None
 
 
@@ -189,7 +215,7 @@ def _command_target(command: str) -> tuple[str | None, str | None]:
     if os.path.basename(head).lower() in _INTERPRETERS:
         script = _interpreter_script(tokens)
         if script is None:
-            return None, "interpreter invocation has no classifiable script operand"
+            return None, "interpreter invocation has no safely classifiable script operand"
         expanded = os.path.expandvars(os.path.expanduser(script))
         if os.path.isabs(expanded):
             return _expand_path(expanded), None
@@ -201,7 +227,10 @@ def _command_target(command: str) -> tuple[str | None, str | None]:
     return None, "command head is neither an absolute artifact nor a known interpreter"
 
 
-def resolve_registration(expects_path: str | os.PathLike[str], home: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+def resolve_registration(
+    expects_path: str | os.PathLike[str],
+    home: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
     expects = Path(expects_path)
     try:
         manifest = json.loads(expects.read_text(encoding="utf-8"))
@@ -216,20 +245,38 @@ def resolve_registration(expects_path: str | os.PathLike[str], home: str | os.Pa
     if not isinstance(segs, list) or not segs or not reader:
         return _result("not_declared", member=member, expects=str(expects))
     if not all(isinstance(s, str) and s for s in segs):
-        return _result("unparseable", member=member, expects=str(expects), error="registration.path must be non-empty string segments")
+        return _result(
+            "unparseable",
+            member=member,
+            expects=str(expects),
+            error="registration.path must be non-empty string segments",
+        )
     if reader not in {"json-hook-commands", "toml-hook-commands"}:
-        return _result("unknown_reader", member=member, expects=str(expects), reader=reader)
+        return _result(
+            "unknown_reader", member=member, expects=str(expects), reader=reader
+        )
 
     root = Path(home) if home is not None else Path.home()
     registration = root.joinpath(*segs)
     try:
         text = registration.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return _result("not_present", member=member, expects=str(expects), reader=reader, registration_path=str(registration))
-    except PermissionError as e:
-        return _result("unreadable", member=member, expects=str(expects), reader=reader, registration_path=str(registration), error=str(e))
-    except OSError as e:
-        return _result("unreadable", member=member, expects=str(expects), reader=reader, registration_path=str(registration), error=str(e))
+        return _result(
+            "not_present",
+            member=member,
+            expects=str(expects),
+            reader=reader,
+            registration_path=str(registration),
+        )
+    except (PermissionError, OSError) as e:
+        return _result(
+            "unreadable",
+            member=member,
+            expects=str(expects),
+            reader=reader,
+            registration_path=str(registration),
+            error=str(e),
+        )
 
     try:
         commands: list[str] = []
@@ -249,19 +296,30 @@ def resolve_registration(expects_path: str | os.PathLike[str], home: str | os.Pa
                 continue
             kind = _kind(target)
             if kind == "directory":
-                discarded.append({"path": target, "reason": "existing directory is not a hook artifact"})
+                discarded.append(
+                    {"path": target, "reason": "existing directory is not a hook artifact"}
+                )
                 continue
             if target in seen:
                 continue
             seen.add(target)
-            targets.append({
-                "path": target,
-                "basename": os.path.basename(target),
-                "exists": kind != "missing",
-                "kind": kind,
-            })
+            targets.append(
+                {
+                    "path": target,
+                    "basename": os.path.basename(target),
+                    "exists": kind != "missing",
+                    "kind": kind,
+                }
+            )
     except (ValueError, TypeError) as e:
-        return _result("unparseable", member=member, expects=str(expects), reader=reader, registration_path=str(registration), error=str(e))
+        return _result(
+            "unparseable",
+            member=member,
+            expects=str(expects),
+            reader=reader,
+            registration_path=str(registration),
+            error=str(e),
+        )
 
     return _result(
         "ok",
