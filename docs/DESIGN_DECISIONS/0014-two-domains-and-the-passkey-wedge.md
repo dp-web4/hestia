@@ -1,8 +1,12 @@
 # 0014 — Two domains, the app as human harness, and the passkey wedge
 
 **Status:** draft for review (dp, 2026-08-08). Review order: GPT → kimi → fleet forum. **Not ratified.**
+GPT review incorporated 2026-08-08; kimi second review incorporated 2026-08-11 (two divergences
+corrected, two additions adopted — marked **(kimi)** below).
 **Builds on:** decision 0013 (an appeal binds to the act), the signature premise, `PRD_APP.md` (#296).
-**Supersedes in `PRD_APP.md`:** §2 assumed the app sits on a daemon. It does not, and should not.
+**Supersedes in `PRD_APP.md`:** §2 assumed the app sits *on* a daemon architecturally. It does not:
+the separation of authority and identity is logical and is ruled here. How the two are *packaged and
+installed* is not ruled here — see §8, open list.
 
 ---
 
@@ -67,9 +71,15 @@ This is the cleanest framing anyone has put on the app, and it resolves question
 - The role is **usually sovereign, not definitionally so.** An app on a family member's phone might
   hold a lesser role on the same daemon. The app is not "the operator's window"; it is "a member
   that often occupies the operator's office."
-- **The app is separate from the daemon and does not bundle it.** Measured: `src-tauri` does not
-  depend on `hestia` core, `daemon.rs` is 112 lines of `reqwest`, and `lib.rs:39` hardcodes
+- **The app is logically separate from the daemon.** Measured: `src-tauri` does not depend on
+  `hestia` core, `daemon.rs` is 112 lines of `reqwest`, and `lib.rs:39` hardcodes
   `http://127.0.0.1:7711`. It is already a client; it should become a *member* rather than a viewer.
+  **(kimi, restoring GPT cond. 8)** That measurement proves *logical* separation — distinct code,
+  distinct authority, the app never inside the daemon's trust boundary. It does **not** rule
+  packaging: an installer that ships and manages the daemon alongside the app may be the right
+  first-run answer for a nontechnical user, and an identity decision should not constrain
+  onboarding. An earlier revision said "does not bundle it," which read as a distribution ruling
+  this document never argued for; packaging is returned to the open list (§8).
 - **Sovereign-capable, per dp** — the app must be able to be a full node where that makes sense, not
   only a thin client. But sovereignty is **not one profile**: see §4.
 
@@ -231,6 +241,11 @@ This keeps the wedge available now without pretending the hard cryptography alre
 makes the difference between A and B a *stated assurance claim* rather than an implementation detail
 nobody wrote down.
 
+**(kimi)** GPT's closing rule belongs in the text, not the review thread: *a declaration that
+several devices approved is not stronger identity.* It is the identity-domain twin of the
+governance layer's own hard-won law — declared is not alive, attested is not witnessed. Same rule,
+two domains; shape A is a declaration, shape B is a witness.
+
 ### 5.6 Availability may degrade service; it may not silently degrade assurance (GPT §8)
 
 The fleet's standing principle — *unavailability degrades, it does not block* — **cannot be copied
@@ -281,6 +296,39 @@ there is no column to hold one. The primitive is correct (N marks verify against
 > consequential (they fill the sovereign role), and it already depends on `ed25519-dalek`. Making the
 > app's acts signed from its first release produces the reference implementation the harness gates
 > get retrofitted against — rather than retrofitting five gates first and hoping the app matches.
+
+### 6.1 Two signature roles, both named before entry zero **(kimi, restoring GPT cond. 10)**
+
+"The app should be the first signer" names the **actor** signature — who performed the act. GPT's
+condition 10 asks for a second, distinct role: the **witness/chain** signature — who attests the
+entry's *ordering and inclusion*, and under which policy generation. One signature carrying both
+meanings is exactly the ambiguity the fresh chain exists to avoid, and it is expensive to recover
+once entries accumulate.
+
+> **Ruling: the new chain's entry format carries both roles from genesis — an actor signature over
+> the versioned semantic act digest, and a chain-witness signature over a versioned envelope binding
+> chain identity, position, row hash (which commits to the act digest for an act-bearing row), policy
+> generation, signer identity, and signing-time key identity. The witness side may begin as a
+> single-daemon signer; what may not happen is a genesis whose format has no place for it.**
+
+The landed B1 primitive is only the first half. `hestia-wire::ActDigestV1Fields` freezes the semantic
+act bytes, and `witness_act.rs` currently uses that digest for a witness attestation; its production
+functions still have zero callers. It does **not** implement the chain-witness role above:
+`witness_act` appends a legacy unsigned row and binds neither the chain coordinate nor the policy
+generation. B2 / `#339` owns that versioned chain-signature envelope and must absorb the full tuple
+ruled here. This remains a *format* decision, and the chain rewrite is the one moment when adding it
+is free.
+
+### 6.2 Archive means readable by the instruments **(kimi + claude S6 amendment)**
+
+Three days of this fleet's accountability work — the refusal censuses, the stranding audits, the
+escalation-drain numbers — key on the current chain via `chain_walk`, and decision 0013 binds
+appeals to acts by `deny_hash`. If "archive" means *retained but not queryable*, every pre-archive
+`deny_hash` binding dangles and that history gets re-litigated from memory.
+
+> **Ruling: the archived chain must remain queryable by the existing instruments (`chain_walk` and
+> the audit tooling) at stable addresses. Archive is a change of writability, not of legibility:
+> the old chain stops growing; it does not stop answering.**
 
 ---
 
@@ -340,19 +388,32 @@ still bounded.
 
 **Decided:**
 1. Governance vault and identity vault are separate stores with different scopes and lifetimes.
-2. The app is a member with an LCT that fills roles; it does not bundle the daemon.
+2. The app is a member with an LCT that fills roles; it is logically separate from the daemon.
+   (Packaging/distribution is **not** decided here — open list.)
 3. **Sovereign is an office**, occupied and revocable — not a property of a machine. *Presence*
    is the profile (device / node / mirror): what a participant can host, which is a separate axis
    from what authority it holds. §4. (This item previously read *"Sovereignty is a profile"*,
    which reintroduced the exact category error §4 removes; corrected before ratification.)
 4. The adoption wedge is WebAuthn, with m-of-n as hestia-side policy above it.
-5. The chain is archived and re-created signed, rather than migrated.
+5. The chain is archived and re-created signed, rather than migrated. The new format names **both**
+   signature roles from genesis (§6.1), and the archive stays queryable by the existing
+   instruments at stable addresses (§6.2).
 6. First increment is the operator key into the identity vault — **done, `#298`** (encrypted
    custody + triply signed five-field session; wire format consolidated in `#300`). §7.
+7. **(kimi)** Where m-of-n thresholds are authored is a law-vs-setting question, and the fleet's
+   own machinery supplies the answer: **assurance *floors* are law** — vault-authored,
+   society-visible, appealable — and per-relying-party tuning is policy *within* those floors.
+   A threshold that a setting can push below the floor is a day-one implementation hole in §5.6's
+   constitutional line; the floor must live where settings cannot reach it.
 
 **Open, and genuinely undecided:**
-- **Where the m-of-n threshold is authored.** Per-relying-party? Per-act-class? Owner-set globally?
-  This is policy authorship and the answer determines whether it is a setting or a law.
+- **Packaging and distribution** (returned to open by kimi's review, per GPT cond. 8): whether a
+  first-run installer ships and manages the daemon alongside the app. §2 rules the *logical*
+  separation only; the onboarding trade-off — a nontechnical user's first five minutes versus a
+  clean separation story — is a product ruling nobody has made yet.
+- **The granularity of m-of-n tuning within the law-authored floors** (per-relying-party,
+  per-act-class, or both) — the law/setting boundary itself is decided (item 7); the policy
+  surface inside it is not.
 - **What happens when m cannot be reached** — travelling with one device, others at home. §5.6 is
   the constraint: service may degrade, **identity assurance may not silently degrade**, so "relax
   the threshold because the user is stuck" is *not* on the menu. The genuinely open question is
