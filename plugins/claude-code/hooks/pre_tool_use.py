@@ -88,8 +88,14 @@ def _set_last_failure(kind: str) -> None:
     _LAST_FAILURE = kind
 
 
-# Per-request HTTP timeout.
-REQUEST_TIMEOUT_S = 0.5
+# Per-request HTTP timeout. Raised 0.5 -> 5.0 and made overridable (dp, 2026-08-11), propagating
+# the society gate's 2026-08-07 fix that never reached this hook. 0.5s was the BINDING constraint,
+# NOT TOTAL_BUDGET_MS: the call site takes min(REQUEST_TIMEOUT_S, remaining), so raising only the
+# total budget was a no-op — every request died at 500ms under any daemon slowness (a loaded box, or
+# the memory-sawtooth), fail-closing the member with "no policy verdict" while the daemon was merely
+# slow, not down. Must stay below TOTAL_BUDGET_MS (set per-member in the launcher), which must itself
+# stay below the engine's hook timeout, or a gate call rides past the engine deadline and fails OPEN.
+REQUEST_TIMEOUT_S = float(os.environ.get("HESTIA_PRE_REQUEST_TIMEOUT_S", "5.0"))
 # Cap on re-poll iterations during the "evaluating" wait protocol.
 MAX_POLLS = 5
 # Floor on poll sleep to avoid busy loops if daemon misbehaves.
