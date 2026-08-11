@@ -1,9 +1,8 @@
 name: release
 
-# Builds prebuilt hestia binaries for the four primary targets and
-# attaches them to a GitHub Release. Trigger by pushing a tag matching
-# v*.*.* (e.g. v0.0.4). The dashboard HTML is baked into the binary
-# via include_str!, so the single executable is the entire artifact.
+# Builds prebuilt hestia binaries and attaches them to a GitHub Release.
+# Trigger by pushing a tag matching v*.*.* (e.g. v0.0.4). The dashboard HTML
+# is baked into the binary via include_str!, so the executable is the artifact.
 #
 # RELEASE INPUTS ARE PART OF THE ARTIFACT. Hestia currently consumes Web4
 # crates through sibling path dependencies, which Cargo.lock cannot pin.
@@ -35,29 +34,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Fleet targets in order: CBP/Thor/Legion/Nomad (x86_64 linux),
-          # Sprout (aarch64 linux/Jetson), McNugget (aarch64 darwin/M-series).
-          # Windows is a bonus — no fleet machine runs Windows but the
-          # plugin reaches Windows users via Claude Code.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             archive: tar.gz
-          # Windows + macOS are TEMPORARILY OUT (2026-08-11). The daemon links
-          # `rusqlite` with `bundled-sqlcipher`, whose C build needs a crypto
-          # backend (OpenSSL/SQLCipher) that the windows-latest and macos-14
-          # runners do not provide out of the box — libsqlite3-sys fails its
-          # build command there while both Linux targets build clean. This is a
-          # per-runner crypto-toolchain task, filed as follow-up; shipping the
-          # Linux targets now beats shipping nothing (no release since v0.0.3).
-          # Restore these two once the runners have the SQLCipher crypto backend.
+          # Windows restored independently after the first v0.0.4 matrix proved
+          # the cross-repo checkout and exposed SQLCipher's missing crypto-provider
+          # discovery. The Windows runner ships OpenSSL; the step below verifies and
+          # exports its actual development paths before Cargo runs.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+          # macOS remains deliberately out until its SQLCipher crypto backend is
+          # independently measured. Restoring Windows is not evidence for macOS.
     steps:
-      # Two repos as SIBLING subdirs of the workspace — the pattern ci.yml proved
-      # green. hestia/core has path deps into ../../web4/..., so the release must
-      # materialize the same layout. Unlike integration CI, Web4 is pinned above:
-      # rebuilding one Hestia tag later must not silently produce different bytes.
       - uses: actions/checkout@v4
         with:
           path: hestia
@@ -80,6 +72,64 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # rusqlite 0.31's `bundled-sqlcipher` bundles SQLCipher but expects the
+      # crypto provider from the host. libsqlite3-sys consults OPENSSL_DIR /
+      # OPENSSL_INCLUDE_DIR / OPENSSL_LIB_DIR. The GitHub Windows image includes
+      # OpenSSL, but the first real release build showed those paths are not
+      # exported for build scripts. Discover the actual development files rather
+      # than pinning a machine path; fail before Cargo if the runner image changes.
+      - name: Locate OpenSSL for SQLCipher (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $roots = [System.Collections.Generic.List[string]]::new()
+          foreach ($candidate in @(
+            'C:\Program Files\OpenSSL',
+            'C:\Program Files\OpenSSL-Win64',
+            'C:\OpenSSL-Win64'
+          )) {
+            if (Test-Path $candidate) { $roots.Add($candidate) }
+          }
+
+          $opensslCmd = Get-Command openssl.exe -ErrorAction SilentlyContinue
+          if ($opensslCmd) {
+            $bin = Split-Path $opensslCmd.Source -Parent
+            $root = Split-Path $bin -Parent
+            if (Test-Path $root) { $roots.Add($root) }
+          }
+
+          $selected = $null
+          $crypto = $null
+          foreach ($root in ($roots | Select-Object -Unique)) {
+            $header = Join-Path $root 'include\openssl\ssl.h'
+            if (-not (Test-Path $header)) { continue }
+            $crypto = Get-ChildItem -Path $root -Recurse -File -Filter 'libcrypto.lib' -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if ($crypto) {
+              $selected = $root
+              break
+            }
+          }
+
+          if (-not $selected -or -not $crypto) {
+            Write-Host 'Candidate OpenSSL roots:'
+            $roots | Select-Object -Unique | ForEach-Object { Write-Host "  $_" }
+            throw 'OpenSSL development headers/libcrypto.lib not found on the Windows runner'
+          }
+
+          $include = Join-Path $selected 'include'
+          $lib = Split-Path $crypto.FullName -Parent
+          "OPENSSL_DIR=$selected" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OPENSSL_INCLUDE_DIR=$include" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OPENSSL_LIB_DIR=$lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "OPENSSL_DIR=$selected"
+          Write-Host "OPENSSL_INCLUDE_DIR=$include"
+          Write-Host "OPENSSL_LIB_DIR=$lib"
+          if ($opensslCmd) { & $opensslCmd.Source version }
 
       - name: Build hestia
         working-directory: hestia/core
@@ -146,11 +196,11 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           name: ${{ github.event.inputs.tag || github.ref_name }}
           body: |
-            Prebuilt `hestia` daemon binaries for the four primary targets.
+            Prebuilt `hestia` daemon binaries for the targets attached to this release.
 
             Build provenance: Web4 `${{ env.WEB4_REF }}`.
 
-            Install (Linux / macOS):
+            Linux example:
             ```sh
             curl -L https://github.com/dp-web4/hestia/releases/download/${{ github.event.inputs.tag || github.ref_name }}/hestia-${{ github.event.inputs.tag || github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz | tar -xz
             ./hestia-${{ github.event.inputs.tag || github.ref_name }}-x86_64-unknown-linux-gnu/hestia --version
