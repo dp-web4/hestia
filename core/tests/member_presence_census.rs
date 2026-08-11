@@ -444,6 +444,22 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/state.rs::trust_entity_key", &[
         "match self.member_lct(plugin_id) {",
     ], SiteClass::Naming),
+    // ADDED 2026-08-11 (claude-code, #352 — idle-but-known harness surfacing). The census went
+    // red the moment this site was written — the instrument working.
+    //
+    // READING, both questions. (1) Who gets named? It RECOVERS a persisted grain's harness pid
+    // for the dashboard trust list: reverse-mapping a stored key (`{member_lct}#{role}`) back to
+    // the registry harness that owns it, so an idle-but-known member (kimi, days quiet) shows its
+    // most recent standing instead of dropping off the list. It surfaces an EXISTING name; it
+    // mints and records nothing. It is the exact INVERSE of `trust_entity_key` above (which
+    // derives the same lct to BUILD the key) and shares its class. (2) Compared to gate a
+    // governance decision? No — the derived lct enters a reverse-lookup map, and the only control
+    // flow it gates is which read-only rows appear, and under which harness name, in the trust
+    // box. No allow/deny, no chain attribution, no NOT-SAME independence check. Naming, not
+    // Predicate; no comparison pinned.
+    ("server/dashboard.rs::dashboard_snapshot_window", &[
+        "if let Some(lct) = self.member_lct(orch.id) {",
+    ], SiteClass::Naming),
 ];
 
 /// The comparison lines of every `SiteClass::Predicate` site, pinned verbatim

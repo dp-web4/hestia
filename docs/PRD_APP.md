@@ -69,6 +69,31 @@ largest gap between what this document promises and what a user can obtain."*
 > in no repository but my own audit. Corrected at `shared-context@5c18b89a`. Recorded here because
 > **an app PRD written against an imagined artifact is the same error one level up.**
 
+### 2.4 What shipped on the DASHBOARD since this baseline (2026-08-11, `v0.0.4-29`)
+
+The measured state above is the **Tauri app**. The **daemon web dashboard** — the surface dp actually
+uses — moved substantially after `a745180`, and toward this PRD's own IA (§4), not away from it:
+
+- **Two top-level views, Agents and Hubs, with a masthead switch** (`#348`/`#349`). The hub surface
+  was a strip at the bottom of the agents screen; it is now a peer view. This is the dashboard
+  reaching the same split §4.1 proposes for the app — *Activity* (agents/local governance) vs
+  *Communities* (hubs) — arrived at from the other end. The switch defaults intelligently: a hestia
+  with no local agents and no trust history opens on Hubs (its whole screen on a mobile/hub-only
+  node), matching this PRD's "hubs is the dominant surface where there is nothing local to govern."
+- **The trust box is now contextual** (`#349`): *All* selected → one line per **harness** (aggregate
+  level, actions, role count); one harness selected → **role trust** for that harness with the full
+  tensor/receipts on drill-in. This is §4.3 progressive disclosure made operable in the dashboard.
+- **Idle-but-known harnesses are surfaced** (`v0.0.4-29`): a member idle for days (kimi-code) shows
+  its most recent standing with an "idle Nd/Nmo" marker rather than vanishing. This is a **stopgap**
+  for the deeper fix now specified in **[`PRD_TRUST_CACHE.md`](PRD_TRUST_CACHE.md)** — trust lives in
+  the vault as a situational cache, read for display, recomputed on a trigger, never re-derived per
+  poll. The dashboard trust surface is the first consumer of that cache.
+- Operator **escalation/scope banners stay global**, above whichever view is mounted — a pending
+  decision is never hidden behind a tab, which is R0 (§3) holding under the new structure.
+
+The point for the app: the dashboard is now a working reference for the IA this PRD argues, and the
+app's job (§2.1) is still to become the *instrument* the dashboard is proving out, not to re-invent it.
+
 ---
 
 ## 3. The primary persona is no longer unevidenced
@@ -138,6 +163,18 @@ trust tensors, tool histograms, derivation internals: all present, none default.
 
 > **R1 — non-salient data is never on a default path.** If a datum cannot change what the owner does
 > in the next minute, it does not appear until requested.
+
+> **R1a — safety/governance status is surfaced usefully and prominently, never buried in a drawer**
+> (dp, 2026-08-11). Coverage — *is each harness actually governed, or is a gate MISWIRED and failing
+> OPEN?* — is the single most consequential thing the owner can be wrong about, and it is the
+> counterpart to R1: it is *always* salient. It must be readable at a glance on the primary surface,
+> not behind a click. A drawer that shows "nothing wrong" on a fully-governed box reads as "useless"
+> and gets removed — losing the alarm for the day a gate *is* miswired. The requirement is that the
+> status live where the owner already looks. **Met in the dashboard by:** a colored coverage dot on
+> each harness chip (green governed · amber not-fully-governed · **red MISWIRED — fails open**) and a
+> coverage badge in the header of that harness's role-trust view. The specific rendering is an
+> implementation of the requirement, not the requirement — the invariant is *prominent, glanceable,
+> per-harness*, and `miswired` must be the loudest state because it is the one that fails open.
 
 ### 4.3 Progressive disclosure, three depths
 
