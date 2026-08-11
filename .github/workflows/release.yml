@@ -45,12 +45,14 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             archive: tar.gz
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
-          - target: aarch64-apple-darwin
-            os: macos-14
-            archive: tar.gz
+          # Windows + macOS are TEMPORARILY OUT (2026-08-11). The daemon links
+          # `rusqlite` with `bundled-sqlcipher`, whose C build needs a crypto
+          # backend (OpenSSL/SQLCipher) that the windows-latest and macos-14
+          # runners do not provide out of the box — libsqlite3-sys fails its
+          # build command there while both Linux targets build clean. This is a
+          # per-runner crypto-toolchain task, filed as follow-up; shipping the
+          # Linux targets now beats shipping nothing (no release since v0.0.3).
+          # Restore these two once the runners have the SQLCipher crypto backend.
     steps:
       # Two repos as SIBLING subdirs of the workspace — the pattern ci.yml proved
       # green. hestia/core has path deps into ../../web4/..., so the release must
