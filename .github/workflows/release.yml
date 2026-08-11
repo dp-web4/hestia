@@ -1,14 +1,14 @@
 name: release
 
 # Builds prebuilt hestia binaries and attaches them to a GitHub Release.
-# Trigger by pushing a tag matching v*.*.* (e.g. v0.0.4). The dashboard HTML
-# is baked into the binary via include_str!, so the executable is the artifact.
+# Tag pushes / workflow_dispatch publish. Pull requests run the SAME build
+# matrix as a release smoke test but never publish, so platform/toolchain
+# regressions are measured before they reach a tag.
 #
 # RELEASE INPUTS ARE PART OF THE ARTIFACT. Hestia currently consumes Web4
 # crates through sibling path dependencies, which Cargo.lock cannot pin.
 # Integration CI intentionally tracks Web4 main; releases MUST NOT. Bump
-# WEB4_REF deliberately before creating each release tag. The workflow stored
-# at that tag then records the exact cross-repo source that produced its bytes.
+# WEB4_REF deliberately before creating each release tag.
 env:
   WEB4_REF: 9958fc6a37279a8fad2872fec1a07ea3ec92224b
 
@@ -22,6 +22,11 @@ on:
         description: 'Tag to release (e.g. v0.0.4). Must already exist.'
         required: true
         type: string
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'core/Cargo.toml'
+      - 'core/Cargo.lock'
 
 permissions:
   contents: write
@@ -40,15 +45,13 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             archive: tar.gz
-          # Windows restored independently after the first v0.0.4 matrix proved
-          # the cross-repo checkout and exposed SQLCipher's missing crypto-provider
-          # discovery. The Windows runner ships OpenSSL; the step below verifies and
-          # exports its actual development paths before Cargo runs.
+          # Windows restored independently after the first v0.0.4 matrix exposed
+          # SQLCipher's missing crypto-provider discovery. This PR must prove both
+          # that it LINKS and that the resulting EXE does not depend on an external
+          # libcrypto/libssl DLL before the row can reach main.
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
-          # macOS remains deliberately out until its SQLCipher crypto backend is
-          # independently measured. Restoring Windows is not evidence for macOS.
     steps:
       - uses: actions/checkout@v4
         with:
@@ -78,7 +81,7 @@ jobs:
       # OPENSSL_INCLUDE_DIR / OPENSSL_LIB_DIR. The GitHub Windows image includes
       # OpenSSL, but the first real release build showed those paths are not
       # exported for build scripts. Discover the actual development files rather
-      # than pinning a machine path; fail before Cargo if the runner image changes.
+      # than pinning a machine path; fail before Cargo if the image changes.
       - name: Locate OpenSSL for SQLCipher (windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -135,6 +138,31 @@ jobs:
         working-directory: hestia/core
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      # A compile on a machine that already carries OpenSSL is insufficient evidence
+      # for a downloadable single-executable artifact. Inspect the PE import table and
+      # reject a binary that would require users to install libcrypto/libssl beside it.
+      - name: Assert Windows executable is standalone
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw 'vswhere.exe not found; cannot inspect PE dependencies' }
+          $vs = (& $vswhere -latest -products * -property installationPath).Trim()
+          if (-not $vs) { throw 'Visual Studio installation not found' }
+          $toolset = Get-ChildItem (Join-Path $vs 'VC\Tools\MSVC') -Directory |
+            Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $toolset) { throw 'MSVC toolset not found' }
+          $dumpbin = Join-Path $toolset.FullName 'bin\Hostx64\x64\dumpbin.exe'
+          if (-not (Test-Path $dumpbin)) { throw "dumpbin not found at $dumpbin" }
+
+          $exe = "hestia/core/target/${{ matrix.target }}/release/hestia.exe"
+          $deps = (& $dumpbin /dependents $exe | Out-String)
+          Write-Host $deps
+          if ($deps -match '(?i)libcrypto|libssl') {
+            throw 'Windows release depends on an external OpenSSL DLL; not a standalone artifact'
+          }
+
       - name: Stage artifacts (unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
@@ -178,6 +206,7 @@ jobs:
 
   release:
     name: publish release
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     steps:
