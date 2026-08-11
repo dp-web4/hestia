@@ -1,17 +1,15 @@
 name: release
 
-# Builds prebuilt hestia binaries for the four primary targets and
-# attaches them to a GitHub Release. Trigger by pushing a tag matching
-# v*.*.* (e.g. v0.0.4). The dashboard HTML is baked into the binary
-# via include_str!, so the single executable is the entire artifact.
+# Builds prebuilt hestia binaries and attaches them to a GitHub Release.
+# Trigger by pushing a tag matching v*.*.* (e.g. v0.0.4) or dispatching an
+# existing tag. The dashboard HTML is baked into the binary, so the single
+# executable is the runtime artifact.
 #
 # RELEASE INPUTS ARE PART OF THE ARTIFACT. Hestia currently consumes Web4
 # crates through sibling path dependencies, which Cargo.lock cannot pin.
 # Integration CI intentionally tracks Web4 main; releases MUST NOT. Bump
-# WEB4_REF deliberately before creating each release tag. The workflow stored
-# at that tag then records the exact cross-repo source that produced its bytes.
-env:
-  WEB4_REF: 9958fc6a37279a8fad2872fec1a07ea3ec92224b
+# web4.pin deliberately before creating each release tag. That file is the
+# single source of truth for the exact cross-repo source that produced bytes.
 
 on:
   push:
@@ -48,38 +46,42 @@ jobs:
           # x86_64-pc-windows-msvc is OUT pending source portability: the daemon
           # uses std::os::unix + Permissions::set_mode (Unix-only). SQLCipher now
           # builds on windows (vendored OpenSSL), so the remaining work is cfg-gating
-          # the Unix file-mode calls — filed as follow-up. Linux + macOS cover the
-          # whole fleet.
+          # the Unix file-mode calls — filed as #342. Linux + macOS cover the fleet.
           - target: aarch64-apple-darwin
             os: macos-14
             archive: tar.gz
     steps:
       # Two repos as SIBLING subdirs of the workspace — the pattern ci.yml proved
       # green. hestia/core has path deps into ../../web4/..., so the release must
-      # materialize the same layout. Unlike integration CI, Web4 is pinned above:
-      # rebuilding one Hestia tag later must not silently produce different bytes.
+      # materialize the same layout. Unlike integration CI, Web4 is pinned by the
+      # hestia source being released.
       - uses: actions/checkout@v4
         with:
           path: hestia
           ref: ${{ github.event.inputs.tag || github.ref }}
+
       - name: Read pinned web4 rev
         id: web4pin
         shell: bash
-        run: echo "rev=$(grep -oiE '[0-9a-f]{7,40}' hestia/web4.pin | head -1)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          rev="$(grep -oiE '[0-9a-f]{40}' hestia/web4.pin | head -1)"
+          test -n "$rev"
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           repository: dp-web4/web4
           ref: ${{ steps.web4pin.outputs.rev }}
           path: web4
-          ref: ${{ env.WEB4_REF }}
 
       - name: Record release inputs
         shell: bash
         run: |
           set -euo pipefail
           echo "hestia_ref=${{ github.event.inputs.tag || github.ref_name }}"
-          echo "web4_ref=${WEB4_REF}"
-          test "$(git -C web4 rev-parse HEAD)" = "$WEB4_REF"
+          echo "web4_ref=${{ steps.web4pin.outputs.rev }}"
+          test "$(git -C web4 rev-parse HEAD)" = "${{ steps.web4pin.outputs.rev }}"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -136,6 +138,22 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # Read provenance from the SAME hestia source/tag the build consumed. Do not
+      # duplicate the pin in workflow env or prose; one release input gets one owner.
+      - uses: actions/checkout@v4
+        with:
+          path: hestia
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Read pinned web4 rev
+        id: web4pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          rev="$(grep -oiE '[0-9a-f]{40}' hestia/web4.pin | head -1)"
+          test -n "$rev"
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -151,11 +169,11 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           name: ${{ github.event.inputs.tag || github.ref_name }}
           body: |
-            Prebuilt `hestia` daemon binaries for the four primary targets.
+            Prebuilt `hestia` daemon binaries for the targets attached to this release.
 
-            Build provenance: Web4 `${{ env.WEB4_REF }}`.
+            Build provenance: Web4 `${{ steps.web4pin.outputs.rev }}`.
 
-            Install (Linux / macOS):
+            Linux example:
             ```sh
             curl -L https://github.com/dp-web4/hestia/releases/download/${{ github.event.inputs.tag || github.ref_name }}/hestia-${{ github.event.inputs.tag || github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz | tar -xz
             ./hestia-${{ github.event.inputs.tag || github.ref_name }}-x86_64-unknown-linux-gnu/hestia --version
@@ -164,7 +182,8 @@ jobs:
             The dashboard HTML is baked into the binary; nothing else is required to run.
           draft: false
           prerelease: false
-          fail_on_unmatched_files: false  # windows .zip absent while win/mac are out (SQLCipher runner toolchain); tolerate the missing pattern
+          # Windows ZIPs are intentionally absent until #342 is resolved.
+          fail_on_unmatched_files: false
           files: |
             dist/hestia-*.tar.gz
             dist/hestia-*.tar.gz.sha256
