@@ -48,6 +48,8 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: wrap;
+    row-gap: 0.75rem;
     background: linear-gradient(to bottom, var(--bg-elev), var(--bg));
   }
   .brand {
@@ -782,6 +784,19 @@
   .orch-connect[data-connectable="false"] { color: var(--fg-faint); cursor: default; }
   /* connected but idle: live + wired, just no tool calls in the last hour */
   .orch-idle { color: var(--fg-faint); font-size: 0.7rem; margin-left: 0.35rem; }
+  /* Governance coverage (moved out of the agents drawer): a colored dot on each harness chip
+     and a badge in the role-trust header. red = MISWIRED (fails open), amber = not fully
+     governed, green = governed, grey = not installed here. */
+  .gov-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 0.4rem; flex: 0 0 auto; }
+  .gov-dot.gov-green { background: var(--success); box-shadow: 0 0 6px var(--success); }
+  .gov-dot.gov-amber { background: var(--warning); box-shadow: 0 0 6px var(--warning); }
+  .gov-dot.gov-red   { background: var(--coral);   box-shadow: 0 0 7px var(--coral); }
+  .gov-dot.gov-grey  { background: var(--fg-faint); }
+  .gov-badge { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em; padding: 0.12rem 0.5rem; border-radius: 999px; font-family: var(--mono); }
+  .gov-badge.gov-green { color: var(--success); background: #4ade8018; }
+  .gov-badge.gov-amber { color: var(--warning); background: #facc1518; }
+  .gov-badge.gov-red   { color: var(--coral);   background: #ff7a6618; }
+  .gov-badge.gov-grey  { color: var(--fg-faint); background: var(--bg-elev); }
 .trust-alias { font-size:0.7rem; color:#94a3b8; font-style:italic; margin:0.15rem 0 0.3rem; }
   /* Web4 hub card */
   .hub-card { margin-top: 1rem; }
@@ -839,12 +854,7 @@
           <option value="all">all time</option>
         </select></span>
       </div>
-      <div class="hstat"><span class="hs-val success" id="stat-rate">—</span><span class="hs-lab" id="stat-rate-delta">success</span></div>
     </div>
-    <!-- The read list hangs off the title bar rather than taking a panel (dp): what is
-         installed here, what hestia could govern, what it actually governs. It is a
-         different question from the working screen — "who is on this box" vs "what are
-         they doing" — and it is asked occasionally, so it gets a drawer, not real estate. -->
     <!-- LEDGER (dp, 2026-08-05): "i need a separate witness chain of admin actions from which i
          can select/review/approve/deny, sortable by all/open/approved/denied ... currently i do
          not see any escalations for me to approve/deny, nor can i see any history."
@@ -856,20 +866,6 @@
               title="Governance ledger — escalations, law edits, grants, adjudications, with history">
         ledger <span class="agents-badge" id="ledger-badge">·</span>
       </button>
-    </div>
-    <div class="agents-wrap">
-      <button type="button" class="agents-btn" id="agents-btn" aria-expanded="false"
-              title="Agents installed on this machine, and which of them are governed">
-        agents <span class="agents-badge" id="agents-badge">·</span>
-      </button>
-      <div class="agents-menu" id="agents-menu" hidden>
-        <div class="agents-head">
-          <span id="agents-summary">loading…</span>
-          <button type="button" class="agents-refresh" id="agents-refresh" title="Re-run the inventory now">refresh</button>
-        </div>
-        <div id="agents-body"><div class="empty">…</div></div>
-        <div class="agents-foot" id="agents-foot"></div>
-      </div>
     </div>
     <div class="live">
       <span class="deployment-health unknown" id="deployment-health" title="Deployment freshness">● deployment unknown</span>
@@ -1440,20 +1436,6 @@
       $('stat-actions').textContent = fmt.int(s.total_actions);
       $('stat-actions').parentElement.classList.remove('stat-unavailable');
     }
-    $('stat-rate').textContent = s.total_actions === 0 ? '—' : fmt.pct(s.success_rate);
-    // Denies never reach an `outcome` (the gate blocks before the tool runs), so they
-    // are not in the success-rate math — surfaced as gate activity, not failure. A deny
-    // is the trust layer working. The strip has room for the short form only; the full
-    // breakdown rides on the tooltip rather than being dropped.
-    const blocked = s.denied_actions ? `${fmt.int(s.denied_actions)} blocked` : '';
-    $('stat-rate-delta').textContent =
-      s.total_actions === 0 ? (blocked || 'success') : (blocked || 'success');
-    $('stat-rate-delta').parentElement.title =
-      s.total_actions === 0
-        ? (s.denied_actions ? `${fmt.int(s.denied_actions)} blocked by policy` : (scope ? `no actions for ${scope}` : 'no actions in range'))
-        : `${fmt.int(s.successful_actions)} ok · ${fmt.int(s.failed_actions)} fail`
-          + (s.denied_actions ? ` · ${fmt.int(s.denied_actions)} blocked by policy` : '')
-          + (scope ? ` · ${scope}` : '');
   }
 
   // Trust rows are one per (instance, role) grain, so a plugin can have several.
@@ -1493,6 +1475,42 @@
     }
     for (const v of Object.values(byId)) if (v.level === null) v.level = 'unmeasured';
     return byId;
+  }
+
+  // ---- Governance coverage — the safety signal that moved OUT of the agents drawer -------
+  // dp: safety/governance status must be surfaced usefully and prominently. It now rides
+  // inline: a colored dot on each harness chip (green governed / amber not-fully-governed /
+  // red MISWIRED) and a status badge in the role-trust header. `miswired` is load-bearing —
+  // a gate wired to a target that does not exist reads as covered and fails OPEN. Fetched on
+  // its own slow clock (install/wiring changes are rare) rather than on every 2s snapshot.
+  const GOV_NOTE = {
+    miswired:       'a gate is wired to a target that does not exist — reads as covered, fails OPEN',
+    partial:        'observation wired, enforcement absent',
+    ungoverned:     'installed, adapter exists, not wired',
+    ungovernable:   'installed, no hestia adapter exists yet',
+    governed:       'installed, wired, and the wiring resolves',
+    dormant_plugin: 'adapter ready; this harness is not installed here',
+  };
+  const GOV_SEVERITY = { miswired: 'red', partial: 'amber', ungoverned: 'amber', ungovernable: 'amber', governed: 'green', dormant_plugin: 'grey' };
+  const GOV_LABEL = { miswired: 'MISWIRED — fails open', partial: 'partial — not enforced', ungoverned: 'not wired', ungovernable: 'no adapter yet', governed: 'governed', dormant_plugin: 'not installed here' };
+  let govByAgent = {};   // plugin_id -> coverage state, from /api/agents
+  async function loadGovernance() {
+    try {
+      const r = await apiFetch('/api/agents', { cache: 'no-store' });
+      if (!r.ok) return;
+      const inv = await r.json();
+      if (!inv || inv.status === 'UNKNOWN') return;   // keep last known rather than blanking the dots
+      const st = {};
+      for (const [k, ids] of Object.entries(inv.gaps || {})) for (const id of ids || []) st[id] = k === 'unknown' ? 'ungovernable' : k;
+      for (const id of inv.governed || []) if (!st[id]) st[id] = 'governed';
+      govByAgent = st;
+      if (lastData) rerender(lastData);   // repaint chips with fresh dots
+    } catch (_) { /* transient — keep last known coverage */ }
+  }
+  function govDot(id) {
+    const g = govByAgent[id];
+    if (!g) return '';
+    return `<span class="gov-dot gov-${GOV_SEVERITY[g] || 'grey'}" title="governance: ${escapeHtml(GOV_LABEL[g] || g)} — ${escapeHtml(GOV_NOTE[g] || '')}"></span>`;
   }
 
   function renderOrchBar(data) {
@@ -1542,7 +1560,7 @@
           ? (t.action_count != null ? `<span class="count">${fmt.int(t.action_count)}</span>` : '')
           : `<span class="orch-idle">idle</span>`;
         return `<span class="orch-chip${sel}" data-pid="${escapeHtml(o.id)}" title="connected · ${state} — click to view its history/stats">
-                  <span>${escapeHtml(o.name)}</span>
+                  ${govDot(o.id)}<span>${escapeHtml(o.name)}</span>
                   ${t.level ? `<span class="level">${escapeHtml(t.level)}</span>` : ''}
                   ${badge}
                 </span>`;
@@ -1550,7 +1568,7 @@
       // not connected → offer to install the plugin hooks (connect).
       const connectable = !!o.plugin_available;
       return `<span class="orch-chip idle" title="${o.running ? 'running · hooks not installed' : 'known · not running'}">
-                <span>${escapeHtml(o.name)}</span>
+                ${govDot(o.id)}<span>${escapeHtml(o.name)}</span>
                 <span class="orch-connect" data-connect="${escapeHtml(o.id)}" data-connectable="${connectable}">${connectable ? '+ connect' : 'no plugin'}</span>
               </span>`;
     }).join('');
@@ -1583,6 +1601,7 @@
       if (!res.ok) throw new Error(body.error || ('HTTP ' + res.status));
       el.textContent = '✓ connected';
       el.title = body.message || '';
+      loadGovernance();   // governing an agent changes its coverage — refresh the dots now
     } catch (e) {
       el.textContent = '⚠ failed';
       el.title = e.message;
@@ -1677,7 +1696,13 @@
   function renderRoleTrust(trust, orchs) {
     const root = $('trust-list'), title = $('trust-title'), hint = $('trust-hint');
     title.textContent = `Role trust — ${selectedOrch}`;
-    if (hint) hint.textContent = 'click a role’s detail for the full tensor and its receipts';
+    // Surface this harness's governance coverage prominently in the role-trust header (dp) —
+    // where the agents-drawer safety signal now lives, at the per-harness grain. MISWIRED
+    // (fails open) reads loudest; a clean harness reads 'governed'.
+    const gcov = govByAgent[selectedOrch];
+    if (hint) hint.innerHTML = gcov
+      ? `<span class="gov-badge gov-${GOV_SEVERITY[gcov] || 'grey'}" title="${escapeHtml(GOV_NOTE[gcov] || '')}">${escapeHtml(GOV_LABEL[gcov] || gcov)}</span>`
+      : 'click a role’s detail for the full tensor and its receipts';
     let filtered = trust.filter(t => t.plugin_id === selectedOrch);
     if (!filtered.length) {
       root.innerHTML = `<div class="empty">No trust data for ${escapeHtml(selectedOrch)}.</div>`;
@@ -2163,127 +2188,6 @@
       // leave the previous cache in place on transient errors
     }
   }
-
-  // ---- Agents drawer: the agent-atlas read half -------------------------------------
-  //
-  // Three inventories and the gaps between them, because each gap has a different
-  // remedy. The gap classes come from the daemon verbatim; this only decides ordering
-  // and which action to offer. Deriving state here rather than reporting the daemon's is
-  // how a view starts disagreeing with the thing it is viewing.
-  const AGENT_STATE_ORDER = ['miswired','partial','ungoverned','ungovernable','governed','dormant_plugin'];
-  const AGENT_STATE_NOTE = {
-    miswired:     'a gate is wired to a target that does not exist — reads as covered, fails OPEN',
-    partial:      'observation wired, enforcement absent',
-    ungoverned:   'installed, adapter exists, not wired',
-    ungovernable: 'installed, no hestia adapter exists yet',
-    governed:     'installed, wired, and the wiring resolves',
-    dormant_plugin: 'adapter ready; this harness is not installed here',
-  };
-  let agentsLast = null;
-
-  function agentStates(inv) {
-    // Invert gaps -> per-agent state, then add everything governed.
-    const st = {};
-    for (const [k, ids] of Object.entries(inv.gaps || {})) {
-      for (const id of ids || []) st[id] = k === 'unknown' ? 'ungovernable' : k;
-    }
-    for (const id of inv.governed || []) if (!st[id]) st[id] = 'governed';
-    return st;
-  }
-
-  function renderAgents(inv) {
-    agentsLast = inv;
-    const btn = $('agents-btn'), badge = $('agents-badge'), body = $('agents-body');
-    if (!inv || inv.status === 'UNKNOWN') {
-      btn.className = 'agents-btn st-unknown';
-      badge.textContent = '?';
-      $('agents-summary').textContent = 'inventory unavailable';
-      body.innerHTML = `<div class="empty">${escapeHtml((inv && inv.reason) || 'no inventory')}</div>`;
-      $('agents-foot').textContent = 'UNKNOWN is not OK — this machine has not been checked.';
-      return;
-    }
-    const st = agentStates(inv);
-    const bad = (inv.gaps.miswired || []).length;
-    const warn = (inv.gaps.ungoverned || []).length + (inv.gaps.partial || []).length
-               + (inv.gaps.ungovernable || []).length;
-    btn.className = 'agents-btn ' + (bad ? 'st-bad' : warn ? 'st-warn' : 'st-ok');
-    badge.textContent = `${(inv.governed || []).length}/${(inv.installed || []).length}`;
-    btn.title = bad ? `${bad} MISWIRED — an enabled gate resolves to nothing and fails open`
-                    : warn ? `${warn} installed but not fully governed`
-                           : 'every installed agent is governed';
-    $('agents-summary').textContent =
-      `${(inv.installed || []).length} installed · ${(inv.plugins_available || []).length} adapters · ${(inv.governed || []).length} governed`;
-
-    const ids = [...new Set([...Object.keys(st)])].sort((a, b) => {
-      const d = AGENT_STATE_ORDER.indexOf(st[a]) - AGENT_STATE_ORDER.indexOf(st[b]);
-      return d || a.localeCompare(b);
-    });
-    const detail = Object.fromEntries((inv.detail || []).map(d => [d.agent, d]));
-    body.innerHTML = ids.map(id => {
-      const s = st[id];
-      const d = detail[id] || {};
-      const finding = (d.findings || []).find(f => /^MISWIRED|^DEAD_HOOK|^FRAGILE|^UNGOVERNED/.test(f));
-      const note = finding ? finding.replace(/^\w+:\s*/, '') : (AGENT_STATE_NOTE[s] || '');
-      // Only offer an action that exists. An adapterless agent has nothing to install,
-      // and offering the button anyway would teach the operator that the button lies.
-      let act = '';
-      if (s === 'governed' || s === 'miswired' || s === 'partial') {
-        act = `<button class="agent-act danger" onclick="agentUngovern('${escapeHtml(id)}')">ungovern</button>`;
-      } else if (s === 'ungoverned' || (s === 'dormant_plugin')) {
-        act = `<button class="agent-act" onclick="agentGovern('${escapeHtml(id)}')"${s === 'dormant_plugin' ? ' disabled title="not installed on this machine"' : ''}>govern</button>`;
-      } else {
-        act = `<button class="agent-act" disabled title="no hestia adapter exists for this harness yet">govern</button>`;
-      }
-      return `<div class="agent-row">
-        <span class="agent-name">${escapeHtml(id)}</span>
-        <span class="agent-state ${s === 'dormant_plugin' ? 'dormant' : escapeHtml(s)}">${escapeHtml(s === 'dormant_plugin' ? 'dormant' : s)}</span>
-        <span class="agent-note" title="${escapeHtml(note)}">${escapeHtml(note)}</span>
-        ${act}
-      </div>`;
-    }).join('');
-
-    const sc = inv.scope || {};
-    $('agents-foot').innerHTML =
-      `scope: workspace <code>${escapeHtml(sc.workspace || '?')}</code>`
-      + (sc.plugins_ref ? ` · adapters from <code>${escapeHtml(sc.plugins_ref)}</code>` : '')
-      + ` · ${(sc.config_scopes_read || []).length} config scope(s) read`
-      + `<br>transcript history for UNGOVERNED agents is ctx's job (agent-atlas read half) — not yet wired here.`;
-  }
-
-  async function loadAgents() {
-    try {
-      const r = await apiFetch('/api/agents', {cache: 'no-store'});
-      renderAgents(r.ok ? await r.json() : {status: 'UNKNOWN', reason: 'HTTP ' + r.status});
-    } catch (e) {
-      renderAgents({status: 'UNKNOWN', reason: String(e)});
-    }
-  }
-
-  window.agentGovern = async function (id) {
-    const b = event && event.target; if (b) b.disabled = true;
-    try {
-      const r = await apiFetch(`/api/orchestrators/${encodeURIComponent(id)}/connect`, {method: 'POST'});
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) alert('govern failed: ' + (j.error || r.status));
-      else alert(j.message || 'governed');
-    } finally { await loadAgents(); }
-  };
-
-  // Ungovern REMOVES enforcement, so it confirms and it names the consequence rather
-  // than asking a generic "are you sure?" — the operator should be agreeing to the
-  // actual outcome, not to a dialog.
-  window.agentUngovern = async function (id) {
-    if (!confirm(
-      `Remove hestia's hooks from "${id}"?\n\n`
-      + `That agent will then run with NO gate and NO witnessing — its actions stop `
-      + `appearing in the chain entirely. A timestamped backup of its config is written `
-      + `first, and the change takes effect when ${id} next restarts.`)) return;
-    try {
-      const r = await apiFetch(`/api/agents/${encodeURIComponent(id)}/ungovern`, {method: 'POST'});
-      const j = await r.json().catch(() => ({}));
-      alert(r.ok ? (j.message || 'ungoverned') : 'ungovern failed: ' + (j.error || r.status));
-    } finally { await loadAgents(); }
-  };
 
   // Calendar window for the feed + windowed stat (hour/day/week/all). The
   // server filters by calendar, not count — a count window silently evicted a
@@ -3034,20 +2938,6 @@
     });
     // Same backdrop/✕/Escape contract for the trust detail popup, so both modals close
     // the three ways a reader will try rather than only the one that was wired.
-    // Agents drawer: open/close, refresh, and close on outside click or Escape.
-    const aBtn = $('agents-btn'), aMenu = $('agents-menu');
-    aBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const open = aMenu.hidden;
-      aMenu.hidden = !open;
-      aBtn.setAttribute('aria-expanded', String(open));
-      if (open) loadAgents();
-    });
-    aMenu.addEventListener('click', (e) => e.stopPropagation());
-    document.addEventListener('click', () => {
-      if (!aMenu.hidden) { aMenu.hidden = true; aBtn.setAttribute('aria-expanded', 'false'); }
-    });
-    $('agents-refresh').addEventListener('click', (e) => { e.stopPropagation(); loadAgents(); });
 
     // Top-level view switch: one delegated listener on the segmented control. A click pins
     // the choice (byUser=true), so the auto-default in rerender won't later override it.
@@ -3058,6 +2948,11 @@
     });
     // Sync <body data-view> to the HTML default (agents) before the first snapshot lands.
     setView(activeView);
+
+    // Governance coverage is the safety signal that replaced the agents drawer — fetch it on
+    // load and on a slow clock (install/wiring changes are rare), plus after a connect.
+    loadGovernance();
+    setInterval(loadGovernance, 20000);
 
     // Harness aggregate rows (the All trust view) drill into that harness's role trust.
     // One delegated listener survives the 2s innerHTML re-renders; keyboard-activatable too.
@@ -3073,9 +2968,6 @@
         if (row) { e.preventDefault(); selectHarness(row.dataset.harness); }
       });
     }
-    // The badge is a standing alarm, so it must be populated without anyone opening the
-    // drawer — an alarm you have to go looking for is not an alarm.
-    loadAgents();
 
     const tmodal = $('trust-modal');
     tmodal.addEventListener('click', (e) => { if (e.target.dataset.close) tmodal.hidden = true; });
@@ -3083,7 +2975,6 @@
       if (e.key !== 'Escape') return;
       if (!modal.hidden) modal.hidden = true;
       if (!tmodal.hidden) tmodal.hidden = true;
-      if (!aMenu.hidden) { aMenu.hidden = true; aBtn.setAttribute('aria-expanded', 'false'); }
     });
   })();
 

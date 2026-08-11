@@ -164,6 +164,18 @@ trust tensors, tool histograms, derivation internals: all present, none default.
 > **R1 — non-salient data is never on a default path.** If a datum cannot change what the owner does
 > in the next minute, it does not appear until requested.
 
+> **R1a — safety/governance status is surfaced usefully and prominently, never buried in a drawer**
+> (dp, 2026-08-11). Coverage — *is each harness actually governed, or is a gate MISWIRED and failing
+> OPEN?* — is the single most consequential thing the owner can be wrong about, and it is the
+> counterpart to R1: it is *always* salient. It must be readable at a glance on the primary surface,
+> not behind a click. A drawer that shows "nothing wrong" on a fully-governed box reads as "useless"
+> and gets removed — losing the alarm for the day a gate *is* miswired. The requirement is that the
+> status live where the owner already looks. **Met in the dashboard by:** a colored coverage dot on
+> each harness chip (green governed · amber not-fully-governed · **red MISWIRED — fails open**) and a
+> coverage badge in the header of that harness's role-trust view. The specific rendering is an
+> implementation of the requirement, not the requirement — the invariant is *prominent, glanceable,
+> per-harness*, and `miswired` must be the loudest state because it is the one that fails open.
+
 ### 4.3 Progressive disclosure, three depths
 
 Every decision surface renders at three depths, and **the owner chooses the depth, never the app**:
