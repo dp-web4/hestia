@@ -1,9 +1,8 @@
 name: release
 
-# Builds prebuilt hestia binaries for the four primary targets and
-# attaches them to a GitHub Release. Trigger by pushing a tag matching
-# v*.*.* (e.g. v0.0.4). The dashboard HTML is baked into the binary
-# via include_str!, so the single executable is the entire artifact.
+# Builds prebuilt hestia binaries and attaches them to a GitHub Release.
+# Trigger by pushing a tag matching v*.*.* (e.g. v0.0.4). The dashboard HTML
+# is baked into the binary via include_str!, so the executable is the artifact.
 #
 # RELEASE INPUTS ARE PART OF THE ARTIFACT. Hestia currently consumes Web4
 # crates through sibling path dependencies, which Cargo.lock cannot pin.
@@ -35,29 +34,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Fleet targets in order: CBP/Thor/Legion/Nomad (x86_64 linux),
-          # Sprout (aarch64 linux/Jetson), McNugget (aarch64 darwin/M-series).
-          # Windows is a bonus — no fleet machine runs Windows but the
-          # plugin reaches Windows users via Claude Code.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             archive: tar.gz
-          # Windows + macOS are TEMPORARILY OUT (2026-08-11). The daemon links
-          # `rusqlite` with `bundled-sqlcipher`, whose C build needs a crypto
-          # backend (OpenSSL/SQLCipher) that the windows-latest and macos-14
-          # runners do not provide out of the box — libsqlite3-sys fails its
-          # build command there while both Linux targets build clean. This is a
-          # per-runner crypto-toolchain task, filed as follow-up; shipping the
-          # Linux targets now beats shipping nothing (no release since v0.0.3).
-          # Restore these two once the runners have the SQLCipher crypto backend.
+          # Measured on release run 31457488128: the aarch64 macOS daemon
+          # compiled successfully. The job failed only in staging because the
+          # runner provides `shasum`, not GNU `sha256sum`. Restore the target and
+          # make checksum generation portable below.
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+          # Windows remains temporarily out. Its first real build reached
+          # libsqlite3-sys and failed because bundled SQLCipher could not discover
+          # an OpenSSL development root. #336 restores it independently once the
+          # Windows-specific provider path is proven.
     steps:
-      # Two repos as SIBLING subdirs of the workspace — the pattern ci.yml proved
-      # green. hestia/core has path deps into ../../web4/..., so the release must
-      # materialize the same layout. Unlike integration CI, Web4 is pinned above:
-      # rebuilding one Hestia tag later must not silently produce different bytes.
       - uses: actions/checkout@v4
         with:
           path: hestia
@@ -96,7 +90,17 @@ jobs:
           cp "hestia/core/target/${{ matrix.target }}/release/hestia" "dist/${STAGE}/"
           cp hestia/README.md hestia/LICENSE "dist/${STAGE}/" 2>/dev/null || true
           (cd dist && tar -czf "${STAGE}.tar.gz" "${STAGE}")
-          (cd dist && sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256")
+          (
+            cd dist
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+            elif command -v shasum >/dev/null 2>&1; then
+              shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+            else
+              echo "no SHA-256 checksum tool (sha256sum or shasum) on runner" >&2
+              exit 1
+            fi
+          )
           ls -la dist/
 
       - name: Stage artifacts (windows)
@@ -146,11 +150,11 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           name: ${{ github.event.inputs.tag || github.ref_name }}
           body: |
-            Prebuilt `hestia` daemon binaries for the four primary targets.
+            Prebuilt `hestia` daemon binaries for the targets attached to this release.
 
             Build provenance: Web4 `${{ env.WEB4_REF }}`.
 
-            Install (Linux / macOS):
+            Linux example:
             ```sh
             curl -L https://github.com/dp-web4/hestia/releases/download/${{ github.event.inputs.tag || github.ref_name }}/hestia-${{ github.event.inputs.tag || github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz | tar -xz
             ./hestia-${{ github.event.inputs.tag || github.ref_name }}-x86_64-unknown-linux-gnu/hestia --version
@@ -159,7 +163,9 @@ jobs:
             The dashboard HTML is baked into the binary; nothing else is required to run.
           draft: false
           prerelease: false
-          fail_on_unmatched_files: false  # windows .zip absent while win/mac are out (SQLCipher runner toolchain); tolerate the missing pattern
+          # Windows is still absent, so zip globs are intentionally unmatched.
+          # Restore strict matching when #336 returns the Windows matrix row.
+          fail_on_unmatched_files: false
           files: |
             dist/hestia-*.tar.gz
             dist/hestia-*.tar.gz.sha256
