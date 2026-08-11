@@ -1,14 +1,14 @@
 name: release
 
 # Builds prebuilt hestia binaries and attaches them to a GitHub Release.
-# Trigger by pushing a tag matching v*.*.* (e.g. v0.0.4). The dashboard HTML
-# is baked into the binary via include_str!, so the executable is the artifact.
+# Tag pushes / workflow_dispatch publish. Pull requests run the SAME build
+# matrix as a release smoke test but never publish, so platform/toolchain and
+# packaging regressions are measured before they reach a tag.
 #
 # RELEASE INPUTS ARE PART OF THE ARTIFACT. Hestia currently consumes Web4
 # crates through sibling path dependencies, which Cargo.lock cannot pin.
 # Integration CI intentionally tracks Web4 main; releases MUST NOT. Bump
-# WEB4_REF deliberately before creating each release tag. The workflow stored
-# at that tag then records the exact cross-repo source that produced its bytes.
+# WEB4_REF deliberately before creating each release tag.
 env:
   WEB4_REF: 9958fc6a37279a8fad2872fec1a07ea3ec92224b
 
@@ -22,6 +22,11 @@ on:
         description: 'Tag to release (e.g. v0.0.4). Must already exist.'
         required: true
         type: string
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'core/Cargo.toml'
+      - 'core/Cargo.lock'
 
 permissions:
   contents: write
@@ -49,8 +54,7 @@ jobs:
             archive: tar.gz
           # Windows remains temporarily out. Its first real build reached
           # libsqlite3-sys and failed because bundled SQLCipher could not discover
-          # an OpenSSL development root. #336 restores it independently once the
-          # Windows-specific provider path is proven.
+          # an OpenSSL development root. #336 restores it independently.
     steps:
       - uses: actions/checkout@v4
         with:
@@ -132,6 +136,7 @@ jobs:
 
   release:
     name: publish release
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     steps:
