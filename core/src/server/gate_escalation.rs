@@ -278,6 +278,14 @@ pub struct Escalation {
     /// The member asking. Recorded as claimed — `plugin_id` is caller-asserted (HST-005), and
     /// this field inherits that weakness rather than laundering it.
     pub plugin_id: String,
+    /// Whether `plugin_id` was PROVEN against a live session at open or is caller-ASSERTED
+    /// (#128). This is the field `arbiter::eligibility` clause 0 reads: an asserted asker
+    /// cannot be peer-cleared, because NOT-SAME would be grading a forgeable operand — and
+    /// an unrecognised one as maximally independent. Fail-closed by default: rows written
+    /// before this field existed carry no proof, so they deserialize as `Asserted` and only
+    /// the sovereign channels (which do not rely on NOT-SAME) can still decide them.
+    #[serde(default)]
+    pub asker_basis: crate::arbiter::AskerBasis,
     pub role: String,
     pub tool_name: String,
     /// Which governance file the write would reach.
@@ -729,6 +737,16 @@ impl EscalationStore {
                                 })
                                 .unwrap_or_default(),
                             plugin_id,
+                            // Restored from the entry when present — the open writer emits
+                            // `asker_basis` on every `gate_escalation_opened`. Absent fails
+                            // closed to `Asserted`: a restored escalation with no recorded
+                            // basis has no proven asker, and no peer may clear it (#128).
+                            asker_basis: d
+                                .get("asker_basis")
+                                .and_then(|v| {
+                                    serde_json::from_value::<crate::arbiter::AskerBasis>(v.clone()).ok()
+                                })
+                                .unwrap_or_default(),
                             role: s(d, "role").unwrap_or_default(),
                             tool_name: s(d, "tool_name").unwrap_or_default(),
                             // Recomputed from the marker rather than read from the entry: the
@@ -851,6 +869,10 @@ impl EscalationStore {
             id: id.clone(),
             invited_peers: Vec::new(),
             plugin_id: plugin_id.to_string(),
+            // Fail closed: every `open` caller is unproven until the handler records
+            // otherwise via `record_asker_basis`. An asserted-by-default asker can be
+            // decided by the sovereign and can never collect a peer factor (#128).
+            asker_basis: crate::arbiter::AskerBasis::default(),
             role: role.trim().to_string(),
             tool_name: tool_name.to_string(),
             marker: marker.to_string(),
@@ -907,6 +929,21 @@ impl EscalationStore {
         match self.by_id.get_mut(id) {
             Some(e) => {
                 e.invited_peers = peers;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record how the asker's identity was established (#128). Separate from `open` for the
+    /// same reason `invite` is: the proof happens in the handler, which owns the session
+    /// registry, and `open`'s existing callers — every one a test with no session to prove
+    /// anything by — keep the fail-closed default without a signature change. Returns false
+    /// only for an unknown id, which cannot happen from the handler's own flow.
+    pub fn record_asker_basis(&mut self, id: &str, basis: crate::arbiter::AskerBasis) -> bool {
+        match self.by_id.get_mut(id) {
+            Some(e) => {
+                e.asker_basis = basis;
                 true
             }
             None => false,
@@ -1206,6 +1243,50 @@ mod tests {
         // Already terminal by time -> not restored; it cannot be ruled and would only pad the queue.
         let mut s5 = EscalationStore::default();
         assert_eq!(s5.rehydrate(&[opened("eee5")], T0 + 7200), 0);
+    }
+
+    /// #128, the restore half. A `gate_escalation_opened` entry written before `asker_basis`
+    /// existed restores as ASSERTED — fail closed, so a daemon restart cannot launder an
+    /// unproven asker into a peer-clearable one — and an entry that carries the basis
+    /// restores it. The basis the open writer emits and the basis the store enforces must be
+    /// the same fact, or a restart is a privilege boundary.
+    #[test]
+    fn a_restored_escalation_keeps_its_asker_basis_and_an_absent_one_fails_closed() {
+        let opened_with = |id: &str, basis: Option<&str>| {
+            let mut data = serde_json::json!({
+                "escalation_id": id, "plugin_id": "codex", "role": "r",
+                "tool_name": "Edit", "marker": "pre_tool_use.py",
+                "opened_at": T0, "expires_at": T0 + 3600,
+            });
+            if let Some(b) = basis {
+                data["asker_basis"] = serde_json::json!(b);
+            }
+            chain_entry("gate_escalation_opened", data)
+        };
+
+        // No basis on the entry (every entry before the basis writer) -> Asserted.
+        let mut s = EscalationStore::default();
+        assert_eq!(s.rehydrate(&[opened_with("f004", None)], T0 + 20), 1);
+        assert_eq!(
+            s.get("f004").map(|e| e.asker_basis),
+            Some(crate::arbiter::AskerBasis::Asserted),
+            "an unrestored basis must fail closed, not default to proven"
+        );
+
+        // A recorded basis survives the restart.
+        let mut s2 = EscalationStore::default();
+        assert_eq!(s2.rehydrate(&[opened_with("f005", Some("session"))], T0 + 20), 1);
+        assert_eq!(
+            s2.get("f005").map(|e| e.asker_basis),
+            Some(crate::arbiter::AskerBasis::Session),
+        );
+
+        // And the live path: `open` defaults to Asserted until the handler records the proof.
+        let mut s3 = EscalationStore::default();
+        let e = s3.open("codex", "r", "Edit", "pre_tool_use.py", None, None, T0, 120).unwrap();
+        assert_eq!(e.asker_basis, crate::arbiter::AskerBasis::Asserted);
+        assert!(s3.record_asker_basis(&e.id, crate::arbiter::AskerBasis::Session));
+        assert_eq!(s3.get(&e.id).map(|e| e.asker_basis), Some(crate::arbiter::AskerBasis::Session));
     }
 
     /// A restart must not erase WHO WAS ASKED.
