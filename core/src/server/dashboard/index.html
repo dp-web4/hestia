@@ -520,7 +520,7 @@
   .feed { max-height: 62vh; min-height: 16rem; overflow-y: auto; }
   .feed-row {
     display: grid;
-    grid-template-columns: 4rem 3.5rem 7rem 1fr 4rem 9rem;
+    grid-template-columns: 8rem 3.5rem 7rem 1fr 4rem 9rem;
     gap: 0.75rem;
     align-items: center;
     padding: 0.6rem 1.25rem;
@@ -535,8 +535,12 @@
     0% { background: var(--accent-dim); }
     100% { background: transparent; }
   }
-  .feed-pos { color: var(--fg-faint); font-variant-numeric: tabular-nums; }
-  .feed-pid { display: block; font-size: 0.72em; color: var(--fg-dim, #8b93a7); opacity: 0.8; line-height: 1.1; }
+  .feed-pos { color: var(--fg-faint); min-width: 0; }
+  /* WHO acted, primary: the AGENT is the first thing read (dp, 2026-08-11 — the chain
+     position is not useful; agent + role is). Ellipsis so a long member id never breaks the
+     grid; the full id + role + position + session ride the hover title. */
+  .feed-agent { display: block; color: var(--fg); line-height: 1.15; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .feed-pid { display: block; font-size: 0.72em; color: var(--fg-dim, #8b93a7); opacity: 0.8; line-height: 1.1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .feed-time { color: var(--fg-faint); font-variant-numeric: tabular-nums; text-align: right; }
   .feed-event { color: var(--fg-dim); }
   .feed-event.outcome { color: var(--fg); }
@@ -1865,21 +1869,24 @@
         detail = e.event_type;
       }
 
-      // WHO acted — plugin + capacity(role) + short session, so an interactive session is
-      // distinguishable from a mesh-worker / autonomous-timer cron at a glance (dp).
-      // WHO acted: show only the compact pid under the entry number; full role + session ride the
-      // number's hover title (same pattern as relative-time '3m' + hover for the absolute time).
+      // WHO acted, primary column (dp, 2026-08-11): the AGENT is what you read first, with its
+      // capacity(role) small beneath it. The chain position — not useful at a glance — plus the
+      // session and the full role move to the hover, alongside the absolute time already there.
+      const whoAgent = e.plugin_id || 'unattributed';
       const whoRole = e.role_lct ? shortRole(e.role_lct) : '';
-      const whoSess = e.host_session_id ? String(e.host_session_id).slice(0,8) : '';
-      // Compact display = the DISTINGUISHING identity (capacity + session), not the constant plugin.
-      // Full line (plugin + full role + full session) rides the hover.
-      const whoShort = [whoRole, whoSess].filter(Boolean).join('·') || (e.plugin_id || '');
-      const whoFull = [e.plugin_id || '', e.role_lct || '', e.host_session_id ? 'session '+e.host_session_id : ''].filter(Boolean).join(' · ');
-      const whoPid = whoShort ? `<span class="feed-pid">${escapeHtml(whoShort)}</span>` : '';
       const absTime = e.timestamp ? new Date(e.timestamp).toLocaleString() : '';
+      // Everything the row no longer shows, on hover: position, full role, session, time.
+      const posHover = [
+        `#${e.chain_position}`,
+        e.plugin_id || 'unattributed',
+        e.role_lct || '',
+        e.host_session_id ? 'session ' + e.host_session_id : '',
+        absTime,
+      ].filter(Boolean).join(' · ');
+      const whoPid = whoRole ? `<span class="feed-pid">${escapeHtml(whoRole)}</span>` : '';
       return `
         <div class="feed-row${isNew ? ' new' : ''}">
-          <span class="feed-pos" title="${escapeHtml(whoFull || (e.plugin_id||''))}">#${e.chain_position}${whoPid}</span>
+          <span class="feed-pos" title="${escapeHtml(posHover)}"><span class="feed-agent">${escapeHtml(whoAgent)}</span>${whoPid}</span>
           <span class="feed-time" title="${escapeHtml(absTime)}">${fmt.relTime(e.timestamp)}</span>
           <span class="feed-event ${e.event_type}">${escapeHtml(e.event_type)}</span>
           <span class="feed-detail" title="${escapeHtml(hover || detail)}">
