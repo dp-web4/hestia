@@ -45,9 +45,11 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             archive: tar.gz
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
+          # x86_64-pc-windows-msvc is OUT pending source portability: the daemon
+          # uses std::os::unix + Permissions::set_mode (Unix-only). SQLCipher now
+          # builds on windows (vendored OpenSSL), so the remaining work is cfg-gating
+          # the Unix file-mode calls — filed as follow-up. Linux + macOS cover the
+          # whole fleet.
           - target: aarch64-apple-darwin
             os: macos-14
             archive: tar.gz
@@ -94,7 +96,7 @@ jobs:
           cp "hestia/core/target/${{ matrix.target }}/release/hestia" "dist/${STAGE}/"
           cp hestia/README.md hestia/LICENSE "dist/${STAGE}/" 2>/dev/null || true
           (cd dist && tar -czf "${STAGE}.tar.gz" "${STAGE}")
-          (cd dist && sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256")
+          (cd dist && { command -v sha256sum >/dev/null 2>&1 && sha256sum "${STAGE}.tar.gz" || shasum -a 256 "${STAGE}.tar.gz"; } > "${STAGE}.tar.gz.sha256")
           ls -la dist/
 
       - name: Stage artifacts (windows)
