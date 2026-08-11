@@ -13,8 +13,22 @@ The gate does FIVE sequential round trips per tool call (pre_tool_use.py:2211-22
 plus re-polls while status == "evaluating". This probe replays exactly that sequence with
 the same payload shapes and reports per-step and total wall time.
 
-READ-ONLY with respect to policy: it opens a session and begins an action for a synthetic
-`Read` of a path under /tmp, then queries policy. It does not execute anything.
+POLICY-NEUTRAL, and it drains what it creates: it opens a session and begins an action
+for a synthetic `Read` of a path under /tmp, queries policy (Allow -> the query itself
+appends nothing), then CLOSES the action with `hestia_record_outcome` -- `s.actions` has
+no other remover, so an unclosed probe action sits in the map the global lock protects
+and every later run measures a more loaded daemon than the last (#316 review, Note A).
+The close appends one "outcome" entry per run to the witness chain: honest accounting
+for an action that was begun.
+
+The session connects `synthetic: true` under a probe-specific plugin id, so trust
+bookkeeping lands in a synthetic grain, no member LCT is minted, and no reputation
+delta reaches the hub (state.rs: unmapped plugins never emit). The id is HARDCODED on
+purpose -- `synthetic: true` durably persists a synthetic exclusion for whatever id it
+rides with, so it must never be paired with a real member id like "claude-code". One
+fidelity cost, stated: a synthetic connect persists that exclusion doc (a vault write)
+on every connect, so `connect` reads heavier here than the real gate's member-registry
+short-circuit; initialize/begin_action/query_policy are unchanged in shape.
 """
 import json
 import os
@@ -112,6 +126,7 @@ def one_run(url: str, role: str, plugin_id: str) -> dict:
         "requested_role": "citizen",
         "protocol_version": PROTOCOL_VERSION,
         "role": role,
+        "synthetic": True,
     }))
     steps["connect"] = (time.monotonic() - t) * 1000
     session_id = connect.get("sessionId") if isinstance(connect, dict) else None
@@ -146,6 +161,20 @@ def one_run(url: str, role: str, plugin_id: str) -> dict:
     steps["_polls"] = polls
 
     total = (time.monotonic() - t_all) * 1000
+
+    # Close the action (untimed -- cleanup is not part of the gate sequence
+    # under test, so it lands after `total` is taken). Best-effort: a failed
+    # close must not turn a successful measurement into an error row.
+    try:
+        res = unwrap(c.call_tool("hestia_record_outcome", {
+            "action_id": action_id, "success": True, "magnitude": 0.0,
+        }))
+        # A daemon rejection arrives as a parsed error envelope, not an
+        # exception -- only the witness entry hash proves the action closed.
+        steps["_outcome_recorded"] = isinstance(res, dict) and "witnessEntryHash" in res
+    except Exception:  # noqa: BLE001
+        steps["_outcome_recorded"] = False
+
     return {
         "total_ms": total,
         "steps": steps,
@@ -157,7 +186,11 @@ def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 10
     url = endpoint()
     role = os.environ.get("HESTIA_ROLE", "role:constellation:member")
-    plugin_id = os.environ.get("HESTIA_MESH_PLUGIN", "claude-code")
+    # Hardcoded, not env-overridable: this id rides with `synthetic: true`,
+    # which persists a durable synthetic EXCLUSION for it. An env override
+    # (HESTIA_MESH_PLUGIN is "claude-code" on live seats) would let the probe
+    # mark a real member synthetic. See the docstring.
+    plugin_id = "gate-handshake-probe"
     print(f"endpoint={url} role={role} plugin={plugin_id} runs={n}")
     print(f"gate TOTAL_BUDGET_MS = {os.environ.get('HESTIA_PRE_TOTAL_BUDGET_MS', '800')}"
           f" (the deadline this whole sequence must fit inside)")

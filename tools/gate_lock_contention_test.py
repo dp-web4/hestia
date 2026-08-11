@@ -17,6 +17,19 @@ CONTROL, both directions:
     box (CPU, scheduler), not the lock, and the hypothesis is refuted.
 
 This probe only reads policy for a synthetic Read of a /tmp path. It executes nothing.
+
+CLEANUP (#316 review, Note A): each handshake closes its action with
+`hestia_record_outcome` -- `s.actions` has no other remover, so a default run
+(4 arms x C x 40 = 600 handshakes) used to leave 600 in-flight actions resident in
+the map the global lock protects, and every later run measured a more loaded daemon
+than the last: a confound inside the instrument. The close is untimed (it lands
+after `total` is taken) but runs inside the arm, so concurrent workers now carry one
+witness-chain append per handshake -- write-side load a real gate sequence also
+generates (witness.py records outcomes). That makes the C-arms slightly harsher
+than the pre-cleanup probe: biased AGAINST the improvement #316 claims, which is
+the safe direction. Sessions connect `synthetic: true` under a hardcoded probe id
+so nothing reaches member reputation or the hub; see the latency probe's docstring
+for why that id must never be a real member's.
 """
 import json
 import statistics
@@ -51,7 +64,7 @@ def handshake(url: str, role: str, plugin_id: str) -> dict:
     connect = unwrap(c.call_tool("hestia_connect", {
         "plugin_id": plugin_id, "plugin_version": "probe", "host_agent": "claude-code",
         "host_agent_version": "claude-code", "requested_role": "citizen",
-        "protocol_version": PROTOCOL_VERSION, "role": role,
+        "protocol_version": PROTOCOL_VERSION, "role": role, "synthetic": True,
     }))
     steps["connect"] = (time.monotonic() - t) * 1000
     sid = connect.get("sessionId") if isinstance(connect, dict) else None
@@ -72,6 +85,18 @@ def handshake(url: str, role: str, plugin_id: str) -> dict:
                        {"action_id": aid, **({"session_id": sid} if sid else {})}))
     steps["query_policy"] = (time.monotonic() - t) * 1000
     steps["total"] = (time.monotonic() - t0) * 1000
+
+    # Close the action (untimed, after `total`; see docstring). Best-effort:
+    # a failed close must not turn a successful measurement into an error row.
+    # A daemon rejection arrives as a parsed error envelope, not an exception,
+    # so count closes by the witness entry hash that proves them.
+    try:
+        res = unwrap(c.call_tool("hestia_record_outcome",
+                                 {"action_id": aid, "success": True, "magnitude": 0.0}))
+        steps["_closed"] = isinstance(res, dict) and "witnessEntryHash" in res
+    except Exception:  # noqa: BLE001
+        steps["_closed"] = False
+
     return steps
 
 
@@ -115,6 +140,10 @@ def summarize(rows, budget=800):
         "p99": round(pct(tot, 99), 1), "max": round(tot[-1], 1),
         "over_budget": sum(1 for x in tot if x > budget),
         "stalls_gt_100ms": sum(1 for x in tot if x > 100),
+        # actions this arm began but could not close -- each one is left
+        # resident in the daemon's in-flight map (the Note A leak); 0 or the
+        # cleanup is not doing its job
+        "unclosed": sum(1 for r in ok if not r.get("_closed", False)),
     }
     for step in ("initialize", "connect", "begin_action", "query_policy"):
         v = sorted(r[step] for r in ok)
@@ -127,7 +156,9 @@ def summarize(rows, budget=800):
 def main():
     url = endpoint()
     role = "role:constellation:member"
-    plugin_id = "claude-code"
+    # Hardcoded: rides with `synthetic: true`, which durably persists a
+    # synthetic exclusion for this id -- it must never be a real member's.
+    plugin_id = "gate-lock-probe"
     per_worker = int(sys.argv[1]) if len(sys.argv) > 1 else 40
     arms = [1, 2, 4, 8]
     print(f"endpoint={url}  per_worker={per_worker}  arms(concurrency)={arms}")
@@ -142,7 +173,8 @@ def main():
         results[c] = s
         print(f"C={c:2d}  n={s['n']:4d}  p50={s['p50']:7.1f}  p90={s['p90']:7.1f}  "
               f"p99={s['p99']:8.1f}  max={s['max']:8.1f}  >800ms={s['over_budget']:3d}  "
-              f">100ms={s['stalls_gt_100ms']:3d}  errors={s['errors']}")
+              f">100ms={s['stalls_gt_100ms']:3d}  errors={s['errors']}  "
+              f"unclosed={s['unclosed']}")
         time.sleep(1.0)  # let the daemon settle between arms
 
     print("\nper-step p99 (ms) — initialize is the unlocked control:")
