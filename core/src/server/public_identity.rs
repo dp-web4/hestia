@@ -15,16 +15,20 @@ use std::path::Path;
 
 const PUBLIC_IDENTITY_FILE: &str = "public-identity.json";
 
+/// The minimum locked-tier identity fact Hestia can always derive from the vault.
+///
+/// `init` may add provenance such as `minted_by` when it genuinely knows the mint
+/// event. A later daemon open must NOT overwrite that field with its own version:
+/// projecting an old identity is not minting it. Serde ignores those extra fields
+/// when we validate the one fact this module owns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PublicIdentity {
+struct PublicIdentityProjection {
     sovereign_lct: String,
-    minted_by: String,
 }
 
-fn expected(sovereign_lct: &str) -> PublicIdentity {
-    PublicIdentity {
+fn expected(sovereign_lct: &str) -> PublicIdentityProjection {
+    PublicIdentityProjection {
         sovereign_lct: sovereign_lct.to_string(),
-        minted_by: concat!("hestia ", env!("CARGO_PKG_VERSION")).to_string(),
     }
 }
 
@@ -37,15 +41,22 @@ pub(super) fn project(home: &Path, sovereign_lct: &str) -> Result<()> {
     let target = home.join(PUBLIC_IDENTITY_FILE);
     let wanted = expected(sovereign_lct);
 
-    // Quiet fast path: valid + current means no filesystem churn on every serve.
+    // Quiet fast path: if the identity is current, preserve any honest mint-time
+    // provenance `init` wrote beside it. We compare identity, not producer version.
     if let Ok(bytes) = std::fs::read(&target) {
-        if serde_json::from_slice::<PublicIdentity>(&bytes).ok().as_ref() == Some(&wanted) {
+        if serde_json::from_slice::<PublicIdentityProjection>(&bytes)
+            .ok()
+            .as_ref()
+            == Some(&wanted)
+        {
             return Ok(());
         }
     }
 
     std::fs::create_dir_all(home)
         .with_context(|| format!("creating public identity directory {}", home.display()))?;
+    // Migration knows only the identity observed in the authoritative vault. Do
+    // not fabricate `minted_by`: an old node may have been minted by any version.
     let bytes = serde_json::to_vec_pretty(&wanted).context("encoding public identity")?;
     let tmp = home.join(format!(
         ".{PUBLIC_IDENTITY_FILE}.tmp-{}",
@@ -81,7 +92,7 @@ pub(super) fn project(home: &Path, sovereign_lct: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn read(path: &Path) -> PublicIdentity {
+    fn read(path: &Path) -> PublicIdentityProjection {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     }
 
@@ -97,8 +108,11 @@ mod tests {
     fn stale_or_corrupt_projection_is_replaced_not_trusted() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join(PUBLIC_IDENTITY_FILE);
-        std::fs::write(&path, br#"{"sovereign_lct":"lct:web4:mb32:WRONG","minted_by":"old"}"#)
-            .unwrap();
+        std::fs::write(
+            &path,
+            br#"{"sovereign_lct":"lct:web4:mb32:WRONG","minted_by":"old"}"#,
+        )
+        .unwrap();
         project(dir.path(), "lct:web4:mb32:bright").unwrap();
         assert_eq!(read(&path), expected("lct:web4:mb32:bright"));
 
@@ -108,13 +122,16 @@ mod tests {
     }
 
     #[test]
-    fn projection_is_idempotent_for_same_identity() {
+    fn current_identity_preserves_honest_mint_provenance() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join(PUBLIC_IDENTITY_FILE);
+        let original = br#"{"sovereign_lct":"lct:web4:mb32:bstable","minted_by":"hestia 0.0.1"}"#;
+        std::fs::write(&path, original).unwrap();
         project(dir.path(), "lct:web4:mb32:bstable").unwrap();
-        let before = std::fs::read(&path).unwrap();
-        project(dir.path(), "lct:web4:mb32:bstable").unwrap();
-        let after = std::fs::read(&path).unwrap();
-        assert_eq!(before, after);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "projecting an old identity must not rewrite who minted it"
+        );
     }
 }
