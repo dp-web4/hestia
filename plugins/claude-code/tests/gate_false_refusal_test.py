@@ -319,6 +319,17 @@ _SURVIVE = [
      'G=`touch /tmp/fp13_x`; grep -c def {g}', 'G=1; grep -c def {g}',
      "a command substitution inside the VALUE runs for real (`G=`rm …`` executes); a "
      "prefix is only free when it is inert, so a backtick value fails closed"),
+    # `git branch` grammar red arms (Sprint 5, 2026-08-10): the mutating spellings must classify
+    # WRITE while the same-head list form reads. A green on the `_FALSE_REFUSALS` branch reads
+    # without these would certify a hole — `git branch <name>` creates, `git branch -D` deletes.
+    ("git_branch_creates_from_positional",
+     "git branch newfeature", "git branch -a",
+     "a bare positional to `git branch` CREATES a ref; the grammar refuses it while the "
+     "flag-only list form is permitted — same head, decided by the positional"),
+    ("git_branch_deletes",
+     "git branch -D doomed", "git branch --contains HEAD",
+     "-D deletes a ref; a mutating short flag must refuse while `--contains` (a read filter "
+     "that consumes its commit argument) is permitted"),
     # FP14's red arm (claude-code, escalation c80e4a2557df241b; fix is the quoting-state
     # walk over the raw command). The carve-out frees DATA only — these must stay
     # refused. The first three were LIVE BYPASSES under the old substring guard, found
@@ -534,6 +545,16 @@ _FALSE_REFUSALS = [
      "beside it read fine. `merge-base` has no writing mode in any spelling"),
     ("git_for_each_ref", "git for-each-ref refs/heads",
      "plumbing enumeration of refs; no mutating spelling exists"),
+    # `git branch` reads, admitted by `_git_branch_args_are_read_only` (2026-08-10). Mutating
+    # spellings that must STAY refused are pinned in `_SURVIVE` (`git_branch_creates_from_
+    # positional`, `git_branch_deletes`) — a green here without those would certify the grammar
+    # as a hole.
+    ("git_branch_contains_is_a_read", "git branch -a --contains 0513661",
+     "the condemning segment of escalation 3d38341a: a list filtered by containing commit"),
+    ("git_branch_bare_lists", "git branch",
+     "no arguments: lists and nothing else"),
+    ("git_branch_verbose_sorted", "git branch -vv --sort=-committerdate",
+     "verbose list with a sort key; `--sort` consumes its value, no positional remains"),
 ]
 
 # FP6 is NOT fixed here, and pinning it as a known-refused case is the honest form: it
@@ -552,18 +573,10 @@ _STILL_OPEN = [
      "quote opens MID-token after `--flag=`: `grep -c \"foo(bar)\" {g}` tokenises fine. "
      "Found 2026-08-08 while grammar-checking `git branch --format`; NOT fixed there, "
      "because it is a tokeniser class that predates and outlives that grammar"),
-    # The unlisted-git-read-subcommand class (kimi-code notice 1745 §3). PARTIALLY closed
-    # 2026-08-10 (Sprint 5): `merge-base` and `for-each-ref` moved to `_FALSE_REFUSALS`
-    # below — both are pure reads with no mutating spelling, safe as bare-set adds. The two
-    # `branch` rows STAY here: `git branch <name>` creates from a positional and `git branch
-    # -d` deletes, so `branch` needs a grammar (mutating-flag + positional guard), which is
-    # the next increment and is deliberately not rushed in beside the safe pair.
-    ("git_branch_contains_is_a_read", "git branch -a --contains 0513661",
-     "the condemning segment of escalation 3d38341a. `branch` cannot go in the bare set "
-     "— `git branch <name>` CREATES from a positional — so it needs a grammar"),
-    ("git_branch_bare_lists", "git branch",
-     "with no arguments `git branch` lists and nothing else — but only a grammar can tell "
-     "that from `git branch <name>`, so it waits on the same increment as the row above"),
+    # The unlisted-git-read-subcommand class (kimi-code notice 1745 §3) is now CLOSED across
+    # two increments: `merge-base`/`for-each-ref` as bare-set reads (#317), and `branch` via a
+    # fail-closed grammar (`_git_branch_args_are_read_only`, 2026-08-10) — its rows are in
+    # `_FALSE_REFUSALS` above and its mutating spellings in `_SURVIVE`.
     # A REGRESSION THE NEWLINE FIX INTRODUCED ON PURPOSE (LEGION, 2026-08-10). Declared here
     # rather than left for someone to trip over, because it is the one verdict that fix moved
     # in the refusing direction, and an undeclared new false refusal is how this file's own
