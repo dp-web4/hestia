@@ -62,9 +62,14 @@ jobs:
         with:
           path: hestia
           ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Read pinned web4 rev
+        id: web4pin
+        shell: bash
+        run: echo "rev=$(grep -oiE '[0-9a-f]{7,40}' hestia/web4.pin | head -1)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: dp-web4/web4
+          ref: ${{ steps.web4pin.outputs.rev }}
           path: web4
           ref: ${{ env.WEB4_REF }}
 
