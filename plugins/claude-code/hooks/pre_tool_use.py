@@ -1328,6 +1328,14 @@ _HEAD_GRAMMARS = {
 # `&` IS HERE (codex peer-review finding 4, 2026-08-02). It was not, so
 # `ls & <mutating command>` was classified read-only from `ls` alone — a protection hole in
 # the deployed gate, not classifier noise. codex withheld the peer factor over it.
+#
+# `"\n"` was DEAD TEXT from the day it was written until 2026-08-10. shlex counts a newline
+# as whitespace and never emits one as a token, so this entry matched nothing and no newline
+# ever started a new command — every line after the first arrived as ARGUMENTS to the first
+# line's head, and `echo checking\ncp evil.py <gate>` was classified from `echo`. It is live
+# now because `_command_lines` splits the TEXT first and the caller inserts one `"\n"` token
+# per honoured newline. A membership test that cannot fire looks exactly like one that
+# passes; this entry is why the fix below is a tokenizer change and not a set edit.
 _SEPARATORS = {";", "&", "&&", "|", "||", "\n"}
 _REDIRECTS = {">", ">>", "<", "<<", "<<<", ">&", "&>", ">|", "<&"}
 # INPUT redirects create and modify nothing. Split out 2026-08-05, and the split is the
@@ -1511,6 +1519,150 @@ def _assignment_remainder(parts):
     return p
 
 
+# Characters after which an unquoted `#` OPENS A COMMENT, plus the start of a line. Bash
+# begins a comment only at the start of a WORD: `echo a#b; echo two` prints both lines
+# (measured against bash 2026-08-10), because `a#b` is one literal word and the `;` after it
+# is a real separator.
+#
+# DELIBERATELY NARROWER THAN BASH: `<`, `>`, `(` and `)` are word boundaries to bash and are
+# NOT in this set. Measured 2026-08-10, and the measurement corrected the reason this comment
+# first gave. The first draft claimed `echo hi >#f` redirects into a file literally named
+# `#f`, so that treating the `#` as a comment would drop a real write target. That is false:
+# bash comments there too, and `echo hi >#f`, `cat <#x`, `echo hi|#w` and `(echo hi)#z` all
+# behave as comments (the first three become a syntax error, having lost the operand the
+# operator needed). So the honest justification is not fidelity, it is DIRECTION:
+#
+#   a `#` this set fails to recognise is text that is KEPT, tokenised and head-checked, so
+#   the miss can only ADD a refusal — never drop a command from the walk. A `#` recognised
+#   too eagerly discards the rest of the line UNCLASSIFIED, which is the bypass shape.
+#
+# And the omission is measured to cost nothing real: a `#` immediately after a redirection
+# operator leaves that operator with no operand, so bash rejects the whole command anyway —
+# there is no valid command this set refuses and bash accepts. Widening it to match bash
+# exactly means dropping MORE text on the security boundary, which is the dangerous
+# direction and wants its own claim and its own review, not a quiet edit here.
+#
+# NOMAD, working the same claim independently on 2026-08-10, wrote `set(" \t\n;&|()<>")` —
+# the faithful spelling. Two parsers, one narrower and one more faithful, neither a bypass.
+# Whichever survives, this paragraph is the record that the difference was deliberate and
+# measured rather than an oversight in the loser.
+_COMMENT_OPENS_AFTER = frozenset(" \t\r\f\v;&|")
+
+
+def _command_lines(text: str) -> list[str]:
+    """Split raw command TEXT into the logical lines bash would run, in order.
+
+    THE HOLE THIS CLOSES (found by claude-code 2026-08-08, escalation 4a3e6f6838acabad;
+    fixed by LEGION 2026-08-10 claiming CBP's 0015 offer). `_SEPARATORS` has listed `"\\n"`
+    since it was written, but the caller's `shlex` treats a newline as whitespace and never
+    emits it as a token, so the entry matched nothing. No newline ever split a segment:
+    every line after the first arrived as ARGUMENTS to line one's head. So
+
+        echo checking
+        cp evil.py <the gate>
+
+    was classified from `echo` alone — read-only, permitted, and the `cp` overwrote the
+    enforcing gate with no `gate_self_access` event, no witness and no approval. A silent
+    write to the thing that governs writes is the one class worse than a false refusal.
+
+    WHY THE SPLIT IS ON TEXT AND NOT ON TOKENS. Three constructs make the newline
+    unrecoverable once shlex has run, and each is a red arm in
+    `gate_false_refusal_test.py`:
+
+      - a QUOTED newline is data (`grep -c 'a\\nb' <gate>`), so a blind `text.split("\\n")`
+        cuts a pattern in half and leaves an unbalanced quote — a legitimate read refused
+        for being multi-line;
+      - a `\\`-newline is ONE logical line, so splitting there leaves the gate's PATH
+        standing alone as a segment, and `basename` of it is a head no list carries. That
+        is FP13's exact shape (`assignment_prefix_is_not_a_head`), reintroduced by the fix
+        meant to close a hole;
+      - a COMMENT is consumed by shlex THROUGH the end of the line, separator included, so
+        by the time there is a token stream the newline after `# note` is already gone.
+
+    AND THE COMMENT RULE HAD TO COME WITH IT, not after it. shlex's `commenters` eats from
+    `#` to end of LINE — and a `;` sits on the line, so the comment never needed a newline
+    to swallow a separator: `echo a#b; cp evil.py <gate>` was permitted with the `cp`
+    entirely unseen, while bash ran it. Splitting on newlines does not touch that; line one
+    is the whole command. So the caller sets `commenters = ""` and the rule moves here,
+    where the word-start test that separates bash's comment from bash's literal can actually
+    be applied. The two directions are pinned as a PAIR —
+    `mid_word_hash_is_not_a_comment` must refuse, `word_start_comment_still_comments` must
+    stay permitted — because a fix that just refuses anything containing `#` passes the
+    first and fails the second, and only the pair says which one happened.
+
+    The quoting walk here follows `_has_live_substitution`'s rules character for character
+    (single quotes inert; inside double quotes a backslash escapes only `$` `` ` `` `"` `\\`
+    and newline; unquoted backslash escapes anything). That is deliberate duplication of
+    SHAPE, not of code: it cannot call that function, which answers one bool about the whole
+    string, but two quote walkers in one classifier that disagreed about where a quote ends
+    would be a bypass generator. Change one, read the other.
+
+    Unterminated quoting is NOT resolved here — the walk simply ends inside the quote and
+    the offending line goes back to the caller with the quote still open, where the
+    tokenizer raises and fails closed. One place decides that, and it is the same place as
+    before this function existed.
+    """
+    lines: list[str] = []
+    buf: list[str] = []
+    state = ""            # "", "'" or '"' — the quoting the walk is inside
+    at_word_start = True  # a `#` here opens a comment; mid-word it is a literal
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if state == "'":
+            buf.append(c)
+            if c == "'":
+                state = ""
+            at_word_start = False
+        elif state == '"':
+            if c == "\\" and text[i + 1:i + 2] in ('$', '`', '"', "\\", "\n"):
+                buf.append(text[i:i + 2])
+                at_word_start = False
+                i += 2
+                continue
+            buf.append(c)
+            if c == '"':
+                state = ""
+            at_word_start = False
+        elif c == "\\":
+            nxt = text[i + 1:i + 2]
+            if nxt == "\n":
+                # Line continuation. Bash removes BOTH characters and the lines become one,
+                # so emit nothing and do NOT touch `at_word_start` — `ec\<nl>ho` is `echo`,
+                # one word across the join.
+                i += 2
+                continue
+            if nxt:
+                buf.append(text[i:i + 2])
+                at_word_start = False
+                i += 2
+                continue
+            buf.append(c)  # a lone trailing backslash; hand it on unchanged
+            at_word_start = False
+        elif c == "\n":
+            lines.append("".join(buf))
+            buf = []
+            at_word_start = True
+        elif c == "#" and at_word_start:
+            # Discard through the end of the line, the newline EXCLUDED so the line still
+            # separates. That exclusion is the whole `comment_does_not_eat_the_separator`
+            # row: shlex's version consumed the newline with the comment.
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        else:
+            buf.append(c)
+            if c == "'" or c == '"':
+                state = c
+                at_word_start = False
+            else:
+                at_word_start = c in _COMMENT_OPENS_AFTER
+        i += 1
+    lines.append("".join(buf))
+    return lines
+
+
 def _is_read_only(tool_name: str, tool_input: Any) -> bool:
     """True only when the call is CONFIDENTLY read-only. Ambiguity means write.
 
@@ -1551,12 +1703,26 @@ def _is_read_only(tool_name: str, tool_input: Any) -> bool:
     # with an 800ms budget, and `shlex` is only needed on the Bash branch.
     import shlex
 
+    # ONE TOKENIZER PER LOGICAL LINE, with an explicit `"\n"` token between them — one per
+    # newline `_command_lines` honoured. shlex cannot do this itself: it counts a newline as
+    # whitespace, so a single pass over the whole command emits no separator and every line
+    # after the first becomes argv to line one's head (the bypass above). Tokenising per line
+    # is also what makes `commenters = ""` safe — the comment rule now lives in
+    # `_command_lines`, where bash's word-start test can be applied, instead of in a
+    # tokenizer that eats to end-of-line and takes any `;` on that line with it.
+    tokens: list[str] = []
     try:
-        lx = shlex.shlex(cmd, posix=False, punctuation_chars=True)
-        lx.whitespace_split = True
-        tokens = list(lx)
+        for idx, line in enumerate(_command_lines(cmd)):
+            if idx:
+                tokens.append("\n")
+            lx = shlex.shlex(line, posix=False, punctuation_chars=True)
+            lx.whitespace_split = True
+            lx.commenters = ""
+            tokens.extend(lx)
     except ValueError:
-        # Unbalanced quotes: we cannot know what this runs. Fail closed.
+        # Unbalanced quotes: we cannot know what this runs. Fail closed. Still decided in
+        # exactly one place, and a quote `_command_lines` left open arrives here to be
+        # refused rather than being resolved by a second, divergent walk.
         return False
     if not tokens:
         return False

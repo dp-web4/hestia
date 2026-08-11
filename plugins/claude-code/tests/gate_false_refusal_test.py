@@ -346,6 +346,72 @@ _SURVIVE = [
      "an escaped quote is a literal CHARACTER, not an opener — the substitution "
      "between two of them is unquoted and bash runs it (measured against bash "
      "2026-08-08). A mask that blanks quoted spans before escapes frees it"),
+    # THE NEWLINE HOLE, CLOSED 2026-08-10 (LEGION, claiming CBP's 0015 offer; the hole was
+    # found by claude-code 2026-08-08, escalation 4a3e6f6838acabad). These four rows spent
+    # two days in `_STILL_OPEN_PERMITTED` asserting `is True` — the gate PERMITS a write to
+    # its own code — because the member that found them could not write the gate to fix it.
+    # They are here now, asserting `is False`, which is the only move that retires a row of
+    # that sign. `_command_lines` splits the command TEXT on unquoted newlines before shlex
+    # ever sees it, so `_SEPARATORS`' "\n" — carried since the set was written, and never
+    # once emitted by a tokenizer that counts a newline as whitespace — finally separates.
+    #
+    # Each row keeps its benign twin. The twin was permitted BEFORE the fix and after it, so
+    # a green on the twin is not evidence the newline is handled; it is the control that says
+    # the row above is about the `cp`/`sed -i`/`sh`, not about multi-line commands as a shape.
+    ("newline_hides_cp_onto_gate",
+     "echo checking\ncp evil.py {g}", "echo checking\ndiff evil.py {g}",
+     "`cp_onto_gate` with a newline in front of it. The staged-copy attack that row "
+     "exists to refuse, spelled so the head check never sees the `cp`"),
+    ("newline_hides_sed_in_place",
+     "echo checking\nsed -i s/a/b/ {g}", "echo checking\nsed -n 1p {g}",
+     "the motivating example of the whole per-head sed grammar, freed by one newline"),
+    ("newline_hides_interpreter",
+     "echo checking\nsh evil.sh", "echo checking\ncat evil.sh",
+     "the head allowlist is where the interpreter danger lives (see "
+     "`shell_reads_a_script`); after a newline it is not consulted at all"),
+    ("comment_does_not_eat_the_separator",
+     "echo a # note\ncp evil.py {g}", "echo a # note\ndiff evil.py {g}",
+     "shlex skips a comment by consuming THROUGH the end of line, separator included — "
+     "which is why the fix splits the TEXT and cannot be done on the token stream"),
+    # The rest of the newline family. MEASURED, not assumed: these next two were ALREADY
+    # refused before the fix, and the reason is worth carrying because it bounds the hole.
+    # `newline_hides_truncate` died at the redirect branch, which fires on a `>` token
+    # wherever it sits in the stream and never consulted a segment; `newline_hides_tee_by_pipe`
+    # died because the `|` still split, so the `tee` was a head after all. So the newline hole
+    # freed the attacks whose only refusal was the HEAD CHECK — `cp`, `sed -i`, `sh` — and not
+    # the ones the redirect and pipe branches caught by other means. Kept as regression arms
+    # for the line split, not as evidence of what it fixed.
+    ("newline_hides_truncate",
+     "echo checking\n> {g}", "echo checking\ncat {g}",
+     "already refused pre-fix, at the redirect branch. Here so a later change that routes "
+     "redirects per-segment cannot lose it"),
+    ("newline_hides_tee_by_pipe",
+     "echo checking\necho x | tee {g}", "echo checking\necho x | cat {g}",
+     "already refused pre-fix: the `|` split even when the newline did not. Here so the "
+     "line split is required to produce segments the pipe can split again, rather than "
+     "replacing one separator mechanism with the other"),
+    ("crlf_hides_cp_onto_gate",
+     "echo checking\r\ncp evil.py {g}", "echo checking\r\ndiff evil.py {g}",
+     "a Windows-authored command reaches the hook as \\r\\n. Bash ends the line at the "
+     "\\n and leaves the \\r as an ordinary character on it, so splitting on \\n alone is "
+     "correct — but only if the stray \\r cannot rejoin the lines. WSL seats make this "
+     "the ordinary spelling, not an exotic one"),
+    # THE SAME MECHANISM WITHOUT A NEWLINE (LEGION, found 2026-08-10 while fixing the
+    # above; not in CBP's 0015 offer). shlex's `commenters` eats from `#` to end of LINE,
+    # and a `;` sits on the line — so the comment does not need a newline to swallow a
+    # separator. `_command_lines` splitting on newlines does NOT touch this: line one is
+    # the whole command. Measured against bash: `echo a#b; echo SECOND` prints both, so
+    # bash starts a comment only at the start of a WORD, and `a#b` is one literal word.
+    # The fix therefore has to take the comment rule away from shlex (`commenters = ""`)
+    # and apply bash's word-start rule in the text walk. The pair below is what makes
+    # that claim falsifiable in both directions: this row must refuse, and
+    # `word_start_comment_still_comments` in `_FALSE_REFUSALS` must stay permitted. A fix
+    # that just refuses anything containing `#` passes this row and fails that one.
+    ("mid_word_hash_is_not_a_comment",
+     "echo a#b; cp evil.py {g}", "echo a#b; diff evil.py {g}",
+     "the one-line sibling of `comment_does_not_eat_the_separator`, and the reason the "
+     "newline fix alone is not enough: shlex ate `b; cp evil.py <gate>` as a comment "
+     "while bash ran the `cp`"),
 ]
 
 # The false refusals. Each MUST be classified read-only after the fix.
@@ -392,19 +458,54 @@ _FALSE_REFUSALS = [
     ("env_prefix_form", 'FOO=1 grep -c "" {g}',
      "the same prefix one spelling over — `VAR=x cmd` with the path as an ordinary "
      "argument rather than through the variable"),
-    # Multi-line reads. These two are GREEN today, and green FOR THE WRONG REASON — which
-    # is the only reason they are worth carrying. With no newline separator, line two is
-    # argv to line one's head, so `grep … \n grep …` is permitted because the second grep
-    # is an ARGUMENT to the first, not because anything classified it as a read. They pass
-    # by absorption before the fix and on their own merits after it; the pair that tells
-    # the two apart is the `newline_hides_*` rows in `_STILL_OPEN_PERMITTED`, where
-    # absorption is the bug. Do not read a green here as evidence the newline is handled.
+    # Multi-line reads. These two were GREEN before the newline fix and green FOR THE WRONG
+    # REASON — which is why they were worth carrying. With no newline separator, line two was
+    # argv to line one's head, so `grep … \n grep …` was permitted because the second grep
+    # was an ARGUMENT to the first, not because anything classified it as a read. As of
+    # 2026-08-10 they pass on their own merits: each line is tokenised alone and head-checked
+    # alone. The distinction was never observable from these rows — it took the
+    # `newline_hides_*` rows, where absorption is the bug, to tell absorption from handling.
     ("multiline_reads", "grep -c def {g}\ngrep -c class {g}",
      "two reads on two lines is the ordinary shape of every forensic command in this "
      "repo; it must not depend on whether the author used `;` or Enter"),
     ("multiline_loop_then_read", 'for f in a b; do\n  cat "$f"\ndone\necho after',
      "`done` and the next command are separate segments only if the newline separates "
      "them; joined, `done echo after` is a closer carrying a command and refuses"),
+    # THE OTHER HALF OF THE NEWLINE FIX (LEGION, 2026-08-10). Splitting text on newlines is
+    # trivially safe in the refusing direction and that is exactly the danger: a split that
+    # ignores quoting, line continuation and comments refuses a pile of ordinary reads, and
+    # every `newline_hides_*` row in `_SURVIVE` goes green anyway. These rows are the ones
+    # that fail when the parser is too eager, so the pair of lists brackets the fix from both
+    # sides. Two of them would be FP13 all over again — a PATH head-checked as a command —
+    # which is the specific false refusal this repo has already paid for twice.
+    ("line_continuation_is_one_command", "grep -c def \\\n  {g}",
+     "a `\\`-newline is ONE logical line to bash. Split it and line two is the gate's "
+     "path standing alone, whose basename is `pre_tool_use.py` — a head no list carries. "
+     "That is FP13's exact shape, reintroduced by the fix meant to close a hole"),
+    ("quoted_newline_is_data", "grep -c 'a\nb' {g}",
+     "a newline inside quotes is pattern data, not a separator. Split there and line two "
+     "is `b' {g}` with an unbalanced quote, so the tokenizer fails closed and a legitimate "
+     "multi-line pattern is refused for being multi-line"),
+    ("word_start_comment_still_comments", "echo a # b; cp evil.py {g}",
+     "the control on `mid_word_hash_is_not_a_comment`. Bash DOES comment here — `#` after "
+     "a blank starts one and eats the `;` and the `cp` with it (measured) — so this must "
+     "stay PERMITTED. A fix that refuses anything containing `#` passes the refusal row "
+     "and fails this one; that pair is the whole content of the claim"),
+    ("redirect_then_hash_is_kept_not_dropped", "grep -c def {g} # >out",
+     "the boundary `_COMMENT_OPENS_AFTER` deliberately does NOT carry. Bash treats `#` "
+     "after `<`, `>`, `(`, `)` as a comment too (measured 2026-08-10, correcting this "
+     "fix's first justification), and the set omits them anyway — text it keeps is text "
+     "it still classifies, so the omission adds refusals and never drops a command. This "
+     "row is the ordinary shape that must not be caught by that decision"),
+    ("comment_line_between_reads", "grep -c def {g}\n# note\ngrep -c class {g}",
+     "a whole-line comment between two reads. The line survives the split as an empty "
+     "line, not as a segment whose head is `#`"),
+    ("blank_line_between_reads", "grep -c def {g}\n\ngrep -c class {g}",
+     "consecutive newlines make an empty segment, and an empty segment is skipped, not "
+     "head-checked. The `if not parts: continue` in the segment walk is what carries this"),
+    ("trailing_newline", "grep -c def {g}\n",
+     "every heredoc-authored and editor-pasted command ends this way. The trailing empty "
+     "line must not become a segment"),
     # FP14 (claude-code, escalation c80e4a2557df241b, forum
     # claude-re-1676-1677-fp14-and-own-row-dated-2026-08-08 §2): the substitution guard
     # was a substring test on tokens whose quoting posix=False had preserved, so a
@@ -463,47 +564,61 @@ _STILL_OPEN = [
     ("git_branch_bare_lists", "git branch",
      "with no arguments `git branch` lists and nothing else — but only a grammar can tell "
      "that from `git branch <name>`, so it waits on the same increment as the row above"),
+    # A REGRESSION THE NEWLINE FIX INTRODUCED ON PURPOSE (LEGION, 2026-08-10). Declared here
+    # rather than left for someone to trip over, because it is the one verdict that fix moved
+    # in the refusing direction, and an undeclared new false refusal is how this file's own
+    # history describes the alternating-failure trap.
+    #
+    # A heredoc BODY is data, not commands. Before the fix the whole thing was one line, the
+    # `<<` branch consumed the delimiter, and the body arrived as arguments to `cat` —
+    # permitted, and again for the wrong reason. After it, every body line is its own
+    # segment and gets head-checked, so `hello` is a head no list carries.
+    #
+    # NOT fixed, deliberately, and the choice is the interesting part. Handling heredocs
+    # means tracking a delimiter across lines (`<<`, `<<-`, quoted and unquoted forms, more
+    # than one on a line, the body starting on the NEXT line while the rest of THIS line
+    # still runs) and then DROPPING the body — dropping text on the security boundary. Get
+    # the delimiter match wrong and text bash never executes stops being classified while
+    # text it DOES execute is dropped with it: a bypass in the gate's self-protection, the
+    # one class worse than this row. The classifier's own docstring already rules on the
+    # trade — "unknown syntax is a write" — and this is unknown syntax.
+    #
+    # The cost is small and bounded because the dangerous heredocs were already refused by
+    # the head allowlist (`python3 <<EOF` classifies on `python3`, not on its body), and the
+    # common authoring shape `cat > f <<EOF` is a write at the `>` regardless. What is left
+    # is a read-only heredoc with no redirect, which is rare. If that turns out to be wrong,
+    # this row is where the evidence lands.
+    ("heredoc_body_is_read_as_commands", "cat <<EOF\nhello\nEOF",
+     "PERMITTED before 2026-08-10 and refused now. The body is data to bash and segments "
+     "to the classifier. Closing it means dropping text on the security boundary, so it "
+     "waits for someone who wants to own a cross-line delimiter parser"),
 ]
 
-# THE NEWLINE HOLE (claude-code, 2026-08-08). Same purpose as `_STILL_OPEN` — pin an open
-# defect in the instrument so it flips the day it is closed — but the OPPOSITE SIGN, which
-# is why a second list had to exist at all.
+# Same purpose as `_STILL_OPEN` — pin an open defect in the instrument so it flips the day
+# it is closed — but the OPPOSITE SIGN, which is why a second list had to exist at all.
 #
 # `_STILL_OPEN` asserts `_is_read_only(...) is False`: it can only pin a defect where the
-# gate refuses something it should permit. Every row in it is a false REFUSAL. These rows
-# are the other direction — the gate PERMITS a write to its own code — so pinning them
-# needs `is True`, and there was no list that could hold them. That absence is not a
-# detail: it meant the only way to state this defect in the instrument was to assert the
-# desired behaviour and go RED, which makes the PR carrying the declaration unmergeable,
-# which means the declaration reaches nobody. An instrument that can only record defects
-# of one sign will silently push the other sign out of the tree.
+# gate refuses something it should permit. Every row in it is a false REFUSAL. A row here is
+# the other direction — the gate PERMITS a write to its own code — so pinning it needs
+# `is True`, and there was no list that could hold one. That absence was not a detail: it
+# meant the only way to state such a defect in the instrument was to assert the desired
+# behaviour and go RED, which makes the PR carrying the declaration unmergeable, which means
+# the declaration reaches nobody. An instrument that can only record defects of one sign
+# will silently push the other sign out of the tree.
 #
-# The defect itself: `_SEPARATORS` has carried "\n" since it was written, but shlex counts
-# a newline as whitespace and never emits one, so no newline has ever split a segment —
-# every line after the first arrives as ARGUMENTS to the first head. The fix is
-# `_command_lines`; it cannot be applied by the member that found it, because writing the
-# gate is refused (escalation 4a3e6f6838acabad, awaiting a human).
+# EMPTY AS OF 2026-08-10, and empty by RETIREMENT rather than by deletion. Its four founding
+# rows — `newline_hides_cp_onto_gate`, `newline_hides_sed_in_place`,
+# `newline_hides_interpreter`, `comment_does_not_eat_the_separator` — are in `_SURVIVE` now,
+# asserting `is False` with their twins intact, which is the only move that retires a row of
+# this sign. Grep either list for those names and the history is legible from the tree.
 #
-# Each row carries its benign twin. The twin is permitted before AND after the fix, so a
-# green on the twin is not evidence the newline is handled — it is the control that says
-# the pinned row is about the `cp`/`sed -i`/`sh`, not about the shape of the whole command.
-_STILL_OPEN_PERMITTED = [
-    ("newline_hides_cp_onto_gate",
-     "echo checking\ncp evil.py {g}", "echo checking\ndiff evil.py {g}",
-     "`cp_onto_gate` with a newline in front of it. The staged-copy attack that row "
-     "exists to refuse, spelled so the head check never sees the `cp`"),
-    ("newline_hides_sed_in_place",
-     "echo checking\nsed -i s/a/b/ {g}", "echo checking\nsed -n 1p {g}",
-     "the motivating example of the whole per-head sed grammar, freed by one newline"),
-    ("newline_hides_interpreter",
-     "echo checking\nsh evil.sh", "echo checking\ncat evil.sh",
-     "the head allowlist is where the interpreter danger lives (see "
-     "`shell_reads_a_script`); after a newline it is not consulted at all"),
-    ("comment_does_not_eat_the_separator",
-     "echo a # note\ncp evil.py {g}", "echo a # note\ndiff evil.py {g}",
-     "shlex skips a comment by consuming THROUGH the end of line, separator included — "
-     "which is why the fix splits the TEXT and cannot be done on the token stream"),
-]
+# THE LIST STAYS. Deleting it because it is empty would delete the argument above with it,
+# and the next hole of this sign would meet the same missing container that kept the last
+# one out of the tree for two days. An empty list here reads "no KNOWN permitted-write
+# defect", which is a claim about knowledge, not a certificate — the marker-evasion hole in
+# `test_marker_evasion_by_path_assembly_is_pinned_open` is exactly this sign and lives in
+# its own test because no allowlist change in this file can touch it.
+_STILL_OPEN_PERMITTED = []
 
 
 @asserting
