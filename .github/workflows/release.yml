@@ -168,7 +168,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            TAG="pr-${{ github.event.pull_request.number }}"
+          else
+            TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          fi
           STAGE="hestia-${TAG}-${{ matrix.target }}"
           mkdir -p "dist/${STAGE}"
           cp "hestia/core/target/${{ matrix.target }}/release/hestia" "dist/${STAGE}/"
@@ -181,7 +185,11 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $tag = "${{ github.event.inputs.tag || github.ref_name }}"
+          if ("${{ github.event_name }}" -eq "pull_request") {
+            $tag = "pr-${{ github.event.pull_request.number }}"
+          } else {
+            $tag = "${{ github.event.inputs.tag || github.ref_name }}"
+          }
           $stage = "hestia-$tag-${{ matrix.target }}"
           New-Item -ItemType Directory -Path "dist/$stage" | Out-Null
           Copy-Item "hestia/core/target/${{ matrix.target }}/release/hestia.exe" "dist/$stage/"
@@ -189,6 +197,7 @@ jobs:
           if (Test-Path "hestia/LICENSE") { Copy-Item "hestia/LICENSE" "dist/$stage/" }
           Compress-Archive -Path "dist/$stage" -DestinationPath "dist/$stage.zip"
           $hash = (Get-FileHash "dist/$stage.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $stage.zip.sha256" | Out-Null
           "$hash  $stage.zip" | Set-Content "dist/$stage.zip.sha256"
           Get-ChildItem dist
 
