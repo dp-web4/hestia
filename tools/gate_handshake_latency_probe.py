@@ -178,9 +178,13 @@ def one_run(url: str, role: str, plugin_id: str) -> dict:
         steps["query_policy"] = (time.monotonic() - t) * 1000
         steps["_polls"] = polls
         total = (time.monotonic() - t_all) * 1000
-    except (urllib.error.URLError, socket.timeout, OSError) as e:
+    except Exception as e:  # noqa: BLE001
         # Caught HERE, not in the caller: an error row must carry its open
         # action's accounting instead of dropping out of the denominator.
+        # Broad on purpose: on py>=3.10 URLError and socket.timeout are both
+        # OSError subclasses, and _post can also raise JSONDecodeError /
+        # IncompleteRead / UnicodeDecodeError -- any of which would skip the
+        # close below and leak the action.
         err = f"query_policy: {type(e).__name__}: {e}"
 
     # Close the action (untimed -- cleanup is not part of the gate sequence
@@ -223,7 +227,7 @@ def main():
     for i in range(n):
         try:
             r = one_run(url, role, plugin_id)
-        except (urllib.error.URLError, socket.timeout, OSError) as e:
+        except Exception as e:  # noqa: BLE001
             r = {"error": f"{type(e).__name__}: {e}"}
         rows.append(r)
         if "error" in r:
