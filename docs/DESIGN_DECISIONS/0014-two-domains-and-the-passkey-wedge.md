@@ -306,12 +306,18 @@ meanings is exactly the ambiguity the fresh chain exists to avoid, and it is exp
 once entries accumulate.
 
 > **Ruling: the new chain's entry format carries both roles from genesis — an actor signature over
-> the act, and a witness signature over (position, act digest, policy generation). The witness side
-> may begin as a single-daemon signer; what may not happen is a genesis whose format has no place
-> for it.**
+> the versioned semantic act digest, and a chain-witness signature over a versioned envelope binding
+> chain identity, position, row hash (which commits to the act digest for an act-bearing row), policy
+> generation, signer identity, and signing-time key identity. The witness side may begin as a
+> single-daemon signer; what may not happen is a genesis whose format has no place for it.**
 
-`witness_act.rs` already holds the correct primitive with zero callers; this is a *format* decision,
-and the chain rewrite is the one moment when adding it is free.
+The landed B1 primitive is only the first half. `hestia-wire::ActDigestV1Fields` freezes the semantic
+act bytes, and `witness_act.rs` currently uses that digest for a witness attestation; its production
+functions still have zero callers. It does **not** implement the chain-witness role above:
+`witness_act` appends a legacy unsigned row and binds neither the chain coordinate nor the policy
+generation. B2 / `#339` owns that versioned chain-signature envelope and must absorb the full tuple
+ruled here. This remains a *format* decision, and the chain rewrite is the one moment when adding it
+is free.
 
 ### 6.2 Archive means readable by the instruments **(kimi + claude S6 amendment)**
 
