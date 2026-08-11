@@ -2589,9 +2589,9 @@ def deny_no_verdict(why: str, *, cause: str = "unknown", tool_name: str = "unkno
         "operator.",
     )
     sys.stderr.write(
-        f"hestia: deny [fail-closed] — no policy verdict ({why}; cause={cause}). "
-        f"This is a boundary, not a tool failure: do not re-run the same call "
-        f"immediately. {remedy}\n"
+        f"hestia: no verdict [fail-closed] — the policy daemon did not return a decision "
+        f"({why}; cause={cause}). This is NOT a policy boundary and NOT a tool failure — the "
+        f"referee is unreachable, so the gate fails closed for safety. {remedy}\n"
     )
     _record_plane_e(cause, why, tool_name)
     debug_log(f"fail-closed deny: {why} cause={cause}")
