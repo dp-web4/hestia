@@ -798,6 +798,55 @@ impl ServerState {
             succ as f64 / total as f64
         };
 
+        // Harnesses that ACTED in the recent window. This — not "has a grain" — is what
+        // `engaged` (the stats/"active" signal, built below) means. Captured BEFORE folding
+        // in the idle known harnesses just below, so surfacing a two-day-idle member's trust
+        // row does not falsely mark it active.
+        let engaged_pids: std::collections::HashSet<String> =
+            active_entities.values().map(|(_, pid, _)| pid.clone()).collect();
+
+        // IDLE-BUT-KNOWN HARNESSES (dp, 2026-08-11): a registry harness that has not acted
+        // within the recent-window sample still deserves its trust row — its accumulated
+        // trust persists in the store, and staleness is conveyed by `days_since_last`, not by
+        // the row vanishing. `stats_window` is the last N rows of ALL event types, dominated
+        // by frequent outcomes, so it only reaches back an hour or two; a member idle for days
+        // (kimi-code) falls out of it entirely though its grain is intact. Seed the active set
+        // from the trust store for every registry harness so it shows its most recent standing.
+        // Insert-if-absent: a harness active in the window keeps its window entry untouched.
+        // The derived LEVEL still comes from `deriv_window` (the last N DERIVATION-type rows —
+        // a far sparser stream that reaches back much further), so an idle member shows its
+        // real last-derived level, never a fabricated one; if even that has aged out, the row
+        // is `unmeasured` but still carries the grain's action_count and days_since_last.
+        if let Ok(all_keys) = self.trust_store.list() {
+            // Reverse map: a grain key's instance prefix -> the human plugin_id, for the
+            // harnesses we know. Both the mapped `lct:web4:member:…` form and the legacy
+            // `plugin:<id>` form, so a grain written before the member was mapped still resolves.
+            let mut instance_pid: std::collections::HashMap<String, &str> =
+                std::collections::HashMap::new();
+            for orch in crate::orchestrators::REGISTRY {
+                if self.is_synthetic(orch.id) {
+                    continue;
+                }
+                if let Some(lct) = self.member_lct(orch.id) {
+                    instance_pid.insert(lct, orch.id);
+                }
+                instance_pid.insert(format!("plugin:{}", orch.id), orch.id);
+            }
+            for key in all_keys {
+                // A MAIN grain is "{instance}#{role}"; its `#adjudicated` / `#judgment`
+                // sub-grains carry a further '#' and are folded by the main grain, not listed.
+                let Some((instance, role)) = key.split_once('#') else { continue };
+                if role.contains('#') {
+                    continue;
+                }
+                if let Some(&pid) = instance_pid.get(instance) {
+                    active_entities
+                        .entry(key.clone())
+                        .or_insert((Utc::now(), pid.to_string(), role.to_string()));
+                }
+            }
+        }
+
         // Build the trust list per (instance, role) entity seen in the window, minus synthetic
         // test harnesses. NOTE: no last-hour filter — an idle-but-known orchestrator stays viewable
         // (dp: always be able to select any visible orchestrator + view its history regardless of
