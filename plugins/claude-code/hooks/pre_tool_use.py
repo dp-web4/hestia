@@ -1486,7 +1486,7 @@ def _control_flow_remainder(parts):
 
 
 def _assignment_remainder(parts):
-    """Consume leading NAME=VALUE assignment prefixes from one segment.
+    r"""Consume leading NAME=VALUE assignment prefixes from one segment.
 
     FP13 (claude-code, notice 1474 §1): the head check read `G=<path>` as a COMMAND —
     basename(`G=<gate>`) is the gate's own filename, which sits in no head list, so a
