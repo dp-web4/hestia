@@ -159,7 +159,7 @@ jobs:
             The dashboard HTML is baked into the binary; nothing else is required to run.
           draft: false
           prerelease: false
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false  # windows .zip absent while win/mac are out (SQLCipher runner toolchain); tolerate the missing pattern
           files: |
             dist/hestia-*.tar.gz
             dist/hestia-*.tar.gz.sha256
