@@ -308,6 +308,18 @@
     letter-spacing: 0.08em;
   }
   .orch-chip.selected .level { color: var(--accent); opacity: 0.85; }
+  /* The aggregate ("All") chip: a reset control, not a harness. Set slightly apart from the
+     harness list by a trailing gap + faint divider so the grouping reads "All | harness…". */
+  .orch-chip-all { margin-right: 0.6rem; letter-spacing: 0.04em; }
+  .orch-chip-all::after {
+    content: '';
+    position: absolute;
+    right: -0.6rem;
+    top: 20%;
+    bottom: 20%;
+    border-right: 1px solid var(--border);
+  }
+  .orch-chip-all { position: relative; }
   .orch-chip .count {
     font-size: 0.75rem;
     color: var(--fg-faint);
@@ -1428,6 +1440,15 @@
     // Same ruling dp already gave for trust rows: staleness is shown, not hidden.
     if (selectedOrch && !orchs.some(o => o.connected && o.id === selectedOrch)) selectedOrch = null;
 
+    // The aggregate ("All") view is the default and a first-class destination, not just the
+    // absence of a selection. Clicking a harness filters to it; there was no signposted way
+    // back to the all-harnesses view once filtered (dp) — re-clicking the same chip cleared
+    // it, but nothing said so. This leading chip makes "all" reachable and shows, when
+    // selected, that you ARE looking at every harness. `selectedOrch === null` is that state.
+    const allChip = `<span class="orch-chip orch-chip-all${selectedOrch === null ? ' selected' : ''}" data-all="1" title="all harnesses — the aggregate view (click any harness to filter)">
+                       <span>All</span>
+                     </span>`;
+
     const chips = orchs.map(o => {
       // `connected` = alive + wired (or acted in the last hour). `engaged` is the
       // narrower "active in the last hour" signal used to filter stats. An idle
@@ -1459,7 +1480,14 @@
                 <span class="orch-connect" data-connect="${escapeHtml(o.id)}" data-connectable="${connectable}">${connectable ? '+ connect' : 'no plugin'}</span>
               </span>`;
     }).join('');
-    root.innerHTML = header + chips;
+    root.innerHTML = header + allChip + chips;
+
+    const allEl = root.querySelector('.orch-chip[data-all]');
+    if (allEl) allEl.addEventListener('click', () => {
+      if (selectedOrch === null) return; // already the all view — no-op, no needless rerender
+      selectedOrch = null;
+      if (lastData) rerender(lastData);
+    });
 
     root.querySelectorAll('.orch-chip[data-pid]').forEach(el => el.addEventListener('click', () => {
       const pid = el.getAttribute('data-pid');
