@@ -486,6 +486,12 @@
   }
   .tr-detail:hover { border-color: var(--accent); color: var(--accent); }
   .trust-row .trust-level { justify-self: end; }
+  /* Harness aggregate rows (the All trust view) are a drill target, not a static row. */
+  .trust-row-harness { cursor: pointer; }
+  .trust-row-harness:hover { background: var(--bg-elev-2); }
+  .trust-row-harness:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+  .trust-row .tr-drill { justify-self: end; font-size: 0.7rem; color: var(--fg-faint); letter-spacing: 0.04em; white-space: nowrap; }
+  .trust-row-harness:hover .tr-drill { color: var(--accent); }
   @media (max-width: 700px) {
     .trust-row { grid-template-columns: minmax(0, 1fr) 3rem auto; }
     .trust-row .tr-bar { display: none; }
@@ -923,7 +929,7 @@
       <div class="card">
         <div class="card-head">
           <h2 id="trust-title">Plugin trust</h2>
-          <span class="head-hint">click a row for the full tensor and its receipts</span>
+          <span class="head-hint" id="trust-hint">click a harness to see its role trust</span>
         </div>
         <div class="trust-list" id="trust-list">
           <div class="empty">No plugins recorded yet. Connect one to start building trust.</div>
@@ -1594,29 +1600,85 @@
     return role.split(':').pop();
   }
 
-  function renderTrust(trust) {
-    const root = $('trust-list');
-    const title = $('trust-title');
-    let filtered = selectedOrch
-      ? trust.filter(t => t.plugin_id === selectedOrch)
-      : trust;
-    title.textContent = selectedOrch
-      ? `Plugin trust — ${selectedOrch}`
-      : 'Plugin trust';
+  // The trust box is contextual to the harness selection (dp):
+  //   ALL selected      → one line per HARNESS, an aggregate (worst-of-measured level,
+  //                        total actions, role count). Click a line to drill in.
+  //   one harness picked → ROLE trust: one line per role of that harness, each carrying
+  //                        the full tensor/score/detail. A harness acts under several
+  //                        roles and the law scores each role's grain separately, so this
+  //                        is where the per-grain detail belongs.
+  function renderTrust(trust, orchs) {
+    if (selectedOrch) renderRoleTrust(trust || [], orchs || []);
+    else renderHarnessTrust(trust || [], orchs || []);
+  }
+
+  // Fold a plugin's grains into one summary. Alias grains route their action_count to the
+  // identity they fold into (so nothing vanishes), matching how the role list drops alias
+  // rows into their target's detail. Level = worst of the plugin's own MEASURED roles.
+  function aggregateHarnessTrust(trust) {
+    const byId = {};
+    const get = id => byId[id] || (byId[id] =
+      { plugin_id: id, level: null, action_count: 0, roles: 0, measured: 0 });
+    for (const t of trust) {
+      if (t.aliased_to) { get(t.aliased_to).action_count += t.action_count; continue; }
+      const cur = get(t.plugin_id);
+      cur.action_count += t.action_count;
+      cur.roles += 1;
+      const rank = LEVEL_ORDER.indexOf(t.level);
+      if (rank < 0) continue;   // unmeasured/unknown: coverage, not a level
+      cur.measured += 1;
+      if (cur.level === null || rank < LEVEL_ORDER.indexOf(cur.level)) cur.level = t.level;
+    }
+    for (const v of Object.values(byId)) if (v.level === null) v.level = 'unmeasured';
+    // A pure alias target with no grain of its own (roles === 0) is not a harness row.
+    return Object.values(byId).filter(v => v.roles > 0);
+  }
+
+  function renderHarnessTrust(trust, orchs) {
+    const root = $('trust-list'), title = $('trust-title'), hint = $('trust-hint');
+    title.textContent = 'Plugin trust';
+    if (hint) hint.textContent = 'click a harness to see its role trust';
+    trustShown = [];   // no per-grain detail buttons in the aggregate view
+    const connected = new Set(orchs.filter(o => o.connected).map(o => o.id));
+    const rows = aggregateHarnessTrust(trust).sort((a, b) => b.action_count - a.action_count);
+    if (!rows.length) {
+      root.innerHTML = '<div class="empty">No plugins recorded yet. Connect one to start building trust.</div>';
+      return;
+    }
+    root.innerHTML = rows.map(r => {
+      // Only a currently-connected harness (idle counts) is drillable: selecting a GONE one
+      // would be cleared by renderOrchBar's guard on the same tick and read as a dead click.
+      const drillable = connected.has(r.plugin_id);
+      const cover = `${r.roles} role${r.roles === 1 ? '' : 's'}`
+        + (r.measured < r.roles ? ` · ${r.roles - r.measured} unmeasured` : '')
+        + ` · ${fmt.int(r.action_count)} action${r.action_count === 1 ? '' : 's'}`;
+      return `
+      <div class="trust-row${drillable ? ' trust-row-harness' : ''}"${drillable
+          ? ` data-harness="${escapeHtml(r.plugin_id)}" role="button" tabindex="0" title="click to see this harness’s role trust"`
+          : ' title="no active session — connect it to drill into roles"'}>
+        <span class="tr-id">${escapeHtml(r.plugin_id)}</span>
+        <span class="tr-bar"><span class="tr-dim">${cover}</span></span>
+        <span class="tr-val"></span>
+        <span class="trust-level">${escapeHtml(r.level)}</span>
+        <span class="tr-drill">${drillable ? 'roles →' : ''}</span>
+      </div>`;
+    }).join('');
+  }
+
+  function renderRoleTrust(trust, orchs) {
+    const root = $('trust-list'), title = $('trust-title'), hint = $('trust-hint');
+    title.textContent = `Role trust — ${selectedOrch}`;
+    if (hint) hint.textContent = 'click a role’s detail for the full tensor and its receipts';
+    let filtered = trust.filter(t => t.plugin_id === selectedOrch);
     if (!filtered.length) {
-      root.innerHTML = selectedOrch
-        ? `<div class="empty">No trust data for ${escapeHtml(selectedOrch)}.</div>`
-        : '<div class="empty">No plugins active in the last hour.</div>';
+      root.innerHTML = `<div class="empty">No trust data for ${escapeHtml(selectedOrch)}.</div>`;
       trustShown = [];
       return;
     }
     // An aliased grain is not a peer of the identity it folds into — that is the whole
-    // content of an alias. It was rendered as a sibling row saying "counted there, not
-    // here", which is accurate and still reads as another agent at a glance; the list is
-    // scanned, not read. So aliased grains leave the list and reappear inside their
-    // TARGET's detail, where the fold is the point rather than a caveat. Nothing is
-    // hidden: the row, its counts and its chain evidence are all one click away, and the
-    // alias itself is a witnessed chain entry either way.
+    // content of an alias. It leaves the list and reappears inside its TARGET's detail,
+    // where the fold is the point rather than a caveat. Nothing is hidden: the row, its
+    // counts and its chain evidence are all one click away.
     trustFolded = filtered.filter(t => t.aliased_to);
     filtered = filtered.filter(t => !t.aliased_to);
     if (!filtered.length) {
@@ -1625,20 +1687,22 @@
       return;
     }
     // Kept so the detail modal can reopen the exact grain that was clicked, rather than
-    // re-deriving "which row was that" from the id (a plugin has several grains and two
-    // can share a plugin_id — the codex / codex-cli case).
+    // re-deriving "which row was that" from the id (a plugin has several role grains).
     trustShown = filtered;
     root.innerHTML = filtered.map((t, i) => {
       const w = lawScore(t);
       const pct = w.score == null ? 0 : Math.max(0, Math.min(1, w.score)) * 100;
-      // Unmeasured renders an explicitly EMPTY track, not a zero-width fill on a track
-      // you cannot see — "no evidence" and "evidence of zero" must not look alike.
+      // Unmeasured renders an explicitly EMPTY track, not a zero-width fill on a track you
+      // cannot see — "no evidence" and "evidence of zero" must not look alike.
       const bar = w.score == null
         ? `<div class="bar bar-unmeasured" title="no adjudicated evidence yet"></div>`
         : `<div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>`;
+      // Role-forward: the harness is fixed in the title, so the row leads with the ROLE.
+      const role = trustRole(t);
+      const label = role ? shortRole(role) : '(no role)';
       return `
       <div class="trust-row">
-        <span class="tr-id">${escapeHtml(t.plugin_id)}${trustRole(t) ? `<span class="tr-role">${escapeHtml(shortRole(trustRole(t)))}</span>` : ''}</span>
+        <span class="tr-id" title="${escapeHtml(role || t.plugin_id)}">${escapeHtml(label)}</span>
         <span class="tr-bar">
           ${bar}
           <span class="tr-dim">${escapeHtml(w.label)} · ${fmt.int(t.action_count)} action${t.action_count === 1 ? '' : 's'}</span>
@@ -1650,6 +1714,10 @@
       </div>`;
     }).join('');
   }
+
+  // Drill from the harness aggregate into that harness's role trust — the same selection
+  // the orch chip makes, so the two entry points stay in sync.
+  function selectHarness(id) { selectedOrch = id; if (lastData) rerender(lastData); }
 
   // THE ROW'S NUMBER IS THE ONE THE LAW USES (dp, 2026-07-26: "the measurements should
   // follow the law"). derivation.rs computes the displayed level as the MEAN of the
@@ -2058,7 +2126,7 @@
         && (data.trust || []).length === 0;
       if (noLocalAgents) setView('hubs');
     }
-    renderTrust(data.trust);
+    renderTrust(data.trust, data.orchestrators);
     renderHistogram(data);
     renderFeed(data.recent);
     renderDeployment(data.deployment);
@@ -2981,6 +3049,21 @@
     });
     // Sync <body data-view> to the HTML default (agents) before the first snapshot lands.
     setView(activeView);
+
+    // Harness aggregate rows (the All trust view) drill into that harness's role trust.
+    // One delegated listener survives the 2s innerHTML re-renders; keyboard-activatable too.
+    const trustList = $('trust-list');
+    if (trustList) {
+      trustList.addEventListener('click', (e) => {
+        const row = e.target.closest('.trust-row-harness[data-harness]');
+        if (row) selectHarness(row.dataset.harness);
+      });
+      trustList.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        const row = e.target.closest('.trust-row-harness[data-harness]');
+        if (row) { e.preventDefault(); selectHarness(row.dataset.harness); }
+      });
+    }
     // The badge is a standing alarm, so it must be populated without anyone opening the
     // drawer — an alarm you have to go looking for is not an alarm.
     loadAgents();
