@@ -170,7 +170,29 @@ def test_bad_budget_env_defaults_not_raises():
     del os.environ["X_TEST_BUDGET"]
 
 
-ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+# Explicit list — NOT a globals() comprehension — so every test name is a static reference
+# (tools/ci_selfexec_test.py rejects test functions whose execution cannot be established
+# statically; a dynamic sweep leaves each name un-referenced and reads as inert).
+ALL = [
+    test_allow_proceeds,
+    test_deny_enforced_blocks,
+    test_warn_allows,
+    test_audit_deny_allows,
+    test_no_endpoint_failcloses,
+    test_init_failure_failcloses,
+    test_connect_rejected_failcloses,
+    test_missing_session_failcloses,
+    test_begin_missing_action_failcloses,
+    test_poll_timeout_failcloses,
+    test_network_exception_failcloses,
+    test_init_exception_failcloses,
+    test_empty_policy_payload_failcloses,
+    test_unknown_status_failcloses,
+    test_missing_decision_failcloses,
+    test_unknown_decision_value_failcloses,
+    test_exhausted_deadline_refuses_request,
+    test_bad_budget_env_defaults_not_raises,
+]
 
 if __name__ == "__main__":
     print("shared society-safety mechanism — fail-closed + wire-shape contract")
