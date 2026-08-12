@@ -107,6 +107,14 @@ Source consolidation is not deployment consolidation: one source file copied int
 ### 7.3 Closure
 8. A write to **any element of the effective governance closure defined in §5** — the core, the shared-mechanism module, the loader/digest-selection path, **the registration/config that selects the shim, the installers/manifests that put it in force, and any exemption ledger** — is **refused and escalatable from every adopting harness** (step B), asserted before step C lands. A criterion that covers only core + mechanism + loader still leaves a path to redirect *which* law executes; it must cover the whole closure §5 names.
 
+### 7.4 Availability parity across harnesses (observed) — the timeout asymmetry must close
+
+Today the gate **times out for kimi and codex even with the box idle**, and **never for claude** (dp, 2026-08-12). This is not (only) CPU contention (#354); it is a **structural per-call cost difference**. claude takes one lean daemon round-trip for its verdict. kimi and codex reach the society-safety verdict by **spawning a subprocess** that runs its own connect + verdict + poll protocol against the daemon, on top of their own fire-and-forget witness — so per gate call they pay subprocess spawn + interpreter startup + a separate multi-round-trip, and the society subprocess may not even inherit the raised total-budget env. Even idle, that accumulated cost blows their budget while claude's stays inside it.
+
+The refactor should close this **by construction**: once every harness decides through the same shared path claude uses — society-safety as an in-process predicate, not a subprocess-delegated round-trip — the extra cost is gone. So the accepted state is:
+
+9. **The idle timeout rate is equal across harnesses (≈0).** Measured over a window of gate calls with the box quiet, kimi's and codex's fail-closed-on-timeout rate matches claude's. If the asymmetry survives the refactor, the consolidation did **not** actually put every harness on the same path (they are still subprocess-delegating, or still on a heavier round-trip), and cutover (§6.F) is not complete. This is an **observed** criterion — measure the live per-harness timeout rate after deploy — the availability half of §7.2's declared → executable → deployed → observed.
+
 ## 8. The procedure fix — make the correct path the easy path
 
 Today "update the gate" means find which of N copies, edit it, notice the others didn't get it, hand-patch each installed copy out-of-band (the in-session path is walled by self-access), and hope nothing drifts. After this: edit the core, tests pin it, the deploy installs one core + thin shims and **measures digest convergence**, and the shim is too thin to hold a decision — so a fix cannot land in one harness and miss another. The cheap path (edit one file) becomes the correct path (fix every seat, provably).
