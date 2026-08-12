@@ -539,7 +539,7 @@ def _touches_self(tool_input):
     return None
 
 
-def _gate_self_call(tool, args):
+def _gate_self_call(tool, args, host_session_id=None):
     """One short daemon round trip for a gate-self event: initialize, connect (session-bound),
     one tools/call. Returns the unwrapped result dict, or None on ANY failure.
 
@@ -547,6 +547,10 @@ def _gate_self_call(tool, args):
     hook yields neither exit 2 nor a JSON deny — the engine reads it as a non-blocking error and
     runs the tool anyway. A gate-self exchange that hangs therefore fails OPEN, which is strictly
     worse than a refusal. Callers treat None as refusal (writes) or best-effort loss (witnesses).
+
+    `host_session_id`, when the caller has one, is threaded into the connect so the gate-self
+    session this call mints joins to the per-wake session the outcome rows carry (same join the
+    main daemon path makes at the Gate 2 call below).
     """
     import urllib.request
     endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
@@ -592,12 +596,15 @@ def _gate_self_call(tool, args):
                                                      "version": "1"}}}, {}, 0.8)
         h = {"mcp-session-id": sid_hdr} if sid_hdr else {}
         post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, h, 0.4)
+        connect_args = {"plugin_id": HESTIA_PLUGIN_ID,
+                        "host_agent": HESTIA_PLUGIN_ID,
+                        "role": _identity_role(),
+                        "instance_name": "gate-self"}
+        if host_session_id:
+            connect_args["host_session_id"] = host_session_id
         raw, _ = post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                        "params": {"name": "hestia_connect",
-                                  "arguments": {"plugin_id": HESTIA_PLUGIN_ID,
-                                                "host_agent": HESTIA_PLUGIN_ID,
-                                                "role": _identity_role(),
-                                                "instance_name": "gate-self"}}}, h, 0.8)
+                                  "arguments": connect_args}}, h, 0.8)
         conn = unwrap(raw)
         sess = conn.get("sessionId") if conn else None
         if not sess:
@@ -624,7 +631,8 @@ def _witness_gate_self(event_type, marker, tool_name):
                        "marker": marker,
                        "gate_path": os.path.abspath(__file__),
                        "severity": "record" if event_type == "gate_self_read" else "escalate",
-                       "role_lct": _identity_role()}}) is not None
+                       "role_lct": _identity_role()}},
+        host_session_id=_EVENT.get("session_id")) is not None
 
 
 def _claim_self_write(marker, tool_name, attempted):
@@ -636,7 +644,7 @@ def _claim_self_write(marker, tool_name, attempted):
     write and the second attempt claims the approval. Every failure — unreachable, malformed, a
     daemon with no escalation channel — is a refusal: a daemon that cannot answer must not be a
     way to get a governance write through."""
-    r = _gate_self_call("hestia_gate_escalation_claim", {
+    claim_args = {
         "plugin_id": HESTIA_PLUGIN_ID,
         "role": _identity_role(),
         "tool_name": tool_name,
@@ -648,7 +656,17 @@ def _claim_self_write(marker, tool_name, attempted):
         "reason": attempted or f"{tool_name} -> {marker}",
         "detail": ("Auto-opened by the gate on a refused write; the member stated no rationale "
                    "because it did not choose to escalate. Approving authorises this one write."),
-    })
+    }
+    # The claimed-row join key (reply-2005/reply-2006, 2026-08-12): of the three session-id
+    # namespaces in a claim window, only the per-wake host session appears on the outcome rows
+    # an auditor joins from — the gate-self connect session above joins only to gate witnesses.
+    # Sent only when in hand: the daemon writes explicit null, and a fabricated placeholder
+    # would be a lie in the exact record used to argue about who authorised what.
+    host_session_id = _EVENT.get("session_id")
+    if host_session_id:
+        claim_args["host_session_id"] = host_session_id
+    r = _gate_self_call("hestia_gate_escalation_claim", claim_args,
+                        host_session_id=host_session_id)
     if not isinstance(r, dict):
         return "unreachable", "no answer from the daemon — refused", None, None
     # BOTH flags, and the daemon owns both — two places deciding what "approved" means is how

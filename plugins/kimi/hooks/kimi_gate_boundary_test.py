@@ -184,6 +184,15 @@ def test_gate_file_write_refused_locally():
             check("stderr-class", "gate-self" in err, err)
             check("escalation-surfaced", "esc-stub-1" in err, err)
             check("claim-made", "hestia_gate_escalation_claim" in stub.names(), stub.names())
+            # The claimed-row join key (reply-2005/reply-2006): the per-wake host session rides
+            # BOTH the connect and the claim, because it is the only session namespace that
+            # appears on the outcome rows a claimed approval must join to.
+            _conn = [a for n, a in stub.calls if n == "hestia_connect"]
+            check("connect-carries-host-session",
+                  _conn and _conn[0].get("host_session_id") == "boundary-test", stub.calls)
+            _claim = [a for n, a in stub.calls if n == "hestia_gate_escalation_claim"]
+            check("claim-carries-host-session",
+                  _claim and _claim[0].get("host_session_id") == "boundary-test", stub.calls)
             check("witnessed", "gate_self_access" in stub.witness_events(), stub.calls)
             # Refused BEFORE the policy path — self-protection is pre-daemon, and an approved
             # gate edit is not a blanket allow: no begin_action may have run for this call.
