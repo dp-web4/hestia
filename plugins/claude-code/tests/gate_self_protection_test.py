@@ -71,6 +71,9 @@ SHARED = os.path.join(REPO, "plugins", "_shared")
 EXEMPT = {
     "test_gate_core.py": "a test of the core, not a decider; editing it cannot change a verdict "
                          "reached at runtime — only whether the build notices",
+    "hestia_gate_mechanism_test.py": "a test of the shared society-safety mechanism, not a decider; "
+                                     "editing it cannot change a runtime verdict — only whether the "
+                                     "build notices a weakened fail-closed contract",
 }
 # `__init__.py` was in this list on the first draft, speculatively, for a file that does not
 # exist. `exemptions_are_not_stale` caught it on the very first run — against its own author,

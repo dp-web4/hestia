@@ -260,6 +260,10 @@ _GOVERNANCE_FILES = (
     "witness.py",
     "law_inject.py",
     "hestia_gate_core.py",
+    # The shared in-process society-safety MECHANISM (#371): it carries the fail-closed contract
+    # and interprets the daemon's verdict, so editing it can weaken a decision — governed like the
+    # core it sits beside. Kept equal with the canonical list by the drift guard.
+    "hestia_gate_mechanism.py",
     # The EXEMPTION LEDGER is a policy artifact too (codex NOT-SAME review of #175).
     # `gate_self_protection_test.py` holds `EXEMPT`, the list of shared files allowed to
     # escape the guard. Outside this tuple, the bypass was one unescalated write: add a new

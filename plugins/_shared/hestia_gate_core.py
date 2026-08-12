@@ -153,6 +153,7 @@ GOVERNANCE_FILES = (
     "witness.py",
     "law_inject.py",
     "hestia_gate_core.py",
+    "hestia_gate_mechanism.py",
     "gate_self_protection_test.py",
 )
 

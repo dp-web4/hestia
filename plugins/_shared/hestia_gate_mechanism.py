@@ -6,20 +6,25 @@ claude-code adapter's tested client so every harness can obtain a society-safety
 IN-PROCESS — no subprocess spawn, no cross-mount re-import of a 2760-line gate. This is what
 lets a shim be *thin* and closes the criterion-10 timeout asymmetry: kimi/codex were reaching
 the verdict by forking the whole claude gate off the slow /mnt/c mount, cold, every call, and
-that path could not complete inside budget (issue: kimi still timed out 2026-08-12).
+that path could not complete inside budget (kimi still timed out 2026-08-12).
 
 This is the MECHANISM, deliberately distinct from the LAW core (hestia_gate_core, which is
 transport-free and must never open a socket). The mechanism MAY talk to the daemon; the law
 may not. Keep that boundary: scope/egress/policy predicates belong in the core, the daemon
 round-trip belongs here.
 
-FAIL-CLOSED CONTRACT (load-bearing — read before editing):
-  query_society_safety NEVER returns allow on an error, timeout, malformed response, or any
-  exception. On any failure it returns SafetyVerdict(allow=False, decided=False, cause=...),
-  and the caller fails closed (exit 2). Every Claude-lineage hook engine (Claude, Kimi, Codex,
-  Cursor) fails OPEN on a hook crash, so a mechanism that returned allow-on-error — or that let
-  an exception escape — would silently UN-GOVERN the member. Every path that could fail resolves
-  to "not allowed, no verdict"; the top-level entry catches everything.
+FAIL-CLOSED CONTRACT (load-bearing — read before editing; hardened per GPT NOT-SAME review of #371):
+  query_society_safety NEVER returns allow except on an EXPLICITLY recognized daemon verdict.
+  It never raises. Specifically, every one of these fails closed (allow=False, decided=False):
+    - config: a non-numeric/invalid budget env var (parsed safely at import, never raising);
+    - transport: no endpoint, initialize failure, connect rejection, network/unexpected exception;
+    - authentication: connect returning no sessionId (a missing session is not an optional downgrade);
+    - budget: the whole-run deadline exhausted — no request may START after it;
+    - WIRE SHAPE: a missing/unknown `status`, or a decision whose `decision` field is not exactly
+      one of {allow, warn, deny}. "Faithful to the claude adapter" is NOT the contract here — the
+      claude adapter defaults unknowns to allow, which on a fail-open engine would un-govern the
+      member. This module treats any unrecognized shape as NO VERDICT.
+  Only `decision in {allow, warn, deny}` (with `enforced`) may authorize or block.
 """
 from __future__ import annotations
 
@@ -34,26 +39,37 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-# ── Budget / timeout contract (env-overridable; shared by every adopting shim) ───────────────
-# Same knobs and defaults as the claude adapter, ON PURPOSE: raising the budget now raises it
-# fleet-wide instead of in one copy (the #353 drift this consolidation removes).
-TOTAL_BUDGET_MS = int(os.environ.get("HESTIA_PRE_TOTAL_BUDGET_MS", "800"))
-REQUEST_TIMEOUT_S = float(os.environ.get("HESTIA_PRE_REQUEST_TIMEOUT_S", "5.0"))
+
+# ── Budget / timeout contract (env-overridable; parsed SAFELY so a bad value cannot raise at
+# import and, on a fail-open engine, turn a config typo into an ALLOW). Invalid → default. ─────
+def _num_env(name: str, default: float, cast) -> float:
+    try:
+        v = cast(os.environ.get(name, default))
+        return v if v > 0 else default
+    except (ValueError, TypeError):
+        return default
+
+
+TOTAL_BUDGET_MS = int(_num_env("HESTIA_PRE_TOTAL_BUDGET_MS", 800, int))
+REQUEST_TIMEOUT_S = float(_num_env("HESTIA_PRE_REQUEST_TIMEOUT_S", 5.0, float))
 MAX_POLLS = 5
 MIN_POLL_SLEEP_MS = 50
 PROTOCOL_VERSION = 1
 DEFAULT_HESTIA_HOME = Path.home() / ".hestia"
+
+_RECOGNIZED_DECISIONS = ("allow", "warn", "deny")
 
 
 @dataclass
 class SafetyVerdict:
     """Result of a society-safety query. `allow` is the ONLY field a caller acts on to proceed.
 
-    allow=True   -> daemon returned allow, warn, or audit-only-deny: the act may proceed.
+    allow=True   -> daemon returned an explicit allow, warn, or audit-only-deny: may proceed.
     allow=False  -> an enforced daemon deny (decided=True) OR no verdict at all
-                    (decided=False, an infrastructure failure). The caller fails closed either way.
-    `decided` distinguishes a real verdict from infra failure so the caller can render the two
-    differently and so infra failures are never scored as member conduct.
+                    (decided=False: infra failure, missing session, or an unrecognized wire shape).
+                    The caller fails closed either way.
+    `decided` distinguishes a real verdict from a fail-closed non-verdict so the caller can render
+    the two differently and so non-verdicts are never scored as member conduct.
     """
     allow: bool
     decided: bool
@@ -108,17 +124,19 @@ class _McpHttp:
         self.next_id += 1
         return self.next_id
 
-    def _remaining_s(self) -> float:
-        return max(0.05, self.deadline - time.monotonic())
-
     def _request(self, body: dict, *, is_notification: bool = False) -> Optional[dict]:
+        # FAIL-CLOSED budget guard: refuse to START a request once the whole-run deadline is
+        # exhausted (GPT #4). Raising here surfaces as a timeout the entry-point catches.
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("whole-run budget exhausted before request")
         data = json.dumps(body).encode("utf-8")
         headers = {"Content-Type": "application/json",
                    "Accept": "application/json, text/event-stream"}
         if self.session_id:
             headers["mcp-session-id"] = self.session_id
         req = urllib.request.Request(self.endpoint, data=data, headers=headers, method="POST")
-        timeout = min(REQUEST_TIMEOUT_S, self._remaining_s())
+        timeout = min(REQUEST_TIMEOUT_S, max(0.01, remaining))
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if not self.session_id:
                 sid = resp.headers.get("mcp-session-id")
@@ -175,8 +193,12 @@ def _extract_target(tool_input: Any, tool_name: str) -> Optional[str]:
 
 def _poll_policy(client: _McpHttp, action_id: str, session_id: Optional[str],
                  deadline: float) -> Optional[dict]:
-    """Call hestia_query_policy, honoring the wait protocol. Returns the decided payload or
-    None (ran out of polls / budget / error). None -> caller fails closed."""
+    """Call hestia_query_policy, honoring the wait protocol. Returns the decided payload, or
+    None on timeout / error / an UNRECOGNIZED status. None -> caller fails closed.
+
+    STRICT (GPT #1): a missing or unknown `status` is NOT treated as decided — that would let a
+    garbled response authorize. Only status == "decided" returns a body; "evaluating" re-polls;
+    anything else is no verdict."""
     for _ in range(MAX_POLLS):
         if time.monotonic() >= deadline:
             return None
@@ -186,11 +208,11 @@ def _poll_policy(client: _McpHttp, action_id: str, session_id: Optional[str],
         body = _unwrap_tool_result(client.call_tool("hestia_query_policy", args))
         if "_hestia_error" in body:
             return None
-        status = body.get("status", "decided")
+        status = body.get("status")
         if status == "decided":
             return body
         if status != "evaluating":
-            return body  # unknown status -> treat as decided (matches the claude adapter)
+            return None  # missing/unknown status -> NO verdict (strict; not "assume decided")
         next_poll_ms = body.get("nextPollMs")
         if not isinstance(next_poll_ms, int) or next_poll_ms < 0:
             next_poll_ms = 200
@@ -203,10 +225,17 @@ def _poll_policy(client: _McpHttp, action_id: str, session_id: Optional[str],
     return None
 
 
-def _interpret(decision: dict) -> SafetyVerdict:
-    """Map a daemon PolicyResult dict to a SafetyVerdict. Mirrors the claude adapter's
-    emit_decision EXACTLY — the verdict field is decision['decision'] (NOT 'verdict'/'effect')."""
-    verdict = decision.get("decision", "allow")
+def _interpret(decision: dict) -> Optional[SafetyVerdict]:
+    """Map a daemon PolicyResult dict to a SafetyVerdict, STRICTLY. Returns None if the decision
+    is not an explicitly recognized {allow, warn, deny} shape — the caller then fails closed.
+
+    Unlike the claude adapter's emit_decision (which defaults unknowns to allow), an unrecognized
+    decision here is NO VERDICT, never an allow (GPT #1)."""
+    if not isinstance(decision, dict):
+        return None
+    verdict = decision.get("decision")
+    if verdict not in _RECOGNIZED_DECISIONS:
+        return None  # missing or unknown decision vocabulary -> no verdict
     enforced = bool(decision.get("enforced", True))
     reason = decision.get("reason", "")
     rule_name = decision.get("ruleName")
@@ -217,10 +246,10 @@ def _interpret(decision: dict) -> SafetyVerdict:
                              message=(guidance or f"hestia: deny{label} — {reason}"))
     if verdict == "warn":
         return SafetyVerdict(allow=True, decided=True, message=f"hestia: warn{label} — {reason}")
-    if verdict == "deny" and not enforced:
+    if verdict == "deny":  # not enforced -> audit-only
         return SafetyVerdict(allow=True, decided=True,
                              message=f"hestia: would-deny (audit-only){label} — {reason}")
-    return SafetyVerdict(allow=True, decided=True, message="")
+    return SafetyVerdict(allow=True, decided=True, message="")  # verdict == "allow"
 
 
 def _no_verdict(plugin_id: str, tool_name: str, cause: str, detail: str) -> SafetyVerdict:
@@ -234,9 +263,10 @@ def _no_verdict(plugin_id: str, tool_name: str, cause: str, detail: str) -> Safe
                     "Report this to your operator and wait — retrying will not help."),
     }.get(cause, ("The gate could not obtain a verdict and cannot tell whether the daemon is down "
                   "or slow. Retry once with backoff; if it repeats, report to your operator."))
-    msg = (f"hestia: no verdict [fail-closed] — the policy daemon did not return a decision "
+    msg = (f"hestia: no verdict [fail-closed] — the policy daemon did not return a usable decision "
            f"({detail}; cause={cause}). This is NOT a policy boundary and NOT a tool failure — the "
-           f"referee is unreachable, so the gate fails closed for safety. {remedy}")
+           f"referee is unreachable or its answer was unusable, so the gate fails closed for "
+           f"safety. {remedy}")
     try:
         here = os.path.dirname(os.path.abspath(__file__))
         if here not in sys.path:
@@ -249,11 +279,16 @@ def _no_verdict(plugin_id: str, tool_name: str, cause: str, detail: str) -> Safe
 
 
 def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
+                         plugin_version: Optional[str] = None,
+                         host_agent_version: Optional[str] = None,
                          host_session_id: Optional[str] = None) -> SafetyVerdict:
     """Obtain the daemon's society-safety verdict for a write/exec act, IN-PROCESS.
 
-    This replaces "spawn the claude gate as a subprocess" for a thin shim. Returns a
-    SafetyVerdict; NEVER raises; on any failure yields allow=False, decided=False (fail-closed).
+    Replaces "spawn the claude gate as a subprocess" for a thin shim. Returns a SafetyVerdict;
+    NEVER raises; on any failure/malformed/missing-session yields allow=False, decided=False.
+
+    `plugin_version` / `host_agent_version` are the shim's REAL version facts and are omitted
+    from the connect payload when unknown — the mechanism does not manufacture provenance (GPT #3).
     """
     tool_name = event.get("tool_name") or "?"
     tool_input = event.get("tool_input") or {}
@@ -270,12 +305,14 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
         client.initialized()
         connect_args: dict = {
             "plugin_id": plugin_id,
-            "plugin_version": "shared-mechanism",
             "host_agent": host_agent,
-            "host_agent_version": host_agent,
             "requested_role": "citizen",
             "protocol_version": PROTOCOL_VERSION,
         }
+        if plugin_version:
+            connect_args["plugin_version"] = plugin_version
+        if host_agent_version:
+            connect_args["host_agent_version"] = host_agent_version
         role = os.environ.get("HESTIA_ROLE")
         if role:
             connect_args["role"] = role
@@ -285,13 +322,16 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
         if "_hestia_error" in connect:
             return _no_verdict(plugin_id, tool_name, "unknown", "connect rejected")
         session_id = connect.get("sessionId")
+        if not session_id:
+            # A governance verdict must ride an authenticated session. Missing sessionId is
+            # fail-closed, not an optional downgrade (GPT #2).
+            return _no_verdict(plugin_id, tool_name, "unknown", "connect returned no sessionId")
         begin_args: dict = {
             "tool_name": tool_name,
             "target": target,
             "parameters": dict(tool_input) if isinstance(tool_input, dict) else {},
+            "session_id": session_id,
         }
-        if session_id:
-            begin_args["session_id"] = session_id
         if host_session_id:
             begin_args["host_session_id"] = host_session_id
         begin = _unwrap_tool_result(client.call_tool("hestia_begin_action", begin_args))
@@ -303,11 +343,15 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
         decision = _poll_policy(client, action_id, session_id, deadline)
         if decision is None:
             return _no_verdict(plugin_id, tool_name, "timeout",
-                               "query_policy never decided within budget")
-        return _interpret(decision)
+                               "query_policy never returned a decided verdict within budget")
+        verdict = _interpret(decision)
+        if verdict is None:
+            return _no_verdict(plugin_id, tool_name, "unknown",
+                               "daemon returned a malformed or unrecognized decision")
+        return verdict
     except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
         reason = getattr(e, "reason", None)
-        if isinstance(reason, TimeoutError) or isinstance(e, socket.timeout):
+        if isinstance(reason, TimeoutError) or isinstance(e, (TimeoutError, socket.timeout)):
             cause = "timeout"
         elif isinstance(reason, ConnectionRefusedError):
             cause = "refused"
