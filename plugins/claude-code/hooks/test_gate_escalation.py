@@ -228,7 +228,8 @@ threading.Thread(target=_srv.serve_forever, daemon=True).start()
 _old_ep2 = os.environ.pop("HESTIA_ENDPOINT", None)
 os.environ["HESTIA_ENDPOINT"] = f"http://127.0.0.1:{_srv.server_port}/mcp"
 try:
-    _v, _ = ptu.request_self_write("pre_tool_use.py", "Edit")
+    _v, _ = ptu.request_self_write("pre_tool_use.py", "Edit",
+                                   host_session_id="host-wake-test-2005")
     _calls = [r for r in _SessionStub.seen if (r.get("params") or {}).get("name")]
     _connect = [r for r in _calls if r["params"]["name"] == "hestia_connect"]
     _claim = [r for r in _calls if r["params"]["name"] == "hestia_gate_escalation_claim"]
@@ -239,6 +240,12 @@ try:
         check("the claim threads the session it connected",
               _claim[0]["params"]["arguments"].get("session_id") == "sess-test-1529",
               json.dumps(_claim[0]["params"]["arguments"])[:200])
+        # The claimed-row remedy's one new wire field (reply-2005, 2026-08-12): the
+        # per-wake key is the only session namespace that joins a claimed approval to
+        # the outcome rows of the act that consumed it.
+        check("the claim carries the per-wake host session (the outcome join key)",
+              _claim[0]["params"]["arguments"].get("host_session_id") == "host-wake-test-2005",
+              json.dumps(_claim[0]["params"]["arguments"])[:200])
     if _connect and _claim:
         check("connect and claim assert ONE plugin_id (the asker-mismatch binding)",
               _connect[0]["params"]["arguments"].get("plugin_id")
@@ -246,6 +253,18 @@ try:
               f"{_connect[0]['params']['arguments'].get('plugin_id')} vs "
               f"{_claim[0]['params']['arguments'].get('plugin_id')}")
     check("the verdict path is unchanged by threading", _v == "escalated", _v)
+
+    # And the sparse path: no host session in hand -> the key stays OUT of the args
+    # (the daemon writes explicit null; a fabricated placeholder would be a lie in the
+    # exact record used to argue about who authorised what).
+    _SessionStub.seen.clear()
+    _v2, _ = ptu.request_self_write("pre_tool_use.py", "Edit")
+    _claim2 = [r for r in _SessionStub.seen
+               if (r.get("params") or {}).get("name") == "hestia_gate_escalation_claim"]
+    if _claim2:
+        check("no host session -> no host_session_id key (null is the daemon's to write)",
+              "host_session_id" not in _claim2[0]["params"]["arguments"],
+              json.dumps(_claim2[0]["params"]["arguments"])[:200])
 finally:
     threading.Thread(target=_srv.shutdown, daemon=True).start()
     if _old_ep2 is None:

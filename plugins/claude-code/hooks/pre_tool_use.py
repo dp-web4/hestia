@@ -2166,6 +2166,13 @@ def request_self_write(marker: str, tool_name: str, attempted: str = "",
         sid = _connect_session(client, host_session_id)
         if sid:
             claim_args["session_id"] = sid
+        # The join key an auditor needs: the claimed row must reach the OUTCOME rows,
+        # and only the per-wake host session appears on those — the connect session
+        # above joins only to gate witnesses (three session-id namespaces, none
+        # joining to each other: kimi-code reply-2002 / claude-code reply-2005,
+        # 2026-08-12). The one wire field the claimed-row remedy required.
+        if host_session_id:
+            claim_args["host_session_id"] = host_session_id
         r = client.call_tool("hestia_gate_escalation_claim", claim_args)
     except Exception as e:  # noqa: BLE001
         return "unreachable", f"no answer from the daemon ({type(e).__name__}) -- refused"
