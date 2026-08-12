@@ -310,9 +310,45 @@ def test_ordinary_write_daemon_down_fails_closed():
         check("rc", rc == 2, f"rc={rc} stderr={err}")
 
 
+def test_gate_file_bash_write_refused_locally():
+    """The Bash write-position arm the in-process rewire dropped and GPT #372 hold #2 restores.
+
+    A shell write names its DESTINATION in the command text, so a raw command scan catches
+    `> <gate>` locally, before the daemon — the coverage the spawned claude gate used to carry.
+    (A read command that merely NAMES the gate is a documented FALSE POSITIVE of the same raw
+    scan: a spurious refusal, not a security hole. The correct write-target parse + heredoc
+    handling is #370's shared governance-access predicate.)"""
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = make_workspace(tmp)
+        stub = StubDaemon()
+        srv = Server(stub)
+        try:
+            target = os.path.join(ws, "hestia", "plugins", "kimi", "hooks", "pre_tool_use.py")
+            rc, err = run_hook(ws, _event("Bash", {"command": f"echo pwned > {target}"}),
+                               srv.endpoint)
+            check("rc", rc == 2, f"rc={rc} stderr={err}")
+            check("stderr-class", "gate-self" in err, err)
+            check("claim-made", "hestia_gate_escalation_claim" in stub.names(), stub.names())
+            # Refused BEFORE the policy path — self-protection is pre-daemon.
+            check("pre-daemon", "hestia_begin_action" not in stub.names(), stub.names())
+        finally:
+            srv.close()
+
+
 def main():
-    tests = [(n, f) for n, f in sorted(globals().items())
-             if n.startswith("test_") and callable(f)]
+    # Explicit list, NOT a globals() sweep — tools/ci_selfexec_test.py requires each test to be a
+    # static reference (a dynamic sweep leaves the names un-referenced and reads as inert).
+    tests = [
+        ("test_gate_file_write_refused_locally", test_gate_file_write_refused_locally),
+        ("test_gate_file_bash_write_refused_locally", test_gate_file_bash_write_refused_locally),
+        ("test_approved_gate_write_proceeds_to_policy", test_approved_gate_write_proceeds_to_policy),
+        ("test_shared_mechanism_write_refused_anywhere", test_shared_mechanism_write_refused_anywhere),
+        ("test_hooks_dir_only_names_do_not_overreach", test_hooks_dir_only_names_do_not_overreach),
+        ("test_ordinary_write_uses_policy_path", test_ordinary_write_uses_policy_path),
+        ("test_gate_file_read_allowed_and_witnessed", test_gate_file_read_allowed_and_witnessed),
+        ("test_gate_write_refused_with_daemon_down", test_gate_write_refused_with_daemon_down),
+        ("test_ordinary_write_daemon_down_fails_closed", test_ordinary_write_daemon_down_fails_closed),
+    ]
     failed = []
     for name, fn in tests:
         try:

@@ -508,25 +508,35 @@ _SELF_HOOKS_DIR_ONLY = ("pre_tool_use.py", "society_pre_tool_use.py", "post_tool
 def _touches_self(tool_input):
     """(marker, resource) if this call's DESTINATION reaches the governance surface, else None.
 
-    Path keys only, matched raw and realpath'd (so `../hooks/...` and a symlinked alias are the
-    same file). The destination decides whether the gate changes — a Write's `content` is
-    payload, not destination, and scanning it refused every document ABOUT the gate (the FP8
-    class on the claude gate: eight recorded instances, including drafts of the report itself).
-    `resource` is the matched path — the escalation record is a human's entire basis for
-    approving, so it names the ACT, with the marker as the REASON."""
+    Two haystacks:
+      * destination PATH keys (`file_path`/`path`/`notebook_path`) — matched raw AND realpath'd,
+        so `../hooks/...` and a symlinked alias resolve to the same file;
+      * the Bash `command` and Edit `new_string` TEXT — matched raw. A shell write names its
+        destination in the command text (`> <gate>`, `cp x <gate>`, `sed -i <gate>`, `tee <gate>`),
+        and the pre-a7cfb6c path — which spawned the claude gate — scanned it. Dropping that scan
+        (PR #372) let a Bash write to the surface pass with only the daemon preset behind it; this
+        restores parity (GPT #372 review, hold #2).
+
+    NO-REGRESSION BRIDGE, stated honestly: the text is matched RAW, without the claude gate's
+    heredoc-blanking. Raw over-matches a command that merely NAMES a marker (the marker-in-command
+    FP) — a spurious refusal, which costs a rephrase, not a security hole. The correct fix — parse
+    the actual write TARGET, and blank inert heredoc bodies — is #370's shared governance-access
+    predicate, which both gates will call. `content` STAYS OUT of the haystack: a Write's payload
+    is not its destination (the FP8 document-about-the-gate class — eight recorded instances on the
+    claude gate). `resource` is the matched string — the escalation record is a human's entire
+    basis for approving, so it names the ACT, with the marker as the REASON."""
     if not isinstance(tool_input, dict):
         return None
-    for key in ("file_path", "path", "notebook_path"):
-        v = tool_input.get(key)
-        if not isinstance(v, str) or not v:
-            continue
-        cands = [v]
-        try:
-            rp = os.path.realpath(v)
-            if rp != v:
-                cands.append(rp)
-        except (OSError, ValueError):
-            pass
+
+    def _match(text, realpath_ok):
+        cands = [text]
+        if realpath_ok:
+            try:
+                rp = os.path.realpath(text)
+                if rp != text:
+                    cands.append(rp)
+            except (OSError, ValueError):
+                pass
         for cand in cands:
             low = cand.replace("\\", "/")
             for d in _SELF_DIR_MARKERS:
@@ -536,6 +546,23 @@ def _touches_self(tool_input):
             for fname in _SELF_GOVERNANCE_FILES:
                 if fname in low and (fname not in _SELF_HOOKS_DIR_ONLY or in_hooks):
                     return (fname, cand)
+        return None
+
+    # Destination PATHS: raw + realpath'd.
+    for key in ("file_path", "path", "notebook_path"):
+        v = tool_input.get(key)
+        if isinstance(v, str) and v:
+            hit = _match(v, realpath_ok=True)
+            if hit:
+                return hit
+    # Bash command + Edit new_string: destination lives IN the text; matched raw (realpath is
+    # meaningless on a command/replacement string).
+    for key in ("command", "new_string"):
+        v = tool_input.get(key)
+        if isinstance(v, str) and v:
+            hit = _match(v, realpath_ok=False)
+            if hit:
+                return hit
     return None
 
 
