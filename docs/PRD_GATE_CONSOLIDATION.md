@@ -113,7 +113,7 @@ Today the gate **times out for kimi and codex even with the box idle**, and **ne
 
 The refactor should close this **by construction**: once every harness decides through the same shared path claude uses — society-safety as an in-process predicate, not a subprocess-delegated round-trip — the extra cost is gone. So the accepted state is:
 
-9. **The idle timeout rate is equal across harnesses (≈0).** Measured over a window of gate calls with the box quiet, kimi's and codex's fail-closed-on-timeout rate matches claude's. If the asymmetry survives the refactor, the consolidation did **not** actually put every harness on the same path (they are still subprocess-delegating, or still on a heavier round-trip), and cutover (§6.F) is not complete. This is an **observed** criterion — measure the live per-harness timeout rate after deploy — the availability half of §7.2's declared → executable → deployed → observed.
+10. **The idle timeout rate is equal across harnesses (≈0).** Measured over a window of gate calls with the box quiet, kimi's and codex's fail-closed-on-timeout rate matches claude's. If the asymmetry survives the refactor, the consolidation did **not** actually put every harness on the same path (they are still subprocess-delegating, or still on a heavier round-trip), and cutover (§6.F) is not complete. This is an **observed** criterion — measure the live per-harness timeout rate after deploy — the availability half of §7.2's declared → executable → deployed → observed.
 
 ## 8. The procedure fix — make the correct path the easy path
 
