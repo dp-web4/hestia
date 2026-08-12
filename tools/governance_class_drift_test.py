@@ -172,23 +172,20 @@ DECLARED = (
              "the widest act on the surface is also the cheapest to approve. "
              "DECIDE: before the shims land, not after."),
 
-    dict(key="hestia_gate_m", label="<policy-mechanism>", intended=AWAITING, via=UNNAMED,
+    dict(key="hestia_gate_m", label="<policy-mechanism>", intended=STRONG, via=EXACT,
          tracked=True,
-         why="The shared in-process society-safety MECHANISM (#371). It carries the "
-             "fail-closed contract and INTERPRETS the daemon's verdict into allow/deny, so on "
-             "every adopting harness it directly decides whether a daemon answer authorises an "
-             "act -- authority-bearing, not inert transport. One approver today, via UNNAMED: "
-             "added to the matcher after the bar's doc comment, so it inherited the weak branch "
-             "by omission, exactly like <policy-core>. GPT's #371 review (a reviewer, not the "
-             "steward) inclines to price it STRONG (sovereign+peer), and I share that read: it "
-             "sits closer to <gate>/<witness> than to <law-renderer>. But the class is a "
-             "steward call, and writing my preference into this test is the 'surface that "
-             "smuggles a verdict' the accountability norm forbids -- so this is AWAITING, "
-             "measured SINGLE, carrying the question. DECIDE: name it in `bar_for` (two-factor) "
-             "or leave it single. Unlike <society-gate> the name is NOT shadowed -- no earlier "
-             "tuple entry is a substring of it -- so a bar clause for it would be LIVE, not "
-             "dead. Recommend deciding before the shims adopt it (step F), when editing this "
-             "one file re-prices the safety verdict for all five harnesses at once."),
+         why="The shared in-process society-safety MECHANISM (#371). It carries the fail-closed "
+             "contract and INTERPRETS the daemon's verdict into allow/deny, so on every adopting "
+             "harness it directly decides whether a daemon answer authorises an act. RATIFIED "
+             "STRONG (sovereign+peer) by the steward (dp, 2026-08-12) when PR #372 made it LIVE -- "
+             "kimi imports it on every consequential act, which is the 'DECIDE before the shims "
+             "adopt it' this row carried while it was AWAITING. Named in `bar_for` as a LIVE "
+             "clause: the name is not shadowed in the matcher tuple, so it is the deciding branch "
+             "for its own marker (checks G/I), priced like <gate>/<witness> rather than inheriting "
+             "<law-renderer>'s single-approver silence. ADJUSTABLE by the same reviewed path that "
+             "set it: edit this declaration + the bar clause together (the drift test binds them, "
+             "so neither moves silently), plus hestia_appeal for a specific deny -- STRONG is a "
+             "starting posture, not a lock."),
 
     dict(key="gate_self", label="<exemption-ledger>", intended=AWAITING, via=UNNAMED,
          tracked=True,

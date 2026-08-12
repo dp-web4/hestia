@@ -9,10 +9,15 @@ engine's default. (This fail-open-on-error behavior is a property of the Claude-
 engines — Kimi, Codex, Cursor, etc. — and is the single most important fact for anyone writing a
 blocking hook for them: the gate itself must be the fail-closed party.)
 
-Two gates, in order:
+Three gates, in order:
   1. SCOPE + EGRESS (local, per-entity, sourced from Kimi's MRH in identity.json). Out-of-scope
      target, or a forbidden egress/secret path, -> deny. No daemon needed, so a down daemon never
      bricks this boundary.
+  1c. SELF-PROTECTION (local, pre-daemon, ALWAYS enforced): a write-class act whose DESTINATION is
+     this plugin's own hook files or the fleet's governance markers is refused and escalated (a
+     pre-existing human approval is claimed and spent); reads are allowed and witnessed. Restored
+     2026-08-12 after the in-process rewire (PR #372) silently dropped the layer the spawned
+     claude gate used to carry — see the marker block below.
   2. SOCIETY SAFETY (the governor): for write/exec-class tools, delegate to hestia's tested daemon
      caller so the decision reaches the governor and is witnessed. Its deny (or fail-closed-on-
      unreachable) is honored.
@@ -463,6 +468,251 @@ def deny(reason, what_to_do, innate=False):
     # warn mode, tunable rule: surfaced but allowed — return so evaluation continues to allow.
 
 
+# ---- Gate 1c: LOCAL SELF-PROTECTION (the governance surface) -------------------------
+#
+# Restored 2026-08-12 (PR #372 blocking note, remedy option (a); asked on-record by the branch
+# owner in forum/claude-code/reply-2001-option-a-go-ahead-kimi-authorized-2026-08-12.md). Before
+# a7cfb6c this gate reached the society verdict by SPAWNING the claude gate, whose main() runs a
+# local self-touch layer "before the daemon, and never conditional on it" — so a kimi act at the
+# governance surface was classified locally and its deny/escalation propagated through
+# returncode != 0. The in-process rewire dropped that layer silently: query_society_safety is
+# pure daemon transport with no local classification, and the daemon holds no gate-self RULE —
+# it knows gate_self_access only as an appealable RECORD the harness gate mints. Net hole: under
+# the default enforce mode, kimi could edit its own hook files with only the daemon's global
+# destructive/secret preset in the way and no escalation minted. This block is the layer,
+# restored in-process.
+#
+# Scope is deliberately option (a), tight: PATH/realpath match on the destination keys only.
+# Disclosed limit: a Bash command that writes the gate names its destination in the command TEXT,
+# which this does not scan — raw text scanning is where the FP8/heredoc complexity lives (the
+# claude gate carries ~200 lines of heredoc-blanking for it). Bash writes to the surface keep the
+# daemon's global preset behind them until option (b) extracts the shared predicate into
+# plugins/_shared/ (gate-consolidation PRD f0fd025).
+
+# Marker set mirrors the claude gate's _SELF_MARKERS/_GOVERNANCE_FILES at a7cfb6c: this plugin's
+# own hook directory, the fleet's hook directories, and the governance filenames. A filename
+# matched ANYWHERE governs a peer's copy too — editing another member's gate is not a lesser act.
+# Common filenames govern only under a hooks/ path (they appear in vendor trees and docs); the
+# distinctive names govern wherever they live. Adding a name STRENGTHENS the gate; moving one
+# into _SELF_HOOKS_DIR_ONLY weakens it — that direction is the visible, deliberate second edit.
+_SELF_DIR_MARKERS = ("plugins/kimi/hooks", "plugins/claude-code/hooks", "hestia/hooks")
+_SELF_GOVERNANCE_FILES = (
+    "pre_tool_use.py", "society_pre_tool_use.py", "post_tool_use.py", "witness.py",
+    "law_inject.py", "hestia_gate_core.py", "hestia_gate_mechanism.py",
+    "gate_self_protection_test.py",
+)
+_SELF_HOOKS_DIR_ONLY = ("pre_tool_use.py", "society_pre_tool_use.py", "post_tool_use.py",
+                        "witness.py", "law_inject.py")
+
+
+def _touches_self(tool_input):
+    """(marker, resource) if this call's DESTINATION reaches the governance surface, else None.
+
+    Two haystacks:
+      * destination PATH keys (`file_path`/`path`/`notebook_path`) — matched raw AND realpath'd,
+        so `../hooks/...` and a symlinked alias resolve to the same file;
+      * the Bash `command` and Edit `new_string` TEXT — matched raw. A shell write names its
+        destination in the command text (`> <gate>`, `cp x <gate>`, `sed -i <gate>`, `tee <gate>`),
+        and the pre-a7cfb6c path — which spawned the claude gate — scanned it. Dropping that scan
+        (PR #372) let a Bash write to the surface pass with only the daemon preset behind it; this
+        restores parity (GPT #372 review, hold #2).
+
+    NO-REGRESSION BRIDGE, stated honestly: the text is matched RAW, without the claude gate's
+    heredoc-blanking. Raw over-matches a command that merely NAMES a marker (the marker-in-command
+    FP) — a spurious refusal, which costs a rephrase, not a security hole. The correct fix — parse
+    the actual write TARGET, and blank inert heredoc bodies — is #370's shared governance-access
+    predicate, which both gates will call. `content` STAYS OUT of the haystack: a Write's payload
+    is not its destination (the FP8 document-about-the-gate class — eight recorded instances on the
+    claude gate). `resource` is the matched string — the escalation record is a human's entire
+    basis for approving, so it names the ACT, with the marker as the REASON."""
+    if not isinstance(tool_input, dict):
+        return None
+
+    def _match(text, realpath_ok):
+        cands = [text]
+        if realpath_ok:
+            try:
+                rp = os.path.realpath(text)
+                if rp != text:
+                    cands.append(rp)
+            except (OSError, ValueError):
+                pass
+        for cand in cands:
+            low = cand.replace("\\", "/")
+            for d in _SELF_DIR_MARKERS:
+                if d in low:
+                    return (d, cand)
+            in_hooks = "hooks/" in low
+            for fname in _SELF_GOVERNANCE_FILES:
+                if fname in low and (fname not in _SELF_HOOKS_DIR_ONLY or in_hooks):
+                    return (fname, cand)
+        return None
+
+    # Destination PATHS: raw + realpath'd.
+    for key in ("file_path", "path", "notebook_path"):
+        v = tool_input.get(key)
+        if isinstance(v, str) and v:
+            hit = _match(v, realpath_ok=True)
+            if hit:
+                return hit
+    # Bash command + Edit new_string: destination lives IN the text; matched raw (realpath is
+    # meaningless on a command/replacement string).
+    for key in ("command", "new_string"):
+        v = tool_input.get(key)
+        if isinstance(v, str) and v:
+            hit = _match(v, realpath_ok=False)
+            if hit:
+                return hit
+    return None
+
+
+def _gate_self_call(tool, args, host_session_id=None):
+    """One short daemon round trip for a gate-self event: initialize, connect (session-bound),
+    one tools/call. Returns the unwrapped result dict, or None on ANY failure.
+
+    Never raises and stays inside a ~2.5s budget: the harness kills this hook at 5s, and a killed
+    hook yields neither exit 2 nor a JSON deny — the engine reads it as a non-blocking error and
+    runs the tool anyway. A gate-self exchange that hangs therefore fails OPEN, which is strictly
+    worse than a refusal. Callers treat None as refusal (writes) or best-effort loss (witnesses).
+
+    `host_session_id`, when the caller has one, is threaded into the connect so the gate-self
+    session this call mints joins to the per-wake session the outcome rows carry (same join the
+    main daemon path makes at the Gate 2 call below).
+    """
+    import urllib.request
+    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+
+    def post(payload, hdrs, timeout):
+        req = urllib.request.Request(
+            endpoint, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream", **hdrs})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read(), r.headers.get("mcp-session-id")
+
+    def unwrap(raw):
+        """The result payload of a tools/call: structuredContent, or the content[0] text JSON —
+        and the body may be plain JSON or SSE-framed (`data: {...}` lines)."""
+        for line in raw.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not (line.startswith("{") or line.startswith("data: {")):
+                continue
+            try:
+                pl = json.loads(line[line.index("{"):])
+            except Exception:
+                continue
+            res = pl.get("result")
+            if not isinstance(res, dict):
+                continue
+            sc = res.get("structuredContent")
+            if isinstance(sc, dict):
+                return sc
+            content = res.get("content") or []
+            if content and isinstance(content[0], dict):
+                try:
+                    d = json.loads(content[0].get("text") or "{}")
+                    return d if isinstance(d, dict) else None
+                except Exception:
+                    return None
+        return None
+
+    try:
+        _, sid_hdr = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                      "clientInfo": {"name": "hestia-kimi-gate-self",
+                                                     "version": "1"}}}, {}, 0.8)
+        h = {"mcp-session-id": sid_hdr} if sid_hdr else {}
+        post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, h, 0.4)
+        connect_args = {"plugin_id": HESTIA_PLUGIN_ID,
+                        "host_agent": HESTIA_PLUGIN_ID,
+                        "role": _identity_role(),
+                        "instance_name": "gate-self"}
+        if host_session_id:
+            connect_args["host_session_id"] = host_session_id
+        raw, _ = post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                       "params": {"name": "hestia_connect",
+                                  "arguments": connect_args}}, h, 0.8)
+        conn = unwrap(raw)
+        sess = conn.get("sessionId") if conn else None
+        if not sess:
+            return None  # an unconnected witness/claim is refused by the daemon anyway
+        args = dict(args)
+        args.setdefault("session_id", sess)
+        raw, _ = post({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                       "params": {"name": tool, "arguments": args}}, h, 0.9)
+        return unwrap(raw)
+    except Exception:
+        return None
+
+
+def _witness_gate_self(event_type, marker, tool_name):
+    """Record a governance-surface event as its OWN class — `gate_self_read` for a permitted
+    read, `gate_self_access` (appealable) for a refused write. The two stay distinct so an alert
+    on the refusal keeps its meaning. Best effort: a failed record never changes the decision —
+    the daemon's health is not a precondition for reading one's own law, and the deny already
+    happened locally."""
+    return _gate_self_call("hestia_request_witness", {
+        "event_type": event_type,
+        "event_data": {"plugin_id": HESTIA_PLUGIN_ID,
+                       "tool_name": tool_name,
+                       "marker": marker,
+                       "gate_path": os.path.abspath(__file__),
+                       "severity": "record" if event_type == "gate_self_read" else "escalate",
+                       "role_lct": _identity_role()}},
+        host_session_id=_EVENT.get("session_id")) is not None
+
+
+def _claim_self_write(marker, tool_name, attempted):
+    """Ask ONCE whether a human has already approved this exact (member, marker) write.
+    Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
+
+    Mirrored from the claude gate's request_self_write: never waits. The first attempt is refused
+    and the refusal opens an escalation; a human decides out of band; the member RE-ISSUES the
+    write and the second attempt claims the approval. Every failure — unreachable, malformed, a
+    daemon with no escalation channel — is a refusal: a daemon that cannot answer must not be a
+    way to get a governance write through."""
+    claim_args = {
+        "plugin_id": HESTIA_PLUGIN_ID,
+        "role": _identity_role(),
+        "tool_name": tool_name,
+        "marker": marker,
+        # `reason` carries the ATTEMPTED ACT, not a rationale: an auto-opened escalation HAS no
+        # stated why — the member did not choose to escalate; the gate opened it on a refused
+        # write. Presenting the act as though it were a rationale would look like the member had
+        # explained itself. A member that wants to state a why opens the escalation itself.
+        "reason": attempted or f"{tool_name} -> {marker}",
+        "detail": ("Auto-opened by the gate on a refused write; the member stated no rationale "
+                   "because it did not choose to escalate. Approving authorises this one write."),
+    }
+    # The claimed-row join key (reply-2005/reply-2006, 2026-08-12): of the three session-id
+    # namespaces in a claim window, only the per-wake host session appears on the outcome rows
+    # an auditor joins from — the gate-self connect session above joins only to gate witnesses.
+    # Sent only when in hand: the daemon writes explicit null, and a fabricated placeholder
+    # would be a lie in the exact record used to argue about who authorised what.
+    host_session_id = _EVENT.get("session_id")
+    if host_session_id:
+        claim_args["host_session_id"] = host_session_id
+    r = _gate_self_call("hestia_gate_escalation_claim", claim_args,
+                        host_session_id=host_session_id)
+    if not isinstance(r, dict):
+        return "unreachable", "no answer from the daemon — refused", None, None
+    # BOTH flags, and the daemon owns both — two places deciding what "approved" means is how
+    # they come to disagree, so the hook re-derives nothing.
+    if r.get("claimed") is True and r.get("permits_write") is True:
+        who = r.get("decided_by") or "a human"
+        via = r.get("decided_via") or "unknown-channel"
+        return ("approved",
+                f"claimed an approval from {who} via {via} (single use, now spent)", None, None)
+    esc_id = r.get("escalation_id")
+    if not esc_id:
+        # An old daemon answers {} to a tool it does not know — which must not permit a write by
+        # failing to understand the question, but also cannot open an escalation. Say which.
+        why = r.get("error") or "this daemon has no escalation channel (is it upgraded?)"
+        return "no-channel", f"refused, and NO escalation was opened — {why}", None, None
+    return ("escalated", "refused; escalation opened for out-of-band decision",
+            esc_id, r.get("how_to_decide") or f"hestia gate approve {esc_id}")
+
+
 def main():
     # Fail-closed skeleton: any unexpected error -> deny (never fall through to allow).
     try:
@@ -503,31 +753,71 @@ def main():
                  f"(granted: {'+'.join(scopes)})",
                  "Scope the command to a granted repo, or if legitimately needed, request it (request_scope).")
 
-    # Gate 2 — society safety (the governor). Read-class already fully covered by the local gates;
-    # only write/exec-class needs the daemon's destructive/secret verdict — and there we fail closed.
-    if tool not in READ_CLASS:
-        try:
-            env = dict(os.environ, HESTIA_PLUGIN_ID="kimi-code", HESTIA_PRE_FAIL_CLOSED="1")
-            if not os.path.isfile(CLAUDE_PRE):
-                raise FileNotFoundError(
-                    f"society gate script missing at {CLAUDE_PRE} — "
-                    "check HESTIA_WORKSPACE / workspace detection")
-            r = subprocess.run([sys.executable, CLAUDE_PRE], input=json.dumps(event),
-                               capture_output=True, text=True, timeout=6, env=env)
-            if r.returncode != 0:  # daemon denied, or inconclusive -> fail-closed for a write/exec act
-                msg = (r.stderr.strip() if r.returncode == 2 and r.stderr.strip()
-                       else "hestia: deny [safety] — blocked/inconclusive at the society safety gate.")
-                if MODE == "enforce":
-                    sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
-                    sys.exit(2)
-                sys.stderr.write("hestia: warn [safety] — " + msg.split("— ", 1)[-1] +
-                                 " (warn-rollout: allowed; would block under enforce)\n")
-        except Exception:
-            if MODE == "enforce":
-                sys.stderr.write("hestia: deny [safety] — could not reach the governor; failing "
-                                 "closed on a consequential act.\n")
+    # Gate 1c — local self-protection. BEFORE the daemon and never conditional on it: if this
+    # check needed a verdict, "stop the daemon, then edit the gate" would be the same evasion one
+    # layer down. ALWAYS enforced — it does not honor warn-rollout, because a governance write
+    # that warns and proceeds is not a boundary.
+    self_hit = _touches_self(tinput)
+    if self_hit:
+        self_marker, self_resource = self_hit
+        if tool in READ_CLASS:
+            # Publish-the-law: a member may read what governs it — refusing would make a member
+            # unable to check its own law. The read is RECORDED so reconnaissance stays visible
+            # as a pattern; a failed witness never blocks the read.
+            _witness_gate_self("gate_self_read", self_marker, tool)
+        else:
+            verdict, detail, esc_id, how = _claim_self_write(
+                self_marker, tool, _attempted_summary(_EVENT))
+            if verdict != "approved":
+                _witness_gate_self("gate_self_access", self_marker, tool)
+                _tally_scope(False)   # a refused reach still closes part of the window
+                esc = (f" Escalation {esc_id} is open — a human decides out of band ({how}); "
+                       f"re-issue the write afterwards to claim the approval." if esc_id else "")
+                sys.stderr.write(
+                    f"hestia: deny [gate-self] — '{tool}' would WRITE to the governance surface: "
+                    f"{self_resource} (matched marker {self_marker!r}; {detail}).{esc} This is not "
+                    f"an ordinary boundary — the target is what draws the boundaries. Legitimate "
+                    f"gate work goes through the escalation, not around it.\n")
                 sys.exit(2)
-            sys.stderr.write("hestia: warn [safety] — governor unreachable (warn-rollout: allowed).\n")
+            # APPROVED lifts self-protection for THIS call only — the ordinary gates below still
+            # run; approving a gate edit is not approving everything else the call might do.
+            sys.stderr.write(f"hestia: gate write APPROVED — {detail}\n")
+
+    # Gate 2 — society safety (the governor). Read-class already fully covered by the local gates;
+    # only write/exec-class needs the daemon's destructive/secret verdict — reached IN-PROCESS via
+    # the shared mechanism (PR #371), NOT by spawning the claude gate as a subprocess off /mnt/c,
+    # cold, every call. That subprocess path was the structural cause of kimi's idle-box timeouts
+    # (criterion 10): fork + interpreter startup + a 2760-line cold import could not finish inside
+    # budget. query_society_safety() never raises and never allows on error; a down/slow daemon or
+    # a malformed verdict returns a no-verdict that fails closed here, exactly as the old
+    # returncode!=0 path did — but in one lean in-process round-trip, the same one claude makes.
+    if tool not in READ_CLASS:
+        verdict = None
+        try:
+            shared = os.path.join(WORKSPACE, "hestia", "plugins", "_shared")
+            if shared not in sys.path:
+                sys.path.insert(0, shared)
+            from hestia_gate_mechanism import query_society_safety
+            verdict = query_society_safety(
+                event, plugin_id="kimi-code", host_agent="kimi-code",
+                host_session_id=event.get("session_id"))
+        except Exception:
+            # Loading the mechanism must itself fail closed on a consequential act: a missing or
+            # unimportable module is not a reason to allow a write on a fail-open harness.
+            if MODE == "enforce":
+                sys.stderr.write("hestia: deny [safety] — the society-safety mechanism could not "
+                                 "be loaded; failing closed on a consequential act.\n")
+                sys.exit(2)
+            sys.stderr.write("hestia: warn [safety] — society-safety mechanism unavailable "
+                             "(warn-rollout: allowed).\n")
+        if verdict is not None and not verdict.allow:  # enforced deny OR no-verdict -> fail closed
+            msg = (verdict.message
+                   or "hestia: deny [safety] — blocked/inconclusive at the society safety gate.")
+            if MODE == "enforce":
+                sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
+                sys.exit(2)
+            sys.stderr.write("hestia: warn [safety] — " + msg.split("— ", 1)[-1] +
+                             " (warn-rollout: allowed; would block under enforce)\n")
 
     # Count the allow before exiting: this is the gate attesting that the reach was
     # inside the grant, which is the only not-self-reported evidence of competent work

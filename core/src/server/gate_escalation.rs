@@ -229,6 +229,12 @@ pub fn bar_for(marker: &str) -> Bar {
     if marker.contains("pre_tool_use.py")
         || marker.contains("post_tool_use.py")
         || marker.contains("witness.py")
+        // The shared in-process society-safety mechanism: it decides allow/deny on every adopting
+        // harness, so editing it is priced two-factor like the gate/witness. Ratified STRONG by the
+        // steward (dp, 2026-08-12) when PR #372 made it LIVE — the "DECIDE before the shims adopt
+        // it" the governance-class declaration named. Live clause: the name is not shadowed in the
+        // matcher tuple, so this is the deciding branch for its own marker (governance_class_drift).
+        || marker.contains("hestia_gate_mechanism.py")
     {
         Bar::SovereignPlusPeer
     } else {
