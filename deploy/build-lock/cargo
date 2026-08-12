@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# cargo build-lock shim — deprioritize heavy cargo so a build cannot DoS the hestia gate.
+# Increment 1 of the git-manager build lock. Issue #358; root cause #354.
+#
+# WHY: a heavy `cargo build` pins the CPU and starves the hestia daemon's gate round-trip
+# (/mcp POST). Under that contention every member's gate call fail-closes on timeout — a
+# single member's build is a fleet-wide gate DoS. The box has ample RAM and never swaps; the
+# problem is purely CPU scheduling. On a multi-member build host (claude / kimi / codex share
+# a home) one build times out everyone, and pausing live sessions does not help because auto
+# sessions keep firing builds.
+#
+# WHAT: run heavy, compile-bound subcommands under `nice` so the daemon (normal priority)
+# preempts the build and the gate stays responsive. The build yields; it does not starve the
+# referee. Every other cargo invocation passes straight through, untouched.
+#
+# INSTALL: place this as `cargo` in a PATH directory that PRECEDES the real cargo (e.g.
+# ~/.local/bin ahead of ~/.cargo/bin). See install.sh. All members sharing a home are then
+# covered by one shim, transparently.
+#
+# SCOPE (MVP): deprioritize only. Serialization (one heavy build at a time via flock, so N
+# concurrent builds become 1) is the tracked follow-up in #358 — `nice` already fixes the
+# gate timeout because it protects the daemon's CPU share regardless of build count.
+#
+# SAFETY: the real cargo is resolved as the first `cargo` on PATH that is not this shim (so it
+# works on any rust layout) and is exec'd by that resolved path — never via PATH — so this can
+# never recurse into itself, and any unrecognized subcommand is a pure pass-through.
+
+self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+real=""
+while IFS= read -r cand; do
+  [ -n "$cand" ] || continue
+  rc="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+  if [ "$rc" != "$self" ]; then real="$cand"; break; fi
+done < <(command -v -a cargo 2>/dev/null || true)
+[ -n "$real" ] || real="$HOME/.cargo/bin/cargo"
+[ -x "$real" ] || real="$(rustup which cargo 2>/dev/null || true)"
+[ -x "$real" ] || { echo "cargo build-lock shim: cannot locate the real cargo" >&2; exit 127; }
+
+case "${1:-}" in
+  build|b|test|t|check|c|clippy|bench|doc|d|install)
+    exec nice -n 15 "$real" "$@" ;;
+  *)
+    exec "$real" "$@" ;;
+esac
