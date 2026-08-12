@@ -132,11 +132,35 @@ pub enum Liveness {
     Unknown,
 }
 
+/// Whether the appellant's identity was PROVEN (resolved from a live session by
+/// `resolve_attributed_caller`) or merely ASSERTED (a string the caller supplied).
+///
+/// #128: NOT-SAME compares the appellant against the arbiter, and every call site resolves
+/// the ARBITER from a session. If the APPELLANT side is a string a caller typed, the whole
+/// comparison has one forgeable operand — a forged `codex` grades CrossVendor against every
+/// real arbiter, so the strongest tier this system can record gets paid for the weakest
+/// evidence it can hold. The default is the fail-closed arm: rows written before this field
+/// existed carry no proof, so they deserialize as `Asserted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskerBasis {
+    /// Resolved from a live session at the moment the ask was recorded.
+    Session,
+    /// Caller-supplied, never verified. Peer-clearing is refused; the sovereign channels
+    /// can still decide, because they do not rely on NOT-SAME.
+    #[default]
+    Asserted,
+}
+
 /// The parties to an appeal, as the daemon knows them.
 #[derive(Debug, Clone)]
 pub struct AppealParties<'a> {
     /// Who filed the appeal — the member the deny landed on.
     pub appellant: &'a str,
+    /// Whether `appellant` was proven against a session or is a bare assertion. The appeal
+    /// surfaces resolve their appellant from the session and pass `Session`; the escalation
+    /// surfaces inherit whatever `tool_gate_escalation_open` could prove (#128).
+    pub appellant_basis: AskerBasis,
     /// Which gate issued the deny (`plugin-gate:<id>`, `hestia-gate`, or a rule id).
     pub deny_adjudicator: Option<&'a str>,
     /// Who proposes to rule.
@@ -201,6 +225,29 @@ pub fn eligibility(p: &AppealParties<'_>) -> Eligibility {
 
 /// `eligibility`, told which way the would-be arbiter proposes to rule.
 pub fn eligibility_for(p: &AppealParties<'_>, disposition: Disposition) -> Eligibility {
+    // 0. THE LEFT OPERAND MUST BE PROVEN. NOT-SAME is a comparison between appellant and
+    //    arbiter; the arbiter is session-resolved at every call site, and if the APPELLANT
+    //    is a bare string a caller typed, the comparison proves nothing. Worse, it pays:
+    //    an unrecognised name matches no lineage, so a forged asker grades CrossVendor
+    //    against every real arbiter — the strongest tier, for the weakest evidence (#128).
+    //    Refusing the `unattributed` sentinel alone was proposed and withdrawn for exactly
+    //    this reason: a forged `codex` is not the sentinel and still grades CrossVendor.
+    //    The generalised clause is this one. An asserted asker is not silenced — the
+    //    SOVEREIGN channels do not rely on NOT-SAME and can still decide its escalation;
+    //    what it cannot collect is a peer factor. The clause applies in BOTH dispositions:
+    //    a self-withdrawal under an asserted appellant would let a proven caller retire
+    //    an escalation someone else filed under its own name.
+    if p.appellant_basis == AskerBasis::Asserted {
+        return Eligibility::Refused {
+            reason: format!(
+                "'{}' is an asserted asker, never proven against a session — NOT-SAME cannot \
+                 peer-clear a name a caller typed, because the comparison would grade a \
+                 forgeable operand, and an unrecognised one as MAXIMALLY independent (#128). \
+                 The sovereign channels do not rely on NOT-SAME and can still decide",
+                p.appellant
+            ),
+        };
+    }
     // 1. NOT THE APPELLANT — IN THE GRANTING DIRECTION. The whole point.
     //
     // The refusal is about self-DEALING, not self-reference: what may not happen is a member
@@ -307,12 +354,13 @@ pub fn eligibility_for(p: &AppealParties<'_>, disposition: Disposition) -> Eligi
 /// than none, because a ruling carries weight a missing ruling does not.
 pub fn select_arbiter<'a>(
     appellant: &str,
+    appellant_basis: AskerBasis,
     deny_adjudicator: Option<&str>,
     candidates: impl IntoIterator<Item = (&'a str, Liveness)>,
 ) -> Option<Selection<'a>> {
     let mut eligible: Vec<(&'a str, Independence, Liveness)> = Vec::new();
     for (cand, liveness) in candidates {
-        let parties = AppealParties { appellant, deny_adjudicator, arbiter: cand };
+        let parties = AppealParties { appellant, appellant_basis, deny_adjudicator, arbiter: cand };
         if let Eligibility::Eligible { independence } = eligibility(&parties) {
             eligible.push((cand, independence, liveness));
         }
@@ -387,7 +435,57 @@ mod tests {
     use super::*;
 
     fn parties<'a>(appellant: &'a str, arbiter: &'a str, gate: Option<&'a str>) -> AppealParties<'a> {
-        AppealParties { appellant, deny_adjudicator: gate, arbiter }
+        // Session-proven: the appeal surfaces, which resolve their appellant from
+        // `resolve_attributed_caller`. The asserted arm gets its own tests below.
+        AppealParties { appellant, appellant_basis: AskerBasis::Session, deny_adjudicator: gate, arbiter }
+    }
+
+    /// CLAUSE 0, the generalised #128 remedy. An appellant whose identity was never proven
+    /// cannot be peer-cleared — NOT-SAME would be comparing the arbiter against a string a
+    /// caller typed. This subsumes the withdrawn `unattributed`-sentinel remedy: a forged
+    /// `codex` is not the sentinel, and without this clause it still grades CrossVendor.
+    #[test]
+    fn an_asserted_appellant_cannot_be_peer_cleared() {
+        let p = AppealParties {
+            appellant: "codex",
+            appellant_basis: AskerBasis::Asserted,
+            deny_adjudicator: None,
+            arbiter: "kimi-code",
+        };
+        match eligibility(&p) {
+            Eligibility::Refused { reason } => {
+                assert!(reason.contains("asserted"), "the refusal must name the basis: {reason}");
+            }
+            other => panic!(
+                "an asserted asker must be refused even when every other clause would pass \
+                 (cross-vendor, recognised, not-self): got {other:?}"
+            ),
+        }
+    }
+
+    /// The strongest-tier trap the clause exists to close: an unrecognised ASSERTED name
+    /// matches no lineage, so absent clause 0 it grades CrossVendor against everyone.
+    #[test]
+    fn a_forged_unrecognised_asker_does_not_grade_maximally_independent() {
+        let p = AppealParties {
+            appellant: "selftest-phantom-asker",
+            appellant_basis: AskerBasis::Asserted,
+            deny_adjudicator: None,
+            arbiter: "kimi-code",
+        };
+        assert!(matches!(eligibility(&p), Eligibility::Refused { .. }));
+    }
+
+    /// Routing inherits the clause: an asserted appellant has NO eligible arbiter, and the
+    /// honest answer is `None` rather than the most independent candidate.
+    #[test]
+    fn an_asserted_appellant_routes_to_nobody() {
+        let pool = [("claude-code", Liveness::Live), ("kimi-code", Liveness::Live)];
+        assert_eq!(
+            select_arbiter("codex", AskerBasis::Asserted, None, pool),
+            None,
+            "an asker nobody proved gets no peer routing — the sovereign channel remains"
+        );
     }
 
     /// The constraint that is not a stub.
@@ -515,7 +613,7 @@ mod tests {
     fn dispatch_routes_to_the_most_independent_admissible_candidate() {
         let pool = [("claude-code", Liveness::Live), ("claude-mesh-worker", Liveness::Live),
                     ("codex", Liveness::Live), ("kimi-code", Liveness::Live)];
-        let picked = select_arbiter("claude-code", Some("hestia-gate"), pool).unwrap();
+        let picked = select_arbiter("claude-code", AskerBasis::Session, Some("hestia-gate"), pool).unwrap();
         // codex and kimi are both cross-vendor and both live; the tie breaks on id.
         assert_eq!(picked.arbiter, "codex");
         assert_eq!(picked.independence, Independence::CrossVendor);
@@ -526,7 +624,7 @@ mod tests {
     #[test]
     fn dispatch_skips_the_gate_that_issued_the_deny() {
         let pool = [("codex", Liveness::Live), ("kimi-code", Liveness::Live)];
-        let picked = select_arbiter("claude-code", Some("plugin-gate:codex"), pool).unwrap();
+        let picked = select_arbiter("claude-code", AskerBasis::Session, Some("plugin-gate:codex"), pool).unwrap();
         assert_eq!(picked.arbiter, "kimi-code");
     }
 
@@ -534,7 +632,7 @@ mod tests {
     /// as anything other than "none" is how a self-arbitration gets laundered by plumbing.
     #[test]
     fn a_single_member_machine_has_no_arbiter_rather_than_a_default_one() {
-        assert!(select_arbiter("codex", None, [("codex", Liveness::Live)]).is_none());
+        assert!(select_arbiter("codex", AskerBasis::Session, None, [("codex", Liveness::Live)]).is_none());
     }
 
     /// THE LIVE ONE. Regression for the first real appeal this surface handled, which was
@@ -546,7 +644,7 @@ mod tests {
         let registry = [("agent-inventory", Liveness::Live), ("claude-code", Liveness::Live),
                         ("hestia-timer", Liveness::Live), ("mesh-watcher", Liveness::Live)];
         assert_eq!(
-            select_arbiter("claude-code", None, registry),
+            select_arbiter("claude-code", AskerBasis::Session, None, registry),
             None,
             "with no other harness present the honest answer is 'no arbiter' — anything else \
              routes the dispute into something that cannot rule, while reporting success"
@@ -554,7 +652,7 @@ mod tests {
         // And with a real peer present, the peer wins over the plumbing.
         let with_peer = [("agent-inventory", Liveness::Live), ("claude-code", Liveness::Live),
                          ("kimi-code", Liveness::Live)];
-        assert_eq!(select_arbiter("claude-code", None, with_peer).unwrap().arbiter, "kimi-code");
+        assert_eq!(select_arbiter("claude-code", AskerBasis::Session, None, with_peer).unwrap().arbiter, "kimi-code");
     }
 
     /// The same floor applies to the direct ruling path, not only to routing — otherwise an
@@ -570,7 +668,7 @@ mod tests {
     fn a_live_arbiter_beats_an_equally_independent_unreachable_one() {
         // Both cross-vendor relative to claude-code. Alphabetically codex wins; it is out.
         let pool = [("codex", Liveness::Dormant), ("kimi-code", Liveness::Live)];
-        let picked = select_arbiter("claude-code", None, pool).unwrap();
+        let picked = select_arbiter("claude-code", AskerBasis::Session, None, pool).unwrap();
         assert_eq!(picked.arbiter, "kimi-code",
                    "an arbiter that cannot read the appeal supplies no independence at all");
         assert_eq!(picked.independence, Independence::CrossVendor);
@@ -583,7 +681,7 @@ mod tests {
     fn trading_independence_for_reachability_is_recorded_not_hidden() {
         // codex is cross-vendor but dark; claude-mesh-worker is same-lineage but live.
         let pool = [("codex", Liveness::Unknown), ("claude-mesh-worker", Liveness::Live)];
-        let picked = select_arbiter("claude-code", None, pool).unwrap();
+        let picked = select_arbiter("claude-code", AskerBasis::Session, None, pool).unwrap();
         assert_eq!(picked.arbiter, "claude-mesh-worker");
         assert_eq!(picked.independence, Independence::CrossMember);
         let skipped = picked.passed_over.expect("the trade must be on the record");

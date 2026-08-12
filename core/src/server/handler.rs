@@ -311,7 +311,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_gate_arbitrate_escalation",
-            "Rule on ANOTHER member's governance-write escalation. NOT-SAME enforced server-side using the same independence rules as the appeal arbiter — you can never grant your own gate write. Approving requires a stated reason; refusing does not. Records role@agent and the independence tier. At A1 a peer shares the operator's UID, so this is recorded SECOND-PARTY REVIEW, not an enforced boundary",
+            "Rule on ANOTHER member's governance-write escalation. NOT-SAME enforced server-side using the same independence rules as the appeal arbiter — you can never grant your own gate write, and an escalation whose asker was never proven against a session (asker_basis: asserted) cannot be peer-cleared at all; the operator decides those. Approving requires a stated reason; refusing does not. Records role@agent and the independence tier. At A1 a peer shares the operator's UID, so this is recorded SECOND-PARTY REVIEW, not an enforced boundary",
         ),
         t(
             "hestia_gate_escalation_corroborate",
@@ -2778,6 +2778,8 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
         pool.iter().map(|id| (id.as_str(), actor_liveness(&window, id))).collect();
     let picked = crate::arbiter::select_arbiter(
         &appellant.plugin_id,
+        // Resolved from the session just above — the left operand is proven (#128).
+        crate::arbiter::AskerBasis::Session,
         adjudicator,
         with_liveness.into_iter(),
     )
@@ -2936,6 +2938,9 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
     // the client.
     let parties = crate::arbiter::AppealParties {
         appellant,
+        // The appeal surface resolves its appellant from the session at filing
+        // (`tool_appeal`), so the left operand here is proven, not asserted (#128).
+        appellant_basis: crate::arbiter::AskerBasis::Session,
         deny_adjudicator,
         arbiter: &arbiter.plugin_id,
     };
@@ -3177,6 +3182,8 @@ async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
             }
             match crate::arbiter::eligibility(&crate::arbiter::AppealParties {
                 appellant,
+                // Session-proven at filing, as in `tool_arbitrate_appeal` (#128).
+                appellant_basis: crate::arbiter::AskerBasis::Session,
                 deny_adjudicator,
                 arbiter: &c.plugin_id,
             }) {
@@ -9123,8 +9130,16 @@ mod tests {
             }
         }
 
+        // The claim carries the session, as the <gate-hook> does since 2026-08-07 (connect
+        // first, thread `session_id`). Without it the asker records as ASSERTED and clause 0
+        // refuses even the withdrawal below — correctly: an asserted "claude-code" is a name
+        // anyone can type, and letting a proven caller retire an escalation filed under a
+        // merely-matching string would spend someone else's visibility in the operator queue.
+        // The asserted arm has its own test:
+        // `an_asserted_asker_collects_no_peer_factor_at_decide_or_corroborate`.
         let open_one = |marker: &'static str| {
             let shared = shared.clone();
+            let sid = sid.clone();
             async move {
                 let c = tool_gate_escalation_claim(
                     &shared,
@@ -9133,6 +9148,7 @@ mod tests {
                         "tool_name": "Edit",
                         "marker": marker,
                         "reason": "Edit -> a governance file",
+                        "session_id": sid,
                     }),
                 )
                 .await
@@ -9605,6 +9621,156 @@ mod tests {
             msg.contains("claude-code") && msg.contains("codex"),
             "the refusal must name BOTH the proven identity and the asserted one, or the \
              caller cannot tell which half to fix: {msg}"
+        );
+    }
+
+    /// CLAUSE 0, the generalised #128 remedy, on the DECIDE path. The binding above stops an
+    /// asserted asker from waking peers; this clause stops it from being CLEARED by one.
+    /// Without it, `eligibility` would compare a proven arbiter against a string a caller
+    /// typed — and an unrecognised forged name grades CrossVendor, the strongest tier, for
+    /// the weakest evidence the system can hold. RED before this change: every assertion
+    /// below passed with the arms reversed (peer decide ALLOWED, corroborate ALLOWED,
+    /// `you_may_rule` true).
+    #[tokio::test]
+    async fn an_asserted_asker_collects_no_peer_factor_at_decide_or_corroborate() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["kimi-code", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+
+        // An ask with NO session — the shape every escalation took before the binding.
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+        assert_eq!(opened["asker_basis"], "asserted", "{opened}");
+
+        // DISCOVERY carries the basis, and no peer may rule.
+        let pending = tool_gate_pending_escalations(
+            &shared,
+            &json!({ "session_id": session_of["kimi-code"] }),
+        )
+        .await
+        .unwrap();
+        let item = pending["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["escalation_id"] == esc_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(item["asker_basis"], "asserted", "the queue must show the basis: {item}");
+        assert_eq!(
+            item["you_may_rule"], false,
+            "a cross-vendor peer with a live session still may not clear an asserted ask: {item}"
+        );
+
+        // DECIDE is refused, and the refusal says which clause.
+        let err = tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "approve": true,
+                "reason": "cross-vendor peer approval, correctly formed in every other respect",
+                "session_id": session_of["kimi-code"],
+            }),
+        )
+        .await
+        .expect_err("an asserted asker must not be peer-clearable");
+        assert!(
+            format!("{err}").contains("asserted"),
+            "the refusal must name the basis, not merely NOT-SAME: {err}"
+        );
+
+        // CORROBORATE is refused on the same clause — an unproven ask mints no peer factor.
+        let err = tool_gate_escalation_corroborate(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "session_id": session_of["kimi-code"],
+            }),
+        )
+        .await
+        .expect_err("corroborating an asserted ask would mint evidence against a name nobody proved");
+        assert!(format!("{err}").contains("asserted"), "{err}");
+
+        // The SOVEREIGN path is untouched: the store still decides it without a murmur.
+        // (The operator channels never consult `eligibility`; this asserts the clause did not
+        // reach them.)
+        let mut s = shared.lock().await;
+        let decided = s
+            .gate_escalations
+            .decide(
+                &esc_id,
+                false,
+                "operator",
+                "role:constellation:sovereign",
+                crate::server::gate_escalation::Channel::OperatorSession,
+                None,
+                None,
+                crate::server::gate_escalation::now_secs(),
+            )
+            .expect("the sovereign channel must still decide an asserted ask");
+        assert_eq!(
+            decided.stored_status(),
+            crate::server::gate_escalation::Status::Denied
+        );
+    }
+
+    /// The positive control, and the more important half: closing the hole must not delete
+    /// the feature. Same registry, same marker, varying ONLY whether the open carried a
+    /// session — the proven asker is still peer-clearable, at the same tier as before.
+    #[tokio::test]
+    async fn a_session_proven_asker_remains_peer_clearable_at_the_same_tier() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["kimi-code", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "session_id": session_of["codex"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+        assert_eq!(opened["asker_basis"], "session", "{opened}");
+
+        let decided = tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "approve": true,
+                "reason": "cross-vendor peer approval from a live session — the path #128 must keep open",
+                "session_id": session_of["kimi-code"],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(decided["status"], "approved", "{decided}");
+        assert_eq!(
+            decided["independence"], "cross_vendor",
+            "the tier must be the one the parties actually earn: {decided}"
         );
     }
 }
@@ -11575,6 +11741,18 @@ fn resolve_invitation(
     // worth branching on: a lost invitation would show up as an empty list in the entry,
     // which is exactly what a reader should then see.
     s.gate_escalations.invite(&esc.id, invited.clone());
+    // The basis the whole record already carries on the chain entry must also live ON the
+    // escalation itself: `arbiter::eligibility` clause 0 reads it from here at decide and
+    // corroborate time, and a basis that exists only on the chain is one the peer path
+    // cannot enforce (#128, generalised remedy).
+    s.gate_escalations.record_asker_basis(
+        &esc.id,
+        if asker_is_proven {
+            crate::arbiter::AskerBasis::Session
+        } else {
+            crate::arbiter::AskerBasis::Asserted
+        },
+    );
 
     OpenedInvitation { invited, evidence, withheld, passed_over }
 }
@@ -12344,6 +12522,10 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
                 matches!(
                     eligibility(&AppealParties {
                         appellant: &e.plugin_id,
+                        // The escalation half of #128: `e.plugin_id` is proven only if the
+                        // open carried a session. An asserted asker reads `you_may_rule:
+                        // false` for every peer — the sovereign can still decide it.
+                        appellant_basis: e.asker_basis,
                         deny_adjudicator: None,
                         arbiter: &c.plugin_id,
                     }),
@@ -12354,6 +12536,10 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
                 "escalation_id": e.id,
                 "asked_by": e.plugin_id,
                 "asked_by_role": e.role,
+                // Proven at open or merely asserted — the field `you_may_rule` is reading
+                // (#128 clause 0). Absent from this payload a reader cannot tell a rulable
+                // ask from one only the sovereign may decide.
+                "asker_basis": e.asker_basis,
                 "tool_name": e.tool_name,
                 // The basis. Absent reads as "the member gave none", which is itself
                 // information — and a reason that does not match the detail is the most
@@ -12377,7 +12563,9 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
              say whether you may rule it. Without it, `you_may_rule` is null, which is not the \
              same as false."
         } else {
-            "you_may_rule reflects NOT-SAME only; a true still means a same-UID peer at A1"
+            "you_may_rule reflects NOT-SAME over the asker BASIS: an `asserted` asker (no \
+             session at open) is false for every peer regardless of identity — only the \
+             sovereign can decide it (#128). And a true still means a same-UID peer at A1"
         },
     }))
 }
@@ -12416,7 +12604,10 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
     };
 
     // NOT-SAME, server-side, reusing the appeal arbiter's own rules rather than a second
-    // implementation that could drift from them.
+    // implementation that could drift from them. Clause 0 (#128) does the load-bearing work
+    // here: `esc.plugin_id` is the ASSERTED asker unless the open proved it against a
+    // session, and an asserted asker cannot be peer-cleared — the refusal is witnessed below
+    // like every other ineligibility.
     //
     // TOLD WHICH WAY IT IS RULING. `approve` was parsed at the top of this function and then
     // never consulted here, so the two acts a member can direct at its own escalation —
@@ -12428,6 +12619,7 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
     // decisions are single-shot.
     let parties = AppealParties {
         appellant: &esc.plugin_id,
+        appellant_basis: esc.asker_basis,
         deny_adjudicator: None,
         arbiter: &arb.plugin_id,
     };
@@ -12453,8 +12645,10 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
                 }),
             );
             return Err(anyhow::anyhow!(
-                "you may not rule this: {other:?}. A member cannot grant its own governance \
-                 write — that is the whole point of the escalation. Ask a different member."
+                "you may not rule this: {other:?}. If the refusal names NOT-SAME, ask a \
+                 different member — a member cannot grant its own governance write. If it \
+                 names the asker basis (#128), NO peer may rule it — that is the clause \
+                 working, and the operator can still decide"
             ));
         }
     };
@@ -12585,9 +12779,12 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
     };
 
     // NOT-SAME, same arbiter rules: a member may not corroborate its own ask, and the
-    // independence tier is recorded with the factor so a reader can weight it.
+    // independence tier is recorded with the factor so a reader can weight it. Clause 0
+    // (#128): an asserted asker collects NO peer factor at all — corroborating an ask
+    // nobody proved would mint cross-vendor evidence against a forgeable name.
     let independence = match eligibility(&AppealParties {
         appellant: &esc.plugin_id,
+        appellant_basis: esc.asker_basis,
         deny_adjudicator: None,
         arbiter: &arb.plugin_id,
     }) {
