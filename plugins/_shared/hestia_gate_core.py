@@ -131,6 +131,32 @@ READ_CLASS = frozenset({"Read", "Glob", "Grep", "TodoWrite", "TodoList", "GetGoa
 MEMBER_ADDRESSES = frozenset({"claude-code", "kimi-code", "codex-cli", "gemini-cli", "cursor"})
 
 
+# ── The governance closure — the CANONICAL list, mirrored (not imported) by every gate ──────
+#
+# Filenames of the files that DECIDE policy, matched anywhere so the rule holds for a peer's
+# copy as well as one's own. This is the single source of truth for the self-protection list
+# the per-harness gates enforce, so their copies cannot silently drift apart. The self-protection
+# test's drift check pins each enforcing gate's literal against this tuple.
+#
+# WHY MIRRORED, NOT IMPORTED (load-bearing). A gate must carry its protection list as a
+# FAIL-SAFE LITERAL, never as `from hestia_gate_core import GOVERNANCE_FILES`. If the list were
+# import-only and the import failed, the self-access check would run against an EMPTY list — and
+# because every Claude-lineage engine fails OPEN on a hook crash, that silently disarms gate
+# self-protection entirely. So the canonical lives here for one-source review + drift detection,
+# and each gate keeps its own literal for fail-safety; the drift test makes the two agree. This
+# is the one place "one implementation" yields to "one canonical + fail-safe replicas + a drift
+# guard," and the reason is that the failure mode of a missing import is a disarmed gate.
+GOVERNANCE_FILES = (
+    "pre_tool_use.py",
+    "society_pre_tool_use.py",
+    "post_tool_use.py",
+    "witness.py",
+    "law_inject.py",
+    "hestia_gate_core.py",
+    "gate_self_protection_test.py",
+)
+
+
 # ── The remedy inventory ─────────────────────────────────────────────────────────────────
 #
 # One table. Every sentence a member reads after a refusal comes from here, and every tool

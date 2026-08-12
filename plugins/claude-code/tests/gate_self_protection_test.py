@@ -299,6 +299,44 @@ def test_exemptions_are_not_stale():
           f"EXEMPT names files that are gone: {stale}")
 
 
+def _core_governance_files():
+    """Read `GOVERNANCE_FILES` out of the shared core's AST — parsed, not imported, for the
+    same reason as `_governance_files()`: a self-protection check must not execute the code it
+    audits, and this must work when the core cannot run at all."""
+    core = os.path.join(SHARED, "hestia_gate_core.py")
+    with open(core, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for tgt in node.targets:
+            if isinstance(tgt, ast.Name) and tgt.id == "GOVERNANCE_FILES":
+                if isinstance(node.value, (ast.Tuple, ast.List)):
+                    return {e.value for e in node.value.elts
+                            if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+    return set()
+
+
+@asserting
+def test_the_enforced_list_matches_the_canonical():
+    """The consolidation drift guard (step B, PR-1). The core now carries the CANONICAL
+    `GOVERNANCE_FILES`; each enforcing gate keeps its own fail-safe literal — the list must NOT
+    become import-only, because an import failure would run the self-access check against an
+    empty list and, since engines fail OPEN on a hook crash, silently disarm the gate. So the
+    canonical and the enforced copy are pinned byte-equal here; if they drift, one gate enforces
+    a different closure than the ratified one — the exact failure the shared core exists to
+    prevent, at the one place fail-safety forbids collapsing to a single copy."""
+    enforced = _governance_files()        # the hook's own literal (AST)
+    canonical = _core_governance_files()  # the core's canonical (AST)
+    check("canonical_list_parsed", len(canonical) >= 5,
+          f"found {len(canonical)} in the core's GOVERNANCE_FILES — the AST read may be broken, "
+          f"which would make this assertion silently vacuous")
+    check("enforced_matches_canonical", enforced == canonical,
+          f"the hook's _GOVERNANCE_FILES and the core's GOVERNANCE_FILES have DRIFTED: "
+          f"only-in-hook={sorted(enforced - canonical)}, only-in-core={sorted(canonical - enforced)}. "
+          f"A gate enforcing a different closure than the canonical is the consolidation failure.")
+
+
 if __name__ == "__main__":
     # The bare runner reads FAILURES itself and wants the whole table, so switch `asserting`
     # off. This assignment is the ONLY difference between the two invocations, and it changes
@@ -306,6 +344,7 @@ if __name__ == "__main__":
     _BARE = True
     print("gate self-protection")
     test_the_shared_core_is_protected()
+    test_the_enforced_list_matches_the_canonical()
     test_the_shared_core_write_is_actually_refused()
     test_the_hooks_dir_qualifier_is_a_subset_of_the_governed_names()
     test_the_exemption_ledger_is_itself_protected()
