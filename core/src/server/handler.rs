@@ -9130,8 +9130,16 @@ mod tests {
             }
         }
 
+        // The claim carries the session, as the <gate-hook> does since 2026-08-07 (connect
+        // first, thread `session_id`). Without it the asker records as ASSERTED and clause 0
+        // refuses even the withdrawal below — correctly: an asserted "claude-code" is a name
+        // anyone can type, and letting a proven caller retire an escalation filed under a
+        // merely-matching string would spend someone else's visibility in the operator queue.
+        // The asserted arm has its own test:
+        // `an_asserted_asker_collects_no_peer_factor_at_decide_or_corroborate`.
         let open_one = |marker: &'static str| {
             let shared = shared.clone();
+            let sid = sid.clone();
             async move {
                 let c = tool_gate_escalation_claim(
                     &shared,
@@ -9140,6 +9148,7 @@ mod tests {
                         "tool_name": "Edit",
                         "marker": marker,
                         "reason": "Edit -> a governance file",
+                        "session_id": sid,
                     }),
                 )
                 .await
