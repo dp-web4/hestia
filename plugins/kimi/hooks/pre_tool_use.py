@@ -504,30 +504,40 @@ def main():
                  "Scope the command to a granted repo, or if legitimately needed, request it (request_scope).")
 
     # Gate 2 — society safety (the governor). Read-class already fully covered by the local gates;
-    # only write/exec-class needs the daemon's destructive/secret verdict — and there we fail closed.
+    # only write/exec-class needs the daemon's destructive/secret verdict — reached IN-PROCESS via
+    # the shared mechanism (PR #371), NOT by spawning the claude gate as a subprocess off /mnt/c,
+    # cold, every call. That subprocess path was the structural cause of kimi's idle-box timeouts
+    # (criterion 10): fork + interpreter startup + a 2760-line cold import could not finish inside
+    # budget. query_society_safety() never raises and never allows on error; a down/slow daemon or
+    # a malformed verdict returns a no-verdict that fails closed here, exactly as the old
+    # returncode!=0 path did — but in one lean in-process round-trip, the same one claude makes.
     if tool not in READ_CLASS:
+        verdict = None
         try:
-            env = dict(os.environ, HESTIA_PLUGIN_ID="kimi-code", HESTIA_PRE_FAIL_CLOSED="1")
-            if not os.path.isfile(CLAUDE_PRE):
-                raise FileNotFoundError(
-                    f"society gate script missing at {CLAUDE_PRE} — "
-                    "check HESTIA_WORKSPACE / workspace detection")
-            r = subprocess.run([sys.executable, CLAUDE_PRE], input=json.dumps(event),
-                               capture_output=True, text=True, timeout=6, env=env)
-            if r.returncode != 0:  # daemon denied, or inconclusive -> fail-closed for a write/exec act
-                msg = (r.stderr.strip() if r.returncode == 2 and r.stderr.strip()
-                       else "hestia: deny [safety] — blocked/inconclusive at the society safety gate.")
-                if MODE == "enforce":
-                    sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
-                    sys.exit(2)
-                sys.stderr.write("hestia: warn [safety] — " + msg.split("— ", 1)[-1] +
-                                 " (warn-rollout: allowed; would block under enforce)\n")
+            shared = os.path.join(WORKSPACE, "hestia", "plugins", "_shared")
+            if shared not in sys.path:
+                sys.path.insert(0, shared)
+            from hestia_gate_mechanism import query_society_safety
+            verdict = query_society_safety(
+                event, plugin_id="kimi-code", host_agent="kimi-code",
+                host_session_id=event.get("session_id"))
         except Exception:
+            # Loading the mechanism must itself fail closed on a consequential act: a missing or
+            # unimportable module is not a reason to allow a write on a fail-open harness.
             if MODE == "enforce":
-                sys.stderr.write("hestia: deny [safety] — could not reach the governor; failing "
-                                 "closed on a consequential act.\n")
+                sys.stderr.write("hestia: deny [safety] — the society-safety mechanism could not "
+                                 "be loaded; failing closed on a consequential act.\n")
                 sys.exit(2)
-            sys.stderr.write("hestia: warn [safety] — governor unreachable (warn-rollout: allowed).\n")
+            sys.stderr.write("hestia: warn [safety] — society-safety mechanism unavailable "
+                             "(warn-rollout: allowed).\n")
+        if verdict is not None and not verdict.allow:  # enforced deny OR no-verdict -> fail closed
+            msg = (verdict.message
+                   or "hestia: deny [safety] — blocked/inconclusive at the society safety gate.")
+            if MODE == "enforce":
+                sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
+                sys.exit(2)
+            sys.stderr.write("hestia: warn [safety] — " + msg.split("— ", 1)[-1] +
+                             " (warn-rollout: allowed; would block under enforce)\n")
 
     # Count the allow before exiting: this is the gate attesting that the reach was
     # inside the grant, which is the only not-self-reported evidence of competent work
