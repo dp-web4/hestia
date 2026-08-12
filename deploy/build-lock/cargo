@@ -31,7 +31,7 @@ while IFS= read -r cand; do
   [ -n "$cand" ] || continue
   rc="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
   if [ "$rc" != "$self" ]; then real="$cand"; break; fi
-done < <(command -v -a cargo 2>/dev/null || true)
+done < <(type -ap cargo 2>/dev/null || true)
 [ -n "$real" ] || real="$HOME/.cargo/bin/cargo"
 [ -x "$real" ] || real="$(rustup which cargo 2>/dev/null || true)"
 [ -x "$real" ] || { echo "cargo build-lock shim: cannot locate the real cargo" >&2; exit 127; }
