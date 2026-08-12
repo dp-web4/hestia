@@ -164,13 +164,31 @@ DECLARED = (
              "covering both files as intended scope -- noting that the second "
              "reading contradicts a sentence already written at the filter."),
 
-    dict(key="hestia_", label="<policy-core>", intended=AWAITING, via=UNNAMED, tracked=True,
+    dict(key="hestia_gate_c", label="<policy-core>", intended=AWAITING, via=UNNAMED, tracked=True,
          why="One approver today. Added to the matcher 2026-08-03, after the bar's "
              "doc comment was written, so its class was inherited from an omission "
              "rather than chosen. The matcher's own comment says this file is to "
              "BECOME the single decider for all five harnesses -- at which point "
              "the widest act on the surface is also the cheapest to approve. "
              "DECIDE: before the shims land, not after."),
+
+    dict(key="hestia_gate_m", label="<policy-mechanism>", intended=AWAITING, via=UNNAMED,
+         tracked=True,
+         why="The shared in-process society-safety MECHANISM (#371). It carries the "
+             "fail-closed contract and INTERPRETS the daemon's verdict into allow/deny, so on "
+             "every adopting harness it directly decides whether a daemon answer authorises an "
+             "act -- authority-bearing, not inert transport. One approver today, via UNNAMED: "
+             "added to the matcher after the bar's doc comment, so it inherited the weak branch "
+             "by omission, exactly like <policy-core>. GPT's #371 review (a reviewer, not the "
+             "steward) inclines to price it STRONG (sovereign+peer), and I share that read: it "
+             "sits closer to <gate>/<witness> than to <law-renderer>. But the class is a "
+             "steward call, and writing my preference into this test is the 'surface that "
+             "smuggles a verdict' the accountability norm forbids -- so this is AWAITING, "
+             "measured SINGLE, carrying the question. DECIDE: name it in `bar_for` (two-factor) "
+             "or leave it single. Unlike <society-gate> the name is NOT shadowed -- no earlier "
+             "tuple entry is a substring of it -- so a bar clause for it would be LIVE, not "
+             "dead. Recommend deciding before the shims adopt it (step F), when editing this "
+             "one file re-prices the safety verdict for all five harnesses at once."),
 
     dict(key="gate_self", label="<exemption-ledger>", intended=AWAITING, via=UNNAMED,
          tracked=True,
