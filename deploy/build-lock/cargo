@@ -72,16 +72,21 @@ case "${1:-}" in
       exec nice -n 15 "$real" "$@"
     fi
     lock="${HESTIA_BUILD_LOCK:-${TMPDIR:-/tmp}/hestia-cargo-build.lock}"
-    # -E 99: the exit code flock returns when it CANNOT acquire within -w (distinct from the
-    # build's own exit), so we can tell "lock stuck" from "build failed" and fail open only on
-    # the former. Not exec'd: we must inspect the exit code to decide the fail-open path.
-    flock -w "$wait" -E 99 "$lock" nice -n 15 "$real" "$@"
-    rc=$?
-    if [ "$rc" -eq 99 ]; then
-      echo "cargo build-lock: lock held >${wait}s; running un-serialized (fail-open, #387)" >&2
-      exec nice -n 15 "$real" "$@"
+    # Hold the lock via a dedicated FD, NOT `flock -E N cmd`. The -E form returns N when it cannot
+    # acquire AND propagates the child's exit — so a legitimate `cargo` exit N (e.g. 99) reads as a
+    # lock timeout and the build re-runs unsynchronized (GPT #392 review). With `flock -w <fd>`, the
+    # ACQUIRE result and the CHILD exit are separate: flock succeeds iff it got the lock within the
+    # wait; the build then runs exactly ONCE either way — holding the lock on success, un-serialized
+    # (fail-open) on timeout — and the block's exit is the build's own exit, whatever its value.
+    if touch "$lock" 2>/dev/null; then
+      {
+        flock -w "$wait" 9 || \
+          echo "cargo build-lock: lock held >${wait}s; running un-serialized (fail-open, #387)" >&2
+        nice -n 15 "$real" "$@"
+      } 9>"$lock"
+      exit $?
     fi
-    exit "$rc" ;;
+    exec nice -n 15 "$real" "$@" ;;
   *)
     exec "$real" "$@" ;;
 esac
