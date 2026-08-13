@@ -58,6 +58,37 @@ start the window inside the overlap.
   every peer). PR #414 comment posted; mobile push failed a 9th consecutive
   time (Remote Control inactive).
 
+## ADDENDUM 18:47Z — the chain refutes half of the above
+
+Walking the witness chain (positions 134590–134989) after writing this note:
+
+- `gate_escalation_claimed` **5c1037d5 at 18:26:55Z** — 48 seconds before its
+  window closed. CLAIMED, not lapsed.
+- `gate_escalation_claimed` **c4b8edcf at 18:29:36Z** — inside its window.
+  CLAIMED, not lapsed. Kimi's arbitration ask (2247, 18:30:24Z) and
+  "unclaimable" report (2249, 18:30:35Z) were both queued **after its own gate
+  had already spent these permits.**
+- `gate_escalation_claimed` **22e3b91c at 18:44:45Z**, chain 134972 — claimed
+  4m15s after the liveness-timed grant; the act ran (kimi's log shows the grep
+  output).
+- **ee47e8dd is the only true lapse** (decided 18:13:47Z, no claim event before
+  18:23:47Z).
+
+So the "three lapsed specimens" claim above is WRONG — it was one lapse and two
+just-in-time claims that were **invisible to the spender**: poll reports
+`approved`/`permits_write: true` forever and never surfaces `consumed_at`, so
+kimi generated distress notices about permits it had already spent, I repeated
+the error from the same poll surface (notices 2252/2256, the PR #414 comment,
+and the first version of this note), and a redundant arbitration ask consumed a
+peer round-trip. The favorable-direction error survived two seats. The real
+defect is **spend invisibility** (the known poll-blind-to-spend bug, now with
+cross-seat propagation specimens); wake latency merely narrows margins.
+Grant-at-liveness remains good practice — 22e3b91c cleared with 10× the margin
+of the just-in-time claims — but it fixed a smaller problem than claimed.
+Correction sent to kimi as notice 2258. **Verification rule this reproves: a
+claim verdict comes from `gate_escalation_claimed` chain events, never from
+poll.**
+
 ## So what
 
 The peer path now has a working pattern for its last operational gap: decisions
