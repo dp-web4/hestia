@@ -119,6 +119,36 @@ READ_CLASS = {"Read", "Glob", "Grep", "TodoWrite", "TodoList", "GetGoal"}
 CODEX_HOME = os.path.expanduser("~/.codex")
 
 
+# ---- Gate 1c (Sprint B, gate-consolidation §6.B): governance-closure protection -------
+# codex had NO self-protection layer at all (PRD §5). The import below + the Gate 1c
+# block in main() add it, mirroring kimi's position (pre-daemon, never conditional on
+# it). GUARDED: this engine fails OPEN on a hook error, so a missing/broken module must
+# not disarm the layer — _CLOSURE_FLOOR is the Tier-2 fallback (deny writes touching the
+# literal floor, allow reads), per the ratified degraded-mode semantics.
+for _shared_cand in (
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "_shared"),
+    os.path.join(WORKSPACE, "hestia", "plugins", "_shared"),
+):
+    if os.path.isdir(_shared_cand) and _shared_cand not in sys.path:
+        sys.path.insert(0, _shared_cand)
+try:
+    from hestia_governance_closure import classify as _closure_classify
+except Exception:
+    _closure_classify = None
+
+# Tier-2 literal floor — consulted ONLY when the classifier is unavailable, as plain
+# substrings against destination paths and command text. It over-denies (text mention)
+# by design in the degraded mode: the FP costs a rephrase; the hole costs the
+# governance model.
+_CLOSURE_FLOOR = (
+    "plugins/claude-code/hooks", "plugins/kimi/hooks", "plugins/codex/hooks",
+    "hestia/hooks", "hestia_gate_core.py", "hestia_gate_mechanism.py",
+    "hestia_governance_closure.py", "gate_self_protection_test.py",
+    "deploy/install-members.sh", ".claude/settings.json", ".codex/config.toml",
+)
+
+
 def load_in_scope():
     """Codex's granted MRH (repos it may touch), read from its identity — per-entity, role-sourced."""
     try:
@@ -704,6 +734,66 @@ def main():
             deny(f"'{tool}' command reaches outside your granted scope: '{offending}' is not granted "
                  f"(granted: {'+'.join(scopes)})",
                  "Scope the command to a granted repo, or if legitimately needed, request it (request_scope).")
+
+    # Gate 1c — LOCAL SELF-PROTECTION (the governance closure; Sprint B, §6.B). BEFORE
+    # the daemon and never conditional on it, mirroring kimi's position: if this check
+    # needed a verdict, "stop the daemon, then edit the gate" would be the same evasion
+    # one layer down. ALWAYS enforced (innate — not subject to warn-rollout): a
+    # governance write that warns and proceeds is not a boundary. Refuse-and-witness is
+    # strictly better than the previous nothing; the escalate/claim flow arrives with
+    # the shared mechanism (§6.E).
+    if _closure_classify is not None:
+        if tool == "apply_patch":
+            # CALL-SITE ADAPTATION (the module stays codex-agnostic): apply_patch's
+            # targets live in the patch body and were already extracted above
+            # (destination, not content — the same judge-the-target rule as Gate
+            # 1a/1b). Each extracted path is classified as a Write destination.
+            _cv = None
+            for _p in paths:
+                _c = _closure_classify("Write", {"file_path": _p}, cwd=event.get("cwd"))
+                if _c.classification == "write":
+                    _cv = _c
+                    break
+                if _c.classification == "read" and _cv is None:
+                    _cv = _c
+        elif tool in ("bash", "shell", "Bash", "Shell"):
+            # CALL-SITE ADAPTATION: codex's shell tool is named "bash" and may pass
+            # argv as a LIST; the module's Bash arm wants the joined string under
+            # "command" (command_of above already joined it).
+            _tin = tinput if isinstance(tinput.get("command"), str) else dict(
+                tinput, command=cmd or "")
+            _cv = _closure_classify("Bash", _tin, cwd=event.get("cwd"))
+        else:
+            _cv = _closure_classify(tool, tinput, cwd=event.get("cwd"))
+        if _cv is not None and _cv.classification == "read":
+            # Publish-the-law: reads pass and are witnessed (existing witness path; a
+            # witness failure never changes the decision).
+            witness_decision("gate_self_read",
+                             f"read of governance surface: {_cv.resource or _cv.marker}",
+                             False)
+        elif _cv is not None and _cv.classification == "write":
+            witness_decision("gate_self_access",
+                             f"{tool} -> {_cv.resource} [rule {_cv.rule}]", True)
+            deny(f"'{tool}' would WRITE to the governance surface [gate-self]: "
+                 f"{_cv.resource} (matched {_cv.marker!r}, rule {_cv.rule})",
+                 "Legitimate gate work goes through escalation — a human approves out "
+                 "of band — not around it.", innate=True)
+    elif tool not in READ_CLASS:
+        # Tier-2 degraded mode (ratified deny-writes-allow-reads): the classifier
+        # failed to import — deny write-class acts that touch the literal floor. This
+        # engine fails OPEN on hook errors, so the layer must not vanish with the
+        # import.
+        _floor_hit = None
+        for _blob in paths + ([cmd] if cmd else []):
+            _low = str(_blob).replace("\\", "/")
+            _floor_hit = next((_t for _t in _CLOSURE_FLOOR if _t in _low), None)
+            if _floor_hit:
+                break
+        if _floor_hit:
+            deny(f"'{tool}' touches the governance floor [gate-self]: {_floor_hit!r}, "
+                 f"and the shared closure classifier is unavailable — failing closed",
+                 "Restore plugins/_shared (hestia_governance_closure) or escalate.",
+                 innate=True)
 
     # Gate 2 — society safety (the governor). Only write/exec-class needs the daemon's verdict; fail closed.
     if tool not in READ_CLASS:
