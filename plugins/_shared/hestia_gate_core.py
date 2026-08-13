@@ -114,6 +114,26 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+# ── Deployed-generation attestation (PRD gate-consolidation §7.2(7), rides #231) ─────────
+# The RUNNING core attests what was imported — a bystander hashing a file beside a process
+# proves nothing about what that process loaded (kimi's sharpening, notice 1929). Computed
+# once at import; carried on every refusal record by the unified recorder.
+import hashlib as _hashlib
+
+
+def core_digest() -> str:
+    """sha256 of this module's own source as imported; "unknown" if unreadable —
+    and unknown must never read as healthy (#231 posture)."""
+    try:
+        with open(__file__, "rb") as _fh:
+            return _hashlib.sha256(_fh.read()).hexdigest()[:16]
+    except Exception:
+        return "unknown"
+
+
+_CORE_DIGEST = core_digest()
+
+
 # ── Innate invariants ────────────────────────────────────────────────────────────────────
 #
 # Denied even inside a granted repo, and NEVER relaxed by trust or by warn-mode: a leaked

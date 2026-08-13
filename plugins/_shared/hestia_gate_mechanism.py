@@ -412,6 +412,15 @@ def _append_deny_fallback(plugin_id: str, record: dict) -> None:
         pass  # the fallback of the fallback is silence; the deny itself already stood
 
 
+
+def _loaded_core_digest():
+    try:
+        import sys as _s
+        _c = _s.modules.get("hestia_gate_" + "core")
+        return getattr(_c, "_CORE_DIGEST", None) if _c is not None else None
+    except Exception:
+        return None
+
 def witness_decision_unified(client_or_none, *, plugin_id: str, decision: str, rule: str,
                              tool_name: str, target: Optional[str], session_id: Optional[str],
                              verdict_available: bool, attempted_summary: str) -> bool:
@@ -430,6 +439,9 @@ def witness_decision_unified(client_or_none, *, plugin_id: str, decision: str, r
         "target": target,                           # ALWAYS present — the audit hole, closed
         "session_id": session_id,
         "verdict_available": bool(verdict_available),
+        # Deployed-generation attestation (§7.2(7)): the digest of the core THIS process
+        # imported, or absent when no core is loaded — never a bystander file hash.
+        "core_digest": _loaded_core_digest(),
         "attempted": attempted_summary,
         "ts": ts,
     }

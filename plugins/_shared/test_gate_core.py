@@ -485,7 +485,11 @@ def test_the_core_is_not_the_only_copy_of_the_scope_rule():
     # remaining 1 is the .orig history file, not an enforcing gate. kimi's 1 is the pair of
     # thin call-site ADAPTERS that delegate to the core (kept for the parity battery), not
     # a second implementation.
-    KNOWN_DUPLICATE_OWNERS = {"codex": 1, "gemini": 1, "kimi": 1}
+    # Sprint G (§6.G): the codex MARKETPLACE stale gate copy (227-line thin fork nobody
+    # installs from) is deleted — with it went codex's last counted file. A future
+    # marketplace package must be a rebuilt artifact carrying the canonical content digest
+    # (§7.2(6)), never a hand-fork that would grow this number back.
+    KNOWN_DUPLICATE_OWNERS = {"gemini": 1, "kimi": 1}
 
     owners = {}
     for root, _dirs, files in os.walk(plugins_dir):
