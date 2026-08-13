@@ -31,13 +31,12 @@ This gate is the shell/edit/MCP-command layer: scope + egress + society-safety, 
 Two gates, in order:
   1. SCOPE + EGRESS (local, per-entity, from Codex's MRH in identity.json). Forbidden egress/secret
      path or out-of-scope target -> deny. No daemon needed, so a down daemon never bricks this.
-  2. SOCIETY SAFETY (the governor): for exec-class tools, delegate to hestia's tested daemon caller
-     so the decision reaches the governor and is witnessed; its deny (or fail-closed-on-unreachable)
-     is honored.
+  2. SOCIETY SAFETY (the governor): for exec-class tools, query the daemon IN-PROCESS via the
+     shared mechanism module (plugins/_shared, PRD gate-consolidation §6.E) so the decision
+     reaches the governor and is witnessed; its deny (or fail-closed-on-no-verdict) is honored.
 
 Config (all env-overridable; defaults suit a generic install):
   HESTIA_WORKSPACE        root that contains the granted repos       (default: ~/ai-workspace)
-  HESTIA_SOCIETY_GATE     path to the society-safety gate caller      (default: $WORKSPACE/hestia/plugins/claude-code/hooks/pre_tool_use.py)
   HESTIA_CODEX_IDENTITY   the member's live identity.json             (default: ~/.codex/hestia-instance/identity.json)
   HESTIA_CODEX_GATE_MODE  warn | enforce   (default: enforce — deny-tight, relax as trust accrues)
   HESTIA_CODEX_LAUNCH_CWD launch dir granted for the session          (default: os.getcwd())
@@ -47,7 +46,6 @@ import json
 import os
 import re
 import sys
-import subprocess
 
 def _detect_workspace():
     """WORKSPACE resolution that survives a wrong or absent env (2026-07-23, live: a session
@@ -76,39 +74,29 @@ def _detect_workspace():
 WORKSPACE = _detect_workspace()
 IDENTITY = os.path.expanduser(
     os.environ.get("HESTIA_CODEX_IDENTITY", "~/.codex/hestia-instance/identity.json"))
-def _society_gate_default():
-    """Prefer an ext4 copy of the society gate over the one in the repo.
-
-    THE BUG THIS FIXES. Codex clamps every hook to 3s, so this gate allows its
-    society-safety subprocess 2s and fails CLOSED when that budget is missed. The gate
-    itself was deliberately installed to ~/.codex/hooks (ext4) precisely so a cold read
-    could not eat the budget — and then it delegated the safety check straight back to
-    $WORKSPACE, which on this fleet's WSL boxes is the 9p mount. The delegation undid the
-    protection: codex's own gate is fast, and the thing it waits on is not.
-
-    Measured 2026-07-26: warm, the inner gate answers in 194-336ms and stays there under
-    8 concurrent callers, so neither latency nor lock contention explains a timeout. Cold
-    9p reads do. Codex was blocked from reviewing PRs three times in four minutes with
-    `no policy verdict (daemon path failed)` while the daemon was up the whole time
-    (NRestarts=0) and answering every probe.
-
-    Note the asymmetry with issue #45: the same 9p fragility makes CLAUDE fail OPEN (no
-    governance) and CODEX fail CLOSED (no work). One root cause, opposite symptoms, and
-    the fail-closed one is the visible half — which is why this surfaced as "codex is
-    hitting blocks" rather than as a silent governance hole.
-    """
-    env = os.environ.get("HESTIA_SOCIETY_GATE")
-    if env:
-        return env
-    # The installed ext4 copy, same file the claude harness runs. First existing wins.
-    for cand in (os.path.expanduser("~/.claude/hooks/hestia/pre_tool_use.py"),
-                 os.path.join(WORKSPACE, "hestia/plugins/claude-code/hooks/pre_tool_use.py")):
-        if os.path.isfile(cand):
-            return cand
-    return os.path.join(WORKSPACE, "hestia/plugins/claude-code/hooks/pre_tool_use.py")
 
 
-CLAUDE_PRE = _society_gate_default()
+def _load_mechanism():
+    """Import the SHARED society-safety mechanism (Sprint E — PRD §6.E, one transport).
+
+    HISTORY (why there is no subprocess here). Gate 2 used to spawn the claude-code gate as a
+    subprocess (a 2760-line cold import, usually off the 9p /mnt/c mount) with a 2s budget under
+    codex's 3s hook clamp. Warm it answered in 194-336ms; cold 9p reads blew the budget, so codex
+    was repeatedly blocked with `no policy verdict (daemon path failed)` while the daemon was up
+    the whole time (2026-07-26, NRestarts=0). That subprocess spawn was the structural cost
+    criterion 10 (§7.4) deletes: the timeout asymmetry cannot close while any harness reaches
+    the verdict through a fork + cold interpreter start. The shared mechanism runs the same
+    connect/begin/poll protocol IN-PROCESS — the identical lean round-trip claude makes.
+
+    Raises on failure — each CALLER decides the fail posture (Gate 2 fails closed on a
+    consequential act; the witness path falls back to the diagnostic log)."""
+    for cand in (os.path.join(WORKSPACE, "hestia", "plugins", "_shared"),
+                 os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "_shared")):
+        if os.path.isdir(cand) and cand not in sys.path:
+            sys.path.insert(0, cand)
+    import hestia_gate_mechanism
+    return hestia_gate_mechanism
 
 
 # The agent's own home is always in scope (state, identity, config).
@@ -619,20 +607,34 @@ def witness_decision(verb, reason, innate, verdict_available=True):
             f.write(json.dumps(rec) + "\n")
     except Exception:
         pass  # witnessing must never break the gate
-    # ALSO report to the daemon's witness chain (hestia_witness_decision MCP tool) so the
-    # deny is visible on the dashboard's warn/deny feed and feeds gate-risk trust. The local
-    # observe log alone made local-gate denies invisible to the dashboard (dp, 2026-07-23).
-    # Fire-and-forget: short timeouts, every failure swallowed — the deny path already exits
-    # 2 regardless, and a down daemon must never change the decision.
+    # ALSO report to the daemon's witness chain — via the ONE deny recorder in the shared
+    # mechanism (Sprint E, PRD §3.3 bullets 4-6): every harness now writes the same refusal
+    # record, ALWAYS carrying `target` (previously no plugin's deny record named what was
+    # refused) and `verdict_available` (real deny vs infra fail-close). The recorder never
+    # raises and never changes the decision; if the daemon is unreachable it appends the full
+    # record to ~/.hestia/telemetry/gate-denies-codex.jsonl (criterion 9(c) fallback witness)
+    # instead of dropping it. The local observe log above stays: it is codex's own telemetry,
+    # not the society's refusal record.
     try:
-        _daemon_witness(verb, reason, verdict_available)
+        m = _load_mechanism()
+        ev_tool = _EVENT.get("tool_name") or ""
+        delivered = m.witness_decision_unified(
+            None,
+            plugin_id="codex",   # ONE member, one identity — `codex` holds the scope grant
+            decision=verb,
+            rule=reason,
+            tool_name=ev_tool,
+            target=m._extract_target(_EVENT.get("tool_input"), ev_tool),
+            session_id=_EVENT.get("session_id"),
+            verdict_available=verdict_available,
+            attempted_summary=_attempted_summary(_EVENT),
+        )
+        if not delivered:
+            sys.stderr.write("hestia: WARNING - deny receipt not delivered to daemon; "
+                             "recorded to the fallback deny log instead.\n")
     except Exception as e:
         # Still fail-safe: the deny stands regardless (the caller exits 2 either way).
-        # But no longer SILENT. A bare `except: pass` here hid a NameError that dropped
-        # EVERY daemon-side deny receipt while the local observe log kept working — so the
-        # gate looked healthy from inside, the agent was correctly blocked, and the
-        # dashboard showed nothing. A witness that can fail invisibly is not a witness.
-        # Report on stderr AND to the one channel known to still work.
+        # But no longer SILENT — an import failure here must not drop the receipt invisibly.
         try:
             sys.stderr.write("hestia: WARNING - deny receipt not delivered to daemon: "
                              f"{type(e).__name__}: {e}\n")
@@ -643,71 +645,6 @@ def witness_decision(verb, reason, innate, verdict_available=True):
                                     "plugin": "codex"}) + "\n")
         except Exception:
             pass
-
-
-def _daemon_witness(verb, reason, verdict_available=True):
-    """Single-shot MCP call: initialize -> tools/call hestia_witness_decision. ~1s worst case,
-    only ever runs on the deny/warn path (never on allows, so no hook-clamp pressure)."""
-    import urllib.request
-    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
-    ti = _EVENT.get("tool_input")
-    ti_hash = None
-    if ti is not None:
-        import hashlib
-        ti_hash = hashlib.sha256(
-            json.dumps(ti, sort_keys=True, default=str).encode("utf-8", "replace")).hexdigest()[:16]
-
-    def post(payload, timeout):
-        req = urllib.request.Request(
-            endpoint, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            hdr = resp.headers.get("mcp-session-id")
-            return resp.read(), hdr
-
-    _, session_hdr = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                           "params": {"protocolVersion": "2024-11-05",
-                                      "capabilities": {},
-                                      "clientInfo": {"name": "hestia-codex-gate", "version": "1"}}},
-                          0.5)
-    def post_s(payload, timeout):
-        req = urllib.request.Request(
-            endpoint, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json",
-                     "Accept": "application/json, text/event-stream",
-                     **({"mcp-session-id": session_hdr} if session_hdr else {})})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
-
-    post_s({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, 0.4)
-    post_s({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {"name": "hestia_witness_decision",
-                       "arguments": {
-                           # ONE member, one identity. This said "codex-cli" while the
-                           # runtime acted as "codex", so the same agent kept two trust
-                           # grains and two inboxes: gate decisions accrued to one and
-                           # work to the other, halving the evidence on each and making
-                           # adjudication ambiguous (dp spotted both listed as separate
-                           # orchestrators, 2026-07-26). `codex` is the identity that
-                           # holds the scope grant and the identity.json, so it wins.
-                           # Pre-split history stays where it landed; this consolidates
-                           # going forward rather than rewriting the record.
-                           "plugin_id": "codex",
-                           "decision": verb,
-                           "adjudicator": "plugin-gate:codex(scope/egress)",
-                           "reason": reason[:300],
-                           # False => the gate could not REACH a verdict (subprocess
-                           # timeout / governor unreachable). Structurally not conduct:
-                           # "I could not judge" is not "I judged you badly", and the
-                           # member could not have behaved its way out of it. Derivation
-                           # excludes these from temperament with no exoneration needed.
-                           "verdict_available": verdict_available,
-                           "tool_name": _EVENT.get("tool_name") or "",
-                           "session_id": _EVENT.get("session_id"),
-                           "payload_sha256": ti_hash,
-                           "attempted": _attempted_summary(_EVENT),
-                           "role": _role_bridge(),
-                       }}}, 0.8)
 
 
 def deny(rule, reason, innate=False):
@@ -857,52 +794,49 @@ def main():
                  "Restore plugins/_shared (hestia_governance_closure) or escalate.",
                  innate=True)
 
-    # Gate 2 — society safety (the governor). Only write/exec-class needs the daemon's verdict; fail closed.
+    # Gate 2 — society safety (the governor). Only write/exec-class needs the daemon's verdict;
+    # fail closed. Reached IN-PROCESS via the shared mechanism (Sprint E, PRD §6.E) — the same
+    # lean connect/begin/poll round-trip claude makes, mirroring kimi's integration. The old
+    # subprocess spawn (fork + cold 2760-line import off 9p, 2s budget under codex's 3s clamp)
+    # was the structural cost §7.4 criterion 10 deletes: it manufactured fail-closed denies
+    # while the daemon was up and answering. query_society_safety() never raises and never
+    # allows on error; a down/slow daemon or malformed verdict returns a no-verdict
+    # (decided=False) that fails closed here, exactly as the old returncode!=0 path did.
+    # NOTE apply_patch still classifies on its EXTRACTED target paths at Gates 1a/1b above —
+    # the patch BODY is content, not a reach; the daemon sees the same event codex saw.
     if tool not in READ_CLASS:
+        verdict = None
         try:
-            env = dict(os.environ, HESTIA_PLUGIN_ID="codex", HESTIA_PRE_FAIL_CLOSED="1")  # ONE identity:
-            # this said "codex-cli" while the runtime witnessed as "codex", so the delegated
-            # society-safety verdict landed on a different grain than the work it governed.
-            # Codex CLAMPS every hook to 3s. The whole gate must finish under that or Codex kills it
-            # and FAILS OPEN — so the society-safety subprocess gets 2s, not 6s: a slow/hung daemon
-            # then fails CLOSED here (enforce) at 2s instead of fail-open at the 3s clamp. (2026-07-23,
-            # from Codex's first live session: "clamping SessionEnd hook timeout to 3s".)
-            if not os.path.isfile(CLAUDE_PRE):
-                raise FileNotFoundError(
-                    f"society gate script missing at {CLAUDE_PRE} — "
-                    "check HESTIA_WORKSPACE / workspace detection")
-            r = subprocess.run([sys.executable, CLAUDE_PRE], input=json.dumps(event),
-                               capture_output=True, text=True, timeout=2, env=env)
-            if r.returncode != 0:  # daemon denied, or inconclusive -> fail-closed for a write/exec act
-                msg = (r.stderr.strip() if r.returncode == 2 and r.stderr.strip()
-                       else "hestia: deny [safety] — blocked/inconclusive at the society safety gate.")
-                # verdict_available=False ONLY when the subprocess could not answer
-                # (timeout / crash). A real deny from the daemon comes back rc=2 WITH
-                # stderr, and that IS a verdict — it must still count.
-                # rc=2 + stderr is NOT sufficient: the inner hook ALSO exits 2 with stderr
-                # when IT failed closed ("no policy verdict"), which is the very case we
-                # must not count. The marker text is the discriminator — a real daemon
-                # denial is a verdict; the inner fail-closed is the absence of one.
-                _err = r.stderr or ""
-                _no_verdict = ("no policy verdict" in _err) or ("daemon path failed" in _err)
-                _had_verdict = (r.returncode == 2 and bool(_err.strip()) and not _no_verdict)
-                witness_decision("deny" if MODE == "enforce" else "warn",
-                                 "society-safety: " + msg.split("— ", 1)[-1].strip(), False,
-                                 verdict_available=_had_verdict)
-                if MODE == "enforce":
-                    sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
-                    sys.exit(2)
-                sys.stderr.write("hestia: warn [safety] — " + msg.split("— ", 1)[-1] +
-                                 " (warn-rollout: allowed; would block under enforce)\n")
+            m = _load_mechanism()
+            verdict = m.query_society_safety(
+                event, plugin_id="codex", host_agent="codex",
+                host_session_id=event.get("session_id"))
         except Exception:
+            # Loading the mechanism must itself fail closed on a consequential act: a missing
+            # or unimportable module is not a reason to allow a write on a fail-open harness.
             witness_decision("deny" if MODE == "enforce" else "warn",
-                             "society-safety: governor unreachable, failing closed", False,
+                             "society-safety: mechanism unavailable, failing closed", False,
                              verdict_available=False)
             if MODE == "enforce":
-                sys.stderr.write("hestia: deny [safety] — could not reach the governor; failing "
-                                 "closed on a consequential act.\n")
+                sys.stderr.write("hestia: deny [safety] — the society-safety mechanism could "
+                                 "not be loaded; failing closed on a consequential act.\n")
                 sys.exit(2)
-            sys.stderr.write("hestia: warn [safety] — governor unreachable (warn-rollout: allowed).\n")
+            sys.stderr.write("hestia: warn [safety] — society-safety mechanism unavailable "
+                             "(warn-rollout: allowed).\n")
+        if verdict is not None and not verdict.allow:  # enforced deny OR no-verdict -> fail closed
+            msg = (verdict.message
+                   or "hestia: deny [safety] — blocked/inconclusive at the society safety gate.")
+            # verdict.decided is the discrimination the old path reconstructed from stderr
+            # marker text: True = the governor really ruled (counts as conduct); False = the
+            # gate could not obtain a verdict (infra — never scored as member conduct).
+            witness_decision("deny" if MODE == "enforce" else "warn",
+                             "society-safety: " + msg.split("— ", 1)[-1].strip(), False,
+                             verdict_available=verdict.decided)
+            if MODE == "enforce":
+                sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
+                sys.exit(2)
+            sys.stderr.write("hestia: warn [safety] — " + msg.split("— ", 1)[-1] +
+                             " (warn-rollout: allowed; would block under enforce)\n")
 
     # Count the allow before exiting: this is the gate attesting that the reach was
     # inside the grant, which is the only not-self-reported evidence of competent work
