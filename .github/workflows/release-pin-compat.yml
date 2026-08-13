@@ -1,0 +1,47 @@
+name: release pin compatibility
+
+# Integration CI intentionally tracks Web4 main. Releases do not: release.yml
+# builds against web4.pin. Keep both seams executable so a live-main repair
+# cannot silently make the declared release input unbuildable (or vice versa).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  pinned-web4:
+    name: hestia builds against web4.pin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hestia
+
+      - name: Read pinned Web4 revision
+        id: web4pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          rev="$(grep -oiE '[0-9a-f]{40}' hestia/web4.pin | head -1)"
+          test -n "$rev"
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          ref: ${{ steps.web4pin.outputs.rev }}
+          path: web4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hestia/core
+
+      # This is the compatibility boundary release.yml actually consumes.
+      # `cargo check` is sufficient to catch cross-repo API drift such as a
+      # struct field/type added on Web4 main while web4.pin still points before it.
+      - name: Check core against pinned Web4
+        working-directory: hestia/core
+        run: cargo check --locked
