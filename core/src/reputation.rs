@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use web4_core::r6::{ReputationDelta, SovereignStrength, TensorDelta};
+use web4_core::r6::{DeltaClass, ReputationDelta, SovereignStrength, TensorDelta};
 use web4_trust_core::EntityTrust;
 
 /// Canonical constellation-role vocabulary (#403 capacity scoping). MUST stay
@@ -159,6 +159,24 @@ pub fn delta_from_change(
         // design), so the hub tags this bucket member-attested-not-hub-verified.
         // Flips to Hardware when the TPM sovereign lands (P4).
         sovereign_strength: SovereignStrength::Placeholder,
+        // Conduct-vs-infra class (web4 #703 / hub F0.1 R7a). The hub HOLDS an
+        // `Unclassified` delta — recorded and counted, never applied to a tensor
+        // — so this is the fail-closed truth until the caller can distinguish,
+        // NOT a placeholder to be quietly upgraded later.
+        //
+        // Why it is not `Conduct` here: this function diffs a trust tensor
+        // before/after and knows only THAT it moved, not WHY. The movement's
+        // first source is the warn/deny gate wiring, and a fail-closed deny
+        // caused by an unreachable daemon is an INFRASTRUCTURE fact wearing a
+        // conduct-shaped signal — which is precisely the conflation R7a exists
+        // to prevent (the measured hestia PR #357 class). Claiming `Conduct`
+        // from a caller that cannot tell the two apart would re-create the
+        // defect inside the field added to fix it.
+        //
+        // The classification belongs at the CALL SITE, which knows the cause.
+        // Threading it there is the hestia-side half of R7a and is deliberately
+        // a separate, reviewable change rather than a value guessed here.
+        class: DeltaClass::Unclassified,
         timestamp: ts,
     })
 }
