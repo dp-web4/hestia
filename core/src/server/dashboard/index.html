@@ -278,6 +278,14 @@
   @media (min-width: 1100px) and (min-height: 720px) {
     html, body { height: 100vh; min-height: 0; overflow: hidden; }
     main { min-height: 0; overflow: hidden; }
+    /* The active view (#agents-view / #hubs-view) is a wrapper BETWEEN main (a flex column) and
+       .live-grid. Its only styling was `[hidden]{display:none}`, so when shown it was a plain
+       display:block of AUTO (content) height. That broke the flex height chain: .live-grid's
+       `flex:1 1 auto` had no bounded parent to fill, so the chain card grew to its full content
+       and main's `overflow:hidden` CLIPPED it — the witness chain could not scroll, it was cut
+       off. Making the visible view a flex column that fills main restores the chain
+       main -> view -> .live-grid -> chain card -> .feed, so .feed's overflow-y:auto engages. */
+    main > .dash-view:not([hidden]) { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
     .live-grid { flex: 1 1 auto; min-height: 0; }
     .live-grid > .card {
       display: flex; flex-direction: column; min-height: 0; max-height: 100%;
