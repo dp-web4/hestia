@@ -3168,7 +3168,10 @@
 
   // Let the main script nudge a refresh the moment the operator switches to the hubs view,
   // instead of waiting out this IIFE's own poll clock. (See setView in the main script.)
-  window.__hubRefresh = () => { hubStatus(); hubTopics(); };
+  // hubUrls included (codex review, PR #384): without it, the pre-sign-in 401
+  // left the hub list permanently "unavailable" — status/topics recover via
+  // this hook and the poll, and the list must recover with them.
+  window.__hubRefresh = () => { hubStatus(); hubTopics(); hubUrls(); };
 
   // ---- known-hub list (#307): view + retarget, no rebuild/relaunch ----------
   async function hubUrls() {
