@@ -70,11 +70,23 @@ class SafetyVerdict:
                     The caller fails closed either way.
     `decided` distinguishes a real verdict from a fail-closed non-verdict so the caller can render
     the two differently and so non-verdicts are never scored as member conduct.
+
+    `kind` (Sprint E) is the RENDER hint: "allow" | "warn" | "deny" | "none". It exists so a
+    renderer (claude-code's emit_decision) keeps its distinct warn/deny messaging without
+    re-parsing `message`. Non-breaking: it never changes the allow/decided contract — an
+    audit-only deny renders as kind="warn" (surfaced on stderr, exit 0; `message` still says
+    would-deny) and a fail-closed non-verdict is kind="none". Callers that ignore `kind`
+    (kimi, codex) behave exactly as before.
+
+    `action_id` (Sprint E) is the daemon's actionId when begin/poll produced one — the
+    correlation key claude-code's PostToolUse outcome cache uses. None when no verdict.
     """
     allow: bool
     decided: bool
     message: str
     cause: str = "unknown"   # when not decided: "timeout" | "refused" | "unknown"
+    kind: str = "none"       # "allow" | "warn" | "deny" | "none" — render hint only
+    action_id: Optional[str] = None
 
 
 # ── MCP-over-HTTP client (in-process; MAY open a socket — mechanism, not law) ─────────────────
@@ -184,7 +196,11 @@ def _extract_target(tool_input: Any, tool_name: str) -> Optional[str]:
         v = tool_input.get(key)
         if isinstance(v, str):
             return v
-    if tool_name in {"Bash", "Shell"}:
+    # CASE-INSENSITIVE (Sprint E, §3.3 audit hole): codex's engine emits the shell tool as
+    # "bash" lowercase; the old {"Bash", "Shell"} literal missed it, so every codex shell act
+    # reached the daemon with target=None and its chain records carried an EMPTY target — a
+    # one-character audit hole. Normalize before comparing; never widen beyond shell names.
+    if isinstance(tool_name, str) and tool_name.lower() in {"bash", "shell"}:
         cmd = tool_input.get("command")
         if isinstance(cmd, str) and cmd.strip():
             return cmd.split()[0]
@@ -242,14 +258,15 @@ def _interpret(decision: dict) -> Optional[SafetyVerdict]:
     label = f" [{rule_name}]" if rule_name else ""
     if verdict == "deny" and enforced:
         guidance = decision.get("guidance")
-        return SafetyVerdict(allow=False, decided=True,
+        return SafetyVerdict(allow=False, decided=True, kind="deny",
                              message=(guidance or f"hestia: deny{label} — {reason}"))
     if verdict == "warn":
-        return SafetyVerdict(allow=True, decided=True, message=f"hestia: warn{label} — {reason}")
-    if verdict == "deny":  # not enforced -> audit-only
-        return SafetyVerdict(allow=True, decided=True,
+        return SafetyVerdict(allow=True, decided=True, kind="warn",
+                             message=f"hestia: warn{label} — {reason}")
+    if verdict == "deny":  # not enforced -> audit-only: surfaced like a warn, exit 0
+        return SafetyVerdict(allow=True, decided=True, kind="warn",
                              message=f"hestia: would-deny (audit-only){label} — {reason}")
-    return SafetyVerdict(allow=True, decided=True, message="")  # verdict == "allow"
+    return SafetyVerdict(allow=True, decided=True, kind="allow", message="")  # verdict == "allow"
 
 
 def _no_verdict(plugin_id: str, tool_name: str, cause: str, detail: str) -> SafetyVerdict:
@@ -348,6 +365,7 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
         if verdict is None:
             return _no_verdict(plugin_id, tool_name, "unknown",
                                "daemon returned a malformed or unrecognized decision")
+        verdict.action_id = action_id  # correlation key for the caller's outcome cache
         return verdict
     except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
         reason = getattr(e, "reason", None)
@@ -360,3 +378,90 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
         return _no_verdict(plugin_id, tool_name, cause, f"network: {type(e).__name__}")
     except Exception as e:  # noqa: BLE001 — FAIL-CLOSED: any unexpected error is no-verdict, never allow
         return _no_verdict(plugin_id, tool_name, "unknown", f"unexpected: {type(e).__name__}")
+
+
+# ── ONE deny recorder (Sprint E — PRD §3.3 bullets 4-6, §6.E) ─────────────────────────────────
+# Before this, the deny recorder varied by vendor: codex reported to the chain (with its own
+# private client), kimi recorded only inside a bare `except: pass`, claude wrote no refusal
+# record at all on this path — and NO plugin's deny record carried the command/target (only
+# claude's begin_action did), so the trust chain's denominator differed by harness and the
+# record could not say WHAT was refused. Every shim now calls witness_decision_unified for
+# refusal records. Contract:
+#   - ALWAYS carries `target` (the audit hole) and `verdict_available` (kimi previously could
+#     not distinguish a real deny from an infra fail-close — §3.3 bullet 5);
+#   - NEVER raises and never changes the caller's decision (the deny stands regardless);
+#   - NON-SILENT failure: if the daemon witness cannot be delivered, the full record — with the
+#     delivery error — is appended to the per-shim diagnostic log
+#     ~/.hestia/telemetry/gate-denies-<plugin_id>.jsonl (criterion 9(c) fallback witness), so a
+#     dead daemon degrades the record's REACH, never its existence.
+
+def _deny_fallback_path(plugin_id: str) -> Path:
+    home = Path(os.environ.get("HESTIA_HOME", str(DEFAULT_HESTIA_HOME)))
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in (plugin_id or "unknown"))
+    return home / "telemetry" / f"gate-denies-{safe}.jsonl"
+
+
+def _append_deny_fallback(plugin_id: str, record: dict) -> None:
+    """Criterion 9(c) fallback witness: append-only, per-shim, never raises."""
+    try:
+        path = _deny_fallback_path(plugin_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        pass  # the fallback of the fallback is silence; the deny itself already stood
+
+
+def witness_decision_unified(client_or_none, *, plugin_id: str, decision: str, rule: str,
+                             tool_name: str, target: Optional[str], session_id: Optional[str],
+                             verdict_available: bool, attempted_summary: str) -> bool:
+    """Record a refusal (deny/warn) to the daemon's witness chain — the ONE deny recorder.
+
+    `client_or_none`: an already-initialized MCP client to reuse, or None to open a short
+    single-shot session (deadline ~1.5s; only ever runs on the deny/warn path, so no
+    hook-clamp pressure on allows). Returns True when the daemon acknowledged the record;
+    False when it went to the fallback log instead. NEVER raises."""
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    record = {
+        "plugin_id": plugin_id,
+        "decision": decision,                       # deny | warn
+        "rule": (rule or "")[:300],
+        "tool_name": tool_name or "",
+        "target": target,                           # ALWAYS present — the audit hole, closed
+        "session_id": session_id,
+        "verdict_available": bool(verdict_available),
+        "attempted": attempted_summary,
+        "ts": ts,
+    }
+    try:
+        client = client_or_none
+        if client is None:
+            endpoint = _discover_endpoint()
+            if endpoint is None:
+                raise RuntimeError("no daemon endpoint discovered")
+            client = _McpHttp(endpoint, time.monotonic() + 1.5)
+            if "result" not in client.initialize():
+                raise RuntimeError("initialize failed")
+            client.initialized()
+        out = client.call_tool("hestia_witness_decision", {
+            "plugin_id": plugin_id,
+            "decision": decision,
+            "adjudicator": f"plugin-gate:{plugin_id}",
+            "reason": (rule or "")[:300],
+            # False => the gate could not REACH a verdict (infra fail-close). Structurally not
+            # conduct: "I could not judge" is not "I judged you badly" — derivation excludes
+            # these from temperament with no exoneration needed (codex's discrimination, now
+            # every harness's — §6.E).
+            "verdict_available": bool(verdict_available),
+            "tool_name": tool_name or "",
+            "target": target,
+            "session_id": session_id,
+            "attempted": attempted_summary,
+        })
+        if not (isinstance(out, dict) and "result" in out):
+            raise RuntimeError("witness call returned no result")
+        return True
+    except Exception as e:  # noqa: BLE001 — non-silent: the record survives in the fallback log
+        record["witness_delivery_failed"] = f"{type(e).__name__}: {e}"
+        _append_deny_fallback(plugin_id, record)
+        return False

@@ -813,6 +813,24 @@ def main():
         if verdict is not None and not verdict.allow:  # enforced deny OR no-verdict -> fail closed
             msg = (verdict.message
                    or "hestia: deny [safety] — blocked/inconclusive at the society safety gate.")
+            # ONE deny recorder (Sprint E, §3.3 bullet 4): kimi's society refusal previously
+            # left no record at all — the chain's denominator differed by harness. The unified
+            # recorder always carries target + verdict_available (real deny vs infra
+            # fail-close), never raises, and falls back to the per-shim diagnostic log when
+            # the witness itself is the unreachable thing (criterion 9(c)).
+            try:
+                from hestia_gate_mechanism import witness_decision_unified, _extract_target
+                witness_decision_unified(
+                    None, plugin_id="kimi-code",
+                    decision="deny" if MODE == "enforce" else "warn",
+                    rule="society-safety",
+                    tool_name=tool,
+                    target=_extract_target(tinput, tool),
+                    session_id=event.get("session_id"),
+                    verdict_available=verdict.decided,
+                    attempted_summary=(verdict.cause or "")[:200])
+            except Exception:
+                pass  # recording must never turn a deny into a crash (this engine fails open)
             if MODE == "enforce":
                 sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
                 sys.exit(2)
