@@ -100,9 +100,11 @@ default path is deny, and `exit 0` is reached only on an explicit confirmed allo
 module never calls `sys.exit` — it returns a Verdict — precisely so a shim cannot mistake
 "the core returned nothing" for "the core allowed it".
 
-NOT WIRED. Nothing imports this yet. Migrating each harness is an edit to that harness's
-governance surface and needs its own escalation; this lands first so the migration is
-reviewable before anything switches over.
+WIRED (Sprints B–F). Sprint C pointed kimi's scope predicates here; D centralised the
+constants and remedies; E unified transport and the deny recorder; F cuts kimi and codex
+over to evaluate() — decided from a policy snapshot fetched LIVE from the daemon
+(hestia_gate_mechanism.fetch_policy_snapshot), or the ratified degraded mode
+(degraded_verdict below) when the daemon is unreachable.
 """
 from __future__ import annotations
 
@@ -237,6 +239,16 @@ REMEDIES: dict[str, Remedy] = {
         "matter and not something to work around.",
         (),
     ),
+    # ── degraded mode (Sprint F — §7.1 criterion 9; semantics ratified dp 2026-08-11) ────
+    "gate.degraded": Remedy(
+        "The policy authority could not be consulted (the daemon is unreachable), so the "
+        "gate is in the ratified degraded mode: deny-writes-allow-reads. This is fault "
+        "isolation, not a judgement of your act — the referee is missing, not ruling "
+        "against you. Retry when the daemon returns; if it stays down, that is an operator "
+        "matter and not something to work around. A shim may tighten this posture locally; "
+        "it may never loosen it.",
+        (),
+    ),
 }
 
 
@@ -364,6 +376,12 @@ class NormalizedEvent:
 
     tool: str = "?"
     paths: list = field(default_factory=list)   # filesystem targets
+    #: Repository NAMES an MCP connector call targets (codex §3.4: the call names a repo
+    #: in its own argument and carries REPO-RELATIVE paths). Scoped by NAME at Gate 1b;
+    #: when present, `paths` are repo-relative and are egress-scanned but NOT re-scoped
+    #: (the 2026-07-26 false-deny class). Sprint F: this moved the last shim-side scope
+    #: decision (codex's mcp_repo check) into the one law.
+    repos: list = field(default_factory=list)
     command: Optional[str] = None               # shell command, if any
     cwd: Optional[str] = None
     raw: dict = field(default_factory=dict)     # kept for witnessing, never for deciding
@@ -588,6 +606,11 @@ def resolve_agent_policy(profile: HarnessProfile,
 # ONLY because `evaluate()` still consumes it; its replacement is an explicit launch-cwd
 # grant in the certified policy snapshot.
 # SPRINT-F: replace with certified snapshot (delete launch_cwd_repo at the evaluate() cutover).
+# SPRINT-F RAN (2026-08-13) AND COULD NOT DELETE THIS: the daemon exposes NO launch-cwd
+# grant surface (measured against core/src/server/handler.rs — no such tool exists, and
+# §9 forbids inventing one), so the per-launch grant still derives from env/cwd here.
+# Declared RED in the Sprint F notes; this bridge dies the day the certified snapshot
+# carries an explicit launch-cwd grant.
 def launch_cwd_repo(profile: HarnessProfile, workspace: str) -> list:
     """The repo the member is launched in is always in scope (dp 2026-07-21: 'whatever cwd we
     launch it in') — a per-launch dynamic grant on top of the static allowlist, so a
@@ -800,7 +823,9 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     forbidden = forbidden_tokens(profile)
 
     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
-    for blob in list(event.paths) + ([event.command] if event.command else []):
+    # Repo names are scanned too: an MCP call naming a forbidden token is still egress.
+    for blob in (list(event.paths) + list(event.repos)
+                 + ([event.command] if event.command else [])):
         low = blob.lower()
         for f in forbidden:
             if f in low:
@@ -847,8 +872,18 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
         # move in.
         scopes = [s for s in scopes if s != AgentPolicy.UNSCOPED]
 
-    # Gate 1b — MRH scope. File paths use path-scope; shell commands use command-scope.
-    for p in event.paths:
+    # Gate 1b — MRH scope. A repo-named MCP call is scoped on the NAME it carries (its
+    # `paths` are repo-relative and must not be re-scoped — egress above already saw
+    # them); file paths use path-scope; shell commands use command-scope.
+    if event.repos:
+        for rname in event.repos:
+            if rname not in scopes:
+                return _deny(
+                    "mrh.repo",
+                    f"'{event.tool}' targets repository '{rname}' outside your granted "
+                    f"scope (granted: {'+'.join(scopes)})",
+                )
+    for p in ([] if event.repos else event.paths):
         if not path_in_scope(p, scopes, ws, profile, event.cwd):
             # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
             # on any long path truncates away the very component that tripped the gate — the
@@ -876,6 +911,49 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
             )
 
     return ALLOW
+
+
+# ── The ratified degraded mode (Sprint F — PRD §7.1 criterion 9) ────────────────────────
+def degraded_verdict(event: NormalizedEvent,
+                     profile: Optional[HarnessProfile] = None) -> Verdict:
+    """Tier-1 degraded posture, computed by the CORE: deny-writes-allow-reads.
+
+    Semantics + trigger ratified (dp, 2026-08-11): the posture is deny-writes-allow-reads
+    and the trigger is the DAEMON/REFEREE BEING UNREACHABLE — a shim calls this when, in
+    enforce mode, no policy snapshot could be fetched. This module is transport-free (it
+    opens no socket), so it stays available exactly when the daemon is not; the shim-level
+    literal backstop (Tier 2) exists only for the rare case this module itself will not
+    import.
+
+    Tighten-only, in both directions that matter: the innate egress invariant still binds
+    the reads this mode allows (a degraded gate that leaked a credential read would be a
+    LOOSENING, and egress is the one rule no mode relaxes), and a shim may deny reads too
+    but may never allow a write. Never raises, never exits — same contract as evaluate().
+
+    Recording is the CALLER's duty (criterion 9(c)): every degraded deny must land in the
+    per-shim diagnostic log via the unified recorder with verdict_available=False — an
+    unrecorded degraded deny is the PR #357 defect this criterion exists to end; degraded
+    read-allows are recorded on the gate-availability telemetry instead (they are an infra
+    series, not refusals, and the deny log's readers expect denies)."""
+    forbidden = forbidden_tokens(profile) if profile is not None else FORBIDDEN_DEFAULT
+    for blob in (list(event.paths) + list(event.repos)
+                 + ([event.command] if event.command else [])):
+        low = blob.lower()
+        for f in forbidden:
+            if f in low:
+                return _deny(
+                    "egress.secret",
+                    f"'{event.tool}' touches a forbidden path (secret/credential or "
+                    f"out-of-MRH private repo): '{f}'",
+                    innate=True,
+                )
+    if event.tool in READ_CLASS:
+        return ALLOW
+    return _deny(
+        "gate.degraded",
+        f"'{event.tool}' is write/exec-class and the policy daemon is unreachable — the "
+        f"ratified degraded mode denies writes and allows reads",
+    )
 
 
 # ── Gate availability telemetry ──────────────────────────────────────────────────────────
