@@ -775,6 +775,9 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
 
     let rep_action_id = action_id.to_string();
     let rep_ctx = crate::reputation::RepContext {
+        // The member ran a tool and hestia observed the outcome directly —
+        // conduct hestia established, not a report it was handed.
+        class: crate::reputation::DeltaClass::Conduct,
         role_lct: &role_lct,
         action_type: "tool_execution",
         action_target: &action.tool_name,
@@ -1330,6 +1333,13 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
             // to the local bridge sink (the first source of hestia->hub reputation).
             let reason = format!("gate:{}", evaluation.decision.as_str());
             let rep_ctx = crate::reputation::RepContext {
+                // The DAEMON's own gate evaluation. Reachability is established by
+                // construction here: if this code is running, the referee answered.
+                // A fail-closed deny (the infra case) never reaches this branch —
+                // it cannot be witnessed through the daemon it could not reach, and
+                // there is no spool (ratified dp 2026-08-04: the chain witnesses
+                // member events, not infra telemetry).
+                class: crate::reputation::DeltaClass::Conduct,
                 role_lct: &role_lct,
                 action_type: "policy_gate",
                 action_target: &action.tool_name,
@@ -2155,6 +2165,9 @@ async fn tool_witness_adjudication(state: &SharedState, args: &Value) -> ToolRes
     if let Some(score) = score {
         let adj_reason = format!("adjudication:{axis}:{verdict}:{method}");
         let rep_ctx = crate::reputation::RepContext {
+        // A witnessed adjudication — a judgment ABOUT conduct, with stronger
+        // causal provenance than an execution outcome.
+        class: crate::reputation::DeltaClass::Conduct,
             role_lct: subject_role,
             action_type: "adjudication",
             action_target: &evidence_ref,
@@ -2298,6 +2311,9 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
     let ref_target = reference.clone().unwrap_or_default();
     let rev_reason = format!("reversal:{kind}:{cause}");
     let rep_ctx = crate::reputation::RepContext {
+        // A witnessed judgment outcome (reversal): same provenance as an
+        // adjudication, opposite direction.
+        class: crate::reputation::DeltaClass::Conduct,
         role_lct: subject_role,
         action_type: "reversal",
         action_target: &ref_target,
@@ -2342,6 +2358,8 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
         let adj_reason = format!("adjudication:validity:refuted:reversal:{}", cause.as_str());
         let adj_target = reference.clone().unwrap_or_default();
         let adj_ctx = crate::reputation::RepContext {
+            // Witnessed adjudication, as above.
+            class: crate::reputation::DeltaClass::Conduct,
             role_lct: subject_role,
             action_type: "adjudication",
             action_target: &adj_target,
@@ -3370,6 +3388,14 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     let risk_magnitude = if decision == "deny" { 0.5 } else { 0.2 };
     let gate_reason = format!("gate:{decision} ({adjudicator})");
     let rep_ctx = crate::reputation::RepContext {
+        // CALLER-REPORTED gate decision from a hook. Hestia did NOT establish
+        // this cause — it received a claim — so it cannot honestly assert
+        // Conduct, and it must NOT infer one from `decision`/`reason`/rule
+        // names: those are descriptive evidence, not causal proof, and
+        // inferring from them is exactly the infrastructure-as-conduct defect
+        // one layer downstream. Held as Unclassified until the hook states a
+        // class of its own; the hub records and counts it either way.
+        class: crate::reputation::DeltaClass::Unclassified,
         role_lct,
         action_type: "policy_gate",
         action_target: &tool_name,

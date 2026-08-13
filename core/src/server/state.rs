@@ -940,6 +940,8 @@ impl ServerState {
         magnitude: f64,
     ) -> Result<EntityTrust> {
         let ctx = crate::reputation::RepContext {
+            // A plain execution outcome hestia observed: conduct it established.
+            class: crate::reputation::DeltaClass::Conduct,
             role_lct: crate::reputation::V1_CONSTELLATION_ROLE,
             action_type: "outcome",
             action_target: "",
@@ -1160,6 +1162,7 @@ mod tests {
 
     fn ctx_for(role: &'static str) -> crate::reputation::RepContext<'static> {
         crate::reputation::RepContext {
+            class: crate::reputation::DeltaClass::Conduct,
             role_lct: role,
             action_type: "outcome",
             action_target: "",
