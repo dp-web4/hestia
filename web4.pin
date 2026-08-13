@@ -4,4 +4,4 @@
 # rebuilding the same tag against a moved web4 main yields a different binary.
 # release.yml checks out THIS rev (not web4 main). Bump it deliberately when
 # integrating a new web4 — that bump is the record of the integration.
-360c3660e7c66ef6f7f6be384380d2c1603ba6f5
+5513af9780b53aab7dfef15b0dbc1dae820a122a
