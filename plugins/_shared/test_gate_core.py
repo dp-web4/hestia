@@ -766,10 +766,13 @@ def test_egress_beats_scope():
 
 
 def test_missing_identity_fails_narrow_not_wide():
-    """A malformed or absent identity must not grant reach. The default is deliberately one
-    repo, not the workspace."""
+    """A malformed or absent identity must not grant reach. §6.D deleted `load_in_scope` and
+    its permissive `["web4"]` guess — a guess that GRANTS; the authenticated path grants
+    NOTHING when nothing certifiable resolves, and says so in `source`."""
     prof = G.HarnessProfile(member_id="x", identity_path="/nonexistent/identity.json")
-    check("missing_identity_is_narrow", G.load_in_scope(prof) == ["web4"])
+    pol = G.resolve_agent_policy(prof)
+    check("missing_identity_is_narrow",
+          pol.scope == () and pol.source == "unresolved" and pol.stale)
 
 
 def test_core_never_exits():

@@ -23,7 +23,8 @@ Three gates, in order:
      unreachable) is honored.
 
 A deny is STEERING, not just a block: the stderr reason says why + what to do (adjust in-scope, or
-ask via request_scope).
+ask via hestia_request_scope). The remedy sentence is rendered from the core's REMEDIES table
+(§6.D) — never authored here — so it can only name doors that exist.
 
 Exit codes (Kimi engine contract): 2 = block (stderr = reason); 0 = allow. Default is 2.
 
@@ -99,48 +100,16 @@ try:
 except Exception:
     _closure_classify = None
 
-# Innate egress/secret invariants — denied even inside a granted repo. Trust never relaxes these (S1).
-# Universal secret/credential patterns here; add your own private-repo names via HESTIA_FORBIDDEN_EXTRA.
-FORBIDDEN = ("/.ssh", ".env", "credentials", "id_rsa", "id_ed25519", "/.git/config", "secrets") + tuple(
-    t.strip() for t in os.environ.get("HESTIA_FORBIDDEN_EXTRA", "").split(",") if t.strip())
-READ_CLASS = {"Read", "Glob", "Grep", "TodoWrite", "TodoList", "GetGoal"}
-
-
-def load_in_scope():
-    """Kimi's granted MRH (repos it may touch), read from its identity — per-entity, role-sourced.
-    Scope grants become entries here. Default reflects an example grant."""
-    try:
-        mrh = json.load(open(IDENTITY, encoding="utf-8")).get("mrh", {})
-        scope = mrh.get("in_scope")
-        if isinstance(scope, list) and scope:
-            return [s.split(":", 1)[-1] for s in scope]  # "repo:web4" -> "web4"
-    except Exception:
-        pass
-    return ["web4"]
-
-
-def _identity_role():
-    """The member's declared LOCAL role (dp 2026-07-24: roles are always local; occupancy
-    attributes carry the 'foreign' dimension). Falls back to the safe default."""
-    try:
-        r = json.load(open(IDENTITY, encoding="utf-8")).get("role")
-        if isinstance(r, str) and r.startswith("role:"):
-            return r
-    except Exception:
-        pass
-    return "role:constellation:member"
-
-
-def launch_cwd_repo():
-    """The repo Kimi is launched in is always in scope (dp 2026-07-21: 'whatever cwd we launch it
-    in') — a per-launch dynamic grant on top of the static allowlist, so a task-specific launch dir
-    (even a private repo) is reachable for that session without widening the standing grant."""
-    cwd = (os.environ.get("HESTIA_KIMI_LAUNCH_CWD") or os.getcwd()).replace("\\", "/")
-    if WORKSPACE in cwd:
-        rest = cwd.split(WORKSPACE, 1)[1].lstrip("/")
-        seg = rest.split("/", 1)[0] if rest else ""
-        return [seg] if seg else []
-    return []
+# ---- Sprint D (§6.D): law constants live in the core; authority resolves, not guesses ----
+#
+# The legacy trio — `load_in_scope` (permissive `["web4"]`-on-any-failure fallback),
+# `_identity_role`, `launch_cwd_repo` — is DELETED, not shared: each derived authority from
+# harness/cwd/identity-file incidentals. Standing scope now comes from the core's
+# authenticated path (`resolve_agent_policy` -> `AgentPolicy`); the two fields AgentPolicy
+# cannot yet supply (role attribution, the launch-cwd grant) are bridged by the marked
+# TEMPORARY functions after _CORE_PROFILE below. The permissive fallback is NOT bridged —
+# absent data grants nothing, which is the tighter direction. FORBIDDEN/READ_CLASS are now
+# core-sourced (§7.1(1): one list, grep finds it once) and are defined after _CORE_PROFILE.
 
 
 def path_targets(tool_input):
@@ -174,6 +143,55 @@ _CORE_PROFILE = (_core.HarnessProfile(
     identity_path=IDENTITY,
     home_markers=("~/.kimi-code",),
 ) if _core is not None else None)
+
+# Innate egress/secret invariants + read-class — ONE list each, in the core (§7.1(1)).
+# Inert placeholders when the core is missing: main() fails closed on `_core is None`
+# before either is consulted, and an empty READ_CLASS reads as "everything is
+# write-class", which is the tighter direction.
+FORBIDDEN = _core.forbidden_tokens(_CORE_PROFILE) if _core is not None else ()
+READ_CLASS = _core.READ_CLASS if _core is not None else frozenset()
+
+
+def _agent_scopes():
+    """Standing scope via the core's authenticated path (resolve_agent_policy -> AgentPolicy).
+    No vault_reader is wired yet, so this resolves from the CERTIFIED local replica or grants
+    NOTHING ('unresolved' / 'replica-uncertified' / 'replica-expired' all -> empty scope).
+    Strictly tighter than the deleted load_in_scope, which returned a fixed one-repo guess on
+    ANY failure — a guess that GRANTS. The wildcard is dropped for the same reason evaluate()
+    drops it on a stale policy: without a vault_reader every resolution here is stale, and
+    '*' from a member-writable replica must never widen.
+    # SPRINT-F: replace with certified snapshot (vault_reader wired; evaluate() cutover)."""
+    pol = _core.resolve_agent_policy(_CORE_PROFILE)
+    return [s for s in pol.scope if s != _core.AgentPolicy.UNSCOPED]
+
+
+def _role_bridge():
+    """TEMPORARY, attribution-only: the role string that witnesses/connects carry. Never used
+    to widen reach — deriving authority from this member-writable file is exactly what §6.D
+    deleted. Same read and same constellation-member fallback the deleted _identity_role had,
+    kept so the witness grain does not silently change mid-train.
+    # SPRINT-F: replace with certified snapshot (role from the vault policy, not identity.json)."""
+    try:
+        r = json.load(open(IDENTITY, encoding="utf-8")).get("role")
+        if isinstance(r, str) and r.startswith("role:"):
+            return r
+    except Exception:
+        pass
+    return "role:constellation:member"
+
+
+def _launch_scope_bridge():
+    """TEMPORARY: the per-launch cwd grant (dp 2026-07-21: 'whatever cwd we launch it in').
+    The ratified target sources this as an EXPLICIT launch-cwd grant in the certified policy
+    snapshot; until that lands this carries the same single-segment grant the deleted
+    launch_cwd_repo computed — no weaker, no wider (one workspace child, never '*').
+    # SPRINT-F: replace with certified snapshot (explicit launch-cwd grant)."""
+    cwd = (os.environ.get("HESTIA_KIMI_LAUNCH_CWD") or os.getcwd()).replace("\\", "/")
+    if WORKSPACE in cwd:
+        rest = cwd.split(WORKSPACE, 1)[1].lstrip("/")
+        seg = rest.split("/", 1)[0] if rest else ""
+        return [seg] if seg else []
+    return []
 
 
 def path_in_scope(path, scopes, cwd=None):
@@ -283,7 +301,7 @@ def _emit_attestation(allows, denies):
                                             # DECLARE THE ROLE ON CONNECT (dp, 2026-07-28:
                                             # "kimi's member alias still shows unmeasured
                                             # with over 3k actions"). This gate has always
-                                            # KNOWN its role — it writes `_identity_role()`
+                                            # KNOWN its role — it writes `_role_bridge()`
                                             # into the attestation payload below — and never
                                             # told the daemon on connect, so the session
                                             # defaulted to role:constellation:member and the
@@ -293,7 +311,7 @@ def _emit_attestation(allows, denies):
                                             # conduct. The capability to declare arrived with
                                             # the connect-echoes-role work; this is the caller
                                             # that never started using it.
-                                            "role": _identity_role(),
+                                            "role": _role_bridge(),
                                             "instance_name": "gate-attest"}}}, 1.5, h)
     sess = None
     for line in raw.decode("utf-8", "replace").splitlines():
@@ -312,7 +330,7 @@ def _emit_attestation(allows, denies):
                                    "event_type": "scope_attestation",
                                    "event_data": {
                                        "plugin_id": HESTIA_PLUGIN_ID,
-                                       "role_lct": _identity_role(),
+                                       "role_lct": _role_bridge(),
                                        "allows": allows,
                                        "denies": denies,
                                        "attested_by": "plugin-gate:" + HESTIA_PLUGIN_ID,
@@ -393,23 +411,27 @@ def _daemon_witness(verb, reason):
                                    "session_id": _EVENT.get("session_id"),
                                    "payload_sha256": ti_hash,
                                    "attempted": _attempted_summary(_EVENT),
-                                   "role": _identity_role()}}}, h, 0.8)
+                                   "role": _role_bridge()}}}, h, 0.8)
 
 
-def deny(reason, what_to_do, innate=False):
+def deny(rule, reason, innate=False):
+    """Takes a RULE ID, not a sentence (§6.D): the remedy is rendered from the core's one
+    REMEDIES table via _deny(rule), never authored at a call site — which is what makes a
+    refusal naming a door nobody built (the request_scope phantom) unwriteable here rather
+    than merely discouraged. innate=True -> ALWAYS blocks (egress/secret is irreversible: a
+    leaked read has no undo, so it is enforced even in warn-rollout). Tunable scope rules
+    honor MODE: warn surfaces + allows, enforce blocks."""
     _tally_scope(False)   # a denied reach still closes part of the window
-    """innate=True -> ALWAYS blocks (egress/secret is irreversible: a leaked read has no undo, so it
-    is enforced even in warn-rollout). Tunable scope/safety rules honor MODE: warn surfaces + allows,
-    enforce blocks."""
-    verb = "deny" if (innate or MODE == "enforce") else "warn"
+    v = _core._deny(rule, reason, innate=innate)
+    verb = "deny" if (v.innate or MODE == "enforce") else "warn"
     sys.stderr.write(
-        f"hestia: {verb} [scope] — {reason}. This is a boundary, not a failure: don't re-run the same "
-        f"call. {what_to_do} Asking is a trust-building act; reaching is witnessed.\n")
+        f"hestia: {verb} [scope] — {v.reason}. This is a boundary, not a failure: don't re-run the same "
+        f"call. {v.remedy} Asking is a trust-building act; reaching is witnessed.\n")
     try:
-        _daemon_witness(verb, reason)
+        _daemon_witness(verb, v.reason)
     except Exception:
         pass  # witnessing must never change the decision
-    if innate or MODE == "enforce":
+    if v.innate or MODE == "enforce":
         sys.exit(2)
     # warn mode, tunable rule: surfaced but allowed — return so evaluation continues to allow.
 
@@ -571,7 +593,7 @@ def _gate_self_call(tool, args, host_session_id=None):
         post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, h, 0.4)
         connect_args = {"plugin_id": HESTIA_PLUGIN_ID,
                         "host_agent": HESTIA_PLUGIN_ID,
-                        "role": _identity_role(),
+                        "role": _role_bridge(),
                         "instance_name": "gate-self"}
         if host_session_id:
             connect_args["host_session_id"] = host_session_id
@@ -605,7 +627,7 @@ def _witness_gate_self(event_type, marker, tool_name, rule=None):
                        "rule": rule,
                        "gate_path": os.path.abspath(__file__),
                        "severity": "record" if event_type == "gate_self_read" else "escalate",
-                       "role_lct": _identity_role()}},
+                       "role_lct": _role_bridge()}},
         host_session_id=_EVENT.get("session_id")) is not None
 
 
@@ -620,7 +642,7 @@ def _claim_self_write(marker, tool_name, attempted):
     way to get a governance write through."""
     claim_args = {
         "plugin_id": HESTIA_PLUGIN_ID,
-        "role": _identity_role(),
+        "role": _role_bridge(),
         "tool_name": tool_name,
         "marker": marker,
         # `reason` carries the ATTEMPTED ACT, not a rationale: an auto-opened escalation HAS no
@@ -687,7 +709,9 @@ def main():
     _EVENT.clear(); _EVENT.update(event)
     tool = event.get("tool_name") or "?"
     tinput = event.get("tool_input") or {}
-    scopes = load_in_scope() + launch_cwd_repo()
+    # §6.D: standing scope resolves through the core's authenticated path (grants NOTHING
+    # when nothing certifiable resolves); the launch-cwd grant rides the marked bridge.
+    scopes = _agent_scopes() + _launch_scope_bridge()
     paths = path_targets(tinput)
     cmd = command_of(tinput)
 
@@ -695,23 +719,24 @@ def main():
     # (innate): a leaked read is irreversible egress, so it is not subject to warn-rollout.
     for blob in paths + ([cmd] if cmd else []):
         if any(f in blob.lower() for f in FORBIDDEN):
-            deny(f"'{tool}' touches a forbidden path (secret/credential or out-of-MRH private repo)",
-                 "There is no in-scope way to do this; it is not yours to touch.", innate=True)
+            deny("egress.secret",
+                 f"'{tool}' touches a forbidden path (secret/credential or out-of-MRH private repo)",
+                 innate=True)
 
     # Gate 1b — MRH scope (per-entity, from Kimi's identity). File paths use path-scope; shell
     # commands use command-scope (out-of-scope repo tokens + root-glob).
     for p in paths:
         if not path_in_scope(p, scopes, event.get("cwd")):
-            deny(f"'{tool}' targets '{p[:60]}' outside your granted scope ({'+'.join(scopes)})",
-                 "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
+            deny("mrh.path",
+                 f"'{tool}' targets '{p[:60]}' outside your granted scope ({'+'.join(scopes)})")
     if cmd is not None:
         ok, offending = command_in_scope(cmd, scopes, event.get("cwd"))
         if not ok:
             # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
             # debugging blind (Codex live session, 2026-07-23).
-            deny(f"'{tool}' command reaches outside your granted scope: '{offending}' is not granted "
-                 f"(granted: {'+'.join(scopes)})",
-                 "Scope the command to a granted repo, or if legitimately needed, request it (request_scope).")
+            deny("mrh.command",
+                 f"'{tool}' command reaches outside your granted scope: '{offending}' is not granted "
+                 f"(granted: {'+'.join(scopes)})")
 
     # Gate 1c — local self-protection. BEFORE the daemon and never conditional on it: if this
     # check needed a verdict, "stop the daemon, then edit the gate" would be the same evasion one

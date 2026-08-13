@@ -188,6 +188,17 @@ REMEDIES: dict[str, Remedy] = {
         "hestia_appeal disputes whether the deny was right, which is a different question.",
         ("hestia_request_scope", "hestia_appeal"),
     ),
+    # An MCP connector call names a REPOSITORY, not a path — the codex gate scopes on that
+    # name (see mcp_repo_target there). Same door as mrh.path, worded for a repo so the
+    # member is not sent asking for "a path" it never named. Added Sprint D (§6.D): before
+    # this, that call site authored its own sentence, naming the request_scope phantom.
+    "mrh.repo": Remedy(
+        "Adjust to work within scope. If the repository is genuinely needed, ask for it with "
+        "hestia_request_scope (one repo, with a reason) — a human decides, the grant is "
+        "memory-only and expires. An appeal cannot deliver a repo — hestia_appeal disputes "
+        "whether the deny was right, which is a different question.",
+        ("hestia_request_scope", "hestia_appeal"),
+    ),
     # ── egress ───────────────────────────────────────────────────────────────────────────
     #
     # Deliberately names NO door. This is the one refusal with no remedy, and saying so is the
@@ -567,40 +578,16 @@ def resolve_agent_policy(profile: HarnessProfile,
     return AgentPolicy(member_id=profile.member_id, scope=(), source="unresolved", stale=True)
 
 
-def load_in_scope(profile: HarnessProfile) -> list:
-    """The member's granted MRH, from its identity. `repo:web4` -> `web4`, `path:.git-inbox`
-    -> `.git-inbox`.
-
-    Both prefixes matter and the difference is not cosmetic: `.git-inbox` is a SIBLING of the
-    repos, so no `repo:` grant ever reaches it. On 2026-08-02 kimi was refused while reading
-    the very directory the push guard tells refused members to use, because only codex held
-    `path:.git-inbox`."""
-    try:
-        with open(os.path.expanduser(profile.identity_path), encoding="utf-8") as fh:
-            mrh = json.load(fh).get("mrh", {})
-        scope = mrh.get("in_scope")
-        if isinstance(scope, list) and scope:
-            return [s.split(":", 1)[-1] for s in scope]
-    except Exception:
-        pass
-    # Deliberately narrow. A default that guessed wide would silently grant reach on any
-    # machine where the identity file is missing or malformed.
-    return ["web4"]
-
-
-def identity_role(profile: HarnessProfile) -> str:
-    """The member's declared LOCAL role (dp 2026-07-24: roles are always local; occupancy
-    attributes carry the 'foreign' dimension)."""
-    try:
-        with open(os.path.expanduser(profile.identity_path), encoding="utf-8") as fh:
-            r = json.load(fh).get("role")
-        if isinstance(r, str) and r.startswith("role:"):
-            return r
-    except Exception:
-        pass
-    return profile.default_role
-
-
+# ── DELETED, not shared (gate-consolidation PRD §6.D, §7.1(4)) ──────────────────────────
+#
+# `load_in_scope` — the blind `split(":", 1)[-1]` parse plus the permissive `["web4"]`-on-
+# ANY-failure fallback (a guess that GRANTS) — and `identity_role` are GONE. Both derived
+# authority from a member-writable identity file; the ratified target sources authority from
+# `resolve_agent_policy` -> `AgentPolicy`, which grants NOTHING when nothing certifiable
+# resolves. `launch_cwd_repo` below is the third of §6.D's authority-bearing trio and remains
+# ONLY because `evaluate()` still consumes it; its replacement is an explicit launch-cwd
+# grant in the certified policy snapshot.
+# SPRINT-F: replace with certified snapshot (delete launch_cwd_repo at the evaluate() cutover).
 def launch_cwd_repo(profile: HarnessProfile, workspace: str) -> list:
     """The repo the member is launched in is always in scope (dp 2026-07-21: 'whatever cwd we
     launch it in') — a per-launch dynamic grant on top of the static allowlist, so a
