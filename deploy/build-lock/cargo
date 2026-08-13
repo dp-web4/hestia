@@ -1,25 +1,37 @@
 #!/usr/bin/env bash
-# cargo build-lock shim — deprioritize heavy cargo so a build cannot DoS the hestia gate.
-# Increment 1 of the git-manager build lock. Issue #358; root cause #354.
+# cargo build-lock shim — keep a heavy cargo build from DoS-ing the hestia gate.
+# Issue #358 (root cause #354); serialization increment tracked in #387.
 #
 # WHY: a heavy `cargo build` pins the CPU and starves the hestia daemon's gate round-trip
 # (/mcp POST). Under that contention every member's gate call fail-closes on timeout — a
 # single member's build is a fleet-wide gate DoS. The box has ample RAM and never swaps; the
 # problem is purely CPU scheduling. On a multi-member build host (claude / kimi / codex share
 # a home) one build times out everyone, and pausing live sessions does not help because auto
-# sessions keep firing builds.
+# sessions keep firing builds — and a PR sweep spawns a COLD build per worktree, several at once.
 #
-# WHAT: run heavy, compile-bound subcommands under `nice` so the daemon (normal priority)
-# preempts the build and the gate stays responsive. The build yields; it does not starve the
-# referee. Every other cargo invocation passes straight through, untouched.
+# WHAT (two layers):
+#   1. nice — run heavy, compile-bound subcommands under `nice` so the daemon (normal priority)
+#      preempts the build and the gate stays responsive. The build yields; it does not starve
+#      the referee.
+#   2. flock (#387) — SERIALIZE heavy builds: only ONE runs at a time across all members sharing
+#      this home, so N concurrent cold builds cannot collectively saturate every core and starve
+#      the verdict path (measured 2026-08-12: the daemon is 5ms idle but times out under a sweep's
+#      concurrent cold builds — `nice` alone protects the daemon's share of a saturated CPU, which
+#      is not enough when N builds saturate all of it). FAIL-OPEN on a stuck lock: if the lock is
+#      held past the wait budget (a hung build), run un-serialized rather than block the fleet's
+#      builds forever — an un-serialized build beats no build.
+# Every other cargo invocation passes straight through, untouched.
 #
 # INSTALL: place this as `cargo` in a PATH directory that PRECEDES the real cargo (e.g.
 # ~/.local/bin ahead of ~/.cargo/bin). See install.sh. All members sharing a home are then
 # covered by one shim, transparently.
 #
-# SCOPE (MVP): deprioritize only. Serialization (one heavy build at a time via flock, so N
-# concurrent builds become 1) is the tracked follow-up in #358 — `nice` already fixes the
-# gate timeout because it protects the daemon's CPU share regardless of build count.
+# TUNABLES (env): HESTIA_BUILD_LOCK (lock path), HESTIA_BUILD_LOCK_WAIT (seconds to wait for the
+# lock before failing open; default 900). Set HESTIA_BUILD_LOCK_WAIT=0 to disable serialization
+# (nice-only) without uninstalling.
+#
+# FOLLOW-UP (#387, not here): a shared/warm CARGO_TARGET_DIR so worktree builds are incremental
+# rather than cold — serialization bounds concurrency, a warm target bounds each build's cost.
 #
 # SAFETY: the real cargo is resolved as the first `cargo` on PATH that is not this shim (so it
 # works on any rust layout) and is exec'd by that resolved path — never via PATH — so this can
@@ -38,7 +50,38 @@ done < <(type -ap cargo 2>/dev/null || true)
 
 case "${1:-}" in
   build|b|test|t|check|c|clippy|bench|doc|d|install)
-    exec nice -n 15 "$real" "$@" ;;
+    # Shared WARM target on ext4 (#387; kimi's IO channel). The dominant cost of a PR sweep is a
+    # COLD build reading thousands of source files off the /mnt/c 9p mount, saturating the drvfs
+    # read queue that every gate call also traverses — which is why timeouts appear at low CPU%.
+    # A target shared across a repo's worktrees makes each build INCREMENTAL (seconds, not a cold
+    # 8 minutes → far fewer source reads) and puts the target IO on ext4. Keyed on the git
+    # COMMON dir so all worktrees of ONE repo share a target while OTHER projects are untouched;
+    # skipped outside a git tree; a caller's own CARGO_TARGET_DIR always wins. flock (below)
+    # serializes, so the shared target is never written by two builds at once.
+    if [ -z "${CARGO_TARGET_DIR:-}" ]; then
+      _gcd="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+      if [ -n "$_gcd" ]; then
+        _gcd="$(cd "$_gcd" 2>/dev/null && pwd || echo "$_gcd")"
+        _key="$(printf '%s' "$_gcd" | cksum | cut -d' ' -f1)"
+        export CARGO_TARGET_DIR="${HESTIA_BUILD_TARGET:-$HOME/.cache/hestia-cargo-target}/$_key"
+      fi
+    fi
+    wait="${HESTIA_BUILD_LOCK_WAIT:-900}"
+    if [ "$wait" = "0" ] || ! command -v flock >/dev/null 2>&1; then
+      # Serialization disabled, or flock unavailable: fall back to nice-only (increment 1).
+      exec nice -n 15 "$real" "$@"
+    fi
+    lock="${HESTIA_BUILD_LOCK:-${TMPDIR:-/tmp}/hestia-cargo-build.lock}"
+    # -E 99: the exit code flock returns when it CANNOT acquire within -w (distinct from the
+    # build's own exit), so we can tell "lock stuck" from "build failed" and fail open only on
+    # the former. Not exec'd: we must inspect the exit code to decide the fail-open path.
+    flock -w "$wait" -E 99 "$lock" nice -n 15 "$real" "$@"
+    rc=$?
+    if [ "$rc" -eq 99 ]; then
+      echo "cargo build-lock: lock held >${wait}s; running un-serialized (fail-open, #387)" >&2
+      exec nice -n 15 "$real" "$@"
+    fi
+    exit "$rc" ;;
   *)
     exec "$real" "$@" ;;
 esac
