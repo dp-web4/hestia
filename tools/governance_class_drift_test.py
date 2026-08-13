@@ -194,6 +194,57 @@ DECLARED = (
              "an unbounded number of future unescalated writes. DECIDE: whether the "
              "thing that says who is exempt should be cheaper to change than the "
              "thing it exempts them from."),
+
+    # ---- a second class: another governed system's DEPLOY closure (web4 #709) ----
+    #
+    # Everything above decides policy for THIS gate. The three below decide which
+    # web4-hub BINARY executes. Same reasoning one system out: a write that can
+    # redirect which binary runs is equivalent to a write to that binary, and that
+    # binary enforces its society's law. The precedent for widening past "files
+    # that decide" is already here -- <exemption-ledger> is a test file, governed
+    # because editing it weakens enforcement for free.
+    #
+    # All three are UNTRACKED here by construction: they are web4/private-context
+    # artifacts, and the matcher protects a NAME. Same shape as <post-hook>, and
+    # for the same reason -- the deployed artifact is the thing being governed.
+    #
+    # SHADOWING, checked rather than assumed: no entry above is a substring of any
+    # of these, and neither of the two `rati*` names is a substring of the other
+    # ("ratify-build.sh" vs "ratified-build.json" diverge at the 6th character), so
+    # each reaches the bar as itself rather than under another name's marker and
+    # price. That is the failure <society-gate> documents, and it is the first
+    # thing to re-check if these names are ever edited.
+
+    dict(key="web4-hub", label="<hub-unit>", intended=AWAITING, via=UNNAMED, tracked=False,
+         why="The unit that decides WHICH hub binary runs and with what environment. "
+             "Editing it redirects execution without touching a line of the program, "
+             "which is why web4's PRD R7c treats it as equivalent to editing the "
+             "binary. UNTRACKED: the unit lives on the deploying seat, not here. "
+             "DECIDE: a deploy-closure write swaps the program enforcing a society's "
+             "law -- whether that is one approver's call is a steward's question, and "
+             "writing a preference into this row would be the 'surface that smuggles "
+             "in a verdict' the accountability norm forbids."),
+
+    dict(key="ratified-", label="<hub-ratification>", intended=AWAITING, via=UNNAMED,
+         tracked=False,
+         why="The supervisor-owned manifest recording which build a hub seat is "
+             "APPROVED to run. A write here does not change what executes -- it "
+             "changes what counts as approved, so the seat reports `current` about "
+             "a build nobody ratified. That is the deploy analogue of the exemption "
+             "ledger: it edits the standard rather than the thing measured against "
+             "it. Primary control is filesystem permissions (root-owned, "
+             "daemon-unwritable); this covers AGENT sessions, which is what R7c "
+             "criterion 9 asks for. UNTRACKED: written per seat by the deploy path. "
+             "DECIDE: same question as <exemption-ledger> -- whether the thing that "
+             "defines approval should be cheaper to change than what it approves."),
+
+    dict(key="ratify-", label="<hub-ratifier>", intended=AWAITING, via=UNNAMED, tracked=False,
+         why="The script that WRITES the ratification manifest, including its refusal "
+             "to ratify a dirty or unverifiable build. Editing it is editing the "
+             "manifest one hop earlier -- the same 'installers are write positions' "
+             "reasoning that put the installers in the marker list. UNTRACKED HERE: "
+             "the file lives in web4/hub/scripts/. DECIDE: with <hub-ratification>, "
+             "since approving one without the other leaves the cheaper path open."),
 )
 
 

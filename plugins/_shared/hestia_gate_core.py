@@ -155,6 +155,32 @@ GOVERNANCE_FILES = (
     "hestia_gate_core.py",
     "hestia_gate_mechanism.py",
     "gate_self_protection_test.py",
+    # ── A SECOND CLASS: another governed system's DEPLOY closure (web4 #709) ──
+    #
+    # Everything above decides policy for THIS gate. The three below decide which
+    # web4-hub BINARY executes — a different system, the same reasoning one step
+    # out: a write that can redirect which binary runs is equivalent to a write to
+    # that binary, and the hub enforces its society's law. The precedent for
+    # widening past "files that decide" is already here: the exemption ledger is a
+    # test file, governed because editing it can weaken enforcement for free.
+    #
+    # Why this gate and not file permissions: permissions are the primary control
+    # (the manifest deploys root-owned, daemon-unwritable — see hub/docs/MAINTAINER.md),
+    # and this is the arm that covers AGENT SESSIONS, which is what PRD R7c
+    # criterion 9 actually asks for ("a write to the deploy closure from a gated
+    # session is refused and escalatable").
+    #
+    # Measured against the shadowing hazard the drift guard documents: none of the
+    # three contains, or is contained by, any entry above, so each reaches the bar
+    # as itself rather than under an earlier entry's marker and price.
+    #
+    # The APPROVAL BAR for these is deliberately left open (declared AWAITING in the
+    # drift guard). What it should cost to approve a deploy-closure write is a policy
+    # call for the steward; encoding a preference here is the "surface that smuggles
+    # in a verdict" the accountability norm forbids.
+    "web4-hub.service",
+    "ratified-build.json",
+    "ratify-build.sh",
 )
 
 

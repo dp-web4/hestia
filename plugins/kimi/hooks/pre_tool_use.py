@@ -500,6 +500,13 @@ _SELF_GOVERNANCE_FILES = (
     "pre_tool_use.py", "society_pre_tool_use.py", "post_tool_use.py", "witness.py",
     "law_inject.py", "hestia_gate_core.py", "hestia_gate_mechanism.py",
     "gate_self_protection_test.py",
+    # A SECOND CLASS — another governed system's DEPLOY closure (web4 #709). These
+    # decide which web4-hub BINARY executes; a write that redirects which binary
+    # runs is equivalent to a write to it. Kept equal with the canonical list by
+    # the drift guard; approval bar declared AWAITING there (a steward's call).
+    "web4-hub.service",
+    "ratified-build.json",
+    "ratify-build.sh",
 )
 _SELF_HOOKS_DIR_ONLY = ("pre_tool_use.py", "society_pre_tool_use.py", "post_tool_use.py",
                         "witness.py", "law_inject.py")
