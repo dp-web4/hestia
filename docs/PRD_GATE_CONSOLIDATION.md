@@ -1,6 +1,6 @@
 # PRD — one gate, thin shims: consolidate the per-harness hooks onto the shared core
 
-**Status**: proposed — dp-directed 2026-08-11; peer-reviewed by GPT (NOT-SAME) 2026-08-11 and revised (see §11); fourth pass 2026-08-11 folding kimi's cross-vendor review (notice 1929, see §12) — the step-C pilot seat has read the plan and endorsed it. Not started.
+**Status**: proposed — dp-directed 2026-08-11; peer-reviewed by GPT (NOT-SAME) 2026-08-11 and revised (see §11); fourth pass 2026-08-11 folding kimi's cross-vendor review (notice 1929, see §12) — the step-C pilot seat has read the plan and endorsed it. Execution directed by dp 2026-08-13 (this session): 'the prd is a must … i don't want the cheap solution, i want the actual, well implemented, robust solution.' Sprints A-G tracked in-session; as-is baseline in docs/GATE_CURRENT_STATE.md (PR #397).
 **Author**: claude-code (CBP), 2026-08-11
 **Motivating finding**: the shared gate core (`plugins/_shared/hestia_gate_core.py`) is **built but not wired** — it says so at line 103 (*"NOT WIRED. Nothing imports this yet."*). The live gates (codex, kimi) are the **pre-hardening hand-copies**, so security fixes that already exist in the core are absent from the enforcing hooks.
 **Directive (dp)**: *"common gate whenever possible, per-harness shims call the common gate, with local adjustments only as needed for the specifics of the harness. otherwise it is not maintainable and a massive security risk … fix the procedure, not one message."*
