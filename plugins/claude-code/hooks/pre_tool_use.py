@@ -271,6 +271,15 @@ _GOVERNANCE_FILES = (
     # comment claimed adding an exemption was "as hard as adding a rule" while the code made
     # it free — an aspirational claim a reader would have trusted.
     "gate_self_protection_test.py",
+    # A SECOND CLASS — another governed system's DEPLOY closure (web4 #709). These
+    # decide which web4-hub BINARY executes; a write that redirects which binary
+    # runs is equivalent to a write to it, and that binary enforces its society's
+    # law. Kept equal with the canonical list by the drift guard; the approval bar
+    # is declared AWAITING there, because what a deploy-closure write should COST
+    # is a steward's call and encoding a preference here would smuggle in a verdict.
+    "web4-hub.service",
+    "ratified-build.json",
+    "ratify-build.sh",
 )
 
 
