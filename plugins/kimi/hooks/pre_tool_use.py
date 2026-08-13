@@ -89,6 +89,15 @@ try:
     import hestia_gate_core as _core
 except Exception:
     _core = None
+# Sprint B (gate-consolidation §6.B): the shared governance-closure classifier — ONE
+# write-position-keyed, accessor-agnostic predicate for every harness. GUARDED like the
+# core above: on this engine an import failure IS a fail-open, so a missing module must
+# not disarm Gate 1c — the Tier-2 fallback (_fallback_touches_self below, the pre-B local
+# predicate, moved not deleted) stays in force when this is None.
+try:
+    from hestia_governance_closure import classify as _closure_classify
+except Exception:
+    _closure_classify = None
 
 # Innate egress/secret invariants — denied even inside a granted repo. Trust never relaxes these (S1).
 # Universal secret/credential patterns here; add your own private-repo names via HESTIA_FORBIDDEN_EXTRA.
@@ -442,7 +451,7 @@ _SELF_HOOKS_DIR_ONLY = ("pre_tool_use.py", "society_pre_tool_use.py", "post_tool
                         "witness.py", "law_inject.py")
 
 
-def _touches_self(tool_input):
+def _fallback_touches_self(tool_input):  # Tier-2 fallback; live path is classify()
     """(marker, resource) if this call's DESTINATION reaches the governance surface, else None.
 
     Two haystacks:
@@ -582,7 +591,7 @@ def _gate_self_call(tool, args, host_session_id=None):
         return None
 
 
-def _witness_gate_self(event_type, marker, tool_name):
+def _witness_gate_self(event_type, marker, tool_name, rule=None):
     """Record a governance-surface event as its OWN class — `gate_self_read` for a permitted
     read, `gate_self_access` (appealable) for a refused write. The two stay distinct so an alert
     on the refusal keeps its meaning. Best effort: a failed record never changes the decision —
@@ -593,6 +602,7 @@ def _witness_gate_self(event_type, marker, tool_name):
         "event_data": {"plugin_id": HESTIA_PLUGIN_ID,
                        "tool_name": tool_name,
                        "marker": marker,
+                       "rule": rule,
                        "gate_path": os.path.abspath(__file__),
                        "severity": "record" if event_type == "gate_self_read" else "escalate",
                        "role_lct": _identity_role()}},
@@ -707,25 +717,40 @@ def main():
     # check needed a verdict, "stop the daemon, then edit the gate" would be the same evasion one
     # layer down. ALWAYS enforced — it does not honor warn-rollout, because a governance write
     # that warns and proceeds is not a boundary.
-    self_hit = _touches_self(tinput)
+    # Sprint B: classification comes from the shared governance-closure module (write-
+    # position keyed, accessor-agnostic — the raw text-match bridge and its disclosed
+    # marker-in-command FP retire with it); this shim only renders and escalates.
+    self_rule = None
+    if _closure_classify is not None:
+        _cv = _closure_classify(tool, tinput, cwd=event.get("cwd"))
+        self_hit = ((_cv.marker or _cv.rule, _cv.resource or _cv.marker or _cv.rule)
+                    if _cv.classification in ("read", "write") else None)
+        self_is_read = _cv.classification == "read"
+        self_rule = _cv.rule
+    else:
+        # Tier-2 degraded mode (ratified): import failed — the pre-B local predicate
+        # decides, unchanged. The layer must not silently vanish with the import.
+        self_hit = _fallback_touches_self(tinput)
+        self_is_read = tool in READ_CLASS
     if self_hit:
         self_marker, self_resource = self_hit
-        if tool in READ_CLASS:
+        if self_is_read:
             # Publish-the-law: a member may read what governs it — refusing would make a member
             # unable to check its own law. The read is RECORDED so reconnaissance stays visible
             # as a pattern; a failed witness never blocks the read.
-            _witness_gate_self("gate_self_read", self_marker, tool)
+            _witness_gate_self("gate_self_read", self_marker, tool, rule=self_rule)
         else:
             verdict, detail, esc_id, how = _claim_self_write(
                 self_marker, tool, _attempted_summary(_EVENT))
             if verdict != "approved":
-                _witness_gate_self("gate_self_access", self_marker, tool)
+                _witness_gate_self("gate_self_access", self_marker, tool, rule=self_rule)
                 _tally_scope(False)   # a refused reach still closes part of the window
                 esc = (f" Escalation {esc_id} is open — a human decides out of band ({how}); "
                        f"re-issue the write afterwards to claim the approval." if esc_id else "")
                 sys.stderr.write(
                     f"hestia: deny [gate-self] — '{tool}' would WRITE to the governance surface: "
-                    f"{self_resource} (matched marker {self_marker!r}; {detail}).{esc} This is not "
+                    f"{self_resource} (matched marker {self_marker!r}; "
+                    f"rule {self_rule or 'gate-self-local'}; {detail}).{esc} This is not "
                     f"an ordinary boundary — the target is what draws the boundaries. Legitimate "
                     f"gate work goes through the escalation, not around it.\n")
                 sys.exit(2)
