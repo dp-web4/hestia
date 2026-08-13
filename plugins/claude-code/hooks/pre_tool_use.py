@@ -274,6 +274,26 @@ _GOVERNANCE_FILES = (
 )
 
 
+# ---------------------------------------------------------------------------
+# SPRINT B (gate-consolidation §6.B): THE SHARED GOVERNANCE-CLOSURE CLASSIFIER
+# ---------------------------------------------------------------------------
+# classify() is write-position keyed and accessor-agnostic (the PR #370 line): it
+# replaces the live path through _touches_self, the text-match half of
+# _touches_registration, and the Bash read/write split for gate-self classification.
+# The local matchers below STAY, verbatim, as the Tier-2 fallback
+# (_fallback_self_protection, before main()): on an import failure the closure
+# protection must not silently vanish — the core's "mirrored, not imported" reasoning,
+# pointed the other way.
+_SHARED_DIR = os.environ.get("HESTIA_SHARED_DIR") or os.path.join(
+    os.path.dirname(os.path.dirname(_SELF_DIR)), "_shared")
+if os.path.isdir(_SHARED_DIR) and _SHARED_DIR not in sys.path:
+    sys.path.insert(0, _SHARED_DIR)
+try:
+    from hestia_governance_closure import classify as _closure_classify
+except Exception:  # noqa: BLE001 — Tier-2: the local matcher below stays in force
+    _closure_classify = None
+
+
 # Commands whose arguments and stdin are DATA, never shell code — the same
 # allowlist policy::shell uses, kept in sync with it deliberately. An allowlist,
 # never a denylist: an unrecognised head is treated as interpreting, so
@@ -2632,6 +2652,58 @@ def invoke_legacy_fallback(stdin_payload: str) -> int:
         return 0
 
 
+def _fallback_self_protection(tool_name: str, tool_input: Any,
+                              host_session_id: Optional[str]) -> Optional[int]:
+    """Tier-2 degraded mode (the ratified deny-writes-allow-reads posture, per-shim
+    tighten-only): the shared governance-closure module failed to import, so the
+    pre-Sprint-B local matcher decides — MOVED here from main() verbatim, not deleted.
+    Returns 2 to deny, or None to continue to the ordinary policy path."""
+    _self_hit = _touches_self(tool_name, tool_input)
+    if _self_hit is None:
+        _reg = _touches_registration(tool_name, tool_input)
+        if _reg is not None:
+            # Registration markers are already descriptive strings; the resource is
+            # the settings path — or, for Bash, the command (write intent there is
+            # undecidable, and the marker already says so).
+            _r = tool_input.get("command") if tool_name == "Bash" else (
+                tool_input.get("file_path") or tool_input.get("path")
+                or tool_input.get("notebook_path"))
+            _self_hit = (_reg, _r if isinstance(_r, str) and _r else _reg,
+                         "command" if tool_name == "Bash" else "file_path")
+    if _self_hit:
+        _self_marker, _self_resource, _self_key = _self_hit
+        # For a TEXT-key match the call's stated destination (if any) is what the
+        # write actually reaches — the report names it and calls the match payload.
+        _self_dest = None
+        if _self_key not in _PATH_KEYS and isinstance(tool_input, dict):
+            for _k in _PATH_KEYS:
+                _v = tool_input.get(_k)
+                if isinstance(_v, str) and _v:
+                    _self_dest = _v
+                    break
+        if _is_read_only(tool_name, tool_input):
+            # Allowed — and RECORDED. A member may inspect what governs it; repeated
+            # reads of the governance surface remain visible as a pattern.
+            _witness_self_read(_self_marker, tool_name)
+            debug_log(f"gate-self-read (allowed, witnessed): {tool_name} -> {_self_marker}")
+        else:
+            verdict, detail = request_self_write(
+                _self_marker, tool_name, _attempted_summary(tool_name, tool_input),
+                resource=_self_resource, key=_self_key, dest=_self_dest,
+                host_session_id=host_session_id,
+            )
+            if verdict != "approved":
+                debug_log(f"gate-self-write {verdict}: {detail}")
+                return deny_self_access(_self_marker, tool_name, resource=_self_resource,
+                                        key=_self_key, dest=_self_dest)
+            # APPROVED -- the self-protection is lifted for THIS call only, and the call
+            # continues to the ordinary policy check below. Approving a gate edit is not
+            # approving everything else the same command might do.
+            sys.stderr.write(f"hestia: gate write APPROVED -- {detail}\n")
+            debug_log(f"gate-self-write approved: {detail}")
+    return None
+
+
 # ---- Main flow --------------------------------------------------------
 
 def emit_decision(decision: dict[str, Any]) -> int:
@@ -2686,49 +2758,39 @@ def main() -> int:
     # SELF-PROTECTION FIRST — before the daemon, and never conditional on it.
     # If this required a verdict, "stop the daemon, then edit the gate" would be
     # the same evasion one layer down.
-    _self_hit = _touches_self(tool_name, tool_input)
-    if _self_hit is None:
-        _reg = _touches_registration(tool_name, tool_input)
-        if _reg is not None:
-            # Registration markers are already descriptive strings; the resource is
-            # the settings path — or, for Bash, the command (write intent there is
-            # undecidable, and the marker already says so).
-            _r = tool_input.get("command") if tool_name == "Bash" else (
-                tool_input.get("file_path") or tool_input.get("path")
-                or tool_input.get("notebook_path"))
-            _self_hit = (_reg, _r if isinstance(_r, str) and _r else _reg,
-                         "command" if tool_name == "Bash" else "file_path")
-    if _self_hit:
-        _self_marker, _self_resource, _self_key = _self_hit
-        # For a TEXT-key match the call's stated destination (if any) is what the
-        # write actually reaches — the report names it and calls the match payload.
-        _self_dest = None
-        if _self_key not in _PATH_KEYS and isinstance(tool_input, dict):
-            for _k in _PATH_KEYS:
-                _v = tool_input.get(_k)
-                if isinstance(_v, str) and _v:
-                    _self_dest = _v
-                    break
-        if _is_read_only(tool_name, tool_input):
+    # Sprint B: the shared governance-closure module CLASSIFIES; this shim renders.
+    # "none" falls through to ordinary policy; "read" is allowed + witnessed
+    # (gate_self_read); "write" runs the existing escalate/claim flow and denies
+    # unapproved — the rule id in the record comes from the module result.
+    if _closure_classify is not None:
+        _cv = _closure_classify(tool_name, tool_input, cwd=event.get("cwd"))
+        if _cv.classification == "read":
             # Allowed — and RECORDED. A member may inspect what governs it; repeated
             # reads of the governance surface remain visible as a pattern.
-            _witness_self_read(_self_marker, tool_name)
-            debug_log(f"gate-self-read (allowed, witnessed): {tool_name} -> {_self_marker}")
-        else:
+            _witness_self_read(_cv.marker, tool_name)
+            debug_log(f"gate-self-read (allowed, witnessed): {tool_name} -> {_cv.marker}")
+        elif _cv.classification == "write":
             verdict, detail = request_self_write(
-                _self_marker, tool_name, _attempted_summary(tool_name, tool_input),
-                resource=_self_resource, key=_self_key, dest=_self_dest,
+                _cv.marker or _cv.rule, tool_name,
+                _attempted_summary(tool_name, tool_input),
+                resource=_cv.resource, key=_cv.rule,
                 host_session_id=host_session_id,
             )
             if verdict != "approved":
                 debug_log(f"gate-self-write {verdict}: {detail}")
-                return deny_self_access(_self_marker, tool_name, resource=_self_resource,
-                                        key=_self_key, dest=_self_dest)
+                return deny_self_access(_cv.marker or _cv.rule, tool_name,
+                                        resource=_cv.resource, key=_cv.rule)
             # APPROVED -- the self-protection is lifted for THIS call only, and the call
             # continues to the ordinary policy check below. Approving a gate edit is not
             # approving everything else the same command might do.
             sys.stderr.write(f"hestia: gate write APPROVED -- {detail}\n")
             debug_log(f"gate-self-write approved: {detail}")
+    else:
+        # Tier-2 degraded mode: the shared classifier failed to import — the pre-B
+        # local matcher decides, moved (not deleted) into _fallback_self_protection.
+        _rc = _fallback_self_protection(tool_name, tool_input, host_session_id)
+        if _rc is not None:
+            return _rc
 
     # Try the daemon first.
     result = ask_daemon(tool_name, tool_input, tool_use_id, host_session_id)
