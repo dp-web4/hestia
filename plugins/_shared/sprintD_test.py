@@ -147,7 +147,14 @@ def main():
     # ── (b) every refusal names a tool that exists ─────────────────────────────────────
     for shim, src in shim_srcs.items():
         rules = _rules_used(src)
-        check(f"{shim}_uses_rule_ids", len(rules) >= 3, f"found {sorted(rules)}")
+        # Sprint F cutover: a shim no longer AUTHORS rule ids — the decision (and its rule)
+        # comes from core.evaluate()/degraded_verdict, rendered via deny(verdict.rule).
+        # Pre-F shims must still carry >=3 literal rule ids; post-F shims must instead show
+        # the cutover shape. Any literal that remains must still be registered (below).
+        if "_core.evaluate(" in src and "degraded_verdict" in src:
+            check(f"{shim}_decides_via_core_evaluate", True)
+        else:
+            check(f"{shim}_uses_rule_ids", len(rules) >= 3, f"found {sorted(rules)}")
         unregistered = sorted(rules - set(core.REMEDIES))
         check(f"{shim}_rules_all_registered", not unregistered, str(unregistered))
         named = set()

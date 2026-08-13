@@ -481,7 +481,11 @@ def test_the_core_is_not_the_only_copy_of_the_scope_rule():
     plugins_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     # Frozen 2026-08-05. Shrink as harnesses consolidate onto the core; never grow it without
     # saying, in the PR, why a fifth copy of the scope rule is the right answer.
-    KNOWN_DUPLICATE_OWNERS = {"codex": 2, "gemini": 1, "kimi": 1}
+    # Sprint F (§6.F): codex's ENFORCING copy consolidated onto core.evaluate() — its
+    # remaining 1 is the .orig history file, not an enforcing gate. kimi's 1 is the pair of
+    # thin call-site ADAPTERS that delegate to the core (kept for the parity battery), not
+    # a second implementation.
+    KNOWN_DUPLICATE_OWNERS = {"codex": 1, "gemini": 1, "kimi": 1}
 
     owners = {}
     for root, _dirs, files in os.walk(plugins_dir):

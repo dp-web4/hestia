@@ -28,9 +28,15 @@ Defense-in-depth, because no single layer covers everything on Codex:
     container that exposes only granted repos is the real read-confinement fix (future).
 This gate is the shell/edit/MCP-command layer: scope + egress + society-safety, fail-closed.
 
-Two gates, in order:
-  1. SCOPE + EGRESS (local, per-entity, from Codex's MRH in identity.json). Forbidden egress/secret
-     path or out-of-scope target -> deny. No daemon needed, so a down daemon never bricks this.
+Three gates, in order (Sprint F: self-protection first, then the ONE decision, then society):
+  1c. SELF-PROTECTION (Sprint B): a write whose DESTINATION is the governance closure is
+     refused and escalated pre-daemon; reads are allowed and witnessed.
+  1. SCOPE + EGRESS — the §6.F cutover: decided by the shared core's evaluate() from a policy
+     snapshot fetched LIVE from the daemon (hestia_gate_mechanism.fetch_policy_snapshot).
+     Daemon unreachable in enforce mode -> the RATIFIED DEGRADED MODE
+     (deny-writes-allow-reads, computed by the core; every degraded deny recorded with
+     verdict_available=False) — never a silent policy=None / local-replica fallback
+     (§7.1 criterion 5).
   2. SOCIETY SAFETY (the governor): for exec-class tools, query the daemon IN-PROCESS via the
      shared mechanism module (plugins/_shared, PRD gate-consolidation §6.E) so the decision
      reaches the governor and is witnessed; its deny (or fail-closed-on-no-verdict) is honored.
@@ -149,45 +155,51 @@ _CORE_PROFILE = (_core.HarnessProfile(
     member_id="codex",
     identity_path=IDENTITY,
     home_markers=("~/.codex",),
+    launch_cwd_env="HESTIA_CODEX_LAUNCH_CWD",
 ) if _core is not None else None)
 
-# Innate egress/secret invariants + read-class — ONE list each, in the core (§7.1(1)).
-# Inert placeholders when the core is missing: main() fails closed on `_core is None`
-# before either is consulted, and an empty READ_CLASS reads as "everything is
-# write-class", which is the tighter direction.
-FORBIDDEN = _core.forbidden_tokens(_CORE_PROFILE) if _core is not None else ()
+# Read-class — ONE list, in the core (§7.1(1)). Inert placeholder when the core is
+# missing: main() fails closed on `_core is None` before it is consulted, and an empty
+# READ_CLASS reads as "everything is write-class", which is the tighter direction.
+# (FORBIDDEN has no shim-side copy at all since the F cutover — Gate 1a runs inside
+# evaluate()/degraded_verdict.)
 READ_CLASS = _core.READ_CLASS if _core is not None else frozenset()
 
 
 
-# ---- Sprint D (§6.D): authority resolves, not guesses ---------------------------------
+# ---- Sprint D (§6.D) -> Sprint F (§6.F): law lives in the core; the shim only renders ----
 #
 # The legacy trio — `load_in_scope` (permissive `["web4"]`-on-any-failure fallback),
-# `_identity_role`, `launch_cwd_repo` — is DELETED, not shared: each derived authority
-# from harness/cwd/identity-file incidentals. Standing scope now comes from the core's
-# authenticated path; the two fields AgentPolicy cannot yet supply are bridged by the
-# marked TEMPORARY functions below. The permissive fallback is NOT bridged — absent data
-# grants nothing, which is the tighter direction.
+# `_identity_role`, `launch_cwd_repo` — is DELETED, not shared. Sprint F completes the
+# cutover: standing scope, egress, and command/path scoping are ALL decided inside the
+# core's evaluate(), from a policy snapshot fetched LIVE from the daemon (the mechanism's
+# fetch_policy_snapshot) — or by the core's ratified degraded_verdict when the daemon is
+# unreachable. The only bridge left shim-side is _role_bridge (attribution only), fed from
+# the snapshot when the daemon answers. READ_CLASS stays core-sourced (§7.1(1)).
 
-def _agent_scopes():
-    """Standing scope via the core's authenticated path (resolve_agent_policy -> AgentPolicy).
-    No vault_reader is wired yet, so this resolves from the CERTIFIED local replica or grants
-    NOTHING ('unresolved' / 'replica-uncertified' / 'replica-expired' all -> empty scope).
-    Strictly tighter than the deleted load_in_scope, which returned a fixed one-repo guess on
-    ANY failure — a guess that GRANTS. The wildcard is dropped for the same reason evaluate()
-    drops it on a stale policy: without a vault_reader every resolution here is stale, and
-    '*' from a member-writable replica must never widen.
-    # SPRINT-F: replace with certified snapshot (vault_reader wired; evaluate() cutover)."""
-    pol = _core.resolve_agent_policy(_CORE_PROFILE)
-    return [s for s in pol.scope if s != _core.AgentPolicy.UNSCOPED]
+# ── Sprint F (§6.F): _agent_scopes deleted — standing scope now arrives inside
+# evaluate()'s policy argument, resolved from the LIVE daemon snapshot in main(); nothing
+# shim-side computes scope any more.
+# SPRINT-F: replace with certified snapshot — PARTIAL: the daemon exposes NO standing
+# `in_scope` surface (only live path grants via hestia_scope_status), so a snapshot
+# carries live grants plus the core's launch-cwd bridge and nothing else. Declared RED in
+# F_NOTES.md; the local replica is OFF the enforce path entirely (§7.1 criterion 5).
+
+
+_SNAPSHOT_ROLE = None  # set by main() from the live daemon snapshot (identity.role)
 
 
 def _role_bridge():
-    """TEMPORARY, attribution-only: the role string that witnesses/connects carry. Never used
-    to widen reach — deriving authority from this member-writable file is exactly what §6.D
-    deleted. Same read and same constellation-member fallback the deleted _identity_role had,
-    kept so the witness grain does not silently change mid-train.
-    # SPRINT-F: replace with certified snapshot (role from the vault policy, not identity.json)."""
+    """Attribution-only: the role string that witnesses/connects carry. Never used to widen
+    reach. Sprint F: RESOLVED from the live snapshot when the daemon answered — the
+    daemon's session-resolved role (hestia_operating_law identity.role) wins over the
+    member-writable identity.json; the file read remains ONLY as the daemon-absent
+    fallback for witness attribution, where the alternative is silently changing the
+    witness grain mid-train.
+    # SPRINT-F: replace with certified snapshot — PARTIAL: resolved when the daemon
+    # answers; the identity.json fallback stays for the unreachable case (F_NOTES.md)."""
+    if isinstance(_SNAPSHOT_ROLE, str) and _SNAPSHOT_ROLE.startswith("role:"):
+        return _SNAPSHOT_ROLE
     try:
         r = json.load(open(IDENTITY, encoding="utf-8")).get("role")
         if isinstance(r, str) and r.startswith("role:"):
@@ -197,18 +209,12 @@ def _role_bridge():
     return "role:constellation:member"
 
 
-def _launch_scope_bridge():
-    """TEMPORARY: the per-launch cwd grant (dp 2026-07-21: 'whatever cwd we launch it in').
-    The ratified target sources this as an EXPLICIT launch-cwd grant in the certified policy
-    snapshot; until that lands this carries the same single-segment grant the deleted
-    launch_cwd_repo computed — no weaker, no wider (one workspace child, never '*').
-    # SPRINT-F: replace with certified snapshot (explicit launch-cwd grant)."""
-    cwd = (os.environ.get("HESTIA_CODEX_LAUNCH_CWD") or os.getcwd()).replace("\\", "/")
-    if WORKSPACE in cwd:
-        rest = cwd.split(WORKSPACE, 1)[1].lstrip("/")
-        seg = rest.split("/", 1)[0] if rest else ""
-        return [seg] if seg else []
-    return []
+# ── Sprint F (§6.F): _launch_scope_bridge deleted — the per-launch cwd grant is computed
+# inside evaluate() (the core's marked launch_cwd_repo bridge, parameterised by
+# HarnessProfile.launch_cwd_env below), so the shim no longer holds a scope computation.
+# The grant itself is still env/cwd-derived pending a daemon surface:
+# SPRINT-F: replace with certified snapshot (explicit launch-cwd grant) — the daemon has
+# no such surface yet; the core-side bridge stays, declared RED in F_NOTES.md.
 
 
 def path_targets(tool_input):
@@ -280,126 +286,10 @@ def apply_patch_targets(tool_input):
     return out
 
 
-def _all_repos():
-    try:
-        return [d for d in os.listdir(WORKSPACE)
-                if os.path.isdir(os.path.join(WORKSPACE, d)) and not d.startswith(".")]
-    except Exception:
-        return []
-
-
-def path_in_scope(path, scopes, cwd=None):
-    """A file path is in-scope if it's the agent's home, /tmp, or under a granted repo.
-    Relative paths resolve against the event cwd — 'scripts/x' inside a granted repo is that
-    repo's subdir, not the workspace-root 'scripts' dir (same class as the command-scope
-    false-deny, 2026-07-23)."""
-    p = path.replace("\\", "/")
-    low = p.lower()
-    if CODEX_HOME.lower() in low or "~/.codex" in low:
-        return True
-    if not p.startswith("/") and not p.startswith("~"):
-        cwd = (cwd or os.getcwd()).replace("\\", "/")
-        p = os.path.normpath(os.path.join(cwd, p)).replace("\\", "/")
-    if p.startswith(("/tmp", "/var/tmp")):
-        return True
-    if WORKSPACE in p:
-        rest = p.split(WORKSPACE, 1)[1].lstrip("/")
-        seg = rest.split("/", 1)[0] if rest else ""
-        if seg == "":
-            return False       # bare workspace root (the glob-the-root antipattern) -> out of scope
-        return seg in scopes
-    # Absolute path outside the workspace (and not home/tmp): conservative deny, as before.
-    return False
-
-
-def command_in_scope(cmd, scopes, cwd=None):
-    """Returns (ok, offending_token). A reach is judged by WHERE IT RESOLVES, not what it
-    lexically mentions. Two passes:
-
-      1. absolute workspace references (ALL occurrences) — the path component right after the
-         root must be a granted repo; bare root (glob-the-root antipattern) denies;
-      2. relative path tokens, resolved against the event cwd — 'scripts/foo.py' inside a
-         granted repo is that repo's subdir, NOT the workspace-root 'scripts' dir.
-
-    History (2026-07-23, both found live by Codex): (a) the oos scan matched the workspace
-    root's own path component ('ai-agents' dir inside .../ai-agents), denying every absolute
-    path; (b) it matched generic dir names ('scripts', 'logs', ...) that exist both at the
-    workspace root and inside granted repos, denying in-repo relative paths. Lexical mention-
-    scanning was the wrong primitive; cwd-resolution replaces it. (Relative traversal that
-    never names a path — `grep -r .` — still escapes string parsing; Codex's sandbox, not this
-    check, is the fs boundary.)"""
-    ws = WORKSPACE.rstrip("/")
-    # Pass 1 — absolute references.
-    parts = cmd.split(WORKSPACE)
-    for after in parts[1:]:
-        head = after.lstrip("/")
-        head = re.split(r"""[\s"'`);&|<>]""", head, 1)[0]  # cut at shell metachars
-        head = head.split("/", 1)[0]
-        if head not in scopes:
-            return False, (head or "<workspace root>")
-    # Pass 2 — relative tokens. The event cwd is NOT reliable for these: Codex runs each
-    # command with a per-command workdir the hook event does not carry (observed live: event
-    # cwd = the session launch dir, e.g. the workspace root, while the command actually ran
-    # inside a granted repo — 'scripts'/'Research'/'simulations'/branch-prefix 'agent/' all
-    # false-denied, 2026-07-23). So a relative token is judged by its PLAUSIBLE
-    # interpretations — the event cwd plus every granted repo root — voting by what EXISTS:
-    #   * an existing in-scope interpretation -> pass (the work is plausibly granted);
-    #   * an existing out-of-scope interpretation with NO in-scope alternative -> deny;
-    #   * a token that exists nowhere -> not a reach (branch names, heredoc fragments).
-    # Residual (documented, accepted): a root-workdir command naming a dir that ALSO exists
-    # in a granted repo passes — the sandbox, not this string check, is the fs boundary.
-    cwd = (cwd or os.getcwd()).replace("\\", "/")
-    bases = [cwd] + [f"{ws}/{s}" for s in scopes]
-    oos_names = {r for r in _all_repos() if r not in scopes}
-    probes = 0
-    for raw in re.split(r"""[\s;|&<>()'"`]+""", cmd):
-        for tok in raw.split("="):
-            tok = tok.strip()
-            # Skip: empty, flags, absolute (pass 1's job), URLs/remotes (':'), pure dots.
-            if (not tok or tok.startswith(("-", "/")) or ":" in tok
-                    or tok.strip(".") == ""):
-                continue
-            first = tok.split("/", 1)[0]
-            if "/" not in tok and first not in oos_names:
-                continue
-            # A bare member plugin-id is an ADDRESS (mesh notify targets, tool
-            # args), not a filesystem reach — even when a same-named directory
-            # exists at the workspace root (live false-deny: kimi's mesh ack
-            # 'send claude-code ack <ptr>' denied on the claude-code DIR,
-            # 2026-07-24). With a slash it is a path again and votes normally.
-            # §6.D: ONE list, in the core — the local literal missed gemini-cli
-            # and cursor, so this centralization only retires a false-deny class.
-            # Safe to reference here: main() fails closed on `_core is None`
-            # before any command is scoped.
-            if "/" not in tok and tok in _core.MEMBER_ADDRESSES:
-                continue  # bare word that isn't a workspace-dir name
-            if probes >= 40:
-                break     # bound fs probing under the engine's 3s hook clamp
-            probes += 1
-            # Probe = leading '..'s plus the first real component ('../synchronism-site',
-            # 'scripts', ...) — enough to know WHERE the token lands, cheap to exists-check.
-            comps = tok.split("/")
-            k = 0
-            while k < len(comps) and comps[k] == "..":
-                k += 1
-            probe = "/".join(comps[:k + 1]) if k < len(comps) else "/".join(comps)
-            in_scope_vote, oos_vote = False, None
-            for base in bases:
-                cand = os.path.normpath(os.path.join(base, probe)).replace("\\", "/")
-                if not os.path.exists(cand):
-                    continue
-                if cand == ws:
-                    oos_vote = oos_vote or "<workspace root>"
-                    continue
-                if cand.startswith(ws + "/"):
-                    seg = cand[len(ws) + 1:].split("/", 1)[0]
-                    if seg in scopes:
-                        in_scope_vote = True
-                        break
-                    oos_vote = seg
-            if not in_scope_vote and oos_vote:
-                return False, oos_vote
-    return True, None
+# ── Sprint F (§6.F): the local scope predicates (path_in_scope / command_in_scope /
+# _all_repos) are DELETED — codex was deliberately pre-hardening until this cutover
+# (GPT 2nd-pass #2); the hardened predicates now reach this gate only through
+# core.evaluate(). test_gate_core's duplication inventory shrinks accordingly.
 
 
 # Rollout mode: DENY-TIGHT by default — a foreign agent starts enforced and RELAXES as role-scoped
@@ -690,49 +580,24 @@ def main():
     _EVENT.clear(); _EVENT.update(event)   # so deny()/witness_decision can record the reach it blocks
     tool = event.get("tool_name") or "?"
     tinput = event.get("tool_input") or {}
-    # §6.D: standing scope resolves through the core's authenticated path (grants NOTHING
-    # when nothing certifiable resolves); the launch-cwd grant rides the marked bridge.
-    scopes = _agent_scopes() + _launch_scope_bridge()
     if tool == "apply_patch":
-        # apply_patch's payload is FILE CONTENT, not a shell command. Check the TARGET paths for
-        # scope/egress; do NOT scan the patch body for forbidden tokens (else a security review that
-        # mentions '.env'/'credentials' is false-denied — Codex, 2026-07-23). Sandbox confines the write.
+        # apply_patch's payload is FILE CONTENT, not a shell command. The TARGET paths are
+        # what evaluate() scopes/egress-checks; the patch body is never scanned for
+        # forbidden tokens (else a security review that mentions '.env'/'credentials' is
+        # false-denied — Codex, 2026-07-23). The sandbox confines the write.
         paths = apply_patch_targets(tinput)
         cmd = None
     else:
         paths = path_targets(tinput)
         cmd = command_of(tinput)
-
-    # Gate 1a — egress/secret innate invariant (denied even inside a granted repo). ALWAYS enforced.
-    for blob in paths + ([cmd] if cmd else []):
-        if any(f in blob.lower() for f in FORBIDDEN):
-            deny("egress.secret",
-                 f"'{tool}' touches a forbidden path (secret/credential or out-of-MRH private repo)",
-                 innate=True)
-
-    # Gate 1b — MRH scope. File paths use path-scope; shell commands use command-scope.
-    # An MCP call that names its repo separately is scoped on THAT name; its `path` is
-    # repo-relative and must not be re-scoped (see mcp_repo_target). The forbidden-token
-    # check above still ran over those paths, so egress/secret protection is unaffected.
+    # An MCP connector call names its repository in its OWN argument; evaluate() scopes
+    # that NAME (NormalizedEvent.repos) and treats the call's repo-relative `path` keys as
+    # content, not a reach (mcp_repo_target docstring — the 2026-07-26 false-deny class).
     mcp_repo = mcp_repo_target(tinput)
-    if mcp_repo is not None:
-        if mcp_repo not in scopes:
-            deny("mrh.repo",
-                 f"'{tool}' targets repository '{mcp_repo}' outside your granted scope "
-                 f"({'+'.join(scopes)})")
-        paths = []
-    for p in paths:
-        if not path_in_scope(p, scopes, event.get("cwd")):
-            deny("mrh.path",
-                 f"'{tool}' targets '{p[:60]}' outside your granted scope ({'+'.join(scopes)})")
-    if cmd is not None:
-        ok, offending = command_in_scope(cmd, scopes, event.get("cwd"))
-        if not ok:
-            # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
-            # debugging blind (Codex live session, 2026-07-23).
-            deny("mrh.command",
-                 f"'{tool}' command reaches outside your granted scope: '{offending}' is not granted "
-                 f"(granted: {'+'.join(scopes)})")
+
+    # Gate 1c runs FIRST now (Sprint F reorder, matching kimi and the claude adapter): the
+    # governance surface is classified before any policy fetch, so a gate write is refused
+    # AS gate-self even when the daemon is down. Gates 1a/1b live INSIDE evaluate(), below.
 
     # Gate 1c — LOCAL SELF-PROTECTION (the governance closure; Sprint B, §6.B). BEFORE
     # the daemon and never conditional on it, mirroring kimi's position: if this check
@@ -793,6 +658,63 @@ def main():
                  f"and the shared closure classifier is unavailable — failing closed",
                  "Restore plugins/_shared (hestia_governance_closure) or escalate.",
                  innate=True)
+
+    # ── Sprint F (§6.F): THE decision — core evaluate() from an AUTHENTICATED policy path,
+    # or the ratified degraded mode. No silent policy=None / local-replica fallback exists
+    # on this path (§7.1 criterion 5).
+    ev = _core.NormalizedEvent(tool=tool, paths=paths, command=cmd,
+                               cwd=event.get("cwd"), raw=event,
+                               repos=([mcp_repo] if mcp_repo else []))
+    snapshot = None
+    try:
+        m = _load_mechanism()
+        snapshot = m.fetch_policy_snapshot(HESTIA_PLUGIN_ID, host_agent=HESTIA_PLUGIN_ID,
+                                           host_session_id=event.get("session_id"))
+    except Exception:
+        snapshot = None   # an unimportable mechanism == an unreachable daemon: degrade below
+    if snapshot is not None:
+        global _SNAPSHOT_ROLE
+        _SNAPSHOT_ROLE = snapshot.get("role")
+        # The core's seam as built: resolve_agent_policy(vault_reader=...) — the reader is
+        # the LIVE daemon snapshot, which ALWAYS carries an `in_scope` list, so resolution
+        # can never fall through to the local replica on this path.
+        # SPRINT-F: replace with certified snapshot — PARTIAL: `in_scope` carries only the
+        # daemon's live path grants; standing repo scope has NO daemon surface (RED,
+        # F_NOTES.md). The launch-cwd grant rides the core's marked bridge in evaluate().
+        policy = _core.resolve_agent_policy(_CORE_PROFILE,
+                                            vault_reader=lambda _member: snapshot)
+        verdict = _core.evaluate(ev, _CORE_PROFILE, WORKSPACE, policy=policy)
+        if verdict.blocks:
+            deny(verdict.rule, verdict.reason, innate=verdict.innate)
+    elif MODE == "enforce":
+        verdict = _core.degraded_verdict(ev, _CORE_PROFILE)
+        if verdict.blocks and verdict.innate:
+            # The innate egress invariant is a REAL verdict — the transport-free core
+            # decided it without the daemon — so it renders and records as conduct.
+            deny(verdict.rule, verdict.reason, innate=True)
+        elif verdict.blocks:
+            # verdict_available=False routes this through record_gate_unavailable AND the
+            # unified recorder's diagnostic-log fallback (criterion 9(c)) — an infra
+            # posture, never member conduct.
+            witness_decision("deny", verdict.reason, False, verdict_available=False)
+            _tally_scope(False)
+            sys.stderr.write(
+                f"hestia: deny [degraded] — {verdict.reason}. {verdict.remedy}\n")
+            sys.exit(2)
+        else:
+            # allow-read in degraded mode: recorded on the availability telemetry (an infra
+            # series); Gate 2 below is read-class-skipped anyway.
+            _core.record_gate_unavailable(HESTIA_PLUGIN_ID, tool, "unknown",
+                                          "degraded: policy snapshot fetch failed "
+                                          "(allow-read)")
+    else:
+        # warn-rollout shakedown with the daemon unreachable: evaluate against a policy
+        # that grants NOTHING (never the replica), so every boundary surfaces as a warn.
+        policy = _core.AgentPolicy(member_id=HESTIA_PLUGIN_ID, scope=(),
+                                   source="daemon-unreachable", stale=True)
+        verdict = _core.evaluate(ev, _CORE_PROFILE, WORKSPACE, policy=policy)
+        if verdict.blocks:
+            deny(verdict.rule, verdict.reason, innate=verdict.innate)
 
     # Gate 2 — society safety (the governor). Only write/exec-class needs the daemon's verdict;
     # fail closed. Reached IN-PROCESS via the shared mechanism (Sprint E, PRD §6.E) — the same

@@ -9,15 +9,19 @@ engine's default. (This fail-open-on-error behavior is a property of the Claude-
 engines — Kimi, Codex, Cursor, etc. — and is the single most important fact for anyone writing a
 blocking hook for them: the gate itself must be the fail-closed party.)
 
-Three gates, in order:
-  1. SCOPE + EGRESS (local, per-entity, sourced from Kimi's MRH in identity.json). Out-of-scope
-     target, or a forbidden egress/secret path, -> deny. No daemon needed, so a down daemon never
-     bricks this boundary.
+Three gates, in order (Sprint F reordered: self-protection FIRST, matching the claude
+adapter, so a gate-file write is classified as gate-self even when the daemon is down):
   1c. SELF-PROTECTION (local, pre-daemon, ALWAYS enforced): a write-class act whose DESTINATION is
      this plugin's own hook files or the fleet's governance markers is refused and escalated (a
      pre-existing human approval is claimed and spent); reads are allowed and witnessed. Restored
      2026-08-12 after the in-process rewire (PR #372) silently dropped the layer the spawned
      claude gate used to carry — see the marker block below.
+  1. SCOPE + EGRESS — the §6.F cutover: decided by the shared core's evaluate() from a policy
+     snapshot fetched LIVE from the daemon (hestia_gate_mechanism.fetch_policy_snapshot). When
+     the daemon is unreachable in enforce mode the gate takes the RATIFIED DEGRADED MODE
+     (deny-writes-allow-reads, computed by the core; every degraded deny recorded with
+     verdict_available=False) — never a silent policy=None / local-replica fallback
+     (§7.1 criterion 5).
   2. SOCIETY SAFETY (the governor): for write/exec-class tools, delegate to hestia's tested daemon
      caller so the decision reaches the governor and is witnessed. Its deny (or fail-closed-on-
      unreachable) is honored.
@@ -100,16 +104,15 @@ try:
 except Exception:
     _closure_classify = None
 
-# ---- Sprint D (§6.D): law constants live in the core; authority resolves, not guesses ----
+# ---- Sprint D (§6.D) -> Sprint F (§6.F): law lives in the core; the shim only renders ----
 #
 # The legacy trio — `load_in_scope` (permissive `["web4"]`-on-any-failure fallback),
-# `_identity_role`, `launch_cwd_repo` — is DELETED, not shared: each derived authority from
-# harness/cwd/identity-file incidentals. Standing scope now comes from the core's
-# authenticated path (`resolve_agent_policy` -> `AgentPolicy`); the two fields AgentPolicy
-# cannot yet supply (role attribution, the launch-cwd grant) are bridged by the marked
-# TEMPORARY functions after _CORE_PROFILE below. The permissive fallback is NOT bridged —
-# absent data grants nothing, which is the tighter direction. FORBIDDEN/READ_CLASS are now
-# core-sourced (§7.1(1): one list, grep finds it once) and are defined after _CORE_PROFILE.
+# `_identity_role`, `launch_cwd_repo` — is DELETED, not shared. Sprint F completes the
+# cutover: standing scope, egress, and command/path scoping are ALL decided inside the
+# core's evaluate(), from a policy snapshot fetched LIVE from the daemon (the mechanism's
+# fetch_policy_snapshot) — or by the core's ratified degraded_verdict when the daemon is
+# unreachable. The only bridge left shim-side is _role_bridge (attribution only), fed from
+# the snapshot when the daemon answers. READ_CLASS stays core-sourced (§7.1(1)).
 
 
 def path_targets(tool_input):
@@ -142,35 +145,40 @@ _CORE_PROFILE = (_core.HarnessProfile(
     member_id="kimi-code",
     identity_path=IDENTITY,
     home_markers=("~/.kimi-code",),
+    launch_cwd_env="HESTIA_KIMI_LAUNCH_CWD",
 ) if _core is not None else None)
 
-# Innate egress/secret invariants + read-class — ONE list each, in the core (§7.1(1)).
-# Inert placeholders when the core is missing: main() fails closed on `_core is None`
-# before either is consulted, and an empty READ_CLASS reads as "everything is
-# write-class", which is the tighter direction.
-FORBIDDEN = _core.forbidden_tokens(_CORE_PROFILE) if _core is not None else ()
+# Read-class — ONE list, in the core (§7.1(1)). Inert placeholder when the core is
+# missing: main() fails closed on `_core is None` before it is consulted, and an empty
+# READ_CLASS reads as "everything is write-class", which is the tighter direction.
+# (FORBIDDEN has no shim-side copy at all since the F cutover — Gate 1a runs inside
+# evaluate()/degraded_verdict.)
 READ_CLASS = _core.READ_CLASS if _core is not None else frozenset()
 
 
-def _agent_scopes():
-    """Standing scope via the core's authenticated path (resolve_agent_policy -> AgentPolicy).
-    No vault_reader is wired yet, so this resolves from the CERTIFIED local replica or grants
-    NOTHING ('unresolved' / 'replica-uncertified' / 'replica-expired' all -> empty scope).
-    Strictly tighter than the deleted load_in_scope, which returned a fixed one-repo guess on
-    ANY failure — a guess that GRANTS. The wildcard is dropped for the same reason evaluate()
-    drops it on a stale policy: without a vault_reader every resolution here is stale, and
-    '*' from a member-writable replica must never widen.
-    # SPRINT-F: replace with certified snapshot (vault_reader wired; evaluate() cutover)."""
-    pol = _core.resolve_agent_policy(_CORE_PROFILE)
-    return [s for s in pol.scope if s != _core.AgentPolicy.UNSCOPED]
+# ── Sprint F (§6.F): _agent_scopes deleted — standing scope now arrives inside
+# evaluate()'s policy argument, resolved from the LIVE daemon snapshot in main(); nothing
+# shim-side computes scope any more.
+# SPRINT-F: replace with certified snapshot — PARTIAL: the daemon exposes NO standing
+# `in_scope` surface (only live path grants via hestia_scope_status), so a snapshot
+# carries live grants plus the core's launch-cwd bridge and nothing else. Declared RED in
+# F_NOTES.md; the local replica is OFF the enforce path entirely (§7.1 criterion 5).
+
+
+_SNAPSHOT_ROLE = None  # set by main() from the live daemon snapshot (identity.role)
 
 
 def _role_bridge():
-    """TEMPORARY, attribution-only: the role string that witnesses/connects carry. Never used
-    to widen reach — deriving authority from this member-writable file is exactly what §6.D
-    deleted. Same read and same constellation-member fallback the deleted _identity_role had,
-    kept so the witness grain does not silently change mid-train.
-    # SPRINT-F: replace with certified snapshot (role from the vault policy, not identity.json)."""
+    """Attribution-only: the role string that witnesses/connects carry. Never used to widen
+    reach. Sprint F: RESOLVED from the live snapshot when the daemon answered — the
+    daemon's session-resolved role (hestia_operating_law identity.role) wins over the
+    member-writable identity.json; the file read remains ONLY as the daemon-absent
+    fallback for witness attribution, where the alternative is silently changing the
+    witness grain mid-train.
+    # SPRINT-F: replace with certified snapshot — PARTIAL: resolved when the daemon
+    # answers; the identity.json fallback stays for the unreachable case (F_NOTES.md)."""
+    if isinstance(_SNAPSHOT_ROLE, str) and _SNAPSHOT_ROLE.startswith("role:"):
+        return _SNAPSHOT_ROLE
     try:
         r = json.load(open(IDENTITY, encoding="utf-8")).get("role")
         if isinstance(r, str) and r.startswith("role:"):
@@ -180,18 +188,12 @@ def _role_bridge():
     return "role:constellation:member"
 
 
-def _launch_scope_bridge():
-    """TEMPORARY: the per-launch cwd grant (dp 2026-07-21: 'whatever cwd we launch it in').
-    The ratified target sources this as an EXPLICIT launch-cwd grant in the certified policy
-    snapshot; until that lands this carries the same single-segment grant the deleted
-    launch_cwd_repo computed — no weaker, no wider (one workspace child, never '*').
-    # SPRINT-F: replace with certified snapshot (explicit launch-cwd grant)."""
-    cwd = (os.environ.get("HESTIA_KIMI_LAUNCH_CWD") or os.getcwd()).replace("\\", "/")
-    if WORKSPACE in cwd:
-        rest = cwd.split(WORKSPACE, 1)[1].lstrip("/")
-        seg = rest.split("/", 1)[0] if rest else ""
-        return [seg] if seg else []
-    return []
+# ── Sprint F (§6.F): _launch_scope_bridge deleted — the per-launch cwd grant is computed
+# inside evaluate() (the core's marked launch_cwd_repo bridge, parameterised by
+# HarnessProfile.launch_cwd_env below), so the shim no longer holds a scope computation.
+# The grant itself is still env/cwd-derived pending a daemon surface:
+# SPRINT-F: replace with certified snapshot (explicit launch-cwd grant) — the daemon has
+# no such surface yet; the core-side bridge stays, declared RED in F_NOTES.md.
 
 
 def path_in_scope(path, scopes, cwd=None):
@@ -709,34 +711,13 @@ def main():
     _EVENT.clear(); _EVENT.update(event)
     tool = event.get("tool_name") or "?"
     tinput = event.get("tool_input") or {}
-    # §6.D: standing scope resolves through the core's authenticated path (grants NOTHING
-    # when nothing certifiable resolves); the launch-cwd grant rides the marked bridge.
-    scopes = _agent_scopes() + _launch_scope_bridge()
     paths = path_targets(tinput)
     cmd = command_of(tinput)
 
-    # Gate 1a — egress/secret innate invariant (denied even inside a granted repo). ALWAYS enforced
-    # (innate): a leaked read is irreversible egress, so it is not subject to warn-rollout.
-    for blob in paths + ([cmd] if cmd else []):
-        if any(f in blob.lower() for f in FORBIDDEN):
-            deny("egress.secret",
-                 f"'{tool}' touches a forbidden path (secret/credential or out-of-MRH private repo)",
-                 innate=True)
-
-    # Gate 1b — MRH scope (per-entity, from Kimi's identity). File paths use path-scope; shell
-    # commands use command-scope (out-of-scope repo tokens + root-glob).
-    for p in paths:
-        if not path_in_scope(p, scopes, event.get("cwd")):
-            deny("mrh.path",
-                 f"'{tool}' targets '{p[:60]}' outside your granted scope ({'+'.join(scopes)})")
-    if cmd is not None:
-        ok, offending = command_in_scope(cmd, scopes, event.get("cwd"))
-        if not ok:
-            # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
-            # debugging blind (Codex live session, 2026-07-23).
-            deny("mrh.command",
-                 f"'{tool}' command reaches outside your granted scope: '{offending}' is not granted "
-                 f"(granted: {'+'.join(scopes)})")
+    # Gate 1c runs FIRST now (Sprint F reorder, matching the claude adapter): the
+    # governance surface is classified before any policy fetch, so a gate write is refused
+    # AS gate-self — with its escalation — even when the daemon is down (a degraded deny
+    # would otherwise mask the class). Gates 1a/1b live INSIDE the core's evaluate(), below.
 
     # Gate 1c — local self-protection. BEFORE the daemon and never conditional on it: if this
     # check needed a verdict, "stop the daemon, then edit the gate" would be the same evasion one
@@ -783,7 +764,76 @@ def main():
             # run; approving a gate edit is not approving everything else the call might do.
             sys.stderr.write(f"hestia: gate write APPROVED — {detail}\n")
 
-    # Gate 2 — society safety (the governor). Read-class already fully covered by the local gates;
+    # ── Sprint F (§6.F): THE decision — core evaluate() from an AUTHENTICATED policy path,
+    # or the ratified degraded mode. No silent policy=None / local-replica fallback exists
+    # on this path (§7.1 criterion 5): a snapshot is fetched LIVE from the daemon; when
+    # that fails in enforce mode the core's degraded_verdict decides
+    # (deny-writes-allow-reads), and every degraded deny is recorded with
+    # verdict_available=False.
+    ev = _core.NormalizedEvent(tool=tool, paths=paths, command=cmd,
+                               cwd=event.get("cwd"), raw=event)
+    snapshot = None
+    try:
+        from hestia_gate_mechanism import fetch_policy_snapshot
+        snapshot = fetch_policy_snapshot(HESTIA_PLUGIN_ID, host_agent=HESTIA_PLUGIN_ID,
+                                         host_session_id=event.get("session_id"))
+    except Exception:
+        snapshot = None   # an unimportable mechanism == an unreachable daemon: degrade below
+    if snapshot is not None:
+        global _SNAPSHOT_ROLE
+        _SNAPSHOT_ROLE = snapshot.get("role")
+        # The core's seam as built: resolve_agent_policy(vault_reader=...) — the reader
+        # returns this member's policy dict; here that dict is the LIVE daemon snapshot,
+        # which ALWAYS carries an `in_scope` list, so resolution can never fall through to
+        # the local replica on this path.
+        # SPRINT-F: replace with certified snapshot — PARTIAL: `in_scope` carries only the
+        # daemon's live path grants; standing repo scope has NO daemon surface (RED,
+        # F_NOTES.md). The launch-cwd grant rides the core's marked bridge in evaluate().
+        policy = _core.resolve_agent_policy(_CORE_PROFILE,
+                                            vault_reader=lambda _member: snapshot)
+        verdict = _core.evaluate(ev, _CORE_PROFILE, WORKSPACE, policy=policy)
+        if verdict.blocks:
+            deny(verdict.rule, verdict.reason, innate=verdict.innate)
+    elif MODE == "enforce":
+        verdict = _core.degraded_verdict(ev, _CORE_PROFILE)
+        if verdict.blocks and verdict.innate:
+            # The innate egress invariant is a REAL verdict — the transport-free core
+            # decided it without the daemon — so it renders and records as conduct.
+            deny(verdict.rule, verdict.reason, innate=True)
+        elif verdict.blocks:
+            _core.record_gate_unavailable(HESTIA_PLUGIN_ID, tool, "unknown",
+                                          "degraded: policy snapshot fetch failed (deny)")
+            try:
+                from hestia_gate_mechanism import witness_decision_unified, _extract_target
+                witness_decision_unified(
+                    None, plugin_id=HESTIA_PLUGIN_ID, decision="deny",
+                    rule=verdict.rule, tool_name=tool,
+                    target=_extract_target(tinput, tool),
+                    session_id=event.get("session_id"),
+                    verdict_available=False,   # infra posture — never member conduct
+                    attempted_summary=_attempted_summary(_EVENT))
+            except Exception:
+                pass  # recording must never turn a deny into a crash (this engine fails open)
+            _tally_scope(False)
+            sys.stderr.write(
+                f"hestia: deny [degraded] — {verdict.reason}. {verdict.remedy}\n")
+            sys.exit(2)
+        else:
+            # allow-read in degraded mode: recorded on the availability telemetry (an infra
+            # series); Gate 2 below is read-class-skipped anyway.
+            _core.record_gate_unavailable(HESTIA_PLUGIN_ID, tool, "unknown",
+                                          "degraded: policy snapshot fetch failed "
+                                          "(allow-read)")
+    else:
+        # warn-rollout shakedown with the daemon unreachable: evaluate against a policy
+        # that grants NOTHING (never the replica), so every boundary surfaces as a warn.
+        policy = _core.AgentPolicy(member_id=HESTIA_PLUGIN_ID, scope=(),
+                                   source="daemon-unreachable", stale=True)
+        verdict = _core.evaluate(ev, _CORE_PROFILE, WORKSPACE, policy=policy)
+        if verdict.blocks:
+            deny(verdict.rule, verdict.reason, innate=verdict.innate)
+
+    # Gate 2 — society safety (the governor). Read-class already fully covered by the core;
     # only write/exec-class needs the daemon's destructive/secret verdict — reached IN-PROCESS via
     # the shared mechanism (PR #371), NOT by spawning the claude gate as a subprocess off /mnt/c,
     # cold, every call. That subprocess path was the structural cause of kimi's idle-box timeouts
