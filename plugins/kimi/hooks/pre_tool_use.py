@@ -73,6 +73,23 @@ CLAUDE_PRE = os.environ.get(
     "HESTIA_SOCIETY_GATE",
     os.path.join(WORKSPACE, "hestia/plugins/claude-code/hooks/pre_tool_use.py"))
 
+# ---- Shared gate core (gate-consolidation PRD §6.C — the consented pilot) -------------
+# The hardened scope predicates live ONCE, in the shared core module under
+# plugins/_shared/: path-boundary containment (compare at the separator, not
+# substring/prefix) and resolve-before-segment traversal (normpath first, containment
+# decides). Same sys.path pattern as the Gate 2 mechanism import in main(). GUARDED,
+# deliberately: on this engine an import failure IS a fail-open (see the attestation block
+# below for the measured class), so a missing/broken core must surface as an explicit
+# fail-closed deny inside main() — the `_core is None` check there — never as a
+# module-level crash.
+_SHARED_DIR = os.path.join(WORKSPACE, "hestia", "plugins", "_shared")
+if _SHARED_DIR not in sys.path:
+    sys.path.insert(0, _SHARED_DIR)
+try:
+    import hestia_gate_core as _core
+except Exception:
+    _core = None
+
 # Innate egress/secret invariants — denied even inside a granted repo. Trust never relaxes these (S1).
 # Universal secret/credential patterns here; add your own private-repo names via HESTIA_FORBIDDEN_EXTRA.
 FORBIDDEN = ("/.ssh", ".env", "credentials", "id_rsa", "id_ed25519", "/.git/config", "secrets") + tuple(
@@ -139,112 +156,32 @@ def command_of(tool_input):
     return None
 
 
-def _all_repos():
-    try:
-        return [d for d in os.listdir(WORKSPACE)
-                if os.path.isdir(os.path.join(WORKSPACE, d)) and not d.startswith(".")]
-    except Exception:
-        # If the workspace listing fails, degrade to root-glob detection only (no static inventory in
-        # the generic adapter — set HESTIA_WORKSPACE so the live listing works). deny-known-out is
-        # better than allow-all, but we don't ship a hardcoded repo list here.
-        return []
+# The core's predicates are parameterized by a HarnessProfile; kimi's harness facts live
+# here ONCE (identity location + home marker — of these only home_markers moves a scope
+# verdict). Built at import so a broken core is caught by the one `_core is None` check in
+# main() rather than per call.
+_CORE_PROFILE = (_core.HarnessProfile(
+    member_id="kimi-code",
+    identity_path=IDENTITY,
+    home_markers=("~/.kimi-code",),
+) if _core is not None else None)
 
 
 def path_in_scope(path, scopes, cwd=None):
-    """A file path is in-scope if it's the agent's home, /tmp, or under a granted repo.
-    Relative paths resolve against the event cwd — 'scripts/x' inside a granted repo is that
-    repo's subdir, not the workspace-root 'scripts' dir (same class as the command-scope
-    false-deny, 2026-07-23)."""
-    p = path.replace("\\", "/")
-    low = p.lower()
-    if "~/.kimi-code" in low or low.startswith(os.path.expanduser("~/.kimi-code").lower()):
-        return True
-    if not p.startswith("/") and not p.startswith("~"):
-        cwd = (cwd or os.getcwd()).replace("\\", "/")
-        p = os.path.normpath(os.path.join(cwd, p)).replace("\\", "/")
-    if p.startswith(("/tmp", "/var/tmp")):
-        return True
-    if WORKSPACE in p:
-        rest = p.split(WORKSPACE, 1)[1].lstrip("/")
-        seg = rest.split("/", 1)[0] if rest else ""
-        if seg == "":
-            return False       # bare workspace root (the glob-the-root antipattern) -> out of scope
-        return seg in scopes
-    # Absolute path outside the workspace (and not home/tmp): conservative deny, as before.
-    return False
+    """Call-site adapter to the core's hardened predicate (shim adapts to law, never law to
+    shim): supplies WORKSPACE and this harness's profile, keeps the local call shape. The
+    hardened semantics — home/tmp/workspace judged by PATH BOUNDARY, every spelling
+    normalised BEFORE a segment is read — now come from the one shared implementation."""
+    return _core.path_in_scope(path, scopes, WORKSPACE, _CORE_PROFILE, cwd)
 
 
 def command_in_scope(cmd, scopes, cwd=None):
-    """Returns (ok, offending_token). A reach is judged by WHERE IT RESOLVES, not what it
-    lexically mentions: (1) absolute workspace references (ALL occurrences) must land in a
-    granted repo (bare root denies); (2) relative path tokens resolve against the event cwd —
-    'scripts/foo.py' inside a granted repo is that repo's subdir, NOT the workspace-root
-    'scripts' dir. Lexical mention-scanning false-denied both classes (found live via the
-    Codex gate, 2026-07-23; same matcher). Relative traversal that never names a path
-    (`grep -r .`) still escapes string parsing — the engine sandbox is the fs boundary."""
-    ws = WORKSPACE.rstrip("/")
-    parts = cmd.split(WORKSPACE)
-    for after in parts[1:]:
-        head = after.lstrip("/")
-        head = re.split(r"""[\s"'`);&|<>]""", head, 1)[0]
-        head = head.split("/", 1)[0]
-        if head not in scopes:
-            return False, (head or "<workspace root>")
-    # Pass 2 — relative tokens. The event cwd is NOT reliable for these: the engine may run
-    # each command with a per-command workdir the hook event does not carry (observed live via
-    # the Codex gate: event cwd = session launch dir while the command ran inside a granted
-    # repo — 'scripts'/'Research'/'simulations'/branch-prefix 'agent/' all false-denied,
-    # 2026-07-23). A relative token is judged by its PLAUSIBLE interpretations — the event cwd
-    # plus every granted repo root — voting by what EXISTS: an existing in-scope
-    # interpretation passes; an existing out-of-scope interpretation with NO in-scope
-    # alternative denies; a token that exists nowhere is not a reach. Residual (documented,
-    # accepted): a root-workdir command naming a dir that ALSO exists in a granted repo
-    # passes — the engine sandbox, not this string check, is the fs boundary.
-    cwd = (cwd or os.getcwd()).replace("\\", "/")
-    bases = [cwd] + [f"{ws}/{s2}" for s2 in scopes]
-    oos_names = {r for r in _all_repos() if r not in scopes}
-    probes = 0
-    for raw in re.split(r"""[\s;|&<>()'"`]+""", cmd):
-        for tok in raw.split("="):
-            tok = tok.strip()
-            if (not tok or tok.startswith(("-", "/")) or ":" in tok
-                    or tok.strip(".") == ""):
-                continue
-            first = tok.split("/", 1)[0]
-            if "/" not in tok and first not in oos_names:
-                continue
-            # A bare member plugin-id is an ADDRESS (mesh notify targets, tool
-            # args), not a filesystem reach — even when a same-named directory
-            # exists at the workspace root (live false-deny: kimi's mesh ack
-            # 'send claude-code ack <ptr>' denied on the claude-code DIR,
-            # 2026-07-24). With a slash it is a path again and votes normally.
-            if "/" not in tok and tok in ("claude-code", "kimi-code", "codex-cli"):
-                continue
-            if probes >= 40:
-                break     # bound fs probing under the engine hook clamp
-            probes += 1
-            comps = tok.split("/")
-            k = 0
-            while k < len(comps) and comps[k] == "..":
-                k += 1
-            probe = "/".join(comps[:k + 1]) if k < len(comps) else "/".join(comps)
-            in_scope_vote, oos_vote = False, None
-            for base in bases:
-                cand = os.path.normpath(os.path.join(base, probe)).replace("\\", "/")
-                if not os.path.exists(cand):
-                    continue
-                if cand == ws:
-                    oos_vote = oos_vote or "<workspace root>"
-                    continue
-                if cand.startswith(ws + "/"):
-                    seg = cand[len(ws) + 1:].split("/", 1)[0]
-                    if seg in scopes:
-                        in_scope_vote = True
-                        break
-                    oos_vote = seg
-            if not in_scope_vote and oos_vote:
-                return False, oos_vote
-    return True, None
+    """Call-site adapter to the core's hardened predicate. Same (ok, offending_token)
+    contract as the deleted local copy; the hardened semantics — every workspace token
+    RESOLVED (normpath) before a segment is read off it, traversal out of the workspace
+    denied at the boundary — now come from the one shared implementation, along with the
+    existence-voting pass for relative tokens and the member-address carve-out."""
+    return _core.command_in_scope(cmd, scopes, WORKSPACE, cwd)
 
 
 # Rollout mode: DENY-TIGHT by default (dp 2026-07-21) — a foreign agent starts enforced and RELAXES
@@ -723,6 +660,19 @@ def main():
 
     if event.get("hook_event_name") != "PreToolUse":
         sys.exit(0)  # not our event
+
+    # Tier-2 backstop (gate-consolidation PRD §7.1 criterion 9): Gate 1b's scope predicates
+    # now live in the shared core, so a core that failed to import leaves this gate unable
+    # to decide scope at all. Letting Gate 1b raise instead would exit 1, which this engine
+    # reads as ALLOW — the import-failure fail-open documented at the attestation block.
+    # Deny outright, like the parse deny above: this is the gate unable to decide, not a
+    # policy verdict, so warn-rollout does not apply. (This TIGHTENS the ratified degraded
+    # posture — deny-writes-allow-reads; per-shim tighten-only is explicitly allowed — the
+    # rare shim-level import-failure path carries no READ_CLASS carve-out.)
+    if _core is None:
+        sys.stderr.write("hestia: deny [gate] — the shared gate core could not be loaded; "
+                         "failing closed.\n")
+        sys.exit(2)
 
     _EVENT.clear(); _EVENT.update(event)
     tool = event.get("tool_name") or "?"
