@@ -819,6 +819,10 @@
   .hub-post pre { white-space: pre-wrap; margin: 0; font: inherit; font-size: 0.85rem; }
   .hub-post .hub-topic-by { margin: 0.1rem 0 0; }
   .hub-reply { display: flex; gap: 0.4rem; align-items: center; margin: 0.3rem 0 0; flex-wrap: wrap; }
+  .hub-urls { margin: 0.3rem 0 0.6rem; }
+  .hub-urls summary { font-size: 0.75rem; color: var(--fg-dim); cursor: pointer; }
+  .hub-urls select { flex: 1 1 14rem; font: inherit; font-size: 0.8rem; color: var(--fg);
+    background: var(--bg-elev, transparent); border: 1px solid var(--border); border-radius: 6px; padding: 0.3rem 0.4rem; }
 </style>
 </head>
 <body>
@@ -972,6 +976,23 @@
         <span class="hub-state" id="hub-state">checking…</span>
       </div>
       <p class="hub-meta" id="hub-meta"></p>
+      <!-- Known-hub list (#307 API): view/retarget without rebuild or relaunch.
+           Collapsed by default — retargeting is an occasional operator act, not
+           part of the daily read path. -->
+      <details class="hub-urls" id="hub-urls-box">
+        <summary id="hub-urls-summary">hubs…</summary>
+        <div class="hub-compose">
+          <select id="hub-urls-select"></select>
+          <button class="policy-btn" id="hub-urls-activate">set active</button>
+          <button class="policy-btn" id="hub-urls-remove">remove</button>
+        </div>
+        <div class="hub-compose">
+          <input id="hub-urls-add-url" placeholder="https://new-hub.example.org">
+          <input id="hub-urls-add-label" placeholder="label (optional)" style="flex:0 1 10rem">
+          <button class="policy-btn" id="hub-urls-add">add + switch</button>
+        </div>
+        <span class="hub-note" id="hub-urls-note"></span>
+      </details>
       <div class="hub-join" id="hub-join" hidden>
         <input id="hub-join-name" placeholder="display name (optional)" maxlength="60">
         <button class="policy-btn" id="hub-join-btn">join hub</button>
@@ -3147,10 +3168,80 @@
 
   // Let the main script nudge a refresh the moment the operator switches to the hubs view,
   // instead of waiting out this IIFE's own poll clock. (See setView in the main script.)
-  window.__hubRefresh = () => { hubStatus(); hubTopics(); };
+  // hubUrls included (codex review, PR #384): without it, the pre-sign-in 401
+  // left the hub list permanently "unavailable" — status/topics recover via
+  // this hook and the poll, and the list must recover with them.
+  window.__hubRefresh = () => { hubStatus(); hubTopics(); hubUrls(); };
+
+  // ---- known-hub list (#307): view + retarget, no rebuild/relaunch ----------
+  async function hubUrls() {
+    try {
+      const r = await hubFetch('/api/hub/urls', { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      const sel = $('hub-urls-select');
+      sel.innerHTML = '';
+      for (const e of (d.entries || [])) {
+        const o = document.createElement('option');
+        o.value = e.url;
+        o.textContent = (e.label ? e.label + ' — ' : '') + e.url
+          + (e.url === d.resolved ? '  ●' : '');
+        if (e.url === (d.active || d.resolved)) o.selected = true;
+        sel.appendChild(o);
+      }
+      if (!(d.entries || []).length) {
+        const o = document.createElement('option');
+        o.value = ''; o.textContent = '(list empty — using ' + d.source + ')';
+        sel.appendChild(o);
+      }
+      $('hub-urls-summary').textContent = 'hub: ' + d.resolved + '  (' + d.source + ')'
+        + (d.env_override_active ? ' — env override wins; list edits will not retarget' : '');
+    } catch (e) { $('hub-urls-summary').textContent = 'hubs: unavailable (' + e.message + ')'; }
+  }
+  function hubRetargeted(msg) {
+    note('hub-urls-note', 'ok', msg);
+    hubUrls(); hubStatus(); hubTopics();
+  }
+  $('hub-urls-activate').addEventListener('click', async () => {
+    const url = $('hub-urls-select').value;
+    if (!url) { note('hub-urls-note', 'warn', 'nothing selected'); return; }
+    try {
+      const r = await hubFetch('/api/hub/urls/active', { method: 'PUT',
+        headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url }) });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok) hubRetargeted('active: ' + url);
+      else note('hub-urls-note', 'err', d.error || ('HTTP ' + r.status));
+    } catch (e) { note('hub-urls-note', 'err', e.message); }
+  });
+  $('hub-urls-remove').addEventListener('click', async () => {
+    const url = $('hub-urls-select').value;
+    if (!url) { note('hub-urls-note', 'warn', 'nothing selected'); return; }
+    try {
+      const r = await hubFetch('/api/hub/urls', { method: 'DELETE',
+        headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url }) });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok) hubRetargeted('removed: ' + url);
+      else note('hub-urls-note', 'err', d.error || ('HTTP ' + r.status));
+    } catch (e) { note('hub-urls-note', 'err', e.message); }
+  });
+  $('hub-urls-add').addEventListener('click', async () => {
+    const url = $('hub-urls-add-url').value.trim();
+    if (!url) { note('hub-urls-note', 'warn', 'enter a URL'); return; }
+    const label = $('hub-urls-add-label').value.trim();
+    try {
+      const r = await hubFetch('/api/hub/urls', { method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ url, ...(label ? { label } : {}), activate: true }) });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok) { $('hub-urls-add-url').value = ''; $('hub-urls-add-label').value = '';
+        hubRetargeted('added + active: ' + url); }
+      else note('hub-urls-note', 'err', d.error || ('HTTP ' + r.status));
+    } catch (e) { note('hub-urls-note', 'err', e.message); }
+  });
 
   hubStatus();
   hubTopics();
+  hubUrls();
   setInterval(() => { hubStatus(); hubTopics(); }, HUB_POLL_MS);
 })();
 </script>
