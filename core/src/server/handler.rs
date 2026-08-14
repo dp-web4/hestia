@@ -775,9 +775,23 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
 
     let rep_action_id = action_id.to_string();
     let rep_ctx = crate::reputation::RepContext {
-        // The member ran a tool and hestia observed the outcome directly —
-        // conduct hestia established, not a report it was handed.
-        class: crate::reputation::DeltaClass::Conduct,
+        // CALLER-REPORTED outcome, not an observation. `success`, `magnitude`
+        // and `error` all arrive in `args` — the PostToolUse witness hook
+        // derives `success` from the tool response and forwards it. That
+        // establishes THAT the call failed, never WHY, so the causal basis for
+        // conduct is absent.
+        //
+        // The seam this closes (web4 #703 review): infra failure → caller
+        // reports success=false → this handler → `Conduct`. Claiming conduct
+        // here recreates the exact infra-as-conduct conflation R7a removes,
+        // and the earlier `Conduct` on this site did precisely that on the
+        // strength of "hestia observed it" — which is not what the handler
+        // does.
+        //
+        // Held until the hook/API can carry an explicit class whose causal
+        // basis it actually establishes. Not inferred from success/failure,
+        // error text, action_type, reason, or delta sign.
+        class: crate::reputation::DeltaClass::Unclassified,
         role_lct: &role_lct,
         action_type: "tool_execution",
         action_target: &action.tool_name,
