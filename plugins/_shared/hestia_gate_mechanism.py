@@ -635,12 +635,23 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
                     p = g.get("path") if isinstance(g, dict) else None
                     if isinstance(p, str) and p.strip():
                         snap["scope_grants"].append(p.strip())
-                        # The seam as built: resolve_agent_policy parses "path:" entries.
-                        # An ABSOLUTE granted path is carried faithfully but is inert
-                        # against the core's segment-keyed scope model — declared RED in
-                        # the Sprint F notes rather than widened here into a repo grant
-                        # nobody made (a file grant must not front for its whole repo).
-                        snap["in_scope"].append("path:" + p.strip())
+                        # A grant for a REPO ROOT under the workspace maps to that repo
+                        # NAME — the form evaluate()'s segment-keyed model admits. Measured
+                        # 2026-08-14 (kimi, first post-install session): "path:" entries are
+                        # INERT (Sprint F R2), so every deny named hestia_request_scope as
+                        # the remedy while a granted path could not actually admit — a
+                        # remedy that cannot deliver. Deeper-than-root grants keep the
+                        # faithful-but-inert "path:" form: a FILE grant must not front for
+                        # its whole repo (the original conservatism, still binding).
+                        _pp = os.path.realpath(os.path.expanduser(p.strip()))
+                        _ws = os.path.realpath(os.path.expanduser(
+                            os.environ.get("HESTIA_WORKSPACE",
+                                           "/mnt/c/exe/projects/ai-agents")))
+                        _par, _name = os.path.split(_pp.rstrip("/"))
+                        if _par == _ws and _name:
+                            snap["in_scope"].append(_name)
+                        else:
+                            snap["in_scope"].append("path:" + p.strip())
         return snap
     except Exception as e:  # noqa: BLE001 — any failure is "unreachable"; the caller degrades
         _snapshot_unavailable(
