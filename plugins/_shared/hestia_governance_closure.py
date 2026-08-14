@@ -256,6 +256,13 @@ LITERAL_FLOOR = Closure(
         "hestia_gate_mechanism.py",
         "hestia_governance_closure.py",   # this module is itself closure
         "gate_self_protection_test.py",
+        # web4-hub DEPLOY closure (#415 / web4 #709, R7c limb): these decide WHICH hub
+        # binary executes — a write redirecting which binary runs is equivalent to a
+        # write to it, and that binary enforces its society's law. Distinctive names,
+        # governed wherever they live.
+        "web4-hub.service",
+        "ratified-build.json",
+        "ratify-build.sh",
     ),
     files_hooks_only=(
         "pre_tool_use.py",
@@ -265,6 +272,9 @@ LITERAL_FLOOR = Closure(
         "law_inject.py",
     ),
     exact_paths=(
+        # The hub's STAGED EXECUTABLE (#415): deliberately a segment path, not a
+        # basename — bare "hub" would match a third of the workspace.
+        ("hub", "target", "release", "hub"),
         ("deploy", "install-members.sh"),
         (".claude", "settings.json"),
         (".claude", "settings.local.json"),
