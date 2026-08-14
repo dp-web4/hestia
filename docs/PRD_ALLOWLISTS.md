@@ -2,7 +2,9 @@
 
 **Status**: proposed — dp-directed 2026-08-14; design PRD, not started; builds on #431's vault-backed operator-walled store; hub twin to follow.
 **Author**: claude-code (CBP), 2026-08-14
-**Operator ruling folded in (dp, 2026-08-14)**: *"i agree with your instinct. consolidation whenever practical is the best way to ensure effective maintenance, clarity, and applying the law uniformly."* — asked whether #431's standing-scope store should become the FILES axis of this system or stay separate. **It becomes the FILES axis.** One store, two axes, one generation counter, one export, one editor, one set of duration semantics. This was drafted as an open question; it is now §2.0 and §3.4, and it is settled.
+**Operator rulings folded in (dp, 2026-08-14)** — both were drafted here as open questions and are now settled design:
+- **Q4 → consolidate.** *"i agree with your instinct. consolidation whenever practical is the best way to ensure effective maintenance, clarity, and applying the law uniformly."* #431's standing-scope store **becomes the FILES axis** of this system. One store, two axes, one generation counter, one export, one editor, one set of duration semantics. See **§2.0** (the principle) and **§3.4/§3.5** (the store and its migration).
+- **Q3 → a bootstrap ratchet.** *"start ceremony-light and have the option to ratchet things up to match increasing resources. we want the sufficiently-correct path to be the easy path."* The ceremony required to edit the society floor is a **declared, stored tier** that ratchets up, whose lowering must pay the tier being lowered *from*. See **§3.6**.
 **Relates to**: `docs/PRD_GATE_CONSOLIDATION.md` (§4 LAW/SHIM/AGENT, §7.1 criterion 5), `docs/GATE_SPRINT_F_NOTES.md` (R1/R2/R3), `docs/PRD_GOVERNANCE.md` (the one-authority-path invariant), `docs/PRD_CONFIG_IN_VAULT.md`, PR #431 (merged — the store pattern this reuses), issues #434 (claim-window race), #435 (permissive renders green), #438 (gauge referent), #393 (friction manufactures bypass).
 
 ---
@@ -184,7 +186,10 @@ than writing a second one**:
   "generation": 41,                       // continues across the bump, never reset
   "society": { "tools": [ {…entry…} ], "files": [ {…entry…} ] },
   "grants":  [ {…StandingGrant…} ],       // = members[*].files, exactly today's rows
-  "tools":   [ {…ToolGrant…} ] }          // = members[*].tools, empty on every old doc
+  "tools":   [ {…ToolGrant…} ],           // = members[*].tools, empty on every old doc
+  "ceremony": { "tier": "operator-only",  // §3.6 — ABSENT reads as tier 0, never as tier 3
+                "society_consequence": "research-single-host",
+                "raised_count": 0, "table": { /* kind × consequence → tier, §3.6.5 */ } } }
 ```
 
 (The per-member view the UI and the export render — `members[m] = {tools, files}` — is a
@@ -334,6 +339,9 @@ pub struct StandingScopeStore {          // name kept through the bump; renaming
     #[serde(default)] pub grants: Vec<StandingGrant>,   // = members[*].files, as today
     #[serde(default)] pub tools: Vec<ToolGrant>,        // NEW axis, empty on every old doc
     #[serde(default)] pub society: SocietyFloor,        // NEW layer, empty on every old doc
+    // NEW. `Default` = tier 0 (§3.6.2): absence must read DOWN, or the floor editor
+    // bricks on the day it ships — the Q3 failure reintroduced by the fix for it.
+    #[serde(default)] pub ceremony: Ceremony,
 }
 ```
 
@@ -356,6 +364,192 @@ act afterwards, which is a change dp makes deliberately rather than one a migrat
 - **Negative control:** a fixture with a grant deliberately deleted must make
   `migration_preserves_every_standing_grant` FAIL. Without this arm, a preservation test that
   silently passes on an empty store proves nothing.
+
+### 3.6 The ceremony ratchet — how much authority a floor edit requires, and how that grows
+
+**Operator ruling (dp, 2026-08-14), on what was Q3:**
+
+> "on q3, like with everything else, we need a bootstrap ratchet. start ceremony-light and have
+> the option to ratchet things up to match increasing resources. we want the
+> sufficiently-correct path to be the easy path. i suspect it will eventually depend on the KIND
+> of society expansion being contemplated, and definitely on how complex/consequential a society
+> is in the first place."
+
+#### 3.6.1 The north star, and why it is a *security* argument
+
+> **"We want the sufficiently-correct path to be the easy path."**
+
+This is `CLAUDE.md`'s efficiency-attractor doctrine applied to ceremony. The attractor is
+structural, not behavioural: the shortest path to completing a task is a deep basin, and
+"try harder" is not an architecture. **A bar set above the resources available to satisfy it does
+not produce more rigor. It produces route-arounds** — and #393 measured exactly that at the gate:
+a false-positive refusal on a benign `flock` command drove the identical shell into a script file
+run as `bash <script>`, which the gate allowed. The friction manufactured the bypass. A ceremony
+nobody can complete manufactures the same thing one layer up: the floor never gets written, and
+every widening arrives as a member expansion instead — which is the exact inversion of dp's
+design (§0: the floor is the minimum, member lists expand).
+
+So the operative rule, stated as a constraint on the design rather than as advice:
+
+> **A ceremony tier is correct only if it is satisfiable today, by the people who must satisfy
+> it.** An unsatisfiable tier is not a stricter policy; it is an unwritten one. Raising the tier
+> as resources arrive is the ratchet's job — not the initial setting's.
+
+That is precisely the finding that raised Q3 and it survives the ruling intact: the
+`SovereignPlusPeer` bar has never scored a lifetime invitation and its corroboration filter is
+uninstalled. Under this section that is no longer a blocker — it is simply a **tier this society
+has not yet ratcheted to**, and the design says so out loud rather than shipping a bar that
+cannot close.
+
+#### 3.6.2 Tiers are declared and stored, never implied
+
+The required ceremony is a **stored value**, not a property emergent from which code path an
+edit happens to take. It lives beside the floor, in the same document (§3.5), so it moves with
+the policy it governs and is covered by the same generation counter:
+
+| tier | name | evidence required | satisfiable today? |
+|---|---|---|---|
+| 0 | `operator-only` | one challenge-signed operator session (`authenticate_operator`) | **yes — bootstrap default** |
+| 1 | `operator-plus-witness` | tier 0 + a second *witnessing* identity recorded on the act (not a second approver — an observer whose record is chain-anchored) | yes, mechanically; needs a designated witness seat |
+| 2 | `sovereign-plus-peer` | `gate_escalation.rs::Bar::SovereignPlusPeer` — operator plus a corroborating peer member | **no — the bar has never scored; corroboration filter uninstalled** |
+| 3 | `quorum` | N-of-M named identities | not built |
+
+**Bootstrap default = tier 0, `operator-only`**, and the rationale is the Q3 finding, kept
+stated: a bar that cannot be satisfied means the floor never gets written and every widening
+becomes a member expansion. Tier 0 is not "no ceremony" — it is the challenge-signed Ed25519 LCT
+operator session that already walls #431's endpoints. It is the *lightest sufficiently-correct*
+setting for a one-machine research society, and that is the whole claim being made.
+
+**An absent tier declaration reads as tier 0, not as tier 3.** This matters at exactly one
+moment — the migration (§3.5), where a pre-upgrade document has no tier field at all. Defaulting
+absence upward would brick the floor editor on the day it ships (unsatisfiable tier 2), which is
+the Q3 failure reintroduced by the fix for it. Defaulting to 0 is also *ceremony-neutral for the
+FILES axis*: tier 0 is exactly the wall #431 already had, so the migration neither raises nor
+lowers what a path grant costs (§3.6.6, asserted).
+
+#### 3.6.3 The ratchet is asymmetric, and lowering must pay the OLD tier
+
+**Accepted, and it is the clause that makes the ratchet real rather than decorative.** Raising is
+cheap: any actor who satisfies the *current* tier may raise it. Lowering is not:
+
+> **Lowering the ceremony tier from N requires satisfying tier N — the tier being lowered FROM,
+> not the tier being lowered to.**
+
+Without this the ratchet is a sign, not a mechanism: an actor who can lower the bar under the
+lowered bar can then perform any act under it, so the effective ceremony of *every* protected act
+collapses to the cheapest tier reachable by one lowering step. This is the same shape as
+`PRD_GATE_CONSOLIDATION` §5's closure rule — *"a write that can redirect **which** core executes
+is equivalent to a write to the core"* — and the answer is the same: **the control must protect
+its own registration.** A tier that governs everything except the setting of itself governs
+nothing.
+
+Pinned, with the negative arm that proves the guard can fire:
+
+- `lowering_tier_requires_the_old_tier` — with the tier at 2 and only tier-1 evidence presented,
+  the lowering is **refused**.
+- `raising_tier_requires_only_the_current_tier` — with the tier at 0 and tier-0 evidence, the
+  raise **succeeds**. (Without this arm, a store that refuses every tier change passes the first
+  test and the ratchet is broken in the other direction.)
+- `tier_change_is_witnessed_and_bumps_generation` — a tier change is a policy mutation like any
+  other: same monotonic counter, same chain record (`allowlist_ceremony_tier_changed` carrying
+  from/to, the evidence relied upon, and the operator identity), same export refresh. A ceremony
+  change that did not move the generation would be a policy change no replica could detect.
+
+#### 3.6.4 The deadlock escape — because "unsatisfiable" is exactly what this section forbids
+
+§3.6.3 creates a hazard the rest of this section exists to prevent: **ratchet to a tier that
+later becomes unsatisfiable — the peer seat retires, the corroboration filter stays uninstalled —
+and the floor is permanently uneditable, with no legitimate way down.** That is the Q3 failure
+again, arrived at by a different road. A ratchet with no escape is a ratchet that eventually
+bricks the thing it protects.
+
+The escape must not become the easy path, so it is designed to be **slow and loud rather than
+forbidden**:
+
+1. Attempts to satisfy the current tier are recorded — a *failed* ceremony is evidence, and today
+   it leaves no trace at all (the fail-closed-deny-leaves-no-record class).
+2. After a declared **dwell period** with recorded failed attempts and no successful satisfaction,
+   a lowering may proceed on tier-(N−1) evidence, as `escape` rather than as an ordinary lowering.
+3. The escape is witnessed with its own event kind and its own reason field, and the dashboard
+   renders the society as **`ceremony lowered under escape`** until an operator affirms the new
+   tier at that tier. It is a visible state, not a silent return to normal.
+
+Why this is the right trade, stated plainly: against a *determined* actor holding the operator's
+UID this buys nothing — hestia is assurance profile A1, HST-009, every member runs as the
+operator (§3.3 makes the same concession about the TOOLS axis and it applies here too). What it
+defeats is the **efficiency attractor**: an agent taking the shortest path to "get this floor
+edit done" will not choose a path that requires a dwell period and paints a banner on the
+dashboard. The bypass is available and expensive and legible — which is the most an A1 system
+can honestly claim.
+
+#### 3.6.5 The seam: tier as a function of KIND × consequence
+
+dp: *"i suspect it will eventually depend on the KIND of society expansion being contemplated,
+and definitely on how complex/consequential a society is in the first place."*
+
+**This PRD commits to the SEAM, not to the table.** The initial table is deliberately trivial;
+what must exist now is the lookup, so that populating it later is data, not a refactor of every
+mutation path.
+
+`required_tier(kind, society_consequence) -> Tier`, a stored table beside the floor.
+
+**KIND** — enumerated from what actually exists in this design, not invented:
+
+| kind | why it is its own kind |
+|---|---|
+| `floor.tool.add` | a verb granted to every seat at once |
+| `floor.path.add.new_root` | a **new repo root** on the floor — territory nobody had |
+| `floor.path.add.within_granted` | a deeper path inside a root already on the floor — strictly less consequential, and the distinction already exists in the code (`_scope_entry_for_grant`: repo root → bare segment, deeper → `path:`) |
+| `floor.remove` (narrowing) | narrowing the floor is *not* the loosening direction this store is for; it removes reach from every member simultaneously, which is high-consequence in the availability direction and must not be filed as "safe because it is tighter" |
+| `member.*` | a member expansion — the lightest kind, and the one that stays cheap so §0's inversion keeps working |
+| `governance.*` | **not floorable at all.** The governance closure sits above allowlists entirely (§2.2, §2.4); it has no tier because no tier admits it. The table returns a refusal, not a number — an entry that returned "tier 3" would imply a price exists |
+
+**SOCIETY CONSEQUENCE** — one declared scalar for now (`research-single-host` |
+`multi-seat` | `hub-occupied`), stored, operator-set, and itself ratchetable. A one-machine
+research society and a fleet with outward hub occupancy are not the same risk and should not be
+forced onto one ceremony. Populating the full matrix is **future work, marked as such**; today
+every cell resolves to tier 0 except `governance.*` (refused) — and that is an honest statement
+of where this society is, not a placeholder pretending to be a policy.
+
+**Batches take the MAX tier of their members**, and the governing tier is recorded on the act.
+Refusing mixed-kind batches would push an operator toward many small edits — more clicks for the
+same act, which is the efficiency attractor being fed rather than designed around.
+
+#### 3.6.6 Interaction with the two-axis consolidation
+
+Three interactions, two benign and one that needs an assertion:
+
+1. **The consolidation is what makes the KIND seam expressible.** `floor.tool.add` and
+   `floor.path.add.*` can only be compared — and given different tiers — because one store knows
+   both kinds. Two stores would have drifted to two ceremonies with no surface on which to notice.
+   The ratchet is *enabled* by §3.4, not in tension with it.
+2. **The migration must be ceremony-neutral for FILES.** #431's path grants were walled at a
+   challenge-signed operator session; tier 0 is that same wall; absence reads as tier 0 (§3.6.2).
+   So the upgrade neither raises nor lowers what a path grant costs. **Asserted:**
+   `migration_does_not_change_the_files_ceremony` — a mutation that succeeded pre-upgrade with
+   tier-0 evidence still succeeds post-upgrade, and one that failed still fails.
+3. **The TOOLS axis inherits a wall it never had, and that is the safe direction** — it arrives
+   governed rather than ungoverned. Worth stating because it is a real behavioural change riding
+   the migration, and unstated behavioural changes riding migrations are how "shipped ≠ in force"
+   happens in reverse.
+
+#### 3.6.7 Visibility (#435/#438)
+
+The current tier is rendered **plainly, on the face of the floor editor** — not in a settings
+page, not on hover. Per the never-flatter doctrine:
+
+- A light-ceremony society is a **legitimate state** and must not be rendered as a defect — no
+  red, no warning icon, no nag. `ceremony: operator-only` is a fact.
+- It must equally not render as though it were heavy — no lock glyph, no shield, no "protected"
+  language that implies a bar nobody set. A tier-0 floor editor that *looked* tier-2 would be
+  #435's green-permissive defect in a new costume: a reduced-ceremony state wearing the
+  appearance of a stronger one.
+- The label names its referent (#438): `ceremony: operator-only · society: research-single-host ·
+  raised 0 times`, and, when applicable, the escape banner of §3.6.4.
+- The **available** tiers and their satisfiability are shown beside the current one, so the ratchet
+  is discoverable — a mechanism nobody can see is a mechanism nobody uses. Tier 2 renders as
+  `sovereign-plus-peer — NOT SATISFIABLE HERE (no corroborating peer seat)`, which is the honest
+  state and also the to-do list for raising it.
 
 ---
 
@@ -516,7 +710,9 @@ does so the same way on both axes.
 
 1. **Society floor**, both axes, editable, with a standing banner naming its blast radius:
    *this binds every seat on this box, including unattended watcher-fired agents* — the argument
-   the policy modal already makes at ~1144 for presets, and it is more true here.
+   the policy modal already makes at ~1144 for presets, and it is more true here. **The current
+   ceremony tier is rendered on the face of this editor** (§3.6.7), with the available tiers and
+   their satisfiability beside it — neither dressed up as protection nor flagged as a defect.
 2. **Per-member expansions**, one card per member, each entry showing **value · granted_by ·
    when · why · origin** (operator-edit, or the escalation id it came from — clickable through to
    the ledger). A grant whose provenance is unreadable is a misconfiguration nobody can date.
@@ -571,16 +767,16 @@ measured would-deny rate over a stated window is ~0 against a floor seeded from 
 then does an operator flip it to enforcing, per-member first, society last. The flip is itself a
 witnessed operator act. **The acceptance criterion is the measurement, not the intention.**
 
-**Q3 (RED) — does the society floor need a stronger ceremony than a member expansion?**
-*Position:* yes — a floor edit binds every seat, so it should require the `SovereignPlusPeer`
-bar while member expansions take `SingleApprover` (both already exist in
-`gate_escalation.rs::Bar`). **The blocker is that the stronger bar is not known to work**: the
-`sovereign_plus_peer` path has never scored a lifetime invitation, and its corroboration filter
-is uninstalled. Requiring a bar that cannot be satisfied would make the floor uneditable, which
-in practice means the floor never gets written and everything becomes a member expansion — the
-exact inversion of dp's design. **So: implement the two-bar distinction, but gate the floor
-editor's ship on a test that actually clears `SovereignPlusPeer` end-to-end.** dp to rule on
-whether to ship the floor editor at `SingleApprover` in the interim.
+**Q3 — RULED, moved out of this section.** *Does the society floor need a stronger ceremony than
+a member expansion?* dp ruled **a bootstrap ratchet** (2026-08-14): start ceremony-light,
+ratchet up as resources arrive, *"we want the sufficiently-correct path to be the easy path."*
+It is now **§3.6** — declared tiers, bootstrap default `operator-only`, asymmetric ratchet whose
+lowering pays the old tier, a slow-and-loud deadlock escape, and the `kind × consequence` seam.
+The finding that raised Q3 (an unsatisfiable bar means the floor is never written and every
+widening becomes a member expansion) is preserved as §3.6.1's rationale rather than discarded.
+Stub kept so a reader who remembers this as open can see it was answered and where. **What
+remains open is the TABLE, not the mechanism** — populating `kind × consequence` is marked
+future work in §3.6.5.
 
 **Q4 — RULED, moved out of this section.** *Does #431's standing scope become the FILES axis, or
 stay separate?* dp ruled **consolidate** (2026-08-14). It is now §2.0 (the principle), §3.4 (the
@@ -637,6 +833,21 @@ Each names the arm that must be able to fail.
 - **AC-14 — one mutation path per operation** (§3.4). Structural: exactly one route mutates the
   store per operation, and the tools axis has no endpoint family the files axis lacks. Asserted
   by enumerating the routes, so adding a parallel surface reds the build.
+- **AC-16 — the ratchet is asymmetric, and provably so** (§3.6.3). Three arms:
+  lowering from tier N with tier-(N−1) evidence is **refused**; raising from tier N with tier-N
+  evidence **succeeds** (the arm that proves the store is not simply refusing every tier change);
+  a tier change is witnessed and moves the generation.
+- **AC-17 — an absent tier reads as tier 0** (§3.6.2). Load a pre-upgrade fixture with no tier
+  field; assert the floor editor is usable at tier 0 and NOT bricked at a higher one. Paired with
+  `migration_does_not_change_the_files_ceremony`: a mutation that succeeded pre-upgrade with
+  tier-0 evidence still succeeds, and one that failed still fails (§3.6.6).
+- **AC-18 — the escape cannot be taken early, and is loud when taken** (§3.6.4). Attempting the
+  escape before the dwell period elapses is refused; after it, the lowering succeeds, records its
+  own event kind, and the dashboard renders `ceremony lowered under escape`. All three — a
+  silent-but-correct escape fails this criterion.
+- **AC-19 — `governance.*` has no tier** (§3.6.5). `required_tier` returns a REFUSAL, not a
+  number, for any governance-closure kind. Asserted on the return shape, because a numeric answer
+  would imply a price exists.
 - **AC-15 — uniformity across axes is testable, not asserted.** The duration, witness, revoke and
   export behaviours are exercised **parameterised over `axis ∈ {tools, files}`**, with the same
   assertions on both. A property that holds for files and was never run for tools is an unvaried
@@ -655,8 +866,19 @@ R: pass [construct: authenticate_operator — challenge-signed session; loopback
 W: pass [construct: OperatorSessionProof / Ed25519 LCT challenge; granted_by recorded from the session, not the request body]
 O: pass [construct: authorize() before store mutation, before persist_standing_scope, before export]
 A: pass [construct: persist_standing_scope + witnessed allowlist_edit carrying value, axis, layer, reason, generation]
-V: present [construct: contraction refusal (409) + operator revoke + expires_at; floor edits gated on Q3's bar]
-verdict: PASS — conditional on Q3 (floor ceremony) being ruled before the floor editor ships
+V: present [construct: contraction refusal (409) + operator revoke + expires_at; floor edits gated on the declared ceremony tier, §3.6]
+verdict: PASS — the floor-ceremony condition is RESOLVED by the ratchet (§3.6); tier 0 is the declared, satisfiable bar
+```
+
+```
+surface: ceremony tier change (§3.6)   act: raise or lower the authority required to edit the society floor
+S: high/irreversible-in-direction [construct: a LOWERING re-prices every future floor edit; the acts taken under a lowered bar cannot be un-taken]
+R: n/a [construct: reachability never authorizes a tier change]
+W: pass [construct: raise = current tier's evidence; LOWER = the OLD tier's evidence (lowering_tier_requires_the_old_tier) — the control protects its own registration]
+O: pass [construct: evidence check before the tier field is written, before persist, before export]
+A: pass [construct: allowlist_ceremony_tier_changed carrying from/to, evidence relied upon, operator identity; generation bumps]
+V: present [construct: the §3.6.4 escape is the veto's inverse — a bounded, witnessed, dashboard-banner path out of an unsatisfiable tier, so V cannot brick the surface it protects]
+verdict: PASS — and explicitly NOT a boundary against a determined same-UID actor (A1/HST-009); it defeats the efficiency attractor, not an adversary
 ```
 
 ```
@@ -701,7 +923,9 @@ here so it is not mistaken for a non-goal:** widening `scope`/`standing` in plac
 it (§3.5) — that is this PRD's work, ruled by dp. Not fixing #434's claim
 race (§5.2 routes around it; the fix is #434's). Not fixing Sprint F **R2** (deeper `path:`
 entries stay inert — this PRD makes them *visibly* inert, §6.2). Not the launch-cwd grant surface
-(**R3**). Not the hub twin (§11). **No new innate rules** — the innate layer is unchanged and the
+(**R3**). Not the hub twin (§11). **Not populating the `kind × consequence` ceremony table**
+(§3.6.5) — this PRD commits to the seam and to a trivial initial table; the matrix is future work
+and is marked as such rather than pre-filled with numbers nobody measured. **No new innate rules** — the innate layer is unchanged and the
 allowlists sit strictly below it.
 
 ---
