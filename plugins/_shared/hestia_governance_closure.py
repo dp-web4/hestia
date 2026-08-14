@@ -102,6 +102,7 @@ __all__ = [
     "LITERAL_FLOOR",
     "RULE_WRITE",
     "RULE_WRITE_UNPARSEABLE",
+    "RULE_OUT_OF_GRAMMAR",
     "RULE_INTERNAL",
     "RULE_READ_INTERNAL",
     "classify",
@@ -113,6 +114,13 @@ __all__ = [
 # ── Rule ids (returned to the shim; the shim's refusal/witness names the RULE and the ACT) ──
 RULE_WRITE = "governance-closure-write"
 RULE_WRITE_UNPARSEABLE = "governance-closure-unparseable-command"
+# REPAIR 2 (GPT fleet-review blocker 1): a Bash command OUTSIDE the supported shell grammar —
+# a substitution/variable in a write position, a shell block/conditional, `bash -c`/`sh -c`/
+# `eval`, or a `git apply`/`patch` invocation — whose write set the classifier therefore
+# CANNOT resolve. Fail-closed as a write ONLY when closure vocabulary appears anywhere in the
+# command (a benign out-of-grammar command that names nothing closure-ish must stay "none",
+# or we recreate the friction→bypass loop). See the SUPPORTED GRAMMAR block below.
+RULE_OUT_OF_GRAMMAR = "governance-closure-out-of-grammar"
 RULE_INTERNAL = "governance-closure-internal-error"
 RULE_READ_INTERNAL = "governance-closure-read-internal-error"
 
@@ -355,15 +363,90 @@ def default_closure() -> Closure:
 
 
 # ── Bash write-position parsing ─────────────────────────────────────────────────────────────
+#
+# SUPPORTED GRAMMAR (REPAIR 2 — GPT fleet-review blocker 1). The classifier resolves write
+# positions for exactly ONE shape: SIMPLE COMMANDS with recognized verbs and LITERAL
+# (non-substitution) arguments, joined by the sequencing operators `;` `&&` `||` `|` `&`. A
+# leading `cd <literal dir>` adjusts the effective cwd for relative write targets that FOLLOW
+# it on the same command line (so `cd plugins/<m>/hooks && echo x > GATE` resolves into the
+# closure). Everything else is OUT OF GRAMMAR and its write set is undecidable:
+#   * a substitution/variable in a WRITE position (`> $VAR`, `> $(cmd)`, `cp x $DEST`);
+#   * a shell block / conditional governing the command (`if`/`while`/`for`/`case`/`{ }`/
+#     subshell) — control flow can hide or gate a write;
+#   * `bash -c` / `sh -c` / `eval` — the write happens inside an opaque string;
+#   * `git apply` / `git am` / `patch` — the write set lives inside patch CONTENT the
+#     classifier never sees.
+# An out-of-grammar command is classified "write" (rule RULE_OUT_OF_GRAMMAR) IFF closure
+# vocabulary appears ANYWHERE in it (including inside a `-c`/`eval` string, which is
+# re-tokenized for the scan); otherwise it stays "none". This is the deliberate fail-closed
+# stance for indirection: we cannot see the write, so any closure mention denies — but a
+# benign out-of-grammar command that names nothing closure-ish is NOT refused (no new FP).
+# Reads are unaffected: a `>` inside a QUOTED argument or a heredoc body is never a write
+# position, so it never creates a write target (it may still classify "read", which is allowed).
 _PUNCT = "();<>|&"
 _SEPARATORS = frozenset({";", "&&", "||", "|", "|&", "&", "(", ")", ";;"})
 _WRAPPERS = frozenset({"sudo", "doas", "env", "command", "exec", "nohup", "nice", "time",
                        "stdbuf"})
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Shell-block / control-flow keywords: a simple command headed by one of these means the line
+# is a compound construct the write-position parser does not model — out of grammar.
+_SHELL_BLOCK_KEYWORDS = frozenset({
+    "if", "then", "elif", "else", "fi", "while", "until", "for", "do", "done",
+    "case", "esac", "function", "select", "{", "}", "((", "[[",
+})
+# Interpreters whose `-c` operand is an opaque program string (out of grammar when `-c` given).
+_SUBSHELL_CMDS = frozenset({"bash", "sh", "dash", "zsh", "ksh", "mksh", "busybox"})
+
+
+class _OutOfGrammar(Exception):
+    """Internal signal: this Bash command is outside the supported grammar, so its write set
+    cannot be resolved. The caller (_write_position_targets) turns it into the
+    RULE_OUT_OF_GRAMMAR posture — a write iff closure vocabulary appears anywhere."""
 
 
 def _is_punct(tok: str) -> bool:
     return bool(tok) and all(ch in _PUNCT for ch in tok)
+
+
+def _has_subst(tok: str) -> bool:
+    """A token carrying a shell substitution/variable — `$VAR`, `${...}`, `$(...)`, or a
+    backtick. In a WRITE position this makes the destination unresolvable (out of grammar)."""
+    return isinstance(tok, str) and ("$" in tok or "`" in tok)
+
+
+def _join_eff(eff: str, target: str) -> str:
+    """Resolve a relative write target against the cd-tracked effective cwd. Absolute/`~`
+    targets are returned unchanged; an empty accumulator leaves the target untouched (the
+    caller's real cwd still applies in Closure.match)."""
+    if not isinstance(target, str) or not target:
+        return target
+    if not eff or os.path.isabs(target) or target.startswith("~"):
+        return target
+    return os.path.normpath(os.path.join(eff, target))
+
+
+def _vocab_tokens(command: str) -> list:
+    """Every token to scan for closure vocabulary on the out-of-grammar path — the outer
+    tokens PLUS the re-tokenized contents of any `-c`/`eval` string operand, so a bare
+    closure filename named inside an opaque string is still visible to the scan."""
+    try:
+        toks = _tokenize(command)
+    except Exception:
+        return command.split()
+    out = [t for t in toks if not _is_punct(t)]
+    for i, t in enumerate(toks):
+        base = os.path.basename(t) if isinstance(t, str) else ""
+        if base in _SUBSHELL_CMDS or base == "eval":
+            for s in toks[i + 1:]:
+                if isinstance(s, str) and s.startswith("-"):
+                    continue
+                if isinstance(s, str) and s:
+                    try:
+                        out.extend(_tokenize(s))
+                    except Exception:
+                        out.append(s)
+                break
+    return out
 
 
 def _tokenize(cmd: str) -> list:
@@ -455,9 +538,19 @@ def _command_write_targets(words: list) -> list:
         return _positionals(args)
     if name == "dd":
         return [a[3:] for a in args if a.startswith("of=")]
+    if name == "patch":
+        # `patch` applies a diff whose write set is inside the patch CONTENT (often on stdin),
+        # not on the argv — undecidable here. Out of grammar.
+        raise _OutOfGrammar()
     if name == "sed":
-        in_place = any(a == "--in-place" or a.startswith("--in-place=")
-                       or (a.startswith("-i") and not a.startswith("--")) for a in args)
+        # In-place: `--in-place[=SUFFIX]`, `-i`, `-i.bak`, AND bundled short clusters that
+        # contain `i` (`-Ei`, `-nEi`, ...). A short cluster is `-<letters>` (not `--`); the
+        # regex fires when an `i` appears anywhere in that letter run before an attached suffix.
+        in_place = any(
+            a == "--in-place" or a.startswith("--in-place=")
+            or (a.startswith("-") and not a.startswith("--")
+                and re.match(r"^-[A-Za-z]*i", a) is not None)
+            for a in args)
         if not in_place:
             return []
         script_flag = any(a in ("-e", "-f") or a.startswith(("--expression", "--file"))
@@ -494,6 +587,10 @@ def _command_write_targets(words: list) -> list:
         if i >= len(args):
             return []
         sub, rest = args[i], args[i + 1:]
+        if sub in ("apply", "am"):
+            # `git apply` / `git am` write files described INSIDE a patch/mbox the classifier
+            # cannot read — undecidable write set. Out of grammar.
+            raise _OutOfGrammar()
         if sub == "checkout":
             # Only explicit pathspec overwrite (`checkout [-|tree-ish] -- paths`); a branch
             # switch is not a targeted closure write.
@@ -508,18 +605,55 @@ def _command_write_targets(words: list) -> list:
     return []
 
 
+def _flush_simple_command(words: list, eff: str, targets: list) -> str:
+    """Resolve ONE simple command: detect out-of-grammar heads (shell block, `bash -c`,
+    `eval`, `git apply`/`patch` — the last two via _command_write_targets), track `cd` into
+    the effective cwd, else append this command's cd-resolved write targets. Returns the
+    (possibly updated) effective cwd. Raises _OutOfGrammar on an out-of-grammar construct."""
+    stripped = _strip_wrappers(words)
+    if not stripped:
+        return eff
+    head = stripped[0]
+    base = os.path.basename(head) if isinstance(head, str) else ""
+    # Shell block / control-flow keyword governing this command -> out of grammar.
+    if head in _SHELL_BLOCK_KEYWORDS or base in _SHELL_BLOCK_KEYWORDS:
+        raise _OutOfGrammar()
+    # `bash -c` / `sh -c` / `eval` -> opaque program string -> out of grammar.
+    if base == "eval":
+        raise _OutOfGrammar()
+    if base in _SUBSHELL_CMDS and any(a == "-c" for a in stripped[1:]):
+        raise _OutOfGrammar()
+    # `cd <literal dir>` -> adjust the effective cwd for subsequent relative write targets.
+    if base == "cd":
+        rest = [a for a in stripped[1:] if not a.startswith("-")]
+        if rest:
+            d = rest[0]
+            if _has_subst(d):
+                return eff  # a computed cd cannot be tracked; leave eff unchanged
+            eff = d if (os.path.isabs(d) or d.startswith("~")) \
+                else os.path.normpath(os.path.join(eff or ".", d))
+        return eff
+    for tg in _command_write_targets(words):  # may raise _OutOfGrammar (git apply/am, patch)
+        if _has_subst(tg):
+            raise _OutOfGrammar()  # substitution in a write position
+        targets.append(_join_eff(eff, tg))
+    return eff
+
+
 def _bash_write_targets(command: str) -> list:
     """All write-position arguments across a compound command: redirect targets plus each
-    simple command's write positions. Raises on tokenizer failure — the caller downgrades
-    that to the unparseable-command posture."""
+    simple command's write positions, each resolved against the cd-tracked effective cwd.
+    Raises on tokenizer failure (caller -> unparseable posture) and raises _OutOfGrammar on
+    any out-of-grammar construct (caller -> out-of-grammar posture)."""
     toks = _tokenize(command)
     targets, cur = [], []
+    eff = ""  # relative cwd accumulator; cd within this command line adjusts it
     i = 0
     while i < len(toks):
         t = toks[i]
         if t in _SEPARATORS:
             if cur:
-                targets.extend(_command_write_targets(cur))
+                eff = _flush_simple_command(cur, eff, targets)
                 cur = []
             i += 1
             continue
@@ -530,7 +664,9 @@ def _bash_write_targets(command: str) -> list:
                     i += 2  # fd dup (2>&1) — not a file
                     continue
                 if nxt is not None and nxt not in _SEPARATORS and not _is_punct(nxt):
-                    targets.append(nxt)
+                    if _has_subst(nxt):
+                        raise _OutOfGrammar()  # substitution in a redirect (write) position
+                    targets.append(_join_eff(eff, nxt))
                     i += 2
                     continue
                 i += 1
@@ -543,7 +679,7 @@ def _bash_write_targets(command: str) -> list:
         cur.append(t)
         i += 1
     if cur:
-        targets.extend(_command_write_targets(cur))
+        eff = _flush_simple_command(cur, eff, targets)
     return targets
 
 
@@ -569,6 +705,10 @@ def _write_position_targets(tool_name: str, tool_input: Any) -> tuple:
             return [], None
         try:
             return _bash_write_targets(cmd), None
+        except _OutOfGrammar:
+            # Undecidable write set: hand the FULL vocabulary token list up, so classify()
+            # can fail closed iff closure vocabulary appears anywhere in the command.
+            return _vocab_tokens(cmd), "out-of-grammar"
         except Exception:
             return cmd.split(), "unparseable"
     # Write / Edit / NotebookEdit / unknown tools: the stated destination keys, and ONLY
@@ -615,10 +755,20 @@ def classify(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None,
     # Phase 1 — WRITE positions. Internal errors here fail CLOSED.
     try:
         targets, note = _write_position_targets(tool_name, tool_input)
+        # OUT OF GRAMMAR (REPAIR 2): `targets` is the command's full vocabulary token list,
+        # not resolved write positions; match with the BROADER read-position semantics (a
+        # bare closure basename anywhere counts as vocabulary) and fail closed as a write if
+        # ANY token is closure vocabulary. If none is, fall through to Phase 2 -> "none".
+        position = "read" if note == "out-of-grammar" else "write"
         for t in targets:
-            marker = closure.match(t, cwd=cwd, position="write")
+            marker = closure.match(t, cwd=cwd, position=position)
             if marker:
-                rule = RULE_WRITE_UNPARSEABLE if note == "unparseable" else RULE_WRITE
+                if note == "out-of-grammar":
+                    rule = RULE_OUT_OF_GRAMMAR
+                elif note == "unparseable":
+                    rule = RULE_WRITE_UNPARSEABLE
+                else:
+                    rule = RULE_WRITE
                 return ClosureVerdict("write", rule, marker, t, src)
     except Exception as e:  # noqa: BLE001 — fail-closed: a broken write classifier must not admit
         return ClosureVerdict("write", RULE_INTERNAL, None,

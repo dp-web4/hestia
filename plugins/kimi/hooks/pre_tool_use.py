@@ -684,6 +684,47 @@ def _claim_self_write(marker, tool_name, attempted):
             esc_id, r.get("how_to_decide") or f"hestia gate approve {esc_id}")
 
 
+def _fail_closed_internal_error(event, exc):
+    """REPAIR 1 (GPT fleet-review blocker 2): the WHOLE decision path failed with an
+    UNEXPECTED error. On a Claude-lineage engine a hook that raises exits rc=1 and the
+    engine reads that as ALLOW — a fail-OPEN. Before this, only stdin parsing was guarded,
+    so an exception from closure classification, target extraction, the snapshot fetch, or
+    evaluate() escaped and this member failed open. Every such error now lands here.
+
+    This is NOT the ratified degraded posture (deny-writes-allow-reads): a degraded gate
+    still KNOWS the act's class; an internally-broken gate does not, so it cannot safely
+    allow even a read. In enforce, any unexpected error therefore DENIES (exit 2);
+    warn-rollout still only warns (exit 0). The record is best-effort and marks this INFRA,
+    never member conduct (verdict_available=False, rule 'gate-internal-error'); the unified
+    recorder already guarantees it never raises."""
+    tool = (event or {}).get("tool_name") or "?"
+    tinput = (event or {}).get("tool_input") or {}
+    detail = f"{type(exc).__name__}: {exc}"
+    try:
+        from hestia_gate_mechanism import witness_decision_unified, _extract_target
+        witness_decision_unified(
+            None, plugin_id=HESTIA_PLUGIN_ID,
+            decision="deny" if MODE == "enforce" else "warn",
+            rule="gate-internal-error", tool_name=tool,
+            target=_extract_target(tinput, tool),
+            session_id=(event or {}).get("session_id"),
+            verdict_available=False,   # infra posture — never member conduct
+            attempted_summary=detail[:200])
+    except Exception:
+        pass  # recording must never turn a fail-close into a crash (this engine fails open)
+    if MODE == "enforce":
+        sys.stderr.write(
+            "hestia: deny [gate-internal-error] — the gate hit an unexpected internal error "
+            f"and cannot decide the act, so it is FAILING CLOSED ({detail}). This is an "
+            "infrastructure fault in the gate, not a judgement of your act — please report "
+            "it. A gate that cannot decide must not allow.\n")
+        sys.exit(2)
+    sys.stderr.write(
+        "hestia: warn [gate-internal-error] — the gate hit an unexpected internal error "
+        f"({detail}); warn-rollout allows, but this would FAIL CLOSED under enforce.\n")
+    sys.exit(0)
+
+
 def main():
     # Fail-closed skeleton: any unexpected error -> deny (never fall through to allow).
     try:
@@ -695,203 +736,225 @@ def main():
     if event.get("hook_event_name") != "PreToolUse":
         sys.exit(0)  # not our event
 
-    # Tier-2 backstop (gate-consolidation PRD §7.1 criterion 9): Gate 1b's scope predicates
-    # now live in the shared core, so a core that failed to import leaves this gate unable
-    # to decide scope at all. Letting Gate 1b raise instead would exit 1, which this engine
-    # reads as ALLOW — the import-failure fail-open documented at the attestation block.
-    # Deny outright, like the parse deny above: this is the gate unable to decide, not a
-    # policy verdict, so warn-rollout does not apply. (This TIGHTENS the ratified degraded
-    # posture — deny-writes-allow-reads; per-shim tighten-only is explicitly allowed — the
-    # rare shim-level import-failure path carries no READ_CLASS carve-out.)
-    if _core is None:
-        sys.stderr.write("hestia: deny [gate] — the shared gate core could not be loaded; "
-                         "failing closed.\n")
-        sys.exit(2)
-
-    _EVENT.clear(); _EVENT.update(event)
-    tool = event.get("tool_name") or "?"
-    tinput = event.get("tool_input") or {}
-    paths = path_targets(tinput)
-    cmd = command_of(tinput)
-
-    # Gate 1c runs FIRST now (Sprint F reorder, matching the claude adapter): the
-    # governance surface is classified before any policy fetch, so a gate write is refused
-    # AS gate-self — with its escalation — even when the daemon is down (a degraded deny
-    # would otherwise mask the class). Gates 1a/1b live INSIDE the core's evaluate(), below.
-
-    # Gate 1c — local self-protection. BEFORE the daemon and never conditional on it: if this
-    # check needed a verdict, "stop the daemon, then edit the gate" would be the same evasion one
-    # layer down. ALWAYS enforced — it does not honor warn-rollout, because a governance write
-    # that warns and proceeds is not a boundary.
-    # Sprint B: classification comes from the shared governance-closure module (write-
-    # position keyed, accessor-agnostic — the raw text-match bridge and its disclosed
-    # marker-in-command FP retire with it); this shim only renders and escalates.
-    self_rule = None
-    if _closure_classify is not None:
-        _cv = _closure_classify(tool, tinput, cwd=event.get("cwd"))
-        self_hit = ((_cv.marker or _cv.rule, _cv.resource or _cv.marker or _cv.rule)
-                    if _cv.classification in ("read", "write") else None)
-        self_is_read = _cv.classification == "read"
-        self_rule = _cv.rule
-    else:
-        # Tier-2 degraded mode (ratified): import failed — the pre-B local predicate
-        # decides, unchanged. The layer must not silently vanish with the import.
-        self_hit = _fallback_touches_self(tinput)
-        self_is_read = tool in READ_CLASS
-    if self_hit:
-        self_marker, self_resource = self_hit
-        if self_is_read:
-            # Publish-the-law: a member may read what governs it — refusing would make a member
-            # unable to check its own law. The read is RECORDED so reconnaissance stays visible
-            # as a pattern; a failed witness never blocks the read.
-            _witness_gate_self("gate_self_read", self_marker, tool, rule=self_rule)
-        else:
-            verdict, detail, esc_id, how = _claim_self_write(
-                self_marker, tool, _attempted_summary(_EVENT))
-            if verdict != "approved":
-                _witness_gate_self("gate_self_access", self_marker, tool, rule=self_rule)
-                _tally_scope(False)   # a refused reach still closes part of the window
-                esc = (f" Escalation {esc_id} is open — a human decides out of band ({how}); "
-                       f"re-issue the write afterwards to claim the approval." if esc_id else "")
-                sys.stderr.write(
-                    f"hestia: deny [gate-self] — '{tool}' would WRITE to the governance surface: "
-                    f"{self_resource} (matched marker {self_marker!r}; "
-                    f"rule {self_rule or 'gate-self-local'}; {detail}).{esc} This is not "
-                    f"an ordinary boundary — the target is what draws the boundaries. Legitimate "
-                    f"gate work goes through the escalation, not around it.\n")
-                sys.exit(2)
-            # APPROVED lifts self-protection for THIS call only — the ordinary gates below still
-            # run; approving a gate edit is not approving everything else the call might do.
-            sys.stderr.write(f"hestia: gate write APPROVED — {detail}\n")
-
-    # ── Sprint F (§6.F): THE decision — core evaluate() from an AUTHENTICATED policy path,
-    # or the ratified degraded mode. No silent policy=None / local-replica fallback exists
-    # on this path (§7.1 criterion 5): a snapshot is fetched LIVE from the daemon; when
-    # that fails in enforce mode the core's degraded_verdict decides
-    # (deny-writes-allow-reads), and every degraded deny is recorded with
-    # verdict_available=False.
-    ev = _core.NormalizedEvent(tool=tool, paths=paths, command=cmd,
-                               cwd=event.get("cwd"), raw=event)
-    snapshot = None
+    # REPAIR 1 (GPT fleet-review blocker 2): WHOLE-DECISION-PATH fail-closed boundary.
+    # Everything from here down — core guard, closure classification, target
+    # extraction, the policy snapshot fetch, evaluate(), and society safety — runs
+    # inside ONE outer guard. On a Claude-lineage engine an uncaught exception exits
+    # rc=1, which the engine reads as ALLOW (fail-OPEN); before this only stdin parsing
+    # was guarded, so a fault in closure classification / target extraction / evaluate()
+    # escaped and this member failed open. `except Exception` deliberately does NOT catch
+    # SystemExit, so every legitimate allow (exit 0) / deny (exit 2) below passes through
+    # untouched — the guard can only ADD a fail-close, never turn an allow into a deny.
     try:
-        from hestia_gate_mechanism import fetch_policy_snapshot
-        snapshot = fetch_policy_snapshot(HESTIA_PLUGIN_ID, host_agent=HESTIA_PLUGIN_ID,
-                                         host_session_id=event.get("session_id"))
-    except Exception:
-        snapshot = None   # an unimportable mechanism == an unreachable daemon: degrade below
-    if snapshot is not None:
-        global _SNAPSHOT_ROLE
-        _SNAPSHOT_ROLE = snapshot.get("role")
-        # The core's seam as built: resolve_agent_policy(vault_reader=...) — the reader
-        # returns this member's policy dict; here that dict is the LIVE daemon snapshot,
-        # which ALWAYS carries an `in_scope` list, so resolution can never fall through to
-        # the local replica on this path.
-        # SPRINT-F: replace with certified snapshot — PARTIAL: `in_scope` carries only the
-        # daemon's live path grants; standing repo scope has NO daemon surface (RED,
-        # F_NOTES.md). The launch-cwd grant rides the core's marked bridge in evaluate().
-        policy = _core.resolve_agent_policy(_CORE_PROFILE,
-                                            vault_reader=lambda _member: snapshot)
-        verdict = _core.evaluate(ev, _CORE_PROFILE, WORKSPACE, policy=policy)
-        if verdict.blocks:
-            deny(verdict.rule, verdict.reason, innate=verdict.innate)
-    elif MODE == "enforce":
-        verdict = _core.degraded_verdict(ev, _CORE_PROFILE)
-        if verdict.blocks and verdict.innate:
-            # The innate egress invariant is a REAL verdict — the transport-free core
-            # decided it without the daemon — so it renders and records as conduct.
-            deny(verdict.rule, verdict.reason, innate=True)
-        elif verdict.blocks:
-            _core.record_gate_unavailable(HESTIA_PLUGIN_ID, tool, "unknown",
-                                          "degraded: policy snapshot fetch failed (deny)")
-            try:
-                from hestia_gate_mechanism import witness_decision_unified, _extract_target
-                witness_decision_unified(
-                    None, plugin_id=HESTIA_PLUGIN_ID, decision="deny",
-                    rule=verdict.rule, tool_name=tool,
-                    target=_extract_target(tinput, tool),
-                    session_id=event.get("session_id"),
-                    verdict_available=False,   # infra posture — never member conduct
-                    attempted_summary=_attempted_summary(_EVENT))
-            except Exception:
-                pass  # recording must never turn a deny into a crash (this engine fails open)
-            _tally_scope(False)
-            sys.stderr.write(
-                f"hestia: deny [degraded] — {verdict.reason}. {verdict.remedy}\n")
+        # TEST-ONLY decision-time fault injector (REPAIR 1 scaffold; INERT without the
+        # env var). Raises AFTER all imports have already succeeded, so the boundary can
+        # be exercised by a REAL subprocess with the fault at DECISION time, not import
+        # time. It fires for every event class (before the read-class skip) so a
+        # sabotaged READ fails closed too. Never fires on a normal run.
+        if os.environ.get("HESTIA_TEST_SABOTAGE"):
+            raise RuntimeError("HESTIA_TEST_SABOTAGE: injected decision-time fault")
+
+        # Tier-2 backstop (gate-consolidation PRD §7.1 criterion 9): Gate 1b's scope predicates
+        # now live in the shared core, so a core that failed to import leaves this gate unable
+        # to decide scope at all. Letting Gate 1b raise instead would exit 1, which this engine
+        # reads as ALLOW — the import-failure fail-open documented at the attestation block.
+        # Deny outright, like the parse deny above: this is the gate unable to decide, not a
+        # policy verdict, so warn-rollout does not apply. (This TIGHTENS the ratified degraded
+        # posture — deny-writes-allow-reads; per-shim tighten-only is explicitly allowed — the
+        # rare shim-level import-failure path carries no READ_CLASS carve-out.)
+        if _core is None:
+            sys.stderr.write("hestia: deny [gate] — the shared gate core could not be loaded; "
+                             "failing closed.\n")
             sys.exit(2)
+
+        _EVENT.clear(); _EVENT.update(event)
+        tool = event.get("tool_name") or "?"
+        tinput = event.get("tool_input") or {}
+        paths = path_targets(tinput)
+        cmd = command_of(tinput)
+
+        # Gate 1c runs FIRST now (Sprint F reorder, matching the claude adapter): the
+        # governance surface is classified before any policy fetch, so a gate write is refused
+        # AS gate-self — with its escalation — even when the daemon is down (a degraded deny
+        # would otherwise mask the class). Gates 1a/1b live INSIDE the core's evaluate(), below.
+
+        # Gate 1c — local self-protection. BEFORE the daemon and never conditional on it: if this
+        # check needed a verdict, "stop the daemon, then edit the gate" would be the same evasion one
+        # layer down. ALWAYS enforced — it does not honor warn-rollout, because a governance write
+        # that warns and proceeds is not a boundary.
+        # Sprint B: classification comes from the shared governance-closure module (write-
+        # position keyed, accessor-agnostic — the raw text-match bridge and its disclosed
+        # marker-in-command FP retire with it); this shim only renders and escalates.
+        self_rule = None
+        if _closure_classify is not None:
+            _cv = _closure_classify(tool, tinput, cwd=event.get("cwd"))
+            self_hit = ((_cv.marker or _cv.rule, _cv.resource or _cv.marker or _cv.rule)
+                        if _cv.classification in ("read", "write") else None)
+            self_is_read = _cv.classification == "read"
+            self_rule = _cv.rule
         else:
-            # allow-read in degraded mode: recorded on the availability telemetry (an infra
-            # series); Gate 2 below is read-class-skipped anyway.
-            _core.record_gate_unavailable(HESTIA_PLUGIN_ID, tool, "unknown",
-                                          "degraded: policy snapshot fetch failed "
-                                          "(allow-read)")
-    else:
-        # warn-rollout shakedown with the daemon unreachable: evaluate against a policy
-        # that grants NOTHING (never the replica), so every boundary surfaces as a warn.
-        policy = _core.AgentPolicy(member_id=HESTIA_PLUGIN_ID, scope=(),
-                                   source="daemon-unreachable", stale=True)
-        verdict = _core.evaluate(ev, _CORE_PROFILE, WORKSPACE, policy=policy)
-        if verdict.blocks:
-            deny(verdict.rule, verdict.reason, innate=verdict.innate)
+            # Tier-2 degraded mode (ratified): import failed — the pre-B local predicate
+            # decides, unchanged. The layer must not silently vanish with the import.
+            self_hit = _fallback_touches_self(tinput)
+            self_is_read = tool in READ_CLASS
+        if self_hit:
+            self_marker, self_resource = self_hit
+            if self_is_read:
+                # Publish-the-law: a member may read what governs it — refusing would make a member
+                # unable to check its own law. The read is RECORDED so reconnaissance stays visible
+                # as a pattern; a failed witness never blocks the read.
+                _witness_gate_self("gate_self_read", self_marker, tool, rule=self_rule)
+            else:
+                verdict, detail, esc_id, how = _claim_self_write(
+                    self_marker, tool, _attempted_summary(_EVENT))
+                if verdict != "approved":
+                    _witness_gate_self("gate_self_access", self_marker, tool, rule=self_rule)
+                    _tally_scope(False)   # a refused reach still closes part of the window
+                    esc = (f" Escalation {esc_id} is open — a human decides out of band ({how}); "
+                           f"re-issue the write afterwards to claim the approval." if esc_id else "")
+                    sys.stderr.write(
+                        f"hestia: deny [gate-self] — '{tool}' would WRITE to the governance surface: "
+                        f"{self_resource} (matched marker {self_marker!r}; "
+                        f"rule {self_rule or 'gate-self-local'}; {detail}).{esc} This is not "
+                        f"an ordinary boundary — the target is what draws the boundaries. Legitimate "
+                        f"gate work goes through the escalation, not around it.\n")
+                    sys.exit(2)
+                # APPROVED lifts self-protection for THIS call only — the ordinary gates below still
+                # run; approving a gate edit is not approving everything else the call might do.
+                sys.stderr.write(f"hestia: gate write APPROVED — {detail}\n")
 
-    # Gate 2 — society safety (the governor). Read-class already fully covered by the core;
-    # only write/exec-class needs the daemon's destructive/secret verdict — reached IN-PROCESS via
-    # the shared mechanism (PR #371), NOT by spawning the claude gate as a subprocess off /mnt/c,
-    # cold, every call. That subprocess path was the structural cause of kimi's idle-box timeouts
-    # (criterion 10): fork + interpreter startup + a 2760-line cold import could not finish inside
-    # budget. query_society_safety() never raises and never allows on error; a down/slow daemon or
-    # a malformed verdict returns a no-verdict that fails closed here, exactly as the old
-    # returncode!=0 path did — but in one lean in-process round-trip, the same one claude makes.
-    if tool not in READ_CLASS:
-        verdict = None
+        # ── Sprint F (§6.F): THE decision — core evaluate() from an AUTHENTICATED policy path,
+        # or the ratified degraded mode. No silent policy=None / local-replica fallback exists
+        # on this path (§7.1 criterion 5): a snapshot is fetched LIVE from the daemon; when
+        # that fails in enforce mode the core's degraded_verdict decides
+        # (deny-writes-allow-reads), and every degraded deny is recorded with
+        # verdict_available=False.
+        ev = _core.NormalizedEvent(tool=tool, paths=paths, command=cmd,
+                                   cwd=event.get("cwd"), raw=event)
+        snapshot = None
         try:
-            shared = os.path.join(WORKSPACE, "hestia", "plugins", "_shared")
-            if shared not in sys.path:
-                sys.path.insert(0, shared)
-            from hestia_gate_mechanism import query_society_safety
-            verdict = query_society_safety(
-                event, plugin_id="kimi-code", host_agent="kimi-code",
-                host_session_id=event.get("session_id"))
+            from hestia_gate_mechanism import fetch_policy_snapshot
+            snapshot = fetch_policy_snapshot(HESTIA_PLUGIN_ID, host_agent=HESTIA_PLUGIN_ID,
+                                             host_session_id=event.get("session_id"))
         except Exception:
-            # Loading the mechanism must itself fail closed on a consequential act: a missing or
-            # unimportable module is not a reason to allow a write on a fail-open harness.
-            if MODE == "enforce":
-                sys.stderr.write("hestia: deny [safety] — the society-safety mechanism could not "
-                                 "be loaded; failing closed on a consequential act.\n")
+            snapshot = None   # an unimportable mechanism == an unreachable daemon: degrade below
+        if snapshot is not None:
+            global _SNAPSHOT_ROLE
+            _SNAPSHOT_ROLE = snapshot.get("role")
+            # The core's seam as built: resolve_agent_policy(vault_reader=...) — the reader
+            # returns this member's policy dict; here that dict is the LIVE daemon snapshot,
+            # which ALWAYS carries an `in_scope` list, so resolution can never fall through to
+            # the local replica on this path.
+            # SPRINT-F: replace with certified snapshot — PARTIAL: `in_scope` carries only the
+            # daemon's live path grants; standing repo scope has NO daemon surface (RED,
+            # F_NOTES.md). The launch-cwd grant rides the core's marked bridge in evaluate().
+            policy = _core.resolve_agent_policy(_CORE_PROFILE,
+                                                vault_reader=lambda _member: snapshot)
+            verdict = _core.evaluate(ev, _CORE_PROFILE, WORKSPACE, policy=policy)
+            if verdict.blocks:
+                deny(verdict.rule, verdict.reason, innate=verdict.innate)
+        elif MODE == "enforce":
+            verdict = _core.degraded_verdict(ev, _CORE_PROFILE)
+            if verdict.blocks and verdict.innate:
+                # The innate egress invariant is a REAL verdict — the transport-free core
+                # decided it without the daemon — so it renders and records as conduct.
+                deny(verdict.rule, verdict.reason, innate=True)
+            elif verdict.blocks:
+                _core.record_gate_unavailable(HESTIA_PLUGIN_ID, tool, "unknown",
+                                              "degraded: policy snapshot fetch failed (deny)")
+                try:
+                    from hestia_gate_mechanism import witness_decision_unified, _extract_target
+                    witness_decision_unified(
+                        None, plugin_id=HESTIA_PLUGIN_ID, decision="deny",
+                        rule=verdict.rule, tool_name=tool,
+                        target=_extract_target(tinput, tool),
+                        session_id=event.get("session_id"),
+                        verdict_available=False,   # infra posture — never member conduct
+                        attempted_summary=_attempted_summary(_EVENT))
+                except Exception:
+                    pass  # recording must never turn a deny into a crash (this engine fails open)
+                _tally_scope(False)
+                sys.stderr.write(
+                    f"hestia: deny [degraded] — {verdict.reason}. {verdict.remedy}\n")
                 sys.exit(2)
-            sys.stderr.write("hestia: warn [safety] — society-safety mechanism unavailable "
-                             "(warn-rollout: allowed).\n")
-        if verdict is not None and not verdict.allow:  # enforced deny OR no-verdict -> fail closed
-            msg = (verdict.message
-                   or "hestia: deny [safety] — blocked/inconclusive at the society safety gate.")
-            # ONE deny recorder (Sprint E, §3.3 bullet 4): kimi's society refusal previously
-            # left no record at all — the chain's denominator differed by harness. The unified
-            # recorder always carries target + verdict_available (real deny vs infra
-            # fail-close), never raises, and falls back to the per-shim diagnostic log when
-            # the witness itself is the unreachable thing (criterion 9(c)).
-            try:
-                from hestia_gate_mechanism import witness_decision_unified, _extract_target
-                witness_decision_unified(
-                    None, plugin_id="kimi-code",
-                    decision="deny" if MODE == "enforce" else "warn",
-                    rule="society-safety",
-                    tool_name=tool,
-                    target=_extract_target(tinput, tool),
-                    session_id=event.get("session_id"),
-                    verdict_available=verdict.decided,
-                    attempted_summary=(verdict.cause or "")[:200])
-            except Exception:
-                pass  # recording must never turn a deny into a crash (this engine fails open)
-            if MODE == "enforce":
-                sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
-                sys.exit(2)
-            sys.stderr.write("hestia: warn [safety] — " + msg.split("— ", 1)[-1] +
-                             " (warn-rollout: allowed; would block under enforce)\n")
+            else:
+                # allow-read in degraded mode: recorded on the availability telemetry (an infra
+                # series); Gate 2 below is read-class-skipped anyway.
+                _core.record_gate_unavailable(HESTIA_PLUGIN_ID, tool, "unknown",
+                                              "degraded: policy snapshot fetch failed "
+                                              "(allow-read)")
+        else:
+            # warn-rollout shakedown with the daemon unreachable: evaluate against a policy
+            # that grants NOTHING (never the replica), so every boundary surfaces as a warn.
+            policy = _core.AgentPolicy(member_id=HESTIA_PLUGIN_ID, scope=(),
+                                       source="daemon-unreachable", stale=True)
+            verdict = _core.evaluate(ev, _CORE_PROFILE, WORKSPACE, policy=policy)
+            if verdict.blocks:
+                deny(verdict.rule, verdict.reason, innate=verdict.innate)
 
-    # Count the allow before exiting: this is the gate attesting that the reach was
-    # inside the grant, which is the only not-self-reported evidence of competent work
-    # the system can get.
-    _tally_scope(True)
-    sys.exit(0)  # the ONLY allow path — reached only after every gate explicitly passed
+        # Gate 2 — society safety (the governor). Read-class already fully covered by the core;
+        # only write/exec-class needs the daemon's destructive/secret verdict — reached IN-PROCESS via
+        # the shared mechanism (PR #371), NOT by spawning the claude gate as a subprocess off /mnt/c,
+        # cold, every call. That subprocess path was the structural cause of kimi's idle-box timeouts
+        # (criterion 10): fork + interpreter startup + a 2760-line cold import could not finish inside
+        # budget. query_society_safety() never raises and never allows on error; a down/slow daemon or
+        # a malformed verdict returns a no-verdict that fails closed here, exactly as the old
+        # returncode!=0 path did — but in one lean in-process round-trip, the same one claude makes.
+        if tool not in READ_CLASS:
+            verdict = None
+            try:
+                shared = os.path.join(WORKSPACE, "hestia", "plugins", "_shared")
+                if shared not in sys.path:
+                    sys.path.insert(0, shared)
+                from hestia_gate_mechanism import query_society_safety
+                verdict = query_society_safety(
+                    event, plugin_id="kimi-code", host_agent="kimi-code",
+                    host_session_id=event.get("session_id"))
+            except Exception:
+                # Loading the mechanism must itself fail closed on a consequential act: a missing or
+                # unimportable module is not a reason to allow a write on a fail-open harness.
+                if MODE == "enforce":
+                    sys.stderr.write("hestia: deny [safety] — the society-safety mechanism could not "
+                                     "be loaded; failing closed on a consequential act.\n")
+                    sys.exit(2)
+                sys.stderr.write("hestia: warn [safety] — society-safety mechanism unavailable "
+                                 "(warn-rollout: allowed).\n")
+            if verdict is not None and not verdict.allow:  # enforced deny OR no-verdict -> fail closed
+                msg = (verdict.message
+                       or "hestia: deny [safety] — blocked/inconclusive at the society safety gate.")
+                # ONE deny recorder (Sprint E, §3.3 bullet 4): kimi's society refusal previously
+                # left no record at all — the chain's denominator differed by harness. The unified
+                # recorder always carries target + verdict_available (real deny vs infra
+                # fail-close), never raises, and falls back to the per-shim diagnostic log when
+                # the witness itself is the unreachable thing (criterion 9(c)).
+                try:
+                    from hestia_gate_mechanism import witness_decision_unified, _extract_target
+                    witness_decision_unified(
+                        None, plugin_id="kimi-code",
+                        decision="deny" if MODE == "enforce" else "warn",
+                        rule="society-safety",
+                        tool_name=tool,
+                        target=_extract_target(tinput, tool),
+                        session_id=event.get("session_id"),
+                        verdict_available=verdict.decided,
+                        attempted_summary=(verdict.cause or "")[:200])
+                except Exception:
+                    pass  # recording must never turn a deny into a crash (this engine fails open)
+                if MODE == "enforce":
+                    sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
+                    sys.exit(2)
+                sys.stderr.write("hestia: warn [safety] — " + msg.split("— ", 1)[-1] +
+                                 " (warn-rollout: allowed; would block under enforce)\n")
+
+        # Count the allow before exiting: this is the gate attesting that the reach was
+        # inside the grant, which is the only not-self-reported evidence of competent work
+        # the system can get.
+        _tally_scope(True)
+        sys.exit(0)  # the ONLY allow path — reached only after every gate explicitly passed
+    except SystemExit:
+        raise  # legitimate allow/deny exits pass through untouched (never a fail-close)
+    except Exception as _exc:  # noqa: BLE001 — ANY unexpected error → fail closed
+        _fail_closed_internal_error(event, _exc)
 
 
 if __name__ == "__main__":
