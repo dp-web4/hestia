@@ -12,6 +12,7 @@ mod http;
 mod hub_tab;
 pub mod operator_auth;
 mod public_identity;
+pub mod standing_scope;
 mod state;
 
 pub use dashboard::{

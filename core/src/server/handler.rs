@@ -1005,6 +1005,20 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
                 "expires_at": r.expires_at,
             }))
             .collect::<Vec<_>>(),
+        // STANDING grants, disclosed beside the live ones and inside the same hashed body
+        // (Sprint F R1): the durable widening is the one a member most needs to see, because
+        // it is the one no restart will quietly retire. A standing grant appearing, expiring
+        // or being revoked MOVES law_hash.
+        "standing_grants": s.live_standing_grants(&who.plugin_id)
+            .iter()
+            .map(|g| json!({
+                "path": g.path,
+                "granted_by": g.granted_by,
+                "reason": g.reason,
+                "granted_at": g.granted_at,
+                "expires_at": g.expires_at,
+            }))
+            .collect::<Vec<_>>(),
         "law": statements,
     });
 
@@ -1049,6 +1063,13 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         // one of three evaluation sites, and now this. The shape to distrust is any place that
         // rebuilds a response key by key.
         "operator_grant": out.get("operator_grant").cloned().unwrap_or(Value::Null),
+        // FIFTH instance, and the one issue #407 filed: `scope_grants` was computed into the
+        // hashed body and then DROPPED right here — `law_hash` covered data the caller never
+        // received, so a gate composing its policy snapshot from this surface could not see
+        // the very grants the law it attests hashes. The projection now carries what its
+        // hash covers, for both grant lists.
+        "scope_grants": out.get("scope_grants").cloned().unwrap_or(Value::Null),
+        "standing_grants": out.get("standing_grants").cloned().unwrap_or(Value::Null),
         "law": out.get("law").cloned().unwrap_or(Value::Null),
         // Quote THIS to say which law you read: it covers every layer, every bound list,
         // and the redaction applied to you. `society_policy_hash` is kept only because
@@ -12367,6 +12388,26 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
     let now = now_secs();
     let s = state.lock().await;
 
+    // THE HONOR HORIZON IS BOUNDED BY WHAT IT COVERS (GPT review of #431, blocker 3). A
+    // flat now+8h told consumers they could honour a cached snapshot for hours while a
+    // grant inside it expired in seconds — and the generation does not move on wall-clock
+    // expiry, so nothing would have repaired the cached copy. The horizon is therefore
+    // min(now + TTL, earliest expiry across EVERY grant this response represents), live
+    // and standing alike: a snapshot may never be honoured past the first moment its own
+    // contents stop being true.
+    let snapshot_expires_at = {
+        let mut horizon = now + crate::server::standing_scope::STANDING_SNAPSHOT_TTL_SECS;
+        for r in s.live_scope_grants(&plugin_id) {
+            horizon = horizon.min(r.expires_at);
+        }
+        for g in s.live_standing_grants(&plugin_id) {
+            if let Some(e) = g.expires_at {
+                horizon = horizon.min(e);
+            }
+        }
+        horizon
+    };
+
     let mut mine: Vec<&crate::server::state::ScopeRequest> = s
         .scope_requests
         .values()
@@ -12401,9 +12442,31 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
             .iter()
             .map(|r| json!({"path": r.path, "expires_at": r.expires_at, "granted_by": r.decided_by}))
             .collect::<Vec<_>>(),
-        "lifetime": "memory-only — every grant here dies with the daemon and is never written \
-                     to your identity file. A standing widening of your MRH is a different, \
-                     operator-made change to that file.",
+        // The DURABLE list, additive beside live_grants (Sprint F R1): operator-promoted
+        // standing grants from the vault-persisted store. Expired grants are filtered in
+        // the store's read, so nothing served here is past its horizon.
+        "standing_grants": s.live_standing_grants(&plugin_id)
+            .iter()
+            .map(|g| json!({
+                "path": g.path,
+                "granted_at": g.granted_at,
+                "granted_by": g.granted_by,
+                "reason": g.reason,
+                "expires_at": g.expires_at,
+                "request_id": g.request_id,
+            }))
+            .collect::<Vec<_>>(),
+        // CERTIFICATION, issued by the authority — the two fields the plugin gate's
+        // certified-replica logic (AgentPolicy) has demanded since 2026-08-04 with nothing
+        // issuing them: WHICH policy this is (the standing store's monotonic generation,
+        // moved by every grant/revoke) and HOW LONG a consumer may honour a cached copy —
+        // bounded by the earliest expiry of any grant represented here (see the horizon
+        // computation above), because past that instant the snapshot over-states.
+        "generation": s.standing_scope.generation,
+        "snapshot_expires_at": snapshot_expires_at,
+        "lifetime": "live_grants are memory-only — they die with the daemon. standing_grants \
+                     are operator-promoted, vault-persisted, and survive restart until they \
+                     expire or are revoked. Neither is ever written to your identity file.",
     }))
 }
 
@@ -12996,5 +13059,353 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
             }))
         }
         Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
+}
+
+#[cfg(test)]
+mod standing_scope_surface_tests {
+    //! The durable standing-scope surface (Sprint F R1) asserted AT the surfaces that serve
+    //! it — `tool_scope_status`, `tool_operating_law` — and at the restart boundary the
+    //! store exists to survive. The store's own unit tests live in `server::standing_scope`;
+    //! these are the "assertion and mechanism in the same room" tests for the handlers.
+    use super::*;
+    use crate::server::standing_scope::StandingGrant;
+    use crate::server::state::ScopeRequest;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    fn live_request(plugin: &str, path: &str, now: u64) -> ScopeRequest {
+        ScopeRequest {
+            id: "scope-test01".into(),
+            plugin_id: plugin.into(),
+            role: String::new(),
+            path: path.into(),
+            reason: "a live memory-only grant".into(),
+            requested_at: now,
+            expires_at: now + 3600,
+            granted: Some(true),
+            decided_by: Some("operator".into()),
+            decided_at: Some(now),
+            decision_reason: None,
+        }
+    }
+
+    fn standing(plugin: &str, path: &str, at: u64, expires_at: Option<u64>) -> StandingGrant {
+        StandingGrant {
+            member: plugin.into(),
+            path: path.into(),
+            granted_at: at,
+            granted_by: "operator".into(),
+            reason: "durable test grant".into(),
+            expires_at,
+            request_id: Some("scope-test01".into()),
+        }
+    }
+
+    /// (e) `hestia_scope_status` carries BOTH lists, additively: `live_grants` keeps its
+    /// exact pre-existing shape (a consumer keyed on it must not notice this PR), and
+    /// `standing_grants` + `generation` + `snapshot_expires_at` arrive beside it.
+    /// (d, at the surface) an expired standing grant is not served.
+    #[tokio::test]
+    async fn scope_status_serves_standing_beside_live_additively() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests
+                .insert("scope-test01".into(), live_request("kimi-code", "/w/one.md", now));
+            s.standing_scope.add(standing("kimi-code", "/w/web4", now, None));
+            s.standing_scope
+                .add(standing("kimi-code", "/w/expired", now - 100, Some(now - 1)));
+            // Another member's standing grant must not bleed in.
+            s.standing_scope.add(standing("codex", "/w/hestia", now, None));
+        }
+        let out = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"}))
+            .await
+            .unwrap();
+
+        // live_grants: unchanged shape, unchanged content.
+        let live = out["live_grants"].as_array().expect("live_grants stays a list");
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0]["path"], "/w/one.md");
+        assert_eq!(live[0]["granted_by"], "operator");
+        assert!(live[0]["expires_at"].is_number());
+
+        // standing_grants: the durable list, additive, expired entries filtered.
+        let st = out["standing_grants"].as_array().expect("standing_grants is a list");
+        assert_eq!(st.len(), 1, "expired + foreign grants must not be served: {out}");
+        assert_eq!(st[0]["path"], "/w/web4");
+        assert_eq!(st[0]["reason"], "durable test grant");
+        assert!(st[0]["expires_at"].is_null(), "durable-until-revoked serves null");
+
+        // certification: issued by the authority, present even for a member with none.
+        assert_eq!(out["generation"].as_u64(), Some(3), "three mutations happened");
+        assert!(
+            out["snapshot_expires_at"].as_u64().unwrap() > now,
+            "the honor horizon must be a future instant"
+        );
+    }
+
+    /// (#407) The operating-law projection carries the scope_grants — live AND standing —
+    /// that its own `law_hash` covers. This is the exact field the issue names: computed
+    /// into the hashed body, then dropped by the allowlist re-projection.
+    #[tokio::test]
+    async fn operating_law_projection_carries_the_grants_its_hash_covers() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let sid = {
+            let c = tool_connect(&state, &json!({"plugin_id": "kimi-code", "host_agent": "t"}))
+                .await
+                .unwrap();
+            c["sessionId"].as_str().unwrap().to_string()
+        };
+        {
+            let mut s = state.lock().await;
+            s.scope_requests
+                .insert("scope-test01".into(), live_request("kimi-code", "/w/one.md", now));
+            s.standing_scope.add(standing("kimi-code", "/w/web4", now, None));
+        }
+        let out = tool_operating_law(&state, &json!({"session_id": sid}))
+            .await
+            .unwrap();
+        assert!(
+            out.get("_hestia_error").is_none(),
+            "attributed session must be answered: {out}"
+        );
+        let sg = out["scope_grants"]
+            .as_array()
+            .expect("scope_grants must survive the projection (#407)");
+        assert_eq!(sg.len(), 1, "{out}");
+        assert_eq!(sg[0]["path"], "/w/one.md");
+        let st = out["standing_grants"]
+            .as_array()
+            .expect("standing_grants must survive the projection");
+        assert_eq!(st.len(), 1, "{out}");
+        assert_eq!(st[0]["path"], "/w/web4");
+        assert!(
+            out["law_hash"].is_string(),
+            "the hash that covers these fields still rides with them"
+        );
+    }
+
+    /// (a, at the state boundary) A standing grant persisted through `persist_standing_scope`
+    /// is there after a full daemon "restart": the state is dropped, the vault reopened from
+    /// disk with the passphrase, and the state rebuilt — the exact replay a redeploy runs.
+    /// The memory-only channel's grants are gone across the same boundary, which is the
+    /// asymmetry working as written, asserted here so neither direction can silently swap.
+    #[tokio::test]
+    async fn standing_grant_survives_restart_and_live_grant_does_not() {
+        let dir = TempDir::new().unwrap();
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+            let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+            let mut s = state.lock().await;
+            s.scope_requests
+                .insert("scope-test01".into(), live_request("kimi-code", "/w/one.md", now));
+            s.standing_scope.add(standing("kimi-code", "/w/web4", now, None));
+            s.persist_standing_scope().unwrap();
+        } // daemon down: every handle dropped.
+
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let out = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"}))
+            .await
+            .unwrap();
+        let st = out["standing_grants"].as_array().unwrap();
+        assert_eq!(st.len(), 1, "the standing grant must survive the restart: {out}");
+        assert_eq!(st[0]["path"], "/w/web4");
+        assert_eq!(
+            out["generation"].as_u64(),
+            Some(1),
+            "the generation is part of the persisted policy"
+        );
+        assert_eq!(
+            out["live_grants"].as_array().unwrap().len(),
+            0,
+            "the memory-only channel must NOT survive — that half of the asymmetry stands"
+        );
+    }
+
+    /// (GPT #431 blocker 1) A failed persist leaves the live store BIT-IDENTICAL —
+    /// generation included — even on the hardest arm, a REPLACEMENT of an existing grant.
+    /// The first cut "rolled back" by revoking the just-added row: that bumped the
+    /// generation a second time and discarded the replaced grant instead of restoring it.
+    /// `commit_standing_scope` persists a candidate before swapping it live, so
+    /// unchangedness is construction, not cleanup. Failure is injected the way it happens:
+    /// the vault's directory is made unwritable, so the atomic temp-file write fails.
+    #[tokio::test]
+    async fn failed_persist_on_replacement_leaves_store_bit_identical() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let mut s = state.lock().await;
+        s.commit_standing_scope(|st| st.add(standing("kimi-code", "/w/web4", now, None)))
+            .unwrap();
+        let before_grants = s.standing_scope.grants.clone();
+        let before_generation = s.standing_scope.generation;
+        assert_eq!(before_generation, 1);
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = s.commit_standing_scope(|st| {
+            st.add(standing("kimi-code", "/w/web4", now + 5, Some(now + 60)))
+        });
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(err.is_err(), "the persist must have failed for this test to test anything");
+
+        assert_eq!(
+            s.standing_scope.generation, before_generation,
+            "a failed persist must not move the generation — not even by a rollback"
+        );
+        assert_eq!(
+            s.standing_scope.grants, before_grants,
+            "the REPLACED grant must still be the live one, byte for byte"
+        );
+        // And the store still works: the retry (with a writable vault) lands normally.
+        s.commit_standing_scope(|st| {
+            st.add(standing("kimi-code", "/w/web4", now + 5, Some(now + 60)))
+        })
+        .unwrap();
+        assert_eq!(s.standing_scope.generation, 2);
+        assert_eq!(s.standing_scope.grants[0].expires_at, Some(now + 60));
+    }
+
+    /// (GPT #431 blocker 2) A revoke whose vault write fails is RETRYABLE, and the retry
+    /// makes the removal durable: revoke -> injected persist failure (row already out of
+    /// memory, memory kept tighter) -> retry succeeds -> vault lacks the grant -> a full
+    /// restart stays revoked. The first cut's existence check 404ed the retry because the
+    /// row had left memory, stranding the operator with a resurrection-on-restart hazard
+    /// and no working recovery verb.
+    #[tokio::test]
+    async fn failed_revoke_is_retryable_and_restart_stays_revoked() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+            let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| st.add(standing("kimi-code", "/w/web4", now, None)))
+                .unwrap();
+
+            // The revoke, with the vault write failing.
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+            let err = s.apply_standing_revoke("kimi-code", "/w/web4");
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            assert!(err.is_err(), "persist must have failed");
+            assert!(
+                s.live_standing_grants("kimi-code").is_empty(),
+                "memory keeps the TIGHTER state after the failure"
+            );
+            assert!(
+                s.standing_scope_dirty,
+                "the dirty flag is what keeps the retry door open past the 404 check"
+            );
+
+            // THE RETRY — the row is absent from memory, and must still persist + succeed.
+            s.apply_standing_revoke("kimi-code", "/w/web4").unwrap();
+            assert!(!s.standing_scope_dirty, "a successful retry closes the window");
+        } // daemon down.
+
+        // Restart: the vault must now lack the grant — revoked stays revoked.
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let s = state.lock().await;
+        assert!(
+            s.live_standing_grants("kimi-code").is_empty(),
+            "the revoked grant must NOT resurrect across the restart"
+        );
+        assert_eq!(
+            s.standing_scope.generation, 2,
+            "grant + revoke: the persisted generation carries both mutations"
+        );
+    }
+
+    /// (GPT #431 blocker 3) `snapshot_expires_at` never outlives a grant the snapshot
+    /// represents: it is min(now+TTL, earliest expiry across live AND standing grants).
+    /// Without the bound, a consumer honouring the cached copy until the flat now+8h
+    /// horizon would keep admitting a grant that expired in seconds — and the generation
+    /// does not move on wall-clock expiry, so nothing would repair it.
+    #[tokio::test]
+    async fn snapshot_horizon_is_bounded_by_earliest_covered_expiry() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+
+        // No grants at all: the ceiling holds.
+        let out = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"}))
+            .await
+            .unwrap();
+        let ceiling = out["snapshot_expires_at"].as_u64().unwrap();
+        assert!(ceiling >= now + 8 * 3600 - 5, "ceiling when nothing bounds it: {out}");
+
+        {
+            let mut s = state.lock().await;
+            // A live grant expiring in ~60s and a standing grant expiring in ~120s.
+            let mut lr = live_request("kimi-code", "/w/one.md", now);
+            lr.expires_at = now + 60;
+            s.scope_requests.insert("scope-test01".into(), lr);
+            s.standing_scope
+                .add(standing("kimi-code", "/w/web4", now, Some(now + 120)));
+        }
+        let out = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out["snapshot_expires_at"].as_u64().unwrap(),
+            now + 60,
+            "the EARLIEST covered expiry bounds the horizon (live grant here): {out}"
+        );
+
+        // Another member's short grant must not tighten this member's horizon.
+        {
+            let mut s = state.lock().await;
+            s.standing_scope
+                .add(standing("codex", "/w/hestia", now, Some(now + 5)));
+        }
+        let out = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out["snapshot_expires_at"].as_u64().unwrap(),
+            now + 60,
+            "a foreign member's expiry is not part of this snapshot: {out}"
+        );
+    }
+
+    /// (b) No MCP tool can mutate standing scope. Same construction as
+    /// `no_mcp_tool_can_set_an_operator_grant`: a denylist over the ACTUAL tool list,
+    /// because the failure mode is somebody adding a convenient `hestia_standing_grant`
+    /// months from now. The only mutation paths are `/api/scope/decide {standing:true}`
+    /// and `/api/scope/standing/revoke`, both inside the operator_gate route_layer
+    /// (challenge-signed session — see `http.rs`), and `no_mcp_tool_can_decide_a_scope_request`
+    /// already pins every scope-named tool to ask/read only.
+    #[test]
+    fn no_mcp_tool_can_mutate_standing_scope() {
+        let names: Vec<String> = hestia_tools().into_iter().map(|t| t.name.to_string()).collect();
+        for n in &names {
+            let l = n.to_ascii_lowercase();
+            assert!(
+                !l.contains("standing"),
+                "MCP tool `{n}` looks like it reaches the STANDING scope store. Durable \
+                 loosening must stay operator-only (challenge-signed HTTP); a member that \
+                 could mint a grant that survives restarts would hold the one control this \
+                 store's durability traded the restart-backstop for. Serve it read-only \
+                 through hestia_scope_status / hestia_operating_law instead."
+            );
+        }
+        // The read path must remain, or the disclosure requirement dies with it.
+        assert!(
+            names.iter().any(|n| n == "hestia_scope_status"),
+            "hestia_scope_status is how a member learns its standing reach"
+        );
     }
 }

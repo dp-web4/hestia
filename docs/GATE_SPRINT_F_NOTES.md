@@ -55,6 +55,27 @@ verified in `tree/` (a full copy of the tip's `plugins/`).
   for non-enforce/diagnostic callers, but neither shim reaches it.
 
 **RED — declared open, with the reason (§9: no daemon protocol redesign, so nothing was invented)**
+
+> **R1 RESOLVED + R4/#407 FIXED (2026-08-14, dp: "might as well do the real fix" —
+> `cbp/standing-scope-surface`).** The daemon now owns a durable standing-scope store
+> (`core/src/server/standing_scope.rs`): vault document `scope`/`standing`, loaded at
+> startup, written atomically through the vault's temp-file-and-rename on every operator
+> decision, per-grant `expires_at`, witnessed revoke, and a monotonic `generation` moved
+> by every mutation. Mutations only via the operator-walled `POST /api/scope/decide
+> {standing:true}` promotion + `POST /api/scope/standing/revoke`; no MCP tool (pinned by
+> `no_mcp_tool_can_mutate_standing_scope`). `hestia_scope_status` serves
+> `standing_grants` + `generation` + `snapshot_expires_at` additively beside
+> `live_grants`; `hestia_operating_law` discloses standing grants inside the hashed body
+> AND its projection now forwards both grant lists (#407 — R4 below). The mechanism's
+> `fetch_policy_snapshot` composes them (repo-root → repo NAME, deeper paths stay
+> faithful-but-inert "path:" entries — R2 still stands), and `resolve_agent_policy`
+> stamps the daemon-issued `generation`/`expires_at` onto the returned policy, refusing
+> a snapshot past its horizon. The certified-replica fields are therefore now ISSUED,
+> not just honoured; the remaining gap is signing (issued ≠ authenticated). R3
+> (launch-cwd grant surface) remains open; claude-code's recorded `*` grant (see below)
+> is now UNBLOCKED but deliberately not made in the same change — a reach-defining grant
+> is dp's act, through the new operator surface, not a PR default.
+
 - **R1. Standing repo scope has NO daemon surface.** `in_scope` appears nowhere in
   `core/src/server/*.rs`; the vault the daemon fronts holds presets/roles/lists, not member
   MRH. A live snapshot therefore cannot carry standing repo grants. Consequence (a real

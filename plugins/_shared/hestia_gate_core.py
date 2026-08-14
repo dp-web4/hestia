@@ -349,6 +349,13 @@ class AgentPolicy:
     distribution this file does not own. Until then `generation`/`expires_at` bound the damage
     and make the gap explicit; they do not close it. The honest summary is that a stale replica
     is now *time-limited and self-describing*, not *authenticated*.
+
+    ISSUANCE LANDED (Sprint F R1, 2026-08-14). The two fields were honor-side only — this
+    class demanded them and nothing issued them. The daemon now does: `hestia_scope_status`
+    serves its durable standing-scope store's monotonic `generation` and a daemon-issued
+    `snapshot_expires_at`, `fetch_policy_snapshot` carries both, and `resolve_agent_policy`'s
+    vault branch stamps them onto the returned policy — refusing the snapshot outright past
+    its horizon. The forgery gap in the paragraph above stands: issued is not yet *signed*.
     """
 
     #: Sentinel for "this member is deliberately unscoped." Never inferred from an empty list —
@@ -580,8 +587,25 @@ def resolve_agent_policy(profile: HarnessProfile,
                 except Exception:
                     parsed = None
                 if parsed is not None:
+                    # CERTIFICATION FIELDS, issued by the authority (Sprint F R1): the
+                    # daemon's standing-store generation and its honor horizon ride the
+                    # snapshot and are stamped onto the policy, so a caller (or a future
+                    # replica-writer) can say WHICH policy it holds and until when.
+                    # Tighten-only: a snapshot past its own horizon grants NOTHING — the
+                    # authority said how long the copy could be honoured and is taken at
+                    # its word — and absent fields leave pre-R1 behaviour untouched.
+                    # bool is excluded because isinstance(True, int) holds in Python.
+                    gen = got.get("generation")
+                    exp = got.get("expires_at")
+                    gen = gen if isinstance(gen, int) and not isinstance(gen, bool) else None
+                    exp = exp if isinstance(exp, int) and not isinstance(exp, bool) else None
+                    if exp is not None and now_secs() >= exp:
+                        return AgentPolicy(member_id=profile.member_id, scope=(),
+                                           source="vault-expired", stale=True,
+                                           generation=gen, expires_at=exp)
                     return AgentPolicy(
                         member_id=profile.member_id, scope=parsed, source="vault",
+                        generation=gen, expires_at=exp,
                     )
 
     # 2. Local replica — fail-closed fallback, marked stale.

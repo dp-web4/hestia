@@ -441,6 +441,19 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/http.rs::scope_decide", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
+    // ADDED 2026-08-14 (claude-code, Sprint F R1 — the standing-scope surface). The census
+    // went red the moment the site was written — the instrument working.
+    //
+    // READING, both questions. (1) Who gets named? The subject of a `scope_standing_revoked`
+    // chain entry — the member whose DURABLE grant an operator just removed. Same shape and
+    // same caveat as `scope_decide` directly above: `plugin_id` is operator-typed here, so
+    // this is a name, not attendance; a typo'd revoke 404s on the store lookup before this
+    // line runs, which bounds the mismatch. (2) Compared to decide control flow? No — the
+    // revoke keys on the store's `(member, path)` strings; the derived LCT is serialised
+    // into the witness entry and read by nothing. Naming, like its sibling.
+    ("server/http.rs::scope_standing_revoke", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
     ("server/state.rs::trust_entity_key", &[
         "match self.member_lct(plugin_id) {",
     ], SiteClass::Naming),

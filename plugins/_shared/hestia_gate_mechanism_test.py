@@ -50,8 +50,9 @@ class FakeClient:
             raise urllib.error.URLError("boom")
         payload = {"hestia_connect": self.connect,
                    "hestia_begin_action": self.begin,
-                   "hestia_query_policy": self.policy}[name]
-        return {"result": {"structuredContent": payload}}
+                   "hestia_query_policy": self.policy}
+        payload.update(getattr(self, "extra", {}))
+        return {"result": {"structuredContent": payload[name]}}
 
 
 def _drive(fake, endpoint="http://fake/mcp"):
@@ -149,6 +150,199 @@ def test_unknown_decision_value_failcloses():
     check("unknown_decision", (not v.allow) and (not v.decided), str(v))
 
 
+# ---- standing scope (Sprint F R1): daemon-certified snapshot admits ----
+def test_standing_grant_becomes_admitting_scope_with_certification():
+    """A durable standing grant served by the daemon must land in the snapshot as an
+    ADMITTING in_scope entry (repo-root -> repo name), carry the daemon-issued
+    certification pair (generation + expires_at), and flow through the core's
+    resolve_agent_policy vault branch onto an AgentPolicy that path_in_scope honours.
+    The expired arm is the tighten half: a snapshot past its own horizon grants NOTHING."""
+    import tempfile
+    import hestia_gate_core as core
+    ws = tempfile.mkdtemp(prefix="sswt-ws-")
+    old_ws = os.environ.get("HESTIA_WORKSPACE")
+    os.environ["HESTIA_WORKSPACE"] = ws
+    try:
+        horizon = int(time.time()) + 3600
+        fake = FakeClient()
+        fake.extra = {
+            "hestia_operating_law": {
+                "identity": {"plugin_id": "kimi-code", "role": "role:constellation:member"},
+                "law_hash": "h-std"},
+            "hestia_scope_status": {
+                "plugin_id": "kimi-code", "requests": [], "live_grants": [],
+                "standing_grants": [
+                    {"path": ws + "/web4", "granted_by": "operator",
+                     "reason": "standing repo grant", "expires_at": None},
+                    {"path": ws + "/web4/deep/file.txt", "granted_by": "operator",
+                     "reason": "file grant stays a path grant", "expires_at": None},
+                ],
+                "generation": 4,
+                "snapshot_expires_at": horizon},
+        }
+        m._discover_endpoint = lambda: "http://fake/mcp"
+        m._McpHttp = lambda ep, dl: fake
+        snap = m.fetch_policy_snapshot("kimi-code", use_cache=False)
+        check("standing_snap_present", isinstance(snap, dict), repr(snap))
+        check("standing_repo_root_maps_to_name", "web4" in snap["in_scope"], str(snap))
+        check("standing_deep_path_stays_path",
+              ("path:" + ws + "/web4/deep/file.txt") in snap["in_scope"], str(snap))
+        check("standing_list_carried", len(snap["standing_grants"]) == 2, str(snap))
+        check("standing_generation", snap["generation"] == 4, str(snap))
+        check("standing_expires_at", snap["expires_at"] == horizon, str(snap))
+
+        prof = core.HarnessProfile(member_id="kimi-code",
+                                   identity_path="/nonexistent/identity.json")
+        pol = core.resolve_agent_policy(prof, vault_reader=lambda mid: snap)
+        check("standing_source_vault", pol.source == "vault", str(pol))
+        check("standing_scope_admits_name", "web4" in pol.scope, str(pol))
+        check("standing_cert_generation", pol.generation == 4, str(pol))
+        check("standing_cert_expires_at", pol.expires_at == horizon, str(pol))
+        check("standing_path_in_scope_admits",
+              core.path_in_scope(ws + "/web4/anything.rs", pol.scope, ws, prof, None),
+              f"scope={pol.scope} ws={ws}")
+
+        expired = dict(snap)
+        expired["expires_at"] = 1
+        pol2 = core.resolve_agent_policy(prof, vault_reader=lambda mid: expired)
+        check("standing_expired_grants_nothing",
+              pol2.scope == () and pol2.source == "vault-expired" and pol2.stale,
+              str(pol2))
+    finally:
+        if old_ws is None:
+            os.environ.pop("HESTIA_WORKSPACE", None)
+        else:
+            os.environ["HESTIA_WORKSPACE"] = old_ws
+
+
+def _std_stub(ws, live=None, standing=None, generation=1, horizon=None):
+    """A daemon answering the R1 surface, for the mapping/horizon arms."""
+    fake = FakeClient()
+    fake.extra = {
+        "hestia_operating_law": {
+            "identity": {"plugin_id": "kimi-code", "role": "role:constellation:member"},
+            "law_hash": "h-std"},
+        "hestia_scope_status": {
+            "plugin_id": "kimi-code", "requests": [],
+            "live_grants": live or [],
+            "standing_grants": standing or [],
+            "generation": generation,
+            "snapshot_expires_at": horizon or (int(time.time()) + 3600)},
+    }
+    return fake
+
+
+def _fetch_with(fake):
+    m._discover_endpoint = lambda: "http://fake/mcp"
+    m._McpHttp = lambda ep, dl: fake
+    return m.fetch_policy_snapshot("kimi-code", use_cache=False)
+
+
+def _fake_workspace():
+    """A discoverable workspace root: >=2 of the core's marker dirs."""
+    import tempfile
+    ws = tempfile.mkdtemp(prefix="sswt-disc-")
+    os.makedirs(os.path.join(ws, "hestia"), exist_ok=True)
+    os.makedirs(os.path.join(ws, "web4"), exist_ok=True)
+    return ws
+
+
+# ---- one grant->entry mapping for BOTH channels (GPT #431 blocker 4) ----
+def test_live_grant_repo_root_maps_via_shared_resolver():
+    """LIVE grants ride the same repo-root->name mapping as standing grants (the #430
+    seam, closed via one resolver): a live grant for a repo root under the workspace
+    must admit as the bare repo name."""
+    ws = _fake_workspace()
+    old = os.environ.get("HESTIA_WORKSPACE")
+    os.environ["HESTIA_WORKSPACE"] = ws
+    try:
+        snap = _fetch_with(_std_stub(ws, live=[{"path": ws + "/web4",
+                                                "expires_at": int(time.time()) + 600}]))
+        check("live_root_maps", "web4" in snap["in_scope"], str(snap))
+    finally:
+        if old is None:
+            os.environ.pop("HESTIA_WORKSPACE", None)
+        else:
+            os.environ["HESTIA_WORKSPACE"] = old
+
+
+def test_workspace_mapping_discovers_root_without_env():
+    """Env absent: the core's marker-based cwd climb finds the workspace, and a standing
+    repo-root grant still admits — the portability arm the machine-specific fallback
+    failed."""
+    ws = _fake_workspace()
+    old_env = os.environ.pop("HESTIA_WORKSPACE", None)
+    old_cwd = os.getcwd()
+    os.chdir(ws)
+    try:
+        snap = _fetch_with(_std_stub(ws, standing=[{"path": ws + "/web4",
+                                                    "granted_by": "operator",
+                                                    "reason": "r", "expires_at": None}]))
+        check("discovered_root_maps", "web4" in snap["in_scope"], str(snap))
+    finally:
+        os.chdir(old_cwd)
+        if old_env is not None:
+            os.environ["HESTIA_WORKSPACE"] = old_env
+
+
+def test_workspace_mapping_invalid_env_falls_back_to_discovery():
+    """An env var naming a NONEXISTENT dir must not poison the mapping: the core's
+    detect_workspace ignores it (isdir check) and discovery still admits the grant."""
+    ws = _fake_workspace()
+    old_env = os.environ.get("HESTIA_WORKSPACE")
+    os.environ["HESTIA_WORKSPACE"] = ws + "-does-not-exist"
+    old_cwd = os.getcwd()
+    os.chdir(ws)
+    try:
+        snap = _fetch_with(_std_stub(ws, standing=[{"path": ws + "/web4",
+                                                    "granted_by": "operator",
+                                                    "reason": "r", "expires_at": None}]))
+        check("invalid_env_discovered", "web4" in snap["in_scope"], str(snap))
+    finally:
+        os.chdir(old_cwd)
+        if old_env is None:
+            os.environ.pop("HESTIA_WORKSPACE", None)
+        else:
+            os.environ["HESTIA_WORKSPACE"] = old_env
+
+
+# ---- bounded horizon, consumer side (GPT #431 blocker 3) ----
+def test_cached_snapshot_refused_after_bounded_horizon():
+    """The daemon bounds snapshot_expires_at by the earliest covered grant expiry; this
+    pins the CONSUMER half: a cached snapshot whose bounded horizon has passed grants
+    NOTHING at resolve time, even though the flat 8h ceiling is nowhere near."""
+    import hestia_gate_core as core
+    ws = _fake_workspace()
+    old = os.environ.get("HESTIA_WORKSPACE")
+    os.environ["HESTIA_WORKSPACE"] = ws
+    try:
+        soon = int(time.time()) + 60
+        snap = _fetch_with(_std_stub(
+            ws,
+            standing=[{"path": ws + "/web4", "granted_by": "operator",
+                       "reason": "short grant", "expires_at": soon}],
+            generation=7, horizon=soon))
+        check("horizon_carried", snap["expires_at"] == soon, str(snap))
+        prof = core.HarnessProfile(member_id="kimi-code",
+                                   identity_path="/nonexistent/identity.json")
+        pol = core.resolve_agent_policy(prof, vault_reader=lambda mid: snap)
+        check("admits_before_horizon", "web4" in pol.scope, str(pol))
+        real_now = core.now_secs
+        try:
+            core.now_secs = lambda: soon + 1
+            pol2 = core.resolve_agent_policy(prof, vault_reader=lambda mid: snap)
+            check("cached_past_horizon_refused",
+                  pol2.scope == () and pol2.source == "vault-expired" and pol2.stale,
+                  str(pol2))
+        finally:
+            core.now_secs = real_now
+    finally:
+        if old is None:
+            os.environ.pop("HESTIA_WORKSPACE", None)
+        else:
+            os.environ["HESTIA_WORKSPACE"] = old
+
+
 # ---- FAIL-CLOSED: deadline exhaustion + bad env (GPT #4) ----
 def test_exhausted_deadline_refuses_request():
     c = _REAL_MCP("http://x", deadline=time.monotonic() - 1.0)  # already past
@@ -190,6 +384,11 @@ ALL = [
     test_unknown_status_failcloses,
     test_missing_decision_failcloses,
     test_unknown_decision_value_failcloses,
+    test_standing_grant_becomes_admitting_scope_with_certification,
+    test_live_grant_repo_root_maps_via_shared_resolver,
+    test_workspace_mapping_discovers_root_without_env,
+    test_workspace_mapping_invalid_env_falls_back_to_discovery,
+    test_cached_snapshot_refused_after_bounded_horizon,
     test_exhausted_deadline_refuses_request,
     test_bad_budget_env_defaults_not_raises,
 ]
