@@ -5345,6 +5345,124 @@ mod accountability_tests {
         (dir, state)
     }
 
+    /// Read every delta the sink has collected, newest last.
+    async fn sink_deltas(state: &SharedState) -> Vec<serde_json::Value> {
+        let path = state.lock().await.reputation_sink();
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    /// **The call-site classification guard (web4 #703 / R7a).**
+    ///
+    /// The builder-level tests prove `delta_from_change` carries whatever class
+    /// it is handed. They cannot prove the HANDLERS hand it the right one — so
+    /// without this, an edit flipping a caller-reported site back to `Conduct`
+    /// would go green, which is exactly how the defect got in the first time.
+    ///
+    /// `hestia_record_outcome` takes `success` from its ARGS. The hook derives
+    /// it from a tool response and forwards it, which establishes THAT a call
+    /// failed and never WHY — so an infrastructure failure reported as
+    /// `success=false` must not become conduct against the member.
+    #[tokio::test]
+    async fn a_caller_reported_outcome_never_scores_as_conduct() {
+        let (_dir, state) = test_state().await;
+        let sid = tool_connect(&state, &json!({"plugin_id": "claude-code", "host_agent": "t"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+
+        // A FAILURE report — the shape an infra fault arrives in.
+        let begin = tool_begin_action(&state, &json!({
+            "tool_name": "Bash", "target": "ls", "session_id": sid, "intent": "list"
+        })).await.unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        tool_record_outcome(&state, &json!({
+            "action_id": aid, "success": false, "magnitude": 0.5,
+            "error": "connection refused"
+        })).await.unwrap();
+
+        let deltas = sink_deltas(&state).await;
+        assert!(!deltas.is_empty(), "the failure must emit a delta at all");
+        for d in &deltas {
+            assert_ne!(
+                d["class"], serde_json::json!("conduct"),
+                "a caller-REPORTED outcome must never be classed as conduct: an \
+                 infrastructure failure arrives in exactly this shape \
+                 (success=false + error), and scoring it against the member is \
+                 the infra-as-conduct defect R7a removes. Got: {d}"
+            );
+        }
+    }
+
+    /// **The discriminating control.** Without this, the guard above could pass
+    /// simply because nothing is ever classed `conduct` — and the first version
+    /// of this test did exactly that: it observed ZERO deltas and passed through
+    /// an `|| deltas.is_empty()` escape, proving nothing.
+    ///
+    /// So this drives a decision the DAEMON's own engines make (a deny rule,
+    /// installed here), where reachability is established by construction, and
+    /// requires that it DOES class as conduct. The two tests together say: the
+    /// classification tracks the causal basis, not the shape of the report.
+    #[tokio::test]
+    async fn a_daemon_evaluated_gate_decision_does_score_as_conduct() {
+        let (_dir, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            s.role_policy_engines.insert(
+                "role:constellation:mesh-worker".into(),
+                crate::policy::PolicyEngine::new(crate::policy::PolicyConfig {
+                    default_policy: crate::policy::PolicyDecision::Allow,
+                    enforce: true,
+                    rules: vec![crate::policy::PolicyRule {
+                        id: "control-deny".into(),
+                        name: "control deny".into(),
+                        priority: 0,
+                        decision: crate::policy::PolicyDecision::Deny,
+                        reason: Some("control".into()),
+                        r#match: crate::policy::PolicyMatch {
+                            categories: Some(vec!["credential_access".into()]),
+                            ..Default::default()
+                        },
+                    }],
+                }),
+            );
+        }
+        let sid = tool_connect(&state, &json!({
+            "plugin_id": "claude-code", "host_agent": "t",
+            "role": "role:constellation:mesh-worker"
+        })).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+
+        // The daemon-evaluated gate delta lives in `tool_query_policy`, which
+        // evaluates an ALREADY-BEGUN action (found by reading the enclosing fn,
+        // after an earlier guess at `vault_get` produced an empty sink and a
+        // vacuous pass). So: begin a credential-class action, then ask.
+        let begin = tool_begin_action(&state, &json!({
+            "tool_name": "Read", "target": "~/.ssh/id_rsa",
+            "session_id": sid, "intent": "control: provoke a daemon deny"
+        })).await.unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        let verdict = tool_query_policy(&state, &json!({
+            "action_id": aid, "session_id": sid
+        })).await.unwrap();
+        assert_ne!(
+            verdict["decision"], serde_json::json!("allow"),
+            "the control needs a NON-allow verdict to emit anything: {verdict}"
+        );
+
+        let deltas = sink_deltas(&state).await;
+        assert!(
+            !deltas.is_empty(),
+            "the control must actually EXERCISE a conduct path — an empty sink \
+             here means this test proves nothing about the guard above, which is \
+             how its first version passed vacuously"
+        );
+        assert!(
+            deltas.iter().any(|d| d["class"] == serde_json::json!("conduct")),
+            "a daemon-evaluated gate decision must class as conduct: {deltas:?}"
+        );
+    }
+
     /// The accountability contract: a completed action's witnessed `outcome`
     /// event carries WHO (per-instance LCT + session_id) and WHY (actor intent),
     /// so concurrent same-type sessions are attributed per-instance and
