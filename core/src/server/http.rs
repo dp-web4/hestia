@@ -766,6 +766,9 @@ async fn operator_adjudicate(
     if let Some(score) = score {
         let adj_reason = format!("adjudication:{}:{}:operator", a.axis, a.verdict);
         let rep_ctx = crate::reputation::RepContext {
+            // An OPERATOR adjudication: a human judgment about conduct, the
+            // strongest causal provenance in this set.
+            class: crate::reputation::DeltaClass::Conduct,
             role_lct: role,
             action_type: "adjudication",
             action_target: "operator",

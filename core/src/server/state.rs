@@ -940,6 +940,13 @@ impl ServerState {
         magnitude: f64,
     ) -> Result<EntityTrust> {
         let ctx = crate::reputation::RepContext {
+            // Same reasoning as `tool_record_outcome`: this wrapper takes
+            // `success` as a PARAMETER, so it cannot establish whether a
+            // failure was member conduct or an environmental one. Held.
+            // (Only test callers reach it today; classifying it honestly now
+            // means a future production caller inherits the safe answer rather
+            // than an inherited claim.)
+            class: crate::reputation::DeltaClass::Unclassified,
             role_lct: crate::reputation::V1_CONSTELLATION_ROLE,
             action_type: "outcome",
             action_target: "",
@@ -1160,6 +1167,7 @@ mod tests {
 
     fn ctx_for(role: &'static str) -> crate::reputation::RepContext<'static> {
         crate::reputation::RepContext {
+            class: crate::reputation::DeltaClass::Conduct,
             role_lct: role,
             action_type: "outcome",
             action_target: "",

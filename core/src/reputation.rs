@@ -16,7 +16,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use web4_core::r6::{DeltaClass, ReputationDelta, SovereignStrength, TensorDelta};
+use web4_core::r6::{ReputationDelta, SovereignStrength, TensorDelta};
+// Re-exported so call sites classify through this module (the seam that owns the
+// conduct-vs-infra claim) rather than reaching into web4-core independently.
+pub use web4_core::r6::DeltaClass;
 use web4_trust_core::EntityTrust;
 
 /// Canonical constellation-role vocabulary (#403 capacity scoping). MUST stay
@@ -72,6 +75,27 @@ pub const SINK_FILE: &str = "reputation-deltas.jsonl";
 
 /// Context carried into an emitted delta (what caused the trust change).
 pub struct RepContext<'a> {
+    /// **Conduct or infrastructure?** (web4 #703 / hub F0.1 R7a.)
+    ///
+    /// The hub ENFORCES this class — `Conduct` may fold into a `(subject, role)`
+    /// tensor, `Infra` and `Unclassified` are recorded and held — so the claim
+    /// has to be established where the CAUSE is known, which is here at the
+    /// caller, not in [`delta_from_change`] and not at hub ingest.
+    ///
+    /// [`delta_from_change`] deliberately cannot supply it: it diffs a tensor
+    /// before/after and knows only THAT it moved. Nor may a later reader infer
+    /// it from `action_type`, `reason`, `rule_triggered`, or the sign of the
+    /// delta — those are descriptive evidence, not causal proof, and inferring
+    /// from them would recreate the infrastructure-as-conduct defect one layer
+    /// downstream (the measured PR #357 class).
+    ///
+    /// Choose by what the caller can actually establish:
+    /// - established member behaviour → [`DeltaClass::Conduct`]
+    /// - timeout / locked vault / unreachable daemon, peer or referee / any
+    ///   other environmental failure → [`DeltaClass::Infra`]
+    /// - causal basis genuinely not established → [`DeltaClass::Unclassified`],
+    ///   which is honest and costs only that the row is held rather than folded
+    pub class: DeltaClass,
     pub role_lct: &'a str,
     pub action_type: &'a str,
     pub action_target: &'a str,
@@ -159,24 +183,13 @@ pub fn delta_from_change(
         // design), so the hub tags this bucket member-attested-not-hub-verified.
         // Flips to Hardware when the TPM sovereign lands (P4).
         sovereign_strength: SovereignStrength::Placeholder,
-        // Conduct-vs-infra class (web4 #703 / hub F0.1 R7a). The hub HOLDS an
-        // `Unclassified` delta — recorded and counted, never applied to a tensor
-        // — so this is the fail-closed truth until the caller can distinguish,
-        // NOT a placeholder to be quietly upgraded later.
-        //
-        // Why it is not `Conduct` here: this function diffs a trust tensor
-        // before/after and knows only THAT it moved, not WHY. The movement's
-        // first source is the warn/deny gate wiring, and a fail-closed deny
-        // caused by an unreachable daemon is an INFRASTRUCTURE fact wearing a
-        // conduct-shaped signal — which is precisely the conflation R7a exists
-        // to prevent (the measured hestia PR #357 class). Claiming `Conduct`
-        // from a caller that cannot tell the two apart would re-create the
-        // defect inside the field added to fix it.
-        //
-        // The classification belongs at the CALL SITE, which knows the cause.
-        // Threading it there is the hestia-side half of R7a and is deliberately
-        // a separate, reviewable change rather than a value guessed here.
-        class: DeltaClass::Unclassified,
+        // Conduct-vs-infra class (web4 #703 / hub F0.1 R7a) — CARRIED FROM THE
+        // CALLER, never decided here. This function diffs a tensor and knows
+        // only THAT it moved, not WHY; `RepContext.class` is where the caller
+        // states the cause it can actually establish. A caller with no causal
+        // basis passes `Unclassified` and the hub holds the row, which is the
+        // honest outcome rather than a guess.
+        class: ctx.class,
         timestamp: ts,
     })
 }
@@ -203,6 +216,7 @@ mod tests {
 
     fn ctx() -> RepContext<'static> {
         RepContext {
+            class: DeltaClass::Conduct,
             role_lct: V1_CONSTELLATION_ROLE,
             action_type: "policy_gate",
             action_target: "Bash",
@@ -288,5 +302,66 @@ mod tests {
         let before = EntityTrust::new("plugin:x");
         let after = before.clone(); // nothing moved
         assert!(delta_from_change("plugin:x", &ctx(), &before, &after, Utc::now()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod class_at_call_site_tests {
+    use super::*;
+    use web4_trust_core::EntityTrust;
+
+    fn moved() -> (EntityTrust, EntityTrust) {
+        let before = EntityTrust::new("plugin:x");
+        let mut after = before.clone();
+        after.update_from_outcome(false, 0.5);
+        (before, after)
+    }
+
+    fn ctx_with(class: DeltaClass) -> RepContext<'static> {
+        RepContext {
+            class,
+            role_lct: V1_CONSTELLATION_ROLE,
+            action_type: "policy_gate",
+            action_target: "Bash",
+            action_id: "",
+            rule_triggered: "",
+            reason: "gate:deny",
+        }
+    }
+
+    /// **The builder carries the caller's claim and invents nothing.** It sees
+    /// only that a tensor moved; the cause is the caller's to establish, so
+    /// whatever class it is handed is what the delta says — including the
+    /// honest `Unclassified`.
+    #[test]
+    fn the_builder_carries_the_class_it_is_given() {
+        let (b, a) = moved();
+        for want in [DeltaClass::Conduct, DeltaClass::Infra, DeltaClass::Unclassified] {
+            let d = delta_from_change("subj", &ctx_with(want), &b, &a, Utc::now())
+                .expect("a moved tensor emits a delta");
+            assert_eq!(d.class, want, "the builder must not re-decide the class");
+        }
+    }
+
+    /// **The regression that matters (web4 #703 review).** Identical descriptive
+    /// evidence — same `action_type`, same `reason`, same tensor movement, same
+    /// sign — carrying two different causes must produce two different classes.
+    /// If this ever fails, something has started inferring cause from
+    /// description, which is the infrastructure-as-conduct defect moved one
+    /// layer downstream.
+    #[test]
+    fn identical_description_does_not_determine_class() {
+        let (b, a) = moved();
+        let as_conduct = delta_from_change("subj", &ctx_with(DeltaClass::Conduct), &b, &a, Utc::now()).unwrap();
+        let as_infra = delta_from_change("subj", &ctx_with(DeltaClass::Infra), &b, &a, Utc::now()).unwrap();
+
+        assert_eq!(as_conduct.action_type, as_infra.action_type);
+        assert_eq!(as_conduct.reason, as_infra.reason);
+        assert_eq!(as_conduct.rule_triggered, as_infra.rule_triggered);
+        assert_eq!(
+            as_conduct.t3_delta.len(), as_infra.t3_delta.len(),
+            "same movement, so description alone cannot tell these apart");
+        assert_ne!(as_conduct.class, as_infra.class,
+            "only the CALLER's stated cause separates them");
     }
 }

@@ -775,6 +775,23 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
 
     let rep_action_id = action_id.to_string();
     let rep_ctx = crate::reputation::RepContext {
+        // CALLER-REPORTED outcome, not an observation. `success`, `magnitude`
+        // and `error` all arrive in `args` — the PostToolUse witness hook
+        // derives `success` from the tool response and forwards it. That
+        // establishes THAT the call failed, never WHY, so the causal basis for
+        // conduct is absent.
+        //
+        // The seam this closes (web4 #703 review): infra failure → caller
+        // reports success=false → this handler → `Conduct`. Claiming conduct
+        // here recreates the exact infra-as-conduct conflation R7a removes,
+        // and the earlier `Conduct` on this site did precisely that on the
+        // strength of "hestia observed it" — which is not what the handler
+        // does.
+        //
+        // Held until the hook/API can carry an explicit class whose causal
+        // basis it actually establishes. Not inferred from success/failure,
+        // error text, action_type, reason, or delta sign.
+        class: crate::reputation::DeltaClass::Unclassified,
         role_lct: &role_lct,
         action_type: "tool_execution",
         action_target: &action.tool_name,
@@ -1330,6 +1347,13 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
             // to the local bridge sink (the first source of hestia->hub reputation).
             let reason = format!("gate:{}", evaluation.decision.as_str());
             let rep_ctx = crate::reputation::RepContext {
+                // The DAEMON's own gate evaluation. Reachability is established by
+                // construction here: if this code is running, the referee answered.
+                // A fail-closed deny (the infra case) never reaches this branch —
+                // it cannot be witnessed through the daemon it could not reach, and
+                // there is no spool (ratified dp 2026-08-04: the chain witnesses
+                // member events, not infra telemetry).
+                class: crate::reputation::DeltaClass::Conduct,
                 role_lct: &role_lct,
                 action_type: "policy_gate",
                 action_target: &action.tool_name,
@@ -2155,6 +2179,9 @@ async fn tool_witness_adjudication(state: &SharedState, args: &Value) -> ToolRes
     if let Some(score) = score {
         let adj_reason = format!("adjudication:{axis}:{verdict}:{method}");
         let rep_ctx = crate::reputation::RepContext {
+        // A witnessed adjudication — a judgment ABOUT conduct, with stronger
+        // causal provenance than an execution outcome.
+        class: crate::reputation::DeltaClass::Conduct,
             role_lct: subject_role,
             action_type: "adjudication",
             action_target: &evidence_ref,
@@ -2298,6 +2325,9 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
     let ref_target = reference.clone().unwrap_or_default();
     let rev_reason = format!("reversal:{kind}:{cause}");
     let rep_ctx = crate::reputation::RepContext {
+        // A witnessed judgment outcome (reversal): same provenance as an
+        // adjudication, opposite direction.
+        class: crate::reputation::DeltaClass::Conduct,
         role_lct: subject_role,
         action_type: "reversal",
         action_target: &ref_target,
@@ -2342,6 +2372,8 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
         let adj_reason = format!("adjudication:validity:refuted:reversal:{}", cause.as_str());
         let adj_target = reference.clone().unwrap_or_default();
         let adj_ctx = crate::reputation::RepContext {
+            // Witnessed adjudication, as above.
+            class: crate::reputation::DeltaClass::Conduct,
             role_lct: subject_role,
             action_type: "adjudication",
             action_target: &adj_target,
@@ -3370,6 +3402,14 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     let risk_magnitude = if decision == "deny" { 0.5 } else { 0.2 };
     let gate_reason = format!("gate:{decision} ({adjudicator})");
     let rep_ctx = crate::reputation::RepContext {
+        // CALLER-REPORTED gate decision from a hook. Hestia did NOT establish
+        // this cause — it received a claim — so it cannot honestly assert
+        // Conduct, and it must NOT infer one from `decision`/`reason`/rule
+        // names: those are descriptive evidence, not causal proof, and
+        // inferring from them is exactly the infrastructure-as-conduct defect
+        // one layer downstream. Held as Unclassified until the hook states a
+        // class of its own; the hub records and counts it either way.
+        class: crate::reputation::DeltaClass::Unclassified,
         role_lct,
         action_type: "policy_gate",
         action_target: &tool_name,
