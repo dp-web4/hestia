@@ -317,6 +317,22 @@ def test_new_file_into_shared_dir_is_write():
     check("ls_shared_not_write", v3.classification != "write", str(v3))
 
 
+
+def test_hub_deploy_closure_is_write():
+    # PR #415 / web4 #709 hand-off: the hub deploy closure joins the floor. Refusing the
+    # WRITE is the R7c limb; #708's STALE detection after the fact is not the same control.
+    for tgt in ("/etc/systemd/system/web4-hub.service",
+                "/mnt/c/exe/projects/ai-agents/web4/ratified-build.json",
+                "/mnt/c/exe/projects/ai-agents/web4/tools/ratify-build.sh",
+                "/mnt/c/exe/projects/ai-agents/web4/hub/target/release/hub"):
+        v = cls("Write", {"file_path": tgt})
+        check(f"hub_write:{tgt}", v.classification == "write", str(v))
+    # Segment discipline: a bare "hub" elsewhere must NOT match the executable entry.
+    v2 = cls("Write", {"file_path": "/tmp/notes/hub"})
+    check("bare_hub_not_matched", v2.classification != "write", str(v2))
+    v3 = cls("Bash", {"command": "systemctl status web4-hub.service"})
+    check("service_read_is_read", v3.classification == "read", str(v3))
+
 # Explicit list — NOT a globals() comprehension — so every test name is a static reference
 # (tools/ci_selfexec_test.py rejects test functions whose execution cannot be established
 # statically; a dynamic sweep leaves each name un-referenced and reads as inert).
@@ -347,6 +363,7 @@ ALL = [
     test_attest_ok_miswired_unknown,
     test_attest_vault_reader_failure_reports_unknown_never_ok,
     test_new_file_into_shared_dir_is_write,
+    test_hub_deploy_closure_is_write,
 ]
 
 if __name__ == "__main__":
