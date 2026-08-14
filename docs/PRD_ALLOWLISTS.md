@@ -5,6 +5,7 @@
 **Operator rulings folded in (dp, 2026-08-14)** — both were drafted here as open questions and are now settled design:
 - **Q4 → consolidate.** *"i agree with your instinct. consolidation whenever practical is the best way to ensure effective maintenance, clarity, and applying the law uniformly."* #431's standing-scope store **becomes the FILES axis** of this system. One store, two axes, one generation counter, one export, one editor, one set of duration semantics. See **§2.0** (the principle) and **§3.4/§3.5** (the store and its migration).
 - **Q3 → a bootstrap ratchet.** *"start ceremony-light and have the option to ratchet things up to match increasing resources. we want the sufficiently-correct path to be the easy path."* The ceremony required to edit the society floor is a **declared, stored tier** that ratchets up, whose lowering must pay the tier being lowered *from*. See **§3.6**.
+- **UI → GOVERN is a top-level view.** *"the LEDGER button should become GOVERN and ledger would be a sub-screen of that … make the screen toggle from agents/hubs into agents/hubs/devices/govern selector (devices being constellation management)."* The masthead switch goes four-way; govern absorbs ledger, policy and the allowlist editor; the pending-decision banners stay **above** it. See **§6.0**. This part is **independently shippable** and need not wait for the allowlist store (§6.0.5).
 **Relates to**: `docs/PRD_GATE_CONSOLIDATION.md` (§4 LAW/SHIM/AGENT, §7.1 criterion 5), `docs/GATE_SPRINT_F_NOTES.md` (R1/R2/R3), `docs/PRD_GOVERNANCE.md` (the one-authority-path invariant), `docs/PRD_CONFIG_IN_VAULT.md`, PR #431 (merged — the store pattern this reuses), issues #434 (claim-window race), #435 (permissive renders green), #438 (gauge referent), #393 (friction manufactures bypass).
 
 ---
@@ -690,11 +691,96 @@ does so the same way on both axes.
 
 ## 6. The UI
 
-### 6.1 Where, and how it authenticates
+### 6.0 Information architecture — GOVERN becomes a top-level view
 
-- **Entry point**: an `allowlists` pill beside the existing `policy` button in the witness-chain
-  header (`index.html` ~957, `.policy-btn`), opening a new `#allowlist-modal` built on the same
-  modal shell as `#policy-modal` / `#scope-modal`.
+**Operator ruling (dp, 2026-08-14):**
+
+> "i think the LEDGER button should become GOVERN and ledger would be a sub-screen of that.
+> within the govern ui we can have the allow lists, generally following the same scheme as the
+> agents screen. in fact, perhaps we should remove the separate button and instead make the
+> screen toggle from agents/hubs into agents/hubs/devices/govern selector (devices being
+> constellation management)"
+
+This is an **information-architecture change**, not a placement detail, and it is the reason the
+allowlist editor does not get a button of its own.
+
+#### 6.0.1 One navigation axis
+
+The masthead segmented switch (`#view-switch` / `.view-chip` / `.dash-view`, `index.html` ~847)
+goes from **agents | hubs** to **agents | hubs | devices | govern**. There is then exactly one
+navigation axis for the whole dashboard, and **no peer-level buttons competing with it.**
+
+The `ledger` button (`#ledger-btn`, `.agents-wrap`, ~877) is **removed** and its modal becomes a
+sub-screen of govern. So is the `policy` view, which today is reachable only through
+`#policy-btn` — a pill buried in the *witness-chain card header* (~957). A governance surface
+hiding inside a live-feed card header is precisely the problem dp is removing: it is discoverable
+only by someone who already knows it is there, which is the same failure the escalation banner
+was built to fix one layer up (*"a route the UI never calls is what we already had"*).
+
+| today | after |
+|---|---|
+| `ledger` button in the masthead → `#ledger-modal` | **govern → ledger** sub-screen |
+| `policy` pill inside the witness-chain card header → `#policy-modal` | **govern → policy** sub-screen |
+| (nothing) | **govern → allowlists** — floor, per-member expansions, ceremony tier |
+
+#### 6.0.2 Govern follows the agents screen's scheme
+
+dp: *"generally following the same scheme as the agents screen."* The agents view is
+**selection-driven detail**: pick an orchestrator chip / harness row, see that thing's trust
+resolved beside it. Govern inherits the shape rather than inventing one — **pick a member, see
+its lists** — so an operator who has learned one screen has learned both, and the allowlist
+editor's per-member cards (§6.2) are the detail pane of that selection rather than a modal
+stacked on a modal.
+
+#### 6.0.3 DEVICES — the slot is reserved, and it must not look finished
+
+`devices` is **constellation management**. `core/src/constellation.rs` exists and is substantial
+(paired device LCTs, capabilities, liveness, `DeviceStatus` as the authoritative gate, the
+constellation proof/attestation), and the dashboard snapshot **already carries** a `constellation`
+field (`dashboard.rs` ~1104). The *screen* largely does not exist.
+
+**This PRD reserves the slot and states its intended scope as future work. It does not invent its
+contents.** And the honest failure mode is named, because it is the never-flatter doctrine
+(#435/#438) applied to navigation: **a nav slot advertising a screen that does nothing is itself
+a never-flatter violation.** A tab that opens onto a plausible-looking empty panel tells the
+operator the constellation is empty, when the truth is that nobody built the view. So `devices`
+either renders real device/seat state from the snapshot field that already exists, or it says
+**"not yet implemented"** in as many words. Those are the two acceptable states; "looks finished,
+shows nothing" is not one of them.
+
+#### 6.0.4 THE CAVEAT — the banners stay ABOVE the switch
+
+Carried as a **hard constraint**, quoted from the code's own design note (`index.html` ~918):
+
+> "The escalation/scope banners deliberately sit ABOVE both — an operator decision awaiting
+> action must never be hidden behind a tab."
+
+When govern becomes a tab there is an obvious tidiness argument for moving pending escalations
+and scope requests into it — they are governance, govern is the governance screen. **Do not.**
+The banners (`#esc-banner`, `#scope-banner`, ~899/~908) stay above `#view-switch`'s views, visible
+on every screen including hubs and devices.
+
+The distinction that makes this non-arbitrary: **govern holds the history and the editing; the
+pending decision is a notification and stays unconditionally visible.** It is the same line the
+ledger button's own comment already draws — *"it sits in the title bar rather than behind a
+banner because a banner is a notification and this is a record"* — and this constraint is that
+sentence read in the other direction. The original defect was five escalations opened against dp
+in one session, none of which dp saw; putting them one tab-click away is a smaller version of the
+same failure, and a later tidy-up is exactly how it would return. Pinned as **AC-20**.
+
+#### 6.0.5 Independently shippable — do not couple the sequencing
+
+**The IA change does not depend on the allowlist store existing and could land before it.**
+Ledger and policy move into govern; allowlists appear as a third sub-screen when built; devices
+takes its slot under §6.0.3's terms. Said explicitly so the two are not welded together in
+planning: the navigation fix is worth having on its own, and holding it hostage to a policy store
+that has not been written would be a self-inflicted dependency.
+
+### 6.1 Where the allowlist editor lives, and how it authenticates
+
+- **Entry point**: **govern → allowlists** (§6.0), a sub-screen of the top-level `govern` view —
+  **not** a modal, and **not** a pill in another card's header. Per-member selection drives the
+  detail pane, following the agents screen (§6.0.2).
 - **Auth**: identical to every other operator surface on this page — the credential in
   `$HESTIA_HOME/operator.key` (lct_id + Ed25519 seed) signs a server challenge from
   `POST /api/operator/challenge`, `POST /api/operator/session` returns a token, and the token
@@ -741,6 +827,89 @@ panel is a breadth display and inherits the doctrine as **hard rules**:
 - An empty member list renders `floor only`, **not** a green checkmark — "no expansions" is a
   fact, not an achievement, and rendering it as success teaches the operator that expansions are
   failures.
+
+### 6.4 The app-shell height chain — YES, the new views need #427's treatment
+
+**Answered here as a requirement so it is not rediscovered as a scroll bug on the new screens.**
+
+**Yes.** #427 fixed exactly this class: `#agents-view` / `#hubs-view` sit *between* `main` (a flex
+column) and `.live-grid`, and carried only `[hidden]{display:none}` — so when shown, a view was a
+plain `display:block` of auto height, the flex chain broke, `.live-grid`'s `flex:1 1 auto` had no
+bounded parent, the chain card grew to full content height, and `main{overflow:hidden}` **clipped
+it — the witness chain could not scroll.** The fix
+(`index.html` ~288, inside the `@media (min-width:1100px) and (min-height:720px)` app-shell block):
+
+```css
+main > .dash-view:not([hidden]) { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+```
+
+The good news: that selector is **generic, not id-based**, so a fourth and fifth view inherit the
+fix *for free* — **but only if all three of its preconditions hold**, and each is easy to violate
+while building a new screen:
+
+1. **Direct child of `main`.** The selector is `main > .dash-view`. Nesting `#govern-view` inside
+   any wrapper (a padding div, a sub-nav container) silently drops the rule and reproduces #427
+   verbatim on the new screen.
+2. **Carries `class="dash-view"`.** A new view styled from scratch, or given its own class, gets
+   nothing.
+3. **Toggled via the `hidden` ATTRIBUTE**, not `style.display`. The rule keys on `:not([hidden])`,
+   and `.dash-view[hidden]{display:none}` (~108) is what hides it. A view hidden by inline
+   `display:none` would still match `:not([hidden])`, so the *hidden* view would also be told to
+   be a flex column — harmless today, but it makes "which view is mounted" a fact with two
+   contradicting sources, which is how the next layout bug gets built.
+
+**And the chain must be CONTINUED inside the new views, which the rule alone does not do.** The
+rule bounds the *view*; the agents screen then continues it with `.live-grid { flex:1 1 auto;
+min-height:0 }` → `.live-grid > .card {display:flex; min-height:0; max-height:100%}` → `.feed
+{flex:1 1 auto}`, and **that** is what makes the feed's `overflow-y:auto` engage. A govern screen
+with a long ledger or a long member list needs its own equivalent: the scrolling region must be a
+flex child with `min-height: 0`. Omitting `min-height: 0` is the classic version of this bug —
+flex items default to `min-height:auto` and refuse to shrink below content, so the list grows and
+`main{overflow:hidden}` clips it exactly as before. **Requirement: every new view names its one
+growing, scrolling region and gives it `flex:1 1 auto; min-height:0`.**
+
+**Both layout regimes must work.** Below 1100×720 the app-shell is dropped entirely and the page
+scrolls normally (the media query's own note: on a short screen a pinned shell would squeeze
+panels into unusable slivers). A govern screen that only works inside the pinned shell is broken
+on every small screen, and the failure would be invisible to anyone developing at desktop size.
+
+### 6.5 What else makes the four-way switch harder than it looks
+
+Found by reading the switch rather than assuming it generalises. None are blockers; all are
+places where "just add two chips" silently misbehaves:
+
+1. **`setView` has a hard whitelist that falls back to `agents`** (~1236):
+   `if (v !== 'agents' && v !== 'hubs') v = 'agents';`. Add chips without extending it and
+   clicking `govern` **appears to do nothing** — the chip syncs back to `agents`, so the bug reads
+   as an unresponsive button rather than as an unhandled value. This is the first thing to change,
+   and it should become a declared list of views rather than a two-value comparison, so the next
+   view cannot be half-added.
+2. **The auto-default fires once and is view-count-sensitive** (`activeView` / `viewUserChose` /
+   `firstViewDecided`, ~1232): a hestia with no local agents opens on `hubs`. That rule was
+   written for two views and must be re-stated for four — explicitly, including that neither
+   `govern` nor `devices` may become an auto-default (an operator should land where their work is,
+   not on a settings screen).
+3. **Per-view CSS is written as hide-by-exception** (~111):
+   `body[data-view="hubs"] .hstats { display: none; }`. Because it names only `hubs`, the new
+   views **inherit the agents behaviour by default** — the masthead's chain-count and
+   actions-range metrics would render on govern and devices, describing a screen the operator is
+   not looking at. That is a small never-flatter defect (a number whose referent is silently the
+   other screen), and the fix is to make the rule an allowlist of where `.hstats` *belongs*.
+4. **Mount-time refresh is per-view and hand-wired** (~1247): `setView` nudges
+   `window.__hubRefresh()` when switching to hubs, precisely so the screen is not a stale frame
+   until the next poll. Govern needs the same nudge (ledger and allowlist state are not on the 2s
+   dashboard tick), or switching to it will show whatever was last loaded — which for a governance
+   screen is worse than showing nothing.
+5. **Removing `#ledger-btn` has a live wire attached** (~2949-2950): the button's click handler
+   both opens the modal and calls `loadLedger()`. The badge (`#ledger-badge`) is also updated from
+   the snapshot render path. Deleting the button without re-homing `loadLedger()` and the badge
+   count loses the *unread-governance* signal, which was the point of the button dp is asking to
+   remove. The badge's information must survive the move — as a count on the `govern` chip.
+6. **The modals stay modals or become panes, but not both.** `#ledger-modal` and `#policy-modal`
+   are `.modal` shells with backdrop/✕/Escape contracts wired in the shared handler. Converted to
+   sub-screens they lose that shell; left as modals they are a modal opened *from* a tab, which is
+   the stacked-navigation the ruling is removing. Pick panes, and delete the modal shells rather
+   than leaving two ways to reach one surface.
 
 ---
 
@@ -848,6 +1017,21 @@ Each names the arm that must be able to fail.
 - **AC-19 — `governance.*` has no tier** (§3.6.5). `required_tier` returns a REFUSAL, not a
   number, for any governance-closure kind. Asserted on the return shape, because a numeric answer
   would imply a price exists.
+- **AC-20 — the pending-decision banners are never behind a tab** (§6.0.4). With a pending
+  escalation and a pending scope request, `#esc-banner` and `#scope-banner` are visible on
+  **every** view — agents, hubs, devices, govern. Asserted per view, not once: a test that checks
+  only the default view would pass while the banners were hidden on the other three.
+- **AC-21 — every view keeps the height chain** (§6.4). For each view in turn: mount it in the
+  app-shell regime and assert its designated scrolling region actually scrolls (its
+  `scrollHeight > clientHeight` with content overflowing), rather than being clipped by
+  `main{overflow:hidden}`. This is #427's bug expressed as a criterion; checking the CSS rule
+  exists is not the same as checking the region scrolls.
+- **AC-22 — `devices` does not look finished** (§6.0.3). Either it renders constellation state
+  from the snapshot's existing `constellation` field, or it renders an explicit "not yet
+  implemented". A view that renders an empty panel with neither is a red test.
+- **AC-23 — one navigation axis** (§6.0.1). No peer-level governance entry point survives: the
+  `#ledger-btn` masthead button and the `#policy-btn` witness-chain-header pill are gone, and the
+  ledger badge's count is re-homed onto the `govern` chip rather than dropped.
 - **AC-15 — uniformity across axes is testable, not asserted.** The duration, witness, revoke and
   export behaviours are exercised **parameterised over `axis ∈ {tools, files}`**, with the same
   assertions on both. A property that holds for files and was never run for tools is an unvaried
