@@ -53,7 +53,13 @@ SHIM_PATHS = {"kimi": _pick(os.path.join(_PLUGINS, "kimi", "hooks", _HOOK),
 # (test_remedies_name_only_globally_registered_doors) checks the same names against the LIVE
 # `tools/list`; this literal and that live check must agree — if the daemon renames a tool,
 # update BOTH or the pair of tests will disagree, which is the intended alarm.
-DAEMON_TOOLS = {"hestia_request_scope", "hestia_appeal", "hestia_gate_escalation_open"}
+DAEMON_TOOLS = {"hestia_request_scope", "hestia_appeal", "hestia_gate_escalation_open",
+                # REPAIR 3: the codex shim now renders its gate-self refusal via
+                # deny("gate.self_access", ...), whose remedy names the claim door. The
+                # claim tool is registered AND dispatched in core/src/server/handler.rs
+                # (the same both-lists criterion the core suite's live check uses), so
+                # this literal was simply stale — written before the door was built.
+                "hestia_gate_escalation_claim"}
 
 FAILS = []
 PASSES = []

@@ -469,6 +469,14 @@ def witness_decision_unified(client_or_none, *, plugin_id: str, decision: str, r
             "target": target,
             "session_id": session_id,
             "attempted": attempted_summary,
+            # REPAIR 5 (GPT fleet-review blocker 5): the deployed-generation attestation
+            # rides the HEALTHY witness call too, not only the fallback log — before this,
+            # the digest that #7.2(7) exists for reached no chain record at all. The daemon
+            # accepts extra arguments (hestia tools accept any argument), which ALSO means
+            # a schema that does not persist this field would discard it SILENTLY - so the
+            # local fallback record above keeps carrying it regardless, and daemon-side
+            # persistence needs its own verification (R345_NOTES.md).
+            "core_digest": record["core_digest"],
         })
         if not (isinstance(out, dict) and "result" in out):
             raise RuntimeError("witness call returned no result")

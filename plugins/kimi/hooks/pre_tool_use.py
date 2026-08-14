@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Hestia Phase-1 PreToolUse GATE for a foreign member (Kimi Code) — reference adapter.
 
+
 This is the membrane — the one hook a Kimi act must transit to have effect. It is FAIL-CLOSED BY
 CONSTRUCTION, because Kimi's hook engine fails OPEN on every failure mode (verified from the binary:
 timeout / spawn-fail / non-2 exit / exception all -> allow). So a blocking hook must default to
@@ -374,46 +375,38 @@ def _attempted_summary(ev, limit=400):
         mask_next = low in KEYS
         out.append(tok)
     s = " ".join(out)
-    return s[:limit] + ("\u2026[truncated]" if len(s) > limit else "")
+    return s[:limit] + ("…[truncated]" if len(s) > limit else "")
 
 
-def _daemon_witness(verb, reason):
-    """Report an enforced deny/warn to the daemon's witness chain (hestia_witness_decision MCP
-    tool) so it shows on the dashboard's warn/deny feed and feeds gate-risk trust. Local-gate
-    denies were otherwise invisible to the dashboard (dp, 2026-07-23). Fire-and-forget: short
-    timeouts, every failure swallowed — a down daemon never changes the decision."""
-    import urllib.request, hashlib
-    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
-    ti = _EVENT.get("tool_input")
-    ti_hash = None
-    if ti is not None:
-        ti_hash = hashlib.sha256(
-            json.dumps(ti, sort_keys=True, default=str).encode("utf-8", "replace")).hexdigest()[:16]
-
-    def post(payload, hdrs, timeout):
-        req = urllib.request.Request(
-            endpoint, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json",
-                     "Accept": "application/json, text/event-stream", **hdrs})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read(), resp.headers.get("mcp-session-id")
-
-    _, sid = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                   "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                              "clientInfo": {"name": "hestia-kimi-gate", "version": "1"}}}, {}, 0.5)
-    h = {"mcp-session-id": sid} if sid else {}
-    post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, h, 0.4)
-    post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-          "params": {"name": "hestia_witness_decision",
-                     "arguments": {"plugin_id": "kimi-code",
-                                   "decision": verb,
-                                   "adjudicator": "plugin-gate:kimi(scope/egress)",
-                                   "reason": reason[:300],
-                                   "tool_name": _EVENT.get("tool_name") or "",
-                                   "session_id": _EVENT.get("session_id"),
-                                   "payload_sha256": ti_hash,
-                                   "attempted": _attempted_summary(_EVENT),
-                                   "role": _role_bridge()}}}, h, 0.8)
+# ── REPAIR 4 (GPT fleet-review blocker 4): ONE deny recorder, literally. ──────────────
+# The private `_daemon_witness` client this gate carried (its own initialize/connect/
+# witness round-trip with its own timeouts and its own argument shape) is DELETED — every
+# refusal seam in this shim now routes through the shared mechanism's
+# witness_decision_unified: same record shape, always carrying target +
+# verdict_available (real rule-based deny = True; infra/degraded/internal = False), never
+# raising, never changing the decision, and falling back to the per-shim diagnostic log
+# when the daemon is unreachable (criterion 9(c)). stderr rendering is unchanged at every
+# seam.
+def _record_refusal(decision, rule, verdict_available, event=None, attempted=None):
+    """Best-effort: route ONE refusal record through the unified recorder. `event` defaults
+    to the module _EVENT (set by main()); a failure here never changes the decision."""
+    ev = event if event is not None else _EVENT
+    try:
+        if _SHARED_DIR not in sys.path:
+            sys.path.insert(0, _SHARED_DIR)
+        from hestia_gate_mechanism import witness_decision_unified, _extract_target
+        tool = ev.get("tool_name") or "?"
+        witness_decision_unified(
+            None, plugin_id=HESTIA_PLUGIN_ID,
+            decision=decision,
+            rule=rule,
+            tool_name=tool,
+            target=_extract_target(ev.get("tool_input") or {}, tool),
+            session_id=ev.get("session_id"),
+            verdict_available=verdict_available,
+            attempted_summary=attempted if attempted is not None else _attempted_summary(ev))
+    except Exception:
+        pass  # recording must never turn a deny into a crash (this engine fails open)
 
 
 def deny(rule, reason, innate=False):
@@ -429,10 +422,10 @@ def deny(rule, reason, innate=False):
     sys.stderr.write(
         f"hestia: {verb} [scope] — {v.reason}. This is a boundary, not a failure: don't re-run the same "
         f"call. {v.remedy} Asking is a trust-building act; reaching is witnessed.\n")
-    try:
-        _daemon_witness(verb, v.reason)
-    except Exception:
-        pass  # witnessing must never change the decision
+    # REPAIR 4: the evaluate-path refusal rides the ONE deny recorder (it previously used
+    # this shim's private client, with a different record shape and no target). A real
+    # rule-based verdict is CONDUCT: verdict_available=True.
+    _record_refusal(verb, v.rule or v.reason, True)
     if v.innate or MODE == "enforce":
         sys.exit(2)
     # warn mode, tunable rule: surfaced but allowed — return so evaluation continues to allow.
@@ -697,21 +690,10 @@ def _fail_closed_internal_error(event, exc):
     warn-rollout still only warns (exit 0). The record is best-effort and marks this INFRA,
     never member conduct (verdict_available=False, rule 'gate-internal-error'); the unified
     recorder already guarantees it never raises."""
-    tool = (event or {}).get("tool_name") or "?"
-    tinput = (event or {}).get("tool_input") or {}
     detail = f"{type(exc).__name__}: {exc}"
-    try:
-        from hestia_gate_mechanism import witness_decision_unified, _extract_target
-        witness_decision_unified(
-            None, plugin_id=HESTIA_PLUGIN_ID,
-            decision="deny" if MODE == "enforce" else "warn",
-            rule="gate-internal-error", tool_name=tool,
-            target=_extract_target(tinput, tool),
-            session_id=(event or {}).get("session_id"),
-            verdict_available=False,   # infra posture — never member conduct
-            attempted_summary=detail[:200])
-    except Exception:
-        pass  # recording must never turn a fail-close into a crash (this engine fails open)
+    _record_refusal("deny" if MODE == "enforce" else "warn",
+                    "gate-internal-error", False,
+                    event=(event or {}), attempted=detail[:200])
     if MODE == "enforce":
         sys.stderr.write(
             "hestia: deny [gate-internal-error] — the gate hit an unexpected internal error "
@@ -763,6 +745,11 @@ def main():
         # posture — deny-writes-allow-reads; per-shim tighten-only is explicitly allowed — the
         # rare shim-level import-failure path carries no READ_CLASS carve-out.)
         if _core is None:
+            # REPAIR 4: this Tier-2 refusal previously left NO record at all — route it
+            # through the ONE deny recorder (best-effort: with the core gone the mechanism
+            # may be gone too; the deny stands regardless). Infra posture, never conduct.
+            _record_refusal("deny", "gate-core-unavailable", False, event=event,
+                            attempted="the shared gate core could not be loaded")
             sys.stderr.write("hestia: deny [gate] — the shared gate core could not be loaded; "
                              "failing closed.\n")
             sys.exit(2)
@@ -818,6 +805,12 @@ def main():
                         f"rule {self_rule or 'gate-self-local'}; {detail}).{esc} This is not "
                         f"an ordinary boundary — the target is what draws the boundaries. Legitimate "
                         f"gate work goes through the escalation, not around it.\n")
+                    # REPAIR 4: the gate-self refusal previously left only its
+                    # hestia_request_witness EVENT (gate_self_access) — no refusal record at
+                    # all on the deny feed. ONE unified record, alongside (not instead of)
+                    # that event class. A rule-based local verdict is CONDUCT:
+                    # verdict_available=True.
+                    _record_refusal("deny", self_rule or "gate.self_access", True)
                     sys.exit(2)
                 # APPROVED lifts self-protection for THIS call only — the ordinary gates below still
                 # run; approving a gate edit is not approving everything else the call might do.
@@ -862,17 +855,10 @@ def main():
             elif verdict.blocks:
                 _core.record_gate_unavailable(HESTIA_PLUGIN_ID, tool, "unknown",
                                               "degraded: policy snapshot fetch failed (deny)")
-                try:
-                    from hestia_gate_mechanism import witness_decision_unified, _extract_target
-                    witness_decision_unified(
-                        None, plugin_id=HESTIA_PLUGIN_ID, decision="deny",
-                        rule=verdict.rule, tool_name=tool,
-                        target=_extract_target(tinput, tool),
-                        session_id=event.get("session_id"),
-                        verdict_available=False,   # infra posture — never member conduct
-                        attempted_summary=_attempted_summary(_EVENT))
-                except Exception:
-                    pass  # recording must never turn a deny into a crash (this engine fails open)
+                # verdict_available=False routes this through the unified recorder's
+                # diagnostic-log fallback (criterion 9(c)) — an infra posture, never
+                # member conduct.
+                _record_refusal("deny", verdict.rule, False)
                 _tally_scope(False)
                 sys.stderr.write(
                     f"hestia: deny [degraded] — {verdict.reason}. {verdict.remedy}\n")
@@ -913,6 +899,12 @@ def main():
             except Exception:
                 # Loading the mechanism must itself fail closed on a consequential act: a missing or
                 # unimportable module is not a reason to allow a write on a fail-open harness.
+                # REPAIR 4: this refusal previously left NO record — route it (best-effort:
+                # if the mechanism is the unimportable thing the record is lost with it, and
+                # the deny still stands). Infra posture, never conduct.
+                _record_refusal("deny" if MODE == "enforce" else "warn",
+                                "society-safety-unavailable", False,
+                                attempted="society-safety mechanism could not be loaded")
                 if MODE == "enforce":
                     sys.stderr.write("hestia: deny [safety] — the society-safety mechanism could not "
                                      "be loaded; failing closed on a consequential act.\n")
@@ -927,19 +919,9 @@ def main():
                 # recorder always carries target + verdict_available (real deny vs infra
                 # fail-close), never raises, and falls back to the per-shim diagnostic log when
                 # the witness itself is the unreachable thing (criterion 9(c)).
-                try:
-                    from hestia_gate_mechanism import witness_decision_unified, _extract_target
-                    witness_decision_unified(
-                        None, plugin_id="kimi-code",
-                        decision="deny" if MODE == "enforce" else "warn",
-                        rule="society-safety",
-                        tool_name=tool,
-                        target=_extract_target(tinput, tool),
-                        session_id=event.get("session_id"),
-                        verdict_available=verdict.decided,
-                        attempted_summary=(verdict.cause or "")[:200])
-                except Exception:
-                    pass  # recording must never turn a deny into a crash (this engine fails open)
+                _record_refusal("deny" if MODE == "enforce" else "warn",
+                                "society-safety", verdict.decided,
+                                attempted=(verdict.cause or "")[:200])
                 if MODE == "enforce":
                     sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
                     sys.exit(2)

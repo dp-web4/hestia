@@ -30,7 +30,9 @@ This gate is the shell/edit/MCP-command layer: scope + egress + society-safety, 
 
 Three gates, in order (Sprint F: self-protection first, then the ONE decision, then society):
   1c. SELF-PROTECTION (Sprint B): a write whose DESTINATION is the governance closure is
-     refused and escalated pre-daemon; reads are allowed and witnessed.
+     refused and escalated pre-daemon (a pre-existing human approval is claimed and spent —
+     REPAIR 3 completed the refuse→escalate→approve→claim lifecycle, mirroring kimi);
+     reads are allowed and witnessed.
   1. SCOPE + EGRESS — the §6.F cutover: decided by the shared core's evaluate() from a policy
      snapshot fetched LIVE from the daemon (hestia_gate_mechanism.fetch_policy_snapshot).
      Daemon unreachable in enforce mode -> the RATIFIED DEGRADED MODE
@@ -449,15 +451,176 @@ def _attempted_summary(ev, limit=400):
         mask_next = low in KEYS
         out.append(tok)
     s = " ".join(out)
-    return s[:limit] + ("\u2026[truncated]" if len(s) > limit else "")
+    return s[:limit] + ("…[truncated]" if len(s) > limit else "")
 
 
-def witness_decision(verb, reason, innate, verdict_available=True):
+# ---- Gate 1c escalation/claim lifecycle (REPAIR 3 — GPT fleet-review blocker 3) --------
+#
+# Mirrored from the kimi gate's _gate_self_call/_witness_gate_self/_claim_self_write:
+# before this, codex's Gate 1c denied gate-self writes DIRECTLY — no escalation opened, no
+# approval claimable, the refusal witnessed only as a deny record — so the
+# refuse→escalate→approve→re-issue lifecycle the boundary test specifies ran on no codex
+# path at all, and the deny fed a rendered sentence into deny() as its rule id (the
+# "no remedy registered" defect). These helpers are transport (urllib, in-process, no
+# subprocess — sprintE pins the no-subprocess shape) and every failure is a refusal,
+# never an allow.
+def _gate_self_call(tool, args, host_session_id=None):
+    """One short daemon round trip for a gate-self event: initialize, connect (session-bound),
+    one tools/call. Returns the unwrapped result dict, or None on ANY failure.
+
+    Never raises and stays inside a ~2.5s budget: this engine fails OPEN on a hook that
+    hangs past its clamp, so a gate-self exchange that stalls would be strictly worse than
+    a refusal. Callers treat None as refusal (writes) or best-effort loss (witnesses).
+
+    `host_session_id`, when the caller has one, is threaded into the connect so the
+    gate-self session this call mints joins to the per-wake session the outcome rows carry
+    (same join the main daemon path makes at the Gate 2 call below)."""
+    import urllib.request
+    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+
+    def post(payload, hdrs, timeout):
+        req = urllib.request.Request(
+            endpoint, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream", **hdrs})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read(), r.headers.get("mcp-session-id")
+
+    def unwrap(raw):
+        """The result payload of a tools/call: structuredContent, or the content[0] text JSON —
+        and the body may be plain JSON or SSE-framed (`data: {...}` lines)."""
+        for line in raw.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not (line.startswith("{") or line.startswith("data: {")):
+                continue
+            try:
+                pl = json.loads(line[line.index("{"):])
+            except Exception:
+                continue
+            res = pl.get("result")
+            if not isinstance(res, dict):
+                continue
+            sc = res.get("structuredContent")
+            if isinstance(sc, dict):
+                return sc
+            content = res.get("content") or []
+            if content and isinstance(content[0], dict):
+                try:
+                    d = json.loads(content[0].get("text") or "{}")
+                    return d if isinstance(d, dict) else None
+                except Exception:
+                    return None
+        return None
+
+    try:
+        _, sid_hdr = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                      "clientInfo": {"name": "hestia-codex-gate-self",
+                                                     "version": "1"}}}, {}, 0.8)
+        h = {"mcp-session-id": sid_hdr} if sid_hdr else {}
+        post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, h, 0.4)
+        connect_args = {"plugin_id": HESTIA_PLUGIN_ID,
+                        "host_agent": HESTIA_PLUGIN_ID,
+                        "role": _role_bridge(),
+                        "instance_name": "gate-self"}
+        if host_session_id:
+            connect_args["host_session_id"] = host_session_id
+        raw, _ = post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                       "params": {"name": "hestia_connect",
+                                  "arguments": connect_args}}, h, 0.8)
+        conn = unwrap(raw)
+        sess = conn.get("sessionId") if conn else None
+        if not sess:
+            return None  # an unconnected witness/claim is refused by the daemon anyway
+        args = dict(args)
+        args.setdefault("session_id", sess)
+        raw, _ = post({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                       "params": {"name": tool, "arguments": args}}, h, 0.9)
+        return unwrap(raw)
+    except Exception:
+        return None
+
+
+def _witness_gate_self(event_type, marker, tool_name, rule=None):
+    """Record a governance-surface event as its OWN class — `gate_self_read` for a permitted
+    read, `gate_self_access` (appealable) for a refused write. The two stay distinct so an
+    alert on the refusal keeps its meaning. Best effort: a failed record never changes the
+    decision — the daemon's health is not a precondition for reading one's own law, and the
+    deny already happened locally."""
+    return _gate_self_call("hestia_request_witness", {
+        "event_type": event_type,
+        "event_data": {"plugin_id": HESTIA_PLUGIN_ID,
+                       "tool_name": tool_name,
+                       "marker": marker,
+                       "rule": rule,
+                       "gate_path": os.path.abspath(__file__),
+                       "severity": "record" if event_type == "gate_self_read" else "escalate",
+                       "role_lct": _role_bridge()}},
+        host_session_id=_EVENT.get("session_id")) is not None
+
+
+def _claim_self_write(marker, tool_name, attempted):
+    """Ask ONCE whether a human has already approved this exact (member, marker) write.
+    Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
+
+    Mirrored from the kimi gate (which mirrored the claude gate's request_self_write): never
+    waits. The first attempt is refused and the refusal opens an escalation; a human decides
+    out of band; the member RE-ISSUES the write and the second attempt claims the approval.
+    Every failure — unreachable, malformed, a daemon with no escalation channel — is a
+    refusal: a daemon that cannot answer must not be a way to get a governance write
+    through."""
+    claim_args = {
+        "plugin_id": HESTIA_PLUGIN_ID,
+        "role": _role_bridge(),
+        "tool_name": tool_name,
+        "marker": marker,
+        # `reason` carries the ATTEMPTED ACT, not a rationale: an auto-opened escalation HAS no
+        # stated why — the member did not choose to escalate; the gate opened it on a refused
+        # write. Presenting the act as though it were a rationale would look like the member had
+        # explained itself. A member that wants to state a why opens the escalation itself.
+        "reason": attempted or f"{tool_name} -> {marker}",
+        "detail": ("Auto-opened by the gate on a refused write; the member stated no rationale "
+                   "because it did not choose to escalate. Approving authorises this one write."),
+    }
+    # The claimed-row join key (reply-2005/reply-2006, 2026-08-12): of the three session-id
+    # namespaces in a claim window, only the per-wake host session appears on the outcome rows
+    # an auditor joins from — the gate-self connect session above joins only to gate witnesses.
+    # Sent only when in hand: the daemon writes explicit null, and a fabricated placeholder
+    # would be a lie in the exact record used to argue about who authorised what.
+    host_session_id = _EVENT.get("session_id")
+    if host_session_id:
+        claim_args["host_session_id"] = host_session_id
+    r = _gate_self_call("hestia_gate_escalation_claim", claim_args,
+                        host_session_id=host_session_id)
+    if not isinstance(r, dict):
+        return "unreachable", "no answer from the daemon — refused", None, None
+    # BOTH flags, and the daemon owns both — two places deciding what "approved" means is how
+    # they come to disagree, so the hook re-derives nothing.
+    if r.get("claimed") is True and r.get("permits_write") is True:
+        who = r.get("decided_by") or "a human"
+        via = r.get("decided_via") or "unknown-channel"
+        return ("approved",
+                f"claimed an approval from {who} via {via} (single use, now spent)", None, None)
+    esc_id = r.get("escalation_id")
+    if not esc_id:
+        # An old daemon answers {} to a tool it does not know — which must not permit a write by
+        # failing to understand the question, but also cannot open an escalation. Say which.
+        why = r.get("error") or "this daemon has no escalation channel (is it upgraded?)"
+        return "no-channel", f"refused, and NO escalation was opened — {why}", None, None
+    return ("escalated", "refused; escalation opened for out-of-band decision",
+            esc_id, r.get("how_to_decide") or f"hestia gate approve {esc_id}")
+
+
+def witness_decision(verb, reason, innate, verdict_available=True, rule=None):
     """Witness a blocked/warned reach to the observation log. 'Reaching is witnessed' has to INCLUDE
     the reaches we deny — they are the boundary-tests the policy entity most needs (escalation
     triggers, precedent, trust calibration). Denied calls never reach PostToolUse, so observe.sh
     never sees them; this is the only record of a deny. Fail-safe: a log failure never changes the
-    decision (the gate still exits 2)."""
+    decision (the gate still exits 2).
+
+    REPAIR 4 (GPT fleet-review blocker 4): `rule` carries the STABLE rule id when the caller
+    has one, so the unified refusal record names the rule and not only the rendered reason —
+    matching what kimi's routed seams record. When absent, the (bounded) reason stands in."""
     if not verdict_available:
         try:
             shared = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_shared")
@@ -485,6 +648,7 @@ def witness_decision(verb, reason, innate, verdict_available=True):
             "innate": bool(innate),
             "mode": MODE,
             "reason": reason,                 # already bounded (no raw payload)
+            "rule": rule,                     # stable rule id when the caller carried one
             "tool_name": _EVENT.get("tool_name"),
             "tool_input_sha256": ti_hash,     # correlate without persisting the (sensitive) payload
             "session_id": _EVENT.get("session_id"),
@@ -512,7 +676,7 @@ def witness_decision(verb, reason, innate, verdict_available=True):
             None,
             plugin_id="codex",   # ONE member, one identity — `codex` holds the scope grant
             decision=verb,
-            rule=reason,
+            rule=rule or reason,
             tool_name=ev_tool,
             target=m._extract_target(_EVENT.get("tool_input"), ev_tool),
             session_id=_EVENT.get("session_id"),
@@ -546,7 +710,9 @@ def deny(rule, reason, innate=False):
     _tally_scope(False)   # a denied reach still closes part of the window
     v = _core._deny(rule, reason, innate=innate)
     verb = "deny" if (v.innate or MODE == "enforce") else "warn"
-    witness_decision(verb, v.reason, v.innate)   # a blocked reach is witnessed, not just shown to the agent
+    # a blocked reach is witnessed, not just shown to the agent; the record carries the
+    # STABLE rule id (REPAIR 4) alongside the rendered reason
+    witness_decision(verb, v.reason, v.innate, rule=v.rule)
     sys.stderr.write(
         f"hestia: {verb} [scope] — {v.reason}. This is a boundary, not a failure: don't re-run the same "
         f"call. {v.remedy} Asking is a trust-building act; reaching is witnessed.\n")
@@ -632,6 +798,24 @@ def main():
         # policy verdict, so warn-rollout does not apply. (This TIGHTENS the ratified degraded
         # posture — deny-writes-allow-reads; per-shim tighten-only is explicitly allowed.)
         if _core is None:
+            # REPAIR 4 (GPT fleet-review blocker 4): this Tier-2 refusal previously left NO
+            # record at all — route it through the ONE deny recorder. Infra posture
+            # (verdict_available=False): the gate could not decide, it did not judge the act.
+            # Best-effort: with the core gone the mechanism may be gone too; the deny stands
+            # regardless.
+            try:
+                _m = _load_mechanism()
+                _m.witness_decision_unified(
+                    None, plugin_id="codex", decision="deny",
+                    rule="gate-core-unavailable",
+                    tool_name=event.get("tool_name") or "?",
+                    target=_m._extract_target(event.get("tool_input") or {},
+                                              event.get("tool_name") or "?"),
+                    session_id=event.get("session_id"),
+                    verdict_available=False,   # infra posture — never member conduct
+                    attempted_summary="the shared gate core could not be loaded")
+            except Exception:
+                pass  # recording must never turn a fail-close into a crash
             sys.stderr.write("hestia: deny [gate] — the shared gate core could not be loaded; "
                              "failing closed.\n")
             sys.exit(2)
@@ -662,9 +846,14 @@ def main():
         # the daemon and never conditional on it, mirroring kimi's position: if this check
         # needed a verdict, "stop the daemon, then edit the gate" would be the same evasion
         # one layer down. ALWAYS enforced (innate — not subject to warn-rollout): a
-        # governance write that warns and proceeds is not a boundary. Refuse-and-witness is
-        # strictly better than the previous nothing; the escalate/claim flow arrives with
-        # the shared mechanism (§6.E).
+        # governance write that warns and proceeds is not a boundary. REPAIR 3 (GPT
+        # fleet-review blocker 3): the full refuse→escalate→approve→claim lifecycle now runs
+        # here, mirroring kimi — a refused write claims a pre-existing human approval once
+        # (single use), opens an escalation when there is none, and an approved re-issue
+        # proceeds to the ordinary gates below.
+        self_hit = None
+        self_is_read = False
+        self_rule = None
         if _closure_classify is not None:
             if tool == "apply_patch":
                 # CALL-SITE ADAPTATION (the module stays codex-agnostic): apply_patch's
@@ -688,24 +877,16 @@ def main():
                 _cv = _closure_classify("Bash", _tin, cwd=event.get("cwd"))
             else:
                 _cv = _closure_classify(tool, tinput, cwd=event.get("cwd"))
-            if _cv is not None and _cv.classification == "read":
-                # Publish-the-law: reads pass and are witnessed (existing witness path; a
-                # witness failure never changes the decision).
-                witness_decision("gate_self_read",
-                                 f"read of governance surface: {_cv.resource or _cv.marker}",
-                                 False)
-            elif _cv is not None and _cv.classification == "write":
-                witness_decision("gate_self_access",
-                                 f"{tool} -> {_cv.resource} [rule {_cv.rule}]", True)
-                deny(f"'{tool}' would WRITE to the governance surface [gate-self]: "
-                     f"{_cv.resource} (matched {_cv.marker!r}, rule {_cv.rule})",
-                     "Legitimate gate work goes through escalation — a human approves out "
-                     "of band — not around it.", innate=True)
-        elif tool not in READ_CLASS:
+            if _cv is not None and _cv.classification in ("read", "write"):
+                self_hit = (_cv.marker or _cv.rule,
+                            _cv.resource or _cv.marker or _cv.rule)
+                self_is_read = _cv.classification == "read"
+                self_rule = _cv.rule
+        else:
             # Tier-2 degraded mode (ratified deny-writes-allow-reads): the classifier
-            # failed to import — deny write-class acts that touch the literal floor. This
-            # engine fails OPEN on hook errors, so the layer must not vanish with the
-            # import.
+            # failed to import — the literal floor decides, and the SAME lifecycle below
+            # renders/escalates the refusal. This engine fails OPEN on hook errors, so the
+            # layer must not vanish with the import.
             _floor_hit = None
             for _blob in paths + ([cmd] if cmd else []):
                 _low = str(_blob).replace("\\", "/")
@@ -713,10 +894,34 @@ def main():
                 if _floor_hit:
                     break
             if _floor_hit:
-                deny(f"'{tool}' touches the governance floor [gate-self]: {_floor_hit!r}, "
-                     f"and the shared closure classifier is unavailable — failing closed",
-                     "Restore plugins/_shared (hestia_governance_closure) or escalate.",
-                     innate=True)
+                self_hit = (_floor_hit, _floor_hit)
+                self_is_read = tool in READ_CLASS
+        if self_hit:
+            self_marker, self_resource = self_hit
+            if self_is_read:
+                # Publish-the-law: a member may read what governs it — refusing would make a
+                # member unable to check its own law. The read is RECORDED (its own witness
+                # class, distinct from a refusal) so reconnaissance stays visible as a
+                # pattern; a failed witness never blocks the read.
+                _witness_gate_self("gate_self_read", self_marker, tool, rule=self_rule)
+            else:
+                verdict, detail, esc_id, how = _claim_self_write(
+                    self_marker, tool, _attempted_summary(_EVENT))
+                if verdict != "approved":
+                    _witness_gate_self("gate_self_access", self_marker, tool, rule=self_rule)
+                    esc = (f" Escalation {esc_id} is open — a human decides out of band ({how}); "
+                           f"re-issue the write afterwards to claim the approval."
+                           if esc_id else "")
+                    deny("gate.self_access",
+                         f"'{tool}' would WRITE to the governance surface [gate-self]: "
+                         f"{self_resource} (matched marker {self_marker!r}; rule "
+                         f"{self_rule or 'gate-self-floor'}; {detail}).{esc}",
+                         innate=True)
+                else:
+                    # APPROVED lifts self-protection for THIS call only — the ordinary gates
+                    # below still run; approving a gate edit is not approving everything else
+                    # the call might do.
+                    sys.stderr.write(f"hestia: gate write APPROVED — {detail}\n")
 
         # ── Sprint F (§6.F): THE decision — core evaluate() from an AUTHENTICATED policy path,
         # or the ratified degraded mode. No silent policy=None / local-replica fallback exists
@@ -755,7 +960,8 @@ def main():
                 # verdict_available=False routes this through record_gate_unavailable AND the
                 # unified recorder's diagnostic-log fallback (criterion 9(c)) — an infra
                 # posture, never member conduct.
-                witness_decision("deny", verdict.reason, False, verdict_available=False)
+                witness_decision("deny", verdict.reason, False, verdict_available=False,
+                                 rule=verdict.rule)
                 _tally_scope(False)
                 sys.stderr.write(
                     f"hestia: deny [degraded] — {verdict.reason}. {verdict.remedy}\n")
@@ -797,7 +1003,7 @@ def main():
                 # or unimportable module is not a reason to allow a write on a fail-open harness.
                 witness_decision("deny" if MODE == "enforce" else "warn",
                                  "society-safety: mechanism unavailable, failing closed", False,
-                                 verdict_available=False)
+                                 verdict_available=False, rule="society-safety-unavailable")
                 if MODE == "enforce":
                     sys.stderr.write("hestia: deny [safety] — the society-safety mechanism could "
                                      "not be loaded; failing closed on a consequential act.\n")
@@ -812,7 +1018,7 @@ def main():
                 # gate could not obtain a verdict (infra — never scored as member conduct).
                 witness_decision("deny" if MODE == "enforce" else "warn",
                                  "society-safety: " + msg.split("— ", 1)[-1].strip(), False,
-                                 verdict_available=verdict.decided)
+                                 verdict_available=verdict.decided, rule="society-safety")
                 if MODE == "enforce":
                     sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
                     sys.exit(2)
