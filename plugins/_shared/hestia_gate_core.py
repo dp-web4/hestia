@@ -100,9 +100,11 @@ default path is deny, and `exit 0` is reached only on an explicit confirmed allo
 module never calls `sys.exit` — it returns a Verdict — precisely so a shim cannot mistake
 "the core returned nothing" for "the core allowed it".
 
-NOT WIRED. Nothing imports this yet. Migrating each harness is an edit to that harness's
-governance surface and needs its own escalation; this lands first so the migration is
-reviewable before anything switches over.
+WIRED (Sprints B–F). Sprint C pointed kimi's scope predicates here; D centralised the
+constants and remedies; E unified transport and the deny recorder; F cuts kimi and codex
+over to evaluate() — decided from a policy snapshot fetched LIVE from the daemon
+(hestia_gate_mechanism.fetch_policy_snapshot), or the ratified degraded mode
+(degraded_verdict below) when the daemon is unreachable.
 """
 from __future__ import annotations
 
@@ -111,6 +113,29 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Optional
+
+# ── Deployed-generation attestation (PRD gate-consolidation §7.2(7), rides #231) ─────────
+# The RUNNING core attests what was imported — a bystander hashing a file beside a process
+# proves nothing about what that process loaded (kimi's sharpening, notice 1929). Computed
+# once at import; carried on every refusal record by the unified recorder.
+import hashlib as _hashlib
+
+
+def core_digest() -> str:
+    """sha256 of this module's own source as imported; "unknown" if unreadable —
+    and unknown must never read as healthy (#231 posture)."""
+    try:
+        with open(__file__, "rb") as _fh:
+            # FULL sha256 (PR #408 review, converging with Hub #708's invariant): the
+            # running thing attests its EXACT bytes; truncation is a second, weaker
+            # definition of identity that external consumers would over-trust.
+            return _hashlib.sha256(_fh.read()).hexdigest()
+    except Exception:
+        return "unknown"
+
+
+_CORE_DIGEST = core_digest()
+
 
 # ── Innate invariants ────────────────────────────────────────────────────────────────────
 #
@@ -188,6 +213,17 @@ REMEDIES: dict[str, Remedy] = {
         "hestia_appeal disputes whether the deny was right, which is a different question.",
         ("hestia_request_scope", "hestia_appeal"),
     ),
+    # An MCP connector call names a REPOSITORY, not a path — the codex gate scopes on that
+    # name (see mcp_repo_target there). Same door as mrh.path, worded for a repo so the
+    # member is not sent asking for "a path" it never named. Added Sprint D (§6.D): before
+    # this, that call site authored its own sentence, naming the request_scope phantom.
+    "mrh.repo": Remedy(
+        "Adjust to work within scope. If the repository is genuinely needed, ask for it with "
+        "hestia_request_scope (one repo, with a reason) — a human decides, the grant is "
+        "memory-only and expires. An appeal cannot deliver a repo — hestia_appeal disputes "
+        "whether the deny was right, which is a different question.",
+        ("hestia_request_scope", "hestia_appeal"),
+    ),
     # ── egress ───────────────────────────────────────────────────────────────────────────
     #
     # Deliberately names NO door. This is the one refusal with no remedy, and saying so is the
@@ -224,6 +260,16 @@ REMEDIES: dict[str, Remedy] = {
         "posture, not a bug: law-in-the-loop means the loop does not proceed when law cannot "
         "be consulted. Retry once the daemon is up; if it stays down, that is an operator "
         "matter and not something to work around.",
+        (),
+    ),
+    # ── degraded mode (Sprint F — §7.1 criterion 9; semantics ratified dp 2026-08-11) ────
+    "gate.degraded": Remedy(
+        "The policy authority could not be consulted (the daemon is unreachable), so the "
+        "gate is in the ratified degraded mode: deny-writes-allow-reads. This is fault "
+        "isolation, not a judgement of your act — the referee is missing, not ruling "
+        "against you. Retry when the daemon returns; if it stays down, that is an operator "
+        "matter and not something to work around. A shim may tighten this posture locally; "
+        "it may never loosen it.",
         (),
     ),
 }
@@ -353,6 +399,12 @@ class NormalizedEvent:
 
     tool: str = "?"
     paths: list = field(default_factory=list)   # filesystem targets
+    #: Repository NAMES an MCP connector call targets (codex §3.4: the call names a repo
+    #: in its own argument and carries REPO-RELATIVE paths). Scoped by NAME at Gate 1b;
+    #: when present, `paths` are repo-relative and are egress-scanned but NOT re-scoped
+    #: (the 2026-07-26 false-deny class). Sprint F: this moved the last shim-side scope
+    #: decision (codex's mcp_repo check) into the one law.
+    repos: list = field(default_factory=list)
     command: Optional[str] = None               # shell command, if any
     cwd: Optional[str] = None
     raw: dict = field(default_factory=dict)     # kept for witnessing, never for deciding
@@ -567,40 +619,21 @@ def resolve_agent_policy(profile: HarnessProfile,
     return AgentPolicy(member_id=profile.member_id, scope=(), source="unresolved", stale=True)
 
 
-def load_in_scope(profile: HarnessProfile) -> list:
-    """The member's granted MRH, from its identity. `repo:web4` -> `web4`, `path:.git-inbox`
-    -> `.git-inbox`.
-
-    Both prefixes matter and the difference is not cosmetic: `.git-inbox` is a SIBLING of the
-    repos, so no `repo:` grant ever reaches it. On 2026-08-02 kimi was refused while reading
-    the very directory the push guard tells refused members to use, because only codex held
-    `path:.git-inbox`."""
-    try:
-        with open(os.path.expanduser(profile.identity_path), encoding="utf-8") as fh:
-            mrh = json.load(fh).get("mrh", {})
-        scope = mrh.get("in_scope")
-        if isinstance(scope, list) and scope:
-            return [s.split(":", 1)[-1] for s in scope]
-    except Exception:
-        pass
-    # Deliberately narrow. A default that guessed wide would silently grant reach on any
-    # machine where the identity file is missing or malformed.
-    return ["web4"]
-
-
-def identity_role(profile: HarnessProfile) -> str:
-    """The member's declared LOCAL role (dp 2026-07-24: roles are always local; occupancy
-    attributes carry the 'foreign' dimension)."""
-    try:
-        with open(os.path.expanduser(profile.identity_path), encoding="utf-8") as fh:
-            r = json.load(fh).get("role")
-        if isinstance(r, str) and r.startswith("role:"):
-            return r
-    except Exception:
-        pass
-    return profile.default_role
-
-
+# ── DELETED, not shared (gate-consolidation PRD §6.D, §7.1(4)) ──────────────────────────
+#
+# `load_in_scope` — the blind `split(":", 1)[-1]` parse plus the permissive `["web4"]`-on-
+# ANY-failure fallback (a guess that GRANTS) — and `identity_role` are GONE. Both derived
+# authority from a member-writable identity file; the ratified target sources authority from
+# `resolve_agent_policy` -> `AgentPolicy`, which grants NOTHING when nothing certifiable
+# resolves. `launch_cwd_repo` below is the third of §6.D's authority-bearing trio and remains
+# ONLY because `evaluate()` still consumes it; its replacement is an explicit launch-cwd
+# grant in the certified policy snapshot.
+# SPRINT-F: replace with certified snapshot (delete launch_cwd_repo at the evaluate() cutover).
+# SPRINT-F RAN (2026-08-13) AND COULD NOT DELETE THIS: the daemon exposes NO launch-cwd
+# grant surface (measured against core/src/server/handler.rs — no such tool exists, and
+# §9 forbids inventing one), so the per-launch grant still derives from env/cwd here.
+# Declared RED in the Sprint F notes; this bridge dies the day the certified snapshot
+# carries an explicit launch-cwd grant.
 def launch_cwd_repo(profile: HarnessProfile, workspace: str) -> list:
     """The repo the member is launched in is always in scope (dp 2026-07-21: 'whatever cwd we
     launch it in') — a per-launch dynamic grant on top of the static allowlist, so a
@@ -644,15 +677,28 @@ def path_in_scope(path: str, scopes, workspace: str, profile: HarnessProfile,
     `_under_temp_root`'s pre-#169 `startswith(("/tmp",...))` — and the same fix: compare at
     the separator."""
     p = path.replace("\\", "/")
-    low = p.lower()
-    for marker in profile.home_markers:
-        m = marker.lower()
-        if m in low or low.startswith(os.path.expanduser(marker).lower()):
-            return True
-    if not p.startswith("/") and not p.startswith("~"):
+    if p.startswith("~"):
+        p = os.path.expanduser(p).replace("\\", "/")
+    elif not p.startswith("/"):
         cwd = (cwd or os.getcwd()).replace("\\", "/")
         p = os.path.join(cwd, p)
     p = os.path.normpath(p).replace("\\", "/")
+    # HOME IS A BOUNDARY, NOT A SUBSTRING (GPT fleet-review blocker 8) -- the same class
+    # _under_temp_root (codex #169) and the workspace branch (kimi #940 B5) were already
+    # cured of, fixed the same way. The old form ran BEFORE normalisation and tested
+    # `marker in path` / `startswith(expanduser(marker))`, so `~/.kimi-code-evil/x` (a
+    # SIBLING anyone can create) and `~/.kimi-code/../.ssh/id` (traversal OUT of home)
+    # both read as the member's own home. Now the candidate resolves first (expanduser +
+    # cwd-join + normpath, above), each marker resolves via expanduser AND realpath (so a
+    # symlinked home dir matches under either spelling), and containment compares at the
+    # separator.
+    low = p.lower()
+    for marker in profile.home_markers:
+        ex = os.path.expanduser(marker).replace("\\", "/").rstrip("/")
+        for root in {ex, os.path.realpath(ex).replace("\\", "/").rstrip("/")}:
+            m = root.lower()
+            if m and (low == m or low.startswith(m + "/")):
+                return True
     if _under_temp_root(p):
         return True
     ws = workspace.replace("\\", "/").rstrip("/")
@@ -813,7 +859,9 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     forbidden = forbidden_tokens(profile)
 
     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
-    for blob in list(event.paths) + ([event.command] if event.command else []):
+    # Repo names are scanned too: an MCP call naming a forbidden token is still egress.
+    for blob in (list(event.paths) + list(event.repos)
+                 + ([event.command] if event.command else [])):
         low = blob.lower()
         for f in forbidden:
             if f in low:
@@ -860,8 +908,18 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
         # move in.
         scopes = [s for s in scopes if s != AgentPolicy.UNSCOPED]
 
-    # Gate 1b — MRH scope. File paths use path-scope; shell commands use command-scope.
-    for p in event.paths:
+    # Gate 1b — MRH scope. A repo-named MCP call is scoped on the NAME it carries (its
+    # `paths` are repo-relative and must not be re-scoped — egress above already saw
+    # them); file paths use path-scope; shell commands use command-scope.
+    if event.repos:
+        for rname in event.repos:
+            if rname not in scopes:
+                return _deny(
+                    "mrh.repo",
+                    f"'{event.tool}' targets repository '{rname}' outside your granted "
+                    f"scope (granted: {'+'.join(scopes)})",
+                )
+    for p in ([] if event.repos else event.paths):
         if not path_in_scope(p, scopes, ws, profile, event.cwd):
             # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
             # on any long path truncates away the very component that tripped the gate — the
@@ -889,6 +947,49 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
             )
 
     return ALLOW
+
+
+# ── The ratified degraded mode (Sprint F — PRD §7.1 criterion 9) ────────────────────────
+def degraded_verdict(event: NormalizedEvent,
+                     profile: Optional[HarnessProfile] = None) -> Verdict:
+    """Tier-1 degraded posture, computed by the CORE: deny-writes-allow-reads.
+
+    Semantics + trigger ratified (dp, 2026-08-11): the posture is deny-writes-allow-reads
+    and the trigger is the DAEMON/REFEREE BEING UNREACHABLE — a shim calls this when, in
+    enforce mode, no policy snapshot could be fetched. This module is transport-free (it
+    opens no socket), so it stays available exactly when the daemon is not; the shim-level
+    literal backstop (Tier 2) exists only for the rare case this module itself will not
+    import.
+
+    Tighten-only, in both directions that matter: the innate egress invariant still binds
+    the reads this mode allows (a degraded gate that leaked a credential read would be a
+    LOOSENING, and egress is the one rule no mode relaxes), and a shim may deny reads too
+    but may never allow a write. Never raises, never exits — same contract as evaluate().
+
+    Recording is the CALLER's duty (criterion 9(c)): every degraded deny must land in the
+    per-shim diagnostic log via the unified recorder with verdict_available=False — an
+    unrecorded degraded deny is the PR #357 defect this criterion exists to end; degraded
+    read-allows are recorded on the gate-availability telemetry instead (they are an infra
+    series, not refusals, and the deny log's readers expect denies)."""
+    forbidden = forbidden_tokens(profile) if profile is not None else FORBIDDEN_DEFAULT
+    for blob in (list(event.paths) + list(event.repos)
+                 + ([event.command] if event.command else [])):
+        low = blob.lower()
+        for f in forbidden:
+            if f in low:
+                return _deny(
+                    "egress.secret",
+                    f"'{event.tool}' touches a forbidden path (secret/credential or "
+                    f"out-of-MRH private repo): '{f}'",
+                    innate=True,
+                )
+    if event.tool in READ_CLASS:
+        return ALLOW
+    return _deny(
+        "gate.degraded",
+        f"'{event.tool}' is write/exec-class and the policy daemon is unreachable — the "
+        f"ratified degraded mode denies writes and allows reads",
+    )
 
 
 # ── Gate availability telemetry ──────────────────────────────────────────────────────────

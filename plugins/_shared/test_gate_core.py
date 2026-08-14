@@ -351,6 +351,71 @@ def test_temp_root_is_a_path_boundary_not_a_prefix():
     check("sibling_tmp_denied_end_to_end", G.evaluate(ev, prof, ws).blocks)
 
 
+def test_home_marker_is_a_path_boundary_not_a_substring():
+    """GPT fleet-review blocker 8. The home-marker branch of `path_in_scope` ran BEFORE
+    normalisation and tested substring/prefix (`marker in path`, `startswith(expanduser)`),
+    so `~/.test-member-evil/x` — a SIBLING anyone can create — and
+    `~/.test-member/../.ssh/id` — traversal OUT of home — both read as the member's own
+    home. The exact defect class `_under_temp_root` (codex #169) and the workspace branch
+    (kimi #940 B5) were already cured of, one branch over, fixed the same way: resolve
+    first, compare at the separator."""
+    ws = _workspace()
+    os.makedirs(os.path.join(ws, "granted"), exist_ok=True)
+    prof = _profile(ws, ["repo:granted"])
+    home = os.path.expanduser("~/.test-member")
+
+    # Positive controls FIRST (deny-everything would green the bypass checks below).
+    check("home_itself_allows",
+          G.path_in_scope(f"{home}/settings.json", ["granted"], ws, prof, cwd=ws))
+    check("home_tilde_spelling_allows",
+          G.path_in_scope("~/.test-member/settings.json", ["granted"], ws, prof, cwd=ws))
+    check("home_root_itself_allows",
+          G.path_in_scope(home, ["granted"], ws, prof, cwd=ws))
+
+    # The bypasses. A sibling dir is not home — under either spelling.
+    check("home_sibling_denied",
+          not G.path_in_scope(f"{home}-evil/loot", ["granted"], ws, prof, cwd=ws))
+    check("home_sibling_tilde_denied",
+          not G.path_in_scope("~/.test-member-evil/loot", ["granted"], ws, prof, cwd=ws))
+    # Traversal OUT of home resolves out and stays out.
+    check("home_dotdot_escape_denied",
+          not G.path_in_scope(f"{home}/../.ssh/id_rsa", ["granted"], ws, prof, cwd=ws))
+    check("home_dotdot_escape_tilde_denied",
+          not G.path_in_scope("~/.test-member/../.ssh/id_rsa", ["granted"], ws, prof, cwd=ws))
+    # The marker as a mere SUBSTRING of a path elsewhere grants nothing.
+    check("marker_text_elsewhere_denied",
+          not G.path_in_scope(f"{ws}/notgranted/~/.test-member/x", ["granted"], ws, prof,
+                              cwd=ws))
+
+    # A symlinked home dir matches under both its lexical and resolved spellings
+    # (markers resolve via expanduser AND realpath).
+    base = os.path.expanduser("~/.cache/hestia-gate-core-tests")
+    real = tempfile.mkdtemp(dir=base)
+    link = os.path.join(base, f"link-{os.path.basename(real)}")
+    os.symlink(real, link)
+    try:
+        linked = G.HarnessProfile(member_id="test-member", identity_path=prof.identity_path,
+                                  home_markers=(link,))
+        check("symlinked_home_lexical_spelling_allows",
+              G.path_in_scope(f"{link}/cfg.json", ["granted"], ws, linked, cwd=ws))
+        check("symlinked_home_resolved_spelling_allows",
+              G.path_in_scope(f"{os.path.realpath(real)}/cfg.json", ["granted"], ws, linked,
+                              cwd=ws))
+        check("symlinked_home_sibling_still_denied",
+              not G.path_in_scope(f"{os.path.realpath(real)}-evil/x", ["granted"], ws, linked,
+                                  cwd=ws))
+    finally:
+        os.unlink(link)
+
+    # And through the real decision path, not just the helper.
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{home}-evil/loot"], cwd=ws)
+    check("home_sibling_denied_end_to_end", G.evaluate(ev, prof, ws).blocks)
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{home}/../.ssh/id_rsa"], cwd=ws)
+    check("home_escape_denied_end_to_end", G.evaluate(ev, prof, ws).blocks)
+    ev = G.NormalizedEvent(tool="Read", paths=[f"{home}/settings.json"], cwd=ws)
+    check("home_allowed_end_to_end", G.evaluate(ev, prof, ws).decision == "allow")
+
+
 def test_scope_is_decided_after_normalisation_not_before():
     """kimi #940 B5/B7. Normalisation ran on the RELATIVE branch only, so an absolute path was
     judged on its lexical first segment: with scope `granted`, `<ws>/granted/../notgranted/x`
@@ -481,7 +546,15 @@ def test_the_core_is_not_the_only_copy_of_the_scope_rule():
     plugins_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     # Frozen 2026-08-05. Shrink as harnesses consolidate onto the core; never grow it without
     # saying, in the PR, why a fifth copy of the scope rule is the right answer.
-    KNOWN_DUPLICATE_OWNERS = {"codex": 2, "gemini": 1, "kimi": 1}
+    # Sprint F (§6.F): codex's ENFORCING copy consolidated onto core.evaluate() — its
+    # remaining 1 is the .orig history file, not an enforcing gate. kimi's 1 is the pair of
+    # thin call-site ADAPTERS that delegate to the core (kept for the parity battery), not
+    # a second implementation.
+    # Sprint G (§6.G): the codex MARKETPLACE stale gate copy (227-line thin fork nobody
+    # installs from) is deleted — with it went codex's last counted file. A future
+    # marketplace package must be a rebuilt artifact carrying the canonical content digest
+    # (§7.2(6)), never a hand-fork that would grow this number back.
+    KNOWN_DUPLICATE_OWNERS = {"gemini": 1, "kimi": 1}
 
     owners = {}
     for root, _dirs, files in os.walk(plugins_dir):
@@ -766,10 +839,13 @@ def test_egress_beats_scope():
 
 
 def test_missing_identity_fails_narrow_not_wide():
-    """A malformed or absent identity must not grant reach. The default is deliberately one
-    repo, not the workspace."""
+    """A malformed or absent identity must not grant reach. §6.D deleted `load_in_scope` and
+    its permissive `["web4"]` guess — a guess that GRANTS; the authenticated path grants
+    NOTHING when nothing certifiable resolves, and says so in `source`."""
     prof = G.HarnessProfile(member_id="x", identity_path="/nonexistent/identity.json")
-    check("missing_identity_is_narrow", G.load_in_scope(prof) == ["web4"])
+    pol = G.resolve_agent_policy(prof)
+    check("missing_identity_is_narrow",
+          pol.scope == () and pol.source == "unresolved" and pol.stale)
 
 
 def test_core_never_exits():
@@ -840,6 +916,7 @@ ALL_TESTS = [
     "test_missing_identity_fails_narrow_not_wide",
     "test_core_never_exits",
     "test_core_is_vendor_agnostic",
+    "test_home_marker_is_a_path_boundary_not_a_substring",
     "test_scope_is_decided_after_normalisation_not_before",
     "test_path_syntax_is_never_a_scope_name",
     "test_the_core_is_not_the_only_copy_of_the_scope_rule",
@@ -915,6 +992,7 @@ if __name__ == "__main__":
     test_missing_identity_fails_narrow_not_wide()
     test_core_never_exits()
     test_core_is_vendor_agnostic()
+    test_home_marker_is_a_path_boundary_not_a_substring()
     test_scope_is_decided_after_normalisation_not_before()
     test_path_syntax_is_never_a_scope_name()
     test_the_core_is_not_the_only_copy_of_the_scope_rule()

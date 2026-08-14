@@ -274,6 +274,26 @@ _GOVERNANCE_FILES = (
 )
 
 
+# ---------------------------------------------------------------------------
+# SPRINT B (gate-consolidation §6.B): THE SHARED GOVERNANCE-CLOSURE CLASSIFIER
+# ---------------------------------------------------------------------------
+# classify() is write-position keyed and accessor-agnostic (the PR #370 line): it
+# replaces the live path through _touches_self, the text-match half of
+# _touches_registration, and the Bash read/write split for gate-self classification.
+# The local matchers below STAY, verbatim, as the Tier-2 fallback
+# (_fallback_self_protection, before main()): on an import failure the closure
+# protection must not silently vanish — the core's "mirrored, not imported" reasoning,
+# pointed the other way.
+_SHARED_DIR = os.environ.get("HESTIA_SHARED_DIR") or os.path.join(
+    os.path.dirname(os.path.dirname(_SELF_DIR)), "_shared")
+if os.path.isdir(_SHARED_DIR) and _SHARED_DIR not in sys.path:
+    sys.path.insert(0, _SHARED_DIR)
+try:
+    from hestia_governance_closure import classify as _closure_classify
+except Exception:  # noqa: BLE001 — Tier-2: the local matcher below stays in force
+    _closure_classify = None
+
+
 # Commands whose arguments and stdin are DATA, never shell code — the same
 # allowlist policy::shell uses, kept in sync with it deliberately. An allowlist,
 # never a denylist: an unrecognised head is treated as interpreting, so
@@ -2262,113 +2282,36 @@ def _dig(result: Any, key: str, _depth: int = 0) -> Any:
     return None
 
 
-def extract_target(tool_input: Any, tool_name: str) -> Optional[str]:
-    if not isinstance(tool_input, dict):
-        return None
-    for key in ("file_path", "path", "url", "notebook_path"):
-        v = tool_input.get(key)
-        if isinstance(v, str):
-            return v
-    if tool_name in {"Bash", "Shell"}:
-        cmd = tool_input.get("command")
-        if isinstance(cmd, str) and cmd.strip():
-            # First token = the executable
-            return cmd.split()[0]
-    return None
+# ---- Shared transport (Sprint E: ONE society-safety transport) --------
+# The private MCP client, SSE parser, wait-protocol poller and target extractor that lived
+# here were the claude-only copy of what the shared gate mechanism module (plugins/_shared)
+# now provides for EVERY harness (PRD gate-consolidation §6.E). Two names survive as thin
+# delegates — `McpHttp` and `unwrap_tool_result` — because the self-protection / escalation
+# call sites (Sprint B's region: _emit_gate_event, _connect_session, request_self_write)
+# still construct a raw client; they resolve to the shared implementation, so there is
+# exactly ONE wire client left to fix. Behaviour note: the shared client REFUSES to start a
+# request after its deadline (raises TimeoutError, which every call site already catches)
+# where the old private copy clamped the timeout to 50ms and tried anyway.
+
+def _load_mechanism():
+    """Import the shared gate mechanism module from plugins/_shared (repo and installed
+    layouts both place it two levels up from this hooks dir). Raises on failure — callers
+    keep their own fail posture (ask_daemon returns None → fail-closed / legacy below)."""
+    shared = Path(__file__).resolve().parents[2] / "_shared"
+    if str(shared) not in sys.path:
+        sys.path.insert(0, str(shared))
+    import hestia_gate_mechanism
+    return hestia_gate_mechanism
 
 
-# ---- Tiny MCP-over-HTTP client (same shape as the witness hook) -------
-
-class McpHttp:
-    def __init__(self, endpoint: str, deadline: float) -> None:
-        self.endpoint = endpoint
-        self.session_id: Optional[str] = None
-        self.next_id = 0
-        self.deadline = deadline  # monotonic time after which we give up
-
-    def _id(self) -> int:
-        self.next_id += 1
-        return self.next_id
-
-    def _remaining_s(self) -> float:
-        return max(0.05, self.deadline - time.monotonic())
-
-    def _request(self, body: dict[str, Any], *, is_notification: bool = False) -> Optional[dict[str, Any]]:
-        data = json.dumps(body).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-        }
-        if self.session_id:
-            headers["mcp-session-id"] = self.session_id
-        req = urllib.request.Request(self.endpoint, data=data, headers=headers, method="POST")
-        timeout = min(REQUEST_TIMEOUT_S, self._remaining_s())
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if not self.session_id:
-                sid = resp.headers.get("mcp-session-id")
-                if sid:
-                    self.session_id = sid
-            if is_notification:
-                return None
-            payload = resp.read().decode("utf-8", errors="replace")
-        return parse_json_or_sse(payload)
-
-    def initialize(self) -> dict[str, Any]:
-        return self._request({
-            "jsonrpc": "2.0", "id": self._id(),
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": PLUGIN_ID, "version": HOOK_VERSION},
-            },
-        }) or {}
-
-    def initialized(self) -> None:
-        self._request(
-            {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
-            is_notification=True,
-        )
-
-    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        return self._request({
-            "jsonrpc": "2.0", "id": self._id(),
-            "method": "tools/call",
-            "params": {"name": name, "arguments": arguments},
-        }) or {}
-
-
-def parse_json_or_sse(text: str) -> dict[str, Any]:
-    text = text.strip()
-    if not text:
-        return {}
-    if text.startswith("{"):
-        return json.loads(text)
-    for line in reversed(text.splitlines()):
-        line = line.strip()
-        if line.startswith("data:"):
-            body = line[5:].strip()
-            if body and body.startswith("{"):
-                try:
-                    return json.loads(body)
-                except json.JSONDecodeError:
-                    continue
-    return {}
+def McpHttp(endpoint: str, deadline: float):
+    """Factory delegate: constructs the SHARED wire client (callable under the old class
+    name so Sprint B's self-protection region stacks on this diff without edits)."""
+    return _load_mechanism()._McpHttp(endpoint, deadline)
 
 
 def unwrap_tool_result(rpc_response: dict[str, Any]) -> dict[str, Any]:
-    result = rpc_response.get("result") or {}
-    structured = result.get("structuredContent")
-    if isinstance(structured, dict):
-        return structured
-    for block in result.get("content") or []:
-        if isinstance(block, dict) and block.get("type") == "text":
-            text = block.get("text", "")
-            try:
-                return json.loads(text)
-            except json.JSONDecodeError:
-                pass
-    return {}
+    return _load_mechanism()._unwrap_tool_result(rpc_response)
 
 
 # ---- Daemon path ------------------------------------------------------
@@ -2378,145 +2321,47 @@ def ask_daemon(
     tool_input: Any,
     tool_use_id: str,
     host_session_id: Optional[str] = None,
-) -> Optional[Tuple[dict[str, Any], str]]:
-    """Returns (decision_dict, action_id) on success, None on any failure
-    or timeout. decision_dict has the shape from spec §3.4."""
-    endpoint = discover_endpoint()
-    if endpoint is None:
-        debug_log("no endpoint discovered; daemon path skipped")
-        return None
+):
+    """Obtain the daemon's verdict IN-PROCESS via the shared mechanism (Sprint E).
 
-    deadline = time.monotonic() + (TOTAL_BUDGET_MS / 1000.0)
-    target = extract_target(tool_input, tool_name)
-    full_command: Optional[str] = None
-    if tool_name in {"Bash", "Shell"} and isinstance(tool_input, dict):
-        cmd = tool_input.get("command")
-        if isinstance(cmd, str):
-            full_command = cmd
+    The mechanism runs the exact connect → begin_action(target) → query_policy wait-protocol
+    this function used to hand-roll (it was EXTRACTED from this file's tested client, PR #371),
+    including endpoint discovery, the TOTAL_BUDGET_MS deadline, HESTIA_ROLE, the
+    host_session_id connect-idempotency key, and the begin_action `target` write.
 
-    client = McpHttp(endpoint, deadline)
+    Returns the mechanism's SafetyVerdict when the daemon DECIDED (verdict.kind in
+    allow|warn|deny, verdict.action_id set for the outcome cache), or None when no verdict was
+    obtained — the caller then applies fail-closed / legacy-fallback exactly as before, with
+    `_LAST_FAILURE` carrying the mechanism's cause classification (timeout vs refused vs
+    unknown — the same URLError triage the private client did).
+
+    POSTURE CHANGE, deliberate (mechanism contract, GPT review of #371): an unknown `status`
+    or unrecognized `decision` vocabulary is NO VERDICT here, where the old private client
+    defaulted unknowns to allow/decided. On a fail-open engine that default un-governed the
+    member; now a garbled wire shape lands in the same fail-closed/legacy branch as a down
+    daemon."""
     try:
-        init = client.initialize()
-        if "result" not in init:
-            debug_log(f"initialize failed: {init}")
-            return None
-        client.initialized()
-
-        # connect
-        connect_args: dict[str, Any] = {
-            "plugin_id": PLUGIN_ID,
-            "plugin_version": HOOK_VERSION,
-            "host_agent": HOST_AGENT,
-            "host_agent_version": "claude-code",
-            "requested_role": "citizen",
-            "protocol_version": PROTOCOL_VERSION,
-        }
-        # Optional constellation role. Absent env → omit → daemon defaults to
-        # role:constellation:member. (Distinct from the legacy requested_role.)
-        role = os.environ.get("HESTIA_ROLE")
-        if role:
-            connect_args["role"] = role
-        # Stable host-session id → connect idempotency: one Claude session = one hestia session,
-        # instead of a fresh session minted per tool call. Descriptive reuse key only (Guard B —
-        # never an authz discriminator; the daemon reuse is liveness-only, Guard A).
-        if host_session_id:
-            connect_args["host_session_id"] = host_session_id
-        connect_resp = client.call_tool("hestia_connect", connect_args)
-        connect = unwrap_tool_result(connect_resp)
-        if "_hestia_error" in connect:
-            debug_log(f"connect rejected: {connect['_hestia_error']}")
-            return None
-        session_id = connect.get("sessionId")
-
-        # begin_action — daemon stores parameters so query_policy can use full_command
-        parameters: dict[str, Any] = {}
-        if isinstance(tool_input, dict):
-            parameters = dict(tool_input)
-        begin_args: dict[str, Any] = {
-            "tool_name": tool_name,
-            "target": target,
-            "parameters": parameters,
-            **({"session_id": session_id} if session_id else {}),
-        }
-        # Thread Claude Code's own session id as the audit grain. The daemon
-        # records it on the witnessed outcome/policy_decision events.
-        if host_session_id:
-            begin_args["host_session_id"] = host_session_id
-        begin_resp = client.call_tool("hestia_begin_action", begin_args)
-        begin = unwrap_tool_result(begin_resp)
-        if "_hestia_error" in begin:
-            debug_log(f"begin_action rejected: {begin['_hestia_error']}")
-            return None
-        action_id = begin.get("actionId")
-        if not action_id:
-            debug_log(f"begin_action missing actionId: {begin}")
-            return None
-
-        # query_policy with wait-protocol re-poll
-        decision = poll_policy(client, action_id, session_id, deadline)
-        if decision is None:
-            debug_log("query_policy never reached 'decided' within budget")
-            return None
-        return (decision, action_id)
-    except urllib.error.URLError as e:
-        # Classify, so the fail-closed message can say what is KNOWN rather than
-        # guess a cause. A timeout means starved; a refused connection means down.
-        # These want opposite member behaviour, so conflating them is not cosmetic.
-        reason = getattr(e, "reason", None)
-        if isinstance(reason, TimeoutError) or isinstance(e, socket.timeout):
-            _set_last_failure("timeout")
-        elif isinstance(reason, ConnectionRefusedError):
-            _set_last_failure("refused")
-        else:
-            _set_last_failure("unknown")
-        debug_log(f"network: {e}")
+        mech = _load_mechanism()
+    except Exception as e:  # noqa: BLE001 — a missing mechanism is a plane-E infra failure
+        _set_last_failure("unknown")
+        _record_plane_e("unknown", f"shared mechanism unavailable: {type(e).__name__}", tool_name)
+        debug_log(f"shared mechanism unavailable: {type(e).__name__}: {e}")
         return None
-    except TimeoutError as e:
-        _set_last_failure("timeout")
-        debug_log(f"timeout: {e}")
+    verdict = mech.query_society_safety(
+        {"tool_name": tool_name, "tool_input": tool_input},
+        plugin_id=PLUGIN_ID,
+        host_agent=HOST_AGENT,
+        plugin_version=HOOK_VERSION,
+        host_agent_version="claude-code",
+        host_session_id=host_session_id,
+    )
+    if not verdict.decided:
+        # The mechanism already recorded the plane-E row (record_gate_unavailable) —
+        # main() passes record=False to deny_no_verdict so the row is not double-counted.
+        _set_last_failure(verdict.cause if verdict.cause in ("timeout", "refused") else "unknown")
+        debug_log(f"no verdict from daemon path: {verdict.message}")
         return None
-    except Exception as e:  # noqa: BLE001 — fail-open path; legacy fallback will catch
-        debug_log(f"unexpected: {type(e).__name__}: {e}")
-        return None
-
-
-def poll_policy(
-    client: McpHttp,
-    action_id: str,
-    session_id: Optional[str],
-    deadline: float,
-) -> Optional[dict[str, Any]]:
-    """Call hestia_query_policy and handle the wait protocol. Returns the
-    final `decided` payload, or None if we ran out of polls / budget."""
-    for poll in range(MAX_POLLS):
-        if time.monotonic() >= deadline:
-            return None
-        args: dict[str, Any] = {"action_id": action_id}
-        if session_id:
-            args["session_id"] = session_id
-        resp = client.call_tool("hestia_query_policy", args)
-        body = unwrap_tool_result(resp)
-        if "_hestia_error" in body:
-            debug_log(f"query_policy error: {body['_hestia_error']}")
-            return None
-        status = body.get("status", "decided")
-        if status == "decided":
-            return body
-        if status != "evaluating":
-            debug_log(f"unknown status {status!r}; treating as decided")
-            return body
-        next_poll_ms = body.get("nextPollMs")
-        if not isinstance(next_poll_ms, int) or next_poll_ms < 0:
-            next_poll_ms = 200
-        sleep_ms = max(MIN_POLL_SLEEP_MS, next_poll_ms)
-        # Cap sleep at remaining budget.
-        remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
-        sleep_ms = min(sleep_ms, remaining_ms)
-        if sleep_ms <= 0:
-            return None
-        debug_log(f"evaluating; sleeping {sleep_ms}ms before re-poll {poll + 2}")
-        time.sleep(sleep_ms / 1000.0)
-    return None
+    return verdict
 
 
 def cache_action(tool_use_id: str, action_id: str, tool_name: str) -> None:
@@ -2547,7 +2392,8 @@ def _record_plane_e(cause: str, detail: str, tool_name: str = "unknown") -> None
         pass
 
 
-def deny_no_verdict(why: str, *, cause: str = "unknown", tool_name: str = "unknown") -> int:
+def deny_no_verdict(why: str, *, cause: str = "unknown", tool_name: str = "unknown",
+                    record: bool = True) -> int:
     """Fail-closed refusal: no daemon verdict → the tool does not run.
 
     Composed locally (the daemon is exactly what we couldn't reach), so this
@@ -2597,7 +2443,10 @@ def deny_no_verdict(why: str, *, cause: str = "unknown", tool_name: str = "unkno
         f"({why}; cause={cause}). This is NOT a policy boundary and NOT a tool failure — the "
         f"referee is unreachable, so the gate fails closed for safety. {remedy}\n"
     )
-    _record_plane_e(cause, why, tool_name)
+    if record:  # False when the daemon path already recorded this row (Sprint E: the shared
+        # mechanism's no-verdict composer writes record_gate_unavailable itself; recording
+        # again here would double-count plane-E rows and skew the unavailability denominator)
+        _record_plane_e(cause, why, tool_name)
     debug_log(f"fail-closed deny: {why} cause={cause}")
     return 2
 
@@ -2632,60 +2481,12 @@ def invoke_legacy_fallback(stdin_payload: str) -> int:
         return 0
 
 
-# ---- Main flow --------------------------------------------------------
-
-def emit_decision(decision: dict[str, Any]) -> int:
-    """Translate a Hestia PolicyResult-shaped dict into a Claude Code
-    hook exit code (with side-effect stderr)."""
-    verdict = decision.get("decision", "allow")
-    enforced = bool(decision.get("enforced", True))
-    reason = decision.get("reason", "")
-    rule_name = decision.get("ruleName")
-    label = f" [{rule_name}]" if rule_name else ""
-
-    if verdict == "deny" and enforced:
-        # Prefer the daemon-composed steering text (deny-as-redirect): it is
-        # what the blocked agent actually reads, so it must say what to DO
-        # next, not just why. Fall back to the bare reason for old daemons.
-        guidance = decision.get("guidance")
-        sys.stderr.write((guidance or f"hestia: deny{label} — {reason}") + "\n")
-        return 2
-    if verdict == "warn":
-        sys.stderr.write(f"hestia: warn{label} — {reason}\n")
-        return 0
-    if verdict == "deny" and not enforced:
-        # audit-only mode: surface the would-be denial as a warning.
-        sys.stderr.write(f"hestia: would-deny (audit-only){label} — {reason}\n")
-        return 0
-    return 0
-
-
-def main() -> int:
-    raw = sys.stdin.read()
-    if not raw.strip():
-        # Empty stdin = the harness sent no event. Not caller-controllable from
-        # inside a session, but under strict fail-closed semantics "no event" is
-        # still "no verdict" → no tool (CBP relay-verify micro-seam, 2026-07-07).
-        if fail_closed():
-            return deny_no_verdict("empty hook event")
-        return 0
-    try:
-        event = json.loads(raw)
-    except json.JSONDecodeError as e:
-        if fail_closed():
-            return deny_no_verdict(f"unparseable hook event: {e}")
-        debug_log(f"bad json: {e}; allowing")
-        return 0
-
-    tool_name = event.get("tool_name") or "?"
-    # Claude Code's own stable session id — the real per-session audit grain.
-    host_session_id = event.get("session_id")
-    tool_use_id = event.get("tool_use_id") or event.get("session_id") or "no-id"
-    tool_input = event.get("tool_input") or {}
-
-    # SELF-PROTECTION FIRST — before the daemon, and never conditional on it.
-    # If this required a verdict, "stop the daemon, then edit the gate" would be
-    # the same evasion one layer down.
+def _fallback_self_protection(tool_name: str, tool_input: Any,
+                              host_session_id: Optional[str]) -> Optional[int]:
+    """Tier-2 degraded mode (the ratified deny-writes-allow-reads posture, per-shim
+    tighten-only): the shared governance-closure module failed to import, so the
+    pre-Sprint-B local matcher decides — MOVED here from main() verbatim, not deleted.
+    Returns 2 to deny, or None to continue to the ordinary policy path."""
     _self_hit = _touches_self(tool_name, tool_input)
     if _self_hit is None:
         _reg = _touches_registration(tool_name, tool_input)
@@ -2729,17 +2530,97 @@ def main() -> int:
             # approving everything else the same command might do.
             sys.stderr.write(f"hestia: gate write APPROVED -- {detail}\n")
             debug_log(f"gate-self-write approved: {detail}")
+    return None
 
-    # Try the daemon first.
-    result = ask_daemon(tool_name, tool_input, tool_use_id, host_session_id)
-    if result is not None:
-        decision, action_id = result
-        cache_action(tool_use_id, action_id, tool_name)
-        debug_log(
-            f"daemon decided: {tool_name} → {decision.get('decision')} "
-            f"(rule={decision.get('ruleId')})"
-        )
-        return emit_decision(decision)
+
+# ---- Main flow --------------------------------------------------------
+
+def emit_decision(verdict) -> int:
+    """Translate the shared mechanism's SafetyVerdict into a Claude Code hook exit code
+    (with side-effect stderr).
+
+    Rendering keys on `verdict.kind` (Sprint E mechanism extension) — the message text is
+    composed by the mechanism with the exact wording this function used to build: enforced
+    deny prefers the daemon's `guidance` steering text (deny-as-redirect) and falls back to
+    "hestia: deny [rule] — reason"; warns render "hestia: warn [rule] — reason"; an
+    audit-only deny arrives as kind="warn" whose message already says
+    "would-deny (audit-only)", so the distinct messaging survives the transport swap."""
+    if verdict.kind == "deny":
+        sys.stderr.write((verdict.message or "hestia: deny — refused by policy") + "\n")
+        return 2
+    if verdict.kind == "warn" and verdict.message:
+        sys.stderr.write(verdict.message + "\n")
+        return 0
+    return 0
+
+
+def main() -> int:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        # Empty stdin = the harness sent no event. Not caller-controllable from
+        # inside a session, but under strict fail-closed semantics "no event" is
+        # still "no verdict" → no tool (CBP relay-verify micro-seam, 2026-07-07).
+        if fail_closed():
+            return deny_no_verdict("empty hook event")
+        return 0
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError as e:
+        if fail_closed():
+            return deny_no_verdict(f"unparseable hook event: {e}")
+        debug_log(f"bad json: {e}; allowing")
+        return 0
+
+    tool_name = event.get("tool_name") or "?"
+    # Claude Code's own stable session id — the real per-session audit grain.
+    host_session_id = event.get("session_id")
+    tool_use_id = event.get("tool_use_id") or event.get("session_id") or "no-id"
+    tool_input = event.get("tool_input") or {}
+
+    # SELF-PROTECTION FIRST — before the daemon, and never conditional on it.
+    # If this required a verdict, "stop the daemon, then edit the gate" would be
+    # the same evasion one layer down.
+    # Sprint B: the shared governance-closure module CLASSIFIES; this shim renders.
+    # "none" falls through to ordinary policy; "read" is allowed + witnessed
+    # (gate_self_read); "write" runs the existing escalate/claim flow and denies
+    # unapproved — the rule id in the record comes from the module result.
+    if _closure_classify is not None:
+        _cv = _closure_classify(tool_name, tool_input, cwd=event.get("cwd"))
+        if _cv.classification == "read":
+            # Allowed — and RECORDED. A member may inspect what governs it; repeated
+            # reads of the governance surface remain visible as a pattern.
+            _witness_self_read(_cv.marker, tool_name)
+            debug_log(f"gate-self-read (allowed, witnessed): {tool_name} -> {_cv.marker}")
+        elif _cv.classification == "write":
+            verdict, detail = request_self_write(
+                _cv.marker or _cv.rule, tool_name,
+                _attempted_summary(tool_name, tool_input),
+                resource=_cv.resource, key=_cv.rule,
+                host_session_id=host_session_id,
+            )
+            if verdict != "approved":
+                debug_log(f"gate-self-write {verdict}: {detail}")
+                return deny_self_access(_cv.marker or _cv.rule, tool_name,
+                                        resource=_cv.resource, key=_cv.rule)
+            # APPROVED -- the self-protection is lifted for THIS call only, and the call
+            # continues to the ordinary policy check below. Approving a gate edit is not
+            # approving everything else the same command might do.
+            sys.stderr.write(f"hestia: gate write APPROVED -- {detail}\n")
+            debug_log(f"gate-self-write approved: {detail}")
+    else:
+        # Tier-2 degraded mode: the shared classifier failed to import — the pre-B
+        # local matcher decides, moved (not deleted) into _fallback_self_protection.
+        _rc = _fallback_self_protection(tool_name, tool_input, host_session_id)
+        if _rc is not None:
+            return _rc
+
+    # Try the daemon first — IN-PROCESS via the shared mechanism (Sprint E, one transport).
+    verdict = ask_daemon(tool_name, tool_input, tool_use_id, host_session_id)
+    if verdict is not None:
+        if verdict.action_id:
+            cache_action(tool_use_id, verdict.action_id, tool_name)
+        debug_log(f"daemon decided: {tool_name} → {verdict.kind}")
+        return emit_decision(verdict)
 
     # Daemon unavailable or didn't settle. Under the fail-closed profile the
     # daemon is the law: no verdict → no tool (GPT review HST-004; governed /
@@ -2749,6 +2630,7 @@ def main() -> int:
             f"daemon path failed for {tool_name}",
             cause=_LAST_FAILURE,
             tool_name=tool_name,
+            record=False,  # the daemon path already wrote the plane-E row (see ask_daemon)
         )
     debug_log(f"daemon path failed; falling back to legacy for {tool_name}")
     return invoke_legacy_fallback(raw)

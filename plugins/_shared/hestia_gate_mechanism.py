@@ -70,11 +70,23 @@ class SafetyVerdict:
                     The caller fails closed either way.
     `decided` distinguishes a real verdict from a fail-closed non-verdict so the caller can render
     the two differently and so non-verdicts are never scored as member conduct.
+
+    `kind` (Sprint E) is the RENDER hint: "allow" | "warn" | "deny" | "none". It exists so a
+    renderer (claude-code's emit_decision) keeps its distinct warn/deny messaging without
+    re-parsing `message`. Non-breaking: it never changes the allow/decided contract — an
+    audit-only deny renders as kind="warn" (surfaced on stderr, exit 0; `message` still says
+    would-deny) and a fail-closed non-verdict is kind="none". Callers that ignore `kind`
+    (kimi, codex) behave exactly as before.
+
+    `action_id` (Sprint E) is the daemon's actionId when begin/poll produced one — the
+    correlation key claude-code's PostToolUse outcome cache uses. None when no verdict.
     """
     allow: bool
     decided: bool
     message: str
     cause: str = "unknown"   # when not decided: "timeout" | "refused" | "unknown"
+    kind: str = "none"       # "allow" | "warn" | "deny" | "none" — render hint only
+    action_id: Optional[str] = None
 
 
 # ── MCP-over-HTTP client (in-process; MAY open a socket — mechanism, not law) ─────────────────
@@ -184,7 +196,11 @@ def _extract_target(tool_input: Any, tool_name: str) -> Optional[str]:
         v = tool_input.get(key)
         if isinstance(v, str):
             return v
-    if tool_name in {"Bash", "Shell"}:
+    # CASE-INSENSITIVE (Sprint E, §3.3 audit hole): codex's engine emits the shell tool as
+    # "bash" lowercase; the old {"Bash", "Shell"} literal missed it, so every codex shell act
+    # reached the daemon with target=None and its chain records carried an EMPTY target — a
+    # one-character audit hole. Normalize before comparing; never widen beyond shell names.
+    if isinstance(tool_name, str) and tool_name.lower() in {"bash", "shell"}:
         cmd = tool_input.get("command")
         if isinstance(cmd, str) and cmd.strip():
             return cmd.split()[0]
@@ -242,14 +258,15 @@ def _interpret(decision: dict) -> Optional[SafetyVerdict]:
     label = f" [{rule_name}]" if rule_name else ""
     if verdict == "deny" and enforced:
         guidance = decision.get("guidance")
-        return SafetyVerdict(allow=False, decided=True,
+        return SafetyVerdict(allow=False, decided=True, kind="deny",
                              message=(guidance or f"hestia: deny{label} — {reason}"))
     if verdict == "warn":
-        return SafetyVerdict(allow=True, decided=True, message=f"hestia: warn{label} — {reason}")
-    if verdict == "deny":  # not enforced -> audit-only
-        return SafetyVerdict(allow=True, decided=True,
+        return SafetyVerdict(allow=True, decided=True, kind="warn",
+                             message=f"hestia: warn{label} — {reason}")
+    if verdict == "deny":  # not enforced -> audit-only: surfaced like a warn, exit 0
+        return SafetyVerdict(allow=True, decided=True, kind="warn",
                              message=f"hestia: would-deny (audit-only){label} — {reason}")
-    return SafetyVerdict(allow=True, decided=True, message="")  # verdict == "allow"
+    return SafetyVerdict(allow=True, decided=True, kind="allow", message="")  # verdict == "allow"
 
 
 def _no_verdict(plugin_id: str, tool_name: str, cause: str, detail: str) -> SafetyVerdict:
@@ -348,6 +365,7 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
         if verdict is None:
             return _no_verdict(plugin_id, tool_name, "unknown",
                                "daemon returned a malformed or unrecognized decision")
+        verdict.action_id = action_id  # correlation key for the caller's outcome cache
         return verdict
     except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
         reason = getattr(e, "reason", None)
@@ -360,3 +378,229 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
         return _no_verdict(plugin_id, tool_name, cause, f"network: {type(e).__name__}")
     except Exception as e:  # noqa: BLE001 — FAIL-CLOSED: any unexpected error is no-verdict, never allow
         return _no_verdict(plugin_id, tool_name, "unknown", f"unexpected: {type(e).__name__}")
+
+
+# ── ONE deny recorder (Sprint E — PRD §3.3 bullets 4-6, §6.E) ─────────────────────────────────
+# Before this, the deny recorder varied by vendor: codex reported to the chain (with its own
+# private client), kimi recorded only inside a bare `except: pass`, claude wrote no refusal
+# record at all on this path — and NO plugin's deny record carried the command/target (only
+# claude's begin_action did), so the trust chain's denominator differed by harness and the
+# record could not say WHAT was refused. Every shim now calls witness_decision_unified for
+# refusal records. Contract:
+#   - ALWAYS carries `target` (the audit hole) and `verdict_available` (kimi previously could
+#     not distinguish a real deny from an infra fail-close — §3.3 bullet 5);
+#   - NEVER raises and never changes the caller's decision (the deny stands regardless);
+#   - NON-SILENT failure: if the daemon witness cannot be delivered, the full record — with the
+#     delivery error — is appended to the per-shim diagnostic log
+#     ~/.hestia/telemetry/gate-denies-<plugin_id>.jsonl (criterion 9(c) fallback witness), so a
+#     dead daemon degrades the record's REACH, never its existence.
+
+def _deny_fallback_path(plugin_id: str) -> Path:
+    home = Path(os.environ.get("HESTIA_HOME", str(DEFAULT_HESTIA_HOME)))
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in (plugin_id or "unknown"))
+    return home / "telemetry" / f"gate-denies-{safe}.jsonl"
+
+
+def _append_deny_fallback(plugin_id: str, record: dict) -> None:
+    """Criterion 9(c) fallback witness: append-only, per-shim, never raises."""
+    try:
+        path = _deny_fallback_path(plugin_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        pass  # the fallback of the fallback is silence; the deny itself already stood
+
+
+
+def _loaded_core_digest():
+    try:
+        import sys as _s
+        _c = _s.modules.get("hestia_gate_" + "core")
+        return getattr(_c, "_CORE_DIGEST", None) if _c is not None else None
+    except Exception:
+        return None
+
+def witness_decision_unified(client_or_none, *, plugin_id: str, decision: str, rule: str,
+                             tool_name: str, target: Optional[str], session_id: Optional[str],
+                             verdict_available: bool, attempted_summary: str) -> bool:
+    """Record a refusal (deny/warn) to the daemon's witness chain — the ONE deny recorder.
+
+    `client_or_none`: an already-initialized MCP client to reuse, or None to open a short
+    single-shot session (deadline ~1.5s; only ever runs on the deny/warn path, so no
+    hook-clamp pressure on allows). Returns True when the daemon acknowledged the record;
+    False when it went to the fallback log instead. NEVER raises."""
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    record = {
+        "plugin_id": plugin_id,
+        "decision": decision,                       # deny | warn
+        "rule": (rule or "")[:300],
+        "tool_name": tool_name or "",
+        "target": target,                           # ALWAYS present — the audit hole, closed
+        "session_id": session_id,
+        "verdict_available": bool(verdict_available),
+        # Deployed-generation attestation (§7.2(7)): the digest of the core THIS process
+        # imported, or absent when no core is loaded — never a bystander file hash.
+        "core_digest": _loaded_core_digest(),
+        "attempted": attempted_summary,
+        "ts": ts,
+    }
+    try:
+        client = client_or_none
+        if client is None:
+            endpoint = _discover_endpoint()
+            if endpoint is None:
+                raise RuntimeError("no daemon endpoint discovered")
+            client = _McpHttp(endpoint, time.monotonic() + 1.5)
+            if "result" not in client.initialize():
+                raise RuntimeError("initialize failed")
+            client.initialized()
+        out = client.call_tool("hestia_witness_decision", {
+            "plugin_id": plugin_id,
+            "decision": decision,
+            "adjudicator": f"plugin-gate:{plugin_id}",
+            "reason": (rule or "")[:300],
+            # False => the gate could not REACH a verdict (infra fail-close). Structurally not
+            # conduct: "I could not judge" is not "I judged you badly" — derivation excludes
+            # these from temperament with no exoneration needed (codex's discrimination, now
+            # every harness's — §6.E).
+            "verdict_available": bool(verdict_available),
+            "tool_name": tool_name or "",
+            "target": target,
+            "session_id": session_id,
+            "attempted": attempted_summary,
+            # REPAIR 5 (GPT fleet-review blocker 5): the deployed-generation attestation
+            # rides the HEALTHY witness call too, not only the fallback log — before this,
+            # the digest that #7.2(7) exists for reached no chain record at all. The daemon
+            # accepts extra arguments (hestia tools accept any argument), which ALSO means
+            # a schema that does not persist this field would discard it SILENTLY - so the
+            # local fallback record above keeps carrying it regardless, and daemon-side
+            # persistence needs its own verification (R345_NOTES.md).
+            "core_digest": record["core_digest"],
+        })
+        if not (isinstance(out, dict) and "result" in out):
+            raise RuntimeError("witness call returned no result")
+        return True
+    except Exception as e:  # noqa: BLE001 — non-silent: the record survives in the fallback log
+        record["witness_delivery_failed"] = f"{type(e).__name__}: {e}"
+        _append_deny_fallback(plugin_id, record)
+        return False
+
+
+# ── Authenticated policy path (Sprint F — PRD §6.F; §7.1 criteria 2/5) ─────────────────
+# fetch_policy_snapshot: the LIVE, in-process fetch of this member's policy from the
+# daemon — the snapshot evaluate() consumes in enforce mode, riding the SAME MCP client
+# as the society-safety path. Returns None on ANY transport failure: that is the ratified
+# degraded-mode trigger (the daemon is unreachable), and the shim then takes the core's
+# degraded_verdict — never a local-replica fallback. A daemon that ANSWERS but lacks a
+# surface (an older build; the boundary-test stub) yields a THIN snapshot instead: thin
+# grants NOTHING extra (the tighter direction), and reachable-but-thin is not the
+# degraded trigger — society safety still governs writes on that path.
+#
+# WHAT THE DAEMON CAN CERTIFY TODAY (measured 2026-08-13, core/src/server/handler.rs):
+#   - hestia_operating_law(session_id): identity{plugin_id, role} — the daemon-resolved
+#     role for this session (replacing the identity.json role bridge when present) — plus
+#     the composed law and its law_hash, and any disclosed operator_grant;
+#   - hestia_scope_status(plugin_id): the live, memory-only PATH grants minted by
+#     hestia_request_scope; carried here as "path:<path>" entries in `in_scope`.
+# WHAT IT CANNOT (declared RED in Sprint F's notes; §9 forbids inventing surfaces):
+#   standing repo scope has NO daemon surface at all, hestia_operating_law's final
+#   projection DROPS the scope_grants field its own hash covers, and no launch-cwd grant
+#   surface exists. Absent surfaces contribute NOTHING to the snapshot.
+
+#: One fetch per gate invocation — gate processes are short-lived, so a per-process cache
+#: is a per-invocation cache; it exists so a shim may consult the snapshot at several
+#: seams without paying several round-trips.
+_POLICY_SNAPSHOT_CACHE: dict = {}
+
+
+def fetch_policy_snapshot(plugin_id: str, *, host_agent: Optional[str] = None,
+                          host_session_id: Optional[str] = None,
+                          use_cache: bool = True) -> Optional[dict]:
+    """Fetch this member's policy snapshot from the daemon, in-process. NEVER raises.
+
+    None  -> the daemon is unreachable / did not authenticate the session (no sessionId):
+             the caller must take the ratified degraded path in enforce mode.
+    dict  -> a snapshot the daemon answered for. ALWAYS carries an `in_scope` LIST (so the
+             core's resolve_agent_policy(vault_reader=...) seam can never fall through to
+             the local replica on this path), plus `role`, `law_hash`, `operator_grant`,
+             `scope_grants`, `source`, `fetched_at`, `session_id`."""
+    if use_cache and plugin_id in _POLICY_SNAPSHOT_CACHE:
+        return _POLICY_SNAPSHOT_CACHE[plugin_id]
+    snap = _fetch_policy_snapshot_uncached(plugin_id, host_agent, host_session_id)
+    if use_cache and snap is not None:
+        _POLICY_SNAPSHOT_CACHE[plugin_id] = snap
+    return snap
+
+
+def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
+                                    host_session_id: Optional[str]) -> Optional[dict]:
+    try:
+        endpoint = _discover_endpoint()
+        if endpoint is None:
+            return None
+        deadline = time.monotonic() + (TOTAL_BUDGET_MS / 1000.0)
+        client = _McpHttp(endpoint, deadline)
+        if "result" not in client.initialize():
+            return None
+        client.initialized()
+        connect_args: dict = {
+            "plugin_id": plugin_id,
+            "host_agent": host_agent or plugin_id,
+            "requested_role": "citizen",
+            "protocol_version": PROTOCOL_VERSION,
+            "instance_name": "gate-policy-fetch",
+        }
+        role_env = os.environ.get("HESTIA_ROLE")
+        if role_env:
+            connect_args["role"] = role_env
+        if host_session_id:
+            connect_args["host_session_id"] = host_session_id
+        connect = _unwrap_tool_result(client.call_tool("hestia_connect", connect_args))
+        if "_hestia_error" in connect:
+            return None
+        session_id = connect.get("sessionId")
+        if not session_id:
+            # A policy snapshot must ride an authenticated session; an unattributed answer
+            # certifies nothing (same rule as the society-safety path, GPT #2).
+            return None
+        snap: dict = {
+            "member_id": plugin_id,
+            "source": "daemon-live",
+            "fetched_at": int(time.time()),
+            "session_id": session_id,
+            "role": None,
+            "law_hash": None,
+            "operator_grant": None,
+            "in_scope": [],
+            "scope_grants": [],
+        }
+        law = _unwrap_tool_result(
+            client.call_tool("hestia_operating_law", {"session_id": session_id}))
+        if isinstance(law, dict) and "_hestia_error" not in law:
+            ident = law.get("identity")
+            if isinstance(ident, dict) and isinstance(ident.get("role"), str):
+                snap["role"] = ident["role"]
+            if isinstance(law.get("law_hash"), str):
+                snap["law_hash"] = law["law_hash"]
+            grant = law.get("operator_grant")
+            if isinstance(grant, dict):
+                snap["operator_grant"] = grant
+        scope = _unwrap_tool_result(
+            client.call_tool("hestia_scope_status", {"plugin_id": plugin_id}))
+        if isinstance(scope, dict) and "_hestia_error" not in scope:
+            grants = scope.get("live_grants")
+            if isinstance(grants, list):
+                for g in grants:
+                    p = g.get("path") if isinstance(g, dict) else None
+                    if isinstance(p, str) and p.strip():
+                        snap["scope_grants"].append(p.strip())
+                        # The seam as built: resolve_agent_policy parses "path:" entries.
+                        # An ABSOLUTE granted path is carried faithfully but is inert
+                        # against the core's segment-keyed scope model — declared RED in
+                        # the Sprint F notes rather than widened here into a repo grant
+                        # nobody made (a file grant must not front for its whole repo).
+                        snap["in_scope"].append("path:" + p.strip())
+        return snap
+    except Exception:  # noqa: BLE001 — any failure is "unreachable"; the caller degrades
+        return None
