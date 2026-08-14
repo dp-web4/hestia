@@ -994,11 +994,32 @@ def _degraded_command_is_read(command: str) -> bool:
                         if sub == "tag" and len(words) > 2 and not any(
                                 w in ("-l", "--list") for w in words[2:]):
                             return False
-                        if sub == "branch" and any(
-                                w in ("-d", "-D", "-m", "-M", "-f") for w in words[2:]):
-                            return False
+                        if sub == "branch":
+                            # `git branch NAME` CREATES (GPT post-merge review, #424):
+                            # any positional after `branch` denies — list/point-at forms
+                            # take args too, and telling them apart is not worth a write
+                            # slipping degraded mode. Bare/flag-only stays read, minus
+                            # the explicit write flags.
+                            rest2 = [w for w in words[2:]]
+                            if any(not w.startswith("-") for w in rest2):
+                                return False
+                            if any(w in ("-d", "-D", "-m", "-M", "-c", "-C", "-f",
+                                         "--force", "--set-upstream-to", "--unset-upstream",
+                                         "--edit-description") for w in rest2):
+                                return False
                     elif head not in _DEGRADED_READ_VERBS:
                         return False
+                    elif head == "find" and any(
+                            w in ("-delete", "-exec", "-execdir", "-ok", "-okdir",
+                                  "-fprint", "-fprintf", "-fls", "-fprint0")
+                            for w in words[1:]):
+                        return False  # find's mutating/executing actions (GPT, #424)
+                    elif head == "sort" and any(
+                            w == "-o" or w.startswith("--output") for w in words[1:]):
+                        return False  # sort -o FILE writes
+                    elif head == "env" and any(
+                            not w.startswith("-") and "=" not in w for w in words[1:]):
+                        return False  # env with a positional EXECUTES it
     return True
 
 
