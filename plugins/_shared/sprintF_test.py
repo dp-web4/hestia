@@ -37,7 +37,11 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TREE = os.environ.get("SPRINTF_TREE") or os.path.join(HERE, "tree")
+# Default IN-REPO: this file sits at <repo>/plugins/_shared/, and post-cutover the repo
+# tree IS the tree under test (sprintD/E convention). SPRINTF_TREE remains the override
+# for out-of-tree staged verification; the old ./tree default was an uncommitted staging
+# dir that exists in no checkout, so the bare CI invocation red-lit every arm.
+TREE = os.environ.get("SPRINTF_TREE") or os.path.abspath(os.path.join(HERE, os.pardir, os.pardir))
 HOOK = "pre_" + "tool_use.py"          # named as data, never a write destination
 CORE = "hestia_gate_" + "core.py"
 MECH = "hestia_gate_" + "mechanism.py"

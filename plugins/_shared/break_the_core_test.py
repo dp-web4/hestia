@@ -26,7 +26,9 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TREE = os.environ.get("SPRINTF_TREE") or os.path.join(HERE, "tree")
+# Default IN-REPO (sprintD/E convention): the repo this file sits in is the tree under
+# test; SPRINTF_TREE remains the staged-tree override. See sprintF_test.py.
+TREE = os.environ.get("SPRINTF_TREE") or os.path.abspath(os.path.join(HERE, os.pardir, os.pardir))
 HOOK = "pre_" + "tool_use.py"
 CORE = "hestia_gate_" + "core.py"
 

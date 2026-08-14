@@ -60,17 +60,22 @@ So governance is **defense in depth**, each layer covering different acts:
    ```
 3. `codex doctor` to validate config. Live hook firing needs auth (`codex login`, dp-only).
 
-### Alternative: native Codex plugin (idiomatic, needs a trust-review)
-A ready-to-install Codex plugin is bundled under `marketplace/` (the `hestia-codex@hestia` plugin,
-format source-verified against codex-rs and confirmed discoverable). Install with:
-```
-codex plugin marketplace add /mnt/c/exe/projects/ai-agents/hestia/plugins/codex/marketplace
-codex plugin add hestia-codex@hestia        # prompts a one-time hook trust-review
-```
-It bundles the same hooks (referenced via `$CLAUDE_PLUGIN_ROOT`). **Do not run both installs at once**
-— the plugin and the config.toml `[[hooks.*]]` would double-fire. The config-based install is the
-active one on this host; the plugin is the portable form for other machines. (Marketplace-manifest
-quirk in 0.145: the manifest must live at `.agents/plugins/marketplace.json`, not `.codex-plugin/`.)
+### Retired: the native Codex plugin marketplace bundle (Sprint G)
+A `marketplace/` bundle (the `hestia-codex@hestia` plugin) used to ship a second, hand-forked
+copy of the gate. Sprint G deleted the forked hooks (§7.1(1) — the 227-line stale gate,
+11.5KB against the live 42KB, nobody installed from it), and the rest of the registration
+(manifests, plugin.json advertising the deleted `./hooks/hooks.json`, frozen identity seed
+with no hydrate writer, PARITY_EXCEPTIONS ledger) is retired with it: a package that
+advertises hooks it does not contain is worse than no package. The config.toml
+`[[hooks.*]]` install above is the ONE install path. If a marketplace package ships again
+it must be a REBUILT artifact carrying the canonical content digest (§7.2(6),
+`plugins/_shared/test_gate_core.py` inventory note) — never a hand-fork. Format notes that
+took real effort, preserved for that rebuild: manifest must live at
+`.agents/plugins/marketplace.json` (not `.codex-plugin/`) in Codex 0.145; scripts resolve
+via `$CLAUDE_PLUGIN_ROOT`; authority (MRH grants, private exceptions) must ship NARROWER
+than canonical, never wider, with every withheld grant declared — see the parity test's
+mechanism/authority axes in git history (`plugins/codex/tests/marketplace_parity_test.py`,
+deleted with the bundle it compared).
 
 ## Launching Codex (the flags, since they are not the ones you expect)
 

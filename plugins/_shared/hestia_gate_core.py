@@ -677,15 +677,28 @@ def path_in_scope(path: str, scopes, workspace: str, profile: HarnessProfile,
     `_under_temp_root`'s pre-#169 `startswith(("/tmp",...))` — and the same fix: compare at
     the separator."""
     p = path.replace("\\", "/")
-    low = p.lower()
-    for marker in profile.home_markers:
-        m = marker.lower()
-        if m in low or low.startswith(os.path.expanduser(marker).lower()):
-            return True
-    if not p.startswith("/") and not p.startswith("~"):
+    if p.startswith("~"):
+        p = os.path.expanduser(p).replace("\\", "/")
+    elif not p.startswith("/"):
         cwd = (cwd or os.getcwd()).replace("\\", "/")
         p = os.path.join(cwd, p)
     p = os.path.normpath(p).replace("\\", "/")
+    # HOME IS A BOUNDARY, NOT A SUBSTRING (GPT fleet-review blocker 8) -- the same class
+    # _under_temp_root (codex #169) and the workspace branch (kimi #940 B5) were already
+    # cured of, fixed the same way. The old form ran BEFORE normalisation and tested
+    # `marker in path` / `startswith(expanduser(marker))`, so `~/.kimi-code-evil/x` (a
+    # SIBLING anyone can create) and `~/.kimi-code/../.ssh/id` (traversal OUT of home)
+    # both read as the member's own home. Now the candidate resolves first (expanduser +
+    # cwd-join + normpath, above), each marker resolves via expanduser AND realpath (so a
+    # symlinked home dir matches under either spelling), and containment compares at the
+    # separator.
+    low = p.lower()
+    for marker in profile.home_markers:
+        ex = os.path.expanduser(marker).replace("\\", "/").rstrip("/")
+        for root in {ex, os.path.realpath(ex).replace("\\", "/").rstrip("/")}:
+            m = root.lower()
+            if m and (low == m or low.startswith(m + "/")):
+                return True
     if _under_temp_root(p):
         return True
     ws = workspace.replace("\\", "/").rstrip("/")

@@ -45,10 +45,11 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# The staged tree whose PATCHED hooks we run. Default: ./tree beside this file (mirrors the
-# Sprint F convention); override with SPRINTF_TREE. The hook basename is assembled from
-# fragments so this file itself never contains the closure filename as a literal.
-TREE = os.environ.get("SPRINTF_TREE") or os.path.join(HERE, "tree")
+# The tree whose hooks we run. Default IN-REPO (sprintD/E convention): post-cutover the
+# repo this file sits in is the tree under test; override with SPRINTF_TREE for staged
+# out-of-tree runs. The hook basename is assembled from fragments so this file itself
+# never contains the closure filename as a literal.
+TREE = os.environ.get("SPRINTF_TREE") or os.path.abspath(os.path.join(HERE, os.pardir, os.pardir))
 HOOK = "pre_" + "tool_use.py"
 MECH = "hestia_gate_" + "mechanism.py"
 CORE = "hestia_gate_" + "core.py"
