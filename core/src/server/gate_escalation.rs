@@ -260,6 +260,13 @@ pub struct Factor {
     /// concurrence, which is what it was.
     #[serde(default)]
     pub dissent: bool,
+    /// The peer's stated argument, in its own words. Load-bearing for dissent — evidence
+    /// with no content is not reviewable, and issue #367's live specimen (99417cc39a7acb5d,
+    /// 2026-08-14) is a dissent argument silently discarded at the door while the factor
+    /// recorded the opposite stance. Defaults None so every factor written before this
+    /// field existed reads as "no argument recorded", which is what it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument: Option<String>,
 }
 
 impl Channel {
@@ -805,6 +812,22 @@ impl EscalationStore {
                         }
                     }
                 }
+                "gate_escalation_corroborated" => {
+                    // RESTORE THE PEER'S EVIDENCE while the escalation is still pending —
+                    // the same restore `gate_escalation_decided` performs, one lifecycle
+                    // stage earlier. Without this arm a restart erased every factor on a
+                    // pending escalation, and it erased in the direction that flatters the
+                    // record: a dissent lodged before the crash (#367) reads afterwards as
+                    // a peer who never looked. The event carries the full set AFTER its
+                    // factor, so the last entry wins and order is preserved.
+                    if let Some(esc) = self.by_id.get_mut(&id) {
+                        if let Some(fs) = d.get("factors_present") {
+                            if let Ok(parsed) = serde_json::from_value::<Vec<Factor>>(fs.clone()) {
+                                esc.factors = parsed;
+                            }
+                        }
+                    }
+                }
                 "gate_escalation_claimed" => {
                     // An approval is single-use. If the chain shows it was already spent, the
                     // restored copy must be spent too — otherwise a restart would RE-ARM every
@@ -1077,8 +1100,10 @@ impl EscalationStore {
             by: decided_by.trim().to_string(),
             role: esc.decided_role.clone(),
             independence,
-            // A decision is concurrence with itself. Dissent is a PEER verb.
+            // A decision is concurrence with itself. Dissent is a PEER verb, and the
+            // decision's own rationale already lives on `reason`.
             dissent: false,
+            argument: None,
             at: now,
         });
         Ok(esc.clone())
@@ -1102,6 +1127,9 @@ impl EscalationStore {
         // A peer that looked and DISAGREED. Recorded, surfaced, and never a veto — dp's
         // ruling makes dissent evidence for review rather than a brake on the sovereign.
         dissent: bool,
+        // The peer's stated argument, verbatim. The CALLER decides whether it is required
+        // (the MCP door requires it for dissent); the store records what it is handed.
+        argument: Option<&str>,
         now: u64,
     ) -> Result<Escalation, DecideError> {
         if by.trim().is_empty() {
@@ -1126,6 +1154,9 @@ impl EscalationStore {
             role: Some(role.trim().to_string()).filter(|r| !r.is_empty()),
             independence,
             dissent,
+            argument: argument
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty()),
             at: now,
         });
         Ok(esc.clone())
@@ -1251,6 +1282,53 @@ mod tests {
         assert_eq!(s5.rehydrate(&[opened("eee5")], T0 + 7200), 0);
     }
 
+    /// #367's restore half: a peer factor lodged while the escalation is still PENDING must
+    /// survive a restart. RED before the `gate_escalation_corroborated` replay arm existed:
+    /// every pre-decision factor was erased, and erased in the flattering direction — a
+    /// dissent lodged before the crash read afterwards as a peer who never looked.
+    #[test]
+    fn replay_restores_pending_peer_factors_dissent_and_argument_included() {
+        let mut s = EscalationStore::default();
+        s.rehydrate(
+            &[
+                chain_entry(
+                    "gate_escalation_opened",
+                    serde_json::json!({
+                        "escalation_id": "fff6", "plugin_id": "claude-code",
+                        "role": "role:constellation:member", "tool_name": "Bash",
+                        "marker": "witness.py", "opened_at": T0, "expires_at": T0 + 3600,
+                    }),
+                ),
+                chain_entry(
+                    "gate_escalation_corroborated",
+                    serde_json::json!({
+                        "escalation_id": "fff6",
+                        "stance": "dissent", "dissent": true,
+                        "argument": "evidence insufficient to review",
+                        "factors_present": [{
+                            "channel": "peer_member", "by": "codex",
+                            "role": "role:constellation:member",
+                            "independence": "cross_vendor", "at": T0 + 30,
+                            "dissent": true,
+                            "argument": "evidence insufficient to review",
+                        }],
+                    }),
+                ),
+            ],
+            T0 + 60,
+        );
+        let esc = s.get("fff6").expect("restored as pending");
+        assert_eq!(esc.status_at(T0 + 60), Status::Pending);
+        assert_eq!(esc.factors.len(), 1, "the pre-decision factor must be restored");
+        assert!(esc.factors[0].dissent, "restored AS the dissent it was, not flattened");
+        assert_eq!(
+            esc.factors[0].argument.as_deref(),
+            Some("evidence insufficient to review"),
+            "the argument survives the restart with it"
+        );
+        assert_eq!(esc.peer_participation().dissented, 1);
+    }
+
     /// #128, the restore half. A `gate_escalation_opened` entry written before `asker_basis`
     /// existed restores as ASSERTED — fail closed, so a daemon restart cannot launder an
     /// unproven asker into a peer-clearable one — and an entry that carries the basis
@@ -1345,7 +1423,7 @@ mod tests {
 
         // And it survives a peer answering after the replay — the arithmetic still refers to
         // the restored list rather than to whoever happened to show up.
-        s.corroborate("f001", "kimi-code", "role:constellation:member", None, false, T0 + 30)
+        s.corroborate("f001", "kimi-code", "role:constellation:member", None, false, None, T0 + 30)
             .expect("an invited peer may participate");
         let p2 = s.get("f001").unwrap().peer_participation();
         assert_eq!(p2.concurred, 1);
@@ -1648,7 +1726,7 @@ mod tests {
         assert!(s.invite(&id, vec!["kimi-code".to_string(), "codex".to_string()]));
 
         let after = s
-            .corroborate(&id, "kimi-code", "role:constellation:member", None, true, T0 + 90)
+            .corroborate(&id, "kimi-code", "role:constellation:member", None, true, Some("recorded dissent"), T0 + 90)
             .expect("a peer may participate AFTER the decision — that is what invitation means");
 
         assert!(after.is_claimable(T0 + 95), "dissent records; it does not veto");
@@ -2138,7 +2216,7 @@ mod bar_factor_tests {
         // and the set — never the first answer — is what the bar evaluates.
         let (mut s, id) = open_with("witness.py");
         let e = s
-            .corroborate(&id, "kimi-code", "role:constellation:member", None, false, T0 + 3)
+            .corroborate(&id, "kimi-code", "role:constellation:member", None, false, None, T0 + 3)
             .expect("peer corroboration lands while pending");
         assert_eq!(e.factors.len(), 1);
         assert_eq!(e.factors[0].channel, Channel::PeerMember);
@@ -2168,7 +2246,7 @@ mod bar_factor_tests {
         let before = s.get(&id).unwrap().bar_met();
 
         let after = s
-            .corroborate(&id, "kimi-code", "r", None, false, T0 + 6)
+            .corroborate(&id, "kimi-code", "r", None, false, None, T0 + 6)
             .expect("a peer may participate after the ruling — that is the invitation");
 
         assert_eq!(after.bar_met(), before, "a late factor MUST NOT change the bar verdict");
@@ -2180,7 +2258,7 @@ mod bar_factor_tests {
     fn corroboration_requires_a_named_peer() {
         let (mut s, id) = open_with("law_inject.py");
         let err = s
-            .corroborate(&id, "  ", "r", None, false, T0 + 3)
+            .corroborate(&id, "  ", "r", None, false, None, T0 + 3)
             .expect_err("anonymous evidence in an attribution record is worse than none");
         assert_eq!(err, DecideError::AnonymousDecider);
     }
@@ -2189,7 +2267,7 @@ mod bar_factor_tests {
     fn an_expired_escalation_takes_no_more_evidence() {
         let (mut s, id) = open_with("law_inject.py");
         let err = s
-            .corroborate(&id, "kimi-code", "r", None, false, T0 + 121)
+            .corroborate(&id, "kimi-code", "r", None, false, None, T0 + 121)
             .expect_err("expired is expired");
         assert_eq!(err, DecideError::Expired);
     }

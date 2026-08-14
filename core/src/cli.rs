@@ -181,6 +181,14 @@ enum GateCmd {
     Corroborate {
         /// Escalation id from the deny text
         escalation_id: String,
+        /// Your stance: concur | dissent. Required — an unstated stance used to default
+        /// to concurrence, which is how a dissent got recorded as agreement (#367)
+        #[arg(long)]
+        stance: String,
+        /// Your reasoning, recorded verbatim (required for dissent — the argument IS the
+        /// evidence)
+        #[arg(long)]
+        argument: Option<String>,
     },
 }
 
@@ -729,8 +737,8 @@ pub fn run() -> AnyResult<()> {
                 GateCmd::Deny { escalation_id, reason } => gate_cli::arbitrate(
                     &endpoint, &escalation_id, false, reason, asserted_id, &role,
                 ),
-                GateCmd::Corroborate { escalation_id } => {
-                    gate_cli::corroborate(&endpoint, &escalation_id, asserted_id, &role)
+                GateCmd::Corroborate { escalation_id, stance, argument } => {
+                    gate_cli::corroborate(&endpoint, &escalation_id, &stance, argument, asserted_id, &role)
                 }
             }
         }
