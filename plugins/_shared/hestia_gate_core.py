@@ -950,6 +950,58 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
 
 
 # ── The ratified degraded mode (Sprint F — PRD §7.1 criterion 9) ────────────────────────
+# Read-only command verbs for the DEGRADED grammar. Two tiers: bare verbs read-only by
+# nature, and git subcommands that only inspect (fetch deliberately absent: it writes
+# .git objects/refs; fine normally, but degraded mode has no referee to ask).
+_DEGRADED_READ_VERBS = frozenset((
+    "ls", "cat", "head", "tail", "wc", "pwd", "echo", "printf", "stat", "file", "df",
+    "du", "date", "uptime", "which", "whoami", "id", "env", "grep", "rg", "find",
+    "readlink", "realpath", "basename", "dirname", "sort", "uniq", "cut", "tr", "true",
+))
+_DEGRADED_GIT_READ_SUBS = frozenset((
+    "status", "log", "show", "diff", "branch", "describe", "rev-parse", "rev-list",
+    "ls-files", "ls-tree", "ls-remote", "remote", "blame", "shortlog", "tag",
+    "merge-base", "cat-file", "count-objects", "config",
+))
+
+
+def _degraded_command_is_read(command: str) -> bool:
+    """True iff EVERY simple command is a known read verb and nothing in the line can
+    write: any redirect (>, >>), substitution ($(, backtick), or unknown verb -> False.
+    Pipes between read verbs are fine (git log | head). Conservative by construction —
+    a miss here costs a retry-after-daemon-returns, never a leak."""
+    if any(tok in command for tok in (">", "$(", "`", "<<")):
+        return False
+    for chunk_or in command.split("||"):
+        for chunk_and in chunk_or.split("&&"):
+            for chunk_semi in chunk_and.split(";"):
+                for seg in chunk_semi.split("|"):
+                    words = seg.strip().split()
+                    if not words:
+                        continue
+                    head = words[0].rsplit("/", 1)[-1]
+                    if head == "git":
+                        sub = next((w for w in words[1:] if not w.startswith("-")), "")
+                        if sub not in _DEGRADED_GIT_READ_SUBS:
+                            return False
+                        # `git config` writes unless read-flagged; `git remote` writes
+                        # unless bare/-v; `git tag` writes unless bare/-l/--list.
+                        if sub == "config" and not any(
+                                w in ("--get", "--list", "-l") for w in words[2:]):
+                            return False
+                        if sub == "remote" and len(words) > 2 and words[2] not in ("-v",):
+                            return False
+                        if sub == "tag" and len(words) > 2 and not any(
+                                w in ("-l", "--list") for w in words[2:]):
+                            return False
+                        if sub == "branch" and any(
+                                w in ("-d", "-D", "-m", "-M", "-f") for w in words[2:]):
+                            return False
+                    elif head not in _DEGRADED_READ_VERBS:
+                        return False
+    return True
+
+
 def degraded_verdict(event: NormalizedEvent,
                      profile: Optional[HarnessProfile] = None) -> Verdict:
     """Tier-1 degraded posture, computed by the CORE: deny-writes-allow-reads.
@@ -984,6 +1036,15 @@ def degraded_verdict(event: NormalizedEvent,
                     innate=True,
                 )
     if event.tool in READ_CLASS:
+        return ALLOW
+    if event.tool.lower() in ("bash", "shell") and event.command \
+            and _degraded_command_is_read(event.command):
+        # The ratified posture is deny-writes-allow-READS, and a read-only shell command
+        # IS a read. Tool-level classing over-denied every Bash in degraded mode (measured
+        # live on the codex seat 2026-08-14: `git rev-parse X && git log Y` and
+        # `git rev-list --count` refused while single reads passed). The grammar below is
+        # deliberately conservative: every segment's verb must be on the read allowlist,
+        # any write-redirect/substitution/unknown verb keeps the deny.
         return ALLOW
     return _deny(
         "gate.degraded",

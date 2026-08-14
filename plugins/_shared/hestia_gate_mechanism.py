@@ -520,7 +520,24 @@ def witness_decision_unified(client_or_none, *, plugin_id: str, decision: str, r
 _POLICY_SNAPSHOT_CACHE: dict = {}
 
 
-def fetch_policy_snapshot(plugin_id: str, *, host_agent: Optional[str] = None,
+def fetch_policy_snapshot(plugin_id, **kw):
+    """One retry before None: the measured failure mode is TRANSIENT starvation (a
+    session-start hook herd overlapping the first tool calls — codex, 2026-08-14),
+    not a down daemon. A 250ms-backoff second attempt absorbs the blip; a genuinely
+    unreachable daemon still returns None inside one extra budget and the ratified
+    degraded mode proceeds. Never raises (same contract as the single attempt)."""
+    snap = _fetch_policy_snapshot_once(plugin_id, **kw)
+    if snap is not None:
+        return snap
+    try:
+        import time as _t
+        _t.sleep(0.25)
+    except Exception:
+        pass
+    return _fetch_policy_snapshot_once(plugin_id, **kw)
+
+
+def _fetch_policy_snapshot_once(plugin_id: str, *, host_agent: Optional[str] = None,
                           host_session_id: Optional[str] = None,
                           use_cache: bool = True) -> Optional[dict]:
     """Fetch this member's policy snapshot from the daemon, in-process. NEVER raises.
