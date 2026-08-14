@@ -556,15 +556,30 @@ def _fetch_policy_snapshot_once(plugin_id: str, *, host_agent: Optional[str] = N
     return snap
 
 
+def _snapshot_unavailable(plugin_id: str, cause: str) -> None:
+    """Field telemetry for a failed snapshot fetch (never raises): the 2026-08-14 codex
+    dropouts were unreproducible from another seat precisely because every failure path
+    collapsed to a causeless None — a 'daemon unreachable' that could be refused/timeout/
+    port-exhaustion/EPERM. Each is a different fix; the log now says which."""
+    try:
+        from hestia_gate_core import record_gate_unavailable  # type: ignore
+        record_gate_unavailable(plugin_id, "policy-snapshot", "snapshot-fetch", cause,
+                                home=str(DEFAULT_HESTIA_HOME))
+    except Exception:
+        pass
+
+
 def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
                                     host_session_id: Optional[str]) -> Optional[dict]:
     try:
         endpoint = _discover_endpoint()
         if endpoint is None:
+            _snapshot_unavailable(plugin_id, "no-endpoint")
             return None
         deadline = time.monotonic() + (TOTAL_BUDGET_MS / 1000.0)
         client = _McpHttp(endpoint, deadline)
         if "result" not in client.initialize():
+            _snapshot_unavailable(plugin_id, "init-no-result")
             return None
         client.initialized()
         connect_args: dict = {
@@ -581,6 +596,8 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             connect_args["host_session_id"] = host_session_id
         connect = _unwrap_tool_result(client.call_tool("hestia_connect", connect_args))
         if "_hestia_error" in connect:
+            _snapshot_unavailable(plugin_id, "connect-refused:" + str(
+                (connect.get("_hestia_error") or {}).get("code", "?"))[:80])
             return None
         session_id = connect.get("sessionId")
         if not session_id:
@@ -625,5 +642,7 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
                         # nobody made (a file grant must not front for its whole repo).
                         snap["in_scope"].append("path:" + p.strip())
         return snap
-    except Exception:  # noqa: BLE001 — any failure is "unreachable"; the caller degrades
+    except Exception as e:  # noqa: BLE001 — any failure is "unreachable"; the caller degrades
+        _snapshot_unavailable(
+            plugin_id, f"{type(e).__name__}:{getattr(e, 'errno', '')}:{str(e)[:120]}")
         return None
