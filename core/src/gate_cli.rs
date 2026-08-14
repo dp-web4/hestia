@@ -341,6 +341,8 @@ fn hollow_approval_warning(approve: bool, r: &Value) -> Option<String> {
 pub fn corroborate(
     endpoint: &str,
     id: &str,
+    stance: &str,
+    argument: Option<String>,
     asserted_id: Option<String>,
     role: &str,
 ) -> Result<()> {
@@ -348,12 +350,16 @@ pub fn corroborate(
     let mut m = Mcp::connect(endpoint)?;
     let (sid, who) = open_session(&mut m, &asserted, role)?;
     banner(&who);
-    let r = m.tool(
-        "hestia_gate_escalation_corroborate",
-        json!({"escalation_id": id, "session_id": sid}),
-    )?;
+    // The stance travels verbatim; the daemon owns the vocabulary and refuses what it
+    // cannot honour (#367: an unstated stance used to default to concurrence, and a
+    // dissent argument was silently discarded — refuse-don't-default is the remedy).
+    let mut payload = json!({"escalation_id": id, "session_id": sid, "stance": stance});
+    if let Some(a) = argument {
+        payload["argument"] = json!(a);
+    }
+    let r = m.tool("hestia_gate_escalation_corroborate", payload)?;
     println!("{}", serde_json::to_string_pretty(&r)?);
-    eprintln!("corroboration is NOT a verdict — it permits nothing by itself");
+    eprintln!("your stance is evidence, NOT a verdict — it permits nothing and vetoes nothing");
     Ok(())
 }
 

@@ -313,9 +313,33 @@ fn hestia_tools() -> Vec<Tool> {
             "hestia_gate_arbitrate_escalation",
             "Rule on ANOTHER member's governance-write escalation. NOT-SAME enforced server-side using the same independence rules as the appeal arbiter — you can never grant your own gate write, and an escalation whose asker was never proven against a session (asker_basis: asserted) cannot be peer-cleared at all; the operator decides those. Approving requires a stated reason; refusing does not. Records role@agent and the independence tier. At A1 a peer shares the operator's UID, so this is recorded SECOND-PARTY REVIEW, not an enforced boundary",
         ),
-        t(
+        t_args(
             "hestia_gate_escalation_corroborate",
-            "Add your evidence to ANOTHER member's pending governance-write escalation WITHOUT deciding it (NOT-SAME enforced). Approval is not first-answer-wins: your factor joins the set, the operator or arbiter decides later, and the stated bar is evaluated over the whole set. A corroboration permits nothing by itself; it is witnessed separately so it cannot be laundered into a ruling",
+            "Add your evidence to ANOTHER member's governance-write escalation WITHOUT deciding it (NOT-SAME enforced). Your STANCE is required and explicit — 'concur' or 'dissent' — because an unstated stance used to default to concurrence and recorded one peer's dissent as agreement (#367, escalation 99417cc). A dissent must carry its argument; it is evidence surfaced to the decider, NEVER a veto — the sovereign decision stands regardless. Approval is not first-answer-wins: your factor joins the set, the operator or arbiter decides later, and the stated bar is evaluated over the whole set. A factor permits nothing by itself; it is witnessed separately so it cannot be laundered into a ruling. Unrecognised arguments are refused, not discarded",
+            json!({
+                "type": "object",
+                "additionalProperties": true,
+                "required": ["escalation_id", "stance"],
+                "properties": {
+                    "escalation_id": {
+                        "type": "string",
+                        "description": "The escalation you are adding evidence to (from the deny text, a review_request notice, or hestia_gate_pending_escalations)."
+                    },
+                    "stance": {
+                        "type": "string",
+                        "enum": ["concur", "dissent"],
+                        "description": "REQUIRED. Which way your evidence points. There is no default: the handler refuses a call that states no stance, because the silent path is how a dissent was once recorded as concurrence."
+                    },
+                    "argument": {
+                        "type": "string",
+                        "description": "Your reasoning, in your own words. REQUIRED for dissent — the argument is the evidence; a bare 'no' gives the decider nothing to weigh. Recorded verbatim on the factor and the witness entry."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Your own live session_id from hestia_connect. Evidence that cannot be attributed cannot be credited."
+                    }
+                }
+            }),
         ),
         t(
             "hestia_gate_escalation_claim",
@@ -9852,11 +9876,14 @@ mod tests {
         );
 
         // CORROBORATE is refused on the same clause — an unproven ask mints no peer factor.
+        // (Stance stated explicitly: the refuse-don't-default check runs first, and this
+        // test is about clause 0, not about the stance vocabulary.)
         let err = tool_gate_escalation_corroborate(
             &shared,
             &json!({
                 "escalation_id": esc_id,
                 "session_id": session_of["kimi-code"],
+                "stance": "concur",
             }),
         )
         .await
@@ -9929,6 +9956,310 @@ mod tests {
         assert_eq!(
             decided["independence"], "cross_vendor",
             "the tier must be the one the parties actually earn: {decided}"
+        );
+    }
+
+    /// Two members with live sessions and one escalation opened by the first — the fixture
+    /// every corroborate-stance test below starts from. Returns (state, escalation_id,
+    /// corroborator's session_id).
+    async fn opened_escalation_with_peer() -> (TempDir, SharedState, String, String) {
+        let (dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": session_of["claude-code"],
+                "tool_name": "Bash",
+                "marker": "witness.py",
+            }),
+        )
+        .await
+        .unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+        (dir, shared, esc_id, session_of["codex"].clone())
+    }
+
+    /// Issue #367's newest specimen, escalation 99417cc39a7acb5d (2026-08-14): codex called
+    /// this door WITH a dissent argument. The argument was silently discarded (#419's
+    /// accept-what-you-won't-honour class) and chain position 137353 recorded
+    /// `dissent: false, independence: cross_vendor` — an INVERSION of the peer's evidence,
+    /// not an omission. Codex had to issue a mesh CORRECTION two minutes later, which is
+    /// chain-unrecordable by the same defect.
+    ///
+    /// RED before the fix: the door had no stance input at all — `dissent: false` was
+    /// hardcoded at the store call, so this test's dissent landed as concurrence.
+    #[tokio::test]
+    async fn a_dissent_sent_through_the_corroborate_door_lands_as_dissent_with_its_argument() {
+        let (_dir, shared, esc_id, codex_sid) = opened_escalation_with_peer().await;
+
+        let r = tool_gate_escalation_corroborate(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "session_id": codex_sid,
+                "stance": "dissent",
+                "argument": "entire act redacted; evidence insufficient to review",
+            }),
+        )
+        .await
+        .expect("a dissent is evidence and must be recordable, not refused or inverted");
+
+        assert_eq!(r["stance"], "dissent", "the reply must name the stance it recorded: {r}");
+        assert_eq!(r["dissent"], true, "the reply must not report a dissent as concurrence: {r}");
+        let factors = r["factors_present"].as_array().expect("factors_present");
+        let peer = factors
+            .iter()
+            .find(|f| f["by"] == "codex")
+            .expect("the peer's factor must be in the set");
+        assert_eq!(
+            peer["dissent"], true,
+            "THE INVERSION: the recorded factor must carry dissent:true, not the hardcoded \
+             false the specimen shows: {peer}"
+        );
+        assert_eq!(
+            peer["argument"], "entire act redacted; evidence insufficient to review",
+            "the argument must land on the factor record, not be silently discarded: {peer}"
+        );
+    }
+
+    /// Refuse-don't-default, the missing-input arm. The silent path — a call that names no
+    /// stance — is exactly how the specimen's dissent became concurrence, so it dies:
+    /// an absent stance refuses and mints NO factor.
+    #[tokio::test]
+    async fn an_absent_stance_refuses_rather_than_minting_concurrence() {
+        let (_dir, shared, esc_id, codex_sid) = opened_escalation_with_peer().await;
+
+        let err = tool_gate_escalation_corroborate(
+            &shared,
+            &json!({ "escalation_id": esc_id, "session_id": codex_sid }),
+        )
+        .await
+        .expect_err("an unstated stance must refuse, never default to concurrence");
+        assert!(
+            format!("{err}").contains("stance"),
+            "the refusal must name the missing input: {err}"
+        );
+
+        let s = shared.lock().await;
+        assert!(
+            s.gate_escalations.get(&esc_id).unwrap().factors.is_empty(),
+            "a refused call must mint no factor"
+        );
+    }
+
+    /// Refuse-don't-default, the misspelling arms. A misspelled stance KEY used to be
+    /// silently discarded (becoming concurrence); a misspelled stance VALUE must not round
+    /// to either side. Both refuse, and neither mints a factor.
+    #[tokio::test]
+    async fn a_misspelled_stance_key_or_value_refuses_rather_than_silently_concurring() {
+        let (_dir, shared, esc_id, codex_sid) = opened_escalation_with_peer().await;
+
+        // Misspelled KEY: the exact specimen shape — an argument this door does not
+        // recognise, silently dropped, stance defaulted.
+        let err = tool_gate_escalation_corroborate(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "session_id": codex_sid,
+                "stanse": "dissent",
+            }),
+        )
+        .await
+        .expect_err("an unrecognised key must refuse, not be discarded");
+        assert!(
+            format!("{err}").contains("stanse"),
+            "the refusal must name the unrecognised key so the caller can fix it: {err}"
+        );
+
+        // Misspelled VALUE.
+        let err = tool_gate_escalation_corroborate(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "session_id": codex_sid,
+                "stance": "disagree",
+            }),
+        )
+        .await
+        .expect_err("an unknown stance value must refuse, not round to a side");
+        assert!(format!("{err}").contains("concur"), "the refusal must teach the vocabulary: {err}");
+
+        // A stance that is not even a string.
+        let err = tool_gate_escalation_corroborate(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "session_id": codex_sid,
+                "stance": true,
+            }),
+        )
+        .await
+        .expect_err("a non-string stance must refuse");
+        assert!(format!("{err}").contains("stance"), "{err}");
+
+        let s = shared.lock().await;
+        assert!(
+            s.gate_escalations.get(&esc_id).unwrap().factors.is_empty(),
+            "no refused call may mint a factor"
+        );
+    }
+
+    /// The positive control and the compatibility contract. Concurrence still lands under
+    /// the explicit `stance` spelling AND under the legacy `dissent` bool a caller may
+    /// already use — only the say-nothing path died. A dissent must carry its argument
+    /// (evidence with no content is not reviewable), and a self-contradicting call
+    /// (stance vs bool) refuses rather than picking a side.
+    #[tokio::test]
+    async fn concur_still_lands_and_stance_spellings_that_disagree_refuse() {
+        let (_dir, shared, esc_id, codex_sid) = opened_escalation_with_peer().await;
+
+        // Explicit concur.
+        let r = tool_gate_escalation_corroborate(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "session_id": codex_sid,
+                "stance": "concur",
+            }),
+        )
+        .await
+        .expect("concurrence is the door's original job and must still work");
+        assert_eq!(r["corroborated"], true, "{r}");
+        assert_eq!(r["stance"], "concur", "{r}");
+        assert_eq!(r["dissent"], false, "{r}");
+
+        // Legacy bool spelling that DOES express a stance keeps working.
+        let (_dir2, shared2, esc2, sid2) = opened_escalation_with_peer().await;
+        let r2 = tool_gate_escalation_corroborate(
+            &shared2,
+            &json!({ "escalation_id": esc2, "session_id": sid2, "dissent": false }),
+        )
+        .await
+        .expect("dissent:false is an expressed stance, not the silent default");
+        assert_eq!(r2["stance"], "concur", "{r2}");
+
+        // Contradictory spellings refuse.
+        let (_dir3, shared3, esc3, sid3) = opened_escalation_with_peer().await;
+        let err = tool_gate_escalation_corroborate(
+            &shared3,
+            &json!({
+                "escalation_id": esc3,
+                "session_id": sid3,
+                "stance": "concur",
+                "dissent": true,
+            }),
+        )
+        .await
+        .expect_err("a call that says concur AND dissent must refuse, not pick a side");
+        assert!(format!("{err}").contains("stance"), "{err}");
+
+        // A dissent with no argument refuses — the argument is the evidence.
+        let err = tool_gate_escalation_corroborate(
+            &shared3,
+            &json!({ "escalation_id": esc3, "session_id": sid3, "stance": "dissent" }),
+        )
+        .await
+        .expect_err("a dissent must carry its argument");
+        assert!(format!("{err}").contains("argument"), "{err}");
+    }
+
+    /// The #367 landing surface, pre-decision half: dp's ruling is that dissent is
+    /// *"surfaced to the live UI"* — so the queue the decider reads must show a dissent AS
+    /// a dissent, argument included, before the decision is made. RED before the fix:
+    /// the pending payload carried no factors at all.
+    #[tokio::test]
+    async fn the_pending_view_shows_a_dissent_as_dissent_before_the_decision() {
+        let (_dir, shared, esc_id, codex_sid) = opened_escalation_with_peer().await;
+
+        tool_gate_escalation_corroborate(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "session_id": codex_sid,
+                "stance": "dissent",
+                "argument": "the stated reason does not match the payload",
+            }),
+        )
+        .await
+        .unwrap();
+
+        let pending = tool_gate_pending_escalations(&shared, &json!({})).await.unwrap();
+        let item = pending["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["escalation_id"] == esc_id)
+            .cloned()
+            .expect("still pending — a dissent is evidence, never a veto");
+        let factors = item["factors"]
+            .as_array()
+            .expect("the pending view must carry the factor set the decider is deciding over");
+        let peer = factors.iter().find(|f| f["by"] == "codex").expect("codex's factor");
+        assert_eq!(peer["dissent"], true, "pre-decision, the dissent must be visible AS dissent: {item}");
+        assert_eq!(peer["argument"], "the stated reason does not match the payload", "{item}");
+        assert_eq!(
+            item["peer_participation"]["dissented"], 1,
+            "the count the fold reads must see the dissent pre-decision too: {item}"
+        );
+    }
+
+    /// The #367 landing surface, post-decision half: the decision stands (invitation
+    /// semantics — dissent is evidence for review, never a brake), and the decided record
+    /// preserves the dissent AND its argument for any later reader.
+    #[tokio::test]
+    async fn the_decided_record_preserves_the_dissent_and_its_argument() {
+        let (_dir, shared, esc_id, codex_sid) = opened_escalation_with_peer().await;
+
+        tool_gate_escalation_corroborate(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "session_id": codex_sid,
+                "stance": "dissent",
+                "argument": "claim key is (plugin, marker), not the exact act",
+            }),
+        )
+        .await
+        .unwrap();
+
+        // The sovereign decides — the dissent must not veto.
+        let decided = {
+            let mut s = shared.lock().await;
+            s.gate_escalations
+                .decide(
+                    &esc_id,
+                    true,
+                    "operator",
+                    "role:constellation:sovereign",
+                    crate::server::gate_escalation::Channel::OperatorSession,
+                    None,
+                    Some("k"),
+                    crate::server::gate_escalation::now_secs(),
+                )
+                .expect("a dissent is evidence, never a veto — the sovereign still decides")
+        };
+        let reply = decided.decision_reply();
+        assert_eq!(
+            reply["peer_participation"]["dissented"], 1,
+            "the decided record must count the dissent: {reply}"
+        );
+        let dissent_factor = decided
+            .factors
+            .iter()
+            .find(|f| f.by == "codex")
+            .expect("the peer factor survives the decision");
+        assert!(dissent_factor.dissent, "post-decision, the stance is preserved");
+        assert_eq!(
+            dissent_factor.argument.as_deref(),
+            Some("claim key is (plugin, marker), not the exact act"),
+            "post-decision, the argument is preserved"
         );
     }
 }
@@ -12708,6 +13039,14 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
                 "opened_at": e.opened_at,
                 "secs_remaining": e.secs_remaining(now),
                 "you_may_rule": may_rule,
+                // The evidence already present, dissent included — the #367 landing
+                // surface's pre-decision half. dp's ruling makes dissent evidence
+                // "surfaced to the live UI"; a queue that hides the factor set would show
+                // the decider a contested ask and an uncontested one identically, and the
+                // dashboard would be the only surface where a dissent is visible before
+                // the ruling it exists to inform.
+                "factors": e.factors,
+                "peer_participation": e.peer_participation(),
             })
         })
         .collect();
@@ -12920,6 +13259,103 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
     let session_id_arg = optional_session_id(args);
     let now = now_secs();
 
+    // REFUSE WHAT YOU WILL NOT HONOUR. This door used to accept any argument set and read
+    // two keys out of it — the #419/#155 accept-and-discard class — and issue #367's live
+    // specimen (escalation 99417cc39a7acb5d, 2026-08-14, chain 137353) is the harvest: codex
+    // passed a dissent argument, the key was silently dropped, and the chain recorded
+    // `dissent: false, independence: cross_vendor` — the peer's evidence INVERTED, cross-
+    // vendor-stamped, and correctable only out of band. A door that names its vocabulary and
+    // refuses the rest turns that silent inversion into a loud, fixable error.
+    if let Some(obj) = args.as_object() {
+        let known = [
+            "escalation_id",
+            "session_id",
+            "sessionId",
+            "stance",
+            "dissent",
+            "argument",
+            "reason",
+        ];
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !known.contains(k))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(anyhow::anyhow!(
+                "unrecognised argument(s) {unknown:?} — this door records exactly what it is \
+                 handed, so it refuses what it cannot honour. It accepts: escalation_id, \
+                 session_id, stance ('concur' | 'dissent'), argument (your reasoning; \
+                 required for dissent)"
+            ));
+        }
+    }
+
+    // THE STANCE IS REQUIRED INPUT, never defaulted. Every factor this door ever minted was
+    // hardcoded `dissent: false` — pre-#367 that made a dissenting peer's only options
+    // silence or looking like agreement; the specimen above shows the third, worst outcome:
+    // meaning "no" and being recorded as "yes". `stance` is the explicit spelling; the
+    // `dissent` bool is kept for callers that already express their stance that way. A call
+    // that says neither refuses, and a call that says both inconsistently refuses — a door
+    // must never pick a side for its caller.
+    let stance_arg = match args.get("stance") {
+        None => None,
+        Some(Value::String(v)) => Some(v.trim().to_ascii_lowercase()),
+        Some(other) => {
+            return Err(anyhow::anyhow!(
+                "'stance' must be the string 'concur' or 'dissent', got {other}"
+            ));
+        }
+    };
+    let dissent_flag = match args.get("dissent") {
+        None => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(other) => {
+            return Err(anyhow::anyhow!(
+                "'dissent' must be an explicit true or false, got {other}"
+            ));
+        }
+    };
+    let dissent = match (stance_arg.as_deref(), dissent_flag) {
+        (Some("concur"), None) => false,
+        (Some("dissent"), None) => true,
+        (Some("concur"), Some(false)) => false,
+        (Some("dissent"), Some(true)) => true,
+        (Some("concur"), Some(true)) | (Some("dissent"), Some(false)) => {
+            return Err(anyhow::anyhow!(
+                "'stance' and 'dissent' disagree — a door must never pick a side for its \
+                 caller. Say one thing"
+            ));
+        }
+        (Some(other), _) => {
+            return Err(anyhow::anyhow!(
+                "unknown stance '{other}' — the vocabulary is 'concur' or 'dissent', and an \
+                 unrecognised value refuses rather than rounding to either"
+            ));
+        }
+        (None, Some(b)) => b,
+        (None, None) => {
+            return Err(anyhow::anyhow!(
+                "your stance is required: pass stance: 'concur' or stance: 'dissent' (with \
+                 your argument). An unstated stance used to default to concurrence — that is \
+                 how a peer's dissent got recorded as agreement (#367) — so it now refuses"
+            ));
+        }
+    };
+    // The argument, in the peer's own words. REQUIRED for dissent: a dissent is evidence
+    // for the operator's review, and evidence with no content is not reviewable — it would
+    // put a bare "no" on the record with nothing the decider can weigh.
+    let argument = optional_string(args, "argument")
+        .or_else(|| optional_string(args, "reason"))
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty());
+    if dissent && argument.is_none() {
+        return Err(anyhow::anyhow!(
+            "a dissent must carry its argument — pass argument: <why you disagree>. The \
+             argument is the evidence; a bare 'no' gives the decider nothing to weigh"
+        ));
+    }
+
     let mut s = state.lock().await;
 
     // Same attribution bar as ruling: evidence you cannot be credited for teaches the society
@@ -12955,20 +13391,23 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
         }
     };
 
-    // `dissent` false here: this MCP path is the concurrence door. A dissent surface is
-    // the remaining half of dp's ruling ("a mechanism to surface dissent to the live UI")
-    // and needs its own operator-visible route rather than a bool smuggled through the
-    // arbitration call — a peer that disagrees should not have to look like one that
-    // agreed in order to be heard.
+    // The stance is the CALLER'S, verbatim — this used to be a hardcoded `false` ("this MCP
+    // path is the concurrence door"), which left dissent with no landing surface (#367) and
+    // then, worse, inverted a dissent that arrived anyway (specimen 99417cc39a7acb5d). Under
+    // dp's invitation-semantics ruling a dissent is evidence surfaced for review, never a
+    // veto: it lands here as a factor, shows on the pending view and dashboard, and the
+    // sovereign decides over the whole set.
     match s.gate_escalations.corroborate(
         &escalation_id,
         &arb.plugin_id,
         &arb.role_lct,
         Some(independence),
-        false,
+        dissent,
+        argument.as_deref(),
         now,
     ) {
         Ok(updated) => {
+            let stance = if dissent { "dissent" } else { "concur" };
             let entry = s.append_chain(
                 "gate_escalation_corroborated",
                 json!({
@@ -12977,6 +13416,12 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                     "corroborated_by": arb.plugin_id,
                     "corroborated_role": arb.role_lct,
                     "independence": independence,
+                    // The peer's stance and argument, first-class on the event — a chain
+                    // reader must never have to dig the only dissent out of a factor list
+                    // to learn this entry was a disagreement.
+                    "stance": stance,
+                    "dissent": dissent,
+                    "argument": argument,
                     // The state of the evidence set AFTER this factor — so a reader never has
                     // to reconstruct accumulation order from separate entries.
                     "factors_present": updated.factors,
@@ -12986,13 +13431,26 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
             );
             Ok(json!({
                 "escalation_id": updated.id,
-                "corroborated": true,
+                // `corroborated` keeps its original meaning — "your CONCURRENCE landed" —
+                // so existing concur callers read exactly what they always read. A dissent
+                // is recorded, not corroborated.
+                "corroborated": !dissent,
+                "recorded": true,
+                "stance": stance,
+                "dissent": dissent,
+                "argument": argument,
                 "factors_present": updated.factors,
                 "bar": updated.bar,
                 "bar_met_if_decided_now": updated.bar_met(),
                 "witnessEntryHash": entry.ok().map(|e| e.hash),
-                "note": "a corroboration is evidence, not a verdict — it permits nothing by \
-                         itself; the decision still has to land and the stated bar be met",
+                "note": if dissent {
+                    "your dissent is ON THE RECORD as evidence for review — never a veto: \
+                     the sovereign decision stands or lands regardless, with your argument \
+                     visible to the decider"
+                } else {
+                    "a corroboration is evidence, not a verdict — it permits nothing by \
+                     itself; the decision still has to land and the stated bar be met"
+                },
             }))
         }
         Err(e) => Err(anyhow::anyhow!("{e}")),
