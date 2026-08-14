@@ -113,8 +113,12 @@ def main():
 
     target = main_ref()
     wts = worktrees()
-    main_path = next((w["path"] for w in wts if w.get("branch") == "main"),
-                     (git("rev-parse", "--show-toplevel")[0]))
+    # The deploy tree is the PRIMARY worktree — the first entry in `git worktree list
+    # --porcelain`, a position git guarantees. Identifying it by "whichever worktree
+    # holds branch main" (the old form) MISSES the exact failure this check exists to
+    # catch: a deploy tree drifted onto a feature branch no longer holds main, so the
+    # old lookup silently re-pointed the invariant at some other worktree (GPT, #394).
+    main_path = wts[0]["path"] if wts else git("rev-parse", "--show-toplevel")[0]
 
     print(f"git-manager reconciliation — target {target}\n")
 
@@ -170,8 +174,13 @@ def main():
             if cls == "PRUNE-GONE":
                 continue
             path = wt["path"]
-            if os.path.isdir(path) and is_dirty(path):
-                print(f"    SKIP {path} — became dirty")
+            # Re-verify the FULL reapable predicate immediately before the forced
+            # removal — not just cleanliness. Between the report pass and this point
+            # a branch may have gained unpushed commits (classify would then say KEEP);
+            # rechecking only `is_dirty` would still remove it (GPT, #394).
+            cls2, why2 = classify(wt, target, main_path)
+            if cls2 != "REAPABLE":
+                print(f"    SKIP {path} — no longer reapable ({cls2}: {why2})")
                 continue
             _, rc = git("worktree", "remove", "--force", path)
             print(f"    {'removed' if rc == 0 else 'FAILED'}: {path}")
