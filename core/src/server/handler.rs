@@ -12388,6 +12388,26 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
     let now = now_secs();
     let s = state.lock().await;
 
+    // THE HONOR HORIZON IS BOUNDED BY WHAT IT COVERS (GPT review of #431, blocker 3). A
+    // flat now+8h told consumers they could honour a cached snapshot for hours while a
+    // grant inside it expired in seconds — and the generation does not move on wall-clock
+    // expiry, so nothing would have repaired the cached copy. The horizon is therefore
+    // min(now + TTL, earliest expiry across EVERY grant this response represents), live
+    // and standing alike: a snapshot may never be honoured past the first moment its own
+    // contents stop being true.
+    let snapshot_expires_at = {
+        let mut horizon = now + crate::server::standing_scope::STANDING_SNAPSHOT_TTL_SECS;
+        for r in s.live_scope_grants(&plugin_id) {
+            horizon = horizon.min(r.expires_at);
+        }
+        for g in s.live_standing_grants(&plugin_id) {
+            if let Some(e) = g.expires_at {
+                horizon = horizon.min(e);
+            }
+        }
+        horizon
+    };
+
     let mut mine: Vec<&crate::server::state::ScopeRequest> = s
         .scope_requests
         .values()
@@ -12439,10 +12459,11 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         // CERTIFICATION, issued by the authority — the two fields the plugin gate's
         // certified-replica logic (AgentPolicy) has demanded since 2026-08-04 with nothing
         // issuing them: WHICH policy this is (the standing store's monotonic generation,
-        // moved by every grant/revoke) and HOW LONG a consumer may honour a cached copy
-        // (bounded staleness; past this horizon a copy must be refused, not trusted).
+        // moved by every grant/revoke) and HOW LONG a consumer may honour a cached copy —
+        // bounded by the earliest expiry of any grant represented here (see the horizon
+        // computation above), because past that instant the snapshot over-states.
         "generation": s.standing_scope.generation,
-        "snapshot_expires_at": now + crate::server::standing_scope::STANDING_SNAPSHOT_TTL_SECS,
+        "snapshot_expires_at": snapshot_expires_at,
         "lifetime": "live_grants are memory-only — they die with the daemon. standing_grants \
                      are operator-promoted, vault-persisted, and survive restart until they \
                      expire or are revoked. Neither is ever written to your identity file.",
@@ -13210,6 +13231,153 @@ mod standing_scope_surface_tests {
             out["live_grants"].as_array().unwrap().len(),
             0,
             "the memory-only channel must NOT survive — that half of the asymmetry stands"
+        );
+    }
+
+    /// (GPT #431 blocker 1) A failed persist leaves the live store BIT-IDENTICAL —
+    /// generation included — even on the hardest arm, a REPLACEMENT of an existing grant.
+    /// The first cut "rolled back" by revoking the just-added row: that bumped the
+    /// generation a second time and discarded the replaced grant instead of restoring it.
+    /// `commit_standing_scope` persists a candidate before swapping it live, so
+    /// unchangedness is construction, not cleanup. Failure is injected the way it happens:
+    /// the vault's directory is made unwritable, so the atomic temp-file write fails.
+    #[tokio::test]
+    async fn failed_persist_on_replacement_leaves_store_bit_identical() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let mut s = state.lock().await;
+        s.commit_standing_scope(|st| st.add(standing("kimi-code", "/w/web4", now, None)))
+            .unwrap();
+        let before_grants = s.standing_scope.grants.clone();
+        let before_generation = s.standing_scope.generation;
+        assert_eq!(before_generation, 1);
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = s.commit_standing_scope(|st| {
+            st.add(standing("kimi-code", "/w/web4", now + 5, Some(now + 60)))
+        });
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(err.is_err(), "the persist must have failed for this test to test anything");
+
+        assert_eq!(
+            s.standing_scope.generation, before_generation,
+            "a failed persist must not move the generation — not even by a rollback"
+        );
+        assert_eq!(
+            s.standing_scope.grants, before_grants,
+            "the REPLACED grant must still be the live one, byte for byte"
+        );
+        // And the store still works: the retry (with a writable vault) lands normally.
+        s.commit_standing_scope(|st| {
+            st.add(standing("kimi-code", "/w/web4", now + 5, Some(now + 60)))
+        })
+        .unwrap();
+        assert_eq!(s.standing_scope.generation, 2);
+        assert_eq!(s.standing_scope.grants[0].expires_at, Some(now + 60));
+    }
+
+    /// (GPT #431 blocker 2) A revoke whose vault write fails is RETRYABLE, and the retry
+    /// makes the removal durable: revoke -> injected persist failure (row already out of
+    /// memory, memory kept tighter) -> retry succeeds -> vault lacks the grant -> a full
+    /// restart stays revoked. The first cut's existence check 404ed the retry because the
+    /// row had left memory, stranding the operator with a resurrection-on-restart hazard
+    /// and no working recovery verb.
+    #[tokio::test]
+    async fn failed_revoke_is_retryable_and_restart_stays_revoked() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+            let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| st.add(standing("kimi-code", "/w/web4", now, None)))
+                .unwrap();
+
+            // The revoke, with the vault write failing.
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+            let err = s.apply_standing_revoke("kimi-code", "/w/web4");
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            assert!(err.is_err(), "persist must have failed");
+            assert!(
+                s.live_standing_grants("kimi-code").is_empty(),
+                "memory keeps the TIGHTER state after the failure"
+            );
+            assert!(
+                s.standing_scope_dirty,
+                "the dirty flag is what keeps the retry door open past the 404 check"
+            );
+
+            // THE RETRY — the row is absent from memory, and must still persist + succeed.
+            s.apply_standing_revoke("kimi-code", "/w/web4").unwrap();
+            assert!(!s.standing_scope_dirty, "a successful retry closes the window");
+        } // daemon down.
+
+        // Restart: the vault must now lack the grant — revoked stays revoked.
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let s = state.lock().await;
+        assert!(
+            s.live_standing_grants("kimi-code").is_empty(),
+            "the revoked grant must NOT resurrect across the restart"
+        );
+        assert_eq!(
+            s.standing_scope.generation, 2,
+            "grant + revoke: the persisted generation carries both mutations"
+        );
+    }
+
+    /// (GPT #431 blocker 3) `snapshot_expires_at` never outlives a grant the snapshot
+    /// represents: it is min(now+TTL, earliest expiry across live AND standing grants).
+    /// Without the bound, a consumer honouring the cached copy until the flat now+8h
+    /// horizon would keep admitting a grant that expired in seconds — and the generation
+    /// does not move on wall-clock expiry, so nothing would repair it.
+    #[tokio::test]
+    async fn snapshot_horizon_is_bounded_by_earliest_covered_expiry() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+
+        // No grants at all: the ceiling holds.
+        let out = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"}))
+            .await
+            .unwrap();
+        let ceiling = out["snapshot_expires_at"].as_u64().unwrap();
+        assert!(ceiling >= now + 8 * 3600 - 5, "ceiling when nothing bounds it: {out}");
+
+        {
+            let mut s = state.lock().await;
+            // A live grant expiring in ~60s and a standing grant expiring in ~120s.
+            let mut lr = live_request("kimi-code", "/w/one.md", now);
+            lr.expires_at = now + 60;
+            s.scope_requests.insert("scope-test01".into(), lr);
+            s.standing_scope
+                .add(standing("kimi-code", "/w/web4", now, Some(now + 120)));
+        }
+        let out = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out["snapshot_expires_at"].as_u64().unwrap(),
+            now + 60,
+            "the EARLIEST covered expiry bounds the horizon (live grant here): {out}"
+        );
+
+        // Another member's short grant must not tighten this member's horizon.
+        {
+            let mut s = state.lock().await;
+            s.standing_scope
+                .add(standing("codex", "/w/hestia", now, Some(now + 5)));
+        }
+        let out = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out["snapshot_expires_at"].as_u64().unwrap(),
+            now + 60,
+            "a foreign member's expiry is not part of this snapshot: {out}"
         );
     }
 

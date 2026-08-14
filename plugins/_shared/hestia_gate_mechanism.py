@@ -529,8 +529,26 @@ def witness_decision_unified(client_or_none, *, plugin_id: str, decision: str, r
 #   against the core's segment-keyed model (R2). Absent surfaces contribute NOTHING to
 #   the snapshot: an older daemon without `standing_grants` yields the pre-R1 snapshot.
 
+def _workspace_root() -> str:
+    """The ONE workspace-root answer for grant mapping — delegated to the core's portable
+    `detect_workspace` (env `HESTIA_WORKSPACE` when it names a real directory, else the
+    marker-based cwd climb, else the core's documented default), so live and standing
+    grants cannot diverge from the boundary the core's scope model actually enforces.
+    GPT review of #431, blocker 4: a second resolver here carried a machine-specific
+    fallback, so a repo-root grant admitted on one box and stayed inert on every layout
+    where the core discovered the workspace without the env var."""
+    try:
+        from hestia_gate_core import HarnessProfile, detect_workspace
+        return detect_workspace(HarnessProfile(member_id="", identity_path=""))
+    except Exception:
+        env = os.environ.get("HESTIA_WORKSPACE")
+        return env if env else os.path.expanduser("~/ai-workspace")
+
+
 def _scope_entry_for_grant(path: str) -> str:
-    """A granted path becomes the `in_scope` spelling the core can actually honour.
+    """A granted path becomes the `in_scope` spelling the core can actually honour —
+    the ONE mapping, used by live and standing grants alike (GPT #431 blocker 4;
+    subsumes #430's inline live-grant fix).
 
     A grant naming a REPO ROOT directly under the workspace maps to the bare repo NAME —
     the only form evaluate()'s segment-keyed scope model admits. Anything deeper keeps
@@ -539,8 +557,7 @@ def _scope_entry_for_grant(path: str) -> str:
     grants while this gate enforces them, and the two must agree on what a path names
     even when the object does not exist yet."""
     p = os.path.realpath(os.path.expanduser(path.strip()))
-    ws = os.path.realpath(os.path.expanduser(
-        os.environ.get("HESTIA_WORKSPACE", "/mnt/c/exe/projects/ai-agents")))
+    ws = os.path.realpath(os.path.expanduser(_workspace_root()))
     par, name = os.path.split(p.rstrip("/"))
     if par == ws and name:
         return name
@@ -674,23 +691,13 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
                     p = g.get("path") if isinstance(g, dict) else None
                     if isinstance(p, str) and p.strip():
                         snap["scope_grants"].append(p.strip())
-                        # A grant for a REPO ROOT under the workspace maps to that repo
-                        # NAME — the form evaluate()'s segment-keyed model admits. Measured
-                        # 2026-08-14 (kimi, first post-install session): "path:" entries are
-                        # INERT (Sprint F R2), so every deny named hestia_request_scope as
-                        # the remedy while a granted path could not actually admit — a
-                        # remedy that cannot deliver. Deeper-than-root grants keep the
-                        # faithful-but-inert "path:" form: a FILE grant must not front for
-                        # its whole repo (the original conservatism, still binding).
-                        _pp = os.path.realpath(os.path.expanduser(p.strip()))
-                        _ws = os.path.realpath(os.path.expanduser(
-                            os.environ.get("HESTIA_WORKSPACE",
-                                           "/mnt/c/exe/projects/ai-agents")))
-                        _par, _name = os.path.split(_pp.rstrip("/"))
-                        if _par == _ws and _name:
-                            snap["in_scope"].append(_name)
-                        else:
-                            snap["in_scope"].append("path:" + p.strip())
+                        # ONE mapping for both grant channels (GPT #431 blocker 4;
+                        # subsumes #430's inline fix): a live grant naming a repo root
+                        # under the core-discovered workspace admits as the repo NAME;
+                        # anything deeper keeps the faithful "path:" form, inert against
+                        # the segment-keyed model (R2) — a file grant must not front for
+                        # its whole repo.
+                        snap["in_scope"].append(_scope_entry_for_grant(p))
             # STANDING grants (Sprint F R1) — the durable, operator-promoted list the
             # daemon persists in its vault. Additive beside live_grants; absent on an
             # older daemon, in which case everything below is a no-op and the snapshot

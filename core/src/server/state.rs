@@ -327,6 +327,14 @@ pub struct ServerState {
     /// decision. Mutated ONLY from the operator-gated HTTP surface; no MCP tool reaches it
     /// (`no_mcp_tool_can_mutate_standing_scope`). See `server::standing_scope`.
     pub standing_scope: crate::server::standing_scope::StandingScopeStore,
+    /// TRUE while the in-memory standing store is TIGHTER than the persisted vault copy —
+    /// set when a revoke's vault write fails after the row was already removed from memory
+    /// (memory keeps the tighter state on purpose). While set, the revoke surface accepts a
+    /// retry for a row memory no longer holds and re-persists the current state, instead of
+    /// 404ing the operator out of the promised recovery (GPT review of #431, blocker 2).
+    /// Never persisted: a restart reloads the vault copy, at which point memory and vault
+    /// agree again (the grant resurrects, visibly, and a fresh revoke takes the normal path).
+    pub standing_scope_dirty: bool,
     /// Hub-law gate (consolidation, 2026-07-10): the third fold input.
     /// `None` = no law file at `$HESTIA_HOME/law/hub-law.yaml` (no-op);
     /// `Some(Invalid)` fails closed. See `policy::law_gate`.
@@ -509,6 +517,8 @@ impl ServerState {
             // The deliberate exception (row 3): standing grants are durable and were just
             // loaded from the vault, so an operator's standing ruling survives the deploy.
             standing_scope,
+            // Memory was just loaded FROM the vault, so the two agree by construction.
+            standing_scope_dirty: false,
             law_gate,
             synthetic_plugins,
             home: home.to_path_buf(),
@@ -844,10 +854,9 @@ impl ServerState {
     }
 
     /// Write the standing-scope store back to its vault document. The vault's own save is
-    /// temp-file-and-rename, so the on-disk document is atomic; callers decide what a
-    /// failed persist means (the decide surface rolls the in-memory mutation back so a
-    /// grant is never live-but-undurable, the revoke surface keeps memory revoked so a
-    /// failure can only ever leave the TIGHTER state in force).
+    /// temp-file-and-rename, so the on-disk document is atomic. Prefer the two shaped
+    /// entry points below — `commit_standing_scope` for widenings, `apply_standing_revoke`
+    /// for tightenings — which encode what a failed persist means for each direction.
     pub fn persist_standing_scope(&mut self) -> Result<()> {
         crate::vault::save_doc(
             &mut self.vault,
@@ -856,6 +865,51 @@ impl ServerState {
             "standing-scope.json",
             &self.standing_scope,
         )
+    }
+
+    /// Mutate the standing store through a CANDIDATE that is persisted BEFORE it becomes
+    /// live (GPT review of #431, blocker 1). The first version mutated live and "rolled
+    /// back" a failed persist by calling `revoke()` — which bumped the generation a second
+    /// time and, for a REPLACEMENT, discarded the prior durable grant instead of restoring
+    /// it, while the error text claimed the store was unchanged. Here unchangedness is a
+    /// property of the construction: on any persist failure the live store was never
+    /// touched, generation included, so there is nothing to claim and nothing to restore.
+    pub fn commit_standing_scope<F>(&mut self, mutate: F) -> Result<()>
+    where
+        F: FnOnce(&mut crate::server::standing_scope::StandingScopeStore),
+    {
+        let mut candidate = self.standing_scope.clone();
+        mutate(&mut candidate);
+        crate::vault::save_doc(&mut self.vault, "scope", "standing", "standing-scope.json", &candidate)?;
+        self.standing_scope = candidate;
+        // The vault now holds exactly what memory holds, so any earlier revoke-persist
+        // failure has been overtaken: the synced state is the tighter one plus this
+        // committed mutation.
+        self.standing_scope_dirty = false;
+        Ok(())
+    }
+
+    /// Apply a standing revoke: remove from memory FIRST (a failure may only ever leave
+    /// the TIGHTER state in force), then persist. Idempotent by design — revoking a row
+    /// memory no longer holds still persists the current state — which is what makes the
+    /// failure mode RETRYABLE (GPT review of #431, blocker 2): after a failed vault write
+    /// the row is gone from memory, so a retry that demanded in-memory existence would 404
+    /// the operator out of the promised recovery while the vault still held the grant,
+    /// waiting to resurrect it at the next restart. `standing_scope_dirty` tracks the
+    /// memory-tighter-than-vault window so the HTTP surface can tell a legitimate retry
+    /// from a typo.
+    pub fn apply_standing_revoke(&mut self, member: &str, path: &str) -> Result<()> {
+        self.standing_scope.revoke(member, path);
+        match self.persist_standing_scope() {
+            Ok(()) => {
+                self.standing_scope_dirty = false;
+                Ok(())
+            }
+            Err(e) => {
+                self.standing_scope_dirty = true;
+                Err(e)
+            }
+        }
     }
 
     pub fn member_lct(&self, plugin_id: &str) -> Option<String> {

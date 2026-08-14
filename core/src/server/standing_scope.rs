@@ -45,8 +45,12 @@
 
 use serde::{Deserialize, Serialize};
 
-/// How long a served standing-scope snapshot may be honoured by a consumer that caches it
-/// (the daemon-issued `snapshot_expires_at` horizon in `hestia_scope_status`).
+/// The CEILING on how long a served standing-scope snapshot may be honoured by a consumer
+/// that caches it. The actual `snapshot_expires_at` served by `hestia_scope_status` is
+/// `min(now + this, earliest expiry of every grant the response represents)` — a horizon
+/// that outlived a grant inside it would keep admitting the grant for hours after the
+/// operator's bound passed, and the generation does not move on wall-clock expiry, so
+/// nothing else could repair the cached copy (GPT review of #431, blocker 3).
 ///
 /// Same 8 hours as `SCOPE_REQUEST_TTL_SECS`, and for the same reason: the longer the
 /// authority has been unreachable, the likelier a revocation the copy cannot know about.

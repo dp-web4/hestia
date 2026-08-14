@@ -1644,28 +1644,29 @@ async fn scope_decide(
     // THE STANDING WIDENING, applied after its record committed (same order rule as above).
     // The in-memory mutation and the vault write must land together: a grant live in memory
     // but absent from the vault would silently die at the next restart — the exact lie this
-    // store exists to end — so a failed persist ROLLS BACK the mutation and reports that the
-    // decision was witnessed but NOT applied. The chain then holds a record of a grant that
-    // is not live: the safe direction, and legible.
+    // store exists to end. `commit_standing_scope` persists a CANDIDATE before swapping it
+    // live (GPT review of #431, blocker 1: the previous revoke-as-rollback double-moved the
+    // generation and, on a replacement, discarded the prior grant), so on a failed vault
+    // write the live store is bit-identical to before — generation included — and the chain
+    // holds a record of a grant that is not live: the safe direction, and legible.
     if standing {
-        s.standing_scope
-            .add(crate::server::standing_scope::StandingGrant {
-                member: plugin_id.clone(),
-                path: path.clone(),
-                granted_at: now,
-                granted_by: "operator".to_string(),
-                reason: reason.clone(),
-                expires_at: standing_expires_at,
-                request_id: Some(request_id.clone()),
-            });
-        if let Err(e) = s.persist_standing_scope() {
-            s.standing_scope.revoke(&plugin_id, &path);
+        let grant = crate::server::standing_scope::StandingGrant {
+            member: plugin_id.clone(),
+            path: path.clone(),
+            granted_at: now,
+            granted_by: "operator".to_string(),
+            reason: reason.clone(),
+            expires_at: standing_expires_at,
+            request_id: Some(request_id.clone()),
+        };
+        if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "error": format!(
                         "standing grant witnessed but NOT applied — vault write failed ({e}); \
-                         the store is unchanged, re-decide to retry"
+                         the live store is untouched (the candidate was persisted first), \
+                         re-decide to retry"
                     ),
                     "witnessEntryHash": entry.hash,
                 })),
@@ -1740,16 +1741,19 @@ async fn scope_standing_revoke(
         .unwrap_or("")
         .trim()
         .to_string();
-    let now = crate::server::gate_escalation::now_secs();
 
     let mut s = state.lock().await;
-    if !s.standing_scope.has_live(&plugin_id, &path, now)
-        && !s
-            .standing_scope
-            .grants
-            .iter()
-            .any(|g| g.member == plugin_id && g.path == path)
-    {
+    let in_memory = s
+        .standing_scope
+        .grants
+        .iter()
+        .any(|g| g.member == plugin_id && g.path == path);
+    // 404 only when the store is CONSISTENT and holds no such grant — a typo, bounded here.
+    // While `standing_scope_dirty` is set, memory is tighter than the vault (a prior revoke's
+    // vault write failed after the row left memory), so a row absent from memory may still be
+    // in the vault: that retry must be accepted and re-persisted, not 404ed out of the
+    // promised recovery (GPT review of #431, blocker 2).
+    if !in_memory && !s.standing_scope_dirty {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "no standing grant of record for that (plugin_id, path)"})),
@@ -1765,7 +1769,14 @@ async fn scope_standing_revoke(
             "reason": reason,
             "revoked_by": "operator",
             "via": "operator_session",
-            "standing_generation": s.standing_scope.generation + 1,
+            // A retry after a failed vault write re-persists a removal memory already made:
+            // recorded as such, so the chain distinguishes the ruling from its durability.
+            "retry_sync": !in_memory,
+            "standing_generation": if in_memory {
+                s.standing_scope.generation + 1
+            } else {
+                s.standing_scope.generation
+            },
         }),
     ) {
         Ok(e) => e,
@@ -1779,16 +1790,18 @@ async fn scope_standing_revoke(
         }
     };
 
-    s.standing_scope.revoke(&plugin_id, &path);
-    if let Err(e) = s.persist_standing_scope() {
+    // Remove-from-memory-first, then persist; idempotent so the failure mode is retryable.
+    if let Err(e) = s.apply_standing_revoke(&plugin_id, &path) {
         // Memory is already the tighter state; keep it. The vault still holds the grant, so
-        // a restart would resurrect a widening — said loudly so the operator retries.
+        // a restart would resurrect a widening — said loudly, and THIS EXACT CALL is the
+        // retry (the dirty flag keeps the door open even though the row has left memory).
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "error": format!(
-                    "revoked in memory but the vault write FAILED ({e}) — a restart would \
-                     resurrect this grant; retry the revoke"
+                    "revoked in memory but the vault write FAILED ({e}) — a restart before a \
+                     successful retry would resurrect this grant; RETRY this same revoke to \
+                     persist the removal"
                 ),
                 "witnessEntryHash": entry.hash,
             })),
@@ -1801,6 +1814,7 @@ async fn scope_standing_revoke(
             "ok": true,
             "plugin_id": plugin_id,
             "path": path,
+            "retry_sync": !in_memory,
             "generation": s.standing_scope.generation,
             "witnessEntryHash": entry.hash,
         })),
