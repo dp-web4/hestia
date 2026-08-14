@@ -253,12 +253,17 @@ fn hestia_tools() -> Vec<Tool> {
     /// empty schema, from two different sessions, by a caller that had no prompt to
     /// include the one field that carries the payload.
     ///
-    /// Deliberately narrow: only `hestia_member_notify` is declared here. Doing the
-    /// whole surface is the right end state and a much larger change — every tool's
-    /// real argument set would have to be read off its handler and kept in sync, and
-    /// getting one wrong ADVERTISES a lie, which is worse than advertising nothing.
-    /// `additionalProperties` stays `true` even here, so this only ever adds
-    /// information; it cannot refuse a call the handler would have accepted.
+    /// Deliberately narrow: only `hestia_member_notify` and
+    /// `hestia_gate_escalation_corroborate` are declared here. Doing the whole surface
+    /// is the right end state and a much larger change — every tool's real argument set
+    /// would have to be read off its handler and kept in sync, and getting one wrong
+    /// ADVERTISES a lie, which is worse than advertising nothing.
+    /// `additionalProperties` stays `true` for member_notify, so its schema only ever
+    /// adds information and cannot refuse a call the handler would have accepted. The
+    /// corroborate door is the exception BOTH ways: its handler refuses unknown keys by
+    /// name, so its schema says `additionalProperties: false` — anything else would
+    /// advertise keys the runtime refuses — and the two are pinned to each other by
+    /// `the_advertised_corroborate_schema_and_the_runtime_are_one_contract`.
     fn t_args(name: &'static str, description: &'static str, schema: Value) -> Tool {
         Tool::new(name, description, schema_of(schema))
     }
@@ -315,10 +320,14 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t_args(
             "hestia_gate_escalation_corroborate",
-            "Add your evidence to ANOTHER member's governance-write escalation WITHOUT deciding it (NOT-SAME enforced). Your STANCE is required and explicit — 'concur' or 'dissent' — because an unstated stance used to default to concurrence and recorded one peer's dissent as agreement (#367, escalation 99417cc). A dissent must carry its argument; it is evidence surfaced to the decider, NEVER a veto — the sovereign decision stands regardless. Approval is not first-answer-wins: your factor joins the set, the operator or arbiter decides later, and the stated bar is evaluated over the whole set. A factor permits nothing by itself; it is witnessed separately so it cannot be laundered into a ruling. Unrecognised arguments are refused, not discarded",
+            "Add your evidence to ANOTHER member's governance-write escalation WITHOUT deciding it (NOT-SAME enforced). Your STANCE is required and explicit — 'concur' or 'dissent' — because an unstated stance used to default to concurrence and recorded one peer's dissent as agreement (#367, escalation 99417cc). A dissent must carry its argument; it is evidence surfaced to the decider, NEVER a veto — the sovereign decision stands regardless. Approval is not first-answer-wins: your factor joins the set, the operator or arbiter decides later, and the stated bar is evaluated over the whole set. A factor permits nothing by itself; it is witnessed separately so it cannot be laundered into a ruling. This schema is the WHOLE contract: arguments outside it are refused by name, not discarded",
             json!({
                 "type": "object",
-                "additionalProperties": true,
+                // False, truthfully: the handler refuses unknown keys by name, so the
+                // schema must not advertise that they are acceptable. This is the one
+                // tool where `additionalProperties: true` would itself be the
+                // advertise-what-you-don't-honour defect (#419) this door was cured of.
+                "additionalProperties": false,
                 "required": ["escalation_id", "stance"],
                 "properties": {
                     "escalation_id": {
@@ -328,7 +337,7 @@ fn hestia_tools() -> Vec<Tool> {
                     "stance": {
                         "type": "string",
                         "enum": ["concur", "dissent"],
-                        "description": "REQUIRED. Which way your evidence points. There is no default: the handler refuses a call that states no stance, because the silent path is how a dissent was once recorded as concurrence."
+                        "description": "REQUIRED. Which way your evidence points. There is no default and no other spelling: the handler refuses a call that states no stance, because the silent path is how a dissent was once recorded as concurrence."
                     },
                     "argument": {
                         "type": "string",
@@ -337,6 +346,10 @@ fn hestia_tools() -> Vec<Tool> {
                     "session_id": {
                         "type": "string",
                         "description": "Your own live session_id from hestia_connect. Evidence that cannot be attributed cannot be credited."
+                    },
+                    "sessionId": {
+                        "type": "string",
+                        "description": "Alternate spelling of session_id — hestia_connect emits camelCase and this surface reads snake_case (#155); both resolve to the same session, snake_case winning if both are present."
                     }
                 }
             }),
@@ -10111,16 +10124,16 @@ mod tests {
         );
     }
 
-    /// The positive control and the compatibility contract. Concurrence still lands under
-    /// the explicit `stance` spelling AND under the legacy `dissent` bool a caller may
-    /// already use — only the say-nothing path died. A dissent must carry its argument
-    /// (evidence with no content is not reviewable), and a self-contradicting call
-    /// (stance vs bool) refuses rather than picking a side.
+    /// The positive control and the contract's edge. Concurrence still lands under the one
+    /// advertised spelling, a dissent must carry its argument (evidence with no content is
+    /// not reviewable), and the unadvertised `dissent` bool — which briefly lived in the
+    /// runtime with no schema entry and zero callers — refuses BY NAME rather than being
+    /// honoured off the record (review 4940109239: schema and runtime are one contract).
     #[tokio::test]
-    async fn concur_still_lands_and_stance_spellings_that_disagree_refuse() {
+    async fn concur_still_lands_and_the_unadvertised_dissent_bool_refuses_by_name() {
         let (_dir, shared, esc_id, codex_sid) = opened_escalation_with_peer().await;
 
-        // Explicit concur.
+        // Explicit concur — the door's original job.
         let r = tool_gate_escalation_corroborate(
             &shared,
             &json!({
@@ -10135,32 +10148,36 @@ mod tests {
         assert_eq!(r["stance"], "concur", "{r}");
         assert_eq!(r["dissent"], false, "{r}");
 
-        // Legacy bool spelling that DOES express a stance keeps working.
+        // The unadvertised bool spelling refuses by name — in BOTH polarities, so it can
+        // neither concur nor dissent from outside the schema.
         let (_dir2, shared2, esc2, sid2) = opened_escalation_with_peer().await;
-        let r2 = tool_gate_escalation_corroborate(
-            &shared2,
-            &json!({ "escalation_id": esc2, "session_id": sid2, "dissent": false }),
-        )
-        .await
-        .expect("dissent:false is an expressed stance, not the silent default");
-        assert_eq!(r2["stance"], "concur", "{r2}");
-
-        // Contradictory spellings refuse.
-        let (_dir3, shared3, esc3, sid3) = opened_escalation_with_peer().await;
-        let err = tool_gate_escalation_corroborate(
-            &shared3,
-            &json!({
-                "escalation_id": esc3,
-                "session_id": sid3,
-                "stance": "concur",
+        for spelling in [
+            json!({ "escalation_id": esc2, "session_id": sid2, "dissent": false }),
+            json!({
+                "escalation_id": esc2,
+                "session_id": sid2,
                 "dissent": true,
+                "argument": "spelled off-schema",
             }),
-        )
-        .await
-        .expect_err("a call that says concur AND dissent must refuse, not pick a side");
-        assert!(format!("{err}").contains("stance"), "{err}");
+        ] {
+            let err = tool_gate_escalation_corroborate(&shared2, &spelling)
+                .await
+                .expect_err("a key the schema does not advertise must refuse, not be honoured");
+            assert!(
+                format!("{err}").contains("dissent"),
+                "the refusal must name the unrecognised key: {err}"
+            );
+        }
+        {
+            let s = shared2.lock().await;
+            assert!(
+                s.gate_escalations.get(&esc2).unwrap().factors.is_empty(),
+                "no off-schema call may mint a factor"
+            );
+        }
 
         // A dissent with no argument refuses — the argument is the evidence.
+        let (_dir3, shared3, esc3, sid3) = opened_escalation_with_peer().await;
         let err = tool_gate_escalation_corroborate(
             &shared3,
             &json!({ "escalation_id": esc3, "session_id": sid3, "stance": "dissent" }),
@@ -10168,6 +10185,80 @@ mod tests {
         .await
         .expect_err("a dissent must carry its argument");
         assert!(format!("{err}").contains("argument"), "{err}");
+    }
+
+    /// The drift guard review 4940109239 asked for: the ADVERTISED schema and the HONOURED
+    /// runtime are pinned to each other through `CORROBORATE_ACCEPTED_KEYS`, so this test
+    /// fails if either side changes without the other. Three assertions carry it:
+    /// the schema's property set IS the runtime's accepted set (advertise everything you
+    /// honour, nothing you don't), `additionalProperties` is false (the runtime refuses
+    /// unknown keys by name, and the schema must say so), and a call spelled entirely from
+    /// the schema is honoured while a key outside it refuses.
+    #[tokio::test]
+    async fn the_advertised_corroborate_schema_and_the_runtime_are_one_contract() {
+        let tools = hestia_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "hestia_gate_escalation_corroborate")
+            .expect("the tool must be advertised");
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+
+        // Advertised property set == runtime accepted set, exactly.
+        let mut advertised: Vec<&str> = schema["properties"]
+            .as_object()
+            .expect("an argument-taking tool must advertise its properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        advertised.sort_unstable();
+        let mut honoured: Vec<&str> = CORROBORATE_ACCEPTED_KEYS.to_vec();
+        honoured.sort_unstable();
+        assert_eq!(
+            advertised, honoured,
+            "schema and runtime have drifted: the advertised vocabulary and the honoured \
+             vocabulary must be the same list"
+        );
+
+        // The runtime refuses unknown keys by name; the schema must not advertise them as
+        // acceptable, and the required set must be exactly what the handler enforces.
+        assert_eq!(schema["additionalProperties"], false, "{schema}");
+        assert_eq!(schema["required"], json!(["escalation_id", "stance"]), "{schema}");
+        assert_eq!(
+            schema["properties"]["stance"]["enum"],
+            json!(["concur", "dissent"]),
+            "the advertised stance vocabulary must be the one the handler matches: {schema}"
+        );
+
+        // Behavioural pin, both directions: the full advertised vocabulary in one call is
+        // honoured end to end...
+        let (_dir, shared, esc_id, codex_sid) = opened_escalation_with_peer().await;
+        let r = tool_gate_escalation_corroborate(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "session_id": codex_sid,
+                "sessionId": codex_sid,
+                "stance": "dissent",
+                "argument": "every advertised key, one call",
+            }),
+        )
+        .await
+        .expect("a call spelled entirely from the advertised schema must be honoured");
+        assert_eq!(r["dissent"], true, "{r}");
+
+        // ...and a key outside it refuses (the runtime side of additionalProperties:false).
+        let err = tool_gate_escalation_corroborate(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "session_id": codex_sid,
+                "stance": "concur",
+                "reason": "an unadvertised alias",
+            }),
+        )
+        .await
+        .expect_err("a key outside the advertised schema must refuse");
+        assert!(format!("{err}").contains("reason"), "{err}");
     }
 
     /// The #367 landing surface, pre-decision half: dp's ruling is that dissent is
@@ -13246,6 +13337,17 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
     }
 }
 
+/// The COMPLETE argument vocabulary of `hestia_gate_escalation_corroborate` — the single
+/// source the runtime refusal and the advertised MCP schema are both pinned to (the
+/// drift guard `the_advertised_corroborate_schema_and_the_runtime_are_one_contract`
+/// fails if either side changes without the other). Advertising keys the handler refuses,
+/// or honouring keys the schema hides, is the same disease this door was cured of:
+/// a contract that says one thing and does another (review 4940109239 on PR #437).
+/// Both session-id spellings appear because `optional_session_id` accepts both — the
+/// `hestia_connect` reply emits camelCase and every handler here reads snake_case (#155).
+const CORROBORATE_ACCEPTED_KEYS: &[&str] =
+    &["escalation_id", "session_id", "sessionId", "stance", "argument"];
+
 /// Add a peer's evidence to a PENDING escalation WITHOUT deciding it — the accumulation half
 /// of the constellation model (dp 2026-07-30: "many-factor preponderance of evidence";
 /// claude-code: "approval shouldn't be a boolean from whichever channel answered first. It
@@ -13267,19 +13369,10 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
     // vendor-stamped, and correctable only out of band. A door that names its vocabulary and
     // refuses the rest turns that silent inversion into a loud, fixable error.
     if let Some(obj) = args.as_object() {
-        let known = [
-            "escalation_id",
-            "session_id",
-            "sessionId",
-            "stance",
-            "dissent",
-            "argument",
-            "reason",
-        ];
         let unknown: Vec<&str> = obj
             .keys()
             .map(String::as_str)
-            .filter(|k| !known.contains(k))
+            .filter(|k| !CORROBORATE_ACCEPTED_KEYS.contains(k))
             .collect();
         if !unknown.is_empty() {
             return Err(anyhow::anyhow!(
@@ -13294,47 +13387,29 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
     // THE STANCE IS REQUIRED INPUT, never defaulted. Every factor this door ever minted was
     // hardcoded `dissent: false` — pre-#367 that made a dissenting peer's only options
     // silence or looking like agreement; the specimen above shows the third, worst outcome:
-    // meaning "no" and being recorded as "yes". `stance` is the explicit spelling; the
-    // `dissent` bool is kept for callers that already express their stance that way. A call
-    // that says neither refuses, and a call that says both inconsistently refuses — a door
-    // must never pick a side for its caller.
-    let stance_arg = match args.get("stance") {
-        None => None,
-        Some(Value::String(v)) => Some(v.trim().to_ascii_lowercase()),
+    // meaning "no" and being recorded as "yes". `stance` is the ONLY spelling: the schema
+    // this tool advertises and the vocabulary this handler honours are one contract
+    // (review 4940109239 on PR #437 — a legacy `dissent` bool briefly lived here,
+    // unadvertised; it had zero callers and died before anyone could depend on it, pinned
+    // by `the_advertised_corroborate_schema_and_the_runtime_are_one_contract`). A call
+    // that states no stance refuses — a door must never pick a side for its caller.
+    let dissent = match args.get("stance") {
+        Some(Value::String(v)) => match v.trim().to_ascii_lowercase().as_str() {
+            "concur" => false,
+            "dissent" => true,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "unknown stance '{other}' — the vocabulary is 'concur' or 'dissent', \
+                     and an unrecognised value refuses rather than rounding to either"
+                ));
+            }
+        },
         Some(other) => {
             return Err(anyhow::anyhow!(
                 "'stance' must be the string 'concur' or 'dissent', got {other}"
             ));
         }
-    };
-    let dissent_flag = match args.get("dissent") {
-        None => None,
-        Some(Value::Bool(b)) => Some(*b),
-        Some(other) => {
-            return Err(anyhow::anyhow!(
-                "'dissent' must be an explicit true or false, got {other}"
-            ));
-        }
-    };
-    let dissent = match (stance_arg.as_deref(), dissent_flag) {
-        (Some("concur"), None) => false,
-        (Some("dissent"), None) => true,
-        (Some("concur"), Some(false)) => false,
-        (Some("dissent"), Some(true)) => true,
-        (Some("concur"), Some(true)) | (Some("dissent"), Some(false)) => {
-            return Err(anyhow::anyhow!(
-                "'stance' and 'dissent' disagree — a door must never pick a side for its \
-                 caller. Say one thing"
-            ));
-        }
-        (Some(other), _) => {
-            return Err(anyhow::anyhow!(
-                "unknown stance '{other}' — the vocabulary is 'concur' or 'dissent', and an \
-                 unrecognised value refuses rather than rounding to either"
-            ));
-        }
-        (None, Some(b)) => b,
-        (None, None) => {
+        None => {
             return Err(anyhow::anyhow!(
                 "your stance is required: pass stance: 'concur' or stance: 'dissent' (with \
                  your argument). An unstated stance used to default to concurrence — that is \
@@ -13346,7 +13421,6 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
     // for the operator's review, and evidence with no content is not reviewable — it would
     // put a bare "no" on the record with nothing the decider can weigh.
     let argument = optional_string(args, "argument")
-        .or_else(|| optional_string(args, "reason"))
         .map(|a| a.trim().to_string())
         .filter(|a| !a.is_empty());
     if dissent && argument.is_none() {
