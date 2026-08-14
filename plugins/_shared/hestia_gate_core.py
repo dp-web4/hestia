@@ -126,7 +126,10 @@ def core_digest() -> str:
     and unknown must never read as healthy (#231 posture)."""
     try:
         with open(__file__, "rb") as _fh:
-            return _hashlib.sha256(_fh.read()).hexdigest()[:16]
+            # FULL sha256 (PR #408 review, converging with Hub #708's invariant): the
+            # running thing attests its EXACT bytes; truncation is a second, weaker
+            # definition of identity that external consumers would over-trust.
+            return _hashlib.sha256(_fh.read()).hexdigest()
     except Exception:
         return "unknown"
 
