@@ -50,7 +50,13 @@ def _num_env(name: str, default: float, cast) -> float:
         return default
 
 
-TOTAL_BUDGET_MS = int(_num_env("HESTIA_PRE_TOTAL_BUDGET_MS", 800, int))
+# 2500ms (was 800): the 800 default predates Sprint F — it assumed ONE lean round-trip.
+# The consolidated path runs TWO legs (policy snapshot + society verdict), and the daemon
+# shows a measured multi-second COLD window after restart (5.7s first-connect, 1ms after;
+# filed as a daemon regression). 2500 fits inside codex's ~3s engine clamp with margin,
+# keeps the gate the fail-closed party, and gives steady-state (1-30ms/leg) wide headroom.
+# Env-overridable as ever: HESTIA_PRE_TOTAL_BUDGET_MS.
+TOTAL_BUDGET_MS = int(_num_env("HESTIA_PRE_TOTAL_BUDGET_MS", 2500, int))
 REQUEST_TIMEOUT_S = float(_num_env("HESTIA_PRE_REQUEST_TIMEOUT_S", 5.0, float))
 MAX_POLLS = 5
 MIN_POLL_SLEEP_MS = 50
