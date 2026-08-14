@@ -31,16 +31,27 @@ cargo --version              # pass-through: prints the real cargo version
 A **running** build that predates the shim can be relieved without killing it:
 `renice -n 15 -p <build-pids>` (loadavg 6.62→0.98 when done live).
 
-## Scope and follow-up
-This MVP **deprioritizes**; it does not yet **serialize**. `nice` alone fixes the gate timeout
-because it protects the daemon's CPU share regardless of how many builds run. The tracked
-follow-ups (issue #358):
-1. **Serialize** — one heavy build at a time via `flock` (N concurrent → 1), fail-open on a
-   stuck lock so a hung build can't deadlock the fleet's builds.
-2. **ionice** the build IO (compiles compete for disk with the daemon's chain reads).
-3. **The git-manager role** owns this properly — the single actor that runs/serializes builds,
-   reconciles merges, and reaps worktrees on behalf of members. This shim is its first
-   increment.
+## Increments
+1. **nice** (increment 1) — deprioritize heavy builds so the daemon preempts them.
+2. **serialize + warm shared target** (increment 2, #387) — after measurement showed timeouts at
+   *low CPU%* during sweeps, the second channel is **IO**: a cold build reads thousands of source
+   files off the `/mnt/c` 9p mount, saturating the drvfs read queue every gate call also traverses
+   (the daemon's own law/chain/vault are ext4, so the daemon is not the `/mnt/c` reader — the
+   builds and the gate imports are). So the shim now:
+   - **serializes** heavy builds via `flock` (N concurrent → 1), fail-open on a stuck lock
+     (`HESTIA_BUILD_LOCK_WAIT`, default 900s) so a hung build can't deadlock the fleet;
+   - defaults `CARGO_TARGET_DIR` to a **warm ext4 target shared across a repo's worktrees** (keyed
+     on the git common-dir, so other projects and a caller's own `CARGO_TARGET_DIR` are untouched)
+     — a worktree build becomes incremental (seconds) instead of a cold 8 minutes, slashing both
+     the source-read storm on `/mnt/c` and the target IO. This is the bigger lever of the two.
+
+### Still tracked (#358 / #387)
+- **ionice** the build IO (compiles still compete with the daemon's ext4 chain reads).
+- **Install the mechanism to ext4** beside each member's installed gate, so the hook's
+  `hestia_gate_mechanism` import is ext4 too (kimi's gate is installed on ext4 but still imports
+  the mechanism off `/mnt/c`) — closes the last `/mnt/c` read on the gate hot path.
+- **The git-manager role** owns this properly — the single actor that runs/serializes builds,
+  reconciles merges, and reaps worktrees on behalf of members. This shim is its increments.
 
 ## Deployment
 Install on every build host (not just CBP). This is exactly the deployment-consolidation
