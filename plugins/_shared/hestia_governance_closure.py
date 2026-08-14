@@ -103,6 +103,7 @@ __all__ = [
     "RULE_WRITE",
     "RULE_WRITE_UNPARSEABLE",
     "RULE_OUT_OF_GRAMMAR",
+    "RULE_OPAQUE_WRITER",
     "RULE_INTERNAL",
     "RULE_READ_INTERNAL",
     "classify",
@@ -121,6 +122,12 @@ RULE_WRITE_UNPARSEABLE = "governance-closure-unparseable-command"
 # command (a benign out-of-grammar command that names nothing closure-ish must stay "none",
 # or we recreate the friction→bypass loop). See the SUPPORTED GRAMMAR block below.
 RULE_OUT_OF_GRAMMAR = "governance-closure-out-of-grammar"
+# An opaque patch writer (patch / git apply / git am) whose patch CONTENT could not be
+# read: the write set is unknowable, so the act is refused UNCONDITIONALLY — no
+# vocabulary condition (GPT second pass: a patch file named /tmp/x.patch carries no
+# closure vocabulary on the argv while its content writes the closure). When the patch
+# IS readable, its +++/---/rename targets are extracted and classified precisely.
+RULE_OPAQUE_WRITER = "governance-closure-opaque-writer"
 RULE_INTERNAL = "governance-closure-internal-error"
 RULE_READ_INTERNAL = "governance-closure-read-internal-error"
 
@@ -398,6 +405,36 @@ _SHELL_BLOCK_KEYWORDS = frozenset({
 _SUBSHELL_CMDS = frozenset({"bash", "sh", "dash", "zsh", "ksh", "mksh", "busybox"})
 
 
+class _OpaqueWriter(Exception):
+    """A patch-applying command whose patch content cannot be read — write set unknowable."""
+    def __init__(self, source: str = "stdin"):
+        self.source = source
+
+
+def _patch_write_targets(src_path: str) -> list:
+    """Extract write targets from a readable diff/mbox: `+++ `/`--- ` headers (a/ b/
+    prefixes stripped, /dev/null skipped) plus git `rename to`/`copy to`. Raises
+    _OpaqueWriter when the file cannot be read — the caller fails closed."""
+    try:
+        with open(os.path.expanduser(src_path), "r", encoding="utf-8",
+                  errors="replace") as fh:
+            text = fh.read(1_048_576)
+    except OSError:
+        raise _OpaqueWriter(src_path)
+    out = []
+    for ln in text.splitlines():
+        if ln.startswith(("+++ ", "--- ")):
+            p = ln[4:].split("\t")[0].strip()
+            if not p or p == "/dev/null":
+                continue
+            if p.startswith(("a/", "b/")):
+                p = p[2:]
+            out.append(p)
+        elif ln.startswith(("rename to ", "copy to ")):
+            out.append(ln.split(" to ", 1)[1].strip())
+    return out
+
+
 class _OutOfGrammar(Exception):
     """Internal signal: this Bash command is outside the supported grammar, so its write set
     cannot be resolved. The caller (_write_position_targets) turns it into the
@@ -512,7 +549,7 @@ def _opt_value(args: list, *names: str) -> Optional[str]:
     return None
 
 
-def _command_write_targets(words: list) -> list:
+def _command_write_targets(words: list, stdin_src=None) -> list:
     """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
     their file args are read positions by default (the anti-FP stance; the daemon's
     destructive preset stays behind anything exotic)."""
@@ -539,9 +576,13 @@ def _command_write_targets(words: list) -> list:
     if name == "dd":
         return [a[3:] for a in args if a.startswith("of=")]
     if name == "patch":
-        # `patch` applies a diff whose write set is inside the patch CONTENT (often on stdin),
-        # not on the argv — undecidable here. Out of grammar.
-        raise _OutOfGrammar()
+        # The write set lives inside the patch CONTENT. Resolve it: read the named input
+        # (-i/--input or the `<` stdin source threaded by the caller) and extract its
+        # targets. No readable input -> _OpaqueWriter -> unconditional fail-close.
+        pin = _opt_value(args, "-i", "--input") or stdin_src
+        if not pin:
+            raise _OpaqueWriter()
+        return _patch_write_targets(pin)
     if name == "sed":
         # In-place: `--in-place[=SUFFIX]`, `-i`, `-i.bak`, AND bundled short clusters that
         # contain `i` (`-Ei`, `-nEi`, ...). A short cluster is `-<letters>` (not `--`); the
@@ -588,9 +629,17 @@ def _command_write_targets(words: list) -> list:
             return []
         sub, rest = args[i], args[i + 1:]
         if sub in ("apply", "am"):
-            # `git apply` / `git am` write files described INSIDE a patch/mbox the classifier
-            # cannot read — undecidable write set. Out of grammar.
-            raise _OutOfGrammar()
+            # The write set lives inside the named patch/mbox files (or stdin). Resolve by
+            # reading them; unreadable/unknowable -> _OpaqueWriter -> unconditional fail-close.
+            pfiles = [a for a in rest if not a.startswith("-")]
+            if not pfiles and stdin_src:
+                pfiles = [stdin_src]
+            if not pfiles:
+                raise _OpaqueWriter()
+            out = []
+            for pf in pfiles:
+                out.extend(_patch_write_targets(pf))
+            return out
         if sub == "checkout":
             # Only explicit pathspec overwrite (`checkout [-|tree-ish] -- paths`); a branch
             # switch is not a targeted closure write.
@@ -605,7 +654,7 @@ def _command_write_targets(words: list) -> list:
     return []
 
 
-def _flush_simple_command(words: list, eff: str, targets: list) -> str:
+def _flush_simple_command(words: list, eff: str, targets: list, stdin_src=None) -> str:
     """Resolve ONE simple command: detect out-of-grammar heads (shell block, `bash -c`,
     `eval`, `git apply`/`patch` — the last two via _command_write_targets), track `cd` into
     the effective cwd, else append this command's cd-resolved write targets. Returns the
@@ -633,7 +682,7 @@ def _flush_simple_command(words: list, eff: str, targets: list) -> str:
             eff = d if (os.path.isabs(d) or d.startswith("~")) \
                 else os.path.normpath(os.path.join(eff or ".", d))
         return eff
-    for tg in _command_write_targets(words):  # may raise _OutOfGrammar (git apply/am, patch)
+    for tg in _command_write_targets(words, stdin_src):  # may raise (git apply/am, patch)
         if _has_subst(tg):
             raise _OutOfGrammar()  # substitution in a write position
         targets.append(_join_eff(eff, tg))
@@ -647,14 +696,16 @@ def _bash_write_targets(command: str) -> list:
     any out-of-grammar construct (caller -> out-of-grammar posture)."""
     toks = _tokenize(command)
     targets, cur = [], []
+    stdin_src = None  # `< file` source for the current simple command (patch input)
     eff = ""  # relative cwd accumulator; cd within this command line adjusts it
     i = 0
     while i < len(toks):
         t = toks[i]
         if t in _SEPARATORS:
             if cur:
-                eff = _flush_simple_command(cur, eff, targets)
+                eff = _flush_simple_command(cur, eff, targets, stdin_src)
                 cur = []
+            stdin_src = None
             i += 1
             continue
         if _is_punct(t):
@@ -672,6 +723,8 @@ def _bash_write_targets(command: str) -> list:
                 i += 1
                 continue
             if t in ("<", "<<", "<<<", "<<-"):
+                if t == "<" and i + 1 < len(toks) and not _is_punct(toks[i + 1]):
+                    stdin_src = toks[i + 1]  # patch/git-apply may consume this as input
                 i += 2  # read redirect / heredoc delimiter — source side, skip operand
                 continue
             i += 1
@@ -679,7 +732,7 @@ def _bash_write_targets(command: str) -> list:
         cur.append(t)
         i += 1
     if cur:
-        eff = _flush_simple_command(cur, eff, targets)
+        eff = _flush_simple_command(cur, eff, targets, stdin_src)
     return targets
 
 
@@ -705,6 +758,10 @@ def _write_position_targets(tool_name: str, tool_input: Any) -> tuple:
             return [], None
         try:
             return _bash_write_targets(cmd), None
+        except _OpaqueWriter as ow:
+            # Patch content unreadable: the write set is unknowable and NO vocabulary
+            # condition applies — classify() refuses unconditionally.
+            return [ow.source], "opaque-writer"
         except _OutOfGrammar:
             # Undecidable write set: hand the FULL vocabulary token list up, so classify()
             # can fail closed iff closure vocabulary appears anywhere in the command.
@@ -759,6 +816,11 @@ def classify(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None,
         # not resolved write positions; match with the BROADER read-position semantics (a
         # bare closure basename anywhere counts as vocabulary) and fail closed as a write if
         # ANY token is closure vocabulary. If none is, fall through to Phase 2 -> "none".
+        if note == "opaque-writer":
+            # GPT second pass: the literal "any closure write" invariant. An opaque patch
+            # whose content cannot be read is refused regardless of argv vocabulary.
+            return ClosureVerdict("write", RULE_OPAQUE_WRITER, None,
+                                  targets[0] if targets else "stdin", src)
         position = "read" if note == "out-of-grammar" else "write"
         for t in targets:
             marker = closure.match(t, cwd=cwd, position=position)

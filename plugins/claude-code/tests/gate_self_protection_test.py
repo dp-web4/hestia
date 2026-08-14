@@ -234,18 +234,36 @@ def test_every_shared_file_is_protected_or_exempted():
         check("shared_dir_exists", False, f"{SHARED} missing — did the layout move?")
         return
     g = _governance_files()
+    # ARCHITECTURE MIGRATION (gate-consolidation train): protection is no longer a
+    # per-name tuple — the closure CLASSIFIER protects plugins/_shared POSITIONALLY
+    # (its dir marker makes any write there a governance write, including files that
+    # did not exist when any tuple was written). The judgement this test schedules is
+    # now: does the classifier actually refuse a write to this file? Name-tuple
+    # membership remains meaningful only for the Tier-2 fallback layer. If the
+    # classifier cannot be imported or does not refuse, the file is red — an
+    # instrument that cannot verify must not report protected.
+    sys.path.insert(0, SHARED)
+    try:
+        import hestia_governance_closure as _hgc
+    except Exception:
+        _hgc = None
     unjudged = []
     for fn in sorted(os.listdir(SHARED)):
         if not fn.endswith(".py"):
             continue
         if fn in g or fn in EXEMPT:
             continue
+        v = (_hgc.classify("Write", {"file_path": os.path.join(SHARED, fn)})
+             if _hgc is not None else None)
+        if v is not None and v.classification == "write":
+            continue  # positionally protected by the canonical closure
         unjudged.append(fn)
     check("every_shared_file_is_protected_or_exempted", not unjudged,
-          f"{unjudged} sit under plugins/_shared/ and are neither protected by name nor "
-          f"exempted. Decide: does this file participate in reaching a verdict? If yes, add "
-          f"it to _GOVERNANCE_FILES (a governance-surface edit, so escalate). If no, add it "
-          f"to EXEMPT here WITH the reason.")
+          f"{unjudged} sit under plugins/_shared/ and are neither refused by the closure "
+          f"classifier, protected by name, nor exempted. Decide: does this file participate "
+          f"in reaching a verdict? If the classifier should refuse it, fix the closure; "
+          f"legacy-tuple membership (escalated edit) or EXEMPT-with-reason remain the "
+          f"fallback-layer options.")
 
 
 @asserting

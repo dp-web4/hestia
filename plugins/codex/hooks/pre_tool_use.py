@@ -138,6 +138,11 @@ _CLOSURE_FLOOR = (
     "hestia/hooks", "hestia_gate_core.py", "hestia_gate_mechanism.py",
     "hestia_governance_closure.py", "gate_self_protection_test.py",
     "deploy/install-members.sh", ".claude/settings.json", ".codex/config.toml",
+    # GPT 2nd pass: Tier-2 mirrors the CANONICAL closure (shared dir, hub deploy
+    # surfaces, remaining registration configs), not the pre-B smaller set.
+    "plugins/_shared", "web4-hub.service", "ratified-build.json", "ratify-build.sh",
+    "hub/target/release/hub", ".claude/settings.local.json", ".kimi-code/config.toml",
+    ".kimi/config.toml",
 )
 
 # ---- Shared gate core (gate-consolidation PRD §6.D) -----------------------------------

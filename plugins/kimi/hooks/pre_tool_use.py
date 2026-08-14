@@ -458,11 +458,16 @@ def deny(rule, reason, innate=False):
 # Common filenames govern only under a hooks/ path (they appear in vendor trees and docs); the
 # distinctive names govern wherever they live. Adding a name STRENGTHENS the gate; moving one
 # into _SELF_HOOKS_DIR_ONLY weakens it — that direction is the visible, deliberate second edit.
-_SELF_DIR_MARKERS = ("plugins/kimi/hooks", "plugins/claude-code/hooks", "hestia/hooks")
+_SELF_DIR_MARKERS = ("plugins/kimi/hooks", "plugins/claude-code/hooks", "hestia/hooks",
+                     # GPT 2nd pass: Tier-2 mirrors the CANONICAL closure, not the pre-B set
+                     "plugins/_shared", "hub/target/release")
 _SELF_GOVERNANCE_FILES = (
     "pre_tool_use.py", "society_pre_tool_use.py", "post_tool_use.py", "witness.py",
     "law_inject.py", "hestia_gate_core.py", "hestia_gate_mechanism.py",
     "gate_self_protection_test.py",
+    # GPT 2nd pass: canonical-closure names the pre-B tuple lacked
+    "hestia_governance_closure.py", "web4-hub.service", "ratified-build.json",
+    "ratify-build.sh", "install-members.sh",
 )
 _SELF_HOOKS_DIR_ONLY = ("pre_tool_use.py", "society_pre_tool_use.py", "post_tool_use.py",
                         "witness.py", "law_inject.py")

@@ -65,6 +65,20 @@ HOOKS = "plugins/kimi/hooks"           # a plugins/*/hooks dir (dir-path literal
 SHARED_DIR = "plugins/_shared"
 OOG = g.RULE_OUT_OF_GRAMMAR
 WRT = g.RULE_WRITE
+OPQ = g.RULE_OPAQUE_WRITER
+RULE_W = WRT
+
+# Patch-content fixtures (GPT 2nd pass): a diff whose CONTENT targets the closure vs one
+# whose content is benign — the argv is identical in shape for both, which is the point.
+BENIGN_DIR = tempfile.mkdtemp(prefix="shell-grammar-patches-")
+with open(os.path.join(BENIGN_DIR, "closure.patch"), "w", encoding="utf-8") as _fh:
+    _fh.write("--- a/plugins/kimi/hooks/" + HOOK + chr(10)
+              + "+++ b/plugins/kimi/hooks/" + HOOK + chr(10)
+              + "@@ -1 +1 @@" + chr(10) + "-x" + chr(10) + "+y" + chr(10))
+with open(os.path.join(BENIGN_DIR, "benign.patch"), "w", encoding="utf-8") as _fh:
+    _fh.write("--- a/tmp/notes.txt" + chr(10) + "+++ b/tmp/notes.txt" + chr(10)
+              + "@@ -1 +1 @@" + chr(10) + "-x" + chr(10) + "+y" + chr(10))
+
 
 CASES = [
     # --- substitution / variable in a WRITE position ---
@@ -131,19 +145,29 @@ CASES = [
     ("eval__benign",
      "eval \"echo hi\"", "none", None),
 
-    # --- git apply / git am / patch (write set inside patch content) ---
-    ("git_apply__closure",
-     f"git apply < {SHARED_DIR}/{CORE}", "write", OOG),
-    ("git_apply__benign",
-     "git apply /tmp/some.patch", "none", None),
-    ("git_am__closure",
-     f"git am {HOOKS}/{HOOK}", "write", OOG),
-    ("git_am__benign",
-     "git am /tmp/mbox", "none", None),
-    ("patch__closure",
-     f"patch {HOOKS}/{HOOK} < /tmp/d.diff", "write", OOG),
-    ("patch__benign",
-     "patch -p1 < /tmp/d.diff", "none", None),
+    # --- git apply / git am / patch: patch CONTENT is read and resolved (GPT 2nd pass).
+    # Readable patch -> precise targets from +++/--- headers; unreadable -> unconditional
+    # fail-close (opaque-writer), because argv vocabulary says nothing about the write set.
+    ("git_apply__closure_content",
+     f"git apply {BENIGN_DIR}/closure.patch", "write", RULE_W),
+    ("git_apply__benign_content",
+     f"git apply {BENIGN_DIR}/benign.patch", "none", None),
+    ("git_apply__missing_patch_fails_closed",
+     "git apply /tmp/definitely-missing-xyz.patch", "write", OPQ),
+    ("git_apply__no_input_at_all_fails_closed",
+     "git apply", "write", OPQ),
+    ("git_am__mbox_with_closure_diff",
+     f"git am {BENIGN_DIR}/closure.patch", "write", RULE_W),
+    ("git_am__missing_mbox_fails_closed",
+     "git am /tmp/definitely-missing.mbox", "write", OPQ),
+    ("patch__stdin_closure_content",
+     f"patch -p1 < {BENIGN_DIR}/closure.patch", "write", RULE_W),
+    ("patch__stdin_benign_content",
+     f"patch -p1 < {BENIGN_DIR}/benign.patch", "none", None),
+    ("patch__stdin_missing_fails_closed",
+     "patch -p1 < /tmp/definitely-missing.diff", "write", OPQ),
+    ("patch__no_input_fails_closed",
+     "patch -p1", "write", OPQ),
 
     # --- read-FP shapes: a quoted `>` or a heredoc body must NOT create a write target ---
     ("quoted_redirect_in_arg__not_write",
