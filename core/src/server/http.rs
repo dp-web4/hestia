@@ -420,6 +420,12 @@ pub async fn serve_with_callback(
         // could answer its own ask would be holding both halves of the control.
         .route("/api/scope/requests", get(scope_list_requests))
         .route("/api/scope/decide", post(scope_decide))
+        // The durable channel's revoke verb (Sprint F R1). Same wall, same reasoning: a
+        // member that could revoke — or, worse, could NOT be revoked — would hold the
+        // control. The GRANT half deliberately has no route of its own: a standing grant
+        // is only ever a promotion of a member's witnessed ask, through /api/scope/decide
+        // {standing:true}, so the ask and its durable answer stay paired.
+        .route("/api/scope/standing/revoke", post(scope_standing_revoke))
         .route("/api/policy/preset", put(policy_set_preset))
         .route("/api/policy/override", put(policy_set_override))
         .route(
@@ -1467,11 +1473,18 @@ async fn scope_list_requests(State(state): State<SharedState>) -> impl IntoRespo
     )
 }
 
-/// `POST /api/scope/decide` {request_id, granted, reason?, expires_in_secs?}
+/// `POST /api/scope/decide` {request_id, granted, reason?, expires_in_secs?, standing?}
 ///
-/// The operator's answer. Grants are memory-only and time-bounded; refusals are recorded with the
-/// same weight, because a channel that only remembers its approvals cannot show that it was ever
-/// used as a filter.
+/// The operator's answer. Plain grants are memory-only and time-bounded; refusals are recorded
+/// with the same weight, because a channel that only remembers its approvals cannot show that it
+/// was ever used as a filter.
+///
+/// `standing: true` PROMOTES the grant into the durable store (Sprint F R1, dp 2026-08-14):
+/// the same ask/answer shape, the same operator wall, but the grant is written to the vault's
+/// standing-scope document and survives a restart. `expires_in_secs` then bounds the STANDING
+/// grant when given; absent, the grant is durable until revoked (`/api/scope/standing/revoke`)
+/// — which is exactly the trade the asymmetry doc records: durability in exchange for an
+/// explicit revoke verb, a generation counter, and disclosure in the hashed operating law.
 async fn scope_decide(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
@@ -1483,6 +1496,7 @@ async fn scope_decide(
         .unwrap_or("")
         .trim()
         .to_string();
+    let standing = body.get("standing").and_then(|v| v.as_bool()).unwrap_or(false);
     let granted = match body.get("granted").and_then(|v| v.as_bool()) {
         Some(g) => g,
         // No default. An absent verdict is not a deny and not an approve — it is a malformed
@@ -1512,11 +1526,31 @@ async fn scope_decide(
             })),
         );
     }
+    // A standing REFUSAL is not a thing: refusing is already durable in effect (nothing was
+    // granted, and a re-ask files a new record). Guessing what the caller meant would put a
+    // durable ruling in the store nobody made.
+    if standing && !granted {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "standing:true is only meaningful with granted:true — a refusal \
+                          grants nothing and needs no durability"
+            })),
+        );
+    }
     let now = crate::server::gate_escalation::now_secs();
     let window = body
         .get("expires_in_secs")
         .and_then(|v| v.as_u64())
         .unwrap_or(SCOPE_REQUEST_TTL_SECS);
+    // The STANDING expiry is different on purpose: given a window, it is bounded by it;
+    // absent one, it is durable until revoked — `None`, never a silent default TTL, because
+    // "standing" with an invisible 8h fuse would teach operators the store lies.
+    let standing_expires_at: Option<u64> = if standing {
+        body.get("expires_in_secs").and_then(|v| v.as_u64()).map(|w| now + w)
+    } else {
+        None
+    };
 
     let mut s = state.lock().await;
     let Some(req) = s.scope_requests.get(&request_id) else {
@@ -1575,7 +1609,21 @@ async fn scope_decide(
             "granted_by": "operator",
             "via": "operator_session",
             "expires_at": expires_at,
-            "durability": "memory-only — a daemon restart revokes it; identity.json is untouched",
+            // The promotion is part of the record, not a separate act: the standing grant's
+            // expiry and the generation it will mint travel with the ruling that made it.
+            "standing": standing,
+            "standing_expires_at": standing_expires_at,
+            "standing_generation": if standing {
+                serde_json::json!(s.standing_scope.generation + 1)
+            } else {
+                serde_json::Value::Null
+            },
+            "durability": if standing {
+                "STANDING — written to the vault's standing-scope document; survives restart; \
+                 revocable via /api/scope/standing/revoke; identity.json is untouched"
+            } else {
+                "memory-only — a daemon restart revokes it; identity.json is untouched"
+            },
         }),
     );
     let entry = match entry {
@@ -1592,6 +1640,38 @@ async fn scope_decide(
             );
         }
     };
+
+    // THE STANDING WIDENING, applied after its record committed (same order rule as above).
+    // The in-memory mutation and the vault write must land together: a grant live in memory
+    // but absent from the vault would silently die at the next restart — the exact lie this
+    // store exists to end — so a failed persist ROLLS BACK the mutation and reports that the
+    // decision was witnessed but NOT applied. The chain then holds a record of a grant that
+    // is not live: the safe direction, and legible.
+    if standing {
+        s.standing_scope
+            .add(crate::server::standing_scope::StandingGrant {
+                member: plugin_id.clone(),
+                path: path.clone(),
+                granted_at: now,
+                granted_by: "operator".to_string(),
+                reason: reason.clone(),
+                expires_at: standing_expires_at,
+                request_id: Some(request_id.clone()),
+            });
+        if let Err(e) = s.persist_standing_scope() {
+            s.standing_scope.revoke(&plugin_id, &path);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "standing grant witnessed but NOT applied — vault write failed ({e}); \
+                         the store is unchanged, re-decide to retry"
+                    ),
+                    "witnessEntryHash": entry.hash,
+                })),
+            );
+        }
+    }
 
     if let Some(req) = s.scope_requests.get_mut(&request_id) {
         req.granted = Some(granted);
@@ -1613,6 +1693,115 @@ async fn scope_decide(
             "granted": granted,
             "path": path,
             "expires_at": expires_at,
+            "standing": standing,
+            "standing_expires_at": standing_expires_at,
+            "generation": if standing { serde_json::json!(s.standing_scope.generation) } else { serde_json::Value::Null },
+            "witnessEntryHash": entry.hash,
+        })),
+    )
+}
+
+/// `POST /api/scope/standing/revoke` {plugin_id, path, reason?}
+///
+/// The revoke half of the durable channel — first-class because a durable widening with no
+/// revocation verb would make "restart the daemon" the only way out, which is precisely the
+/// backstop the standing store gave up. Behind the operator gate like every scope decision.
+///
+/// ORDER, deliberately different from the grant path: witness first (a revoke that could not
+/// be recorded is refused, same as the grant), but on a failed PERSIST the in-memory removal
+/// is KEPT rather than rolled back — a failure here may only ever leave the TIGHTER state in
+/// force, and the error says the disk still holds the grant so the operator retries.
+async fn scope_standing_revoke(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let plugin_id = body
+        .get("plugin_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let raw_path = body
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if plugin_id.is_empty() || raw_path.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "plugin_id and path are required"})),
+        );
+    }
+    let path = crate::server::state::normalize_scope_path(&raw_path);
+    let reason = body
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let now = crate::server::gate_escalation::now_secs();
+
+    let mut s = state.lock().await;
+    if !s.standing_scope.has_live(&plugin_id, &path, now)
+        && !s
+            .standing_scope
+            .grants
+            .iter()
+            .any(|g| g.member == plugin_id && g.path == path)
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no standing grant of record for that (plugin_id, path)"})),
+        );
+    }
+
+    let entry = match s.append_chain(
+        "scope_standing_revoked",
+        serde_json::json!({
+            "plugin_id": plugin_id,
+            "subject_instance_lct": s.member_lct(&plugin_id),
+            "path": path,
+            "reason": reason,
+            "revoked_by": "operator",
+            "via": "operator_session",
+            "standing_generation": s.standing_scope.generation + 1,
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("witness append failed, revoke NOT applied: {e}")
+                })),
+            );
+        }
+    };
+
+    s.standing_scope.revoke(&plugin_id, &path);
+    if let Err(e) = s.persist_standing_scope() {
+        // Memory is already the tighter state; keep it. The vault still holds the grant, so
+        // a restart would resurrect a widening — said loudly so the operator retries.
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!(
+                    "revoked in memory but the vault write FAILED ({e}) — a restart would \
+                     resurrect this grant; retry the revoke"
+                ),
+                "witnessEntryHash": entry.hash,
+            })),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "plugin_id": plugin_id,
+            "path": path,
+            "generation": s.standing_scope.generation,
             "witnessEntryHash": entry.hash,
         })),
     )

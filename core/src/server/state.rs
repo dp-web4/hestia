@@ -195,22 +195,31 @@ impl ScopeRequest {
 /// task turns a scoped exception into a standing one by inattention.
 pub const SCOPE_REQUEST_TTL_SECS: u64 = 8 * 3600;
 
-/// THE ASYMMETRY, stated once so neither half drifts (dp, 2026-08-01):
+/// THE ASYMMETRY, stated once so neither half drifts (dp, 2026-08-01; amended 2026-08-14):
 ///
-/// | direction  | where it lives              | survives restart |
-/// |------------|-----------------------------|------------------|
-/// | TIGHTENING | vault (`instance_overlays`) | **yes**          |
-/// | LOOSENING  | memory (`instance_grants`)  | **no**           |
+/// | direction           | where it lives                      | survives restart |
+/// |---------------------|-------------------------------------|------------------|
+/// | TIGHTENING          | vault (`instance_overlays`)         | **yes**          |
+/// | LIVE loosening      | memory (`instance_grants`,          | **no**           |
+/// |                     |  `scope_requests`)                  |                  |
+/// | STANDING loosening  | vault (`scope`/`standing` document) | **yes**          |
 ///
-/// This is deliberate and the two directions must never be unified into one store. A
-/// RESTRICTION has to be durable — a member restricted for cause must not be freed by a
-/// reboot, and "restart the daemon" would otherwise be the way out of any tightening. A
-/// PERMISSION has to be ephemeral — a grant nobody remembers to revoke must expire on its own,
-/// and the daemon restarting is the backstop that guarantees it does.
+/// The first two rows are the 2026-08-01 doctrine and are unchanged: a RESTRICTION has to be
+/// durable — a member restricted for cause must not be freed by a reboot — and a LIVE
+/// permission has to be ephemeral, with the daemon restarting as the backstop that guarantees
+/// a grant nobody remembers to revoke dies on its own.
 ///
-/// Neither lives in an external file. Tightening is vault↔memory: it is written into the
-/// encrypted vault and read back into `instance_policy_engines`, never to a plaintext config
-/// on disk that could be edited around the gate — which is the hole `#133` recorded, where
+/// The third row was added on dp's explicit ruling (2026-08-14, Sprint F R1 "the real fix"):
+/// standing member scope needs a daemon surface, or the only durable widening is a
+/// member-writable `identity.json` the certified-replica logic rightly refuses. A STANDING
+/// permission is durable ON PURPOSE — but it trades the restart backstop for four explicit
+/// controls: operator-only mutation (the challenge-signed HTTP surface; no MCP tool), an
+/// honoured `expires_at`, a first-class witnessed revoke, and a monotonic `generation` so a
+/// consumer can tell WHICH policy a copy is. See `server::standing_scope`.
+///
+/// None of the three lives in an external plaintext file. Both durable rows are vault↔memory:
+/// written into the encrypted vault and read back at startup, never to a plaintext config on
+/// disk that could be edited around the gate — which is the hole `#133` recorded, where
 /// widening a member's authority was a `json.dump` nobody had to ask permission for.
 pub const POLICY_SCOPE_ASYMMETRY: () = ();
 
@@ -312,6 +321,12 @@ pub struct ServerState {
     /// refused is as much of the account as the record of one that was granted, and a map
     /// keyed by target would let a re-ask overwrite a refusal.
     pub scope_requests: HashMap<String, ScopeRequest>,
+    /// STANDING scope grants — the third row of `POLICY_SCOPE_ASYMMETRY`: durable,
+    /// operator-decided, vault-persisted (`scope`/`standing` document), generation-counted.
+    /// Loaded at startup, written back through `persist_standing_scope` on every operator
+    /// decision. Mutated ONLY from the operator-gated HTTP surface; no MCP tool reaches it
+    /// (`no_mcp_tool_can_mutate_standing_scope`). See `server::standing_scope`.
+    pub standing_scope: crate::server::standing_scope::StandingScopeStore,
     /// Hub-law gate (consolidation, 2026-07-10): the third fold input.
     /// `None` = no law file at `$HESTIA_HOME/law/hub-law.yaml` (no-op);
     /// `Some(Invalid)` fails closed. See `policy::law_gate`.
@@ -456,6 +471,19 @@ impl ServerState {
             )?
         };
 
+        // Standing scope grants (durable loosenings — POLICY_SCOPE_ASYMMETRY row 3).
+        // Present-but-unparseable must abort startup like the synthetic set: collapsing a
+        // corrupt store to empty would silently drop operator-made durable grants, and a
+        // ruling that vanishes without a trace is the exact failure the escalation-replay
+        // block above refuses. An ABSENT document is a fresh install and empty is correct.
+        let standing_scope: crate::server::standing_scope::StandingScopeStore = {
+            use anyhow::Context;
+            crate::vault::load_doc(&vault, "scope", "standing", "standing-scope.json").context(
+                "standing-scope store unreadable — failing closed instead of dropping \
+                 operator-made durable grants",
+            )?
+        };
+
         let mut st = Self {
             scope_tally: std::collections::HashMap::new(),
             vault,
@@ -478,6 +506,9 @@ impl ServerState {
             instance_grants: HashMap::new(),
             // Same reasoning, same lifetime: a widening dies with the daemon.
             scope_requests: HashMap::new(),
+            // The deliberate exception (row 3): standing grants are durable and were just
+            // loaded from the vault, so an operator's standing ruling survives the deploy.
+            standing_scope,
             law_gate,
             synthetic_plugins,
             home: home.to_path_buf(),
@@ -796,6 +827,35 @@ impl ServerState {
         self.scope_requests
             .values()
             .any(|r| r.plugin_id == plugin_id && r.grants(&want, now))
+            // A STANDING grant answers the same question — "is there a grant of record for
+            // exactly this path" — so a member re-asking for a path it durably holds hears
+            // `already_granted` instead of filing an ask nobody needs to rule on.
+            || self.standing_scope.has_live(plugin_id, &want, now)
+    }
+
+    /// Every live STANDING grant this member holds (durable row of the asymmetry).
+    /// Expiry is filtered at the read, in the store, so no serving surface can leak one.
+    pub fn live_standing_grants(
+        &self,
+        plugin_id: &str,
+    ) -> Vec<&crate::server::standing_scope::StandingGrant> {
+        let now = crate::server::gate_escalation::now_secs();
+        self.standing_scope.live_for(plugin_id, now)
+    }
+
+    /// Write the standing-scope store back to its vault document. The vault's own save is
+    /// temp-file-and-rename, so the on-disk document is atomic; callers decide what a
+    /// failed persist means (the decide surface rolls the in-memory mutation back so a
+    /// grant is never live-but-undurable, the revoke surface keeps memory revoked so a
+    /// failure can only ever leave the TIGHTER state in force).
+    pub fn persist_standing_scope(&mut self) -> Result<()> {
+        crate::vault::save_doc(
+            &mut self.vault,
+            "scope",
+            "standing",
+            "standing-scope.json",
+            &self.standing_scope,
+        )
     }
 
     pub fn member_lct(&self, plugin_id: &str) -> Option<String> {

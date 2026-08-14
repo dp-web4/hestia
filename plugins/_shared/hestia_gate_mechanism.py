@@ -508,16 +508,44 @@ def witness_decision_unified(client_or_none, *, plugin_id: str, decision: str, r
 # grants NOTHING extra (the tighter direction), and reachable-but-thin is not the
 # degraded trigger — society safety still governs writes on that path.
 #
-# WHAT THE DAEMON CAN CERTIFY TODAY (measured 2026-08-13, core/src/server/handler.rs):
+# WHAT THE DAEMON CAN CERTIFY TODAY (measured 2026-08-13, core/src/server/handler.rs;
+# extended 2026-08-14, Sprint F R1 — the standing-scope surface, ending R1's "no daemon
+# surface for standing repo scope"):
 #   - hestia_operating_law(session_id): identity{plugin_id, role} — the daemon-resolved
 #     role for this session (replacing the identity.json role bridge when present) — plus
-#     the composed law and its law_hash, and any disclosed operator_grant;
+#     the composed law and its law_hash, and any disclosed operator_grant (and, with R1,
+#     a projection that finally carries the scope_grants its own hash covers — #407);
 #   - hestia_scope_status(plugin_id): the live, memory-only PATH grants minted by
-#     hestia_request_scope; carried here as "path:<path>" entries in `in_scope`.
-# WHAT IT CANNOT (declared RED in Sprint F's notes; §9 forbids inventing surfaces):
-#   standing repo scope has NO daemon surface at all, hestia_operating_law's final
-#   projection DROPS the scope_grants field its own hash covers, and no launch-cwd grant
-#   surface exists. Absent surfaces contribute NOTHING to the snapshot.
+#     hestia_request_scope (carried as "path:<path>" entries in `in_scope`), PLUS the
+#     durable operator-promoted `standing_grants` from the daemon's vault-persisted
+#     store, with the store's monotonic `generation` and a daemon-issued
+#     `snapshot_expires_at` — the certification pair AgentPolicy has required since
+#     2026-08-04 with nothing issuing it. A standing grant naming a REPO ROOT directly
+#     under the workspace is carried as the bare repo NAME (the form the core's
+#     segment-keyed scope model admits); a deeper path keeps the faithful "path:" form
+#     (a file grant must not front for its whole repo).
+# WHAT IT STILL CANNOT (declared RED in Sprint F's notes):
+#   no launch-cwd grant surface exists, and deeper-than-root "path:" entries stay inert
+#   against the core's segment-keyed model (R2). Absent surfaces contribute NOTHING to
+#   the snapshot: an older daemon without `standing_grants` yields the pre-R1 snapshot.
+
+def _scope_entry_for_grant(path: str) -> str:
+    """A granted path becomes the `in_scope` spelling the core can actually honour.
+
+    A grant naming a REPO ROOT directly under the workspace maps to the bare repo NAME —
+    the only form evaluate()'s segment-keyed scope model admits. Anything deeper keeps
+    the faithful "path:" form: a FILE grant must not front for its whole repo (Sprint F
+    R2's conservatism, still binding). Lexical + realpath, no stat: the daemon records
+    grants while this gate enforces them, and the two must agree on what a path names
+    even when the object does not exist yet."""
+    p = os.path.realpath(os.path.expanduser(path.strip()))
+    ws = os.path.realpath(os.path.expanduser(
+        os.environ.get("HESTIA_WORKSPACE", "/mnt/c/exe/projects/ai-agents")))
+    par, name = os.path.split(p.rstrip("/"))
+    if par == ws and name:
+        return name
+    return "path:" + path.strip()
+
 
 #: One fetch per gate invocation — gate processes are short-lived, so a per-process cache
 #: is a per-invocation cache; it exists so a shim may consult the snapshot at several
@@ -552,7 +580,10 @@ def _fetch_policy_snapshot_once(plugin_id: str, *, host_agent: Optional[str] = N
     dict  -> a snapshot the daemon answered for. ALWAYS carries an `in_scope` LIST (so the
              core's resolve_agent_policy(vault_reader=...) seam can never fall through to
              the local replica on this path), plus `role`, `law_hash`, `operator_grant`,
-             `scope_grants`, `source`, `fetched_at`, `session_id`."""
+             `scope_grants`, `standing_grants`, `generation`, `expires_at`, `source`,
+             `fetched_at`, `session_id`. `generation`/`expires_at` are the daemon-issued
+             certification pair (Sprint F R1): resolve_agent_policy stamps them onto the
+             AgentPolicy it returns, and refuses the snapshot outright past its horizon."""
     if use_cache and plugin_id in _POLICY_SNAPSHOT_CACHE:
         return _POLICY_SNAPSHOT_CACHE[plugin_id]
     snap = _fetch_policy_snapshot_uncached(plugin_id, host_agent, host_session_id)
@@ -619,6 +650,9 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             "operator_grant": None,
             "in_scope": [],
             "scope_grants": [],
+            "standing_grants": [],
+            "generation": None,
+            "expires_at": None,
         }
         law = _unwrap_tool_result(
             client.call_tool("hestia_operating_law", {"session_id": session_id}))
@@ -657,6 +691,33 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
                             snap["in_scope"].append(_name)
                         else:
                             snap["in_scope"].append("path:" + p.strip())
+            # STANDING grants (Sprint F R1) — the durable, operator-promoted list the
+            # daemon persists in its vault. Additive beside live_grants; absent on an
+            # older daemon, in which case everything below is a no-op and the snapshot
+            # is exactly the pre-R1 one.
+            standing = scope.get("standing_grants")
+            if isinstance(standing, list):
+                for g in standing:
+                    p = g.get("path") if isinstance(g, dict) else None
+                    if isinstance(p, str) and p.strip():
+                        snap["standing_grants"].append({
+                            "path": p.strip(),
+                            "expires_at": g.get("expires_at"),
+                            "granted_by": g.get("granted_by"),
+                            "reason": g.get("reason"),
+                        })
+                        snap["scope_grants"].append(p.strip())
+                        snap["in_scope"].append(_scope_entry_for_grant(p))
+            # CERTIFICATION, issued by the authority (Sprint F R1): the standing store's
+            # monotonic generation ("WHICH policy is this copy") and the daemon's honor
+            # horizon for it. Booleans are excluded deliberately — isinstance(True, int)
+            # holds in Python, and a `true` here must not read as generation 1.
+            gen = scope.get("generation")
+            if isinstance(gen, int) and not isinstance(gen, bool):
+                snap["generation"] = gen
+            exp = scope.get("snapshot_expires_at")
+            if isinstance(exp, int) and not isinstance(exp, bool):
+                snap["expires_at"] = exp
         return snap
     except Exception as e:  # noqa: BLE001 — any failure is "unreachable"; the caller degrades
         _snapshot_unavailable(

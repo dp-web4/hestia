@@ -50,8 +50,9 @@ class FakeClient:
             raise urllib.error.URLError("boom")
         payload = {"hestia_connect": self.connect,
                    "hestia_begin_action": self.begin,
-                   "hestia_query_policy": self.policy}[name]
-        return {"result": {"structuredContent": payload}}
+                   "hestia_query_policy": self.policy}
+        payload.update(getattr(self, "extra", {}))
+        return {"result": {"structuredContent": payload[name]}}
 
 
 def _drive(fake, endpoint="http://fake/mcp"):
@@ -149,6 +150,71 @@ def test_unknown_decision_value_failcloses():
     check("unknown_decision", (not v.allow) and (not v.decided), str(v))
 
 
+# ---- standing scope (Sprint F R1): daemon-certified snapshot admits ----
+def test_standing_grant_becomes_admitting_scope_with_certification():
+    """A durable standing grant served by the daemon must land in the snapshot as an
+    ADMITTING in_scope entry (repo-root -> repo name), carry the daemon-issued
+    certification pair (generation + expires_at), and flow through the core's
+    resolve_agent_policy vault branch onto an AgentPolicy that path_in_scope honours.
+    The expired arm is the tighten half: a snapshot past its own horizon grants NOTHING."""
+    import tempfile
+    import hestia_gate_core as core
+    ws = tempfile.mkdtemp(prefix="sswt-ws-")
+    old_ws = os.environ.get("HESTIA_WORKSPACE")
+    os.environ["HESTIA_WORKSPACE"] = ws
+    try:
+        horizon = int(time.time()) + 3600
+        fake = FakeClient()
+        fake.extra = {
+            "hestia_operating_law": {
+                "identity": {"plugin_id": "kimi-code", "role": "role:constellation:member"},
+                "law_hash": "h-std"},
+            "hestia_scope_status": {
+                "plugin_id": "kimi-code", "requests": [], "live_grants": [],
+                "standing_grants": [
+                    {"path": ws + "/web4", "granted_by": "operator",
+                     "reason": "standing repo grant", "expires_at": None},
+                    {"path": ws + "/web4/deep/file.txt", "granted_by": "operator",
+                     "reason": "file grant stays a path grant", "expires_at": None},
+                ],
+                "generation": 4,
+                "snapshot_expires_at": horizon},
+        }
+        m._discover_endpoint = lambda: "http://fake/mcp"
+        m._McpHttp = lambda ep, dl: fake
+        snap = m.fetch_policy_snapshot("kimi-code", use_cache=False)
+        check("standing_snap_present", isinstance(snap, dict), repr(snap))
+        check("standing_repo_root_maps_to_name", "web4" in snap["in_scope"], str(snap))
+        check("standing_deep_path_stays_path",
+              ("path:" + ws + "/web4/deep/file.txt") in snap["in_scope"], str(snap))
+        check("standing_list_carried", len(snap["standing_grants"]) == 2, str(snap))
+        check("standing_generation", snap["generation"] == 4, str(snap))
+        check("standing_expires_at", snap["expires_at"] == horizon, str(snap))
+
+        prof = core.HarnessProfile(member_id="kimi-code",
+                                   identity_path="/nonexistent/identity.json")
+        pol = core.resolve_agent_policy(prof, vault_reader=lambda mid: snap)
+        check("standing_source_vault", pol.source == "vault", str(pol))
+        check("standing_scope_admits_name", "web4" in pol.scope, str(pol))
+        check("standing_cert_generation", pol.generation == 4, str(pol))
+        check("standing_cert_expires_at", pol.expires_at == horizon, str(pol))
+        check("standing_path_in_scope_admits",
+              core.path_in_scope(ws + "/web4/anything.rs", pol.scope, ws, prof, None),
+              f"scope={pol.scope} ws={ws}")
+
+        expired = dict(snap)
+        expired["expires_at"] = 1
+        pol2 = core.resolve_agent_policy(prof, vault_reader=lambda mid: expired)
+        check("standing_expired_grants_nothing",
+              pol2.scope == () and pol2.source == "vault-expired" and pol2.stale,
+              str(pol2))
+    finally:
+        if old_ws is None:
+            os.environ.pop("HESTIA_WORKSPACE", None)
+        else:
+            os.environ["HESTIA_WORKSPACE"] = old_ws
+
+
 # ---- FAIL-CLOSED: deadline exhaustion + bad env (GPT #4) ----
 def test_exhausted_deadline_refuses_request():
     c = _REAL_MCP("http://x", deadline=time.monotonic() - 1.0)  # already past
@@ -190,6 +256,7 @@ ALL = [
     test_unknown_status_failcloses,
     test_missing_decision_failcloses,
     test_unknown_decision_value_failcloses,
+    test_standing_grant_becomes_admitting_scope_with_certification,
     test_exhausted_deadline_refuses_request,
     test_bad_budget_env_defaults_not_raises,
 ]
