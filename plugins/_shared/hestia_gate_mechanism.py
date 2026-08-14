@@ -56,7 +56,12 @@ def _num_env(name: str, default: float, cast) -> float:
 # filed as a daemon regression). 2500 fits inside codex's ~3s engine clamp with margin,
 # keeps the gate the fail-closed party, and gives steady-state (1-30ms/leg) wide headroom.
 # Env-overridable as ever: HESTIA_PRE_TOTAL_BUDGET_MS.
-TOTAL_BUDGET_MS = int(_num_env("HESTIA_PRE_TOTAL_BUDGET_MS", 2500, int))
+# 4000 (was 2500): first FIELD-DIAGNOSED dropout (2026-08-14, cause telemetry) was a
+# raw socket TimeoutError on an idle box — the daemon has intermittent multi-second
+# stall windows (#423: latency jitter 2-228ms + spikes past 2.5s, 10% idle CPU busy
+# loop). 4000 x (1 try + 1 retry) absorbs stalls to ~8s, still well inside the
+# measured engine clamps (codex 15s config, kimi 30s config).
+TOTAL_BUDGET_MS = int(_num_env("HESTIA_PRE_TOTAL_BUDGET_MS", 4000, int))
 REQUEST_TIMEOUT_S = float(_num_env("HESTIA_PRE_REQUEST_TIMEOUT_S", 5.0, float))
 MAX_POLLS = 5
 MIN_POLL_SLEEP_MS = 50
