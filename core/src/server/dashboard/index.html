@@ -125,6 +125,11 @@
   .govern-pane-head h2 { margin: 0; font-size: 0.95rem; }
   .policy-state { font-size: 0.72rem; color: var(--fg-dim); margin-left: auto; }
   .policy-state.policy-btn-scoped { color: var(--warning); font-weight: 600; }
+  /* A LIVE grant is the amber one. `.grant-preset` is already the warning colour, which is
+     right for a grant that dies at the next restart; STANDING overrides it to a calm accent
+     because durability is the state the operator meant to buy. There is deliberately no
+     styling in which an about-to-evaporate grant reads as settled (§6.3). */
+  .scope-standing { color: var(--accent) !important; }
   .devices-notice { border: 1px solid var(--warning); border-radius: 8px; padding: 0.7rem 0.9rem;
     margin-bottom: 0.8rem; font-size: 0.78rem; line-height: 1.55; color: var(--fg); }
   .devices-raw { font-size: 0.72rem; background: var(--bg-elev); border: 1px solid var(--border);
@@ -1115,6 +1120,7 @@
     <div id="govern-view" class="dash-view" hidden>
       <nav class="govern-nav" id="govern-nav" aria-label="Governance section">
         <button type="button" class="govern-chip selected" data-gov="ledger">ledger</button>
+        <button type="button" class="govern-chip" data-gov="grants">grants</button>
         <button type="button" class="govern-chip" data-gov="policy">policy</button>
       </nav>
 
@@ -1146,6 +1152,61 @@
             </select>
           </div>
           <div id="ledger-list" class="govern-scroll"><div class="empty">loading…</div></div>
+        </section>
+
+        <!-- MRH SCOPE GRANTS sub-screen. dp, 2026-08-15: "i still don't have a way of actually
+             granting scope. you have not yet created the govern screen, nor a way for me to
+             get to it." This is that way.
+
+             It is deliberately NOT a second place to decide pending requests. Deciding lives
+             in the scope banner's modal, which AC-20 keeps reachable from every view and which
+             #456 just repaired; building a second copy of a decision control is how the two
+             drift until one of them lies. Pending requests appear here as rows that hand you
+             to that one control. -->
+        <section class="govern-pane" id="govern-grants" hidden>
+          <div class="govern-pane-head">
+            <h2>Scope grants <span class="pol-mode" id="scope-gen"></span></h2>
+          </div>
+          <div class="govern-scroll">
+            <div class="esc-note">
+              An MRH scope grant is what lets a member reach a path outside its own tree. Two
+              kinds, and the difference is the one that has been costing you grants:
+              <strong>live</strong> grants are held in memory and <strong>die at the next daemon
+              restart</strong>; <strong>standing</strong> grants are written to the vault and
+              survive it. Every grant and revocation is witnessed.
+            </div>
+
+            <div class="pol-section-label">Pending requests — a member is asking</div>
+            <div id="scope-pending-list"><div class="empty">No member is waiting on a scope decision.</div></div>
+
+            <div class="pol-section-label">In force now</div>
+            <div id="scope-grant-list"><div class="empty">loading…</div></div>
+
+            <div class="pol-section-label">Grant scope directly — no member request needed</div>
+            <div class="grant-note">
+              This is the <strong>operator-originated</strong> grant. Until 2026-08-15 the only
+              widening door answered a member's ask, so a member had to fail first before you
+              could act — and when every envelope emptied after a restart, the remedy a member
+              would use to ask was itself denied by the emptiness it existed to fill. A grant
+              made here is <strong>standing</strong> (durable across restarts), is recorded as
+              an act you originated rather than a reply to a request nobody made, and is
+              revocable above.
+            </div>
+            <div class="pol-add grant-add">
+              <input class="pol-input" id="sg-plugin" placeholder="plugin_id (e.g. kimi-code)" size="16">
+              <input class="pol-input" id="sg-path" placeholder="absolute path" size="34">
+              <select class="pol-select" id="sg-ttl">
+                <option value="">until revoked</option>
+                <option value="28800">8 hours</option>
+                <option value="86400">1 day</option>
+                <option value="604800">1 week</option>
+              </select>
+              <input class="pol-input" id="sg-reason" placeholder="reason (required)" size="26">
+              <button class="pol-btn-add" id="sg-grant-btn" disabled>grant</button>
+            </div>
+            <div class="esc-err" id="sg-err" hidden></div>
+            <div class="grant-note" id="sg-ok" hidden></div>
+          </div>
         </section>
 
         <!-- policy sub-screen -->
@@ -2334,6 +2395,14 @@
     renderScopeRequests(data);
     updateGovernBadge(data);
     renderGrants(data);
+    // Devices renders from the snapshot, so it must be re-rendered ON THE TICK and not only
+    // on mount — otherwise sitting on the tab shows a frame frozen at the moment you arrived,
+    // which is a staleness defect wearing the same face as "nothing has changed". Guarded on
+    // the active view so an unmounted screen costs nothing.
+    if (activeView === 'devices') renderDevices(data);
+    // Same rule for the grants pane, and it matters more there: a live grant's remaining time
+    // is counting down, so a frozen frame would show an expired grant as still in force.
+    if (activeView === 'govern' && governSection === 'grants') renderScopeGrants(data);
     renderOrchBar(data);
     // Decide the opening view once, from the first real snapshot: no local agents AND no
     // trust history → this box has nothing to govern, so open on hubs (its dominant screen).
@@ -2681,6 +2750,78 @@
       : '';
   }
 
+  // MRH SCOPE GRANTS — what each member may reach, and which half of it survives a restart.
+  //
+  // Renders from the snapshot (`scope_grants`, both kinds merged, each row carrying its own
+  // `lifetime`). The LIFETIME IS THE LOAD-BEARING COLUMN, not decoration: a live grant dies at
+  // the next daemon restart and a standing one does not, and the whole reason this screen
+  // exists is that operators have been spending grants that evaporate on the next deploy
+  // without anything on screen saying so.
+  //
+  // Never-flatter (§6.3): a live grant renders AMBER with its remaining time, because "you
+  // have a grant" and "you have a grant until someone restarts the daemon" are different
+  // facts and only one of them is what the operator thinks they bought. Standing renders
+  // plain. There is no state in which a grant that is about to evaporate renders as calm.
+  function renderScopeGrants(data) {
+    const gen = $('scope-gen');
+    if (gen) {
+      gen.textContent = data
+        ? `standing generation ${data.standing_generation ?? 0}`
+        : 'no snapshot yet';
+    }
+
+    // Pending asks — read-only here on purpose; the decide control lives in the scope modal.
+    const pend = data?.pending_scope_requests ?? [];
+    const pl = $('scope-pending-list');
+    if (pl) {
+      pl.innerHTML = pend.length
+        ? pend.map(r => `
+            <div class="grant-row">
+              <span class="grant-who">${escapeHtml(String(r.claimed_by ?? '?'))}</span>
+              <span class="grant-preset">wants</span>
+              <code>${escapeHtml(String(r.path ?? ''))}</code>
+              <span class="grant-ttl">expires in ${escFmtAge(r.secs_remaining ?? 0)}</span>
+              <span class="grant-why">why: ${escapeHtml(String(r.reason ?? '(none stated)'))}</span>
+              <span class="grant-why"><button class="pol-btn" data-open-scope="1">decide →</button></span>
+            </div>`).join('')
+        : '<div class="empty">No member is waiting on a scope decision.</div>';
+    }
+
+    const list = $('scope-grant-list');
+    if (!list) return;
+    if (!data) { list.innerHTML = '<div class="empty">loading…</div>'; return; }
+    const rows = data.scope_grants ?? [];
+    if (!rows.length) {
+      // "No grants" is a FACT, not an achievement, and must not render as success (§6.3).
+      // It is also the state that produced 102 denies across kimi and codex on 2026-08-15,
+      // so it says what it means rather than showing a reassuring empty panel.
+      list.innerHTML = `<div class="empty">No scope grants in force. Every member is bounded by
+        its own tree — which is the safe state, and also the state in which a member that needs
+        a path outside it will be denied until you grant one here.</div>`;
+      return;
+    }
+    list.innerHTML = rows.map(g => {
+      const live = g.lifetime === 'live';
+      const secs = g.secs_remaining;
+      const when = live
+        ? `dies on restart · ${escFmtAge(secs ?? 0)} left`
+        : (secs === null || secs === undefined ? 'until revoked' : `${escFmtAge(secs)} left`);
+      const origin = g.origin === 'operator_initiated' ? 'you granted this directly' : 'answered a request';
+      return `
+        <div class="grant-row">
+          <span class="grant-who">${escapeHtml(String(g.plugin_id ?? '?'))}</span>
+          <span class="grant-preset${live ? '' : ' scope-standing'}">${live ? 'LIVE' : 'STANDING'}</span>
+          <code>${escapeHtml(String(g.path ?? ''))}</code>
+          <span class="grant-ttl">${escapeHtml(when)}</span>
+          <span class="grant-why">${escapeHtml(origin)}${
+            g.reason ? ' · ' + escapeHtml(String(g.reason)) : ''}</span>
+          ${live ? '' : `<button class="grant-revoke" data-revoke-member="${
+            escapeHtml(String(g.plugin_id))}" data-revoke-path="${
+            escapeHtml(String(g.path))}">revoke</button>`}
+        </div>`;
+    }).join('');
+  }
+
   // DEVICES — constellation management (§6.0.3, AC-22).
   //
   // Two legal outputs and no third: real device state, or an explicit "not yet implemented".
@@ -2704,10 +2845,21 @@
          screen cannot imply your constellation is empty when it is only unrendered.
        </div>`,
     ];
-    if (c === null || c === undefined) {
-      parts.push(`<div class="empty">The snapshot carries no <code>constellation</code> field
-        (it is optional, and absent here). That is a fact about the SNAPSHOT, not evidence that
-        no devices are paired.</div>`);
+    // THREE STATES, NOT TWO — and the first one is the defect this screen exists to prevent,
+    // committed inside the fix for it. The first draft branched on `c` alone, so before the
+    // first snapshot arrived (`lastData === null`, which is exactly when an operator opening
+    // this tab first sees it) it rendered "the snapshot carries no constellation field". There
+    // was no snapshot. It stated a fact about data that had not loaded, which is the same move
+    // as #438's gauge saying `current` about a referent nobody asked for. "Not loaded yet",
+    // "loaded and the field is absent", and "loaded and here it is" are three different
+    // claims, and only the last two are about your constellation.
+    if (!data) {
+      parts.push(`<div class="empty">No snapshot has loaded yet — this says nothing at all
+        about your constellation. If this persists, the dashboard is not reaching the daemon.</div>`);
+    } else if (c === null || c === undefined) {
+      parts.push(`<div class="empty">The snapshot loaded and carries no
+        <code>constellation</code> field (it is optional, and absent here). That is a fact about
+        the SNAPSHOT, not evidence that no devices are paired.</div>`);
     } else {
       parts.push(`<pre class="devices-raw">${escapeHtml(JSON.stringify(c, null, 2))}</pre>`);
     }
@@ -3174,19 +3326,28 @@
   // frame. Policy and the ledger are no longer modals opened by a button; they are panes of
   // the govern view, selected by the sub-nav, following the agents screen's selection-driven
   // scheme (§6.0.2) so an operator who learned one screen has learned both.
+  // Declared list, same reasoning as VIEWS: a half-added pane should be a missing entry, not
+  // a chip that silently falls back to the ledger.
+  const GOVERN_PANES = {
+    ledger: { el: 'govern-ledger', mount: () => loadLedger() },
+    // Grants render from the snapshot, which the page polls anyway, so mounting costs nothing
+    // and the pane is never a stale frame.
+    grants: { el: 'govern-grants', mount: () => renderScopeGrants(lastData) },
+    policy: { el: 'govern-policy', mount: () => fetchPolicy() },
+  };
   let governSection = 'ledger';
   function governShow(section) {
-    if (section !== 'ledger' && section !== 'policy') section = 'ledger';
+    if (!Object.prototype.hasOwnProperty.call(GOVERN_PANES, section)) section = 'ledger';
     governSection = section;
-    const l = $('govern-ledger'), p = $('govern-policy');
-    if (l) l.hidden = section !== 'ledger';
-    if (p) p.hidden = section !== 'policy';
+    for (const [name, spec] of Object.entries(GOVERN_PANES)) {
+      const el = $(spec.el);
+      if (el) el.hidden = name !== section;
+    }
     document.querySelectorAll('#govern-nav .govern-chip')
       .forEach(c => c.classList.toggle('selected', c.dataset.gov === section));
-    // Refresh the section being SHOWN, not both — the ledger reads the chain over HTTP and
-    // is the expensive one; fetching it while the operator is reading policy is work whose
-    // result nobody sees.
-    if (section === 'ledger') loadLedger(); else fetchPolicy();
+    // Refresh only the pane being SHOWN — the ledger reads the chain over HTTP and is the
+    // expensive one; fetching it while the operator is reading policy is work nobody sees.
+    try { GOVERN_PANES[section].mount?.(); } catch (_) { /* never strand the sub-nav */ }
   }
   function governMount() { governShow(governSection); }
 
@@ -3195,6 +3356,88 @@
     if (nav) nav.addEventListener('click', (e) => {
       const chip = e.target.closest('.govern-chip');
       if (chip) governShow(chip.dataset.gov);
+    });
+  })();
+
+  // THE OPERATOR-ORIGINATED SCOPE GRANT, and the revoke beside it.
+  (function wireScopeGrants() {
+    const pane = $('govern-grants');
+    if (!pane) return;
+    const plugin = $('sg-plugin'), path = $('sg-path'), reason = $('sg-reason'),
+          ttl = $('sg-ttl'), btn = $('sg-grant-btn'), err = $('sg-err'), ok = $('sg-ok');
+
+    // Enabled only when every required field is present — the same rule #456 had to add to
+    // the scope popup after dp clicked an enabled-looking button and got silence. A button
+    // that is live-looking and inert is the defect; a visibly disabled one is the fix.
+    const sync = () => {
+      btn.disabled = !(plugin.value.trim() && path.value.trim() && reason.value.trim());
+    };
+    [plugin, path, reason].forEach(el => el.addEventListener('input', sync));
+    sync();
+
+    btn.addEventListener('click', async () => {
+      err.hidden = true; ok.hidden = true;
+      btn.disabled = true;
+      try {
+        const body = {
+          plugin_id: plugin.value.trim(),
+          path: path.value.trim(),
+          reason: reason.value.trim(),
+        };
+        if (ttl.value) body.expires_in_secs = Number(ttl.value);
+        const res = await apiFetch('/api/scope/grant', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const out = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+        // The daemon reports whether that plugin_id has ever connected. A grant to a member
+        // nobody has seen is legitimate (granting ahead of a first connect) and is ALSO what
+        // a typo looks like — so its own answer is shown rather than a generic success.
+        ok.innerHTML = out.member_known
+          ? `Granted <code>${escapeHtml(out.path)}</code> to <strong>${escapeHtml(out.plugin_id)}</strong>
+             — standing, generation ${out.generation}. The gate consults it immediately.`
+          : `<strong>Granted, but no member called "${escapeHtml(out.plugin_id)}" has ever
+             connected to this daemon.</strong> That is fine if you are granting ahead of a
+             first connect — and it is also what a typo looks like. Check the spelling.`;
+        ok.hidden = false;
+        path.value = ''; reason.value = '';
+        sync();
+        await tick();
+        renderScopeGrants(lastData);
+      } catch (e) {
+        err.textContent = `grant failed: ${e.message}`;
+        err.hidden = false;
+        sync();
+      }
+    });
+
+    // Revoke, and the hand-off to the one decide control. Delegated, because the rows are
+    // re-rendered on every tick and per-row listeners would be rebound continuously.
+    pane.addEventListener('click', async (e) => {
+      const open = e.target.closest('[data-open-scope]');
+      if (open) { $('scope-modal').hidden = false; return; }
+      const rev = e.target.closest('[data-revoke-member]');
+      if (!rev) return;
+      const member = rev.dataset.revokeMember, p = rev.dataset.revokePath;
+      const why = prompt(`Revoke standing scope for ${member}?\n\n${p}\n\nReason (optional):`);
+      if (why === null) return;   // cancelled — a tightening still must not happen by accident
+      rev.disabled = true;
+      err.hidden = true;
+      try {
+        const res = await apiFetch('/api/scope/standing/revoke', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ plugin_id: member, path: p, reason: why }),
+        });
+        const out = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+        await tick();
+        renderScopeGrants(lastData);
+      } catch (e2) {
+        err.textContent = `revoke failed: ${e2.message}`;
+        err.hidden = false;
+        rev.disabled = false;
+      }
     });
   })();
 

@@ -422,10 +422,29 @@ pub async fn serve_with_callback(
         .route("/api/scope/decide", post(scope_decide))
         // The durable channel's revoke verb (Sprint F R1). Same wall, same reasoning: a
         // member that could revoke — or, worse, could NOT be revoked — would hold the
-        // control. The GRANT half deliberately has no route of its own: a standing grant
-        // is only ever a promotion of a member's witnessed ask, through /api/scope/decide
-        // {standing:true}, so the ask and its durable answer stay paired.
+        // control.
         .route("/api/scope/standing/revoke", post(scope_standing_revoke))
+        // THE GRANT HALF NOW HAS A ROUTE, REVERSING A DELIBERATE DECISION RECORDED HERE.
+        //
+        // What stood here said: "The GRANT half deliberately has no route of its own: a
+        // standing grant is only ever a promotion of a member's witnessed ask, through
+        // /api/scope/decide {standing:true}, so the ask and its durable answer stay paired."
+        //
+        // The pairing was worth wanting and the mechanism was the wrong way to get it. Making
+        // the ONLY widening door an answer-to-an-ask made the operator's composing power
+        // derivative of a member act — ratify, never originate — against this society's own
+        // rule that only an operator-walled act may compose upward. The restart of
+        // 2026-08-15 showed what that costs: every member's envelope empty, the remedy
+        // (`hestia_request_scope`) denied by the very emptiness it exists to fill, and the
+        // operator holding no verb that could reach in from outside the cycle. The single
+        // grant that landed did so only because a member routed around its own gate to file
+        // the ask. A door reachable only from inside a room nobody can enter is not a door.
+        //
+        // The pairing's EVIDENTIARY value is kept, which is what actually mattered: a
+        // ratification carries a `request_id` and the ask it answered; an originated grant
+        // carries `request_id: null` and `origin: "operator_initiated"`. A reader can always
+        // tell them apart. What is gone is the DEPENDENCY, not the distinction.
+        .route("/api/scope/grant", post(scope_grant))
         .route("/api/policy/preset", put(policy_set_preset))
         .route("/api/policy/override", put(policy_set_override))
         .route(
@@ -1697,6 +1716,196 @@ async fn scope_decide(
             "standing": standing,
             "standing_expires_at": standing_expires_at,
             "generation": if standing { serde_json::json!(s.standing_scope.generation) } else { serde_json::Value::Null },
+            "witnessEntryHash": entry.hash,
+        })),
+    )
+}
+
+/// `POST /api/scope/grant` {plugin_id, path, reason, expires_in_secs?}
+///
+/// THE OPERATOR'S OWN GRANT — no `request_id`, because no member asked.
+///
+/// dp, 2026-08-15: *"i still don't have a way of actually granting scope."* This is why.
+/// `/api/scope/decide` is the only widening door that existed, and it opens with
+/// `scope_requests.get(&request_id)` — it can only ANSWER an ask. So the operator could
+/// ratify a member's request and could not originate a grant, and the fleet reached a state
+/// no one intended: every member's authoritative envelope empty after a restart, the remedy
+/// (`hestia_request_scope`) itself denied by the empty envelope it exists to fill, and the
+/// operator holding no verb that could break the cycle from outside it. The one grant that
+/// did land only landed because a member routed around its own gate to file the ask.
+///
+/// That is not a missing convenience, it is backwards against this society's own rule that
+/// **only an operator-walled act may compose upward; admission may only narrow**. Making the
+/// operator's composing power conditional on a member first failing makes it derivative of a
+/// member act — the operator could ratify, never originate. This verb restores the direction.
+///
+/// **It is its own act, not a synthesized ask.** The obvious shortcut — mint a fake
+/// `ScopeRequest` and immediately decide it — would put a request in the chain that no member
+/// made, and every later reader of that record would mis-attribute the asking. So this appends
+/// `scope_granted` with `request_id: null` and `origin: "operator_initiated"`: a reader can
+/// always tell a grant that answered someone from a grant the operator chose to make.
+///
+/// **It mints a STANDING grant, and only a standing grant.** Live grants are rows in
+/// `scope_requests` (see `live_scope_grants`), so a memory-only version would need exactly the
+/// fake ask this refuses to write. That constraint points the right way: a proactive grant
+/// should outlive a restart. The memory-only form exists because it answers a time-bounded
+/// ask; this one answers nothing, so it is durable until revoked, or until `expires_in_secs`
+/// if the operator wants it bounded — and a bounded STANDING grant still survives a restart,
+/// which is strictly better than what the fleet has been losing on every deploy.
+async fn scope_grant(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let plugin_id = body
+        .get("plugin_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let raw_path = body
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if plugin_id.is_empty() || raw_path.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "plugin_id and path are required"})),
+        );
+    }
+    let path = crate::server::state::normalize_scope_path(&raw_path);
+    let reason = body
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // Same asymmetry as every other widening on this surface, and it binds harder here: this
+    // grant has no member ask attached to explain it, so the reason is the ONLY statement of
+    // why the reach exists. Without it the record is a widening from nowhere.
+    if reason.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "reason is required — an operator-initiated grant carries no member \
+                          request to explain it, so its rationale is the only account of why \
+                          this reach exists"
+            })),
+        );
+    }
+    let now = crate::server::gate_escalation::now_secs();
+    let expires_at: Option<u64> = body
+        .get("expires_in_secs")
+        .and_then(|v| v.as_u64())
+        .filter(|w| *w > 0)
+        .map(|w| now + w);
+
+    let mut s = state.lock().await;
+    // A GRANT TO A MEMBER NOBODY HAS SEEN IS ALMOST ALWAYS A TYPO, and it fails silently:
+    // the row persists, the generation moves, and nothing ever matches it. Not refused —
+    // granting ahead of a member's first connect is legitimate — but REPORTED, so the caller
+    // can tell "granted to kimi-code" from "granted to kimi-cod" while still on the screen.
+    //
+    // THE REGISTRY, NOT `member_lct`. The first version of this asked `member_lct(..).is_some()`
+    // and was structurally incapable of failing: `member_lct` DERIVES a label by hashing the
+    // plugin_id with the sovereign LCT, so it returns `Some` for any non-empty, non-synthetic
+    // string — including `kimi-cod`. It was a guard that could only ever say "known", printing
+    // "the gate consults it immediately" over a grant that would never match anything. Caught
+    // by running the negative case rather than the happy one; a guard nobody has watched FAIL
+    // is a claim, not a check. `member_registry` is the store of members actually recorded, so
+    // asking it can return false.
+    let member_known = s.member_registry.get(&plugin_id).is_some();
+    let replaces = s
+        .standing_scope
+        .grants
+        .iter()
+        .any(|g| g.member == plugin_id && g.path == path);
+
+    // ORDER: WITNESS, THEN WIDEN — the same rule as `scope_decide`, for the same reason. The
+    // record commits before the grant takes effect, and the grant applies only if it committed.
+    let entry = match s.append_chain(
+        "scope_granted",
+        serde_json::json!({
+            // NULL, and load-bearing: this grant answered no ask. A reader that finds a
+            // request_id here is looking at a ratification; one that finds null is looking at
+            // an act the operator originated.
+            "request_id": serde_json::Value::Null,
+            "origin": "operator_initiated",
+            "plugin_id": plugin_id,
+            "subject_instance_lct": s.member_lct(&plugin_id),
+            "path": path,
+            "path_as_asked": raw_path,
+            // There is no `requested_because` because nobody requested it. Saying so beats
+            // omitting the field, which reads as a record that lost its ask.
+            "requested_because": serde_json::Value::Null,
+            "decision_reason": reason,
+            "granted_by": "operator",
+            "via": "operator_session",
+            "standing": true,
+            "standing_expires_at": expires_at,
+            "standing_generation": s.standing_scope.generation + 1,
+            "replaces_existing": replaces,
+            "member_known": member_known,
+            "durability": "STANDING — written to the vault's standing-scope document; survives \
+                           restart; revocable via /api/scope/standing/revoke; identity.json is \
+                           untouched",
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("witness append failed, grant NOT applied: {e}")
+                })),
+            );
+        }
+    };
+
+    let grant = crate::server::standing_scope::StandingGrant {
+        member: plugin_id.clone(),
+        path: path.clone(),
+        granted_at: now,
+        granted_by: "operator".to_string(),
+        reason: reason.clone(),
+        expires_at,
+        // None, for the same reason `request_id` is null in the record above.
+        request_id: None,
+    };
+    if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!(
+                    "grant witnessed but NOT applied — vault write failed ({e}); the live \
+                     store is untouched (the candidate was persisted first), retry to apply"
+                ),
+                "witnessEntryHash": entry.hash,
+            })),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "plugin_id": plugin_id,
+            "path": path,
+            "standing": true,
+            "expires_at": expires_at,
+            "generation": s.standing_scope.generation,
+            "replaced_existing": replaces,
+            // Surfaced so a typo is visible at the moment it is made, not at the moment the
+            // grant fails to help someone.
+            "member_known": member_known,
+            "note": if member_known {
+                "granted — durable until revoked or expiry; the gate consults it immediately"
+            } else {
+                "GRANTED, BUT NO MEMBER BY THAT plugin_id HAS EVER CONNECTED to this daemon. \
+                 That is legitimate if you are granting ahead of a first connect, and it is \
+                 what a typo looks like too. Check the spelling before relying on this."
+            },
             "witnessEntryHash": entry.hash,
         })),
     )

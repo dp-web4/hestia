@@ -103,6 +103,27 @@ pub struct DashboardSnapshot {
     /// that implies something is owed.
     #[serde(default)]
     pub pending_scope_requests: Vec<serde_json::Value>,
+    /// MRH scope grants currently in force — BOTH kinds, each labelled with its lifetime.
+    ///
+    /// Rides the snapshot for the reason the two fields above do, and the doc comment on
+    /// `pending_scope_requests` says it best: *"building the decision surface is not building
+    /// the notice."* The standing store (#431) has been durable and operator-walled since it
+    /// landed, and on 2026-08-15 a restart found `generation=0, standing_grants=[]` for every
+    /// member — the mechanism existed and nobody had ever populated it, because nothing ever
+    /// SHOWED it. There was no read path outside an MCP tool no operator calls.
+    ///
+    /// `lifetime` is on every row deliberately, and is the whole point of merging the two
+    /// lists rather than shipping one: a `live` grant dies at the next daemon restart and a
+    /// `standing` one does not, and an operator who cannot see which is which will keep
+    /// spending grants that evaporate on the next deploy — which is exactly what has been
+    /// happening. Two lists side by side would let the reader assume; one list with the
+    /// distinction on the face of every row does not.
+    #[serde(default)]
+    pub scope_grants: Vec<serde_json::Value>,
+    /// The standing store's generation counter — moves on every durable mutation.
+    /// Rendered beside the grants so a stale panel is legible AS stale (#438).
+    #[serde(default)]
+    pub standing_generation: u64,
     /// Set when the chain read backing `stats` / `stats_by_plugin` FAILED.
     ///
     /// When this is present the counts are not measurements and must not be rendered as
@@ -1212,6 +1233,67 @@ impl ServerState {
                 v.sort_by_key(|x| x["requested_at"].as_u64().unwrap_or(0));
                 v
             },
+            // BOTH kinds of scope grant, in one list, each row carrying its own lifetime.
+            // Live grants are rows in `scope_requests` that were granted and have not lapsed
+            // (`live_scope_grants`); standing grants are rows in the vault-backed store. They
+            // are merged here rather than served as two lists because the question an operator
+            // actually has is "what can this member reach, and which half of it survives a
+            // restart" — and that question is answered wrong by two lists read in sequence.
+            scope_grants: {
+                let now = crate::server::gate_escalation::now_secs();
+                let mut v: Vec<serde_json::Value> = self
+                    .scope_requests
+                    .values()
+                    .filter(|r| r.granted == Some(true) && now < r.expires_at)
+                    .map(|r| {
+                        serde_json::json!({
+                            "lifetime": "live",
+                            "plugin_id": r.plugin_id,
+                            "path": r.path,
+                            "reason": r.decision_reason,
+                            "requested_because": r.reason,
+                            "granted_by": r.decided_by,
+                            "request_id": r.id,
+                            "origin": "member_request",
+                            "expires_at": r.expires_at,
+                            "secs_remaining": r.expires_at.saturating_sub(now),
+                            "durability": "memory-only — the next daemon restart revokes this",
+                        })
+                    })
+                    .collect();
+                v.extend(self.standing_scope.grants.iter()
+                    .filter(|g| g.expires_at.is_none_or(|e| now < e))
+                    .map(|g| {
+                        serde_json::json!({
+                            "lifetime": "standing",
+                            "plugin_id": g.member,
+                            "path": g.path,
+                            "reason": g.reason,
+                            "requested_because": serde_json::Value::Null,
+                            "granted_by": g.granted_by,
+                            "request_id": g.request_id,
+                            // The distinction the route table argues for: a grant that
+                            // ratified a member's ask carries that ask's id; one the operator
+                            // originated carries none. Derived, never stored twice.
+                            "origin": if g.request_id.is_some() {
+                                "member_request"
+                            } else {
+                                "operator_initiated"
+                            },
+                            "granted_at": g.granted_at,
+                            "expires_at": g.expires_at,
+                            "secs_remaining": g.expires_at.map(|e| e.saturating_sub(now)),
+                            "durability": "STANDING — survives restart; revocable",
+                        })
+                    }));
+                v.sort_by(|a, b| {
+                    a["plugin_id"].as_str().unwrap_or("")
+                        .cmp(b["plugin_id"].as_str().unwrap_or(""))
+                        .then(a["path"].as_str().unwrap_or("").cmp(b["path"].as_str().unwrap_or("")))
+                });
+                v
+            },
+            standing_generation: self.standing_scope.generation,
             stats_unavailable: stats_read_error,
             recent_unavailable: recent_read_error,
             deployment: deployment_health(),
