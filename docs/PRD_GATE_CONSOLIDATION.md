@@ -1,6 +1,12 @@
 # PRD — one gate, thin shims: consolidate the per-harness hooks onto the shared core
 
-**Status**: proposed — dp-directed 2026-08-11; peer-reviewed by GPT (NOT-SAME) 2026-08-11 and revised (see §11); fourth pass 2026-08-11 folding kimi's cross-vendor review (notice 1929, see §12) — the step-C pilot seat has read the plan and endorsed it. Execution directed by dp 2026-08-13 (this session): 'the prd is a must … i don't want the cheap solution, i want the actual, well implemented, robust solution.' Sprints A-G tracked in-session; as-is baseline in docs/GATE_CURRENT_STATE.md (PR #397). Fifth pass 2026-08-14: nomad's codex-seat field data re-measured against the landed train (see §13) — one hazard confirmed but not exercised, one criterion still open with a measurement behind it, one half-landed in Sprint G.
+**Status**: **IMPLEMENTED (post-execution)** — sprints A–G are built, reviewed twice by GPT (NOT-SAME),
+repaired, merged (#420 and successors) and **deployed**; the daemon has served the consolidated gate since
+2026-08-14. This document is therefore a record of an executed plan plus its open remainder, not a proposal:
+where a section still reads as future tense it is describing the remainder (§13's open criteria, the
+deployment-observation half of §7.2, and the R1/R2/R3 ledger in `docs/GATE_SPRINT_F_NOTES.md`), and
+carrying "proposed" at the top while the body describes execution was itself a stale truth (GPT audit,
+2026-08-14). History: dp-directed 2026-08-11; peer-reviewed by GPT (NOT-SAME) 2026-08-11 and revised (see §11); fourth pass 2026-08-11 folding kimi's cross-vendor review (notice 1929, see §12) — the step-C pilot seat has read the plan and endorsed it. Execution directed by dp 2026-08-13 (this session): 'the prd is a must … i don't want the cheap solution, i want the actual, well implemented, robust solution.' Sprints A-G tracked in-session; as-is baseline in docs/GATE_CURRENT_STATE.md (PR #397). Fifth pass 2026-08-14: nomad's codex-seat field data re-measured against the landed train (see §13) — one hazard confirmed but not exercised, one criterion still open with a measurement behind it, one half-landed in Sprint G.
 **Author**: claude-code (CBP), 2026-08-11
 **Motivating finding**: the shared gate core (`plugins/_shared/hestia_gate_core.py`) is **built but not wired** — it says so at line 103 (*"NOT WIRED. Nothing imports this yet."*). The live gates (codex, kimi) are the **pre-hardening hand-copies**, so security fixes that already exist in the core are absent from the enforcing hooks.
 **Directive (dp)**: *"common gate whenever possible, per-harness shims call the common gate, with local adjustments only as needed for the specifics of the harness. otherwise it is not maintainable and a massive security risk … fix the procedure, not one message."*
@@ -192,8 +198,19 @@ actually did**, not as proposals. Re-measured at `9a7f45b`; each verdict names i
    re-trust closed it. **Corollary, and the part that outlives the incident:** because trust keys the command
    and not the content, codex hook trust attests nothing about what the hook *does*. Content attestation is a
    separate instrument and it **landed in Sprint G** — `hestia_gate_core.core_digest()`, self-hashed at import
-   and carried on every refusal record by the unified recorder (§7.2(7)). Nomad's hazard is an argument for
+   and **sent on every refusal record by the unified recorder** (§7.2(7)). Nomad's hazard is an argument for
    that instrument, not a second one.
+
+   **SENT is not PERSISTED, and the distinction is the whole lesson of this PRD applied to itself**
+   (GPT audit, 2026-08-14). The shim half is deployed and does send the digest; the daemon half does not
+   keep it. `tool_witness_decision` parses a fixed argument list under `additionalProperties: true`, so the
+   wire `core_digest` is **accepted and silently dropped** at the boundary — filed as **#419**, which also
+   records that the same door never reads `verdict_available`. Until #419 lands, the digest survives only on
+   the per-shim fallback diagnostic log (i.e. precisely when the daemon is *unreachable*), which is inverted
+   from intent. So the honest statement of §7.2(7)'s status is: **declared and executable and deployed on the
+   producing side; not yet observable on the witness chain.** Anyone reading this section as "deployed
+   generation is attested end-to-end" would be reading a claim one boundary wider than the evidence — the
+   exact `shipped ≠ in force` failure the train exists to make impossible to state by accident.
 
 2. **Witness-path parity (nomad's criterion 11) — STILL OPEN, and now measured rather than anecdotal.**
    Sprint E unified the **deny** recorder across harnesses, and `witness_decision_unified()` in
