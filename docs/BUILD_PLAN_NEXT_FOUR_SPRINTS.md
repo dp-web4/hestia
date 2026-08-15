@@ -55,10 +55,25 @@ means the mechanism gets exercised by CLI/API before an interface hardens around
 - **The `.directory` export** with its generation stamp, written on every vault change; a test asserting
   the decision path never reads it.
 - **The denial echo**: a refusal names what would have admitted.
-- **R6/R7 fork** — the one decision this sprint's shape waits on: if `R7Action` subsumes the composite
-  authority object (the PRD in flight answers this), allowlist acts are R7 envelopes from day one and we
-  never build a parallel certification. If it only partly subsumes it, the remainder is built here and
-  named. **Do not start sprint 2 before that finding.**
+- **R6/R7 — the fork is now RESOLVED (PR #451), and the answer is neither branch.** The envelope is the
+  right vocabulary and the right destination, but three of its promises have no implementing code:
+  `escrow_condition` has zero consumers, `available_atp` is a copied float so "atomic settlement" is
+  unimplemented, and `min_atp` only fires when `hard: true`. Two further findings change what we build:
+  - **`ActionStatus` has no `Refused`** (`Pending | Validated | InProgress | Success | Failure | Error`),
+    so a refusal must be logged as "ran and failed" or "infrastructure" — reproducing on the status axis
+    the exact conduct-vs-infra conflation `DeltaClass` was added to fix. Worse, `validate()` sets no
+    status at all, so a validation-refused action stays `Pending`, indistinguishable from one never
+    attempted. That is fail-closed-denies-unrecorded living inside web4-core.
+  - **hestia constructs zero `R7Action`s** and builds a thinner `R6Request` with
+    `resource: Default::default()` — so a hub-law norm selecting on `r6.resource.atp` resolves to `None`
+    on every evaluation, forever. hestia emits R7's reputation *output* without ever constructing the R6
+    *input* it belongs to.
+  
+  **So sprint 2 does not wrap wholesale.** It uses the envelope where it is implemented and **contributes
+  the gaps upstream to web4** rather than working around them locally — starting with
+  `ActionStatus::Refused`, which every governance system downstream needs and which nobody can add
+  locally without forking the canon. Wholesale wrapping stays a later rung, once the envelope can carry
+  a refusal.
 
 **Dogfooding act**: dp grants kimi and codex their working repos and `gh` — once, durably — and the
 denials that blocked them this week stop, lawfully, without an escalation. This is the sprint that pays
@@ -120,7 +135,17 @@ zero compose acts routed to a non-operator rung (structural, testable).
 
 ## The one open question that gates nothing yet
 
-Sybil-resistance of citizenship — the parameter the whole outward scheme's attack resistance reduces to.
+**Calibrating the outward rate governor's nonlinearity.** This *replaces* what I had here — I wrote that
+the outward scheme's attack resistance reduces to citizenship cost, and GPT's review (4942991816) showed
+that is wrong at the population level: a per-caller ceiling bounds one caller, but sybils multiply
+callers, and N identities each drawing a full allowance sum to the whole pool. The population-level bound
+is a **society-wide nonlinear service-rate governor** — a busy call centre — under which *all* external
+identities share one rate envelope, so 1,000 identities do not buy 1,000× capacity. Citizenship's role
+becomes the governed escape into the self-funded regime, not the free tier's anti-sybil parameter.
+
+The remaining calibration question: too shallow a curve is no bound; too steep and the beneficial
+function dies at the knee, cutting off a genuine surge of interest at exactly the moment interest became
+real. Not on the critical path for sprints 1–4.
 Not on the critical path for sprints 1–4, and it should be answered before any outward work starts.
 
 ## Order rationale, in one line each
