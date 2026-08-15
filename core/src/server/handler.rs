@@ -9656,6 +9656,137 @@ mod tests {
         );
     }
 
+    /// Open + sovereign-approve, the setup half of the claim-joinability test below —
+    /// a plain fn rather than a closure so the borrows across `.await` stay obvious.
+    async fn open_and_sovereign_approve(shared: &SharedState, session: &str, marker: &str) {
+        let opened = tool_gate_escalation_claim(
+            shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": session,
+                "tool_name": "Edit",
+                "marker": marker,
+                "reason": format!("Edit -> {marker}"),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened["claimed"], false, "precondition — the open fallback: {opened}");
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+        let mut s = shared.lock().await;
+        s.gate_escalations
+            .decide(
+                &esc_id,
+                true,
+                "operator",
+                "role:constellation:sovereign",
+                crate::server::gate_escalation::Channel::OperatorSession,
+                None,
+                None,
+                crate::server::gate_escalation::now_secs(),
+            )
+            .expect("the sovereign channel decides");
+    }
+
+    /// A claimed approval must carry the join to the act that consumed it. Until
+    /// 2026-08-12 the claimed row was built entirely from STORED escalation fields: the
+    /// attempted act (arriving as `reason`, by the hook's documented design) and the
+    /// caller's session (resolved pre-claim) were parsed on the claim call and dropped —
+    /// so two approved spends (escalations a9ad671d/9921f56c, claimed @131487/@131507)
+    /// provably have no identifiable consuming act on the chain. Walked independently by
+    /// both peers (kimi-code reply-2002; claude-code reply-2005, which also named the
+    /// join key: `host_session_id`, the only one of the window's three session-id
+    /// namespaces — per-act outcome session, per-wake host session, gate-hook connect
+    /// session — that appears on the outcome rows an auditor reads).
+    ///
+    /// ASSERTS ON THE CHAIN ENTRY, not the response: a census reads payloads, and the
+    /// payload is the row a later auditor must be able to join from.
+    ///
+    /// The marker is the gate-hook path, spelled with this file's existing `<gate-hook>`
+    /// redaction convention (see `tool_gate_escalation_claim`, which explains why): the
+    /// literal is what the two production spends carried, and writing the literal here
+    /// refuses this edit for the reason documented there.
+    #[tokio::test]
+    async fn a_claimed_row_carries_the_attempted_act_and_the_outcome_join_key() {
+        let (_dir, shared) = make_shared_state();
+        let r = tool_connect(&shared, &json!({ "plugin_id": "kimi-code", "host_agent": "h" }))
+            .await
+            .unwrap();
+        let session = r["sessionId"].as_str().unwrap().to_string();
+
+        // Open + approve out of band, then RE-ISSUE — the exact shape of the two
+        // production spends this guards: sovereign channel decides, the hook's second
+        // attempt claims.
+        open_and_sovereign_approve(&shared, &session, "<gate-hook>").await;
+
+        // The claiming call the hook makes: attempted act in `reason`, the per-wake key
+        // in `host_session_id`.
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": session,
+                "tool_name": "Edit",
+                "marker": "<gate-hook>",
+                "reason": "Edit -> <gate-hook> (re-issued, claiming the approval)",
+                "host_session_id": "host-wake-37aa0412",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed["claimed"], true, "the approval is spent here: {claimed}");
+
+        let row = shared
+            .lock()
+            .await
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_claimed")
+            .expect("the spend must be witnessed");
+        let d = &row.event_data;
+        assert_eq!(
+            d["attempted_act"], "Edit -> <gate-hook> (re-issued, claiming the approval)",
+            "WHAT the authorised write is — the value that already arrived on this call and \
+             was dropped until now: {d}"
+        );
+        assert_eq!(
+            d["host_session_id"], "host-wake-37aa0412",
+            "the key that joins this spend to its consuming act's outcome rows: {d}"
+        );
+
+        // The sparse claim — a hook that sends neither field (every hook older than this
+        // change) — must still write both keys as explicit nulls. A missing key and a
+        // not-sent value must not be the same row to a census: absence read as pass is
+        // the defect this whole seam keeps producing.
+        open_and_sovereign_approve(&shared, &session, "KINDS.md").await;
+        let sparse = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": session,
+                "tool_name": "Edit",
+                "marker": "KINDS.md",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sparse["claimed"], true, "{sparse}");
+        let row = shared
+            .lock()
+            .await
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| {
+                e.event_type == "gate_escalation_claimed" && e.event_data["marker"] == "KINDS.md"
+            })
+            .expect("the sparse spend must be witnessed");
+        let d = &row.event_data;
+        for k in ["attempted_act", "host_session_id"] {
+            assert!(d.get(k).is_some(), "key `{k}` must be WRITTEN, not omitted: {d}");
+            assert!(d[k].is_null(), "and explicitly null when not sent: {d}");
+        }
+    }
+
     /// The same forgery, at the OPEN door. Both doors carry a copy of this guard, and the
     /// copy is the finding: a census of the claim path's append sites can be exactly right
     /// and still describe half the population. Neither seat's audit had counted this arm —
@@ -12952,6 +13083,12 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // the operator ruled on an id, an asker and a path fragment (dp, 2026-08-02).
     let stated_reason = optional_string(args, "reason");
     let stated_detail = optional_string(args, "detail");
+    // The durable per-wake key the daemon's own outcome rows carry. The claiming hook's
+    // connect session proves WHO asks but joins only to gate-witness rows; this is the
+    // value that joins a spent approval to the act that consumed it. Optional for the
+    // same reason `session_id` is (version skew must not darken the refusal channel) —
+    // and its absence is recorded as explicit null, not a missing key.
+    let host_session_id = optional_string(args, "host_session_id");
     // WHO is asking, provable. Accepted here for the same reason `tool_gate_escalation_open`
     // accepts it (#128: `eligibility` otherwise compares an ASSERTION against an IDENTITY),
     // and because the invitation half cannot issue without it — an invitation is an outward
@@ -13004,6 +13141,23 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
         // Spending an approval is an ACT and is witnessed. The approval itself was already
         // recorded when it was decided; this entry is what ties it to the write it authorised,
         // without which the record would show a permission granted and never show it used.
+        //
+        // For most of this entry's life that sentence was an intent no payload field
+        // implemented: the payload was built entirely from STORED escalation fields, while
+        // the two values that name the consuming act — the attempted act (arriving as
+        // `reason`, by the hook's documented design) and the caller's session (resolved
+        // above) — were parsed on this very call and dropped. Measured, not inferred: two
+        // approved spends (escalations a9ad671d/9921f56c, claimed @131487/@131507) provably
+        // have no identifiable consuming act on the chain — walked independently by both
+        // peers (kimi-code reply-2002, claude-code reply-2005, 2026-08-12).
+        //
+        // The join key is `host_session_id`, NOT the claiming session: three session-id
+        // namespaces live in one window (per-act outcome `session_id`, per-wake
+        // `host_session_id`, the gate hook's own connect session under
+        // `requested_by.session_id`) and only the host session joins a claimed row to the
+        // outcome rows an auditor reads (claude-code's increment, same thread). Both new
+        // fields are null rather than absent when the caller does not send them — a missing
+        // key and a not-sent value must not be the same row to a census.
         let entry = s.append_chain(
             "gate_escalation_claimed",
             json!({
@@ -13015,6 +13169,10 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                 "decided_by": esc.decided_by,
                 "decided_via": esc.decided_via,
                 "reason": esc.reason,
+                // WHAT the authorised write is, in the hook's own words at claim time.
+                "attempted_act": stated_reason,
+                // The per-wake key that joins this spend to its consuming act's outcomes.
+                "host_session_id": host_session_id,
                 // TWO durations, because they answer different questions and the single field
                 // that used to be here answered neither honestly: it was named for the decision
                 // and computed from `opened_at`. kimi-code, PR #114 review.
