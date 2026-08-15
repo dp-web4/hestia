@@ -2418,42 +2418,75 @@
       note.type = 'text';
       note.placeholder = 'note (required to grant)';
       note.value = scopeDrafts.get(String(r.request_id)) ?? '';
-      note.addEventListener('input', () => scopeDrafts.set(String(r.request_id), note.value));
 
-      const mk = (label, granted, cls) => {
-        const b = document.createElement('button');
-        b.className = cls;
-        b.textContent = label;
-        b.addEventListener('click', async () => {
-          // A REASON IS REQUIRED TO GRANT AND NOT TO REFUSE — the same asymmetry the daemon
-          // enforces (`scope_decide` 400s a grant with no reason). Refusing is the safe
-          // direction and must never carry more friction than approving.
-          if (granted && !note.value.trim()) { note.focus(); return; }
-          b.disabled = true;
-          try {
-            const res = await apiFetch('/api/scope/decide', {
-              method: 'POST',
-              body: JSON.stringify({
-                request_id: r.request_id,
-                granted,
-                reason: note.value.trim(),
-              }),
-            });
-            if (!res.ok) { b.disabled = false; return; }
-            scopeDrafts.delete(String(r.request_id));
-            // Force a rebuild next tick rather than optimistically mutating the row: the
-            // daemon owns the outcome, and a UI that shows a decision the daemon has not
-            // recorded is the exact "the button lies" failure the escalation panel names.
-            scopeRenderedSig = null;
-            await tick();
-          } catch (_) { b.disabled = false; }
-        });
-        return b;
+      // A SILENT NO-OP IS THE ONE THING THIS PANEL MUST NOT DO. This handler used to keep the
+      // grant button ENABLED and `return` without a word when the note was empty, and swallow
+      // a non-ok response the same way — so dp clicked `grant` on kimi's request and the UI
+      // did nothing, said nothing, and left the request pending (2026-08-15). The identical
+      // control in the ledger worked, which is what made it look like a dead button rather
+      // than a missing note. Two rules, both copied from the ledger renderer, which had them:
+      //   1. Unmet precondition => the button is VISIBLY disabled, never enabled-and-inert.
+      //   2. A failed decision => the daemon's own error text renders next to the row.
+      // The comment below about "the button lies" was already here, one branch away from the
+      // branch that lied. Requiring a reason to GRANT and not to REFUSE is deliberate and
+      // matches the daemon (`scope_decide` 400s a grant with no reason): refusing is the safe
+      // direction and must never carry more friction than approving.
+      const err = document.createElement('div');
+      err.className = 'esc-err';
+      err.hidden = true;
+
+      const grantBtn = document.createElement('button');
+      grantBtn.className = 'esc-approve';
+      grantBtn.textContent = 'grant';
+      grantBtn.disabled = !note.value.trim();
+      grantBtn.title = 'A note is required to grant — it is recorded as the reason.';
+      note.addEventListener('input', () => {
+        scopeDrafts.set(String(r.request_id), note.value);
+        grantBtn.disabled = !note.value.trim();
+      });
+
+      const decide = async (b, granted) => {
+        err.hidden = true;
+        b.disabled = true;
+        try {
+          const res = await apiFetch('/api/scope/decide', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              request_id: r.request_id,
+              granted,
+              reason: note.value.trim() || null,
+            }),
+          });
+          if (!res.ok) {
+            let msg = `HTTP ${res.status}`;
+            try { const body = await res.json(); if (body?.error) msg = body.error; } catch (_) {}
+            throw new Error(msg);
+          }
+          scopeDrafts.delete(String(r.request_id));
+          // Force a rebuild next tick rather than optimistically mutating the row: the
+          // daemon owns the outcome, and a UI that shows a decision the daemon has not
+          // recorded is the exact "the button lies" failure the escalation panel names.
+          scopeRenderedSig = null;
+          await tick();
+        } catch (e) {
+          err.textContent = `decision failed: ${e.message}`;
+          err.hidden = false;
+          b.disabled = granted ? !note.value.trim() : false;
+        }
       };
+
+      const refuseBtn = document.createElement('button');
+      refuseBtn.className = 'esc-deny';
+      refuseBtn.textContent = 'refuse';
+      grantBtn.addEventListener('click', () => decide(grantBtn, true));
+      refuseBtn.addEventListener('click', () => decide(refuseBtn, false));
+
       controls.appendChild(note);
-      controls.appendChild(mk('grant', true, 'esc-approve'));
-      controls.appendChild(mk('refuse', false, 'esc-deny'));
+      controls.appendChild(grantBtn);
+      controls.appendChild(refuseBtn);
       row.appendChild(controls);
+      row.appendChild(err);
       list.appendChild(row);
     }
   }
