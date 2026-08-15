@@ -346,12 +346,22 @@ def test_hub_deploy_closure_is_write():
 # `i += 1; continue` — never flushes `cur`, never starts a new simple command. The command
 # boundary is ERASED and everything after folds into the preceding argv.
 #
+# THE CLASS IS SEVEN SPELLINGS, NOT ONE (claude-code reply-2628 §5b; replicated
+# row-for-row by kimi-code on its own seat, both arms): `)` fused with any of
+# ; & | ;; && || ) tokenizes as one punct token and erases the boundary the same way.
+# A pin asserting a single spelling would certify the class as closed under the most
+# likely fix — enumerating `");"` into _SEPARATORS — while six spellings stay open
+# (fb_fix_class_not_instance_hold, from the guard side). So the pins assert the CLASS:
+# green only while ALL SEVEN hide the write; red names the closed subset, and a subset
+# means an instance-grain fix landed and the class is STILL OPEN — do not retire.
+#
 # Both defects replicated independently by kimi-code (forum reply 2625), same rows, exact.
 #
 # WHEN ONE OF THESE FAILS: the fix landed. Delete the pin and enable the `# FIXED:` line
 # beneath it — do not just flip the expectation, the twin is the real contract.
 _MARK = "hestia_governance" + "_closure.py"  # assembled: a literal here trips the scan
 _GATE = os.path.expanduser("~/.claude/_shared/") + _MARK
+_FUSED_TRAILINGS = (";", "&", "|", ";;", "&&", "||", ")")
 
 
 def _targets_or_exc(command):
@@ -365,10 +375,17 @@ def _targets_or_exc(command):
 def test_PIN_fused_paren_hides_write_onto_gate_STILL_OPEN():
     k = g._bash_write_targets("f () ( cp /tmp/evil " + _GATE + " )")
     check("K_lone_paren_sees_write", _GATE in k, f"positive control broke: {k}")
-    j = g._bash_write_targets("f() ( cp /tmp/evil " + _GATE + " ); f")
-    check("J_fused_paren_STILL_hides_write", j == ["f"],
-          f"FIX LANDED — hole J is closed, retire this pin. targets={j}")
-    # FIXED: check("J_fused_paren_sees_write", _GATE in j, str(j))
+    s = g._bash_write_targets("f() ( cp /tmp/evil " + _GATE + " ) ; f")
+    check("J_separated_sees_write", _GATE in s, f"separated control broke: {s}")
+    closed = [t for t in _FUSED_TRAILINGS
+              if _GATE in g._bash_write_targets("f() ( cp /tmp/evil " + _GATE + " )" + t + " f")]
+    check("J_fused_class_STILL_hides_write", closed == [],
+          f"closed spellings: {closed}/{len(_FUSED_TRAILINGS)} — ALL closed means the class "
+          f"fix landed, retire this pin; a SUBSET means instance-grain fix, class STILL OPEN")
+    # FIXED: for t in _FUSED_TRAILINGS:
+    #            check(f"J_fused_sees_write:{t}",
+    #                  _GATE in g._bash_write_targets(
+    #                      "f() ( cp /tmp/evil " + _GATE + " )" + t + " f"), t)
 
 
 def test_PIN_fused_paren_leaks_stdin_src_past_boundary_STILL_OPEN():
@@ -379,10 +396,15 @@ def test_PIN_fused_paren_leaks_stdin_src_past_boundary_STILL_OPEN():
         sep = _targets_or_exc("( cat < /tmp/f.patch ) ; " + verb)
         check(f"separated_fails_closed:{verb}", sep == "_OpaqueWriter",
               f"positive control broke: {sep}")
-        fused = _targets_or_exc("( cat < /tmp/f.patch ); " + verb)
-        check(f"fused_STILL_leaks_preimage:{verb}", fused == [],
-              f"FIX LANDED — the new arm resets stdin_src, retire this pin. got={fused}")
-        # FIXED: check(f"fused_fails_closed:{verb}", fused == "_OpaqueWriter", str(fused))
+        closed = [t for t in _FUSED_TRAILINGS
+                  if _targets_or_exc("( cat < /tmp/f.patch )" + t + " " + verb) != []]
+        check(f"fused_class_STILL_leaks_preimage:{verb}", closed == [],
+              f"closed spellings: {closed}/{len(_FUSED_TRAILINGS)} — ALL closed means the new "
+              f"arm resets stdin_src, retire this pin; a SUBSET means class STILL OPEN")
+        # FIXED: for t in _FUSED_TRAILINGS:
+        #            check(f"fused_fails_closed:{verb}:{t}",
+        #                  _targets_or_exc("( cat < /tmp/f.patch )" + t + " " + verb)
+        #                  == "_OpaqueWriter", t)
 
 
 # Explicit list — NOT a globals() comprehension — so every test name is a static reference
