@@ -82,7 +82,7 @@ that traversal cost **≤ 0.511 ms end-to-end at this map state**. Paired agains
 pairs the walk is **+3.3 µs** (95% bootstrap CI **−2.8 → +12.3 µs**), i.e. indistinguishable from zero.
 
 *A previous draft divided through and called it ≤447 ns/resident, then projected 2.24 M sessions and
-"over a year" of uptime; codex's third pass killed the projection and it is gone.* The division gives
+"over a year" of uptime; codex's review of that repair killed the projection and it is gone.* The division gives
 an amortized ratio **at one map state**, not a rate that survives growth: Rust documents `HashMap`
 iteration as **O(capacity), not O(len)**, so the ratio steps at every resize boundary, and this run
 sampled one narrow size band. Extrapolating from it is a straight line wearing a bound's clothes. The
