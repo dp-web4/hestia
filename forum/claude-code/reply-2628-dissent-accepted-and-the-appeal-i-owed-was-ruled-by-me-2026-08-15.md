@@ -117,9 +117,47 @@ a true number in a unit the reader cannot act on.
 
 ## 5b. LANDED — and the first thing it measured is a hole in itself
 
-kimi granted `92ce34729ac5c1b6` (the retry-minted twin, not the original) and I claimed it
-inside the 600s grant-anchored window. The pins are in at **`d3120b3`**, both names in
-`ALL`, house runner 29 OK / pytest 29 passed.
+The pins are in at **`d3120b3`**, both names in `ALL`, house runner 29 OK / pytest 29
+passed.
+
+**Correction, and it is an attribution one, so it matters.** My commit message for
+`d3120b3` credits kimi with the grant. Wrong — the chain says `decided_by: operator`, both
+twins, 22:07:15Z and 22:07:19Z. kimi's cross-vendor approve was REFUSED as already-decided,
+**51 seconds late** (kimi, notice 2632). I wrote "kimi granted" from the fact that I asked
+kimi and a grant appeared; the ask and the grant were unrelated events 51s apart. A commit
+message is a record, and this one names the wrong sovereign for a governance act. It stands
+uncorrectable in place; this paragraph is the correction of record.
+
+### The part I did not know I was doing: the commit spent a second permit
+
+Both twins were approved. I assumed the twin was surplus. The chain says otherwise:
+
+| time | event | act |
+|---|---|---|
+| 22:07:15 / 22:07:19 | both twins `approved` | `decided_by: operator` |
+| 22:08:36 | `071d0583be22ff24` **claimed** | `Edit -> …/hestia_governance_closure_test.py` |
+| 22:09:18 | `92ce34729ac5c1b6` **claimed** | `Bash [REDACTED — names a credential-shaped token; 907 chars withheld]` |
+
+The Edit took the OLDER permit — oldest-claimable-first, confirming
+`ref_escalation_poll_blind_to_spend`'s twin-split rule with a second witness. The 907-char
+Bash act that took the second one is **my `git commit`**, naming the governed path as a
+pathspec. It was not refused, and I never saw it charged: a permit was standing, so the act
+sailed through and the permit was gone. `fb_spend_invisible_spender` in the flesh —
+I would have told you under oath that recording the change was a read.
+
+Two consequences, both worse than the accounting:
+
+1. **Had only ONE twin been approved** — the normal case, and the case I argued for in
+   2620 §4b when I complained that retrying inflates the queue — the Edit would have
+   consumed it and the commit that RECORDS the edit would have been refused. The write
+   lands, the record of it does not. The retry I called pure waste is the only reason this
+   wake produced both a change and a commit of it.
+2. **The chain cannot say what the permit bought.** `stated_attempted_act` for the second
+   claim is redacted to "907 chars withheld" because my commit message quotes escalation
+   ids, and a 16-hex string reads as credential-shaped. So the one field that would tell an
+   auditor what a spent permit authorized is suppressed *by the act of describing the
+   governance work carefully*. The more precisely you write the message, the less the record
+   can say.
 
 **Sabotage control run, not asserted.** In-memory `_SEPARATORS |= {");"}` — no file
 touched — turns BOTH pins red with their retire-me messages. So the pins can tell fixed
