@@ -475,7 +475,7 @@ impl Escalation {
             .filter(|f| f.channel == Channel::PeerMember && f.dissent)
             .count();
         // Invited seats whose mailbox had a reader when they were asked. `absent` is derived
-        // over THIS number, not over every invitee.
+        // over THESE SEATS, not over every invitee.
         //
         // Measured (`tools/invitation_deadletter_census.py`, 60k-entry window): 172 of 272
         // invitation rows went to registry ids with no `member_inbox_touch` row at all —
@@ -488,7 +488,34 @@ impl Escalation {
             .iter()
             .filter(|p| self.invited_without_reader.contains(p))
             .count();
-        let reachable = self.invited_peers.len().saturating_sub(no_reader);
+        // PER IDENTITY, never by subtracting global factor counts from a reduced population
+        // (codex, PR#454 review). Two ways the subtraction lies, both toward silence:
+        //
+        // 1. A readerless invitee whose watcher starts later may still corroborate —
+        //    `corroborate` allows it, expressly including after the decision. Its factor was
+        //    subtracted from a population it had already been held out of, so one answer
+        //    cancelled a DIFFERENT seat's absence: invite A (no reader) and B (reader), let A
+        //    answer, and the record said `absent: 0` while B had never looked.
+        // 2. A peer factor from someone who was never invited subtracted an invited seat's
+        //    absence for the same reason — the arithmetic knew a count, not a name.
+        //
+        // Matching on `Factor::by` costs the identity join both cases were missing. `concurred`
+        // and `dissented` stay global on purpose: they count the evidence that actually
+        // arrived, from whoever sent it. So the four numbers do NOT sum to `invited.len()`,
+        // and that is the honest shape — an uninvited corroboration is real evidence and an
+        // invited silence is real absence, and neither cancels the other.
+        let answered: std::collections::HashSet<&str> = self
+            .factors
+            .iter()
+            .filter(|f| f.channel == Channel::PeerMember)
+            .map(|f| f.by.as_str())
+            .collect();
+        let absent = self
+            .invited_peers
+            .iter()
+            .filter(|p| !self.invited_without_reader.contains(p))
+            .filter(|p| !answered.contains(p.as_str()))
+            .count();
         PeerParticipation {
             invited: self.invited_peers.clone(),
             concurred,
@@ -497,7 +524,7 @@ impl Escalation {
             // same as one that declined, and storing "absent" would freeze a moment as a
             // verdict. Post-decision participation is expressly allowed, so this number
             // can fall after a decision — which is the mechanism working, not drift.
-            absent: reachable.saturating_sub(concurred + dissented),
+            absent,
             invited_without_reader: no_reader,
         }
     }
@@ -660,8 +687,14 @@ pub struct PeerParticipation {
     pub invited: Vec<String>,
     pub concurred: usize,
     pub dissented: usize,
-    /// Invited, HAD A MAILBOX READER, and not yet heard from. Derived, not stored — see
-    /// `peer_participation`.
+    /// Invited seats that HAD A MAILBOX READER and have not answered — counted by identity,
+    /// not by subtracting `concurred + dissented`. Derived, not stored; see
+    /// `peer_participation` for why the difference is load-bearing.
+    ///
+    /// Does NOT complete a partition with the fields above it: `concurred`/`dissented` count
+    /// every peer factor, including one from a seat that was never invited, while this counts
+    /// only invited seats. `absent + invited_without_reader <= invited.len()` is the invariant;
+    /// equality holds exactly while no invited seat has answered.
     pub absent: usize,
     /// Invited seats no watcher had ever read a mailbox for at invite time. Held out of
     /// `absent` because they cannot have looked, and reported beside it because they were
@@ -1606,6 +1639,71 @@ mod tests {
         assert_eq!(p.concurred, 0);
         assert_eq!(p.dissented, 0);
         assert_eq!(p.absent, 0, "nobody was invited, so nobody is absent — absent is DERIVED");
+    }
+
+    /// One peer's answer must not cancel a DIFFERENT peer's silence.
+    ///
+    /// codex's review of PR#454 (the change that first held readerless invitees out of
+    /// `absent`) named the hole in that change: it subtracted a GLOBAL factor count from a
+    /// REDUCED population, so the two numbers were about different sets of seats. The
+    /// specimen it prescribed, run verbatim here — invite a readerless seat and a readable
+    /// one, flag only the readerless seat, let only the readerless seat answer.
+    ///
+    /// The late reader is not hypothetical: `corroborate` expressly admits a factor after the
+    /// decision, which is precisely the window in which a watcher that was not running at
+    /// invite time starts and reads its queue. Under the subtraction that answer drove
+    /// `absent` to 0, so the record said every invited seat had participated while the seat
+    /// with a live mailbox had never looked — the exact confusion the field was added to end,
+    /// reintroduced one layer in.
+    #[test]
+    fn a_late_readers_answer_cannot_hide_a_readable_peers_absence() {
+        let mut s = EscalationStore::default();
+        let e = s
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        let id = e.id.clone();
+        s.invite(&id, vec!["late-reader".into(), "readable-but-absent".into()]);
+        s.record_invitee_readers(&id, vec!["late-reader".into()]);
+
+        // Nothing has landed yet: one flagged, one genuinely awaited.
+        let p = s.get(&id).unwrap().peer_participation();
+        assert_eq!((p.absent, p.invited_without_reader), (1, 1), "{p:?}");
+
+        // The flagged seat's watcher starts and it answers. Its own row leaves `absent`
+        // untouched — it was never counted there — and, critically, does not consume the
+        // other seat's.
+        let after = s
+            .corroborate(&id, "late-reader", "role:constellation:member", None, false,
+                         Some("read the queue late, concur"), T0 + 30)
+            .unwrap()
+            .peer_participation();
+        assert_eq!(after.concurred, 1, "the late answer is still counted as evidence: {after:?}");
+        assert_eq!(
+            after.absent, 1,
+            "`readable-but-absent` has a reader and has said nothing — one answer from a \
+             DIFFERENT seat must not report it as participating: {after:?}"
+        );
+
+        // Same defect, other cause: a peer nobody invited is real evidence, and it is not an
+        // invited seat's absence either. `absent` is a fact about the invitation list.
+        let uninvited = s
+            .corroborate(&id, "a-passing-probe", "role:constellation:member", None, false,
+                         Some("was not asked, looked anyway"), T0 + 40)
+            .unwrap()
+            .peer_participation();
+        assert_eq!(uninvited.concurred, 2, "recorded as the evidence it is: {uninvited:?}");
+        assert_eq!(
+            uninvited.absent, 1,
+            "but it cannot stand in for the seat that WAS asked: {uninvited:?}"
+        );
+
+        // And when the awaited seat finally answers, absence closes — by identity.
+        let done = s
+            .corroborate(&id, "readable-but-absent", "role:constellation:member", None, true,
+                         Some("looked, and disagree"), T0 + 50)
+            .unwrap()
+            .peer_participation();
+        assert_eq!((done.absent, done.dissented), (0, 1), "{done:?}");
     }
 
     /// The two deciding surfaces must answer the same question, because the last time they
