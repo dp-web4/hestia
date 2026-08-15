@@ -1228,3 +1228,38 @@ and all bound the horizon.
 three certification semantics that agree until the first time they do not — and the first time they
 do not is a snapshot that is fresh by one document's rule and stale by another's, admitting an act
 under a policy that had already changed. One composite has one answer.
+
+---
+
+## 13. R6/R7 envelopes — cross-reference
+
+**See `docs/PRD_R6_R7_ENVELOPES.md`** (dp-ruled, 2026-08-14): *"the key is to wrap all these acts in
+r6/r7 envelopes — that automatically folds in the full web4 structure, including resource caps."*
+
+What that amendment subsumes from **this** PRD:
+
+- **§3.6.5's `kind × consequence` seam is R6-vs-R7.** `web4-core/src/r6.rs:9-10` already defines the
+  consequence axis (*"R6 is for low-consequence actions (cheap). R7 adds explicit reputation
+  tracking for consequential actions"*), and `is_r7()` (`r6.rs:397`) is its whole implementation.
+  The envelope PRD proposes `kind × consequence → (R6|R7, Constraint[])` as the single selection
+  this table and the ladder's route table both key off.
+- **§3.6.2's tier 3 (`quorum`) is `Constraint{witness_quorum}`** (`r6.rs:57`, enforced
+  `r6.rs:431-439`) — **but tiers 0–2 are NOT.** `witness_quorum` is a count and
+  `WitnessAttestation` (`r6.rs:139-149`) has no field naming a witness's *standing*, so
+  "sovereign-plus-peer" and "operator-plus-witness" are the same value to it. Named as a genuine
+  gap, not forced.
+- **§3.6.5's refusal-not-a-number for `governance.*` is `Rules.prohibitions`** (`r6.rs:42`), which
+  short-circuits at `r6.rs:47-49`. The envelope got that shape right: a prohibition is the absence
+  of a price, not a very high one.
+- **§2.2's "no per-member deny field; a member entry is a set union and nothing else" is at risk
+  under a naive wrapping** — read `PRD_R6_R7_ENVELOPES.md` §2.2 row 8 before building. `Rules` is
+  **absence-means-unrestricted** (`r6.rs:50`: an empty `permissions` list allows everything), and
+  there is exactly one `Rules` per action, so layered composition is auditable only by simulation.
+  That is the one place the mapping, taken literally, would make this repo *less* safe.
+- **§12.1's composite revision is `Rules.law_hash`** (`r6.rs:34`) — no new object. But only about
+  half of the primitive: a hash has no order, so §3.4-style stranding still needs the monotonic
+  generation, and the horizon has no carrier at all. Two missing fields on an existing struct, not a
+  fourth parallel structure.
+- **§3.6's ratchet-as-template is reused for RESOURCE.** §4.4.4 of the envelope PRD ships a
+  three-level external-interaction budget (society ⊇ per-caller ⊇ per-call) on exactly this
+  pattern: declared levels, society-set values, stored beside the law, moving `law_hash` on change.
