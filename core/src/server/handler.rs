@@ -3460,6 +3460,33 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     let target = optional_string(args, "target").unwrap_or_default();
     let session_id = optional_session_id(args);
     let payload_sha256 = optional_string(args, "payload_sha256");
+    // Same door as `rule_id` below, one layer deeper — except this key has a CONSUMER,
+    // so dropping it does not merely lose an attestation, it changes a score.
+    //
+    // The hooks have sent `verdict_available` since Sprint E (hestia_gate_mechanism.py:478).
+    // `derivation.rs:353` reads it to exclude "I could not judge" from temperament — dp,
+    // 2026-07-26, on codex being dinged for two of these while the daemon was demonstrably
+    // up: "well, fix it". Nothing between the two ever WROTE it. Grep the identifier over
+    // core/src and you get the reader twice and the writer never, so that arm has never had
+    // an input, and the whole exclusion has been riding its own legacy fallback: a substring
+    // match on `reason` for "no policy verdict" / "daemon path failed". The comment there
+    // says the flag is for "going forward" and the text match for "entries already on the
+    // chain"; going forward never arrived.
+    //
+    // Measured on CBP 2026-08-15 over 142,756 entries (tools/claude_verdict_available_arm_-
+    // audit.py, tools/claude_infra_denies_scored_as_conduct.py): ZERO rows of ANY event type
+    // carry the key. The text arm does real work — it excludes 247 of codex's 476 enforced
+    // denies — but 33 enforced denies whose reason is `gate.degraded` (the degraded mode
+    // RATIFIED 2026-08-11) or codex's pre-Sprint-E "governor unreachable, failing closed"
+    // match neither marker and reach temperament as member conduct. Six landed that day.
+    // The newest infra posture is the least protected, because a text arm can only match
+    // words that already existed when it was written.
+    //
+    // CALLER-ASSERTED, exactly like `payload_sha256` and `rule_id` on this path: the daemon
+    // did not observe the gate's availability, it received a claim about it. Recorded under
+    // the name derivation already reads and `DERIVATION_KEYS` already carries, because the
+    // projection was built for this key years before anything emitted it.
+    let verdict_available = args.get("verdict_available").and_then(Value::as_bool);
     // The hook layer's half of rule attribution is sending this; the daemon's
     // half is reading it. Daemon side lands FIRST: `hestia_tools()` declares
     // every tool `additionalProperties: true`, so a caller that sends `rule_id`
@@ -3507,6 +3534,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
             "payload_sha256": payload_sha256,
             "attempted": attempted,
             "rule_id": rule_id,
+            "verdict_available": verdict_available,
         }),
     )?;
     // Same asymmetric gate-risk trust as the daemon's own gate decisions.
@@ -9652,6 +9680,128 @@ mod tests {
         );
     }
 
+    /// THE MEASURED HARM, as a regression: probe residue evicting a live peer from the cap.
+    ///
+    /// `plugin_id` is caller-supplied at connect, so `member_registry` holds every probe that
+    /// ever spoke to this daemon. The pool sorted by (act-liveness, id), and inside the
+    /// `Unknown` tier — where residue and a quiet real peer are indistinguishable to
+    /// `actor_liveness` — the tie-break is ALPHABETICAL. Censused on CBP's chain
+    /// (`tools/invitation_deadletter_census.py`, 60k entries): 172 of 272 invitation rows went
+    /// to ids with no mailbox reader, and `kimi-code` was passed over on two escalations by
+    /// names like `attest-probe` and `egress-drain` that sort ahead of it.
+    ///
+    /// The fix is a tie-break, NOT a filter, and this test pins both halves: the real peer is
+    /// invited, and the residue is still invited when slots remain. dp's rule for evidence of
+    /// this kind — *"it reorders routing, it never excludes"* — is what makes the second half
+    /// a requirement rather than an accident.
+    #[tokio::test]
+    async fn probe_residue_no_longer_evicts_a_live_peer_from_the_invitation_cap() {
+        let (_dir, shared) = make_shared_state();
+        // Nine residue ids, all sorting alphabetically ahead of `kimi-code`, so under the old
+        // key they fill all eight slots and the real peer lands in `passed_over`.
+        let residue = [
+            "a-completely-different-impostor",
+            "agent-inventory",
+            "attest-probe",
+            "contention-probe",
+            "egress-drain",
+            "hestia-cli",
+            "identity-probe",
+            "jitter-probe",
+            "kimi-a-probe",
+        ];
+        let mut session_of = std::collections::HashMap::new();
+        for id in residue.iter().copied().chain(["kimi-code", "codex"]) {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id.to_string(), r["sessionId"].as_str().unwrap().to_string());
+        }
+        // The ONLY difference between `kimi-code` and the residue: something has read its
+        // mailbox. Neither has acted, so `actor_liveness` calls both `Unknown` — which is
+        // exactly the tier the old alphabetical tie-break decided by name length and luck.
+        shared.lock().await.inbox_store.drain_member("kimi-code").unwrap();
+
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "session_id": session_of["codex"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "reason": "Edit -> a governance file",
+            }),
+        )
+        .await
+        .unwrap();
+
+        let invited: Vec<String> = claimed["invited_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            invited.len(),
+            MAX_INVITED_PEERS,
+            "the cap is still spent in full: {invited:?}"
+        );
+        assert!(
+            invited.contains(&"kimi-code".to_string()),
+            "the seat with a mailbox reader must survive the cap, whatever it is called: \
+             {invited:?}"
+        );
+        // NOT A FILTER. Residue still fills the slots the real peers leave, because absence of
+        // a reader is weak evidence about a route and permanent about nothing — a member whose
+        // watcher starts tomorrow reads the notice queued today.
+        assert!(
+            invited.iter().any(|p| residue.contains(&p.as_str())),
+            "reordering, not exclusion: readerless candidates still take free slots: {invited:?}"
+        );
+
+        // And the fact is RECORDED per peer ON THE CHAIN, at invite time, so a reader of the
+        // decision — not just this process — can tell a queue nobody reads from a peer that
+        // saw the ask and declined.
+        let s = shared.lock().await;
+        let opened = s
+            .recent_chain(40)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened")
+            .expect("the open must be witnessed");
+        let ev = opened.event_data["invitation_evidence"]
+            .as_array()
+            .expect("per-peer invitation evidence")
+            .clone();
+        let flagged: Vec<String> = ev
+            .iter()
+            .filter(|r| r["mailbox_reader"] == json!(false))
+            .map(|r| r["peer"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!flagged.is_empty(), "the doorbell fact must be on the record: {ev:#?}");
+        assert!(
+            !flagged.contains(&"kimi-code".to_string()),
+            "and it must not be flagged on the seat that has one: {flagged:?}"
+        );
+
+        let esc_id = claimed["escalation_id"].as_str().unwrap();
+        let pp = s
+            .gate_escalations
+            .get(esc_id)
+            .expect("the escalation this call opened")
+            .peer_participation();
+        assert_eq!(
+            pp.invited_without_reader,
+            flagged.len(),
+            "peer_participation must hold the readerless invitees OUT of `absent`, or a queue \
+             nobody reads is counted as a peer who saw the ask and declined: {pp:?}"
+        );
+        assert_eq!(
+            pp.absent + pp.invited_without_reader,
+            invited.len(),
+            "and every invited seat is still accounted for somewhere: {pp:?}"
+        );
+    }
+
     /// A session that disagrees with the asserted `plugin_id` is a forgery, and the claim door
     /// must refuse it BEFORE spending anything — a claimed approval cannot be un-claimed.
     #[tokio::test]
@@ -12622,6 +12772,35 @@ struct OpenedInvitation {
     passed_over: Vec<Value>,
 }
 
+/// Has ANY watcher ever read this candidate's mailbox?
+///
+/// `plugin_id` is caller-supplied at connect, so `member_registry` accumulates every probe
+/// that ever spoke to this daemon, and `resolve_invitation` re-invites all of it forever.
+/// Measured over the chain (`tools/invitation_deadletter_census.py`, 60k-entry window): of
+/// 272 invitation rows on 34 escalations, **172 went to ids with no `member_inbox_touch`
+/// row at all** — 73.5% of the rows that seat can classify — and the residue did not merely
+/// sit in the list. Inside the `Unknown` act-liveness tier the tie-break is alphabetical,
+/// and five residue names sort ahead of `kimi-code`, so the cap EVICTED the fleet's most
+/// active peer from two invitations (`invitation_passed_over`, same census).
+///
+/// NOT AN EXCLUSION, and that is dp's call, not a hedge: *"liveness comes from witnessed
+/// actions by the actor (not an automatic doorbell)"* — the doorbell was rejected as a
+/// liveness signal precisely because a watcher polls whether or not its member can run, and
+/// `actor_liveness` states the resulting rule for evidence of this kind: *it reorders
+/// routing, it never excludes*. Absence of a reader is also not permanent: a legitimate new
+/// member has no touch row until its watcher first drains, and the queue is exactly what
+/// carries a notice across that gap. So this ranks LAST and is recorded per peer; it never
+/// drops anyone the cap would otherwise have reached.
+///
+/// ONE DIRECTION. Absence of a doorbell is weak evidence about a ROUTE. Presence certifies
+/// NOTHING about the member — that is the confusion `recipient_liveness` was built to avoid
+/// — which is why this is only ever the last tie-break under act evidence, never a promotion.
+/// An unreadable store reads as `true` (rank it with the reachable): a lookup that failed
+/// must not be recorded as a specific finding about a peer.
+fn has_mailbox_reader(store: &crate::storage::SqliteInboxStore, plugin_id: &str) -> bool {
+    !matches!(store.inbox_touch(plugin_id), Ok(None))
+}
+
 /// Resolve who this escalation invites, and record it on the escalation.
 ///
 /// NOT A GATE. Nothing here can refuse the open, delay it, or change `bar_met`. An invitation
@@ -12650,7 +12829,7 @@ fn resolve_invitation(
         // router so both routing receipts on this daemon are cut from the same depth of
         // evidence.
         let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
-        let mut pool: Vec<(String, crate::arbiter::Liveness)> = s
+        let mut pool: Vec<(String, crate::arbiter::Liveness, bool)> = s
             .member_registry
             .iter_sorted()
             .into_iter()
@@ -12662,32 +12841,43 @@ fn resolve_invitation(
             })
             .map(|id| {
                 let l = actor_liveness(&window, &id);
-                (id, l)
+                let reader = has_mailbox_reader(&s.inbox_store, &id);
+                (id, l, reader)
             })
             .collect();
-        // Live first, then dormant, then unknown; the id breaks ties so the order — and
-        // therefore who survives the cap — is deterministic and not a function of HashMap
-        // iteration. Ordering is a REACHABILITY preference, not a merit one: a seat that has
-        // acted this hour is likelier to read the notice in time to corroborate.
-        pool.sort_by_key(|(id, l)| {
+        // Live first, then dormant, then unknown; then — under all of it — whether any
+        // watcher has ever read that mailbox; then the id, so the order, and therefore who
+        // survives the cap, is deterministic and not a function of HashMap iteration.
+        // Ordering is a REACHABILITY preference, not a merit one: a seat that has acted this
+        // hour is likelier to read the notice in time to corroborate.
+        //
+        // The doorbell tie-break sits BELOW act evidence deliberately (`has_mailbox_reader`):
+        // it decides only between candidates the acts cannot tell apart, which is exactly the
+        // `Unknown` tier where an alphabetical tie-break was handing slots to probe residue
+        // ahead of a live peer.
+        pool.sort_by_key(|(id, l, reader)| {
             (
                 match l {
                     crate::arbiter::Liveness::Live => 0u8,
                     crate::arbiter::Liveness::Dormant => 1,
                     crate::arbiter::Liveness::Unknown => 2,
                 },
+                u8::from(!reader),
                 id.clone(),
             )
         });
         let over = pool.split_off(pool.len().min(MAX_INVITED_PEERS));
+        // `mailbox_reader` rides in the evidence, not just in the sort: `peer_participation`
+        // derives `absent` from this list, and an id no watcher reads must not be counted as
+        // a peer that read the ask and declined. Recording it at INVITE time is the only
+        // moment the fact is true of the invitation rather than of the reader's later state.
+        let ev = |(id, l, reader): &(String, crate::arbiter::Liveness, bool)| {
+            json!({"peer": id, "liveness_at_invite": l, "mailbox_reader": reader})
+        };
         (
-            pool.iter().map(|(id, _)| id.clone()).collect::<Vec<String>>(),
-            pool.iter()
-                .map(|(id, l)| json!({"peer": id, "liveness_at_invite": l}))
-                .collect::<Vec<Value>>(),
-            over.iter()
-                .map(|(id, l)| json!({"peer": id, "liveness_at_invite": l}))
-                .collect::<Vec<Value>>(),
+            pool.iter().map(|(id, _, _)| id.clone()).collect::<Vec<String>>(),
+            pool.iter().map(ev).collect::<Vec<Value>>(),
+            over.iter().map(ev).collect::<Vec<Value>>(),
         )
     } else {
         (Vec::new(), Vec::new(), Vec::new())
@@ -12725,6 +12915,17 @@ fn resolve_invitation(
     // worth branching on: a lost invitation would show up as an empty list in the entry,
     // which is exactly what a reader should then see.
     s.gate_escalations.invite(&esc.id, invited.clone());
+    // The doorbell half of the same write. Ordered AFTER `invite` because
+    // `record_invitee_readers` keeps only ids that were actually invited — a flag on a seat
+    // nobody asked must not be able to reduce `absent`.
+    s.gate_escalations.record_invitee_readers(
+        &esc.id,
+        evidence
+            .iter()
+            .filter(|r| r.get("mailbox_reader") == Some(&Value::Bool(false)))
+            .filter_map(|r| r.get("peer").and_then(Value::as_str).map(str::to_string))
+            .collect(),
+    );
     // The basis the whole record already carries on the chain entry must also live ON the
     // escalation itself: `arbiter::eligibility` clause 0 reads it from here at decide and
     // corroborate time, and a basis that exists only on the chain is one the peer path
