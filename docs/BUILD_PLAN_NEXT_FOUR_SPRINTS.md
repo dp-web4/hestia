@@ -1,6 +1,9 @@
 # Build plan — the next four sprints
 
-**Status**: proposed, 2026-08-14, claude-code (CBP). For dp's ruling and GPT's review before work starts.
+**Status**: proposed, 2026-08-14, claude-code (CBP). For dp's ruling before work starts.
+**Second pass, 2026-08-15**: GPT/codex review (notice 2420) landed three narrowings — all three adopted.
+Two were prose corrections; the first sent me to take a measurement, and the measurement **refuted** the
+claim the plan was making. Sprint 1's fix list is smaller and #423 keeps its own investigation as a result.
 **Frame (dp, 2026-08-14)**: *"once we have all of the above running and dogfooded, we'll discover more
 questions and more answers… it's a ladder, not one giant leap."*
 
@@ -28,17 +31,52 @@ today's substrate is confounded*. This sprint is cheap and de-confounds the thre
 
 | item | what | why now |
 |---|---|---|
-| **#320 → #423** | session map: add the remover; index the `host_session_id` reuse path instead of the O(n) scan under the global state lock | the leading root cause of the multi-second stalls. Cheap (a remover + an index), and until it lands, every latency number we take is noise |
+| **#320** (the proven half) | session map: add the remover — TTL/idle sweep keyed on `connected_at` — and make `session/siblings` and `session/own` read one shared liveness predicate | presence truth and unbounded RAM are *measured*, on three machines now. CBP right now: **794 resident sessions, oldest 3h22m old, ~218 minted/hour**, of which 320 render as `claude-code` seats. The fleet's own "count live seats before writing a shared repo" discipline reads that surface |
+| **#423** (a separate, still-open diagnosis) | instrument before prescribing: the stalls are real and their cause is **not** the session map | see below — the control #423 asked for has now run, and it came back null for the scan |
 | **#419** | witness handler persists `core_digest`, `verdict_available`, `rule_id`; tighten the schema so unknown keys refuse rather than vanish | the shims already SEND all three. Without this, deployed-generation attestation exists only on the fallback log — i.e. only when the daemon is unreachable, inverted from intent |
 | **#434 / #366** | claim window measured from delivery-to-member (or notify-on-approve), and budget the claim sequence as a sequence | dp's approvals expired unclaimed repeatedly this week; the loop only closes reliably for a machine in a retry loop. This is the approval path every later sprint depends on |
-| **#389** | escalation-open must be deterministic (two byte-identical denies produced different paperwork) | a refusal with no escalation is unappealable, and it undercounts the deny ledger by an unknown fraction |
+| **#389**, arm A (the issue's original failure) | when the daemon-witness write fails, the shim writes a **durable append-only local record** of the deny, reconciled exactly once when the daemon returns | this is what #389 is actually about: the boundary held 4× in a row under load and left no record. Determinism alone does not give a deny a trustworthy record |
+| **#389**, arm B (the later specimen) | escalation-open must be **deterministic** — two byte-identical denies produced different paperwork | a refusal with no escalation is unappealable, and it undercounts the deny ledger by an unknown fraction |
+
+**Why #423 is no longer a fix row.** The plan's first draft called #320's O(n) `host_session_id` reuse
+scan "the leading root cause" of #423's stalls and prescribed an index. GPT's review flagged that as a
+hypothesis wearing a root cause's clothes; #423 itself asks for `sessions.len()` vs latency *before* any
+fix is written. So it was run — as a paired differential rather than a correlation, since the scan sits
+behind `if let Some(hsid)`, which is a within-daemon A/B available immediately
+(`tools/session_scan_cost_differential.py`, deployed binary `v0.0.4-172-gdae0aa3`, n≈794 residents):
+
+| arm | what it does | median |
+|---|---|---|
+| WITH `host_session_id` (unique) | enters the scan, matches nothing → **walks all 794** under the state lock | 115.64 ms |
+| WITHOUT one | never enters the scan | 115.67 ms |
+| second connect, same transport, scan **HITS** | enters the scan, whole call | **0.79 ms** |
+
+**The scan is unmeasurable.** The differential is −0.03 ms; better, the third arm *contains* a scan and
+bounds the entire call at 0.79 ms, so the walk costs under 1 µs per resident. For it to reach one second
+linearly the map would need ~10⁶ sessions — at CBP's measured 218/hour, ~190 days of unbroken uptime.
+The stalls are real (outliers to 1.05 s appeared in this run) but they appear in **every** arm, including
+the 0.79 ms one that never touches a large map. Two consequences for this sprint:
+
+- **#320's remover is still worth landing**, on the RAM and presence-truth grounds that were always the
+  measured ones. The **index is dropped** — it optimizes a walk that costs nothing.
+- **#423 keeps its own investigation**, now pointed where the time demonstrably is: a **~115 ms floor
+  paid on the first connect of a new transport session and not on later ones** (0.79 ms). That is
+  per-transport setup, not the map. A sprint that lands a remover and declares the stalls fixed would be
+  closing #423 on a refuted mechanism.
 
 **Dogfooding act**: run `tools/gate_class_t_probe.py` after a quiet hour and get a clean, *trustworthy*
 criterion-10 reading — the one we could not take honestly today. Plus: dp approves an escalation and it
 claims on the first re-issue.
 
-**Exit criterion**: idle infra-fail-close rate ≈0 and equal across members; a deny's record contains its
-digest and its conduct-vs-infra flag; one approval → one claim, no race.
+**Exit criterion**:
+- `session/siblings` renders live seats only — pinned by a test that a session idle past the TTL
+  disappears while one holding an in-flight action does not.
+- Idle infra-fail-close rate ≈0 and equal across members; a deny's record contains its digest and its
+  conduct-vs-infra flag.
+- A deny survives a **failed** witness write as a durable local record and reconciles exactly once; and
+  identical denial inputs produce identical escalation dispositions.
+- One approval → one claim, no race.
+- **Not** an exit criterion: "the stalls are gone." #423 exits on its own evidence, not on #320's landing.
 
 ---
 
@@ -55,8 +93,10 @@ means the mechanism gets exercised by CLI/API before an interface hardens around
 - **The `.directory` export** with its generation stamp, written on every vault change; a test asserting
   the decision path never reads it.
 - **The denial echo**: a refusal names what would have admitted.
-- **R6/R7 — the fork is now RESOLVED (PR #451), and the answer is neither branch.** The envelope is the
-  right vocabulary and the right destination, but three of its promises have no implementing code:
+- **R6/R7 — PR #451 resolves the DIRECTION, not the readiness.** The envelope is the right vocabulary and
+  the right destination; that much is well supported and settles the fork. What #451 does *not* do is
+  clear the envelope for load-bearing use, and the distinction matters because this sprint could
+  accidentally lean on a property that is prose. Three of its promises have no implementing code:
   `escrow_condition` has zero consumers, `available_atp` is a copied float so "atomic settlement" is
   unimplemented, and `min_atp` only fires when `hard: true`. Two further findings change what we build:
   - **`ActionStatus` has no `Refused`** (`Pending | Validated | InProgress | Success | Failure | Error`),
@@ -72,8 +112,19 @@ means the mechanism gets exercised by CLI/API before an interface hardens around
   **So sprint 2 does not wrap wholesale.** It uses the envelope where it is implemented and **contributes
   the gaps upstream to web4** rather than working around them locally — starting with
   `ActionStatus::Refused`, which every governance system downstream needs and which nobody can add
-  locally without forking the canon. Wholesale wrapping stays a later rung, once the envelope can carry
-  a refusal.
+  locally without forking the canon. That contribution is a necessary first upstream step, **not** the
+  adoption gate. Wholesale wrapping stays a later rung, once the envelope can carry a refusal.
+
+  **Ordering inside sprint 2**, so the rung cannot quietly overclaim (GPT's narrowing, and #451 is still
+  open on exactly these):
+  1. Store / shadow / export work proceeds **independently** of the envelope. None of it needs R6/R7.
+  2. Any envelope use must **name in its PR which currently-implemented property it relies on**. "It is
+     an R6 action" is not a citation; `r6.rs:34 law_hash` is.
+  3. **No immutable-law, resource-cap, evidence-bundle or atomic-settlement claim** — in code, docs, or a
+     dashboard string — until the relevant upstream extension and its conformance vectors land. Today the
+     canonical hash does not bind Rules/Reference/resource/reputation, Rust and Python disagree on the
+     canonical set, fresh consultation has no carrier, payer/settlement provenance is absent, and
+     consequence grade cannot collapse into binary R6/R7.
 
 **Dogfooding act**: dp grants kimi and codex their working repos and `gh` — once, durably — and the
 denials that blocked them this week stop, lawfully, without an escalation. This is the sprint that pays
@@ -145,8 +196,7 @@ becomes the governed escape into the self-funded regime, not the free tier's ant
 
 The remaining calibration question: too shallow a curve is no bound; too steep and the beneficial
 function dies at the knee, cutting off a genuine surge of interest at exactly the moment interest became
-real. Not on the critical path for sprints 1–4.
-Not on the critical path for sprints 1–4, and it should be answered before any outward work starts.
+real. Not on the critical path for sprints 1–4, and it should be answered before any outward work starts.
 
 ## Order rationale, in one line each
 
