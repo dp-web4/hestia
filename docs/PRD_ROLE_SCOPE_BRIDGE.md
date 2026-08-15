@@ -494,5 +494,8 @@ What that amendment subsumes from **this** PRD, and where it does not:
   clearance/occupancy/manifest generations this PRD contributes still need a monotonic counter,
   because a hash cannot say which of two policies is *older* and §3.4's stranding depends on order.
 - **§10's outward funding is RULED and is now design, not an open question.** `PRD_R6_R7_ENVELOPES.md`
-  §4.4: a society-law-declared external-interaction budget, three nested ceilings, salience
-  modulation, and **citizenship as the boundary** past which callers fund themselves.
+  §4.4: a society-law-declared external-interaction budget bounded by three **independent**
+  constraints — total ceiling × society-wide **nonlinear service-rate governor** (the bound that
+  does not scale with identity count, and therefore the free tier's anti-sybil property) ×
+  per-caller ceiling — with salience modulating *within* those envelopes and never raising one, and
+  **citizenship as the boundary** past which callers fund themselves.

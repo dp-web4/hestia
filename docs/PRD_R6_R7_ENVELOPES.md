@@ -511,25 +511,63 @@ amendment** — due process, ceremony-tiered per `PRD_ALLOWLISTS.md` §3.6 — n
 convenience, and per row 4 it moves `law_hash` (`r6.rs:34`) like any other authority, so every
 outward act is pinned to the budget in force when it happened.
 
-#### 4.4.2 THREE nested envelopes, not one pool — and `Constraint` cannot express them
+#### 4.4.2 THREE INDEPENDENT constraints — and a corrected claim
+
+> **CORRECTED CLAIM (GPT-5.6 Sol, PR #451 review `4942991816`, 2026-08-14).** An earlier revision of
+> this section held that the per-caller and per-call limits *"mostly address"* the sybil and accrual
+> question. **That is false at the population level, and §4.4 rested on it.** A per-caller ceiling
+> bounds **one** caller. Sybils multiply callers. N identities each drawing their full per-caller
+> allowance **sum to the whole pool** — so a per-caller ceiling, however tight, supplies no
+> population-level bound at all. The error is dp's and mine (relayed and written up without
+> checking the population arithmetic); the catch is GPT's. Recorded as a correction rather than
+> quietly patched, because the conclusion it supported was load-bearing.
+
+**The missing bound was population-level, and the mechanism is a society-wide rate envelope.** In
+GPT's words:
+
+> "the stronger defense is not citizenship cost itself. The public/receptionist path should be
+> bounded by a society-wide **nonlinear service-rate governor** — effectively a busy call center."
+
+> "**all external identities share that same society-level rate envelope**, so creating 1,000 caller
+> identities does not create 1,000x service capacity."
+
+That last clause is the whole correction in one sentence. The free tier's anti-sybil property comes
+from a bound that **does not scale with identity count**, and no per-identity ceiling can ever be
+one.
+
+**The free tier's structure is therefore THREE INDEPENDENT constraints — not three nested ones:**
+
+| # | constraint | bounds | scales with identity count? |
+|---|---|---|---|
+| 1 | **total PR budget ceiling** | *how much* the society can lose | **no** — one pool |
+| 2 | **PR spend-rate / active-call ceiling** | *how fast* it can lose it | **no** — one society-wide envelope, shared by all external identities |
+| 3 | **per-caller ceiling** | *how much* one apparent identity can consume | **yes** — which is exactly why it cannot carry the anti-sybil property alone |
+
+**Get the topology right, because the earlier revision did not.** Constraints 1 and 2 are an
+**orthogonal pair**: a total says nothing about a rate, and a rate says nothing about a total. A
+patient attacker defeats a rate ceiling alone; a burst attacker defeats a total alone. **Both are
+needed and neither nests inside the other.** The nesting language belongs only to the per-caller /
+per-call relationship:
 
 ```
-society external-interaction budget   ⊇   per-caller limit   ⊇   per-call limit
+constraint 1: total   ⟂   constraint 2: rate            (orthogonal — an AND, not a containment)
+constraint 3: per-caller limit  ⊇  per-call limit        (nested — this is where ⊇ applies)
 ```
 
-Each is a ceiling and **none may widen another**. This is not budget-specific language and must not
-become any: it is **ADMIT's narrowing rule applied to resource**, and the vocabulary already exists
-— `PRD_ADJUDICATOR_LADDER.md` §13.6 **[branch 6a14bbf]** states the algebra, and the term the
-budgets occupy is already named in it:
+All of them are ceilings and **none may widen another**. That is not budget-specific language and
+must not become any: it is **ADMIT's narrowing rule applied to resource**, and the vocabulary
+already exists — `PRD_ADJUDICATOR_LADDER.md` §13.6 **[branch 6a14bbf]** states the algebra, and the
+term the budgets occupy is already named in it:
 
 ```
 effective_access(act) = composed_capabilities ∩ caller_standing ∩ pair_mrh
                         ∩ resource_context_policy ∩ hub_law ∩ … ∩ innate_invariants
 ```
 
-The three budget levels are `resource_context_policy`. §13.6's rule 2 — *"no composed grant may
+All three constraints are `resource_context_policy`. §13.6's rule 2 — *"no composed grant may
 union past a ceiling owned by another layer"* — is exactly why a per-caller allocation cannot be
-enlarged by anything downstream of it.
+enlarged by anything downstream of it, and why the society total and rate ceilings cannot be
+enlarged **at all** at act time (§4.4.6).
 
 **Checked against source: `Constraint` cannot express this, and saying so is worth more than
 forcing the mapping.**
@@ -548,13 +586,16 @@ different shape in two independent ways:
    `ResourceRequirements{required_atp, available_atp}` (`r6.rs:155-157`) with
    `has_sufficient_atp()` (`r6.rs:166-170`) is the right *shape* for a pool check — but
    `available_atp` is documented as *"Actor's current available ATP"* (`r6.rs:156`), it is **a copied
-   float, not a handle to an account** (§1 qualifier 1), and there is one of it. Three nested pools
-   need three (available, required) pairs with a narrowing relation between them. The struct has
-   room for one.
+   float, not a handle to an account** (§1 qualifier 1), and there is one of it. The three
+   constraints need three independent (available, required) pairs. The struct has room for one.
+3. **A RATE ceiling is not expressible at all.** Constraint 2 is a bound on *consumption per unit
+   time across all callers* — it needs a window, a shared counter, and concurrency state. `Rules`
+   has no clock and `Constraint` has no window. This is a strictly harder gap than 1 and 2: those
+   want more instances of an existing shape, this one wants a shape that does not exist.
 
 **Gap (a) — genuine extension web4 should absorb**, and it is the **same structural gap as row 8**.
 Row 8 found that `Rules` is one flat object with no record of which layer contributed which
-constraint, so permission narrowing is auditable only by simulation. The three-level budget needs
+constraint, so permission narrowing is auditable only by simulation. The budget constraints need
 precisely the same missing thing — a layered/attributed ceiling structure — on the resource axis.
 **One extension closes both.** That convergence is the strongest argument in this document for the
 layered-`Rules` proposal: two independent rulings, arriving from opposite directions (inward
@@ -568,17 +609,106 @@ society's operating capital, because that capital was never in the pool the outw
 
 > **The outward attack surface has a bounded cost ceiling, set in advance, by the society itself.**
 
-This falls straight out of dp's framing and it is qualitatively better than what a rate limiter
-buys. A rate limiter bounds the *frequency* of an attack and leaves its *total cost* open-ended
-(a patient attacker just waits). A pre-declared pool bounds the *total*, and the society chose the
-number. Compare §3.6.1's argument in the ceremony direction: a bar nobody can satisfy manufactures
-route-arounds. Here the society is not setting a bar at all — it is deciding, in advance and by law,
-how much of its own energy it is willing to lose to strangers in the worst case. That is a
-decision a society can actually make.
+This falls straight out of dp's framing. A pre-declared pool bounds the *total*, and the society
+chose the number. Compare §3.6.1's argument in the ceremony direction: a bar nobody can satisfy
+manufactures route-arounds. Here the society is not setting a bar at all — it is deciding, in
+advance and by law, how much of its own energy it is willing to lose to strangers in the worst case.
+That is a decision a society can actually make.
 
-With the per-caller level (§4.4.4), the property sharpens: **the anonymous prober cannot starve the
-partner in active negotiation**, because they draw from separate sub-allocations under the same
-society ceiling. Exhaustion is contained to the exhausting caller.
+**But the total is a bound on the worst *outcome*, not on the worst *day*, and the earlier revision
+of this section over-claimed on exactly that point.** It argued that a pool bound was *"qualitatively
+better than what a rate limiter buys"*, on the ground that a rate limiter leaves total cost
+open-ended. True, and irrelevant — the two bound different things and the correct answer is **both**
+(§4.4.2). A total alone permits the entire pool to be drained in one burst; a rate alone permits
+unbounded cumulative loss to a patient attacker. Neither substitutes for the other.
+
+Likewise the earlier claim that *"the anonymous prober cannot starve the partner in active
+negotiation"* was attributed to the per-caller level. **It is the rate envelope that does that
+work** — or rather, the rate envelope plus salience prioritisation *within* it (§4.4.5, §4.4.6). A
+per-caller ceiling stops one identity monopolising the pool and stops nothing else; under N sybils
+the partner is starved anyway.
+
+##### Why the rate governor must be NONLINEAR (this argument is mine, not GPT's)
+
+GPT specifies a *nonlinear* service-rate governor rather than a hard cutoff, and the reason deserves
+stating because it is the same failure this whole PRD family keeps circling.
+
+**A hard rate cutoff fails dp's "ultimately beneficial function" test.** It slams shut at exactly the
+threshold where external interest became real — the society's *best day*, a genuine wave of
+legitimate callers, hits the wall in precisely the same way an attack does. The naive fix punishes
+both, and it punishes the good case hardest, because the good case is the one whose value was
+destroyed by being refused.
+
+A **nonlinear** governor raises the *marginal cost of the Nth concurrent caller* instead of
+forbidding them. So:
+
+- a **real surge degrades gracefully** — service slows, queues lengthen, nobody is turned away at a
+  cliff, and the society's own throughput becomes the signal that its budget is too small for the
+  interest it is attracting (which is an argument to raise it by law, §4.4.11);
+- a **flood becomes self-limiting** — each additional concurrent caller costs the attacker more for
+  less, and the curve, not a gate, does the work.
+
+> **The failure mode of the naive version is that the society's best day and its worst day are
+> indistinguishable at the envelope, and a hard cutoff punishes both identically.**
+
+That indistinguishability is not a flaw to be engineered away at act time — see below.
+
+##### Surge and flood are distinguished by OUTCOME, after the fact — and R7 already carries it (also mine)
+
+The temptation, having noticed that a legitimate surge and a sybil flood look identical at the
+envelope, is to try to tell them apart **at the gate**. Resist it. Any gate-time discriminator must
+read signals available before service — origin, stated purpose, claimed urgency — and those are
+**caller-authored**, which lands straight back in §4.4.8's gaming problem with extra steps. A
+classifier over attacker-controlled inputs is not a defence; it is a new attack surface with a
+model attached.
+
+**The discrimination is a post-hoc measurement, and the envelope already carries the evidence.**
+Outward acts are `R7Action`s with `reputation: Option<ReputationDelta>` (`r6.rs:354`):
+
+- a **genuine surge** produces citizenships established, partnerships opened, cases resolved —
+  **positive `ReputationDelta`s**, in volume, traceable to the spend that funded them;
+- a **sybil flood** produces nothing. The spend is real; the reputation output is empty.
+
+So the two are trivially separable **in the record**, a period later, with no gate-time
+classification and no caller-authored signal anywhere in the judgment. And this is not a second
+mechanism bolted on: it is exactly the ROI signal of §4.4.11, which is the same evidence a society
+uses to decide whether to raise the budget by law. **One measurement answers "was that beneficial?"
+and "was that an attack?" — because for this design they are the same question.**
+
+Two caveats carried forward rather than dropped:
+
+- **§4.4.11's feedback-loop caution applies here with more force.** If reputation output justifies
+  budget increases, and budget funds the interactions that generate reputation, then an attacker who
+  can manufacture *any* positive reputation signal is now attacking the budget-setting loop rather
+  than the budget. Flagged as future work, not claimed solved.
+- **Row 7's grain mismatch again**: `ReputationDelta` is per-action and this discrimination is a
+  fold over many. The evidence is carried; the aggregation is unbuilt.
+
+##### The waiting state must be nearly FREE, or the queue IS the attack surface
+
+GPT's third constraint, and it is a requirement rather than a note:
+
+> "The waiting state should be extremely cheap: ideally Hub-level queue/witness state with
+> essentially no model inference, private-context retrieval, or meaningful ATP burn until admitted.
+> Otherwise an attacker can simply move the denial-of-attention attack into the queue."
+
+This is correct and it is the obvious hole in any rate-governor design: a governor that defends
+service by making callers *wait* has achieved nothing if waiting itself consumes the resource being
+defended. A queued caller must cost **no model inference, no private-context retrieval, and no
+meaningful ATP** — the queue is Hub-level state, and admission is where cost begins. Pinned as
+**AC-E14**.
+
+Note the ordering this forces, because it is the same rule §10.5(1) states for retrieval: the
+governor must run **before** anything expensive, not as a filter over work already done. *A control
+that runs after the thing it governs is not a control.*
+
+**One caution I have not seen raised: queue delay is itself an observable.** A prober who cannot
+read the private corpus can still measure society load from response latency — how busy you are, at
+what hours, and (by A/B-ing request shapes) possibly which request classes are prioritised, which
+leaks the salience function. Minor next to the attacks the governor stops, and it does not argue
+against the design; it argues for naming it now rather than discovering it in a forum thread later.
+The mitigations are the usual ones (jitter, quantised delay buckets) and they cost service quality,
+so this is a knob, not a fix.
 
 #### 4.4.4 The template ships the SHAPE; law supplies the NUMBERS
 
@@ -588,9 +718,14 @@ default:
 
 | level | what it bounds | hard or default |
 |---|---|---|
-| society external-interaction budget | total outward draw, all callers, per period | **HARD** ceiling |
-| per-caller limit | one caller's total draw | **HARD** ceiling |
-| per-call limit | one exchange's draw | **DEFAULT** — salience-modulable (§4.4.5) |
+| society external-interaction budget (constraint 1) | total outward draw, all callers, per period | **HARD** ceiling |
+| society service-rate / active-call governor (constraint 2) | outward draw **per unit time**, shared by ALL external identities | **HARD** ceiling, **nonlinear** in load (§4.4.3) |
+| per-caller limit (constraint 3) | one apparent identity's total draw | **HARD** ceiling |
+| per-call limit | one exchange's draw, nested under per-caller | **DEFAULT** — salience-modulable (§4.4.5) |
+
+Constraint 2 is the one that does not scale with identity count, and therefore the one carrying the
+free tier's anti-sybil property (§4.4.2). A template shipping constraints 1, 3 and 4 without it —
+which is what an earlier revision of this section described — has no population-level bound.
 
 A society amending its numbers is **filling in a template, not designing a mechanism**. This is dp's
 *"mechanisms for the evolution, not hardcode things"* applied to resource, and it is the identical
@@ -648,10 +783,22 @@ COMPOSE (∪) is an operator or delegated act, witnessed, ceremony-tiered, gener
 (∩) is machine-time and **no term may add**. A rung raising a per-caller ceiling because a caller
 seemed important is COMPOSE performed at admission time, which §13 exists to forbid.
 
-Concretely, the boundary is: a rung may move a draw **up to the per-caller ceiling** and may cut it
-off **at any point below**; a change to the per-caller or society ceiling is a `governance.*` act
-that the route table answers with a **refusal, not a rung** (`PRD_ALLOWLISTS.md` §3.6.5, ladder
-§5.3). Budget ceilings join that refusal set.
+GPT states the same boundary from the rate-governor side, and it is the clause that keeps the
+correction of §4.4.2 inside the existing doctrine rather than needing new doctrine:
+
+> "Salience may prioritize or modulate service *inside* those envelopes but may not raise the
+> society total/rate ceilings. That preserves ADMIT-not-COMPOSE."
+
+Concretely, the boundary is: a rung may move a draw **up to the per-caller ceiling**, may **order**
+the queue under the rate governor (prioritisation is a within-envelope act), and may cut service off
+**at any point below**. A change to the **per-caller, society-total or society-rate** ceiling is a
+`governance.*` act that the route table answers with a **refusal, not a rung**
+(`PRD_ALLOWLISTS.md` §3.6.5, ladder §5.3). All three ceilings join that refusal set.
+
+Worth stating explicitly because it is the subtle case: **prioritising one caller under load is
+ADMIT; admitting more callers under load is COMPOSE.** A rung that responds to a queue by widening
+the rate envelope has performed a composition at admission time, and it will feel like good service
+while it does it.
 
 #### 4.4.7 TWO ECONOMIC REGIMES — and the boundary between them is CITIZENSHIP
 
@@ -662,9 +809,15 @@ that the route table answers with a **refusal, not a rung** (`PRD_ALLOWLISTS.md`
 > merit the resource, and spend their own atp doing it. those not willing, prove it wasn't salient
 > enough :)"
 
+**The first sentence of that ruling is superseded** — per-caller and per-call limits do **not**
+address the sybil question, for the population-level reason set out in §4.4.2 (dp's claim, my
+failure to check the arithmetic, GPT's catch). The **regime split** the rest of the ruling
+establishes is unaffected, and is what this subsection is about: the free tier is bounded by
+§4.4.2's three constraints; citizenship is the boundary past which callers fund themselves.
+
 | regime | who | funded by | bounded by |
 |---|---|---|---|
-| **free tier** | external / non-citizen callers | the society's law-declared external-interaction (PR) budget | per-caller and per-call limits (§4.4.4); low salience terminated early (§4.4.5) |
+| **free tier** | external / non-citizen callers | the society's law-declared external-interaction (PR) budget | all three constraints of §4.4.2 — total, **shared nonlinear rate governor**, per-caller — with low salience terminated early (§4.4.5) |
 | **self-funded** | citizens | **the caller's own ATP** | their own balance, plus the ordinary inward machinery — `Constraint{min_atp}` (`r6.rs:57`), `ResourceRequirements{required_atp, available_atp}` (`r6.rs:155-157`), `has_sufficient_atp()` (`r6.rs:166-170`) |
 
 **The society stops subsidising at exactly the point the caller has standing to pay.** This is the
@@ -674,8 +827,9 @@ which point the relationship is **funded rather than donated**.
 
 Mechanically the second regime needs **nothing new**. A citizen escalating for cause is the inward
 case of §4.1, already implemented in `validate()` (`r6.rs:402-443`). The free tier is the only half
-that required the three-level budget structure at all. That is a good sign about the design: the
-novel machinery is confined to the regime where the payer is absent.
+that required the three-constraint structure at all. That is a good sign about the design: the novel
+machinery — and every gap §4.4.2 names, including the rate ceiling web4 cannot currently express —
+is confined to the regime where the payer is absent.
 
 #### 4.4.8 COST IS THE SALIENCE ORACLE — do not assess the claim, PRICE it
 
@@ -725,6 +879,17 @@ grants may be composed, never itself a capability (`PRD_ADJUDICATOR_LADDER.md` �
 ELIGIBILITY, not a grant"* **[branch 6a14bbf]**). dp's ruling adds the second half: citizenship is
 also **the point at which a caller funds their own interactions**.
 
+GPT's review sharpens the role further, and the sharpened version is the one to build on:
+
+> Citizenship is "the governed escape from the deliberately constrained public/receptionist regime
+> into accountable, self-funded interaction." It "remains eligibility/standing, not a context grant."
+
+Two things follow. **The free tier is *deliberately* constrained** — the rate governor is not a
+regrettable limitation to be relaxed as capacity allows, it is the regime's defining property, and
+the sanctioned way past it is to *become accountable*, not to wait for the society to loosen. And
+**citizenship is not itself the anti-sybil mechanism** (§4.4.2); it is the exit from the regime the
+anti-sybil mechanism governs.
+
 Both are true and they compose cleanly — *eligibility for grants*, and *responsibility for cost*.
 But the consequence needs stating before someone discovers it late:
 
@@ -736,6 +901,11 @@ boundary and changed who the society subsidises. Raise it to reduce subsidy, and
 narrowed who may ever hold a grant. Neither effect is wrong; both being invisible to whoever moves
 the number is. Any law amendment touching the citizenship bar should be required to state which of
 the two it intends — a small documentation obligation that prevents a large class of surprise.
+
+**What the correction of §4.4.2 removes from this section** is the third duty it was briefly carrying
+— population-level sybil resistance. That job belongs to the shared rate envelope, which does not
+scale with identity count. Citizenship cost is a real parameter with two real effects; it was never
+going to be able to carry a third, and asking it to was the error.
 
 #### 4.4.10 Exhaustion must be LEGIBLE — a never-flatter requirement
 
@@ -782,44 +952,52 @@ Two honest caveats, because this is the part most likely to be over-claimed:
 - **Row 7's grain mismatch applies here too**: `ReputationDelta` is per-action, ROI is a fold over
   many, and no such fold exists in `r6.rs`. The evidence is carried; the aggregation is unbuilt.
 
-#### 4.4.12 The residual — and it is a SINGLE law-set parameter
+#### 4.4.12 The residual — the GOVERNOR'S CURVE, not citizenship's price
 
-**Accrual vs per-period expiry is resolved, and the reasoning matters more than the answer.** The
-question was: does a long-quiet society present a single-day attack surface equal to its entire
-saved pool? **The per-caller limit already answers it.** A per-caller ceiling bounds any single
-caller's draw *regardless of how large the accrued pool is*, so an accrued budget **cannot be
-drained by one actor**. Draining it requires **many** callers, which is one of exactly two things:
+**This subsection previously named the cost of obtaining citizenship as the scheme's load-bearing
+security parameter. That is withdrawn.** It followed from the per-caller-bounds-sybils claim that
+§4.4.2 corrects: if a per-caller ceiling supplied the population bound, then the price of minting a
+caller would indeed be the parameter that mattered. It does not, so it is not. Recorded as a
+withdrawal rather than an edit, because the conclusion was stated forcefully and someone may have
+carried it forward.
 
-1. **a genuine surge of external interest** — the budget doing precisely the job it exists for, and
-   a signal to raise it by law rather than a failure; or
-2. **a sybil attack** — many identities under one hand.
+**Accrual vs per-period expiry is resolved, and the corrected reasoning is different from the
+reasoning that first resolved it.** The question was whether a long-quiet society presents a
+single-day attack surface equal to its entire saved pool. It does **not**, but the bound is
+**constraint 2, not constraint 3**: the shared service-rate governor limits how fast the pool can be
+drawn down *no matter how many identities are drawing or how large the accrual is*. A per-caller
+ceiling could never have delivered this, for the reason §4.4.2 states. With a rate envelope in
+place, "accrue or expire" becomes an ordinary policy preference a society may set either way — the
+worst day is bounded by the rate, not by the balance.
 
-So "accrue or expire" stops being the security question. It becomes an ordinary policy preference a
-society may set either way, and the real question is (2).
+Draining an accrued pool at the permitted rate therefore takes **time**, and time is what makes the
+outcome measurement of §4.4.3 possible: a sustained draw producing no reputation output is
+identifiable long before the pool is gone.
 
-> ### The load-bearing security parameter is THE COST OF OBTAINING CITIZENSHIP.
+> ### The load-bearing security parameter is THE NONLINEARITY OF THE RATE GOVERNOR.
 >
-> **The PR budget bounds the blast radius. Citizenship cost bounds the number of actors who can aim
-> at it.**
+> **Constraint 1 bounds how much can be lost. Constraint 2 bounds how fast — and the SHAPE of
+> constraint 2's curve is where the whole design can still fail, in either direction.**
 
-Cheap citizenship reopens the free tier at scale under N identities — each sybil gets its own
-per-caller allocation, and the per-caller ceiling that made §4.4.3's containment work is defeated by
-multiplying callers rather than by exceeding any one limit. Expensive citizenship excludes
-legitimate newcomers and starves the beneficial function the PR budget exists to fund (§4.4.11) —
-§3.6.1's unsatisfiable-bar failure, arriving on the membership axis.
+**OPEN — and it replaces sybil-resistance-of-citizenship as the sole remaining budget question:
+calibration of the governor's nonlinearity.**
 
-**That the whole scheme's outward attack resistance concentrates into one explicitly law-set number
-is a feature, not a defect** — one parameter, one amendment path, one thing to audit, and it moves
-`law_hash` when it changes (row 4). A security property that concentrates somewhere visible is
-better than one distributed across mechanisms nobody can total up. But it must be *stated* as the
-load-bearing parameter rather than left implicit, which is what this subsection is for. Note also
-§4.4.9: this same number is simultaneously the access-control bar, so it cannot be tuned for
-sybil-resistance alone without moving who may hold a grant.
+- **Too shallow** and there is effectively no bound — the curve permits enough concurrency that a
+  flood is served, and the population-level protection §4.4.2 exists to supply is nominal.
+- **Too steep** and **the beneficial function dies at the knee** — a genuine surge hits a wall that
+  is a hard cutoff in all but name, which is the failure §4.4.3 argues nonlinearity exists to avoid.
+  A curve steep enough to stop an attack instantly is a curve that stops a good day instantly.
 
-**OPEN — and it replaces accrual-vs-expiry as the sole remaining budget question:
-sybil-resistance of citizenship.** What makes citizenship costly enough to bound N without being
-costly enough to exclude the callers the PR budget exists to attract? Not answered here.
-**Hub's**, because Hub owns citizenship.
+There is no obviously correct answer and it is probably not one number but a shape a society tunes
+against its own measured traffic. **Not answered here.** The natural evidence is §4.4.3's outcome
+signal — the ratio of reputation output to PR spend across load levels — which is the same
+instrument that justifies moving constraint 1, and inherits the same feedback-loop caveat
+(§4.4.11).
+
+**Citizenship cost remains a real parameter with real effects (§4.4.9) — access control and economic
+admission — but it now matters only once a caller elects to cross into the self-funded regime.** It
+governs the exit, not the free tier. That is Hub's to calibrate, and it is no longer the question
+this design's outward security rests on.
 
 ---
 
@@ -996,10 +1174,12 @@ R: n/a [construct: caller reachability is a routing key, never authority — rol
 W: pass [construct: ActionRole names the OCCUPANT; the caller is evidence via Reference — note row 9's two-party gap]
 O: pass-by-design [construct: draw checked before the exchange proceeds; low-salience terminates EARLY, §4.4.5]
 A: pass-with-gap [construct: Rules.society r6.rs:36 + law_hash r6.rs:34 pin the budget in force; the DRAW itself has no carrier — §4.4.2]
-V: present [construct: society ceiling is pre-declared and separate — the blast-radius bound, §4.4.3; ceiling changes return a refusal, not a rung, §4.4.6]
-verdict: ESCALATE — the design is sound and RULED; adoption is blocked on two web4-core extensions,
-  not on an unanswered question: (i) Constraint cannot express a depleting nested pool (§4.4.2),
-  (ii) ActionStatus cannot express budget-exhausted (§4.4.8/§6.3).
+V: present [construct: society TOTAL and RATE ceilings pre-declared and separate — the blast-radius bound §4.4.3; all three ceiling changes return a refusal, not a rung, §4.4.6]
+verdict: ESCALATE — the design is sound and RULED; adoption is blocked on three web4-core extensions,
+  not on an unanswered question: (i) Constraint cannot express a depleting pool (§4.4.2),
+  (ii) Constraint cannot express a RATE at all — no window, no clock (§4.4.2, added on GPT's
+  correction and the hardest of the three), (iii) ActionStatus cannot express budget-exhausted
+  (§4.4.10/§6.3).
 ```
 
 The verdicts have moved since dp's rulings. The outward half is **no longer blocked on a policy
@@ -1073,6 +1253,33 @@ call count; and a citizen's escalation draws from **their own** balance
 act by the same identity before and after citizenship must draw from different sources, and the
 record must say which.
 
+**AC-E13 — the shared rate envelope does not scale with identity count.** §4.4.2, and it is the
+criterion the corrected claim exists for. Differential: 1 caller issuing N requests and N callers
+issuing 1 request each must encounter **the same** society-level rate envelope. The arm that must
+fire: an implementation that keys the rate counter per-caller instead of per-society passes the
+single-caller arm and **fails** the N-caller arm. Without the second arm the test measures nothing —
+`fb_replication_must_vary_axis`, where the unvaried axis is identity count.
+
+**AC-E14 — the waiting state is nearly free.** §4.4.3, pinned as a criterion rather than a note
+because GPT is right that an expensive queue relocates the attack rather than stopping it. A queued
+(not yet admitted) caller must cost **zero model inference, zero private-context retrieval, and no
+meaningful ATP draw**. Measured, not asserted: instrument the three and assert each is zero across a
+queue of depth > 1. The arm that must fire: admit one caller and assert the same instruments become
+non-zero — otherwise the criterion is satisfied by a system that does no work at all
+(`fb_zero_iteration_loop_reads_all`).
+
+**AC-E15 — the governor is nonlinear, and the curve is measured at both ends.** §4.4.3/§4.4.12. Two
+arms, because a one-sided test cannot distinguish "nonlinear" from "broken": marginal cost of the
+Nth concurrent caller must **rise** with N (so a flood is self-limiting), and service at moderate
+load must **not** be cut off (so a surge degrades rather than dies). Report the measured curve, not
+a pass/pass. Per `fb_controls_magnitude_calibrated`, measure the ONSET — the knee is the parameter
+§4.4.12 says is open, so the test's job is to locate it, not to certify it.
+
+**AC-E16 — salience orders the queue; it never widens the envelope.** §4.4.6. Positive arm: under
+load, a high-salience caller is served **before** a low-salience one. Negative arm: the same
+assessment must **not** increase the number served, the society total, or the rate ceiling. A
+governor whose queue prioritisation changes throughput has performed COMPOSE at admission time.
+
 **AC-E12 — budget exhaustion is distinguishable from merit refusal, at all three surfaces.**
 §4.4.10: in the caller-facing text, in the act record, and on the operator dashboard. The arm that
 must fire: with the budget spent, a refusal that is byte-identical to a merit refusal fails the
@@ -1085,16 +1292,24 @@ than deferred, per `fb_declare_open_decision_red`.
 
 **Q1 — RULED, three times, and moved out of this section.** *Who pays for an outward caller's
 escalation?* dp ruled (2026-08-14): a **society-law-declared external-interaction budget** — the
-machine form of a PR cost — structured as **three nested ceilings** (society ⊇ per-caller ⊇
-per-call), modulated by **salience** in both directions, with **citizenship as the boundary** past
+machine form of a PR cost — structured as **three independent constraints** (total ceiling ×
+shared nonlinear rate governor × per-caller ceiling, with per-call nested under the last),
+modulated by **salience** *within* those envelopes, and with **citizenship as the boundary** past
 which callers fund themselves. It is now §4.4. Stub kept so a reader who remembers this as the
 load-bearing open question can see it was answered and where. **What remains open is Q6, not the
 mechanism.**
 
-**Q6 — sybil-resistance of citizenship. THE remaining budget question, and it is Hub's.** §4.4.12.
-The scheme's outward attack resistance reduces to one law-set number: cheap citizenship reopens the
-free tier at scale under N identities; expensive citizenship excludes the newcomers the budget
-exists to attract. Not answered here, and deliberately not guessed at — Hub owns citizenship.
+**Q6 — calibration of the rate governor's nonlinearity. THE remaining budget question.** §4.4.12.
+**Supersedes** this slot's previous occupant (*sybil-resistance of citizenship*), which rested on the
+population-level claim §4.4.2 corrects. The free tier's anti-sybil property comes from a shared,
+identity-count-independent rate envelope; what is open is the SHAPE of its curve. Too shallow and
+there is no bound; too steep and the beneficial function dies at the knee. Probably a tuned shape
+rather than a number. Evidence is §4.4.3's outcome signal, which carries §4.4.11's feedback-loop
+caveat.
+
+**Q7 — citizenship cost, now scoped down.** Still real, still Hub's, but it governs **the exit into
+the self-funded regime**, not the free tier's population bound. It does double duty as access
+control and economic admission (§4.4.9), so an amendment should state which it intends.
 
 **Q2 — Does the family's ternary consequence grade collapse to R6/R7's binary, or ride alongside?**
 §3 recommends alongside (`kind × consequence → (R6|R7, Constraint[])`). Open because collapsing to
@@ -1124,8 +1339,10 @@ discovered late if not recorded now.
 - **Not building any of this.** Docs-only. No code lands in this PR.
 - **Not amending web4-core.** §2's gaps (a) are stated as things web4 should absorb; they are
   web4's decisions, and hestia proposing them is not hestia making them.
-- **Not answering §9 Q6** (sybil-resistance of citizenship). Deliberately — it is Hub's, and §4.4.12
-  states why it is the one that matters.
+- **Not answering §9 Q6** (the rate governor's nonlinearity) or **Q7** (citizenship cost).
+  Deliberately — §4.4.12 states why Q6 is now the one the outward design rests on.
+- **Not specifying the governor's curve family.** §4.4.2 constraint 2 is named, its gap in web4-core
+  is named (`Constraint` has no window and `Rules` has no clock), and the shape is left open.
 - **Not setting any budget NUMBER.** §4.4.4 ships the shape; every value is a society's own law.
 - **Not deprecating the three PRDs.** The envelope subsumes their *carriers*, not their *arguments*.
   §3.6.1's efficiency-attractor rationale, §4.3's measurement obligation and §10.5's three
