@@ -85,6 +85,35 @@ def on_remote(head):
     return bool(out.strip())
 
 
+def in_use_by(path):
+    """Non-empty when a LIVE process is working inside this worktree — clean-and-pushed is
+    not the same as idle. Measured 2026-08-14: a reap of a clean, fully-pushed worktree
+    landed mid-`cargo test` and killed the run; the failure surfaced as `exit 101` +
+    `(never executed)` + ENOENT on a target path, which reads exactly like a red suite to
+    anyone scanning the output. A custodian that races the work it is tidying up around is
+    worse than no custodian, so 'somebody is standing in it' is now a KEEP reason of its
+    own. Best-effort: /proc may deny us a cwd we do not own, and an unreadable /proc yields
+    no evidence of idleness — so an error here KEEPS (never reaps on ignorance)."""
+    real = os.path.realpath(path)
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return "cannot read /proc — refusing to call it idle"
+    for pid in pids:
+        for what in ("cwd", "exe"):
+            try:
+                tgt = os.readlink(f"/proc/{pid}/{what}")
+            except OSError:
+                continue
+            if tgt == real or tgt.startswith(real + os.sep):
+                try:
+                    comm = open(f"/proc/{pid}/comm").read().strip()
+                except OSError:
+                    comm = "?"
+                return f"pid {pid} ({comm}) has its {what} here"
+    return ""
+
+
 def classify(wt, target, main_path):
     path = wt["path"]
     if wt.get("bare"):
@@ -103,6 +132,9 @@ def classify(wt, target, main_path):
         return "KEEP", "unpushed + unmerged work"
     if is_dirty(path):
         return "KEEP", "uncommitted changes"
+    busy = in_use_by(path)
+    if busy:
+        return "KEEP", f"IN USE — {busy}"
     return "REAPABLE", ("branch merged to main" if merged else "HEAD pushed to a remote (clean)")
 
 
