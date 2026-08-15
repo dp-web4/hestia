@@ -6,7 +6,8 @@ on #431's standing-scope surface.
 **Twin**: `web4/hub/docs/PRD_ROLE_SCOPE_BRIDGE.md` — the hub side of the same bridge. §2 (concepts)
 is normative for BOTH documents; each side details only its own mechanics and defers to the twin for
 the other half. Amend the shared concepts in both PRs or neither.
-**Relates to**: `PRD_GATE_CONSOLIDATION.md` (LAW/SHIM/AGENT, the one-authority-path invariant, ratified
+**Reframe folded in (dp, 2026-08-14)** — *"rather than rule on these, i want to add hooks for planned infrastructure."* §7's Q1–Q4 are no longer awaiting rulings: each is recast as an **extension point** with an initial best guess, a stored home, an operator-walled path to change it, and the measurement that would justify changing it. Q5 stays a question, with its precondition named (§7.5). §7.3 — the agent second factor — now states what would have to be true for an **adjudicator rung** to count as one. See **§7** and **§9**.
+**Relates to**: `docs/PRD_ADJUDICATOR_LADDER.md` (the decider axis — §9 is the cross-reference and the shared-convergence contract), `docs/PRD_ALLOWLISTS.md` (the sibling authority; §12.1 carries the same composite contract), `PRD_GATE_CONSOLIDATION.md` (LAW/SHIM/AGENT, the one-authority-path invariant, ratified
 degraded mode), PR #431 (the standing-scope store this bridge delivers through), `docs/GATE_SPRINT_F_NOTES.md`
 R1/R3 (standing scope + launch-cwd grant — §3.6 subsumes R3), `web4/hub/docs/PRD_HUB_V2_FEDERATED.md`
 R4 (roles as entities — the role manifest extends the R4 charter), CLAUDE.md's RWOA+S+V norm (§5.6).
@@ -258,26 +259,134 @@ verdict: PASS (design) — contingent on §7 Q3 ruling what a second factor IS; 
 7. **R3 subsumption**: with session occupancies live, a session's reach with the launch-cwd bridge
    deleted equals its reach with the bridge present (differential), and the occupancy is witnessed.
 
-## 7. Open questions (declared RED until ruled)
+## 7. Open questions — and, since 2026-08-14, EXTENSION POINTS
 
-1. **Class taxonomy governance.** Who defines the class vocabulary and tier mapping — hestia
-   operator law, hub law, or a shared ratified list? A class both sides spell differently is a
-   flow-rule bypass or a permanent withhold; the taxonomy needs one authoritative home and a
-   compatibility rule for federation (the twin's Q1 is the same question from the hub side).
-2. **Cross-hub occupancy.** A member conferred a role by a *federated* hub (R1/R2 edge): does the
-   flow rule consume it at all, and if so does it demand edge-scoped law compatibility
-   (federated-PRD R6) plus a higher tier? Recommendation: out of v0; local-hub occupancies only.
-3. **What is a second factor for an agent member?** Candidates: session key + operator co-sign
-   (human in the loop — the only one that clearly satisfies T2 today); mesh witness quorum (k
-   distinct constellation members co-witness the act — but a quorum of same-host processes is one
-   factor wearing k hats); hardware-backed key (TPM/AttestationEnvelope — strongest, least
-   available). Needs a ruling before any class maps to T2-without-operator.
-4. **Reputation interaction.** Should clearance approval require/consume T3 evidence (e.g. a
-   temperament threshold in the role's context), or is reputation only advisory to the operator's
-   decision? Web4 doctrine says evidence-in, verdict-with-the-relying-party — recommendation:
-   surface T3 beside the ask, never auto-decide.
-5. **Withheld-item ergonomics.** Does a `role_scope_withheld` witness auto-open a clearance ask for
-   the operator, or is that escalation-noise (the known approve→re-issue loop-close gap applies)?
+**dp declined to rule on these. The directive, verbatim:**
+
+> "all of these things we're going to have to take a best guess at and evolve as we go. the key is
+> to have mechanisms for the evolution, not hardcode things. and remember, the policy entity AGENT
+> is still intended to slot in between heuristic slot and human, as a middle escalation layer. and
+> even that can be a neural net, and THEN an agent. your own 'auto mode' in claude-code already
+> implements this. so rather than rule on these, i want to add hooks for planned infrastructure.
+> ultimately, a competent agent will be a far more effective reviewer than a human - always there,
+> much faster, able to actually look at the full context, consult the actual law. that is the goal."
+
+Q1–Q4 below are **converted, not answered and not deleted**. Each states the initial best guess,
+where the value lives, who may change it, what measurement would justify a change, and — where the
+question has a per-case form — that the adjudicator ladder is its eventual decider. Q5 stays a
+question, and §7.6 says why.
+
+### 7.1 Class taxonomy governance → EXTENSION POINT
+
+*Who defines the class vocabulary and tier mapping — hestia operator law, hub law, or a shared
+ratified list? A class both sides spell differently is a flow-rule bypass or a permanent withhold.*
+
+| | |
+|---|---|
+| **initial best guess** | **hestia operator law is authoritative for what a LOCAL member is cleared for; the hub is authoritative for what a ROLE requires.** Neither can spell the other's half. A hub manifest naming a class hestia does not know is **withheld and disclosed** (`role_scope_withheld`), never silently absorbed — which is §2's flow rule already, applied to an unknown spelling rather than to a missing clearance. That is the fail-closed default and it needs no ruling to ship. |
+| **where the value lives** | one taxonomy document, stored beside clearances (§3.1), generation-covered, and — per `PRD_ALLOWLISTS.md` §12's shared-key argument — **the same `kind` vocabulary the ceremony table and the ladder route table resolve on**. Three vocabularies of "what kind of act is this" would drift; one has one answer. |
+| **who can change it** | the operator, at the ceremony tier `required_tier` returns for the taxonomy's own `kind`. Federation compatibility is a **mapping** the operator writes (hub class ⇒ local class), not an implicit string match — a string match is the flow-rule bypass this question is about. |
+| **what would justify a change** | the withheld-item log, joined on the class that was unknown. A class withheld repeatedly is either a mapping the operator should write or a clearance they should refuse, and the log distinguishes them. An empty log means the taxonomy is adequate. |
+| **eventual decider, per-case** | the ladder. "This manifest names `deploy:staging`; our taxonomy has `deploy` — is that the same class?" is a judgment about two documents, and a rung reading both is better placed than a static equality test. Note the failure mode explicitly: a rung that resolves spellings **liberally** is a flow-rule bypass with a faster clock, so this route is one where an advisory rung should stay advisory for a long time. |
+
+### 7.2 Cross-hub occupancy → EXTENSION POINT
+
+*A member conferred a role by a federated hub (R1/R2 edge): does the flow rule consume it at all,
+and if so does it demand edge-scoped law compatibility (federated-PRD R6) plus a higher tier?*
+
+| | |
+|---|---|
+| **initial best guess** | **out of v0 — local-hub occupancies only.** Unchanged from the original recommendation; what changes is that "out of v0" is now a stored value rather than an absence of code. |
+| **where the value lives** | an `accepted_occupancy_sources` list in the same store: initially the paired local hub's identity and nothing else. An occupancy from an unlisted source is **withheld and disclosed**, the same disposition as an unknown class — so the v0 restriction produces a record rather than silence. |
+| **who can change it** | the operator, by adding a hub identity, at the taxonomy's ceremony tier. The **proof-tier floor** for federated occupancies is a second stored value on the same entry, defaulting to +1 tier — so admitting a federated hub does not simultaneously decide how much it is trusted. Two values, because they are two decisions. |
+| **what would justify a change** | a federated occupancy actually being needed — i.e. a non-empty withheld-by-source log. Today that log would be empty, which is the honest reason this is out of v0: not that it is wrong, but that nobody has asked. |
+| **eventual decider, per-case** | the ladder, and this is the strongest per-case case in the section: edge-scoped law compatibility (federated-PRD R6) is a comparison of two law documents, both hash-pinned. A rung can fetch both, diff them, and state which norms conflict. A human comparing two law documents per occupancy is exactly dp's *"a human skims"* case. |
+
+### 7.3 The agent second factor → EXTENSION POINT, and an AGENT RUNG IS A CANDIDATE
+
+*What is a second factor for an agent member? Candidates: session key + operator co-sign (the only
+one that clearly satisfies T2 today); mesh witness quorum (k distinct constellation members
+co-witness the act — but a quorum of same-host processes is **one factor wearing k hats**);
+hardware-backed key (TPM/AttestationEnvelope — strongest, least available).*
+
+**This is the most interesting of the five, and the reframe changes its shape rather than
+deferring it. An adjudicator rung is itself a candidate second factor** — and stating what would
+have to be true for that to count is more useful than a ruling, because it is falsifiable.
+
+**What would have to be true for an agent rung to count as a second factor:**
+
+1. **Independence, computed and recorded — not assumed.** `arbiter::eligibility_for` clauses 0–4
+   apply to the rung exactly as to a peer: the asker must be **proven, not asserted** (clause 0,
+   #128 — a forged asker grades `cross_vendor` against everyone, which is the strongest tier for
+   the weakest evidence), the rung must not be the member (clause 1), must not be the gate that
+   denied (clause 2), and must resolve to a recognised lineage (clause 3, added after an hourly
+   cron was selected as arbiter and graded `cross_vendor`). **A rung of the same lineage as the
+   asker grades `CrossMember`, never `CrossVendor`.**
+2. **A different failure domain — and this is the clause the phrase in this PRD already names.**
+   *A quorum of same-host processes is one factor wearing k hats.* An agent rung inherits that
+   objection **in full** unless its failure domain genuinely differs. Enumerate what it must not
+   share: the same model lineage as the asker; the same host and process supervisor; the same
+   credential material; the same law snapshot **read at the same instant from the same cache**;
+   the same gate whose refusal is under review. `arbiter.rs`'s deleted `CrossSession` tier is the
+   precedent and the standard — it was removed on the ground that a second session of the same
+   member *"is precisely the entity that cannot see this entity's blind spots."* **A second
+   process of the same member is not a second factor, however many hats it wears.**
+3. **Not the same process wearing k hats, asserted rather than argued.** The rung binding records
+   host, lineage, process identity and credential source; the second-factor check refuses when any
+   of them matches the asker's. This is a test, not a doctrine, and it must be able to fail: the
+   positive control is the same rung admitted for a *different* member.
+4. **Availability that does not become the argument.** A second factor is only worth something if
+   it can refuse. A rung reachable enough to always co-sign and never dissent is a rubber stamp,
+   which is the thing dp already said he was doing by hand. **The measurement is the dissent rate,
+   and a rung whose dissent rate is zero over a stated window has not demonstrated it is a factor
+   at all.** That is the falsifiable form of this whole question.
+
+| | |
+|---|---|
+| **initial best guess** | **operator co-sign remains the only thing that satisfies T2 today.** Unchanged. What is added is a path: an agent rung may be *recorded* as an additional factor from day one (advisory, per `PRD_ADJUDICATOR_LADDER.md` §4.1 stage A) while satisfying T2 by itself remains reserved. |
+| **where the value lives** | the class→tier map (§2's proof tiers) plus, per class, the **set of factor kinds that satisfy that tier**. Stored. So "an agent rung satisfies T2 for class C" is a value an operator writes, not a code path someone ships. |
+| **who can change it** | the operator, at the tier being modified — the §3.6.3 asymmetry applies: **widening what satisfies a tier pays the tier being widened FROM.** A rung that could be added to its own tier's satisfying set is the ratchet-defeat one layer up. |
+| **what would justify a change** | the stage-A record: per-class agreement rate with the operator's co-sign, **and a non-zero dissent rate**. Agreement alone is satisfied by a rung that always says yes; the two together are not. |
+| **eventual decider** | not the ladder — **this one is the operator's, permanently.** What counts as a second factor for a T2 act is a statement about the trust model, and `PRD_ADJUDICATOR_LADDER.md` §5.3 forbids a rung from adjudicating changes to the ladder's own authority. This is that rule applied one layer out. |
+
+### 7.4 T3 / reputation interaction → EXTENSION POINT
+
+*Should clearance approval require or consume T3 evidence (e.g. a temperament threshold in the
+role's context), or is reputation only advisory to the operator's decision?*
+
+| | |
+|---|---|
+| **initial best guess** | **advisory. Surface T3 beside the ask; never auto-decide.** Unchanged, and it is not a compromise — it is Web4 doctrine and CLAUDE.md's own ratified norm: *"produce checkable evidence and let the caller decide; do not smuggle in an exclude/admit verdict."* A T3 threshold that gated clearance approval would be the `satisfied_by` inversion (CLAUDE.md's named 2026-07-16 bug) reproduced at the clearance grain. |
+| **where the value lives** | a per-class `reputation_display` config: which T3 axes are shown beside the ask, and any **advisory** band. Displayed, never evaluated as a precondition. |
+| **who can change it** | the operator. Note what is deliberately **not** offered: there is no stored value that turns the advisory band into a gate. Adding one would be a change to the trust model, not a config edit, and it belongs in a PR that argues for it. |
+| **what would justify a change** | nothing measurable at this grain — which is the honest answer, and it is why this is the one extension point whose mechanism is deliberately incomplete. If a case for gating ever arrives it will arrive as an argument, not as a number. |
+| **eventual decider, per-case** | the ladder, in exactly the shape doctrine permits: a rung **reads** T3 as part of its evidence bundle (`PRD_ADJUDICATOR_LADDER.md` §3.3) and cites it in its rationale. Evidence-in, verdict-with-the-relying-party — the rung is a relying party, and a rung that *thresholded* on T3 would be committing the same inversion the operator is forbidden from committing. |
+
+### 7.5 Withheld-item ergonomics — still a question, and it should be
+
+*Does a `role_scope_withheld` witness auto-open a clearance ask for the operator, or is that
+escalation-noise?*
+
+**Not converted, deliberately.** It is genuinely undecided and it is undecided for a measurable
+reason: the known approve→re-issue loop-close gap means a duplicate ask is not merely noise but
+noise that **keys on (member, marker) rather than on the ask id**, so duplicates are
+indistinguishable from retries. Auto-opening before that gap is closed would manufacture exactly the
+flood dp described (*"being flooded with false positives"*).
+
+The right sequencing is stated rather than the answer: **close the loop first, then auto-opening is
+a stored boolean and this becomes an extension point like the others.** Recording it as an open
+question with a named precondition is more useful than recording it as a value nobody can safely
+set. This is also the question the ladder most plausibly *dissolves*: an escalation queue that
+drains at machine speed changes what counts as noise, because the cost of a spurious ask is a rung's
+attention rather than dp's.
+
+### 7.6 What was NOT converted, and why
+
+Q5 above. And one meta-note, because it is the failure mode this section could produce: **an
+extension point with no measurement attached is an open question wearing a design's clothes.** Four
+of the five above name the measurement that would move them; §7.4 explicitly does not, and says so
+rather than inventing one. A table row reading "what would justify a change: further review" would
+be the reassuring version of an unanswered question, and it is not offered.
 
 ## 8. Non-goals
 
@@ -287,3 +396,61 @@ verdict: PASS (design) — contingent on §7 Q3 ruling what a second factor IS; 
 - No auto-approval of clearances from reputation, occupancy pressure, or role need.
 - No re-design of the gate's decision topology, the vault, or the R2 path-grant model — this PRD
   consumes them and names them where it depends on them.
+- **Not building the adjudicator ladder** (§9). This PRD names it as the eventual per-case decider
+  for §7's questions and contributes the seventh authority to the composite; the ladder is its own
+  PRD and its own work.
+
+## 9. Adjudicator ladder — cross-reference
+
+**See `docs/PRD_ADJUDICATOR_LADDER.md`** (dp-directed, 2026-08-14). That PRD is why §7's questions
+are extension points rather than pending rulings, and it is where the per-case form of each of them
+is decided.
+
+The relationship, stated so neither document has to be read to understand the other:
+
+- **This PRD governs WHAT reach flows and to whom** — classes, manifests, occupancy, the flow rule.
+  **The ladder PRD governs WHO DECIDES** a contested case. They meet at the proof tiers (§2): a
+  tier says what evidence an act demands, and the ladder says which entity supplies it.
+- **They share one `kind` vocabulary.** §7.1's taxonomy, `PRD_ALLOWLISTS.md` §3.6.5's ceremony
+  table and the ladder's route table resolve on the **same** key. Three vocabularies for "what kind
+  of act is this" would drift with no surface on which to notice.
+- **An agent rung is a candidate second factor, and §7.3 states what would have to be true** —
+  computed independence via `arbiter::eligibility_for`, a genuinely different failure domain, not
+  the same process wearing k hats, and a **non-zero dissent rate**. The ladder PRD §5.1 carries the
+  same anti-capture rules from the other side.
+- **The ladder never decides its own authority, and by extension never decides §7.3.** What counts
+  as a second factor for a T2 act is the operator's, permanently (`PRD_ADJUDICATOR_LADDER.md` §5.3
+  applied one layer out).
+
+### 9.1 The convergence requirement (GPT, relayed by dp 2026-08-14) — binding on all three PRDs
+
+> Both PRDs must share **ONE composite policy revision/digest** and **ONE horizon bounded by every
+> contributing authority** — standing grants, allowlists, floor, clearances, occupancy, manifest
+> generation — rather than each inventing certification semantics.
+
+**One composite revision.** A single digest over the tuple of every contributing authority's
+generation — standing grants, allowlists, floor, **clearances (§3.1)**, **occupancy**, **manifest
+generation (§2)**, and the ladder generation. Any authority moving moves the composite, and it
+surfaces to members through `law_hash`. This PRD contributes three of the seven, which is why it
+must not mint its own: a clearance generation that moved without moving the composite would be a
+policy change no replica could detect. `PRD_ALLOWLISTS.md` §12.1 and
+`PRD_ADJUDICATOR_LADDER.md` §11 carry the identical text.
+
+**One horizon.**
+
+```
+horizon = min( now + STANDING_SNAPSHOT_TTL_SECS,  earliest covered expiry across ALL authorities )
+```
+
+§3.3's certification pair and §3.4's *"within its certification horizon (else vault-expired → empty
+scope, #431 behaviour)"* are that expression; the requirement is that all three PRDs use **the same
+expression evaluated over the union**, not three similarly-worded expressions in three documents.
+A clearance expiry, an occupancy end, a manifest amendment and a rung-binding expiry are all covered
+expiries and all bound the horizon. **§6 criterion 3 is where this is proved** — each of the three
+revocation paths must strand the derived grants within *one* horizon, and "one horizon" is only
+meaningful if there is exactly one.
+
+**Why this is not bookkeeping.** Three PRDs each minting a generation, a digest and a TTL produces
+three certification semantics that agree until the first time they do not — and the first time they
+do not is a snapshot that is fresh by one document's rule and stale by another's, admitting an act
+under a policy that had already changed. One composite has one answer.
