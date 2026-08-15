@@ -115,8 +115,40 @@ def test_a_consumed_row_reads_consumed_even_with_no_open_or_decide():
     check("consumed named", v.startswith("NO — already consumed"), v)
 
 
+# Listed by name, deliberately, rather than swept out of `globals()`. The sweep worked --
+# run bare, this file printed 7 PASS and exited 0 -- but `tools/ci_selfexec_test.py` checks
+# for a reference to each `test_*` by walking `ast.Name`, and a `globals()` dispatch is
+# invisible to it. So the file was red in CI for a week while being green on every
+# assertion it makes, and PR #468 sat unmerged behind that red.
+#
+# The guard is right to be unconvinced, which is why this is a fix and not a suppression:
+# a dispatch a CHECKER cannot see, a REVIEWER cannot see either, and the failure mode it
+# is defending against -- a test file that defines assertions and never runs them, then
+# reports green -- is the exact shape this corpus keeps finding elsewhere. An explicit
+# list costs one line per test and makes "is this test wired up?" answerable by reading.
+# Same defect, same remedy as `test_gate_core.py` on PR #171.
+TESTS = [
+    test_an_undecided_row_is_never_YES,
+    test_an_undecided_row_has_no_horizon,
+    test_an_approved_row_still_claims_inside_its_window,
+    test_an_approved_row_dies_at_the_grant_anchor_not_the_ttl,
+    test_a_denied_row_names_its_status,
+    test_bar_not_met_is_still_reported,
+    test_a_consumed_row_reads_consumed_even_with_no_open_or_decide,
+]
+
+
 def main():
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    tests = TESTS
+    defined = {k for k in globals() if k.startswith("test_")}
+    listed = {t.__name__ for t in TESTS}
+    if defined != listed:
+        # The cost of an explicit list is that it can go stale. This makes staleness a
+        # RED, not a silently smaller run -- a new test that nobody added here would
+        # otherwise never execute, which is the very thing being fixed.
+        print(f"FAIL TESTS is stale: defined-not-listed={sorted(defined - listed)} "
+              f"listed-not-defined={sorted(listed - defined)}")
+        return 1
     failed = []
     for t in tests:
         try:
