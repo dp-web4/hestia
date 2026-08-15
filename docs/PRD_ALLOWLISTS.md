@@ -6,7 +6,8 @@
 - **Q4 → consolidate.** *"i agree with your instinct. consolidation whenever practical is the best way to ensure effective maintenance, clarity, and applying the law uniformly."* #431's standing-scope store **becomes the FILES axis** of this system. One store, two axes, one generation counter, one export, one editor, one set of duration semantics. See **§2.0** (the principle) and **§3.4/§3.5** (the store and its migration).
 - **Q3 → a bootstrap ratchet.** *"start ceremony-light and have the option to ratchet things up to match increasing resources. we want the sufficiently-correct path to be the easy path."* The ceremony required to edit the society floor is a **declared, stored tier** that ratchets up, whose lowering must pay the tier being lowered *from*. See **§3.6**.
 - **UI → GOVERN is a top-level view.** *"the LEDGER button should become GOVERN and ledger would be a sub-screen of that … make the screen toggle from agents/hubs into agents/hubs/devices/govern selector (devices being constellation management)."* The masthead switch goes four-way; govern absorbs ledger, policy and the allowlist editor; the pending-decision banners stay **above** it. See **§6.0**. This part is **independently shippable** and need not wait for the allowlist store (§6.0.5).
-**Relates to**: `docs/PRD_GATE_CONSOLIDATION.md` (§4 LAW/SHIM/AGENT, §7.1 criterion 5), `docs/GATE_SPRINT_F_NOTES.md` (R1/R2/R3), `docs/PRD_GOVERNANCE.md` (the one-authority-path invariant), `docs/PRD_CONFIG_IN_VAULT.md`, PR #431 (merged — the store pattern this reuses), issues #434 (claim-window race), #435 (permissive renders green), #438 (gauge referent), #393 (friction manufactures bypass).
+**Reframe folded in (dp, 2026-08-14)** — *"rather than rule on these, i want to add hooks for planned infrastructure."* §7's Q1, Q2 and Q5 are no longer awaiting rulings: each is recast as an **extension point** with an initial best guess, a stored home, an operator-walled path to change it, and the measurement that would justify changing it. The per-case form of each question is routed to the adjudicator ladder. See **§7** and **§12**.
+**Relates to**: `docs/PRD_ADJUDICATOR_LADDER.md` (the decider axis — §12 is the cross-reference and the shared-convergence contract), `docs/PRD_ROLE_SCOPE_BRIDGE.md` (the third contributing authority to the composite), `docs/PRD_GATE_CONSOLIDATION.md` (§4 LAW/SHIM/AGENT, §7.1 criterion 5), `docs/GATE_SPRINT_F_NOTES.md` (R1/R2/R3), `docs/PRD_GOVERNANCE.md` (the one-authority-path invariant), `docs/PRD_CONFIG_IN_VAULT.md`, PR #431 (merged — the store pattern this reuses), issues #434 (claim-window race), #435 (permissive renders green), #438 (gauge referent), #393 (friction manufactures bypass).
 
 ---
 
@@ -913,28 +914,61 @@ places where "just add two chips" silently misbehaves:
 
 ---
 
-## 7. Open questions — RED
+## 7. Open questions — and, since 2026-08-14, EXTENSION POINTS
 
-**Q1 (RED) — how does a TOOLS entry interact with the shell grammar?**
-*Position taken, for ruling:* the TOOLS axis is keyed on the **executable position**, not on
-mention — the resolved head of each simple command, reusing the segmentation
+**dp declined to hardcode these, and declined to rule on them. The directive, verbatim:**
+
+> "all of these things we're going to have to take a best guess at and evolve as we go. the key is
+> to have mechanisms for the evolution, not hardcode things. […] so rather than rule on these, i
+> want to add hooks for planned infrastructure."
+
+So Q1, Q2 and Q5 are **not deleted and not answered**. They are converted. Each now states: the
+**initial best guess** (the value that ships), the **mechanism of evolution** (who may change it,
+where the value lives, what would justify a change), and the **eventual decider** for the per-case
+form of the question — which is the adjudicator ladder (`docs/PRD_ADJUDICATOR_LADDER.md`, §12
+below).
+
+The distinction that makes this coherent: these questions have a **policy form** ("what should the
+default be?") and a **per-case form** ("should THIS member run THIS head, right now?"). The policy
+form is a stored value with an operator-walled edit path. The per-case form is an adjudication, and
+adjudications are what the ladder routes. A question that reads as unanswerable at the policy grain
+is usually a question that was being asked at the wrong grain.
+
+**Q1 → EXTENSION POINT — how does a TOOLS entry interact with the shell grammar?**
+
+*Settled by construction, and it ships:* the TOOLS axis is keyed on the **executable position**,
+not on mention — the resolved head of each simple command, reusing the segmentation
 `_degraded_command_is_read` already performs (splits on `|`, `&&`, `||`, `;`, then
 `words[0].rsplit("/", 1)[-1]`), so `/usr/bin/gh` and `gh` are one entry, and a *mention* of `gh`
 in an argument is not a tool use. It is global to the member, not per-path, because a
 verb-crossed-with-territory matrix is a policy nobody can hold in their head and both axes must
-pass anyway. **Not settled:** `bash`, `sh`, `python3`, `node`, `eval` are heads that *execute
-other things* (#393). Options: (a) treat them as ordinary entries and accept that the axis is
-legibility not security (consistent with §3.3); (b) mark them `indirect` and render every act
-through them as amber in the display; (c) refuse to allowlist them at all, which would deny
-almost everything and is not viable. Leaning (a)+(b). **dp's ruling wanted.**
+pass anyway.
 
-**Q2 (RED) — enforcement onset for the TOOLS axis.** An allowlist is restrictive by definition:
-a head not on the effective list is denied (`mrh.tool`). Applied on day one to a floor nobody has
-populated, that denies the fleet. **Position:** the axis ships in **shadow mode** — computed,
-recorded to `telemetry/allowlist-shadow.jsonl` as `would_deny`, verdict unchanged — until the
-measured would-deny rate over a stated window is ~0 against a floor seeded from real usage; only
-then does an operator flip it to enforcing, per-member first, society last. The flip is itself a
-witnessed operator act. **The acceptance criterion is the measurement, not the intention.**
+*The part that was RED — `bash`, `sh`, `python3`, `node`, `eval` are heads that execute other
+things (#393) — is now a stored per-entry attribute rather than a ruling:*
+
+| | |
+|---|---|
+| **initial best guess** | option (a)+(b): interpreter heads are ordinary entries, marked `indirect: true`, and every act through one renders amber. The axis is **legibility, not security** — consistent with §3.3 and with A1/HST-009. Option (c) was never viable: refusing to allowlist interpreters denies almost everything. |
+| **where the value lives** | `indirect` is a per-entry boolean on the TOOLS axis in the same vault document as the entry itself (§3.5). Not a hardcoded head list in the matcher — a hardcoded list is what made this a question. |
+| **who can change it** | the operator, through the same operator-walled editor as any other entry, at the ceremony tier `required_tier("floor.tool.add", …)` returns (§3.6.5). Changing `indirect` on an entry is a `floor.tool.*` act, not a free-text edit. |
+| **what would justify a change** | the amber-rate telemetry. If ~all acts render amber the marking is noise and carries no information; if ~none do, the marking is unearned reassurance. Either extreme is measurable from the shadow log Q2 already requires, at no extra instrumentation cost. |
+| **eventual decider, per-case** | the ladder. "Should this member run `bash <script>` right now" is exactly a bundle-in/verdict-out adjudication: the payload is available, the law is hash-pinned, and a rung can read the script the head would execute — which is the one thing the static entry provably cannot. #393 measured that the FP on a benign `flock` drove the identical shell into `bash <script>`; a static list cannot tell those apart and a rung that reads the script can. |
+
+**Q2 → EXTENSION POINT — enforcement onset for the TOOLS axis.**
+
+*The position stands and is now the shipped mechanism rather than a proposal:* an allowlist is
+restrictive by definition — a head not on the effective list is denied (`mrh.tool`) — so applied on
+day one to a floor nobody has populated it denies the fleet. The axis ships in **shadow mode**:
+computed, recorded to `telemetry/allowlist-shadow.jsonl` as `would_deny`, verdict unchanged.
+
+| | |
+|---|---|
+| **initial best guess** | shadow, society-wide, from the first day the axis exists. Not a flag defaulting to enforcing "once we're confident." |
+| **where the value lives** | an enforcement state per (axis, scope) in the same document as the lists, carrying its own generation. `shadow` \| `enforcing`, and the state is rendered on the face of the editor (§6.3) so a shadow axis never looks like a live one — the #435 never-flatter rule applied to onset. |
+| **who can change it** | the operator, and the flip is itself a witnessed act. **AC-11 already refuses the flip unless a named window of shadow telemetry shows a would-deny rate below the stated threshold, and the refusal quotes the measured number.** That is the mechanism of evolution, and it was already written this way before the reframe — Q2 was closer to an extension point than to a question. |
+| **what would justify a change** | the measured would-deny rate over a stated window against a floor seeded from real usage. Per-member first, society last. **The acceptance criterion is the measurement, not the intention.** |
+| **eventual decider, per-case** | the ladder, and this is the cleanest correspondence in the section: `PRD_ADJUDICATOR_LADDER.md` §4.1 stage A **is** shadow mode, for the decider axis instead of the policy axis — computed, recorded, verdict unchanged, promoted only on a measured agreement rate. Build the shadow-telemetry-plus-measured-flip machinery **once** and let both axes use it. Two shadow implementations would drift to two definitions of "would-deny rate." |
 
 **Q3 — RULED, moved out of this section.** *Does the society floor need a stronger ceremony than
 a member expansion?* dp ruled **a bootstrap ratchet** (2026-08-14): start ceremony-light,
@@ -952,14 +986,24 @@ stay separate?* dp ruled **consolidate** (2026-08-14). It is now §2.0 (the prin
 one store) and §3.5 (the migration). Left as a stub here rather than deleted, so a reader who
 remembers this as an open question can see it was answered and where.
 
-**Q5 (RED) — is a bare tool name (`Read`, `Edit`) on the TOOLS axis the same kind of thing as a
-command head (`gh`)?** They arrive through different fields (`NormalizedEvent.tool` vs the
-command grammar) and a member could hold `Bash` but not `gh`, or the reverse. Position: one axis,
-two matchers, one namespace, and the UI labels each entry `tool` or `command-head` so the operator
-is never guessing which they wrote. Unresolved: whether `Bash` on the list is implied by any
-command-head entry (i.e. does allowing `gh` imply allowing the Bash tool that carries it?).
-Leaning **yes, implied** — otherwise every operator writes `Bash` forty times — but that makes
-`Bash` un-deniable in practice, which is worth dp seeing before it is built.
+**Q5 → EXTENSION POINT — is a bare tool name (`Read`, `Edit`) the same kind of thing as a command
+head (`gh`)?**
+
+*Settled and shipping:* one axis, two matchers, one namespace. They arrive through different fields
+(`NormalizedEvent.tool` vs the command grammar), and the UI labels each entry `tool` or
+`command-head` so the operator is never guessing which they wrote.
+
+*The RED part — does allowing `gh` imply allowing the `Bash` tool that carries it? — is now a
+stored composition rule:*
+
+| | |
+|---|---|
+| **initial best guess** | **yes, implied.** A command-head entry implies the carrier tool. The alternative makes every operator write `Bash` forty times, which is the efficiency attractor being fed rather than designed around (§3.6.1) — and an operator who writes `Bash` forty times out of ritual has stopped reading it. |
+| **the cost, stated** | implication makes `Bash` **un-deniable in practice**: any command-head entry re-admits it. This is a real narrowing of what the axis can express and it is the reason this was RED. It is accepted rather than hidden, and it is consistent with §3.3 — the TOOLS axis is legibility, not security. A member that must be denied `Bash` outright is a member whose FILES axis and innate layer are doing the work, not this one. |
+| **where the value lives** | a `carrier_implication` mode on the TOOLS axis: `implied` \| `explicit`. Stored, generation-covered, one value for the axis rather than per-entry — a per-entry version would produce a list whose meaning depends on read order. |
+| **who can change it** | the operator, at the tier `required_tier` returns for `floor.tool.*`. Flipping `implied → explicit` is a **narrowing** and therefore, per §3.6.5's `floor.remove` reasoning, is high-consequence in the availability direction and must not be filed as safe-because-tighter. |
+| **what would justify a change** | a measured case where the implication admitted an act the operator would have refused — recoverable from the shadow log by joining `would_deny` rows against the entry that implied the carrier. If that join is empty over a stated window, `implied` is costing nothing. |
+| **eventual decider, per-case** | the ladder. "This member holds `gh`; it is invoking `Bash` to run something else" is a per-act judgment that no static implication rule can make, because the answer depends on the payload. A rung reads the payload. The stored mode is the default the ladder falls back to when no rung is routed — which is the correct relationship between a policy default and an adjudication, and the reason this PRD does not have to choose one answer forever. |
 
 ---
 
@@ -1128,3 +1172,59 @@ is the same union at a third layer. **The open seam** is the direction of travel
 floor is pushed to societies (and therefore whether a society can be *narrower* than the hub,
 which under §2.2's inversion it cannot) or offered for adoption. That is the hub PRD's first
 question, not this one's.
+
+---
+
+## 12. Adjudicator ladder — cross-reference
+
+**See `docs/PRD_ADJUDICATOR_LADDER.md`** (dp-directed, 2026-08-14). That PRD is why §7's questions
+are extension points rather than pending rulings.
+
+The relationship, stated so neither document has to be read to understand the other:
+
+- **This PRD governs the EVIDENCE.** What may be reached, by whom, and how much ceremony a change
+  to that costs (§3.6). **The ladder PRD governs the DECIDER** — which entity is asked, in what
+  order, for a given act. Two axes of one authority story; neither is a special case of the other.
+- **They share one key.** §3.6.5's `required_tier(kind, society_consequence) -> Tier` and the
+  ladder's `rungs_for(kind, consequence) -> [RungId]` resolve from the **same** `kind × consequence`
+  table in the **same** store. One key, two answers: *how much evidence* and *who supplies it*. Two
+  tables would drift to two taxonomies of `kind` with no surface on which to notice — the identical
+  argument §3.6.6 makes for why the two-axis consolidation enables the seam at all.
+- **They share one ratchet.** The ladder's promotion path (advisory → decides-under-tier → wider)
+  is §3.6's ratchet applied to the decider: bootstrap-light, asymmetric, lowering pays the tier
+  being lowered FROM, with a slow-and-loud escape. A rung that could route its own promotion is
+  §3.6.3's ratchet-defeat one layer up, and the ladder PRD §5.3 forbids it by making a `ladder.*`
+  route return a **refusal, not a rung id** — exactly as this PRD's table returns a refusal, not a
+  number, for `governance.*`.
+- **They share one shadow.** §7 Q2's shadow-to-enforce machinery and the ladder's stage-A advisory
+  mode are the same instrument pointed at different axes. Build it once (§7 Q2).
+
+### 12.1 The convergence requirement (GPT, relayed by dp 2026-08-14) — binding on all three PRDs
+
+> Both PRDs must share **ONE composite policy revision/digest** and **ONE horizon bounded by every
+> contributing authority** — standing grants, allowlists, floor, clearances, occupancy, manifest
+> generation — rather than each inventing certification semantics.
+
+**One composite revision.** A single digest over the tuple of every contributing authority's
+generation — standing grants, allowlists, floor, clearances, occupancy, manifest generation, and
+the ladder generation. Any authority moving moves the composite. **AC-12** already requires that an
+allowlist edit move `law_hash`; that requirement is unchanged and is now understood as *the
+composite surfacing to members through `law_hash`*, not as an allowlist-specific rule.
+`PRD_ROLE_SCOPE_BRIDGE.md` §9 and `PRD_ADJUDICATOR_LADDER.md` §11 carry the identical text.
+
+**One horizon.**
+
+```
+horizon = min( now + STANDING_SNAPSHOT_TTL_SECS,  earliest covered expiry across ALL authorities )
+```
+
+§3's table (`snapshot horizon = min(now + TTL, earliest covered expiry)`, reusing
+`STANDING_SNAPSHOT_TTL_SECS`) is that expression; the requirement is that the sibling PRDs use
+**the same expression evaluated over the union**, not three similarly-worded expressions in three
+documents. A clearance expiry, an occupancy end and a rung-binding expiry are all covered expiries
+and all bound the horizon.
+
+**Why this is not bookkeeping.** Three PRDs each minting a generation, a digest and a TTL produces
+three certification semantics that agree until the first time they do not — and the first time they
+do not is a snapshot that is fresh by one document's rule and stale by another's, admitting an act
+under a policy that had already changed. One composite has one answer.
