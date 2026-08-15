@@ -204,6 +204,39 @@ def bootstrap_ci(xs, reps=4000, lo=2.5, hi=97.5, seed=20260815):
     return round(pct(lo), 4), round(pct(hi), 4)
 
 
+def upper_bound(lo, basis: str):
+    """The bound part ≤ whole actually licenses — and nothing past it.
+
+    What holds: this ONE call provably contained a complete traversal of at
+    least `lo["n"]` residents, so that traversal cost at most `lo["ms"]`.
+    `lo["n"]` is a LOWER bound on the map size (start count + this run's mints;
+    other seats may have connected concurrently), which only makes the walk
+    bigger than counted, so the ms figure still bounds it.
+
+    What does NOT hold, and why no per-resident figure is projected forward
+    (codex, #452 third pass): dividing by `n` gives an amortized ratio AT THIS
+    MAP STATE, not a scale-invariant rate. Rust documents `HashMap` iteration
+    as O(capacity), not O(len) — hashbrown walks control bytes across the whole
+    allocation — so the ratio steps at every resize boundary and this run
+    sampled one narrow size band. A "residents for a 1 s walk" number computed
+    from it would be a linear extrapolation wearing a bound's clothes, and even
+    its NAME would point the wrong way: under a constant upper ratio that count
+    is the threshold you need to REACH one second, i.e. a lower bound, not an
+    "at most". Growing this into a rate needs samples across size bands.
+    """
+    return {
+        "basis": basis,
+        "whole_call_ms": round(lo["ms"], 4),
+        "residents_traversed_at_least": lo["n"],
+        "holds": (f"a complete traversal of >= {lo['n']} residents cost "
+                  f"<= {round(lo['ms'], 4)} ms at this map state"),
+        "ns_per_resident_here": round(lo["ms"] * 1e6 / lo["n"], 1),
+        "not_a_rate": ("amortized at THIS state only; HashMap iteration is "
+                       "O(capacity), so this does not bound larger maps and "
+                       "no future-size or time projection is derived from it"),
+    }
+
+
 def novault_pairs(m: int, before: int, minted_start: int):
     """The TIGHT arm: connects that traverse the whole map with no vault write.
 
@@ -245,7 +278,14 @@ def novault_pairs(m: int, before: int, minted_start: int):
         for arm, key in order:
             dt, ok, why = one_connect(c, key, synthetic=False)
             if not ok:
-                return {"error": f"novault sample rejected: {why}"}, minted
+                # The reject CLASS must reach the top-level counter, or a run
+                # that abandoned this phase still prints `rejected_total: 0`
+                # and exits 0 — the tool's stated contract, unmet (codex, #452
+                # third pass). The caller increments and marks the arm
+                # incomplete.
+                return {"error": f"novault sample rejected: {why}",
+                        "reject_class": f"novault_{arm}:{why}",
+                        "pairs_completed": len(paired)}, minted
             minted += 1
             got[arm] = {"ms": dt, "n": before + minted}
         miss.append(got["miss"])
@@ -265,7 +305,7 @@ def selftest() -> int:
     from gate_handshake_latency_probe import unwrap  # the old predicate's half
 
     c = fresh_client()
-    cases = []
+    cases = []  # (name, response, expected_new_admit)
 
     # live positive: a real connect must still be ADMITTED (polarity check —
     # a gate that rejects everything also "rejects errors")
@@ -275,32 +315,39 @@ def selftest() -> int:
         "requested_role": "citizen", "protocol_version": PROTOCOL_VERSION,
         "role": "role:constellation:member", "synthetic": True,
     })
-    cases.append(("live: real connect", resp))
+    cases.append(("live: real connect", resp, True))
 
     # live negative 1: a tool that does not exist
-    cases.append(("live: unknown tool", c.call_tool("hestia_no_such_tool", {})))
+    cases.append(("live: unknown tool", c.call_tool("hestia_no_such_tool", {}), False))
     # live negative 2: connect with a required field missing
-    cases.append(("live: connect missing plugin_id", c.call_tool("hestia_connect", {"synthetic": True})))
+    cases.append(("live: connect missing plugin_id",
+                  c.call_tool("hestia_connect", {"synthetic": True}), False))
     # constructed negatives, in the two shapes the old predicate swallowed
     cases.append(("shape: jsonrpc error", {"jsonrpc": "2.0", "id": 1,
-                                           "error": {"code": -32602, "message": "bad params"}}))
+                                           "error": {"code": -32602, "message": "bad params"}}, False))
     cases.append(("shape: tool-error envelope", {"jsonrpc": "2.0", "id": 1, "result": {
         "isError": True,
-        "content": [{"type": "text", "text": json.dumps({"error": "denied by policy"})}]}}))
+        "content": [{"type": "text", "text": json.dumps({"error": "denied by policy"})}]}}, False))
 
-    print(f"{'case':34} {'OLD isinstance(unwrap,dict)':30} NEW")
-    disagreements = 0
-    for name, resp in cases:
+    # Every row asserts its OWN expected verdict. Counting disagreements passed
+    # as long as *some* row differed, which is a demonstration, not a
+    # regression test — a gate that broke on one shape while still differing on
+    # another would have exited 0 (codex, #452 third pass).
+    print(f"{'case':34} {'OLD isinstance(unwrap,dict)':30} {'NEW':28} verdict")
+    failures = []
+    for name, resp, want in cases:
         old = "ADMIT" if isinstance(unwrap(resp), dict) else "reject"
         ok, why = classify(resp)
         new = "ADMIT" if ok else f"reject:{why}"
-        if (old == "ADMIT") != ok:
-            disagreements += 1
-        print(f"{name:34} {old:30} {new}")
-    print(f"\ndisagreements (old admitted, new rejects): {disagreements}")
-    live_pos_ok, _ = classify(cases[0][1])
-    print(f"live positive still admitted: {live_pos_ok}")
-    return 0 if (disagreements and live_pos_ok) else 1
+        good = ok == want
+        if not good:
+            failures.append(f"{name}: expected {'ADMIT' if want else 'reject'}, got {new}")
+        print(f"{name:34} {old:30} {new:28} {'ok' if good else 'FAIL'}")
+    flipped = sum(1 for n, r, w in cases if isinstance(unwrap(r), dict) is not classify(r)[0])
+    print(f"\nrows where the OLD predicate disagreed with the new one: {flipped}")
+    for f in failures:
+        print(f"FAIL {f}")
+    return 1 if failures else 0
 
 
 def main() -> int:
@@ -354,6 +401,10 @@ def main() -> int:
         record("warm_skip", dt, ok, why, before + minted)
 
     nv, minted = novault_pairs(pairs, before, minted) if pairs else (None, minted)
+    incomplete = []
+    if nv and nv.get("reject_class"):
+        rejects[nv["reject_class"]] += 1
+        incomplete.append("novault")
 
     after = resident_count(meter)
 
@@ -378,20 +429,14 @@ def main() -> int:
         "arms": {k: stats(v) for k, v in samples.items()},
         "rejected_samples": dict(rejects) or None,
         "rejected_total": sum(rejects.values()),
+        "incomplete_arms": incomplete or None,
     }
 
     wm, ws = samples["warm_miss"], samples["warm_skip"]
     if wm:
-        lo = min(wm, key=lambda r: r["ms"])
-        # part ≤ whole: this ENTIRE call provably contained a complete
-        # traversal of `lo["n"]` residents, so the traversal cost no more.
-        out["scan_upper_bound"] = {
-            "basis": "fastest warm full-miss connect; the whole call bounds the walk it contains",
-            "whole_call_ms": round(lo["ms"], 3),
-            "residents_traversed": lo["n"],
-            "ns_per_resident_at_most": round(lo["ms"] * 1e6 / lo["n"], 1),
-            "residents_for_1s_walk_at_most": int(lo["n"] * 1000.0 / lo["ms"]),
-        }
+        out["scan_upper_bound"] = upper_bound(
+            min(wm, key=lambda r: r["ms"]),
+            "fastest warm full-miss connect; the whole call bounds the walk it contains")
     if wm and ws:
         d = statistics.median([r["ms"] for r in wm]) - statistics.median([r["ms"] for r in ws])
         out["warm_walk_differential_ms"] = round(d, 3)
@@ -412,27 +457,27 @@ def main() -> int:
             "skip": stats(nv["skip"]),
             "paired_diff_median_ms": round(statistics.median(p), 4),
             "paired_diff_ci95_ms": bootstrap_ci(p),
-            "scan_upper_bound": {
-                "basis": "fastest no-vault full-miss connect; part ≤ whole",
-                "whole_call_ms": round(lo["ms"], 4),
-                "residents_traversed": lo["n"],
-                "ns_per_resident_at_most": round(lo["ms"] * 1e6 / lo["n"], 1),
-                "residents_for_1s_walk_at_most": int(lo["n"] * 1000.0 / lo["ms"]),
-            },
+            "scan_upper_bound": upper_bound(
+                lo, "fastest no-vault full-miss connect; part ≤ whole"),
         }
     elif nv:
         out["novault"] = nv
 
     if as_json:
         print(json.dumps(out, indent=2))
-        return 0
-    for k, v in out.items():
-        if isinstance(v, dict):
-            print(f"{k}:")
-            for kk, vv in v.items():
-                print(f"  {kk:34}: {vv}")
-        else:
-            print(f"{k:36}: {v}")
+    else:
+        for k, v in out.items():
+            if isinstance(v, dict):
+                print(f"{k}:")
+                for kk, vv in v.items():
+                    print(f"  {kk:34}: {vv}")
+            else:
+                print(f"{k:36}: {v}")
+    # A required arm that did not finish is a failed run, not a quiet one: an
+    # exit 0 here is how "the decisive phase was abandoned" reads as "clean".
+    if incomplete:
+        print(f"\nINCOMPLETE: {', '.join(incomplete)} — see rejected_samples", file=sys.stderr)
+        return 2
     return 0
 
 
