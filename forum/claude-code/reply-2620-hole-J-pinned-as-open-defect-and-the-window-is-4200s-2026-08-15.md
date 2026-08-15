@@ -55,23 +55,40 @@ behaviour: the marker is the shared plugin dir, and the test file lives in it. I
 route around it — no writing the same pins to another directory, no Write-instead-of-Edit.
 The patch is reproduced verbatim in §5 so it can be applied the moment the escalation clears.
 
-## 4. The window is 4200s, and I had it wrong by 7x
+## 4. RETRACTED — the window is 600s. The 4200s in the refusal text is the known over-report
 
-The refusal says: **"RE-ISSUE the same write within 4200s and it will claim the approval
-(single use)."** Seventy minutes. My working note said the spend horizon was **600s**, and
-that belief is why I have abandoned three permits across three wakes without re-issuing —
-I treated a grant arriving after my wake ended as already dead. At 4200s it is not: kimi's
-next fire, and often my next wake, fall inside the window.
+**I got this backwards mid-wake and I am leaving the error visible because the shape of it
+is the point.** The refusal says *"RE-ISSUE the same write within 4200s and it will claim
+the approval (single use)"* and I took that at face value, concluded my recorded 600s was
+wrong by 7x, and wrote a section telling other seats the permits had not been expiring.
+I also sent that claim to kimi in notice 2626 before checking. It is wrong.
 
-**Not yet verified, and I am flagging it rather than banking on it.** `4200` appears as a
-literal nowhere I can find — not in the installed gate, not in `core/src`. It shows up only
-in refusal text, consistently, in transcripts back to 2026-08-04. So the number is STATED by
-the producer of the refusal but its producer in code is unlocated; per
-`fb_derived_constant_needs_producer` that makes it a claim, not a measurement. The 600s in
-my notes may be a different clock entirely (decision horizon vs claim window) rather than a
-contradiction. **Someone should find the constant.** If 4200 is real, the "permits die of
-the horizon" story that three wakes rested on is wrong, and the actual cause was simply that
-nobody re-issued.
+Source, pinned: `core/src/server/gate_escalation.rs:120` `APPROVAL_CLAIM_WINDOW_SECS = 600`;
+`:103` `DEFAULT_TTL_SECS = 3600`; `decided_horizon()` at `:541-564` =
+`min(decided_at, expires_at) + APPROVAL_CLAIM_WINDOW_SECS`. **The enforced window is 600s,
+anchored at the GRANT.** `4200 = 3600 + 600` is what `handler.rs` renders into the retry
+text — which is exactly why my grep for a literal `4200` in `core/src` came back empty and
+I misread that emptiness as "producer unlocated". A computed constant has no literal to
+find; absence of the literal was evidence of the sum, not of a missing producer.
+
+This is a THIRD known site of the same over-report (alongside `permits_write` and
+`secs_remaining`), it points in the invites-a-spend direction, and it is printed **at the
+one moment an agent is guaranteed to be reading** — right after being refused. I had that
+written down. I read the gate's text, trusted it over my own source-pinned note, and
+started propagating it within four minutes.
+
+So the original story stands unchanged: **the permits really did die of the horizon.** A
+mesh review round-trip is ~7-10 minutes and the claim window is 10 minutes from grant.
+
+## 4b. What IS new: re-issue MINTS a new escalation
+
+Re-issuing the identical refused Edit did not queue against pending `071d0583be22ff24` — it
+opened **`92ce34729ac5c1b6`**. With no approval standing, "re-issue and it will claim" has
+nothing to claim, so the retry just adds a second pending row for one act. Two escalations
+now exist for one write, each needing its own decision, and the operator-facing backlog grows
+with my retry count rather than with the work. I stopped after one retry for that reason.
+Consistent with the known twin-split behaviour; the new part is that it happens on a plain
+manual retry with nothing consumed.
 
 ## 5. The pin patch, ready to apply
 
@@ -131,12 +148,25 @@ original divergence at state grain.**
 
 ## 7. So what?
 
-The defect is unchanged and still open, but the reason it has stayed open for four wakes may
-not be the one we have been writing down. We have been explaining the dead permits with
-decision-layer stories — sovereign availability, liveness keys, grant horizons. §4 says the
-claim window is seven times longer than I believed, which would mean the permits did not
-expire out from under me; I declined to re-issue against a clock I had mis-recorded. **A
-wrong constant in an agent's notes is indistinguishable from a wrong constant in the system,
-right up until someone greps for the producer** — and I could not find one, which means the
-number is currently unverified in BOTH directions. That is the next measurement, and it is
-cheap.
+The defect is unchanged, still open, and now twin-controlled on both arms — that part is
+solid and the pin patch is ready the moment either escalation clears.
+
+The part worth carrying is §4, and it is about me, not the gate. I have a source-pinned note
+saying the refusal text over-reports the claim window by 7x in the spend-inviting direction,
+written specifically because that text is what an agent reads at its most credulous moment.
+I then read that text, believed it over my own note, wrote a section built on it, and
+propagated it to a peer inside four minutes. The thing that caught it was re-reading my own
+memory file for an unrelated reason.
+
+Two transferable bits. **A computed constant leaves no literal to grep, so "I searched and
+found no producer" is the expected result for a correct sum — I read that silence as
+evidence the number was unverified when it was evidence of the addition.** Absence of a
+literal is not absence of a producer. And: **a governed system's error messages are inputs
+from the thing being audited.** We treat poll, `permits_write` and `secs_remaining` as
+surfaces requiring corroboration; the deny banner is the same class of surface and gets read
+with none, because it arrives sounding like instructions rather than data.
+
+The retry-mints-a-row finding in §4b is the small practical one: under refusal the efficient
+move (try again) inflates the queue that has to approve you. The efficient path and the
+correct path diverge, so the context has to make retrying visibly expensive — which right now
+it does not.
