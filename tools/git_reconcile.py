@@ -207,11 +207,20 @@ def main():
     pr_state = {}
     try:
         import subprocess as _sp
-        _r = _sp.run(["gh", "pr", "list", "--state", "all", "--limit", "400",
+        # LIMIT IS A CEILING ON TRUTH, not a page size: a branch whose PR falls outside the
+        # window silently loses its disposition annotation and reads as stranded work. PR
+        # numbers passed 445 on 2026-08-14, so 400 was already too small (GPT audit). Ask for
+        # far more than exists and treat a full page as suspicious rather than complete.
+        _LIM = 2000
+        _r = _sp.run(["gh", "pr", "list", "--state", "all", "--limit", str(_LIM),
                       "--json", "headRefName,state,number"],
-                     capture_output=True, text=True, timeout=45)
+                     capture_output=True, text=True, timeout=90)
         if _r.returncode == 0:
-            for pr in json.loads(_r.stdout or "[]"):
+            _prs = json.loads(_r.stdout or "[]")
+            if len(_prs) >= _LIM:
+                print(f"    WARNING: PR listing hit the {_LIM} ceiling — some branches may "
+                      f"show as stranded because their disposition fell outside the window")
+            for pr in _prs:
                 # newest PR per branch wins (a branch can be reused)
                 prev = pr_state.get(pr["headRefName"])
                 if prev is None or pr["number"] > prev[0]:
@@ -227,7 +236,7 @@ def main():
         # count it rather than skipping it silently.
         _, rc_have = git("rev-parse", "--verify", "-q", b)
         if rc_have != 0:
-            rows.append((-1, -1, b, "UNFETCHED"))
+            rows.append((-1, -1, b, "UNFETCHED", ""))
             continue
         behind_s, _ = git("rev-list", "--count", f"{b}..{target}")
         ahead_s, _ = git("rev-list", "--count", f"{target}..{b}")
@@ -237,22 +246,39 @@ def main():
             continue
         if ahead == 0:
             continue
-        flag = "TRANSPLANT" if behind > 20 else ("rebase" if behind else "mergeable")
+        # CATEGORY and ANNOTATION are separate values, deliberately. They were one string,
+        # and the summary counted `flag == "TRANSPLANT"` — so the moment an open PR relabeled
+        # a row "TRANSPLANT PR#445", that row stopped being counted and the summary
+        # UNDERCOUNTED exactly the live population an operator most needs (GPT audit,
+        # 2026-08-14). A count that a display change can silently move is not a count.
+        cat = "TRANSPLANT" if behind > 20 else ("rebase" if behind else "mergeable")
         pr = pr_state.get(b[len("origin/"):])
+        note = ""
         if pr and pr[1] == "CLOSED":
-            flag = f"RETIRED(#{pr[0]})"      # disposition already made — do not transplant
+            cat, note = "RETIRED", f"#{pr[0]}"   # disposition made — do not transplant
         elif pr and pr[1] == "MERGED":
-            flag = f"merged(#{pr[0]})"       # branch outlived its merge; deletable
+            cat, note = "merged", f"#{pr[0]}"    # branch outlived its merge; deletable
         elif pr and pr[1] == "OPEN":
-            flag = f"{flag} PR#{pr[0]}"
-        rows.append((behind, ahead, b, flag))
-    for behind, ahead, b, flag in sorted(rows, reverse=True):
-        if flag == "UNFETCHED":
-            print(f"    {b:52.52} {'(on the remote, never fetched here)':>28}  -> {flag}")
+            note = f"PR#{pr[0]}"
+        rows.append((behind, ahead, b, cat, note))
+    for behind, ahead, b, cat, note in sorted(rows, reverse=True):
+        label = f"{cat} {note}".strip()
+        if cat == "UNFETCHED":
+            print(f"    {b:52.52} {'(on the remote, never fetched here)':>28}  -> {label}")
             continue
-        print(f"    {b:52.52} behind {behind:3} ahead {ahead:3}  -> {flag}")
-    print(f"    {sum(1 for r in rows if r[3] == 'TRANSPLANT')} need clean-transplant "
-          f"(too far behind to rebase); population = {len(remote_heads or [])} remote heads\n")
+        print(f"    {b:52.52} behind {behind:3} ahead {ahead:3}  -> {label}")
+    from collections import Counter as _C
+    tally = _C(r[3] for r in rows)
+    n_transplant = tally.get("TRANSPLANT", 0)
+    # "of them" means OF THE TRANSPLANTS — counting open-PR rows across every category and
+    # calling them a subset of one is the same scope-collision the category split just fixed.
+    n_open_transplant = sum(1 for r in rows if r[3] == "TRANSPLANT" and r[4].startswith("PR#"))
+    n_open_any = sum(1 for r in rows if r[4].startswith("PR#"))
+    print(f"    {n_transplant} need clean-transplant (too far behind to rebase), "
+          f"{n_open_transplant} of them on OPEN PRs "
+          f"({n_open_any} open-PR branches in all categories); "
+          f"population = {len(remote_heads or [])} remote heads")
+    print(f"    by category: {dict(tally)}\n")
 
     # 4. phantom local refs — the finding that corrected this tool (#442)
     print("[4] PHANTOM LOCAL REFS (under refs/remotes/ but owned by no configured remote)")
