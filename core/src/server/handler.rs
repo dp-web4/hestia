@@ -3460,6 +3460,33 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     let target = optional_string(args, "target").unwrap_or_default();
     let session_id = optional_session_id(args);
     let payload_sha256 = optional_string(args, "payload_sha256");
+    // Same door as `rule_id` below, one layer deeper — except this key has a CONSUMER,
+    // so dropping it does not merely lose an attestation, it changes a score.
+    //
+    // The hooks have sent `verdict_available` since Sprint E (hestia_gate_mechanism.py:478).
+    // `derivation.rs:353` reads it to exclude "I could not judge" from temperament — dp,
+    // 2026-07-26, on codex being dinged for two of these while the daemon was demonstrably
+    // up: "well, fix it". Nothing between the two ever WROTE it. Grep the identifier over
+    // core/src and you get the reader twice and the writer never, so that arm has never had
+    // an input, and the whole exclusion has been riding its own legacy fallback: a substring
+    // match on `reason` for "no policy verdict" / "daemon path failed". The comment there
+    // says the flag is for "going forward" and the text match for "entries already on the
+    // chain"; going forward never arrived.
+    //
+    // Measured on CBP 2026-08-15 over 142,756 entries (tools/claude_verdict_available_arm_-
+    // audit.py, tools/claude_infra_denies_scored_as_conduct.py): ZERO rows of ANY event type
+    // carry the key. The text arm does real work — it excludes 247 of codex's 476 enforced
+    // denies — but 33 enforced denies whose reason is `gate.degraded` (the degraded mode
+    // RATIFIED 2026-08-11) or codex's pre-Sprint-E "governor unreachable, failing closed"
+    // match neither marker and reach temperament as member conduct. Six landed that day.
+    // The newest infra posture is the least protected, because a text arm can only match
+    // words that already existed when it was written.
+    //
+    // CALLER-ASSERTED, exactly like `payload_sha256` and `rule_id` on this path: the daemon
+    // did not observe the gate's availability, it received a claim about it. Recorded under
+    // the name derivation already reads and `DERIVATION_KEYS` already carries, because the
+    // projection was built for this key years before anything emitted it.
+    let verdict_available = args.get("verdict_available").and_then(Value::as_bool);
     // The hook layer's half of rule attribution is sending this; the daemon's
     // half is reading it. Daemon side lands FIRST: `hestia_tools()` declares
     // every tool `additionalProperties: true`, so a caller that sends `rule_id`
@@ -3507,6 +3534,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
             "payload_sha256": payload_sha256,
             "attempted": attempted,
             "rule_id": rule_id,
+            "verdict_available": verdict_available,
         }),
     )?;
     // Same asymmetric gate-risk trust as the daemon's own gate decisions.
