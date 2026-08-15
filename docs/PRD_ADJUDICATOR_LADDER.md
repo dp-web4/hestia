@@ -1136,3 +1136,46 @@ giving it its own event class (AC-C2). Its own failure mode is therefore measura
 friction rather than a boundary, and §13.2 is the pressure valve that was designed for it. **The
 number to watch is the ratio of refused compose attempts to issued delegations**, and it is
 watchable only because AC-C2 insisted the two be distinguishable events.
+
+## 14. R6/R7 envelopes — cross-reference
+
+*(Numbered 14 because §13 — "RUNGS ADMIT. RUNGS DO NOT COMPOSE." — took the slot this section
+was written to leave free for it. That section landed in #450 on 2026-08-15; this one was
+authored while it was still on an unmerged branch, and the two were reconciled at merge by
+keeping BOTH in numeric order rather than letting either overwrite the other. Recorded because
+a section-number collision resolved by picking a side is how a PRD silently loses a ruling.)*
+
+**See `docs/PRD_R6_R7_ENVELOPES.md`** (dp-ruled, 2026-08-14). The ladder's own constructs are, in
+several cases, fields web4's canonical action envelope already declares.
+
+- **§3.3's hash-pinned law consultation is `Rules.law_hash`** (`web4-core/src/r6.rs:34`). This is
+  the cleanest correspondence in the whole family: because the verdict and the act are one
+  `R7Action`, AC-L4's *"obtained within the decision, not cached across decisions"* is satisfied by
+  **schema** rather than by discipline. §6.3's *"remembered policy is folklore"* becomes a property.
+- **§3.3's evidence bundle does NOT all live in `Reference`.** Checked row by row, it distributes:
+  the act is `Request` (`r6.rs:79-85`), history and prior decisions are `Reference.precedents`
+  (`r6.rs:118`), the bar in force is `Rules.constraints` (`r6.rs:38`). **Two rows have no carrier:**
+  the refusal text with the rule that fired (`rule_triggered`, `r6.rs:307`, is an R7 *output* field),
+  and the factor set's **independence grade** — `WitnessAttestation` (`r6.rs:139-149`) has no such
+  field, so §5.1's NOT-SAME rules are unrepresentable in the record.
+- **§3.1's `consulted` has NO R6 carrier, and that is the sharpest gap found.** `Reference` is what
+  was **offered**; R6 has no field for what was **read**. Since §3.1 note 4 makes `consulted` the
+  entire auditability of a rung, this is a genuine extension web4 should absorb rather than a hestia
+  peculiarity.
+- **§3.2's `decline` (incl. timeout, unreachability) is `DeltaClass::Infra`** (`r6.rs:262-270`) on
+  the reputation axis — already canonical, already shipped in hestia
+  (`core/src/reputation.rs:19,22`). **But `ActionStatus` (`r6.rs:173-182`) has no `Declined` and no
+  `Refused`**: its six variants are `Pending | Validated | InProgress | Success | Failure | Error`.
+  A refused act recorded as `Failure` reads as "ran and did not work"; as `Error` it reads as
+  infrastructure — reproducing on the status axis the exact conflation `DeltaClass` was added to
+  prevent. Named as web4's gap to fix.
+- **§2.3's `rungs_for(kind, consequence)` and R6-vs-R7 are the same axis** (`r6.rs:9-10`). The
+  envelope PRD proposes one selection, `kind × consequence → (R6|R7, Constraint[])`, with a rung's
+  `max_consequence` (§3.2) reading as *"this rung may decide R6 acts, not R7 acts"*.
+- **§4.3's promotion measurement is PARTIAL against `ReputationDelta`** (`r6.rs:283-320`): the delta
+  is per-action, the criterion is a fold over many, and no such fold exists in `r6.rs`. The evidence
+  is carried; the aggregation is unbuilt — which is §4.3's own warning, arriving from the schema.
+- **§13's ADMIT-not-COMPOSE governs the new outward budget**, and salience is where it will be
+  tested: `PRD_R6_R7_ENVELOPES.md` §4.4.6 pins that a salience assessment may modulate a draw
+  *within* the composed ceilings and may **never raise one** — §13.2's hop, at the most tempting
+  place in the design for it to happen.

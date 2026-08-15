@@ -815,3 +815,47 @@ must be able to fail — a criterion with only a satisfiable arm is not a criter
   the same `accepted_occupancy_sources` mechanism.
 - **Not populating any route table.** As with §7 and the ladder PRD: this section commits to the
   object and the invariant, not to a table of roles nobody has measured a need for.
+
+## 11. R6/R7 envelopes — cross-reference
+
+*(Numbered 11 because §10 — "The OUTWARD direction" — took the slot this section was written to
+leave free for it. That section landed in #449 on 2026-08-15, so the §10 references below now
+resolve against this same file rather than against a branch. Reconciled at merge by keeping
+BOTH sections in numeric order.)*
+
+**See `docs/PRD_R6_R7_ENVELOPES.md`** (dp-ruled, 2026-08-14): every governed act — compose, admit,
+escalate, adjudicate — is carried in an R6/R7 envelope rather than in bespoke per-PRD structures.
+
+What that amendment subsumes from **this** PRD, and where it does not:
+
+- **§2's ROLE as the scope carrier is `ActionRole{actor_lct, role_lct, paired_at}`**
+  (`web4-core/src/r6.rs:67-75`), under the invariant *"Role isolation: actions scoped to role's
+  permissions"* (`r6.rs:16`). `r6.rs:66` states dp's ruling from the other side without having been
+  written for it: *"Reputation is ROLE-CONTEXTUALIZED, never global."*
+- **Two real limits on that row.** `ActionRole` carries no `occupancy_id` and no
+  `manifest_generation`, which §3.2's derived entry and §3.4's stranding both need. And **the
+  outward direction needs two parties where `ActionRole` names one** — §10.2's
+  `reachable(caller, role) = admitted(manifest) ∩ effective_scope(occupant)` has no carrier.
+  `ProofOfAgency` (`r6.rs:102-112`) is the wrong shape: an outward caller delegates nothing.
+- **§2's proof tiers map PARTIALLY, and `min_atp` was dropped from that mapping.** T0/T1/T2 grade
+  *evidence*, not *cost*; attaching an ATP minimum there would have been a forced mapping. T2's mesh
+  witness quorum maps to `Reference.witnesses` (`r6.rs:124`); T2's operator co-sign and
+  hardware-backed key do not (see the witness-standing gap above). T1's "fresh certified snapshot"
+  has no carrier — `Request.deadline` (`r6.rs:92`) is the action's own deadline, not the evidence's.
+- **§10.3's "nothing carries across an escalation but provenance" is `prev_action_hash`**
+  (`r6.rs:360`) — a hash, not a payload, so it *cannot* carry the transcript. The most elegant
+  correspondence in the family. Honest half: `Request.parameters` (`r6.rs:85`) is an open map and
+  nothing forbids putting the transcript in it. The envelope makes non-carryover **auditable**, not
+  **enforced**.
+- **§10.6's escalation governor is `Constraint{min_atp}`, and `rate_limit` was dropped** — it exists
+  only as a doc-comment string at `r6.rs:57` with no implementation anywhere in web4. dp's economic
+  example is the implemented half.
+- **§9.1's composite revision is `Rules.law_hash`** (`r6.rs:34`) plus two missing fields; the
+  clearance/occupancy/manifest generations this PRD contributes still need a monotonic counter,
+  because a hash cannot say which of two policies is *older* and §3.4's stranding depends on order.
+- **§10's outward funding is RULED and is now design, not an open question.** `PRD_R6_R7_ENVELOPES.md`
+  §4.4: a society-law-declared external-interaction budget bounded by three **independent**
+  constraints — total ceiling × society-wide **nonlinear service-rate governor** (the bound that
+  does not scale with identity count, and therefore the free tier's anti-sybil property) ×
+  per-caller ceiling — with salience modulating *within* those envelopes and never raising one, and
+  **citizenship as the boundary** past which callers fund themselves.
