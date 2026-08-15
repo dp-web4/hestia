@@ -3,6 +3,13 @@
 **Status**: proposed — dp-directed 2026-08-14; design PRD, not started; the seam that lets other
 PRDs' open questions be configuration rather than rulings.
 **Author**: claude-code (CBP), 2026-08-14.
+**Vocabulary folded in (2026-08-14, evening)** — **COMPOSE (∪) / ADMIT (∩) is now normative across
+the authority family**, and §13 states what it binds here: *the ladder resolves ADMIT decisions; a
+rung never composes.* Established in three fleet forum notes of 2026-08-14 —
+`gpt-to-hub-outward-context-access-is-scope-permission-turned-outward-2026-08-14.md`,
+`claude-to-gpt-one-scope-grammar-compose-vs-admit-2026-08-14.md`,
+`gpt-to-claude-compose-admit-and-context-envelope-2026-08-14.md` (GPT-5.6 Sol's acceptance and the
+boundary this document's §13 lands) — and carried in `PRD_ROLE_SCOPE_BRIDGE.md` §10.3.
 **Relates to**: `docs/PRD_ALLOWLISTS.md` (§3.6 the ceremony ratchet — this PRD is that ratchet
 applied to the DECIDER rather than to the evidence; §7 open questions recast as extension points),
 `docs/PRD_ROLE_SCOPE_BRIDGE.md` (§2 proof tiers, §7 the second-factor question — an agent rung is a
@@ -241,6 +248,12 @@ ladder:
     - when: { kind: "*" }                     rungs: [heuristic, operator]
 ```
 
+**One correction to the sketch, made by §13 and stated here so the sketch is not copied as-is:** the
+`floor.tool.add` route above lists a non-operator rung for an act whose EFFECT is a composition.
+Under §13 that route is valid only while the agent rung is ADVISORY on it (§4.1 stage A), or while an
+explicit prior delegation names that class. A deciding rung on a compose-effect `kind` is the
+migration §13.1 forbids, arriving through the route table rather than through the interface.
+
 **Bootstrap default is `[heuristic, operator]` for everything** — which is exactly today's
 behaviour, expressed as data. That is the migration test: the ladder ships as a no-op, and
 `PRD_ALLOWLISTS.md` §3.6.6's ceremony-neutrality argument applies here unchanged. A config that
@@ -270,6 +283,11 @@ concept of a decider other than the operator at all — no `decide()` equivalent
 factors. It should not grow a *parallel* ladder. It routes through `rungs_for("scope.grant.*", …)`
 like everything else, and the literal becomes the resolved rung's identity. Stated here so it is
 not mistaken for a non-goal.
+
+**With §13's bound, which this section does not get to skip:** granting scope is a COMPOSE act. The
+scope surface joins the ladder for *routing and evidence*, and a rung on `scope.grant.*` is advisory
+or delegated (§13.2) — never, by default, the decider. Joining the ladder is not the same as becoming
+a rung's to decide.
 
 ### 2.5 The appeal ladder is this ladder
 
@@ -536,6 +554,10 @@ This is the sharpest rule in the document and it is worth stating alone.
 refusal, not a number**, because an entry returning "tier 3" would imply a price exists. Same here:
 an entry naming any rung for `ladder.*` would imply a rung could ever be the decider, and the whole
 point is that it cannot.
+
+**§13 generalises this rule.** What is written here protects the ladder's OWN config — the special
+case where the composition being defended is the ladder's. §13 states the general form: no rung
+composes anything, and `ladder.*`/`governance.*` are the instance of it that was already visible.
 
 Ratchet asymmetry, inherited from §3.6.3: **narrowing a rung's authority is cheap; widening it pays
 the tier being widened FROM.** Without this, a rung promoted to decide `floor.tool.add` could, in
@@ -830,3 +852,287 @@ is for.
 measurement is. The ladder is what makes the measurement possible, and a ladder built without §4.3
 being built alongside it is the well-known shape where an advisory surface accumulates records
 nobody reads.
+
+---
+
+## 13. RUNGS ADMIT. RUNGS DO NOT COMPOSE.
+
+Folded in 2026-08-14 (evening), after §1–§12 were merged, from the forum exchange that made
+COMPOSE/ADMIT normative across the authority family (header note; `PRD_ROLE_SCOPE_BRIDGE.md` §10.3).
+It is placed last because it arrived last, not because it is least — it is a bound on every preceding
+section, and where it and an earlier section disagree, this section wins and the disagreement is
+named in place (§2.2, §2.4, §5.3 now carry pointers here).
+
+### 13.0 The rule (GPT-5.6 Sol, 2026-08-14) — VERBATIM, and it is this section's thesis
+
+> "An agent may cheaply decide whether a request fits an existing grant. It must not gain ambient
+> power to enlarge that grant merely because it is competent to review the request."
+
+### 13.1 The two verbs, and which one a rung performs
+
+The family now has two verbs where it had one word ("scope"), and the ladder sits squarely on one
+side of the split:
+
+| | **COMPOSE (∪)** | **ADMIT (∩)** |
+|---|---|---|
+| what it does | assembles or deliberately widens an authority/capability set | checks ONE act against every constraining layer |
+| who | a principal, through an operator-walled act | a machine, at machine time |
+| ceremony | witnessed, generation-bumping, ceremony-tiered (`PRD_ALLOWLISTS.md` §3.6) | none — it is the hot path |
+| direction | may widen | **every layer narrows; none may add** |
+| this PRD | **not a rung's act, at any rung, by default** | **this is what the ladder resolves** |
+
+> **The ladder resolves ADMIT decisions. Every rung, at every rung, for every route: does this act
+> fit an already-composed envelope, under the law in force? COMPOSE — assembling or widening the
+> envelope itself — is a DIFFERENT ACT and is not a rung's to make.**
+
+This is not a new restriction bolted on; it is what the interface already is, stated so it cannot be
+drifted away from. §3.1's verdict vocabulary is admission-shaped by construction — `approve | deny |
+decline` over one bundle — and §3.3's bundle is an admission bundle: the act, the asker's reason and
+basis, the hash-pinned law, the history, the prior decisions, the refusal text, the factors, the bar.
+**There is no field in that bundle for what the envelope SHOULD be.** A rung cannot compose from it,
+because nothing in it is evidence about a principal's intent.
+
+**The failure mode, plainly.** Without this rule a rung silently migrates from *fast reviewer* to
+*authority issuer*, and the migration is invisible **because both look like a competent decision on a
+hard question**. Nothing goes red. The rung is fast, it is available, it read the law, it recorded
+its `consulted` set — and the thing it approved was a widening. The record is complete and the
+boundary is gone.
+
+**Where the migration actually enters is the route table, not the interface**, which is why §2.2 and
+§2.4 now carry corrections. The verb the rung emits is `approve`; whether that approval *admits* an
+act or *effects a composition* is a property of the act's `kind`, not of the verdict. So:
+
+> **The stakes classifier (§2.3's `rungs_for(kind, consequence)`) must key on the act's EFFECT.**
+> A `kind` whose effect is composition — `floor.*.add`, member expansion, `scope.grant.*`,
+> `clearance.*`, `role.manifest.*`, `role.route.*`, `ladder.*`, `governance.*` — routes to
+> `[operator]` by default, or to a rung in ADVISORY mode only (§4.1 stage A), unless §13.2's
+> delegation covers it.
+
+Otherwise the boundary is defeated by one hop of indirection: the rung does not compose, it merely
+*admits the act that composes*. That reads as compliance and is not.
+
+### 13.2 The one exception, and its shape
+
+A prior delegation MAY authorize a rung to compose a specific **class** of grant. That is a real
+affordance, not a loophole — it is how a rung ever comes to issue anything. Its shape is fixed, and
+every clause of the shape is load-bearing:
+
+1. **The delegation is ITSELF a compose act.** Operator-walled, ceremony-tiered, generation-bumping,
+   revocable — the §5.2 wall and the §3.6 ratchet, unchanged. Delegating the power to compose is a
+   composition of authority, and pricing it lower than the grants it will issue is the ratchet defeat
+   with an extra step.
+2. **It names the class NARROWLY.** An enumerated `kind` set, never a wildcard, never `*`, never a
+   prefix that a future `kind` could join by being named. A delegation that grows when the taxonomy
+   grows (§9 Q1) is a delegation nobody agreed to.
+3. **It can NEVER be self-issued.** §5.1 clause 1 in the ladder's direction: a rung must not
+   adjudicate an act it requested, and *"grant me the power to grant"* is that act in its purest
+   form. The issuer must resolve to a principal that is not the delegate, and the resolution is from
+   a live session, not an asserted name (clause 0).
+4. **It is bounded and revocable like any other authority.** It carries an expiry — and a delegation
+   expiry is a covered expiry, so it bounds the §11 composite horizon — and its generation folds into
+   the §11 composite revision. A delegation invisible to the composite is a policy change no replica
+   can detect (AC-9's argument, on the authority the AC did not anticipate).
+5. **What it delegates is still bounded by §13.6's ceilings.** A delegated composer composes *inside*
+   the envelope admission will later enforce. It cannot union past a ceiling owned by another layer,
+   and it cannot reach the innate invariants at all.
+
+**This generalises §5.3, and the generalisation is the point.** §5.3 forbids a rung from writing or
+adjudicating the ladder's own config: a route whose `kind` is `ladder.*` or `governance.*` returns a
+**refusal, not a rung**. That rule protected **the ladder's OWN composition** — the special case where
+the authority being widened is the ladder's. §13 states the general form: **a rung composes nothing,
+and the ladder's config was simply the instance that was already visible.** The refusal-not-a-rung
+mechanism is the right implementation for the general case too — the table returns a refusal for
+every compose-effect `kind` not covered by a §13.2 delegation, because an entry naming a rung would
+imply a rung could be the decider, and the whole point is that it cannot.
+
+### 13.3 Why this is the NATURAL boundary, not a conservative one
+
+Stated because "the agent may not widen" reads like caution, and if it were only caution it would be
+traded away the first time a rung was measurably good. It is not caution. **The two acts have
+different evidence requirements, and the ladder is built for exactly one of them.**
+
+- **Admission is decidable from the act + the envelope + the law.** That is a closed evidence set,
+  and it is precisely the bundle §3.3 already mandates and hash-pins. A rung with the bundle has
+  everything the question needs. It is a *competence* question, and competence is measurable — which
+  is what §4.3's agreement rate measures.
+- **Composition requires a judgement about what SHOULD be reachable.** No bundle answers that,
+  because the answer is not in the world; it is in a principal's intent. It is a **prerogative**, not
+  a competence question, and prerogative is not transferable by being good at something adjacent.
+
+This is why dp's four advantages (§0: *always there, much faster, able to look at the full context,
+consult the actual law*) are all admission-quality properties and none of them is standing:
+
+| dp's advantage | what it improves | what it says about composing |
+|---|---|---|
+| always there | queue latency, AC-L6/L7 | nothing |
+| much faster | time-to-verdict, AC-L1 | nothing |
+| full context | AC-L2/L3 — reads more of the envelope than the human's UI shows | nothing |
+| consults the actual law, hash-pinned | AC-L4/L5 — law-as-fact, not memory | nothing |
+
+**A rung being BETTER at admission than a human — which this PRD expects, and which §6 is built to
+demonstrate — says nothing whatever about its standing to widen.** The boundary does not cost the
+ladder anything it was built to do. It costs it only the thing it was never evidence for.
+
+### 13.4 Escalation is not a loophole — and the word means two things
+
+`PRD_ROLE_SCOPE_BRIDGE.md` §10.3 rules that **escalation composes a new grant under a different
+role; it never widens the existing grant.** Read together with §13.1 that yields a conclusion this
+document must state explicitly, because the sentence that would erase it is one anybody would write:
+
+> **"The ladder handles escalation."**
+
+The ladder handles the ADMISSION decisions escalation produces, and it ROUTES escalation requests. It
+does not confer the escalated-to authority. **An escalation is a COMPOSE act, therefore it is not a
+rung's to perform unilaterally.** A rung may:
+
+- **route** it — name the target rung/role, record the request, witness the routing decision
+  (`PRD_ROLE_SCOPE_BRIDGE.md` §10.5(2): a refusal to escalate is a witnessed decision, never
+  silence), and
+- **admit** acts under the resulting grant once it exists.
+
+The composition itself is operator-walled or covered by an explicit §13.2 delegation. **A rung that
+routes an escalation and thereby produces a wider envelope has composed**, whatever the record calls
+it — AC-C4 is the assertion.
+
+**And a vocabulary hazard, named before it costs something.** This document already uses "escalate"
+for one act and the role PRD uses it for another:
+
+| spelling | act | does authority change hands? |
+|---|---|---|
+| **RUNG-ESCALATION** (§3.2 — decline / low confidence / over-tier) | ask the NEXT DECIDER the same question about the same envelope | **no.** The envelope is untouched; only the answerer changes |
+| **GRANT-ESCALATION** (`PRD_ROLE_SCOPE_BRIDGE.md` §10.3 — role transfer) | move the interaction to a role that ALREADY holds more | **yes — it is a COMPOSE act** |
+
+One word, two acts, opposite answers to the only question §13 asks. This is
+`fb_vocabulary_language_bet`'s shape and the remedy is the same one §3.1 applies to the verdict
+vocabularies: **map explicitly and assert the map.** Where either spelling appears unqualified in a
+route table, a record, or an interface, it is a defect.
+
+### 13.5 Standing is ELIGIBILITY, not a grant — the rung's form of it
+
+GPT's first tightening is about citizenship (*"a citizen does not inherit citizen context"*); its
+ladder form is about what a rung is allowed to reason from.
+
+> **A rung must not treat standing as conferring capability.** Standing selects which roles are
+> reachable (`PRD_ROLE_SCOPE_BRIDGE.md` §10.1: the caller's standing is a **routing key**); the ROLE
+> carries the scope. Inwardly the same shape: a clearance class is eligibility for items of that
+> class — the item still has to be in a manifest (§3.4 of the role PRD's flow rule).
+
+The concrete rung-level defect this forbids: a verdict whose rationale is *"this member is a trusted
+long-standing member, so approve"* for an act the envelope does not admit. That is the rung
+substituting a routing key for the envelope — **ambient authority, arrived at by reasoning rather
+than by configuration**, and it is the same migration as §13.1 with no config change to notice. It is
+also the shape an agent rung is *most* prone to, because standing is exactly the kind of contextual
+consideration a competent reviewer is good at weighing, and here it is not evidence.
+
+`Escalation.asker_basis` (§3.3) is the related trap read from the other end: `Session` vs `Asserted`
+tells a rung how much a *claim of identity* is worth. It never tells it what that identity may reach.
+
+### 13.6 Independent ceilings — composition widens only INSIDE the envelope admission enforces
+
+GPT's second tightening, and it is the reason §13.2's delegation is safe to have at all. The algebra
+is two expressions, not one:
+
+```
+composed_capabilities =                     # COMPOSE — ∪ — operator-walled, ceremony-tiered
+      public_floor ∪ valid_owner_grants ∪ valid_role_grants ∪ valid_named_lct_grants
+
+effective_access(act) =                     # ADMIT — ∩ — machine-time, every term narrows
+      composed_capabilities ∩ caller_standing ∩ pair_mrh ∩ resource_context_policy
+      ∩ hub_law ∩ agent_delegation ∩ runtime_cap ∩ innate_invariants
+```
+
+Two rules for a rung follow directly, and both are assertable:
+
+1. **A rung evaluating admission applies EVERY ceiling — innate invariants last and always.** A rung
+   that approves because *the grant says so* has read one term of an intersection and called it the
+   answer. The composed set is the FIRST term, not the verdict. (The rung's own `max_consequence` is
+   itself a ceiling, and §3.2 already checks it before the rung is asked — that ordering is this rule
+   in the one place it was already implemented.)
+2. **No composed grant may union past a ceiling owned by another layer.** A grant authored by one
+   legitimate principal cannot widen past a ceiling another layer owns — which is what makes
+   `PRD_ALLOWLISTS.md`'s inward `effective(m) = floor ∪ member(m)` and the outward *"no layer may
+   widen another"* the same doctrine rather than a contradiction: the union is the composition, the
+   intersection is the admission, and they happen at different times.
+
+**Consequence for §13.2:** a delegated compose class cannot be used to reach past a ceiling either.
+The delegation widens the composed set; the ceilings still narrow the act. A delegation that could
+union past an innate invariant would be an innate invariant with a price, and the innate layer's only
+property is that it does not have one.
+
+### 13.7 Acceptance criteria — falsifiable
+
+Numbered `AC-C*` so this section's population stays distinguishable from §6's `AC-L*` and §8's
+`AC-*`. Each names the arm that must be able to fail.
+
+- **AC-C1 — a rung's verdict vocabulary contains no compose verb. STRUCTURAL, and testable against
+  the interface itself.** Enumerate §3.1's `decision` domain and the mapped `ADJUDICATION_VERDICTS`
+  (`handler.rs:2085`): the union is `{approve, deny, decline}` ∪ `{upheld, partial, refuted,
+  deferred}` and contains no verb that issues, grants, extends, widens, or delegates. Asserted over
+  the type, not over a sample of verdicts. **The arm that must fire:** add a `grant` variant to the
+  enum in a fixture and assert the test goes RED — otherwise the assertion is a comment about a type
+  that nobody re-checks when the type grows.
+- **AC-C2 — a rung attempting a compose is refused, and the attempt is witnessed as its OWN event
+  class.** A rung verdict on a compose-effect `kind` not covered by a §13.2 delegation is refused,
+  and the refusal lands as `rung_compose_refused`, distinct from `gate_escalation_arbiter_refused`.
+  Distinct because a compose attempt folded into the generic refusal class is **unmeasurable** — and
+  the rate of compose attempts is the single number that would show the §13.1 migration beginning.
+  **The arm that must fire:** the same rung, same route, on an admission-effect `kind`, produces no
+  such record — otherwise a store that emits the event unconditionally passes.
+- **AC-C3 — a delegated compose class names the class, and cannot be self-issued.** Three assertions,
+  one test: (a) a delegation whose class is a wildcard or a bare prefix is REFUSED at write time,
+  with the refusal naming the clause; (b) a delegation whose issuer resolves to the delegate rung is
+  REFUSED (§5.1 clause 1, ladder direction), and the issuer is resolved from a live session, not an
+  asserted name (clause 0); (c) the delegation's generation moves the §11 composite. **The arm that
+  must fire:** an operator-issued, narrowly-enumerated delegation to a different rung SUCCEEDS — else
+  a store that refuses every delegation passes all three.
+- **AC-C4 — escalation routing by a rung produces a REQUEST, never a widened envelope.** After a rung
+  routes an escalation, the subject's effective envelope — composed set, admitted items, composite
+  revision — is **bit-identical**, and a pending request exists naming the target and the reason.
+  **The arm that must fire:** the operator (or a §13.2-delegated composer) acting on that same
+  request DOES change the envelope and DOES move the composite revision — otherwise a routing path
+  that quietly does nothing at all satisfies the criterion.
+- **AC-C5 — every ceiling is applied, and the innate layer is last.** For an act inside the composed
+  set but outside a ceiling owned by another layer, the rung's verdict is deny-or-decline, and the
+  record names which ceiling bound. Property-shaped: over a generated composed set and a generated
+  ceiling set, `effective_access ⊆ every term`. **The arm that must fire:** the same act with that one
+  ceiling widened IS admitted — else a rung that denies everything passes, which is
+  `fb_zero_iteration_loop_reads_all` on the admission axis.
+- **AC-C6 — standing is not evidence for admission.** For an act the envelope does not admit, varying
+  the asker's standing across its full range does not change the verdict. **The arm that must fire:**
+  for an act whose envelope admits it *conditionally on standing* — standing is a legitimate term of
+  the intersection — varying standing DOES change the verdict. Without that arm the criterion is
+  satisfied by a rung that ignores standing entirely, which is a different defect wearing this one's
+  green.
+
+### 13.8 Self-audit addendum (RWOA+S+V) — the surface §13 creates
+
+§7 audits three surfaces. §13.2 adds a fourth, and it is audited here rather than by amending §7, so
+the arrival order stays legible.
+
+```
+surface: delegated compose class   act: authorize a rung to COMPOSE a named class of grant
+S: high/irreversible-in-effect [construct: every grant the delegate issues under the class is composed and takes effect; revoking the delegation strands future issuance, never the acts already admitted under grants it issued]
+R: n/a [construct: a rung's measured competence at ADMISSION is not evidence for the delegation — §13.3 is exactly this clause, stated as doctrine because it is the most persuasive wrong argument available here]
+W: pass [construct: operator-walled at the ladder store's ceremony tier (§5.2); issuer resolved from a live session and never the delegate (§13.2.3, arbiter::eligibility_for clauses 0 and 1); the class enumerated, never a wildcard]
+O: pass [construct: the delegation is checked BEFORE the rung is asked, on the same ordering as the §3.2 max_consequence check; a rung on an uncovered compose-effect kind is refused before it sees the bundle, so an uncovered compose attempt leaves the envelope bit-identical]
+A: pass [construct: rung_compose_refused as its own event class (AC-C2); an issued grant carries the delegation id, the class, the issuing rung, the law_hash, and the ladder generation; the delegation's own generation folds into the §11 composite]
+V: present [construct: revocation is always available and costs strictly less than delegation; the delegation expires and its expiry bounds the composite horizon; §13.6's ceilings bound what any delegated composition can reach even while the delegation is live]
+verdict: PASS (design) — CONDITIONAL on the class enumeration being closed against taxonomy growth (§13.2.2). If a delegated class ever widens because §9 Q1's `kind` taxonomy grew, this block is void and the delegation has become the wildcard it was written to refuse.
+```
+
+### 13.9 What §13 would look like if it were wrong
+
+Per §12's norm, and it has a real form. **The strongest case against §13:** the boundary is
+unenforceable in an A1 society (§5.3's concession — every member runs as the operator's UID), so it
+buys nothing an adversary must respect, while imposing a route-table discipline that will be
+worked around the first time an operator is asleep and a compose-effect act is urgent — which is
+`fb_friction_manufactures_bypass` exactly.
+
+**The answer this section accepts rather than refutes:** §13 is not an adversary boundary and does
+not claim to be one. It defeats the **efficiency attractor** — the shortest path to "get this
+decided" must not run through "let the fast thing widen it" — and it makes the widening *legible* by
+giving it its own event class (AC-C2). Its own failure mode is therefore measurable: if
+`rung_compose_refused` accumulates while nothing is ever delegated, the section has manufactured
+friction rather than a boundary, and §13.2 is the pressure valve that was designed for it. **The
+number to watch is the ratio of refused compose attempts to issued delegations**, and it is
+watchable only because AC-C2 insisted the two be distinguishable events.
