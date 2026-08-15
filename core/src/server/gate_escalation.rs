@@ -288,6 +288,16 @@ pub struct Escalation {
     /// a list can tell those apart.
     #[serde(default)]
     pub invited_peers: Vec<String>,
+    /// The subset of `invited_peers` no watcher has ever read a mailbox for, AT INVITE TIME.
+    ///
+    /// Kept as a subset rather than removed from the invitation: they WERE invited, the
+    /// notice IS queued, and a member whose watcher starts tomorrow will read it. What this
+    /// field buys is that `absent` stops accusing them in the meantime — see
+    /// `peer_participation`. Restored empty for every escalation opened before the field
+    /// existed, which reads as "every invitee had a reader" and is the direction that
+    /// under-claims this finding rather than over-claiming it.
+    #[serde(default)]
+    pub invited_without_reader: Vec<String>,
     /// The member asking. Recorded as claimed — `plugin_id` is caller-asserted (HST-005), and
     /// this field inherits that weakness rather than laundering it.
     pub plugin_id: String,
@@ -464,6 +474,21 @@ impl Escalation {
             .iter()
             .filter(|f| f.channel == Channel::PeerMember && f.dissent)
             .count();
+        // Invited seats whose mailbox had a reader when they were asked. `absent` is derived
+        // over THIS number, not over every invitee.
+        //
+        // Measured (`tools/invitation_deadletter_census.py`, 60k-entry window): 172 of 272
+        // invitation rows went to registry ids with no `member_inbox_touch` row at all —
+        // probe residue that `plugin_id`-at-connect mints and nothing ever prunes. Counted as
+        // `absent`, they read exactly like a peer that saw the ask and declined, which is the
+        // one distinction this function exists to make. Reported, never hidden: `invited`
+        // still names everyone, and the count moves to `invited_without_reader`.
+        let no_reader = self
+            .invited_peers
+            .iter()
+            .filter(|p| self.invited_without_reader.contains(p))
+            .count();
+        let reachable = self.invited_peers.len().saturating_sub(no_reader);
         PeerParticipation {
             invited: self.invited_peers.clone(),
             concurred,
@@ -472,10 +497,8 @@ impl Escalation {
             // same as one that declined, and storing "absent" would freeze a moment as a
             // verdict. Post-decision participation is expressly allowed, so this number
             // can fall after a decision — which is the mechanism working, not drift.
-            absent: self
-                .invited_peers
-                .len()
-                .saturating_sub(concurred + dissented),
+            absent: reachable.saturating_sub(concurred + dissented),
+            invited_without_reader: no_reader,
         }
     }
 
@@ -637,8 +660,14 @@ pub struct PeerParticipation {
     pub invited: Vec<String>,
     pub concurred: usize,
     pub dissented: usize,
-    /// Invited and not yet heard from. Derived, not stored — see `peer_participation`.
+    /// Invited, HAD A MAILBOX READER, and not yet heard from. Derived, not stored — see
+    /// `peer_participation`.
     pub absent: usize,
+    /// Invited seats no watcher had ever read a mailbox for at invite time. Held out of
+    /// `absent` because they cannot have looked, and reported beside it because they were
+    /// still asked: a reader must be able to see that the invitation went somewhere nobody
+    /// listens, which is a finding about the ROUTE, not about the seat.
+    pub invited_without_reader: usize,
 }
 
 #[derive(Default)]
@@ -747,6 +776,23 @@ impl EscalationStore {
                                 .get("invited_peers")
                                 .and_then(|v| {
                                     serde_json::from_value::<Vec<String>>(v.clone()).ok()
+                                })
+                                .unwrap_or_default(),
+                            // Derived from the same entry rather than stored twice: the open
+                            // writer records the doorbell fact per peer inside
+                            // `invitation_evidence`, so a restart rebuilds the split from the
+                            // evidence the decision was issued on, not from today's mailboxes
+                            // — which is the whole reason it is captured at invite time.
+                            invited_without_reader: d
+                                .get("invitation_evidence")
+                                .and_then(|v| v.as_array())
+                                .map(|rows| {
+                                    rows.iter()
+                                        .filter(|r| r.get("mailbox_reader") == Some(&serde_json::Value::Bool(false)))
+                                        .filter_map(|r| {
+                                            r.get("peer").and_then(|p| p.as_str()).map(str::to_string)
+                                        })
+                                        .collect()
                                 })
                                 .unwrap_or_default(),
                             plugin_id,
@@ -897,6 +943,7 @@ impl EscalationStore {
         let esc = Escalation {
             id: id.clone(),
             invited_peers: Vec::new(),
+            invited_without_reader: Vec::new(),
             plugin_id: plugin_id.to_string(),
             // Fail closed: every `open` caller is unproven until the handler records
             // otherwise via `record_asker_basis`. An asserted-by-default asker can be
@@ -958,6 +1005,27 @@ impl EscalationStore {
         match self.by_id.get_mut(id) {
             Some(e) => {
                 e.invited_peers = peers;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Which of the invited seats had no mailbox reader when they were asked.
+    ///
+    /// Separate from `invite` for the reason `record_asker_basis` is: the fact belongs to the
+    /// handler, which owns the inbox store, and `invite`'s existing callers — every one a
+    /// test — keep the honest default (nobody flagged) without a signature change. Silently
+    /// ignores ids that were not invited: a flag on a seat nobody asked is not a fact about
+    /// this escalation, and letting it through would let `absent` be reduced by a name that
+    /// never appeared in the invitation.
+    pub fn record_invitee_readers(&mut self, id: &str, without_reader: Vec<String>) -> bool {
+        match self.by_id.get_mut(id) {
+            Some(e) => {
+                e.invited_without_reader = without_reader
+                    .into_iter()
+                    .filter(|p| e.invited_peers.contains(p))
+                    .collect();
                 true
             }
             None => false,
