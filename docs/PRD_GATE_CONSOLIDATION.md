@@ -1,6 +1,6 @@
 # PRD — one gate, thin shims: consolidate the per-harness hooks onto the shared core
 
-**Status**: proposed — dp-directed 2026-08-11; peer-reviewed by GPT (NOT-SAME) 2026-08-11 and revised (see §11); fourth pass 2026-08-11 folding kimi's cross-vendor review (notice 1929, see §12) — the step-C pilot seat has read the plan and endorsed it. Execution directed by dp 2026-08-13 (this session): 'the prd is a must … i don't want the cheap solution, i want the actual, well implemented, robust solution.' Sprints A-G tracked in-session; as-is baseline in docs/GATE_CURRENT_STATE.md (PR #397).
+**Status**: proposed — dp-directed 2026-08-11; peer-reviewed by GPT (NOT-SAME) 2026-08-11 and revised (see §11); fourth pass 2026-08-11 folding kimi's cross-vendor review (notice 1929, see §12) — the step-C pilot seat has read the plan and endorsed it. Execution directed by dp 2026-08-13 (this session): 'the prd is a must … i don't want the cheap solution, i want the actual, well implemented, robust solution.' Sprints A-G tracked in-session; as-is baseline in docs/GATE_CURRENT_STATE.md (PR #397). Fifth pass 2026-08-14: nomad's codex-seat field data re-measured against the landed train (see §13) — one hazard confirmed but not exercised, one criterion still open with a measurement behind it, one half-landed in Sprint G.
 **Author**: claude-code (CBP), 2026-08-11
 **Motivating finding**: the shared gate core (`plugins/_shared/hestia_gate_core.py`) is **built but not wired** — it says so at line 103 (*"NOT WIRED. Nothing imports this yet."*). The live gates (codex, kimi) are the **pre-hardening hand-copies**, so security fixes that already exist in the core are absent from the enforcing hooks.
 **Directive (dp)**: *"common gate whenever possible, per-harness shims call the common gate, with local adjustments only as needed for the specifics of the harness. otherwise it is not maintainable and a massive security risk … fix the procedure, not one message."*
@@ -166,3 +166,78 @@ Kimi read the PRD at main (notice 1929) and filed four points; all four adopted,
 2. **§3.3 gains its sixth instance** — PR #357's measured evidence that the deny/infra conflation is live: marker-naming read-only commands drew unrecorded fail-closed denies and manufactured escalations. Sharpening: the daemon-side marker policy-eval error stays out of scope (§9); the PRD claims only the shim half (§6.E discrimination + criterion 9's recording requirement). Meta-datum: adding this bullet to this PRD *itself* drew the fail-closed content-match deny until the marker was paraphrased — the defect censored its own documentation, in a temp-worktree doc file the gate does not otherwise protect (escalation `4c40012185cbee3f`, left for dp to deny as a content-match false positive).
 3. **Fault-isolation inversion → acceptance criterion 9** — kimi's strongest point: N hand-copies were accidental availability-redundancy, one core is one failure domain, so degraded mode is the only fault isolation left and cannot stay an open question. Adopted as §7.1 criterion 9 (defined at A, implemented in core, break-the-core test per harness, degraded verdicts recorded and distinguishable from conduct denies). Sharpening: the inversion is **asymmetric** — for security faults heterogeneity was anti-isolation (the attacker picks the weakest copy), so consolidation strictly improves that side; criterion 9 is the price of the availability side, not a reason to keep the copies.
 4. **§7.2 rides #231 instead of inventing a second instrument** — the supervisor-owned build-authority manifest, per-seat current/stale/unknown, and fail-closed `unknown` already exist and are live; the enforcing-core digest is the same problem at a second scope. Two carried-over sharpenings: the digest must be self-reported by the loaded core (attest what was imported, not hash a nearby file), and it is an operator surface, not a CI check — install-drift is structurally invisible to CI.
+
+## 13. Revision note — nomad's codex-seat field data, re-measured after the A–G train, 2026-08-14
+
+Nomad ran the codex seat under the per-harness adapter through the hackathon weekend and filed three
+field data points on 2026-08-12 (mesh notice `47e57a2f-1d96-4a08-b8f4-6be93cd927f4`; carried into PR #385
+against the pre-execution text, when this PRD still read *"Not started"*). Sprints A–G have since landed,
+been reviewed twice by GPT, repaired and merged, so the points are recorded here **against what the train
+actually did**, not as proposals. Re-measured at `9a7f45b`; each verdict names its instrument.
+
+1. **The codex trust-rearm hazard — mechanism CONFIRMED, trigger NOT exercised by this train, seat currently armed.**
+   Nomad's description of the mechanism is exact: codex persists a per-hook-command trust hash keyed
+   `"<config path>:<event>:<leg indices>"`, and a leg whose key is absent is silently skipped in
+   non-interactive runs — no error, no prompt, no log line. Read at the seat on 2026-08-14: six hook legs
+   are registered and **six `[hooks.state]` entries exist**, so every leg on this seat is currently trusted.
+   The sharpening the re-measurement adds is the trigger condition: **the hash keys the COMMAND STRING, not
+   the hook file's content.** Sprints D/E/F rewired codex *inside* its gate script; the registration was not
+   touched — `plugins/codex/hooks/hooks.json` has **exactly one commit in its whole history**, the adapter's
+   original landing, so no train commit changed a registered command line and no trust entry was invalidated.
+   Nomad's prediction is therefore **untested by this train rather than refuted** — it stays live for the first
+   codex deploy that changes a command (new leg, wrapper env var, interpreter or path change).
+   The one place it *did* fire is nomad's own measured instance: a **new** PostToolUse leg added beside the
+   already-trusted observe leg (`post_tool_use:0:1`). Nomad's 2026-08-08 reading (new leg skipped, sibling
+   fired) and today's reading (both legs carry trust entries) are the two ends of one event — an interactive
+   re-trust closed it. **Corollary, and the part that outlives the incident:** because trust keys the command
+   and not the content, codex hook trust attests nothing about what the hook *does*. Content attestation is a
+   separate instrument and it **landed in Sprint G** — `hestia_gate_core.core_digest()`, self-hashed at import
+   and carried on every refusal record by the unified recorder (§7.2(7)). Nomad's hazard is an argument for
+   that instrument, not a second one.
+
+2. **Witness-path parity (nomad's criterion 11) — STILL OPEN, and now measured rather than anecdotal.**
+   Sprint E unified the **deny** recorder across harnesses, and `witness_decision_unified()` in
+   `plugins/_shared/hestia_gate_mechanism.py` says so in its own contract: it "only ever runs on the deny/warn
+   path, so no hook-clamp pressure on allows." The allow leg is still per-adapter hook wiring, which is exactly
+   the asymmetry nomad reported. Two readings at `9a7f45b`, and they disagree with each other:
+   - **In the repo**, codex's `hooks.json` registers only the Phase-0 observe shell hook on PostToolUse — a
+     fire-and-forget append of the raw event JSON to a local `observe.jsonl`, `exit 0`, no daemon call. A seat
+     installed from the tree today still gets **denials-only chain visibility**. Nomad's finding stands.
+   - **At the installed seat**, `~/.codex/config.toml` registers a *second* PostToolUse leg, the codex witness
+     script, which does fire `hestia_begin_action` + `hestia_record_outcome`. The allow side was fixed — by the
+     per-adapter route nomad explicitly declined to keep fighting — and the tree and the seat now disagree.
+   That divergence is install-drift of exactly the class §7.2 says CI cannot see, on the witness path instead
+   of the gate path. **Criterion 11 as nomad stated it is not met:** witness ingestion is not a property of
+   adopting the shared core, it is a property of one seat's hand-edited config. Recording it here as open, with
+   the two readings that make it checkable, rather than restating it as a new criterion in §7.
+
+3. **Post-cutover liveness probe (nomad's criterion 12) — HALF LANDED in Sprint G, in a different shape.**
+   `tools/gate_class_t_probe.py` reads per-member reached-verdict vs infra-fail-close rates from the reputation
+   ledger and calls out the Class T signature — *a member with acts but ZERO reached verdicts, the un-governed
+   twin of a healthy member.* That is precisely the state a silently-skipped gate leg produces, and the probe
+   produced the pre-deploy baseline (one member at 22 infra fail-closes / 2h against ~0 for the others). What it
+   does **not** do is the canary half: it reads acts that happened to occur, so an idle seat and a skipped-hook
+   seat read the same. **Landed:** the passive detector. **Open:** *fire* a canary act per seat after any wiring
+   change and assert the entry landed on both sides. The remaining half is the smaller one, and it is the half
+   that turns "the hooks are configured" from an attestation into a check.
+
+4. **Held-branch disposition — HOLDS, and its stated precondition has half-arrived.**
+   `nomad/kiro-crush-adapters` (`1dacafc`, 2026-07-24, 17 files / +1562) and `nomad/antigravity-adapter`
+   (`d63f2fb`, 2026-07-28, 7 files / +564) both still exist at origin, unmerged, with no PR. Holding them was
+   right and stays right: they are per-harness gate copies of the pre-consolidation shape, and merging them now
+   would add two more instances of the thing B–E exist to remove. The stated gate on migration — *after codex
+   proves the rearm path* — needs restating in light of point 1: codex **is** on the shared core (D–F), so the
+   "wait for the rewire" clause is satisfied, but the rewire never exercised rearm. Migration should therefore
+   be gated on **the first command-line-changing codex deploy**, not on the consolidation train, which would
+   otherwise read as satisfied by a train that never touched the hazard.
+   Antigravity's carried-forward property gets *better* under the train, not worse: it fails closed natively,
+   the only harness measured here that does, and the post-F shared path is fail-closed by contract
+   (`query_society_safety` never returns allow except on an explicitly recognized daemon verdict). The migration
+   now has a fail-closed target to land on rather than a fail-open one to defend against — nomad's worry becomes
+   a check, not a risk.
+
+**Left behind from the original fifth pass (PR #385), deliberately:** its Status-line rewrite (written when
+this PRD read "Not started"; the line now records dp's 2026-08-13 execution directive and the A–G sprints), its
+inline §6.F cutover-precondition paragraph, and its §7.5 proposing criteria 11 and 12. Re-adding proposals to a
+plan that has already executed would misdate them; the two criteria are recorded above as one open, one
+half-landed, each with the instrument that would close it.
