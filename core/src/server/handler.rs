@@ -1559,6 +1559,59 @@ fn refuse_asker_mismatch(
     )
 }
 
+/// Witness a caller asserting a `host_session_id` that its OWN proven session contradicts,
+/// and return the refusal the claim path sends back.
+///
+/// The sibling of `refuse_asker_mismatch`, one level down: that one catches a caller claiming
+/// a name it does not own, this one catches a caller claiming a WAKE it is not in. Both are
+/// the same defect — an attribution field asserted rather than proven — and the second is the
+/// more dangerous of the two on a claimed row, because `host_session_id` is the key an auditor
+/// joins a spent approval to the acts it covered. A mismatched value does not merely mislabel
+/// the spend; it files it against a different session's outcome rows.
+///
+/// REFUSES rather than silently preferring the derived value. Silent correction would be
+/// defensible for a typo and indefensible for a forgery, and nothing here can tell them apart
+/// — while a refusal names the discrepancy and lets the caller fix its own send. The claim is
+/// refused BEFORE `gate_escalations.claim`, so nothing is spent and no claimed row is minted:
+/// a spent approval cannot be un-spent.
+///
+/// Both values are recorded IN FULL, unlike `refuse_asker_mismatch`'s 8-char session prefix.
+/// A `host_session_id` is not a capability — Guard B (HUB ruling 2026-07-24) makes it a
+/// descriptive key that can never confer authorization — and the daemon's own `outcome` rows
+/// already carry it whole. Truncating the one field this row exists to compare would make the
+/// row unable to state its own finding.
+fn refuse_host_session_mismatch(
+    s: &super::state::ServerState,
+    plugin_id: &str,
+    tool_name: &str,
+    marker: &str,
+    stated: &str,
+    proven: &str,
+) -> anyhow::Error {
+    let _ = s.append_chain(
+        "gate_escalation_refused",
+        json!({
+            "plugin_id": plugin_id,
+            "tool_name": tool_name,
+            "marker": marker,
+            "why": "host session mismatch",
+            "asserted_host_session_id": stated,
+            "proven_host_session_id": proven,
+            "spent": false,
+        }),
+    );
+    anyhow::anyhow!(
+        "escalation host session mismatch: the session you claimed on is provably in host \
+         session '{}', but the call asserts '{}'. The claimed row's host_session_id is the \
+         key an auditor joins your spent approval to the acts it authorised, so it is DERIVED \
+         from the session you are demonstrably using, never taken from the arguments. Nothing \
+         was spent. Send the host_session_id your connect carried, or omit the field entirely \
+         and let the daemon derive it.",
+        proven,
+        stated
+    )
+}
+
 // NOTE: `resolve_caller` — the latest-session-fallback resolver — was deleted
 // 2026-07-28 when its last call site (tool_vault_get) was converted to
 // `resolve_attributed_caller`. Every authority-bearing surface now PROVES its caller;
@@ -9688,6 +9741,20 @@ mod tests {
             .expect("the sovereign channel decides");
     }
 
+    /// The claimed row a later auditor reads, in one shot.
+    async fn claimed_row(shared: &SharedState, marker: &str) -> serde_json::Value {
+        shared
+            .lock()
+            .await
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| {
+                e.event_type == "gate_escalation_claimed" && e.event_data["marker"] == marker
+            })
+            .unwrap_or_else(|| panic!("the spend on `{marker}` must be witnessed"))
+            .event_data
+    }
+
     /// A claimed approval must carry the join to the act that consumed it. Until
     /// 2026-08-12 the claimed row was built entirely from STORED escalation fields: the
     /// attempted act (arriving as `reason`, by the hook's documented design) and the
@@ -9702,16 +9769,31 @@ mod tests {
     /// ASSERTS ON THE CHAIN ENTRY, not the response: a census reads payloads, and the
     /// payload is the row a later auditor must be able to join from.
     ///
+    /// BOTH FIELDS ARE NAMED FOR WHAT THEY PROVE (GPT review of #445). The act is
+    /// `stated_attempted_act` — caller prose, testimony, unverified by anything on this
+    /// path; canonicalising it so the daemon could check it is #318's job and is NOT done
+    /// here. The join key is DERIVED from the proven session, so it is named plainly; the
+    /// three tests below this one pin that derivation from all three directions.
+    ///
     /// The marker is the gate-hook path, spelled with this file's existing `<gate-hook>`
     /// redaction convention (see `tool_gate_escalation_claim`, which explains why): the
     /// literal is what the two production spends carried, and writing the literal here
     /// refuses this edit for the reason documented there.
     #[tokio::test]
-    async fn a_claimed_row_carries_the_attempted_act_and_the_outcome_join_key() {
+    async fn a_claimed_row_carries_the_stated_attempted_act_and_the_derived_join_key() {
         let (_dir, shared) = make_shared_state();
-        let r = tool_connect(&shared, &json!({ "plugin_id": "kimi-code", "host_agent": "h" }))
-            .await
-            .unwrap();
+        // The wake this session is provably in. The hook threads the same value into its
+        // escalation connect that it puts on the wire, which is exactly why the daemon
+        // never has to take the wire copy.
+        let r = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code", "host_agent": "h",
+                "host_session_id": "host-wake-37aa0412",
+            }),
+        )
+        .await
+        .unwrap();
         let session = r["sessionId"].as_str().unwrap().to_string();
 
         // Open + approve out of band, then RE-ISSUE — the exact shape of the two
@@ -9719,8 +9801,8 @@ mod tests {
         // attempt claims.
         open_and_sovereign_approve(&shared, &session, "<gate-hook>").await;
 
-        // The claiming call the hook makes: attempted act in `reason`, the per-wake key
-        // in `host_session_id`.
+        // The claiming call the hook makes: attempted act in `reason`, and the per-wake key
+        // echoed in `host_session_id` — where it is CHECKED against the session, not used.
         let claimed = tool_gate_escalation_claim(
             &shared,
             &json!({
@@ -9736,18 +9818,11 @@ mod tests {
         .unwrap();
         assert_eq!(claimed["claimed"], true, "the approval is spent here: {claimed}");
 
-        let row = shared
-            .lock()
-            .await
-            .recent_chain(20)
-            .into_iter()
-            .find(|e| e.event_type == "gate_escalation_claimed")
-            .expect("the spend must be witnessed");
-        let d = &row.event_data;
+        let d = claimed_row(&shared, "<gate-hook>").await;
         assert_eq!(
-            d["attempted_act"], "Edit -> <gate-hook> (re-issued, claiming the approval)",
-            "WHAT the authorised write is — the value that already arrived on this call and \
-             was dropped until now: {d}"
+            d["stated_attempted_act"], "Edit -> <gate-hook> (re-issued, claiming the approval)",
+            "WHAT the caller SAYS the authorised write is — the value that already arrived on \
+             this call and was dropped until now. Testimony, not proof (#318): {d}"
         );
         assert_eq!(
             d["host_session_id"], "host-wake-37aa0412",
@@ -9755,15 +9830,21 @@ mod tests {
         );
 
         // The sparse claim — a hook that sends neither field (every hook older than this
-        // change) — must still write both keys as explicit nulls. A missing key and a
-        // not-sent value must not be the same row to a census: absence read as pass is
-        // the defect this whole seam keeps producing.
-        open_and_sovereign_approve(&shared, &session, "KINDS.md").await;
+        // change), on a session that never carried a host session either — must still write
+        // both keys as explicit nulls. A missing key and a not-sent value must not be the
+        // same row to a census: absence read as pass is the defect this whole seam keeps
+        // producing. Note the second connect: a session with NO host_session_id is the only
+        // way the derived key can legitimately be null, which is the point of deriving it.
+        let r2 = tool_connect(&shared, &json!({ "plugin_id": "kimi-code", "host_agent": "h" }))
+            .await
+            .unwrap();
+        let bare_session = r2["sessionId"].as_str().unwrap().to_string();
+        open_and_sovereign_approve(&shared, &bare_session, "KINDS.md").await;
         let sparse = tool_gate_escalation_claim(
             &shared,
             &json!({
                 "plugin_id": "kimi-code",
-                "session_id": session,
+                "session_id": bare_session,
                 "tool_name": "Edit",
                 "marker": "KINDS.md",
             }),
@@ -9771,20 +9852,191 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(sparse["claimed"], true, "{sparse}");
-        let row = shared
-            .lock()
-            .await
-            .recent_chain(20)
-            .into_iter()
-            .find(|e| {
-                e.event_type == "gate_escalation_claimed" && e.event_data["marker"] == "KINDS.md"
-            })
-            .expect("the sparse spend must be witnessed");
-        let d = &row.event_data;
-        for k in ["attempted_act", "host_session_id"] {
+        let d = claimed_row(&shared, "KINDS.md").await;
+        for k in ["stated_attempted_act", "host_session_id"] {
             assert!(d.get(k).is_some(), "key `{k}` must be WRITTEN, not omitted: {d}");
             assert!(d[k].is_null(), "and explicitly null when not sent: {d}");
         }
+    }
+
+    /// THE DERIVATION, with nothing on the wire to derive from.
+    ///
+    /// The first draft of this change wrote the caller's `host_session_id` argument straight
+    /// into the audit join key, and its test supplied that argument — so the test could not
+    /// tell a derived key from a trusted one. Here the claim sends NO `host_session_id` at
+    /// all and the row must still carry the wake, because the daemon reads it off the live
+    /// `Session` the caller proved. This is the arm that would go red if the field ever
+    /// reverted to `optional_string(args, "host_session_id")`.
+    #[tokio::test]
+    async fn the_claimed_join_key_is_derived_from_the_session_not_the_claim_arguments() {
+        let (_dir, shared) = make_shared_state();
+        let r = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code", "host_agent": "h",
+                "host_session_id": "host-wake-derived-only",
+            }),
+        )
+        .await
+        .unwrap();
+        let session = r["sessionId"].as_str().unwrap().to_string();
+        open_and_sovereign_approve(&shared, &session, "<gate-hook>").await;
+
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": session,
+                "tool_name": "Edit",
+                "marker": "<gate-hook>",
+                "reason": "Edit -> <gate-hook> (claiming, sending no host session at all)",
+                // deliberately absent: `host_session_id`
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed["claimed"], true, "{claimed}");
+
+        let d = claimed_row(&shared, "<gate-hook>").await;
+        assert_eq!(
+            d["host_session_id"], "host-wake-derived-only",
+            "the join key must come from the PROVEN session, not the arguments — the caller \
+             sent none and the row must still be joinable: {d}"
+        );
+    }
+
+    /// THE FORGERY ARM. A caller asserting a host session that its own proven session
+    /// contradicts is claiming a WAKE it is not in — the same defect as asserting a
+    /// `plugin_id` it does not own, one level down and more consequential: `host_session_id`
+    /// is the key an auditor joins a spent approval to the acts it covered, so a mismatched
+    /// value does not mislabel the spend, it files it against somebody else's outcome rows.
+    ///
+    /// Refused, not silently corrected: nothing here can tell a typo from a laundering
+    /// attempt, and the refusal names the discrepancy so the caller can fix its own send.
+    /// Refused BEFORE the spend, so the approval survives — asserted here by claiming it
+    /// again, correctly, and watching it work. A refusal that quietly burned the approval
+    /// would be a denial of service dressed as a guard.
+    #[tokio::test]
+    async fn a_claim_asserting_a_host_session_its_own_session_contradicts_is_refused() {
+        let (_dir, shared) = make_shared_state();
+        let r = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code", "host_agent": "h",
+                "host_session_id": "host-wake-proven",
+            }),
+        )
+        .await
+        .unwrap();
+        let session = r["sessionId"].as_str().unwrap().to_string();
+        open_and_sovereign_approve(&shared, &session, "<gate-hook>").await;
+
+        let err = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": session,
+                "tool_name": "Edit",
+                "marker": "<gate-hook>",
+                "reason": "Edit -> <gate-hook>",
+                "host_session_id": "host-wake-asserted-elsewhere",
+            }),
+        )
+        .await
+        .expect_err("a wake the caller cannot prove must not become the audit join key");
+        assert!(
+            err.to_string().contains("host session mismatch"),
+            "the refusal must name what disagreed: {err}"
+        );
+
+        // The error text reaches only the caller, and on a detected forgery the caller is the
+        // party least interested in reporting it. The row is what makes the refusal
+        // accountable — and it carries BOTH values, or it cannot state its own finding.
+        let rows = shared.lock().await.recent_chain(50);
+        let refused = rows
+            .iter()
+            .find(|e| {
+                e.event_type == "gate_escalation_refused"
+                    && e.event_data["why"] == "host session mismatch"
+            })
+            .expect("a detected mismatch must leave a row, not just an error string");
+        assert_eq!(refused.event_data["asserted_host_session_id"], "host-wake-asserted-elsewhere");
+        assert_eq!(refused.event_data["proven_host_session_id"], "host-wake-proven");
+        assert_eq!(refused.event_data["spent"], false);
+        assert!(
+            !rows.iter().any(|e| e.event_type == "gate_escalation_claimed"),
+            "a refused claim must mint NO claimed row — a spend recorded for a write that \
+             never happened is the inverse of the defect this whole change fixes"
+        );
+        drop(rows);
+
+        // And the approval was not burned by the refusal: the corrected claim still works.
+        let ok = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": session,
+                "tool_name": "Edit",
+                "marker": "<gate-hook>",
+                "reason": "Edit -> <gate-hook> (corrected)",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok["claimed"], true, "the refusal must not spend the approval: {ok}");
+    }
+
+    /// THE MATCHING ARM, which is the one the deployed producer actually takes. kimi's gate
+    /// hook has sent `host_session_id` on every Gate-1c self-write claim since 2026-08-12
+    /// (#372, `78350da`) and threads the SAME value into its escalation connect — so the
+    /// stated value equals the proven one and the claim must sail through. A guard that
+    /// refused the honest case would take the refusal channel dark on the exact population
+    /// it was built for.
+    ///
+    /// The derived value is what lands. Here the two are equal by construction, so this arm
+    /// cannot distinguish them alone; it is the pair with the two tests above that pins it —
+    /// derived-when-absent, refused-when-different, accepted-when-same.
+    #[tokio::test]
+    async fn a_claim_asserting_the_host_session_it_can_prove_is_accepted() {
+        let (_dir, shared) = make_shared_state();
+        let r = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code", "host_agent": "h",
+                "host_session_id": "host-wake-agreed",
+            }),
+        )
+        .await
+        .unwrap();
+        let session = r["sessionId"].as_str().unwrap().to_string();
+        open_and_sovereign_approve(&shared, &session, "<gate-hook>").await;
+
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": session,
+                "tool_name": "Edit",
+                "marker": "<gate-hook>",
+                "reason": "Edit -> <gate-hook>",
+                "host_session_id": "host-wake-agreed",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed["claimed"], true, "corroboration must not read as forgery: {claimed}");
+
+        let d = claimed_row(&shared, "<gate-hook>").await;
+        assert_eq!(d["host_session_id"], "host-wake-agreed", "{d}");
+        assert!(
+            !shared
+                .lock()
+                .await
+                .recent_chain(50)
+                .iter()
+                .any(|e| e.event_data["why"] == "host session mismatch"),
+            "an agreeing assertion must leave no refusal row"
+        );
     }
 
     /// The same forgery, at the OPEN door. Both doors carry a copy of this guard, and the
@@ -13083,12 +13335,20 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // the operator ruled on an id, an asker and a path fragment (dp, 2026-08-02).
     let stated_reason = optional_string(args, "reason");
     let stated_detail = optional_string(args, "detail");
-    // The durable per-wake key the daemon's own outcome rows carry. The claiming hook's
-    // connect session proves WHO asks but joins only to gate-witness rows; this is the
-    // value that joins a spent approval to the act that consumed it. Optional for the
-    // same reason `session_id` is (version skew must not darken the refusal channel) —
-    // and its absence is recorded as explicit null, not a missing key.
-    let host_session_id = optional_string(args, "host_session_id");
+    // The durable per-wake key the daemon's own outcome rows carry — the value that joins a
+    // spent approval to the act that consumed it. ACCEPTED HERE ONLY TO BE CHECKED, NEVER TO
+    // BE BELIEVED: the row written below carries the value DERIVED from the caller's proven
+    // live session, not this one. See `proven_host_session_id` at the claim site.
+    //
+    // The first draft of this change (PR #445) wrote this argument straight into the audit
+    // join key. GPT's review blocked it, correctly: a live `Session` already stores its
+    // `host_session_id`, and this path already resolves the caller's live session before
+    // spending an approval, so the daemon can DERIVE the correlation instead of trusting a
+    // caller-supplied one. Same doctrine as plugin identity two dozen lines below — an
+    // attribution field a caller can assert freely is an attribution field a caller can
+    // launder, and a join key is exactly the field an auditor would rely on to say WHICH
+    // acts a spent approval covered.
+    let stated_host_session_id = optional_string(args, "host_session_id");
     // WHO is asking, provable. Accepted here for the same reason `tool_gate_escalation_open`
     // accepts it (#128: `eligibility` otherwise compares an ASSERTION against an IDENTITY),
     // and because the invitation half cannot issue without it — an invitation is an outward
@@ -13137,6 +13397,45 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     }
     let asker_is_proven = proven_asker.is_some();
 
+    // THE JOIN KEY IS DERIVED, NOT ASSERTED.
+    //
+    // The caller's live session already stores its own `host_session_id` (set at connect,
+    // `state::Session::host_session_id`), and the claim path has just resolved that session
+    // above in order to bind the asker. So the daemon can READ the correlation off the proven
+    // session; it never has to take the caller's word for it. That is the whole difference
+    // between an audit key and a self-report.
+    //
+    // PRECEDENCE, exhaustively:
+    //   proven                        -> write the proven value (whatever the caller stated).
+    //   absent (no session, or a session that never carried one)
+    //                                 -> write explicit NULL, never the caller's assertion.
+    //   asserted AND matching proven  -> accept; the DERIVED value is what lands (they are
+    //                                    equal, so this is a corroboration, not a source).
+    //   asserted AND mismatched       -> REFUSE the claim. Nothing is spent, no claimed row.
+    //
+    // The mismatch arm is not pedantry. A caller asserting a different session than the one
+    // it is provably using is precisely the attribution laundering this chain exists to
+    // prevent: it would let a spend be filed against acts performed under someone else's
+    // wake. Refusing costs a hook one retry with the right value; accepting costs every
+    // later auditor the ability to trust the key at all.
+    //
+    // The "absent" arm deliberately does NOT refuse an assertion it cannot check. A caller
+    // that never sent `host_session_id` at connect has a session with no such value, and the
+    // honest record of that is a null — an unverifiable claim written into an audit field
+    // would be worse than the missing key this change set out to fix.
+    let proven_host_session_id: Option<String> = proven_asker
+        .as_ref()
+        .and_then(|who| who.session_uuid)
+        .and_then(|uuid| s.sessions.get(&uuid))
+        .and_then(|sess| sess.host_session_id.clone());
+    if let (Some(stated), Some(proven)) = (&stated_host_session_id, &proven_host_session_id) {
+        if stated != proven {
+            return Err(refuse_host_session_mismatch(
+                &s, &plugin_id, &tool_name, &marker, stated, proven,
+            ));
+        }
+    }
+
     if let Some(esc) = s.gate_escalations.claim(&plugin_id, &marker, now) {
         // Spending an approval is an ACT and is witnessed. The approval itself was already
         // recorded when it was decided; this entry is what ties it to the write it authorised,
@@ -13156,8 +13455,25 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
         // `host_session_id`, the gate hook's own connect session under
         // `requested_by.session_id`) and only the host session joins a claimed row to the
         // outcome rows an auditor reads (claude-code's increment, same thread). Both new
-        // fields are null rather than absent when the caller does not send them — a missing
-        // key and a not-sent value must not be the same row to a census.
+        // fields are written as explicit null rather than omitted when there is nothing to
+        // write — `stated_attempted_act` when the caller stated none, `host_session_id` when
+        // the PROVEN SESSION carries none (never merely when the caller sent none: see the
+        // derivation above). A missing key and an absent value must not be the same row to a
+        // census.
+        //
+        // WHY `stated_attempted_act` AND NOT `attempted_act` (GPT review of #445): the value
+        // is the claim call's `reason`, which is CALLER PROSE. The hook composes it as
+        // `f"{tool_name} -> {resource or marker}"`, and nothing on this path compares it to
+        // the act that actually follows. The chain proves an approval was spent by a proven
+        // asker under a derived session; it does NOT prove what was attempted. A field named
+        // `attempted_act` would invite exactly the reading the rest of this comment argues
+        // against — a census treating a self-report as a finding. The `stated_` prefix is the
+        // same discipline `stated_reason`/`stated_detail` already carry ten lines up.
+        //
+        // Upgrading `reason` to a CANONICAL act representation — one the daemon could compare
+        // against the write it later witnesses — is #318's job (act-binding). This PR does not
+        // solve it and must not read as though it had. Until #318 lands, the honest shape is:
+        // the session key is proof, the act string is testimony.
         let entry = s.append_chain(
             "gate_escalation_claimed",
             json!({
@@ -13169,10 +13485,12 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                 "decided_by": esc.decided_by,
                 "decided_via": esc.decided_via,
                 "reason": esc.reason,
-                // WHAT the authorised write is, in the hook's own words at claim time.
-                "attempted_act": stated_reason,
+                // WHAT the caller SAYS the authorised write is, in its own words at claim
+                // time. Testimony, not proof — see the note above and #318.
+                "stated_attempted_act": stated_reason,
                 // The per-wake key that joins this spend to its consuming act's outcomes.
-                "host_session_id": host_session_id,
+                // DERIVED from the proven session, never from the arguments.
+                "host_session_id": proven_host_session_id,
                 // TWO durations, because they answer different questions and the single field
                 // that used to be here answered neither honestly: it was named for the decision
                 // and computed from `opened_at`. kimi-code, PR #114 review.
