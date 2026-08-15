@@ -1121,6 +1121,7 @@
       <nav class="govern-nav" id="govern-nav" aria-label="Governance section">
         <button type="button" class="govern-chip selected" data-gov="ledger">ledger</button>
         <button type="button" class="govern-chip" data-gov="grants">grants</button>
+        <button type="button" class="govern-chip" data-gov="acts">acts</button>
         <button type="button" class="govern-chip" data-gov="policy">policy</button>
       </nav>
 
@@ -1206,6 +1207,98 @@
             </div>
             <div class="esc-err" id="sg-err" hidden></div>
             <div class="grant-note" id="sg-ok" hidden></div>
+          </div>
+        </section>
+
+        <!-- OPERATOR ACTS. Three consequential surfaces that have existed, operator-walled and
+             witnessed, with NO front end — the same defect as the scope-grant door, three more
+             times: `POST /api/operator/adjudicate`, `/api/operator/alias`, `/api/operator/amnesty`.
+             The dashboard has never called any of them.
+
+             All three REQUIRE an evidence pointer, and that is not a form-validation detail —
+             it is the surface's design. Each one changes how a member's history is READ:
+             adjudication adds the human's own rating to derivation, alias folds two identities'
+             evidence together, amnesty excludes a class of past conduct from it. An unsourced
+             claim of that kind is indistinguishable afterwards from a mistake, so the daemon
+             refuses without a ref and this screen does not pretend otherwise. -->
+        <section class="govern-pane" id="govern-acts" hidden>
+          <div class="govern-pane-head">
+            <h2>Operator acts</h2>
+          </div>
+          <div class="govern-scroll">
+            <div class="esc-note">
+              Acts only <strong>you</strong> can perform, each witnessed to the chain with the
+              sovereign as author. They change how history is <em>read</em>, never what it says:
+              nothing here edits or deletes a record.
+            </div>
+
+            <!-- 1. ADJUDICATION -->
+            <div class="pol-section-label">Adjudicate — record your own rating of a member</div>
+            <div class="grant-note">
+              dp, 2026-07-24: <em>"i would rate you 1.0 personally"</em> — the most trusted witness
+              in the system had no way to witness that. Enters derivation as
+              <strong>validity</strong> or <strong>valuation</strong> only. Temperament stays
+              conduct-derived and is deliberately not settable here: a hand-set temperament would
+              be prescribed trust, which is the thing web4 exists not to do.
+            </div>
+            <div class="pol-add grant-add">
+              <input class="pol-input" id="adj-plugin" placeholder="plugin_id" size="14">
+              <input class="pol-input" id="adj-role" placeholder="role" list="grant-roles" size="24">
+              <select class="pol-select" id="adj-axis">
+                <option value="validity">validity</option>
+                <option value="valuation">valuation</option>
+              </select>
+              <select class="pol-select" id="adj-verdict">
+                <option value="upheld">upheld</option>
+                <option value="partial">partial</option>
+                <option value="refuted">refuted</option>
+                <option value="deferred">deferred</option>
+              </select>
+              <input class="pol-input" id="adj-ref" placeholder="evidence pointer (required)" size="26">
+              <input class="pol-input" id="adj-reason" placeholder="reason" size="20">
+              <button class="pol-btn-add" id="adj-btn" disabled>adjudicate</button>
+            </div>
+            <div class="esc-err" id="adj-err" hidden></div>
+            <div class="grant-note" id="adj-ok" hidden></div>
+
+            <!-- 2. ALIAS -->
+            <div class="pol-section-label">Alias — declare two plugin_ids are the same member</div>
+            <div class="grant-note">
+              Folds the two identities' trust evidence together at read time.
+              <strong>Append-only</strong>: history stays where it landed and a later contradicting
+              alias supersedes this one — nothing is rewritten. Refused if the two are the same,
+              and refused without a pointer: no evidence, no join.
+            </div>
+            <div class="pol-add grant-add">
+              <input class="pol-input" id="ali-of" placeholder="alias_of — the SURVIVING id" size="18">
+              <input class="pol-input" id="ali-alias" placeholder="alias — folds INTO it" size="18">
+              <input class="pol-input" id="ali-ref" placeholder="evidence pointer (required)" size="26">
+              <input class="pol-input" id="ali-reason" placeholder="reason" size="20">
+              <button class="pol-btn-add" id="ali-btn" disabled>join identities</button>
+            </div>
+            <div class="esc-err" id="ali-err" hidden></div>
+            <div class="grant-note" id="ali-ok" hidden></div>
+
+            <!-- 3. AMNESTY -->
+            <div class="pol-section-label">Amnesty — exclude past conduct from derivation</div>
+            <div class="grant-note devices-notice">
+              <strong>This is a society-level act and the widest control on this page.</strong> It
+              excludes every <code>deny</code> below a chain position from conduct scoring, for
+              <em>every</em> member at once — there is no per-member form of it. History is
+              <strong>not deleted</strong>: the amnesty is itself witnessed, and each excluded item
+              still shows in receipts with this amnesty as its reason. Point <code>ref</code> at
+              the thing that ended the era being amnestied — typically the fix commit — because
+              afterwards that pointer is the only account of why a stretch of conduct stopped
+              counting.
+            </div>
+            <div class="pol-add grant-add">
+              <input class="pol-input" id="amn-before" placeholder="before chain position" size="16">
+              <input class="pol-input" id="amn-ref" placeholder="evidence pointer (required)" size="26">
+              <input class="pol-input" id="amn-reason" placeholder="reason (required)" size="26">
+              <button class="pol-btn-add" id="amn-btn" disabled>grant amnesty</button>
+            </div>
+            <div class="esc-err" id="amn-err" hidden></div>
+            <div class="grant-note" id="amn-ok" hidden></div>
           </div>
         </section>
 
@@ -3333,6 +3426,9 @@
     // Grants render from the snapshot, which the page polls anyway, so mounting costs nothing
     // and the pane is never a stale frame.
     grants: { el: 'govern-grants', mount: () => renderScopeGrants(lastData) },
+    // Acts are pure forms — nothing to fetch, so no mount hook. A mount that did nothing but
+    // exist would be the "looks wired" shape this file keeps refusing.
+    acts:   { el: 'govern-acts' },
     policy: { el: 'govern-policy', mount: () => fetchPolicy() },
   };
   let governSection = 'ledger';
@@ -3356,6 +3452,103 @@
     if (nav) nav.addEventListener('click', (e) => {
       const chip = e.target.closest('.govern-chip');
       if (chip) governShow(chip.dataset.gov);
+    });
+  })();
+
+  // THE THREE OPERATOR ACTS — adjudicate, alias, amnesty.
+  //
+  // One helper, because all three obey the same three rules and writing them out three times
+  // is how two of them would eventually stop obeying one: (1) the submit button is DISABLED
+  // until every required field is present — never enabled-and-inert, which is #456's defect;
+  // (2) the daemon's own error text is rendered, never swallowed; (3) the inputs that identify
+  // the SUBJECT are not cleared on success, because the operator is usually recording several
+  // acts about the same member and re-typing the id is how the wrong one gets rated.
+  //
+  // `ref` is required on all three by the daemon. The UI treats it as required too rather than
+  // letting the round trip discover it — a rejection that could have been prevented on screen
+  // trains the operator to distrust the form.
+  function wireOperatorAct({ btn, err, ok, required, build, endpoint, describe }) {
+    const b = $(btn), e = $(err), o = $(ok);
+    if (!b) return;
+    const fields = required.map(id => $(id)).filter(Boolean);
+    const sync = () => { b.disabled = !fields.every(f => f.value.trim()); };
+    fields.forEach(f => f.addEventListener('input', sync));
+    sync();
+    b.addEventListener('click', async () => {
+      e.hidden = true; o.hidden = true; b.disabled = true;
+      try {
+        const res = await apiFetch(endpoint, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(build()),
+        });
+        const out = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+        o.innerHTML = describe(out);
+        o.hidden = false;
+        // The witness hash is the receipt. Showing it means the operator can find the act in
+        // the ledger without trusting this panel's own claim that it landed.
+        await tick();
+      } catch (ex) {
+        e.textContent = `${btn.replace(/-btn$/, '')} failed: ${ex.message}`;
+        e.hidden = false;
+      } finally { sync(); }
+    });
+  }
+
+  (function wireOperatorActs() {
+    const hash = out => out?.witnessEntryHash
+      ? ` <code>${escapeHtml(String(out.witnessEntryHash).slice(0, 16))}</code>` : '';
+
+    wireOperatorAct({
+      btn: 'adj-btn', err: 'adj-err', ok: 'adj-ok',
+      required: ['adj-plugin', 'adj-role', 'adj-ref'],
+      endpoint: '/api/operator/adjudicate',
+      build: () => ({
+        subject_plugin_id: $('adj-plugin').value.trim(),
+        subject_role: $('adj-role').value.trim(),
+        axis: $('adj-axis').value,
+        verdict: $('adj-verdict').value,
+        ref: $('adj-ref').value.trim(),
+        reason: $('adj-reason').value.trim() || null,
+      }),
+      describe: out => `Adjudication recorded — ${escapeHtml($('adj-verdict').value)} on
+        ${escapeHtml($('adj-axis').value)} for <strong>${escapeHtml($('adj-plugin').value.trim())}</strong>.
+        Witnessed${hash(out)}. It enters derivation as evidence, not as a set score.`,
+    });
+
+    wireOperatorAct({
+      btn: 'ali-btn', err: 'ali-err', ok: 'ali-ok',
+      required: ['ali-of', 'ali-alias', 'ali-ref'],
+      endpoint: '/api/operator/alias',
+      build: () => ({
+        alias_of: $('ali-of').value.trim(),
+        alias: $('ali-alias').value.trim(),
+        ref: $('ali-ref').value.trim(),
+        reason: $('ali-reason').value.trim() || null,
+      }),
+      describe: out => `Identities joined — <strong>${escapeHtml($('ali-alias').value.trim())}</strong>
+        now folds into <strong>${escapeHtml($('ali-of').value.trim())}</strong> at read time.
+        Witnessed${hash(out)}. Append-only: nothing was rewritten, and a later contradicting
+        alias supersedes this one.`,
+    });
+
+    wireOperatorAct({
+      btn: 'amn-btn', err: 'amn-err', ok: 'amn-ok',
+      required: ['amn-before', 'amn-ref', 'amn-reason'],
+      endpoint: '/api/operator/amnesty',
+      build: () => ({
+        class: 'deny',
+        before_position: Number($('amn-before').value.trim()),
+        reason: $('amn-reason').value.trim(),
+        ref: $('amn-ref').value.trim(),
+      }),
+      // Says what it DID, in the direction that is easy to misread. An operator who came here
+      // to "clear" something should leave knowing the record is intact and only its reading
+      // changed — otherwise amnesty becomes the delete button people believe it is.
+      describe: out => `Amnesty recorded for denies below chain position
+        <strong>${escapeHtml($('amn-before').value.trim())}</strong>. Witnessed${hash(out)}.
+        Nothing was deleted — those entries remain in the chain and now show this amnesty as
+        the reason they no longer score as conduct.`,
     });
   })();
 
