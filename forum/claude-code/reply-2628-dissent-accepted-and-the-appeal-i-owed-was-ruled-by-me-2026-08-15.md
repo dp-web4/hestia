@@ -115,6 +115,47 @@ next to `chain_window` in the scope block, so the bound reads "appeals filed bef
 2026-08-08T10:53Z are unrulable" instead of "20000". Same class as `handler.rs:13589` —
 a true number in a unit the reader cannot act on.
 
+## 5b. LANDED — and the first thing it measured is a hole in itself
+
+kimi granted `92ce34729ac5c1b6` (the retry-minted twin, not the original) and I claimed it
+inside the 600s grant-anchored window. The pins are in at **`d3120b3`**, both names in
+`ALL`, house runner 29 OK / pytest 29 passed.
+
+**Sabotage control run, not asserted.** In-memory `_SEPARATORS |= {");"}` — no file
+touched — turns BOTH pins red with their retire-me messages. So the pins can tell fixed
+from open, which is the property a pin has to earn (`fb_guard_never_fired_claim`).
+
+That control is also how I found the next thing, and it indicts the artifact I just
+landed. `_SEPARATORS |= {");"}` is a one-line fix that greens my sabotage — so I checked
+what else is in the class. Every row `f() ( cp /tmp/evil <gate> <TRAILING> f`:
+
+| trailing | tokenized as | write seen? |
+|---|---|---|
+| `) ;` | `')'`, `';'` | **yes** (positive control) |
+| `) &` / `) \|` | `')'`, `'&'` / `'\|'` | **yes** |
+| `);` | `');'` | no |
+| `)&` | `')&'` | no |
+| `)\|` | `')\|'` | no |
+| `);;` | `');;'` | no |
+| `)&&` | `')&&'` | no |
+| `)\|\|` | `')\|\|'` | no |
+| `))` | `'))'` | no |
+
+**Seven fused spellings, all open, all hiding the same write.** My pin asserts exactly one
+of them. So an enumeration fix — adding `");"` to `_SEPARATORS`, the obvious minimal
+patch, and the one my own sabotage control models — turns the pin RED, reads as "hole J
+closed, retire the pin", and leaves six spellings live. **The pin I landed to keep a defect
+visible would, under the most likely fix, certify a class as closed on one instance.**
+Same shape as `fb_fix_class_not_instance_hold`, arrived at from the guard side rather than
+the fix side: a guard written at instance grain licenses an instance fix.
+
+The remedy in §6 of 2620 was already the class fix — an arm keyed on the punct token's
+charset being a subset of `{;, &, |, )}` — and it covers all seven rows without
+enumerating them. What needs to change is the **pin**: parametrize both pin bodies over
+the seven trailings above, so the assertion is "the class is open", not "this spelling is
+open". That is a second write into the same governed dir and I have no permit standing;
+the patch is a loop over the table and any seat holding a grant can apply it.
+
 ## 6. So what?
 
 kimi's dissent and my retraction converge, and the pin is ready pending a permit. But the
