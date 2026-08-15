@@ -4,6 +4,10 @@
 **Second pass, 2026-08-15**: GPT/codex review (notice 2420) landed three narrowings — all three adopted.
 Two were prose corrections; the first sent me to take a measurement, and the measurement **refuted** the
 claim the plan was making. Sprint 1's fix list is smaller and #423 keeps its own investigation as a result.
+**Third pass, 2026-08-15**: codex reviewed that measurement (notice 2425) and found the bound invalid —
+the arm I used to bound a full walk short-circuits. Both of its findings held; the instrument is repaired
+(a warm full-miss arm, a strict success-shape gate) and re-run. The scan verdict survives with a *sounder*
+bound, but the plan's account of **where the time goes** did not, and #423 is re-pointed accordingly.
 **Frame (dp, 2026-08-14)**: *"once we have all of the above running and dogfooded, we'll discover more
 questions and more answers… it's a ladder, not one giant leap."*
 
@@ -31,7 +35,7 @@ today's substrate is confounded*. This sprint is cheap and de-confounds the thre
 
 | item | what | why now |
 |---|---|---|
-| **#320** (the proven half) | session map: add the remover — TTL/idle sweep keyed on `connected_at` — and make `session/siblings` and `session/own` read one shared liveness predicate | presence truth and unbounded RAM are *measured*, on three machines now. CBP right now: **794 resident sessions, oldest 3h22m old, ~218 minted/hour**, of which 320 render as `claude-code` seats. The fleet's own "count live seats before writing a shared repo" discipline reads that surface |
+| **#320** (the proven half) | session map: add the remover — TTL/idle sweep keyed on `connected_at` — and make `session/siblings` and `session/own` read one shared liveness predicate | presence truth and unbounded RAM are *measured*, on three machines now. CBP right now: **1,279 resident sessions, oldest 3h48m old**, of which 399 render as `claude-code` seats. The fleet's own "count live seats before writing a shared repo" discipline reads that surface. Sharper since the third pass: the largest single population is now **`scan-cost-differential` at 415** — the instrument below minted 367 of them in one hour proving the map is *not* a latency problem. Nothing can remove them. That is the RAM/presence case, made by accident |
 | **#423** (a separate, still-open diagnosis) | instrument before prescribing: the stalls are real and their cause is **not** the session map | see below — the control #423 asked for has now run, and it came back null for the scan |
 | **#419** | witness handler persists `core_digest`, `verdict_available`, `rule_id`; tighten the schema so unknown keys refuse rather than vanish | the shims already SEND all three. Without this, deployed-generation attestation exists only on the fallback log — i.e. only when the daemon is unreachable, inverted from intent |
 | **#434 / #366** | claim window measured from delivery-to-member (or notify-on-approve), and budget the claim sequence as a sequence | dp's approvals expired unclaimed repeatedly this week; the loop only closes reliably for a machine in a retry loop. This is the approval path every later sprint depends on |
@@ -42,27 +46,53 @@ today's substrate is confounded*. This sprint is cheap and de-confounds the thre
 scan "the leading root cause" of #423's stalls and prescribed an index. GPT's review flagged that as a
 hypothesis wearing a root cause's clothes; #423 itself asks for `sessions.len()` vs latency *before* any
 fix is written. So it was run — as a paired differential rather than a correlation, since the scan sits
-behind `if let Some(hsid)`, which is a within-daemon A/B available immediately
-(`tools/session_scan_cost_differential.py`, deployed binary `v0.0.4-172-gdae0aa3`, n≈794 residents):
+behind `if let Some(hsid)`, which is a within-daemon A/B available immediately. **The first run's
+arithmetic was wrong and codex caught it**; what follows is the repaired instrument
+(`tools/session_scan_cost_differential.py`, deployed binary `v0.0.4-172-gdae0aa3`, n≈1,100 residents).
 
-| arm | what it does | median |
-|---|---|---|
-| WITH `host_session_id` (unique) | enters the scan, matches nothing → **walks all 794** under the state lock | 115.64 ms |
-| WITHOUT one | never enters the scan | 115.67 ms |
-| second connect, same transport, scan **HITS** | enters the scan, whole call | **0.79 ms** |
+*What was wrong.* The first run bounded the walk with a **second connect carrying the same
+`host_session_id`** — 0.79 ms — and reasoned part ≤ whole. But that arm *hits*:
+`values_mut().find(..)` short-circuits at the matched entry (`handler.rs:578-582`), and a `HashMap`
+gives that entry no traversal position, so the arm walks an unknown prefix, not 794 residents. The
+bound did not exist. The repair codex named is the right one: **warm the transport first, then miss.**
 
-**The scan is unmeasurable.** The differential is −0.03 ms; better, the third arm *contains* a scan and
-bounds the entire call at 0.79 ms, so the walk costs under 1 µs per resident. For it to reach one second
-linearly the map would need ~10⁶ sessions — at CBP's measured 218/hour, ~190 days of unbroken uptime.
-The stalls are real (outliers to 1.05 s appeared in this run) but they appear in **every** arm, including
-the 0.79 ms one that never touches a large map. Two consequences for this sprint:
+| arm (all on an already-warmed transport) | what it provably does | median | max |
+|---|---|---|---|
+| full-miss, `synthetic:true` | walks **all** residents, **plus a vault write** | 113.4 ms | 1,499 ms |
+| no-id, `synthetic:true` | no walk, **plus a vault write** | 113.6 ms | 125 ms |
+| hit (`host_session_id` matches) | walks an **unknown prefix**; no write, no mint | 0.76 ms | 464 ms |
+| **full-miss, no vault write** | walks **all 1,143**, nothing else | **0.594 ms** | 1.2 ms |
+| no-id, no vault write | no walk, nothing else | 0.582 ms | 0.9 ms |
+
+The last two arms exist because the ~113 ms floor is **not** per-transport setup, as the first run
+claimed — it is `mark_synthetic` → `vault::save_doc`, called **unconditionally on every synthetic
+connect** (`state.rs:581-602`), re-encrypting the whole 110 KB `vault.enc` even when the id is already
+in the set. Declaring `synthetic:false` under an id already excluded removes exactly that write and
+nothing else (`ensure_member` returns at its `is_synthetic` guard, `member_registry.rs:216`), which the
+instrument confirms two-sidedly: `--writecheck` shows the vault's mtime moving on the synthetic arm and
+holding on the no-vault arm. That floor is a **probe artifact** — no fleet seat connects synthetic.
+
+**The scan is bounded, now honestly.** The fastest no-vault full-miss connect took **0.511 ms** and
+provably contained a complete traversal of **1,143** residents, so the walk costs **≤ 447 ns per
+resident** — a hard bound, no differential required. Paired against its no-id twin over 80 pairs the
+walk is **+3.3 µs** (95% bootstrap CI **−2.8 → +12.3 µs**), i.e. indistinguishable from zero. For the
+walk to reach one second at the *conservative* bound the map would need ~2.24 M sessions — at CBP's
+measured 218/hour, **over a year** of unbroken uptime. Three consequences:
 
 - **#320's remover is still worth landing**, on the RAM and presence-truth grounds that were always the
   measured ones. The **index is dropped** — it optimizes a walk that costs nothing.
-- **#423 keeps its own investigation**, now pointed where the time demonstrably is: a **~115 ms floor
-  paid on the first connect of a new transport session and not on later ones** (0.79 ms). That is
-  per-transport setup, not the map. A sprint that lands a remover and declares the stalls fixed would be
-  closing #423 on a refuted mechanism.
+- **#423 keeps its own investigation**, now pointed at **writes serialized behind the one global state
+  lock**, not at the map and not at transport setup. The evidence is in the max column: the arm that
+  does the *least* work of any — a hit, no write, no mint, 0.76 ms median — still stalled to **464 ms**.
+  A call that does nothing cannot stall itself; it was waiting on another holder. Meanwhile 160
+  consecutive no-vault calls never exceeded 1.2 ms.
+- **The instrument is a stall source.** Each synthetic connect holds the global lock for ~113 ms of
+  encrypt-and-write. Probes that measure contention while generating it must say so, and this one now
+  does.
+
+Two caveats kept: a null bounds the **scan arm only** — a different lock holder is a hypothesis this
+design cannot see; and the no-stall observation in the no-vault phase is time-confounded, since the
+phases ran in sequence rather than interleaved. The 464 ms hit-arm excursion is the un-confounded half.
 
 **Dogfooding act**: run `tools/gate_class_t_probe.py` after a quiet hour and get a clean, *trustworthy*
 criterion-10 reading — the one we could not take honestly today. Plus: dp approves an escalation and it
