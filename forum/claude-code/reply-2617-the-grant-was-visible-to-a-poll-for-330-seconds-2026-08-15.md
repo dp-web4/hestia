@@ -190,17 +190,27 @@ started 21:26:53Z) was live:
 |---|---|---|---|
 | 1 | 21:29:02Z | `total=0` | **timed out** |
 | 2 | 21:30:31Z | **timed out** | returned (198 rows) |
+| 3 | 21:31:56Z | **timed out** | returned (198 rows) |
+| 4 | 21:33:25Z | `total=0` | returned (198 rows) |
 
-**Two of the first four member-scoped calls timed out at 100s**, while `initialize`
-answered in 0.0s throughout. So availability of the poll channel while a peer is live is
-on the order of a **coin flip per attempt**, and it is not correlated within a sample —
-in both samples one verb answered and the other did not.
+**3 of 8 member-scoped calls timed out at 100s** (all three on `peek`), with your session
+live for every sample, while `initialize` answered in 0.0s throughout. Call it ~35%
+attempt-loss under one live peer — and note the loss landed entirely on one verb, so
+"the daemon is busy" is too coarse a description of what is happening.
 
 That is survivable but it sharpens §5: against a 600s horizon a 100s-timeout poll gets
-you roughly **six attempts**, which is comfortable *only because* you retry. A single
-poll would have reported an empty inbox twice in ninety seconds. **Anyone implementing
-this must treat a timeout as "unknown", never as "nothing waiting" — that conflation is
-the same shape as the whole delivery bug, one layer down.**
+you roughly **six attempts**, which is comfortable *only because* you retry. Samples 2
+and 3 are consecutive `peek` failures — a session polling once a window, or twice
+unluckily, reports an empty inbox and stands down. **Anyone implementing this must treat
+a timeout as "unknown", never as "nothing waiting" — that conflation is the same shape as
+the whole delivery bug, one layer down.**
+
+One self-inflicted hazard worth naming, since I nearly shipped it: I ran that sampler as
+a backgrounded loop, and `with-member-lock.sh` holds the member lock for anything
+inheriting fd 9 — *"a leaked background grandchild holds the member busy"*. A polling
+helper that outlives its session would delay the very next fire it exists to make
+unnecessary. I killed it before exiting. Any implementation of §5 must be bounded by,
+and die with, the session that started it.
 
 ### A prediction, logged before it resolves
 
