@@ -928,6 +928,73 @@ mod tests {
     }
 
     #[test]
+    fn infra_fail_close_is_excluded_by_the_flag_and_not_only_by_its_words() {
+        // `has_no_verdict` has two arms and until 2026-08-15 only one of them could ever
+        // fire. The hooks sent `verdict_available`; `tool_witness_decision` never read it;
+        // so arm 1 had no input on ANY chain row (measured over 142,756 entries on CBP: the
+        // key appears zero times, in every event type), and the exclusion rode entirely on
+        // arm 2 — a substring match for "no policy verdict" / "daemon path failed".
+        //
+        // Every assertion below is a way that fix could ship looking correct:
+        //   - the flag arm passing because NOTHING is ever scored (hence the sibling that
+        //     must still score),
+        //   - the flag arm passing while the legacy text arm is quietly dead (hence the
+        //     text-only row, which is the shape 247 of codex's 476 denies actually take),
+        //   - and the limit of the repair being left implicit (hence the last case, which
+        //     asserts that pre-fix rows still score — the 33 already on the chain are an
+        //     operator matter, `exoneration`/`amnesty`, not something this diff reaches).
+        let role = "role:constellation:interactive-dev";
+        let deny = |extra: Value| {
+            let mut d = json!({
+                "decision": "deny", "enforced": true, "plugin_id": "kimi-code",
+                "role_lct": role, "session_id": "s1", "tool_name": "Bash", "target": "",
+            });
+            let obj = d.as_object_mut().unwrap();
+            for (k, v) in extra.as_object().unwrap() {
+                obj.insert(k.clone(), v.clone());
+            }
+            vec![entry(1, 0, "policy_decision", d)]
+        };
+
+        // ARM 1, the one this fix gives an input to. `gate.degraded` is the mode ratified
+        // 2026-08-11 — "the referee is missing, not ruling against you" — and its words
+        // match neither marker, which is why 22 such rows were scoring as conduct.
+        let flagged = deny(json!({"reason": "gate.degraded", "verdict_available": false}));
+        assert!(
+            derive("kimi-code", role, &flagged).temperament.score.is_none(),
+            "verdict_available=false must exclude the deny from temperament"
+        );
+
+        // THE SIBLING. Identical row, flag says a verdict WAS reached: real conduct, scored.
+        // Without this the assertion above passes for a grain that simply scores nothing.
+        let real = deny(json!({"reason": "gate.degraded", "verdict_available": true}));
+        assert!(
+            derive("kimi-code", role, &real).temperament.score.is_some(),
+            "verdict_available=true is a real verdict and must still be scored"
+        );
+
+        // ARM 2 must survive the repair: rows already on the chain carry no flag at all and
+        // are excluded on their words alone. This is the majority of the real population.
+        let legacy = deny(json!({
+            "reason": "society-safety: no policy verdict (daemon path failed for Bash; cause=timeout)"
+        }));
+        assert!(
+            derive("kimi-code", role, &legacy).temperament.score.is_none(),
+            "the legacy text arm must keep excluding pre-flag infra denies"
+        );
+
+        // THE LIMIT OF THE FIX, asserted rather than described. A flagless `gate.degraded`
+        // row — exactly the 33 measured on CBP — still scores as conduct. The repair is
+        // forward-only by construction; if this ever flips to `is_none()` someone has
+        // taught arm 2 new words, and that is a different change with a different argument.
+        let already_on_chain = deny(json!({"reason": "gate.degraded"}));
+        assert!(
+            derive("kimi-code", role, &already_on_chain).temperament.score.is_some(),
+            "pre-fix rows are NOT retroactively excluded; they need exoneration/amnesty"
+        );
+    }
+
+    #[test]
     fn escalation_pays_on_the_ruling_and_only_when_linked() {
         // The ladder this module reserved `ask-after-deny 1.0` for. Every assertion here is a
         // way the feature could ship looking correct and score nothing — which is exactly how
