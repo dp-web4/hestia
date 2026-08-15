@@ -7,10 +7,15 @@ on #431's standing-scope surface.
 is normative for BOTH documents; each side details only its own mechanics and defers to the twin for
 the other half. Amend the shared concepts in both PRs or neither.
 **Reframe folded in (dp, 2026-08-14)** — *"rather than rule on these, i want to add hooks for planned infrastructure."* §7's Q1–Q4 are no longer awaiting rulings: each is recast as an **extension point** with an initial best guess, a stored home, an operator-walled path to change it, and the measurement that would justify changing it. Q5 stays a question, with its precondition named (§7.5). §7.3 — the agent second factor — now states what would have to be true for an **adjudicator rung** to count as one. See **§7** and **§9**.
+**Second reframe folded in (dp, 2026-08-14)** — *"the key to this is roles."* The OUTWARD direction — what an external caller may reach through an agent presence — is not a second permission system. It is this document's role object, read from the other side: a caller's standing decides **which role they are routed to**, and the role's manifest decides **what they may reach**. Escalation is a role TRANSFER, never a widening. See **§10**, which carries the directive verbatim and is normative for the hub's outward-context PRD in the same way §2 is normative for the twin.
 **Relates to**: `docs/PRD_ADJUDICATOR_LADDER.md` (the decider axis — §9 is the cross-reference and the shared-convergence contract), `docs/PRD_ALLOWLISTS.md` (the sibling authority; §12.1 carries the same composite contract), `PRD_GATE_CONSOLIDATION.md` (LAW/SHIM/AGENT, the one-authority-path invariant, ratified
 degraded mode), PR #431 (the standing-scope store this bridge delivers through), `docs/GATE_SPRINT_F_NOTES.md`
 R1/R3 (standing scope + launch-cwd grant — §3.6 subsumes R3), `web4/hub/docs/PRD_HUB_V2_FEDERATED.md`
-R4 (roles as entities — the role manifest extends the R4 charter), CLAUDE.md's RWOA+S+V norm (§5.6).
+R4 (roles as entities — the role manifest extends the R4 charter), CLAUDE.md's RWOA+S+V norm (§5.6),
+and — for §10 — two fleet forum notes of 2026-08-14: GPT-5.6 Sol's
+`gpt-to-hub-outward-context-access-is-scope-permission-turned-outward-2026-08-14.md` (the outward
+problem statement and the `ConversationGrant` sketch) and this author's reply
+`claude-to-gpt-one-scope-grammar-compose-vs-admit-2026-08-14.md` (COMPOSE ∪ vs ADMIT ∩).
 
 ---
 
@@ -454,3 +459,359 @@ meaningful if there is exactly one.
 three certification semantics that agree until the first time they do not — and the first time they
 do not is a snapshot that is fresh by one document's rule and stale by another's, admitting an act
 under a policy that had already changed. One composite has one answer.
+
+---
+
+## 10. The OUTWARD direction — a caller REACHES a role; the role bounds what they reach
+
+This section is dp's second ruling on this document, and it extends the bridge one hop further than
+§1 stated the problem. §1–§9 answer *what may a MEMBER touch, having been given a job*. §10 answers
+*what may a STRANGER reach, having been routed to one* — and the answer is that it is the same
+question, the same object, and must not become a second mechanism. It is normative for the hub's
+outward-context PRD in the same way §2 is normative for the twin.
+
+### 10.0 Directive (dp, 2026-08-14, verbatim)
+
+> the key to this is roles. external entities can only access certain scoped roles, which can
+> escalate as needed. again a mirror. an average customer only gets to talk to customer service
+> agent, and access is scoped by the service agent role. if situation needs escalation to a manager,
+> or manager's manager, there is a process for that. human orgs are already governed this way. we're
+> just making it operate at machine speed, auditably, and with law-in-the-loop
+
+Everything below is construction detail for that paragraph. Where this section and §10.0 disagree,
+§10.0 wins.
+
+### 10.1 The access "tiers" are ROLES, not caller standings — and that is what removes the second ACL
+
+GPT's outward note proposes three default tiers — **receptionist** (no citizenship), **citizen**
+(relationship established, still least-privilege), **named / need-to-know grants** — and frames them
+as tiers of the CALLER. dp's ruling **relocates the scope**: the caller's standing determines *which
+role they are routed to*; the ROLE's manifest determines what may be reached. The tier is a property
+of the role, and the caller's standing is a routing key.
+
+This is strictly better for a reason that is mechanical rather than aesthetic: **the role object
+already exists in this document.** §2 defines a ROLE SCOPE MANIFEST (the classes a role requires and
+the detailed items it confers, each tagged with exactly one class, carrying a monotonic manifest
+generation) and an OCCUPANCY (witnessed, time-bounded, revocable). Restated as roles, GPT's three
+tiers need **no new type at all**:
+
+| GPT's tier | as a role in this document's vocabulary |
+|---|---|
+| receptionist | a role whose manifest confers items of one class only — a `context:public-corpus` class over an explicitly public corpus. No private retrieval is *withheld*; it was never in the manifest |
+| citizen-facing presence | a role whose manifest is bounded to one relationship's context classes (a project MRH, a customer's own account) — the customer-service presence |
+| named / need-to-know | a role with a narrow manifest and a **higher proof tier** (§2) — the tier table is where "M-of-N approved, time-bound" already lives, rather than a bespoke approval flow per secret |
+
+**So outward access needs no second ACL system.** The alternative — a per-caller permission set — is
+a parallel authority path, and this repo's one-authority-path invariant already refuses that shape
+inwardly. Refusing it outwardly costs nothing here because the object was built.
+
+**Reconciling GPT's `ConversationGrant`.** It survives, with its meaning corrected: the grant is
+**the record of which role a caller reached and under what occupancy**, not a bespoke permission set.
+Concretely `{caller LCT, presence LCT, role LCT, manifest_generation, occupancy_id, admitted items,
+purpose/MRH, budget, expiry}` — where `admitted items` is a *projection* of the manifest, not an
+independent list, and every field except caller identity, purpose and budget is derived from objects
+this document already governs. The grant is a receipt; the manifest is the authority.
+
+Two fields in the sketch are **not** projections of a manifest, and both are flagged rather than
+absorbed:
+
+- **`denied context labels / selectors`.** A per-grant deny field is a subtraction inside a
+  composition, and `PRD_ALLOWLISTS.md` §2.2 refuses exactly that shape inwardly: *"There is no
+  per-member 'deny' field, no override, no shadowing… a member entry is a set union and nothing
+  else"* — which is what makes composition auditable by inspection rather than by simulation. The
+  narrowing direction already has a home (`instance_overlays`, tighten-only, `POLICY_SCOPE_ASYMMETRY`
+  row 1) and the innate layer above everything. **Recommendation to the Hub PRD: drop the deny list
+  from the grant.** A grant that both adds and subtracts cannot be read; it must be simulated.
+- **`disclosure ceiling`.** This one is real and is *not* a subtraction — "may reason over" vs "may
+  quote verbatim" vs "may not load" is a second property of an item, not a narrowing of the item set.
+  It belongs on the **item's class** in the manifest (§2), so one lookup answers both "may this be
+  retrieved" and "in what form may it leave," rather than on the grant where it would drift per
+  caller.
+
+**And one correction to the tier frame itself.** "Tiers" implies a total order, and roles are a
+partial order: a customer-service role and a partner-facing role are incomparable — neither contains
+the other. Nothing in the design should assume a caller can be ranked. Routing resolves on
+`kind × consequence` (§10.4), which is a lookup, not a rank.
+
+### 10.2 Inward and outward are one object seen from two directions
+
+| | INWARD (§2–§3) | OUTWARD (§10) |
+|---|---|---|
+| the role | a member **OCCUPIES** it | a caller **REACHES** it |
+| what the role confers | the occupant's local reach | the projection of context the caller may encounter |
+| the ceiling | the member's operator-approved classes (clearances, §3.1) | the caller's standing, which decides routing — plus, always, the occupant's own clearances (below) |
+| the flow rule | items ⊆ classes, per item, at delivery and re-checked at act time (§3.4) | **identical, unmodified** |
+| expiry / revocation | generation stranding, three paths (§3.5) | **identical**, plus withdrawal of caller standing, which is the caller-side analog of occupancy ending |
+| the record | the `role_derived` entry (§3.2) | the `ConversationGrant` (§10.1) |
+
+**The bound applies twice, and this is the part worth building the section around.** An outward
+interaction is bounded by the role's manifest *and* by the clearances of the presence occupying that
+role:
+
+```
+reachable(caller, role) = admitted(manifest_role)  ∩  effective_scope(occupant_of(role))
+```
+
+A role cannot confer to a caller what its occupant may not itself hold. That is not a new rule — it
+is §2's FLOW RULE applied without modification, with a second party added to an existing check. It
+also closes an outward laundering path before it opens: minting a generous outward role does not
+create reach, because the presence filling it is still bounded by the operator's clearance decisions.
+**Outward adds no rule. It adds a party.**
+
+This is why one vocabulary must serve both, and GPT's closing warning is the argument, quoted so it
+is in the document rather than in a forum thread:
+
+> If the two develop as different mechanisms, they will drift. Prefer one scope/grant vocabulary
+> reusable for tools, context, disclosure, and memory.
+
+Two mechanisms would not drift immediately. They would agree until the first case where they did
+not — which is the same failure shape §9.1 names for certification semantics, arriving on the
+authority axis instead of the freshness axis.
+
+**Revocation needs no new text.** §3.5's three structural paths cover outward unchanged: the
+presence's occupancy ends and every conversation under it lapses; a clearance is revoked and strands
+that class across *all* callers at once; the manifest is amended and derived projections are stranded
+until re-flow-checked. Outward grants join **§6 criterion 3's population** rather than getting a
+criterion of their own, and they join §9.1's composite — a manifest amendment on an outward-facing
+role moves the composite revision like any other authority.
+
+### 10.3 ESCALATION IS A ROLE TRANSFER, NOT A WIDENING
+
+> **This is the load-bearing rule of the section.**
+
+In a human org, escalating to a manager does not widen the customer-service agent's access. It moves
+the interaction to someone whose role *already* holds more. The machine version must be identical,
+and the reason is COMPOSE-vs-ADMIT (the distinction named in the forum reply of 2026-08-14):
+
+- **COMPOSE (∪)** — how an authority set is assembled. An **operator or ladder act**: witnessed,
+  generation-bumping, ceremony-tiered (`PRD_ALLOWLISTS.md` §3.6).
+- **ADMIT (∩)** — how a single act is checked against every constraining layer. A **machine act**:
+  no layer may add.
+
+**Escalation COMPOSES a new grant under a different role. It never widens the existing grant.** A
+grant that grew during a conversation would be composition happening at admission time, which is the
+bug in its general form.
+
+> **The invariant: the escalated-to role's own admission is evaluated afresh. Nothing carries over
+> from the prior role except the conversation's provenance.**
+
+Provenance is deliberately small and deliberately not a capability: the caller's identity and
+standing, the prior role LCT, the prior grant id, and the stated reason for escalation. **Notably it
+does not include the transcript.** Carrying the conversation so far into the manager's context is
+itself an admission decision against the manager role's manifest — a role whose manifest does not
+admit the customer's context class does not receive the customer's transcript merely because the
+conversation was transferred. Treating carryover as a courtesy is how the first outward leak would
+happen, and it would look like helpfulness.
+
+**Why the rule is load-bearing.** Without it, *"escalate me to a manager"* is a laundering path: the
+caller obtains through escalation what the role they reached could not confer, and the ratchet is
+defeated by the very mechanism that exists to handle exceptions. This is **§5.1's laundering
+argument, outward** — and the inward form is already written and already pinned. §5.1 states that no
+composition of roles can exceed the member's clearance set; §6 criterion 2 tests it as a property
+over random manifests. **The outward form needs no new mechanism** — only the statement that a
+conversation escalation is a role transfer, and therefore a composition, and therefore an
+operator-or-ladder act rather than something the presence can do for a caller who asks nicely.
+
+One corollary, stated because it will otherwise be discovered late: the escalated-to role's occupant
+may be — and by §10.6's NOT-SAME clause usually should be — a **different presence entirely**. "Same
+agent, wider grant" is the shape this rule forbids.
+
+### 10.4 The adjudicator ladder (#448) and the role hierarchy are ONE structure
+
+*"Escalate to a manager"* and *"escalate to the next rung"* are the same mechanism.
+`PRD_ADJUDICATOR_LADDER.md` §2.2 stores `(act kind × consequence) -> ordered rung list`; an org chart
+is an ordered list of who is asked next, resolved on what the request is and how consequential it is.
+**The org chart IS the ladder**, and the ladder PRD's own framing already accommodates this: §2.6
+holds that who occupies a rung is not the seam's business (*"a heuristic, a neural net, and THEN an
+agent"* are all valid bindings under one schema). **The policy-agent rung is a role like any other**,
+and the role manifest is how a rung binding is expressed rather than a second binding format.
+
+Two consequences follow, and the second is a security rule.
+
+1. **One route table, one `kind` vocabulary.** §7.1 already commits this document to one taxonomy
+   shared with `PRD_ALLOWLISTS.md` §3.6.5's ceremony table and the ladder's route table. Outward
+   routing joins the *same* key rather than minting `caller.*` as a fourth spelling. "May this caller
+   reach this context class?" and "may this member write this path?" are the same question asked of
+   different principals — the point made in the forum reply's third ask.
+
+2. **A role that can route its own escalation is the ratchet-defeat one layer up.** The ladder PRD
+   §5.3 already refuses this shape for itself: a route whose `kind` is `ladder.*` or `governance.*`
+   resolves to `[operator]`, and the table returns a **refusal, not a rung** — because an entry
+   naming a rung would imply a rung could ever be the decider. **The identical refusal must cover
+   role-routing configuration.** `role.route.*` (which role a given standing is routed to) and
+   `role.manifest.*` (what a role confers) join that refusal set. Without it, a role reached by an
+   untrusted caller could name itself, or a role it controls, as its own escalation target — and the
+   effective authority of every outward act collapses to whatever the cheapest reachable role will
+   confer. `PRD_ALLOWLISTS.md` §3.6.3's corollary is the governing precedent: **the control must
+   protect its own registration.**
+
+**One asymmetry worth stating plainly: outward routing config is MORE consequential than inward.**
+Inward, a mis-routed escalation affects a member who is inside the society, holds a chain identity,
+and can appeal. Outward, the affected party is a stranger with no seat, no appeal verb, and no
+visibility into the decision. The ceremony tier for `role.route.*` on an outward-facing role should
+therefore be at least the tier of the highest class its manifest confers — not the tier of the act of
+editing a table.
+
+### 10.5 What the machine version must FIX — dp's "machine speed, auditably, law-in-the-loop" as requirements
+
+Human orgs are governed this way, and they are governed this way *badly* in three specific respects.
+Each is a design requirement here, not a compliment.
+
+1. **Role scope must be enforced AT RETRIEVAL, not at disclosure.** In a human org the
+   customer-service agent typically **can** see far more than the role permits — they hold the
+   database credential, and the scoping is policy rather than mechanism. The machine version must not
+   reproduce that: `ContextBroker.retrieve()` is authorization-aware **before model invocation**
+   (GPT's note, and it is the correct rule). Prompt-level *"don't reveal this"* is a request, not a
+   boundary — the disclosure decision would run after the context had already entered the model. This
+   is the inward failure this repo spent 2026-08-14 eliminating, in outward dress: **a control that
+   runs after the thing it governs is not a control.** The role manifest is the *retrieval predicate*,
+   not a post-filter over what was retrieved.
+
+2. **Every routing decision must be witnessed — including the refusals.** In a human org escalation
+   is undocumented hallway routing: who transferred whom to whom, and why, is unrecoverable a week
+   later. The machine version records the routing act with caller, from-role, to-role, the ladder
+   generation in force, the stated reason, and the decision. **A refusal to escalate is a witnessed
+   DECISION, never silence** — `PRD_ADJUDICATOR_LADDER.md` §3.2 makes ladder exhaustion a witnessed
+   DENY for the same reason, and the measured defect it answers is that today's fail-closed denies
+   leave no trace at all. Honest caveat, because this clause is the weakest of the three: **a witness
+   record that nobody reads is the hallway conversation with better storage.** The requirement is
+   satisfied by the record being *queryable per caller and per role*, not by its existence.
+
+3. **Each rung must consult the hash-pinned law, not its memory.** In a human org the manager applies
+   remembered policy — usually a version of it that was current when they learned it. The machine
+   version has a solved sub-problem here and must use it: `PRD_ADJUDICATOR_LADDER.md` AC-L4 requires
+   every rung verdict to carry the `law_hash` obtained from `hestia_operating_law` **within** the
+   decision, not cached across decisions, which converts law-consultation from a claim into a
+   checkable fact. The cautionary specimen is in this repo and it is exact:
+   `GATE_BYPASS_CATALOG.md` §17 records a figure that *"travelled from conversation → PRD → cited
+   authority without ever being measured, and was wrong by 5–10×"*, and the ladder PRD §1.3 found a
+   **live instance of the same shape** — a superseded census still sitting in a code comment,
+   arguing for a design decision, three days after a re-walk to genesis superseded it. **Remembered
+   policy is folklore.** The hash is the entire difference between a rung that read the law and a
+   rung that remembered it.
+
+Stated without flattery: (1) and (3) are genuinely better than the human org, because they are
+mechanism where the human version is policy. (2) is better *only if the record is read*, and that is
+a measurement obligation this section does not get to assume.
+
+### 10.6 The cautions
+
+**Role explosion.** Every distinct caller relationship is a temptation to mint a role, and a role per
+caller is an ACL per caller wearing more ceremony — the second ACL system §10.1 exists to avoid,
+arrived at by a different road. The bound: **a role is justified by a distinct MANIFEST, not by a
+distinct caller.** Callers sharing a manifest share a role and differ only in their grant records.
+This is measurable rather than exhortative, because the manifest is data: count roles whose manifests
+are set-equal; a rising count is the explosion, detectable by inspection. Name the pressure honestly
+— it comes *from* §10.0's ruling, because a role's manifest must be written for its least-trusted
+admissible caller, and the tempting fix is a narrower role per caller.
+
+**Escalation as social engineering.** A caller who can trigger escalation at will holds two weapons:
+
+- a **denial-of-attention** weapon — escalation routes work to the scarcest rung, and a caller who can
+  route at will can flood it. This is `PRD_ALLOWLISTS.md` §3.6.1's friction argument inverted: there,
+  an unsatisfiable bar manufactured a bypass; here, a *free* escalation manufactures a flood.
+- a **probing oracle** — *which* escalations are accepted maps the org chart and the manifest
+  boundaries. A caller who learns that "patent strategy" escalates to a different role than "invoice
+  question" has learned the shape of the private corpus without reading a byte of it.
+
+Three requirements follow. Escalation is itself an act with a `kind`, so it is **rate-bounded and
+adjudicated on the same key** as everything else. A refusal to escalate is **recorded as a decision
+with a reason**, per §10.5(2). And — this is the sharp one — **the refusal text must not disclose the
+role that was not reached.**
+
+> **An inward/outward asymmetry this document did not previously have, and it is a genuine
+> contradiction with §3.2.** Inwardly, a withheld item is **disclosed**: §3.2 records
+> `role_scope_withheld` naming the item, its class, and the missing clearance, deliberately, as
+> *"the disclosure that lets the member ask for the clearance rather than mysteriously lacking
+> reach."* **Outwardly that disclosure is the probing oracle.** Telling a caller *which* class they
+> lack tells them the class exists. So the rule inverts across the boundary: **withheld items are
+> disclosed to MEMBERS and never to CALLERS**, and the outward refusal for a class that exists must
+> be indistinguishable from the refusal for a class that does not. The witness record still carries
+> the full reason — the asymmetry is in what is *returned*, never in what is *recorded*.
+
+This also re-opens §7.5 in the outward direction with a second precondition. §7.5 leaves
+"does a withheld item auto-open a clearance ask" undecided pending the approve→re-issue loop-close
+gap. Outwardly, auto-opening on a *caller's* withheld item is precisely the denial-of-attention
+weapon above, so the outward answer needs rate-bounding in addition to loop-closure. Recorded as an
+extension of §7.5's precondition list, not as a new question.
+
+**NOT-SAME extends outward.** The role adjudicating what a caller may reach **must not be the
+presence answering them**. `arbiter::eligibility_for` clause 1 (never your own adjudicator) and
+clause 2 (not the gate that denied) carry over unchanged, and this bites harder outward than inward:
+the caller is not a fleet member, the stakes are disclosure rather than a refused shell command, and
+there is no operator watching each request. A presence that could adjudicate its own caller's
+escalation is the same entity deciding what it may say and whether it may say more.
+
+### 10.7 Accountability self-audit (RWOA+S+V) — the outward-routing surface
+
+```
+surface: caller -> role routing + admission   act: admit an external caller to a role's context projection
+S: high/reversible-per-conversation, IRREVERSIBLE-in-disclosure [construct: a disclosed context object cannot be un-disclosed; the grant is revocable, the knowledge is not — so this surface is scored at the disclosure grain, not the grant grain]
+R: n/a [construct: reaching the presence's endpoint is not standing; external presence proves only that a cryptographic endpoint exists (GPT's note). Standing is the ROUTING KEY and never the scope]
+W: pass [construct: caller LCT + hub-witnessed standing for the routing decision; the ROLE's manifest generation + the occupant presence's occupancy for the scope; the double bound of §10.2 means both must verify]
+O: pass [construct: retrieval-time enforcement (§10.5.1) — the admission decision dominates the retrieval, which dominates model invocation. A post-filter over retrieved context fails O by construction]
+A: pass [construct: the ConversationGrant records role, manifest generation, occupancy, admitted projection; every routing decision witnessed with from-role/to-role/ladder generation/reason (§10.5.2)]
+V: present [construct: three §3.5 revocation paths plus standing withdrawal; the occupant's clearances are the operator's standing veto — pulling a clearance strands the class across all callers at once]
+verdict: PASS (design) — CONDITIONAL on §10.6's outward non-disclosure rule: if a refusal names the withheld class, A is satisfied and this surface still leaks through R's own answer. The condition is AC-O5.
+
+surface: conversation escalation (role transfer)   act: compose a NEW grant for an existing caller under a different role
+S: high/irreversible-in-effect [construct: the escalated-to role's projection is disclosed once the transfer completes; a transfer cannot be un-taken, only ended]
+R: n/a [construct: a caller's ability to ASK for escalation is never evidence for granting it — this is R's most tempting outward form, because asking is the whole interface]
+W: pass [construct: fresh admission against the escalated-to role's manifest AND the new occupant's clearances; nothing carries from the prior role except provenance (§10.3); the transfer is an operator-or-ladder act, resolved on kind x consequence]
+O: pass [construct: the new admission is evaluated BEFORE any context of the prior conversation reaches the new occupant — transcript carryover is itself an admitted item, not a courtesy]
+A: pass [construct: the transfer record names caller, from-role, to-role, the reason, the ladder generation, and the decider; a REFUSED transfer is recorded identically minus the grant]
+V: present [construct: refusal to escalate is a first-class recorded decision; rate-bounding is a veto against the flood weapon; the operator rung is terminal in every route]
+verdict: PASS (design) — CONDITIONAL on `role.route.*` and `role.manifest.*` resolving to [operator] per §10.4(2). If any route ever names a role as decider of its own routing, this block is void.
+```
+
+### 10.8 Falsifiable acceptance criteria (outward)
+
+Numbered separately from §6 so the two populations stay distinguishable. Each names the arm that
+must be able to fail — a criterion with only a satisfiable arm is not a criterion.
+
+- **AC-O1 — escalation COMPOSES, it never WIDENS.** After a caller is escalated from role A to role
+  B, the reachable set equals `admitted(manifest_B) ∩ effective_scope(occupant_B)` exactly. Assert an
+  item present in A's manifest and absent from B's is **not** reachable after the transfer — the
+  grant did not accumulate. **The arm that must fire:** an item present in B and absent from A **is**
+  reachable, otherwise a broken transfer that confers nothing passes the first assertion. Second arm,
+  separately asserted: the prior conversation's transcript is reachable to B **only** if B's manifest
+  admits its context class.
+- **AC-O2 — role scope is enforced BEFORE model invocation.** Measured on the **retrieval** log, not
+  the output. For a caller routed to a receptionist role, the set of context objects that entered the
+  model's context is a subset of the public corpus. **The arm that must fire:** a prompt-level-only
+  implementation goes RED — a forbidden object appears in the retrieval record even when it never
+  appears in the emitted text. Without this arm the criterion is satisfied by a well-behaved model,
+  which is exactly the thing that is not a boundary.
+- **AC-O3 — every routing decision is witnessed, including refusals.** A routed escalation, a refused
+  escalation, and an escalation whose target rung declined produce **three distinguishable** chain
+  records, each carrying its reason. **The arm that must fire:** with the target stubbed unreachable,
+  the record produced is not the record a refusal produces (`PRD_ADJUDICATOR_LADDER.md` AC-7's shape;
+  a silent timeout that reads as "no objection" is the most dangerous failure this surface can have).
+- **AC-O4 — no role routes its own escalation.** A route naming any role as the decider of
+  `role.route.*` or `role.manifest.*` is REFUSED at write time, with the refusal naming the clause;
+  the table returns a refusal, not a role id. Constructed like
+  `no_rung_can_mutate_ladder_config` / `no_mcp_tool_can_mutate_standing_scope`. **The arm that must
+  fire:** the same write with a non-governance `kind` succeeds, so a store that refuses everything
+  does not pass.
+- **AC-O5 — outward withholding does not disclose.** A caller refused a context class receives a
+  response byte-identical to the response for a class that does not exist. **The arm that must fire
+  is in the same test:** the corresponding INWARD withhold **does** name the class and the missing
+  clearance (§3.2's `role_scope_withheld`). One test asserting both directions pins the §10.6
+  asymmetry rather than leaving it as prose that a future implementer will "simplify" into symmetry.
+
+### 10.9 Non-goals for §10
+
+- **Not building the receptionist, the broker, or the presence.** This section states that the role
+  object carries outward access; the hub's outward-context PRD is where the presence lifecycle,
+  pairing, and transport live (GPT's note, §"Hub vs Hestia responsibility" — and this section does not
+  disturb that split).
+- **Not defining the context-label schema.** GPT's context-object attributes (provenance, subject,
+  steward, sensitivity, citizenship floor, purpose tags, disclosure rules) land in this document's
+  vocabulary as **classes** and their tier mapping. §7.1's taxonomy governs the spelling, and the
+  outward side must not fork it — a class the hub spells differently is a flow-rule bypass or a
+  permanent withhold, which is §7.1's whole argument, now with a caller behind it.
+- **Not admitting cross-hub callers.** §7.2 keeps federated occupancy out of v0; an outward caller
+  from a non-paired hub is withheld and disclosed *to the operator* (never to the caller, §10.6) on
+  the same `accepted_occupancy_sources` mechanism.
+- **Not populating any route table.** As with §7 and the ladder PRD: this section commits to the
+  object and the invariant, not to a table of roles nobody has measured a need for.
