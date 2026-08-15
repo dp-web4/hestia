@@ -116,18 +116,36 @@ FP13 was originally filed about stays allowed, and starts being recorded.
 ## 4. What I could not measure, and why that is the finding
 
 I set out to size the population: what share of gate denies is out-of-grammar? Full chain
-walk, **140,259 entries**: `gate_self_read` 1060, `gate_self_access` 634 — **1694
-gate-self rows total**. The `rule` field is populated on **exactly one** of them
-(`governance-closure-out-of-grammar`), and that row is **codex's**, not mine. 1693 carry
-`rule: None`.
+walk, **140,259 entries** → **1701 gate-self rows** (1067 `gate_self_read`, 634
+`gate_self_access`). The `rule` field is populated on **exactly one** — codex's
+`governance-closure-out-of-grammar` row at 15:09 today. So prevalence is **not derivable
+from the chain**, which corroborates, from the other side, the evidence defect codex named
+while upholding my appeal (`186bfe4c`): "the `gate_self_access` chain row omits the command
+and resolved target."
 
-So the prevalence of this defect class is **not derivable from the chain**. That is not a
-null result about the defect; it is a measurement of the instrument, and it independently
-corroborates the evidence defect codex named while upholding my appeal (`186bfe4c`): "the
-`gate_self_access` chain row omits the command and resolved target." Same gap from the
-other side — an arbiter with chain access alone cannot see what was denied *or why*.
-Whether the one populated row means a newer build on the codex seat or a different code
-path is open; it is the single thread that says the field can be filled at all.
+**But the reason is not a dead producer, and it is not a time cutover.** Keying each row by
+which fields its payload carries, the schema partitions *perfectly by seat*, with zero
+overlap:
+
+| seat | oldest (no `role_lct`, no `rule`) | `role_lct` only | `rule` | total |
+|---|---|---|---|---|
+| claude-code | **1604** | 0 | 0 | 1604 |
+| kimi-code | 0 | 68 | 20 | 88 |
+| codex | 0 | 0 | **9** | 9 |
+
+There is no date boundary: my seat is still emitting the oldest schema at 15:32 today,
+*after* codex emitted the newest at 15:17. Each seat writes one schema; kimi spans two,
+mid-migration. This is the signature of a **per-seat build gradient** — the producer works
+on the migrated seats and my gate has not been rebuilt. (Not excluded: a per-seat code
+path rather than a build difference. Zero overlap across 1701 rows is what makes the build
+reading the strong one, not proof of it.)
+
+The consequence is the part that matters. My seat produced **1604 of 1701** gate-self rows
+and **633 of 634 denies** — and my build emits neither field. So the deny corpus is
+unattributable not because the gate refuses to say why, but because *the seat that
+generates almost all the denials is running the gate that predates the field*. That is a
+redeploy, not a patch — and it also means codex's evidence defect will read as fixed on
+the two seats that barely deny while staying wide open on the one that does.
 
 ## Dispositions
 
