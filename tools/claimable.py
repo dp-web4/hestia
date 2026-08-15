@@ -112,8 +112,16 @@ def collect(ids: Optional[set], max_entries: int = 20000) -> Dict[str, Dict[str,
 
 
 def horizon(row: Dict[str, Any]) -> Optional[int]:
-    """`decided_horizon()` — BOTH ceilings, min of the two. Grant anchor usually binds."""
-    decided = row.get("decided_at") or row.get("opened_at")
+    """`decided_horizon()` — BOTH ceilings, min of the two. Grant anchor usually binds.
+
+    There is NO fallback to `opened_at`. An undecided row has no grant, so it has no
+    grant anchor; substituting the open time manufactures a horizon for a permit that was
+    never issued, and the caller reads the leftover seconds as permission. That fallback
+    was here until 2026-08-15 and it made `verdict()` answer YES on 81 of 82 never-decided
+    rows during their first `APPROVAL_CLAIM_WINDOW_SECS` — i.e. exactly the window in
+    which anyone asks, because you ask right after you are refused.
+    """
+    decided = row.get("decided_at")
     expires = row.get("expires_at")
     if decided is None:
         return None
@@ -129,16 +137,21 @@ def verdict(row: Dict[str, Any], now: int) -> str:
     Reporting which conjunct killed it is the point: "not claimable" sent two members
     looking at the TTL when the grant anchor was what had bitten.
     """
-    status = (row.get("status") or "").lower()
-    if status and status != "approved":
-        return f"NO — status={status or '?'}"
-    if row.get("bar_met") is False:
-        return "NO — bar not met (peer conjunct)"
     if row.get("consumed_at"):
         return "NO — already consumed"
+    status = (row.get("status") or "").lower()
+    # Affirmative, not "not-disqualifying". `if status and status != "approved"` skipped
+    # itself on the empty string an UNDECIDED row carries, and `bar_met is False` skipped
+    # itself on that row's None — two sentinel-shaped guards in series, both stepped over
+    # by the same absence, so a never-decided escalation reached the clock check and
+    # reported YES. Approval must be present to pass, never merely un-contradicted.
+    if status != "approved":
+        return f"NO — status={status or 'undecided'}"
+    if row.get("bar_met") is False:
+        return "NO — bar not met (peer conjunct)"
     h = horizon(row)
     if h is None:
-        return "UNKNOWN — never decided in this window"
+        return "UNKNOWN — approved with no decided_at (malformed row)"
     if now >= h:
         return f"NO — past horizon by {now - h}s"
     return f"YES — {h - now}s left"
