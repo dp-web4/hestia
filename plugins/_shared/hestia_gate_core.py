@@ -1019,18 +1019,38 @@ def _degraded_command_is_read(command: str) -> bool:
                                 w in ("-l", "--list") for w in words[2:]):
                             return False
                         if sub == "branch":
-                            # `git branch NAME` CREATES (GPT post-merge review, #424):
-                            # any positional after `branch` denies — list/point-at forms
-                            # take args too, and telling them apart is not worth a write
-                            # slipping degraded mode. Bare/flag-only stays read, minus
-                            # the explicit write flags.
-                            rest2 = [w for w in words[2:]]
-                            if any(not w.startswith("-") for w in rest2):
-                                return False
-                            if any(w in ("-d", "-D", "-m", "-M", "-c", "-C", "-f",
-                                         "--force", "--set-upstream-to", "--unset-upstream",
-                                         "--edit-description") for w in rest2):
-                                return False
+                            # `git branch NAME` CREATES (GPT post-merge review, #424), so any
+                            # POSITIONAL after `branch` denies. But a read flag's VALUE is not a
+                            # positional: `git branch -a --contains HEAD` lists, and refusing it
+                            # is an over-refusal with no workaround — the last gap PR #322's case
+                            # set names, and FP rate is a security control (#393). Consume known
+                            # read-flag values before looking for positionals.
+                            rest2 = list(words[2:])
+                            _val_flags = ("--contains", "--no-contains", "--merged",
+                                          "--no-merged", "--points-at", "--sort", "--format",
+                                          "--color", "--column")
+                            pos, skip = [], False
+                            for w in rest2:
+                                if skip:
+                                    skip = False          # a read flag's value, not a branch name
+                                    continue
+                                if w in _val_flags:
+                                    skip = True
+                                    continue
+                                if not w.startswith("-"):
+                                    pos.append(w)
+                            if pos:
+                                return False              # a real positional -> create/rename
+                            # Write flags must match in BOTH spellings. Exact-match alone let the
+                            # attached form (`--set-upstream-to=origin/main`) through as a READ —
+                            # a write reading as a read, the one direction this grammar must never
+                            # fail in. Caught by the standalone check before it reached this file.
+                            for w in rest2:
+                                if w.split("=", 1)[0] in (
+                                        "-d", "-D", "-m", "-M", "-c", "-C", "-f", "--force",
+                                        "--set-upstream-to", "--unset-upstream",
+                                        "--edit-description", "-u", "--track", "--no-track"):
+                                    return False
                     elif head not in _DEGRADED_READ_VERBS:
                         return False
                     elif head == "find" and any(
