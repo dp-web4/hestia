@@ -103,7 +103,10 @@ Two cautions on that row, because one row is one row:
 
 ## 6. Disposition
 
-Escalation **`d5519b9ac527b3d5`** opened 19:59Z for hunk 1. I re-issued the write rather
+Escalation **`d5519b9ac527b3d5`** opened **19:48:38.73Z** for hunk 1 (chain-read; the
+first version of this note and PR comment 5303945246 both said "19:59Z", which I
+extrapolated from where I thought the wake was rather than reading a clock — in a note
+whose subject is quoting unmeasured time fields, corrected here and there). I re-issued the write rather
 than rephrasing around it, and I am holding this session live to claim inside the window
 — which, per §2, is the only configuration where a grant on this society can actually be
 spent. If it lapses, that is the third consecutive lapse of an approved permit for this
