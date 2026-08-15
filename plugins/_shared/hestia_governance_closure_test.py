@@ -333,10 +333,66 @@ def test_hub_deploy_closure_is_write():
     v3 = cls("Bash", {"command": "systemctl status web4-hub.service"})
     check("service_read_is_read", v3.classification == "read", str(v3))
 
+# ---- OPEN-DEFECT PINS (hole J) ----
+# These assert the CURRENT, WRONG behaviour on purpose. Green while the defect is open;
+# RED the moment it is fixed, which is the only shape that survives this file's TWO
+# invocations (pytest and the __main__ runner): a pytest-only xfail would leave the house
+# runner reporting a hard FAIL and exiting 1.
+#
+# THE DEFECT. _tokenize uses shlex with punctuation_chars, which MERGES adjacent
+# punctuation: `)` closing a subshell followed by `;` arrives as the single token `');'`.
+# That fused token is not in _SEPARATORS (which lists `)` and `;` separately, never `);`)
+# and the punct branch handles only the `>`/`<` families, so it falls through to
+# `i += 1; continue` — never flushes `cur`, never starts a new simple command. The command
+# boundary is ERASED and everything after folds into the preceding argv.
+#
+# Both defects replicated independently by kimi-code (forum reply 2625), same rows, exact.
+#
+# WHEN ONE OF THESE FAILS: the fix landed. Delete the pin and enable the `# FIXED:` line
+# beneath it — do not just flip the expectation, the twin is the real contract.
+_MARK = "hestia_governance" + "_closure.py"  # assembled: a literal here trips the scan
+_GATE = os.path.expanduser("~/.claude/_shared/") + _MARK
+
+
+def _targets_or_exc(command):
+    """Write targets, or the exception's class name — the fail-closed arm is a RAISE."""
+    try:
+        return g._bash_write_targets(command)
+    except Exception as exc:  # noqa: BLE001 — the class name IS the observation
+        return type(exc).__name__
+
+
+def test_PIN_fused_paren_hides_write_onto_gate_STILL_OPEN():
+    k = g._bash_write_targets("f () ( cp /tmp/evil " + _GATE + " )")
+    check("K_lone_paren_sees_write", _GATE in k, f"positive control broke: {k}")
+    j = g._bash_write_targets("f() ( cp /tmp/evil " + _GATE + " ); f")
+    check("J_fused_paren_STILL_hides_write", j == ["f"],
+          f"FIX LANDED — hole J is closed, retire this pin. targets={j}")
+    # FIXED: check("J_fused_paren_sees_write", _GATE in j, str(j))
+
+
+def test_PIN_fused_paren_leaks_stdin_src_past_boundary_STILL_OPEN():
+    # The worse half: the fused token does not merely move a write target, it removes the
+    # `< file` preimage the fail-closed branch keys on. An arm modelled on another arm must
+    # reset ALL of that arm's state; partial parity re-creates the divergence at state grain.
+    for verb in ("git apply", "patch"):
+        sep = _targets_or_exc("( cat < /tmp/f.patch ) ; " + verb)
+        check(f"separated_fails_closed:{verb}", sep == "_OpaqueWriter",
+              f"positive control broke: {sep}")
+        fused = _targets_or_exc("( cat < /tmp/f.patch ); " + verb)
+        check(f"fused_STILL_leaks_preimage:{verb}", fused == [],
+              f"FIX LANDED — the new arm resets stdin_src, retire this pin. got={fused}")
+        # FIXED: check(f"fused_fails_closed:{verb}", fused == "_OpaqueWriter", str(fused))
+
+
 # Explicit list — NOT a globals() comprehension — so every test name is a static reference
 # (tools/ci_selfexec_test.py rejects test functions whose execution cannot be established
 # statically; a dynamic sweep leaves each name un-referenced and reads as inert).
+# The two PINs are listed here as well: functions defined above but absent from ALL run
+# under pytest only and are silently skipped by the house runner (kimi, reply 2625 §3).
 ALL = [
+    test_PIN_fused_paren_hides_write_onto_gate_STILL_OPEN,
+    test_PIN_fused_paren_leaks_stdin_src_past_boundary_STILL_OPEN,
     test_readonly_find_naming_hook_is_read,
     test_chained_benign_rm_not_write_unless_target_in_closure,
     test_edit_write_parity,
