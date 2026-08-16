@@ -36,12 +36,14 @@ not routed: closing someone's open thread is send-worthy.
 | kind | semantics |
 |---|---|
 | unreachable | *the daemon only.* Your outbound forward to a peer was retired unsent after exhausting its hand-off budget. Pointer -> `hestia://egress/{id}#unreachable:{peer}/{member} after {n} attempts: {reason}` |
+| disposition | *the daemon only.* The petition you filed has been RULED — appeal upheld/denied, scope granted/refused, escalation decided (#459) — or your escalation LAPSED: the reconciler records `gate_escalation_expired` and mints to the asker with pointer `hestia://escalation/{id}#lapsed` (#480 review — a lapse used to leave no return edge and no record, and on the sovereign_plus_peer bar it is the modal terminal outcome). Pointer -> `hestia://appeal/{hash}#ruled`, `hestia://scope/{request_id}`, or `hestia://escalation/{id}#decided`. Minting is reconciled, not one-shot: a daemon timer re-mints any ruling no `member_notice_disposition` names (absence is the queue). NOT minted on scope-request timeout expiry: that refusal is pull-only by design — the requester filed knowing the window, and `hestia_scope_status` answers it. NOT minted for `POST /api/scope/grant` either (considered, #480 review): an operator-originated grant is not a petition — there is no petitioner to notify, and its `request_id: null` says so |
 
-`unreachable` is deliberately absent from `MEMBER_NOTICE_KINDS` (`handler.rs`), so
-`tool_member_notify` refuses it and **no member can emit it**; the store does not validate,
-so the daemon can. That split is the kind's whole value: "your packet never left the box"
-from any member is a *claim*, while the same sentence written by the daemon next to the
-`member_notice_unreachable` chain entry that justifies it is *evidence*.
+`unreachable` and `disposition` are deliberately absent from `MEMBER_NOTICE_KINDS`
+(`handler.rs`), so `tool_member_notify` refuses them and **no member can emit them**;
+the store does not validate, so the daemon can. That split is each kind's whole value:
+"your packet never left the box" or "your petition was ruled" from any member is a
+*claim*, while the same sentence written by the daemon next to the chain entry that
+justifies it is *evidence*.
 
 Two obligations follow, and both have been violated once already:
 
@@ -62,9 +64,13 @@ path hardcodes its own kind. A future daemon-emitted kind inherits the protectio
 it is excluded the same way. Add a daemon kind *to* `MEMBER_NOTICE_KINDS` for convenience
 and its pair becomes as claimable as its name, silently, with the rendering allowlists
 still reading as safe. So: **before pairing a new kind into a rendering allowlist, check
-that no member-reachable surface can mint it** — the three non-test `enqueue_member` call
-sites in `handler.rs` are the whole surface to check (appeal: hardcoded `review_request`;
-`tool_member_notify`: validated against `MEMBER_NOTICE_KINDS`; retire: the daemon's own).
+that no member-reachable surface can mint it** — the non-test `enqueue_member` call sites
+are the whole surface to check (appeal: hardcoded `review_request`; `tool_member_notify`:
+validated against `MEMBER_NOTICE_KINDS`; retire: the daemon's own). For `disposition`
+(#459) that check landed on the three minting sites this PR adds — `tool_arbitrate_appeal`,
+`http::scope_decide`, and the two escalation decision surfaces — all daemon-internal:
+none takes a caller-chosen `to`, each reports to the petitioner the record itself names,
+and each is witnessed by a `member_notice_disposition` entry BEFORE the enqueue.
 
 This section exists because the code comment introducing the kind said "Documented in
 `plugins/member-mesh/KINDS.md`" when it was not — and the receiving side, which is the side

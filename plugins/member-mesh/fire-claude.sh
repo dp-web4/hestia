@@ -70,13 +70,15 @@ ALLOW={"kimi-code","codex","codex-cli"}
 # The daemon is admitted as a (sender, kind) PAIR, never as a bare name. `plugin_id`
 # is caller-supplied at hestia_connect and rejected only for "/" (handler.rs:345),
 # so "hestia" is a claimable id — and unlike every peer name above, one no real
-# member occupies, so a squatter on it would be noticed by nobody. `unreachable` is
-# deliberately NOT in MEMBER_NOTICE_KINDS: tool_member_notify refuses it, and the
-# appeal path that does mint a notice under a caller-supplied name (handler.rs:2044)
-# hardcodes `review_request`. So the PAIR is unforgeable through every
+# member occupies, so a squatter on it would be noticed by nobody. Both kinds below
+# are deliberately NOT in MEMBER_NOTICE_KINDS: tool_member_notify refuses them, and
+# the appeal path that does mint a notice under a caller-supplied name (handler.rs:2044)
+# hardcodes `review_request`. `unreachable` reports a packet that never left the box;
+# `disposition` (#459) reports that a petition — appeal, scope request, escalation —
+# has been RULED. So the PAIR is unforgeable through every
 # member-reachable surface; the bare name is not. Anything else claiming to be the
 # daemon still hits the wall, and is still disclosed as WITHHELD.
-DAEMON={("hestia","unreachable")}
+DAEMON={("hestia","unreachable"),("hestia","disposition")}
 d=json.load(open(sys.argv[1]))
 live=[x for x in d.get("notices",[]) if x.get("kind")!="ack"]
 clean=lambda s: re.sub(r"[\x00-\x1f\x7f]","",str(s))[:512]

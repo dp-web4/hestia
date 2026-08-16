@@ -475,6 +475,37 @@ pub async fn serve_with_callback(
             operator_gate,
         ));
 
+    // The disposition reconciler (#480 review, change 2): the only periodic task
+    // this daemon runs, added because a ruling whose disposition enqueue failed
+    // was otherwise permanent silence for the petitioner — every decision surface
+    // refuses a second ruling, so nothing could re-mint. The sweep is idempotent
+    // (absence of a `member_notice_disposition` naming the ruling IS the queue)
+    // and it is where escalation LAPSE gets its chain record (`gate_escalation_
+    // expired`, change 3). Runs off the same lock every handler uses; a pass is a
+    // window scan plus, in the steady state, zero appends. Spawned before `app`
+    // below moves `state`.
+    let reconcile_state = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(
+            super::handler::DISPOSITION_RECONCILE_INTERVAL_SECS,
+        ));
+        loop {
+            tick.tick().await;
+            let now = super::gate_escalation::now_secs();
+            let did = {
+                let mut s = reconcile_state.lock().await;
+                super::handler::reconcile_dispositions(&mut s, now)
+            };
+            if did.reminted > 0 || did.lapsed > 0 {
+                tracing::info!(
+                    reminted = did.reminted,
+                    lapsed = did.lapsed,
+                    "disposition reconciler closed open obligations"
+                );
+            }
+        }
+    });
+
     let mut app = axum::Router::new()
         .merge(operator_surface)
         // The dashboard HTML shell — unauthenticated (app skeleton + sign-in JS,
@@ -1764,6 +1795,41 @@ async fn scope_decide(
         req.expires_at = expires_at;
     }
 
+    // #459: the decision's RETURN EDGE. The requester filed through MCP and until
+    // now had no way to learn the answer short of polling — a granted or refused
+    // ask read exactly like a pending one. Minted after the decision is applied,
+    // witnessed before it is queued, and a failed enqueue is surfaced rather than
+    // swallowed: a witnessed-but-unreported decision is the hole this closes.
+    let disposition_notice_id = match super::handler::report_disposition(
+        &mut s,
+        &plugin_id,
+        &format!("hestia://scope/{request_id}"),
+        serde_json::json!({
+            "request_id": request_id,
+            "plugin_id": plugin_id,
+            "granted": granted,
+            "decided_by": "operator",
+            "expires_at": expires_at,
+            "note": "the scope request you filed has been decided; the pointer resolves \
+                     to the decision",
+        }),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "decision applied and witnessed, but the disposition notice could \
+                         NOT be queued ({e}) — the requester does not know its ask was ruled"
+                    ),
+                    "request_id": request_id,
+                    "granted": granted,
+                })),
+            );
+        }
+    };
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1776,6 +1842,7 @@ async fn scope_decide(
             "standing_expires_at": standing_expires_at,
             "generation": if standing { serde_json::json!(s.standing_scope.generation) } else { serde_json::Value::Null },
             "witnessEntryHash": entry.hash,
+            "disposition_notice_id": disposition_notice_id,
         })),
     )
 }
@@ -2809,6 +2876,42 @@ async fn operator_gate_escalation(
                     "secs_into_window": now.saturating_sub(esc.opened_at),
                 }),
             );
+            // #459: the decision's RETURN EDGE, on the channel that decides 207 of
+            // 210 rulings. Minted at this layer because `EscalationStore::decide`
+            // has no inbox access; a failed enqueue is an error, not a warn — an
+            // asker never told its escalation was ruled keeps polling a settled
+            // question.
+            let disposition_notice_id = match super::handler::report_disposition(
+                &mut s,
+                &esc.plugin_id,
+                &format!("hestia://escalation/{}#decided", esc.id),
+                serde_json::json!({
+                    "escalation_id": esc.id,
+                    "tool_name": esc.tool_name,
+                    "approved": esc.stored_status() == crate::server::gate_escalation::Status::Approved,
+                    "decided_by": esc.decided_by,
+                    "decided_via": esc.decided_via,
+                    "reason": esc.reason,
+                    "note": "the escalation you filed has been decided; the pointer \
+                             resolves to the decision",
+                }),
+            ) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "decision applied and witnessed, but the disposition notice \
+                                 could NOT be queued ({e}) — the asker does not know its \
+                                 escalation was ruled"
+                            ),
+                            "escalation_id": esc.id,
+                        })),
+                    )
+                        .into_response();
+                }
+            };
             // THE DECIDER SEES THE BAR — on this surface too.
             //
             // This reply used to be `{escalation_id, status, witnessEntryHash}`. #219 measured
@@ -2828,6 +2931,10 @@ async fn operator_gate_escalation(
                     "witnessEntryHash".into(),
                     serde_json::json!(entry.ok().map(|e| e.hash)),
                 );
+                o.insert(
+                    "disposition_notice_id".into(),
+                    serde_json::json!(disposition_notice_id),
+                );
             }
             (StatusCode::OK, Json(body)).into_response()
         }
@@ -2840,5 +2947,118 @@ async fn operator_gate_escalation(
             })),
         )
             .into_response(),
+    }
+}
+#[cfg(test)]
+mod disposition_tests {
+    //! #459: petition surfaces get a return edge. Ruling a scope request or an
+    //! escalation used to end at the ruling — the petitioner was never told and
+    //! had to poll. These drive the two operator-side decision surfaces and
+    //! assert the daemon-only `disposition` notice lands in the petitioner's
+    //! inbox, witnessed first, the way `unreachable` is reported at the
+    //! retirement site.
+    use super::*;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    /// Minting site B (#459): the operator's scope decision tells the REQUESTER.
+    #[tokio::test]
+    async fn a_scope_decision_reports_its_disposition_to_the_requester() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert(
+                "scope-test459b".into(),
+                crate::server::state::ScopeRequest {
+                    id: "scope-test459b".into(),
+                    plugin_id: "kimi-code".into(),
+                    role: String::new(),
+                    path: "/x/y.md".into(),
+                    reason: "needed for the task at hand".into(),
+                    requested_at: now,
+                    expires_at: now + 3600,
+                    granted: None,
+                    decided_by: None,
+                    decided_at: None,
+                    decision_reason: None,
+                },
+            );
+        }
+        let resp = scope_decide(
+            State(state.clone()),
+            Json(serde_json::json!({
+                "request_id": "scope-test459b", "granted": true, "reason": "yes, that file",
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "the decision itself must land");
+
+        let s = state.lock().await;
+        let disp = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "member_notice_disposition")
+            .expect("a decision without its disposition entry is the hole #459 closes");
+        assert_eq!(
+            disp.event_data.get("request_id").and_then(|v| v.as_str()),
+            Some("scope-test459b")
+        );
+        assert_eq!(disp.event_data.get("granted").and_then(|v| v.as_bool()), Some(true));
+
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        let note = mail
+            .iter()
+            .find(|n| n.kind == "disposition")
+            .expect("the requester must learn its ask was decided: {mail:?}");
+        assert_eq!(note.from_plugin, "hestia");
+        assert_eq!(note.pointer_uri.as_deref(), Some("hestia://scope/scope-test459b"));
+    }
+
+    /// Minting site C, the operator channel (#459): deciding an escalation tells
+    /// the ASKER. Same return edge as the peer-ruling path, minted here because
+    /// this surface decides 207 of 210 rulings and the store layer has no inbox.
+    #[tokio::test]
+    async fn an_operator_escalation_decision_reports_its_disposition_to_the_asker() {
+        let (_dir, state) = test_state().await;
+        let esc_id = {
+            let mut s = state.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            s.gate_escalations
+                .open("kimi-code", "", "policy_edit", "policy.json", None, None, now, 3600)
+                .unwrap()
+                .id
+        };
+        let resp = operator_gate_escalation(
+            State(state.clone()),
+            Json(GateEscalationDecision {
+                id: esc_id.clone(),
+                approve: true,
+                reason: Some("reviewed the diff".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "the decision itself must land");
+
+        let s = state.lock().await;
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        let note = mail
+            .iter()
+            .find(|n| n.kind == "disposition")
+            .expect("the asker must learn its escalation was decided: {mail:?}");
+        assert_eq!(note.from_plugin, "hestia");
+        assert_eq!(
+            note.pointer_uri.as_deref(),
+            Some(format!("hestia://escalation/{esc_id}#decided")).as_deref()
+        );
     }
 }

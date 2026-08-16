@@ -186,6 +186,21 @@ impl ServerHandler for HestiaServer {
                  deny_hash and whether the appeal is still open.",
             ),
             make_resource_template(
+                "hestia://scope/{request_id}",
+                "Scope request and its decision by id",
+                "Dereference the pointer a scope disposition notice carries (#459). Resolves \
+                 from the in-memory request store: status/granted/decided_by/decision_reason/\
+                 expires_at. A restart clears the store, and the not-found arm says so — \
+                 unknown is not refused.",
+            ),
+            make_resource_template(
+                "hestia://escalation/{id}",
+                "Gate escalation and its decision by id",
+                "Dereference the pointer an escalation invitation (#corroborate-or-dissent) \
+                 or disposition notice (#decided, #459) carries: status/decided_by/decided_at/\
+                 reason. Unknown id answers UNKNOWN, never denied.",
+            ),
+            make_resource_template(
                 "hestia://chain/{hash}",
                 "Witness chain entry by hash",
                 "Dereference ANY chain entry by hash or hash prefix — appeals, denies, outcomes, \
@@ -3184,8 +3199,30 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         }),
     )?;
 
+    // #459: the ruling's RETURN EDGE. The appeal had an outbound wake (the arbiter
+    // was asked to rule) and no way back — until this, a ruled appeal read exactly
+    // like an open one to the member who filed it, and the petitioner had to poll
+    // or be told out of band. Witnessed first, then enqueued, and a failed enqueue
+    // is an ERROR: a witnessed-but-unreported ruling is the hole this closes.
+    let disposition_notice_id = report_disposition(
+        &mut s,
+        appellant,
+        &format!("hestia://appeal/{deny_hash}#ruled"),
+        json!({
+            "about_deny_hash": deny_hash,
+            "upheld": upheld,
+            "adjudicator": arbiter.plugin_id,
+            "independence": independence,
+            "was_designee": routed_to.as_deref() == Some(arbiter.plugin_id.as_str()),
+            "adjudication_entry": entry.hash,
+            "note": "the appeal you filed has been ruled; the pointer resolves to the \
+                     appeal and its ruling",
+        }),
+    )?;
+
     Ok(json!({
         "witnessEntryHash": entry.hash,
+        "disposition_notice_id": disposition_notice_id,
         "subject_plugin_id": appellant,
         "about_deny_hash": deny_hash,
         "upheld": upheld,
@@ -3851,6 +3888,27 @@ const MEMBER_NOTICE_KINDS: &[&str] = &[
 /// caller-supplied at connect, so the name `hestia` is claimable and the KIND is the
 /// only unforgeable half.
 const DAEMON_NOTICE_KIND_UNREACHABLE: &str = "unreachable";
+
+/// The daemon's second notice kind (#459), and likewise deliberately NOT in
+/// [`MEMBER_NOTICE_KINDS`] — same split, same reason: `tool_member_notify` refuses
+/// it, so no member can emit it; the store does not validate, so the daemon can.
+///
+/// What it reports is the RETURN EDGE on a petition surface. Appeals, scope
+/// requests and escalations all had an outbound wake (the arbiter/operator is
+/// asked to rule) and no way back: once ruled, the petitioner had to poll or be
+/// told out of band, and a ruled appeal read exactly like an open one. This kind
+/// is minted at each ruling site — `tool_arbitrate_appeal`, `http::scope_decide`,
+/// and both escalation decision surfaces — witnessed by a
+/// `member_notice_disposition` chain entry BEFORE the enqueue, the same order
+/// `retire_and_report_egress` keeps. A "your petition has been ruled" notice any
+/// member could send is a claim; one only the daemon can send, written next to the
+/// ruling it reports, is evidence.
+///
+/// The receiver-side obligations are the same two as `unreachable` and are
+/// documented with it: receivers must not filter it, and renderers must admit it
+/// as the `(sender, kind)` PAIR `("hestia", "disposition")` — see "Daemon-only" in
+/// `plugins/member-mesh/KINDS.md`.
+const DAEMON_NOTICE_KIND_DISPOSITION: &str = "disposition";
 
 // ---- id-binding (Kimi ↔ CBP, 2026-07-25): two DIFFERENT per-kind sets ----
 //
@@ -4638,6 +4696,301 @@ fn retire_and_report_egress(
     }))
 }
 
+/// Report a petition's ruling to the petitioner (#459) — the return edge every
+/// petition surface (appeal, scope request, escalation) used to lack.
+///
+/// The shape is `retire_and_report_egress`'s, for the same reasons:
+///
+/// 1. Witnessed BEFORE it is queued (O: witness precedes delivery) — a
+///    `member_notice_disposition` entry carrying the about-reference, the verdict
+///    and who decided, so the notice is evidence attached to a ruling that exists,
+///    not a bare claim that one does.
+/// 2. A failed enqueue is NOT swallowed: a ruling that was witnessed but never
+///    reported is exactly the hole this kind exists to close, so the caller gets
+///    the error and the ruling stays visible on the chain either way.
+///
+/// `to` is a local member by construction at every call site (the appellant proven
+/// by session, the requester/asker who filed locally), so this is a local enqueue
+/// and cannot re-enter the egress plane.
+pub(crate) fn report_disposition(
+    s: &mut super::state::ServerState,
+    to: &str,
+    pointer: &str,
+    event_data: Value,
+) -> anyhow::Result<u64> {
+    let entry = s.append_chain("member_notice_disposition", event_data)?;
+    let notice_id = s
+        .inbox_store
+        .enqueue_member(
+            to,
+            "hestia",
+            crate::reputation::DEFAULT_CONSTELLATION_ROLE,
+            DAEMON_NOTICE_KIND_DISPOSITION,
+            Some(pointer),
+            &entry.hash,
+            None,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "the disposition was witnessed ({}), but the report to '{to}' could NOT be \
+                 queued ({e}) — the petitioner does not know its petition was ruled",
+                entry.hash
+            )
+        })?;
+    Ok(notice_id)
+}
+
+/// How often the daemon sweeps for rulings whose disposition never landed. Minutes,
+/// not seconds: every mint this task exists to catch is already late by the time it
+/// runs, and the chain window it scans makes a faster period buy nothing.
+pub(crate) const DISPOSITION_RECONCILE_INTERVAL_SECS: u64 = 300;
+
+/// What one reconciler pass did, returned so the timer can log it and the tests can
+/// pin it.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub(crate) struct DispositionReconciliation {
+    /// Rulings re-minted because no `member_notice_disposition` names them.
+    pub reminted: usize,
+    /// Escalations recorded as lapsed (`gate_escalation_expired`) this pass.
+    pub lapsed: usize,
+}
+
+/// The disposition reconciler (#480 review, change 2, and the operator's contract:
+/// notification is a durable, idempotent obligation, not "ruling committed, enqueue
+/// attempted once").
+///
+/// THE HOLE IT CLOSES. Every minting site makes the enqueue failure loud to the
+/// RULER (a 500, a returned error) — and then no surface can re-mint: `scope_decide`
+/// refuses a non-pending request, `decide` refuses a settled escalation,
+/// `tool_arbitrate_appeal` refuses an already-ruled appeal. A ruling whose
+/// disposition never landed was therefore permanent silence for the petitioner.
+///
+/// ABSENCE IS THE QUEUE. This sweeps the recent chain window for rulings —
+/// `adjudication` (keyed on `about_deny_hash`; operator reputation adjudications
+/// carry none and are skipped), `gate_escalation_decided` (`escalation_id`),
+/// `scope_granted` / `scope_refused` (`request_id`) — that no
+/// `member_notice_disposition` entry names, and re-mints them through
+/// `report_disposition`, the same witnessed-first path the ruling sites use.
+/// Idempotent by construction: the re-mint IS the entry the next sweep looks for,
+/// so a second pass finds the queue empty. The scope arm skips `request_id: null`
+/// on purpose — that is an operator-ORIGINATED grant (`POST /api/scope/grant`,
+/// a8be418), not a petition, and there is no petitioner to notify (#480 review,
+/// change 5).
+///
+/// IT ALSO RECORDS THE LAPSE (change 3). `status_at` derives Expired from the clock
+/// alone, so an escalation nobody ruled left no chain event and no return edge —
+/// and on the sovereign_plus_peer bar the modal terminal outcome is exactly that.
+/// Here an open entry past its deadline with no `gate_escalation_decided` /
+/// `_withdrawn` / `_expired` naming it gets the `gate_escalation_expired` record
+/// the clock implied, and the asker gets a `#lapsed` disposition. The recorded
+/// entry is the idempotency marker; a withdrawn escalation is settled (the asker
+/// was present for its own act) and is left alone.
+///
+/// ONE BOUNDARY, stated rather than hidden: if the re-mint's ENQUEUE fails, the
+/// `member_notice_disposition` entry has already been appended (witness-first),
+/// so the next sweep sees this ruling as noticed and will not retry the queue.
+/// That is the same trade the ruling sites make — a witnessed-but-unqueued notice
+/// is reported (here: logged), never silent — and closing it would mean keying
+/// idempotency on inbox contents, which are drain-once and unreadable for this.
+pub(crate) fn reconcile_dispositions(
+    s: &mut super::state::ServerState,
+    now: u64,
+) -> DispositionReconciliation {
+    let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
+    fn str_of<'a>(e: &'a crate::storage::chain::ChainEntry, k: &str) -> Option<&'a str> {
+        e.event_data.get(k).and_then(Value::as_str)
+    }
+
+    // The queue, negatively defined: every about-reference a disposition already names.
+    let mut noticed_appeals = std::collections::HashSet::new();
+    let mut noticed_escalations = std::collections::HashSet::new();
+    let mut noticed_scope = std::collections::HashSet::new();
+    for e in window
+        .iter()
+        .filter(|e| e.event_type == "member_notice_disposition")
+    {
+        if let Some(h) = str_of(e, "about_deny_hash") {
+            noticed_appeals.insert(h.to_string());
+        }
+        if let Some(i) = str_of(e, "escalation_id") {
+            noticed_escalations.insert(i.to_string());
+        }
+        if let Some(r) = str_of(e, "request_id") {
+            noticed_scope.insert(r.to_string());
+        }
+    }
+    // Settled = cannot lapse. A withdrawal settles too: the asker refused its own
+    // request and was there for it — the no-mint-on-withdrawal rule the minting
+    // sites already keep.
+    let settled_escalations: std::collections::HashSet<&str> = window
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.event_type.as_str(),
+                "gate_escalation_decided" | "gate_escalation_withdrawn" | "gate_escalation_expired"
+            )
+        })
+        .filter_map(|e| str_of(e, "escalation_id"))
+        .collect();
+
+    // Plan first, mint second: the window is a snapshot, and the entries this pass
+    // appends are exactly what makes the NEXT pass a no-op.
+    let mut remints: Vec<(String, String, Value)> = Vec::new();
+    let mut lapses: Vec<(Value, String, String, Value)> = Vec::new();
+    for e in &window {
+        match e.event_type.as_str() {
+            "adjudication" => {
+                let Some(deny) = str_of(e, "about_deny_hash") else {
+                    continue;
+                };
+                if noticed_appeals.contains(deny) {
+                    continue;
+                }
+                let Some(to) = str_of(e, "subject_plugin_id") else {
+                    continue;
+                };
+                remints.push((
+                    to.to_string(),
+                    format!("hestia://appeal/{deny}#ruled"),
+                    json!({
+                        "about_deny_hash": deny,
+                        "upheld": e.event_data.get("upheld"),
+                        "adjudicator": e.event_data.get("adjudicator"),
+                        "adjudication_entry": e.hash,
+                        "remint": "disposition_reconciler",
+                        "note": "the appeal you filed has been ruled; the pointer resolves \
+                                 to the appeal and its ruling. Re-minted by the disposition \
+                                 reconciler: the ruling was on the chain but no disposition \
+                                 had been witnessed for it",
+                    }),
+                ));
+            }
+            "gate_escalation_decided" => {
+                let Some(id) = str_of(e, "escalation_id") else {
+                    continue;
+                };
+                if noticed_escalations.contains(id) {
+                    continue;
+                }
+                let Some(to) = str_of(e, "plugin_id") else {
+                    continue;
+                };
+                remints.push((
+                    to.to_string(),
+                    format!("hestia://escalation/{id}#decided"),
+                    json!({
+                        "escalation_id": id,
+                        "tool_name": e.event_data.get("tool_name"),
+                        "approved": str_of(e, "status") == Some("approved"),
+                        "decided_by": e.event_data.get("decided_by"),
+                        "decided_via": e.event_data.get("decided_via"),
+                        "reason": e.event_data.get("reason"),
+                        "remint": "disposition_reconciler",
+                        "note": "the escalation you filed has been decided; the pointer \
+                                 resolves to the decision. Re-minted by the disposition \
+                                 reconciler: the ruling was on the chain but no disposition \
+                                 had been witnessed for it",
+                    }),
+                ));
+            }
+            "scope_granted" | "scope_refused" => {
+                // `request_id` null/absent = the operator originated this grant
+                // (/api/scope/grant). Not a petition; nobody to notify.
+                let Some(rid) = str_of(e, "request_id") else {
+                    continue;
+                };
+                if noticed_scope.contains(rid) {
+                    continue;
+                }
+                let Some(to) = str_of(e, "plugin_id") else {
+                    continue;
+                };
+                let granted = e.event_type == "scope_granted";
+                remints.push((
+                    to.to_string(),
+                    format!("hestia://scope/{rid}"),
+                    json!({
+                        "request_id": rid,
+                        "plugin_id": to,
+                        "granted": granted,
+                        "decided_by": e.event_data.get("granted_by"),
+                        "expires_at": e.event_data.get("expires_at"),
+                        "remint": "disposition_reconciler",
+                        "note": "the scope request you filed has been decided; the pointer \
+                                 resolves to the decision. Re-minted by the disposition \
+                                 reconciler: the ruling was on the chain but no disposition \
+                                 had been witnessed for it",
+                    }),
+                ));
+            }
+            "gate_escalation_opened" => {
+                let (Some(id), Some(expires_at)) =
+                    (str_of(e, "escalation_id"), e.event_data.get("expires_at").and_then(Value::as_u64))
+                else {
+                    continue;
+                };
+                if now < expires_at || settled_escalations.contains(id) {
+                    continue;
+                }
+                let Some(to) = str_of(e, "plugin_id") else {
+                    continue;
+                };
+                lapses.push((
+                    json!({
+                        "escalation_id": id,
+                        "plugin_id": to,
+                        "subject_instance_lct": s.member_lct(to),
+                        "tool_name": e.event_data.get("tool_name"),
+                        "marker": e.event_data.get("marker"),
+                        "opened_at": e.event_data.get("opened_at"),
+                        "expires_at": expires_at,
+                        "lapsed_at": now,
+                        "note": "the deadline passed with no decision. Until the reconciler \
+                                 existed this outcome was derived from the clock at read \
+                                 time and left no record of its own — and on the \
+                                 sovereign_plus_peer bar it is the modal terminal outcome",
+                    }),
+                    to.to_string(),
+                    format!("hestia://escalation/{id}#lapsed"),
+                    json!({
+                        "escalation_id": id,
+                        "tool_name": e.event_data.get("tool_name"),
+                        "lapsed": true,
+                        "expires_at": expires_at,
+                        "note": "your escalation was neither approved nor denied — it ran \
+                                 out its clock with no ruling. The write stayed refused; \
+                                 re-escalate if the need stands",
+                    }),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let mut did = DispositionReconciliation::default();
+    for (to, pointer, data) in remints {
+        match report_disposition(s, &to, &pointer, data) {
+            Ok(_) => did.reminted += 1,
+            // Witnessed but unqueued — logged, not silent, and NOT retried next
+            // pass (the entry now names the ruling). See the doc comment's boundary.
+            Err(err) => tracing::warn!("disposition reconciler: {err}"),
+        }
+    }
+    for (entry_data, to, pointer, notice_data) in lapses {
+        // Witness the lapse BEFORE telling the asker — the same order
+        // report_disposition keeps. An unwitnessed lapse notice would be a claim
+        // about a record that does not exist.
+        match s.append_chain("gate_escalation_expired", entry_data) {
+            Ok(_) => match report_disposition(s, &to, &pointer, notice_data) {
+                Ok(_) => did.lapsed += 1,
+                Err(err) => tracing::warn!("disposition reconciler: {err}"),
+            },
+            Err(err) => tracing::warn!("disposition reconciler: witnessing a lapse: {err}"),
+        }
+    }
+    did
+}
+
 async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
     let session_id_arg = optional_session_id(args);
     let mut s = state.lock().await;
@@ -5144,20 +5497,36 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
     // well-formed — it is the target that is missing, ambiguous or mislabelled,
     // and collapsing those four outcomes into one protocol error rebuilds the
     // exact ambiguity this resolver exists to remove.
+    // A fragment is a within-document marker, not part of the lookup key. The
+    // daemon-minted disposition pointers (#459) carry one — `…#ruled`,
+    // `…#decided` — to say WHAT about the target the notice concerns; resolving
+    // on the full URI would miss the entry every one of them names.
+    let lookup = uri.split('#').next().unwrap_or(&uri);
     // `hestia://appeal/<hash>` needs its own resolver and cannot use the table below —
     // see `resolve_appeal_pointer`. It was absent from that table entirely, which meant the
     // daemon minted this pointer into every appeal dispatch notice and no surface could
     // follow it: the same unfollowable-pointer defect the adjudication case fixed, surviving
     // that fix because that fix was driven by a received ADJUDICATION notice.
-    if let Some(ptr) = uri.strip_prefix("hestia://appeal/") {
+    if let Some(ptr) = lookup.strip_prefix("hestia://appeal/") {
         let body = resolve_appeal_pointer(&s, ptr);
+        return Ok(serde_json::to_string(&body).unwrap_or("{}".into()));
+    }
+    // The #459 disposition pointers, resolved from the stores the decisions live
+    // in (both memory-only, and their not-found arms say so — an unknown id must
+    // not read as a ruling).
+    if let Some(ptr) = lookup.strip_prefix("hestia://scope/") {
+        let body = resolve_scope_pointer(&s, ptr);
+        return Ok(serde_json::to_string(&body).unwrap_or("{}".into()));
+    }
+    if let Some(ptr) = lookup.strip_prefix("hestia://escalation/") {
+        let body = resolve_escalation_pointer(&s, ptr);
         return Ok(serde_json::to_string(&body).unwrap_or("{}".into()));
     }
     for (prefix, expect) in [
         ("hestia://adjudication/", Some("adjudication")),
         ("hestia://chain/", None),
     ] {
-        if let Some(ptr) = uri.strip_prefix(prefix) {
+        if let Some(ptr) = lookup.strip_prefix(prefix) {
             let body = resolve_chain_pointer(&s, ptr, expect);
             return Ok(serde_json::to_string(&body).unwrap_or("{}".into()));
         }
@@ -5280,6 +5649,242 @@ fn resolve_appeal_pointer(s: &super::state::ServerState, pointer: &str) -> Value
                      rule it now: hestia_arbitrate_appeal with the deny_hash above. You do not \
                      need to have been routed it — designation is advisory.",
         },
+    })
+}
+
+/// Dereference `hestia://scope/{request_id}` — the pointer a scope `disposition`
+/// notice (#459) carries — to the request AND its decision.
+///
+/// The store is MEMORY-ONLY (state.rs's asymmetry table: live loosening dies with
+/// the daemon), so on a store miss this falls back to the witness chain (#480
+/// review, change 1) before saying UNKNOWN: a `scope_granted` / `scope_refused`
+/// naming the id IS the decision, and a `scope_requested` with no decision yet is
+/// the ask, still open or run out. Only when the chain window also misses is the
+/// answer "unknown" — and the not-found arm has to keep saying so, because the two
+/// failure readings are otherwise indistinguishable: "no such request" is the null
+/// state, "refused" is a ruling, and a petitioner told the first who hears the
+/// second will re-ask for something nobody denied — or worse, not.
+fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value {
+    let ptr = pointer.trim();
+    if ptr.is_empty() {
+        return hestia_error_envelope(
+            "hestia.scope_pointer_malformed",
+            "hestia://scope/ needs a request id (what hestia_request_scope returned as \
+             request_id)",
+            None,
+        );
+    }
+    let now = crate::server::gate_escalation::now_secs();
+    if let Some(req) = s.scope_requests.get(ptr) {
+        return json!({
+            "pointer": ptr,
+            "source": "live_store",
+            "request_id": req.id,
+            "plugin_id": req.plugin_id,
+            "path": req.path,
+            "requested_because": req.reason,
+            "status": req.status(now),
+            "granted": req.granted,
+            "decided_by": req.decided_by,
+            "decision_reason": req.decision_reason,
+            "expires_at": req.expires_at,
+        });
+    }
+    // Store miss — a restart forgets every live ask. The chain does not.
+    let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
+    fn id_of<'a>(e: &'a crate::storage::chain::ChainEntry) -> Option<&'a str> {
+        e.event_data.get("request_id").and_then(Value::as_str)
+    }
+    let decision = window.iter().find(|e| {
+        matches!(e.event_type.as_str(), "scope_granted" | "scope_refused") && id_of(e) == Some(ptr)
+    });
+    let requested = window
+        .iter()
+        .find(|e| e.event_type == "scope_requested" && id_of(e) == Some(ptr));
+    let Some(anchor) = decision.or(requested) else {
+        return hestia_error_envelope(
+            "hestia.scope_pointer_not_found",
+            &format!(
+                "no scope request with id '{ptr}' on this daemon, and no scope_requested / \
+                 scope_granted / scope_refused naming it in the last {APPEAL_CHAIN_WINDOW} \
+                 chain entries. That is UNKNOWN, not refused: scope requests live in memory \
+                 and do not survive a restart, so an absent id says nothing about whether \
+                 any ask was granted or refused. The witnessed decision, if one was made, \
+                 is on the chain — if this one is older than the window, it is beyond every \
+                 reader this daemon has"
+            ),
+            Some(json!({"pointer": ptr, "window": APPEAL_CHAIN_WINDOW, "chainLength": s.chain_len()})),
+        );
+    };
+    let status = match decision {
+        Some(e) if e.event_type == "scope_granted" => "granted",
+        Some(_) => "refused",
+        // An ask with no decision yet keeps the store's own clock semantics: past
+        // the window, silence IS the refusal (`ScopeRequest::status`).
+        None => match anchor
+            .event_data
+            .get("expires_at")
+            .and_then(Value::as_u64)
+        {
+            Some(x) if now >= x => "expired",
+            _ => "pending",
+        },
+    };
+    json!({
+        "pointer": ptr,
+        "source": "witness_chain",
+        "request_id": ptr,
+        "plugin_id": anchor.event_data.get("plugin_id"),
+        "path": anchor.event_data.get("path"),
+        "requested_because": anchor
+            .event_data
+            .get("requested_because")
+            .or_else(|| anchor.event_data.get("reason")),
+        "status": status,
+        "granted": decision.map(|e| e.event_type == "scope_granted"),
+        "decided_by": decision.and_then(|e| e.event_data.get("granted_by")),
+        "decision_reason": decision.and_then(|e| e.event_data.get("decision_reason")),
+        "expires_at": anchor.event_data.get("expires_at"),
+        "decision_entry": decision.map(chain_entry_json),
+        "note": "answered from the witness chain — the live store lost this row to a \
+                 restart (scope requests are memory-only by design). The chain is the \
+                 record; the store was a cache of it",
+    })
+}
+
+/// Dereference `hestia://escalation/{id}` — carried by escalation invitations
+/// (`#corroborate-or-dissent`, minted since 2026-08 with no resolver behind it)
+/// and by escalation `disposition` notices (`#decided` / `#lapsed`, #459). All
+/// fragments strip to the same record: the escalation and, once settled, its
+/// outcome.
+///
+/// THE STORE IS A CACHE OF THE CHAIN, and this resolver now treats it as one
+/// (#480 review, change 1). The memory store reaps decided rows about two hours
+/// after they open (`reap(now, REAP_KEEP_SECS)`), and `rehydrate` skips expired
+/// opens on restart — but a disposition notice outlives both by days. So on a
+/// store miss this falls back to the witness chain: the `gate_escalation_opened`
+/// entry is the ask, a matching `gate_escalation_decided` / `gate_escalation_expired`
+/// is the outcome, and the answer is rebuilt from those. `reaping_can_never_change_
+/// an_answer` was only ever asserted over `status_of`; the fallback is what makes
+/// it true for THIS reader too (pinned by `a_reaped_escalation_reads_the_same_from_
+/// the_chain`).
+fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> Value {
+    let ptr = pointer.trim();
+    if ptr.is_empty() {
+        return hestia_error_envelope(
+            "hestia.escalation_pointer_malformed",
+            "hestia://escalation/ needs an escalation id",
+            None,
+        );
+    }
+    let now = crate::server::gate_escalation::now_secs();
+    if let Some(esc) = s.gate_escalations.get(ptr) {
+        return json!({
+            "pointer": ptr,
+            "source": "live_store",
+            "escalation_id": esc.id,
+            "plugin_id": esc.plugin_id,
+            "tool_name": esc.tool_name,
+            "marker": esc.marker,
+            "status": esc.status_at(now),
+            // What an invited peer is woken to WEIGH (#480 review, change 4). An
+            // invitation that resolved to an id and a status was a wake with
+            // nothing to evaluate: the asker's own account (`stated_reason` —
+            // deliberately NOT `reason`, which is the decider's finding and is
+            // still null here; the two are separate fields because the record's
+            // value is that the claim and the finding are separately attributable),
+            // the bar, the evidence so far, who else was asked, and whether the
+            // asker is proven (#128 — a NOT-SAME tier against an `asserted` asker
+            // is a comparison with one forgeable operand).
+            "stated_reason": esc.stated_reason,
+            "stated_detail": esc.stated_detail,
+            "bar": esc.bar,
+            "factors_present": esc.factors,
+            "invited_peers": esc.invited_peers,
+            "asker_basis": esc.asker_basis,
+            "decided_by": esc.decided_by,
+            "decided_at": esc.decided_at,
+            "reason": esc.reason,
+            "opened_at": esc.opened_at,
+            "expires_at": esc.expires_at,
+        });
+    }
+    // Store miss. Before saying UNKNOWN, look where the record actually lives.
+    let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
+    fn id_of<'a>(e: &'a crate::storage::chain::ChainEntry) -> Option<&'a str> {
+        e.event_data.get("escalation_id").and_then(Value::as_str)
+    }
+    let opened = window
+        .iter()
+        .find(|e| e.event_type == "gate_escalation_opened" && id_of(e) == Some(ptr));
+    let Some(opened) = opened else {
+        return hestia_error_envelope(
+            "hestia.escalation_pointer_not_found",
+            &format!(
+                "no escalation with id '{ptr}' in this daemon's live store, and no \
+                 gate_escalation_opened entry naming it in the last {APPEAL_CHAIN_WINDOW} \
+                 chain entries. That is UNKNOWN, not denied: the store is memory-only and \
+                 reaps settled rows about two hours after they open, so an absent id says \
+                 nothing about how a real ask was ruled. The witnessed record of a real \
+                 ask is on the chain as gate_escalation_opened / gate_escalation_decided \
+                 — if this one is older than the window, it is beyond every reader this \
+                 daemon has"
+            ),
+            Some(json!({"pointer": ptr, "window": APPEAL_CHAIN_WINDOW, "chainLength": s.chain_len()})),
+        );
+    };
+    // The same body, sourced from the entries rather than the row. `status` keeps
+    // `status_at`'s clock semantics for an open-but-overdue ask: Expired is a real
+    // answer whether or not the reconciler has recorded the lapse yet. The settled
+    // entry's fields are lifted to the top level so a reader gets the SAME shape
+    // either arm answers with — a pointer that changes shape when a sweep runs is
+    // the filtered-window illusion one level up.
+    let d = &opened.event_data;
+    let get = |k: &str| d.get(k).cloned().unwrap_or(Value::Null);
+    let settled = window.iter().find(|e| {
+        matches!(
+            e.event_type.as_str(),
+            "gate_escalation_decided" | "gate_escalation_withdrawn" | "gate_escalation_expired"
+        ) && id_of(e) == Some(ptr)
+    });
+    let settled_get = |k: &str| {
+        settled
+            .and_then(|e| e.event_data.get(k))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let status = match settled {
+        Some(e) if e.event_type == "gate_escalation_expired" => "expired".to_string(),
+        Some(e) => e
+            .event_data
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("denied")
+            .to_string(),
+        None if get("expires_at").as_u64().is_some_and(|x| now >= x) => "expired".to_string(),
+        None => "pending".to_string(),
+    };
+    json!({
+        "pointer": ptr,
+        "source": "witness_chain",
+        "escalation_id": ptr,
+        "plugin_id": get("plugin_id"),
+        "tool_name": get("tool_name"),
+        "marker": get("marker"),
+        "status": status,
+        "stated_reason": get("stated_reason"),
+        "stated_detail": get("stated_detail"),
+        "bar": get("bar"),
+        "invited_peers": get("invited_peers"),
+        "asker_basis": get("asker_basis"),
+        "opened_at": get("opened_at"),
+        "expires_at": get("expires_at"),
+        "decided_by": settled_get("decided_by"),
+        "reason": settled_get("reason"),
+        "settled_entry": settled.map(chain_entry_json),
+        "note": "answered from the witness chain — the live store has reaped this row \
+                 (settled rows are dropped about two hours after open). The chain is \
+                 the record; the store was a cache of it",
     })
 }
 
@@ -12041,6 +12646,255 @@ mod appeal_tests {
         assert_eq!(via_tool["entry"]["hash"].as_str(), Some(hash.as_str()), "{via_tool}");
     }
 
+    // ---- #459: petition surfaces get a return edge ---------------------------
+    //
+    // An appeal ruled, a scope request decided, an escalation decided each used to
+    // end AT the ruling: the petitioner was never told, and had to poll or be told
+    // out of band. `disposition` is the daemon-only notice kind that closes that
+    // loop, minted at each ruling site the way `unreachable` is minted at the
+    // retirement site — same absent-from-`MEMBER_NOTICE_KINDS` split, same
+    // witness-before-enqueue order, same enqueue failure surfaced as an error.
+
+    /// The kind is reserved the way `unreachable` is: a member asking for it by name
+    /// hits the same unknown-kind refusal, while the daemon's own enqueue — through
+    /// the store, which does not validate kinds — goes through. That split is the
+    /// kind's whole value, so both halves are pinned.
+    #[tokio::test]
+    async fn a_member_cannot_mint_the_disposition_kind_but_the_daemon_can() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat(&state, "claude-code").await;
+        let out = tool_member_notify(&state, &json!({
+            "to_plugin_id": "kimi-code", "kind": "disposition",
+            "pointer_uri": "hestia://appeal/deadbeef#ruled",
+            "session_id": sid.to_string(),
+        })).await.unwrap();
+        assert_eq!(
+            out["_hestia_error"]["code"], "hestia.member_notify_unknown_kind",
+            "a member must not be able to speak for a ruling surface: {out}"
+        );
+
+        let st = state.lock().await;
+        st.inbox_store
+            .enqueue_member(
+                "kimi-code",
+                "hestia",
+                crate::reputation::DEFAULT_CONSTELLATION_ROLE,
+                "disposition",
+                Some("hestia://appeal/deadbeef#ruled"),
+                "hash",
+                None,
+            )
+            .expect("the store does not validate kinds — that split IS the kind's value");
+        let mail = st.inbox_store.drain_member("kimi-code").unwrap();
+        assert!(
+            mail.iter().any(|n| n.kind == "disposition" && n.from_plugin == "hestia"),
+            "the daemon-minted disposition must be deliverable: {mail:?}"
+        );
+    }
+
+    /// Minting site A (#459): ruling an appeal tells the APPELLANT — witnessed on the
+    /// chain first, then enqueued, with the `hestia://appeal/{deny_hash}#ruled`
+    /// pointer. And the pointer must FOLLOW: the fragment is a marker, not part of
+    /// the lookup key.
+    #[tokio::test]
+    async fn a_ruled_appeal_reports_its_disposition_to_the_appellant() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let a_sid = seat(&state, "claude-code").await;
+        let codex_sid = seat(&state, "codex").await;
+        let deny_hash = seat_deny(&state, "claude-code", a_sid, "hestia-gate").await;
+        tool_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": a_sid.to_string(),
+            "reason": "the matched token sat in a heredoc body, never in executable position",
+        })).await.unwrap();
+        let ruled = tool_arbitrate_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": codex_sid.to_string(), "upheld": true,
+            "rationale": "the rule targets chaining, not the delete; the deny was over-broad",
+        })).await.unwrap();
+        assert!(
+            ruled.get("_hestia_error").is_none(),
+            "the ruling itself must land: {ruled}"
+        );
+
+        {
+            let st = state.lock().await;
+            // Witnessed: the disposition is on the chain, carrying what it answers.
+            let disp = st
+                .recent_chain(20)
+                .into_iter()
+                .find(|e| e.event_type == "member_notice_disposition")
+                .expect("a ruling without its disposition entry is the hole #459 closes");
+            assert_eq!(disp.event_data["about_deny_hash"].as_str(), Some(deny_hash.as_str()));
+            assert_eq!(disp.event_data["upheld"], json!(true));
+            assert_eq!(disp.event_data["adjudicator"].as_str(), Some("codex"));
+
+            // Enqueued: to the APPELLANT, from the daemon, pointer naming the ruling.
+            let mail = st.inbox_store.drain_member("claude-code").unwrap();
+            let note = mail
+                .iter()
+                .find(|n| n.kind == "disposition")
+                .expect("the appellant must learn its appeal was ruled: {mail:?}");
+            assert_eq!(note.from_plugin, "hestia");
+            assert_eq!(
+                note.pointer_uri.as_deref(),
+                Some(format!("hestia://appeal/{deny_hash}#ruled")).as_deref(),
+            );
+        }
+
+        // The pointer the daemon mints must resolve, fragment and all.
+        let body = read_resource_body(&state, &format!("hestia://appeal/{deny_hash}#ruled"))
+            .await
+            .unwrap_or_else(|e| panic!("the disposition pointer must resolve: {e}"));
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ruled"], json!(true), "{v}");
+    }
+
+    /// A disposition is terminal: it answers a petition and awaits nothing, so it
+    /// must never surface in `member_unanswered` — counting it would manufacture a
+    /// debt on a petitioner whose petition was just ruled.
+    #[tokio::test]
+    async fn a_disposition_is_terminal_not_an_unanswered_debt() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let st = state.lock().await;
+        assert!(
+            !MEMBER_KINDS_AWAIT_RESPONSE.contains(&"disposition"),
+            "the kind is a ruling delivered, not a question asked"
+        );
+        st.inbox_store
+            .enqueue_member(
+                "kimi-code", "hestia", crate::reputation::DEFAULT_CONSTELLATION_ROLE,
+                "disposition", Some("hestia://scope/scope-dead01"), "h1", None,
+            )
+            .unwrap();
+        // Control: a kind that DOES await a response, same recipient, same query.
+        st.inbox_store
+            .enqueue_member(
+                "kimi-code", "claude-code", crate::reputation::DEFAULT_CONSTELLATION_ROLE,
+                "review_request", Some("shared-context/x.md"), "h2", None,
+            )
+            .unwrap();
+        let owed = st
+            .inbox_store
+            .member_unanswered("kimi-code", MEMBER_KINDS_AWAIT_RESPONSE, -1)
+            .unwrap();
+        assert!(
+            owed.iter().any(|n| n.kind == "review_request"),
+            "control: a review_request IS counted: {owed:?}"
+        );
+        assert!(
+            owed.iter().all(|n| n.kind != "disposition"),
+            "a disposition answers a petition; it awaits nothing: {owed:?}"
+        );
+    }
+
+    /// Minting site B's pointer (#459): `hestia://scope/{request_id}` resolves to the
+    /// decision, and an unknown id errors in a way that cannot read as "refused" —
+    /// unknown is not a ruling, and collapsing the two rebuilds the
+    /// null-state/healthy-state defect this resolver family exists to end.
+    #[tokio::test]
+    async fn a_scope_decision_pointer_resolves_and_an_unknown_id_is_not_a_refusal() {
+        use crate::server::state::ScopeRequest;
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut st = state.lock().await;
+            st.scope_requests.insert("scope-test459a".into(), ScopeRequest {
+                id: "scope-test459a".into(),
+                plugin_id: "kimi-code".into(),
+                role: String::new(),
+                path: "/x/y.md".into(),
+                reason: "dp asked me to read this in-session".into(),
+                requested_at: now,
+                expires_at: now + 3600,
+                granted: Some(true),
+                decided_by: Some("operator".into()),
+                decided_at: Some(now),
+                decision_reason: Some("yes, that file".into()),
+            });
+        }
+        let body = read_resource_body(&state, "hestia://scope/scope-test459a")
+            .await
+            .unwrap_or_else(|e| panic!("the daemon mints this pointer; it must resolve: {e}"));
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], json!("granted"), "{v}");
+        assert_eq!(v["granted"], json!(true), "{v}");
+        assert_eq!(v["decided_by"], json!("operator"), "{v}");
+
+        let missing = read_resource_body(&state, "hestia://scope/scope-nosuch0")
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&missing).unwrap();
+        assert_eq!(
+            v["_hestia_error"]["code"], json!("hestia.scope_pointer_not_found"),
+            "a bogus id is an unknown, distinctly — not a decision: {v}"
+        );
+        let msg = v["_hestia_error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("not") && msg.contains("refused"),
+            "the error must say what 'no such request' does NOT mean: {msg}"
+        );
+    }
+
+    /// Minting site C, the peer-ruling path (#459): a member ruling on an escalation
+    /// tells the ASKER. Minted at the tool handler, the layer that holds
+    /// `SharedState` — the store's `decide` has no inbox access.
+    #[tokio::test]
+    async fn a_decided_escalation_reports_its_disposition_to_the_asker() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let asker_sid = seat(&state, "claude-code").await;
+        let peer_sid = seat(&state, "codex").await;
+        let opened = tool_gate_escalation_open(&state, &json!({
+            "plugin_id": "claude-code", "tool_name": "policy_edit", "marker": "policy.json",
+            "reason": "the deny blocks a legitimate rule addition",
+            "session_id": asker_sid.to_string(),
+        })).await.unwrap();
+        let esc_id = opened["escalation_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the open must return its id: {opened}"))
+            .to_string();
+        let ruled = tool_gate_arbitrate_escalation(&state, &json!({
+            "escalation_id": esc_id, "approve": true, "session_id": peer_sid.to_string(),
+            "reason": "reviewed the diff; the rule is scoped to the one path",
+        })).await.unwrap();
+        assert!(
+            ruled.get("_hestia_error").is_none(),
+            "the ruling itself must land: {ruled}"
+        );
+
+        {
+            let st = state.lock().await;
+            let disp = st
+                .recent_chain(20)
+                .into_iter()
+                .find(|e| e.event_type == "member_notice_disposition")
+                .expect("a decided escalation without its disposition entry is the hole #459 closes");
+            assert_eq!(disp.event_data["escalation_id"].as_str(), Some(esc_id.as_str()));
+            assert_eq!(disp.event_data["decided_by"].as_str(), Some("codex"));
+
+            let mail = st.inbox_store.drain_member("claude-code").unwrap();
+            let note = mail
+                .iter()
+                .find(|n| n.kind == "disposition")
+                .expect("the asker must learn its escalation was decided: {mail:?}");
+            assert_eq!(note.from_plugin, "hestia");
+            assert_eq!(
+                note.pointer_uri.as_deref(),
+                Some(format!("hestia://escalation/{esc_id}#decided")).as_deref(),
+            );
+        }
+
+        let body = read_resource_body(&state, &format!("hestia://escalation/{esc_id}#decided"))
+            .await
+            .unwrap_or_else(|e| panic!("the disposition pointer must resolve: {e}"));
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], json!("approved"), "{v}");
+        assert_eq!(v["decided_by"], json!("codex"), "{v}");
+    }
+
     /// The regression that motivated all of this: `limit` is a window over the TAIL, so an
     /// entry that has scrolled past it reads as absent. A hash lookup must not compose with
     /// the window, or "old" and "nonexistent" stay indistinguishable.
@@ -14051,6 +14905,30 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
                     },
                 }),
             );
+            // #459: the decision's RETURN EDGE, minted HERE — the layer holding
+            // SharedState — because `EscalationStore::decide` has no inbox access.
+            // Skipped for a withdrawal: that is the asker's own act and the asker
+            // was there for it; waking a member to tell it what it just did is
+            // noise wearing the return edge's clothes.
+            let disposition_notice_id = if withdrawn {
+                None
+            } else {
+                Some(report_disposition(
+                    &mut s,
+                    &decided.plugin_id,
+                    &format!("hestia://escalation/{}#decided", decided.id),
+                    json!({
+                        "escalation_id": decided.id,
+                        "tool_name": decided.tool_name,
+                        "approved": approve,
+                        "decided_by": decided.decided_by,
+                        "decided_via": decided.decided_via,
+                        "reason": decided.reason,
+                        "note": "the escalation you filed has been decided; the pointer \
+                                 resolves to the decision",
+                    }),
+                )?)
+            };
             // The bar and whether this decision met it go to the DECIDER, not only to the
             // chain. They were recorded above and withheld here, and the asymmetry had a
             // measured cost: across the whole chain, 66 `sovereign_plus_peer` escalations
@@ -14070,6 +14948,7 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
             if let Some(o) = reply.as_object_mut() {
                 o.insert("independence".into(), json!(independence));
                 o.insert("witnessEntryHash".into(), json!(entry.ok().map(|e| e.hash)));
+                o.insert("disposition_notice_id".into(), json!(disposition_notice_id));
             }
             Ok(reply)
         }
@@ -14623,5 +15502,518 @@ mod standing_scope_surface_tests {
             names.iter().any(|n| n == "hestia_scope_status"),
             "hestia_scope_status is how a member learns its standing reach"
         );
+    }
+}
+
+#[cfg(test)]
+mod disposition_durability_tests {
+    //! #480 review (claude-code seat, "approve with four changes") + the operator's
+    //! contract: a disposition is a DURABLE, IDEMPOTENT obligation, not "ruling
+    //! committed, enqueue attempted once". These tests pin the four changes:
+    //!
+    //! 1. The `hestia://escalation/{id}` and `hestia://scope/{request_id}` resolvers
+    //!    fall back to the witness chain when the memory store has reaped/forgotten
+    //!    the row — point at the chain, don't make the memory store live longer.
+    //! 2. The reconciler re-mints any ruling with no `member_notice_disposition`
+    //!    naming it. Absence is the queue.
+    //! 3. An escalation that ran out its clock gets a `gate_escalation_expired`
+    //!    record and a `#lapsed` disposition — the modal terminal outcome on the
+    //!    sovereign_plus_peer bar used to leave neither.
+    //! 4. An OPEN escalation's pointer carries what the invited peer is woken to
+    //!    weigh: stated_reason, bar, factors_present, invited_peers, asker_basis.
+    use super::*;
+    use crate::server::gate_escalation::{now_secs, REAP_KEEP_SECS};
+    use crate::server::state::ServerState;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    /// Witness an escalation's open the way both production doors do: the store row
+    /// AND the `gate_escalation_opened` entry, written together (`opened_payload`).
+    fn witness_open(
+        s: &mut ServerState,
+        plugin: &str,
+        stated_reason: Option<&str>,
+        opened_at: u64,
+        ttl_secs: u64,
+    ) -> String {
+        let esc = s
+            .gate_escalations
+            .open(
+                plugin,
+                "",
+                "policy_edit",
+                "policy.json",
+                stated_reason,
+                None,
+                opened_at,
+                ttl_secs,
+            )
+            .unwrap();
+        s.append_chain(
+            "gate_escalation_opened",
+            json!({
+                "escalation_id": esc.id,
+                "plugin_id": esc.plugin_id,
+                "tool_name": esc.tool_name,
+                "marker": esc.marker,
+                "asker_basis": "session",
+                "stated_reason": esc.stated_reason,
+                "bar": esc.bar,
+                "invited_peers": esc.invited_peers,
+                "opened_at": esc.opened_at,
+                "expires_at": esc.expires_at,
+            }),
+        )
+        .unwrap();
+        esc.id
+    }
+
+    /// Change 4: an invited peer follows `hestia://escalation/{id}#corroborate-or-dissent`
+    /// BEFORE any ruling. What it gets back must be the record the invitation exists
+    /// to evaluate — the asker's stated reason (NOT the decider's `reason`, which is
+    /// still null; the two were deliberately kept separate fields, gate_escalation.rs
+    /// :319-323), the bar, the evidence so far, who else was asked, and the asker's
+    /// basis. An invitation that resolves to an id and a status is a wake with
+    /// nothing to weigh.
+    #[tokio::test]
+    async fn an_open_escalation_pointer_carries_what_the_invited_peer_must_weigh() {
+        let (_dir, state) = test_state().await;
+        let now = now_secs();
+        let id = {
+            let mut s = state.lock().await;
+            let id = witness_open(
+                &mut s,
+                "kimi-code",
+                Some("the deny text told me to say what I need changed and why"),
+                now,
+                3600,
+            );
+            s.gate_escalations
+                .invite(&id, vec!["claude-code".into(), "codex".into()]);
+            id
+        };
+
+        // Follow the pointer exactly as the invited peer would: the full URI,
+        // fragment included, through the resource door — which strips the fragment
+        // before dispatch (#459 carry-forward, pinned here end to end).
+        let raw = read_resource_body(&state, &format!("hestia://escalation/{id}#corroborate-or-dissent"))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(body["status"], "pending");
+        assert_eq!(
+            body["stated_reason"],
+            "the deny text told me to say what I need changed and why",
+            "the asker's own account is the single most useful field a decider gets"
+        );
+        assert!(body.get("bar").is_some(), "the criterion must be visible: {body}");
+        assert!(
+            body.get("factors_present").is_some(),
+            "the evidence so far must be visible: {body}"
+        );
+        assert_eq!(
+            body["invited_peers"],
+            json!(["claude-code", "codex"]),
+            "who else was asked is part of what a peer weighs"
+        );
+        assert!(
+            body.get("asker_basis").is_some(),
+            "a peer reading a NOT-SAME tier must see the asker's basis first (#128)"
+        );
+    }
+
+    /// Change 1 + review point 1b: `reap`'s call-site invariant — "reaping can never
+    /// change an answer" — was only ever asserted over `status_of`. The resolver is
+    /// the new reader: the SAME escalation must read the same before the reap (live
+    /// store) and after it (witness chain).
+    #[tokio::test]
+    async fn a_reaped_escalation_reads_the_same_from_the_chain() {
+        let (_dir, state) = test_state().await;
+        let real_now = now_secs();
+        // Opened three hours ago with a one-hour TTL: expired on the clock AND past
+        // the reap horizon, so `reap` will drop it — the exact shape the review
+        // flagged (notices outlive the store by days).
+        let id = {
+            let mut s = state.lock().await;
+            witness_open(
+                &mut s,
+                "kimi-code",
+                Some("needed the governance file"),
+                real_now - 3 * 3600,
+                3600,
+            )
+        };
+
+        let mut s = state.lock().await;
+        let before = resolve_escalation_pointer(&s, &id);
+        assert_eq!(before["status"], "expired");
+        assert_eq!(before["source"], "live_store");
+
+        let reaped = s.gate_escalations.reap(real_now, REAP_KEEP_SECS);
+        assert_eq!(reaped, 1, "the row is past its keep horizon");
+        assert!(s.gate_escalations.get(&id).is_none());
+
+        let after = resolve_escalation_pointer(&s, &id);
+        assert_eq!(after["source"], "witness_chain");
+        assert_eq!(after["escalation_id"], id);
+        assert_eq!(
+            after["status"], before["status"],
+            "reaping can never change an answer — now pinned over the resolver, not \
+             only over status_of"
+        );
+        assert_eq!(after["stated_reason"], "needed the governance file");
+        assert_eq!(after["plugin_id"], "kimi-code");
+    }
+
+    /// Change 1, the decided case: the disposition notice outlives the store row by
+    /// days, so the pointer it carries must still resolve — verdict, decider and
+    /// rationale served from the chain entries.
+    #[tokio::test]
+    async fn a_decided_escalation_resolves_from_the_chain_after_the_reap() {
+        let (_dir, state) = test_state().await;
+        let real_now = now_secs();
+        let id = {
+            let mut s = state.lock().await;
+            let id = witness_open(&mut s, "kimi-code", None, real_now - 3 * 3600, 3600);
+            s.append_chain(
+                "gate_escalation_decided",
+                json!({
+                    "escalation_id": id,
+                    "plugin_id": "kimi-code",
+                    "tool_name": "policy_edit",
+                    "marker": "policy.json",
+                    "status": "denied",
+                    "decided_by": "operator",
+                    "decided_via": "operator_session",
+                    "reason": "the diff widens more than the ask stated",
+                }),
+            )
+            .unwrap();
+            id
+        };
+
+        let mut s = state.lock().await;
+        s.gate_escalations.reap(real_now, REAP_KEEP_SECS);
+        assert!(s.gate_escalations.get(&id).is_none());
+
+        let body = resolve_escalation_pointer(&s, &id);
+        assert_eq!(body["source"], "witness_chain");
+        assert_eq!(body["status"], "denied");
+        assert_eq!(body["decided_by"], "operator");
+        assert_eq!(body["reason"], "the diff widens more than the ask stated");
+    }
+
+    /// Change 1, scope arm: same fallback, and the not-found arm must stop saying
+    /// "no such ask is on record" when the record is on the chain.
+    #[tokio::test]
+    async fn a_scope_decision_resolves_from_the_chain_when_the_store_has_forgotten() {
+        let (_dir, state) = test_state().await;
+        let now = now_secs();
+        {
+            let mut s = state.lock().await;
+            // No scope_requests row at all — the daemon restarted; the chain is all
+            // that is left.
+            s.append_chain(
+                "scope_requested",
+                json!({
+                    "request_id": "scope-gone1", "plugin_id": "kimi-code",
+                    "path": "/x/y.md", "reason": "needed for the task at hand",
+                    "expires_at": now + 3600,
+                }),
+            )
+            .unwrap();
+            s.append_chain(
+                "scope_refused",
+                json!({
+                    "request_id": "scope-gone1", "plugin_id": "kimi-code",
+                    "path": "/x/y.md", "requested_because": "needed for the task at hand",
+                    "decision_reason": "that file is the law, not the workspace",
+                    "granted_by": "operator", "expires_at": now + 3600,
+                }),
+            )
+            .unwrap();
+        }
+
+        let s = state.lock().await;
+        let body = resolve_scope_pointer(&s, "scope-gone1");
+        assert_eq!(body["source"], "witness_chain");
+        assert_eq!(body["status"], "refused");
+        assert_eq!(body["granted"], false);
+        assert_eq!(body["decision_reason"], "that file is the law, not the workspace");
+
+        // The not-found arm now names the window it actually searched — an absent id
+        // after a chain scan is a stronger sentence than "not in memory".
+        let miss = resolve_scope_pointer(&s, "scope-never-heard-of-it");
+        assert_eq!(
+            miss["_hestia_error"]["code"], "hestia.scope_pointer_not_found",
+            "an unknown id is still UNKNOWN, not refused: {miss}"
+        );
+        let msg = miss["_hestia_error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("chain entries"),
+            "the not-found arm must name the mechanism it searched: {msg}"
+        );
+    }
+
+    /// The escalation not-found arm gets the scope arm's shape: name the mechanism,
+    /// point at the chain.
+    #[tokio::test]
+    async fn an_unknown_escalation_pointer_names_the_mechanism_and_the_chain() {
+        let (_dir, state) = test_state().await;
+        let s = state.lock().await;
+        let miss = resolve_escalation_pointer(&s, "no-such-escalation");
+        assert_eq!(
+            miss["_hestia_error"]["code"],
+            "hestia.escalation_pointer_not_found"
+        );
+        let msg = miss["_hestia_error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("gate_escalation_opened"),
+            "the arm must point at the chain record a real ask would have left: {msg}"
+        );
+    }
+
+    /// Change 2: a ruling whose enqueue was skipped (the failure the review named —
+    /// "ruling committed, enqueue attempted once", and every surface then refuses the
+    /// retry) is re-minted by the reconciler, and exactly once no matter how many
+    /// times it runs. Absence is the queue.
+    #[tokio::test]
+    async fn the_reconciler_remints_a_ruling_whose_disposition_never_landed() {
+        let (_dir, state) = test_state().await;
+        let now = now_secs();
+        let mut s = state.lock().await;
+        s.append_chain(
+            "gate_escalation_opened",
+            json!({
+                "escalation_id": "esc-rec1", "plugin_id": "kimi-code",
+                "tool_name": "policy_edit", "marker": "policy.json",
+                "opened_at": now - 100, "expires_at": now + 3500,
+            }),
+        )
+        .unwrap();
+        s.append_chain(
+            "gate_escalation_decided",
+            json!({
+                "escalation_id": "esc-rec1", "plugin_id": "kimi-code",
+                "tool_name": "policy_edit", "status": "approved",
+                "decided_by": "operator", "decided_via": "operator_session",
+                "reason": "reviewed the diff",
+            }),
+        )
+        .unwrap();
+
+        let did = reconcile_dispositions(&mut s, now);
+        assert_eq!(did.reminted, 1, "the unreported ruling is the queue");
+        assert_eq!(did.lapsed, 0);
+
+        let again = reconcile_dispositions(&mut s, now);
+        assert_eq!(
+            (again.reminted, again.lapsed),
+            (0, 0),
+            "idempotent: a second sweep finds the disposition and does nothing"
+        );
+
+        let dispositions: Vec<_> = s
+            .recent_chain(50)
+            .into_iter()
+            .filter(|e| e.event_type == "member_notice_disposition")
+            .collect();
+        assert_eq!(
+            dispositions.len(),
+            1,
+            "exactly one disposition per ruling, however many sweeps"
+        );
+        assert_eq!(
+            dispositions[0].event_data.get("escalation_id").and_then(Value::as_str),
+            Some("esc-rec1")
+        );
+
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        let notes: Vec<_> = mail.iter().filter(|n| n.kind == "disposition").collect();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            notes[0].pointer_uri.as_deref(),
+            Some("hestia://escalation/esc-rec1#decided")
+        );
+    }
+
+    /// Change 2, the other two petition kinds: an appeal ruling (`adjudication`,
+    /// keyed on `about_deny_hash`) and a scope decision (`scope_refused`, keyed on
+    /// `request_id`) are re-minted to the appellant / requester.
+    #[tokio::test]
+    async fn the_reconciler_remints_appeal_and_scope_rulings() {
+        let (_dir, state) = test_state().await;
+        let now = now_secs();
+        let mut s = state.lock().await;
+        s.append_chain(
+            "adjudication",
+            json!({
+                "subject_plugin_id": "kimi-code", "about_deny_hash": "deadbeef",
+                "upheld": true, "adjudicator": "claude-code",
+            }),
+        )
+        .unwrap();
+        s.append_chain(
+            "scope_refused",
+            json!({
+                "request_id": "scope-rec1", "plugin_id": "kimi-code",
+                "path": "/x/y.md", "granted_by": "operator",
+                "decision_reason": "no", "expires_at": now + 3600,
+            }),
+        )
+        .unwrap();
+
+        let did = reconcile_dispositions(&mut s, now);
+        assert_eq!(did.reminted, 2);
+
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        let mut pointers: Vec<_> = mail
+            .iter()
+            .filter(|n| n.kind == "disposition")
+            .filter_map(|n| n.pointer_uri.clone())
+            .collect();
+        pointers.sort();
+        assert_eq!(
+            pointers,
+            vec![
+                "hestia://appeal/deadbeef#ruled".to_string(),
+                "hestia://scope/scope-rec1".to_string(),
+            ]
+        );
+    }
+
+    /// Change 3: the lapse. `status_at` derives Expired from the clock alone, so a
+    /// lapsed petition used to leave no return edge AND no record. The reconciler
+    /// appends the `gate_escalation_expired` the clock implied and tells the asker —
+    /// once.
+    #[tokio::test]
+    async fn the_reconciler_records_a_lapse_and_tells_the_asker_once() {
+        let (_dir, state) = test_state().await;
+        let now = now_secs();
+        let mut s = state.lock().await;
+        s.append_chain(
+            "gate_escalation_opened",
+            json!({
+                "escalation_id": "esc-lapse1", "plugin_id": "kimi-code",
+                "tool_name": "policy_edit", "marker": "policy.json",
+                "opened_at": now - 3700, "expires_at": now - 100,
+            }),
+        )
+        .unwrap();
+
+        let did = reconcile_dispositions(&mut s, now);
+        assert_eq!(did.lapsed, 1, "the clock's verdict gets a record");
+        assert_eq!(did.reminted, 0);
+
+        let expired = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_expired")
+            .expect("a lapse must be witnessed, not only derived");
+        assert_eq!(
+            expired.event_data.get("escalation_id").and_then(Value::as_str),
+            Some("esc-lapse1")
+        );
+
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        let note = mail
+            .iter()
+            .find(|n| n.kind == "disposition")
+            .expect("the asker must learn its petition died of the clock: {mail:?}");
+        assert_eq!(
+            note.pointer_uri.as_deref(),
+            Some("hestia://escalation/esc-lapse1#lapsed")
+        );
+
+        let again = reconcile_dispositions(&mut s, now);
+        assert_eq!(
+            (again.lapsed, again.reminted),
+            (0, 0),
+            "the lapse entry is the idempotency marker — a second sweep adds nothing"
+        );
+    }
+
+    /// A decided escalation does not ALSO get lapsed, and a withdrawn one neither —
+    /// both are settled, and the asker of a withdrawal was present for its own act.
+    #[tokio::test]
+    async fn the_reconciler_never_lapses_a_settled_escalation() {
+        let (_dir, state) = test_state().await;
+        let now = now_secs();
+        let mut s = state.lock().await;
+        for (id, closer) in [
+            ("esc-decided", "gate_escalation_decided"),
+            ("esc-withdrawn", "gate_escalation_withdrawn"),
+        ] {
+            s.append_chain(
+                "gate_escalation_opened",
+                json!({
+                    "escalation_id": id, "plugin_id": "kimi-code",
+                    "tool_name": "policy_edit", "marker": "policy.json",
+                    "opened_at": now - 3700, "expires_at": now - 100,
+                }),
+            )
+            .unwrap();
+            s.append_chain(
+                closer,
+                json!({
+                    "escalation_id": id, "plugin_id": "kimi-code",
+                    "tool_name": "policy_edit", "status": "denied",
+                    "decided_by": "operator",
+                }),
+            )
+            .unwrap();
+        }
+
+        let did = reconcile_dispositions(&mut s, now);
+        assert_eq!(did.lapsed, 0, "a settled escalation cannot lapse");
+        // The decided one IS re-minted (no disposition witnessed for it); the
+        // withdrawn one is not — that is the existing no-mint-on-withdrawal rule.
+        assert_eq!(did.reminted, 1);
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        assert_eq!(
+            mail.iter().filter(|n| n.kind == "disposition").count(),
+            1,
+            "decided re-minted, withdrawn left alone: {mail:?}"
+        );
+    }
+
+    /// Change 5's mechanical half: an operator-ORIGINATED grant (`POST
+    /// /api/scope/grant`, a8be418) is a `scope_granted` with `request_id: null` —
+    /// not a petition, no petitioner to notify. The reconciler must skip it rather
+    /// than mint a disposition about an ask nobody made.
+    #[tokio::test]
+    async fn the_reconciler_does_not_notify_an_operator_originated_grant() {
+        let (_dir, state) = test_state().await;
+        let now = now_secs();
+        let mut s = state.lock().await;
+        s.append_chain(
+            "scope_granted",
+            json!({
+                "request_id": serde_json::Value::Null,
+                "plugin_id": "kimi-code", "path": "/x/y.md",
+                "origin": "operator_initiated", "granted_by": "operator",
+            }),
+        )
+        .unwrap();
+
+        let did = reconcile_dispositions(&mut s, now);
+        assert_eq!(
+            (did.reminted, did.lapsed),
+            (0, 0),
+            "no petition, no petitioner, no disposition"
+        );
+        assert!(s
+            .recent_chain(20)
+            .into_iter()
+            .all(|e| e.event_type != "member_notice_disposition"));
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        assert!(mail.is_empty(), "nothing to notify: {mail:?}");
     }
 }
