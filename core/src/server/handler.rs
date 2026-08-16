@@ -10530,6 +10530,83 @@ mod tests {
         );
     }
 
+    /// THE BAR A PEER CAN CLEAR ALONE IS THE BAR THAT MUST INVITE. `resolve_invitation` built
+    /// its pool only under `SovereignPlusPeer`, reasoning that `SingleApprover` "names no peer
+    /// conjunct". But `SingleApprover` is defined as one sovereign-channel decision OR a
+    /// NOT-SAME peer, so a peer disjunct clears it outright — the invitation is worth strictly
+    /// more there, and it was the one bar where nobody was ever told.
+    ///
+    /// Measured, not hypothesised: on CBP 2026-08-16 escalations `24602a7422113a5d` and
+    /// `3e7df571825a14e8` opened `single_approver` / `invited_peers: []`, sat refused ~20
+    /// minutes while the peer that could clear them was awake on the same host, and were then
+    /// decided by that peer with `bar_met: true`. The chain held the refutation 118 entries
+    /// below the comment asserting the opposite.
+    ///
+    /// The sibling above (`..._invites_and_wakes_real_peers`, `pre_tool_use.py`) is the
+    /// positive control for the other bar: it must keep passing, so a "fix" that simply
+    /// inverted the condition is caught rather than greened.
+    #[tokio::test]
+    async fn a_single_approver_escalation_invites_and_wakes_the_peers_that_can_clear_it() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "kimi-code", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+
+        // A marker outside the two-factor list, so `bar_for` returns `SingleApprover` — the
+        // same marker shape the live escalations above carried.
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "session_id": session_of["codex"],
+                "tool_name": "Edit",
+                "marker": "plugins/_shared/hestia_governance_closure.py",
+                "reason": "Edit -> a governance file",
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Guard the premise: if this ever stops being `single_approver` the test is measuring
+        // the branch it was written to leave alone.
+        assert_eq!(claimed["bar"], "single_approver", "{claimed}");
+        assert_eq!(claimed["asker_basis"], "session", "{claimed}");
+
+        let invited: Vec<String> = claimed["invited_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            invited.contains(&"claude-code".to_string())
+                && invited.contains(&"kimi-code".to_string()),
+            "single_approver is cleared by ONE not-same peer, so the peers must be asked: \
+             {invited:?}"
+        );
+        assert!(
+            !invited.contains(&"codex".to_string()),
+            "the asker is still excluded from its own ask: {invited:?}"
+        );
+
+        // ASKED, not merely labelled — the whole defect class this subsystem keeps reproducing
+        // is a name in a list that no mailbox ever received.
+        let mail = shared
+            .lock()
+            .await
+            .inbox_store
+            .drain_member("kimi-code")
+            .unwrap();
+        assert!(
+            mail.iter().any(|m| m.kind == "review_request"),
+            "the invited peer must actually be woken: {mail:?}"
+        );
+    }
+
     /// A session that disagrees with the asserted `plugin_id` is a forgery, and the claim door
     /// must refuse it BEFORE spending anything — a claimed approval cannot be un-claimed.
     #[tokio::test]
@@ -13867,12 +13944,28 @@ fn resolve_invitation(
     esc: &crate::server::gate_escalation::Escalation,
     asker_is_proven: bool,
 ) -> OpenedInvitation {
-    use crate::server::gate_escalation::Bar;
-
-    // Only `SovereignPlusPeer` invites. `SingleApprover` names no peer conjunct, so an empty
-    // list there is the honest answer, not a gap — and the key is emitted either way, because
-    // a census over PAYLOAD KEYS cannot read a field that is sometimes absent.
-    let (invited, evidence, passed_over) = if esc.bar == Bar::SovereignPlusPeer {
+    // BOTH bars invite. Until 2026-08-16 this branch read `esc.bar == Bar::SovereignPlusPeer`,
+    // justified as: "SingleApprover names no peer conjunct, so an empty list there is the honest
+    // answer, not a gap". That mistook the absence of a CONJUNCT for the absence of a ROLE.
+    // `Bar::SingleApprover` defines itself as "one decision from a sovereign channel (operator
+    // session / operator CLI) OR a NOT-SAME peer" — a peer DISJUNCT, which makes an invitation
+    // strictly MORE actionable here than under `SovereignPlusPeer`, where a peer factor is
+    // necessary but never sufficient on its own. The polarity was backwards: the one bar a
+    // single peer can clear alone was the one bar on which no peer was ever told.
+    //
+    // Refuted by this store, not by argument. Escalations `24602a7422113a5d` and
+    // `3e7df571825a14e8` opened `bar: single_approver` with `invited_peers: []` (chain 146101,
+    // 146108) and were then DECIDED by a not-same peer with `bar_met: true` (146219, 146220).
+    // The counterexample to the comment was 118 entries below it in the same chain. Both had
+    // sat refused ~20 minutes with nobody told, while the peer that cleared them was awake on
+    // the same host, mid-review, blocked on exactly those writes.
+    //
+    // The RECORD SHAPE is why it went unseen. For a proven asker under `SingleApprover` all
+    // three of `invited_peers`, `invitation_withheld` and `invitation_passed_over` came out
+    // empty, so "this box knows no admissible peer" and "we never built the pool" rendered
+    // identically. That is the asked-versus-never-asked confusion this writer exists to end —
+    // closed for unproven askers, left open for this bar.
+    let (invited, evidence, passed_over) = {
         // Same identity test the appeal router uses, and it has the same measured reach:
         // `member_lct` hashes the trimmed id, so it separates `codex` from `codex-cli` only
         // by whitespace (`state::tests::the_member_lct_alias_guard_reaches_only_whitespace`).
@@ -13936,8 +14029,6 @@ fn resolve_invitation(
             pool.iter().map(ev).collect::<Vec<Value>>(),
             over.iter().map(ev).collect::<Vec<Value>>(),
         )
-    } else {
-        (Vec::new(), Vec::new(), Vec::new())
     };
 
     // THE BINDING. An invitation is an outward message sent on behalf of an identity —
@@ -14051,10 +14142,11 @@ fn opened_payload(
         // entry until now, which is why 0 of 362 opened payloads could be read for it.
         "bar": esc.bar,
         // WHO WAS ASKED. The field whose absence made "invited and absent" and "never
-        // asked" the same row. Empty is a real answer here and means one of two things
-        // the `bar` alongside it disambiguates: a `single_approver` bar asks for no peer,
-        // while an empty list under `sovereign_plus_peer` says either that this box knows no
-        // admissible peer, or — read `asker_basis` — that the ask was never proven.
+        // asked" the same row. Both bars populate it: `single_approver` is satisfied by a
+        // NOT-SAME peer acting alone, so it is the bar an invitation helps MOST — reading it
+        // as "asks for no peer" is what left it empty on every row until 2026-08-16 (see
+        // `resolve_invitation`). Empty now says either that this box knows no admissible
+        // peer, or — read `asker_basis` — that the ask was never proven.
         "invited_peers": inv.invited,
         // The evidence the invitation was issued ON — liveness AT INVITE, per seat.
         // Without it, an absent peer six hours later cannot be told from a seat that was
