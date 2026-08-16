@@ -25,8 +25,15 @@ grammar.  v3 therefore changes three things rather than adding a fourth spelling
      bash itself, so an unmodelled construct is found by search rather than by review.
 
 Run:  python3 tools/claude_heredoc_excision_v3_2751.py
-      python3 tools/claude_heredoc_excision_v3_2751.py --fuzz
+      python3 tools/claude_heredoc_excision_v3_2751.py --fuzz --fuzz-limit 6000
       python3 tools/claude_heredoc_excision_v3_2751.py --emit-diff
+
+A fuzz table is pinned to the generator's VINTAGE, not just to the limit.  `--fuzz-limit`
+strides over the product, so adding one entry to any axis changes the stride and therefore
+the whole sample: 543e1fa widened _FUZZ_OP 12 -> 17 and moved the published 3e13f25 table
+(6000/386/3178/1938/834) to 6000/129/3359/2805/2526 without regressing anything.  Every
+table therefore prints its own axis sizes, space and stride — quote those with the numbers
+or the numbers cannot be checked.
 
 Superseded context — the refusal v2 answered (kept: v3 must not reopen it):
 
@@ -900,8 +907,19 @@ def main():
             v2m.build_patched(v2dir)
             mods.insert(1, ("v2 (control)", load(v2dir)))
         report, n, undecided = run_fuzz(mods, args.fuzz_limit)
-        print("--- generated construct space: %d cases, %d undecided by the oracle ---"
-              % (n, undecided))
+        # VINTAGE.  A table is meaningless without the generator that produced it: the
+        # limit strides over the product, so one added axis entry reshuffles the entire
+        # sample.  543e1fa moved this table by widening _FUZZ_OP alone and nothing in the
+        # old output said so.  Print what a re-runner needs to tell "different generator"
+        # from "different result".
+        _axes = (("PREFIX", _FUZZ_PREFIX), ("OP", _FUZZ_OP), ("DELIM", _FUZZ_DELIM),
+                 ("BODY", _FUZZ_BODY), ("TERM", _FUZZ_TERM), ("SUFFIX", _FUZZ_SUFFIX))
+        _space = len(_fuzz_cases("/x"))
+        print("--- generator vintage: %s | space=%d sampled=%d stride=%d ---"
+              % (" ".join("%s=%d" % (k, len(v)) for k, v in _axes), _space, n,
+                 max(1, _space // args.fuzz_limit) if args.fuzz_limit else 1))
+        print("--- generated construct space: %d cases sampled, %d undecided by the oracle"
+              " (the SPACE is %d; %d is the stride sample) ---" % (n, undecided, _space, n))
         for label, (holes, fps, decided) in report.items():
             print("  %-14s holes=%-4d false-positives=%-5d decided=%d"
                   % (label, len(holes), fps, decided))

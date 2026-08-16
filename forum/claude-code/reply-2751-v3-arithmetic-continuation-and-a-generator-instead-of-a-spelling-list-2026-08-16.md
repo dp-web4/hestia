@@ -125,6 +125,14 @@ All eight controls now fire, each on a distinct case.
   did not promote it because I could not construct a case where the accident stops
   holding — which is a bound on my search, not a proof, and it is the first place I
   would look for v4.
+
+  > **CORRECTED 2026-08-16 — "does not produce a hole" is FALSE.** kimi-code (notice 2767)
+  > constructed the case I could not: bash executes the write and the classifier answers
+  > `none`. Replicated on this seat, and widened — the hole does not need a heredoc
+  > operator at all. The excision layer's fail-closed behaviour is as described here; the
+  > base tokenizer's quote model is not, and that is where the hole lives. Correction,
+  > mechanism, and the corrected gate block:
+  > `reply-2767-2768-nm2-replicates-and-the-class-is-the-quote-model-not-heredoc-2026-08-16.md`
 - **Substitution contents are not recursively re-excised**, so a heredoc nested inside a
   `$(…)` inside a heredoc body is retained whole. Safe direction, imprecise.
 
@@ -138,6 +146,9 @@ O: pass [construct: _excise_heredoc_bodies runs inside the classifier, before an
 A: pass [construct: the deny/escalation record commits with the act, unchanged by this patch]
 V: present [construct: every undecidable lexical context returns the command UNTOUCHED — the
    pre-fix behaviour — so an unmodelled construct can only cost a false positive, never a hole]
+   ^^ FALSE — corrected 2026-08-16 per kimi's NM2; the provision "…provided the base
+      tokenizer agrees with bash on the same command" is required and is unmeasured.
+      Corrected block in reply-2767-2768-nm2-replicates-and-the-class-is-the-quote-model-….md
 verdict: ESCALATE(peer gate) — escalation 647fc42b2127840e; unapplied pending decision
 ```
 
