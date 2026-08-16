@@ -2614,6 +2614,100 @@ def main() -> int:
         if _rc is not None:
             return _rc
 
+    # ── GATE 1 — MRH SCOPE, decided by the SHARED CORE. The Sprint F cutover, for the seat
+    # that wrote the core and then never adopted it.
+    #
+    # dp, 2026-08-16: "law has to be applied uniformly to ALL. that is the only way the law is
+    # trusted." Measured the same day, from the installed gates and the daemon's own chain:
+    #
+    #     seat          evaluate()   scope resolution   denies / acts
+    #     claude-code       0              0              0 / 266     <- this file
+    #     kimi             13              4              8 / 126
+    #     codex            16              4              2 /  12
+    #
+    # This gate was the LARGEST of the three and enforced the LEAST. It never called the common
+    # law at all, so for 266 acts this seat was judged by a rule the other seats were bound by
+    # and it was not — while adjudicating their appeals and writing rulings about their conduct.
+    # That is not a coverage gap. It is the author of the law being outside it.
+    #
+    # WHY IT COULD NOT LAND UNTIL NOW, stated so the delay does not read as an excuse: cutting
+    # over while the standing store was empty would have left this seat at scope=() and bricked
+    # it mid-session, because `launch_cwd_repo` returns nothing on a mesh wake. The society
+    # floor (2026-08-16, 28 paths, identical for every member) removed that precondition — this
+    # seat now inherits the same floor as everyone else and needs no per-member grant to work.
+    # The exemption outlived its justification by exactly as long as it took to build the floor.
+    #
+    # FAIL-CLOSED, deliberately, including on import failure. An earlier draft let an
+    # unimportable core fall through to the daemon path "to be safe during the cutover" — which
+    # is the exemption surviving on the error path, the same privilege wearing an apology. If
+    # the core cannot be reached this seat degrades like every other: deny writes, allow reads.
+    try:
+        import hestia_gate_core as _core
+    except Exception as _e:  # noqa: BLE001
+        sys.stderr.write(
+            f"hestia: deny [gate.core_unavailable] — the shared law core could not be imported "
+            f"({type(_e).__name__}). This seat does not fall back to an unscoped path: that is "
+            f"the exemption this cutover exists to end.\n")
+        return 2
+
+    _CORE_PROFILE = _core.HarnessProfile(
+        member_id=PLUGIN_ID,
+        identity_path=os.path.join(os.path.expanduser("~/.claude"), "hestia-instance",
+                                   "identity.json"),
+        # THE MEMBER'S OWN HOME. Omitted in the first draft of this cutover, and the omission
+        # would have denied this seat its own config and memory directory — `path_in_scope`
+        # falls through to "absolute, outside the workspace" for anything under ~/.claude.
+        # `/tmp` is already exempt in the core, so the scratchpad was never at risk; this is
+        # the other half.
+        #
+        # It does NOT weaken gate protection: self-protection runs BEFORE this gate, so a write
+        # aimed at the hook files under here is classified and refused by the closure
+        # classifier and never reaches scope. Home means "this member's own state", not "this
+        # member's own law". And the core resolves each marker through expanduser AND realpath
+        # and compares at the separator, so a sibling like `~/.claude-evil/` cannot ride in on
+        # a prefix match.
+        home_markers=("~/.claude",),
+        workspace_env="HESTIA_WORKSPACE",
+    )
+    _WS = os.environ.get("HESTIA_WORKSPACE") or "/mnt/c/exe/projects/ai-agents"
+
+    # The event, normalised the way the core expects. Paths and command come from the same
+    # tool_input the closure classifier already read — one extraction, not a second opinion.
+    _paths = [tool_input[k] for k in ("file_path", "path", "notebook_path")
+              if isinstance(tool_input.get(k), str) and tool_input.get(k).strip()]
+    _cmd = tool_input.get("command") if isinstance(tool_input.get("command"), str) else None
+    _ev = _core.NormalizedEvent(tool=tool_name, paths=_paths, command=_cmd,
+                                cwd=event.get("cwd"), raw=event)
+
+    _snapshot = None
+    try:
+        from hestia_gate_mechanism import fetch_policy_snapshot
+        _snapshot = fetch_policy_snapshot(PLUGIN_ID, host_agent=HOST_AGENT,
+                                          host_session_id=host_session_id)
+    except Exception:  # noqa: BLE001 — an unimportable mechanism IS an unreachable daemon
+        _snapshot = None
+
+    if _snapshot is not None:
+        # The live snapshot always carries `in_scope`, so resolution can never fall through to
+        # a member-writable replica on this path (Sprint D deleted that authority source). As
+        # of 2026-08-16 `in_scope` also carries the SOCIETY FLOOR, which is why this seat needs
+        # no grant of its own to keep working.
+        _policy = _core.resolve_agent_policy(_CORE_PROFILE,
+                                             vault_reader=lambda _m: _snapshot)
+        _v = _core.evaluate(_ev, _CORE_PROFILE, _WS, policy=_policy)
+        if _v.blocks:
+            sys.stderr.write(f"hestia: deny [{_v.rule}] — {_v.reason}\n")
+            debug_log(f"scope deny: {_v.rule} {tool_name}")
+            return 2
+    elif fail_closed():
+        # The ratified degraded mode, computed by the core rather than invented here:
+        # deny writes, allow reads. Same posture kimi and codex have had since Sprint F.
+        _v = _core.degraded_verdict(_ev, _CORE_PROFILE)
+        if _v.blocks:
+            sys.stderr.write(f"hestia: deny [{_v.rule}] — {_v.reason}\n")
+            debug_log(f"degraded scope deny: {_v.rule} {tool_name}")
+            return 2
+
     # Try the daemon first — IN-PROCESS via the shared mechanism (Sprint E, one transport).
     verdict = ask_daemon(tool_name, tool_input, tool_use_id, host_session_id)
     if verdict is not None:
