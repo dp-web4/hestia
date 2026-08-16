@@ -112,6 +112,11 @@
      1100x720 the shell is dropped and the page scrolls normally — a govern screen that only
      works inside the pinned shell is broken on every small screen, and the failure would be
      invisible to anyone developing at desktop size (§6.4). */
+  /* The govern screen's member selector. Same `.orch-chip` look as the agents bar —
+     deliberately, because it IS the same selection — with its own spacing since it sits
+     above the section tabs rather than in a card header. */
+  .govern-orch-bar { display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 0 0 0.7rem;
+    align-items: center; }
   .govern-nav { display: flex; gap: 0; margin: 0 0 0.8rem; border: 1px solid var(--border);
     border-radius: 999px; overflow: hidden; align-self: flex-start; }
   .govern-chip { background: transparent; color: var(--fg-dim); border: 0; font: inherit;
@@ -1118,6 +1123,21 @@
          original defect was five escalations opened against dp in one session, none of which
          dp saw — putting them one tab-click away is a smaller version of that same failure. -->
     <div id="govern-view" class="dash-view" hidden>
+      <!-- WHO THIS SCREEN IS ABOUT. dp, 2026-08-16: "policy only gives society-level control
+           not per agent. it should have the same 'all' 'agent1'... selection as agents screen".
+           Correct, and the defect was mine: the policy controls ALREADY scope per member — they
+           key on `selectedOrch` — but moving the pane into govern left its selector behind on
+           the agents screen. The scoping mechanism arrived without its control, so from here
+           everything silently meant SOCIETY. The policy banner even said "Select a member above
+           to scope it" while pointing at a control that was not on the screen.
+
+           SAME SELECTION, not a second one. This drives the same `selectedOrch` the agents
+           screen does, so a member picked on either screen is the member on both. Two
+           independent selections would be a governance surface where the thing you are editing
+           depends on which screen you last touched. §6.0.2: an operator who has learned one
+           screen has learned both. -->
+      <div class="orch-bar govern-orch-bar" id="govern-orch-bar"></div>
+
       <nav class="govern-nav" id="govern-nav" aria-label="Governance section">
         <button type="button" class="govern-chip selected" data-gov="ledger">ledger</button>
         <button type="button" class="govern-chip" data-gov="grants">grants</button>
@@ -2497,6 +2517,8 @@
     // is counting down, so a frozen frame would show an expired grant as still in force.
     if (activeView === 'govern' && governSection === 'grants') renderScopeGrants(data);
     renderOrchBar(data);
+    // The govern screen's copy of the selection, driven by the same state.
+    renderGovernOrchBar(data);
     // Decide the opening view once, from the first real snapshot: no local agents AND no
     // trust history → this box has nothing to govern, so open on hubs (its dominant screen).
     // A manual switch pins the choice and suppresses this forever.
@@ -2843,6 +2865,91 @@
       : '';
   }
 
+  // THE GOVERN SCREEN'S MEMBER SELECTOR — dp, 2026-08-16: "all of governance surface should
+  // follow that scheme". One selection, and EVERY pane obeys it: the ledger filters to that
+  // member's rows, grants filters to its grants and pre-fills the grant form, acts pre-fills
+  // the subject, and policy scopes its presets (which it already did — it was the only one
+  // wired, and it had no control to read).
+  //
+  // It writes the SAME `selectedOrch` the agents screen writes. A second, govern-local
+  // selection would mean the thing you are editing depends on which screen you last touched —
+  // which is the class of ambiguity this whole surface exists to remove.
+  //
+  // Deliberately leaner than the agents bar: no trust levels, action counts, idle badges or
+  // connect buttons. Those describe a harness's activity, which is the agents screen's
+  // question. Here the only question is WHO THIS ACT IS ABOUT, so the chip carries a name and
+  // whether it is currently selected, and nothing that could be mistaken for a reason to pick
+  // one. Same `.orch-chip` classes, so it is visibly the same control.
+  function renderGovernOrchBar(data) {
+    const root = $('govern-orch-bar');
+    if (!root) return;
+    const orchs = (data?.orchestrators || []).filter(o => o.connected);
+    // Members that hold governance state but are not currently connected must still be
+    // selectable, or their grants and history become unreachable the moment they go quiet —
+    // the same defect the agents bar fixed by keeping idle members clickable.
+    const known = new Set(orchs.map(o => o.id));
+    for (const g of (data?.scope_grants || [])) if (g.plugin_id) known.add(g.plugin_id);
+    for (const g of (data?.instance_grants || [])) if (g.plugin_id) known.add(g.plugin_id);
+    const names = [...known].sort();
+
+    const sig = JSON.stringify([names, selectedOrch]);
+    if (root.dataset.sig === sig) return;   // don't rebuild on every tick
+    root.dataset.sig = sig;
+
+    const chip = (id, label, sel, title) =>
+      `<span class="orch-chip${sel ? ' selected' : ''}" ${id ? `data-gov-pid="${escapeHtml(id)}"` : 'data-gov-all="1"'} title="${escapeHtml(title)}"><span>${escapeHtml(label)}</span></span>`;
+    root.innerHTML =
+      chip(null, 'All', selectedOrch === null,
+           'every member — society-level acts change the baseline for all of them')
+      + names.map(n => chip(n, n, selectedOrch === n,
+           `scope this screen to ${n}`)).join('');
+
+    root.querySelectorAll('[data-gov-all]').forEach(el => el.addEventListener('click', () => {
+      if (selectedOrch === null) return;
+      selectedOrch = null;
+      if (lastData) rerender(lastData);
+      governRefreshPanes();
+    }));
+    root.querySelectorAll('[data-gov-pid]').forEach(el => el.addEventListener('click', () => {
+      const pid = el.getAttribute('data-gov-pid');
+      selectedOrch = (selectedOrch === pid) ? null : pid;
+      if (lastData) rerender(lastData);
+      governRefreshPanes();
+    }));
+  }
+
+  // The panes that fetch rather than render from the snapshot need a nudge when the selection
+  // changes, or the screen would show the previous member's rows until the next poll.
+  function governRefreshPanes() {
+    if (governSection === 'ledger') loadLedger();
+    if (governSection === 'acts') governPrefillActs();
+    // POLICY MUST BE REFRESHED TOO, and leaving it out was the bug in the first version of
+    // this: selecting a member re-scoped the grants, the ledger and the act subjects while the
+    // policy banner still read "Presets below change the SOCIETY baseline". That is the worst
+    // possible pane to leave stale — the operator had just narrowed the screen to one member,
+    // and the control that changes the law for EVERY member looked like it had narrowed too.
+    // The banner is the only thing standing between "scope kimi" and "set the whole fleet
+    // permissive", which is a mistake that has already happened twice on this surface.
+    if (governSection === 'policy') fetchPolicy();
+    if (lastData) renderScopeGrants(lastData);
+  }
+
+  // Pre-fill the SUBJECT of every operator act with the selected member. It is a default, not
+  // a lock — the fields stay editable, because adjudicating a member you have not selected is
+  // legitimate. What it prevents is the far likelier error: selecting kimi-code, reading its
+  // history, and then typing a different id into the act you were moved to record.
+  function governPrefillActs() {
+    const m = selectedOrch;
+    if (!m) return;
+    for (const id of ['adj-plugin', 'ali-of', 'sg-plugin']) {
+      const el = $(id);
+      if (el && !el.value.trim()) {
+        el.value = m;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    }
+  }
+
   // MRH SCOPE GRANTS — what each member may reach, and which half of it survives a restart.
   //
   // Renders from the snapshot (`scope_grants`, both kinds merged, each row carrying its own
@@ -2883,7 +2990,20 @@
     const list = $('scope-grant-list');
     if (!list) return;
     if (!data) { list.innerHTML = '<div class="empty">loading…</div>'; return; }
-    const rows = data.scope_grants ?? [];
+    const all = data.scope_grants ?? [];
+    // OBEY THE SELECTION. With a member selected this screen is about that member, so a grant
+    // belonging to someone else is not "context" — it is the wrong answer to the question the
+    // operator asked by clicking a name.
+    const rows = selectedOrch ? all.filter(g => g.plugin_id === selectedOrch) : all;
+    if (selectedOrch && !rows.length && all.length) {
+      // Say WHICH member is empty and that others are not, so a filtered-empty view is never
+      // mistaken for "no grants exist" — the bare-empty-under-a-filter defect the ledger's own
+      // status facets already guard against.
+      list.innerHTML = `<div class="empty"><strong>${escapeHtml(selectedOrch)}</strong> holds no
+        scope grants. ${all.length} grant${all.length > 1 ? 's are' : ' is'} in force for other
+        members — click <em>All</em> to see them.</div>`;
+      return;
+    }
     if (!rows.length) {
       // "No grants" is a FACT, not an achievement, and must not render as success (§6.3).
       // It is also the state that produced 102 denies across kimi and codex on 2026-08-15,
@@ -3167,11 +3287,29 @@
       // the snapshot instead, and the note there for why.
       $('ledger-scanned').textContent = `${data.scanned ?? 0} scanned`;
 
-      const rows = data.rows || [];
+      const allRows = data.rows || [];
+      // OBEY THE MEMBER SELECTION, like every other pane on this screen. Filtered client-side
+      // rather than by re-querying: the ledger read is the expensive call on this page (8-15s
+      // against the live chain), and the rows are already here.
+      //
+      // Rows with NO plugin_id are kept under a selection on purpose. Society-level acts — law
+      // edits, amnesty, operator sessions — are not "somebody else's rows"; they are the acts
+      // that bind the selected member too, and dropping them would let an operator conclude
+      // that nothing governs a member when the governing act simply named no one.
+      const rows = selectedOrch
+        ? allRows.filter(r => !r.plugin_id || r.plugin_id === selectedOrch)
+        : allRows;
       if (!rows.length) {
-        // Say which filter is empty. A bare "nothing here" under a selected tab is how an
-        // operator concludes the system is quiet when they are looking through one facet.
-        list.innerHTML = `<div class="empty">No <strong>${ledgerStatus}</strong> admin acts in this range.</div>`;
+        // Say which filter is empty, and name EVERY filter in play — status, range, and now
+        // member. A bare "nothing here" under three stacked filters is how an operator
+        // concludes the system is quiet while looking through a keyhole.
+        const scope = selectedOrch
+          ? ` for <strong>${escapeHtml(selectedOrch)}</strong> (plus society-wide acts)`
+          : '';
+        list.innerHTML = `<div class="empty">No <strong>${ledgerStatus}</strong> admin acts in this range${scope}.${
+          selectedOrch && allRows.length
+            ? ` ${allRows.length} row${allRows.length > 1 ? 's' : ''} exist for other members — click <em>All</em>.`
+            : ''}</div>`;
         return;
       }
       list.innerHTML = rows.map(renderLedgerRow).join('');
@@ -3428,7 +3566,7 @@
     grants: { el: 'govern-grants', mount: () => renderScopeGrants(lastData) },
     // Acts are pure forms — nothing to fetch, so no mount hook. A mount that did nothing but
     // exist would be the "looks wired" shape this file keeps refusing.
-    acts:   { el: 'govern-acts' },
+    acts:   { el: 'govern-acts', mount: () => governPrefillActs() },
     policy: { el: 'govern-policy', mount: () => fetchPolicy() },
   };
   let governSection = 'ledger';

@@ -668,6 +668,15 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             "in_scope": [],
             "scope_grants": [],
             "standing_grants": [],
+            # Initialised HERE, with its siblings. The omission was a real bug for the ten
+            # minutes it existed: the floor block below appends to this key, and an
+            # uninitialised key raises KeyError INSIDE the try — where the bare
+            # `except Exception` converts it into `_snapshot_unavailable`, i.e. every member
+            # drops to DEGRADED MODE. A missing dict key would have presented as "the daemon
+            # is unreachable" fleet-wide, which is the most expensive possible disguise for a
+            # typo. Latent rather than live only because the append is guarded on a daemon
+            # that serves a floor, and no deployed daemon did yet.
+            "society_floor": [],
             "generation": None,
             "expires_at": None,
         }
@@ -725,6 +734,26 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             exp = scope.get("snapshot_expires_at")
             if isinstance(exp, int) and not isinstance(exp, bool):
                 snap["expires_at"] = exp
+            # THE SOCIETY FLOOR (dp, 2026-08-16) — paths every member of this society may
+            # reach, served identically to all of them and additive to whatever this member
+            # holds of its own: effective(m) = floor ∪ member(m), never a subtraction.
+            #
+            # Mapped through the SAME `_scope_entry_for_grant` the two grant channels use, so
+            # a floor path admits by exactly the rule a granted path does — a repo root as a
+            # repo-name grant, anything deeper as an inert `path:` entry. A second mapping
+            # here would be a second law for the same question, which is the drift this list
+            # exists to prevent.
+            #
+            # Absent on an older daemon, in which case every line below is a no-op and the
+            # snapshot is exactly the pre-floor one: a member talking to a daemon that has no
+            # floor gets no floor, rather than an error or a guess.
+            floor = scope.get("society_floor")
+            if isinstance(floor, list):
+                for f in floor:
+                    p = f.get("path") if isinstance(f, dict) else None
+                    if isinstance(p, str) and p.strip():
+                        snap["society_floor"].append(p.strip())
+                        snap["in_scope"].append(_scope_entry_for_grant(p))
         return snap
     except Exception as e:  # noqa: BLE001 — any failure is "unreachable"; the caller degrades
         _snapshot_unavailable(

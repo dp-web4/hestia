@@ -445,6 +445,13 @@ pub async fn serve_with_callback(
         // carries `request_id: null` and `origin: "operator_initiated"`. A reader can always
         // tell them apart. What is gone is the DEPENDENCY, not the distinction.
         .route("/api/scope/grant", post(scope_grant))
+        // THE SOCIETY FLOOR (dp, 2026-08-16). Same operator wall as every other widening, and
+        // deliberately NOT reachable from MCP: a member that could edit the floor could widen
+        // itself AND every peer in one act, which is the largest privilege escalation this
+        // codebase could offer. The floor is the one list that must be editable from exactly
+        // one direction.
+        .route("/api/scope/floor", post(scope_floor_add))
+        .route("/api/scope/floor/remove", post(scope_floor_remove))
         .route("/api/policy/preset", put(policy_set_preset))
         .route("/api/policy/override", put(policy_set_override))
         .route(
@@ -2094,6 +2101,204 @@ async fn scope_grant(
             // Both halves of the pair are returned, so a caller can verify the ordering on the
             // chain itself rather than trusting this response's word for it.
             "intentEntryHash": intent_hash,
+        })),
+    )
+}
+
+/// `POST /api/scope/floor` {path, reason} — add a path to THE SOCIETY FLOOR.
+///
+/// dp, 2026-08-16: *"law has to be applied uniformly to ALL. that is the only way the law is
+/// trusted."* This is the surface that makes that structural rather than aspirational: one
+/// list, consulted for every member, that no member can hold a different copy of.
+///
+/// **Wider than any grant on this box, and the response says so.** A standing grant widens one
+/// member; this widens every member at once, including ones that have never connected and ones
+/// nobody is watching. It is operator-walled like every other widening, requires a stated
+/// reason for the same evidentiary purpose, and is witnessed before it takes effect.
+///
+/// **Why this is nonetheless the SAFER instrument.** The alternative — granting each member
+/// the same list — produces N copies that drift the moment one member is granted something the
+/// others are not, and then the law differs per seat while looking identical. Uniformity has
+/// to be structural or it decays. One list cannot drift.
+async fn scope_floor_add(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if raw_path.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "path is required"})),
+        );
+    }
+    if reason.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "reason is required — this widens EVERY member of this society at \
+                          once, and a widening of that breadth whose rationale is not recorded \
+                          is indistinguishable afterwards from a misconfiguration"
+            })),
+        );
+    }
+    let path = crate::server::state::normalize_scope_path(&raw_path);
+    let now = crate::server::gate_escalation::now_secs();
+
+    let mut s = state.lock().await;
+    let replaces = s.standing_scope.floor_allows(&path);
+    let members_affected = s.member_registry.len();
+
+    // ORDER: WITNESS, THEN WIDEN — and the intent/success split, for the same reason the
+    // per-member grant has it: a failed vault write must not leave the chain asserting that
+    // the whole society was widened when it was not.
+    let entry = match s.append_chain(
+        "society_floor_intent",
+        serde_json::json!({
+            "path": path,
+            "path_as_asked": raw_path,
+            "reason": reason,
+            "added_by": "operator",
+            "via": "operator_session",
+            "replaces_existing": replaces,
+            "members_in_registry": members_affected,
+            "scope": "SOCIETY — every member of this society, present and future",
+            "semantics": "additive only: effective(m) = society_floor ∪ member(m)",
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("witness append failed, floor NOT changed: {e}"),
+                    "state": "nothing recorded, nothing widened",
+                })),
+            );
+        }
+    };
+
+    let fe = crate::server::standing_scope::FloorEntry {
+        path: path.clone(),
+        added_at: now,
+        added_by: "operator".to_string(),
+        reason: reason.clone(),
+    };
+    if let Err(e) = s.commit_standing_scope(|st| st.floor_add(fe)) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("floor NOT changed — vault write failed ({e}); the live store \
+                                  is untouched (the candidate was persisted first), retry"),
+                "state": "the chain holds the INTENT and no society_floor_added",
+                "intentEntryHash": entry.hash,
+            })),
+        );
+    }
+    let generation = s.standing_scope.generation;
+    if let Err(e) = s.append_chain(
+        "society_floor_added",
+        serde_json::json!({
+            "path": path, "reason": reason, "added_by": "operator",
+            "intent": entry.hash, "standing_generation": generation,
+        }),
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("THE FLOOR IS WIDENED but its success record could not be \
+                                  appended ({e}). Under-recorded, not unrecorded: the intent is \
+                                  on the chain."),
+                "state": "floor IS in force; chain holds only the intent",
+                "intentEntryHash": entry.hash,
+            })),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "path": path,
+            "generation": generation,
+            "replaced_existing": replaces,
+            "applies_to": "every member of this society, including any that connect later",
+            "note": "additive only — a member's own grants can widen beyond this, never narrow \
+                     below it",
+            "witnessEntryHash": entry.hash,
+        })),
+    )
+}
+
+/// `POST /api/scope/floor/remove` {path, reason?} — take a path OFF the society floor.
+///
+/// The tightening direction, and the only one on this surface. It narrows every member at
+/// once — including members that never asked for the path, are not watching, and may be
+/// mid-act against it. That is strictly more consequential than revoking one member's grant,
+/// so it is recorded with the same weight rather than treated as cleanup.
+async fn scope_floor_remove(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if raw_path.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "path is required"})),
+        );
+    }
+    let path = crate::server::state::normalize_scope_path(&raw_path);
+    let mut s = state.lock().await;
+    if !s.standing_scope.floor_allows(&path) && !s.standing_scope_dirty {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "that path is not on the society floor"})),
+        );
+    }
+    let entry = match s.append_chain(
+        "society_floor_removed",
+        serde_json::json!({
+            "path": path, "reason": reason, "removed_by": "operator",
+            "via": "operator_session",
+            "scope": "SOCIETY — narrows every member at once",
+            "standing_generation": s.standing_scope.generation + 1,
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("witness append failed, floor NOT changed: {e}")
+                })),
+            );
+        }
+    };
+    // Tightening: apply to memory first, then persist — a failed vault write may only ever
+    // leave the TIGHTER state in force, which is the same rule `apply_standing_revoke` obeys.
+    let removed = s.standing_scope.floor_remove(&path);
+    if let Err(e) = s.persist_standing_scope() {
+        s.standing_scope_dirty = true;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("removed from the live floor but the vault write FAILED ({e}); \
+                                  memory is the tighter state and is kept, but a restart would \
+                                  resurrect this path — retry this exact call"),
+                "removed_from_memory": removed,
+                "witnessEntryHash": entry.hash,
+            })),
+        );
+    }
+    s.standing_scope_dirty = false;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true, "path": path, "removed": removed,
+            "generation": s.standing_scope.generation,
+            "effect": "every member of this society loses this path unless they hold their own \
+                       grant for it",
+            "witnessEntryHash": entry.hash,
         })),
     )
 }
