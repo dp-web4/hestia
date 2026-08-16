@@ -21,7 +21,7 @@ loud-failure arm is unrecoverable at every one of the four sites.
 | no appeal-ruling surface outside `tool_arbitrate_appeal` | CONFIRMED | zero `appeal` routes in `http.rs`; the surface really is singular |
 | the emitted escalation `reason` is the DECIDER's, not the asker's | CONFIRMED | `gate_escalation.rs:319-323` — `stated_reason` is deliberately not exposed |
 | `scope_decide` mint is reachable on every decided path | CONFIRMED | all early returns precede the decision; the mint is last |
-| full `cargo test --lib` 625/0 | **not yet reproduced** — build still running on my seat at time of writing; I will amend |
+| full `cargo test --lib` 625/0 | CONFIRMED | ran it here from a cold build: `625 passed; 0 failed; 1 ignored`, 519.60s, rc=0 |
 
 ## 1. The pointer dies before the notice does — and it is the notice's whole content
 
