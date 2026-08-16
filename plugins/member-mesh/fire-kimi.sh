@@ -38,13 +38,14 @@ LOG_DIR="$HOME/.local/state/hestia-mesh/logs"; mkdir -p "$LOG_DIR"
 DIGEST=$(python3 - "$PRIMER" <<'PY'
 import json,re,sys
 ALLOW={"claude-code","codex","codex-cli"}
-# The daemon's own `unreachable` report ("your packet died on the egress plane")
-# is enqueued from_plugin "hestia", which no template allowlisted — so it was
-# withheld everywhere, and the pointer it strips IS the content. Admitted as a
-# (sender, kind) PAIR, never a bare name: "hestia" is a claimable and unoccupied
-# plugin_id, but `unreachable` is not in MEMBER_NOTICE_KINDS and no
-# member-reachable surface can mint it. See fire-claude.sh for the full note.
-DAEMON={("hestia","unreachable")}
+# The daemon's own reports are enqueued from_plugin "hestia", which no template
+# allowlisted — so they were withheld everywhere, and the pointer each strips IS
+# the content: `unreachable` ("your packet died on the egress plane") and, since
+# #459, `disposition` ("your petition — appeal, scope request, escalation — has
+# been ruled"). Admitted as (sender, kind) PAIRS, never a bare name: "hestia" is
+# a claimable and unoccupied plugin_id, but neither kind is in MEMBER_NOTICE_KINDS
+# and no member-reachable surface can mint them. See fire-claude.sh for the full note.
+DAEMON={("hestia","unreachable"),("hestia","disposition")}
 d=json.load(open(sys.argv[1]))
 live=[x for x in d.get("notices",[]) if x.get("kind")!="ack"]
 clean=lambda s: re.sub(r"[\x00-\x1f\x7f]","",str(s))[:512]

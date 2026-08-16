@@ -186,6 +186,21 @@ impl ServerHandler for HestiaServer {
                  deny_hash and whether the appeal is still open.",
             ),
             make_resource_template(
+                "hestia://scope/{request_id}",
+                "Scope request and its decision by id",
+                "Dereference the pointer a scope disposition notice carries (#459). Resolves \
+                 from the in-memory request store: status/granted/decided_by/decision_reason/\
+                 expires_at. A restart clears the store, and the not-found arm says so — \
+                 unknown is not refused.",
+            ),
+            make_resource_template(
+                "hestia://escalation/{id}",
+                "Gate escalation and its decision by id",
+                "Dereference the pointer an escalation invitation (#corroborate-or-dissent) \
+                 or disposition notice (#decided, #459) carries: status/decided_by/decided_at/\
+                 reason. Unknown id answers UNKNOWN, never denied.",
+            ),
+            make_resource_template(
                 "hestia://chain/{hash}",
                 "Witness chain entry by hash",
                 "Dereference ANY chain entry by hash or hash prefix — appeals, denies, outcomes, \
@@ -3184,8 +3199,30 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         }),
     )?;
 
+    // #459: the ruling's RETURN EDGE. The appeal had an outbound wake (the arbiter
+    // was asked to rule) and no way back — until this, a ruled appeal read exactly
+    // like an open one to the member who filed it, and the petitioner had to poll
+    // or be told out of band. Witnessed first, then enqueued, and a failed enqueue
+    // is an ERROR: a witnessed-but-unreported ruling is the hole this closes.
+    let disposition_notice_id = report_disposition(
+        &mut s,
+        appellant,
+        &format!("hestia://appeal/{deny_hash}#ruled"),
+        json!({
+            "about_deny_hash": deny_hash,
+            "upheld": upheld,
+            "adjudicator": arbiter.plugin_id,
+            "independence": independence,
+            "was_designee": routed_to.as_deref() == Some(arbiter.plugin_id.as_str()),
+            "adjudication_entry": entry.hash,
+            "note": "the appeal you filed has been ruled; the pointer resolves to the \
+                     appeal and its ruling",
+        }),
+    )?;
+
     Ok(json!({
         "witnessEntryHash": entry.hash,
+        "disposition_notice_id": disposition_notice_id,
         "subject_plugin_id": appellant,
         "about_deny_hash": deny_hash,
         "upheld": upheld,
@@ -3823,6 +3860,27 @@ const MEMBER_NOTICE_KINDS: &[&str] = &[
 /// caller-supplied at connect, so the name `hestia` is claimable and the KIND is the
 /// only unforgeable half.
 const DAEMON_NOTICE_KIND_UNREACHABLE: &str = "unreachable";
+
+/// The daemon's second notice kind (#459), and likewise deliberately NOT in
+/// [`MEMBER_NOTICE_KINDS`] — same split, same reason: `tool_member_notify` refuses
+/// it, so no member can emit it; the store does not validate, so the daemon can.
+///
+/// What it reports is the RETURN EDGE on a petition surface. Appeals, scope
+/// requests and escalations all had an outbound wake (the arbiter/operator is
+/// asked to rule) and no way back: once ruled, the petitioner had to poll or be
+/// told out of band, and a ruled appeal read exactly like an open one. This kind
+/// is minted at each ruling site — `tool_arbitrate_appeal`, `http::scope_decide`,
+/// and both escalation decision surfaces — witnessed by a
+/// `member_notice_disposition` chain entry BEFORE the enqueue, the same order
+/// `retire_and_report_egress` keeps. A "your petition has been ruled" notice any
+/// member could send is a claim; one only the daemon can send, written next to the
+/// ruling it reports, is evidence.
+///
+/// The receiver-side obligations are the same two as `unreachable` and are
+/// documented with it: receivers must not filter it, and renderers must admit it
+/// as the `(sender, kind)` PAIR `("hestia", "disposition")` — see "Daemon-only" in
+/// `plugins/member-mesh/KINDS.md`.
+const DAEMON_NOTICE_KIND_DISPOSITION: &str = "disposition";
 
 // ---- id-binding (Kimi ↔ CBP, 2026-07-25): two DIFFERENT per-kind sets ----
 //
@@ -4610,6 +4668,50 @@ fn retire_and_report_egress(
     }))
 }
 
+/// Report a petition's ruling to the petitioner (#459) — the return edge every
+/// petition surface (appeal, scope request, escalation) used to lack.
+///
+/// The shape is `retire_and_report_egress`'s, for the same reasons:
+///
+/// 1. Witnessed BEFORE it is queued (O: witness precedes delivery) — a
+///    `member_notice_disposition` entry carrying the about-reference, the verdict
+///    and who decided, so the notice is evidence attached to a ruling that exists,
+///    not a bare claim that one does.
+/// 2. A failed enqueue is NOT swallowed: a ruling that was witnessed but never
+///    reported is exactly the hole this kind exists to close, so the caller gets
+///    the error and the ruling stays visible on the chain either way.
+///
+/// `to` is a local member by construction at every call site (the appellant proven
+/// by session, the requester/asker who filed locally), so this is a local enqueue
+/// and cannot re-enter the egress plane.
+pub(crate) fn report_disposition(
+    s: &mut super::state::ServerState,
+    to: &str,
+    pointer: &str,
+    event_data: Value,
+) -> anyhow::Result<u64> {
+    let entry = s.append_chain("member_notice_disposition", event_data)?;
+    let notice_id = s
+        .inbox_store
+        .enqueue_member(
+            to,
+            "hestia",
+            crate::reputation::DEFAULT_CONSTELLATION_ROLE,
+            DAEMON_NOTICE_KIND_DISPOSITION,
+            Some(pointer),
+            &entry.hash,
+            None,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "the disposition was witnessed ({}), but the report to '{to}' could NOT be \
+                 queued ({e}) — the petitioner does not know its petition was ruled",
+                entry.hash
+            )
+        })?;
+    Ok(notice_id)
+}
+
 async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
     let session_id_arg = optional_session_id(args);
     let mut s = state.lock().await;
@@ -5116,20 +5218,36 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
     // well-formed — it is the target that is missing, ambiguous or mislabelled,
     // and collapsing those four outcomes into one protocol error rebuilds the
     // exact ambiguity this resolver exists to remove.
+    // A fragment is a within-document marker, not part of the lookup key. The
+    // daemon-minted disposition pointers (#459) carry one — `…#ruled`,
+    // `…#decided` — to say WHAT about the target the notice concerns; resolving
+    // on the full URI would miss the entry every one of them names.
+    let lookup = uri.split('#').next().unwrap_or(&uri);
     // `hestia://appeal/<hash>` needs its own resolver and cannot use the table below —
     // see `resolve_appeal_pointer`. It was absent from that table entirely, which meant the
     // daemon minted this pointer into every appeal dispatch notice and no surface could
     // follow it: the same unfollowable-pointer defect the adjudication case fixed, surviving
     // that fix because that fix was driven by a received ADJUDICATION notice.
-    if let Some(ptr) = uri.strip_prefix("hestia://appeal/") {
+    if let Some(ptr) = lookup.strip_prefix("hestia://appeal/") {
         let body = resolve_appeal_pointer(&s, ptr);
+        return Ok(serde_json::to_string(&body).unwrap_or("{}".into()));
+    }
+    // The #459 disposition pointers, resolved from the stores the decisions live
+    // in (both memory-only, and their not-found arms say so — an unknown id must
+    // not read as a ruling).
+    if let Some(ptr) = lookup.strip_prefix("hestia://scope/") {
+        let body = resolve_scope_pointer(&s, ptr);
+        return Ok(serde_json::to_string(&body).unwrap_or("{}".into()));
+    }
+    if let Some(ptr) = lookup.strip_prefix("hestia://escalation/") {
+        let body = resolve_escalation_pointer(&s, ptr);
         return Ok(serde_json::to_string(&body).unwrap_or("{}".into()));
     }
     for (prefix, expect) in [
         ("hestia://adjudication/", Some("adjudication")),
         ("hestia://chain/", None),
     ] {
-        if let Some(ptr) = uri.strip_prefix(prefix) {
+        if let Some(ptr) = lookup.strip_prefix(prefix) {
             let body = resolve_chain_pointer(&s, ptr, expect);
             return Ok(serde_json::to_string(&body).unwrap_or("{}".into()));
         }
@@ -5252,6 +5370,91 @@ fn resolve_appeal_pointer(s: &super::state::ServerState, pointer: &str) -> Value
                      rule it now: hestia_arbitrate_appeal with the deny_hash above. You do not \
                      need to have been routed it — designation is advisory.",
         },
+    })
+}
+
+/// Dereference `hestia://scope/{request_id}` — the pointer a scope `disposition`
+/// notice (#459) carries — to the request AND its decision.
+///
+/// The store is MEMORY-ONLY (state.rs's asymmetry table: live loosening dies with
+/// the daemon), and the not-found arm has to say so, because the two failure
+/// readings are otherwise indistinguishable: "no such request" after a restart is
+/// the null state, "refused" is a ruling, and a petitioner told the first who
+/// hears the second will re-ask for something nobody denied — or worse, not.
+fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value {
+    let ptr = pointer.trim();
+    if ptr.is_empty() {
+        return hestia_error_envelope(
+            "hestia.scope_pointer_malformed",
+            "hestia://scope/ needs a request id (what hestia_request_scope returned as \
+             request_id)",
+            None,
+        );
+    }
+    let now = crate::server::gate_escalation::now_secs();
+    let Some(req) = s.scope_requests.get(ptr) else {
+        return hestia_error_envelope(
+            "hestia.scope_pointer_not_found",
+            &format!(
+                "no scope request with id '{ptr}' on this daemon. That is UNKNOWN, not \
+                 refused: scope requests live in memory and do not survive a restart, so an \
+                 absent id says nothing about whether any ask was granted or refused. The \
+                 witnessed decision, if one was made, is on the chain as scope_granted / \
+                 scope_refused"
+            ),
+            Some(json!({"pointer": ptr})),
+        );
+    };
+    json!({
+        "pointer": ptr,
+        "request_id": req.id,
+        "plugin_id": req.plugin_id,
+        "path": req.path,
+        "requested_because": req.reason,
+        "status": req.status(now),
+        "granted": req.granted,
+        "decided_by": req.decided_by,
+        "decision_reason": req.decision_reason,
+        "expires_at": req.expires_at,
+    })
+}
+
+/// Dereference `hestia://escalation/{id}` — carried by escalation invitations
+/// (`#corroborate-or-dissent`, minted since 2026-08 with no resolver behind it)
+/// and by escalation `disposition` notices (`#decided`, #459). Both fragments
+/// strip to the same record: the escalation and, once ruled, its decision.
+fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> Value {
+    let ptr = pointer.trim();
+    if ptr.is_empty() {
+        return hestia_error_envelope(
+            "hestia.escalation_pointer_malformed",
+            "hestia://escalation/ needs an escalation id",
+            None,
+        );
+    }
+    let now = crate::server::gate_escalation::now_secs();
+    let Some(esc) = s.gate_escalations.get(ptr) else {
+        return hestia_error_envelope(
+            "hestia.escalation_pointer_not_found",
+            &format!(
+                "no escalation with id '{ptr}' on this daemon. Unknown ids are denies at the \
+                 gate, but here that is UNKNOWN, not denied: it says no such ask is on \
+                 record, nothing about how a real one was ruled"
+            ),
+            Some(json!({"pointer": ptr})),
+        );
+    };
+    json!({
+        "pointer": ptr,
+        "escalation_id": esc.id,
+        "plugin_id": esc.plugin_id,
+        "tool_name": esc.tool_name,
+        "marker": esc.marker,
+        "status": esc.status_at(now),
+        "decided_by": esc.decided_by,
+        "decided_at": esc.decided_at,
+        "reason": esc.reason,
+        "expires_at": esc.expires_at,
     })
 }
 
@@ -11891,6 +12094,255 @@ mod appeal_tests {
         assert_eq!(via_tool["entry"]["hash"].as_str(), Some(hash.as_str()), "{via_tool}");
     }
 
+    // ---- #459: petition surfaces get a return edge ---------------------------
+    //
+    // An appeal ruled, a scope request decided, an escalation decided each used to
+    // end AT the ruling: the petitioner was never told, and had to poll or be told
+    // out of band. `disposition` is the daemon-only notice kind that closes that
+    // loop, minted at each ruling site the way `unreachable` is minted at the
+    // retirement site — same absent-from-`MEMBER_NOTICE_KINDS` split, same
+    // witness-before-enqueue order, same enqueue failure surfaced as an error.
+
+    /// The kind is reserved the way `unreachable` is: a member asking for it by name
+    /// hits the same unknown-kind refusal, while the daemon's own enqueue — through
+    /// the store, which does not validate kinds — goes through. That split is the
+    /// kind's whole value, so both halves are pinned.
+    #[tokio::test]
+    async fn a_member_cannot_mint_the_disposition_kind_but_the_daemon_can() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat(&state, "claude-code").await;
+        let out = tool_member_notify(&state, &json!({
+            "to_plugin_id": "kimi-code", "kind": "disposition",
+            "pointer_uri": "hestia://appeal/deadbeef#ruled",
+            "session_id": sid.to_string(),
+        })).await.unwrap();
+        assert_eq!(
+            out["_hestia_error"]["code"], "hestia.member_notify_unknown_kind",
+            "a member must not be able to speak for a ruling surface: {out}"
+        );
+
+        let st = state.lock().await;
+        st.inbox_store
+            .enqueue_member(
+                "kimi-code",
+                "hestia",
+                crate::reputation::DEFAULT_CONSTELLATION_ROLE,
+                "disposition",
+                Some("hestia://appeal/deadbeef#ruled"),
+                "hash",
+                None,
+            )
+            .expect("the store does not validate kinds — that split IS the kind's value");
+        let mail = st.inbox_store.drain_member("kimi-code").unwrap();
+        assert!(
+            mail.iter().any(|n| n.kind == "disposition" && n.from_plugin == "hestia"),
+            "the daemon-minted disposition must be deliverable: {mail:?}"
+        );
+    }
+
+    /// Minting site A (#459): ruling an appeal tells the APPELLANT — witnessed on the
+    /// chain first, then enqueued, with the `hestia://appeal/{deny_hash}#ruled`
+    /// pointer. And the pointer must FOLLOW: the fragment is a marker, not part of
+    /// the lookup key.
+    #[tokio::test]
+    async fn a_ruled_appeal_reports_its_disposition_to_the_appellant() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let a_sid = seat(&state, "claude-code").await;
+        let codex_sid = seat(&state, "codex").await;
+        let deny_hash = seat_deny(&state, "claude-code", a_sid, "hestia-gate").await;
+        tool_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": a_sid.to_string(),
+            "reason": "the matched token sat in a heredoc body, never in executable position",
+        })).await.unwrap();
+        let ruled = tool_arbitrate_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": codex_sid.to_string(), "upheld": true,
+            "rationale": "the rule targets chaining, not the delete; the deny was over-broad",
+        })).await.unwrap();
+        assert!(
+            ruled.get("_hestia_error").is_none(),
+            "the ruling itself must land: {ruled}"
+        );
+
+        {
+            let st = state.lock().await;
+            // Witnessed: the disposition is on the chain, carrying what it answers.
+            let disp = st
+                .recent_chain(20)
+                .into_iter()
+                .find(|e| e.event_type == "member_notice_disposition")
+                .expect("a ruling without its disposition entry is the hole #459 closes");
+            assert_eq!(disp.event_data["about_deny_hash"].as_str(), Some(deny_hash.as_str()));
+            assert_eq!(disp.event_data["upheld"], json!(true));
+            assert_eq!(disp.event_data["adjudicator"].as_str(), Some("codex"));
+
+            // Enqueued: to the APPELLANT, from the daemon, pointer naming the ruling.
+            let mail = st.inbox_store.drain_member("claude-code").unwrap();
+            let note = mail
+                .iter()
+                .find(|n| n.kind == "disposition")
+                .expect("the appellant must learn its appeal was ruled: {mail:?}");
+            assert_eq!(note.from_plugin, "hestia");
+            assert_eq!(
+                note.pointer_uri.as_deref(),
+                Some(format!("hestia://appeal/{deny_hash}#ruled")).as_deref(),
+            );
+        }
+
+        // The pointer the daemon mints must resolve, fragment and all.
+        let body = read_resource_body(&state, &format!("hestia://appeal/{deny_hash}#ruled"))
+            .await
+            .unwrap_or_else(|e| panic!("the disposition pointer must resolve: {e}"));
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ruled"], json!(true), "{v}");
+    }
+
+    /// A disposition is terminal: it answers a petition and awaits nothing, so it
+    /// must never surface in `member_unanswered` — counting it would manufacture a
+    /// debt on a petitioner whose petition was just ruled.
+    #[tokio::test]
+    async fn a_disposition_is_terminal_not_an_unanswered_debt() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let st = state.lock().await;
+        assert!(
+            !MEMBER_KINDS_AWAIT_RESPONSE.contains(&"disposition"),
+            "the kind is a ruling delivered, not a question asked"
+        );
+        st.inbox_store
+            .enqueue_member(
+                "kimi-code", "hestia", crate::reputation::DEFAULT_CONSTELLATION_ROLE,
+                "disposition", Some("hestia://scope/scope-dead01"), "h1", None,
+            )
+            .unwrap();
+        // Control: a kind that DOES await a response, same recipient, same query.
+        st.inbox_store
+            .enqueue_member(
+                "kimi-code", "claude-code", crate::reputation::DEFAULT_CONSTELLATION_ROLE,
+                "review_request", Some("shared-context/x.md"), "h2", None,
+            )
+            .unwrap();
+        let owed = st
+            .inbox_store
+            .member_unanswered("kimi-code", MEMBER_KINDS_AWAIT_RESPONSE, -1)
+            .unwrap();
+        assert!(
+            owed.iter().any(|n| n.kind == "review_request"),
+            "control: a review_request IS counted: {owed:?}"
+        );
+        assert!(
+            owed.iter().all(|n| n.kind != "disposition"),
+            "a disposition answers a petition; it awaits nothing: {owed:?}"
+        );
+    }
+
+    /// Minting site B's pointer (#459): `hestia://scope/{request_id}` resolves to the
+    /// decision, and an unknown id errors in a way that cannot read as "refused" —
+    /// unknown is not a ruling, and collapsing the two rebuilds the
+    /// null-state/healthy-state defect this resolver family exists to end.
+    #[tokio::test]
+    async fn a_scope_decision_pointer_resolves_and_an_unknown_id_is_not_a_refusal() {
+        use crate::server::state::ScopeRequest;
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut st = state.lock().await;
+            st.scope_requests.insert("scope-test459a".into(), ScopeRequest {
+                id: "scope-test459a".into(),
+                plugin_id: "kimi-code".into(),
+                role: String::new(),
+                path: "/x/y.md".into(),
+                reason: "dp asked me to read this in-session".into(),
+                requested_at: now,
+                expires_at: now + 3600,
+                granted: Some(true),
+                decided_by: Some("operator".into()),
+                decided_at: Some(now),
+                decision_reason: Some("yes, that file".into()),
+            });
+        }
+        let body = read_resource_body(&state, "hestia://scope/scope-test459a")
+            .await
+            .unwrap_or_else(|e| panic!("the daemon mints this pointer; it must resolve: {e}"));
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], json!("granted"), "{v}");
+        assert_eq!(v["granted"], json!(true), "{v}");
+        assert_eq!(v["decided_by"], json!("operator"), "{v}");
+
+        let missing = read_resource_body(&state, "hestia://scope/scope-nosuch0")
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&missing).unwrap();
+        assert_eq!(
+            v["_hestia_error"]["code"], json!("hestia.scope_pointer_not_found"),
+            "a bogus id is an unknown, distinctly — not a decision: {v}"
+        );
+        let msg = v["_hestia_error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("not") && msg.contains("refused"),
+            "the error must say what 'no such request' does NOT mean: {msg}"
+        );
+    }
+
+    /// Minting site C, the peer-ruling path (#459): a member ruling on an escalation
+    /// tells the ASKER. Minted at the tool handler, the layer that holds
+    /// `SharedState` — the store's `decide` has no inbox access.
+    #[tokio::test]
+    async fn a_decided_escalation_reports_its_disposition_to_the_asker() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let asker_sid = seat(&state, "claude-code").await;
+        let peer_sid = seat(&state, "codex").await;
+        let opened = tool_gate_escalation_open(&state, &json!({
+            "plugin_id": "claude-code", "tool_name": "policy_edit", "marker": "policy.json",
+            "reason": "the deny blocks a legitimate rule addition",
+            "session_id": asker_sid.to_string(),
+        })).await.unwrap();
+        let esc_id = opened["escalation_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the open must return its id: {opened}"))
+            .to_string();
+        let ruled = tool_gate_arbitrate_escalation(&state, &json!({
+            "escalation_id": esc_id, "approve": true, "session_id": peer_sid.to_string(),
+            "reason": "reviewed the diff; the rule is scoped to the one path",
+        })).await.unwrap();
+        assert!(
+            ruled.get("_hestia_error").is_none(),
+            "the ruling itself must land: {ruled}"
+        );
+
+        {
+            let st = state.lock().await;
+            let disp = st
+                .recent_chain(20)
+                .into_iter()
+                .find(|e| e.event_type == "member_notice_disposition")
+                .expect("a decided escalation without its disposition entry is the hole #459 closes");
+            assert_eq!(disp.event_data["escalation_id"].as_str(), Some(esc_id.as_str()));
+            assert_eq!(disp.event_data["decided_by"].as_str(), Some("codex"));
+
+            let mail = st.inbox_store.drain_member("claude-code").unwrap();
+            let note = mail
+                .iter()
+                .find(|n| n.kind == "disposition")
+                .expect("the asker must learn its escalation was decided: {mail:?}");
+            assert_eq!(note.from_plugin, "hestia");
+            assert_eq!(
+                note.pointer_uri.as_deref(),
+                Some(format!("hestia://escalation/{esc_id}#decided")).as_deref(),
+            );
+        }
+
+        let body = read_resource_body(&state, &format!("hestia://escalation/{esc_id}#decided"))
+            .await
+            .unwrap_or_else(|e| panic!("the disposition pointer must resolve: {e}"));
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], json!("approved"), "{v}");
+        assert_eq!(v["decided_by"], json!("codex"), "{v}");
+    }
+
     /// The regression that motivated all of this: `limit` is a window over the TAIL, so an
     /// entry that has scrolled past it reads as absent. A hash lookup must not compose with
     /// the window, or "old" and "nonexistent" stay indistinguishable.
@@ -13850,6 +14302,30 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
                     },
                 }),
             );
+            // #459: the decision's RETURN EDGE, minted HERE — the layer holding
+            // SharedState — because `EscalationStore::decide` has no inbox access.
+            // Skipped for a withdrawal: that is the asker's own act and the asker
+            // was there for it; waking a member to tell it what it just did is
+            // noise wearing the return edge's clothes.
+            let disposition_notice_id = if withdrawn {
+                None
+            } else {
+                Some(report_disposition(
+                    &mut s,
+                    &decided.plugin_id,
+                    &format!("hestia://escalation/{}#decided", decided.id),
+                    json!({
+                        "escalation_id": decided.id,
+                        "tool_name": decided.tool_name,
+                        "approved": approve,
+                        "decided_by": decided.decided_by,
+                        "decided_via": decided.decided_via,
+                        "reason": decided.reason,
+                        "note": "the escalation you filed has been decided; the pointer \
+                                 resolves to the decision",
+                    }),
+                )?)
+            };
             // The bar and whether this decision met it go to the DECIDER, not only to the
             // chain. They were recorded above and withheld here, and the asymmetry had a
             // measured cost: across the whole chain, 66 `sovereign_plus_peer` escalations
@@ -13869,6 +14345,7 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
             if let Some(o) = reply.as_object_mut() {
                 o.insert("independence".into(), json!(independence));
                 o.insert("witnessEntryHash".into(), json!(entry.ok().map(|e| e.hash)));
+                o.insert("disposition_notice_id".into(), json!(disposition_notice_id));
             }
             Ok(reply)
         }
