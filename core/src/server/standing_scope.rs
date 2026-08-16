@@ -96,10 +96,53 @@ pub struct StandingScopeStore {
     /// Monotonic, incremented on EVERY mutation (grant and revoke alike). This is the
     /// counter the certified-replica honor logic requires: it answers "WHICH policy is
     /// this copy", so two snapshots can be ordered and a stale one refused.
+    ///
+    /// Covers the FLOOR as well as the per-member grants: both live in this document, so a
+    /// floor edit moves the same counter and a replica cannot be current for one and stale
+    /// for the other.
     #[serde(default)]
     pub generation: u64,
     #[serde(default)]
     pub grants: Vec<StandingGrant>,
+    /// THE SOCIETY FLOOR — paths every member of this society may reach, without any of them
+    /// having asked.
+    ///
+    /// dp, 2026-08-16: *"ideally, we would have society grants. not hardcoded, but specific to
+    /// cbp machine"*, and then the reason: *"law has to be applied uniformly to ALL. that is
+    /// the only way the law is trusted."*
+    ///
+    /// **Not hardcoded, by construction.** It lives in THIS instance's vault beside the
+    /// per-member grants, so it is per-machine because the vault is, and editing it is an
+    /// operator act rather than a release. Nothing in the binary names a path.
+    ///
+    /// **Additive only** — `effective(m) = floor ∪ member(m)` (`PRD_ALLOWLISTS` AC-1). The
+    /// floor is a written MINIMUM, never a ceiling and never a subtraction: a member's own
+    /// grants can only widen what the floor already allows. That direction is what makes it
+    /// safe to apply to everyone at once — no member can be made *worse* off by a floor edit
+    /// than by having no floor at all.
+    ///
+    /// **Why a floor rather than granting each member the same list**: uniformity has to be
+    /// structural or it decays. Per-member copies of one list drift the moment somebody is
+    /// granted a path the others were not, and then the law differs per seat while looking
+    /// identical. One list, consulted for everyone, cannot drift.
+    #[serde(default)]
+    pub floor: Vec<FloorEntry>,
+}
+
+/// One floor path: every member may reach this, because the society says so.
+///
+/// It carries its own provenance for the same reason a standing grant does — a widening whose
+/// rationale is not recorded is indistinguishable afterwards from a misconfiguration, and this
+/// one is wider than any single grant because it binds every seat at once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FloorEntry {
+    /// Normalised absolute path (see `state::normalize_scope_path`).
+    pub path: String,
+    pub added_at: u64,
+    #[serde(default)]
+    pub added_by: String,
+    #[serde(default)]
+    pub reason: String,
 }
 
 impl StandingScopeStore {
@@ -118,9 +161,49 @@ impl StandingScopeStore {
     /// Exact-path membership, same comparison discipline as `has_scope_grant`: a grant is
     /// for one path, and prefix matching would silently widen what the operator read.
     pub fn has_live(&self, member: &str, path: &str, now: u64) -> bool {
-        self.grants
-            .iter()
-            .any(|g| g.member == member && g.path == path && g.is_live(now))
+        // THE UNION, and the floor is checked FIRST because it is the common case and
+        // because it is member-independent: if the society allows this path, no per-member
+        // lookup can change the answer. `effective(m) = floor ∪ member(m)` (AC-1).
+        self.floor_allows(path)
+            || self
+                .grants
+                .iter()
+                .any(|g| g.member == member && g.path == path && g.is_live(now))
+    }
+
+    /// Does the society floor admit this path, for anyone?
+    ///
+    /// No expiry and no member: the floor is what this society has decided its members may
+    /// reach, full stop. A path that should lapse is a per-member grant, not a floor entry —
+    /// keeping the floor unconditional is what lets a reader answer "may members reach X"
+    /// without knowing who is asking or what time it is.
+    pub fn floor_allows(&self, path: &str) -> bool {
+        self.floor.iter().any(|f| f.path == path)
+    }
+
+    /// Add (or replace, keyed by path) a floor entry. Same replace-not-duplicate rule as
+    /// `add`, for the same reason: two records for one path make "removed" ambiguous.
+    pub fn floor_add(&mut self, entry: FloorEntry) {
+        self.floor.retain(|f| f.path != entry.path);
+        self.floor.push(entry);
+        self.generation += 1;
+    }
+
+    /// Remove a floor path. Returns whether anything was removed; the generation moves only
+    /// on a real change, so the counter never claims a mutation that did not happen.
+    ///
+    /// THIS IS THE ONE TIGHTENING ON THIS SURFACE, and it is society-wide: removing a floor
+    /// path narrows every member at once, including any that never asked for it and are
+    /// mid-act against it. That is the opposite direction from `floor_add` and deserves the
+    /// same ceremony a revoke gets, not less.
+    pub fn floor_remove(&mut self, path: &str) -> bool {
+        let before = self.floor.len();
+        self.floor.retain(|f| f.path != path);
+        let removed = self.floor.len() != before;
+        if removed {
+            self.generation += 1;
+        }
+        removed
     }
 
     /// Add (or replace, keyed by `(member, path)`) a grant. Replacement rather than

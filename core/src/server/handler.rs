@@ -13468,11 +13468,34 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         // moved by every grant/revoke) and HOW LONG a consumer may honour a cached copy —
         // bounded by the earliest expiry of any grant represented here (see the horizon
         // computation above), because past that instant the snapshot over-states.
+        // THE SOCIETY FLOOR — what EVERY member of this society may reach, served to each of
+        // them identically and without any of them having asked (dp, 2026-08-16: "law has to
+        // be applied uniformly to ALL. that is the only way the law is trusted").
+        //
+        // Served here rather than as its own tool so it arrives through the channel the gate
+        // already reads. A floor the gate had to fetch separately would be a floor that
+        // applies only to members whose gate remembered to ask — which is per-seat law again,
+        // wearing the word "uniform".
+        //
+        // Member-independent by construction: this list does not depend on `plugin_id`, so
+        // two members comparing their snapshots see the same floor or the daemon is lying.
+        "society_floor": s.standing_scope.floor
+            .iter()
+            .map(|f| json!({
+                "path": f.path,
+                "added_at": f.added_at,
+                "added_by": f.added_by,
+                "reason": f.reason,
+            }))
+            .collect::<Vec<_>>(),
         "generation": s.standing_scope.generation,
         "snapshot_expires_at": snapshot_expires_at,
         "lifetime": "live_grants are memory-only — they die with the daemon. standing_grants \
                      are operator-promoted, vault-persisted, and survive restart until they \
-                     expire or are revoked. Neither is ever written to your identity file.",
+                     expire or are revoked. society_floor is the society's own list: it is \
+                     durable, applies to EVERY member identically, and is not yours to lose — \
+                     effective(you) = society_floor ∪ your grants, additive only. None of the \
+                     three is ever written to your identity file.",
     }))
 }
 
