@@ -14593,10 +14593,17 @@ mod standing_scope_surface_tests {
     /// (b) No MCP tool can mutate standing scope. Same construction as
     /// `no_mcp_tool_can_set_an_operator_grant`: a denylist over the ACTUAL tool list,
     /// because the failure mode is somebody adding a convenient `hestia_standing_grant`
-    /// months from now. The only mutation paths are `/api/scope/decide {standing:true}`
-    /// and `/api/scope/standing/revoke`, both inside the operator_gate route_layer
+    /// months from now. The mutation paths are `/api/scope/decide {standing:true}`,
+    /// `/api/scope/grant` (the operator-originated grant, added 2026-08-15 — see the route
+    /// table's note on why the grant half stopped being ratification-only) and
+    /// `/api/scope/standing/revoke` — all three inside the operator_gate route_layer
     /// (challenge-signed session — see `http.rs`), and `no_mcp_tool_can_decide_a_scope_request`
     /// already pins every scope-named tool to ask/read only.
+    ///
+    /// The list is enumerated here on purpose, so adding a fourth mutation path without
+    /// updating this comment leaves the discrepancy visible to the next reader. A test whose
+    /// prose says "the only paths are X and Y" while three exist is a stale claim wearing the
+    /// authority of an assertion.
     #[test]
     fn no_mcp_tool_can_mutate_standing_scope() {
         let names: Vec<String> = hestia_tools().into_iter().map(|t| t.name.to_string()).collect();

@@ -436,9 +436,23 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/handler.rs::tool_request_scope", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
-    // The operator's answer to a scope request. Widens what a member may reach, memory-only and
-    // time-bounded; this line names the subject in the `scope_granted`/`scope_refused` entry.
+    // The operator's answer to a scope request. Widens what a member may reach; this line names
+    // the subject in the `scope_granted`/`scope_refused` entry.
+    //
+    // TWO IDENTICAL LINES as of 2026-08-15, and the duplication is the fix, not sloppiness. A
+    // STANDING grant now records INTENT → COMMIT → SUCCESS: the first line names the subject in
+    // the `scope_grant_intent` entry, the second names it again in the `scope_granted` entry
+    // that is appended only once the vault commit has landed. Before that split there was one
+    // append, named `scope_granted`, written BEFORE the commit — so a failed vault write left
+    // the chain asserting a grant that never came into force (GPT review of #462). The subject
+    // must be named in both records because either one can be the last word: if the commit
+    // fails, the intent is the only account of who the widening was for.
+    //
+    // Both remain Naming. Neither derived lct is compared to anything — the decision keys on
+    // `request_id` and the `(plugin_id, path)` strings, and these values are serialised into
+    // witness entries and read by nothing.
     ("server/http.rs::scope_decide", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
     // ADDED 2026-08-14 (claude-code, Sprint F R1 — the standing-scope surface). The census
@@ -452,6 +466,24 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     // revoke keys on the store's `(member, path)` strings; the derived LCT is serialised
     // into the witness entry and read by nothing. Naming, like its sibling.
     ("server/http.rs::scope_standing_revoke", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    // ADDED 2026-08-15 (claude-code, the operator-originated grant `POST /api/scope/grant`).
+    // The census went red the moment the site was written — the instrument working, and it
+    // caught a change I had already convinced myself was verified: I had run only
+    // `--lib server::dashboard` locally, and this is an integration test.
+    //
+    // READING, both questions. (1) Who gets named? The subject of a `scope_granted` entry —
+    // the member whose DURABLE reach an operator just widened WITHOUT any member having asked.
+    // Same shape as `scope_decide` and `scope_standing_revoke` above, with one difference
+    // worth recording: those two name a subject the member itself put on the record by
+    // filing a request, whereas here `plugin_id` is operator-TYPED and there is no ask to
+    // corroborate the spelling. That makes this the weakest-corroborated naming site of the
+    // three, which is precisely why the handler also reports `member_known` (see this same fn
+    // in REGISTRY_CENSUS) so a typo is visible to the operator at the moment it is made.
+    // (2) Compared to decide control flow? No. The derived LCT is serialised into the witness
+    // entry and read by nothing; the grant keys on the `(plugin_id, path)` strings. Naming.
+    ("server/http.rs::scope_grant", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
     ("server/state.rs::trust_entity_key", &[
@@ -546,6 +578,34 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ]),
     ("server/dashboard.rs::dashboard_snapshot_window", &[
         "member_entities: self.member_registry.len(),",
+    ]),
+    // Added 2026-08-15 (claude-code, `POST /api/scope/grant`). READING, answering the question
+    // this table schedules — **is this a safety use of presence?**
+    //
+    // NO, and deliberately not. The grant proceeds whether or not the member is in the
+    // registry; presence changes only the ADVISORY the operator is handed back. Granting
+    // ahead of a member's first connect is legitimate, so refusing on absence would break a
+    // real workflow to catch a typo.
+    //
+    // It exists because the alternative failed silently: a grant to `kimi-cod` persists, moves
+    // the generation, and never matches anything, and nothing on screen would have said so.
+    // Worth recording that the FIRST version of this check was inert — it asked
+    // `member_lct(..).is_some()`, and `member_lct` DERIVES a label by hashing the plugin_id, so
+    // it returned `Some` for every string ever passed to it. It printed "the gate consults it
+    // immediately" over grants that could never match. A guard structurally incapable of
+    // failing is worse than none, because it reassures; this now asks the registry, which can
+    // answer no, and both arms were demonstrated on one daemon before it shipped.
+    //
+    // DEGRADATION DIRECTION, since that is what this table really wants to know: if the
+    // registry were empty or unreadable, every grant would be labelled "no member by that
+    // name" — over-warning, not under-warning. The operator is told to check a spelling that
+    // was fine. That is the loud direction and the safe one: it cannot cause a grant to be
+    // made, and it cannot cause one to be silently trusted. The opposite failure — a registry
+    // that wrongly reports a member present — would restore exactly the silent-typo state this
+    // was added to end, so if this ever becomes a gate rather than an advisory, that reading
+    // must be redone.
+    ("server/http.rs::scope_grant", &[
+        "let member_known = s.member_registry.get(&plugin_id).is_some();",
     ]),
     // Added 2026-08-07 (claude-code, the #226 invitation writer). READING, answering the
     // question this table schedules — **is this a safety use of presence?**

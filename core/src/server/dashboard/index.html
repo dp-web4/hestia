@@ -106,9 +106,57 @@
   /* Only one view is mounted at a time. `hidden` on the container is authoritative; this
      guards against a CSS reset that forgets the attribute's default. */
   .dash-view[hidden] { display: none; }
-  /* The headline chain/actions/rate figures describe LOCAL agent governance; on a hub-only
-     screen (no agents to govern) they are noise, so the hubs view drops them. */
-  body[data-view="hubs"] .hstats { display: none; }
+
+  /* --- govern / devices views (PRD_ALLOWLISTS §6.0) ------------------------------------
+     Visual only. The HEIGHT chain lives in the app-shell media query above, because below
+     1100x720 the shell is dropped and the page scrolls normally — a govern screen that only
+     works inside the pinned shell is broken on every small screen, and the failure would be
+     invisible to anyone developing at desktop size (§6.4). */
+  .govern-nav { display: flex; gap: 0; margin: 0 0 0.8rem; border: 1px solid var(--border);
+    border-radius: 999px; overflow: hidden; align-self: flex-start; }
+  .govern-chip { background: transparent; color: var(--fg-dim); border: 0; font: inherit;
+    font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em;
+    padding: 0.3rem 0.9rem; cursor: pointer; }
+  .govern-chip + .govern-chip { border-left: 1px solid var(--border); }
+  .govern-chip:hover { color: var(--fg); background: var(--bg-elev); }
+  .govern-chip.selected { background: var(--accent-dim); color: var(--accent); }
+  .govern-pane[hidden] { display: none; }
+  .govern-pane-head { display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.5rem; }
+  .govern-pane-head h2 { margin: 0; font-size: 0.95rem; }
+  .policy-state { font-size: 0.72rem; color: var(--fg-dim); margin-left: auto; }
+  .policy-state.policy-btn-scoped { color: var(--warning); font-weight: 600; }
+  /* A LIVE grant is the amber one. `.grant-preset` is already the warning colour, which is
+     right for a grant that dies at the next restart; STANDING overrides it to a calm accent
+     because durability is the state the operator meant to buy. There is deliberately no
+     styling in which an about-to-evaporate grant reads as settled (§6.3). */
+  .scope-standing { color: var(--accent) !important; }
+  .devices-notice { border: 1px solid var(--warning); border-radius: 8px; padding: 0.7rem 0.9rem;
+    margin-bottom: 0.8rem; font-size: 0.78rem; line-height: 1.55; color: var(--fg); }
+  .devices-raw { font-size: 0.72rem; background: var(--bg-elev); border: 1px solid var(--border);
+    border-radius: 8px; padding: 0.7rem; overflow-x: auto; white-space: pre; }
+
+  /* The govern chip carries two signals. The BADGE is a count of things waiting on the
+     operator; it is hidden at zero rather than rendered as a dot, so its presence means
+     something. The STATE is the law actually in force, and goes amber whenever a per-member
+     grant is overriding the society baseline — the signal that used to live on the `policy`
+     pill, now visible from every view instead of only the agents screen. */
+  .view-chip-badge { display: inline-block; margin-left: 0.35rem; padding: 0 0.3rem;
+    border-radius: 999px; background: var(--coral); color: var(--bg);
+    font-size: 0.62rem; font-weight: 700; line-height: 1.5; }
+  .view-chip-badge[hidden] { display: none; }
+  .view-chip-state { margin-left: 0.35rem; font-size: 0.62rem; color: var(--fg-dim);
+    text-transform: none; letter-spacing: 0; }
+  .view-chip-state:empty { display: none; }
+  .view-chip-state.policy-btn-scoped { color: var(--warning); font-weight: 700; }
+  /* The headline chain/actions/rate figures describe LOCAL agent governance, so they belong on
+     the agents screen and nowhere else. WRITTEN AS AN ALLOWLIST, DELIBERATELY (PRD_ALLOWLISTS
+     §6.5.3): this was `body[data-view="hubs"] .hstats{display:none}`, which named the ONE screen
+     to hide on — so every view added later inherited the agents behaviour by default, and the
+     masthead would have rendered local-governance numbers on `devices` and `govern` while
+     describing a screen the operator was not looking at. A number whose referent is silently the
+     other screen is a small never-flatter defect (#435/#438). Keying on where .hstats BELONGS
+     means the next view added cannot inherit it by accident. */
+  body:not([data-view="agents"]) .hstats { display: none; }
 
   .live {
     display: flex;
@@ -286,6 +334,16 @@
        off. Making the visible view a flex column that fills main restores the chain
        main -> view -> .live-grid -> chain card -> .feed, so .feed's overflow-y:auto engages. */
     main > .dash-view:not([hidden]) { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+    /* THE CHAIN MUST BE CONTINUED INSIDE EACH NEW VIEW — the rule above bounds the VIEW, and
+       stops there (§6.4). The agents screen continues it via .live-grid; govern and devices
+       need their own equivalent, or their long lists grow to content height and main's
+       `overflow:hidden` clips them, which is #427 verbatim on a new screen.
+       `min-height: 0` is the load-bearing half: flex items default to `min-height:auto` and
+       refuse to shrink below their content, so omitting it reproduces the bug while looking
+       like the fix was applied. Each view names ONE growing, scrolling region. */
+    .govern-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+    .govern-pane:not([hidden]) { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+    .govern-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
     .live-grid { flex: 1 1 auto; min-height: 0; }
     .live-grid > .card {
       display: flex; flex-direction: column; min-height: 0; max-height: 100%;
@@ -844,9 +902,18 @@
            badge used to; the badge moved to the right cluster with the other system-state
            signals. Going forward hubs is the dominant view — on mobile and on hestia
            instances with no local agents, it is the whole screen. -->
+      <!-- FOUR-WAY, and this is now the ONLY navigation axis on the page (PRD_ALLOWLISTS
+           §6.0.1, AC-23). The `ledger` masthead button and the `policy` pill that hid inside
+           the witness-chain card header are gone; both are sub-screens of govern. A governance
+           surface reachable only by someone who already knew it was there is the same defect
+           the escalation banner exists to fix one layer up. -->
       <nav class="view-switch" id="view-switch" aria-label="Dashboard view">
         <button type="button" class="view-chip selected" data-view="agents">agents</button>
         <button type="button" class="view-chip" data-view="hubs">hubs</button>
+        <button type="button" class="view-chip" data-view="devices">devices</button>
+        <button type="button" class="view-chip" data-view="govern">govern<span
+          class="view-chip-badge" id="govern-chip-badge" hidden></span><span
+          class="view-chip-state" id="govern-chip-state"></span></button>
       </nav>
     </div>
     <!-- Metrics live in the title bar. They were four full-width cards holding three
@@ -872,13 +939,14 @@
          not see any escalations for me to approve/deny, nor can i see any history."
          It sits in the title bar rather than behind a banner because a banner is a notification
          and this is a record. The two escalations dp could not find had EXPIRED — a banner had
-         nothing to show, correctly, and that was the whole failure. -->
-    <div class="agents-wrap">
-      <button type="button" class="agents-btn" id="ledger-btn"
-              title="Governance ledger — escalations, law edits, grants, adjudications, with history">
-        ledger <span class="agents-badge" id="ledger-badge">·</span>
-      </button>
-    </div>
+         nothing to show, correctly, and that was the whole failure.
+
+         2026-08-15 (§6.0.1, AC-23): the BUTTON is gone and the ledger is now `govern → ledger`.
+         The reasoning above survives the move intact — a record still must not live behind a
+         notification — but it no longer needs a peer-level button competing with the view
+         switch, because govern IS a view. Its open-count badge is re-homed onto the govern
+         chip (`#govern-chip-badge`) rather than dropped, so the count that made dp look is
+         still on the face of the nav. -->
     <div class="live">
       <span class="deployment-health unknown" id="deployment-health" title="Deployment freshness">● deployment unknown</span>
       <span class="dot"></span>
@@ -954,7 +1022,15 @@
       <div class="card">
         <div class="card-head">
           <h2 id="feed-title">Witness chain — live</h2>
-          <button class="policy-btn" id="policy-btn" title="View / edit policy">policy</button>
+          <!-- The `policy` pill that used to sit HERE is gone (§6.0.1, AC-23). A governance
+               surface hiding inside a live-feed card header is discoverable only by someone who
+               already knows it is there — the same failure the escalation banner exists to fix
+               one layer up. Policy is now `govern → policy`. The pill also doubled as a STATE
+               display ("policy: permissive · kimi-code", amber when a per-member grant was in
+               force); that signal was too useful to delete with the button, so it moved to
+               `#govern-chip-state` on the nav chip, where it is visible from every screen
+               instead of only from the agents view. -->
+
           <div class="feed-filter" role="group" aria-label="Filter chain entries">
             <button type="button" class="filter-btn selected" data-filter="all">all</button>
             <button type="button" class="filter-btn" data-filter="warn">warn</button>
@@ -1016,6 +1092,286 @@
       </div>
     </div>
     </div><!-- /#hubs-view -->
+    <!-- DEVICES — constellation management (PRD_ALLOWLISTS §6.0.3, AC-22).
+         The slot is real, and it must not LOOK finished. `core/src/constellation.rs` is
+         substantial and the snapshot already carries a `constellation` field, but the screen
+         does not exist yet. A tab that opens onto a plausible empty panel tells the operator
+         the constellation is empty when the truth is that nobody built the view — that is the
+         never-flatter doctrine (#435/#438) applied to navigation. So `renderDevices` has
+         exactly two legal outputs: real device state, or an explicit "not yet implemented".
+         "Looks finished, shows nothing" is not one of them. -->
+    <div id="devices-view" class="dash-view" hidden>
+      <!-- This view's ONE growing, scrolling region (§6.4). Direct flex child of the view. -->
+      <div class="govern-scroll" id="devices-body">
+        <div class="empty">loading…</div>
+      </div>
+    </div>
+
+    <!-- GOVERN — the top-level governance view (§6.0). Absorbs what used to be the `ledger`
+         masthead button and the `policy` pill buried in the witness-chain card header. Follows
+         the agents screen's scheme (§6.0.2): a selector drives a detail pane, so an operator
+         who has learned one screen has learned both.
+
+         The pending-decision BANNERS deliberately do not live here (§6.0.4, AC-20). They stay
+         above the view switch, visible on all four screens. Govern holds the history and the
+         editing; a pending decision is a notification and stays unconditionally visible. The
+         original defect was five escalations opened against dp in one session, none of which
+         dp saw — putting them one tab-click away is a smaller version of that same failure. -->
+    <div id="govern-view" class="dash-view" hidden>
+      <nav class="govern-nav" id="govern-nav" aria-label="Governance section">
+        <button type="button" class="govern-chip selected" data-gov="ledger">ledger</button>
+        <button type="button" class="govern-chip" data-gov="grants">grants</button>
+        <button type="button" class="govern-chip" data-gov="acts">acts</button>
+        <button type="button" class="govern-chip" data-gov="policy">policy</button>
+      </nav>
+
+      <div class="govern-body">
+        <!-- ledger sub-screen -->
+        <section class="govern-pane" id="govern-ledger">
+          <div class="govern-pane-head">
+            <h2>Governance ledger <span class="pol-mode" id="ledger-scanned"></span></h2>
+          </div>
+          <div class="esc-note">
+            Every <strong>admin act</strong> on this society's chain: who asked, who ruled, and why.
+            <strong>Expired</strong> means the window closed with nobody ruling — that is not a
+            decision, and it is shown separately from <strong>denied</strong> for that reason.
+            Identities shown are <strong>claimed, not authenticated</strong>.
+          </div>
+          <div class="ledger-warn" id="ledger-error" hidden></div>
+          <div class="ledger-tabs" id="ledger-tabs">
+            <button class="ledger-tab" data-status="all" aria-selected="true">all<span class="lt-n" data-n="all"></span></button>
+            <button class="ledger-tab" data-status="open" aria-selected="false">open<span class="lt-n" data-n="open"></span></button>
+            <button class="ledger-tab" data-status="approved" aria-selected="false">approved<span class="lt-n" data-n="approved"></span></button>
+            <button class="ledger-tab" data-status="denied" aria-selected="false">denied<span class="lt-n" data-n="denied"></span></button>
+            <button class="ledger-tab" data-status="expired" aria-selected="false">expired<span class="lt-n" data-n="expired"></span></button>
+            <button class="ledger-tab" data-status="recorded" aria-selected="false">recorded<span class="lt-n" data-n="recorded"></span></button>
+            <select id="ledger-range" aria-label="Ledger time range" style="margin-left:auto;font-size:0.72rem;">
+              <option value="day">last day</option>
+              <option value="week">last week</option>
+              <option value="month" selected>last 30 days</option>
+              <option value="all">all time</option>
+            </select>
+          </div>
+          <div id="ledger-list" class="govern-scroll"><div class="empty">loading…</div></div>
+        </section>
+
+        <!-- MRH SCOPE GRANTS sub-screen. dp, 2026-08-15: "i still don't have a way of actually
+             granting scope. you have not yet created the govern screen, nor a way for me to
+             get to it." This is that way.
+
+             It is deliberately NOT a second place to decide pending requests. Deciding lives
+             in the scope banner's modal, which AC-20 keeps reachable from every view and which
+             #456 just repaired; building a second copy of a decision control is how the two
+             drift until one of them lies. Pending requests appear here as rows that hand you
+             to that one control. -->
+        <section class="govern-pane" id="govern-grants" hidden>
+          <div class="govern-pane-head">
+            <h2>Scope grants <span class="pol-mode" id="scope-gen"></span></h2>
+          </div>
+          <div class="govern-scroll">
+            <div class="esc-note">
+              An MRH scope grant is what lets a member reach a path outside its own tree. Two
+              kinds, and the difference is the one that has been costing you grants:
+              <strong>live</strong> grants are held in memory and <strong>die at the next daemon
+              restart</strong>; <strong>standing</strong> grants are written to the vault and
+              survive it. Every grant and revocation is witnessed.
+            </div>
+
+            <div class="pol-section-label">Pending requests — a member is asking</div>
+            <div id="scope-pending-list"><div class="empty">No member is waiting on a scope decision.</div></div>
+
+            <div class="pol-section-label">In force now</div>
+            <div id="scope-grant-list"><div class="empty">loading…</div></div>
+
+            <div class="pol-section-label">Grant scope directly — no member request needed</div>
+            <div class="grant-note">
+              This is the <strong>operator-originated</strong> grant. Until 2026-08-15 the only
+              widening door answered a member's ask, so a member had to fail first before you
+              could act — and when every envelope emptied after a restart, the remedy a member
+              would use to ask was itself denied by the emptiness it existed to fill. A grant
+              made here is <strong>standing</strong> (durable across restarts), is recorded as
+              an act you originated rather than a reply to a request nobody made, and is
+              revocable above.
+            </div>
+            <div class="pol-add grant-add">
+              <input class="pol-input" id="sg-plugin" placeholder="plugin_id (e.g. kimi-code)" size="16">
+              <input class="pol-input" id="sg-path" placeholder="absolute path" size="34">
+              <select class="pol-select" id="sg-ttl">
+                <option value="">until revoked</option>
+                <option value="28800">8 hours</option>
+                <option value="86400">1 day</option>
+                <option value="604800">1 week</option>
+              </select>
+              <input class="pol-input" id="sg-reason" placeholder="reason (required)" size="26">
+              <button class="pol-btn-add" id="sg-grant-btn" disabled>grant</button>
+            </div>
+            <div class="esc-err" id="sg-err" hidden></div>
+            <div class="grant-note" id="sg-ok" hidden></div>
+          </div>
+        </section>
+
+        <!-- OPERATOR ACTS. Three consequential surfaces that have existed, operator-walled and
+             witnessed, with NO front end — the same defect as the scope-grant door, three more
+             times: `POST /api/operator/adjudicate`, `/api/operator/alias`, `/api/operator/amnesty`.
+             The dashboard has never called any of them.
+
+             All three REQUIRE an evidence pointer, and that is not a form-validation detail —
+             it is the surface's design. Each one changes how a member's history is READ:
+             adjudication adds the human's own rating to derivation, alias folds two identities'
+             evidence together, amnesty excludes a class of past conduct from it. An unsourced
+             claim of that kind is indistinguishable afterwards from a mistake, so the daemon
+             refuses without a ref and this screen does not pretend otherwise. -->
+        <section class="govern-pane" id="govern-acts" hidden>
+          <div class="govern-pane-head">
+            <h2>Operator acts</h2>
+          </div>
+          <div class="govern-scroll">
+            <div class="esc-note">
+              Acts only <strong>you</strong> can perform, each witnessed to the chain with the
+              sovereign as author. They change how history is <em>read</em>, never what it says:
+              nothing here edits or deletes a record.
+            </div>
+
+            <!-- 1. ADJUDICATION -->
+            <div class="pol-section-label">Adjudicate — record your own rating of a member</div>
+            <div class="grant-note">
+              dp, 2026-07-24: <em>"i would rate you 1.0 personally"</em> — the most trusted witness
+              in the system had no way to witness that. Enters derivation as
+              <strong>validity</strong> or <strong>valuation</strong> only. Temperament stays
+              conduct-derived and is deliberately not settable here: a hand-set temperament would
+              be prescribed trust, which is the thing web4 exists not to do.
+            </div>
+            <div class="pol-add grant-add">
+              <input class="pol-input" id="adj-plugin" placeholder="plugin_id" size="14">
+              <input class="pol-input" id="adj-role" placeholder="role" list="grant-roles" size="24">
+              <select class="pol-select" id="adj-axis">
+                <option value="validity">validity</option>
+                <option value="valuation">valuation</option>
+              </select>
+              <select class="pol-select" id="adj-verdict">
+                <option value="upheld">upheld</option>
+                <option value="partial">partial</option>
+                <option value="refuted">refuted</option>
+                <option value="deferred">deferred</option>
+              </select>
+              <input class="pol-input" id="adj-ref" placeholder="evidence pointer (required)" size="26">
+              <input class="pol-input" id="adj-reason" placeholder="reason" size="20">
+              <button class="pol-btn-add" id="adj-btn" disabled>adjudicate</button>
+            </div>
+            <div class="esc-err" id="adj-err" hidden></div>
+            <div class="grant-note" id="adj-ok" hidden></div>
+
+            <!-- 2. ALIAS -->
+            <div class="pol-section-label">Alias — declare two plugin_ids are the same member</div>
+            <div class="grant-note">
+              Folds the two identities' trust evidence together at read time.
+              <strong>Append-only</strong>: history stays where it landed and a later contradicting
+              alias supersedes this one — nothing is rewritten. Refused if the two are the same,
+              and refused without a pointer: no evidence, no join.
+            </div>
+            <div class="pol-add grant-add">
+              <input class="pol-input" id="ali-of" placeholder="alias_of — the SURVIVING id" size="18">
+              <input class="pol-input" id="ali-alias" placeholder="alias — folds INTO it" size="18">
+              <input class="pol-input" id="ali-ref" placeholder="evidence pointer (required)" size="26">
+              <input class="pol-input" id="ali-reason" placeholder="reason" size="20">
+              <button class="pol-btn-add" id="ali-btn" disabled>join identities</button>
+            </div>
+            <div class="esc-err" id="ali-err" hidden></div>
+            <div class="grant-note" id="ali-ok" hidden></div>
+
+            <!-- 3. AMNESTY -->
+            <div class="pol-section-label">Amnesty — exclude past conduct from derivation</div>
+            <div class="grant-note devices-notice">
+              <strong>This is a society-level act and the widest control on this page.</strong> It
+              excludes every <code>deny</code> below a chain position from conduct scoring, for
+              <em>every</em> member at once — there is no per-member form of it. History is
+              <strong>not deleted</strong>: the amnesty is itself witnessed, and each excluded item
+              still shows in receipts with this amnesty as its reason. Point <code>ref</code> at
+              the thing that ended the era being amnestied — typically the fix commit — because
+              afterwards that pointer is the only account of why a stretch of conduct stopped
+              counting.
+            </div>
+            <div class="pol-add grant-add">
+              <input class="pol-input" id="amn-before" placeholder="before chain position" size="16">
+              <input class="pol-input" id="amn-ref" placeholder="evidence pointer (required)" size="26">
+              <input class="pol-input" id="amn-reason" placeholder="reason (required)" size="26">
+              <button class="pol-btn-add" id="amn-btn" disabled>grant amnesty</button>
+            </div>
+            <div class="esc-err" id="amn-err" hidden></div>
+            <div class="grant-note" id="amn-ok" hidden></div>
+          </div>
+        </section>
+
+        <!-- policy sub-screen -->
+        <section class="govern-pane" id="govern-policy" hidden>
+          <div class="govern-pane-head">
+            <h2>Policy <span class="pol-mode" id="pol-mode"></span></h2>
+            <!-- The law ACTUALLY IN FORCE for what is on screen — society preset, or the
+                 per-member grant that overrides it. Written by the shim in renderFeed(). -->
+            <span class="policy-state" id="policy-state-label"></span>
+          </div>
+          <div class="govern-scroll">
+            <div class="pol-scope society" id="pol-scope"></div>
+            <div class="pol-presets" id="pol-presets"></div>
+            <!-- PER-MEMBER GRANTS. The preset above is the SOCIETY baseline and applies to every
+                 seat on this box -- including unattended watcher-fired agents -- so using it to
+                 unblock one member grants the whole fleet. This section is the scoped alternative.
+                 It sits directly under the preset buttons on purpose: that adjacency is the thing
+                 that stops the next person reaching for the global switch. -->
+            <div class="pol-section-label">Per-member grants — loosen ONE member without touching the society</div>
+            <div class="grant-note">
+              Held in <strong>memory only</strong>: a grant does not survive a daemon restart, and
+              tightening applied through the vault does. Ratified hub law still binds over a grant.
+              Every grant and revocation is witnessed.
+            </div>
+            <div id="grant-list"><div class="empty">No grants active — every member is on the society baseline.</div></div>
+            <details class="pol-add-wrap">
+              <summary>+ Grant a member a preset</summary>
+              <div class="pol-add grant-add">
+                <input class="pol-input" id="grant-plugin" placeholder="plugin_id (e.g. kimi-code)" size="16">
+                <input class="pol-input" id="grant-role" placeholder="role" list="grant-roles" size="20">
+                <datalist id="grant-roles">
+                  <option value="role:constellation:member"></option>
+                  <option value="role:constellation:interactive-dev"></option>
+                  <option value="role:constellation:mesh-worker"></option>
+                  <option value="role:constellation:reviewer"></option>
+                  <option value="role:constellation:autonomous-timer"></option>
+                </datalist>
+                <select class="pol-select" id="grant-preset">
+                  <option value="permissive">permissive</option>
+                  <option value="audit-only">audit-only</option>
+                  <option value="safety">safety</option>
+                  <option value="strict">strict</option>
+                </select>
+                <select class="pol-select" id="grant-ttl">
+                  <option value="3600">1 hour</option>
+                  <option value="900">15 min</option>
+                  <option value="14400">4 hours</option>
+                  <option value="">until restart</option>
+                </select>
+                <input class="pol-input" id="grant-reason" placeholder="reason (required)" size="24">
+                <button class="pol-btn-add" id="grant-add-btn" disabled>grant</button>
+              </div>
+            </details>
+            <div class="pol-section-label">Preset rules — change a decision, disable, or revert</div>
+            <div id="pol-rules"><div class="empty">Loading…</div></div>
+            <div class="pol-section-label">Custom rules</div>
+            <div id="pol-custom"><div class="empty">No custom rules.</div></div>
+            <details class="pol-add-wrap">
+              <summary>+ Add a rule (by category or specifically)</summary>
+              <div class="pol-add">
+                <input class="pol-input" id="pol-add-name" placeholder="rule name" size="16">
+                <select class="pol-select" id="pol-add-decision"><option value="deny">deny</option><option value="warn">warn</option><option value="allow">allow</option></select>
+                <select class="pol-select" id="pol-add-kind"><option value="category">category</option><option value="tool">tool</option><option value="command">command ~</option></select>
+                <input class="pol-input" id="pol-add-value" placeholder="value" list="pol-categories" size="18">
+                <datalist id="pol-categories"></datalist>
+                <button class="pol-btn" id="pol-add-btn">add</button>
+              </div>
+            </details>
+          </div>
+        </section>
+      </div>
+    </div>
   </main>
 
   <div class="modal" id="trust-modal" hidden>
@@ -1041,39 +1397,6 @@
 
        Expired is rendered as its own status, in the warning colour, never folded into denied.
        Both refuse the act; only one of them is a decision. -->
-  <div class="modal" id="ledger-modal" hidden>
-    <div class="modal-backdrop" data-close="1"></div>
-    <div class="modal-panel" id="ledger-card">
-      <div class="modal-head">
-        <h2>Governance ledger <span class="pol-mode" id="ledger-scanned"></span></h2>
-        <button class="modal-close" data-close="1" aria-label="Close">✕</button>
-      </div>
-      <div class="modal-body">
-        <div class="esc-note">
-          Every <strong>admin act</strong> on this society's chain: who asked, who ruled, and why.
-          <strong>Expired</strong> means the window closed with nobody ruling — that is not a
-          decision, and it is shown separately from <strong>denied</strong> for that reason.
-          Identities shown are <strong>claimed, not authenticated</strong>.
-        </div>
-        <div class="ledger-warn" id="ledger-error" hidden></div>
-        <div class="ledger-tabs" id="ledger-tabs">
-          <button class="ledger-tab" data-status="all" aria-selected="true">all<span class="lt-n" data-n="all"></span></button>
-          <button class="ledger-tab" data-status="open" aria-selected="false">open<span class="lt-n" data-n="open"></span></button>
-          <button class="ledger-tab" data-status="approved" aria-selected="false">approved<span class="lt-n" data-n="approved"></span></button>
-          <button class="ledger-tab" data-status="denied" aria-selected="false">denied<span class="lt-n" data-n="denied"></span></button>
-          <button class="ledger-tab" data-status="expired" aria-selected="false">expired<span class="lt-n" data-n="expired"></span></button>
-          <button class="ledger-tab" data-status="recorded" aria-selected="false">recorded<span class="lt-n" data-n="recorded"></span></button>
-          <select id="ledger-range" aria-label="Ledger time range" style="margin-left:auto;font-size:0.72rem;">
-            <option value="day">last day</option>
-            <option value="week">last week</option>
-            <option value="month" selected>last 30 days</option>
-            <option value="all">all time</option>
-          </select>
-        </div>
-        <div id="ledger-list"><div class="empty">loading…</div></div>
-      </div>
-    </div>
-  </div>
 
   <!-- Governance-surface escalation decisions. Renders from the dashboard snapshot the page
        already polls, and decides through POST /api/operator/gate-escalation — the operator
@@ -1131,74 +1454,6 @@
     </div>
   </div>
 
-  <div class="modal" id="policy-modal" hidden>
-    <div class="modal-backdrop" data-close="1"></div>
-    <div class="modal-panel" id="policy-card">
-      <div class="modal-head">
-        <h2>Policy <span class="pol-mode" id="pol-mode"></span></h2>
-        <button class="modal-close" data-close="1" aria-label="Close">✕</button>
-      </div>
-      <div class="modal-body">
-        <div class="pol-scope society" id="pol-scope"></div>
-        <div class="pol-presets" id="pol-presets"></div>
-        <!-- PER-MEMBER GRANTS. The preset above is the SOCIETY baseline and applies to every
-             seat on this box -- including unattended watcher-fired agents -- so using it to
-             unblock one member grants the whole fleet. This section is the scoped alternative.
-             It sits directly under the preset buttons on purpose: that adjacency is the thing
-             that stops the next person reaching for the global switch. -->
-        <div class="pol-section-label">Per-member grants — loosen ONE member without touching the society</div>
-        <div class="grant-note">
-          Held in <strong>memory only</strong>: a grant does not survive a daemon restart, and
-          tightening applied through the vault does. Ratified hub law still binds over a grant.
-          Every grant and revocation is witnessed.
-        </div>
-        <div id="grant-list"><div class="empty">No grants active — every member is on the society baseline.</div></div>
-        <details class="pol-add-wrap">
-          <summary>+ Grant a member a preset</summary>
-          <div class="pol-add grant-add">
-            <input class="pol-input" id="grant-plugin" placeholder="plugin_id (e.g. kimi-code)" size="16">
-            <input class="pol-input" id="grant-role" placeholder="role" list="grant-roles" size="20">
-            <datalist id="grant-roles">
-              <option value="role:constellation:member"></option>
-              <option value="role:constellation:interactive-dev"></option>
-              <option value="role:constellation:mesh-worker"></option>
-              <option value="role:constellation:reviewer"></option>
-              <option value="role:constellation:autonomous-timer"></option>
-            </datalist>
-            <select class="pol-select" id="grant-preset">
-              <option value="permissive">permissive</option>
-              <option value="audit-only">audit-only</option>
-              <option value="safety">safety</option>
-              <option value="strict">strict</option>
-            </select>
-            <select class="pol-select" id="grant-ttl">
-              <option value="3600">1 hour</option>
-              <option value="900">15 min</option>
-              <option value="14400">4 hours</option>
-              <option value="">until restart</option>
-            </select>
-            <input class="pol-input" id="grant-reason" placeholder="reason (required)" size="24">
-            <button class="pol-btn-add" id="grant-add-btn" disabled>grant</button>
-          </div>
-        </details>
-        <div class="pol-section-label">Preset rules — change a decision, disable, or revert</div>
-        <div id="pol-rules"><div class="empty">Loading…</div></div>
-        <div class="pol-section-label">Custom rules</div>
-        <div id="pol-custom"><div class="empty">No custom rules.</div></div>
-        <details class="pol-add-wrap">
-          <summary>+ Add a rule (by category or specifically)</summary>
-          <div class="pol-add">
-            <input class="pol-input" id="pol-add-name" placeholder="rule name" size="16">
-            <select class="pol-select" id="pol-add-decision"><option value="deny">deny</option><option value="warn">warn</option><option value="allow">allow</option></select>
-            <select class="pol-select" id="pol-add-kind"><option value="category">category</option><option value="tool">tool</option><option value="command">command ~</option></select>
-            <input class="pol-input" id="pol-add-value" placeholder="value" list="pol-categories" size="18">
-            <datalist id="pol-categories"></datalist>
-            <button class="pol-btn" id="pol-add-btn">add</button>
-          </div>
-        </details>
-      </div>
-    </div>
-  </div>
 
   <footer>
     <div>
@@ -1229,22 +1484,51 @@
   // snapshot: a hestia with no local agents opens on hubs (that is its whole screen); one
   // with agents or trust history opens on agents. A manual click pins the choice and the
   // auto-default never fires again.
-  let activeView = 'agents';
+  // ONE DECLARED LIST, not a chain of string comparisons. The old guard read
+  // `if (v !== 'agents' && v !== 'hubs') v = 'agents';` — so adding a chip without editing
+  // this line made the new chip SYNC BACK to agents, and the bug presented as an
+  // unresponsive button rather than as an unhandled value (PRD_ALLOWLISTS §6.5.1). That is
+  // the same silent-no-op class as #456's grant button, one layer up, so it is fixed the
+  // same way: the set of views is data, every view declares its own container and mount
+  // hook, and a half-added view is a missing table entry rather than a mystery.
+  //
+  // `autoDefault` is per-view eligibility, and govern/devices are FALSE on purpose: an
+  // operator should land where their work is, not on a settings screen (§6.5.2). The old
+  // rule ("no local agents ⇒ open on hubs") was written when there were two views and is
+  // restated here for four rather than left to fall through.
+  const VIEWS = {
+    agents:  { el: 'agents-view',  autoDefault: true  },
+    hubs:    { el: 'hubs-view',    autoDefault: true,
+               mount: () => { if (typeof window.__hubRefresh === 'function') window.__hubRefresh(); } },
+    devices: { el: 'devices-view', autoDefault: false,
+               mount: () => renderDevices(lastData) },
+    govern:  { el: 'govern-view',  autoDefault: false,
+               mount: () => governMount() },
+  };
+  const DEFAULT_VIEW = 'agents';
+
+  let activeView = DEFAULT_VIEW;
   let viewUserChose = false;
   let firstViewDecided = false;
   function setView(v, byUser) {
-    if (v !== 'agents' && v !== 'hubs') v = 'agents';
+    if (!Object.prototype.hasOwnProperty.call(VIEWS, v)) v = DEFAULT_VIEW;
     activeView = v;
     if (byUser) viewUserChose = true;
     document.body.dataset.view = v;
-    const av = $('agents-view'), hv = $('hubs-view');
-    if (av) av.hidden = v !== 'agents';
-    if (hv) hv.hidden = v !== 'hubs';
+    // Toggled via the `hidden` ATTRIBUTE, never style.display — the app-shell height rule
+    // `main > .dash-view:not([hidden])` keys on it (§6.4 precondition 3), and hiding by
+    // inline display would leave "which view is mounted" a fact with two contradicting
+    // sources, which is how the next layout bug gets built.
+    for (const [name, spec] of Object.entries(VIEWS)) {
+      const el = $(spec.el);
+      if (el) el.hidden = name !== v;
+    }
     document.querySelectorAll('#view-switch .view-chip')
       .forEach(c => c.classList.toggle('selected', c.dataset.view === v));
-    // The hub surface is a separate script polling on its own clock; nudge it to refresh
-    // now so switching to it doesn't show a stale/empty frame until the next poll.
-    if (v === 'hubs' && typeof window.__hubRefresh === 'function') window.__hubRefresh();
+    // Per-view mount hook. Each view that polls on its own clock, or renders from the last
+    // snapshot rather than on every tick, refreshes HERE so switching to it never shows a
+    // stale or empty frame. Previously hand-wired for hubs alone (§6.5.4).
+    try { VIEWS[v].mount?.(); } catch (_) { /* a mount hook must never strand the switch */ }
   }
 
   // ---- Operator authentication (RWOA W) — sign in with your LCT -------------
@@ -1974,10 +2258,34 @@
       ? source.filter(e => e.plugin_id === selectedOrch)
       : source;
     // Title carries the active policy setting (preset + enforce mode).
-    // The active policy is surfaced on the `policy` button (opens the editor),
-    // not inline in the title.
     const pol = lastData?.policy;
-    const polBtn = $('policy-btn');
+    // THE PILL IS GONE; THE SIGNAL IS NOT. This label used to be written onto the `policy`
+    // button in the witness-chain card header, which §6.0.1/AC-23 removed. Rather than
+    // re-point the logic below at a new id, it is fanned out through a shim to the two places
+    // that now carry it: a compact state marker on the govern NAV CHIP — visible from every
+    // view, which the pill never was — and the full label in the policy pane's head.
+    //
+    // Written as a shim ON PURPOSE. The state machine below is the product of three separate
+    // defects dp hit live (see the comment block that follows), and re-deriving it against new
+    // element ids is the likeliest way to reintroduce one of them. So the logic is not touched:
+    // `textContent`, `title` and `classList` keep working exactly as written.
+    const polBtn = (() => {
+      const chip = $('govern-chip-state'), head = $('policy-state-label');
+      if (!chip && !head) return null;
+      return {
+        set textContent(v) {
+          if (head) head.textContent = v;
+          // The chip is a nav element, so it carries the state WITHOUT the "policy:" prefix
+          // the pane head keeps — on the chip the surrounding word is already `govern`.
+          if (chip) chip.textContent = String(v).replace(/^policy:\s*/, '');
+        },
+        set title(v) { if (chip) chip.title = v; if (head) head.title = v; },
+        classList: {
+          add:    c => { if (chip) chip.classList.add(c);    if (head) head.classList.add(c); },
+          remove: c => { if (chip) chip.classList.remove(c); if (head) head.classList.remove(c); },
+        },
+      };
+    })();
     // THE LABEL MUST NAME THE LAW THAT IS ACTUALLY IN FORCE FOR WHAT IS ON SCREEN.
     //
     // This read `lastData.policy` unconditionally — always the SOCIETY preset — so with a member
@@ -2178,16 +2486,30 @@
     renderStats(s, data.society, selectedOrch);
     renderEscalations(data);
     renderScopeRequests(data);
+    updateGovernBadge(data);
     renderGrants(data);
+    // Devices renders from the snapshot, so it must be re-rendered ON THE TICK and not only
+    // on mount — otherwise sitting on the tab shows a frame frozen at the moment you arrived,
+    // which is a staleness defect wearing the same face as "nothing has changed". Guarded on
+    // the active view so an unmounted screen costs nothing.
+    if (activeView === 'devices') renderDevices(data);
+    // Same rule for the grants pane, and it matters more there: a live grant's remaining time
+    // is counting down, so a frozen frame would show an expired grant as still in force.
+    if (activeView === 'govern' && governSection === 'grants') renderScopeGrants(data);
     renderOrchBar(data);
     // Decide the opening view once, from the first real snapshot: no local agents AND no
     // trust history → this box has nothing to govern, so open on hubs (its dominant screen).
     // A manual switch pins the choice and suppresses this forever.
+    //
+    // The `autoDefault` assertion is the point, not decoration: this rule was written for two
+    // views, and the failure mode when views were added was that a settings screen could
+    // become the landing page. Asserting eligibility here means the auto-default can only ever
+    // choose a WORK screen, and a future view opting in has to say so in the VIEWS table.
     if (!firstViewDecided && !viewUserChose) {
       firstViewDecided = true;
       const noLocalAgents = (data.orchestrators || []).length === 0
         && (data.trust || []).length === 0;
-      if (noLocalAgents) setView('hubs');
+      if (noLocalAgents && VIEWS.hubs.autoDefault) setView('hubs');
     }
     renderTrust(data.trust, data.orchestrators);
     renderHistogram(data);
@@ -2491,6 +2813,152 @@
     }
   }
 
+  // THE GOVERN CHIP BADGE — driven from the SNAPSHOT, on every tick.
+  //
+  // The count it replaces (`#ledger-badge` on the old masthead button) was written only by
+  // loadLedger(), and loadLedger() is not on the tick — so that badge read `·` until you
+  // opened the ledger, which is to say it could not tell you to open the ledger. It was
+  // decorative. Re-homing it unchanged would have satisfied AC-23's letter ("the count is
+  // re-homed rather than dropped") while carrying a dead control onto the navigation, where
+  // an always-empty badge is worse than it was on a button: it teaches the eye to skip the
+  // one place a real count would appear.
+  //
+  // So the chip carries the number that means SOMETHING IS WAITING ON YOU — pending
+  // escalations plus pending scope requests, the same two populations the banners render —
+  // taken from the snapshot the page already polls, and therefore always current. The
+  // ledger's own six status counts stay in the ledger, beside the rows they describe. One
+  // number, one source, one meaning; polling the chain every 2s to keep a badge warm would
+  // have been the expensive way to get a worse answer.
+  function updateGovernBadge(data) {
+    const badge = $('govern-chip-badge');
+    if (!badge) return;
+    const esc = (data?.pending_escalations ?? []).length;
+    const scope = (data?.pending_scope_requests ?? []).length;
+    const n = esc + scope;
+    badge.textContent = n ? String(n) : '';
+    badge.hidden = !n;
+    badge.title = n
+      ? `${n} awaiting your decision — ${esc} escalation${esc === 1 ? '' : 's'}, `
+        + `${scope} scope request${scope === 1 ? '' : 's'}`
+      : '';
+  }
+
+  // MRH SCOPE GRANTS — what each member may reach, and which half of it survives a restart.
+  //
+  // Renders from the snapshot (`scope_grants`, both kinds merged, each row carrying its own
+  // `lifetime`). The LIFETIME IS THE LOAD-BEARING COLUMN, not decoration: a live grant dies at
+  // the next daemon restart and a standing one does not, and the whole reason this screen
+  // exists is that operators have been spending grants that evaporate on the next deploy
+  // without anything on screen saying so.
+  //
+  // Never-flatter (§6.3): a live grant renders AMBER with its remaining time, because "you
+  // have a grant" and "you have a grant until someone restarts the daemon" are different
+  // facts and only one of them is what the operator thinks they bought. Standing renders
+  // plain. There is no state in which a grant that is about to evaporate renders as calm.
+  function renderScopeGrants(data) {
+    const gen = $('scope-gen');
+    if (gen) {
+      gen.textContent = data
+        ? `standing generation ${data.standing_generation ?? 0}`
+        : 'no snapshot yet';
+    }
+
+    // Pending asks — read-only here on purpose; the decide control lives in the scope modal.
+    const pend = data?.pending_scope_requests ?? [];
+    const pl = $('scope-pending-list');
+    if (pl) {
+      pl.innerHTML = pend.length
+        ? pend.map(r => `
+            <div class="grant-row">
+              <span class="grant-who">${escapeHtml(String(r.claimed_by ?? '?'))}</span>
+              <span class="grant-preset">wants</span>
+              <code>${escapeHtml(String(r.path ?? ''))}</code>
+              <span class="grant-ttl">expires in ${escFmtAge(r.secs_remaining ?? 0)}</span>
+              <span class="grant-why">why: ${escapeHtml(String(r.reason ?? '(none stated)'))}</span>
+              <span class="grant-why"><button class="pol-btn" data-open-scope="1">decide →</button></span>
+            </div>`).join('')
+        : '<div class="empty">No member is waiting on a scope decision.</div>';
+    }
+
+    const list = $('scope-grant-list');
+    if (!list) return;
+    if (!data) { list.innerHTML = '<div class="empty">loading…</div>'; return; }
+    const rows = data.scope_grants ?? [];
+    if (!rows.length) {
+      // "No grants" is a FACT, not an achievement, and must not render as success (§6.3).
+      // It is also the state that produced 102 denies across kimi and codex on 2026-08-15,
+      // so it says what it means rather than showing a reassuring empty panel.
+      list.innerHTML = `<div class="empty">No scope grants in force. Every member is bounded by
+        its own tree — which is the safe state, and also the state in which a member that needs
+        a path outside it will be denied until you grant one here.</div>`;
+      return;
+    }
+    list.innerHTML = rows.map(g => {
+      const live = g.lifetime === 'live';
+      const secs = g.secs_remaining;
+      const when = live
+        ? `dies on restart · ${escFmtAge(secs ?? 0)} left`
+        : (secs === null || secs === undefined ? 'until revoked' : `${escFmtAge(secs)} left`);
+      const origin = g.origin === 'operator_initiated' ? 'you granted this directly' : 'answered a request';
+      return `
+        <div class="grant-row">
+          <span class="grant-who">${escapeHtml(String(g.plugin_id ?? '?'))}</span>
+          <span class="grant-preset${live ? '' : ' scope-standing'}">${live ? 'LIVE' : 'STANDING'}</span>
+          <code>${escapeHtml(String(g.path ?? ''))}</code>
+          <span class="grant-ttl">${escapeHtml(when)}</span>
+          <span class="grant-why">${escapeHtml(origin)}${
+            g.reason ? ' · ' + escapeHtml(String(g.reason)) : ''}</span>
+          ${live ? '' : `<button class="grant-revoke" data-revoke-member="${
+            escapeHtml(String(g.plugin_id))}" data-revoke-path="${
+            escapeHtml(String(g.path))}">revoke</button>`}
+        </div>`;
+    }).join('');
+  }
+
+  // DEVICES — constellation management (§6.0.3, AC-22).
+  //
+  // Two legal outputs and no third: real device state, or an explicit "not yet implemented".
+  // The forbidden state is the plausible empty panel, which tells the operator their
+  // constellation is empty when the truth is that nobody built the view — never-flatter
+  // (#435/#438) applied to navigation. So the not-built notice renders UNCONDITIONALLY at the
+  // top; if the snapshot's `constellation` field carries anything, it is shown BELOW that
+  // notice rather than instead of it, because partial data on an unbuilt screen is exactly
+  // how "looks finished, shows nothing" gets built by accident.
+  function renderDevices(data) {
+    const root = $('devices-body');
+    if (!root) return;
+    const c = data?.constellation ?? null;
+    const parts = [
+      `<div class="devices-notice">
+         <strong>Not yet implemented.</strong> Device / constellation management is a reserved
+         slot, not a finished screen. <code>core/src/constellation.rs</code> carries the real
+         mechanism — paired device LCTs, capabilities, liveness, <code>DeviceStatus</code> as
+         the authoritative gate — and this view does not yet render or drive it. What follows
+         is the raw <code>constellation</code> field from the dashboard snapshot, shown so this
+         screen cannot imply your constellation is empty when it is only unrendered.
+       </div>`,
+    ];
+    // THREE STATES, NOT TWO — and the first one is the defect this screen exists to prevent,
+    // committed inside the fix for it. The first draft branched on `c` alone, so before the
+    // first snapshot arrived (`lastData === null`, which is exactly when an operator opening
+    // this tab first sees it) it rendered "the snapshot carries no constellation field". There
+    // was no snapshot. It stated a fact about data that had not loaded, which is the same move
+    // as #438's gauge saying `current` about a referent nobody asked for. "Not loaded yet",
+    // "loaded and the field is absent", and "loaded and here it is" are three different
+    // claims, and only the last two are about your constellation.
+    if (!data) {
+      parts.push(`<div class="empty">No snapshot has loaded yet — this says nothing at all
+        about your constellation. If this persists, the dashboard is not reaching the daemon.</div>`);
+    } else if (c === null || c === undefined) {
+      parts.push(`<div class="empty">The snapshot loaded and carries no
+        <code>constellation</code> field (it is optional, and absent here). That is a fact about
+        the SNAPSHOT, not evidence that no devices are paired.</div>`);
+    } else {
+      parts.push(`<pre class="devices-raw">${escapeHtml(JSON.stringify(c, null, 2))}</pre>`);
+    }
+    root.innerHTML = parts.join('');
+  }
+
   function renderEscalations(data) {
     const pend = data?.pending_escalations ?? [];
     const banner = $('esc-banner');
@@ -2693,7 +3161,10 @@
         const n = c[el.dataset.n];
         el.textContent = (n === undefined || n === null) ? '' : ` ${n}`;
       });
-      $('ledger-badge').textContent = c.open ? String(c.open) : '·';
+      // The ledger's own OPEN count stays here, on the `open` facet tab, where it is one of
+      // six status counts and is read next to the rows it describes. It is deliberately NOT
+      // written to the govern nav chip — see updateGovernBadge(), which drives that badge from
+      // the snapshot instead, and the note there for why.
       $('ledger-scanned').textContent = `${data.scanned ?? 0} scanned`;
 
       const rows = data.rows || [];
@@ -2897,7 +3368,9 @@
   }
 
   (function wirePolicyEditor() {
-    const card = $('policy-card');
+    // Was `#policy-card`, the modal panel. Now the govern → policy PANE. The delegated
+    // click contract is identical, so only the container id changes.
+    const card = $('govern-policy');
     card.addEventListener('click', (e) => {
       const t = e.target;
       if (t.dataset.preset) {
@@ -2942,17 +3415,237 @@
     });
   })();
 
-  // policy modal: open from the witness-chain header button, refresh on open.
-  (function wirePolicyModal() {
-    const modal = $('policy-modal');
-    $('policy-btn').addEventListener('click', () => { modal.hidden = false; fetchPolicy(); });
-    modal.addEventListener('click', (e) => { if (e.target.dataset.close) modal.hidden = true; });
+  // GOVERN sub-navigation, and the mount hook that keeps the view from opening on a stale
+  // frame. Policy and the ledger are no longer modals opened by a button; they are panes of
+  // the govern view, selected by the sub-nav, following the agents screen's selection-driven
+  // scheme (§6.0.2) so an operator who learned one screen has learned both.
+  // Declared list, same reasoning as VIEWS: a half-added pane should be a missing entry, not
+  // a chip that silently falls back to the ledger.
+  const GOVERN_PANES = {
+    ledger: { el: 'govern-ledger', mount: () => loadLedger() },
+    // Grants render from the snapshot, which the page polls anyway, so mounting costs nothing
+    // and the pane is never a stale frame.
+    grants: { el: 'govern-grants', mount: () => renderScopeGrants(lastData) },
+    // Acts are pure forms — nothing to fetch, so no mount hook. A mount that did nothing but
+    // exist would be the "looks wired" shape this file keeps refusing.
+    acts:   { el: 'govern-acts' },
+    policy: { el: 'govern-policy', mount: () => fetchPolicy() },
+  };
+  let governSection = 'ledger';
+  function governShow(section) {
+    if (!Object.prototype.hasOwnProperty.call(GOVERN_PANES, section)) section = 'ledger';
+    governSection = section;
+    for (const [name, spec] of Object.entries(GOVERN_PANES)) {
+      const el = $(spec.el);
+      if (el) el.hidden = name !== section;
+    }
+    document.querySelectorAll('#govern-nav .govern-chip')
+      .forEach(c => c.classList.toggle('selected', c.dataset.gov === section));
+    // Refresh only the pane being SHOWN — the ledger reads the chain over HTTP and is the
+    // expensive one; fetching it while the operator is reading policy is work nobody sees.
+    try { GOVERN_PANES[section].mount?.(); } catch (_) { /* never strand the sub-nav */ }
+  }
+  function governMount() { governShow(governSection); }
+
+  (function wireGovernNav() {
+    const nav = $('govern-nav');
+    if (nav) nav.addEventListener('click', (e) => {
+      const chip = e.target.closest('.govern-chip');
+      if (chip) governShow(chip.dataset.gov);
+    });
+  })();
+
+  // THE THREE OPERATOR ACTS — adjudicate, alias, amnesty.
+  //
+  // One helper, because all three obey the same three rules and writing them out three times
+  // is how two of them would eventually stop obeying one: (1) the submit button is DISABLED
+  // until every required field is present — never enabled-and-inert, which is #456's defect;
+  // (2) the daemon's own error text is rendered, never swallowed; (3) the inputs that identify
+  // the SUBJECT are not cleared on success, because the operator is usually recording several
+  // acts about the same member and re-typing the id is how the wrong one gets rated.
+  //
+  // `ref` is required on all three by the daemon. The UI treats it as required too rather than
+  // letting the round trip discover it — a rejection that could have been prevented on screen
+  // trains the operator to distrust the form.
+  function wireOperatorAct({ btn, err, ok, required, build, endpoint, describe }) {
+    const b = $(btn), e = $(err), o = $(ok);
+    if (!b) return;
+    const fields = required.map(id => $(id)).filter(Boolean);
+    const sync = () => { b.disabled = !fields.every(f => f.value.trim()); };
+    fields.forEach(f => f.addEventListener('input', sync));
+    sync();
+    b.addEventListener('click', async () => {
+      e.hidden = true; o.hidden = true; b.disabled = true;
+      try {
+        const res = await apiFetch(endpoint, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(build()),
+        });
+        const out = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+        o.innerHTML = describe(out);
+        o.hidden = false;
+        // The witness hash is the receipt. Showing it means the operator can find the act in
+        // the ledger without trusting this panel's own claim that it landed.
+        await tick();
+      } catch (ex) {
+        e.textContent = `${btn.replace(/-btn$/, '')} failed: ${ex.message}`;
+        e.hidden = false;
+      } finally { sync(); }
+    });
+  }
+
+  (function wireOperatorActs() {
+    const hash = out => out?.witnessEntryHash
+      ? ` <code>${escapeHtml(String(out.witnessEntryHash).slice(0, 16))}</code>` : '';
+
+    wireOperatorAct({
+      btn: 'adj-btn', err: 'adj-err', ok: 'adj-ok',
+      required: ['adj-plugin', 'adj-role', 'adj-ref'],
+      endpoint: '/api/operator/adjudicate',
+      build: () => ({
+        subject_plugin_id: $('adj-plugin').value.trim(),
+        subject_role: $('adj-role').value.trim(),
+        axis: $('adj-axis').value,
+        verdict: $('adj-verdict').value,
+        ref: $('adj-ref').value.trim(),
+        reason: $('adj-reason').value.trim() || null,
+      }),
+      describe: out => `Adjudication recorded — ${escapeHtml($('adj-verdict').value)} on
+        ${escapeHtml($('adj-axis').value)} for <strong>${escapeHtml($('adj-plugin').value.trim())}</strong>.
+        Witnessed${hash(out)}. It enters derivation as evidence, not as a set score.`,
+    });
+
+    wireOperatorAct({
+      btn: 'ali-btn', err: 'ali-err', ok: 'ali-ok',
+      required: ['ali-of', 'ali-alias', 'ali-ref'],
+      endpoint: '/api/operator/alias',
+      build: () => ({
+        alias_of: $('ali-of').value.trim(),
+        alias: $('ali-alias').value.trim(),
+        ref: $('ali-ref').value.trim(),
+        reason: $('ali-reason').value.trim() || null,
+      }),
+      describe: out => `Identities joined — <strong>${escapeHtml($('ali-alias').value.trim())}</strong>
+        now folds into <strong>${escapeHtml($('ali-of').value.trim())}</strong> at read time.
+        Witnessed${hash(out)}. Append-only: nothing was rewritten, and a later contradicting
+        alias supersedes this one.`,
+    });
+
+    wireOperatorAct({
+      btn: 'amn-btn', err: 'amn-err', ok: 'amn-ok',
+      required: ['amn-before', 'amn-ref', 'amn-reason'],
+      endpoint: '/api/operator/amnesty',
+      build: () => ({
+        class: 'deny',
+        before_position: Number($('amn-before').value.trim()),
+        reason: $('amn-reason').value.trim(),
+        ref: $('amn-ref').value.trim(),
+      }),
+      // Says what it DID, in the direction that is easy to misread. An operator who came here
+      // to "clear" something should leave knowing the record is intact and only its reading
+      // changed — otherwise amnesty becomes the delete button people believe it is.
+      describe: out => `Amnesty recorded for denies below chain position
+        <strong>${escapeHtml($('amn-before').value.trim())}</strong>. Witnessed${hash(out)}.
+        Nothing was deleted — those entries remain in the chain and now show this amnesty as
+        the reason they no longer score as conduct.`,
+    });
+  })();
+
+  // THE OPERATOR-ORIGINATED SCOPE GRANT, and the revoke beside it.
+  (function wireScopeGrants() {
+    const pane = $('govern-grants');
+    if (!pane) return;
+    const plugin = $('sg-plugin'), path = $('sg-path'), reason = $('sg-reason'),
+          ttl = $('sg-ttl'), btn = $('sg-grant-btn'), err = $('sg-err'), ok = $('sg-ok');
+
+    // Enabled only when every required field is present — the same rule #456 had to add to
+    // the scope popup after dp clicked an enabled-looking button and got silence. A button
+    // that is live-looking and inert is the defect; a visibly disabled one is the fix.
+    const sync = () => {
+      btn.disabled = !(plugin.value.trim() && path.value.trim() && reason.value.trim());
+    };
+    [plugin, path, reason].forEach(el => el.addEventListener('input', sync));
+    sync();
+
+    btn.addEventListener('click', async () => {
+      err.hidden = true; ok.hidden = true;
+      btn.disabled = true;
+      try {
+        const body = {
+          plugin_id: plugin.value.trim(),
+          path: path.value.trim(),
+          reason: reason.value.trim(),
+        };
+        if (ttl.value) body.expires_in_secs = Number(ttl.value);
+        const res = await apiFetch('/api/scope/grant', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const out = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+        // The daemon reports whether that plugin_id has ever connected. A grant to a member
+        // nobody has seen is legitimate (granting ahead of a first connect) and is ALSO what
+        // a typo looks like — so its own answer is shown rather than a generic success.
+        ok.innerHTML = out.member_known
+          ? `Granted <code>${escapeHtml(out.path)}</code> to <strong>${escapeHtml(out.plugin_id)}</strong>
+             — standing, generation ${out.generation}. The gate consults it immediately.`
+          : `<strong>Granted, but no member called "${escapeHtml(out.plugin_id)}" has ever
+             connected to this daemon.</strong> That is fine if you are granting ahead of a
+             first connect — and it is also what a typo looks like. Check the spelling.`;
+        ok.hidden = false;
+        path.value = ''; reason.value = '';
+        sync();
+        await tick();
+        renderScopeGrants(lastData);
+      } catch (e) {
+        err.textContent = `grant failed: ${e.message}`;
+        err.hidden = false;
+        sync();
+      }
+    });
+
+    // Revoke, and the hand-off to the one decide control. Delegated, because the rows are
+    // re-rendered on every tick and per-row listeners would be rebound continuously.
+    pane.addEventListener('click', async (e) => {
+      const open = e.target.closest('[data-open-scope]');
+      if (open) { $('scope-modal').hidden = false; return; }
+      const rev = e.target.closest('[data-revoke-member]');
+      if (!rev) return;
+      const member = rev.dataset.revokeMember, p = rev.dataset.revokePath;
+      const why = prompt(`Revoke standing scope for ${member}?\n\n${p}\n\nReason (optional):`);
+      if (why === null) return;   // cancelled — a tightening still must not happen by accident
+      rev.disabled = true;
+      err.hidden = true;
+      try {
+        const res = await apiFetch('/api/scope/standing/revoke', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ plugin_id: member, path: p, reason: why }),
+        });
+        const out = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+        await tick();
+        renderScopeGrants(lastData);
+      } catch (e2) {
+        err.textContent = `revoke failed: ${e2.message}`;
+        err.hidden = false;
+        rev.disabled = false;
+      }
+    });
+  })();
+
+  // The two panels that are STILL modals: pending escalations and pending scope requests.
+  // They stay overlays on purpose (§6.0.4, AC-20) — they are notifications reachable from
+  // every view, not records filed under govern.
+  (function wireGovernanceModals() {
 
     // Escalation modal: same backdrop/✕ contract. The list is already current from the
     // last tick, so opening it shows what is pending without a second fetch.
-    // WHEN A MEMBER IS SELECTED, THE POLICY BUTTON TARGETS THAT MEMBER (dp, 2026-08-01):
+    // WHEN A MEMBER IS SELECTED, THE POLICY CONTROLS TARGET THAT MEMBER (dp, 2026-08-01):
     // "when an agent is selected and the chain shows only its actions, clicking the policy
     // button should only change the policy for the selected agent."
+    // (The `policy` BUTTON is gone as of §6.0.1 — the scoping behaviour it named is not, and
+    // now lives on the preset controls inside govern → policy.)
     //
     // The preset buttons were always the SOCIETY preset, so selecting kimi and clicking
     // `permissive` set every seat on the box permissive — twice, in one session, because the
@@ -2977,11 +3670,11 @@
     // "the three ways a reader will try" (kimi NOT-SAME review of #186). A modal that ignores
     // one of the three teaches the operator that this panel is different from the one beside
     // it, which is the opposite of why it reuses the escalation panel's shape.
-    // Governance ledger: same backdrop / ✕ / Escape contract as the two panels above, because
-    // an operator should not have to learn a third habit for the same job.
-    const ledgerModal = $('ledger-modal');
-    $('ledger-btn').addEventListener('click', () => { ledgerModal.hidden = false; loadLedger(); });
-    ledgerModal.addEventListener('click', (e) => { if (e.target.dataset.close) ledgerModal.hidden = true; });
+    // THE LEDGER IS NO LONGER A MODAL (§6.0.1) — it is `govern → ledger`, so there is no
+    // backdrop, no ✕ and no Escape contract to honour here. What survives is its CONTENT
+    // wiring: the status facets and the range selector, which are unchanged and still drive
+    // loadLedger(). Opening it is now `setView('govern')`, and the govern mount hook is what
+    // calls loadLedger() — see governMount().
     $('ledger-tabs').addEventListener('click', (e) => {
       const tab = e.target.closest('.ledger-tab');
       if (!tab) return;
@@ -2996,7 +3689,9 @@
       if (e.key !== 'Escape') return;
       escModal.hidden = true;
       scopeModal.hidden = true;
-      ledgerModal.hidden = true;
+      // `ledgerModal` is deliberately absent: the ledger is a VIEW now, not a modal, and
+      // Escape must not navigate. Escape closes overlays; it does not change which screen
+      // the operator is on.
     });
     // Same backdrop/✕/Escape contract for the trust detail popup, so both modals close
     // the three ways a reader will try rather than only the one that was wired.
