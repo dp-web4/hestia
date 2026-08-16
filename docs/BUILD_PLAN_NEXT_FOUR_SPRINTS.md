@@ -1,4 +1,41 @@
-# Build plan — the next four sprints
+# Planning record — the four sprints proposed 2026-08-14/15
+
+> **THIS IS A HISTORICAL RECORD, NOT A CURRENT PLAN.** Retitled 2026-08-16 after GPT's
+> integration pass: *"the document is continuing to acquire new 'current truth' faster than its
+> branch is being updated"* — and it was right. The choice offered was living-plan or
+> historical-record, and this is the historical one, deliberately.
+>
+> **Why historical rather than living.** A living plan has to be re-ruled every time the
+> ordering moves, and the ordering moved four times in two days — sprint 3 jumped the queue
+> because the operator could not grant scope at all; the society floor was then built ahead of
+> everything because uniform law was the precondition for the cutover; the return edge (#480)
+> and policy-edit authorship (#479) arrived from other seats while this branch sat. A document
+> that keeps a present-tense "next four sprints" title under that churn is not a plan, it is a
+> claim that keeps going stale between reads. The reasoning and the measurements below are
+> worth keeping; the present tense is not.
+>
+> **Where the live ordering actually lives**: the open PR/issue set, and dp's direction. Not
+> here. Nothing below should be read as a statement about what happens next.
+>
+> **What became true after this was written** (recorded once, as of 2026-08-16, and then left
+> alone rather than maintained):
+> - **#451 merged** — the R6/R7 hard gate this plan names on sprint 2 has CLEARED.
+> - **#462 merged and DEPLOYED** — the govern view, the grants pane, `POST /api/scope/grant`,
+>   and the INTENT → COMMIT → SUCCESS repair are in force on the running daemon. The earlier
+>   status block called this BUILT-NOT-LANDED; that is now false, which is the specific
+>   staleness that prompted this reframing.
+> - **The society floor is live** — 28 paths, identical across every member including one that
+>   has never connected. Not in this plan at all; it displaced sprint 2's allowlist store as
+>   the thing everything waited on.
+> - **The governance dashboard was starving the daemon** — `/api/governance/ledger` held the
+>   global state lock for 8-15s, so the gate's 1.5s witness budget could not be met while an
+>   operator watched the governance screen. Fixed; not foreseen here.
+> - **#479 / #480** — policy-edit authorship and the petition return edge, both from other
+>   seats, both reordering sprint 1's substrate list underneath this document.
+>
+> Sprint 4's advisory-rung design and the "every sprint ends in something the fleet USES" rule
+> are the parts that have survived contact unchanged, and are the parts worth re-reading.
+
 
 **Status**: proposed, 2026-08-14, claude-code (CBP). For dp's ruling before work starts.
 **Second pass, 2026-08-15**: GPT/codex review (notice 2420) landed three narrowings — all three adopted.
