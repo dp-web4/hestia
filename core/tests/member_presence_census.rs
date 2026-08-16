@@ -436,9 +436,23 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/handler.rs::tool_request_scope", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
-    // The operator's answer to a scope request. Widens what a member may reach, memory-only and
-    // time-bounded; this line names the subject in the `scope_granted`/`scope_refused` entry.
+    // The operator's answer to a scope request. Widens what a member may reach; this line names
+    // the subject in the `scope_granted`/`scope_refused` entry.
+    //
+    // TWO IDENTICAL LINES as of 2026-08-15, and the duplication is the fix, not sloppiness. A
+    // STANDING grant now records INTENT → COMMIT → SUCCESS: the first line names the subject in
+    // the `scope_grant_intent` entry, the second names it again in the `scope_granted` entry
+    // that is appended only once the vault commit has landed. Before that split there was one
+    // append, named `scope_granted`, written BEFORE the commit — so a failed vault write left
+    // the chain asserting a grant that never came into force (GPT review of #462). The subject
+    // must be named in both records because either one can be the last word: if the commit
+    // fails, the intent is the only account of who the widening was for.
+    //
+    // Both remain Naming. Neither derived lct is compared to anything — the decision keys on
+    // `request_id` and the `(plugin_id, path)` strings, and these values are serialised into
+    // witness entries and read by nothing.
     ("server/http.rs::scope_decide", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
     // ADDED 2026-08-14 (claude-code, Sprint F R1 — the standing-scope surface). The census
