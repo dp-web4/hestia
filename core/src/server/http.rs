@@ -2846,6 +2846,12 @@ async fn operator_gate_escalation(
 
     let now = now_secs();
     let mut s = state.lock().await;
+    // Witness IS finality (revised #480 review, defect 2), same shape as the MCP
+    // surface: the store mutation happens first only because the witness payload
+    // is built from the post-decision record, and a failed append ROLLS THE
+    // DECISION BACK — an applied-but-unwitnessed ruling has no ruling hash, no
+    // projector source, and no representable obligation.
+    let prior = s.gate_escalations.get(&d.id).cloned();
     match s.gate_escalations.decide(
         &d.id,
         d.approve,
@@ -2859,7 +2865,7 @@ async fn operator_gate_escalation(
         now,
     ) {
         Ok(esc) => {
-            let entry = s.append_chain(
+            let entry = match s.append_chain(
                 "gate_escalation_decided",
                 serde_json::json!({
                     "escalation_id": esc.id,
@@ -2880,29 +2886,40 @@ async fn operator_gate_escalation(
                     "bar_met": esc.bar_met(),
                     "secs_into_window": now.saturating_sub(esc.opened_at),
                 }),
-            );
+            ) {
+                Ok(e) => e,
+                Err(append_err) => {
+                    // The ruling is NOT final: restore the exact pre-decision row
+                    // (`decide` succeeded, so it existed) and tell the operator.
+                    if let Some(p) = prior {
+                        s.gate_escalations.undo_decide(p);
+                    }
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "decision NOT applied — its witness append failed \
+                                 ({append_err}); the escalation stays pending and the \
+                                 write stays refused"
+                            ),
+                            "escalation_id": d.id,
+                        })),
+                    )
+                        .into_response();
+                }
+            };
             // #459: the decision's RETURN EDGE, on the channel that decides 207 of
             // 210 rulings. Minted at this layer because `EscalationStore::decide`
             // has no inbox access. Revised #480 contract: the decision entry IS
             // the witness, so the obligation anchors to its hash, and a failed
             // ensure is warned about rather than returned — the decision landed;
             // the cursor projector re-derives the obligation and retries.
-            let disposition_notice_id = match &entry {
-                Ok(e) => super::handler::ensure_disposition(
-                    &s,
-                    &esc.plugin_id,
-                    &format!("hestia://escalation/{}#decided", esc.id),
-                    &e.hash,
-                ),
-                Err(append_err) => {
-                    tracing::warn!(
-                        "escalation {} decided but its witness append failed \
-                         ({append_err}) — no disposition can anchor to it",
-                        esc.id
-                    );
-                    None
-                }
-            };
+            let disposition_notice_id = super::handler::ensure_disposition(
+                &s,
+                &esc.plugin_id,
+                &format!("hestia://escalation/{}#decided", esc.id),
+                &entry.hash,
+            );
             // THE DECIDER SEES THE BAR — on this surface too.
             //
             // This reply used to be `{escalation_id, status, witnessEntryHash}`. #219 measured
@@ -2920,7 +2937,7 @@ async fn operator_gate_escalation(
             if let Some(o) = body.as_object_mut() {
                 o.insert(
                     "witnessEntryHash".into(),
-                    serde_json::json!(entry.ok().map(|e| e.hash)),
+                    serde_json::json!(entry.hash),
                 );
                 o.insert(
                     "disposition_notice_id".into(),
@@ -3063,5 +3080,61 @@ mod disposition_tests {
             note.pointer_uri.as_deref(),
             Some(format!("hestia://escalation/{esc_id}#decided")).as_deref()
         );
+    }
+
+    /// Revised #480 review, defect 2, on the channel that decides 207 of 210
+    /// rulings: a failed witness append rolls the decision BACK — the operator
+    /// gets a 500, the escalation stays Pending, and nothing was authorised.
+    #[tokio::test]
+    async fn an_unwitnessed_operator_decision_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        let esc_id = {
+            let mut s = state.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            s.gate_escalations
+                .open("kimi-code", "", "policy_edit", "policy.json", None, None, now, 3600)
+                .unwrap()
+                .id
+        };
+        let decision = GateEscalationDecision {
+            id: esc_id.clone(),
+            approve: true,
+            reason: Some("reviewed the diff".into()),
+        };
+
+        // RESERVED lock on witness.db: reads proceed, writes fail BUSY.
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let blocker = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        blocker.pragma_update(None, "key", hex::encode(key)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let resp = operator_gate_escalation(State(state.clone()), Json(decision))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an unwitnessed ruling is an error, not a null-hash success"
+        );
+        {
+            let s = state.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            assert_eq!(
+                s.gate_escalations.status_of(&esc_id, now),
+                crate::server::gate_escalation::Status::Pending,
+                "the decision was rolled back — finality requires its witness"
+            );
+        }
+        blocker.execute_batch("COMMIT").unwrap();
+
+        let decision = GateEscalationDecision {
+            id: esc_id.clone(),
+            approve: true,
+            reason: Some("reviewed the diff".into()),
+        };
+        let resp = operator_gate_escalation(State(state.clone()), Json(decision))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "the retry rules cleanly");
     }
 }

@@ -309,6 +309,31 @@ impl SqliteChainStore {
         Ok(out)
     }
 
+    /// Up to `limit` entries strictly BEFORE `before_position`, newest first —
+    /// the backward page for a bounded lookup walking toward a floor (#480
+    /// review, defect 3: the pointer resolvers' fallback used to materialize a
+    /// 20,000-entry window under the shared-state read path; a lookup by
+    /// event_data id has no index, so it pages instead). `before_position` is
+    /// EXCLUSIVE; pass a value past the tail to start at the newest entry.
+    pub fn read_before(&self, before_position: u64, limit: u64) -> Result<Vec<ChainEntry>> {
+        let conn = self.conn.lock().unwrap();
+        // u64::MAX as i64 would wrap negative — clamp into range.
+        let before = i64::try_from(before_position).unwrap_or(i64::MAX);
+        let mut stmt = conn.prepare(
+            "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+             FROM chain_entries
+             WHERE chain_position < ?1
+             ORDER BY chain_position DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![before, limit as i64], row_to_entry)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
     /// Most recent entries at-or-after `cutoff_rfc3339` (a calendar window),
     /// descending chain_position, capped at `limit`. `None` = no calendar
     /// filter (plain `read_recent`).

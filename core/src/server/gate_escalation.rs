@@ -1219,6 +1219,19 @@ impl EscalationStore {
         Ok(esc.clone())
     }
 
+    /// Undo a decision, restoring the exact pre-decision row. Exists for ONE
+    /// caller pattern (revised #480 review, defect 2): the decision surfaces
+    /// apply `decide` and then witness, because the witness payload is built
+    /// from the post-decision record — and if the `gate_escalation_decided`
+    /// append fails, the ruling must NOT become final. An applied-but-unwitnessed
+    /// decision has no ruling hash, no projector source, and no representable
+    /// disposition obligation: finality without its terminal witness. So the
+    /// caller clones the row before `decide` and hands it back here on append
+    /// failure. Not a general undo — nothing else may call this.
+    pub fn undo_decide(&mut self, prior: Escalation) {
+        self.by_id.insert(prior.id.clone(), prior);
+    }
+
     /// Add a peer's evidence to a PENDING escalation without deciding it.
     ///
     /// This is the accumulation half of the constellation model: approval is not a boolean

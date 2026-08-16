@@ -404,7 +404,14 @@ impl SqliteInboxStore {
         // Same retention discipline as every other writer on this plane.
         conn.execute(
             "DELETE FROM member_notices
-              WHERE queued_at < ?1 AND (dest_peer IS NULL OR drained_at IS NOT NULL)",
+              WHERE queued_at < ?1 AND (dest_peer IS NULL OR drained_at IS NOT NULL)
+                -- The disposition exemption (revised #480 review, defect 1): an
+                -- UNDRAINED disposition is an undelivered obligation, and the
+                -- projection cursor has already passed its ruling — deleting it
+                -- here would make the return edge silently evaporate at day 7.
+                -- Retention starts only after delivery (`drained_at` set); every
+                -- other kind keeps the TTL exactly as before.
+                AND NOT (kind = 'disposition' AND drained_at IS NULL)",
             params![cutoff],
         )
         .context("pruning expired member notices")?;
@@ -766,7 +773,14 @@ impl SqliteInboxStore {
         // omission.
         conn.execute(
             "DELETE FROM member_notices
-              WHERE queued_at < ?1 AND (dest_peer IS NULL OR drained_at IS NOT NULL)",
+              WHERE queued_at < ?1 AND (dest_peer IS NULL OR drained_at IS NOT NULL)
+                -- The disposition exemption (revised #480 review, defect 1): an
+                -- UNDRAINED disposition is an undelivered obligation, and the
+                -- projection cursor has already passed its ruling — deleting it
+                -- here would make the return edge silently evaporate at day 7.
+                -- Retention starts only after delivery (`drained_at` set); every
+                -- other kind keeps the TTL exactly as before.
+                AND NOT (kind = 'disposition' AND drained_at IS NULL)",
             params![cutoff],
         )
         .context("pruning expired member notices")?;
@@ -917,8 +931,13 @@ impl SqliteInboxStore {
                     "SELECT id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
                             in_reply_to
                      FROM member_notices
-                     WHERE to_plugin = ?1 AND queued_at >= ?2 AND drained_at IS NULL
+                     WHERE to_plugin = ?1 AND drained_at IS NULL
                        AND dest_peer IS NULL
+                       -- Undrained dispositions are exempt from the TTL *deletion*
+                       -- (see the prune in enqueue_member); that exemption would be
+                       -- hollow if the delivery window still hid the row. They are
+                       -- served until delivered, however old.
+                       AND (queued_at >= ?2 OR kind = 'disposition')
                      ORDER BY id ASC",
                 )
                 .context("preparing member drain SELECT")?;
@@ -1008,8 +1027,11 @@ impl SqliteInboxStore {
             "SELECT id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
                     in_reply_to
              FROM member_notices
-             WHERE to_plugin = ?1 AND queued_at >= ?2 AND drained_at IS NULL
+             WHERE to_plugin = ?1 AND drained_at IS NULL
                AND dest_peer IS NULL
+               -- Same exemption as drain_member: an undrained disposition is
+               -- served until delivered, however old.
+               AND (queued_at >= ?2 OR kind = 'disposition')
              ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![to_plugin, cutoff], |row| {
@@ -2236,5 +2258,68 @@ mod tests {
             drained.last().unwrap().sealed,
             format!("sealed-{}", MAX_INBOX_NOTICES + 1)
         );
+    }
+
+    /// Revised #480 review, defect 1: an UNDRAINED disposition is an undelivered
+    /// OBLIGATION — the projection cursor has already passed its ruling, so a TTL
+    /// deletion would be silent, permanent loss. The prune must spare it and the
+    /// delivery windows must still serve it, however old; retention starts only at
+    /// delivery, so a DRAINED disposition past the TTL is pruned like any other
+    /// row — and every other kind is untouched by the exemption.
+    #[test]
+    fn an_undrained_disposition_survives_the_ttl_prune_a_drained_one_does_not() {
+        let (_tmp, store) = fresh();
+        let drained_id = store
+            .ensure_member_disposition("kimi-code", "disposition",
+                                       "hestia://escalation/a1#decided", "ruling-hash-1")
+            .unwrap()
+            .expect("first ensure inserts");
+        let undrained_id = store
+            .ensure_member_disposition("codex", "disposition",
+                                       "hestia://escalation/b2#decided", "ruling-hash-2")
+            .unwrap()
+            .expect("second ensure inserts");
+        let plain_id = store
+            .enqueue_member("codex", "claude-code", "role:constellation:interactive-dev",
+                            "coordination", Some("forum/x.md"), "hash-plain", None)
+            .unwrap();
+        // kimi-code collects its mail; codex never does.
+        assert_eq!(store.drain_member("kimi-code").unwrap().len(), 1);
+
+        // Age all three rows past the TTL, directly — the test cannot wait a week.
+        let old = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS + 3600)).to_rfc3339();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE member_notices SET queued_at = ?1", params![old])
+                .unwrap();
+        }
+
+        // Any write runs the prune.
+        let fresh_id = store
+            .ensure_member_disposition("codex", "disposition",
+                                       "hestia://escalation/c3#lapsed", "ruling-hash-3")
+            .unwrap()
+            .expect("third ensure inserts");
+
+        assert!(
+            row_exists(&store, undrained_id),
+            "an undrained disposition survives the TTL — the obligation outlives retention"
+        );
+        assert!(
+            !row_exists(&store, drained_id),
+            "retention starts at delivery: a DRAINED disposition ages out"
+        );
+        assert!(
+            !row_exists(&store, plain_id),
+            "the exemption is narrow — every other kind still prunes"
+        );
+
+        // And the survivor is still DELIVERABLE: the drain window exempts it too,
+        // or the prune exemption would be a row nobody can ever read.
+        let mail = store.drain_member("codex").unwrap();
+        let ids: Vec<u64> = mail.iter().map(|n| n.id).collect();
+        assert!(ids.contains(&undrained_id), "served however old: {ids:?}");
+        assert!(ids.contains(&fresh_id));
+        assert_eq!(mail.len(), 2, "the pruned plain notice stays gone: {mail:?}");
     }
 }

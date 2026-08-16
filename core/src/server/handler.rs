@@ -5495,6 +5495,90 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
 // Helpers
 // =========================================================================
 
+/// One backward page of a pointer-fallback scan (#480 review, defect 3).
+pub(crate) const POINTER_LOOKUP_PAGE: u64 = 500;
+/// The hard cap on entries a single pointer resolution may read.
+pub(crate) const POINTER_LOOKUP_MAX: u64 = 1000;
+
+/// The outcome of a bounded backward scan: the matches, how many entries were
+/// actually read, and whether the scan reached genesis. The last two exist for
+/// the not-found arms, which may only claim absence over what was actually
+/// searched.
+struct PagedLookup {
+    primary: Option<crate::storage::chain::ChainEntry>,
+    secondary: Option<crate::storage::chain::ChainEntry>,
+    searched: u64,
+    complete: bool,
+}
+
+/// Bounded backward scan for the two entry kinds a #459 pointer fallback needs
+/// (e.g. the escalation's `opened` entry and its `settled` one). Newest-first
+/// pages of [`POINTER_LOOKUP_PAGE`], at most [`POINTER_LOOKUP_MAX`] entries
+/// total, stopping early when both predicates hit — this replaced a
+/// `recent_chain(APPEAL_CHAIN_WINDOW)` call that materialized 20,000 full
+/// entries under the shared-state read path every time a member followed a
+/// disposition pointer whose memory row had been reaped. A lookup by
+/// `escalation_id` / `request_id` has no index to use, so it pages; the cap is
+/// what keeps the page from becoming the window it replaced.
+fn paged_chain_lookup(
+    chain: &crate::storage::chain::SqliteChainStore,
+    want_primary: &dyn Fn(&crate::storage::chain::ChainEntry) -> bool,
+    want_secondary: &dyn Fn(&crate::storage::chain::ChainEntry) -> bool,
+) -> anyhow::Result<PagedLookup> {
+    let mut found = PagedLookup {
+        primary: None,
+        secondary: None,
+        searched: 0,
+        complete: false,
+    };
+    let mut before = u64::MAX;
+    loop {
+        let page = chain.read_before(before, POINTER_LOOKUP_PAGE)?;
+        if page.is_empty() {
+            found.complete = true;
+            return Ok(found);
+        }
+        let oldest = page.last().map(|e| e.chain_position).unwrap_or(0);
+        let page_len = page.len() as u64;
+        for e in &page {
+            found.searched += 1;
+            if found.primary.is_none() && want_primary(e) {
+                found.primary = Some(e.clone());
+            }
+            if found.secondary.is_none() && want_secondary(e) {
+                found.secondary = Some(e.clone());
+            }
+        }
+        if found.primary.is_some() && found.secondary.is_some() {
+            return Ok(found);
+        }
+        if found.searched >= POINTER_LOOKUP_MAX {
+            // The cap, not the floor: deeper history exists and was NOT read.
+            return Ok(found);
+        }
+        if page_len < POINTER_LOOKUP_PAGE || oldest == 0 {
+            found.complete = true;
+            return Ok(found);
+        }
+        before = oldest;
+    }
+}
+
+/// How a not-found arm reports the scan's coverage — the truthfulness rule
+/// (defect 3): never claim "no such ask is on record" beyond what was actually
+/// searched.
+fn scan_coverage_note(searched: u64, complete: bool) -> String {
+    if complete {
+        format!("the whole chain, back to genesis ({searched} chain entries)")
+    } else {
+        format!(
+            "the newest {searched} chain entries — the bounded page this resolver reads; \
+             older history was NOT searched (hestia_query_history and hestia://chain/ \
+             pointers page deeper)"
+        )
+    }
+}
+
 fn chain_entry_json(e: &crate::storage::chain::ChainEntry) -> Value {
     json!({
         "hash": e.hash,
@@ -5646,33 +5730,51 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
             "expires_at": req.expires_at,
         });
     }
-    // Store miss — a restart forgets every live ask. The chain does not.
-    let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
-    fn id_of<'a>(e: &'a crate::storage::chain::ChainEntry) -> Option<&'a str> {
-        e.event_data.get("request_id").and_then(Value::as_str)
-    }
-    let decision = window.iter().find(|e| {
-        matches!(e.event_type.as_str(), "scope_granted" | "scope_refused") && id_of(e) == Some(ptr)
-    });
-    let requested = window
-        .iter()
-        .find(|e| e.event_type == "scope_requested" && id_of(e) == Some(ptr));
-    let Some(anchor) = decision.or(requested) else {
+    // Store miss — a restart forgets every live ask. The chain does not. The
+    // scan is BOUNDED (revised #480 review, defect 3): newest-first pages, at
+    // most POINTER_LOOKUP_MAX entries — never the 20k full-window
+    // materialization the first shape ran on this read path.
+    let scan = paged_chain_lookup(
+        &s.chain_store,
+        &|e| {
+            matches!(e.event_type.as_str(), "scope_granted" | "scope_refused")
+                && e.event_data.get("request_id").and_then(Value::as_str) == Some(ptr)
+        },
+        &|e| {
+            e.event_type == "scope_requested"
+                && e.event_data.get("request_id").and_then(Value::as_str) == Some(ptr)
+        },
+    );
+    let PagedLookup {
+        primary: decision,
+        secondary: requested,
+        searched,
+        complete,
+    } = match scan {
+        Ok(l) => l,
+        Err(e) => {
+            return hestia_error_envelope(
+                "hestia.pointer_lookup_failed",
+                &format!("the bounded chain scan for '{ptr}' failed: {e}"),
+                Some(json!({"pointer": ptr})),
+            )
+        }
+    };
+    let Some(anchor) = decision.as_ref().or(requested.as_ref()) else {
         return hestia_error_envelope(
             "hestia.scope_pointer_not_found",
             &format!(
                 "no scope request with id '{ptr}' on this daemon, and no scope_requested / \
-                 scope_granted / scope_refused naming it in the last {APPEAL_CHAIN_WINDOW} \
-                 chain entries. That is UNKNOWN, not refused: scope requests live in memory \
-                 and do not survive a restart, so an absent id says nothing about whether \
-                 any ask was granted or refused. The witnessed decision, if one was made, \
-                 is on the chain — if this one is older than the window, it is beyond every \
-                 reader this daemon has"
+                 scope_granted / scope_refused naming it in {}. That is UNKNOWN, not \
+                 refused: scope requests live in memory and do not survive a restart, so \
+                 an absent id says nothing about whether any ask was granted or refused",
+                scan_coverage_note(searched, complete),
             ),
-            Some(json!({"pointer": ptr, "window": APPEAL_CHAIN_WINDOW, "chainLength": s.chain_len()})),
+            Some(json!({"pointer": ptr, "searched": searched, "complete": complete,
+                        "chainLength": s.chain_len()})),
         );
     };
-    let status = match decision {
+    let status = match &decision {
         Some(e) if e.event_type == "scope_granted" => "granted",
         Some(_) => "refused",
         // An ask with no decision yet keeps the store's own clock semantics: past
@@ -5697,11 +5799,12 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
             .get("requested_because")
             .or_else(|| anchor.event_data.get("reason")),
         "status": status,
-        "granted": decision.map(|e| e.event_type == "scope_granted"),
-        "decided_by": decision.and_then(|e| e.event_data.get("granted_by")),
-        "decision_reason": decision.and_then(|e| e.event_data.get("decision_reason")),
+        "granted": decision.as_ref().map(|e| e.event_type == "scope_granted"),
+        "decided_by": decision.as_ref().and_then(|e| e.event_data.get("granted_by")),
+        "decision_reason": decision.as_ref().and_then(|e| e.event_data.get("decision_reason")),
         "expires_at": anchor.event_data.get("expires_at"),
-        "decision_entry": decision.map(chain_entry_json),
+        "decision_entry": decision.as_ref().map(chain_entry_json),
+        "searched": searched,
         "note": "answered from the witness chain — the live store lost this row to a \
                  restart (scope requests are memory-only by design). The chain is the \
                  record; the store was a cache of it",
@@ -5765,28 +5868,52 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
             "expires_at": esc.expires_at,
         });
     }
-    // Store miss. Before saying UNKNOWN, look where the record actually lives.
-    let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
+    // Store miss. Before saying UNKNOWN, look where the record actually lives —
+    // BOUNDED (revised #480 review, defect 3): newest-first pages, at most
+    // POINTER_LOOKUP_MAX entries, never the 20k full-window materialization the
+    // first shape ran on this read path.
     fn id_of<'a>(e: &'a crate::storage::chain::ChainEntry) -> Option<&'a str> {
         e.event_data.get("escalation_id").and_then(Value::as_str)
     }
-    let opened = window
-        .iter()
-        .find(|e| e.event_type == "gate_escalation_opened" && id_of(e) == Some(ptr));
+    let scan = paged_chain_lookup(
+        &s.chain_store,
+        &|e| e.event_type == "gate_escalation_opened" && id_of(e) == Some(ptr),
+        &|e| {
+            matches!(
+                e.event_type.as_str(),
+                "gate_escalation_decided" | "gate_escalation_withdrawn" | "gate_escalation_expired"
+            ) && id_of(e) == Some(ptr)
+        },
+    );
+    let PagedLookup {
+        primary: opened,
+        secondary: settled,
+        searched,
+        complete,
+    } = match scan {
+        Ok(l) => l,
+        Err(e) => {
+            return hestia_error_envelope(
+                "hestia.pointer_lookup_failed",
+                &format!("the bounded chain scan for '{ptr}' failed: {e}"),
+                Some(json!({"pointer": ptr})),
+            )
+        }
+    };
     let Some(opened) = opened else {
         return hestia_error_envelope(
             "hestia.escalation_pointer_not_found",
             &format!(
                 "no escalation with id '{ptr}' in this daemon's live store, and no \
-                 gate_escalation_opened entry naming it in the last {APPEAL_CHAIN_WINDOW} \
-                 chain entries. That is UNKNOWN, not denied: the store is memory-only and \
-                 reaps settled rows about two hours after they open, so an absent id says \
-                 nothing about how a real ask was ruled. The witnessed record of a real \
-                 ask is on the chain as gate_escalation_opened / gate_escalation_decided \
-                 — if this one is older than the window, it is beyond every reader this \
-                 daemon has"
+                 gate_escalation_opened entry naming it in {}. That is UNKNOWN, not \
+                 denied: the store is memory-only and reaps settled rows about two hours \
+                 after they open, so an absent id says nothing about how a real ask was \
+                 ruled. The witnessed record of a real ask is on the chain as \
+                 gate_escalation_opened / gate_escalation_decided",
+                scan_coverage_note(searched, complete),
             ),
-            Some(json!({"pointer": ptr, "window": APPEAL_CHAIN_WINDOW, "chainLength": s.chain_len()})),
+            Some(json!({"pointer": ptr, "searched": searched, "complete": complete,
+                        "chainLength": s.chain_len()})),
         );
     };
     // The same body, sourced from the entries rather than the row. `status` keeps
@@ -5797,19 +5924,14 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
     // the filtered-window illusion one level up.
     let d = &opened.event_data;
     let get = |k: &str| d.get(k).cloned().unwrap_or(Value::Null);
-    let settled = window.iter().find(|e| {
-        matches!(
-            e.event_type.as_str(),
-            "gate_escalation_decided" | "gate_escalation_withdrawn" | "gate_escalation_expired"
-        ) && id_of(e) == Some(ptr)
-    });
     let settled_get = |k: &str| {
         settled
+            .as_ref()
             .and_then(|e| e.event_data.get(k))
             .cloned()
             .unwrap_or(Value::Null)
     };
-    let status = match settled {
+    let status = match &settled {
         Some(e) if e.event_type == "gate_escalation_expired" => "expired".to_string(),
         Some(e) => e
             .event_data
@@ -5837,7 +5959,8 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
         "expires_at": get("expires_at"),
         "decided_by": settled_get("decided_by"),
         "reason": settled_get("reason"),
-        "settled_entry": settled.map(chain_entry_json),
+        "settled_entry": settled.as_ref().map(chain_entry_json),
+        "searched": searched,
         "note": "answered from the witness chain — the live store has reaped this row \
                  (settled rows are dropped about two hours after open). The chain is \
                  the record; the store was a cache of it",
@@ -13180,6 +13303,66 @@ mod appeal_tests {
             "the message a member actually reads must carry the true count too: {amb}"
         );
     }
+
+    /// Revised #480 review, defect 2: WITNESS IS FINALITY. If the
+    /// `gate_escalation_decided` append fails, the decision must not stand — the
+    /// store is rolled back to Pending, nothing is claimable, and the caller gets
+    /// an error rather than a ruling with `witnessEntryHash: null`.
+    #[tokio::test]
+    async fn an_unwitnessed_escalation_decision_is_rolled_back() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let asker_sid = seat(&state, "claude-code").await;
+        let peer_sid = seat(&state, "codex").await;
+        let opened = tool_gate_escalation_open(&state, &json!({
+            "plugin_id": "claude-code", "tool_name": "policy_edit", "marker": "policy.json",
+            "reason": "the deny blocks a legitimate rule addition",
+            "session_id": asker_sid.to_string(),
+        })).await.unwrap();
+        let esc_id = opened["escalation_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the open must return its id: {opened}"))
+            .to_string();
+        let args = json!({
+            "escalation_id": esc_id, "approve": true, "session_id": peer_sid.to_string(),
+            "reason": "reviewed the diff; the rule is scoped to the one path",
+        });
+
+        // A RESERVED lock on witness.db (BEGIN IMMEDIATE): reads proceed, every
+        // WRITE fails with BUSY — the witness append fails while everything
+        // upstream of it works.
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let blocker = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        blocker.pragma_update(None, "key", hex::encode(key)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let failed = tool_gate_arbitrate_escalation(&state, &args).await;
+        assert!(
+            failed.is_err(),
+            "an unwitnessed ruling must be an error, not a null-hash success: {failed:?}"
+        );
+        {
+            let mut s = state.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            assert_eq!(
+                s.gate_escalations.status_of(&esc_id, now),
+                crate::server::gate_escalation::Status::Pending,
+                "the decision was rolled back — finality requires its witness"
+            );
+            assert!(
+                s.gate_escalations.claim("claude-code", "policy.json", now).is_none(),
+                "claimable state is unchanged: nothing was authorised"
+            );
+        }
+        blocker.execute_batch("COMMIT").unwrap();
+
+        // And the door still works afterwards — the retry rules cleanly.
+        let ruled = tool_gate_arbitrate_escalation(&state, &args).await.unwrap();
+        assert!(
+            ruled.get("_hestia_error").is_none() && ruled["witnessEntryHash"].is_string(),
+            "the retry after the outage rules and is witnessed: {ruled}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -14839,6 +15022,15 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
         ));
     }
 
+    // Witness IS finality (revised #480 review, defect 2). The store mutation
+    // comes first only because the witness payload is built from the
+    // post-decision record — and if the append fails, the decision is ROLLED
+    // BACK, not left final-but-unwitnessed: an applied ruling with no chain
+    // entry has no ruling hash, no projector source, and no representable
+    // disposition obligation. (Apply-then-rollback, not witness-then-apply: the
+    // payload needs `bar_met()` and the factor set AFTER the decider's factor
+    // lands, and recomputing those speculatively would duplicate `decide`.)
+    let prior = s.gate_escalations.get(&escalation_id).cloned();
     match s.gate_escalations.decide(
         &escalation_id,
         approve,
@@ -14850,7 +15042,7 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
         now,
     ) {
         Ok(decided) => {
-            let entry = s.append_chain(
+            let entry = match s.append_chain(
                 if withdrawn { "gate_escalation_withdrawn" } else { "gate_escalation_decided" },
                 json!({
                     "escalation_id": decided.id,
@@ -14880,7 +15072,20 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
                          SECOND-PARTY REVIEW, not an enforced boundary."
                     },
                 }),
-            );
+            ) {
+                Ok(e) => e,
+                Err(append_err) => {
+                    // The ruling is NOT final: restore the exact pre-decision row
+                    // (`decide` succeeded, so it existed) and tell the caller.
+                    if let Some(p) = prior {
+                        s.gate_escalations.undo_decide(p);
+                    }
+                    return Err(anyhow::anyhow!(
+                        "decision NOT applied — its witness append failed ({append_err}); \
+                         the escalation stays pending and nothing was authorised"
+                    ));
+                }
+            };
             // #459: the decision's RETURN EDGE, minted HERE — the layer holding
             // SharedState — because `EscalationStore::decide` has no inbox access.
             // Skipped for a withdrawal: that is the asker's own act and the asker
@@ -14892,25 +15097,12 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
             let disposition_notice_id = if withdrawn {
                 None
             } else {
-                match &entry {
-                    Ok(e) => ensure_disposition(
-                        &s,
-                        &decided.plugin_id,
-                        &format!("hestia://escalation/{}#decided", decided.id),
-                        &e.hash,
-                    ),
-                    // The ruling's OWN append failed: there is no witness to anchor
-                    // to and nothing for the projector to re-derive from. This was
-                    // already tolerated below (witnessEntryHash: null); say so.
-                    Err(append_err) => {
-                        tracing::warn!(
-                            "escalation {} decided but its witness append failed \
-                             ({append_err}) — no disposition can anchor to it",
-                            decided.id
-                        );
-                        None
-                    }
-                }
+                ensure_disposition(
+                    &s,
+                    &decided.plugin_id,
+                    &format!("hestia://escalation/{}#decided", decided.id),
+                    &entry.hash,
+                )
             };
             // The bar and whether this decision met it go to the DECIDER, not only to the
             // chain. They were recorded above and withheld here, and the asymmetry had a
@@ -14930,7 +15122,7 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
             let mut reply = decided.decision_reply();
             if let Some(o) = reply.as_object_mut() {
                 o.insert("independence".into(), json!(independence));
-                o.insert("witnessEntryHash".into(), json!(entry.ok().map(|e| e.hash)));
+                o.insert("witnessEntryHash".into(), json!(entry.hash));
                 o.insert("disposition_notice_id".into(), json!(disposition_notice_id));
             }
             Ok(reply)
@@ -15703,7 +15895,7 @@ mod disposition_durability_tests {
         let (_dir, state) = test_state().await;
         let now = now_secs();
         {
-            let mut s = state.lock().await;
+            let s = state.lock().await;
             // No scope_requests row at all — the daemon restarted; the chain is all
             // that is left.
             s.append_chain(
@@ -16214,5 +16406,48 @@ mod disposition_durability_tests {
         let s = state.lock().await;
         let mail = s.inbox_store.drain_member("kimi-code").unwrap();
         assert!(mail.is_empty(), "nothing to notify: {mail:?}");
+    }
+
+    /// Defect 3 (revised review): the fallback scan is BOUNDED. A record deeper
+    /// than POINTER_LOOKUP_MAX is reported as not-searched — the arm says what
+    /// was scanned and what was not — never as a flat "no such ask".
+    #[tokio::test]
+    async fn a_record_deeper_than_the_lookup_cap_is_unsearched_not_absent() {
+        let (_dir, state) = test_state().await;
+        let real_now = now_secs();
+        let mut s = state.lock().await;
+        // A reaped, clock-expired escalation: live store misses, chain has it.
+        let id = witness_open(&mut s, "kimi-code", Some("deep record"), real_now - 3 * 3600, 3600);
+        s.gate_escalations.reap(real_now, REAP_KEEP_SECS);
+        assert!(s.gate_escalations.get(&id).is_none());
+        // Push it beyond the hard cap.
+        for i in 0..(POINTER_LOOKUP_MAX + 100) {
+            s.append_chain("outcome", json!({"filler": i})).unwrap();
+        }
+
+        let body = resolve_escalation_pointer(&s, &id);
+        assert_eq!(
+            body["_hestia_error"]["code"],
+            "hestia.escalation_pointer_not_found"
+        );
+        assert_eq!(
+            body["_hestia_error"]["data"]["searched"],
+            json!(POINTER_LOOKUP_MAX),
+            "the scan stopped at the cap: {body}"
+        );
+        assert_eq!(body["_hestia_error"]["data"]["complete"], json!(false));
+        let msg = body["_hestia_error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("older history was NOT searched"),
+            "the arm must say what it did NOT search: {msg}"
+        );
+
+        // The control, one id over: a record INSIDE the cap resolves from the
+        // chain even this deep in fillers.
+        let id2 = witness_open(&mut s, "kimi-code", Some("shallow record"), real_now - 3 * 3600, 3600);
+        s.gate_escalations.reap(real_now, REAP_KEEP_SECS);
+        let found = resolve_escalation_pointer(&s, &id2);
+        assert_eq!(found["source"], "witness_chain", "{found}");
+        assert_eq!(found["escalation_id"], id2);
     }
 }
