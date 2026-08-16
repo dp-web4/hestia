@@ -1611,7 +1611,21 @@ async fn scope_decide(
     // between, which leaves a record of a grant that is not live: safe direction, and legible.
     let entry = s.append_chain(
         if granted {
-            "scope_granted"
+            if standing {
+                // A STANDING grant is not in force until the vault write lands, so this first
+                // record is an INTENT, not a success (GPT review of #462). Naming it
+                // `scope_granted` here — as it was — meant a failed commit below left the
+                // chain asserting a durable grant that never existed, and every reader,
+                // including the reputation fold, would believe it. The success record is
+                // appended after the commit, carrying this entry's hash as `intent`.
+                //
+                // A MEMORY-ONLY grant keeps the single `scope_granted`: its only "apply" step
+                // is the in-memory `scope_requests.get_mut` below, which cannot fail, so there
+                // is no window in which the record could outlive the thing it records.
+                "scope_grant_intent"
+            } else {
+                "scope_granted"
+            }
         } else {
             "scope_refused"
         },
@@ -1666,8 +1680,16 @@ async fn scope_decide(
     // store exists to end. `commit_standing_scope` persists a CANDIDATE before swapping it
     // live (GPT review of #431, blocker 1: the previous revoke-as-rollback double-moved the
     // generation and, on a replacement, discarded the prior grant), so on a failed vault
-    // write the live store is bit-identical to before — generation included — and the chain
-    // holds a record of a grant that is not live: the safe direction, and legible.
+    // write the live store is bit-identical to before — generation included.
+    //
+    // This comment used to end "...and the chain holds a record of a grant that is not live:
+    // the safe direction, and legible." That was wrong, and it is corrected rather than
+    // deleted because the wrong version is instructive: the record in question was named
+    // `scope_granted`, so "legible" was being asked to do a mechanism's job. It is only the
+    // safe direction relative to the OTHER ordering (a live grant nothing recorded); against
+    // an auditor it is the worse one, because a false `scope_granted` is a phantom widening
+    // nothing contradicts. The first record is now an INTENT and the success is appended
+    // after the commit, so neither direction can lie.
     if standing {
         let grant = crate::server::standing_scope::StandingGrant {
             member: plugin_id.clone(),
@@ -1683,11 +1705,48 @@ async fn scope_decide(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "error": format!(
-                        "standing grant witnessed but NOT applied — vault write failed ({e}); \
-                         the live store is untouched (the candidate was persisted first), \
-                         re-decide to retry"
+                        "standing grant NOT applied — vault write failed ({e}); the live store \
+                         is untouched (the candidate was persisted first), re-decide to retry"
                     ),
-                    "witnessEntryHash": entry.hash,
+                    // The chain holds the INTENT and no `scope_granted`, so nothing reads this
+                    // member as holding the path. That is the whole reason the first record is
+                    // named for an attempt rather than an outcome.
+                    "state": "the chain holds the INTENT and no scope_granted",
+                    "intentEntryHash": entry.hash,
+                })),
+            );
+        }
+        // SUCCESS — appended only now, when the grant is really durable. Carries the intent's
+        // hash so the pair is joinable, and the generation the commit actually produced rather
+        // than the `+1` the intent could only predict.
+        if let Err(e) = s.append_chain(
+            "scope_granted",
+            serde_json::json!({
+                "request_id": request_id,
+                "plugin_id": plugin_id,
+                "subject_instance_lct": s.member_lct(&plugin_id),
+                "path": path,
+                "decision_reason": reason,
+                "granted_by": "operator",
+                "via": "operator_session",
+                "origin": "member_request",
+                "standing": true,
+                "standing_expires_at": standing_expires_at,
+                "standing_generation": s.standing_scope.generation,
+                "intent": entry.hash,
+            }),
+        ) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "THE STANDING GRANT IS LIVE but its success record could not be \
+                         appended ({e}). Under-recorded, not unrecorded: the intent is on the \
+                         chain. Revoke and re-decide, or repair the chain — do not assume the \
+                         grant is absent because the confirmation is."
+                    ),
+                    "state": "grant IS in force; chain holds only the intent",
+                    "intentEntryHash": entry.hash,
                 })),
             );
         }
@@ -1822,47 +1881,37 @@ async fn scope_grant(
         .iter()
         .any(|g| g.member == plugin_id && g.path == path);
 
-    // ORDER: WITNESS, THEN WIDEN — the same rule as `scope_decide`, for the same reason. The
-    // record commits before the grant takes effect, and the grant applies only if it committed.
-    let entry = match s.append_chain(
-        "scope_granted",
-        serde_json::json!({
-            // NULL, and load-bearing: this grant answered no ask. A reader that finds a
-            // request_id here is looking at a ratification; one that finds null is looking at
-            // an act the operator originated.
-            "request_id": serde_json::Value::Null,
-            "origin": "operator_initiated",
-            "plugin_id": plugin_id,
-            "subject_instance_lct": s.member_lct(&plugin_id),
-            "path": path,
-            "path_as_asked": raw_path,
-            // There is no `requested_because` because nobody requested it. Saying so beats
-            // omitting the field, which reads as a record that lost its ask.
-            "requested_because": serde_json::Value::Null,
-            "decision_reason": reason,
-            "granted_by": "operator",
-            "via": "operator_session",
-            "standing": true,
-            "standing_expires_at": expires_at,
-            "standing_generation": s.standing_scope.generation + 1,
-            "replaces_existing": replaces,
-            "member_known": member_known,
-            "durability": "STANDING — written to the vault's standing-scope document; survives \
-                           restart; revocable via /api/scope/standing/revoke; identity.json is \
-                           untouched",
-        }),
-    ) {
-        Ok(e) => e,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("witness append failed, grant NOT applied: {e}")
-                })),
-            );
-        }
-    };
-
+    // ORDER: INTENT → COMMIT → SUCCESS, via the one function that owns it
+    // (`witness_and_commit_standing_grant`). This used to append `scope_granted` and THEN
+    // commit, so a failed vault write left the chain asserting a grant that never came into
+    // force — a PHANTOM WIDENING that the reputation fold, the ledger and any auditor would
+    // believe, with nothing to contradict it. GPT caught it on #462 and was right; I had
+    // documented the outcome and called it "the safe direction, and legible", which was true
+    // only against the OTHER ordering and did the work of a mechanism with a word.
+    let record = serde_json::json!({
+        // NULL, and load-bearing: this grant answered no ask. A reader that finds a
+        // request_id here is looking at a ratification; one that finds null is looking at
+        // an act the operator originated.
+        "request_id": serde_json::Value::Null,
+        "origin": "operator_initiated",
+        "plugin_id": plugin_id,
+        "subject_instance_lct": s.member_lct(&plugin_id),
+        "path": path,
+        "path_as_asked": raw_path,
+        // There is no `requested_because` because nobody requested it. Saying so beats
+        // omitting the field, which reads as a record that lost its ask.
+        "requested_because": serde_json::Value::Null,
+        "decision_reason": reason,
+        "granted_by": "operator",
+        "via": "operator_session",
+        "standing": true,
+        "standing_expires_at": expires_at,
+        "replaces_existing": replaces,
+        "member_known": member_known,
+        "durability": "STANDING — written to the vault's standing-scope document; survives \
+                       restart; revocable via /api/scope/standing/revoke; identity.json is \
+                       untouched",
+    });
     let grant = crate::server::standing_scope::StandingGrant {
         member: plugin_id.clone(),
         path: path.clone(),
@@ -1873,18 +1922,52 @@ async fn scope_grant(
         // None, for the same reason `request_id` is null in the record above.
         request_id: None,
     };
-    if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!(
-                    "grant witnessed but NOT applied — vault write failed ({e}); the live \
-                     store is untouched (the candidate was persisted first), retry to apply"
-                ),
-                "witnessEntryHash": entry.hash,
-            })),
-        );
-    }
+    let (intent_hash, entry_hash) = match s.witness_and_commit_standing_grant(grant, record) {
+        Ok(pair) => pair,
+        // Each arm reports WHAT IS TRUE NOW, because "500" alone leaves the operator unable to
+        // tell an attempt that changed nothing from one that widened reach without saying so.
+        Err(crate::server::state::StandingGrantFailure::IntentNotWitnessed(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("witness append failed, grant NOT applied: {e}"),
+                    "state": "nothing was recorded and nothing was granted",
+                })),
+            );
+        }
+        Err(crate::server::state::StandingGrantFailure::NotCommitted { intent_hash, err }) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "grant NOT applied — vault write failed ({err}); the live store is \
+                         untouched (the candidate was persisted first), retry to apply"
+                    ),
+                    "state": "the chain holds the INTENT and no scope_granted, so nothing \
+                              reads this member as holding the path",
+                    "intentEntryHash": intent_hash,
+                })),
+            );
+        }
+        Err(crate::server::state::StandingGrantFailure::LiveButUnconfirmed {
+            intent_hash,
+            err,
+        }) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "THE GRANT IS LIVE but its success record could not be appended \
+                         ({err}). This is under-recorded, not unrecorded: the intent is on \
+                         the chain. Revoke and re-grant, or repair the chain — do not assume \
+                         the grant is absent because the confirmation is."
+                    ),
+                    "state": "grant IS in force; chain holds only the intent",
+                    "intentEntryHash": intent_hash,
+                })),
+            );
+        }
+    };
 
     (
         StatusCode::OK,
@@ -1906,7 +1989,10 @@ async fn scope_grant(
                  That is legitimate if you are granting ahead of a first connect, and it is \
                  what a typo looks like too. Check the spelling before relying on this."
             },
-            "witnessEntryHash": entry.hash,
+            "witnessEntryHash": entry_hash,
+            // Both halves of the pair are returned, so a caller can verify the ordering on the
+            // chain itself rather than trusting this response's word for it.
+            "intentEntryHash": intent_hash,
         })),
     )
 }

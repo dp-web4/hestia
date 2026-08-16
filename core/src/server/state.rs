@@ -403,6 +403,32 @@ pub fn normalize_scope_path(path: &str) -> String {
     }
 }
 
+/// A durable scope widening that failed part-way, named by WHAT IS TRUE AFTERWARDS.
+///
+/// The variants are the point. Each says exactly what the chain holds and what the store
+/// holds, so an HTTP surface can report the real state instead of a generic 500 that leaves
+/// the operator guessing which half landed — and so the one genuinely dangerous case
+/// (`LiveButUnconfirmed`) is distinguishable from the two benign ones.
+#[derive(Debug)]
+pub enum StandingGrantFailure {
+    /// Nothing happened. No record, no grant.
+    IntentNotWitnessed(anyhow::Error),
+    /// The intent is on the chain; the store is untouched. No `scope_granted` exists, so no
+    /// reader can conclude the member holds this reach. Retryable.
+    NotCommitted {
+        intent_hash: String,
+        err: anyhow::Error,
+    },
+    /// The grant IS LIVE and durable, but the success record could not be appended. The intent
+    /// is on the chain, so the widening is not unrecorded — it is UNDER-recorded. This is the
+    /// variant a caller must surface loudly rather than retry: retrying would commit a second
+    /// identical grant (harmless — `add` replaces) but would not undo the missing record.
+    LiveButUnconfirmed {
+        intent_hash: String,
+        err: anyhow::Error,
+    },
+}
+
 impl ServerState {
     /// Open all persistent stores rooted at `home` and prepare server state.
     /// `passphrase` is the vault passphrase — used to derive the storage key
@@ -887,6 +913,73 @@ impl ServerState {
         // committed mutation.
         self.standing_scope_dirty = false;
         Ok(())
+    }
+
+    /// INTENT → COMMIT → SUCCESS. The one place the ordering of a durable scope widening is
+    /// decided, so both doors (`/api/scope/grant` and `/api/scope/decide {standing:true}`)
+    /// obey it by construction rather than by each remembering to.
+    ///
+    /// WHY THIS EXISTS (GPT review of #462, 2026-08-15). Both doors used to
+    /// `append_chain("scope_granted", ..)` and THEN `commit_standing_scope(..)`. The ordering
+    /// was deliberate and half right: witness-then-widen is correct, because the opposite
+    /// order can leave a LIVE grant that nothing recorded. But the event appended first was
+    /// named `scope_granted` — a SUCCESS NAME — so a failed vault write left the chain
+    /// asserting a grant that never came into force.
+    ///
+    /// I had documented that outcome and called it "the safe direction, and legible". It is
+    /// not. It is safe only against the other ordering; in the auditing direction it is the
+    /// worse failure, because a false `scope_granted` is a PHANTOM WIDENING — a reader, the
+    /// reputation fold, and the ledger all conclude a member held reach it never had, and
+    /// nothing in the chain contradicts them. "Legible" was doing the work of a mechanism.
+    ///
+    /// The split fixes it without giving up witness-then-widen:
+    ///   1. `scope_grant_intent` — the full evidence, named as an ATTEMPT.
+    ///   2. the durable commit.
+    ///   3. `scope_granted` — appended only once the grant is really in force, carrying
+    ///      `intent` so the pair is joinable.
+    /// A reader that sees an intent with no matching `scope_granted` is looking at a widening
+    /// that did not take effect, which is exactly what happened.
+    ///
+    /// Old readers are strictly better off, not worse: `scope_granted` now appears only when
+    /// it is true. They ignore the new `scope_grant_intent` kind, so a FAILED grant becomes
+    /// invisible to them rather than a false success — incomplete beats actively misleading,
+    /// and the intent record is there for anyone who looks.
+    pub fn witness_and_commit_standing_grant(
+        &mut self,
+        grant: crate::server::standing_scope::StandingGrant,
+        record: serde_json::Value,
+    ) -> std::result::Result<(String, String), StandingGrantFailure> {
+        // 1. INTENT. Carries the same evidence the success record will, so a failure at step 2
+        //    still leaves a complete account of what was attempted and why.
+        let intent = self
+            .append_chain("scope_grant_intent", record.clone())
+            .map_err(StandingGrantFailure::IntentNotWitnessed)?;
+
+        // 2. COMMIT. `commit_standing_scope` persists a candidate before swapping it live, so
+        //    on failure the live store is bit-identical — generation included.
+        if let Err(err) = self.commit_standing_scope(|st| st.add(grant)) {
+            return Err(StandingGrantFailure::NotCommitted {
+                intent_hash: intent.hash,
+                err,
+            });
+        }
+
+        // 3. SUCCESS — now, and only now, is `scope_granted` true.
+        let mut success = record;
+        if let Some(map) = success.as_object_mut() {
+            map.insert("intent".into(), serde_json::json!(intent.hash));
+            map.insert(
+                "standing_generation".into(),
+                serde_json::json!(self.standing_scope.generation),
+            );
+        }
+        match self.append_chain("scope_granted", success) {
+            Ok(e) => Ok((intent.hash, e.hash)),
+            Err(err) => Err(StandingGrantFailure::LiveButUnconfirmed {
+                intent_hash: intent.hash,
+                err,
+            }),
+        }
     }
 
     /// Apply a standing revoke: remove from memory FIRST (a failure may only ever leave
@@ -1723,5 +1816,150 @@ mod tests {
             state.resolve_plugin_id(Some("00000000-0000-0000-0000-000000000000")),
             None
         );
+    }
+
+    fn a_grant(member: &str, path: &str) -> crate::server::standing_scope::StandingGrant {
+        crate::server::standing_scope::StandingGrant {
+            member: member.into(),
+            path: path.into(),
+            granted_at: 1_000,
+            granted_by: "operator".into(),
+            reason: "forced-failure fixture".into(),
+            expires_at: None,
+            request_id: None,
+        }
+    }
+
+    /// Chain-ordered (OLDEST first). `read_recent` returns newest-first, and asserting on its
+    /// raw order made a correct implementation look reversed — the assertion was wrong, not
+    /// the code. Sorting by `chain_position` here states the property the tests actually mean.
+    fn kinds(state: &ServerState) -> Vec<String> {
+        let mut es = state.chain_store.read_recent(50).unwrap();
+        es.sort_by_key(|e| e.chain_position);
+        es.into_iter().map(|e| e.event_type).collect()
+    }
+
+    fn position_of(state: &ServerState, hash: &str) -> u64 {
+        state
+            .chain_store
+            .read_recent(50)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.hash == hash)
+            .unwrap_or_else(|| panic!("{hash} is not on the chain"))
+            .chain_position
+    }
+
+    /// THE HAPPY ARM. Both records land, in order, and the success record joins to its intent.
+    #[test]
+    fn a_durable_grant_witnesses_intent_then_commits_then_success() {
+        let (_dir, mut state) = make_state();
+        let before = kinds(&state).len();
+        let (intent_hash, granted_hash) = state
+            .witness_and_commit_standing_grant(
+                a_grant("kimi-code", "/w/hestia"),
+                serde_json::json!({"plugin_id": "kimi-code", "path": "/w/hestia"}),
+            )
+            .expect("the happy path commits");
+
+        let ks = kinds(&state);
+        let added: Vec<&String> = ks.iter().skip(before).collect();
+        assert_eq!(
+            added,
+            vec!["scope_grant_intent", "scope_granted"],
+            "intent must precede success, and both must exist: {ks:?}"
+        );
+        assert_ne!(intent_hash, granted_hash);
+        // The ORDERING invariant, stated directly rather than inferred from list order.
+        assert!(
+            position_of(&state, &intent_hash) < position_of(&state, &granted_hash),
+            "the intent must sit strictly BELOW the success on the chain — that ordering is \
+             the whole guarantee: a reader scanning forward can never meet a `scope_granted` \
+             whose grant had not yet committed"
+        );
+        assert!(state.standing_scope.has_live("kimi-code", "/w/hestia", 1_000));
+
+        // The pair must be JOINABLE — an intent nobody can match to its outcome is only half
+        // a record.
+        let success = state
+            .chain_store
+            .read_recent(50)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.hash == granted_hash)
+            .unwrap();
+        assert_eq!(
+            success.event_data["intent"].as_str(),
+            Some(intent_hash.as_str()),
+            "the success record must name the intent it completes"
+        );
+    }
+
+    /// THE FORCED-FAILURE ARM (GPT review of #462) — the arm the old ordering got wrong.
+    ///
+    /// The failure is injected by putting a DIRECTORY where the vault's atomic-write temp file
+    /// must go (`storage::save` writes `<vault>.enc.tmp` then renames). That is deliberate:
+    /// it fails ONLY the vault, leaves the chain's `witness.db` fully writable, and does not
+    /// depend on file permissions — which are unreliable under root and on NTFS mounts, so a
+    /// chmod-based version of this test would silently pass by not failing at all.
+    #[test]
+    fn a_failed_commit_leaves_an_intent_and_no_scope_granted() {
+        let (dir, mut state) = make_state();
+
+        // Land one good grant first, so the test proves the failure is caused by the
+        // injection and not by the mechanism never having worked.
+        state
+            .witness_and_commit_standing_grant(
+                a_grant("kimi-code", "/w/first"),
+                serde_json::json!({"plugin_id": "kimi-code", "path": "/w/first"}),
+            )
+            .expect("control: the mechanism works before the injection");
+        let gen_before = state.standing_scope.generation;
+        let kinds_before = kinds(&state);
+
+        // Inject: a directory cannot be opened as the temp file.
+        std::fs::create_dir(dir.path().join("v.enc.tmp")).unwrap();
+
+        let err = state
+            .witness_and_commit_standing_grant(
+                a_grant("codex", "/w/second"),
+                serde_json::json!({"plugin_id": "codex", "path": "/w/second"}),
+            )
+            .expect_err("the vault write must fail with a directory in the temp path");
+
+        let intent_hash = match err {
+            StandingGrantFailure::NotCommitted { intent_hash, .. } => intent_hash,
+            other => panic!("expected NotCommitted, got {other:?}"),
+        };
+
+        // 1. The store is bit-identical — the grant did NOT come into force.
+        assert_eq!(
+            state.standing_scope.generation, gen_before,
+            "a failed commit must not move the generation"
+        );
+        assert!(
+            !state.standing_scope.has_live("codex", "/w/second", 1_000),
+            "the grant must not be live"
+        );
+
+        // 2. THE POINT: the chain gained an INTENT and NO `scope_granted`. Under the old
+        //    ordering this arm left a `scope_granted` for a grant that never existed — a
+        //    phantom widening that every reader, including the reputation fold, would believe.
+        let added: Vec<String> = kinds(&state).into_iter().skip(kinds_before.len()).collect();
+        assert_eq!(
+            added,
+            vec!["scope_grant_intent".to_string()],
+            "a failed durable grant must leave its INTENT and nothing that claims success"
+        );
+
+        // 3. The intent is findable, so the attempt is auditable rather than merely absent.
+        let intent = state
+            .chain_store
+            .read_recent(50)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.hash == intent_hash)
+            .expect("the intent must be on the chain");
+        assert_eq!(intent.event_data["plugin_id"].as_str(), Some("codex"));
     }
 }

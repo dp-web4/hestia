@@ -68,6 +68,17 @@ pub const GOVERNANCE_EVENTS: &[&str] = &[
     "gate_escalation_arbiter_refused",
     // Scope requests — also decidable, same operator, different surface.
     "scope_requested",
+    // A DURABLE grant that was attempted. Listed so a grant that failed its vault write is
+    // VISIBLE here rather than only in the raw chain: `scope_granted` is now appended after
+    // the commit, so a failed durable grant emits an intent and no success, and without this
+    // line the ledger would show nothing at all for it — an invisible failure, which is the
+    // class this whole surface exists to end.
+    //
+    // The cost, named rather than hidden: a SUCCESSFUL standing grant now emits two entries,
+    // intent and success. They key on the same `request_id` where one exists, so the scope
+    // row resolves to `granted` either way and the noise is bounded to operator-originated
+    // grants (which carry no request_id). Truthful-and-slightly-noisy beats tidy-and-silent.
+    "scope_grant_intent",
     "scope_granted",
     "scope_refused",
     "scope_attestation",
@@ -448,6 +459,29 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                     .or_else(|| s(d, "scope"))
                     .or_else(|| s(d, "role"));
                 order.push(Row::OneShot(one_shot(e, LedgerKind::Permission, LedgerStatus::Recorded, subject)));
+            }
+            // A durable grant that was ATTEMPTED. Its own row, as a Permission act, because the
+            // question it answers is "was a widening tried here, and did it land" — and the
+            // answer is legible only if the attempt is visible beside its outcome.
+            //
+            // It is a one-shot rather than a keyed row on purpose: keying it by `request_id`
+            // would make it collide with the `scope_granted`/`scope_refused` that closes the
+            // scope row, and the LAST write would win — so a successful grant's intent would
+            // overwrite, or be overwritten by, its own success depending on scan order. That is
+            // a coin-flip in a governance ledger. Separate rows cost one extra line per durable
+            // grant and cannot lie about which one happened.
+            //
+            // A FAILED durable grant therefore shows exactly one intent row and no success —
+            // which is the state — while its scope row (keyed on request_id, for the
+            // member-asked path) correctly remains undecided, because nothing was granted.
+            "scope_grant_intent" => {
+                let subject = s(d, "path").or_else(|| s(d, "plugin_id"));
+                order.push(Row::OneShot(one_shot(
+                    e,
+                    LedgerKind::Permission,
+                    LedgerStatus::Recorded,
+                    subject,
+                )));
             }
             "appeal" | "adjudication" | "reversal" => {
                 let subject = s(d, "deny_hash")
