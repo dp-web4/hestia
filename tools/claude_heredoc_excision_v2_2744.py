@@ -286,6 +286,17 @@ def test_heredoc_pseudo_operator_does_not_hide_a_real_write():
               f"{label} -> {v.classification}")
 
 
+def test_unquoted_delimiter_inert_body_is_still_excised():
+    # the only excision route through _heredoc_body_is_inert rather than the
+    # literal-delimiter shortcut: an UNQUOTED delimiter whose body cannot expand
+    # (no $ and no backtick) is still payload, not a write position
+    for prose in ("route stdout > %s here", "route stdout >> %s here"):
+        cmd = _hd_commit(prose % _HD_CITE, quoted=False)
+        v = cls("Bash", {"command": cmd})
+        check("unquoted inert heredoc body is excised", v.classification == "read",
+              f"{prose!r} -> {v.classification}")
+
+
 def test_unquoted_heredoc_body_with_substitution_stays_write():
     # an UNQUOTED delimiter expands the body, so $(...) inside it can execute
     cmd = _hd_commit("prose $(echo x > %s) more" % _HD_CITE, quoted=False)
@@ -372,6 +383,7 @@ TEST_ALL_NEW = """ALL = [
     test_heredoc_body_odd_quote_parity_citing_closure_is_read,
     test_heredoc_body_redirect_prose_citing_closure_is_read,
     test_heredoc_pseudo_operator_does_not_hide_a_real_write,
+    test_unquoted_delimiter_inert_body_is_still_excised,
     test_unquoted_heredoc_body_with_substitution_stays_write,
     test_unterminated_heredoc_citing_closure_fails_closed,
     test_heredoc_terminator_requires_the_delimiter_alone,
@@ -411,6 +423,14 @@ BATTERY = [
     ("FP4  <<- tab-stripped terminator, redirect prose + cite",
      "git commit-tree e74cc02 -F /dev/stdin <<-'MSG'\n\troute stdout > %s here\n\tMSG" % CITE,
      "read", False),
+    # FP5/FP6: UNQUOTED delimiter, inert body, redirect prose. Gap found by kimi-code
+    # (review 2742): this is the only excision route that goes through
+    # _heredoc_body_is_inert rather than the literal-delimiter shortcut, and the battery
+    # had no instance of it. Bash confirms the body is stdin data either way.
+    ("FP5  UNQUOTED delimiter, inert body, > prose + cite",
+     _hd("route stdout > %s here" % CITE, quoted=False), "read", False),
+    ("FP6  UNQUOTED delimiter, inert body, >> prose + cite",
+     _hd("route stdout >> %s here" % CITE, quoted=False), "read", False),
     # --- codex's refusal: pseudo-operators must NOT excise a real write ---
     ("HOLE1 comment pseudo-operator then real redirect",
      "# docs <<EOF\nprintf x > %s\nEOF" % CITE, "write", True),
@@ -532,9 +552,11 @@ def main():
             "fixed" if moved else "unchanged")
         if pinned and moved:
             good = False
-        # arm C only for the cases that assert a real write survives
+        # Arm C runs BOTH directions (the read direction was kimi-code's gap in review
+        # 2742): a case the fix moves to `read` while bash actually writes is a false
+        # negative BOUGHT BY THE FIX — the same defect codex refused v1 for, one arm over.
         truth = ""
-        if name.startswith(("HOLE", "TP1", "TP2")):
+        if name.startswith(("HOLE", "TP1", "TP2", "FP")):
             wrote = shell_truth(cmd, tmp, name.split()[0])
             truth = "  shell_wrote=%s" % wrote
             if wrote and ra[name] != "write":

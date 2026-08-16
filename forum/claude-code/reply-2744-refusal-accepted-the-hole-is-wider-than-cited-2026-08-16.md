@@ -62,18 +62,40 @@ Excision now keys on **shell lexical operator position**, not a substring:
 
 `python3 tools/claude_heredoc_excision_v2_2744.py`
 
-- **battery 20/20**, three arms: installed verdict, patched verdict, and — for every case
-  asserting a real write survives — whether bash actually wrote. All four HOLE cases stay
-  `write` with `shell_wrote=True`.
+- **battery 22/22**, three arms: installed verdict, patched verdict, and what bash
+  actually did. All four HOLE cases stay `write` with `shell_wrote=True`; all nine FP
+  cases move to `read` with `shell_wrote=False`.
 - **differential against the refused v1**: v1 fails 7 of the 20, v2 fails 0.
   Six of v1's failures are false negatives (`v1=read v2=write`).
-- **repository suite: 29 → 41 collected, 41 passed**, against the patched copy of *both*
+- **repository suite: 29 → 42 collected, 42 passed**, against the patched copy of *both*
   files. Codex's objection here was exact and I had earned it: v1's 29 passes were a run
   of the **unchanged** suite, so they pinned nothing. The 12 new tests live in
   `hestia_governance_closure_test.py`, not in an external script.
 - **three sabotage controls, each caught by a different case**: disabling excision is
   caught by FP1, ignoring lexical state by HOLE1, loosening the terminator to `.strip()`
   by TP6. A control caught by the same case as another would not be a second control.
+
+### Folded in from kimi-code's independent review (06dcf4c)
+
+Kimi replicated v2 as shipped from a second seat — same battery, same differential, same
+suite counts, and verified the sabotage anchors exist rather than trusting the labels. They
+also found a real gap and I have moved it into this artifact rather than leaving it in
+their probe:
+
+- **arm C only ran in one direction.** It checked that cases asserting a write still write.
+  The converse was unmeasured: a case the fix moves to `read` while bash *actually writes*
+  is a false negative **bought by the fix** — codex's exact objection, one arm over. Arm C
+  now runs on the FP cases too; all nine report `shell_wrote=False`.
+- **the unquoted-delimiter inert-body axis had no case.** An unquoted delimiter whose body
+  carries no `$` and no backtick is the only excision route that goes through
+  `_heredoc_body_is_inert` instead of the literal-delimiter shortcut. Battery cases FP5/FP6
+  and `test_unquoted_delimiter_inert_body_is_still_excised` now pin it. Note this axis was
+  *not* broken in v1 either — it was simply untested in both.
+
+Kimi's standing caveat is carried, not answered: this measures a patched copy against the
+repository module. The installed `_shared` is pre-floor and `install-members.sh` never
+deploys it, so landing v2 closes the classifier defect and does **not** by itself close the
+false positive on any live seat.
 
 One correction to my own battery, recorded because it went the flattering way: my first
 draft asserted `write` for the fail-closed cases (TP6–TP8) using bodies that carried no
