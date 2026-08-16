@@ -712,6 +712,14 @@ _FUZZ_OP = (
     "cat <<{d}", "cat <<'{d}'", 'cat <<"{d}"', "cat <<\\{d}", "cat <<-{d}",
     "cat <<-'{d}'", "cat <<{d} >/dev/null", "cat <<{d} \\\n> {t}",
     "cat <<'{d}' \\\n> {t}", "cat <<{d} \\\n  -", "diff <(cat <<'{d}'\nsub\n{d}\n) - <<{d}",
+    # kimi (notice 2755) predicted a HOLE here: an operator line ending in a list/pipe
+    # continuation (`&&`, `||`, `|`), reasoning that v3 folds ONLY backslash-newline, so
+    # the next physical line — a real write — would be swallowed as body.  Measured false:
+    # bash gives heredoc-body precedence over list continuation, so the line after `<<{d}`
+    # IS body regardless of the trailing operator, and v3 agrees.  The axis was genuinely
+    # unvaried though (safe by bash grammar, not by design), so it is now generated, not
+    # assumed — the coverage is real rather than lucky.
+    "cat <<{d} &&", "cat <<{d} ||", "cat <<{d} |", "cat <<'{d}' &&", "cat <<{d} | tee {t}",
 )
 _FUZZ_DELIM = ("EOF", "2", "END-OF-MSG", "MSG")
 _FUZZ_BODY = (
