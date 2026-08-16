@@ -15,6 +15,90 @@ below; the tool's reject accounting is fixed and now fires under test. The scan 
 **Frame (dp, 2026-08-14)**: *"once we have all of the above running and dogfooded, we'll discover more
 questions and more answers… it's a ladder, not one giant leap."*
 
+## STATUS RESTATED AGAINST CURRENT MAIN — 2026-08-15, evening
+
+Added because the plan below stopped being an honest snapshot within a day of being written
+(GPT, reviewing: *"no longer an honest 'next four sprints' snapshot"*). The body is **left
+intact** rather than rewritten: what was planned, and the reasoning for the order, is evidence
+about how we were thinking, and deleting it to match what happened would erase the only record
+that the order changed. This section is the correction; everything below it is the original.
+
+**The classification that matters here is BUILT vs LANDED, and it is not pedantry.** "done"
+in this fleet means *in force and measured* — not merged, not built, not awaiting deploy. Most
+of what moved this week is BUILT AND NOT LANDED, and calling it done is exactly the failure
+mode this plan's own dogfooding rule exists to prevent.
+
+### DONE — landed on main
+
+- **#451 R6/R7 envelope PRD** (merged). The plan below names R6/R7 as a hard gate on sprint 2;
+  **that gate has cleared.** It is architecture now, not a branch dependency.
+- **#450 ladder §13** (merged) — rungs ADMIT, rungs do not COMPOSE. Sprint 4's route table
+  inherits `effect` from it, as planned.
+- **#449 role-scope §10**, **#454 invitation tiebreak**, **#456 the scope-grant button that
+  was enabled and inert**, **#457 the ruling on appeal f1208a6a**.
+
+### BUILT, NOT LANDED — #462, still open
+
+Sprint 3's **IA change is built**: `agents | hubs | devices | govern`, ledger and policy
+absorbed, banners above the switch, AC-20…AC-23 asserted. So is **more of sprint 3 than the
+plan scoped**: a grants sub-screen, the operator-originated grant door `POST /api/scope/grant`,
+and `govern → acts` wiring the three operator surfaces that had front ends nowhere
+(`adjudicate`, `alias`, `amnesty`).
+
+Sprint 3's **exit criterion — "a grant made in the UI is in force on the next member call" —
+is met on an isolated daemon and NOT on the fleet.** It has not been deployed. Under this
+plan's own rule that is not an exit.
+
+### REORDERED — sprint 3 ran before sprints 1 and 2, and one consequence is structural
+
+The order changed because the operator could not grant scope at all: `/api/scope/decide`
+required a `request_id`, so the operator could only ratify a member's ask, and the ask itself
+was denied by the empty envelope it existed to fill. That deadlock outranked the substrate
+work, and it is why sprint 3 jumped the queue.
+
+**The consequence, which is not a scheduling detail:** sprint 3's *allowlist editor* CANNOT be
+built, because sprint 2 was supposed to build the store it edits and sprint 2 has not run.
+There is no `/api/allowlist/*` route and no allowlist module. An editor over a store that does
+not exist is the never-flatter violation `PRD_ALLOWLISTS` §6.0.3 names — a screen implying a
+mechanism — so it is deliberately absent from #462 rather than stubbed.
+
+### STILL OPEN — sprint 1's substrate is essentially untouched
+
+`#320` (session remover / false presence), `#423` (state-lock contention, holder still
+unidentified), `#389` (denies can lose their durable record), `#434`/`#366` (claim timing and
+requester notification), `#419` (witness fields dropped by the daemon), `#438` (deployment
+"current" names the wrong referent), `#435` (permissive renders green). All open, all still
+the right work. Sprint 3 landing first did not make any of them less load-bearing — #389 in
+particular sits directly under everything this week measured.
+
+### NEW SINCE — findings the plan could not have scoped, listed because they change priorities
+
+- **The gate's scope check judges spelling, not resolved target.** `gh pr list --repo x/y` is
+  denied; `cd` into the repo and run it, and it is allowed — same reach. Both kimi and codex
+  found this independently, unprompted, and disclosed it. **The deny counts measure friction,
+  not containment**, which weakens every conclusion drawn from them.
+- **MRH enforcement is asymmetric.** kimi and codex enforce and get denied; claude-code's
+  installed gate has no MRH layer at all and is therefore the least-gated seat while doing the
+  most acts. GPT's framing is the right one: *empty authority + working enforcement* is noisy
+  and safe; *intended authority + missing enforcement* is quiet and dangerous.
+- **A durable grant used to record success before it committed** — a failed vault write left a
+  `scope_granted` on the chain for a grant that never existed. Found by GPT on #462, fixed in
+  both doors with a forced-failure test.
+- **Rulability is bounded in ENTRIES, not time** — the appeal window is 20 000 chain entries,
+  roughly 19 hours at this week's rate. A busy hour shortens the window in which an appeal can
+  be heard, and an appeal that ages out gets no ruling and no notice.
+
+### What I would do next, given the above
+
+1. **Deploy #462 and measure it**, because until then sprint 3 has no exit.
+2. **Populate standing scope deliberately**, then make MRH enforcement parity a deployment
+   invariant — in that order, since granting claude-code the MRH layer while the standing store
+   is empty would leave the one unblocked seat with `scope=()` by construction.
+3. **Then sprint 1's substrate**, unchanged and still right, with #389 first.
+4. **Sprint 2's allowlist store**, which sprint 3 is now waiting on rather than preceding.
+
+---
+
 ## The rule this plan obeys
 
 **Every sprint ends in something the fleet USES, not something the fleet merged.** A sprint that lands
