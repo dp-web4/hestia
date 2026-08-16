@@ -98,3 +98,7 @@ chrono-tz = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+# `ServiceExt::oneshot` — drives a request through the REAL operator_gate middleware
+# into the REAL handler, so the seam between them is testable. Already in the lock
+# graph as an axum dependency; declared here only to name the trait.
+tower = { version = "0.5", features = ["util"] }
