@@ -253,13 +253,21 @@ pub struct ServerState {
     pub vault: Vault,
     pub sessions: HashMap<Uuid, Session>,
     pub actions: HashMap<Uuid, InFlightAction>,
-    pub chain_store: SqliteChainStore,
+    /// Shared (`Arc`) so the disposition projector can page the chain WITHOUT the
+    /// outer `SharedState` lock — the revised #480 review's lock-discipline
+    /// requirement. Both stores own an internal `Mutex<Connection>`; the `Arc`
+    /// only moves the handle, every method stays `&self`. Field reads through the
+    /// guard deref transparently, so existing `s.chain_store` callers are
+    /// unchanged.
+    pub chain_store: Arc<SqliteChainStore>,
     pub trust_store: TrustStore,
     /// Durable inbound mailbox (entity-edge inbox): still-sealed notices parked
     /// by `hestia_notify {defer: true}` before the hub is ACKed, drained by
     /// `hestia_inbox`. Encrypted at rest under the same storage key as the
     /// witness chain, in its own file (queue ≠ ledger — two persistences).
-    pub inbox_store: crate::storage::SqliteInboxStore,
+    /// Shared for the same reason as `chain_store`: the projector's obligations
+    /// and cursor live here.
+    pub inbox_store: Arc<crate::storage::SqliteInboxStore>,
     /// The legacy sovereign anchor string — witness-chain authorship + member-label
     /// derivation still key on this verbatim. See `sovereign` for the LCT identity.
     pub sovereign_lct: String,
@@ -523,9 +531,9 @@ impl ServerState {
             vault,
             sessions: HashMap::new(),
             actions: HashMap::new(),
-            chain_store,
+            chain_store: Arc::new(chain_store),
             trust_store,
-            inbox_store,
+            inbox_store: Arc::new(inbox_store),
             sovereign_lct,
             sovereign,
             role_registry,

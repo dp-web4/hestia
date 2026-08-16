@@ -3048,7 +3048,7 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
     }
     let session_id_arg = optional_session_id(args);
 
-    let mut s = state.lock().await;
+    let s = state.lock().await;
     let Some(arbiter) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
         return Ok(hestia_error_envelope(
             "hestia.arbitration_unattributed",
@@ -3202,23 +3202,16 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
     // #459: the ruling's RETURN EDGE. The appeal had an outbound wake (the arbiter
     // was asked to rule) and no way back — until this, a ruled appeal read exactly
     // like an open one to the member who filed it, and the petitioner had to poll
-    // or be told out of band. Witnessed first, then enqueued, and a failed enqueue
-    // is an ERROR: a witnessed-but-unreported ruling is the hole this closes.
-    let disposition_notice_id = report_disposition(
-        &mut s,
+    // or be told out of band. Revised #480 contract: the adjudication entry above
+    // IS the witness, so the disposition anchors to its hash directly, and a failed
+    // ensure is warned about, not returned — the ruling succeeded, and the cursor
+    // projector re-derives the obligation from the chain and retries.
+    let disposition_notice_id = ensure_disposition(
+        &s,
         appellant,
         &format!("hestia://appeal/{deny_hash}#ruled"),
-        json!({
-            "about_deny_hash": deny_hash,
-            "upheld": upheld,
-            "adjudicator": arbiter.plugin_id,
-            "independence": independence,
-            "was_designee": routed_to.as_deref() == Some(arbiter.plugin_id.as_str()),
-            "adjudication_entry": entry.hash,
-            "note": "the appeal you filed has been ruled; the pointer resolves to the \
-                     appeal and its ruling",
-        }),
-    )?;
+        &entry.hash,
+    );
 
     Ok(json!({
         "witnessEntryHash": entry.hash,
@@ -3898,11 +3891,13 @@ const DAEMON_NOTICE_KIND_UNREACHABLE: &str = "unreachable";
 /// asked to rule) and no way back: once ruled, the petitioner had to poll or be
 /// told out of band, and a ruled appeal read exactly like an open one. This kind
 /// is minted at each ruling site — `tool_arbitrate_appeal`, `http::scope_decide`,
-/// and both escalation decision surfaces — witnessed by a
-/// `member_notice_disposition` chain entry BEFORE the enqueue, the same order
-/// `retire_and_report_egress` keeps. A "your petition has been ruled" notice any
-/// member could send is a claim; one only the daemon can send, written next to the
-/// ruling it reports, is evidence.
+/// and both escalation decision surfaces — with the notice row anchored to the
+/// TERMINAL RULING's chain hash: the ruling is the witness, the durable inbox row
+/// is the obligation (revised #480 review; the first shape's
+/// `member_notice_disposition` pre-enqueue entry was struck — it manufactured
+/// "witnessed but never queued" states nothing could retry). A "your petition has
+/// been ruled" notice any member could send is a claim; one only the daemon can
+/// send, pointing at the ruling it reports, is evidence.
 ///
 /// The receiver-side obligations are the same two as `unreachable` and are
 /// documented with it: receivers must not filter it, and renderers must admit it
@@ -4696,299 +4691,260 @@ fn retire_and_report_egress(
     }))
 }
 
-/// Report a petition's ruling to the petitioner (#459) — the return edge every
-/// petition surface (appeal, scope request, escalation) used to lack.
+/// Ensure the petitioner of a terminal ruling holds a durable disposition notice
+/// (#459, reshaped by the revised #480 review).
 ///
-/// The shape is `retire_and_report_egress`'s, for the same reasons:
+/// THE DOCTRINE CHANGE. The first shape witnessed every disposition with a
+/// `member_notice_disposition` chain entry BEFORE the enqueue. The revised review
+/// struck that: the terminal ruling IS the witness — the adjudication /
+/// `gate_escalation_decided` / `scope_granted` / `scope_refused` /
+/// `gate_escalation_expired` hash is already the durable evidentiary act — and
+/// the pre-enqueue append manufactured the exact false state being fixed
+/// (witness exists → enqueue fails → every later reader assumes notified). So
+/// the inbox row anchors `chain_hash` AND its idempotency key directly to the
+/// RULING's hash, and there is one less chain append per ruling.
 ///
-/// 1. Witnessed BEFORE it is queued (O: witness precedes delivery) — a
-///    `member_notice_disposition` entry carrying the about-reference, the verdict
-///    and who decided, so the notice is evidence attached to a ruling that exists,
-///    not a bare claim that one does.
-/// 2. A failed enqueue is NOT swallowed: a ruling that was witnessed but never
-///    reported is exactly the hole this kind exists to close, so the caller gets
-///    the error and the ruling stays visible on the chain either way.
-///
-/// `to` is a local member by construction at every call site (the appellant proven
-/// by session, the requester/asker who filed locally), so this is a local enqueue
-/// and cannot re-enter the egress plane.
-pub(crate) fn report_disposition(
-    s: &mut super::state::ServerState,
+/// This is the SYNCHRONOUS FAST PATH the ruling sites call, and it is
+/// warn-and-continue by contract: the ruling itself has already committed, so a
+/// failed ensure is not the ruler's error to carry — the cursor projector
+/// (`project_dispositions`) re-derives the same obligation from the chain and
+/// retries, idempotently. Returns the notice id when this call inserted the row,
+/// `None` when the obligation already existed or could not be made durable.
+pub(crate) fn ensure_disposition(
+    s: &super::state::ServerState,
     to: &str,
     pointer: &str,
-    event_data: Value,
-) -> anyhow::Result<u64> {
-    let entry = s.append_chain("member_notice_disposition", event_data)?;
-    let notice_id = s
-        .inbox_store
-        .enqueue_member(
-            to,
-            "hestia",
-            crate::reputation::DEFAULT_CONSTELLATION_ROLE,
-            DAEMON_NOTICE_KIND_DISPOSITION,
-            Some(pointer),
-            &entry.hash,
-            None,
-        )
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "the disposition was witnessed ({}), but the report to '{to}' could NOT be \
-                 queued ({e}) — the petitioner does not know its petition was ruled",
-                entry.hash
-            )
-        })?;
-    Ok(notice_id)
+    ruling_hash: &str,
+) -> Option<u64> {
+    match s.inbox_store.ensure_member_disposition(to, DAEMON_NOTICE_KIND_DISPOSITION, pointer, ruling_hash) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                "disposition for ruling {ruling_hash} (to '{to}') could NOT be made \
+                 durable ({e}) — the cursor projector will retry from the chain"
+            );
+            None
+        }
+    }
 }
 
-/// How often the daemon sweeps for rulings whose disposition never landed. Minutes,
-/// not seconds: every mint this task exists to catch is already late by the time it
-/// runs, and the chain window it scans makes a faster period buy nothing.
+/// One projector pass's page bound (#480 revised review, item 4a): at most this
+/// many chain positions per pass. The page is an index walk over
+/// `chain_position`, taken on the chain store's OWN connection mutex — never
+/// under the outer `SharedState` lock, which is what made the r2 sweep the
+/// gate-starving shape #488/#482 flagged.
+pub(crate) const DISPOSITION_PROJECTION_PAGE: u64 = 500;
+
+/// How often the disposition worker runs (lapse recording + projection).
+/// Minutes, not seconds: every obligation this task exists to catch is already
+/// late by the time it runs, and the ruling sites' synchronous fast path covers
+/// the common case.
 pub(crate) const DISPOSITION_RECONCILE_INTERVAL_SECS: u64 = 300;
 
-/// What one reconciler pass did, returned so the timer can log it and the tests can
-/// pin it.
+/// The cursor row's name in inbox.db's `projection_cursors` table.
+const DISPOSITION_PROJECTION_CURSOR: &str = "disposition";
+
+/// What one projector pass did.
 #[derive(Default, Debug, PartialEq, Eq)]
-pub(crate) struct DispositionReconciliation {
-    /// Rulings re-minted because no `member_notice_disposition` names them.
-    pub reminted: usize,
-    /// Escalations recorded as lapsed (`gate_escalation_expired`) this pass.
-    pub lapsed: usize,
+pub(crate) struct DispositionProjection {
+    /// Ruling entries this pass ensured an obligation for (inserted OR already
+    /// present — idempotency makes them indistinguishable, by design).
+    pub projected: usize,
+    /// The chain position the cursor now stands at.
+    pub advanced_to: u64,
+    /// True when the page came back short — the projection has caught the tail.
+    pub caught_up: bool,
 }
 
-/// The disposition reconciler (#480 review, change 2, and the operator's contract:
-/// notification is a durable, idempotent obligation, not "ruling committed, enqueue
-/// attempted once").
+/// The obligation a chain entry creates, if it is a terminal ruling:
+/// `(recipient, pointer)`, keyed later on the entry's own hash.
 ///
-/// THE HOLE IT CLOSES. Every minting site makes the enqueue failure loud to the
-/// RULER (a 500, a returned error) — and then no surface can re-mint: `scope_decide`
-/// refuses a non-pending request, `decide` refuses a settled escalation,
-/// `tool_arbitrate_appeal` refuses an already-ruled appeal. A ruling whose
-/// disposition never landed was therefore permanent silence for the petitioner.
-///
-/// ABSENCE IS THE QUEUE. This sweeps the recent chain window for rulings —
-/// `adjudication` (keyed on `about_deny_hash`; operator reputation adjudications
-/// carry none and are skipped), `gate_escalation_decided` (`escalation_id`),
-/// `scope_granted` / `scope_refused` (`request_id`) — that no
-/// `member_notice_disposition` entry names, and re-mints them through
-/// `report_disposition`, the same witnessed-first path the ruling sites use.
-/// Idempotent by construction: the re-mint IS the entry the next sweep looks for,
-/// so a second pass finds the queue empty. The scope arm skips `request_id: null`
-/// on purpose — that is an operator-ORIGINATED grant (`POST /api/scope/grant`,
-/// a8be418), not a petition, and there is no petitioner to notify (#480 review,
-/// change 5).
-///
-/// IT ALSO RECORDS THE LAPSE (change 3). `status_at` derives Expired from the clock
-/// alone, so an escalation nobody ruled left no chain event and no return edge —
-/// and on the sovereign_plus_peer bar the modal terminal outcome is exactly that.
-/// Here an open entry past its deadline with no `gate_escalation_decided` /
-/// `_withdrawn` / `_expired` naming it gets the `gate_escalation_expired` record
-/// the clock implied, and the asker gets a `#lapsed` disposition. The recorded
-/// entry is the idempotency marker; a withdrawn escalation is settled (the asker
-/// was present for its own act) and is left alone.
-///
-/// ONE BOUNDARY, stated rather than hidden: if the re-mint's ENQUEUE fails, the
-/// `member_notice_disposition` entry has already been appended (witness-first),
-/// so the next sweep sees this ruling as noticed and will not retry the queue.
-/// That is the same trade the ruling sites make — a witnessed-but-unqueued notice
-/// is reported (here: logged), never silent — and closing it would mean keying
-/// idempotency on inbox contents, which are drain-once and unreadable for this.
-pub(crate) fn reconcile_dispositions(
-    s: &mut super::state::ServerState,
-    now: u64,
-) -> DispositionReconciliation {
-    let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
-    fn str_of<'a>(e: &'a crate::storage::chain::ChainEntry, k: &str) -> Option<&'a str> {
-        e.event_data.get(k).and_then(Value::as_str)
+/// The covered set is the petition surfaces' terminal facts: an appeal's
+/// `adjudication` (only the appeal kind — operator REPUTATION adjudications
+/// carry no `about_deny_hash` and are skipped), an escalation's
+/// `gate_escalation_decided` and its lapse (`gate_escalation_expired`, recorded
+/// by `record_newly_lapsed`), and a scope request's `scope_granted` /
+/// `scope_refused`. `scope_granted` with a NULL `request_id` is the
+/// operator-ORIGINATED grant (`/api/scope/grant`) — not a petition, no
+/// petitioner, deliberately skipped (#480 review change 5). A ruling row too
+/// thin to derive a recipient from is warned about and skipped — unprojectable
+/// is a real state, and the cursor advancing past it is safe because no later
+/// pass could do better.
+fn disposition_obligation(e: &crate::storage::chain::ChainEntry) -> Option<(String, String)> {
+    let get = |k: &str| e.event_data.get(k).and_then(Value::as_str);
+    let thin = |what: &str| {
+        tracing::warn!(
+            "disposition projector: a {} entry ({}) lacks {what} — no obligation derivable",
+            e.event_type,
+            e.hash
+        );
+        None
+    };
+    match e.event_type.as_str() {
+        "adjudication" => {
+            let deny = get("about_deny_hash")?;
+            match get("subject_plugin_id") {
+                Some(to) => Some((to.to_string(), format!("hestia://appeal/{deny}#ruled"))),
+                None => thin("subject_plugin_id"),
+            }
+        }
+        "gate_escalation_decided" => {
+            let id = get("escalation_id")?;
+            match get("plugin_id") {
+                Some(to) => Some((to.to_string(), format!("hestia://escalation/{id}#decided"))),
+                None => thin("plugin_id"),
+            }
+        }
+        "gate_escalation_expired" => {
+            let id = get("escalation_id")?;
+            match get("plugin_id") {
+                Some(to) => Some((to.to_string(), format!("hestia://escalation/{id}#lapsed"))),
+                None => thin("plugin_id"),
+            }
+        }
+        "scope_granted" | "scope_refused" => {
+            // `request_id` null/absent = operator-originated grant: not a petition.
+            let rid = get("request_id")?;
+            match get("plugin_id") {
+                Some(to) => Some((to.to_string(), format!("hestia://scope/{rid}"))),
+                None => thin("plugin_id"),
+            }
+        }
+        _ => None,
     }
+}
 
-    // The queue, negatively defined: every about-reference a disposition already names.
-    let mut noticed_appeals = std::collections::HashSet::new();
-    let mut noticed_escalations = std::collections::HashSet::new();
-    let mut noticed_scope = std::collections::HashSet::new();
-    for e in window
-        .iter()
-        .filter(|e| e.event_type == "member_notice_disposition")
-    {
-        if let Some(h) = str_of(e, "about_deny_hash") {
-            noticed_appeals.insert(h.to_string());
+/// The disposition projector (#480 revised review, item 4): a CURSOR, not an
+/// absence-inference sweep.
+///
+/// Each pass reads at most [`DISPOSITION_PROJECTION_PAGE`] chain rows strictly
+/// after the persisted cursor, derives the obligation each terminal ruling
+/// creates (`disposition_obligation`), and idempotently ensures one durable
+/// `member_notices` row keyed by the ruling's hash. The cursor advances only
+/// through safely projected positions: a failed ensure breaks the pass BEFORE
+/// the cursor moves past that ruling, so the next pass retries it (item 4e).
+/// Once the row is durable, the existing `drain_member` / `drained_at`
+/// consume-once semantics own delivery — the projector never re-creates a
+/// drained notice, because the cursor has passed its ruling and the key would
+/// conflict anyway.
+///
+/// COLD START = THE TAIL, not genesis. A cursor that began at zero would
+/// backfill a notice for every ruling the chain has ever held — a burst of
+/// wakes about petitions long since settled out of band, the same failure the
+/// revised review struck the sweep for. History is paged explicitly, or not at
+/// all (item 6's backfill rule applied to the whole projection).
+///
+/// LOCK DISCIPLINE (item 4b, the load-bearing one): this function takes the two
+/// STORES, not `ServerState`. `SqliteChainStore` and `SqliteInboxStore` each own
+/// an internal `Mutex<Connection>`, so the chain page and the inbox writes run
+/// on their own connections and the outer `SharedState` lock is never held
+/// around the scan — a governance-ledger poll or a gate call does not queue
+/// behind the projector.
+pub(crate) fn project_dispositions(
+    chain: &crate::storage::chain::SqliteChainStore,
+    inbox: &crate::storage::SqliteInboxStore,
+) -> anyhow::Result<DispositionProjection> {
+    // The cursor is the NEXT UNREAD position (chain positions start at 0, so
+    // "last processed" has no empty-chain representation). Cold start = the
+    // current tail: `len` is the next position an append will take, so nothing
+    // already on the chain is ever backfilled.
+    let Some(cursor) = inbox.projection_cursor(DISPOSITION_PROJECTION_CURSOR)? else {
+        let tail = chain.len()?;
+        inbox.set_projection_cursor(DISPOSITION_PROJECTION_CURSOR, tail)?;
+        return Ok(DispositionProjection {
+            projected: 0,
+            advanced_to: tail,
+            caught_up: true,
+        });
+    };
+    let rows = chain.read_from(cursor, DISPOSITION_PROJECTION_PAGE)?;
+    let mut advanced_to = cursor;
+    let mut projected = 0usize;
+    for row in &rows {
+        if let Some((to, pointer)) = disposition_obligation(row) {
+            match inbox.ensure_member_disposition(&to, DAEMON_NOTICE_KIND_DISPOSITION, &pointer, &row.hash) {
+                Ok(_) => projected += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        "disposition projector: could not make the obligation for ruling \
+                         {} durable ({e}) — cursor stays at {advanced_to}, retry next pass",
+                        row.hash
+                    );
+                    break;
+                }
+            }
         }
-        if let Some(i) = str_of(e, "escalation_id") {
-            noticed_escalations.insert(i.to_string());
-        }
-        if let Some(r) = str_of(e, "request_id") {
-            noticed_scope.insert(r.to_string());
-        }
+        advanced_to = row.chain_position + 1;
     }
-    // Settled = cannot lapse. A withdrawal settles too: the asker refused its own
-    // request and was there for it — the no-mint-on-withdrawal rule the minting
-    // sites already keep.
-    let settled_escalations: std::collections::HashSet<&str> = window
-        .iter()
-        .filter(|e| {
-            matches!(
-                e.event_type.as_str(),
-                "gate_escalation_decided" | "gate_escalation_withdrawn" | "gate_escalation_expired"
-            )
-        })
-        .filter_map(|e| str_of(e, "escalation_id"))
-        .collect();
+    if advanced_to != cursor {
+        inbox.set_projection_cursor(DISPOSITION_PROJECTION_CURSOR, advanced_to)?;
+    }
+    Ok(DispositionProjection {
+        projected,
+        advanced_to,
+        caught_up: (rows.len() as u64) < DISPOSITION_PROJECTION_PAGE,
+    })
+}
 
-    // Plan first, mint second: the window is a snapshot, and the entries this pass
-    // appends are exactly what makes the NEXT pass a no-op.
-    let mut remints: Vec<(String, String, Value)> = Vec::new();
-    let mut lapses: Vec<(Value, String, String, Value)> = Vec::new();
-    for e in &window {
-        match e.event_type.as_str() {
-            "adjudication" => {
-                let Some(deny) = str_of(e, "about_deny_hash") else {
-                    continue;
-                };
-                if noticed_appeals.contains(deny) {
-                    continue;
-                }
-                let Some(to) = str_of(e, "subject_plugin_id") else {
-                    continue;
-                };
-                remints.push((
-                    to.to_string(),
-                    format!("hestia://appeal/{deny}#ruled"),
-                    json!({
-                        "about_deny_hash": deny,
-                        "upheld": e.event_data.get("upheld"),
-                        "adjudicator": e.event_data.get("adjudicator"),
-                        "adjudication_entry": e.hash,
-                        "remint": "disposition_reconciler",
-                        "note": "the appeal you filed has been ruled; the pointer resolves \
-                                 to the appeal and its ruling. Re-minted by the disposition \
-                                 reconciler: the ruling was on the chain but no disposition \
-                                 had been witnessed for it",
-                    }),
-                ));
+/// Record the lapse of every newly-crossed escalation in the LIVE store (#480
+/// revised review, item 6 — the useful half of the r2 lapse reconciler is
+/// creating the missing terminal fact, and the bounded live store is the right
+/// input: open rows are few and reaped, so this never scans history).
+///
+/// `status_at` derives Expired from the clock alone, so a petition nobody ruled
+/// used to leave no chain event and no return edge — and on the
+/// sovereign_plus_peer bar that is the modal terminal outcome. Each crossing
+/// gets its `gate_escalation_expired` record (witness FIRST — an unwitnessed
+/// lapse notice would be a claim about a record that does not exist), the
+/// store marks it so the append never repeats, and the expiry hash flows into
+/// the same obligation the other rulings use: the synchronous ensure here is
+/// the fast path, the cursor projector the guarantee.
+///
+/// The accepted gap, stated rather than hidden: a lapse that crosses while the
+/// daemon is DOWN is never recorded (`rehydrate` skips expired opens), per item
+/// 6 — a historical backfill is a separate, explicit act, not a side effect of
+/// a periodic task.
+pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -> usize {
+    let lapsed = s.gate_escalations.newly_lapsed(now);
+    let mut recorded = 0;
+    for esc in lapsed {
+        let entry = s.append_chain(
+            "gate_escalation_expired",
+            json!({
+                "escalation_id": esc.id,
+                "plugin_id": esc.plugin_id,
+                "subject_instance_lct": s.member_lct(&esc.plugin_id),
+                "tool_name": esc.tool_name,
+                "marker": esc.marker,
+                "opened_at": esc.opened_at,
+                "expires_at": esc.expires_at,
+                "lapsed_at": now,
+                "note": "the deadline passed with no decision. Until this record existed \
+                         the outcome was derived from the clock at read time and left no \
+                         trace of its own — and on the sovereign_plus_peer bar it is the \
+                         modal terminal outcome",
+            }),
+        );
+        match entry {
+            Ok(e) => {
+                // Marked only after the append landed: a failed append leaves the
+                // row eligible so the next pass retries, and a recorded one never
+                // appends twice.
+                s.gate_escalations.mark_lapse_recorded(&esc.id);
+                ensure_disposition(
+                    s,
+                    &esc.plugin_id,
+                    &format!("hestia://escalation/{}#lapsed", esc.id),
+                    &e.hash,
+                );
+                recorded += 1;
             }
-            "gate_escalation_decided" => {
-                let Some(id) = str_of(e, "escalation_id") else {
-                    continue;
-                };
-                if noticed_escalations.contains(id) {
-                    continue;
-                }
-                let Some(to) = str_of(e, "plugin_id") else {
-                    continue;
-                };
-                remints.push((
-                    to.to_string(),
-                    format!("hestia://escalation/{id}#decided"),
-                    json!({
-                        "escalation_id": id,
-                        "tool_name": e.event_data.get("tool_name"),
-                        "approved": str_of(e, "status") == Some("approved"),
-                        "decided_by": e.event_data.get("decided_by"),
-                        "decided_via": e.event_data.get("decided_via"),
-                        "reason": e.event_data.get("reason"),
-                        "remint": "disposition_reconciler",
-                        "note": "the escalation you filed has been decided; the pointer \
-                                 resolves to the decision. Re-minted by the disposition \
-                                 reconciler: the ruling was on the chain but no disposition \
-                                 had been witnessed for it",
-                    }),
-                ));
+            Err(e) => {
+                tracing::warn!("lapse recorder: witnessing the lapse of {}: {e}", esc.id)
             }
-            "scope_granted" | "scope_refused" => {
-                // `request_id` null/absent = the operator originated this grant
-                // (/api/scope/grant). Not a petition; nobody to notify.
-                let Some(rid) = str_of(e, "request_id") else {
-                    continue;
-                };
-                if noticed_scope.contains(rid) {
-                    continue;
-                }
-                let Some(to) = str_of(e, "plugin_id") else {
-                    continue;
-                };
-                let granted = e.event_type == "scope_granted";
-                remints.push((
-                    to.to_string(),
-                    format!("hestia://scope/{rid}"),
-                    json!({
-                        "request_id": rid,
-                        "plugin_id": to,
-                        "granted": granted,
-                        "decided_by": e.event_data.get("granted_by"),
-                        "expires_at": e.event_data.get("expires_at"),
-                        "remint": "disposition_reconciler",
-                        "note": "the scope request you filed has been decided; the pointer \
-                                 resolves to the decision. Re-minted by the disposition \
-                                 reconciler: the ruling was on the chain but no disposition \
-                                 had been witnessed for it",
-                    }),
-                ));
-            }
-            "gate_escalation_opened" => {
-                let (Some(id), Some(expires_at)) =
-                    (str_of(e, "escalation_id"), e.event_data.get("expires_at").and_then(Value::as_u64))
-                else {
-                    continue;
-                };
-                if now < expires_at || settled_escalations.contains(id) {
-                    continue;
-                }
-                let Some(to) = str_of(e, "plugin_id") else {
-                    continue;
-                };
-                lapses.push((
-                    json!({
-                        "escalation_id": id,
-                        "plugin_id": to,
-                        "subject_instance_lct": s.member_lct(to),
-                        "tool_name": e.event_data.get("tool_name"),
-                        "marker": e.event_data.get("marker"),
-                        "opened_at": e.event_data.get("opened_at"),
-                        "expires_at": expires_at,
-                        "lapsed_at": now,
-                        "note": "the deadline passed with no decision. Until the reconciler \
-                                 existed this outcome was derived from the clock at read \
-                                 time and left no record of its own — and on the \
-                                 sovereign_plus_peer bar it is the modal terminal outcome",
-                    }),
-                    to.to_string(),
-                    format!("hestia://escalation/{id}#lapsed"),
-                    json!({
-                        "escalation_id": id,
-                        "tool_name": e.event_data.get("tool_name"),
-                        "lapsed": true,
-                        "expires_at": expires_at,
-                        "note": "your escalation was neither approved nor denied — it ran \
-                                 out its clock with no ruling. The write stayed refused; \
-                                 re-escalate if the need stands",
-                    }),
-                ));
-            }
-            _ => {}
         }
     }
-
-    let mut did = DispositionReconciliation::default();
-    for (to, pointer, data) in remints {
-        match report_disposition(s, &to, &pointer, data) {
-            Ok(_) => did.reminted += 1,
-            // Witnessed but unqueued — logged, not silent, and NOT retried next
-            // pass (the entry now names the ruling). See the doc comment's boundary.
-            Err(err) => tracing::warn!("disposition reconciler: {err}"),
-        }
-    }
-    for (entry_data, to, pointer, notice_data) in lapses {
-        // Witness the lapse BEFORE telling the asker — the same order
-        // report_disposition keeps. An unwitnessed lapse notice would be a claim
-        // about a record that does not exist.
-        match s.append_chain("gate_escalation_expired", entry_data) {
-            Ok(_) => match report_disposition(s, &to, &pointer, notice_data) {
-                Ok(_) => did.lapsed += 1,
-                Err(err) => tracing::warn!("disposition reconciler: {err}"),
-            },
-            Err(err) => tracing::warn!("disposition reconciler: witnessing a lapse: {err}"),
-        }
-    }
-    did
+    recorded
 }
 
 async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
@@ -5835,7 +5791,7 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
     };
     // The same body, sourced from the entries rather than the row. `status` keeps
     // `status_at`'s clock semantics for an open-but-overdue ask: Expired is a real
-    // answer whether or not the reconciler has recorded the lapse yet. The settled
+    // answer whether or not the lapse recorder has witnessed the crossing yet. The settled
     // entry's fields are lifted to the top level so a reader gets the SAME shape
     // either arm answers with — a pointer that changes shape when a sweep runs is
     // the filtered-window illusion one level up.
@@ -12719,15 +12675,20 @@ mod appeal_tests {
 
         {
             let st = state.lock().await;
-            // Witnessed: the disposition is on the chain, carrying what it answers.
-            let disp = st
+            // Revised #480 doctrine: the adjudication IS the witness — there is no
+            // separate `member_notice_disposition` entry to drift from it, and the
+            // notice row anchors directly to the ruling's hash.
+            assert!(
+                st.recent_chain(20)
+                    .iter()
+                    .all(|e| e.event_type != "member_notice_disposition"),
+                "the struck pre-enqueue witness must stay struck"
+            );
+            let ruling = st
                 .recent_chain(20)
                 .into_iter()
-                .find(|e| e.event_type == "member_notice_disposition")
-                .expect("a ruling without its disposition entry is the hole #459 closes");
-            assert_eq!(disp.event_data["about_deny_hash"].as_str(), Some(deny_hash.as_str()));
-            assert_eq!(disp.event_data["upheld"], json!(true));
-            assert_eq!(disp.event_data["adjudicator"].as_str(), Some("codex"));
+                .find(|e| e.event_type == "adjudication")
+                .expect("the ruling itself must be witnessed");
 
             // Enqueued: to the APPELLANT, from the daemon, pointer naming the ruling.
             let mail = st.inbox_store.drain_member("claude-code").unwrap();
@@ -12739,6 +12700,10 @@ mod appeal_tests {
             assert_eq!(
                 note.pointer_uri.as_deref(),
                 Some(format!("hestia://appeal/{deny_hash}#ruled")).as_deref(),
+            );
+            assert_eq!(
+                note.chain_hash, ruling.hash,
+                "the obligation anchors to the terminal ruling, not to a notice-side entry"
             );
         }
 
@@ -12867,13 +12832,20 @@ mod appeal_tests {
 
         {
             let st = state.lock().await;
-            let disp = st
+            // Revised #480 doctrine: the decision entry IS the witness — no
+            // `member_notice_disposition` entry, and the notice anchors to the
+            // ruling's hash.
+            assert!(
+                st.recent_chain(20)
+                    .iter()
+                    .all(|e| e.event_type != "member_notice_disposition"),
+                "the struck pre-enqueue witness must stay struck"
+            );
+            let ruling = st
                 .recent_chain(20)
                 .into_iter()
-                .find(|e| e.event_type == "member_notice_disposition")
-                .expect("a decided escalation without its disposition entry is the hole #459 closes");
-            assert_eq!(disp.event_data["escalation_id"].as_str(), Some(esc_id.as_str()));
-            assert_eq!(disp.event_data["decided_by"].as_str(), Some("codex"));
+                .find(|e| e.event_type == "gate_escalation_decided")
+                .expect("the decision itself must be witnessed");
 
             let mail = st.inbox_store.drain_member("claude-code").unwrap();
             let note = mail
@@ -12884,6 +12856,10 @@ mod appeal_tests {
             assert_eq!(
                 note.pointer_uri.as_deref(),
                 Some(format!("hestia://escalation/{esc_id}#decided")).as_deref(),
+            );
+            assert_eq!(
+                note.chain_hash, ruling.hash,
+                "the obligation anchors to the terminal ruling, not to a notice-side entry"
             );
         }
 
@@ -14909,25 +14885,32 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
             // SharedState — because `EscalationStore::decide` has no inbox access.
             // Skipped for a withdrawal: that is the asker's own act and the asker
             // was there for it; waking a member to tell it what it just did is
-            // noise wearing the return edge's clothes.
+            // noise wearing the return edge's clothes. Revised #480 contract: the
+            // decision entry IS the witness, so the obligation anchors to its
+            // hash; a failed ensure warns and is retried by the cursor projector,
+            // it is not the decider's error.
             let disposition_notice_id = if withdrawn {
                 None
             } else {
-                Some(report_disposition(
-                    &mut s,
-                    &decided.plugin_id,
-                    &format!("hestia://escalation/{}#decided", decided.id),
-                    json!({
-                        "escalation_id": decided.id,
-                        "tool_name": decided.tool_name,
-                        "approved": approve,
-                        "decided_by": decided.decided_by,
-                        "decided_via": decided.decided_via,
-                        "reason": decided.reason,
-                        "note": "the escalation you filed has been decided; the pointer \
-                                 resolves to the decision",
-                    }),
-                )?)
+                match &entry {
+                    Ok(e) => ensure_disposition(
+                        &s,
+                        &decided.plugin_id,
+                        &format!("hestia://escalation/{}#decided", decided.id),
+                        &e.hash,
+                    ),
+                    // The ruling's OWN append failed: there is no witness to anchor
+                    // to and nothing for the projector to re-derive from. This was
+                    // already tolerated below (witnessEntryHash: null); say so.
+                    Err(append_err) => {
+                        tracing::warn!(
+                            "escalation {} decided but its witness append failed \
+                             ({append_err}) — no disposition can anchor to it",
+                            decided.id
+                        );
+                        None
+                    }
+                }
             };
             // The bar and whether this decision met it go to the DECIDER, not only to the
             // chain. They were recorded above and withheld here, and the asymmetry had a
@@ -15507,18 +15490,21 @@ mod standing_scope_surface_tests {
 
 #[cfg(test)]
 mod disposition_durability_tests {
-    //! #480 review (claude-code seat, "approve with four changes") + the operator's
-    //! contract: a disposition is a DURABLE, IDEMPOTENT obligation, not "ruling
-    //! committed, enqueue attempted once". These tests pin the four changes:
+    //! #480 review (claude-code seat, "approve with four changes"), then reshaped by
+    //! the REVISED contract (GPT, with dp's sign-off): a disposition is a durable,
+    //! idempotent OBLIGATION — the terminal ruling is the witness, the inbox row is
+    //! the obligation, a cursor projector guarantees it. These tests pin:
     //!
     //! 1. The `hestia://escalation/{id}` and `hestia://scope/{request_id}` resolvers
     //!    fall back to the witness chain when the memory store has reaped/forgotten
     //!    the row — point at the chain, don't make the memory store live longer.
-    //! 2. The reconciler re-mints any ruling with no `member_notice_disposition`
-    //!    naming it. Absence is the queue.
+    //! 2. The cursor projector (`project_dispositions`): paged by position, ≤500
+    //!    positions a pass, idempotent on the ruling hash, restart-safe, and never
+    //!    under the outer `SharedState` lock.
     //! 3. An escalation that ran out its clock gets a `gate_escalation_expired`
-    //!    record and a `#lapsed` disposition — the modal terminal outcome on the
-    //!    sovereign_plus_peer bar used to leave neither.
+    //!    record from the bounded live store, and a `#lapsed` disposition — the
+    //!    modal terminal outcome on the sovereign_plus_peer bar used to leave
+    //!    neither.
     //! 4. An OPEN escalation's pointer carries what the invited peer is woken to
     //!    weigh: stated_reason, bar, factors_present, invited_peers, asker_basis.
     use super::*;
@@ -15780,239 +15766,452 @@ mod disposition_durability_tests {
         );
     }
 
-    /// Change 2: a ruling whose enqueue was skipped (the failure the review named —
-    /// "ruling committed, enqueue attempted once", and every surface then refuses the
-    /// retry) is re-minted by the reconciler, and exactly once no matter how many
-    /// times it runs. Absence is the queue.
+
+    // ---- the revised contract's durability tests (GPT review of r2, items 2-7) ----
+    //
+    // Reviewer item 7's sixth case — "the governance-ledger panel polling while the
+    // projector runs doesn't push a simple gate/connect call beyond budget (#482)" —
+    // is documented rather than asserted, and here is why: a budget test needs
+    // wall-clock assertions, which are flaky under any CI load, and the mechanism
+    // it would measure no longer shares the lock it would contend on. The
+    // projector takes the two STORES (each with its own `Mutex<Connection>`), never
+    // `ServerState`; `a_pass_pages_at_most_five_hundred_positions_and_needs_no_outer_lock`
+    // proves that structurally by running a pass while HOLDING the outer lock.
+    // What a gate call can contend on is one 500-row index walk on the chain
+    // connection or one single-row insert on the inbox connection — sub-millisecond
+    // critical sections, not a 20k-entry materialization under the global lock,
+    // which is the shape #488/#482 measured.
+
+    /// A raw SQLCipher connection to the test home's inbox.db — for failure
+    /// injection (an EXCLUSIVE transaction makes every other connection's read
+    /// and write fail with BUSY) and for asserting on `drained_at`, which no
+    /// store method exposes.
+    fn raw_inbox_conn(dir: &TempDir) -> rusqlite::Connection {
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("inbox.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn
+    }
+
+    fn count_dispositions(conn: &rusqlite::Connection, undrained_only: bool) -> i64 {
+        let sql = if undrained_only {
+            "SELECT COUNT(*) FROM member_notices WHERE kind = 'disposition' AND drained_at IS NULL"
+        } else {
+            "SELECT COUNT(*) FROM member_notices WHERE kind = 'disposition'"
+        };
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    /// Reviewer test 1: the ruling commits, the synchronous ensure FAILS (injected
+    /// by an exclusive lock on inbox.db), the cursor stays behind, and the next
+    /// pass inserts exactly one durable disposition.
     #[tokio::test]
-    async fn the_reconciler_remints_a_ruling_whose_disposition_never_landed() {
-        let (_dir, state) = test_state().await;
-        let now = now_secs();
-        let mut s = state.lock().await;
-        s.append_chain(
-            "gate_escalation_opened",
-            json!({
-                "escalation_id": "esc-rec1", "plugin_id": "kimi-code",
-                "tool_name": "policy_edit", "marker": "policy.json",
-                "opened_at": now - 100, "expires_at": now + 3500,
-            }),
-        )
-        .unwrap();
-        s.append_chain(
-            "gate_escalation_decided",
-            json!({
-                "escalation_id": "esc-rec1", "plugin_id": "kimi-code",
-                "tool_name": "policy_edit", "status": "approved",
-                "decided_by": "operator", "decided_via": "operator_session",
-                "reason": "reviewed the diff",
-            }),
-        )
-        .unwrap();
+    async fn a_failed_ensure_leaves_the_cursor_behind_and_the_next_pass_delivers_once() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox, ruling_hash, ruling_pos) = {
+            let mut s = state.lock().await;
+            let handles = (s.chain_store.clone(), s.inbox_store.clone());
+            // Cold start: the cursor opens at the tail, so only rulings appended
+            // AFTER this are the projection's work.
+            let first = project_dispositions(&handles.0, &handles.1).unwrap();
+            assert_eq!(first.projected, 0, "cold start backfills nothing");
+            let e = s
+                .append_chain(
+                    "gate_escalation_decided",
+                    json!({
+                        "escalation_id": "esc-fail1", "plugin_id": "kimi-code",
+                        "tool_name": "policy_edit", "status": "approved",
+                        "decided_by": "operator",
+                    }),
+                )
+                .unwrap();
+            (handles.0, handles.1, e.hash, e.chain_position)
+        };
 
-        let did = reconcile_dispositions(&mut s, now);
-        assert_eq!(did.reminted, 1, "the unreported ruling is the queue");
-        assert_eq!(did.lapsed, 0);
-
-        let again = reconcile_dispositions(&mut s, now);
+        let blocker = raw_inbox_conn(&dir);
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        {
+            let s = state.lock().await;
+            // The synchronous fast path fails — and, per the revised contract,
+            // that is a warn, not the ruler's error.
+            assert_eq!(
+                ensure_disposition(&s, "kimi-code", "hestia://escalation/esc-fail1#decided", &ruling_hash),
+                None,
+                "a locked inbox must fail the fast path"
+            );
+        }
+        // The projector cannot even READ its cursor under the exclusive lock —
+        // either way, the cursor must not move.
+        assert!(project_dispositions(&chain, &inbox).is_err());
+        blocker.execute_batch("COMMIT").unwrap();
         assert_eq!(
-            (again.reminted, again.lapsed),
-            (0, 0),
-            "idempotent: a second sweep finds the disposition and does nothing"
+            inbox.projection_cursor("disposition").unwrap(),
+            Some(ruling_pos),
+            "the cursor stayed behind the unprojected ruling"
         );
 
-        let dispositions: Vec<_> = s
-            .recent_chain(50)
-            .into_iter()
-            .filter(|e| e.event_type == "member_notice_disposition")
-            .collect();
-        assert_eq!(
-            dispositions.len(),
-            1,
-            "exactly one disposition per ruling, however many sweeps"
-        );
-        assert_eq!(
-            dispositions[0].event_data.get("escalation_id").and_then(Value::as_str),
-            Some("esc-rec1")
-        );
+        let pass = project_dispositions(&chain, &inbox).unwrap();
+        assert_eq!(pass.projected, 1);
+        assert_eq!(pass.advanced_to, ruling_pos + 1);
+        let again = project_dispositions(&chain, &inbox).unwrap();
+        assert_eq!(again.projected, 0, "idempotent: the ruling hash is the key");
 
+        let s = state.lock().await;
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        let notes: Vec<_> = mail.iter().filter(|n| n.kind == "disposition").collect();
+        assert_eq!(notes.len(), 1, "exactly one durable disposition: {mail:?}");
+        assert_eq!(notes[0].chain_hash, ruling_hash);
+        assert_eq!(
+            notes[0].pointer_uri.as_deref(),
+            Some("hestia://escalation/esc-fail1#decided")
+        );
+    }
+
+    /// Reviewer test 2: a restart between the ruling and the projection — the
+    /// cursor lives in inbox.db, so the new daemon resumes it and inserts exactly
+    /// one disposition.
+    #[tokio::test]
+    async fn the_cursor_survives_a_restart_between_ruling_and_projection() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        {
+            let state = super::inbox_tests::open_state(&dir);
+            let mut s = state.lock().await;
+            let (chain, inbox) = (s.chain_store.clone(), s.inbox_store.clone());
+            project_dispositions(&chain, &inbox).unwrap(); // cold start
+            s.append_chain(
+                "scope_refused",
+                json!({
+                    "request_id": "scope-restart1", "plugin_id": "kimi-code",
+                    "path": "/x/y.md", "granted_by": "operator",
+                }),
+            )
+            .unwrap();
+            // The daemon "dies" here: no synchronous ensure, no projection.
+        }
+
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox) = {
+            let s = state.lock().await;
+            (s.chain_store.clone(), s.inbox_store.clone())
+        };
+        let pass = project_dispositions(&chain, &inbox).unwrap();
+        assert_eq!(pass.projected, 1, "the resumed cursor finds the ruling");
+
+        let s = state.lock().await;
         let mail = s.inbox_store.drain_member("kimi-code").unwrap();
         let notes: Vec<_> = mail.iter().filter(|n| n.kind == "disposition").collect();
         assert_eq!(notes.len(), 1);
         assert_eq!(
             notes[0].pointer_uri.as_deref(),
-            Some("hestia://escalation/esc-rec1#decided")
+            Some("hestia://scope/scope-restart1")
         );
     }
 
-    /// Change 2, the other two petition kinds: an appeal ruling (`adjudication`,
-    /// keyed on `about_deny_hash`) and a scope decision (`scope_refused`, keyed on
-    /// `request_id`) are re-minted to the appellant / requester.
+    /// Reviewer test 3: repeated passes — and a repeated direct ensure — never
+    /// duplicate. The ruling hash is the unique obligation key.
     #[tokio::test]
-    async fn the_reconciler_remints_appeal_and_scope_rulings() {
-        let (_dir, state) = test_state().await;
-        let now = now_secs();
-        let mut s = state.lock().await;
-        s.append_chain(
-            "adjudication",
-            json!({
-                "subject_plugin_id": "kimi-code", "about_deny_hash": "deadbeef",
-                "upheld": true, "adjudicator": "claude-code",
-            }),
-        )
-        .unwrap();
-        s.append_chain(
-            "scope_refused",
-            json!({
-                "request_id": "scope-rec1", "plugin_id": "kimi-code",
-                "path": "/x/y.md", "granted_by": "operator",
-                "decision_reason": "no", "expires_at": now + 3600,
-            }),
-        )
-        .unwrap();
-
-        let did = reconcile_dispositions(&mut s, now);
-        assert_eq!(did.reminted, 2);
-
-        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
-        let mut pointers: Vec<_> = mail
-            .iter()
-            .filter(|n| n.kind == "disposition")
-            .filter_map(|n| n.pointer_uri.clone())
-            .collect();
-        pointers.sort();
-        assert_eq!(
-            pointers,
-            vec![
-                "hestia://appeal/deadbeef#ruled".to_string(),
-                "hestia://scope/scope-rec1".to_string(),
-            ]
-        );
-    }
-
-    /// Change 3: the lapse. `status_at` derives Expired from the clock alone, so a
-    /// lapsed petition used to leave no return edge AND no record. The reconciler
-    /// appends the `gate_escalation_expired` the clock implied and tells the asker —
-    /// once.
-    #[tokio::test]
-    async fn the_reconciler_records_a_lapse_and_tells_the_asker_once() {
-        let (_dir, state) = test_state().await;
-        let now = now_secs();
-        let mut s = state.lock().await;
-        s.append_chain(
-            "gate_escalation_opened",
-            json!({
-                "escalation_id": "esc-lapse1", "plugin_id": "kimi-code",
-                "tool_name": "policy_edit", "marker": "policy.json",
-                "opened_at": now - 3700, "expires_at": now - 100,
-            }),
-        )
-        .unwrap();
-
-        let did = reconcile_dispositions(&mut s, now);
-        assert_eq!(did.lapsed, 1, "the clock's verdict gets a record");
-        assert_eq!(did.reminted, 0);
-
-        let expired = s
-            .recent_chain(20)
-            .into_iter()
-            .find(|e| e.event_type == "gate_escalation_expired")
-            .expect("a lapse must be witnessed, not only derived");
-        assert_eq!(
-            expired.event_data.get("escalation_id").and_then(Value::as_str),
-            Some("esc-lapse1")
-        );
-
-        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
-        let note = mail
-            .iter()
-            .find(|n| n.kind == "disposition")
-            .expect("the asker must learn its petition died of the clock: {mail:?}");
-        assert_eq!(
-            note.pointer_uri.as_deref(),
-            Some("hestia://escalation/esc-lapse1#lapsed")
-        );
-
-        let again = reconcile_dispositions(&mut s, now);
-        assert_eq!(
-            (again.lapsed, again.reminted),
-            (0, 0),
-            "the lapse entry is the idempotency marker — a second sweep adds nothing"
-        );
-    }
-
-    /// A decided escalation does not ALSO get lapsed, and a withdrawn one neither —
-    /// both are settled, and the asker of a withdrawal was present for its own act.
-    #[tokio::test]
-    async fn the_reconciler_never_lapses_a_settled_escalation() {
-        let (_dir, state) = test_state().await;
-        let now = now_secs();
-        let mut s = state.lock().await;
-        for (id, closer) in [
-            ("esc-decided", "gate_escalation_decided"),
-            ("esc-withdrawn", "gate_escalation_withdrawn"),
-        ] {
+    async fn repeated_passes_never_duplicate_an_obligation() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox, appeal_hash) = {
+            let mut s = state.lock().await;
+            let handles = (s.chain_store.clone(), s.inbox_store.clone());
+            project_dispositions(&handles.0, &handles.1).unwrap();
+            let e = s
+                .append_chain(
+                    "adjudication",
+                    json!({
+                        "subject_plugin_id": "kimi-code", "about_deny_hash": "deadbeef",
+                        "upheld": true, "adjudicator": "claude-code",
+                    }),
+                )
+                .unwrap();
             s.append_chain(
-                "gate_escalation_opened",
+                "scope_refused",
                 json!({
-                    "escalation_id": id, "plugin_id": "kimi-code",
-                    "tool_name": "policy_edit", "marker": "policy.json",
-                    "opened_at": now - 3700, "expires_at": now - 100,
+                    "request_id": "scope-dup1", "plugin_id": "kimi-code",
+                    "path": "/x/y.md", "granted_by": "operator",
                 }),
             )
             .unwrap();
+            (handles.0, handles.1, e.hash)
+        };
+
+        assert_eq!(project_dispositions(&chain, &inbox).unwrap().projected, 2);
+        assert_eq!(project_dispositions(&chain, &inbox).unwrap().projected, 0);
+        // The store-level key, directly: second ensure of the same ruling is a no-op.
+        assert!(
+            inbox
+                .ensure_member_disposition(
+                    "kimi-code",
+                    DAEMON_NOTICE_KIND_DISPOSITION,
+                    "hestia://appeal/deadbeef#ruled",
+                    &appeal_hash,
+                )
+                .unwrap()
+                .is_none(),
+            "ON CONFLICT DO NOTHING, not a second notice"
+        );
+
+        let conn = raw_inbox_conn(&dir);
+        assert_eq!(count_dispositions(&conn, false), 2, "one row per ruling, ever");
+    }
+
+    /// Reviewer test 4: after `drain_member`, `drained_at` records the consumption
+    /// and a later pass does NOT recreate the notice.
+    #[tokio::test]
+    async fn a_drained_disposition_is_never_recreated() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox) = {
+            let mut s = state.lock().await;
+            let handles = (s.chain_store.clone(), s.inbox_store.clone());
+            project_dispositions(&handles.0, &handles.1).unwrap();
             s.append_chain(
-                closer,
+                "gate_escalation_decided",
                 json!({
-                    "escalation_id": id, "plugin_id": "kimi-code",
+                    "escalation_id": "esc-drain1", "plugin_id": "kimi-code",
                     "tool_name": "policy_edit", "status": "denied",
                     "decided_by": "operator",
                 }),
             )
             .unwrap();
-        }
+            handles
+        };
+        assert_eq!(project_dispositions(&chain, &inbox).unwrap().projected, 1);
 
-        let did = reconcile_dispositions(&mut s, now);
-        assert_eq!(did.lapsed, 0, "a settled escalation cannot lapse");
-        // The decided one IS re-minted (no disposition witnessed for it); the
-        // withdrawn one is not — that is the existing no-mint-on-withdrawal rule.
-        assert_eq!(did.reminted, 1);
+        {
+            let s = state.lock().await;
+            let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+            assert_eq!(mail.iter().filter(|n| n.kind == "disposition").count(), 1);
+        }
+        let conn = raw_inbox_conn(&dir);
+        assert_eq!(
+            count_dispositions(&conn, true),
+            0,
+            "drained_at marks the consumption"
+        );
+        assert_eq!(count_dispositions(&conn, false), 1, "the record survives");
+
+        assert_eq!(project_dispositions(&chain, &inbox).unwrap().projected, 0);
+        assert_eq!(
+            count_dispositions(&conn, false),
+            1,
+            "a later pass must not recreate a delivered notice"
+        );
+        // A second drain returns nothing for it — consume-once is the store's own
+        // semantics, which the projector inherits by never rewriting the row.
+        let s = state.lock().await;
+        assert!(s.inbox_store.drain_member("kimi-code").unwrap().is_empty());
+    }
+
+    /// Reviewer test 5: one pass processes at most DISPOSITION_PROJECTION_PAGE
+    /// chain positions — and the pass runs while the outer state lock is HELD,
+    /// which is the structural proof that the chain scan never needs it (a
+    /// projector that took the lock would deadlock this test on the spot).
+    #[tokio::test]
+    async fn a_pass_pages_at_most_five_hundred_positions_and_needs_no_outer_lock() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox, start) = {
+            let mut s = state.lock().await;
+            let handles = (s.chain_store.clone(), s.inbox_store.clone());
+            let cold = project_dispositions(&handles.0, &handles.1).unwrap();
+            // Rulings at offsets 1 and 300 land inside the first page; the one at
+            // 508 lands outside it.
+            s.append_chain(
+                "gate_escalation_decided",
+                json!({"escalation_id": "esc-page-a", "plugin_id": "kimi-code",
+                       "tool_name": "t", "status": "approved", "decided_by": "operator"}),
+            )
+            .unwrap();
+            for i in 0..298 {
+                s.append_chain("outcome", json!({"filler": i})).unwrap();
+            }
+            s.append_chain(
+                "scope_granted",
+                json!({"request_id": "scope-page-b", "plugin_id": "kimi-code",
+                       "path": "/x", "granted_by": "operator"}),
+            )
+            .unwrap();
+            for i in 0..207 {
+                s.append_chain("outcome", json!({"filler": i})).unwrap();
+            }
+            s.append_chain(
+                "gate_escalation_expired",
+                json!({"escalation_id": "esc-page-c", "plugin_id": "kimi-code",
+                       "tool_name": "t"}),
+            )
+            .unwrap();
+            (handles.0, handles.1, cold.advanced_to)
+        };
+
+        let guard = state.lock().await; // held across BOTH passes
+        let first = project_dispositions(&chain, &inbox).unwrap();
+        assert_eq!(first.projected, 2, "only the rulings inside the page");
+        assert_eq!(
+            first.advanced_to,
+            start + DISPOSITION_PROJECTION_PAGE,
+            "exactly one page of positions"
+        );
+        assert!(!first.caught_up);
+        let second = project_dispositions(&chain, &inbox).unwrap();
+        assert!(second.caught_up);
+        assert_eq!(second.projected, 1, "the late ruling is next pass's work");
+        drop(guard);
+
+        let conn = raw_inbox_conn(&dir);
+        assert_eq!(count_dispositions(&conn, false), 3);
+    }
+
+    /// The lapse half (revised item 6): a crossing found in the bounded LIVE store
+    /// gets its `gate_escalation_expired` record and the asker its `#lapsed`
+    /// disposition, anchored to the expiry entry's hash — once.
+    #[tokio::test]
+    async fn the_lapse_recorder_witnesses_a_crossing_and_tells_the_asker_once() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let real_now = now_secs();
+        let id = {
+            let mut s = state.lock().await;
+            witness_open(&mut s, "kimi-code", None, real_now - 3 * 3600, 3600)
+        };
+
+        {
+            let mut s = state.lock().await;
+            assert_eq!(record_newly_lapsed(&mut s, real_now), 1);
+            let expired = s
+                .recent_chain(20)
+                .into_iter()
+                .find(|e| e.event_type == "gate_escalation_expired")
+                .expect("a lapse must be witnessed, not only derived");
+            assert_eq!(
+                expired.event_data.get("escalation_id").and_then(Value::as_str),
+                Some(id.as_str())
+            );
+
+            let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+            let note = mail
+                .iter()
+                .find(|n| n.kind == "disposition")
+                .expect("the asker must learn its petition died of the clock: {mail:?}");
+            assert_eq!(
+                note.pointer_uri.as_deref(),
+                Some(format!("hestia://escalation/{id}#lapsed")).as_deref()
+            );
+            assert_eq!(
+                note.chain_hash, expired.hash,
+                "the lapse obligation anchors to the expiry record"
+            );
+
+            assert_eq!(
+                record_newly_lapsed(&mut s, real_now),
+                0,
+                "the store marker dedups the append within a daemon lifetime"
+            );
+        }
+    }
+
+    /// The projector path for a lapse: the expiry entry was witnessed but the
+    /// daemon died before the ensure — the cursor projector mints from the record.
+    #[tokio::test]
+    async fn the_projector_mints_a_lapsed_disposition_from_the_expiry_record() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox) = {
+            let mut s = state.lock().await;
+            let handles = (s.chain_store.clone(), s.inbox_store.clone());
+            project_dispositions(&handles.0, &handles.1).unwrap();
+            s.append_chain(
+                "gate_escalation_expired",
+                json!({"escalation_id": "esc-lapse-p", "plugin_id": "kimi-code",
+                       "tool_name": "policy_edit"}),
+            )
+            .unwrap();
+            handles
+        };
+        assert_eq!(project_dispositions(&chain, &inbox).unwrap().projected, 1);
+        let s = state.lock().await;
         let mail = s.inbox_store.drain_member("kimi-code").unwrap();
         assert_eq!(
-            mail.iter().filter(|n| n.kind == "disposition").count(),
-            1,
-            "decided re-minted, withdrawn left alone: {mail:?}"
+            mail.iter()
+                .find(|n| n.kind == "disposition")
+                .and_then(|n| n.pointer_uri.as_deref()),
+            Some("hestia://escalation/esc-lapse-p#lapsed")
         );
     }
 
-    /// Change 5's mechanical half: an operator-ORIGINATED grant (`POST
-    /// /api/scope/grant`, a8be418) is a `scope_granted` with `request_id: null` —
-    /// not a petition, no petitioner to notify. The reconciler must skip it rather
-    /// than mint a disposition about an ask nobody made.
+    /// A decided escalation is not Pending in the store, so the recorder never
+    /// lapses it — settled is settled, whichever direction it settled.
     #[tokio::test]
-    async fn the_reconciler_does_not_notify_an_operator_originated_grant() {
+    async fn the_lapse_recorder_never_lapses_a_settled_escalation() {
         let (_dir, state) = test_state().await;
-        let now = now_secs();
+        let real_now = now_secs();
         let mut s = state.lock().await;
-        s.append_chain(
-            "scope_granted",
-            json!({
-                "request_id": serde_json::Value::Null,
-                "plugin_id": "kimi-code", "path": "/x/y.md",
-                "origin": "operator_initiated", "granted_by": "operator",
-            }),
-        )
-        .unwrap();
-
-        let did = reconcile_dispositions(&mut s, now);
+        for approve in [true, false] {
+            // Opened three hours ago on a one-hour TTL, decided thirty minutes in
+            // — BEFORE the deadline, because `decide` rightly refuses an expired
+            // row. So the row is clock-expired AND settled: exactly the case where
+            // the stored-status check must dominate the clock check.
+            let opened_at = real_now - 3 * 3600;
+            let esc = s
+                .gate_escalations
+                .open("kimi-code", "", "policy_edit", "policy.json", None, None, opened_at, 3600)
+                .unwrap();
+            let id = esc.id.clone();
+            s.gate_escalations
+                .decide(
+                    &id,
+                    approve,
+                    "operator",
+                    "sovereign",
+                    crate::server::gate_escalation::Channel::OperatorSession,
+                    None,
+                    Some("reviewed"),
+                    opened_at + 1800,
+                )
+                .unwrap();
+        }
         assert_eq!(
-            (did.reminted, did.lapsed),
-            (0, 0),
-            "no petition, no petitioner, no disposition"
+            record_newly_lapsed(&mut s, real_now),
+            0,
+            "a settled escalation cannot lapse"
         );
         assert!(s
             .recent_chain(20)
             .into_iter()
-            .all(|e| e.event_type != "member_notice_disposition"));
+            .all(|e| e.event_type != "gate_escalation_expired"));
+    }
+
+    /// Change 5's mechanical half, carried forward to the projector: an
+    /// operator-ORIGINATED grant (`POST /api/scope/grant`, a8be418) is a
+    /// `scope_granted` with `request_id: null` — not a petition, no petitioner to
+    /// notify.
+    #[tokio::test]
+    async fn the_projector_does_not_notify_an_operator_originated_grant() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox) = {
+            let mut s = state.lock().await;
+            let handles = (s.chain_store.clone(), s.inbox_store.clone());
+            project_dispositions(&handles.0, &handles.1).unwrap();
+            s.append_chain(
+                "scope_granted",
+                json!({
+                    "request_id": serde_json::Value::Null,
+                    "plugin_id": "kimi-code", "path": "/x/y.md",
+                    "origin": "operator_initiated", "granted_by": "operator",
+                }),
+            )
+            .unwrap();
+            handles
+        };
+        let pass = project_dispositions(&chain, &inbox).unwrap();
+        assert_eq!(pass.projected, 0, "no petition, no petitioner, no disposition");
+        assert!(pass.caught_up, "the cursor still passes the row");
+
+        let s = state.lock().await;
         let mail = s.inbox_store.drain_member("kimi-code").unwrap();
         assert!(mail.is_empty(), "nothing to notify: {mail:?}");
     }

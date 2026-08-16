@@ -36,7 +36,7 @@ not routed: closing someone's open thread is send-worthy.
 | kind | semantics |
 |---|---|
 | unreachable | *the daemon only.* Your outbound forward to a peer was retired unsent after exhausting its hand-off budget. Pointer -> `hestia://egress/{id}#unreachable:{peer}/{member} after {n} attempts: {reason}` |
-| disposition | *the daemon only.* The petition you filed has been RULED — appeal upheld/denied, scope granted/refused, escalation decided (#459) — or your escalation LAPSED: the reconciler records `gate_escalation_expired` and mints to the asker with pointer `hestia://escalation/{id}#lapsed` (#480 review — a lapse used to leave no return edge and no record, and on the sovereign_plus_peer bar it is the modal terminal outcome). Pointer -> `hestia://appeal/{hash}#ruled`, `hestia://scope/{request_id}`, or `hestia://escalation/{id}#decided`. Minting is reconciled, not one-shot: a daemon timer re-mints any ruling no `member_notice_disposition` names (absence is the queue). NOT minted on scope-request timeout expiry: that refusal is pull-only by design — the requester filed knowing the window, and `hestia_scope_status` answers it. NOT minted for `POST /api/scope/grant` either (considered, #480 review): an operator-originated grant is not a petition — there is no petitioner to notify, and its `request_id: null` says so |
+| disposition | *the daemon only.* The petition you filed has been RULED — appeal upheld/denied, scope granted/refused, escalation decided (#459) — or your escalation LAPSED: the daemon records `gate_escalation_expired` and mints to the asker with pointer `hestia://escalation/{id}#lapsed` (#480 review — a lapse used to leave no return edge and no record, and on the sovereign_plus_peer bar it is the modal terminal outcome). Pointer -> `hestia://appeal/{hash}#ruled`, `hestia://scope/{request_id}`, or `hestia://escalation/{id}#decided`. The obligation is DURABLE, not one-shot (revised #480 review): the terminal ruling is the witness, and the notice row in inbox.db is the obligation — keyed on the ruling's chain hash, so a second projection of the same ruling is a no-op, and a cursor projector re-derives any obligation whose insert failed. NOT minted on scope-request timeout expiry: that refusal is pull-only by design — the requester filed knowing the window, and `hestia_scope_status` answers it. NOT minted for `POST /api/scope/grant` either (considered, #480 review): an operator-originated grant is not a petition — there is no petitioner to notify, and its `request_id: null` says so |
 
 `unreachable` and `disposition` are deliberately absent from `MEMBER_NOTICE_KINDS`
 (`handler.rs`), so `tool_member_notify` refuses them and **no member can emit them**;
@@ -70,7 +70,9 @@ validated against `MEMBER_NOTICE_KINDS`; retire: the daemon's own). For `disposi
 (#459) that check landed on the three minting sites this PR adds — `tool_arbitrate_appeal`,
 `http::scope_decide`, and the two escalation decision surfaces — all daemon-internal:
 none takes a caller-chosen `to`, each reports to the petitioner the record itself names,
-and each is witnessed by a `member_notice_disposition` entry BEFORE the enqueue.
+and each anchors the notice row to the terminal ruling's chain hash — the ruling IS the
+witness (revised #480 review; the earlier `member_notice_disposition` pre-enqueue entry
+was struck: it manufactured "witnessed but never queued" states no surface could retry).
 
 This section exists because the code comment introducing the kind said "Documented in
 `plugins/member-mesh/KINDS.md`" when it was not — and the receiving side, which is the side

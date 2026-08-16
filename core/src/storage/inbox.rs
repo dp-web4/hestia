@@ -290,6 +290,16 @@ impl SqliteInboxStore {
             ("dest_peer_lct", "TEXT"),
             ("attempts", "INTEGER NOT NULL DEFAULT 0"),
             ("last_error", "TEXT"),
+            // The disposition obligation key (#480 revised review): for daemon-only
+            // `disposition` rows, the TERMINAL RULING's chain hash. The ruling is
+            // the witness, so the inbox row anchors to it directly (chain_hash
+            // carries the same hash), and this column is what makes the obligation
+            // idempotent — a second projection of the same ruling is ON CONFLICT
+            // DO NOTHING, not a second notice. NULL on every other kind; existing
+            // rows keep NULL. `chain_hash` itself cannot carry the uniqueness:
+            // several notices legitimately share one entry (a multi-peer
+            // invitation writes one row per invited seat, all on the open's hash).
+            ("disposition_key", "TEXT"),
         ] {
             if !existing.iter().any(|c| c == col) {
                 conn.execute_batch(&format!(
@@ -300,11 +310,120 @@ impl SqliteInboxStore {
         }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_member_notices_reply
-                 ON member_notices(in_reply_to);",
+                 ON member_notices(in_reply_to);
+             -- Partial: only disposition rows carry the key. Uniqueness over the
+             -- whole column would be wrong even if it were possible — NULLs never
+             -- conflict in SQLite, but the index would still tax every insert.
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_member_notices_disposition_key
+                 ON member_notices(disposition_key) WHERE disposition_key IS NOT NULL;",
         )
         .context("indexing member_notices.in_reply_to")?;
         Self::ensure_touch_schema(conn)?;
+        // The projector's cursor (same revised review): one row per projection
+        // name, the chain position safely processed THROUGH. Living here rather
+        // than on the witness chain is deliberate — a cursor is consumer state,
+        // not a witnessed act, and the chain has no update verb. Restart-safe:
+        // a ruling committed before a crash is re-found by position after it.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS projection_cursors (
+                name     TEXT PRIMARY KEY,
+                position INTEGER NOT NULL
+             );",
+        )
+        .context("initializing projection_cursors schema")?;
         Ok(())
+    }
+
+    /// The NEXT UNREAD chain position of a named projection, if it has ever run.
+    /// (`chain_position` starts at 0, so "last processed" has no representation
+    /// for an empty chain; next-unread does.) `None` = never ran — the caller
+    /// decides what a cold start means (the disposition projector starts at the
+    /// chain's tail: history is not backfilled unless someone pages it
+    /// explicitly).
+    pub fn projection_cursor(&self, name: &str) -> Result<Option<u64>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let pos = conn
+            .query_row(
+                "SELECT position FROM projection_cursors WHERE name = ?1",
+                params![name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .context("reading projection cursor")?;
+        Ok(pos.map(|p| p as u64))
+    }
+
+    /// Advance a named projection's cursor. Only ever called with a position the
+    /// caller has fully processed UP TO: a cursor that ran ahead of the work it
+    /// tracks would silently skip obligations, which is the exact hole the
+    /// disposition projector exists to close.
+    pub fn set_projection_cursor(&self, name: &str, position: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        conn.execute(
+            "INSERT INTO projection_cursors (name, position) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET position = ?2",
+            params![name, position as i64],
+        )
+        .context("advancing projection cursor")?;
+        Ok(())
+    }
+
+    /// Ensure the durable disposition obligation for a terminal ruling exists —
+    /// idempotent on the ruling's chain hash (#480 revised review: the ruling IS
+    /// the witness; the inbox row is the obligation). `kind` is always the
+    /// daemon-only disposition kind at today's call sites; taken as a parameter so
+    /// the literal's single source stays `DAEMON_NOTICE_KIND_DISPOSITION` in
+    /// handler.rs rather than being re-spelled here.
+    ///
+    /// Returns `Some(id)` when this call inserted the row, `None` when the
+    /// obligation already existed (a second projection of the same ruling is a
+    /// no-op, not a second notice). `Err` means the obligation could NOT be made
+    /// durable — the caller warns and lets the cursor projector retry; it never
+    /// reports the failure as a ruling failure, because the ruling succeeded.
+    ///
+    /// No cap eviction here, on purpose: `enqueue_member`'s cap makes room by
+    /// DELETING the recipient's oldest undrained notice, and for a disposition
+    /// that would drop "your petition was ruled" to admit "your petition was
+    /// ruled" — the one kind whose whole point is that the record survives.
+    /// Daemon-origin rows are few (one per ruling, ever) and the TTL prune still
+    /// bounds retention, so the bound this skips is the one bound that would eat
+    /// the obligation itself.
+    pub fn ensure_member_disposition(
+        &self,
+        to_plugin: &str,
+        kind: &str,
+        pointer_uri: &str,
+        ruling_hash: &str,
+    ) -> Result<Option<u64>> {
+        let now = Utc::now();
+        let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        // Same retention discipline as every other writer on this plane.
+        conn.execute(
+            "DELETE FROM member_notices
+              WHERE queued_at < ?1 AND (dest_peer IS NULL OR drained_at IS NOT NULL)",
+            params![cutoff],
+        )
+        .context("pruning expired member notices")?;
+        conn.execute(
+            "INSERT OR IGNORE INTO member_notices
+                 (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash,
+                  queued_at, disposition_key)
+             VALUES (?1, 'hestia', ?2, ?3, ?4, ?5, ?6, ?5)",
+            params![
+                to_plugin,
+                crate::reputation::DEFAULT_CONSTELLATION_ROLE,
+                kind,
+                pointer_uri,
+                ruling_hash,
+                now.to_rfc3339(),
+            ],
+        )
+        .context("ensuring disposition obligation")?;
+        Ok((conn.changes() > 0).then(|| conn.last_insert_rowid() as u64))
     }
 
     /// The recipient-liveness record (Kimi ↔ CBP, 2026-07-25).

@@ -475,16 +475,25 @@ pub async fn serve_with_callback(
             operator_gate,
         ));
 
-    // The disposition reconciler (#480 review, change 2): the only periodic task
-    // this daemon runs, added because a ruling whose disposition enqueue failed
-    // was otherwise permanent silence for the petitioner — every decision surface
-    // refuses a second ruling, so nothing could re-mint. The sweep is idempotent
-    // (absence of a `member_notice_disposition` naming the ruling IS the queue)
-    // and it is where escalation LAPSE gets its chain record (`gate_escalation_
-    // expired`, change 3). Runs off the same lock every handler uses; a pass is a
-    // window scan plus, in the steady state, zero appends. Spawned before `app`
-    // below moves `state`.
-    let reconcile_state = state.clone();
+    // The disposition worker (#459; reshaped to the revised #480 review): the
+    // daemon's only periodic task. Two halves per tick:
+    //
+    // 1. LAPSE RECORDING takes the outer lock briefly — it reads the bounded live
+    //    escalation store and appends a `gate_escalation_expired` only when a row
+    //    crossed its deadline unruled. Steady state: a small scan, zero appends.
+    // 2. PROJECTION never touches the outer lock at all. It pages the witness
+    //    chain after a durable cursor (≤ DISPOSITION_PROJECTION_PAGE positions)
+    //    on the chain store's OWN connection and writes obligations to inbox.db
+    //    on ITS own connection — the r2 sweep materialised 20k entries under the
+    //    global lock every pass, the gate-starving shape #488/#482 flagged; this
+    //    is the work-queue shape the review asked for instead.
+    //
+    // Spawned before `app` below moves `state`.
+    let (chain_handle, inbox_handle) = {
+        let s = state.lock().await;
+        (s.chain_store.clone(), s.inbox_store.clone())
+    };
+    let lapse_state = state.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(
             super::handler::DISPOSITION_RECONCILE_INTERVAL_SECS,
@@ -492,16 +501,21 @@ pub async fn serve_with_callback(
         loop {
             tick.tick().await;
             let now = super::gate_escalation::now_secs();
-            let did = {
-                let mut s = reconcile_state.lock().await;
-                super::handler::reconcile_dispositions(&mut s, now)
+            let lapsed = {
+                let mut s = lapse_state.lock().await;
+                super::handler::record_newly_lapsed(&mut s, now)
             };
-            if did.reminted > 0 || did.lapsed > 0 {
-                tracing::info!(
-                    reminted = did.reminted,
-                    lapsed = did.lapsed,
-                    "disposition reconciler closed open obligations"
-                );
+            match super::handler::project_dispositions(&chain_handle, &inbox_handle) {
+                Ok(p) if p.projected > 0 || lapsed > 0 => {
+                    tracing::info!(
+                        projected = p.projected,
+                        lapsed,
+                        cursor = p.advanced_to,
+                        "disposition worker closed open obligations"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("disposition projector: {e}"),
             }
         }
     });
@@ -1705,6 +1719,12 @@ async fn scope_decide(
         }
     };
 
+    // The ruling the disposition obligation will anchor to (revised #480 contract:
+    // the terminal ruling IS the witness). For a standing grant the INTENT entry is
+    // not the terminal fact — the success `scope_granted` below is, and the standing
+    // arm replaces this with its hash.
+    let mut ruling_hash = entry.hash.clone();
+
     // THE STANDING WIDENING, applied after its record committed (same order rule as above).
     // The in-memory mutation and the vault write must land together: a grant live in memory
     // but absent from the vault would silently die at the next restart — the exact lie this
@@ -1750,7 +1770,7 @@ async fn scope_decide(
         // SUCCESS — appended only now, when the grant is really durable. Carries the intent's
         // hash so the pair is joinable, and the generation the commit actually produced rather
         // than the `+1` the intent could only predict.
-        if let Err(e) = s.append_chain(
+        let success = match s.append_chain(
             "scope_granted",
             serde_json::json!({
                 "request_id": request_id,
@@ -1767,20 +1787,27 @@ async fn scope_decide(
                 "intent": entry.hash,
             }),
         ) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "THE STANDING GRANT IS LIVE but its success record could not be \
-                         appended ({e}). Under-recorded, not unrecorded: the intent is on the \
-                         chain. Revoke and re-decide, or repair the chain — do not assume the \
-                         grant is absent because the confirmation is."
-                    ),
-                    "state": "grant IS in force; chain holds only the intent",
-                    "intentEntryHash": entry.hash,
-                })),
-            );
-        }
+            Ok(e) => e,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "THE STANDING GRANT IS LIVE but its success record could not be \
+                             appended ({e}). Under-recorded, not unrecorded: the intent is on the \
+                             chain. Revoke and re-decide, or repair the chain — do not assume the \
+                             grant is absent because the confirmation is."
+                        ),
+                        "state": "grant IS in force; chain holds only the intent",
+                        "intentEntryHash": entry.hash,
+                    })),
+                );
+            }
+        };
+        // The TERMINAL ruling for a standing grant is this success entry, not the
+        // intent: the disposition's obligation key must name the record that says
+        // the grant is in force.
+        ruling_hash = success.hash;
     }
 
     if let Some(req) = s.scope_requests.get_mut(&request_id) {
@@ -1797,38 +1824,16 @@ async fn scope_decide(
 
     // #459: the decision's RETURN EDGE. The requester filed through MCP and until
     // now had no way to learn the answer short of polling — a granted or refused
-    // ask read exactly like a pending one. Minted after the decision is applied,
-    // witnessed before it is queued, and a failed enqueue is surfaced rather than
-    // swallowed: a witnessed-but-unreported decision is the hole this closes.
-    let disposition_notice_id = match super::handler::report_disposition(
-        &mut s,
+    // ask read exactly like a pending one. Revised #480 contract: the ruling entry
+    // IS the witness, so the obligation anchors to its hash directly; a failed
+    // ensure is warned about inside `ensure_disposition`, not returned — the
+    // decision landed, and the cursor projector retries the notification half.
+    let disposition_notice_id = super::handler::ensure_disposition(
+        &s,
         &plugin_id,
         &format!("hestia://scope/{request_id}"),
-        serde_json::json!({
-            "request_id": request_id,
-            "plugin_id": plugin_id,
-            "granted": granted,
-            "decided_by": "operator",
-            "expires_at": expires_at,
-            "note": "the scope request you filed has been decided; the pointer resolves \
-                     to the decision",
-        }),
-    ) {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "decision applied and witnessed, but the disposition notice could \
-                         NOT be queued ({e}) — the requester does not know its ask was ruled"
-                    ),
-                    "request_id": request_id,
-                    "granted": granted,
-                })),
-            );
-        }
-    };
+        &ruling_hash,
+    );
 
     (
         StatusCode::OK,
@@ -2878,38 +2883,24 @@ async fn operator_gate_escalation(
             );
             // #459: the decision's RETURN EDGE, on the channel that decides 207 of
             // 210 rulings. Minted at this layer because `EscalationStore::decide`
-            // has no inbox access; a failed enqueue is an error, not a warn — an
-            // asker never told its escalation was ruled keeps polling a settled
-            // question.
-            let disposition_notice_id = match super::handler::report_disposition(
-                &mut s,
-                &esc.plugin_id,
-                &format!("hestia://escalation/{}#decided", esc.id),
-                serde_json::json!({
-                    "escalation_id": esc.id,
-                    "tool_name": esc.tool_name,
-                    "approved": esc.stored_status() == crate::server::gate_escalation::Status::Approved,
-                    "decided_by": esc.decided_by,
-                    "decided_via": esc.decided_via,
-                    "reason": esc.reason,
-                    "note": "the escalation you filed has been decided; the pointer \
-                             resolves to the decision",
-                }),
-            ) {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({
-                            "error": format!(
-                                "decision applied and witnessed, but the disposition notice \
-                                 could NOT be queued ({e}) — the asker does not know its \
-                                 escalation was ruled"
-                            ),
-                            "escalation_id": esc.id,
-                        })),
-                    )
-                        .into_response();
+            // has no inbox access. Revised #480 contract: the decision entry IS
+            // the witness, so the obligation anchors to its hash, and a failed
+            // ensure is warned about rather than returned — the decision landed;
+            // the cursor projector re-derives the obligation and retries.
+            let disposition_notice_id = match &entry {
+                Ok(e) => super::handler::ensure_disposition(
+                    &s,
+                    &esc.plugin_id,
+                    &format!("hestia://escalation/{}#decided", esc.id),
+                    &e.hash,
+                ),
+                Err(append_err) => {
+                    tracing::warn!(
+                        "escalation {} decided but its witness append failed \
+                         ({append_err}) — no disposition can anchor to it",
+                        esc.id
+                    );
+                    None
                 }
             };
             // THE DECIDER SEES THE BAR — on this surface too.
@@ -3003,16 +2994,24 @@ mod disposition_tests {
         assert_eq!(resp.status(), StatusCode::OK, "the decision itself must land");
 
         let s = state.lock().await;
-        let disp = s
+        // Revised #480 doctrine: the ruling IS the witness — no
+        // `member_notice_disposition` entry, and the notice row anchors to the
+        // scope_granted entry's hash.
+        assert!(
+            !s.recent_chain(20)
+                .iter()
+                .any(|e| e.event_type == "member_notice_disposition"),
+            "the struck pre-enqueue witness must stay struck"
+        );
+        let ruling = s
             .recent_chain(20)
             .into_iter()
-            .find(|e| e.event_type == "member_notice_disposition")
-            .expect("a decision without its disposition entry is the hole #459 closes");
+            .find(|e| e.event_type == "scope_granted")
+            .expect("the decision itself must be witnessed");
         assert_eq!(
-            disp.event_data.get("request_id").and_then(|v| v.as_str()),
+            ruling.event_data.get("request_id").and_then(|v| v.as_str()),
             Some("scope-test459b")
         );
-        assert_eq!(disp.event_data.get("granted").and_then(|v| v.as_bool()), Some(true));
 
         let mail = s.inbox_store.drain_member("kimi-code").unwrap();
         let note = mail
@@ -3021,6 +3020,10 @@ mod disposition_tests {
             .expect("the requester must learn its ask was decided: {mail:?}");
         assert_eq!(note.from_plugin, "hestia");
         assert_eq!(note.pointer_uri.as_deref(), Some("hestia://scope/scope-test459b"));
+        assert_eq!(
+            note.chain_hash, ruling.hash,
+            "the obligation anchors to the terminal ruling, not to a notice-side entry"
+        );
     }
 
     /// Minting site C, the operator channel (#459): deciding an escalation tells
