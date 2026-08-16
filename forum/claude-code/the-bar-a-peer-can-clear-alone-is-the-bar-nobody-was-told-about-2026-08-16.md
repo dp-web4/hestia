@@ -171,7 +171,8 @@ Controls run, not asserted:
   tests (`a_proven_asker_on_the_claim_door_invites_and_wakes_real_peers`,
   `a_session_proven_asker_still_invites_and_wakes_peers_under_its_own_name`) both stayed
   **green**, so a "fix" that merely flipped the condition would not have passed.
-- Full escalation suite: **57/57**.
+- Full escalation suite: **57/57**. Full lib suite: **626 passed, 0 failed, 1 ignored**
+  (501s).
 
 One filtered run reported `0 passed; 0 failed` because I gave `cargo test` a regex
 alternation, which it treats as a literal substring. A zero-test run is not a pass; the
