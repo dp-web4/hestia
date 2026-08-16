@@ -241,10 +241,10 @@ fn bad_operator_session(reason: &str) -> (StatusCode, Json<serde_json::Value>) {
 /// is self-witnessed (A). Reachability alone never admits.
 async fn operator_gate(
     State(state): State<SharedState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    use super::operator_auth::{AuthzOutcome, Stakes, gate_session_request};
+    use super::operator_auth::{AuthzOutcome, GateWitness, Stakes, gate_session_request};
 
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
@@ -272,12 +272,22 @@ async fn operator_gate(
             eprintln!(
                 "[hestia] WARNING: operator dev-override used on {method} {path} (dev-only, unsafe)"
             );
-            let _ = s.append_chain(
-                "operator_gate",
-                serde_json::json!({ "act": format!("{method} {path}"), "verdict": "dev-override",
-                    "stakes": stakes.as_str(), "unsafe": true, "at": now }),
-            );
+            let gate_entry_hash = s
+                .append_chain(
+                    "operator_gate",
+                    serde_json::json!({ "act": format!("{method} {path}"), "verdict": "dev-override",
+                        "stakes": stakes.as_str(), "unsafe": true, "at": now }),
+                )
+                .ok()
+                .map(|e| e.hash);
             drop(s);
+            // The escape hatch names no operator, so the act row it admits will carry a
+            // pointer to an authorization with no author — which is exactly what a
+            // dev-override IS, and better than an act row that looks unauthorized.
+            req.extensions_mut().insert(GateWitness {
+                provenance: None,
+                gate_entry_hash,
+            });
             return next.run(req).await;
         }
     }
@@ -308,16 +318,30 @@ async fn operator_gate(
 
     // Self-witness the authorization decision (A) for consequential acts (skip the
     // low-stakes read flood).
+    let mut gate_entry_hash = None;
     if !matches!(stakes, Stakes::LowReversible) {
         let mut s = state.lock().await;
-        let _ = s.append_chain(
-            "operator_gate",
-            super::operator_auth::attach_operator_provenance(
-                outcome.evidence_record(&format!("{method} {path}")),
-                provenance.as_ref(),
-            ),
-        );
+        gate_entry_hash = s
+            .append_chain(
+                "operator_gate",
+                super::operator_auth::attach_operator_provenance(
+                    outcome.evidence_record(&format!("{method} {path}")),
+                    provenance.as_ref(),
+                ),
+            )
+            .ok()
+            .map(|e| e.hash);
     }
+
+    // Carry the proof forward instead of dropping it here. Handlers that append their own
+    // act row can then name the operator and POINT AT the authorization, rather than
+    // leaving a reader to join by adjacency. Inserted on every outcome — a handler only
+    // runs on `Authorized`, but the extension is the gate's statement about the request,
+    // not a claim that the request proceeded.
+    req.extensions_mut().insert(GateWitness {
+        provenance,
+        gate_entry_hash,
+    });
 
     match outcome {
         AuthzOutcome::Authorized { .. } => next.run(req).await,
@@ -370,6 +394,66 @@ pub async fn serve_with_callback(
         config,
     );
 
+    // The operator data surface, built by `operator_surface_router` below.
+    let operator_surface = operator_surface_router(state.clone());
+
+    let mut app = axum::Router::new()
+        .merge(operator_surface)
+        // The dashboard HTML shell — unauthenticated (app skeleton + sign-in JS,
+        // no data). The operator signs in from here; all /api/* data is gated.
+        .route("/", get(dashboard_html))
+        // Operator auth bootstrap surface — UNauthenticated by design (this is how
+        // an operator establishes a session; issuing a challenge grants nothing).
+        .route("/api/operator/challenge", post(operator_challenge))
+        .route("/api/operator/session", post(operator_session))
+        // OID4VCI issuance (EUDI Phase 2) — hestia as person-scale issuer.
+        // /metadata + /nonce are legitimately unauthenticated (discovery + a freshness
+        // nonce grant nothing). /credential — which mints an OWNER-SIGNED presentation —
+        // was moved behind the operator gate above (fail-closed stopgap, PRD §5.6) and is
+        // deliberately NOT mounted here anymore.
+        .route("/.well-known/openid-credential-issuer", get(vci_metadata))
+        .route("/nonce", post(vci_nonce))
+        .with_state(state)
+        .nest_service("/mcp", service);
+
+    if let Some(kp) = callback_keypair {
+        let cb_state = Arc::new(tokio::sync::Mutex::new(CallbackState::new(kp)));
+        app = app.nest("/callback", callback_router(cb_state));
+        tracing::info!("Sovereign callback active at /callback");
+    }
+
+    let listener = TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("binding {}", addr))?;
+
+    tracing::info!("Hestia MCP server listening on http://{}", addr);
+    tracing::info!("Dashboard at http://{}/", addr);
+
+    // Run until ctrl-c
+    let shutdown_token = CancellationToken::new();
+    let shutdown_clone = shutdown_token.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutdown signal received");
+        shutdown_clone.cancel();
+    });
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move { shutdown_token.cancelled().await })
+        .await
+        .context("axum::serve failed")?;
+
+    Ok(())
+}
+
+/// The OPERATOR DATA surface (`/api/*`), built as a value so a test can drive a route
+/// through the REAL `operator_gate` middleware instead of around it. Extracted from
+/// `serve_with_callback` for exactly that reason: the property this file's tests pin —
+/// that the authorization the gate proved reaches the handler's own chain row — lives in
+/// the SEAM between middleware and handler. A test that builds its own two-route router
+/// exercises both real halves and still cannot fail if production stops mounting the
+/// policy routes behind the layer; driving this function can.
+fn operator_surface_router(state: SharedState) -> axum::Router<SharedState> {
     // The OPERATOR DATA surface (/api/*): every route behind the operator_gate
     // preflight (RWOA O). route_layer applies only to these routes, not fallbacks.
     // NB: the dashboard HTML shell `GET /` is served UNAUTHENTICATED below — it
@@ -455,54 +539,7 @@ pub async fn serve_with_callback(
             state.clone(),
             operator_gate,
         ));
-
-    let mut app = axum::Router::new()
-        .merge(operator_surface)
-        // The dashboard HTML shell — unauthenticated (app skeleton + sign-in JS,
-        // no data). The operator signs in from here; all /api/* data is gated.
-        .route("/", get(dashboard_html))
-        // Operator auth bootstrap surface — UNauthenticated by design (this is how
-        // an operator establishes a session; issuing a challenge grants nothing).
-        .route("/api/operator/challenge", post(operator_challenge))
-        .route("/api/operator/session", post(operator_session))
-        // OID4VCI issuance (EUDI Phase 2) — hestia as person-scale issuer.
-        // /metadata + /nonce are legitimately unauthenticated (discovery + a freshness
-        // nonce grant nothing). /credential — which mints an OWNER-SIGNED presentation —
-        // was moved behind the operator gate above (fail-closed stopgap, PRD §5.6) and is
-        // deliberately NOT mounted here anymore.
-        .route("/.well-known/openid-credential-issuer", get(vci_metadata))
-        .route("/nonce", post(vci_nonce))
-        .with_state(state)
-        .nest_service("/mcp", service);
-
-    if let Some(kp) = callback_keypair {
-        let cb_state = Arc::new(tokio::sync::Mutex::new(CallbackState::new(kp)));
-        app = app.nest("/callback", callback_router(cb_state));
-        tracing::info!("Sovereign callback active at /callback");
-    }
-
-    let listener = TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("binding {}", addr))?;
-
-    tracing::info!("Hestia MCP server listening on http://{}", addr);
-    tracing::info!("Dashboard at http://{}/", addr);
-
-    // Run until ctrl-c
-    let shutdown_token = CancellationToken::new();
-    let shutdown_clone = shutdown_token.clone();
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("shutdown signal received");
-        shutdown_clone.cancel();
-    });
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move { shutdown_token.cancelled().await })
-        .await
-        .context("axum::serve failed")?;
-
-    Ok(())
+    operator_surface
 }
 
 async fn dashboard_html() -> impl IntoResponse {
@@ -1821,8 +1858,23 @@ async fn scope_standing_revoke(
     )
 }
 
+/// Stamp an act record with the authorization the `operator_gate` middleware already
+/// proved for this request. `None` means the handler was reached without passing the
+/// gate — impossible on the mounted routes, so the record is left unstamped rather than
+/// stamped with an invented author.
+fn stamped(
+    gate: &Option<axum::Extension<super::operator_auth::GateWitness>>,
+    record: serde_json::Value,
+) -> serde_json::Value {
+    match gate {
+        Some(axum::Extension(witness)) => witness.stamp(record),
+        None => record,
+    }
+}
+
 async fn policy_set_preset(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let preset = body
@@ -1842,7 +1894,10 @@ async fn policy_set_preset(
             s.reload_policy();
             let _ = s.append_chain(
                 "policy_edit",
-                serde_json::json!({"change": "preset", "preset": preset}),
+                stamped(
+                    &gate,
+                    serde_json::json!({"change": "preset", "preset": preset}),
+                ),
             );
             (
                 StatusCode::OK,
@@ -1869,6 +1924,7 @@ struct OverrideBody {
 /// state (the "edit specifically" path for built-in rules).
 async fn policy_set_override(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Json(body): Json<OverrideBody>,
 ) -> impl IntoResponse {
     let decision = match body.decision.as_deref() {
@@ -1893,10 +1949,13 @@ async fn policy_set_override(
             s.reload_policy();
             let _ = s.append_chain(
                 "policy_edit",
-                serde_json::json!({
-                    "change": "override", "rule_id": body.rule_id,
-                    "decision": body.decision, "enabled": body.enabled,
-                }),
+                stamped(
+                    &gate,
+                    serde_json::json!({
+                        "change": "override", "rule_id": body.rule_id,
+                        "decision": body.decision, "enabled": body.enabled,
+                    }),
+                ),
             );
             (
                 StatusCode::OK,
@@ -1913,6 +1972,7 @@ async fn policy_set_override(
 /// `DELETE /api/policy/override/{rule_id}` — revert a preset rule to its default.
 async fn policy_clear_override(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Path(rule_id): Path<String>,
 ) -> impl IntoResponse {
     let mut s = state.lock().await;
@@ -1921,7 +1981,10 @@ async fn policy_clear_override(
             s.reload_policy();
             let _ = s.append_chain(
                 "policy_edit",
-                serde_json::json!({"change": "clear_override", "rule_id": rule_id}),
+                stamped(
+                    &gate,
+                    serde_json::json!({"change": "clear_override", "rule_id": rule_id}),
+                ),
             );
             (
                 StatusCode::OK,
@@ -1940,6 +2003,7 @@ async fn policy_clear_override(
 /// "edit by category or specifically" path).
 async fn policy_upsert_rule(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Json(rule): Json<crate::policy::PolicyRule>,
 ) -> impl IntoResponse {
     if rule.id.trim().is_empty() || rule.name.trim().is_empty() {
@@ -1955,7 +2019,10 @@ async fn policy_upsert_rule(
             s.reload_policy();
             let _ = s.append_chain(
                 "policy_edit",
-                serde_json::json!({"change": "upsert_rule", "rule_id": rule_id}),
+                stamped(
+                    &gate,
+                    serde_json::json!({"change": "upsert_rule", "rule_id": rule_id}),
+                ),
             );
             (
                 StatusCode::OK,
@@ -1972,13 +2039,14 @@ async fn policy_upsert_rule(
 /// `DELETE /api/policy/rule/{rule_id}` — remove a custom rule.
 async fn policy_delete_rule(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Path(rule_id): Path<String>,
 ) -> impl IntoResponse {
     let mut s = state.lock().await;
     match s.vault.remove_custom_rule(&rule_id) {
         Ok(removed) => {
             s.reload_policy();
-            let _ = s.append_chain("policy_edit", serde_json::json!({"change": "delete_rule", "rule_id": rule_id, "removed": removed}));
+            let _ = s.append_chain("policy_edit", stamped(&gate, serde_json::json!({"change": "delete_rule", "rule_id": rule_id, "removed": removed})));
             (
                 StatusCode::OK,
                 Json(serde_json::json!({"ok": true, "removed": removed})),
@@ -2545,5 +2613,173 @@ async fn operator_gate_escalation(
             })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod policy_edit_authorship_tests {
+    use super::*;
+    use crate::vault::Vault;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        // Without a bootstrapped operator, `authorize` denies every write and the act
+        // under test never runs -- the test would then pass on an empty chain.
+        state
+            .lock()
+            .await
+            .bootstrap_operator_if_genesis()
+            .expect("genesis operator");
+        (dir, state)
+    }
+
+    /// Drive a real request through the real gate into the real handler.
+    async fn put_preset(state: &SharedState, preset: &str) -> StatusCode {
+        let now = super::super::state::unix_now();
+        let token = {
+            let mut s = state.lock().await;
+            // A DIRECT operator session -- deliberately the shape that carries NO
+            // `OperatorProvenance` (SessionStore::provenance returns None for it). This is
+            // the shape every `policy_edit` row on this seat was actually written under, so
+            // a fix that only threads provenance would be a no-op here. The pointer is what
+            // has to carry the authorship, and that is what this test pins.
+            s.operator_sessions
+                .open("lct:web4:test:operator:direct", now)
+        };
+        let app = operator_surface_router(state.clone()).with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/policy/preset")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"preset":"{preset}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        resp.status()
+    }
+
+    /// **The authorship thread (forum 2662/2664/2666).** `policy_edit` -- law amendment --
+    /// was one of two chain families out of 39 naming no author. The middleware proved the
+    /// operator, wrote it into its own row, and dropped it one stack frame before the act.
+    ///
+    /// This pins the seam, not the helper: the act row must name the authorization that
+    /// admitted it, and that name must RESOLVE -- by hash, against the chain -- to the gate
+    /// row for this very act. Asserting only that the key is present would pass on a
+    /// constant, and `distinct=1 at fill=100%` is the exact shape (`signer_lct`) this
+    /// chain's authorship gap is already made of.
+    #[tokio::test]
+    async fn a_policy_edit_row_points_at_the_authorization_that_admitted_it() {
+        let (_dir, state) = test_state().await;
+        assert_eq!(put_preset(&state, "safety").await, StatusCode::OK);
+
+        let s = state.lock().await;
+        let chain = s.recent_chain(50);
+        let edit = chain
+            .iter()
+            .rev()
+            .find(|e| e.event_type == "policy_edit")
+            .expect("the act was witnessed");
+        let pointer = edit
+            .event_data
+            .get("authorized_by_gate")
+            .and_then(|v| v.as_str())
+            .expect("policy_edit names its authorization");
+
+        // Resolve it AS A REFERENCE. Nothing here reads a position: if the pointer only
+        // happened to equal the neighbouring row's hash, this still passes; if it is a
+        // plausible 64-char constant, this fails.
+        let target = s
+            .chain_by_pointer(pointer)
+            .expect("pointer lookup")
+            .into_iter()
+            .next()
+            .expect("the authorization it names is IN the chain");
+        assert_eq!(target.event_type, "operator_gate");
+        assert_eq!(
+            target.event_data.get("act").and_then(|v| v.as_str()),
+            Some("PUT /api/policy/preset"),
+            "the pointer must resolve to the gate row for THIS act, not merely to some gate row"
+        );
+
+        // ... and the reader who followed it lands on the author. That is the whole point:
+        // one join, committed, instead of a positional guess whose width the reader picks.
+        let signers = target
+            .event_data
+            .get("signers")
+            .and_then(|v| v.as_array())
+            .expect("the gate row names its signers");
+        assert_eq!(
+            signers.first().and_then(|v| v.as_str()),
+            Some("lct:web4:test:operator:direct"),
+            "following the pointer must recover WHO authorized the amendment"
+        );
+    }
+
+    /// The pointer must be a pointer, not a per-request constant that merely looks like one.
+    /// Two amendments, two authorizations, two distinct hashes -- and each resolving to its
+    /// OWN gate row. A stamp that wrote the same value twice would pass the test above.
+    #[tokio::test]
+    async fn two_amendments_name_two_different_authorizations() {
+        let (_dir, state) = test_state().await;
+        assert_eq!(put_preset(&state, "safety").await, StatusCode::OK);
+        assert_eq!(put_preset(&state, "permissive").await, StatusCode::OK);
+
+        let s = state.lock().await;
+        let chain = s.recent_chain(100);
+        let pointers: Vec<String> = chain
+            .iter()
+            .filter(|e| e.event_type == "policy_edit")
+            .filter_map(|e| {
+                e.event_data
+                    .get("authorized_by_gate")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(pointers.len(), 2, "both amendments carry a pointer");
+        assert_ne!(pointers[0], pointers[1], "distinct acts, distinct authorizations");
+        for p in &pointers {
+            let target = s.chain_by_pointer(p).expect("lookup").into_iter().next();
+            assert!(target.is_some(), "every pointer resolves: {p}");
+        }
+    }
+
+    /// The negative arm the positive one cannot supply: with no operator session the gate
+    /// denies, so there must be NO `policy_edit` row at all. Without this, a handler that
+    /// ran unauthenticated and stamped nothing would look identical to a clean deny.
+    #[tokio::test]
+    async fn an_unauthenticated_amendment_writes_no_act_row() {
+        let (_dir, state) = test_state().await;
+        let app = operator_surface_router(state.clone()).with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/policy/preset")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"preset":"permissive"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let s = state.lock().await;
+        assert!(
+            !s.recent_chain(50)
+                .iter()
+                .any(|e| e.event_type == "policy_edit"),
+            "a denied amendment must leave no act row"
+        );
     }
 }
