@@ -2676,7 +2676,26 @@ async fn governance_ledger(
 ) -> impl IntoResponse {
     use crate::server::governance_ledger as gl;
 
-    let s = state.lock().await;
+    // THE STATE LOCK IS TAKEN ONLY TO CLONE THE CHAIN HANDLE, AND RELEASED BEFORE THE READ.
+    //
+    // This handler used to hold `state.lock()` across the SQL read, the projection and the
+    // paging — 8–15s against the live chain — so the dashboard's own ledger poll starved every
+    // other caller of the daemon. Measured 2026-08-16: with this panel open `hestia_connect`
+    // took 3.3–7.0s; with it closed, 0.001s.
+    //
+    // That is a governance failure, not a performance one. The plugin gate's witness budget is
+    // 1.5s and its escalation round trip is barely more, so an operator READING the governance
+    // screen prevented every member's gate from witnessing a refusal or opening an escalation
+    // — and a hook killed at the harness's 5s clamp FAILS OPEN. The surface built to make
+    // governance visible was, while visible, switching governance off.
+    //
+    // The store locks internally and is Send + Sync, so nothing about correctness required the
+    // outer lock. `Arc::clone` here, `drop(s)` immediately, and the expensive work runs with
+    // the daemon free.
+    let chain = {
+        let s = state.lock().await;
+        std::sync::Arc::clone(&s.chain_store)
+    };
     let now_dt = chrono::Utc::now();
     // Admin acts are rare compared with member traffic, so the default window reaches back FAR.
     // A day-shaped default would reproduce the original complaint for anything ruled last week.
@@ -2694,7 +2713,7 @@ async fn governance_ledger(
     // would put the heaviest read in the daemon behind a UI panel.
     const LEDGER_CAP: u64 = 5_000;
 
-    let (raw, read_error) = match s.chain_store.read_recent_by_types(
+    let (raw, read_error) = match chain.read_recent_by_types(
         cutoff_str.as_deref(),
         gl::GOVERNANCE_EVENTS,
         LEDGER_CAP,
