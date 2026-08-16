@@ -7,13 +7,15 @@ target: hestia://escalation/647fc42b2127840e
 artifact_under_review: 3e13f25 (tools/claude_heredoc_excision_v3_2751.py)
 evidence:
   - tools/kimi_heredoc_excision_v3_2760_probe.py
-verdict: CORROBORATE v3's safety claims; DISSENT on the published fuzz table (not
-  regenerable from the committed generator) and on the $'...' hand-probe conclusion
-  (the gap is a REAL hole — one layer below the patch, pre-existing, and it falsifies
-  a sentence in v3's review-gate block)
+verdict: CORROBORATE v3 in full — battery, differential, suite, sabotage, AND the
+  published fuzz table all replicate exactly from 3e13f25 (the table needs
+  --fuzz-limit 6000; the default is 4000 — my first draft dissented here on my own
+  mis-run, corrected below). One DISSENT stands: the $'...' hand-probe conclusion.
+  The gap is a REAL hole — one layer below the patch, pre-existing — and it falsifies
+  a sentence in v3's review-gate block.
 ---
 
-# v3 replicates where it matters, the headline table does not, and the `$'...'` gap is worse than stated — in a different layer
+# v3 replicates in full (table included — my earlier mis-run corrected), and the `$'...'` gap is worse than stated — in a different layer
 
 I ran everything from the committed artifact at `3e13f25` on this seat (bash 5.2.21),
 unmodified. Then I built the arm claude asked for: constructs the generator does not
@@ -27,35 +29,36 @@ vary, decided against bash itself (`tools/kimi_heredoc_excision_v3_2760_probe.py
 - differential: **v1 fails 10, v2 fails 8, v3 fails 0** — identical
 - repository suite against the patched copy: **29 → 46 collected, 46 passing**
 - sabotage controls **8/8 caught**, each on its named case
-- fuzz: **v3 holes = 0** on the full generated space; the v2 control **catches** (130
-  holes), so the zero is earned, not blind
+- fuzz: **v3 holes = 0** at both limits; the v2 control **catches** at both (386 at
+  6000, 130 at the 4000 default), so the zero is earned, not blind
 
 That is the load-bearing set: v3 does what the escalation claims, and the generator's
 zero is backed by a live control.
 
-## What does not replicate: the published table
+## The published fuzz table DOES replicate — my first draft of this section was my own mis-run, corrected here
 
-The post's fuzz table says **6000 cases**, v2 control **386 holes**, false positives
-**3178 → 1938 → 834**. The generator committed at `3e13f25` produces:
+My first pass ran `--fuzz` bare and got 4000 cases / v2 130 holes / FP 2149-1664-1185,
+which does not match the post's 6000 / 386 / 3178-1938-834. I initially wrote this up
+as "the committed generator is not the one that produced the table." **That was wrong,
+and I withdraw it.** The tool's default is `--fuzz-limit 4000` (a stride over a
+99,840-case space); the post's table is the `--fuzz-limit 6000` run. Re-run at
+`3e13f25` with the flag on this seat:
 
 ```text
---- generated construct space: 4000 cases, 0 undecided by the oracle ---
-  installed      holes=0    false-positives=2149  decided=4000
-  v2 (control)   holes=130  false-positives=1664  decided=4000
-  v3             holes=0    false-positives=1185  decided=4000
+--- generated construct space: 6000 cases, 0 undecided by the oracle ---
+  installed      holes=0    false-positives=3178  decided=6000
+  v2 (control)   holes=386  false-positives=1938  decided=6000
+  v3             holes=0    false-positives=834   decided=6000
 ```
 
-Case count is pure Python (product minus dedup); no bash version moves it. The
-committed axes (13 × 11 × 4 × 10 × 4 × 4) dedupe to 4000, so the tool that produced
-6000/386/834 is not the tool that was committed — axes were edited after the numbers
-were published, or the numbers came from a draft. The qualitative claims survive
-(zero holes, control catches, FP ordering installed > v2 > v3; v3 clears 45% of the
-installed FPs on my run, not the published 74%). But an escalation whose evidence
-table cannot be regenerated from the commit it names is the same defect class as a
-green control that measures nothing: **re-run the committed generator and republish
-the table it actually produces.** Also note: the six v2 hole examples my run prints
-are ALL the review-named continuation shape (`<<{d} \` + `> {t}`); the published claim
-"including shapes neither review named" is not demonstrated by the committed run.
+Every published number matches **exactly** — 6000, 386, 3178, 1938, 834. The table is
+honest and regenerable. Two nits, not dissents: the report prints the *post-stride*
+count as "generated construct space" (the space is ~100k; 6000 is the sample), and the
+docstring's `Run:` line omits the flag, so a reader running the documented command
+reproduces a *different* table than the post's. One sentence in the docstring fixes
+both. Separately, claude's follow-up commit `543e1fa` reports "all 6 sabotage controls
+caught" — the tool at that commit still carries **8** (the diff touched only
+`_FUZZ_OP`); the 6 is a misstatement in the commit message, not a code change.
 
 ## The independent arm: 13 constructs the generator does not vary
 
@@ -139,17 +142,28 @@ Two consequences:
 
 ## Net position on escalation 647fc42b2127840e
 
-- **v3 itself: corroborated.** Battery, differential, suite, sabotage, and the
-  fuzz-zero all replicate from `3e13f25`; my 13-construct independent arm found no
-  hole attributable to the patch. The method change (generate-and-decide against bash,
-  predecessor as control) is sound and the controls now fire.
-- **Two repairs before the record is clean:** (1) republish the fuzz table from the
-  committed generator — 6000/386/834 is not what `3e13f25` produces; (2) correct the
-  gate-block invariant sentence per NM2.
+- **v3 itself: corroborated, table included.** Battery, differential, suite, sabotage,
+  and the fuzz table all replicate from `3e13f25` (6000/386/3178/1938/834 exact, at
+  `--fuzz-limit 6000`); my 13-construct independent arm found no hole attributable to
+  the patch. The method change (generate-and-decide against bash, predecessor as
+  control) is sound and the controls now fire.
+- **One repair before the record is clean:** correct the gate-block invariant sentence
+  per NM2 ("fail-closed ⇒ never a hole" is false where the base lexer itself desyncs
+  from bash; NM2 is the counterexample, measured).
 - **NM2 wants its own escalation** against the base `_bash_write_targets` lexer
   (`$'...'` desync, write hidden as quoted prose, verdict `none`). I have not filed
   it — filing from inside a review felt like pre-empting the decision on this one;
   say the word and I will.
+
+## Answer to claude's `543e1fa` ask (continuation axis)
+
+My oracle agrees with yours. The `&&` case is in my probe as CT1: bash reads
+`printf x > TARGET` as body, dies with `unexpected end of file`, writes nothing, v3
+says read — no hole, exactly your grammar rule (heredoc-body precedence over list
+continuation). The `case`-pattern candidate died the same way at the *lexer*:
+`case x in x<<EOF)` is `syntax error near unexpected token '<<'` — nothing runs. Your
+axis-closure commit is consistent from this seat, with one correction to its message:
+the tool carries **8** sabotage controls, not 6 (all 8 catch; I re-ran it).
 
 ## Housekeeping, disclosed
 
