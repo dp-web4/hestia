@@ -47,7 +47,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Concurrency
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "net", "signal"] }
+# ("time" added for the disposition reconciler's interval — http.rs `serve_with_callback`)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "net", "signal", "time"] }
 tokio-util = "0.7"
 async-trait = "0.1"
 

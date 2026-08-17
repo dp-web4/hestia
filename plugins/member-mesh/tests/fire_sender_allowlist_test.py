@@ -49,9 +49,10 @@ forged is the KIND: `unreachable` is deliberately absent from `MEMBER_NOTICE_KIN
 `tool_member_notify` refuses it, and the one other path that mints a notice under a
 caller-supplied name (the appeal dispatch) hardcodes `review_request`. So:
 
-  A4/A5. Every template admits the daemon as the PAIR ("hestia", "unreachable"), and
-     none allowlists the bare name. Read from the scripts, so a fourth template must
-     make the same decision rather than inheriting the gap.
+  A4/A5. Every template admits the daemon as (sender, kind) PAIRs — ("hestia",
+     "unreachable") and, since #459, ("hestia", "disposition"), the report that a
+     petition was ruled — and none allowlists the bare name. Read from the scripts,
+     so a fourth template must make the same decision rather than inheriting the gap.
   B4/B5. Behavioural, and deliberately at the layer PR #62's own acceptance test
      stopped short of: that test asserted the report reached `drain_member` — the
      store — which was never the wall. B4 fires a daemon report ALONE and demands the
@@ -140,6 +141,12 @@ for script in fire_scripts():
           f"packet died is the one notice its recipient cannot learn any other way, and "
           f"its pointer IS its content; without this pair it is WITHHELD, and when it is "
           f"the only notice in the batch the member is not woken at all")
+    check(f"A4b. {script} admits the daemon's disposition report as a (sender, kind) pair",
+          ("hestia", "disposition") in daemon_pairs(script),
+          f"DAEMON={sorted(daemon_pairs(script))} — #459: the daemon's report that a "
+          f"petition was RULED (appeal/scope/escalation) is the return edge the petitioner "
+          f"cannot learn any other way; withheld, a ruled appeal reads exactly like an "
+          f"open one")
     _, allow = parse(script)
     check(f"A5. {script} does not allowlist the bare name 'hestia'",
           allow is not None and "hestia" not in allow,
@@ -256,6 +263,23 @@ for script, stub, peer in CASES:
               f"the name was admitted instead of the pair; prompt={str(prompt)[:300]!r}")
         check(f"B5b. {script}: the impostor's pointer never reaches the prompt",
               "evil.example" not in (prompt or ""),
+              f"prompt={str(prompt)[:300]!r}")
+
+    # B6. The second daemon kind (#459). A `disposition` — "the petition you filed
+    #     has been ruled" — ALONE must wake the member with its pointer intact:
+    #     withheld, a ruled appeal reads exactly like an open one and the member
+    #     keeps polling a question that already has an answer.
+    with tempfile.TemporaryDirectory() as tmp:
+        ptr = "hestia://appeal/8bea2e21fa62eccd#ruled"
+        r, prompt = fire(script, stub,
+                         [notice(8, "hestia", kind="disposition", pointer=ptr)], tmp)
+        check(f"B6. {script}: the daemon's disposition report alone WAKES the member",
+              prompt is not None and "id=8" in (prompt or ""),
+              f"rc={r.returncode} — rc=70 means the petitioner was never told its "
+              f"petition was ruled; prompt={str(prompt)[:300]!r}")
+        check(f"B6b. {script}: the disposition's pointer survives (it names the ruling)",
+              "#ruled" in (prompt or ""),
+              f"pointer stripped — the petitioner cannot follow it to the ruling; "
               f"prompt={str(prompt)[:300]!r}")
 
 

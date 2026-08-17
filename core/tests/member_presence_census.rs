@@ -433,6 +433,21 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/handler.rs::tool_gate_arbitrate_escalation", &[
         "\"subject_instance_lct\": s.member_lct(&decided.plugin_id),",
     ], SiteClass::Naming),
+    // ADDED 2026-08-16 (kimi-code, revised #480 review defect 4b — the lapse recorder's
+    // `gate_escalation_expired` entry). The census went red the moment the site was written —
+    // the instrument working, again on an integration test `cargo test --lib` never runs.
+    //
+    // READING, both questions. (1) Who gets named? The ASKER of a petition that ran out its
+    // clock unruled — attribution inside the lapse record, recording WHO the lapsed
+    // escalation belonged to. (2) Compared to decide control flow? No — the lapse decision
+    // is the clock (`newly_lapsed` keys on stored status and `expires_at`); the derived LCT
+    // is serialised into the witness entry and read by nothing. Naming, same class as the
+    // decided-entry sibling directly above, and the same HST-005 caveat holds unchanged:
+    // `esc.plugin_id` is caller-asserted, so this is a well-formed name derived from a
+    // self-reported id, not evidence of membership.
+    ("server/handler.rs::record_newly_lapsed", &[
+        "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
+    ], SiteClass::Naming),
     ("server/handler.rs::tool_request_scope", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),

@@ -188,6 +188,11 @@ impl ScopeRequest {
     }
 }
 
+/// The disposition projector's cursor row name (inbox.db `projection_cursors`).
+/// Lives here rather than in handler.rs because the cursor is initialized at
+/// state OPEN — `ServerState::open` — not at the worker's first pass.
+pub(crate) const DISPOSITION_PROJECTION_CURSOR: &str = "disposition";
+
 /// How long an undecided scope request stays askable, and the default life of a grant.
 ///
 /// Both are the same 8 hours, and that is not laziness: a request is a question about work
@@ -271,13 +276,20 @@ pub struct ServerState {
     /// The `len()` doc-comment below already diagnosed this exact shape for a different
     /// caller. This is the same lesson applied to the field itself: shared ownership, so the
     /// expensive work happens with the state lock released.
+    ///
+    /// The disposition projector relies on the same ownership boundary: it clones
+    /// this handle while holding `SharedState`, then pages the chain after releasing
+    /// that outer lock. The store's internal `Mutex<Connection>` remains the sole
+    /// serialization point, and existing field reads dereference transparently.
     pub chain_store: Arc<SqliteChainStore>,
     pub trust_store: TrustStore,
     /// Durable inbound mailbox (entity-edge inbox): still-sealed notices parked
     /// by `hestia_notify {defer: true}` before the hub is ACKed, drained by
     /// `hestia_inbox`. Encrypted at rest under the same storage key as the
     /// witness chain, in its own file (queue ≠ ledger — two persistences).
-    pub inbox_store: crate::storage::SqliteInboxStore,
+    /// Shared for the same reason as `chain_store`: the projector's obligations
+    /// and cursor live here.
+    pub inbox_store: Arc<crate::storage::SqliteInboxStore>,
     /// The legacy sovereign anchor string — witness-chain authorship + member-label
     /// derivation still key on this verbatim. See `sovereign` for the LCT identity.
     pub sovereign_lct: String,
@@ -459,6 +471,22 @@ impl ServerState {
         let chain_store = Arc::new(SqliteChainStore::open(home.join("witness.db"), store_key)?);
         let trust_store = TrustStore::open(home.join("trust"), store_key)?;
         let inbox_store = crate::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
+        // The disposition projection cursor is initialized HERE — synchronously,
+        // at state open, before any ruling surface is reachable (revised #480
+        // review, blocker 2). The r3 shape initialized it lazily on the worker's
+        // first pass, which had a loss window: cursor not yet written + a ruling
+        // lands + its fast-path ensure fails = the later cold start jumps to the
+        // new tail and permanently skips that ruling. With the watermark written
+        // at open, no ruling can ever land before the cursor exists. Cold start
+        // still means THE TAIL (history is not backfilled implicitly); on any
+        // daemon that already ran once, the row exists and this is a no-op read.
+        if inbox_store
+            .projection_cursor(DISPOSITION_PROJECTION_CURSOR)?
+            .is_none()
+        {
+            let tail = chain_store.len()?;
+            inbox_store.set_projection_cursor(DISPOSITION_PROJECTION_CURSOR, tail)?;
+        }
         let sovereign_lct = "lct:web4:hestia:sovereign:phase1-placeholder".to_string();
         // The sovereign as a first-class, vault-persisted LCT — the society that
         // mints the roles now has durable presence of its own (id stable across
@@ -543,7 +571,7 @@ impl ServerState {
             actions: HashMap::new(),
             chain_store,
             trust_store,
-            inbox_store,
+            inbox_store: Arc::new(inbox_store),
             sovereign_lct,
             sovereign,
             role_registry,

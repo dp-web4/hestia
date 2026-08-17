@@ -290,6 +290,16 @@ impl SqliteInboxStore {
             ("dest_peer_lct", "TEXT"),
             ("attempts", "INTEGER NOT NULL DEFAULT 0"),
             ("last_error", "TEXT"),
+            // The disposition obligation key (#480 revised review): for daemon-only
+            // `disposition` rows, the TERMINAL RULING's chain hash. The ruling is
+            // the witness, so the inbox row anchors to it directly (chain_hash
+            // carries the same hash), and this column is what makes the obligation
+            // idempotent — a second projection of the same ruling is ON CONFLICT
+            // DO NOTHING, not a second notice. NULL on every other kind; existing
+            // rows keep NULL. `chain_hash` itself cannot carry the uniqueness:
+            // several notices legitimately share one entry (a multi-peer
+            // invitation writes one row per invited seat, all on the open's hash).
+            ("disposition_key", "TEXT"),
         ] {
             if !existing.iter().any(|c| c == col) {
                 conn.execute_batch(&format!(
@@ -300,11 +310,127 @@ impl SqliteInboxStore {
         }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_member_notices_reply
-                 ON member_notices(in_reply_to);",
+                 ON member_notices(in_reply_to);
+             -- Partial: only disposition rows carry the key. Uniqueness over the
+             -- whole column would be wrong even if it were possible — NULLs never
+             -- conflict in SQLite, but the index would still tax every insert.
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_member_notices_disposition_key
+                 ON member_notices(disposition_key) WHERE disposition_key IS NOT NULL;",
         )
         .context("indexing member_notices.in_reply_to")?;
         Self::ensure_touch_schema(conn)?;
+        // The projector's cursor (same revised review): one row per projection
+        // name, the chain position safely processed THROUGH. Living here rather
+        // than on the witness chain is deliberate — a cursor is consumer state,
+        // not a witnessed act, and the chain has no update verb. Restart-safe:
+        // a ruling committed before a crash is re-found by position after it.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS projection_cursors (
+                name     TEXT PRIMARY KEY,
+                position INTEGER NOT NULL
+             );",
+        )
+        .context("initializing projection_cursors schema")?;
         Ok(())
+    }
+
+    /// The NEXT UNREAD chain position of a named projection, if it has ever run.
+    /// (`chain_position` starts at 0, so "last processed" has no representation
+    /// for an empty chain; next-unread does.) `None` = never ran — the caller
+    /// decides what a cold start means (the disposition projector starts at the
+    /// chain's tail: history is not backfilled unless someone pages it
+    /// explicitly).
+    pub fn projection_cursor(&self, name: &str) -> Result<Option<u64>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let pos = conn
+            .query_row(
+                "SELECT position FROM projection_cursors WHERE name = ?1",
+                params![name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .context("reading projection cursor")?;
+        Ok(pos.map(|p| p as u64))
+    }
+
+    /// Advance a named projection's cursor. Only ever called with a position the
+    /// caller has fully processed UP TO: a cursor that ran ahead of the work it
+    /// tracks would silently skip obligations, which is the exact hole the
+    /// disposition projector exists to close.
+    pub fn set_projection_cursor(&self, name: &str, position: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        conn.execute(
+            "INSERT INTO projection_cursors (name, position) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET position = ?2",
+            params![name, position as i64],
+        )
+        .context("advancing projection cursor")?;
+        Ok(())
+    }
+
+    /// Ensure the durable disposition obligation for a terminal ruling exists —
+    /// idempotent on the ruling's chain hash (#480 revised review: the ruling IS
+    /// the witness; the inbox row is the obligation). `kind` is always the
+    /// daemon-only disposition kind at today's call sites; taken as a parameter so
+    /// the literal's single source stays `DAEMON_NOTICE_KIND_DISPOSITION` in
+    /// handler.rs rather than being re-spelled here.
+    ///
+    /// Returns `Some(id)` when this call inserted the row, `None` when the
+    /// obligation already existed (a second projection of the same ruling is a
+    /// no-op, not a second notice). `Err` means the obligation could NOT be made
+    /// durable — the caller warns and lets the cursor projector retry; it never
+    /// reports the failure as a ruling failure, because the ruling succeeded.
+    ///
+    /// No cap eviction here, on purpose: `enqueue_member`'s cap makes room by
+    /// DELETING the recipient's oldest undrained notice, and for a disposition
+    /// that would drop "your petition was ruled" to admit "your petition was
+    /// ruled" — the one kind whose whole point is that the record survives.
+    /// Daemon-origin rows are few (one per ruling, ever) and the TTL prune still
+    /// bounds retention, so the bound this skips is the one bound that would eat
+    /// the obligation itself.
+    pub fn ensure_member_disposition(
+        &self,
+        to_plugin: &str,
+        kind: &str,
+        pointer_uri: &str,
+        ruling_hash: &str,
+    ) -> Result<Option<u64>> {
+        let now = Utc::now();
+        let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        // Same retention discipline as every other writer on this plane.
+        conn.execute(
+            "DELETE FROM member_notices
+              WHERE queued_at < ?1 AND (dest_peer IS NULL OR drained_at IS NOT NULL)
+                -- The disposition exemption (revised #480 review, defect 1): an
+                -- UNDRAINED disposition is an undelivered obligation, and the
+                -- projection cursor has already passed its ruling — deleting it
+                -- here would make the return edge silently evaporate at day 7.
+                -- Retention starts only after delivery (`drained_at` set); every
+                -- other kind keeps the TTL exactly as before.
+                AND NOT (kind = 'disposition' AND drained_at IS NULL)",
+            params![cutoff],
+        )
+        .context("pruning expired member notices")?;
+        conn.execute(
+            "INSERT OR IGNORE INTO member_notices
+                 (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash,
+                  queued_at, disposition_key)
+             VALUES (?1, 'hestia', ?2, ?3, ?4, ?5, ?6, ?5)",
+            params![
+                to_plugin,
+                crate::reputation::DEFAULT_CONSTELLATION_ROLE,
+                kind,
+                pointer_uri,
+                ruling_hash,
+                now.to_rfc3339(),
+            ],
+        )
+        .context("ensuring disposition obligation")?;
+        Ok((conn.changes() > 0).then(|| conn.last_insert_rowid() as u64))
     }
 
     /// The recipient-liveness record (Kimi ↔ CBP, 2026-07-25).
@@ -647,7 +773,14 @@ impl SqliteInboxStore {
         // omission.
         conn.execute(
             "DELETE FROM member_notices
-              WHERE queued_at < ?1 AND (dest_peer IS NULL OR drained_at IS NOT NULL)",
+              WHERE queued_at < ?1 AND (dest_peer IS NULL OR drained_at IS NOT NULL)
+                -- The disposition exemption (revised #480 review, defect 1): an
+                -- UNDRAINED disposition is an undelivered obligation, and the
+                -- projection cursor has already passed its ruling — deleting it
+                -- here would make the return edge silently evaporate at day 7.
+                -- Retention starts only after delivery (`drained_at` set); every
+                -- other kind keeps the TTL exactly as before.
+                AND NOT (kind = 'disposition' AND drained_at IS NULL)",
             params![cutoff],
         )
         .context("pruning expired member notices")?;
@@ -688,14 +821,34 @@ impl SqliteInboxStore {
             |row| row.get(0),
         )?;
         if count as u64 >= MAX_INBOX_NOTICES {
-            conn.execute(
+            // The eviction victim is the oldest undrained NON-DISPOSITION row
+            // (revised #480 review, blocker 1): an undrained disposition is an
+            // undelivered obligation whose projector cursor has already passed
+            // the ruling — evicting it here would be the TTL bug one level down,
+            // loss by capacity instead of by age. The exclusion repeats the
+            // prune's predicate so the two retention paths exempt exactly the
+            // same rows.
+            let evicted = conn.execute(
                 "DELETE FROM member_notices
                  WHERE id = (SELECT MIN(id) FROM member_notices
                              WHERE to_plugin = ?1 AND drained_at IS NULL
-                               AND dest_peer IS NULL)",
+                               AND dest_peer IS NULL
+                               AND NOT (kind = 'disposition' AND drained_at IS NULL))",
                 params![to_plugin],
             )
             .context("dropping oldest member notice at cap")?;
+            // If every undrained row in this recipient's queue is a disposition,
+            // nothing is evictable — and the insert below proceeds PAST THE CAP
+            // rather than refusing or evicting an obligation. Chosen over
+            // refusing the incoming notice: the cap exists to stop a SENDER's
+            // flood, and here the pressure is daemon-owed mail — erroring an
+            // innocent member's ordinary send because the daemon owes it
+            // rulings would be the cross-channel denial this cap was built to
+            // remove, wearing an error's clothes. Daemon-origin rows are few
+            // (one per ruling, ever), so the overshoot is bounded by the
+            // ruling rate, not by sender behaviour. The overshoot IS visible:
+            // `member_pending` reports the true depth.
+            if evicted > 0 {
             // An eviction is a silent DELETE: no error to the sender, no
             // notice to the recipient, no chain entry. Until this counter the
             // ONLY way to learn the cap had fired was to already know what
@@ -719,6 +872,7 @@ impl SqliteInboxStore {
                 params![to_plugin, now.to_rfc3339()],
             )
             .context("recording member queue eviction")?;
+            }
         }
         conn.execute(
             "INSERT INTO member_notices
@@ -798,8 +952,13 @@ impl SqliteInboxStore {
                     "SELECT id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
                             in_reply_to
                      FROM member_notices
-                     WHERE to_plugin = ?1 AND queued_at >= ?2 AND drained_at IS NULL
+                     WHERE to_plugin = ?1 AND drained_at IS NULL
                        AND dest_peer IS NULL
+                       -- Undrained dispositions are exempt from the TTL *deletion*
+                       -- (see the prune in enqueue_member); that exemption would be
+                       -- hollow if the delivery window still hid the row. They are
+                       -- served until delivered, however old.
+                       AND (queued_at >= ?2 OR kind = 'disposition')
                      ORDER BY id ASC",
                 )
                 .context("preparing member drain SELECT")?;
@@ -889,8 +1048,11 @@ impl SqliteInboxStore {
             "SELECT id, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
                     in_reply_to
              FROM member_notices
-             WHERE to_plugin = ?1 AND queued_at >= ?2 AND drained_at IS NULL
+             WHERE to_plugin = ?1 AND drained_at IS NULL
                AND dest_peer IS NULL
+               -- Same exemption as drain_member: an undrained disposition is
+               -- served until delivered, however old.
+               AND (queued_at >= ?2 OR kind = 'disposition')
              ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![to_plugin, cutoff], |row| {
@@ -2117,5 +2279,132 @@ mod tests {
             drained.last().unwrap().sealed,
             format!("sealed-{}", MAX_INBOX_NOTICES + 1)
         );
+    }
+
+    /// Revised #480 review, defect 1: an UNDRAINED disposition is an undelivered
+    /// OBLIGATION — the projection cursor has already passed its ruling, so a TTL
+    /// deletion would be silent, permanent loss. The prune must spare it and the
+    /// delivery windows must still serve it, however old; retention starts only at
+    /// delivery, so a DRAINED disposition past the TTL is pruned like any other
+    /// row — and every other kind is untouched by the exemption.
+    #[test]
+    fn an_undrained_disposition_survives_the_ttl_prune_a_drained_one_does_not() {
+        let (_tmp, store) = fresh();
+        let drained_id = store
+            .ensure_member_disposition("kimi-code", "disposition",
+                                       "hestia://escalation/a1#decided", "ruling-hash-1")
+            .unwrap()
+            .expect("first ensure inserts");
+        let undrained_id = store
+            .ensure_member_disposition("codex", "disposition",
+                                       "hestia://escalation/b2#decided", "ruling-hash-2")
+            .unwrap()
+            .expect("second ensure inserts");
+        let plain_id = store
+            .enqueue_member("codex", "claude-code", "role:constellation:interactive-dev",
+                            "coordination", Some("forum/x.md"), "hash-plain", None)
+            .unwrap();
+        // kimi-code collects its mail; codex never does.
+        assert_eq!(store.drain_member("kimi-code").unwrap().len(), 1);
+
+        // Age all three rows past the TTL, directly — the test cannot wait a week.
+        let old = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS + 3600)).to_rfc3339();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE member_notices SET queued_at = ?1", params![old])
+                .unwrap();
+        }
+
+        // Any write runs the prune.
+        let fresh_id = store
+            .ensure_member_disposition("codex", "disposition",
+                                       "hestia://escalation/c3#lapsed", "ruling-hash-3")
+            .unwrap()
+            .expect("third ensure inserts");
+
+        assert!(
+            row_exists(&store, undrained_id),
+            "an undrained disposition survives the TTL — the obligation outlives retention"
+        );
+        assert!(
+            !row_exists(&store, drained_id),
+            "retention starts at delivery: a DRAINED disposition ages out"
+        );
+        assert!(
+            !row_exists(&store, plain_id),
+            "the exemption is narrow — every other kind still prunes"
+        );
+
+        // And the survivor is still DELIVERABLE: the drain window exempts it too,
+        // or the prune exemption would be a row nobody can ever read.
+        let mail = store.drain_member("codex").unwrap();
+        let ids: Vec<u64> = mail.iter().map(|n| n.id).collect();
+        assert!(ids.contains(&undrained_id), "served however old: {ids:?}");
+        assert!(ids.contains(&fresh_id));
+        assert_eq!(mail.len(), 2, "the pruned plain notice stays gone: {mail:?}");
+    }
+
+    /// Revised #480 review, blocker 1: the cap's eviction must never take an
+    /// undrained DISPOSITION — loss by capacity is the TTL bug one level down,
+    /// and the projector cursor has already passed the ruling, so the loss is
+    /// permanent. The victim is the oldest undrained NON-disposition row.
+    #[test]
+    fn the_cap_never_evicts_an_undrained_disposition() {
+        let (_tmp, store) = fresh();
+        // The oldest row in a full queue is an undrained disposition.
+        let disp_id = store
+            .ensure_member_disposition("kimi-code", "disposition",
+                                       "hestia://escalation/a1#decided", "ruling-hash-cap")
+            .unwrap()
+            .expect("ensure inserts");
+        let mut ordinary_ids = Vec::new();
+        for i in 0..(MAX_INBOX_NOTICES - 1) {
+            ordinary_ids.push(
+                store
+                    .enqueue_member("kimi-code", "claude-code",
+                                    "role:constellation:interactive-dev",
+                                    "coordination", None, &format!("h{i}"), None)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(store.member_pending("kimi-code").unwrap(), MAX_INBOX_NOTICES);
+
+        // One more ordinary send hits the cap.
+        store
+            .enqueue_member("kimi-code", "claude-code", "role:constellation:interactive-dev",
+                            "coordination", None, "h-overflow", None)
+            .unwrap();
+        assert!(row_exists(&store, disp_id), "the obligation survives the cap");
+        assert!(
+            !row_exists(&store, ordinary_ids[0]),
+            "the eviction took the oldest ORDINARY row"
+        );
+        assert!(row_exists(&store, ordinary_ids[1]));
+        assert_eq!(store.member_pending("kimi-code").unwrap(), MAX_INBOX_NOTICES);
+    }
+
+    /// The other arm of blocker 1's choice: when every undrained row is a
+    /// disposition, nothing is evictable — the ordinary send is admitted PAST
+    /// the cap (bounded by the ruling rate, not sender behaviour) rather than
+    /// refused, and no obligation is deleted.
+    #[test]
+    fn a_queue_of_only_undrained_dispositions_overruns_the_cap_rather_than_evicting_one() {
+        let (_tmp, store) = fresh();
+        for i in 0..MAX_INBOX_NOTICES {
+            store
+                .ensure_member_disposition("kimi-code", "disposition",
+                                           "hestia://escalation/x#decided", &format!("ruling-{i}"))
+                .unwrap();
+        }
+        store
+            .enqueue_member("kimi-code", "claude-code", "role:constellation:interactive-dev",
+                            "coordination", None, "h-new", None)
+            .unwrap();
+        assert_eq!(
+            store.member_pending("kimi-code").unwrap(),
+            MAX_INBOX_NOTICES + 1,
+            "admitted past the cap; the overshoot is visible in the true depth"
+        );
+        assert_eq!(count_rows(&store), MAX_INBOX_NOTICES as i64 + 1);
     }
 }

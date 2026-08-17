@@ -737,6 +737,15 @@ pub struct EscalationStore {
     /// daemon file, not gate code — is then refused as a write to the gate. That is the same
     /// mention-not-resolution defect tracked in #158, hit while fixing a different one.)
     gate_markers: HashMap<String, std::collections::BTreeSet<String>>,
+    /// Escalations whose lapse has already been witnessed (`gate_escalation_expired`
+    /// appended) by the periodic lapse recorder. MEMORY-ONLY, and that is
+    /// sufficient: `rehydrate` skips expired opens, so after a restart no row that
+    /// could double-record a lapse is ever restored — a lapse that crossed while
+    /// the daemon was down is simply never recorded (accepted gap, #480 revised
+    /// review item 6: process newly-crossed expiries, page history explicitly or
+    /// not at all). The chain entry is the durable record; this set only dedups
+    /// the append within one daemon lifetime.
+    lapse_recorded: std::collections::HashSet<String>,
 }
 
 pub fn now_secs() -> u64 {
@@ -1210,6 +1219,19 @@ impl EscalationStore {
         Ok(esc.clone())
     }
 
+    /// Undo a decision, restoring the exact pre-decision row. Exists for ONE
+    /// caller pattern (revised #480 review, defect 2): the decision surfaces
+    /// apply `decide` and then witness, because the witness payload is built
+    /// from the post-decision record — and if the `gate_escalation_decided`
+    /// append fails, the ruling must NOT become final. An applied-but-unwitnessed
+    /// decision has no ruling hash, no projector source, and no representable
+    /// disposition obligation: finality without its terminal witness. So the
+    /// caller clones the row before `decide` and hands it back here on append
+    /// failure. Not a general undo — nothing else may call this.
+    pub fn undo_decide(&mut self, prior: Escalation) {
+        self.by_id.insert(prior.id.clone(), prior);
+    }
+
     /// Add a peer's evidence to a PENDING escalation without deciding it.
     ///
     /// This is the accumulation half of the constellation model: approval is not a boolean
@@ -1275,6 +1297,31 @@ impl EscalationStore {
         v
     }
 
+    /// Live-store rows that have crossed their deadline with no decision and no
+    /// recorded lapse — the bounded input to the lapse recorder (#480 revised
+    /// review, item 6). Bounded by construction: open rows are few and reaped,
+    /// so this never scans history. `status_at` does the clock derivation; the
+    /// stored-Pending predicate excludes decided and withdrawn rows; the marker
+    /// set excludes rows already witnessed this daemon lifetime.
+    pub fn newly_lapsed(&self, now: u64) -> Vec<Escalation> {
+        self.by_id
+            .values()
+            .filter(|e| {
+                e.stored_status() == Status::Pending
+                    && e.status_at(now) == Status::Expired
+                    && !self.lapse_recorded.contains(&e.id)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Mark a lapse as witnessed. Called only AFTER the `gate_escalation_expired`
+    /// append succeeded — a failed append leaves the row eligible so the next
+    /// pass retries, and a recorded one never appends twice.
+    pub fn mark_lapse_recorded(&mut self, id: &str) {
+        self.lapse_recorded.insert(id.to_string());
+    }
+
     /// Drop entries that have been terminal for a while. Purely housekeeping: it can never
     /// change an answer, because `status_at` already treats a missing id and an expired id the
     /// same way.
@@ -1282,6 +1329,9 @@ impl EscalationStore {
         let before = self.by_id.len();
         self.by_id
             .retain(|_, e| e.status_at(now) == Status::Pending || now < e.expires_at + keep_secs);
+        // The lapse markers name rows; a reaped row's marker is dead weight, and
+        // an unbounded set would grow with daemon uptime for no reader.
+        self.lapse_recorded.retain(|id| self.by_id.contains_key(id));
         before - self.by_id.len()
     }
 

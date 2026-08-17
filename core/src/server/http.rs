@@ -475,6 +475,51 @@ pub async fn serve_with_callback(
             operator_gate,
         ));
 
+    // The disposition worker (#459; reshaped to the revised #480 review): the
+    // daemon's only periodic task. Two halves per tick:
+    //
+    // 1. LAPSE RECORDING takes the outer lock briefly — it reads the bounded live
+    //    escalation store and appends a `gate_escalation_expired` only when a row
+    //    crossed its deadline unruled. Steady state: a small scan, zero appends.
+    // 2. PROJECTION never touches the outer lock at all. It pages the witness
+    //    chain after a durable cursor (≤ DISPOSITION_PROJECTION_PAGE positions)
+    //    on the chain store's OWN connection and writes obligations to inbox.db
+    //    on ITS own connection — the r2 sweep materialised 20k entries under the
+    //    global lock every pass, the gate-starving shape #488/#482 flagged; this
+    //    is the work-queue shape the review asked for instead.
+    //
+    // Spawned before `app` below moves `state`.
+    let (chain_handle, inbox_handle) = {
+        let s = state.lock().await;
+        (s.chain_store.clone(), s.inbox_store.clone())
+    };
+    let lapse_state = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(
+            super::handler::DISPOSITION_RECONCILE_INTERVAL_SECS,
+        ));
+        loop {
+            tick.tick().await;
+            let now = super::gate_escalation::now_secs();
+            let lapsed = {
+                let mut s = lapse_state.lock().await;
+                super::handler::record_newly_lapsed(&mut s, now)
+            };
+            match super::handler::project_dispositions(&chain_handle, &inbox_handle) {
+                Ok(p) if p.projected > 0 || lapsed > 0 => {
+                    tracing::info!(
+                        projected = p.projected,
+                        lapsed,
+                        cursor = p.advanced_to,
+                        "disposition worker closed open obligations"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("disposition projector: {e}"),
+            }
+        }
+    });
+
     let mut app = axum::Router::new()
         .merge(operator_surface)
         // The dashboard HTML shell — unauthenticated (app skeleton + sign-in JS,
@@ -1674,6 +1719,12 @@ async fn scope_decide(
         }
     };
 
+    // The ruling the disposition obligation will anchor to (revised #480 contract:
+    // the terminal ruling IS the witness). For a standing grant the INTENT entry is
+    // not the terminal fact — the success `scope_granted` below is, and the standing
+    // arm replaces this with its hash.
+    let mut ruling_hash = entry.hash.clone();
+
     // THE STANDING WIDENING, applied after its record committed (same order rule as above).
     // The in-memory mutation and the vault write must land together: a grant live in memory
     // but absent from the vault would silently die at the next restart — the exact lie this
@@ -1691,6 +1742,15 @@ async fn scope_decide(
     // nothing contradicts. The first record is now an INTENT and the success is appended
     // after the commit, so neither direction can lie.
     if standing {
+        // Snapshot for rollback (revised #480 review, blocker 3): the SUCCESS
+        // witness below is part of the grant's finality. If it fails after the
+        // commit landed, the grant must NOT stay live — permission in force,
+        // requester uninformed, projector without a terminal source is the
+        // escalation defect one door over. A whole-store snapshot, not
+        // `revoke(member, path)`: a decide can REPLACE an existing grant on the
+        // same path, and revoking would destroy the predecessor along with the
+        // new grant; restoring the snapshot loses neither.
+        let standing_prior = s.standing_scope.clone();
         let grant = crate::server::standing_scope::StandingGrant {
             member: plugin_id.clone(),
             path: path.clone(),
@@ -1719,7 +1779,7 @@ async fn scope_decide(
         // SUCCESS — appended only now, when the grant is really durable. Carries the intent's
         // hash so the pair is joinable, and the generation the commit actually produced rather
         // than the `+1` the intent could only predict.
-        if let Err(e) = s.append_chain(
+        let success = match s.append_chain(
             "scope_granted",
             serde_json::json!({
                 "request_id": request_id,
@@ -1736,20 +1796,47 @@ async fn scope_decide(
                 "intent": entry.hash,
             }),
         ) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "THE STANDING GRANT IS LIVE but its success record could not be \
-                         appended ({e}). Under-recorded, not unrecorded: the intent is on the \
-                         chain. Revoke and re-decide, or repair the chain — do not assume the \
-                         grant is absent because the confirmation is."
+            Ok(e) => e,
+            Err(e) => {
+                // Roll the grant back THROUGH the commit path, so memory and the
+                // vault's standing-scope document move together and the store is
+                // bit-identical to before the decide — generation included. If
+                // THAT write fails the grant is live with no terminal record:
+                // the dire case, said as loudly as this surface can say it.
+                return match s.commit_standing_scope(|st| *st = standing_prior) {
+                    Ok(()) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "decision NOT applied — the terminal scope_granted append \
+                                 failed ({e}); the standing grant was ROLLED BACK (live store \
+                                 and vault), the chain holds only the intent. Re-decide to retry."
+                            ),
+                            "state": "grant NOT in force; chain holds the intent of a \
+                                      rolled-back decision",
+                            "intentEntryHash": entry.hash,
+                        })),
                     ),
-                    "state": "grant IS in force; chain holds only the intent",
-                    "intentEntryHash": entry.hash,
-                })),
-            );
-        }
+                    Err(rb) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "THE STANDING GRANT IS LIVE but its success record could not be \
+                                 appended ({e}) AND the rollback failed ({rb}). Revoke via \
+                                 /api/scope/standing/revoke or repair the chain — do not assume \
+                                 the grant is absent because the confirmation is."
+                            ),
+                            "state": "grant IS in force; chain holds only the intent",
+                            "intentEntryHash": entry.hash,
+                        })),
+                    ),
+                };
+            }
+        };
+        // The TERMINAL ruling for a standing grant is this success entry, not the
+        // intent: the disposition's obligation key must name the record that says
+        // the grant is in force.
+        ruling_hash = success.hash;
     }
 
     if let Some(req) = s.scope_requests.get_mut(&request_id) {
@@ -1764,6 +1851,19 @@ async fn scope_decide(
         req.expires_at = expires_at;
     }
 
+    // #459: the decision's RETURN EDGE. The requester filed through MCP and until
+    // now had no way to learn the answer short of polling — a granted or refused
+    // ask read exactly like a pending one. Revised #480 contract: the ruling entry
+    // IS the witness, so the obligation anchors to its hash directly; a failed
+    // ensure is warned about inside `ensure_disposition`, not returned — the
+    // decision landed, and the cursor projector retries the notification half.
+    let disposition_notice_id = super::handler::ensure_disposition(
+        &s,
+        &plugin_id,
+        &format!("hestia://scope/{request_id}"),
+        &ruling_hash,
+    );
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1776,6 +1876,7 @@ async fn scope_decide(
             "standing_expires_at": standing_expires_at,
             "generation": if standing { serde_json::json!(s.standing_scope.generation) } else { serde_json::Value::Null },
             "witnessEntryHash": entry.hash,
+            "disposition_notice_id": disposition_notice_id,
         })),
     )
 }
@@ -2793,6 +2894,12 @@ async fn operator_gate_escalation(
 
     let now = now_secs();
     let mut s = state.lock().await;
+    // Witness IS finality (revised #480 review, defect 2), same shape as the MCP
+    // surface: the store mutation happens first only because the witness payload
+    // is built from the post-decision record, and a failed append ROLLS THE
+    // DECISION BACK — an applied-but-unwitnessed ruling has no ruling hash, no
+    // projector source, and no representable obligation.
+    let prior = s.gate_escalations.get(&d.id).cloned();
     match s.gate_escalations.decide(
         &d.id,
         d.approve,
@@ -2806,7 +2913,7 @@ async fn operator_gate_escalation(
         now,
     ) {
         Ok(esc) => {
-            let entry = s.append_chain(
+            let entry = match s.append_chain(
                 "gate_escalation_decided",
                 serde_json::json!({
                     "escalation_id": esc.id,
@@ -2827,6 +2934,39 @@ async fn operator_gate_escalation(
                     "bar_met": esc.bar_met(),
                     "secs_into_window": now.saturating_sub(esc.opened_at),
                 }),
+            ) {
+                Ok(e) => e,
+                Err(append_err) => {
+                    // The ruling is NOT final: restore the exact pre-decision row
+                    // (`decide` succeeded, so it existed) and tell the operator.
+                    if let Some(p) = prior {
+                        s.gate_escalations.undo_decide(p);
+                    }
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "decision NOT applied — its witness append failed \
+                                 ({append_err}); the escalation stays pending and the \
+                                 write stays refused"
+                            ),
+                            "escalation_id": d.id,
+                        })),
+                    )
+                        .into_response();
+                }
+            };
+            // #459: the decision's RETURN EDGE, on the channel that decides 207 of
+            // 210 rulings. Minted at this layer because `EscalationStore::decide`
+            // has no inbox access. Revised #480 contract: the decision entry IS
+            // the witness, so the obligation anchors to its hash, and a failed
+            // ensure is warned about rather than returned — the decision landed;
+            // the cursor projector re-derives the obligation and retries.
+            let disposition_notice_id = super::handler::ensure_disposition(
+                &s,
+                &esc.plugin_id,
+                &format!("hestia://escalation/{}#decided", esc.id),
+                &entry.hash,
             );
             // THE DECIDER SEES THE BAR — on this surface too.
             //
@@ -2845,7 +2985,11 @@ async fn operator_gate_escalation(
             if let Some(o) = body.as_object_mut() {
                 o.insert(
                     "witnessEntryHash".into(),
-                    serde_json::json!(entry.ok().map(|e| e.hash)),
+                    serde_json::json!(entry.hash),
+                );
+                o.insert(
+                    "disposition_notice_id".into(),
+                    serde_json::json!(disposition_notice_id),
                 );
             }
             (StatusCode::OK, Json(body)).into_response()
@@ -2859,6 +3003,277 @@ async fn operator_gate_escalation(
             })),
         )
             .into_response(),
+    }
+}
+#[cfg(test)]
+mod disposition_tests {
+    //! #459: petition surfaces get a return edge. Ruling a scope request or an
+    //! escalation used to end at the ruling — the petitioner was never told and
+    //! had to poll. These drive the two operator-side decision surfaces and
+    //! assert the daemon-only `disposition` notice lands in the petitioner's
+    //! inbox, witnessed first, the way `unreachable` is reported at the
+    //! retirement site.
+    use super::*;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    /// Minting site B (#459): the operator's scope decision tells the REQUESTER.
+    #[tokio::test]
+    async fn a_scope_decision_reports_its_disposition_to_the_requester() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert(
+                "scope-test459b".into(),
+                crate::server::state::ScopeRequest {
+                    id: "scope-test459b".into(),
+                    plugin_id: "kimi-code".into(),
+                    role: String::new(),
+                    path: "/x/y.md".into(),
+                    reason: "needed for the task at hand".into(),
+                    requested_at: now,
+                    expires_at: now + 3600,
+                    granted: None,
+                    decided_by: None,
+                    decided_at: None,
+                    decision_reason: None,
+                },
+            );
+        }
+        let resp = scope_decide(
+            State(state.clone()),
+            Json(serde_json::json!({
+                "request_id": "scope-test459b", "granted": true, "reason": "yes, that file",
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "the decision itself must land");
+
+        let s = state.lock().await;
+        // Revised #480 doctrine: the ruling IS the witness — no
+        // `member_notice_disposition` entry, and the notice row anchors to the
+        // scope_granted entry's hash.
+        assert!(
+            !s.recent_chain(20)
+                .iter()
+                .any(|e| e.event_type == "member_notice_disposition"),
+            "the struck pre-enqueue witness must stay struck"
+        );
+        let ruling = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "scope_granted")
+            .expect("the decision itself must be witnessed");
+        assert_eq!(
+            ruling.event_data.get("request_id").and_then(|v| v.as_str()),
+            Some("scope-test459b")
+        );
+
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        let note = mail
+            .iter()
+            .find(|n| n.kind == "disposition")
+            .expect("the requester must learn its ask was decided: {mail:?}");
+        assert_eq!(note.from_plugin, "hestia");
+        assert_eq!(note.pointer_uri.as_deref(), Some("hestia://scope/scope-test459b"));
+        assert_eq!(
+            note.chain_hash, ruling.hash,
+            "the obligation anchors to the terminal ruling, not to a notice-side entry"
+        );
+    }
+
+    /// Minting site C, the operator channel (#459): deciding an escalation tells
+    /// the ASKER. Same return edge as the peer-ruling path, minted here because
+    /// this surface decides 207 of 210 rulings and the store layer has no inbox.
+    #[tokio::test]
+    async fn an_operator_escalation_decision_reports_its_disposition_to_the_asker() {
+        let (_dir, state) = test_state().await;
+        let esc_id = {
+            let mut s = state.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            s.gate_escalations
+                .open("kimi-code", "", "policy_edit", "policy.json", None, None, now, 3600)
+                .unwrap()
+                .id
+        };
+        let resp = operator_gate_escalation(
+            State(state.clone()),
+            Json(GateEscalationDecision {
+                id: esc_id.clone(),
+                approve: true,
+                reason: Some("reviewed the diff".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "the decision itself must land");
+
+        let s = state.lock().await;
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        let note = mail
+            .iter()
+            .find(|n| n.kind == "disposition")
+            .expect("the asker must learn its escalation was decided: {mail:?}");
+        assert_eq!(note.from_plugin, "hestia");
+        assert_eq!(
+            note.pointer_uri.as_deref(),
+            Some(format!("hestia://escalation/{esc_id}#decided")).as_deref()
+        );
+    }
+
+    /// Revised #480 review, defect 2, on the channel that decides 207 of 210
+    /// rulings: a failed witness append rolls the decision BACK — the operator
+    /// gets a 500, the escalation stays Pending, and nothing was authorised.
+    #[tokio::test]
+    async fn an_unwitnessed_operator_decision_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        let esc_id = {
+            let mut s = state.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            s.gate_escalations
+                .open("kimi-code", "", "policy_edit", "policy.json", None, None, now, 3600)
+                .unwrap()
+                .id
+        };
+        let decision = GateEscalationDecision {
+            id: esc_id.clone(),
+            approve: true,
+            reason: Some("reviewed the diff".into()),
+        };
+
+        // RESERVED lock on witness.db: reads proceed, writes fail BUSY.
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let blocker = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        blocker.pragma_update(None, "key", hex::encode(key)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let resp = operator_gate_escalation(State(state.clone()), Json(decision))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an unwitnessed ruling is an error, not a null-hash success"
+        );
+        {
+            let s = state.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            assert_eq!(
+                s.gate_escalations.status_of(&esc_id, now),
+                crate::server::gate_escalation::Status::Pending,
+                "the decision was rolled back — finality requires its witness"
+            );
+        }
+        blocker.execute_batch("COMMIT").unwrap();
+
+        let decision = GateEscalationDecision {
+            id: esc_id.clone(),
+            approve: true,
+            reason: Some("reviewed the diff".into()),
+        };
+        let resp = operator_gate_escalation(State(state.clone()), Json(decision))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "the retry rules cleanly");
+    }
+
+    /// Revised #480 review, blocker 3: the standing grant's SUCCESS witness is
+    /// part of finality. If the terminal `scope_granted` append fails after the
+    /// commit landed, the grant is rolled back (live store AND vault), the
+    /// operator gets an error, and the request stays pending. Failure injected
+    /// by a trigger that fails only the success insert (the intent names no
+    /// `intent` key; the success entry does).
+    #[tokio::test]
+    async fn an_unwitnessed_standing_grant_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert(
+                "scope-standing-rb".into(),
+                crate::server::state::ScopeRequest {
+                    id: "scope-standing-rb".into(),
+                    plugin_id: "kimi-code".into(),
+                    role: String::new(),
+                    path: "/x/standing.md".into(),
+                    reason: "needed durably".into(),
+                    requested_at: now,
+                    expires_at: now + 3600,
+                    granted: None,
+                    decided_by: None,
+                    decided_at: None,
+                    decision_reason: None,
+                },
+            );
+        }
+        let decide = |state: &SharedState| {
+            let state = state.clone();
+            async move {
+                scope_decide(
+                    State(state),
+                    Json(serde_json::json!({
+                        "request_id": "scope-standing-rb", "granted": true,
+                        "standing": true, "reason": "durable, reviewed",
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        };
+
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_scope_granted_success
+             BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'scope_granted' AND NEW.event_data LIKE '%\"intent\"%'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;",
+        )
+        .unwrap();
+
+        let resp = decide(&state).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an unwitnessed standing grant is an error, not a live permission"
+        );
+        {
+            let s = state.lock().await;
+            assert!(
+                !s.standing_scope.has_live("kimi-code", "/x/standing.md", now),
+                "the grant was rolled back — no live permission without its witness"
+            );
+            let chain = s.recent_chain(20);
+            assert!(
+                chain.iter().any(|e| e.event_type == "scope_grant_intent"),
+                "the intent stays on the chain as the record of the rolled-back act"
+            );
+            assert!(
+                !chain.iter().any(|e| e.event_type == "scope_granted"),
+                "no terminal record exists for a grant that is not in force"
+            );
+            assert_eq!(
+                s.scope_requests["scope-standing-rb"].granted, None,
+                "the request stays pending — a re-decide is the retry"
+            );
+        }
+        conn.execute_batch("DROP TRIGGER fail_scope_granted_success")
+            .unwrap();
+
+        let resp = decide(&state).await;
+        assert_eq!(resp.status(), StatusCode::OK, "the retry rules cleanly");
+        let s = state.lock().await;
+        assert!(s.standing_scope.has_live("kimi-code", "/x/standing.md", now));
     }
 }
 
