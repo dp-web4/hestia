@@ -1742,6 +1742,15 @@ async fn scope_decide(
     // nothing contradicts. The first record is now an INTENT and the success is appended
     // after the commit, so neither direction can lie.
     if standing {
+        // Snapshot for rollback (revised #480 review, blocker 3): the SUCCESS
+        // witness below is part of the grant's finality. If it fails after the
+        // commit landed, the grant must NOT stay live — permission in force,
+        // requester uninformed, projector without a terminal source is the
+        // escalation defect one door over. A whole-store snapshot, not
+        // `revoke(member, path)`: a decide can REPLACE an existing grant on the
+        // same path, and revoking would destroy the predecessor along with the
+        // new grant; restoring the snapshot loses neither.
+        let standing_prior = s.standing_scope.clone();
         let grant = crate::server::standing_scope::StandingGrant {
             member: plugin_id.clone(),
             path: path.clone(),
@@ -1789,19 +1798,39 @@ async fn scope_decide(
         ) {
             Ok(e) => e,
             Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": format!(
-                            "THE STANDING GRANT IS LIVE but its success record could not be \
-                             appended ({e}). Under-recorded, not unrecorded: the intent is on the \
-                             chain. Revoke and re-decide, or repair the chain — do not assume the \
-                             grant is absent because the confirmation is."
-                        ),
-                        "state": "grant IS in force; chain holds only the intent",
-                        "intentEntryHash": entry.hash,
-                    })),
-                );
+                // Roll the grant back THROUGH the commit path, so memory and the
+                // vault's standing-scope document move together and the store is
+                // bit-identical to before the decide — generation included. If
+                // THAT write fails the grant is live with no terminal record:
+                // the dire case, said as loudly as this surface can say it.
+                return match s.commit_standing_scope(|st| *st = standing_prior) {
+                    Ok(()) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "decision NOT applied — the terminal scope_granted append \
+                                 failed ({e}); the standing grant was ROLLED BACK (live store \
+                                 and vault), the chain holds only the intent. Re-decide to retry."
+                            ),
+                            "state": "grant NOT in force; chain holds the intent of a \
+                                      rolled-back decision",
+                            "intentEntryHash": entry.hash,
+                        })),
+                    ),
+                    Err(rb) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "THE STANDING GRANT IS LIVE but its success record could not be \
+                                 appended ({e}) AND the rollback failed ({rb}). Revoke via \
+                                 /api/scope/standing/revoke or repair the chain — do not assume \
+                                 the grant is absent because the confirmation is."
+                            ),
+                            "state": "grant IS in force; chain holds only the intent",
+                            "intentEntryHash": entry.hash,
+                        })),
+                    ),
+                };
             }
         };
         // The TERMINAL ruling for a standing grant is this success entry, not the
@@ -3136,5 +3165,95 @@ mod disposition_tests {
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::OK, "the retry rules cleanly");
+    }
+
+    /// Revised #480 review, blocker 3: the standing grant's SUCCESS witness is
+    /// part of finality. If the terminal `scope_granted` append fails after the
+    /// commit landed, the grant is rolled back (live store AND vault), the
+    /// operator gets an error, and the request stays pending. Failure injected
+    /// by a trigger that fails only the success insert (the intent names no
+    /// `intent` key; the success entry does).
+    #[tokio::test]
+    async fn an_unwitnessed_standing_grant_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert(
+                "scope-standing-rb".into(),
+                crate::server::state::ScopeRequest {
+                    id: "scope-standing-rb".into(),
+                    plugin_id: "kimi-code".into(),
+                    role: String::new(),
+                    path: "/x/standing.md".into(),
+                    reason: "needed durably".into(),
+                    requested_at: now,
+                    expires_at: now + 3600,
+                    granted: None,
+                    decided_by: None,
+                    decided_at: None,
+                    decision_reason: None,
+                },
+            );
+        }
+        let decide = |state: &SharedState| {
+            let state = state.clone();
+            async move {
+                scope_decide(
+                    State(state),
+                    Json(serde_json::json!({
+                        "request_id": "scope-standing-rb", "granted": true,
+                        "standing": true, "reason": "durable, reviewed",
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        };
+
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_scope_granted_success
+             BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'scope_granted' AND NEW.event_data LIKE '%\"intent\"%'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;",
+        )
+        .unwrap();
+
+        let resp = decide(&state).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an unwitnessed standing grant is an error, not a live permission"
+        );
+        {
+            let s = state.lock().await;
+            assert!(
+                !s.standing_scope.has_live("kimi-code", "/x/standing.md", now),
+                "the grant was rolled back — no live permission without its witness"
+            );
+            let chain = s.recent_chain(20);
+            assert!(
+                chain.iter().any(|e| e.event_type == "scope_grant_intent"),
+                "the intent stays on the chain as the record of the rolled-back act"
+            );
+            assert!(
+                !chain.iter().any(|e| e.event_type == "scope_granted"),
+                "no terminal record exists for a grant that is not in force"
+            );
+            assert_eq!(
+                s.scope_requests["scope-standing-rb"].granted, None,
+                "the request stays pending — a re-decide is the retry"
+            );
+        }
+        conn.execute_batch("DROP TRIGGER fail_scope_granted_success")
+            .unwrap();
+
+        let resp = decide(&state).await;
+        assert_eq!(resp.status(), StatusCode::OK, "the retry rules cleanly");
+        let s = state.lock().await;
+        assert!(s.standing_scope.has_live("kimi-code", "/x/standing.md", now));
     }
 }

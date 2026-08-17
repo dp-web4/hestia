@@ -4741,8 +4741,11 @@ pub(crate) const DISPOSITION_PROJECTION_PAGE: u64 = 500;
 /// the common case.
 pub(crate) const DISPOSITION_RECONCILE_INTERVAL_SECS: u64 = 300;
 
-/// The cursor row's name in inbox.db's `projection_cursors` table.
-const DISPOSITION_PROJECTION_CURSOR: &str = "disposition";
+/// The cursor row's name in inbox.db's `projection_cursors` table — initialized
+/// at state open (`ServerState::open`), so by the time this projector runs the
+/// row always exists; the cold-start arm below is belt-and-braces for stores
+/// built before this initialization existed.
+use super::state::DISPOSITION_PROJECTION_CURSOR;
 
 /// What one projector pass did.
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -5958,6 +5961,13 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
         "opened_at": get("opened_at"),
         "expires_at": get("expires_at"),
         "decided_by": settled_get("decided_by"),
+        // Shape parity with the live arm (revised #480 review, item 4): the
+        // evidence and the decision timestamp come from the terminal record's
+        // event_data — `factors_present` is written by both decision surfaces;
+        // `decided_at` passes through whatever the entry carries (null on
+        // entries that predate the field, and while still unsettled).
+        "decided_at": settled_get("decided_at"),
+        "factors_present": settled_get("factors_present"),
         "reason": settled_get("reason"),
         "settled_entry": settled.as_ref().map(chain_entry_json),
         "searched": searched,
@@ -16449,5 +16459,108 @@ mod disposition_durability_tests {
         let found = resolve_escalation_pointer(&s, &id2);
         assert_eq!(found["source"], "witness_chain", "{found}");
         assert_eq!(found["escalation_id"], id2);
+    }
+
+    /// Blocker 2 (revised review): the cursor exists from STATE OPEN — written
+    /// synchronously in `ServerState::open`, before any ruling surface is
+    /// reachable — so no ruling can ever land before it does.
+    #[tokio::test]
+    async fn the_cursor_exists_from_state_open_before_any_ruling_can_land() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let s = state.lock().await;
+        assert_eq!(
+            s.inbox_store
+                .projection_cursor(DISPOSITION_PROJECTION_CURSOR)
+                .unwrap(),
+            Some(s.chain_len()),
+            "the watermark is written at open, at the tail — not on the worker's first pass"
+        );
+    }
+
+    /// The r3 loss sequence, closed: cursor absent (r3 shape) + ruling lands +
+    /// fast-path ensure fails = the cold start used to jump past the ruling.
+    /// With startup initialization the cursor already covers the ruling, so the
+    /// first pass after the outage delivers it — exactly once.
+    #[tokio::test]
+    async fn a_ruling_with_a_failed_fast_path_before_any_pass_is_still_delivered() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox) = {
+            let s = state.lock().await;
+            (s.chain_store.clone(), s.inbox_store.clone())
+        };
+        // RESERVED on inbox.db: the cursor read proceeds, the ensure write fails.
+        let blocker = raw_inbox_conn(&dir);
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let ruling_hash = {
+            let s = state.lock().await;
+            let e = s
+                .append_chain(
+                    "gate_escalation_decided",
+                    json!({
+                        "escalation_id": "esc-cold1", "plugin_id": "kimi-code",
+                        "tool_name": "policy_edit", "status": "approved",
+                        "decided_by": "operator",
+                    }),
+                )
+                .unwrap();
+            assert_eq!(
+                ensure_disposition(&s, "kimi-code", "hestia://escalation/esc-cold1#decided", &e.hash),
+                None,
+                "the fast path fails under the lock"
+            );
+            e.hash
+        };
+        blocker.execute_batch("COMMIT").unwrap();
+
+        // No projector pass has ever run in this daemon's life — and the ruling
+        // is still covered, because the cursor predates it.
+        let pass = project_dispositions(&chain, &inbox).unwrap();
+        assert_eq!(pass.projected, 1, "the ruling is not skipped");
+        let s = state.lock().await;
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        let notes: Vec<_> = mail.iter().filter(|n| n.kind == "disposition").collect();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].chain_hash, ruling_hash);
+    }
+
+    /// Item 4 (revised review): the chain fallback carries the SAME decided-record
+    /// fields the live arm does — `factors_present` and `decided_at` included.
+    #[tokio::test]
+    async fn the_chain_fallback_carries_the_decided_record_fields() {
+        let (_dir, state) = test_state().await;
+        let real_now = now_secs();
+        let id = {
+            let mut s = state.lock().await;
+            let id = witness_open(&mut s, "kimi-code", None, real_now - 3 * 3600, 3600);
+            s.append_chain(
+                "gate_escalation_decided",
+                json!({
+                    "escalation_id": id, "plugin_id": "kimi-code", "tool_name": "policy_edit",
+                    "marker": "policy.json", "status": "approved", "decided_by": "operator",
+                    "decided_at": real_now - 2 * 3600,
+                    "factors_present": [{"channel": "operator_session", "by": "operator",
+                                         "dissent": false, "at": real_now - 2 * 3600}],
+                    "reason": "reviewed the diff",
+                }),
+            )
+            .unwrap();
+            id
+        };
+
+        let mut s = state.lock().await;
+        s.gate_escalations.reap(real_now, REAP_KEEP_SECS);
+        assert!(s.gate_escalations.get(&id).is_none());
+
+        let body = resolve_escalation_pointer(&s, &id);
+        assert_eq!(body["source"], "witness_chain");
+        assert_eq!(body["status"], "approved");
+        assert_eq!(body["decided_at"], json!(real_now - 2 * 3600), "{body}");
+        let factors = body["factors_present"]
+            .as_array()
+            .expect("the evidence comes along, shape-parity with the live arm: {body}");
+        assert_eq!(factors[0]["by"], "operator");
+        assert_eq!(factors[0]["dissent"], json!(false));
     }
 }

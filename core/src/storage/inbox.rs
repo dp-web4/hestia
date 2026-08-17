@@ -821,14 +821,34 @@ impl SqliteInboxStore {
             |row| row.get(0),
         )?;
         if count as u64 >= MAX_INBOX_NOTICES {
-            conn.execute(
+            // The eviction victim is the oldest undrained NON-DISPOSITION row
+            // (revised #480 review, blocker 1): an undrained disposition is an
+            // undelivered obligation whose projector cursor has already passed
+            // the ruling — evicting it here would be the TTL bug one level down,
+            // loss by capacity instead of by age. The exclusion repeats the
+            // prune's predicate so the two retention paths exempt exactly the
+            // same rows.
+            let evicted = conn.execute(
                 "DELETE FROM member_notices
                  WHERE id = (SELECT MIN(id) FROM member_notices
                              WHERE to_plugin = ?1 AND drained_at IS NULL
-                               AND dest_peer IS NULL)",
+                               AND dest_peer IS NULL
+                               AND NOT (kind = 'disposition' AND drained_at IS NULL))",
                 params![to_plugin],
             )
             .context("dropping oldest member notice at cap")?;
+            // If every undrained row in this recipient's queue is a disposition,
+            // nothing is evictable — and the insert below proceeds PAST THE CAP
+            // rather than refusing or evicting an obligation. Chosen over
+            // refusing the incoming notice: the cap exists to stop a SENDER's
+            // flood, and here the pressure is daemon-owed mail — erroring an
+            // innocent member's ordinary send because the daemon owes it
+            // rulings would be the cross-channel denial this cap was built to
+            // remove, wearing an error's clothes. Daemon-origin rows are few
+            // (one per ruling, ever), so the overshoot is bounded by the
+            // ruling rate, not by sender behaviour. The overshoot IS visible:
+            // `member_pending` reports the true depth.
+            if evicted > 0 {
             // An eviction is a silent DELETE: no error to the sender, no
             // notice to the recipient, no chain entry. Until this counter the
             // ONLY way to learn the cap had fired was to already know what
@@ -852,6 +872,7 @@ impl SqliteInboxStore {
                 params![to_plugin, now.to_rfc3339()],
             )
             .context("recording member queue eviction")?;
+            }
         }
         conn.execute(
             "INSERT INTO member_notices
@@ -2321,5 +2342,69 @@ mod tests {
         assert!(ids.contains(&undrained_id), "served however old: {ids:?}");
         assert!(ids.contains(&fresh_id));
         assert_eq!(mail.len(), 2, "the pruned plain notice stays gone: {mail:?}");
+    }
+
+    /// Revised #480 review, blocker 1: the cap's eviction must never take an
+    /// undrained DISPOSITION — loss by capacity is the TTL bug one level down,
+    /// and the projector cursor has already passed the ruling, so the loss is
+    /// permanent. The victim is the oldest undrained NON-disposition row.
+    #[test]
+    fn the_cap_never_evicts_an_undrained_disposition() {
+        let (_tmp, store) = fresh();
+        // The oldest row in a full queue is an undrained disposition.
+        let disp_id = store
+            .ensure_member_disposition("kimi-code", "disposition",
+                                       "hestia://escalation/a1#decided", "ruling-hash-cap")
+            .unwrap()
+            .expect("ensure inserts");
+        let mut ordinary_ids = Vec::new();
+        for i in 0..(MAX_INBOX_NOTICES - 1) {
+            ordinary_ids.push(
+                store
+                    .enqueue_member("kimi-code", "claude-code",
+                                    "role:constellation:interactive-dev",
+                                    "coordination", None, &format!("h{i}"), None)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(store.member_pending("kimi-code").unwrap(), MAX_INBOX_NOTICES);
+
+        // One more ordinary send hits the cap.
+        store
+            .enqueue_member("kimi-code", "claude-code", "role:constellation:interactive-dev",
+                            "coordination", None, "h-overflow", None)
+            .unwrap();
+        assert!(row_exists(&store, disp_id), "the obligation survives the cap");
+        assert!(
+            !row_exists(&store, ordinary_ids[0]),
+            "the eviction took the oldest ORDINARY row"
+        );
+        assert!(row_exists(&store, ordinary_ids[1]));
+        assert_eq!(store.member_pending("kimi-code").unwrap(), MAX_INBOX_NOTICES);
+    }
+
+    /// The other arm of blocker 1's choice: when every undrained row is a
+    /// disposition, nothing is evictable — the ordinary send is admitted PAST
+    /// the cap (bounded by the ruling rate, not sender behaviour) rather than
+    /// refused, and no obligation is deleted.
+    #[test]
+    fn a_queue_of_only_undrained_dispositions_overruns_the_cap_rather_than_evicting_one() {
+        let (_tmp, store) = fresh();
+        for i in 0..MAX_INBOX_NOTICES {
+            store
+                .ensure_member_disposition("kimi-code", "disposition",
+                                           "hestia://escalation/x#decided", &format!("ruling-{i}"))
+                .unwrap();
+        }
+        store
+            .enqueue_member("kimi-code", "claude-code", "role:constellation:interactive-dev",
+                            "coordination", None, "h-new", None)
+            .unwrap();
+        assert_eq!(
+            store.member_pending("kimi-code").unwrap(),
+            MAX_INBOX_NOTICES + 1,
+            "admitted past the cap; the overshoot is visible in the true depth"
+        );
+        assert_eq!(count_rows(&store), MAX_INBOX_NOTICES as i64 + 1);
     }
 }

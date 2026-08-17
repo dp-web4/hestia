@@ -188,6 +188,11 @@ impl ScopeRequest {
     }
 }
 
+/// The disposition projector's cursor row name (inbox.db `projection_cursors`).
+/// Lives here rather than in handler.rs because the cursor is initialized at
+/// state OPEN — `ServerState::open` — not at the worker's first pass.
+pub(crate) const DISPOSITION_PROJECTION_CURSOR: &str = "disposition";
+
 /// How long an undecided scope request stays askable, and the default life of a grant.
 ///
 /// Both are the same 8 hours, and that is not laziness: a request is a question about work
@@ -449,6 +454,22 @@ impl ServerState {
         let chain_store = SqliteChainStore::open(home.join("witness.db"), store_key)?;
         let trust_store = TrustStore::open(home.join("trust"), store_key)?;
         let inbox_store = crate::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
+        // The disposition projection cursor is initialized HERE — synchronously,
+        // at state open, before any ruling surface is reachable (revised #480
+        // review, blocker 2). The r3 shape initialized it lazily on the worker's
+        // first pass, which had a loss window: cursor not yet written + a ruling
+        // lands + its fast-path ensure fails = the later cold start jumps to the
+        // new tail and permanently skips that ruling. With the watermark written
+        // at open, no ruling can ever land before the cursor exists. Cold start
+        // still means THE TAIL (history is not backfilled implicitly); on any
+        // daemon that already ran once, the row exists and this is a no-op read.
+        if inbox_store
+            .projection_cursor(DISPOSITION_PROJECTION_CURSOR)?
+            .is_none()
+        {
+            let tail = chain_store.len()?;
+            inbox_store.set_projection_cursor(DISPOSITION_PROJECTION_CURSOR, tail)?;
+        }
         let sovereign_lct = "lct:web4:hestia:sovereign:phase1-placeholder".to_string();
         // The sovereign as a first-class, vault-persisted LCT — the society that
         // mints the roles now has durable presence of its own (id stable across
