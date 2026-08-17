@@ -2676,7 +2676,26 @@ async fn governance_ledger(
 ) -> impl IntoResponse {
     use crate::server::governance_ledger as gl;
 
-    let s = state.lock().await;
+    // THE STATE LOCK IS TAKEN ONLY TO CLONE THE CHAIN HANDLE, AND RELEASED BEFORE THE READ.
+    //
+    // This handler used to hold `state.lock()` across the SQL read, the projection and the
+    // paging — 8–15s against the live chain — so the dashboard's own ledger poll starved every
+    // other caller of the daemon. Measured 2026-08-16: with this panel open `hestia_connect`
+    // took 3.3–7.0s; with it closed, 0.001s.
+    //
+    // That is a governance failure, not a performance one. The plugin gate's witness budget is
+    // 1.5s and its escalation round trip is barely more, so an operator READING the governance
+    // screen prevented every member's gate from witnessing a refusal or opening an escalation
+    // — and a hook killed at the harness's 5s clamp FAILS OPEN. The surface built to make
+    // governance visible was, while visible, switching governance off.
+    //
+    // The store locks internally and is Send + Sync, so nothing about correctness required the
+    // outer lock. `Arc::clone` here, `drop(s)` immediately, and the expensive work runs with
+    // the daemon free.
+    let chain = {
+        let s = state.lock().await;
+        std::sync::Arc::clone(&s.chain_store)
+    };
     let now_dt = chrono::Utc::now();
     // Admin acts are rare compared with member traffic, so the default window reaches back FAR.
     // A day-shaped default would reproduce the original complaint for anything ruled last week.
@@ -2694,7 +2713,7 @@ async fn governance_ledger(
     // would put the heaviest read in the daemon behind a UI panel.
     const LEDGER_CAP: u64 = 5_000;
 
-    let (raw, read_error) = match s.chain_store.read_recent_by_types(
+    let (raw, read_error) = match chain.read_recent_by_types(
         cutoff_str.as_deref(),
         gl::GOVERNANCE_EVENTS,
         LEDGER_CAP,
@@ -2840,5 +2859,182 @@ async fn operator_gate_escalation(
             })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Vault;
+    use crate::server::state::ServerState;
+
+    fn make_shared_state() -> (tempfile::TempDir, SharedState) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = ServerState::open(vault, dir.path(), "p").unwrap();
+        (dir, Arc::new(tokio::sync::Mutex::new(state)))
+    }
+
+    /// Issue #482 regression probe: a governance-ledger read must NOT hold the
+    /// global state lock. Before 14be6a5 the handler held `state.lock()` across
+    /// the whole SQL read + projection + paging (8–15s on the live chain), so the
+    /// dashboard's own poll starved every other caller — and the plugin gate's
+    /// witness budget is 1.5s. The acceptance question is therefore: while
+    /// ledger reads are in flight, how long does an UNRELATED state-lock
+    /// acquisition wait? That is a wall-clock quantity by definition, and that
+    /// is what this test measures.
+    ///
+    /// Construction:
+    /// 1. Seed a chain whose rows carry a large padding field, then run ONE
+    ///    ledger read to calibrate: `read` is what the expensive section costs
+    ///    on THIS box (~2s here; the padding keeps it from collapsing to
+    ///    nothing on a fast box — every row is fetched and its event_data
+    ///    parsed). The calibration response is also checked field by field:
+    ///    the lock change must not change the ledger's answer.
+    /// 2. Hold the state lock, spawn ONE reader (it signals `started` and parks
+    ///    on the lock in the same poll), then drop the guard and immediately
+    ///    re-acquire, timing the wait. `tokio::sync::Mutex` grants fairly, so
+    ///    the wait is exactly the reader's lock hold: microseconds under the
+    ///    fix (an `Arc::clone`), a full read under the old shape.
+    ///
+    /// Why the spinner tasks: this probe depends on a woken waiter being
+    /// POLLED promptly, and empirically it is not. The reader's read is
+    /// synchronous, so once it starts it occupies its worker for the whole
+    /// read; a waiter woken into that worker's local queue is not looked at
+    /// until the read ends, and on a loaded box no parked worker came to steal
+    /// it — measured here: a woken waiter sat unpolled behind NINE completed
+    /// 410ms reads on a 14-worker runtime. The spinners (`yield_now` in a loop)
+    /// keep every other worker awake and stealing, so a woken waiter is polled
+    /// within microseconds. With them, the measured wait is the lock hold and
+    /// nothing else.
+    ///
+    /// Why the margins are safe:
+    /// * Fixed code: the wait is one `Arc::clone` hold plus one task handoff —
+    ///   microseconds to single-digit milliseconds — against a 1s bound. The
+    ///   bound does NOT depend on the read being slow, so the test cannot flake
+    ///   on a fast box, and the measured interval starts inside the test task
+    ///   itself, so the test's own scheduling latency before the measurement
+    ///   is not part of it.
+    /// * Old shape: the wait is a full read. The primary bound (1s, against the
+    ///   gate's 1.5s witness budget) catches it wherever a padded read costs
+    ///   >1s; the comparative bound (wait < read/4, applied only when the
+    ///   calibration read is >= 100ms) catches it on any box where the read is
+    ///   measurable at all, because under the old shape wait == read.
+    /// * Earlier versions of this test failed in instructive ways, recorded so
+    ///   they are not re-tried: (a) asserting `JoinHandle::is_finished` at the
+    ///   re-acquisition point PASSED against the old shape (the guard's drop
+    ///   at function end races the task's completion mark) and FAILED against
+    ///   the fixed shape when the read was short (a ~10ms read is the same
+    ///   order as wakeup latency); (b) amplifying with K queued readers
+    ///   serialized the readers themselves on one worker — K x read even with
+    ///   the fix — because nobody was awake to steal the woken waiters.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn governance_ledger_read_does_not_hold_the_state_lock() {
+        // ~77MB of event_data in total: the read costs ~2s on the 2026-08 WSL
+        // dev box. ROWS stays well under LEDGER_CAP (5000) so every seeded act
+        // is scanned; the per-row pad is what the fetch + parse pays for.
+        const ROWS: usize = 1_200;
+        const PAD: usize = 65_536;
+
+        let (_dir, state) = make_shared_state();
+        {
+            let s = state.lock().await;
+            let pad = "x".repeat(PAD);
+            for i in 0..ROWS {
+                s.append_chain(
+                    "policy_edit",
+                    serde_json::json!({"change": "add_rule", "rule_id": format!("r{i}"), "pad": pad}),
+                )
+                .unwrap();
+            }
+        }
+
+        let spawn_handler = |state: &SharedState| {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            let handle = tokio::spawn({
+                let state = Arc::clone(state);
+                async move {
+                    let _ = started_tx.send(());
+                    governance_ledger(
+                        State(state),
+                        Query(LedgerQuery {
+                            status: None,
+                            range: Some("all".into()),
+                            limit: Some(2_000),
+                        }),
+                    )
+                    .await
+                    .into_response()
+                }
+            });
+            (handle, started_rx)
+        };
+
+        // Calibrate: one full ledger read — and check the answer while at it:
+        // every seeded admin act, no read error (the lock change must not
+        // change the ledger's semantics).
+        let t = std::time::Instant::now();
+        let (h, started) = spawn_handler(&state);
+        started.await.unwrap();
+        let resp = h.await.unwrap();
+        let read = t.elapsed();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["scanned"].as_u64(), Some(ROWS as u64));
+        assert_eq!(page["rows"].as_array().map(Vec::len), Some(ROWS));
+        assert!(page.get("read_error").is_none());
+
+        // The spinners: keep every other worker awake and stealing, so the
+        // woken waiter below is polled promptly (see the doc comment).
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut spinners = Vec::new();
+        for _ in 0..6 {
+            let stop = Arc::clone(&stop);
+            spinners.push(tokio::spawn(async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        let guard = state.lock().await;
+        let (h, started) = spawn_handler(&state);
+        started.await.unwrap();
+        // The handler signalled started and parked on the lock in the same
+        // poll; the settle is belt-and-braces. A laggard would only weaken
+        // old-shape discrimination, never fail the fixed code.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let t_drop = std::time::Instant::now();
+        drop(guard);
+        let reacquired = state.lock().await;
+        let wait = t_drop.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(reacquired);
+
+        assert!(
+            wait < Duration::from_secs(1),
+            "an unrelated state-lock acquisition waited {wait:?} behind one in-flight \
+             ledger read (calibrated at {read:?} on this box) — the read is holding the \
+             global lock again (issue #482: the gate's 1.5s witness budget starves \
+             behind a dashboard poll)"
+        );
+        if read >= Duration::from_millis(100) {
+            assert!(
+                wait < read / 4,
+                "the state-lock wait {wait:?} is a substantial fraction of the full \
+                 ledger read {read:?} — the read is serialized behind the state lock \
+                 again (issue #482)"
+            );
+        }
+
+        // The reader completes without ever needing the state lock again.
+        assert_eq!(h.await.unwrap().status(), StatusCode::OK);
+        for s in spinners {
+            s.await.unwrap();
+        }
     }
 }

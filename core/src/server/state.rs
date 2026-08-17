@@ -253,7 +253,25 @@ pub struct ServerState {
     pub vault: Vault,
     pub sessions: HashMap<Uuid, Session>,
     pub actions: HashMap<Uuid, InFlightAction>,
-    pub chain_store: SqliteChainStore,
+    /// BEHIND AN `Arc` SO A HEAVY READ NEED NOT HOLD THE GLOBAL STATE LOCK.
+    ///
+    /// The store already locks internally (`conn: Mutex<Connection>`) and is `Send + Sync`, so
+    /// holding `state.lock()` across a chain read bought nothing but contention. It cost a
+    /// great deal: `/api/governance/ledger` takes 8–15s against the live chain, and it held
+    /// this lock for all of it, so every other caller queued behind a UI panel.
+    ///
+    /// Measured on CBP 2026-08-16, with the dashboard open vs closed:
+    ///   `hestia_connect`  3.3–7.0s  ->  0.001s
+    /// That is not a latency nuisance. The plugin gate's witness budget is 1.5s and its
+    /// escalation round trip is barely more, so while the governance screen was open the gate
+    /// could neither witness a refusal nor open an escalation — and the harness kills a hook
+    /// at 5s, which the hook's own comments note FAILS OPEN. The governance dashboard was
+    /// disabling governance enforcement for every member, silently, while being read.
+    ///
+    /// The `len()` doc-comment below already diagnosed this exact shape for a different
+    /// caller. This is the same lesson applied to the field itself: shared ownership, so the
+    /// expensive work happens with the state lock released.
+    pub chain_store: Arc<SqliteChainStore>,
     pub trust_store: TrustStore,
     /// Durable inbound mailbox (entity-edge inbox): still-sealed notices parked
     /// by `hestia_notify {defer: true}` before the hub is ACKed, drained by
@@ -438,7 +456,7 @@ impl ServerState {
         // (SQLCipher) and the trust files.
         let store_key = crate::storage::storage_key(home, passphrase)
             .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
-        let chain_store = SqliteChainStore::open(home.join("witness.db"), store_key)?;
+        let chain_store = Arc::new(SqliteChainStore::open(home.join("witness.db"), store_key)?);
         let trust_store = TrustStore::open(home.join("trust"), store_key)?;
         let inbox_store = crate::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
         let sovereign_lct = "lct:web4:hestia:sovereign:phase1-placeholder".to_string();
