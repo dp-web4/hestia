@@ -59,7 +59,14 @@ impl ChainRowRef<'_> {
 /// Witness chain persisted to SQLite. Locking is internal so the store
 /// is `Send + Sync` from the caller's perspective.
 pub struct SqliteChainStore {
+    /// Authoritative append connection. Reads that can be long-running belong
+    /// on `read_conn` so a display projection never waits on this process-local
+    /// mutex before a witness write can begin.
     conn: Mutex<Connection>,
+    /// Dedicated query-only connection. WAL mode lets its snapshot coexist
+    /// with an append transaction; the mutex serializes display/read
+    /// projections with each other, never with the writer.
+    read_conn: Mutex<Connection>,
     path: PathBuf,
     /// Cached entry count, so `len()` is O(1) instead of an O(n) `COUNT(*)`.
     ///
@@ -153,6 +160,14 @@ impl SqliteChainStore {
         // SQLCipher: key the connection before any other access.
         conn.pragma_update(None, "key", &key_hex)
             .with_context(|| "applying SQLCipher key to witness chain")?;
+        // Dashboard and ledger projections must never stand between a
+        // governance act and its witness append. One connection mutex cannot
+        // provide that property: moving a read outside ServerState would still
+        // make append() wait on the store's inner mutex. WAL gives the writer
+        // and a stable reader snapshot independent file-level progress. The WAL
+        // is encrypted by SQLCipher under the same database key.
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .with_context(|| "enabling WAL mode for concurrent chain reads")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chain_entries (
                 chain_position INTEGER PRIMARY KEY,
@@ -166,10 +181,23 @@ impl SqliteChainStore {
              CREATE INDEX IF NOT EXISTS idx_chain_event_type ON chain_entries(event_type);
              CREATE INDEX IF NOT EXISTS idx_chain_timestamp  ON chain_entries(timestamp);",
         )?;
+        let read_conn = Connection::open(&path).with_context(|| {
+            format!(
+                "opening witness-chain read connection at {}",
+                path.display()
+            )
+        })?;
+        read_conn
+            .pragma_update(None, "key", &key_hex)
+            .with_context(|| "applying SQLCipher key to witness-chain read connection")?;
+        read_conn
+            .pragma_update(None, "query_only", true)
+            .with_context(|| "making witness-chain read connection query-only")?;
         // Pay the O(n) count exactly once, at open, then track it incrementally.
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM chain_entries", [], |row| row.get(0))?;
         Ok(Self {
             conn: Mutex::new(conn),
+            read_conn: Mutex::new(read_conn),
             path,
             len: AtomicU64::new(n as u64),
         })
@@ -194,7 +222,7 @@ impl SqliteChainStore {
 
     /// Most recent entry's hash, or the genesis sentinel if empty.
     pub fn tail_hash(&self) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn.lock().unwrap();
         let h: Option<String> = conn
             .query_row(
                 "SELECT hash FROM chain_entries ORDER BY chain_position DESC LIMIT 1",
@@ -423,7 +451,7 @@ impl SqliteChainStore {
         if matches!(event_types, Some(t) if t.is_empty()) {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn.lock().unwrap();
         let mut where_parts: Vec<String> = Vec::new();
         if let Some(types) = event_types {
             where_parts.push(format!("event_type IN ({})", vec!["?"; types.len()].join(",")));
@@ -922,6 +950,59 @@ mod tests {
 
         // An empty type list asks for nothing — same rule as read_recent_by_types.
         assert!(store.scan_recent(None, Some(&[]), 10, |_| Some(())).unwrap().is_empty());
+    }
+
+    /// A dashboard projection is allowed to be slow; it is not allowed to
+    /// become part of governance-write finality. Hold a live SELECT snapshot
+    /// open inside the projection callback and prove an append commits before
+    /// that reader is released. A second connection without WAL fails this
+    /// control at commit; one shared connection mutex fails before the write can
+    /// begin.
+    #[test]
+    fn scan_recent_snapshot_does_not_block_append() {
+        let dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(
+            SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap(),
+        );
+        let signer = "lct:web4:hestia:sovereign:test";
+        store
+            .append("seed", json!({"n": 1}), signer)
+            .unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let reader_store = store.clone();
+        let reader = std::thread::spawn(move || {
+            reader_store
+                .scan_recent(None, None, 1, |row| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Some(row.chain_position)
+                })
+                .unwrap()
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("reader reached a live SQLite row");
+
+        let (appended_tx, appended_rx) = std::sync::mpsc::sync_channel(0);
+        let writer_store = store.clone();
+        let writer = std::thread::spawn(move || {
+            let result = writer_store.append("concurrent", json!({"n": 2}), signer);
+            appended_tx.send(result).unwrap();
+        });
+        let append_while_reader_is_live =
+            appended_rx.recv_timeout(std::time::Duration::from_secs(2));
+
+        // Always release and join before asserting, so a broken implementation
+        // fails rather than leaving a permanently blocked test thread behind.
+        release_tx.send(()).unwrap();
+        assert_eq!(reader.join().unwrap(), vec![0]);
+        writer.join().unwrap();
+        append_while_reader_is_live
+            .expect("a display snapshot must not delay a witness append")
+            .expect("concurrent witness append succeeds");
+        assert_eq!(store.len().unwrap(), 2);
     }
 
     #[test]
