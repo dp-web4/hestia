@@ -599,10 +599,6 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
 
     let mut s = state.lock().await;
 
-    if let Some(capabilities) = gate_capabilities {
-        s.gate_capabilities.insert(plugin_id.clone(), capabilities);
-    }
-
     // Connect idempotency (HUB ruling 2026-07-24): the claude-code hook connects on EVERY tool call
     // (fresh MCP connection per hook subprocess), so without this each tool call mints a distinct
     // session — an interactive session becomes ephemeral churn invisible to coordination. If the caller
@@ -624,7 +620,7 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
             // caller actually gets, so "I declared interactive-dev and got a member
             // session back" is visible rather than silent.
             let honored = !declared_role.is_empty() && declared_role == existing.constellation_role;
-            return Ok(json!({
+            let response = json!({
                 "sessionId": existing.session_id,
                 "softLct": existing.soft_lct,
                 "assignedRole": existing.assigned_role,
@@ -634,7 +630,14 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
                 "gateCapabilityReportAccepted": gate_capability_report_accepted,
                 "protocolVersion": 1,
                 "reused": true,
-            }));
+            });
+            // Store the report only after this call has been accepted as a real reuse. A
+            // refused connect must never leave a green deployment-health residue.
+            if let Some(capabilities) = gate_capabilities.as_ref() {
+                s.gate_capabilities
+                    .insert(plugin_id.clone(), capabilities.clone());
+            }
+            return Ok(response);
         }
     }
 
@@ -704,6 +707,12 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     }
 
     s.sessions.insert(session_id, session);
+    // Fresh-connect success boundary: synthetic persistence/member setup has completed and
+    // the session now exists. Recording before this point would let a refused connect claim
+    // that a loaded gate is active.
+    if let Some(capabilities) = gate_capabilities {
+        s.gate_capabilities.insert(plugin_id.clone(), capabilities);
+    }
     // Readback, not a mirror (the #68 shape, one field over): the fresh path
     // echoes the STORED, normalized role — the same value the reuse path
     // reads back — so the two paths cannot disagree about what was assigned,
@@ -15816,6 +15825,22 @@ mod standing_scope_surface_tests {
         .unwrap();
         assert_eq!(second["gateCapabilityReportAccepted"], false);
         assert!(state.lock().await.gate_capabilities["codex"].contains("society-floor:v1"));
+
+        let refused = tool_connect(
+            &state,
+            &json!({
+                "plugin_id": "not/a/member",
+                "host_agent": "probe",
+                "gate_capabilities": ["society-floor:v1"],
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(refused.get("_hestia_error").is_some());
+        assert!(
+            !state.lock().await.gate_capabilities.contains_key("not/a/member"),
+            "a refused connect cannot leave a capability report behind"
+        );
     }
 }
 
