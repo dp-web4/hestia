@@ -445,6 +445,13 @@ pub async fn serve_with_callback(
         // carries `request_id: null` and `origin: "operator_initiated"`. A reader can always
         // tell them apart. What is gone is the DEPENDENCY, not the distinction.
         .route("/api/scope/grant", post(scope_grant))
+        // THE SOCIETY FLOOR (dp, 2026-08-16). Same operator wall as every other widening, and
+        // deliberately NOT reachable from MCP: a member that could edit the floor could widen
+        // itself AND every peer in one act, which is the largest privilege escalation this
+        // codebase could offer. The floor is the one list that must be editable from exactly
+        // one direction.
+        .route("/api/scope/floor", post(scope_floor_add))
+        .route("/api/scope/floor/remove", post(scope_floor_remove))
         .route("/api/policy/preset", put(policy_set_preset))
         .route("/api/policy/override", put(policy_set_override))
         .route(
@@ -2098,6 +2105,281 @@ async fn scope_grant(
     )
 }
 
+/// `POST /api/scope/floor` {path, reason} — add a path to THE SOCIETY FLOOR.
+///
+/// dp, 2026-08-16: *"law has to be applied uniformly to ALL. that is the only way the law is
+/// trusted."* This is the surface that makes that structural rather than aspirational: one
+/// list, consulted for every member, that no member can hold a different copy of.
+///
+/// **Wider than any grant on this box, and the response says so.** A standing grant widens one
+/// member; this widens every member at once, including ones that have never connected and ones
+/// nobody is watching. It is operator-walled like every other widening, requires a stated
+/// reason for the same evidentiary purpose, and is witnessed before it takes effect.
+///
+/// **Why this is nonetheless the SAFER instrument.** The alternative — granting each member
+/// the same list — produces N copies that drift the moment one member is granted something the
+/// others are not, and then the law differs per seat while looking identical. Uniformity has
+/// to be structural or it decays. One list cannot drift.
+async fn scope_floor_add(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if raw_path.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "path is required"})),
+        );
+    }
+    if reason.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "reason is required — this widens EVERY member of this society at \
+                          once, and a widening of that breadth whose rationale is not recorded \
+                          is indistinguishable afterwards from a misconfiguration"
+            })),
+        );
+    }
+    let path = crate::server::state::normalize_scope_path(&raw_path);
+    let now = crate::server::gate_escalation::now_secs();
+
+    let mut s = state.lock().await;
+    let replaces = s.standing_scope.floor_allows(&path);
+    let members_affected = s.member_registry.len();
+
+    // ORDER: WITNESS, THEN WIDEN — and the intent/success split, for the same reason the
+    // per-member grant has it: a failed vault write must not leave the chain asserting that
+    // the whole society was widened when it was not.
+    let entry = match s.append_chain(
+        "society_floor_intent",
+        serde_json::json!({
+            "path": path,
+            "path_as_asked": raw_path,
+            "reason": reason,
+            "added_by": "operator",
+            "via": "operator_session",
+            "replaces_existing": replaces,
+            "members_in_registry": members_affected,
+            "scope": "SOCIETY — every member of this society, present and future",
+            "semantics": "additive only: effective(m) = society_floor ∪ member(m)",
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("witness append failed, floor NOT changed: {e}"),
+                    "state": "nothing recorded, nothing widened",
+                })),
+            );
+        }
+    };
+
+    let fe = crate::server::standing_scope::FloorEntry {
+        path: path.clone(),
+        added_at: now,
+        added_by: "operator".to_string(),
+        reason: reason.clone(),
+    };
+    // The terminal success witness is part of finality. Preserve the exact prior store so
+    // a failed terminal append can restore both memory and vault, including a predecessor
+    // when this call replaces an existing floor entry.
+    let standing_prior = s.standing_scope.clone();
+    if let Err(e) = s.commit_standing_scope(|st| st.floor_add(fe)) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("floor NOT changed — vault write failed ({e}); the live store \
+                                  is untouched (the candidate was persisted first), retry"),
+                "state": "the chain holds the INTENT and no society_floor_added",
+                "intentEntryHash": entry.hash,
+            })),
+        );
+    }
+    let generation = s.standing_scope.generation;
+    let success = match s.append_chain(
+        "society_floor_added",
+        serde_json::json!({
+            "path": path, "reason": reason, "added_by": "operator",
+            "intent": entry.hash, "standing_generation": generation,
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return match s.commit_standing_scope(|st| *st = standing_prior) {
+                Ok(()) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("floor NOT applied — the terminal society_floor_added \
+                                          append failed ({e}); the prior floor was restored in \
+                                          memory and vault. Retry this exact call."),
+                        "state": "floor change NOT in force; chain holds only the intent",
+                        "intentEntryHash": entry.hash,
+                    })),
+                ),
+                Err(rb) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("THE FLOOR CHANGE IS LIVE but its success record could \
+                                          not be appended ({e}) AND rollback failed ({rb}). \
+                                          Remove or repair it explicitly; do not infer absence \
+                                          from the missing terminal record."),
+                        "state": "floor change IS in force; chain holds only the intent",
+                        "intentEntryHash": entry.hash,
+                    })),
+                ),
+            };
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "path": path,
+            "generation": generation,
+            "replaced_existing": replaces,
+            "applies_to": "every member of this society, including any that connect later",
+            "note": "additive only — a member's own grants can widen beyond this, never narrow \
+                     below it",
+            // The terminal fact, not the intent. This is the record that says the floor is
+            // durably in force and is the only correct pointer for downstream consumers.
+            "witnessEntryHash": success.hash,
+            "intentEntryHash": entry.hash,
+        })),
+    )
+}
+
+/// `POST /api/scope/floor/remove` {path, reason?} — take a path OFF the society floor.
+///
+/// The tightening direction, and the only one on this surface. It narrows every member at
+/// once — including members that never asked for the path, are not watching, and may be
+/// mid-act against it. That is strictly more consequential than revoking one member's grant,
+/// so it is recorded with the same weight rather than treated as cleanup.
+async fn scope_floor_remove(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if raw_path.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "path is required"})),
+        );
+    }
+    let path = crate::server::state::normalize_scope_path(&raw_path);
+    let mut s = state.lock().await;
+    let was_present = s.standing_scope.floor_allows(&path);
+    if !was_present && !s.standing_scope_dirty {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "that path is not on the society floor"})),
+        );
+    }
+    let prior = s.standing_scope.clone();
+    let intended_generation = if was_present {
+        prior.generation + 1
+    } else {
+        prior.generation
+    };
+
+    // A removal is a terminal FACT only after the vault holds it. Writing
+    // `society_floor_removed` first made a failed persist plus restart resurrect the path
+    // while the immutable chain claimed completion. Use the same truthful three-stage
+    // contract as the widening: intent -> durable candidate -> terminal fact.
+    let intent = match s.append_chain(
+        "society_floor_remove_intent",
+        serde_json::json!({
+            "path": path, "reason": reason, "removed_by": "operator",
+            "via": "operator_session",
+            "scope": "SOCIETY — narrows every member at once",
+            "standing_generation": intended_generation,
+            "retry_sync": !was_present,
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("witness append failed, floor NOT changed: {e}")
+                })),
+            );
+        }
+    };
+
+    // Persist a candidate before swapping it into live memory. Tightening is fail-safe, but
+    // a terminal chain claim that is false after restart is not: durability and witnessing
+    // are both parts of finality.
+    if let Err(e) = s.commit_standing_scope(|st| {
+        st.floor_remove(&path);
+    }) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("floor NOT removed — vault write failed ({e}); the live store \
+                                  is untouched (the candidate was persisted first), retry"),
+                "state": "the chain holds the remove INTENT and no society_floor_removed",
+                "intentEntryHash": intent.hash,
+            })),
+        );
+    }
+    let generation = s.standing_scope.generation;
+    let success = match s.append_chain(
+        "society_floor_removed",
+        serde_json::json!({
+            "path": path, "reason": reason, "removed_by": "operator",
+            "via": "operator_session",
+            "scope": "SOCIETY — narrows every member at once",
+            "intent": intent.hash,
+            "standing_generation": generation,
+            "retry_sync": !was_present,
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return match s.commit_standing_scope(|st| *st = prior) {
+                Ok(()) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("floor removal NOT applied — the terminal \
+                                          society_floor_removed append failed ({e}); the prior \
+                                          floor was restored in memory and vault. Retry this \
+                                          exact call."),
+                        "state": "floor removal NOT in force; chain holds only the intent",
+                        "intentEntryHash": intent.hash,
+                    })),
+                ),
+                Err(rb) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("THE FLOOR REMOVAL IS LIVE but its terminal record \
+                                          could not be appended ({e}) AND rollback failed \
+                                          ({rb}). Restore or retry explicitly; do not infer \
+                                          completion from the intent."),
+                        "state": "floor removal IS in force; chain holds only the intent",
+                        "intentEntryHash": intent.hash,
+                    })),
+                ),
+            };
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true, "path": path, "removed": was_present,
+            "generation": generation,
+            "effect": "every member of this society loses this path unless they hold their own \
+                       grant for it",
+            "witnessEntryHash": success.hash,
+            "intentEntryHash": intent.hash,
+        })),
+    )
+}
+
 /// `POST /api/scope/standing/revoke` {plugin_id, path, reason?}
 ///
 /// The revoke half of the durable channel — first-class because a durable widening with no
@@ -3274,6 +3556,228 @@ mod disposition_tests {
         assert_eq!(resp.status(), StatusCode::OK, "the retry rules cleanly");
         let s = state.lock().await;
         assert!(s.standing_scope.has_live("kimi-code", "/x/standing.md", now));
+    }
+
+    /// #483 finality: a society-wide widening is not in force until its terminal
+    /// `society_floor_added` record lands. Failure restores the exact prior store, then an
+    /// identical retry succeeds once witnessing is available again.
+    #[tokio::test]
+    async fn an_unwitnessed_society_floor_change_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        let (prior_floor, prior_generation) = {
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| {
+                st.floor_add(crate::server::standing_scope::FloorEntry {
+                    path: "/x/society".into(),
+                    added_at: 1,
+                    added_by: "operator".into(),
+                    reason: "predecessor".into(),
+                })
+            })
+            .unwrap();
+            (s.standing_scope.floor.clone(), s.standing_scope.generation)
+        };
+        let add = |state: &SharedState| {
+            let state = state.clone();
+            async move {
+                scope_floor_add(
+                    State(state),
+                    Json(serde_json::json!({
+                        "path": "/x/society",
+                        "reason": "common working surface",
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        };
+
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_society_floor_success
+             BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'society_floor_added'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;",
+        )
+        .unwrap();
+
+        let resp = add(&state).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        {
+            let s = state.lock().await;
+            assert_eq!(
+                s.standing_scope.floor, prior_floor,
+                "rollback must restore the replaced predecessor byte for byte"
+            );
+            assert_eq!(
+                s.standing_scope.generation, prior_generation,
+                "rollback restores the exact prior generation"
+            );
+            let chain = s.recent_chain(20);
+            assert!(chain.iter().any(|e| e.event_type == "society_floor_intent"));
+            assert!(!chain.iter().any(|e| e.event_type == "society_floor_added"));
+        }
+        conn.execute_batch("DROP TRIGGER fail_society_floor_success")
+            .unwrap();
+
+        let resp = add(&state).await;
+        assert_eq!(resp.status(), StatusCode::OK, "the identical retry lands cleanly");
+        let s = state.lock().await;
+        assert!(s.standing_scope.floor_allows("/x/society"));
+        assert_eq!(s.standing_scope.generation, prior_generation + 1);
+        assert_eq!(s.standing_scope.floor[0].reason, "common working surface");
+    }
+
+    /// #490 NOT-SAME: a vault failure cannot leave a terminal removal claim for a path
+    /// that restart resurrects. The candidate persist fails before live memory changes;
+    /// the chain therefore contains only an intent, and restart reloads the unchanged floor.
+    #[tokio::test]
+    async fn failed_society_floor_remove_persist_is_an_intent_not_a_terminal_fact() {
+        let (dir, state) = test_state().await;
+        let (prior_floor, prior_generation) = {
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| {
+                st.floor_add(crate::server::standing_scope::FloorEntry {
+                    path: "/x/remove-persist".into(),
+                    added_at: 1,
+                    added_by: "operator".into(),
+                    reason: "restart invariant".into(),
+                })
+            })
+            .unwrap();
+            (s.standing_scope.floor.clone(), s.standing_scope.generation)
+        };
+
+        // Vault writes use v.enc.tmp then rename. A directory at that path fails the
+        // persist without affecting witness.db, so this isolates stage two.
+        std::fs::create_dir(dir.path().join("v.enc.tmp")).unwrap();
+        let resp = scope_floor_remove(
+            State(state.clone()),
+            Json(serde_json::json!({
+                "path": "/x/remove-persist",
+                "reason": "exercise persist failure",
+            })),
+        )
+        .await
+        .into_response();
+        std::fs::remove_dir(dir.path().join("v.enc.tmp")).unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        {
+            let s = state.lock().await;
+            assert_eq!(s.standing_scope.floor, prior_floor);
+            assert_eq!(s.standing_scope.generation, prior_generation);
+            let chain = s.recent_chain(20);
+            assert!(
+                chain
+                    .iter()
+                    .any(|e| e.event_type == "society_floor_remove_intent")
+            );
+            assert!(
+                !chain
+                    .iter()
+                    .any(|e| e.event_type == "society_floor_removed"),
+                "a failed persist must not mint a terminal removal"
+            );
+        }
+
+        drop(state);
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let restarted = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let s = restarted.lock().await;
+        assert!(
+            s.standing_scope.floor_allows("/x/remove-persist"),
+            "restart must agree with the non-terminal chain state"
+        );
+        assert_eq!(s.standing_scope.generation, prior_generation);
+    }
+
+    /// The terminal removal witness is part of finality too. If it fails after the durable
+    /// candidate lands, restore the exact prior floor and generation in memory and vault;
+    /// after the witness recovers, the identical retry removes durably.
+    #[tokio::test]
+    async fn unwitnessed_society_floor_remove_restores_prior_store_and_restart_state() {
+        let (dir, state) = test_state().await;
+        let (prior_floor, prior_generation) = {
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| {
+                st.floor_add(crate::server::standing_scope::FloorEntry {
+                    path: "/x/remove-terminal".into(),
+                    added_at: 1,
+                    added_by: "operator".into(),
+                    reason: "terminal invariant".into(),
+                })
+            })
+            .unwrap();
+            (s.standing_scope.floor.clone(), s.standing_scope.generation)
+        };
+        let remove = |state: &SharedState| {
+            let state = state.clone();
+            async move {
+                scope_floor_remove(
+                    State(state),
+                    Json(serde_json::json!({
+                        "path": "/x/remove-terminal",
+                        "reason": "exercise terminal failure",
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        };
+
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_society_floor_removed
+             BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'society_floor_removed'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;",
+        )
+        .unwrap();
+
+        let resp = remove(&state).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        {
+            let s = state.lock().await;
+            assert_eq!(s.standing_scope.floor, prior_floor);
+            assert_eq!(s.standing_scope.generation, prior_generation);
+            let chain = s.recent_chain(20);
+            assert!(
+                chain
+                    .iter()
+                    .any(|e| e.event_type == "society_floor_remove_intent")
+            );
+            assert!(
+                !chain
+                    .iter()
+                    .any(|e| e.event_type == "society_floor_removed")
+            );
+        }
+
+        conn.execute_batch("DROP TRIGGER fail_society_floor_removed")
+            .unwrap();
+        let resp = remove(&state).await;
+        assert_eq!(resp.status(), StatusCode::OK, "the identical retry lands cleanly");
+        {
+            let s = state.lock().await;
+            assert!(!s.standing_scope.floor_allows("/x/remove-terminal"));
+            assert_eq!(s.standing_scope.generation, prior_generation + 1);
+        }
+        drop(conn);
+        drop(state);
+
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let restarted = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let s = restarted.lock().await;
+        assert!(
+            !s.standing_scope.floor_allows("/x/remove-terminal"),
+            "a terminal removal must survive restart"
+        );
+        assert_eq!(s.standing_scope.generation, prior_generation + 1);
     }
 }
 

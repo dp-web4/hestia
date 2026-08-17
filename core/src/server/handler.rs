@@ -574,6 +574,25 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     // reuse (Guard A below) this call's value is ignored and the minted one is
     // echoed, the same discipline as `role`.
     let role_basis = optional_string(args, "role_basis");
+    // Runtime capability self-report from this caller. Absence means "no new evidence" and
+    // deliberately does not erase an earlier report: ordinary app connects do not carry gate
+    // metadata. An explicit array replaces the member's report, including an empty array for
+    // a caller reporting no understood capabilities. The retained value is historical within
+    // this daemon run — no freshness/session/build binding — and any caller can assert both
+    // plugin_id and capabilities at A1. #481 is the separate artifact-integrity problem.
+    let gate_capabilities: Option<std::collections::HashSet<String>> = args
+        .get("gate_capabilities")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && s.len() <= 128)
+                .map(str::to_string)
+                .collect()
+        });
+    let gate_capability_report_accepted = gate_capabilities.is_some();
     let synthetic = args
         .get("synthetic")
         .and_then(|v| v.as_bool())
@@ -602,16 +621,24 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
             // caller actually gets, so "I declared interactive-dev and got a member
             // session back" is visible rather than silent.
             let honored = !declared_role.is_empty() && declared_role == existing.constellation_role;
-            return Ok(json!({
+            let response = json!({
                 "sessionId": existing.session_id,
                 "softLct": existing.soft_lct,
                 "assignedRole": existing.assigned_role,
                 "constellationRole": existing.constellation_role,
                 "roleDeclarationHonored": honored,
                 "roleBasis": existing.role_basis,
+                "gateCapabilityReportAccepted": gate_capability_report_accepted,
                 "protocolVersion": 1,
                 "reused": true,
-            }));
+            });
+            // Store the report only after this call has been accepted as a real reuse. A
+            // refused connect must never leave a green deployment-health residue.
+            if let Some(capabilities) = gate_capabilities.as_ref() {
+                s.gate_capabilities
+                    .insert(plugin_id.clone(), capabilities.clone());
+            }
+            return Ok(response);
         }
     }
 
@@ -681,6 +708,12 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     }
 
     s.sessions.insert(session_id, session);
+    // Fresh-connect success boundary: synthetic persistence/member setup has completed and
+    // the session now exists. Recording before this point would let a refused connect claim
+    // that a loaded gate is active.
+    if let Some(capabilities) = gate_capabilities {
+        s.gate_capabilities.insert(plugin_id.clone(), capabilities);
+    }
     // Readback, not a mirror (the #68 shape, one field over): the fresh path
     // echoes the STORED, normalized role — the same value the reuse path
     // reads back — so the two paths cannot disagree about what was assigned,
@@ -703,6 +736,7 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         "constellationRole": constellation_role,
         "roleDeclarationHonored": role_declaration_honored,
         "roleBasis": role_basis,
+        "gateCapabilityReportAccepted": gate_capability_report_accepted,
         "protocolVersion": 1,
     }))
 }
@@ -14491,11 +14525,38 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         // moved by every grant/revoke) and HOW LONG a consumer may honour a cached copy —
         // bounded by the earliest expiry of any grant represented here (see the horizon
         // computation above), because past that instant the snapshot over-states.
+        // THE SOCIETY FLOOR — what EVERY member of this society may reach, served to each of
+        // them identically and without any of them having asked (dp, 2026-08-16: "law has to
+        // be applied uniformly to ALL. that is the only way the law is trusted").
+        //
+        // Served here rather than as its own tool so it arrives through the channel the gate
+        // already reads. A floor the gate had to fetch separately would be a floor that
+        // applies only to members whose gate remembered to ask — which is per-seat law again,
+        // wearing the word "uniform".
+        //
+        // Member-independent by construction: this list does not depend on `plugin_id`, so
+        // two members comparing their snapshots see the same floor or the daemon is lying.
+        "society_floor": s.standing_scope.floor
+            .iter()
+            .map(|f| json!({
+                "path": f.path,
+                "added_at": f.added_at,
+                "added_by": f.added_by,
+                "reason": f.reason,
+            }))
+            .collect::<Vec<_>>(),
+        // Canonical over the path set, not presentation order or provenance. Combined with
+        // `generation`, this lets two members prove they received the same society baseline
+        // without learning anything about one another's personal expansions.
+        "society_floor_digest": s.standing_scope.floor_digest(),
         "generation": s.standing_scope.generation,
         "snapshot_expires_at": snapshot_expires_at,
         "lifetime": "live_grants are memory-only — they die with the daemon. standing_grants \
                      are operator-promoted, vault-persisted, and survive restart until they \
-                     expire or are revoked. Neither is ever written to your identity file.",
+                     expire or are revoked. society_floor is the society's own list: it is \
+                     durable, applies to EVERY member identically, and is not yours to lose — \
+                     effective(you) = society_floor ∪ your grants, additive only. None of the \
+                     three is ever written to your identity file.",
     }))
 }
 
@@ -15342,7 +15403,7 @@ mod standing_scope_surface_tests {
     //! store exists to survive. The store's own unit tests live in `server::standing_scope`;
     //! these are the "assertion and mechanism in the same room" tests for the handlers.
     use super::*;
-    use crate::server::standing_scope::StandingGrant;
+    use crate::server::standing_scope::{FloorEntry, StandingGrant};
     use crate::server::state::ScopeRequest;
     use crate::vault::Vault;
     use tempfile::TempDir;
@@ -15424,6 +15485,42 @@ mod standing_scope_surface_tests {
             out["snapshot_expires_at"].as_u64().unwrap() > now,
             "the honor horizon must be a future instant"
         );
+    }
+
+    /// #483 acceptance 5: one non-empty floor is served byte-for-byte identically to
+    /// different members, including a member with zero personal grants. The shared
+    /// generation/digest identify the same daemon policy revision; personal expansions do
+    /// not leak across the comparison.
+    #[tokio::test]
+    async fn society_floor_is_identical_for_members_with_different_personal_scope() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.standing_scope.floor_add(FloorEntry {
+                path: "/w/shared".into(),
+                added_at: now,
+                added_by: "operator".into(),
+                reason: "public workspace".into(),
+            });
+            s.standing_scope
+                .add(standing("kimi-code", "/w/kimi-only", now, None));
+        }
+
+        let kimi = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"}))
+            .await
+            .unwrap();
+        let codex = tool_scope_status(&state, &json!({"plugin_id": "codex"}))
+            .await
+            .unwrap();
+
+        assert_eq!(kimi["society_floor"], codex["society_floor"]);
+        assert_eq!(kimi["society_floor_digest"], codex["society_floor_digest"]);
+        assert_eq!(kimi["generation"], codex["generation"]);
+        assert_eq!(codex["standing_grants"].as_array().map(Vec::len), Some(0));
+        assert_eq!(kimi["standing_grants"].as_array().map(Vec::len), Some(1));
+        assert_eq!(kimi["society_floor"][0]["path"], "/w/shared");
+        assert_eq!(kimi["society_floor_digest"].as_str().map(str::len), Some(64));
     }
 
     /// (#407) The operating-law projection carries the scope_grants — live AND standing —
@@ -15686,6 +15783,64 @@ mod standing_scope_surface_tests {
         assert!(
             names.iter().any(|n| n == "hestia_scope_status"),
             "hestia_scope_status is how a member learns its standing reach"
+        );
+    }
+
+    #[test]
+    fn no_mcp_tool_can_mutate_the_society_floor() {
+        let names: Vec<String> = hestia_tools()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.to_ascii_lowercase().contains("floor")),
+            "the society floor widens every present and future member; mutation stays behind \
+             the challenge-signed operator HTTP wall"
+        );
+        assert!(names.iter().any(|n| n == "hestia_scope_status"));
+    }
+
+    #[tokio::test]
+    async fn gate_connect_reports_floor_consumer_capability_without_silent_erasure() {
+        let (_d, state) = test_state().await;
+        let first = tool_connect(
+            &state,
+            &json!({
+                "plugin_id": "codex",
+                "host_agent": "codex",
+                "gate_capabilities": ["society-floor:v1"],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["gateCapabilityReportAccepted"], true);
+        assert!(state.lock().await.gate_capabilities["codex"].contains("society-floor:v1"));
+
+        // A normal non-gate connect says nothing about the installed gate and must not turn
+        // a prior positive report into a false negative merely by omitting the field.
+        let second = tool_connect(
+            &state,
+            &json!({"plugin_id": "codex", "host_agent": "ordinary-client"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["gateCapabilityReportAccepted"], false);
+        assert!(state.lock().await.gate_capabilities["codex"].contains("society-floor:v1"));
+
+        let refused = tool_connect(
+            &state,
+            &json!({
+                "plugin_id": "not/a/member",
+                "host_agent": "probe",
+                "gate_capabilities": ["society-floor:v1"],
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(refused.get("_hestia_error").is_some());
+        assert!(
+            !state.lock().await.gate_capabilities.contains_key("not/a/member"),
+            "a refused connect cannot leave a capability report behind"
         );
     }
 }

@@ -82,6 +82,12 @@ pub const GOVERNANCE_EVENTS: &[&str] = &[
     "scope_granted",
     "scope_refused",
     "scope_attestation",
+    // Society-wide permission mutations. Intent and terminal fact remain separate rows so a
+    // failed durable change is visible without being mistaken for one that landed.
+    "society_floor_intent",
+    "society_floor_added",
+    "society_floor_remove_intent",
+    "society_floor_removed",
     // The law itself.
     "policy_edit",
     // Permission grants and restrictions.
@@ -483,6 +489,19 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                     subject,
                 )));
             }
+            // A society-floor mutation is wider than a member grant, but has the same
+            // evidentiary shape: intent says it was attempted; the terminal event says it
+            // became durable. Never fold the pair into one row because, on a failed persist or
+            // terminal append, the surviving intent must stay visible without implying success.
+            "society_floor_intent" | "society_floor_added"
+            | "society_floor_remove_intent" | "society_floor_removed" => {
+                order.push(Row::OneShot(one_shot(
+                    e,
+                    LedgerKind::Permission,
+                    LedgerStatus::Recorded,
+                    s(d, "path"),
+                )));
+            }
             "appeal" | "adjudication" | "reversal" => {
                 let subject = s(d, "deny_hash")
                     .or_else(|| s(d, "claim_ref"))
@@ -820,6 +839,40 @@ mod tests {
         assert_eq!(rows[0].subject.as_deref(), Some("/repo/x"));
     }
 
+    /// The society floor is the widest permission surface on the box. Its attempts and
+    /// completions must each remain independently reviewable: folding an intent into its
+    /// terminal fact would make a failed durable mutation disappear from the ledger.
+    #[test]
+    fn society_floor_intents_and_terminal_facts_are_distinct_permission_rows() {
+        let rows = project(
+            &[
+                entry(1, 0, "society_floor_intent",
+                      serde_json::json!({"path": "/repo/shared"})),
+                entry(2, 10, "society_floor_added",
+                      serde_json::json!({"path": "/repo/shared", "intent": "hash1"})),
+                entry(3, 20, "society_floor_remove_intent",
+                      serde_json::json!({"path": "/repo/shared"})),
+                entry(4, 30, "society_floor_removed",
+                      serde_json::json!({"path": "/repo/shared", "intent": "hash3"})),
+            ],
+            T0 + 60,
+        );
+        assert_eq!(rows.len(), 4, "every intent and terminal fact is its own row");
+        assert!(rows.iter().all(|r| r.kind == LedgerKind::Permission));
+        assert!(rows.iter().all(|r| r.status == LedgerStatus::Recorded));
+        assert!(rows.iter().all(|r| r.subject.as_deref() == Some("/repo/shared")));
+        assert_eq!(
+            rows.iter().map(|r| r.event_type.as_str()).collect::<Vec<_>>(),
+            vec![
+                "society_floor_removed",
+                "society_floor_remove_intent",
+                "society_floor_added",
+                "society_floor_intent",
+            ],
+            "newest-first projection must retain all four event identities"
+        );
+    }
+
     /// Events that annotate an existing row rather than creating one. They are governance events —
     /// the ledger must read them — but a claim with no ask in the window is not itself a row.
     const ANNOTATION_ONLY: &[&str] = &["gate_escalation_claimed", "gate_escalation_corroborated"];
@@ -832,7 +885,7 @@ mod tests {
         for ev in GOVERNANCE_EVENTS.iter().filter(|e| !ANNOTATION_ONLY.contains(e)) {
             let data = serde_json::json!({
                 "escalation_id": "x", "request_id": "x", "plugin_id": "p",
-                "change": "c", "expires_at": T0 + 3600,
+                "change": "c", "path": "/repo/x", "expires_at": T0 + 3600,
             });
             if project(&[entry(1, 0, ev, data)], T0).is_empty() {
                 missing.push(*ev);

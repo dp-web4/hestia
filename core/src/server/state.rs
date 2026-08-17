@@ -238,6 +238,16 @@ const ESCALATION_REPLAY_SCAN: u64 = 5_000;
 
 /// The mutable core state passed to every request handler.
 pub struct ServerState {
+    /// Last accepted runtime reports from callers that connected to this daemon.
+    ///
+    /// These are A1 self-reports, not artifact attestation: a caller can assert a plugin id
+    /// and a capability. Omission intentionally preserves an earlier report because ordinary
+    /// clients do not carry gate metadata, so this map is historical within one daemon run:
+    /// it has no freshness/session/build binding and cannot prove what is loaded now. It still
+    /// answers a narrower question the daemon's build id cannot — whether a caller ever said
+    /// it understood a newly served field. #481 remains the integrity boundary for proving
+    /// which installed bytes made that report.
+    pub gate_capabilities: HashMap<String, HashSet<String>>,
     /// In-scope work awaiting attestation, keyed by (plugin_id, role_lct) → (allows, denies).
     ///
     /// WHY THIS EXISTS. Trust could only be earned two ways — be denied and comply, or be
@@ -565,6 +575,7 @@ impl ServerState {
         };
 
         let mut st = Self {
+            gate_capabilities: HashMap::new(),
             scope_tally: std::collections::HashMap::new(),
             vault,
             sessions: HashMap::new(),

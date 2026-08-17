@@ -221,6 +221,17 @@ impl Default for ReadBasis {
 /// deliberately `unknown`, not green: a daemon cannot claim freshness from its
 /// own build string alone.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GateEngineHealth {
+    /// `last-self-report-capable`, `partial`, or `unknown`.
+    pub state: String,
+    pub capability: String,
+    pub capable_members: Vec<String>,
+    pub unknown_members: Vec<String>,
+    pub reported_without_capability: Vec<String>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeploymentHealth {
     /// `current`, `stale`, or `unknown`.
     pub state: String,
@@ -228,6 +239,11 @@ pub struct DeploymentHealth {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_build: Option<String>,
     pub note: String,
+    /// The last gate-capability self-report accepted during this daemon run, distinct from
+    /// the daemon build above. This is A1 historical runtime evidence with no freshness,
+    /// session, identity, or build binding — not installed-byte attestation. #481 owns that
+    /// stronger claim.
+    pub gate_engine: GateEngineHealth,
 }
 
 fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
@@ -238,6 +254,7 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
             running_build,
             current_build: None,
             note: "deployment authority is not configured".into(),
+            gate_engine: GateEngineHealth::default(),
         };
     };
     let raw = match std::fs::read_to_string(path) {
@@ -248,6 +265,7 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
                 running_build,
                 current_build: None,
                 note: format!("cannot read deployment authority: {error}"),
+                gate_engine: GateEngineHealth::default(),
             };
         }
     };
@@ -259,6 +277,7 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
                 running_build,
                 current_build: None,
                 note: format!("deployment authority is invalid JSON: {error}"),
+                gate_engine: GateEngineHealth::default(),
             };
         }
     };
@@ -274,6 +293,7 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
             running_build,
             current_build: None,
             note: "deployment authority has no build_id".into(),
+            gate_engine: GateEngineHealth::default(),
         };
     };
     let current = current_build == running_build;
@@ -286,15 +306,60 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
         },
         running_build,
         current_build: Some(current_build),
+        gate_engine: GateEngineHealth::default(),
     }
 }
 
-fn deployment_health() -> DeploymentHealth {
-    deployment_health_from_path(
+fn deployment_health(state: &ServerState) -> DeploymentHealth {
+    let mut health = deployment_health_from_path(
         std::env::var_os("HESTIA_CURRENT_BUILD_FILE")
             .as_deref()
             .map(Path::new),
-    )
+    );
+    const CAPABILITY: &str = "society-floor:v1";
+    let mut capable_members = Vec::new();
+    let mut unknown_members = Vec::new();
+    let mut reported_without_capability = Vec::new();
+    let mut members = std::collections::BTreeSet::new();
+    members.extend(
+        state
+            .member_registry
+            .iter_sorted()
+            .into_iter()
+            .map(|(member, _)| member.clone()),
+    );
+    members.extend(state.gate_capabilities.keys().cloned());
+    for member in members {
+        match state.gate_capabilities.get(&member) {
+            Some(caps) if caps.contains(CAPABILITY) => capable_members.push(member),
+            Some(_) => reported_without_capability.push(member),
+            None => unknown_members.push(member),
+        }
+    }
+    let report_count = capable_members.len() + reported_without_capability.len();
+    let state_name = if !capable_members.is_empty()
+        && unknown_members.is_empty()
+        && reported_without_capability.is_empty()
+    {
+        "last-self-report-capable"
+    } else if report_count > 0 {
+        "partial"
+    } else {
+        "unknown"
+    };
+    health.gate_engine = GateEngineHealth {
+        state: state_name.into(),
+        capability: CAPABILITY.into(),
+        capable_members,
+        unknown_members,
+        reported_without_capability,
+        note: "last accepted A1 self-report during this daemon run; caller identity and bytes \
+               are not authenticated, omission preserves an earlier report, and there is no \
+               freshness/session/build binding — this does not prove what is currently loaded \
+               or installed; see #481"
+            .into(),
+    };
+    health
 }
 
 /// Identity + macro state of this Hestia society.
@@ -1296,7 +1361,7 @@ impl ServerState {
             standing_generation: self.standing_scope.generation,
             stats_unavailable: stats_read_error,
             recent_unavailable: recent_read_error,
-            deployment: deployment_health(),
+            deployment: deployment_health(self),
             instance_grants: {
                 let now = crate::server::gate_escalation::now_secs();
                 let mut v: Vec<serde_json::Value> = self
@@ -1407,6 +1472,41 @@ mod tests {
         let current = deployment_health_from_path(Some(&manifest));
         assert_eq!(current.state, "current");
         assert_eq!(current.current_build.as_deref(), Some(running));
+    }
+
+    #[test]
+    fn deployment_health_separates_daemon_build_from_last_gate_self_report() {
+        let (_dir, mut state) = make_state();
+        let unknown = deployment_health(&state);
+        assert_eq!(unknown.gate_engine.state, "unknown");
+
+        state.gate_capabilities.insert(
+            "codex".into(),
+            ["society-floor:v1".to_string()].into_iter().collect(),
+        );
+        state
+            .gate_capabilities
+            .insert("legacy-member".into(), std::collections::HashSet::new());
+        let partial = deployment_health(&state);
+        assert_eq!(partial.gate_engine.state, "partial");
+        assert_eq!(partial.gate_engine.capable_members, ["codex"]);
+        assert_eq!(
+            partial.gate_engine.reported_without_capability,
+            ["legacy-member"]
+        );
+
+        state.gate_capabilities.remove("legacy-member");
+        let capable = deployment_health(&state);
+        assert_eq!(capable.gate_engine.state, "last-self-report-capable");
+        assert!(
+            capable.gate_engine.note.contains("A1")
+                && capable.gate_engine.note.contains("#481")
+                && capable
+                    .gate_engine
+                    .note
+                    .contains("no freshness/session/build binding"),
+            "the dashboard must not launder a self-report into artifact attestation"
+        );
     }
 
     /// The snapshot must CARRY pending scope requests, and must drop the decided ones.
