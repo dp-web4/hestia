@@ -34,7 +34,7 @@ ask via hestia_request_scope). The remedy sentence is rendered from the core's R
 Exit codes (Kimi engine contract): 2 = block (stderr = reason); 0 = allow. Default is 2.
 
 Config (all env-overridable; defaults suit a generic install):
-  HESTIA_WORKSPACE       root that contains the granted repos      (default: ~/ai-workspace)
+  HESTIA_WORKSPACE       root that contains the granted repos      (set explicitly at install)
   HESTIA_SOCIETY_GATE    path to the society-safety gate caller     (default: $WORKSPACE/hestia/plugins/claude-code/hooks/pre_tool_use.py)
   HESTIA_KIMI_IDENTITY   the member's live identity.json            (default: ~/.kimi-code/hestia-instance/identity.json)
   HESTIA_KIMI_GATE_MODE  warn | enforce   (default: enforce — deny-tight, relax as trust accrues)
@@ -47,27 +47,24 @@ import sys
 import subprocess
 
 def _detect_workspace():
-    """WORKSPACE resolution that survives a wrong or absent env (2026-07-23, live: a session
-    launched before HESTIA_WORKSPACE landed in its hook config ran the gate against the
-    default ~/ai-workspace — every real-workspace path then read as 'outside the workspace'
-    (deny-everything) and the society-gate script resolved to a nonexistent file. A gate's
-    own config must not be able to poison its verdicts). Priority:
-      1. HESTIA_WORKSPACE env (explicit wins);
-      2. walk up from cwd to a dir that contains >=2 marker repos;
-      3. the historical default."""
+    """Resolve explicit install scope and otherwise fail narrow.
+
+    A public adapter cannot infer an operator's repository names or home layout. An
+    installer should set HESTIA_WORKSPACE. A .hestia-workspace marker is the portable
+    fallback; without either signal, cwd keeps sibling-repository grants inert.
+    """
     env = os.environ.get("HESTIA_WORKSPACE")
     if env and os.path.isdir(env):
         return env
-    markers = ("hestia", "shared-context", "web4", "private-context")
     d = os.getcwd()
     for _ in range(8):
-        if sum(os.path.isdir(os.path.join(d, m)) for m in markers) >= 2:
+        if os.path.isfile(os.path.join(d, ".hestia-workspace")):
             return d
         parent = os.path.dirname(d)
         if parent == d:
             break
         d = parent
-    return os.path.expanduser("~/ai-workspace")
+    return os.getcwd()
 
 
 WORKSPACE = _detect_workspace()
@@ -433,8 +430,7 @@ def deny(rule, reason, innate=False):
 
 # ---- Gate 1c: LOCAL SELF-PROTECTION (the governance surface) -------------------------
 #
-# Restored 2026-08-12 (PR #372 blocking note, remedy option (a); asked on-record by the branch
-# owner in forum/claude-code/reply-2001-option-a-go-ahead-kimi-authorized-2026-08-12.md). Before
+# Restored 2026-08-12 (PR #372 blocking note, remedy option (a), with operator approval). Before
 # a7cfb6c this gate reached the society verdict by SPAWNING the claude gate, whose main() runs a
 # local self-touch layer "before the daemon, and never conditional on it" — so a kimi act at the
 # governance surface was classified locally and its deny/escalation propagated through

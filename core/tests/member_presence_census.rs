@@ -15,7 +15,7 @@
 //! test preserves only the conditions under which that reading stays
 //! applicable. The reading itself is UNCONFIRMED the moment this file is the
 //! only thing you have checked — the same distinction
-//! `tools/workspace_root_test.py` learned as agreement vs. correctness
+//! the deployment checks learned as agreement vs. correctness
 //! (#75/#77): a gauge that enforces agreement is not a gauge that reports
 //! correctness.
 //!

@@ -151,8 +151,8 @@ priority map. Where this gate is the *only* layer is exactly where its weakest m
 
 The gate grants three roots on top of the member's MRH. They are design choices, not oversights:
 
-- `~/.gemini` — the member's own home (identity, state, config). Without it the gate would deny the
-  member reading its own identity.
+- `~/.gemini` — the member's own home (identity, state, config). The identity replica carries
+  continuity but does not authorize standing scope.
 - **`/tmp` and `/var/tmp`** — unconditional staging grant, so scratch work doesn't need a scope
   request. **On a shared host this is a cross-member channel**: anything gemini writes to `/tmp` is
   readable by every other member on the box, and anything they write there is reachable by gemini.
@@ -287,8 +287,8 @@ fail-open timeout behavior empirically (contract-read only).
 ```
 surface: gemini BeforeTool gate   act: allow/deny a foreign member's tool call (write/exec/read scope)
 S: med/reversible (a single denied-or-allowed tool call; irreversible egress is the high-stakes tail) [construct: MODE=enforce default]
-R: n/a — the gate does not authorize on reachability; it authorizes on MRH scope read from role-sourced identity [construct: load_in_scope]
-W: pass — scope comes from the member's identity (role-sourced, grant-time), not a hook-time editable input; society-safety defers to the witnessed claude-code governor [construct: Gate-2 delegation]
+R: n/a — the gate does not authorize on identity-file reachability; standing scope stays deny-tight until the shared daemon-policy consumer is wired [construct: load_in_scope]
+W: partial — the member-writable identity replica grants nothing; the explicit launch directory is session-local, and society-safety defers to the witnessed governor [constructs: load_in_scope, launch_cwd_repo, Gate-2 delegation]
 O: pass — the gate runs BeforeTool, before any side effect; a denied act leaves state bit-identical (the decision is emitted and the process exits, no mutation) [construct: deny/anomaly before sys.exit]
 A: n/a here — this is an enforcement point, not a ledger writer; witness/continuity is observe.sh + the governor's record [construct: observe.sh]
 V: present — egress/secret is an innate always-deny (the catastrophic-irreversible tail); operator holds the widen/veto [construct: deny(..., innate=True)]

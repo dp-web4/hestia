@@ -109,11 +109,10 @@ MIN_POLL_SLEEP_MS = 50
 # hooks to local fs (the 9p-migration pattern) could relocate the outer gate and silently
 # leave the fallback behind — and if the path is simply wrong, `invoke_legacy_fallback`
 # returns 0, so a missing fallback ALLOWS. Wrong-path and no-policy are indistinguishable
-# at the exit code. The default preserves the previous behaviour exactly.
-LEGACY_FALLBACK = os.environ.get(
-    "HESTIA_LEGACY_FALLBACK",
-    "/mnt/c/exe/projects/ai-agents/claude-code/plugins/web4-governance/hooks/pre_tool_use.py",
-)
+# at the exit code. The fallback is optional and must be configured explicitly by an
+# installer. An absent value preserves the primary gate's normal no-fallback behavior;
+# public source cannot name an operator-specific legacy checkout.
+LEGACY_FALLBACK = os.environ.get("HESTIA_LEGACY_FALLBACK", "")
 
 
 def debug_log(msg: str) -> None:
@@ -1063,7 +1062,7 @@ _GUARDED_HEADS = {
 # Per-head argument grammars (kimi-code, 2026-08-06; notices 1218 -> 1226 -> 1241)
 # ---------------------------------------------------------------------------
 #
-# The probe at `tools/kimi_read_only_mutation_probe_1218.py` measured that this classifier
+# A private deployment probe measured that this classifier
 # was head-only: adding `sed` to `_READ_ONLY_HEADS` admits `sed -i 's/a/b/' <gate>` in both
 # spellings and laundered through a `cd` segment — an in-place write indistinguishable, by
 # head, from the `sed -n` range-print the addition is for. "Add it to the list" is off the

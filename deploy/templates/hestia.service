@@ -28,7 +28,7 @@ Documentation=https://github.com/dp-web4/hestia
 # (-qx on tokenised lines, not a bare grep: `grep -q hestia.service` also
 # matches a unit merely *named* like it, e.g. myhestia.service.)
 # Packaged as install.sh:verify_service_linux — run it fleet-wide, and let it,
-# not deploy/fleet/ROSTER.md, define which machines are affected.
+# not a source-controlled operator roster, define which installations are affected.
 # Credit: pub (three-node model + detector), nomad (charge/detonator framing),
 # sprout (initial confirm).
 

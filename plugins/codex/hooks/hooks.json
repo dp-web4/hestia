@@ -1,5 +1,6 @@
 {
-  "_comment": "Hestia governance hooks for the Codex CLI occupant. Codex loads hooks from a hooks.json OR inline [[hooks.EVENT]] tables in ~/.codex/config.toml; both use this event structure. Requires [features] codex_hooks = true. The PreToolUse gate is FAIL-CLOSED (Codex fails open) and covers the SHELL tool ONLY — the filesystem boundary for out-of-scope repos is the sandbox (sandbox_mode = workspace-write). Commands bake HESTIA_WORKSPACE because the gate's default (~/ai-workspace) is wrong on this host; observe/hydrate default CODEX_HOME to ~/.codex.",
+  "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Codex CLI hooks. Codex loads hooks from a hooks.json or inline hook tables in its user configuration. Requires codex_hooks enabled. Replace both placeholders with verified absolute paths before installing; unrendered placeholders must never be deployed.",
+  "_paths_note": "Replace @HESTIA_WORKSPACE@ and @HESTIA_PLUGIN_ROOT@ at install time. The public repository carries no operator-specific workspace path.",
   "hooks": {
     "PreToolUse": [
       {
@@ -7,7 +8,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "HESTIA_WORKSPACE=/mnt/c/exe/projects/ai-agents python3 /mnt/c/exe/projects/ai-agents/hestia/plugins/codex/hooks/pre_tool_use.py",
+            "command": "HESTIA_WORKSPACE=@HESTIA_WORKSPACE@ python3 @HESTIA_PLUGIN_ROOT@/codex/hooks/pre_tool_use.py",
             "statusMessage": "hestia: scope + safety gate",
             "timeout": 15
           }
@@ -19,7 +20,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/mnt/c/exe/projects/ai-agents/hestia/plugins/codex/hooks/observe.sh",
+            "command": "@HESTIA_PLUGIN_ROOT@/codex/hooks/observe.sh",
             "timeout": 15
           }
         ]
@@ -31,7 +32,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/mnt/c/exe/projects/ai-agents/hestia/plugins/codex/hooks/observe.sh",
+            "command": "@HESTIA_PLUGIN_ROOT@/codex/hooks/observe.sh",
             "timeout": 10
           }
         ]
@@ -42,7 +43,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "HESTIA_WORKSPACE=/mnt/c/exe/projects/ai-agents /mnt/c/exe/projects/ai-agents/hestia/plugins/codex/hooks/hydrate.sh",
+            "command": "HESTIA_WORKSPACE=@HESTIA_WORKSPACE@ @HESTIA_PLUGIN_ROOT@/codex/hooks/hydrate.sh",
             "timeout": 20
           }
         ]

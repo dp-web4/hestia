@@ -44,7 +44,7 @@ Three gates, in order (Sprint F: self-protection first, then the ONE decision, t
      reaches the governor and is witnessed; its deny (or fail-closed-on-no-verdict) is honored.
 
 Config (all env-overridable; defaults suit a generic install):
-  HESTIA_WORKSPACE        root that contains the granted repos       (default: ~/ai-workspace)
+  HESTIA_WORKSPACE        root that contains the granted repos       (set explicitly at install)
   HESTIA_CODEX_IDENTITY   the member's live identity.json             (default: ~/.codex/hestia-instance/identity.json)
   HESTIA_CODEX_GATE_MODE  warn | enforce   (default: enforce — deny-tight, relax as trust accrues)
   HESTIA_CODEX_LAUNCH_CWD launch dir granted for the session          (default: os.getcwd())
@@ -56,27 +56,24 @@ import re
 import sys
 
 def _detect_workspace():
-    """WORKSPACE resolution that survives a wrong or absent env (2026-07-23, live: a session
-    launched before HESTIA_WORKSPACE landed in its hook config ran the gate against the
-    default ~/ai-workspace — every real-workspace path then read as 'outside the workspace'
-    (deny-everything) and the society-gate script resolved to a nonexistent file. A gate's
-    own config must not be able to poison its verdicts). Priority:
-      1. HESTIA_WORKSPACE env (explicit wins);
-      2. walk up from cwd to a dir that contains >=2 marker repos;
-      3. the historical default."""
+    """Resolve explicit install scope and otherwise fail narrow.
+
+    A public adapter cannot infer an operator's repository names or home layout. An
+    installer should set HESTIA_WORKSPACE. A .hestia-workspace marker is the portable
+    fallback; without either signal, cwd keeps sibling-repository grants inert.
+    """
     env = os.environ.get("HESTIA_WORKSPACE")
     if env and os.path.isdir(env):
         return env
-    markers = ("hestia", "shared-context", "web4", "private-context")
     d = os.getcwd()
     for _ in range(8):
-        if sum(os.path.isdir(os.path.join(d, m)) for m in markers) >= 2:
+        if os.path.isfile(os.path.join(d, ".hestia-workspace")):
             return d
         parent = os.path.dirname(d)
         if parent == d:
             break
         d = parent
-    return os.path.expanduser("~/ai-workspace")
+    return os.getcwd()
 
 
 WORKSPACE = _detect_workspace()
@@ -88,7 +85,7 @@ def _load_mechanism():
     """Import the SHARED society-safety mechanism (Sprint E — PRD §6.E, one transport).
 
     HISTORY (why there is no subprocess here). Gate 2 used to spawn the claude-code gate as a
-    subprocess (a 2760-line cold import, usually off the 9p /mnt/c mount) with a 2s budget under
+    subprocess (a 2760-line cold import, from a mounted workspace) with a 2s budget under
     codex's 3s hook clamp. Warm it answered in 194-336ms; cold 9p reads blew the budget, so codex
     was repeatedly blocked with `no policy verdict (daemon path failed)` while the daemon was up
     the whole time (2026-07-26, NRestarts=0). That subprocess spawn was the structural cost

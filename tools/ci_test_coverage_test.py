@@ -20,7 +20,7 @@ SEVEN of sixteen test-shaped files ran in no job at all --
     plugins/lib/tests/test_path_scope.py          (21 assertions, path scope)
     plugins/reviewer/test_discover_prs.py         (shipped ungated in #92)
     tools/shebang_exec_bit_test.py
-    tools/workspace_root_test.py
+    tools/public_boundary_test.py
 
 -- because the repo carries two naming conventions and each job's glob was
 blind to the other's.
