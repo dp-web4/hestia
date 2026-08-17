@@ -1,8 +1,8 @@
 # Device & Vault Lifecycle — spec draft
 
 **Status:** DRAFT (v0.1, 2026-07-10) · **Lane:** HUB · **Thread:** `hestia-device-vault-model`
-**Answers:** `shared-context/hestia/open-questions-vault-constellation-device-mgmt-2026-07-10.md`
-**Positions ratified in:** `shared-context/hestia/plan-device-vault-lifecycle-spec-2026-07-10.md`
+**Answers:** the device-vault questions promoted into this public document
+**Positions ratified in:** the maintainers' private planning record; this file is the public specification
 
 The principle throughout is the one already applied to orchestrator scope and the egress boundary:
 **trust and authority are specific and witnessed, not global and assumed.** This spec applies it one

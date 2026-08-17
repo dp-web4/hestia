@@ -127,15 +127,10 @@ priority map. Where this gate is the *only* layer is exactly where its weakest m
   no drift across adapters.
 - `hooks/observe.sh` — fire-and-forget observation (SessionStart / AfterTool), always exit 0.
 - `hooks/hydrate.sh` — identity persistence on SessionEnd, always exit 0.
-- `hooks/hooks.json` — the `hooks` block to merge into `~/.gemini/settings.json` (or ship in a Gemini
-  extension). Adjust the absolute paths per install.
-- `instance/identity.seed.json` — the seed identity (foreign member #3, honest 0.5 T3, zero
-  observations, `web4`-scoped MRH). Shape mirrors `plugins/codex` (substrate object, `mrh.scope_policy`
-  prose, `milestones`, `sessions`). Copied to `~/.gemini/hestia-instance/identity.json` on first run.
-  **`mrh.in_scope` is not hand-maintained** — hydrate regenerates it from
-  `private-context/infrastructure/repos.jsonl` (visibility==public) + shared-context + launch cwd, so
-  new public repos auto-grant and private stays denied-by-default (the current `hydrate.sh` here is a
-  minimal stub; porting the full codex regeneration is the tracked follow-up).
+- `hooks/hooks.json` — a non-runnable installation template. Prefer `install.sh`, which renders real
+  paths into user configuration and verifies that the governor exists.
+- `instance/identity.seed.json` — a generic seed with no relationships or scope. It is continuity
+  bootstrap, never policy authority.
 - `GEMINI.md` — the standing law the member reads natively (siblings CLAUDE.md / AGENTS.md). Deploy to
   the granted repo root and `~/.gemini/GEMINI.md`.
 
@@ -143,7 +138,7 @@ priority map. Where this gate is the *only* layer is exactly where its weakest m
 
 | Var | Meaning | Default |
 |---|---|---|
-| `HESTIA_WORKSPACE` | root holding the granted repos | `~/ai-workspace` (set per host in hooks.json) |
+| `HESTIA_WORKSPACE` | root holding candidate repos | required at install; never guessed |
 | `HESTIA_SOCIETY_GATE` | society-safety governor to delegate to | `$WORKSPACE/hestia/plugins/claude-code/hooks/pre_tool_use.py` |
 | `HESTIA_GEMINI_IDENTITY` | live identity.json | `~/.gemini/hestia-instance/identity.json` |
 | `HESTIA_GEMINI_GATE_MODE` | `warn` \| `enforce` | `enforce` (deny-tight; relax as trust accrues) |
@@ -168,19 +163,17 @@ The gate grants three roots on top of the member's MRH. They are design choices,
   task-specific launch dir is reachable without widening the standing grant.
 
 (Shared env names — `HESTIA_WORKSPACE`, `HESTIA_SOCIETY_GATE`, `HESTIA_FORBIDDEN_EXTRA`,
-`HESTIA_OBSERVE_DIR`, `HESTIA_REPO_REGISTRY` — and the per-member `HESTIA_GEMINI_*` prefix follow the
+`HESTIA_OBSERVE_DIR` — and the per-member `HESTIA_GEMINI_*` prefix follow the
 codex convention so nothing drifts across adapters.)
 
 ## Install
 
-1. Deploy `instance/identity.seed.json` → `~/.gemini/hestia-instance/identity.json`, then set
-   `mrh.in_scope` to the repos this member is granted. **Hand-editing is the truth today** — the seed's
-   `_note` describes the *target* state (hydrate regenerating `in_scope` from the repo registry, as
-   `plugins/codex` does), and that port has not landed here yet; this `hydrate.sh` is a stub. Until it
-   does, hand-edit, and re-check after the port so a hand-edit doesn't get silently overwritten.
-2. Deploy `GEMINI.md` → the granted repo root and `~/.gemini/GEMINI.md`.
-3. Merge `hooks/hooks.json`'s `hooks` block into `~/.gemini/settings.json`, fixing the absolute paths
-   and `HESTIA_WORKSPACE` for the host.
+1. Run `install.sh WORKSPACE`. It copies the runtime hooks locally, seeds continuity without grants,
+   and renders the actual hook commands into user configuration.
+2. Do not hand-edit `mrh.in_scope`: the identity file is not authority. Until this adapter completes
+   the global daemon-policy cutover, an absent certified scope must remain deny-tight rather than
+   acquiring a repository grant from a public seed.
+3. Deploy `GEMINI.md` → the granted repo root and `~/.gemini/GEMINI.md`.
 4. **Install at USER level (`~/.gemini/settings.json`), not project level.** Gemini gates
    Project-source hooks behind `isTrustedFolder()` — a project-scoped gate does not execute in an
    untrusted folder, i.e. it is absent exactly where you most want it.

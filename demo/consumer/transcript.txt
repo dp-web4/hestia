@@ -1,7 +1,7 @@
 
 ━━━ Hestia consumer demo ━━━
   HOME: /tmp/hestia-demo-dAlKwC
-  daemon: /mnt/c/exe/projects/ai-agents/hestia/core/target/debug/hestia
+  daemon: /workspace/hestia/core/target/debug/hestia
 
 ▸ 1. Initialize Hestia (vault + identity)
   ✓ Vault created at /tmp/hestia-demo-dAlKwC/vault.enc

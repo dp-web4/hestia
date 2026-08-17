@@ -40,7 +40,7 @@ import urllib.request
 
 MCP = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
 API = MCP.rsplit("/mcp", 1)[0]
-WORKSPACE = os.environ.get("HESTIA_WORKSPACE", "/mnt/c/exe/projects/ai-agents")
+WORKSPACE = os.environ.get("HESTIA_WORKSPACE")
 
 
 def _post(url, body, hdrs=None, timeout=20):
@@ -142,6 +142,9 @@ def main() -> int:
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
     if len(args) < 3:
         print(__doc__)
+        return 2
+    if not WORKSPACE:
+        print("HESTIA_WORKSPACE is required; the probe will not guess installation scope", file=sys.stderr)
         return 2
     gate, subject, rest = args[0], args[1], args[2]
     if "--json" in flags:

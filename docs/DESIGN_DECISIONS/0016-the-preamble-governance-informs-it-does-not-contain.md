@@ -190,8 +190,8 @@ Assessing whether `law_inject.py` is portable across engines requires reading it
 refusals, two minutes apart:
 
 ```
-grep … /home/dp/.claude/hooks/hestia/law_inject.py
-  -> deny [gate-self-access]  marker '/home/dp/.claude/hooks/hestia'
+grep … /home/member/.claude/hooks/hestia/law_inject.py
+  -> deny [gate-self-access]  marker '/home/member/.claude/hooks/hestia'
 
 git show origin/main:plugins/claude-code/hooks/law_inject.py | grep …
   -> deny [gate-self-access]  marker 'plugins/claude-code/hooks'

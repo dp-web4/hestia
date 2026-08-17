@@ -820,7 +820,7 @@ mod tests {
         // segment and a FOURTH segment (`&& git log`) follows the opener on the same line
         // before the body arrives at the newline. A projection that got segment ownership
         // wrong would still pass every row above and fail here.
-        let cmd = "cd /mnt/c/exe/projects/ai-agents/hestia/.wt/claude-unevaluable \
+        let cmd = "cd /workspace/hestia/.wt/review-unevaluable \
                    && git add core/src/server/handler.rs tools/ladder.py \
                    && git -c user.name=\"Dennis Palatov\" -c user.email=\"dp@dpcars.net\" \
                    commit -q -F - <<'MSG' && git log --oneline -1\n\

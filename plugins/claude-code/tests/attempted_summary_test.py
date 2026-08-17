@@ -111,7 +111,7 @@ def test_the_path_fallback_is_redacted_too():
     redaction at all. Lower risk than a command — paths, not contents — but a path can BE the
     secret (`~/.ssh/id_ed25519`), and an inconsistent rule is one a reader cannot rely on."""
     m = _load_hook()
-    out = m._attempted_summary("Read", {"file_path": "/home/dp/.ssh/id_ed25519"})
+    out = m._attempted_summary("Read", {"file_path": "/home/member/.ssh/id_ed25519"})
     check("path_fallback_redacts", "REDACTED" in out,
           f"credential path echoed into the record verbatim: {out!r}")
 

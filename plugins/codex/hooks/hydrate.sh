@@ -54,36 +54,9 @@ ident.setdefault("sessions", []).append(
     {"n": ident["session_count"], "id": sid, "ended": now, "acts_observed": acts})
 ident["sessions"] = ident["sessions"][-50:]  # bounded
 
-# Refresh the MRH base grant from the repo registry: base = ALL public repos + granted private
-# exceptions (shared-context, memory, private-context), PLUS the launch cwd (handled live in the gate). PRESERVE accrued
-# private grants (trust-earned widening). Fail-soft: no readable registry -> leave in_scope untouched.
-PRIVATE_EXCEPTIONS = {"shared-context", "memory", "private-context"}
-REGISTRY = os.environ.get("HESTIA_REPO_REGISTRY") or os.path.join(
-    os.environ.get("HESTIA_WORKSPACE", os.path.expanduser("~/ai-workspace")),
-    "private-context", "infrastructure", "repos.jsonl")
-try:
-    public = set()
-    for line in open(REGISTRY, encoding="utf-8"):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            r = json.loads(line)
-        except Exception:
-            continue
-        name = r.get("name") or r.get("repo") or r.get("dir")
-        vis = str(r.get("visibility") or r.get("access")
-                  or ("public" if r.get("public") else "")).lower()
-        if name and vis == "public":
-            public.add(name)
-    if public:  # only rewrite if the registry actually parsed public entries
-        allowed_base = public | PRIVATE_EXCEPTIONS
-        base = {f"repo:{n}" for n in allowed_base}
-        cur = (ident.get("mrh", {}) or {}).get("in_scope", []) or []
-        accrued = [s for s in cur if s.split(":", 1)[-1] not in allowed_base]  # trust-earned private grants
-        ident.setdefault("mrh", {})["in_scope"] = sorted(base | set(accrued))
-except FileNotFoundError:
-    pass
+# This hook owns continuity only. It must not derive or mutate authorization
+# from a repository inventory. Scope is supplied by the daemon's vault-backed
+# policy snapshot; the identity file is a bounded, non-authoritative replica.
 
 json.dump(ident, open(ident_p, "w", encoding="utf-8"), indent=2)
 

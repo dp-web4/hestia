@@ -27,13 +27,10 @@ DEFAULT_VERSION="v0.0.3"
 VERSION="${HESTIA_VERSION:-$DEFAULT_VERSION}"
 HESTIA_HOME="${HESTIA_HOME:-$HOME/.hestia}"
 HESTIA_BIND="${HESTIA_BIND:-127.0.0.1:7711}"
-# Detect rather than assume: this fleet is WSL + Linux + macOS with three different
-# layouts, and a hardcoded path is wrong on two thirds of it.
-if [ -z "${HESTIA_WORKSPACE:-}" ]; then
-  for _ws in /mnt/c/exe/projects/ai-agents "$HOME/ai-workspace" "$HOME/ai-agents" "$HOME/repos"; do
-    [ -d "$_ws/hestia" ] && HESTIA_WORKSPACE="$_ws" && break
-  done
-fi
+# Never infer an installation's repository layout from developer machines.
+# A checkout install may set this explicitly; release installs may leave it
+# absent, in which case inventory reports the scope as unknown rather than guess.
+HESTIA_WORKSPACE="${HESTIA_WORKSPACE:-}"
 BIN_DIR="$HOME/.local/bin"
 BIN_PATH="$BIN_DIR/hestia"
 
@@ -190,11 +187,8 @@ Type=simple
 ExecStart=/bin/sh -c 'HESTIA_PASSPHRASE="\$(cat %h/.hestia/.passphrase)" exec %h/.local/bin/hestia serve --bind ${HESTIA_BIND}'
 Environment=HESTIA_HOME=%h/.hestia
 Environment=RUST_LOG=warn
-# The workspace the daemon hands to agent-inventory when the dashboard asks for the
-# read list. Without it the inventory falls back to a compiled-in default that is only
-# correct on the machine it was written on, and — correctly — degrades its whole report
-# to UNKNOWN rather than reporting OK off a guess (thor, agent-inventory review §5).
-# Per-machine: WSL boxes use /mnt/c/exe/projects/ai-agents, Linux boxes ~/ai-workspace.
+# Optional workspace handed to agent-inventory for the dashboard read list. An
+# empty value is not authority; inventory reports inference/unknown explicitly.
 Environment=HESTIA_WORKSPACE=${HESTIA_WORKSPACE}
 NoNewPrivileges=true
 ProtectSystem=strict

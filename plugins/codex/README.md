@@ -39,8 +39,8 @@ So governance is **defense in depth**, each layer covering different acts:
 ## Files
 - `hooks/pre_tool_use.py` — the fail-closed shell gate (scope + egress + society-safety).
 - `hooks/observe.sh` — fire-and-forget witness (SessionStart/PostToolUse/SessionEnd), always exit 0.
-- `hooks/hydrate.sh` — SessionEnd identity hydration + registry-driven scope refresh.
-- `hooks/hooks.json` — the Codex hooks manifest (portable declaration).
+- `hooks/hydrate.sh` — SessionEnd continuity hydration. It never writes authorization.
+- `hooks/hooks.json` — an installation template; the installer must render absolute runtime paths.
 - `instance/identity.seed.json` — the foreign-Codex identity seed (SAGE pattern).
 - `AGENTS.md` — the occupant's standing-law file (deployed to `~/.codex/AGENTS.md`).
 

@@ -540,7 +540,7 @@ impl Escalation {
     /// `{escalation_id, status, witnessEntryHash}`.
     ///
     /// That is the surface that decides. Censused over 111,620 chain entries
-    /// (`tools/cbp_invitation_census_1304.py`): of 210 decided escalations, **207 came through
+    /// (private deployment census): of 210 decided escalations, **207 came through
     /// `operator_session` and 3 through `peer_member`**. So the remedy landed on the path used
     /// 3 times and skipped the path used 207 times, and every `sovereign_plus_peer` decision on
     /// the chain — 72 of them, `bar_met` true on ZERO — was reported to its decider as a bare
@@ -1023,7 +1023,7 @@ impl EscalationStore {
     /// blocker"*: `bar_met` for `SovereignPlusPeer` stopped requiring the peer conjunct, and
     /// the peer half was retained *as evidence* through `invited_peers` /
     /// `peer_participation()`. The removal shipped. The evidence did not. Censused over
-    /// 111,620 chain entries (`tools/cbp_invitation_census_1304.py`): `invited_peers` had NO
+    /// 111,620 chain entries (private deployment census): `invited_peers` had NO
     /// production writer — `open()` and `rehydrate()` both set `Vec::new()`, and the only
     /// assignment in the crate was inside a test — and **0 of 317 `gate_escalation_opened`
     /// payloads carried any key naming a peer**. So the record could not tell *invited and
@@ -1762,7 +1762,7 @@ mod tests {
     /// #219 added `bar`/`bar_met`/`permits_write` to the MCP arbitrate reply. The operator
     /// HTTP reply kept returning `{escalation_id, status, witnessEntryHash}` — and that is
     /// the surface that rules: 207 of 210 decided escalations on this chain came through
-    /// `operator_session`, 3 through `peer_member` (`tools/cbp_invitation_census_1304.py`).
+    /// `operator_session`, 3 through `peer_member` (private deployment census).
     ///
     /// This exercises `decision_reply` directly. It does NOT drive the axum route, so it
     /// proves the shared answer is correct, not that the route calls it —

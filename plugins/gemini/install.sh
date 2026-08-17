@@ -1,21 +1,26 @@
 #!/usr/bin/env bash
 # Deploy the hestia gemini governance adapter for a live gemini-cli member.
 #
-# Copies the gate + its shared lib to EXT4 (the only fail-open surface on gemini's engine is a hook
-# TIMEOUT, and a 9p /mnt/c cold-load can exceed it), seeds the member identity + standing law, and
+# Copies the gate + its shared lib to a local runtime directory (the only fail-open surface on
+# gemini's engine is a hook timeout), seeds the member identity + standing law, and
 # wires the BeforeTool gate into ~/.gemini/settings.json at USER level (project-source hooks are gated
 # behind isTrustedFolder()). Idempotent: re-run to redeploy after the repo changes.
 #
 # Usage: install.sh [WORKSPACE] [EXT4_DEST]
-#   WORKSPACE  repo root the member is granted within (default: /mnt/c/exe/projects/ai-agents)
-#   EXT4_DEST  ext4 dir to hold the runnable copy      (default: ~/.gemini/hestia-plugins)
+#   WORKSPACE  repo root the member is granted within (required unless HESTIA_WORKSPACE is set)
+#   EXT4_DEST  local dir to hold the runnable copy     (default: ~/.gemini/hestia-plugins)
 set -euo pipefail
 
-WORKSPACE="${1:-/mnt/c/exe/projects/ai-agents}"
+WORKSPACE="${1:-${HESTIA_WORKSPACE:-}}"
 EXT4_DEST="${2:-$HOME/.gemini/hestia-plugins}"
 SRC="$(cd "$(dirname "$0")/.." && pwd)"          # hestia/plugins
 GEMINI_HOME="$HOME/.gemini"
 GOVERNOR="$WORKSPACE/hestia/plugins/claude-code/hooks/pre_tool_use.py"
+
+[ -n "$WORKSPACE" ] || {
+  echo "[install] FATAL: pass WORKSPACE or set HESTIA_WORKSPACE; public installers do not guess host layout" >&2
+  exit 2
+}
 
 echo "[install] source=$SRC  workspace=$WORKSPACE  ext4=$EXT4_DEST"
 [ -f "$GOVERNOR" ] || { echo "[install] FATAL: society governor not found at $GOVERNOR" >&2; exit 1; }

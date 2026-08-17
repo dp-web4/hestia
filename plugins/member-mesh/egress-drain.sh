@@ -22,38 +22,15 @@ ENDPOINT="${HESTIA_ENDPOINT:-http://127.0.0.1:7711/mcp}"
 # drain causes, so it is a name a reader can hold responsible — not a member id
 # borrowed from whoever happened to start the script.
 DRAIN_PLUGIN_ID="${EGRESS_DRAIN_PLUGIN_ID:-egress-drain}"
-HUB_MESH_ENV="${HUB_MESH_ENV:-$HOME/.config/hub-mesh.env}"
 LOG="${EGRESS_DRAIN_LOG:-$HOME/.local/state/hestia-mesh/egress-drain.log}"
 mkdir -p "$(dirname "$LOG")"
 say() { echo "[$(date -u +%FT%TZ)] $*" | tee -a "$LOG"; }
 
 # --- locating hub-notify ------------------------------------------------------
-# This used to be one hardcoded default, the WSL layout. The fleet has three:
-# WSL /mnt/c/exe/projects/ai-agents/..., Legion ~/ai-workspace/..., Darwin
-# ~/repos/.... On any host but the first, that default named a path that does not
-# exist, bash returned 127, and 127 is non-zero, so the row took the RETAIN arm
-# below and logged "still pending" — every tick, forever. A misconfiguration that
-# can never succeed was rendered in the log as patience, and the queue only grows.
-#
-# Resolution order: explicit env wins; then whatever the host's hub-mesh.env
-# declares (the same file hub-notify.sh itself reads, so a host that has already
-# configured the mesh does not configure it twice); then the known layouts.
-resolve_hub_notify() {
-  local c
-  if [ -n "${HUB_NOTIFY:-}" ]; then printf '%s' "$HUB_NOTIFY"; return; fi
-  if [ -r "$HUB_MESH_ENV" ]; then
-    # Subshell: the env file is a fleet config, not our namespace to inherit.
-    c="$( . "$HUB_MESH_ENV" >/dev/null 2>&1; printf '%s' "${HUB_NOTIFY:-}" )"
-    if [ -n "$c" ]; then printf '%s' "$c"; return; fi
-  fi
-  for c in "$HOME/repos/private-context/hub-mesh/hub-notify.sh" \
-           "$HOME/ai-workspace/private-context/hub-mesh/hub-notify.sh" \
-           "/mnt/c/exe/projects/ai-agents/private-context/hub-mesh/hub-notify.sh"; do
-    if [ -x "$c" ]; then printf '%s' "$c"; return; fi
-  done
-  printf '%s' ""
-}
-HUB_NOTIFY="$(resolve_hub_notify)"
+# The forwarding command is installation policy. Hestia therefore accepts one
+# explicit executable path and never searches private repositories or guesses a
+# host layout. A missing value is a visible configuration error.
+HUB_NOTIFY="${HESTIA_HUB_NOTIFY:-${HUB_NOTIFY:-}}"
 
 # Refuse to drain against a notifier we cannot invoke. An absent or non-executable
 # hub-notify is a CONFIG error, not an unreachable hub: no number of retries fixes
@@ -63,7 +40,7 @@ HUB_NOTIFY="$(resolve_hub_notify)"
 # drain is working.
 preflight_notifier() {
   if [ -z "$HUB_NOTIFY" ]; then
-    say "CONFIG    no hub-notify found. Set HUB_NOTIFY, or declare it in $HUB_MESH_ENV. \
+    say "CONFIG    no hub-notify configured. Set HESTIA_HUB_NOTIFY. \
 Not draining: an absent notifier cannot succeed on retry, and treating it as a transient \
 failure parks every forward forever while the log reports patience."
     exit 78

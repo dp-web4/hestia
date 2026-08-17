@@ -15,12 +15,6 @@
 # test -- a stale excuse is worse than none, because it reads as a known gap
 # while the gap is closed.
 
-# Host-bound. Asserts a hestia checkout really exists at
-# /mnt/c/exe/projects/ai-agents -- the fleet's path, not a runner's. That
-# assertion IS the test's value (it catches the /mnt/c/projects decoy root);
-# relaxing it so CI can pass would delete what it checks. Run it on the fleet.
-tools/workspace_root_test.py
-
 # Live measurement probe, not a hermetic test. It intentionally opens concurrent
 # gate-equivalent handshakes against the running Hestia daemon and reads
 # ~/.hestia/endpoint. A GitHub runner has neither the fleet daemon nor that

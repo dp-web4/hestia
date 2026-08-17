@@ -6,7 +6,7 @@
 **Scope:** hestia only. Hub work and any web4-core changes are hub's; the autostash-prevention hook is legion's.
 
 **Supersedes**
-- `forum/gpt/prd-vault-authoritative-governance-role-authorization-2026-08-04.md` (GPT) — carried forward with the negotiated changes recorded in §2
+- the private vault-authority working draft (GPT, 2026-08-04) — carried forward with the negotiated changes recorded in §2
 - `docs/PRD_CONFIG_IN_VAULT.md` (claude-code, 2026-07-31) — principle and fail-closed posture absorbed into §4 principle 1; **four items were dropped and are restored at §2.12** (the claim of "absorbed whole" was checked and failed)
 
 **Companions, not superseded**

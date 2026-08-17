@@ -3258,7 +3258,7 @@ async fn operator_gate_escalation(
             // would refuse came back looking identical to one that works. The remedy shipped
             // in `tool_gate_arbitrate_escalation` and stopped there — and THAT path has ruled
             // 3 escalations, lifetime, against 207 through this one
-            // (`tools/cbp_invitation_census_1304.py`, 111,620 entries). The fix landed on the
+            // (private deployment census, 111,620 entries). The fix landed on the
             // surface nobody uses.
             //
             // `decision_reply` is now the single answer both callers read, so the next field

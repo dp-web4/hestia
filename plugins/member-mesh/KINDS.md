@@ -5,9 +5,8 @@
 > `review.request`, `review.request.pr`, `review.done`. A specialization needs no
 > vocabulary edit — it is already accepted by whoever accepts its parent.
 > `pr_review_request` was never a peer of `review`; it is a subset of it, and the
-> flat list could not express that. Fleet-side implementation and the migration
-> rule: `private-context/hub-mesh/KINDS` + `hub-notify.sh`/`hub-watch.sh`
-> (`kind_allowed`), tested in `hub-mesh/tests/kind_matching_test.sh`.
+> flat list could not express that. A hub transport may use the same prefix rule,
+> but its configuration and tests belong to that installation, not this repository.
 >
 > This table is the local (member↔member) vocabulary. It called itself a "mirror"
 > of the fleet list while diverging from it — this one had `review_request`, the

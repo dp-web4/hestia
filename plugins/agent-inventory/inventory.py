@@ -140,27 +140,14 @@ try:
 except ModuleNotFoundError:  # <3.11 — TOML harnesses degrade to UNKNOWN, not to clean
     tomllib = None
 
-DEFAULT_WORKSPACE = "/mnt/c/exe/projects/ai-agents"
-
-
 def resolve_workspace(argv: list[str]) -> tuple[Path, str]:
     """Where the workspace came from, as well as what it is.
 
-    SCOPE MUST SURVIVE THE TRIGGER (thor, 2026-07-26). `install.sh` wires three triggers
-    and baked the workspace into exactly ONE of them — `Environment=` in the timer unit.
-    A systemd unit's environment is not the shell's and not the hook's, so on Thor the
-    hourly timer read `/home/dp/ai-workspace` while `hestia-agent-inventory --brief` from
-    a terminal AND the SessionStart hook both fell back to the compiled-in CBP default and
-    returned:
-
-        UNKNOWN | agent-atlas registry not readable at /mnt/c/exe/projects/ai-agents/...
-
-    Two of the three triggers were inert on every machine that is not CBP. This degraded
-    honestly — rule 4 doing its job, UNKNOWN and not OK — but an on-demand check that
-    cannot answer is not much better than one that answers wrong, and the SessionStart
-    trigger exists precisely so a session opens KNOWING. So the workspace is now an
-    explicit `--workspace` argument that install.sh writes into all three call sites, and
-    the resolution order is reported rather than assumed.
+    SCOPE MUST SURVIVE THE TRIGGER. A service's environment is not the shell's and not
+    the hook's, so installers must write the resolved workspace into every trigger.
+    There is deliberately no compiled-in installation path. An explicit argument or
+    environment wins; otherwise we infer only from a checkout containing this plugin and
+    report that inference so callers can treat it as weaker evidence.
     """
     for i, a in enumerate(argv):
         if a == "--workspace" and i + 1 < len(argv):
@@ -169,13 +156,19 @@ def resolve_workspace(argv: list[str]) -> tuple[Path, str]:
             return Path(a.split("=", 1)[1]), "argv"
     if "HESTIA_WORKSPACE" in os.environ:
         return Path(os.environ["HESTIA_WORKSPACE"]), "env"
-    return Path(DEFAULT_WORKSPACE), "default"
+    cwd = Path.cwd().resolve()
+    for candidate in (cwd, *cwd.parents):
+        if (candidate / "hestia" / "plugins" / "agent-inventory").is_dir():
+            return candidate, "checkout-inference"
+        if (candidate / "plugins" / "agent-inventory").is_dir():
+            return candidate.parent, "checkout-inference"
+    return cwd, "cwd-unverified"
 
 
 # Rebound in main() once argv is known. Module scope keeps the import-time shape for
 # anything that reads these directly.
 WORKSPACE = resolve_workspace([])[0]
-WORKSPACE_SOURCE = "default"
+WORKSPACE_SOURCE = "cwd-unverified"
 ATLAS = WORKSPACE / "agent-atlas" / "talk-to"
 PLUGINS = WORKSPACE / "hestia" / "plugins"
 HOME = Path.home()
@@ -1188,8 +1181,8 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
                     rec["findings"].append(
                         f"FRAGILE: hook target under /tmp, cleared on reboot "
                         f"{where} -> {target}")
-                elif "/mnt/c/" in target:
-                    # MECHANISM CORRECTED 2026-07-26 (CBP), because the previous wording made
+                elif re.match(r"^/mnt/[A-Za-z]/", target):
+                    # MECHANISM CORRECTED after measurement, because the previous wording made
                     # a quantitative claim and measurement refuted it. Old text: "cold-load can
                     # exceed the hook timeout". Measured on CBP with the Linux page cache
                     # dropped between runs:
@@ -1199,7 +1192,8 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
                     # on the strength of that sentence, and none of us had measured it — the
                     # claim was load-bearing and untested.
                     #
-                    # The finding SURVIVES on a different mechanism. What bites on WSL2 is not
+                    # The finding SURVIVES on a different mechanism. What bites on a host-mounted
+                    # filesystem is not
                     # slow steady-state cold-load, it is tail latency: the 9p mount can stall
                     # (host FS contention, Defender, a sleeping host), and a stall is UNBOUNDED,
                     # so no timeout margin protects against it. A 20x median margin says nothing
@@ -1498,7 +1492,7 @@ def main() -> int:
     # the ref makes that visible rather than silently wrong.
     scope = {
         "workspace": str(WORKSPACE),
-        "workspace_source": WORKSPACE_SOURCE,      # argv | env | default
+        "workspace_source": WORKSPACE_SOURCE,      # argv | env | checkout-inference | cwd-unverified
         # Where the list of agent ids came from, and whether it was the whole list. A
         # fleet dashboard differencing machines needs this to tell "McNugget has no codex"
         # from "McNugget never looked for one".
@@ -1547,11 +1541,11 @@ def main() -> int:
     unknowns = sorted({u for r in recs for u in r["unknown"]})
     if enumeration_gap:
         unknowns.append(enumeration_gap)
-    if WORKSPACE_SOURCE == "default":
+    if WORKSPACE_SOURCE in {"checkout-inference", "cwd-unverified"}:
         unknowns.append(
             f"workspace neither passed as --workspace nor set in HESTIA_WORKSPACE — "
-            f"fell back to the compiled-in default {WORKSPACE}, which is only correct "
-            "on the machine it was written on")
+            f"used {WORKSPACE_SOURCE} at {WORKSPACE}; pass an explicit workspace before "
+            "treating the inventory as complete")
     if REGISTRY.degraded:
         unknowns.append(REGISTRY.degraded)
     drifted = hook_timeout_finding()

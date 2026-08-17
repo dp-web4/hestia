@@ -109,10 +109,10 @@ the path that just failed. That class does not become unappealable — it takes 
 (plane E), and appeals reference it. Unavailability degrades the evidence; it does not remove the
 right to appeal.
 
-> **Open dependency: plane E has never recorded** (kimi, 1649). Measured the same day
-> (`forum/claude-code/plane-e-has-never-recorded-2026-08-07.md`): three independent reasons — the
-> recorder is absent from the installed gate, its import is unresolvable off-repo, and the
-> destination directory is never created — plus a latent wrong-`HESTIA_HOME` bug. The *principle*
+> **Open dependency: plane E had not recorded in the reference deployment when this decision was
+> written.** The private operational evidence identified three independent reasons: the recorder
+> was absent from the installed gate, its import was unresolvable off-repo, and the destination
+> directory was never created — plus a latent wrong-`HESTIA_HOME` bug. The *principle*
 > stands. But the state machine's totality **in the unrecordable-denial case is aspirational until
 > plane E records once from an installed seat**, and this decision should not be read as claiming
 > otherwise. By this document's own standard, a criterion satisfiable by prose is not satisfied.

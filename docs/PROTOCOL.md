@@ -7,7 +7,7 @@ is canonically specified outside this repo:
 - **Changelog**: [`web4/web4-standard/core-spec/presence-protocol-CHANGELOG.md`](https://github.com/dp-web4/web4/blob/main/web4-standard/core-spec/presence-protocol-CHANGELOG.md)
 - **Schemas**: [`web4/web4-standard/schemas/presence-protocol/`](https://github.com/dp-web4/web4/tree/main/web4-standard/schemas/presence-protocol)
 - **Conformance vectors**: [`web4/web4-standard/testing/conformance/presence-protocol-conformance.json`](https://github.com/dp-web4/web4/blob/main/web4-standard/testing/conformance/presence-protocol-conformance.json)
-- **PR checklist for changes**: [`shared-context/protocol-discipline/PR_CHECKLIST.md`](https://github.com/dp-web4/shared-context/blob/main/protocol-discipline/PR_CHECKLIST.md) (private repo — Metalinxx contributors)
+- **PR checklist for changes**: the repository pull-request template and required CI checks; private operator process may add controls but cannot weaken these public requirements
 
 Hardbound (private) and Hestia (this repo) both speak this same
 protocol — same wire format, same error envelope, same tool surface.

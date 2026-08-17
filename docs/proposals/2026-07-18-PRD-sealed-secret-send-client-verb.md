@@ -45,7 +45,7 @@ transfer (secrets are small — cap e.g. 8 KB); key management beyond using the 
    arbitrary peer pubkey or only to the hub; if only-hub, add `seal_to_peer(recipient_pubkey, body)`.
    *(Open crypto detail for Legion: Ed25519 identity vs X25519 sealing key — derive or require an
    X25519 key per member.)*
-2. **New kind `secret`** added to `private-context/hub-mesh/KINDS` (single source; both send gate and
+2. **New kind `secret`** added to the installation's hub-mesh vocabulary (single source; both send gate and
    `hub-watch` receive allowlist read it — do not edit the scripts). Without this, the drain is
    consume-once and would silently destroy the notice (the 2026-07-15 drop incident).
 3. **Delivery as `SealedNotice`.** The sealed body rides the mailbox envelope, not a `referenced_act`

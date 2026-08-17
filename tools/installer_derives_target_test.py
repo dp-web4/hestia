@@ -8,7 +8,7 @@ each member's declared `install.dest`. Three of four members declared correctly.
 three hooks were registered and enforcing from a `hestia-plugins` subtree. The
 installer therefore printed:
 
-    SKIP  gemini — /home/dp/.gemini/hooks does not exist (member not installed on this host)
+    SKIP  gemini — /home/member/.gemini/hooks does not exist (member not installed on this host)
 
 about a member that was fully installed and currently enforcing, and would have
 left its gate stale indefinitely while reporting the member absent. A declared

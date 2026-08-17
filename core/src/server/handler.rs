@@ -1226,7 +1226,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     // BYTE-IDENTICAL to genuinely evaluating a command and permitting it.
     //
     // Measured against the live daemon 2026-08-07
-    // (`tools/claude_evaluator_reachability_ladder.py`, controls both ways):
+    // (private deployment probe, controls both ways):
     // `rm -rf / --no-preserve-root` is DENIED at `parameters.command` and ALLOWED at
     // `tool_input.command`. Same string, same binary, same vault, same rules — the
     // verdict decided by the spelling of the envelope around it.
@@ -12469,7 +12469,7 @@ mod appeal_tests {
                 "plugin_id": subject_in_payload,
                 "tool_name": "Edit",
                 "marker": "<governance-surface marker>",
-                "gate_path": "/home/dp/.claude/hooks/<gate>",
+                "gate_path": "/home/member/.claude/hooks/<gate>",
                 "severity": "escalate",
             },
         })).await.unwrap();
@@ -14214,7 +14214,7 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // blocker"* — and shipped only the removal. `bar_met` for `SovereignPlusPeer` stopped
     // requiring the peer conjunct; the peer half was to survive *as evidence* through
     // `invited_peers`/`peer_participation()`. Nothing wrote it. Censused over 111,620 chain
-    // entries (`tools/cbp_invitation_census_1304.py`): 0 of 317 `gate_escalation_opened`
+    // entries (private deployment census): 0 of 317 `gate_escalation_opened`
     // payloads carried any key naming a peer, and all 72 `sovereign_plus_peer` escalations
     // had `bar_met` false. So what landed was a blocker's removal with nothing standing where
     // the invitation was, and a record that cannot distinguish INVITED-AND-ABSENT from
