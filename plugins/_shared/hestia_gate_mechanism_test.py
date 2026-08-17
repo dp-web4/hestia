@@ -215,6 +215,50 @@ def test_standing_grant_becomes_admitting_scope_with_certification():
             os.environ["HESTIA_WORKSPACE"] = old_ws
 
 
+def test_society_floor_is_uniform_and_admitting_for_two_members():
+    """The same daemon floor reaches two different members byte-for-byte, including a
+    member with no personal grant, and both gates use the shared path mapping to admit it."""
+    import hestia_gate_core as core
+    ws = _fake_workspace()
+    old = os.environ.get("HESTIA_WORKSPACE")
+    os.environ["HESTIA_WORKSPACE"] = ws
+    try:
+        floor_path = ws + "/web4"
+        digest = "a" * 64
+        fake = _std_stub(ws, standing=[{"path": ws + "/hestia"}], generation=9)
+        fake.extra["hestia_scope_status"]["society_floor"] = [
+            {"path": floor_path, "added_by": "operator", "reason": "common surface"}
+        ]
+        fake.extra["hestia_scope_status"]["society_floor_digest"] = digest
+        m._discover_endpoint = lambda: "http://fake/mcp"
+        m._McpHttp = lambda ep, dl: fake
+        kimi = m.fetch_policy_snapshot("kimi-code", use_cache=False)
+        codex = m.fetch_policy_snapshot("codex", use_cache=False)
+
+        check("floor_identical", kimi["society_floor"] == codex["society_floor"],
+              f"kimi={kimi} codex={codex}")
+        check("floor_digest_identical",
+              kimi["society_floor_digest"] == codex["society_floor_digest"] == digest,
+              f"kimi={kimi} codex={codex}")
+        check("floor_maps_for_both",
+              "web4" in kimi["in_scope"] and "web4" in codex["in_scope"],
+              f"kimi={kimi} codex={codex}")
+        # Codex has no personal grant in the daemon response; the floor alone still admits.
+        codex["standing_grants"] = []
+        codex["scope_grants"] = []
+        profile = core.HarnessProfile(member_id="codex",
+                                      identity_path="/nonexistent/identity.json")
+        policy = core.resolve_agent_policy(profile, vault_reader=lambda mid: codex)
+        check("zero_personal_still_admits_floor",
+              core.path_in_scope(floor_path + "/src/lib.rs", policy.scope, ws, profile, None),
+              str(policy))
+    finally:
+        if old is None:
+            os.environ.pop("HESTIA_WORKSPACE", None)
+        else:
+            os.environ["HESTIA_WORKSPACE"] = old
+
+
 def _std_stub(ws, live=None, standing=None, generation=1, horizon=None):
     """A daemon answering the R1 surface, for the mapping/horizon arms."""
     fake = FakeClient()
@@ -385,6 +429,7 @@ ALL = [
     test_missing_decision_failcloses,
     test_unknown_decision_value_failcloses,
     test_standing_grant_becomes_admitting_scope_with_certification,
+    test_society_floor_is_uniform_and_admitting_for_two_members,
     test_live_grant_repo_root_maps_via_shared_resolver,
     test_workspace_mapping_discovers_root_without_env,
     test_workspace_mapping_invalid_env_falls_back_to_discovery,

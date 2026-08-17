@@ -641,6 +641,11 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             "requested_role": "citizen",
             "protocol_version": PROTOCOL_VERSION,
             "instance_name": "gate-policy-fetch",
+            # Runtime SELF-REPORT from the gate engine that is actually loaded. The daemon
+            # keeps this separate from its own build freshness: a current daemon cannot
+            # prove an installed consumer understands a new policy field. A1 evidence only;
+            # the governed installed-artifact problem remains #481.
+            "gate_capabilities": ["society-floor:v1"],
         }
         role_env = os.environ.get("HESTIA_ROLE")
         if role_env:
@@ -677,6 +682,7 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             # typo. Latent rather than live only because the append is guarded on a daemon
             # that serves a floor, and no deployed daemon did yet.
             "society_floor": [],
+            "society_floor_digest": None,
             "generation": None,
             "expires_at": None,
         }
@@ -754,6 +760,9 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
                     if isinstance(p, str) and p.strip():
                         snap["society_floor"].append(p.strip())
                         snap["in_scope"].append(_scope_entry_for_grant(p))
+            floor_digest = scope.get("society_floor_digest")
+            if isinstance(floor_digest, str) and len(floor_digest) == 64:
+                snap["society_floor_digest"] = floor_digest
         return snap
     except Exception as e:  # noqa: BLE001 — any failure is "unreachable"; the caller degrades
         _snapshot_unavailable(

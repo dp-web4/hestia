@@ -2184,6 +2184,10 @@ async fn scope_floor_add(
         added_by: "operator".to_string(),
         reason: reason.clone(),
     };
+    // The terminal success witness is part of finality. Preserve the exact prior store so
+    // a failed terminal append can restore both memory and vault, including a predecessor
+    // when this call replaces an existing floor entry.
+    let standing_prior = s.standing_scope.clone();
     if let Err(e) = s.commit_standing_scope(|st| st.floor_add(fe)) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2196,24 +2200,40 @@ async fn scope_floor_add(
         );
     }
     let generation = s.standing_scope.generation;
-    if let Err(e) = s.append_chain(
+    let success = match s.append_chain(
         "society_floor_added",
         serde_json::json!({
             "path": path, "reason": reason, "added_by": "operator",
             "intent": entry.hash, "standing_generation": generation,
         }),
     ) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("THE FLOOR IS WIDENED but its success record could not be \
-                                  appended ({e}). Under-recorded, not unrecorded: the intent is \
-                                  on the chain."),
-                "state": "floor IS in force; chain holds only the intent",
-                "intentEntryHash": entry.hash,
-            })),
-        );
-    }
+        Ok(e) => e,
+        Err(e) => {
+            return match s.commit_standing_scope(|st| *st = standing_prior) {
+                Ok(()) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("floor NOT applied — the terminal society_floor_added \
+                                          append failed ({e}); the prior floor was restored in \
+                                          memory and vault. Retry this exact call."),
+                        "state": "floor change NOT in force; chain holds only the intent",
+                        "intentEntryHash": entry.hash,
+                    })),
+                ),
+                Err(rb) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("THE FLOOR CHANGE IS LIVE but its success record could \
+                                          not be appended ({e}) AND rollback failed ({rb}). \
+                                          Remove or repair it explicitly; do not infer absence \
+                                          from the missing terminal record."),
+                        "state": "floor change IS in force; chain holds only the intent",
+                        "intentEntryHash": entry.hash,
+                    })),
+                ),
+            };
+        }
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2224,7 +2244,10 @@ async fn scope_floor_add(
             "applies_to": "every member of this society, including any that connect later",
             "note": "additive only — a member's own grants can widen beyond this, never narrow \
                      below it",
-            "witnessEntryHash": entry.hash,
+            // The terminal fact, not the intent. This is the record that says the floor is
+            // durably in force and is the only correct pointer for downstream consumers.
+            "witnessEntryHash": success.hash,
+            "intentEntryHash": entry.hash,
         })),
     )
 }
@@ -3479,6 +3502,61 @@ mod disposition_tests {
         assert_eq!(resp.status(), StatusCode::OK, "the retry rules cleanly");
         let s = state.lock().await;
         assert!(s.standing_scope.has_live("kimi-code", "/x/standing.md", now));
+    }
+
+    /// #483 finality: a society-wide widening is not in force until its terminal
+    /// `society_floor_added` record lands. Failure restores the exact prior store, then an
+    /// identical retry succeeds once witnessing is available again.
+    #[tokio::test]
+    async fn an_unwitnessed_society_floor_change_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        let add = |state: &SharedState| {
+            let state = state.clone();
+            async move {
+                scope_floor_add(
+                    State(state),
+                    Json(serde_json::json!({
+                        "path": "/x/society",
+                        "reason": "common working surface",
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        };
+
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_society_floor_success
+             BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'society_floor_added'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;",
+        )
+        .unwrap();
+
+        let resp = add(&state).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        {
+            let s = state.lock().await;
+            assert!(
+                !s.standing_scope.floor_allows("/x/society"),
+                "a society-wide permission without its terminal witness must be rolled back"
+            );
+            assert_eq!(s.standing_scope.generation, 0, "rollback restores generation too");
+            let chain = s.recent_chain(20);
+            assert!(chain.iter().any(|e| e.event_type == "society_floor_intent"));
+            assert!(!chain.iter().any(|e| e.event_type == "society_floor_added"));
+        }
+        conn.execute_batch("DROP TRIGGER fail_society_floor_success")
+            .unwrap();
+
+        let resp = add(&state).await;
+        assert_eq!(resp.status(), StatusCode::OK, "the identical retry lands cleanly");
+        let s = state.lock().await;
+        assert!(s.standing_scope.floor_allows("/x/society"));
+        assert_eq!(s.standing_scope.generation, 1);
     }
 }
 

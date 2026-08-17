@@ -44,6 +44,7 @@
 //!     copy that cannot say which policy it is grants nothing.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// The CEILING on how long a served standing-scope snapshot may be honoured by a consumer
 /// that caches it. The actual `snapshot_expires_at` served by `hestia_scope_status` is
@@ -181,6 +182,22 @@ impl StandingScopeStore {
         self.floor.iter().any(|f| f.path == path)
     }
 
+    /// A canonical digest of the EFFECTIVE society-wide path set.
+    ///
+    /// Provenance and insertion order are deliberately excluded: this answers whether two
+    /// members received the same enforcing floor, while `generation` answers which complete
+    /// policy revision they received. Length-prefixing prevents concatenation ambiguity.
+    pub fn floor_digest(&self) -> String {
+        let mut paths: Vec<&str> = self.floor.iter().map(|f| f.path.as_str()).collect();
+        paths.sort_unstable();
+        let mut hasher = Sha256::new();
+        for path in paths {
+            hasher.update((path.len() as u64).to_be_bytes());
+            hasher.update(path.as_bytes());
+        }
+        hex::encode(hasher.finalize())
+    }
+
     /// Add (or replace, keyed by path) a floor entry. Same replace-not-duplicate rule as
     /// `add`, for the same reason: two records for one path make "removed" ambiguous.
     pub fn floor_add(&mut self, entry: FloorEntry) {
@@ -247,6 +264,38 @@ mod tests {
             expires_at,
             request_id: None,
         }
+    }
+
+    fn floor(path: &str, at: u64) -> FloorEntry {
+        FloorEntry {
+            path: path.into(),
+            added_at: at,
+            added_by: "operator".into(),
+            reason: "society baseline".into(),
+        }
+    }
+
+    #[test]
+    fn society_floor_is_one_additive_policy_for_every_member() {
+        let mut s = StandingScopeStore::default();
+        s.floor_add(floor("/w/shared", 1));
+        s.add(grant("kimi-code", "/w/kimi-only", 2, None));
+
+        assert!(s.has_live("kimi-code", "/w/shared", 3));
+        assert!(s.has_live("codex", "/w/shared", 3));
+        assert!(s.has_live("kimi-code", "/w/kimi-only", 3));
+        assert!(!s.has_live("codex", "/w/kimi-only", 3));
+
+        let digest = s.floor_digest();
+        assert_eq!(digest.len(), 64);
+        assert_ne!(digest, StandingScopeStore::default().floor_digest());
+
+        s.floor_add(floor("/w/shared", 4));
+        assert_eq!(s.floor.len(), 1, "replacement cannot fork one floor path");
+        assert_eq!(s.generation, 3, "floor add, member add, floor replace");
+        assert!(s.floor_remove("/w/shared"));
+        assert!(!s.floor_remove("/w/shared"));
+        assert_eq!(s.generation, 4, "a no-op removal is not a policy revision");
     }
 
     /// (c) The counter is monotonic across every mutation — grant, replace, revoke — and
@@ -340,6 +389,7 @@ mod tests {
             serde_json::to_vec(&StandingScopeStore {
                 generation: 7,
                 grants: vec![grant("codex", "/w/web4", 1, None)],
+                floor: Vec::new(),
             })
             .unwrap(),
         )
