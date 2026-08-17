@@ -641,10 +641,11 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             "requested_role": "citizen",
             "protocol_version": PROTOCOL_VERSION,
             "instance_name": "gate-policy-fetch",
-            # Runtime SELF-REPORT from the gate engine that is actually loaded. The daemon
-            # keeps this separate from its own build freshness: a current daemon cannot
-            # prove an installed consumer understands a new policy field. A1 evidence only;
-            # the governed installed-artifact problem remains #481.
+            # Runtime SELF-REPORT from this gate engine. The daemon keeps the last accepted
+            # report separate from its own build freshness, but it has no identity,
+            # session, freshness, or build binding: A1 historical evidence only. It cannot
+            # prove which gate is currently loaded; the governed installed-artifact problem
+            # remains #481.
             "gate_capabilities": ["society-floor:v1"],
         }
         role_env = os.environ.get("HESTIA_ROLE")

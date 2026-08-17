@@ -222,7 +222,7 @@ impl Default for ReadBasis {
 /// own build string alone.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GateEngineHealth {
-    /// `reported-capable`, `partial`, or `unknown`.
+    /// `last-self-report-capable`, `partial`, or `unknown`.
     pub state: String,
     pub capability: String,
     pub capable_members: Vec<String>,
@@ -239,8 +239,10 @@ pub struct DeploymentHealth {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_build: Option<String>,
     pub note: String,
-    /// What the LOADED gate consumers report, distinct from the daemon build above. This is
-    /// A1 runtime evidence, not installed-byte attestation; #481 owns that stronger claim.
+    /// The last gate-capability self-report accepted during this daemon run, distinct from
+    /// the daemon build above. This is A1 historical runtime evidence with no freshness,
+    /// session, identity, or build binding — not installed-byte attestation. #481 owns that
+    /// stronger claim.
     pub gate_engine: GateEngineHealth,
 }
 
@@ -339,7 +341,7 @@ fn deployment_health(state: &ServerState) -> DeploymentHealth {
         && unknown_members.is_empty()
         && reported_without_capability.is_empty()
     {
-        "reported-capable"
+        "last-self-report-capable"
     } else if report_count > 0 {
         "partial"
     } else {
@@ -351,8 +353,10 @@ fn deployment_health(state: &ServerState) -> DeploymentHealth {
         capable_members,
         unknown_members,
         reported_without_capability,
-        note: "runtime self-report from each loaded gate consumer; A1 evidence only, not an \
-               attestation of installed bytes — see #481"
+        note: "last accepted A1 self-report during this daemon run; caller identity and bytes \
+               are not authenticated, omission preserves an earlier report, and there is no \
+               freshness/session/build binding — this does not prove what is currently loaded \
+               or installed; see #481"
             .into(),
     };
     health
@@ -1471,7 +1475,7 @@ mod tests {
     }
 
     #[test]
-    fn deployment_health_separates_daemon_build_from_loaded_gate_capability() {
+    fn deployment_health_separates_daemon_build_from_last_gate_self_report() {
         let (_dir, mut state) = make_state();
         let unknown = deployment_health(&state);
         assert_eq!(unknown.gate_engine.state, "unknown");
@@ -1493,10 +1497,14 @@ mod tests {
 
         state.gate_capabilities.remove("legacy-member");
         let capable = deployment_health(&state);
-        assert_eq!(capable.gate_engine.state, "reported-capable");
+        assert_eq!(capable.gate_engine.state, "last-self-report-capable");
         assert!(
             capable.gate_engine.note.contains("A1")
-                && capable.gate_engine.note.contains("#481"),
+                && capable.gate_engine.note.contains("#481")
+                && capable
+                    .gate_engine
+                    .note
+                    .contains("no freshness/session/build binding"),
             "the dashboard must not launder a self-report into artifact attestation"
         );
     }

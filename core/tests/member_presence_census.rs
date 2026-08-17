@@ -594,6 +594,20 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("server/dashboard.rs::dashboard_snapshot_window", &[
         "member_entities: self.member_registry.len(),",
     ]),
+    // Added 2026-08-17 (codex, PR #490 NOT-SAME pass). READING, answering the question
+    // this table schedules — **is this a safety use of presence?**
+    //
+    // NO. `deployment_health` enumerates known members only to report which of them have
+    // supplied an A1 gate-capability self-report. The result is dashboard evidence; it is
+    // never consulted by authorization, floor serving, or mutation. A missing/corrupt
+    // registry can make the coverage report incomplete (and therefore potentially
+    // over-optimistic), but cannot admit an act. That limitation is stated in the returned
+    // note: these are last accepted, unauthenticated self-reports, not current loaded-byte
+    // attestation; #481 owns the stronger claim.
+    ("server/dashboard.rs::deployment_health", &[
+        ".iter_sorted()",
+        ".member_registry",
+    ]),
     // Added 2026-08-15 (claude-code, `POST /api/scope/grant`). READING, answering the question
     // this table schedules — **is this a safety use of presence?**
     //
@@ -621,6 +635,17 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     // must be redone.
     ("server/http.rs::scope_grant", &[
         "let member_known = s.member_registry.get(&plugin_id).is_some();",
+    ]),
+    // Added 2026-08-17 (codex, PR #490 NOT-SAME pass). READING, answering the question
+    // this table schedules — **is this a safety use of presence?**
+    //
+    // NO. `scope_floor_add` reads only `member_registry.len()` and writes that number into
+    // the immutable INTENT as contemporaneous context. It does not branch on the value:
+    // zero, stale, or incomplete membership produces the same operator-authorized floor
+    // mutation, whose stated scope is every present and future member. A bad count weakens
+    // the evidence record; it cannot widen or refuse authority.
+    ("server/http.rs::scope_floor_add", &[
+        "let members_affected = s.member_registry.len();",
     ]),
     // Added 2026-08-07 (claude-code, the #226 invitation writer). READING, answering the
     // question this table schedules — **is this a safety use of presence?**

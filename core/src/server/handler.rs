@@ -574,11 +574,12 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     // reuse (Guard A below) this call's value is ignored and the minted one is
     // echoed, the same discipline as `role`.
     let role_basis = optional_string(args, "role_basis");
-    // Runtime capability report from the gate engine making this connection. Absence means
-    // "unknown" and deliberately does not erase an earlier report: ordinary app connects do
-    // not carry gate metadata. An explicit array replaces the member's report, including an
-    // empty array for an engine that reports no understood capabilities. A1 self-report only;
-    // #481 is the separate artifact-integrity problem.
+    // Runtime capability self-report from this caller. Absence means "no new evidence" and
+    // deliberately does not erase an earlier report: ordinary app connects do not carry gate
+    // metadata. An explicit array replaces the member's report, including an empty array for
+    // a caller reporting no understood capabilities. The retained value is historical within
+    // this daemon run — no freshness/session/build binding — and any caller can assert both
+    // plugin_id and capabilities at A1. #481 is the separate artifact-integrity problem.
     let gate_capabilities: Option<std::collections::HashSet<String>> = args
         .get("gate_capabilities")
         .and_then(Value::as_array)

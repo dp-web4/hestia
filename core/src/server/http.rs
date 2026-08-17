@@ -2272,19 +2272,32 @@ async fn scope_floor_remove(
     }
     let path = crate::server::state::normalize_scope_path(&raw_path);
     let mut s = state.lock().await;
-    if !s.standing_scope.floor_allows(&path) && !s.standing_scope_dirty {
+    let was_present = s.standing_scope.floor_allows(&path);
+    if !was_present && !s.standing_scope_dirty {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "that path is not on the society floor"})),
         );
     }
-    let entry = match s.append_chain(
-        "society_floor_removed",
+    let prior = s.standing_scope.clone();
+    let intended_generation = if was_present {
+        prior.generation + 1
+    } else {
+        prior.generation
+    };
+
+    // A removal is a terminal FACT only after the vault holds it. Writing
+    // `society_floor_removed` first made a failed persist plus restart resurrect the path
+    // while the immutable chain claimed completion. Use the same truthful three-stage
+    // contract as the widening: intent -> durable candidate -> terminal fact.
+    let intent = match s.append_chain(
+        "society_floor_remove_intent",
         serde_json::json!({
             "path": path, "reason": reason, "removed_by": "operator",
             "via": "operator_session",
             "scope": "SOCIETY — narrows every member at once",
-            "standing_generation": s.standing_scope.generation + 1,
+            "standing_generation": intended_generation,
+            "retry_sync": !was_present,
         }),
     ) {
         Ok(e) => e,
@@ -2297,31 +2310,72 @@ async fn scope_floor_remove(
             );
         }
     };
-    // Tightening: apply to memory first, then persist — a failed vault write may only ever
-    // leave the TIGHTER state in force, which is the same rule `apply_standing_revoke` obeys.
-    let removed = s.standing_scope.floor_remove(&path);
-    if let Err(e) = s.persist_standing_scope() {
-        s.standing_scope_dirty = true;
+
+    // Persist a candidate before swapping it into live memory. Tightening is fail-safe, but
+    // a terminal chain claim that is false after restart is not: durability and witnessing
+    // are both parts of finality.
+    if let Err(e) = s.commit_standing_scope(|st| {
+        st.floor_remove(&path);
+    }) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
-                "error": format!("removed from the live floor but the vault write FAILED ({e}); \
-                                  memory is the tighter state and is kept, but a restart would \
-                                  resurrect this path — retry this exact call"),
-                "removed_from_memory": removed,
-                "witnessEntryHash": entry.hash,
+                "error": format!("floor NOT removed — vault write failed ({e}); the live store \
+                                  is untouched (the candidate was persisted first), retry"),
+                "state": "the chain holds the remove INTENT and no society_floor_removed",
+                "intentEntryHash": intent.hash,
             })),
         );
     }
-    s.standing_scope_dirty = false;
+    let generation = s.standing_scope.generation;
+    let success = match s.append_chain(
+        "society_floor_removed",
+        serde_json::json!({
+            "path": path, "reason": reason, "removed_by": "operator",
+            "via": "operator_session",
+            "scope": "SOCIETY — narrows every member at once",
+            "intent": intent.hash,
+            "standing_generation": generation,
+            "retry_sync": !was_present,
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return match s.commit_standing_scope(|st| *st = prior) {
+                Ok(()) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("floor removal NOT applied — the terminal \
+                                          society_floor_removed append failed ({e}); the prior \
+                                          floor was restored in memory and vault. Retry this \
+                                          exact call."),
+                        "state": "floor removal NOT in force; chain holds only the intent",
+                        "intentEntryHash": intent.hash,
+                    })),
+                ),
+                Err(rb) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("THE FLOOR REMOVAL IS LIVE but its terminal record \
+                                          could not be appended ({e}) AND rollback failed \
+                                          ({rb}). Restore or retry explicitly; do not infer \
+                                          completion from the intent."),
+                        "state": "floor removal IS in force; chain holds only the intent",
+                        "intentEntryHash": intent.hash,
+                    })),
+                ),
+            };
+        }
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "ok": true, "path": path, "removed": removed,
-            "generation": s.standing_scope.generation,
+            "ok": true, "path": path, "removed": was_present,
+            "generation": generation,
             "effect": "every member of this society loses this path unless they hold their own \
                        grant for it",
-            "witnessEntryHash": entry.hash,
+            "witnessEntryHash": success.hash,
+            "intentEntryHash": intent.hash,
         })),
     )
 }
@@ -3510,6 +3564,19 @@ mod disposition_tests {
     #[tokio::test]
     async fn an_unwitnessed_society_floor_change_is_rolled_back() {
         let (dir, state) = test_state().await;
+        let (prior_floor, prior_generation) = {
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| {
+                st.floor_add(crate::server::standing_scope::FloorEntry {
+                    path: "/x/society".into(),
+                    added_at: 1,
+                    added_by: "operator".into(),
+                    reason: "predecessor".into(),
+                })
+            })
+            .unwrap();
+            (s.standing_scope.floor.clone(), s.standing_scope.generation)
+        };
         let add = |state: &SharedState| {
             let state = state.clone();
             async move {
@@ -3540,11 +3607,14 @@ mod disposition_tests {
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         {
             let s = state.lock().await;
-            assert!(
-                !s.standing_scope.floor_allows("/x/society"),
-                "a society-wide permission without its terminal witness must be rolled back"
+            assert_eq!(
+                s.standing_scope.floor, prior_floor,
+                "rollback must restore the replaced predecessor byte for byte"
             );
-            assert_eq!(s.standing_scope.generation, 0, "rollback restores generation too");
+            assert_eq!(
+                s.standing_scope.generation, prior_generation,
+                "rollback restores the exact prior generation"
+            );
             let chain = s.recent_chain(20);
             assert!(chain.iter().any(|e| e.event_type == "society_floor_intent"));
             assert!(!chain.iter().any(|e| e.event_type == "society_floor_added"));
@@ -3556,7 +3626,158 @@ mod disposition_tests {
         assert_eq!(resp.status(), StatusCode::OK, "the identical retry lands cleanly");
         let s = state.lock().await;
         assert!(s.standing_scope.floor_allows("/x/society"));
-        assert_eq!(s.standing_scope.generation, 1);
+        assert_eq!(s.standing_scope.generation, prior_generation + 1);
+        assert_eq!(s.standing_scope.floor[0].reason, "common working surface");
+    }
+
+    /// #490 NOT-SAME: a vault failure cannot leave a terminal removal claim for a path
+    /// that restart resurrects. The candidate persist fails before live memory changes;
+    /// the chain therefore contains only an intent, and restart reloads the unchanged floor.
+    #[tokio::test]
+    async fn failed_society_floor_remove_persist_is_an_intent_not_a_terminal_fact() {
+        let (dir, state) = test_state().await;
+        let (prior_floor, prior_generation) = {
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| {
+                st.floor_add(crate::server::standing_scope::FloorEntry {
+                    path: "/x/remove-persist".into(),
+                    added_at: 1,
+                    added_by: "operator".into(),
+                    reason: "restart invariant".into(),
+                })
+            })
+            .unwrap();
+            (s.standing_scope.floor.clone(), s.standing_scope.generation)
+        };
+
+        // Vault writes use v.enc.tmp then rename. A directory at that path fails the
+        // persist without affecting witness.db, so this isolates stage two.
+        std::fs::create_dir(dir.path().join("v.enc.tmp")).unwrap();
+        let resp = scope_floor_remove(
+            State(state.clone()),
+            Json(serde_json::json!({
+                "path": "/x/remove-persist",
+                "reason": "exercise persist failure",
+            })),
+        )
+        .await
+        .into_response();
+        std::fs::remove_dir(dir.path().join("v.enc.tmp")).unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        {
+            let s = state.lock().await;
+            assert_eq!(s.standing_scope.floor, prior_floor);
+            assert_eq!(s.standing_scope.generation, prior_generation);
+            let chain = s.recent_chain(20);
+            assert!(
+                chain
+                    .iter()
+                    .any(|e| e.event_type == "society_floor_remove_intent")
+            );
+            assert!(
+                !chain
+                    .iter()
+                    .any(|e| e.event_type == "society_floor_removed"),
+                "a failed persist must not mint a terminal removal"
+            );
+        }
+
+        drop(state);
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let restarted = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let s = restarted.lock().await;
+        assert!(
+            s.standing_scope.floor_allows("/x/remove-persist"),
+            "restart must agree with the non-terminal chain state"
+        );
+        assert_eq!(s.standing_scope.generation, prior_generation);
+    }
+
+    /// The terminal removal witness is part of finality too. If it fails after the durable
+    /// candidate lands, restore the exact prior floor and generation in memory and vault;
+    /// after the witness recovers, the identical retry removes durably.
+    #[tokio::test]
+    async fn unwitnessed_society_floor_remove_restores_prior_store_and_restart_state() {
+        let (dir, state) = test_state().await;
+        let (prior_floor, prior_generation) = {
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| {
+                st.floor_add(crate::server::standing_scope::FloorEntry {
+                    path: "/x/remove-terminal".into(),
+                    added_at: 1,
+                    added_by: "operator".into(),
+                    reason: "terminal invariant".into(),
+                })
+            })
+            .unwrap();
+            (s.standing_scope.floor.clone(), s.standing_scope.generation)
+        };
+        let remove = |state: &SharedState| {
+            let state = state.clone();
+            async move {
+                scope_floor_remove(
+                    State(state),
+                    Json(serde_json::json!({
+                        "path": "/x/remove-terminal",
+                        "reason": "exercise terminal failure",
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        };
+
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_society_floor_removed
+             BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'society_floor_removed'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;",
+        )
+        .unwrap();
+
+        let resp = remove(&state).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        {
+            let s = state.lock().await;
+            assert_eq!(s.standing_scope.floor, prior_floor);
+            assert_eq!(s.standing_scope.generation, prior_generation);
+            let chain = s.recent_chain(20);
+            assert!(
+                chain
+                    .iter()
+                    .any(|e| e.event_type == "society_floor_remove_intent")
+            );
+            assert!(
+                !chain
+                    .iter()
+                    .any(|e| e.event_type == "society_floor_removed")
+            );
+        }
+
+        conn.execute_batch("DROP TRIGGER fail_society_floor_removed")
+            .unwrap();
+        let resp = remove(&state).await;
+        assert_eq!(resp.status(), StatusCode::OK, "the identical retry lands cleanly");
+        {
+            let s = state.lock().await;
+            assert!(!s.standing_scope.floor_allows("/x/remove-terminal"));
+            assert_eq!(s.standing_scope.generation, prior_generation + 1);
+        }
+        drop(conn);
+        drop(state);
+
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let restarted = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let s = restarted.lock().await;
+        assert!(
+            !s.standing_scope.floor_allows("/x/remove-terminal"),
+            "a terminal removal must survive restart"
+        );
+        assert_eq!(s.standing_scope.generation, prior_generation + 1);
     }
 }
 
