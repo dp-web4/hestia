@@ -1,5 +1,6 @@
-//! Dashboard snapshot — aggregations consumed by both the web UI and the
-//! TUI. Cheap enough to call every 1-2s.
+//! Dashboard snapshot — aggregations consumed by both the web UI and the TUI.
+//! The HTTP surface serves an immutable read model; projection cost never rides
+//! on the request path.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -7,7 +8,80 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::state::ServerState;
+use crate::storage::{ChainEntry, SqliteChainStore};
 use web4_trust_core::EntityTrust;
+
+/// Dashboard reads are display-grade projections, never authority. Keep their
+/// chain window bounded and, more importantly, read it without holding the
+/// authoritative [`ServerState`] lock (see [`DashboardChainProjection`]).
+const STATS_WINDOW: u64 = 2_000;
+
+/// The slow, blocking half of a dashboard snapshot.
+///
+/// SQLCipher owns its own connection mutex. Carrying these reads through the
+/// outer `ServerState` mutex only made unrelated governance requests queue
+/// behind a display projection. The HTTP read-model worker builds this value on
+/// Tokio's blocking pool, then briefly re-enters state to assemble the
+/// lightweight, ephemeral presentation.
+pub(crate) struct DashboardChainProjection {
+    deriv_window: Vec<ChainEntry>,
+    stats_window: Vec<RecentEntry>,
+    stats_read_error: Option<String>,
+    recent: Vec<RecentEntry>,
+    recent_read_error: Option<String>,
+}
+
+impl DashboardChainProjection {
+    pub(crate) fn read(
+        chain_store: &SqliteChainStore,
+        recent_cap: u64,
+        window_cutoff: Option<DateTime<Utc>>,
+    ) -> Self {
+        // A failed read is not zero activity. Carry failures into the snapshot
+        // so the UI renders unavailable rather than fabricating a quiet fleet.
+        // Each scan projects only what its consumer declares: derivation gets
+        // its pruned ChainEntry, while stats/feed keep RecentEntry scalars.
+        let deriv_window = match chain_store.scan_recent(
+            None,
+            Some(crate::derivation::DERIVATION_EVENT_TYPES),
+            STATS_WINDOW,
+            crate::derivation::project_row,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("dashboard derivation chain read failed: {e}");
+                Vec::new()
+            }
+        };
+        let (stats_window, stats_read_error) =
+            match chain_store.scan_recent(None, None, STATS_WINDOW, |r| Some(flatten_row(r))) {
+                Ok(v) => (v, None),
+                Err(e) => {
+                    tracing::error!("dashboard stats chain read failed: {e}");
+                    (Vec::new(), Some(e.to_string()))
+                }
+            };
+        let cutoff = window_cutoff.map(|c| c.to_rfc3339());
+        let (recent, recent_read_error) =
+            match chain_store.scan_recent(cutoff.as_deref(), None, recent_cap, |r| {
+                Some(flatten_row(r))
+            }) {
+                Ok(v) => (v, None),
+                Err(e) => {
+                    tracing::error!("dashboard recent-feed chain read failed: {e}");
+                    (Vec::new(), Some(e.to_string()))
+                }
+            };
+
+        Self {
+            deriv_window,
+            stats_window,
+            stats_read_error,
+            recent,
+            recent_read_error,
+        }
+    }
+}
 
 /// The active policy setting, surfaced so the dashboard can show which gate is
 /// in force (e.g. "safety, enforcing" vs "audit-only, observing").
@@ -650,85 +724,29 @@ impl ServerState {
         window_cutoff: Option<DateTime<Utc>>,
         window_label: &str,
     ) -> DashboardSnapshot {
-        // For activity stats, scan the recent window plus a wider sample.
-        // The chain can be huge; cap the stats window at 10k entries which
-        // is plenty for an "actions seen" picture without scanning forever.
-        //
-        // A FAILED READ IS NOT ZERO ACTIVITY (2026-08-01). This was
-        // `.unwrap_or_default()`, so any error — lock contention, a busy timeout, transient I/O
-        // — became an empty Vec and the dashboard served HTTP 200 reporting **zero actions for
-        // every member**. And because this read is `read_recent`, NOT range-scoped, one failure
-        // zeroes hour, day and week at the same instant, which is precisely how it presented:
-        // dp saw every member empty across every timeframe, a hard refresh did not help, and it
-        // came back by itself later.
-        //
-        // "Nothing happened" and "we could not find out what happened" are different facts, and
-        // rendering the second as the first is the defect this codebase keeps finding in itself.
-        // Here it was worse than a wrong number: an operator watching a governance console for
-        // unexpected agent activity would have been shown a quiet fleet by a broken query.
-        //
-        // So the error is CARRIED to the surface instead of swallowed. The UI must render
-        // unavailable rather than 0.
-        // THE ATTENTION WINDOW — short by decision, and now also projected.
-        //
-        // dp, 2026-08-06: *"the attention window should be fairly short, only dramatic
-        // events should be tracked permanently"* — and, of these counts specifically,
-        // *"the stats are questionably meaningful currently, and aren't actually used in
-        // any decisions. it's display-only, so i wouldn't treat them as sacred."*
-        //
-        // This read was the daemon's largest routine cost: 10,000 entries per poll, each
-        // materialised as a `ChainEntry` with a fully parsed `serde_json::Value`, to
-        // produce display counts AND feed `derivation::derive`. Measured 2026-08-06:
-        // 164 MB -> 1349 MB in twenty-one minutes, flat at idle, stepping on every read.
-        //
-        // #221 shortened the window and left the read eager, saying derivation's needs
-        // were "eleven fields". THAT COUNT WAS WRONG — it came from grepping the direct
-        // `event_data.get` calls and missed `entry_str`, which is most of them. The real
-        // inventory is TWENTY-EIGHT keys (`derivation::DERIVATION_KEYS`), and a
-        // projection built on the wrong number would not have failed: it would have
-        // derived a wrong trust value and looked fine. Corrected here rather than left
-        // standing, because a stale figure in a comment is exactly how the next author
-        // inherits it.
-        const STATS_WINDOW: u64 = 2_000;
+        let projection =
+            DashboardChainProjection::read(&self.chain_store, recent_cap, window_cutoff);
+        self.dashboard_snapshot_from_projection(projection, window_cutoff, window_label)
+    }
 
-        // TWO READS, EACH FETCHING ONLY WHAT ITS CONSUMER DECLARES.
-        //
-        // dp, 2026-08-06: the chain is sacred and full traversal stays available, but it
-        // is EXPENSIVE and should run only when context warrants. Dashboard stats are
-        // "cheap, transient situational awareness" that "do not influence anything of
-        // consequence" — so they take the cheap read, and say so (`stats_basis`).
-        //
-        // Previously ONE eager `read_recent(10_000)` served both display counts and trust
-        // derivation, materialising ten thousand full documents per poll to harvest a few
-        // dozen fields. Measured 164 MB -> 1349 MB in twenty-one minutes.
-        //
-        // Now: display counts project to `RecentEntry` (fourteen scalars), and derivation
-        // gets its own SQL-filtered, key-pruned window built from what the model declares
-        // it reads. Neither materialises a document nobody folds.
-        let (deriv_window, deriv_read_error) = match self.chain_store.scan_recent(
-            None,
-            Some(crate::derivation::DERIVATION_EVENT_TYPES),
-            STATS_WINDOW,
-            crate::derivation::project_row,
-        ) {
-            Ok(v) => (v, None),
-            Err(e) => {
-                tracing::error!("dashboard derivation chain read failed: {e}");
-                (Vec::new(), Some(e.to_string()))
-            }
-        };
-        let (stats_window, stats_read_error) = match self.chain_store.scan_recent(
-            None,
-            None,
-            STATS_WINDOW,
-            |r| Some(flatten_row(r)),
-        ) {
-            Ok(v) => (v, None),
-            Err(e) => {
-                tracing::error!("dashboard stats chain read failed: {e}");
-                (Vec::new(), Some(e.to_string()))
-            }
-        };
+    /// Assemble the display model from an already-read chain projection.
+    ///
+    /// HTTP uses this split to perform the SQLCipher work outside the
+    /// authoritative state lock. The compatibility wrapper above keeps direct
+    /// callers and tests on the same arithmetic.
+    pub(crate) fn dashboard_snapshot_from_projection(
+        &self,
+        projection: DashboardChainProjection,
+        window_cutoff: Option<DateTime<Utc>>,
+        window_label: &str,
+    ) -> DashboardSnapshot {
+        let DashboardChainProjection {
+            deriv_window,
+            stats_window,
+            stats_read_error,
+            recent,
+            recent_read_error,
+        } = projection;
 
         let mut total = 0u64;
         let mut succ = 0u64;
@@ -1006,35 +1024,6 @@ impl ServerState {
                 }
             })
             .collect();
-
-        // Recent feed: flatten the outcome / session_started / etc. shape.
-        // Calendar-windowed (count cap is transport safety, not the filter).
-        let cutoff_str = window_cutoff.map(|c| c.to_rfc3339());
-        // CARRY THE ERROR, exactly as the stats read above does. `.unwrap_or_default()` here
-        // turned every failure into an empty feed indistinguishable from a quiet fleet — see
-        // `recent_unavailable`. The two reads now fail the same way, which is the point: a
-        // reader should not have to know which panel was hardened and which was not.
-        // PROJECT, DO NOT MATERIALISE. This read ran on every dashboard poll and its only
-        // consumer was `flatten_entry` — so it parsed a full JSON document per row to
-        // keep the dozen scalars `RecentEntry` carries, then dropped the rest. Now the
-        // projection happens inside the scan and no `Vec<ChainEntry>` is ever built.
-        //
-        // The error arm is unchanged and deliberately so: a failed read must still set
-        // `recent_unavailable` rather than render as an empty feed. That distinction is
-        // what the comment on `recent_unavailable` above exists to protect, and a memory
-        // fix is not a licence to loosen it.
-        let (recent, recent_read_error) =
-            match self
-                .chain_store
-                .scan_recent(cutoff_str.as_deref(), None, recent_cap, |r| {
-                    Some(flatten_row(r))
-                }) {
-                Ok(v) => (v, None),
-                Err(e) => {
-                    tracing::error!("dashboard recent-feed chain read failed: {e}");
-                    (Vec::new(), Some(e.to_string()))
-                }
-            };
 
         let delegations = crate::delegation::DelegationStore::load(&self.vault)
             .ok()

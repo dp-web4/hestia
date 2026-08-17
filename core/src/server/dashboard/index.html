@@ -2559,7 +2559,13 @@
     tick();
   });
 
+  // A slow response must not let setInterval stack another fetch behind it.
+  // Multiple tabs are deduplicated again by the server-side read model; this
+  // guard prevents one tab from manufacturing its own request queue.
+  let tickInFlight = false;
   async function tick() {
+    if (tickInFlight) return;
+    tickInFlight = true;
     try {
       const res = await apiFetch(`/api/dashboard?range=${rangeSel}`, { cache: 'no-store' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -2569,6 +2575,8 @@
       $('live-status').textContent = 'live';
     } catch (err) {
       $('live-status').textContent = `offline (${err.message})`;
+    } finally {
+      tickInFlight = false;
     }
   }
 
