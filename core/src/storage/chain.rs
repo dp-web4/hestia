@@ -136,6 +136,66 @@ fn migrate_plaintext_to_encrypted(path: &Path, key_hex: &str) -> Result<()> {
 }
 
 impl SqliteChainStore {
+    /// Copy one consistent encrypted chain snapshot while its live daemon may
+    /// continue appending in WAL mode.
+    ///
+    /// A raw copy of only `witness.db` is not a snapshot once committed frames
+    /// may still live in `witness.db-wal`. SQLite's online backup API reads one
+    /// transactionally consistent view across both and re-encrypts it through a
+    /// separately keyed destination connection. The destination is replaced,
+    /// matching `std::fs::copy` semantics used by the callers this supersedes.
+    pub fn backup_encrypted(
+        source_path: impl AsRef<Path>,
+        destination_path: impl AsRef<Path>,
+        key: [u8; 32],
+    ) -> Result<()> {
+        let source_path = source_path.as_ref();
+        let destination_path = destination_path.as_ref();
+        anyhow::ensure!(
+            source_path != destination_path,
+            "chain snapshot destination must differ from its source"
+        );
+        if let Some(parent) = destination_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("creating chain snapshot dir {}", parent.display())
+            })?;
+        }
+        if destination_path.exists() {
+            std::fs::remove_file(destination_path).with_context(|| {
+                format!(
+                    "removing prior chain snapshot {}",
+                    destination_path.display()
+                )
+            })?;
+        }
+
+        let key_hex = hex::encode(key);
+        let source = Connection::open(source_path)
+            .with_context(|| format!("opening chain snapshot source {}", source_path.display()))?;
+        source
+            .pragma_update(None, "key", &key_hex)
+            .with_context(|| "keying chain snapshot source")?;
+        source
+            .pragma_update(None, "query_only", true)
+            .with_context(|| "making chain snapshot source query-only")?;
+
+        let mut destination = Connection::open(destination_path).with_context(|| {
+            format!(
+                "opening chain snapshot destination {}",
+                destination_path.display()
+            )
+        })?;
+        destination
+            .pragma_update(None, "key", &key_hex)
+            .with_context(|| "keying chain snapshot destination")?;
+        let backup = rusqlite::backup::Backup::new(&source, &mut destination)
+            .with_context(|| "starting encrypted chain snapshot")?;
+        backup
+            .run_to_completion(256, std::time::Duration::from_millis(10), None)
+            .with_context(|| "copying encrypted chain snapshot")?;
+        Ok(())
+    }
+
     /// Open or create the SQLCipher-encrypted witness chain. `key` is the stable
     /// storage key (see [`crate::storage::storage_key`]); it's applied as the
     /// SQLCipher key (hex), so the DB is encrypted at rest. A legacy plaintext
@@ -1003,6 +1063,45 @@ mod tests {
             .expect("a display snapshot must not delay a witness append")
             .expect("concurrent witness append succeeds");
         assert_eq!(store.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn online_backup_includes_wal_frames_and_stays_encrypted() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("live.db");
+        let snapshot_path = dir.path().join("snapshot.db");
+        let store = SqliteChainStore::open(&source_path, TEST_KEY).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        }
+        store
+            .append(
+                "committed-in-wal",
+                json!({"visible": true}),
+                "lct:web4:hestia:sovereign:test",
+            )
+            .unwrap();
+        let wal_path = source_path.with_extension("db-wal");
+        assert!(
+            wal_path.metadata().map(|m| m.len() > 0).unwrap_or(false),
+            "negative-control precondition: committed WAL frames exist"
+        );
+
+        SqliteChainStore::backup_encrypted(&source_path, &snapshot_path, TEST_KEY).unwrap();
+        assert!(
+            !is_plaintext_sqlite(&snapshot_path),
+            "snapshot bytes remain encrypted at rest"
+        );
+        let snapshot = SqliteChainStore::open(&snapshot_path, TEST_KEY).unwrap();
+        let rows = snapshot.read_recent(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_type, "committed-in-wal");
+        drop(snapshot);
+        assert!(
+            SqliteChainStore::open(&snapshot_path, [9u8; 32]).is_err(),
+            "snapshot must require the original key"
+        );
     }
 
     #[test]
