@@ -119,18 +119,66 @@ fi
 # by construction: an unanswered report that only one member is shown would
 # measure one member.
 DEBT=$(python3 - "$PRIMER" <<'PY'
-import json,re,sys
+import datetime,json,re,sys,time
 clean=lambda s: re.sub(r"[\x00-\x1f\x7f]","",str(s))[:512]
+
+def _age_secs(ts):
+    """Seconds since an RFC3339 stamp, or None if it will not parse."""
+    try:
+        s = re.sub(r"(\.\d{6})\d+", r"\1", str(ts)).replace("Z", "+00:00")
+        return max(0.0, time.time() - datetime.datetime.fromisoformat(s).timestamp())
+    except Exception:
+        return None
+
+def _short(sec):
+    for div, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if sec >= div:
+            return f"{int(sec // div)}{unit}"
+    return f"{int(sec)}s"
+
+def liveness(x):
+    """Recipient liveness as EVIDENCE, never as a diagnosis (#506).
+
+    "live and unanswered" is a member choosing not to reply; "never seen on this
+    mesh" is a misroute; and the two want opposite responses from you. That much
+    was always right. What was wrong: `dormant` was rendered as "watcher not
+    running" — ONE of the three causes handler.rs:3953 names for that verdict and
+    explicitly declines to choose between (watcher down, host asleep, member
+    between sessions) — while this renderer dropped, unread, the evidence the
+    daemon ships in the same row so the verdict would be checkable.
+
+    Measured 2026-08-18T14:41:22Z: kimi-code rendered here as "watcher not
+    running" while its watcher had been up 45,156s and the member was 727s into a
+    wake — with `mailbox_reads: 14164` sitting in the row being rendered.
+    `touch_inbox` fires on mailbox READ paths only and a wake drains once at the
+    top, so from 300s (MEMBER_LIVE_WITHIN_SECS) into an 1800s wake budget a member
+    that does not peek again reads `dormant` for up to 83% of its wake. The harder
+    a member works, the more reliably this line called it not running.
+
+    So: print what the daemon measured, and let the reader do the inferring.
+    """
+    live = clean(x.get("recipient_liveness") or "")
+    ev = x.get("recipient_liveness_evidence") or {}
+    if not isinstance(ev, dict) or not ev:
+        # No liveness record at all — not a dormancy verdict, an absence of one.
+        return ("; recipient NEVER SEEN on this mesh — likely misrouted, try the hub mesh"
+                if live == "unknown" else "")
+    bits = []
+    age = _age_secs(ev.get("last_inbox_touch"))
+    bits.append(f"quiet {_short(age)}" if age is not None else "quiet unknown")
+    if ev.get("mailbox_reads") is not None:
+        bits.append(f"reads={clean(ev.get('mailbox_reads'))}")
+    # first_seen == last_inbox_touch means the name touched the mailbox once, at
+    # first contact, and never again: not a member between sessions, a dead name.
+    if ev.get("first_seen") and ev.get("first_seen") == ev.get("last_inbox_touch"):
+        bits.append("ONE touch ever, at first contact — this NAME has never worked")
+    return f"; recipient {live or 'seen'}: " + ", ".join(bits)
+
 u=json.load(open(sys.argv[1])).get("unanswered") or {}
 for label,key in (("you have not answered","i_owe"),("nobody has answered you","owed_to_me")):
     for x in u.get(key) or []:
         seen = "delivered" if x.get("drained_at") else "never picked up"
-        # Liveness of the recipient, on the sent side only: "live and unanswered"
-        # is a member choosing not to reply; "never seen on this mesh" is a
-        # misroute, and the two want opposite responses from you.
-        live = clean(x.get("recipient_liveness") or "")
-        hint = {"unknown": "; recipient NEVER SEEN on this mesh — likely misrouted, try the hub mesh",
-                "dormant": "; recipient dormant — queued, watcher not running"}.get(live, "")
+        hint = liveness(x)
         print(f"- id={clean(x.get('id',''))} {clean(x.get('kind',''))} "
               f"{clean(x.get('from_plugin',''))}->{clean(x.get('to_plugin',''))} "
               f"({label}; {seen}{hint}) {clean(x.get('pointer_uri',''))}")
@@ -139,6 +187,7 @@ PY
 DEBT_BLOCK=""
 [ -n "$DEBT" ] && DEBT_BLOCK="
 Unanswered (no notice binds a response to these — responsiveness only; a member that woke and silently acted still shows here):
+Recipient liveness is EVIDENCE, not a diagnosis: `quiet Xm` is how long since that recipient last READ its mailbox, `reads=N` its lifetime read count. A member drains once at the top of a wake and then works, so a BUSY member reads quiet for most of it — quiet is not down (#506). `NEVER SEEN` means no liveness record exists at all.
 $DEBT"
 # LAST WORDS — the reporting-void repair (decision of record, dp 2026-08-04:
 # shared-context/forum/kimi-decision-of-record-no-deprivation-experiments-2026-08-04.md).
