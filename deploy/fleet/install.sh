@@ -728,6 +728,37 @@ main() {
   c_hdr "done"
   c_ok "open http://${HESTIA_BIND}/ for the dashboard"
   c_dim "logs: journalctl --user -u hestia (Linux) | tail $HESTIA_HOME/hestia.log (macOS)"
+  step_environment_report
+}
+
+# Say what the environment ended up as, especially the parts left empty.
+#
+# WHY: every path Hestia uses comes from the environment, and an UNSET path variable is a
+# supported state with a defined behaviour — the capability reports unknown and declines,
+# rather than probing for a workspace (docs/PUBLIC_PRIVATE_BOUNDARY.md forbids enumerating
+# familiar layouts, and hestia.service says so at the HESTIA_WORKSPACE line: "Unset or empty
+# means the inventory must report inference/unknown rather than guess").
+#
+# That is correct and it is also SILENT: nothing errors, a capability is simply not there.
+# An operator who never learns the variable exists cannot tell "installed without it" from
+# "installed and broken". So the installer states what it rendered. It does not guess a value
+# and it does not prompt — it reports, and points at the one document that explains the rest.
+step_environment_report() {
+  c_hdr "environment"
+  c_dim "these are the values this install rendered; see docs/ENVIRONMENT.md"
+  printf '  %-22s %s\n' "HESTIA_HOME" "$HESTIA_HOME"
+  printf '  %-22s %s\n' "HESTIA_BIND" "$HESTIA_BIND"
+  if [ -n "$HESTIA_WORKSPACE" ]; then
+    printf '  %-22s %s\n' "HESTIA_WORKSPACE" "$HESTIA_WORKSPACE"
+  else
+    printf '  %-22s %s\n' "HESTIA_WORKSPACE" "(empty)"
+    c_dim "    optional, and empty is a complete install. Workspace-dependent reads"
+    c_dim "    (e.g. agent-inventory) report unknown rather than guessing a layout."
+    # Not "$0": the documented install is `bash <(curl ...)`, where $0 is a process
+    # substitution fd (/dev/fd/63) and useless as advice to re-run.
+    c_dim "    To enable them, re-run the installer with:"
+    c_dim "      HESTIA_WORKSPACE=/path/to/workspace bash deploy/fleet/install.sh"
+  fi
 }
 
 main "$@"
