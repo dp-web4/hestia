@@ -27,12 +27,25 @@ DEFAULT_VERSION="v0.0.3"
 VERSION="${HESTIA_VERSION:-$DEFAULT_VERSION}"
 HESTIA_HOME="${HESTIA_HOME:-$HOME/.hestia}"
 HESTIA_BIND="${HESTIA_BIND:-127.0.0.1:7711}"
-# Detect rather than assume: this fleet is WSL + Linux + macOS with three different
-# layouts, and a hardcoded path is wrong on two thirds of it.
+# DERIVE, do not enumerate. The first draft of this block listed the workspace roots of
+# the machines in this fleet, which is wrong twice: it is a guess on any machine not on
+# the list, and it bakes an installation-local path into the public tree — the class
+# `tools/public_boundary.py` exists to reject, and it did reject it.
+#
+# The layout is readable instead of guessable. A checkout install is running THIS FILE out
+# of `<workspace>/hestia/deploy/fleet/`, so the workspace is two levels up from the script,
+# established from the filesystem on the machine being installed.
+#
+# A release install (`curl | sh`) has no checkout and no way to know: it keeps the empty
+# value, which is the original contract here — inventory reports the scope as unknown
+# rather than reporting OK off a guess. An explicit HESTIA_WORKSPACE still wins over both.
 if [ -z "${HESTIA_WORKSPACE:-}" ]; then
-  for _ws in /mnt/c/exe/projects/ai-agents "$HOME/ai-workspace" "$HOME/ai-agents" "$HOME/repos"; do
-    [ -d "$_ws/hestia" ] && HESTIA_WORKSPACE="$_ws" && break
-  done
+  _self_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+  _repo_root="${_self_dir%/deploy/fleet}"
+  if [ "$_repo_root" != "$_self_dir" ] && [ -e "$_repo_root/.git" ]; then
+    HESTIA_WORKSPACE="$(dirname -- "$_repo_root")"
+  fi
+  unset _self_dir _repo_root
 fi
 BIN_DIR="$HOME/.local/bin"
 BIN_PATH="$BIN_DIR/hestia"
@@ -194,7 +207,7 @@ Environment=RUST_LOG=warn
 # read list. Without it the inventory falls back to a compiled-in default that is only
 # correct on the machine it was written on, and — correctly — degrades its whole report
 # to UNKNOWN rather than reporting OK off a guess (thor, agent-inventory review §5).
-# Per-machine: WSL boxes use /mnt/c/exe/projects/ai-agents, Linux boxes ~/ai-workspace.
+# Per-machine and derived above from where this script sits, not from a list of layouts.
 Environment=HESTIA_WORKSPACE=${HESTIA_WORKSPACE}
 NoNewPrivileges=true
 ProtectSystem=strict
