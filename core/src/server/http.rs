@@ -3402,7 +3402,7 @@ async fn operator_gate_escalation(
             //
             // `decision_reply` is now the single answer both callers read, so the next field
             // added to one cannot silently miss the other.
-            let mut body = esc.decision_reply();
+            let mut body = esc.decision_reply(now);
             if let Some(o) = body.as_object_mut() {
                 o.insert(
                     "witnessEntryHash".into(),

@@ -11872,7 +11872,7 @@ mod tests {
                 )
                 .expect("a dissent is evidence, never a veto — the sovereign still decides")
         };
-        let reply = decided.decision_reply();
+        let reply = decided.decision_reply(crate::server::gate_escalation::now_secs());
         assert_eq!(
             reply["peer_participation"]["dissented"], 1,
             "the decided record must count the dissent: {reply}"
@@ -14830,7 +14830,21 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         // recorded but permits nothing. The mismatch is a visible state, never an implicit
         // sufficient. (dp 2026-07-30 + claude-code: the record must carry the bar, not just
         // the evidence and the verdict.)
-        "permits_write": status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false),
+        // THE POLL ASKS EXACTLY THE QUESTION `is_claimable` ANSWERS, and it has had `now`
+        // in scope the entire time. It used to re-derive two of the four conjuncts here —
+        // approved-and-bar-met — so a permit that was already SPENT, or past its claim
+        // horizon, polled back `permits_write: true`. Measured live 2026-08-08 on three
+        // real permits, and again 2026-08-18 on `c2df1592a9a81eed`, which this seat then
+        // published to the operator as live with "~40 min left" while the claim path had
+        // already refused it.
+        //
+        // `tools/claimable.py` is the correct reader and has been in `main` since
+        // 2026-08-08 with ZERO call sites. That is the whole lesson: the right answer
+        // existing somewhere does not put it on the path anyone takes. It goes HERE, where
+        // the wrong field already was.
+        "permits_write": esc.map(|e| e.is_claimable(now)).unwrap_or(false),
+        "granted": status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false),
+        "claim_window_secs_remaining": esc.map(|e| e.claim_window_secs_remaining(now)).unwrap_or(0),
         "bar": esc.map(|e| e.bar),
         "bar_met": esc.map(|e| e.bar_met()),
         "factors_present": esc.map(|e| e.factors.clone()),
@@ -15444,7 +15458,7 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
             // (`http::operator_gate_escalation`) kept returning a bare `{escalation_id,
             // status, witnessEntryHash}` and it is the path that decides — 207 of 210 rulings
             // on this chain. This call site keeps only what is specific to it.
-            let mut reply = decided.decision_reply();
+            let mut reply = decided.decision_reply(crate::server::gate_escalation::now_secs());
             if let Some(o) = reply.as_object_mut() {
                 o.insert("independence".into(), json!(independence));
                 o.insert("witnessEntryHash".into(), json!(entry.hash));
