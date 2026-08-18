@@ -391,7 +391,53 @@ def default_closure() -> Closure:
 # Reads are unaffected: a `>` inside a QUOTED argument or a heredoc body is never a write
 # position, so it never creates a write target (it may still classify "read", which is allowed).
 _PUNCT = "();<>|&"
-_SEPARATORS = frozenset({";", "&&", "||", "|", "|&", "&", "(", ")", ";;"})
+# The alphabet `_tokenize` actually hands shlex — "\n" is in it (#463). `_is_punct` keys on
+# THIS, not on `_PUNCT`: a token shlex assembled out of this alphabet must never read back as
+# an ordinary word, or it is appended to the running simple command as an argument.
+_PUNCT_CHARS = _PUNCT + "\n"
+# BASH'S OPERATOR TABLE, and why it has to exist here (#496, GPT not-same review of the
+# first #463 fix). shlex's `punctuation_chars` mode FUSES adjacent punctuation into one
+# token — `\n\n`, `;\n`, `\n;`, `\n&&`, `\n>`, `);`, `()` are each a SINGLE token. That
+# fusion is a shlex artifact, not a bash rule: bash emits maximal operators from exactly
+# this table and nothing else. Every fused spelling was absent from `_SEPARATORS` and, not
+# being a separator, was appended to the current simple command — so the boundary vanished
+# and the write behind it went unseen again, one token wider than #463:
+#
+#     printf hi\ncp /tmp/evil <closure>    -> DENY   (#463, closed by the newline token)
+#     printf hi\n\ncp /tmp/evil <closure>  -> ALLOW  (#496: one blank line and it is back)
+#
+# RE-SPLITTING, NOT A WIDER `_SEPARATORS`. A set of fused spellings is a list the next
+# fusion outgrows — `\n\n\n` and `\n>` are already outside the four the review named. The
+# operator table is CLOSED: bash has no other operators, so restoring bash's own token
+# boundaries settles the class instead of enumerating it. It also keeps shlex the SOLE
+# quote model (#485's hazard, which the caller's docstring warns of in those words): we
+# re-split tokens shlex has ALREADY resolved to unquoted punctuation and never look at raw
+# text. And because everything routes back through the EXISTING separator arm, no second
+# arm exists to fall out of state parity with it — the fused `);` that carried a `< file`
+# preimage past a boundary now hits the one arm that already resets `stdin_src`.
+#
+# Longest-first, because these are maximal munch: `>>` must not become `>` `>`, and `>&`
+# must not become `>` `&` — that would split an fd-dup off its fd and lose `2>&1`.
+_OPERATORS = tuple(sorted(
+    {";;", "<<<", "&>>", "<<", ">>", "<&", ">&", "<>", ">|", "&>", "&&", "||", "|&",
+     ";", "&", "|", "<", ">", "(", ")", "\n"},
+    key=len, reverse=True))
+# "\n" IS A SEPARATOR AND IT IS EMITTED AS ONE (#463). It was listed here before and
+# matched NOTHING, because the tokenizer let shlex treat a newline as whitespace and shlex
+# never emits whitespace as a token. Every line after the first therefore arrived as
+# ARGUMENTS to line one's head, so a benign head hid every write behind it:
+#
+#     cp /tmp/evil <closure>/x.py            -> DENY   (positive control)
+#     printf hi\ncp /tmp/evil <closure>/x.py -> ALLOW  (#463: same write, invisible)
+#
+# A silent write to the code that decides writes is the one class worse than a false
+# refusal. `_tokenize` now removes "\n" from shlex's whitespace set and adds it to the
+# punctuation set, so it arrives here as its own token and this entry finally matches.
+# Each entry is one bash operator, and `_tokenize` guarantees they arrive that way: it
+# re-splits shlex's fused punctuation runs, so `;\n` reaches here as `;` then `\n` and both
+# match. Without that guarantee this set would need every fused spelling, which is not a
+# finite thing to maintain (#496).
+_SEPARATORS = frozenset({";", "&&", "||", "|", "|&", "&", "(", ")", ";;", "\n"})
 _WRAPPERS = frozenset({"sudo", "doas", "env", "command", "exec", "nohup", "nice", "time",
                        "stdbuf"})
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -442,7 +488,33 @@ class _OutOfGrammar(Exception):
 
 
 def _is_punct(tok: str) -> bool:
-    return bool(tok) and all(ch in _PUNCT for ch in tok)
+    return bool(tok) and all(ch in _PUNCT_CHARS for ch in tok)
+
+
+def _split_operator_run(tok: str) -> list:
+    """Split one fused punctuation run into the bash operators it actually is.
+
+    shlex hands back `');'` where bash emits `)` then `;`. Maximal munch against
+    `_OPERATORS`, longest first.
+
+    The `raise` is unreachable by construction: every single character of `_PUNCT_CHARS` is
+    itself a 1-character operator, so the scan always makes progress. That closure is the
+    load-bearing part and it is PINNED as a test rather than assumed here, because a set
+    whose producer can emit a value it does not cover is exactly the defect that produced
+    #463. If the closure is ever broken, this raises, the caller turns a tokenizer failure
+    into the fail-closed unparseable posture, and no unsplit run is ever passed through as
+    if it were a word.
+    """
+    out, i, n = [], 0, len(tok)
+    while i < n:
+        for op in _OPERATORS:
+            if tok.startswith(op, i):
+                out.append(op)
+                i += len(op)
+                break
+        else:
+            raise ValueError("operator run %r has no operator at offset %d" % (tok, i))
+    return out
 
 
 def _has_subst(tok: str) -> bool:
@@ -487,9 +559,52 @@ def _vocab_tokens(command: str) -> list:
 
 
 def _tokenize(cmd: str) -> list:
-    lex = shlex.shlex(cmd, posix=True, punctuation_chars=_PUNCT)
+    """Tokenize a command, with NEWLINES and COMMENT MARKERS visible to the caller.
+
+    TWO HOLES, ONE CAUSE, CLOSED HERE (#463, measured 2026-08-18):
+
+      `printf hi\ncp /tmp/evil <closure>/x.py`   was permitted — shlex counts a newline as
+      whitespace, so the second line became arguments to `printf` and the `cp` was never a
+      head. The 2026-08-10 fix for this lived in the caller's own text splitter; the
+      2026-08-13 consolidation moved classification here and left the splitter behind, so
+      the hole reopened in the module that replaced it.
+
+      `echo a#b; cp /tmp/evil <closure>/x.py`    was permitted — shlex's `commenters` eats
+      from `#` to end of LINE, and the `;` sits on that line, so the comment swallowed the
+      separator and the write with it. No newline was needed for that one.
+
+    ONE QUOTE MODEL, DELIBERATELY. The obvious repair is to pre-split the raw text on
+    unquoted newlines, and the caller's `_command_lines` does exactly that — correctly, with
+    its own hand-written quote walk. Porting that walk here would put TWO quote models in one
+    classifier, and the day they disagree about where a quote ends is the day the disagreement
+    is a bypass (that is #485's class, and the caller's own docstring warns of it in those
+    words). So the newline is handed to shlex instead: removed from `whitespace`, added to
+    `punctuation_chars`. shlex keeps deciding what is quoted, and a QUOTED newline stays data
+    inside its token exactly as before — verified, not assumed.
+
+    COMMENTS ARE NOT STRIPPED, and that is a considered fail-closed trade. Dropping tokens
+    from a `#` to the next newline would be the faithful bash rule, but after tokenization a
+    token beginning with `#` cannot be distinguished from a QUOTED one (`echo "#x"`), and
+    dropping on that guess would make everything after a quoted `#` invisible — trading a
+    false refusal for a silent write, which is the wrong direction for this module. Left in,
+    a comment's words become an ordinary simple command whose head is `#`: harmless, and the
+    following line is still seen. The residual cost is a comment containing a redirect
+    (`# write with > here`) raising a phantom write target and refusing a benign command.
+    That is a false POSITIVE, it fails closed, and it is the direction this module prefers.
+    `a#b` is unaffected: shlex keeps a mid-word `#` attached, so it never opens anything.
+    """
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=_PUNCT_CHARS)
     lex.whitespace_split = True
-    return list(lex)
+    # Newline must not be whitespace, or it is consumed before it can be punctuation.
+    lex.whitespace = " \t\r\f\v"
+    # shlex's comment rule eats the separator with the comment; see the docstring.
+    lex.commenters = ""
+    out = []
+    for tok in lex:
+        # Only runs shlex ITSELF resolved to unquoted punctuation are re-split, so shlex
+        # remains the sole quote model: a quoted word is never re-examined here.
+        out.extend(_split_operator_run(tok) if _is_punct(tok) else [tok])
+    return out
 
 
 def _strip_wrappers(words: list) -> list:

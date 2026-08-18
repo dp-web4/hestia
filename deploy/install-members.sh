@@ -212,6 +212,18 @@ for f in (json.load(open(sys.argv[1])).get("install") or {}).get("files",[]):
   # uses. Deleting it would delete the only place the drift can be caught; using it is the
   # defect. Divergence is the signal that a member's manifest has rotted away from its
   # harness, and it is exactly how gemini's was found.
+  #
+  # 2026-08-18: the divergence is STRUCTURAL for claude-code, not a stale string. Three
+  # layouts are now measured, one per seat that looked:
+  #   declaration  ~/.claude/hooks/hestia          (an installed hooks dir)
+  #   Legion       ~/.claude/plugins/hestia/hooks  (a different installed subtree)
+  #   HUB          the hestia git checkout, in place — the declared dir does not exist there
+  # No single string is right for all three, so the warning below must NOT tell the operator
+  # to "fix the declaration": that instruction is unsatisfiable fleet-wide and would invite
+  # someone to pick a winner and break the other two seats. What is per-seat is the SHAPE of
+  # the answer, not just its content. HUB's case is the sharp one — its enforcing copy is a
+  # working tree, so `git pull` is a gate deployment there and a survey keyed on installed
+  # paths reads HUB as ungated while it runs the newest code in the fleet.
   declared="$(python3 -c '
 import json,os,sys
 p=((json.load(open(sys.argv[1])).get("install") or {}).get("dest") or "")
@@ -236,7 +248,7 @@ print(os.path.expanduser(p) if p else "")' "$expects")"
     target_dir="$(dirname "$target")"
     [ -d "$target_dir" ] || die "$member/$base is registered at $target but $target_dir does not exist"
     if [ -n "$declared" ] && [ "$target_dir" != "$declared" ]; then
-      warn "$member/$base: expects.json declares '$declared' but the harness invokes it from '$target_dir' — installing to the REGISTERED path; fix the declaration"
+      warn "$member/$base: expects.json declares '$declared' but the harness invokes it from '$target_dir' — installing to the REGISTERED path. The declared value is a per-seat CLAIM this run just checked, not a fleet-wide target: layouts differ by seat, so this divergence may be structural rather than a stale string to correct"
     fi
 
     src_hash="$(sha256sum "$src" | cut -d' ' -f1)"

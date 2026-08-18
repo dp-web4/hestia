@@ -516,6 +516,23 @@ impl SqliteInboxStore {
         Ok(())
     }
 
+    /// TEST-ONLY: rewind a member's `last_touch` so a stale row can be told from a fresh
+    /// one. There is no production path that moves a touch backwards — `touch_inbox` only
+    /// ever writes `now` — so the only way to exercise the "seen once, months ago" class
+    /// is to construct it. The row must already exist: this backdates a reader, it does
+    /// not invent one.
+    #[cfg(test)]
+    pub fn backdate_inbox_touch(&self, plugin_id: &str, when: DateTime<Utc>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let n = conn.execute(
+            "UPDATE member_inbox_touch SET first_seen = ?2, last_touch = ?2 WHERE plugin_id = ?1",
+            params![plugin_id, when.to_rfc3339()],
+        )?;
+        anyhow::ensure!(n == 1, "no member_inbox_touch row for {plugin_id} to backdate");
+        Ok(())
+    }
+
     /// What is on record about `plugin_id` ever having read its mailbox.
     /// `None` = never seen: no evidence any local watcher exists for that name.
     /// That is the dead-letter class, and *only* that is — a member seen before

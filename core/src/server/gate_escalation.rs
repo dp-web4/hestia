@@ -398,6 +398,18 @@ impl Escalation {
         self.expires_at.saturating_sub(now)
     }
 
+    /// How long this approval may still be SPENT — the countdown a holder actually needs.
+    ///
+    /// Distinct from `secs_remaining`, which counts down the RECORD's life (`expires_at`,
+    /// anchored at the open). The two diverge by construction once a decision lands, and the
+    /// record outlives the claim: measured live 2026-08-08, three permits polled
+    /// `secs_remaining ~1500` while ~24 minutes past their grant-anchored horizon. Reporting
+    /// the record clock where a holder reads for the claim clock is how a spent permit gets
+    /// published as live.
+    pub fn claim_window_secs_remaining(&self, now: u64) -> u64 {
+        self.decided_horizon().saturating_sub(now)
+    }
+
     /// May this approval still authorise the write it was granted for?
     ///
     /// Four conditions, all of which have to hold, and each of which is a way this could
@@ -549,9 +561,22 @@ impl Escalation {
     /// The MCP handler already carried the comment *"two places deciding what 'permits the
     /// write' means is how they come to disagree."* It was right, and they disagreed anyway,
     /// one layer up. So the answer moves here and both callers read it.
-    pub fn decision_reply(&self) -> serde_json::Value {
+    pub fn decision_reply(&self, now: u64) -> serde_json::Value {
         let bar_met = self.bar_met();
-        let permits_write = self.stored_status() == Status::Approved && bar_met;
+        // THE GRANT AND THE PERMISSION ARE TWO DIFFERENT FACTS, and this field is named for
+        // the second one. `granted` is the decision as a decision: approved, bar met. It is
+        // fixed the moment the ruling lands and never changes again. `permits_write` asks
+        // whether the write would be allowed IF RE-ISSUED NOW, which is what its name claims
+        // and what `is_claimable` enforces — and that answer decays, through `consumed_at`
+        // and through the claim horizon.
+        //
+        // This used to be `granted`, published under the name `permits_write`. Two of four
+        // conjuncts, on a field with no clock, so it could not have tracked the other two at
+        // any time. Nothing was lost by keeping `status` and `bar_met` beside it: a reader
+        // who wants the decision fact reads those.
+        let granted = self.stored_status() == Status::Approved && bar_met;
+        let permits_write = self.is_claimable(now);
+        let spent = self.consumed_at.is_some();
         serde_json::json!({
             "escalation_id": self.id,
             "status": self.stored_status(),
@@ -559,9 +584,14 @@ impl Escalation {
             "decided_role": self.decided_role,
             "bar": self.bar,
             "bar_met": bar_met,
-            // The same conjunction `is_claimable` enforces, answered here rather than left for
-            // each caller to re-derive.
+            // The same conjunction `is_claimable` enforces — the SAME FOUR, evaluated
+            // against the same clock, not two of them re-derived without one.
             "permits_write": permits_write,
+            // The decision as a decision, so nothing this field used to carry is lost.
+            "granted": granted,
+            // The countdown that belongs to the holder. Zero once the window has shut, which
+            // is the state `secs_remaining` cannot distinguish from a live permit.
+            "claim_window_secs_remaining": self.claim_window_secs_remaining(now),
             // The invitation half of the bar, reported as a RECORD (#226). Under blocker
             // semantics an absent peer showed up as `bar_met: false`; now that the sovereign
             // conjunct decides alone, nothing on any surface would say whether a peer was ever
@@ -572,6 +602,13 @@ impl Escalation {
             "peer_participation": self.peer_participation(),
             "note": if permits_write {
                 "the asker must RE-ISSUE the write to claim this; approvals are single use"
+            } else if granted && spent {
+                "this approval has ALREADY BEEN CLAIMED. Approvals are single use: re-issuing \
+                 the write will be refused, and a new escalation must be opened."
+            } else if granted {
+                "this approval was granted and its CLAIM WINDOW HAS CLOSED. It is recorded as \
+                 approved and it authorises nothing: re-issuing the write will be refused, \
+                 and a new escalation must be opened."
             } else if bar_met {
                 "this decision does not permit the write: it is a DENY, recorded as one"
             } else {
@@ -1790,7 +1827,7 @@ mod tests {
                     Channel::OperatorSession, None, Some("proceed"), T0 + 5)
             .unwrap();
 
-        let r = decided.decision_reply();
+        let r = decided.decision_reply(T0 + 6);
         // The three fields the operator surface has never carried.
         assert!(r.get("bar").is_some(), "name the criterion: {r}");
         assert_eq!(r.get("bar_met").and_then(serde_json::Value::as_bool), Some(true));
@@ -1805,6 +1842,98 @@ mod tests {
             decided.is_claimable(T0 + 6),
             "the reported answer and `is_claimable` are one predicate or they will diverge"
         );
+    }
+
+    /// `permits_write` must track `is_claimable` ACROSS THE TWO CONJUNCTS THAT MOVE.
+    ///
+    /// WHY A SECOND TEST, when `one_answer_serves_both_deciding_surfaces` already asserts
+    /// `permits_write == is_claimable`: because it asserts it at ONE instant, on a fresh
+    /// unspent approval, six seconds after the grant. Both conjuncts that can differ —
+    /// `consumed_at.is_none()` and `now < decided_horizon()` — are trivially satisfied
+    /// there, so that equality held for a `permits_write` that did not contain either of
+    /// them, and could not have. The field took no clock at all. A time-independent
+    /// predicate cannot equal a time-dependent one except on the sub-domain where the
+    /// time-dependent conjuncts are constant, and that test picked exactly that sub-domain.
+    /// It named the divergence in its own failure message — "one predicate or they will
+    /// diverge" — and was structurally incapable of observing it.
+    ///
+    /// So this samples the axis instead of a point, and asserts the equality at each
+    /// sample. Sabotage arm: restore `permits_write` to the old two-conjunct form
+    /// (`stored_status() == Approved && bar_met`) and the horizon and spent samples below
+    /// both go red; the fresh sample stays green, which is the whole reason the old pin
+    /// passed.
+    #[test]
+    fn permits_write_tracks_the_two_conjuncts_that_move() {
+        let mut s = EscalationStore::default();
+        let e = s
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        let id = e.id.clone();
+        let decided = s
+            .decide(&id, true, "operator", "role:constellation:sovereign",
+                    Channel::OperatorSession, None, Some("proceed"), T0 + 5)
+            .unwrap();
+
+        // --- sample 1: inside the window. The only point the old pin ever looked at.
+        let live = decided.decision_reply(T0 + 6);
+        assert_eq!(live["permits_write"], serde_json::json!(true));
+        assert_eq!(live["granted"], serde_json::json!(true));
+        assert_eq!(
+            live["claim_window_secs_remaining"],
+            serde_json::json!(APPROVAL_CLAIM_WINDOW_SECS - 1),
+            "the countdown is anchored at the GRANT, not the open: {live}"
+        );
+
+        // --- sample 2: one second past the claim horizon. `granted` is unchanged forever;
+        // `permits_write` is not, and this is the interval in which a spent-or-stale permit
+        // was published as live.
+        let past = T0 + 5 + APPROVAL_CLAIM_WINDOW_SECS + 1;
+        assert!(!decided.is_claimable(past), "the enforcement refuses here");
+        let stale = decided.decision_reply(past);
+        assert_eq!(
+            stale["permits_write"], serde_json::json!(false),
+            "past the horizon the reporting surface must refuse too: {stale}"
+        );
+        assert_eq!(
+            stale["granted"], serde_json::json!(true),
+            "the decision fact does not decay — it is still an approval that met its bar"
+        );
+        assert_eq!(stale["claim_window_secs_remaining"], serde_json::json!(0));
+        assert!(
+            stale["note"].as_str().unwrap().contains("CLAIM WINDOW HAS CLOSED"),
+            "and the note must name WHICH conjunct failed: {stale}"
+        );
+
+        // --- sample 3: SPENT, well inside the window. The other moving conjunct, and the
+        // one that produced the false publication on 2026-08-18: a permit already claimed,
+        // polled back as live.
+        let claimed = s
+            .claim("claude-code", "pre_tool_use.py", T0 + 10)
+            .expect("the approval is claimable at T0+10, so the claim must find it");
+        assert_eq!(claimed.consumed_at, Some(T0 + 10), "and the claim spends it");
+        let spent = s.get(&id).unwrap().decision_reply(T0 + 11);
+        assert_eq!(
+            spent["permits_write"], serde_json::json!(false),
+            "a SPENT approval permits nothing, one second later and 589s inside the \
+             window — the case `secs_remaining` cannot see: {spent}"
+        );
+        assert_eq!(spent["granted"], serde_json::json!(true));
+        assert!(
+            spent["note"].as_str().unwrap().contains("ALREADY BEEN CLAIMED"),
+            "name this conjunct too: {spent}"
+        );
+
+        // --- the invariant, asserted on the whole axis rather than at a point.
+        let e_final = s.get(&id).unwrap();
+        for offset in [0u64, 1, 6, 11, 300, 599, 600, 601, 4200] {
+            let now = T0 + offset;
+            assert_eq!(
+                e_final.decision_reply(now)["permits_write"],
+                serde_json::json!(e_final.is_claimable(now)),
+                "reporting and enforcement are one predicate at every sample, or they are \
+                 not one predicate at all (offset {offset})"
+            );
+        }
     }
 
     /// An approval short of the bar must say it permits nothing — the class #219 found, kept
@@ -1833,7 +1962,7 @@ mod tests {
             x.factors.clear();
             x.clone()
         };
-        let r = hollow.decision_reply();
+        let r = hollow.decision_reply(T0 + 6);
         assert_eq!(r.get("bar_met").and_then(serde_json::Value::as_bool), Some(false));
         assert_eq!(r.get("permits_write").and_then(serde_json::Value::as_bool), Some(false));
         assert!(
@@ -1873,7 +2002,7 @@ mod tests {
                     Channel::OperatorSession, None, Some("proceed"), T0 + 5)
             .unwrap();
 
-        let p = decided.decision_reply();
+        let p = decided.decision_reply(T0 + 6);
         let part = p.get("peer_participation").expect("participation must be ON the reply");
         assert_eq!(part.get("invited").and_then(serde_json::Value::as_array).unwrap().len(), 0);
         assert_eq!(part.get("concurred").and_then(serde_json::Value::as_u64), Some(0));
@@ -1921,7 +2050,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            code.contains(".decision_reply()"),
+            code.contains(".decision_reply("),
             "the operator decide route builds its own reply again. That is the exact drift \
              #219 left behind: the chain records `bar`/`bar_met` and the decider is told \
              neither, on the path that rules 207 of 210 escalations."

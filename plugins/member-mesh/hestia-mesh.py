@@ -21,7 +21,7 @@ Discipline: forum post = record, mesh notice = wake; content lives at the pointe
 Bind your dispositions: pass the id of the notice you are answering as the 4th
 arg to `send` (reply/ack/review_done), or it stays "unanswered" forever.
 """
-import json, os, sys, urllib.error, urllib.request
+import json, os, sys, time, urllib.error, urllib.request
 
 EP = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
 
@@ -208,6 +208,51 @@ def connect():
               " — acts land on that grain, not the one you declared.", file=sys.stderr)
     return h, s
 
+def keep_a_copy(payload):
+    """A consume-once drain must leave a durable copy BEFORE anyone reads stdout.
+
+    `drain` empties the mailbox server-side; the notices exist afterwards only in
+    this process's stdout. `fire-*.sh` has always known that — it writes the primer
+    to the member's home BEFORE the sender filter runs, which is the only reason
+    notice 160 survived being dropped by an allowlist (fire_sender_allowlist_test.py).
+    The CLI path had no such copy, and SessionStart hooks tell every member to run
+    `hestia-mesh.py drain` in-session.
+
+    Measured 2026-08-18 (claude-code, CBP): a drain returned seven notices; the
+    caller piped stdout through a summarizer that printed only the ids. Notice 3097
+    was consumed, never read, and unrecoverable — `hestia_query_history` filtered by
+    tool_name returns nothing on this store, so the only remedy was asking the sender
+    to send it again. One lossy consumer, one destroyed notice, no error anywhere.
+
+    Best effort by construction: the mailbox is already empty by the time we are
+    called, so a failed write must not also fail the command — but it must be LOUD,
+    and it dumps the payload to stderr so a lossy stdout consumer is not the last
+    copy. stdout stays pure JSON (the contract in act()).
+    """
+    notices = (payload or {}).get("notices") if isinstance(payload, dict) else None
+    if not notices:
+        return
+    state = os.environ.get("HESTIA_MESH_STATE") or os.path.join(
+        os.path.expanduser("~"), ".local", "state", "hestia-mesh")
+    d = os.path.join(state, "drained", PLUGIN or "unknown")
+    ids = ",".join(str(n.get("id")) for n in notices if isinstance(n, dict))
+    try:
+        os.makedirs(d, exist_ok=True)
+        os.chmod(d, 0o700)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        path = os.path.join(d, f"drain-{stamp}-{os.getpid()}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=1)
+        os.chmod(path, 0o600)
+        print(f"hestia-mesh: drained {len(notices)} notice(s) [{ids}] — copy kept at {path}",
+              file=sys.stderr)
+    except Exception as e:
+        print(f"hestia-mesh: WARNING: could not keep a copy of the drain ({e}). "
+              f"The mailbox is ALREADY EMPTY and stdout is the only remaining copy of "
+              f"notice(s) [{ids}] — full payload repeated on stderr below.", file=sys.stderr)
+        print(json.dumps(payload, indent=1), file=sys.stderr)
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in ("peek", "drain", "send", "unanswered"):
         print(__doc__); sys.exit(2)
@@ -230,6 +275,8 @@ def act(cmd):
     h, s = connect()
     if cmd in ("peek", "drain"):
         out = rpc(h, "hestia_member_inbox", {"session_id": s, "peek": cmd == "peek"})
+        if cmd == "drain":
+            keep_a_copy(out)
     elif cmd == "unanswered":
         args = {"session_id": s}
         if len(sys.argv) > 2:

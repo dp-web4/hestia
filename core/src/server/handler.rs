@@ -10127,6 +10127,114 @@ mod tests {
         );
     }
 
+    /// THE MISSING DIRECTION.
+    ///
+    /// `governance_ledger::tests::every_declared_governance_event_is_actually_projected` walks
+    /// `GOVERNANCE_EVENTS` and checks each name projects to a row. Nothing walked the other way,
+    /// so an event a producer actually EMITS could go undeclared forever with that test green —
+    /// and it did, for both terminal escalation events, while 18 such rows sat on the live chain
+    /// (codex, reviewing #499, over 151,172 entries). A set-membership test can only be as
+    /// complete as the set; it can never notice what was never added.
+    ///
+    /// This asserts the direction no list can, and it is deliberately NOT a second spelling list
+    /// (codex's implementation constraint on #499): it runs the REAL producers and reads each
+    /// event type off the chain entry they actually wrote. No expected name appears below, so
+    /// renaming an event cannot silently retire the check, and a NEW terminal producer added
+    /// later is caught by the same assertion without anyone remembering to extend anything.
+    ///
+    /// Scope, stated rather than implied: this bounds the events carrying an `escalation_id`.
+    /// It does not bound producers on other surfaces — the honest guarantee is "no escalation
+    /// lifecycle event escapes declaration", not "no event anywhere does". A typed lifecycle
+    /// registry is the stronger route and is not what this is.
+    #[tokio::test]
+    async fn every_escalation_event_a_producer_emits_is_a_declared_governance_event() {
+        let (_dir, shared) = make_shared_state();
+        let mut sid = String::new();
+        for id in ["claude-code", "kimi-code"] {
+            let out = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            if id == "claude-code" {
+                sid = out["sessionId"].as_str().expect("a session to rule from").to_string();
+            }
+        }
+        let open_one = |marker: &'static str| {
+            let shared = shared.clone();
+            let sid = sid.clone();
+            async move {
+                let c = tool_gate_escalation_claim(
+                    &shared,
+                    &json!({
+                        "plugin_id": "claude-code",
+                        "tool_name": "Edit",
+                        "marker": marker,
+                        "reason": "Edit -> a governance file",
+                        "session_id": sid,
+                    }),
+                )
+                .await
+                .unwrap();
+                c["escalation_id"].as_str().expect("an id to rule on").to_string()
+            }
+        };
+
+        // PRODUCER 1 — the asker withdraws. Emits the terminal event that is not a verdict.
+        let withdrawn = open_one("witness.py").await;
+        tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({ "escalation_id": &withdrawn, "approve": false, "session_id": sid }),
+        )
+        .await
+        .expect("a member must be able to retire its own ask");
+
+        // PRODUCER 2 — the clock wins. `record_newly_lapsed` is the real lapse recorder, driven
+        // here at a `now` past the horizon rather than by waiting out the TTL.
+        let lapsed = open_one("pre_tool_use.py").await;
+        let recorded = {
+            let mut s = shared.lock().await;
+            let expires_at = s
+                .gate_escalations
+                .get(&lapsed)
+                .expect("the escalation just opened")
+                .expires_at;
+            record_newly_lapsed(&mut s, expires_at + 1)
+        };
+        assert_eq!(recorded, 1, "the lapse producer must have written exactly one row");
+
+        // THE ASSERTION. Every chain event these producers wrote that names an escalation is an
+        // admin act, so the ledger must be able to read it. Read the types off the chain — never
+        // compare against a name written here.
+        let s = shared.lock().await;
+        let emitted: Vec<String> = s
+            .recent_chain(200)
+            .into_iter()
+            .filter(|e| e.event_data.get("escalation_id").is_some())
+            .map(|e| e.event_type.clone())
+            .collect();
+        let undeclared: Vec<&String> = emitted
+            .iter()
+            .filter(|t| !crate::server::governance_ledger::is_governance_event(t))
+            .collect();
+        assert!(
+            undeclared.is_empty(),
+            "these escalation events are PRODUCED but declared in GOVERNANCE_EVENTS by nothing, \
+             so the operator ledger filters them out and the projector never sees them: \
+             {undeclared:?} (all emitted: {emitted:?})"
+        );
+
+        // The premise, guarded: an assertion over an empty list passes for the wrong reason, and
+        // a zero-iteration loop reading as "all clear" is this repo's recurring shape.
+        assert!(
+            emitted.iter().any(|t| t.ends_with("_withdrawn")),
+            "the withdrawal producer emitted nothing — the test proved a vacuous truth: \
+             {emitted:?}"
+        );
+        assert!(
+            emitted.iter().any(|t| t.ends_with("_expired")),
+            "the lapse producer emitted nothing — the test proved a vacuous truth: {emitted:?}"
+        );
+    }
+
     /// THE ASKER MAY DROP ITS OWN ASK — AND STILL MAY NOT GRANT IT.
     ///
     /// `tool_gate_arbitrate_escalation` parsed `approve` and then decided eligibility without
@@ -10604,6 +10712,152 @@ mod tests {
         assert!(
             mail.iter().any(|m| m.kind == "review_request"),
             "the invited peer must actually be woken: {mail:?}"
+        );
+    }
+
+    /// OPEN-DEFECT PIN, hole-J shape (CBP 2026-08-18): the assertions below record the
+    /// CURRENT WRONG behaviour, so this test is green exactly while the defect stands and
+    /// goes RED the moment it is fixed. **A red here is the intended end state** — read the
+    /// failure messages, not the polarity.
+    ///
+    /// `invited_without_reader` catches "never seen" and misses "not seen since July", so a
+    /// dead mailbox is scored as a peer that declined.
+    ///
+    /// `has_mailbox_reader` is `inbox_touch(id).is_some()` — row exists, all time, no window.
+    /// The daemon already computes the windowed reading of the SAME row on the notify path:
+    /// `recipient_liveness` splits it three ways (`live` inside
+    /// [`MEMBER_LIVE_WITHIN_SECS`], `dormant`, `unknown`) and ships `last_inbox_touch` as
+    /// evidence. The invitation path calls the same `inbox_touch` and keeps one bit of it.
+    ///
+    /// That bit decides an EVIDENTIARY question, not a queueing one. `dormant` is the right
+    /// answer to "is this worth queueing?" — the notice waits, the watcher starts tomorrow,
+    /// nothing is lost. It is the wrong answer to "did this seat read the ask and decline?",
+    /// because that question has a deadline: `ttl_secs`, 3600 on every `sovereign_plus_peer`
+    /// escalation this daemon has opened. A seat whose mailbox was last read weeks ago cannot
+    /// read one inside the hour, and `peer_participation` counts it in `absent` anyway —
+    /// the exact reading `invited_without_reader` was added to prevent.
+    ///
+    /// MEASURED, not hypothesised. Escalations `5725d296b05cbc4c` (claude-code, 17:11:21Z)
+    /// and `18705bb00dd24903` (kimi-code, 17:13:48Z), both `ttl_secs: 3600`, invited 8 and
+    /// flagged 5 readerless. `codex-cli` was in the unflagged 3 on both, carrying
+    /// `mailbox_reader: true` with `liveness_at_invite: unknown` — and the daemon's own
+    /// liveness readout on that same row, minted 17:43Z the same day, is
+    /// `{first_seen: 2026-07-26T05:54:39Z, last_inbox_touch: 2026-07-26T05:54:39Z,
+    /// mailbox_reads: 1}`. One read, twenty-three days earlier, never an act on the chain:
+    /// dead by both instruments the daemon owns, and scored as a peer that declined by the
+    /// field built to stop exactly that.
+    ///
+    /// `tools/invitation_deadletter_census.py` could not see this class. It defines the
+    /// dead-letter population as ids "with no `member_inbox_touch` row at all", inheriting
+    /// `recipient_liveness`'s "`unknown` ... is the dead-letter class, and *only* this" —
+    /// a boundary drawn for the queueing question and then reused for the conduct one. Its
+    /// 172-of-272 is a floor on the defect, not a measure of it.
+    ///
+    /// The fix is a WINDOW on an existing read, not a filter: `invited_without_reader` should
+    /// hold a seat whose `last_touch` predates the escalation's own TTL. Still not a gate —
+    /// the seat stays invited and may corroborate late, which `corroborate` expressly allows.
+    /// It changes only whether silence from an unreachable mailbox is published as a decision.
+    #[tokio::test]
+    async fn a_stale_mailbox_row_is_still_counted_as_a_peer_that_declined() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "codex-cli"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id.to_string(), r["sessionId"].as_str().unwrap().to_string());
+        }
+        // A reader existed once: the only production path that writes the row is a drain.
+        // Then rewind it to the measured vintage of the live `codex-cli` row — 23 days, or
+        // 552 times the 3600s TTL the escalation below will carry.
+        {
+            let s = shared.lock().await;
+            s.inbox_store.drain_member("codex-cli").unwrap();
+            s.inbox_store
+                .backdate_inbox_touch("codex-cli", Utc::now() - chrono::Duration::days(23))
+                .unwrap();
+        }
+
+        // CONTROL, and it is the reason this test cannot pass by accident: the SAME row, read
+        // by the daemon's other consumer, already answers the question correctly.
+        {
+            let s = shared.lock().await;
+            let (verdict, evidence) = recipient_liveness(&s.inbox_store, "codex-cli");
+            assert_eq!(
+                verdict, "dormant",
+                "the notify path reads this row as stale: {evidence}"
+            );
+        }
+
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": session_of["claude-code"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "reason": "Edit -> a governance file",
+            }),
+        )
+        .await
+        .unwrap();
+        let invited: Vec<String> = claimed["invited_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            invited.contains(&"codex-cli".to_string()),
+            "precondition: the stale seat is invited (over-issuing is deliberate): {invited:?}"
+        );
+
+        let s = shared.lock().await;
+        let opened = s
+            .recent_chain(40)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened")
+            .expect("the open must be witnessed");
+        assert_eq!(
+            opened.event_data["ttl_secs"],
+            json!(3600),
+            "the deadline the conduct question is asked against"
+        );
+        let reader_flag = opened.event_data["invitation_evidence"]
+            .as_array()
+            .expect("per-peer invitation evidence")
+            .iter()
+            .find(|r| r["peer"] == json!("codex-cli"))
+            .expect("the stale seat has an evidence row")["mailbox_reader"]
+            .clone();
+        assert_eq!(
+            reader_flag,
+            json!(true),
+            "PIN OF THE DEFECT, and a red here means it was FIXED — delete this assertion, \
+             not the fix. A mailbox last read 23 days before a 3600s escalation has no reader \
+             FOR THIS ASK, yet `has_mailbox_reader` reports one off a row with no window. \
+             That bit is what carries the seat past `invited_without_reader` and into `absent`."
+        );
+
+        let esc_id = claimed["escalation_id"].as_str().unwrap();
+        let pp = s
+            .gate_escalations
+            .get(esc_id)
+            .expect("the escalation this call opened")
+            .peer_participation();
+        // The registry here is exactly {claude-code (asker, excluded), codex-cli}, so the
+        // whole invited set is the one stale seat and the two counts have no room to hide
+        // in each other.
+        assert_eq!(invited.len(), 1, "the invited set is the stale seat alone: {invited:?}");
+        assert_eq!(
+            pp.invited_without_reader, 0,
+            "PIN OF THE DEFECT (red here = fixed): the one seat that is unreachable for this \
+             ask is NOT held by the field built to hold exactly it: {pp:?}"
+        );
+        assert_eq!(
+            pp.absent, 1,
+            "PIN OF THE DEFECT (red here = fixed): and so it is published as a peer that saw \
+             the ask and stayed silent — a decline manufactured out of a dead mailbox: {pp:?}"
         );
     }
 
@@ -11695,7 +11949,7 @@ mod tests {
                 )
                 .expect("a dissent is evidence, never a veto — the sovereign still decides")
         };
-        let reply = decided.decision_reply();
+        let reply = decided.decision_reply(crate::server::gate_escalation::now_secs());
         assert_eq!(
             reply["peer_participation"]["dissented"], 1,
             "the decided record must count the dissent: {reply}"
@@ -14668,7 +14922,21 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         // recorded but permits nothing. The mismatch is a visible state, never an implicit
         // sufficient. (dp 2026-07-30 + claude-code: the record must carry the bar, not just
         // the evidence and the verdict.)
-        "permits_write": status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false),
+        // THE POLL ASKS EXACTLY THE QUESTION `is_claimable` ANSWERS, and it has had `now`
+        // in scope the entire time. It used to re-derive two of the four conjuncts here —
+        // approved-and-bar-met — so a permit that was already SPENT, or past its claim
+        // horizon, polled back `permits_write: true`. Measured live 2026-08-08 on three
+        // real permits, and again 2026-08-18 on `c2df1592a9a81eed`, which this seat then
+        // published to the operator as live with "~40 min left" while the claim path had
+        // already refused it.
+        //
+        // `tools/claimable.py` is the correct reader and has been in `main` since
+        // 2026-08-08 with ZERO call sites. That is the whole lesson: the right answer
+        // existing somewhere does not put it on the path anyone takes. It goes HERE, where
+        // the wrong field already was.
+        "permits_write": esc.map(|e| e.is_claimable(now)).unwrap_or(false),
+        "granted": status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false),
+        "claim_window_secs_remaining": esc.map(|e| e.claim_window_secs_remaining(now)).unwrap_or(0),
         "bar": esc.map(|e| e.bar),
         "bar_met": esc.map(|e| e.bar_met()),
         "factors_present": esc.map(|e| e.factors.clone()),
@@ -15282,7 +15550,7 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
             // (`http::operator_gate_escalation`) kept returning a bare `{escalation_id,
             // status, witnessEntryHash}` and it is the path that decides — 207 of 210 rulings
             // on this chain. This call site keeps only what is specific to it.
-            let mut reply = decided.decision_reply();
+            let mut reply = decided.decision_reply(crate::server::gate_escalation::now_secs());
             if let Some(o) = reply.as_object_mut() {
                 o.insert("independence".into(), json!(independence));
                 o.insert("witnessEntryHash".into(), json!(entry.hash));
