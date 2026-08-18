@@ -66,6 +66,20 @@ pub const GOVERNANCE_EVENTS: &[&str] = &[
     "gate_escalation_corroborated",
     "gate_escalation_refused",
     "gate_escalation_arbiter_refused",
+    // The two TERMINAL escalation outcomes that are neither a decision nor a refusal-to-open.
+    // Both were produced by the daemon and absent from this list, so neither could reach the
+    // one surface an operator reads acts back from:
+    //
+    // * `gate_escalation_expired` is #310's fix — "expiry must be an EVENT, not a derived
+    //   absence". It is appended by `record_newly_lapsed`, and this module could not see it,
+    //   so the ledger went on inferring expiry from the clock (below) — the exact derivation
+    //   the event exists to replace. A lapse whose `opened` had scrolled out of the window
+    //   produced NO ROW AT ALL, while `gate_escalation_decided` in the same position
+    //   synthesises one.
+    // * `gate_escalation_withdrawn` is the asker ending its own ask. It carries the same
+    //   payload as `decided` and was invisible for the same reason.
+    "gate_escalation_expired",
+    "gate_escalation_withdrawn",
     // Scope requests — also decidable, same operator, different surface.
     "scope_requested",
     // A DURABLE grant that was attempted. Listed so a grant that failed its vault write is
@@ -81,6 +95,10 @@ pub const GOVERNANCE_EVENTS: &[&str] = &[
     "scope_grant_intent",
     "scope_granted",
     "scope_refused",
+    // Revoking a DURABLE grant is a widening undone: the same operator, the same surface, and
+    // the act a reader is most likely to be looking for when they ask what happened to a
+    // standing permission. Produced by `http::scope_standing_revoke`, undeclared until now.
+    "scope_standing_revoked",
     "scope_attestation",
     // Society-wide permission mutations. Intent and terminal fact remain separate rows so a
     // failed durable change is visible without being mistaken for one that landed.
@@ -362,8 +380,15 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                     order.push(Row::Keyed(id));
                 }
             }
-            "gate_escalation_decided" | "scope_granted" | "scope_refused" => {
-                let is_scope = e.event_type != "gate_escalation_decided";
+            // A withdrawal rides this arm because it IS this shape: `tool_gate_arbitrate_escalation`
+            // appends one or the other from the same `json!` block, with the same `status`. The
+            // coarse status bucket does not lose the difference — `event_type` is carried onto the
+            // row, so "the operator denied it" and "the asker withdrew it" stay distinguishable to
+            // any reader that looks, which is the same contract the society-floor rows keep.
+            "gate_escalation_decided" | "gate_escalation_withdrawn" | "scope_granted"
+            | "scope_refused" => {
+                let is_scope =
+                    !matches!(e.event_type.as_str(), "gate_escalation_decided" | "gate_escalation_withdrawn");
                 let Some(id) = (if is_scope {
                     s(d, "request_id").or_else(|| s(d, "id"))
                 } else {
@@ -422,6 +447,56 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                     order.push(Row::Keyed(id));
                 }
             }
+            // THE RECORDED LAPSE, which is not the same fact as a row that is merely past its
+            // horizon. The clock pass below still resolves Open -> Expired for asks with no
+            // expiry record — that inference is right for a lapse the daemon was down for
+            // (`record_newly_lapsed` documents that gap) — but an inference and a witnessed
+            // ending must not render identically. The discriminator is `decided_hash`: set
+            // here from the chain entry that ended it, and `None` on every clock-derived row.
+            // `decided_by` stays None because nobody decided; that is the finding, not a hole.
+            "gate_escalation_expired" => {
+                let Some(id) = s(d, "escalation_id") else { continue };
+                if let Some(row) = keyed.get_mut(&id) {
+                    row.status = LedgerStatus::Expired;
+                    row.secs_remaining = Some(0);
+                    row.decided_at = Some(ts);
+                    row.decided_hash = Some(e.hash.clone());
+                    // The note now carries the participation census, so an operator reading
+                    // the ledger sees who was asked and what they did without a chain join.
+                    row.decision_reason = s(d, "note");
+                } else {
+                    // Same rule as a ruling whose ask scrolled out of the window: an ending is
+                    // still an ending. Before this arm existed the entry was filtered out one
+                    // step earlier and the lapse left no row at all.
+                    let row = LedgerRow {
+                        id: id.clone(),
+                        kind: LedgerKind::Escalation,
+                        status: LedgerStatus::Expired,
+                        event_type: e.event_type.clone(),
+                        opened_at: ts.clone(),
+                        decided_at: Some(ts),
+                        plugin_id: s(d, "plugin_id"),
+                        role: s(d, "role"),
+                        subject: s(d, "marker"),
+                        tool_name: s(d, "tool_name"),
+                        reason: s(d, "stated_reason"),
+                        detail: s(d, "stated_detail"),
+                        decided_by: None,
+                        decided_via: None,
+                        decision_reason: s(d, "note"),
+                        expires_at: u(d, "expires_at"),
+                        secs_remaining: Some(0),
+                        corroborations: Vec::new(),
+                        claimed_at: None,
+                        opened_hash: e.hash.clone(),
+                        decided_hash: Some(e.hash.clone()),
+                        chain_position: e.chain_position,
+                        open_not_in_window: true,
+                    };
+                    keyed.insert(id.clone(), row);
+                    order.push(Row::Keyed(id));
+                }
+            }
             "gate_escalation_claimed" => {
                 if let Some(id) = s(d, "escalation_id") {
                     if let Some(row) = keyed.get_mut(&id) {
@@ -459,7 +534,7 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                 order.push(Row::OneShot(one_shot(e, LedgerKind::LawEdit, LedgerStatus::Recorded, subject)));
             }
             "policy_instance_grant" | "policy_instance_grant_revoked" | "agent_ungovern"
-            | "amnesty" => {
+            | "amnesty" | "scope_standing_revoked" => {
                 let subject = s(d, "preset")
                     .or_else(|| s(d, "path"))
                     .or_else(|| s(d, "scope"))
@@ -892,5 +967,161 @@ mod tests {
             }
         }
         assert!(missing.is_empty(), "declared but not projected: {missing:?}");
+    }
+
+    /// Spellings that carry a lifecycle PREFIX but are not event types. Each one has to be
+    /// named here deliberately, and each is checked below for still existing and for not
+    /// being declared — a stale exclusion fails rather than quietly widening the guard.
+    const NOT_AN_EVENT_TYPE: &[&str] = &[
+        // A response FIELD (`"scope_grants": s.live_scope_grants(..)`), never appended.
+        "scope_grants",
+    ];
+
+    /// Every source file that appends escalation/scope lifecycle events.
+    const LIFECYCLE_PRODUCERS: &[&str] = &["src/server/handler.rs", "src/server/http.rs"];
+
+    /// Collect `"prefix..."` spellings out of Rust source WITHOUT depending on quote parity.
+    ///
+    /// Scanning for an opening quote immediately followed by the prefix, then reading to the
+    /// next quote, is deliberately over-inclusive: a spelling that appears only in a comment
+    /// or a match arm is still counted. Over-inclusion costs a one-line exclusion; a parity
+    /// walk that a quoted phrase in a doc comment could shift would MISS a real producer and
+    /// report a clean run, which is the failure this test exists to end.
+    fn lifecycle_spellings(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for prefix in ["\"gate_escalation_", "\"scope_"] {
+            let mut from = 0;
+            while let Some(i) = src[from..].find(prefix) {
+                let start = from + i + 1;
+                match src[start..].find('"') {
+                    Some(end) => {
+                        let lit = &src[start..start + end];
+                        if lit.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                            out.push(lit.to_string());
+                        }
+                        from = start + end;
+                    }
+                    None => break,
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The OTHER direction of the drift guard, and the one that was missing.
+    ///
+    /// `every_declared_governance_event_is_actually_projected` walks declared -> projected, so
+    /// it can only catch a name added to the list without an arm. It is structurally blind to
+    /// the reverse: an event the daemon PRODUCES that was never declared is filtered out one
+    /// step before projection, and every test that starts from the list agrees it is fine. A
+    /// dead element reads as covered.
+    ///
+    /// Run in this direction the first time, it found three — `gate_escalation_expired`
+    /// (#310's own fix, invisible to the surface that still infers expiry from the clock),
+    /// `gate_escalation_withdrawn`, and `scope_standing_revoked`. Only the first had been
+    /// named by anyone.
+    #[test]
+    fn every_produced_lifecycle_event_is_declared() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut produced: Vec<String> = Vec::new();
+        for rel in LIFECYCLE_PRODUCERS {
+            let path = root.join(rel);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("lifecycle producer {} is unreadable: {e}", path.display()));
+            produced.extend(lifecycle_spellings(&text));
+        }
+        produced.sort();
+        produced.dedup();
+
+        // The scan has to see something, or an empty result would pass vacuously.
+        assert!(
+            produced.len() >= 10,
+            "the producer scan found only {} spellings — it has stopped matching, not the code              stopped producing: {produced:?}",
+            produced.len()
+        );
+
+        let undeclared: Vec<&String> = produced
+            .iter()
+            .filter(|ev| !GOVERNANCE_EVENTS.contains(&ev.as_str()))
+            .filter(|ev| !NOT_AN_EVENT_TYPE.contains(&ev.as_str()))
+            .collect();
+        assert!(
+            undeclared.is_empty(),
+            "produced but not declared in GOVERNANCE_EVENTS — the ledger filters these out              before projection, so an operator cannot read them back at all: {undeclared:?}"
+        );
+
+        for ex in NOT_AN_EVENT_TYPE {
+            assert!(
+                produced.iter().any(|p| p == ex),
+                "{ex} is excluded but no longer appears in the source — a stale exclusion is a                  hole waiting for a name to be reused"
+            );
+            assert!(
+                !GOVERNANCE_EVENTS.contains(ex),
+                "{ex} is both declared and excluded; one of the two is wrong"
+            );
+        }
+    }
+
+    /// A WITNESSED lapse and a row that merely ran past its horizon are different facts, and
+    /// #310 is the reason: expiry was made an event precisely so it would stop being inferred.
+    /// The ledger inferred it anyway, because the event was undeclared. Both still render as
+    /// `Expired` — that is the honest bucket for both — and `decided_hash` is what separates
+    /// "the chain says it ended" from "the clock says it must have".
+    #[test]
+    fn a_recorded_lapse_is_distinguishable_from_a_clock_inference() {
+        let opened = |id: &str| {
+            entry(1, 0, "gate_escalation_opened", serde_json::json!({
+                "escalation_id": id, "plugin_id": "claude-code",
+                "marker": "/hooks/x", "expires_at": T0 + 3600,
+            }))
+        };
+
+        // Arm A: the daemon recorded the lapse.
+        let recorded = project(
+            &[
+                opened("a"),
+                entry(2, 3600, "gate_escalation_expired", serde_json::json!({
+                    "escalation_id": "a", "plugin_id": "claude-code", "marker": "/hooks/x",
+                    "expires_at": T0 + 3600, "lapsed_at": T0 + 3600,
+                    "bar": "single_approver",
+                    "peer_participation": {"invited": [], "concurred": 0, "dissented": 0,
+                                           "absent": 0, "invited_without_reader": 0},
+                    "note": "the deadline passed without a terminal ruling — 0 invited",
+                })),
+            ],
+            T0 + 3700,
+        );
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].status, LedgerStatus::Expired);
+        assert!(recorded[0].decided_hash.is_some(), "a witnessed lapse names the entry that ended it");
+        assert!(
+            recorded[0].decision_reason.as_deref().unwrap_or("").contains("invited"),
+            "the participation census reaches the operator's row, not just the chain"
+        );
+        assert!(recorded[0].decided_by.is_none(), "nobody decided — a lapse must not name a decider");
+
+        // Arm B: same horizon, no record. Still Expired, and it must NOT claim a witness.
+        let inferred = project(&[opened("b")], T0 + 3700);
+        assert_eq!(inferred.len(), 1);
+        assert_eq!(inferred[0].status, LedgerStatus::Expired, "the clock inference is retained");
+        assert!(
+            inferred[0].decided_hash.is_none(),
+            "an inference must not render as a witnessed ending"
+        );
+
+        // Arm C: the lapse whose `opened` scrolled out of the window. Before the arm existed
+        // this produced no row at all, while a `decided` in the same position synthesised one.
+        let orphan = project(
+            &[entry(9, 3600, "gate_escalation_expired", serde_json::json!({
+                "escalation_id": "c", "plugin_id": "kimi-code", "marker": "/hooks/y",
+                "expires_at": T0 + 3600, "note": "n",
+            }))],
+            T0 + 3700,
+        );
+        assert_eq!(orphan.len(), 1, "an ending is still an ending when its ask scrolled off");
+        assert!(orphan[0].open_not_in_window);
+        assert_eq!(orphan[0].status, LedgerStatus::Expired);
     }
 }

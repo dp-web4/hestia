@@ -4945,6 +4945,37 @@ pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -
     let lapsed = s.gate_escalations.newly_lapsed(now);
     let mut recorded = 0;
     for esc in lapsed {
+        // WHAT THE INVITED PEERS ACTUALLY DID, carried onto the terminal row.
+        //
+        // The first version of this record hard-coded one sentence over every population, so
+        // eight expiry rows on the chain shared a byte-identical `note` and nothing in the
+        // payload distinguished "eight peers invited, one read it and dissented before the
+        // deadline" from "nobody was ever asked". Both of those happened; the row said the
+        // same thing about them. The evidence was three fields away the whole time — `esc`
+        // is the complete `Escalation` here.
+        //
+        // `peer_participation()` rather than counting the factors again at this call site
+        // (codex, reply 3000): it already distinguishes invited / concurred / dissented /
+        // silent / invited-without-reader BY IDENTITY, and re-deriving those counts here
+        // would fork the arithmetic away from the live decision surfaces that use it.
+        let part = esc.peer_participation();
+        // The prose says what the structure says, and no more. "No decision" was TRUE — a
+        // dissent is evidence for review and never a veto, so a peer factor alone does not
+        // end a sovereign_plus_peer ask (codex's dissent, accepted). What it was not is
+        // COMPLETE: it reported the terminal fact while withholding the participation that
+        // is the only reason a reader would ever accept it.
+        let note = format!(
+            "the deadline passed without a terminal ruling — {} invited, {} concurred, \
+             {} dissented, {} silent, {} invited-without-reader. A dissent is an answer and \
+             not a decision, and this row now distinguishes the two. Until this record \
+             existed the outcome was derived from the clock at read time and left no trace \
+             of its own — and on the sovereign_plus_peer bar it is the modal terminal outcome",
+            part.invited.len(),
+            part.concurred,
+            part.dissented,
+            part.absent,
+            part.invited_without_reader,
+        );
         let entry = s.append_chain(
             "gate_escalation_expired",
             json!({
@@ -4956,10 +4987,11 @@ pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -
                 "opened_at": esc.opened_at,
                 "expires_at": esc.expires_at,
                 "lapsed_at": now,
-                "note": "the deadline passed with no decision. Until this record existed \
-                         the outcome was derived from the clock at read time and left no \
-                         trace of its own — and on the sovereign_plus_peer bar it is the \
-                         modal terminal outcome",
+                // The criterion that was in force, so the row is readable without joining
+                // back to its `opened` — which the ledger's bounded window may not hold.
+                "bar": esc.bar,
+                "peer_participation": part,
+                "note": note,
             }),
         );
         match entry {
