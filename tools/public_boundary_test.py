@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Regression tests for tools/public_boundary.py."""
+import hashlib
 import json
 import os
 import subprocess
@@ -143,18 +144,46 @@ with tempfile.TemporaryDirectory() as td:
     cached = boundary.inspect(root, paths, cached=True, modes=modes)
     check("staged symlink rejected", any("innocent-link" in p and "not a regular" in p
                                          for p in cached))
-    check("unexpected binary rejected", any("notes.bin" in p and "non-text" in p
+    check("unexpected binary rejected", any("notes.bin" in p and "manifest" in p
                                              for p in cached))
+
+    worktree_link = root / "worktree-link"
+    worktree_link.write_text("regular in the index\n")
+    subprocess.run(["git", "add", "worktree-link"], cwd=root, check=True)
+    worktree_link.unlink()
+    worktree_link.symlink_to("relative-product-path")
+    worktree = boundary.inspect(
+        root, ["worktree-link"], cached=False, modes=boundary.tracked_modes(root),
+    )
+    check("unstaged worktree symlink rejected",
+          any("worktree-link" in p and "worktree path is a symlink" in p
+              for p in worktree))
 
     icon = root / "app" / "src-tauri" / "icons" / "icon.png"
     icon.parent.mkdir(parents=True)
-    icon.write_bytes(b"\x89PNG\r\n\x1a\n\xff")
-    subprocess.run(["git", "add", "app/src-tauri/icons/icon.png"], cwd=root, check=True)
+    icon_bytes = b"\x89PNG\r\n\x1a\n\xff"
+    icon.write_bytes(icon_bytes)
     icon_rel = "app/src-tauri/icons/icon.png"
+    manifest = root / boundary.BINARY_MANIFEST
+    manifest.parent.mkdir(exist_ok=True)
+    manifest.write_text(f"{hashlib.sha256(icon_bytes).hexdigest()}  {icon_rel}\n")
+    subprocess.run(
+        ["git", "add", icon_rel, boundary.BINARY_MANIFEST], cwd=root, check=True,
+    )
     allowed = boundary.inspect(
-        root, [icon_rel], cached=True, modes=boundary.tracked_modes(root),
+        root, [icon_rel, boundary.BINARY_MANIFEST], cached=True,
+        modes=boundary.tracked_modes(root),
     )
     check("reviewed product binary allowed", allowed == [])
+
+    icon.write_bytes(icon_bytes + b"changed")
+    subprocess.run(["git", "add", icon_rel], cwd=root, check=True)
+    changed = boundary.inspect(
+        root, [icon_rel, boundary.BINARY_MANIFEST], cached=True,
+        modes=boundary.tracked_modes(root),
+    )
+    check("changed product binary needs review",
+          any(icon_rel in p and "manifest review" in p for p in changed))
 
 with tempfile.TemporaryDirectory() as td:
     root = Path(td)

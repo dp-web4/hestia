@@ -9,6 +9,7 @@ separate release process because deleting a current file does not erase a blob.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import re
@@ -35,14 +36,7 @@ TOKEN_SHAPES = (
 )
 RUNTIME_SUFFIXES = {".py", ".sh", ".json", ".toml", ".service", ".yaml", ".yml"}
 REGULAR_MODES = {"100644", "100755"}
-ALLOWED_BINARY_ROOTS = (
-    "app/public/brand/",
-    "app/src-tauri/gen/android/app/src/main/res/",
-    "app/src-tauri/icons/",
-    "docs/screenshots/",
-)
-ALLOWED_BINARY_SUFFIXES = {".png", ".icns", ".ico"}
-ALLOWED_BINARY_FILES = {"app/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.jar"}
+BINARY_MANIFEST = "tools/public_binary_assets.sha256"
 
 
 def tracked_paths(repo: Path) -> list[str]:
@@ -114,10 +108,30 @@ def worktree_blob(repo: Path, rel: str) -> bytes | None:
         return None
 
 
-def allowed_binary(rel: str) -> bool:
-    return (rel in ALLOWED_BINARY_FILES or
-            (Path(rel).suffix.lower() in ALLOWED_BINARY_SUFFIXES and
-             rel.startswith(ALLOWED_BINARY_ROOTS)))
+def parse_binary_manifest(raw: bytes) -> tuple[dict[str, str], list[str]]:
+    entries: dict[str, str] = {}
+    problems: list[str] = []
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return {}, [f"{BINARY_MANIFEST}: manifest is not UTF-8 text"]
+    ordered: list[str] = []
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line or line.startswith("#"):
+            continue
+        match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+        if not match:
+            problems.append(f"{BINARY_MANIFEST}:{number}: malformed manifest row")
+            continue
+        digest, rel = match.groups()
+        if rel in entries:
+            problems.append(f"{BINARY_MANIFEST}:{number}: duplicate path {rel}")
+            continue
+        entries[rel] = digest
+        ordered.append(rel)
+    if ordered != sorted(ordered):
+        problems.append(f"{BINARY_MANIFEST}: paths are not sorted")
+    return entries, problems
 
 
 def inspect(repo: Path, paths: list[str], *, cached: bool = False,
@@ -125,6 +139,19 @@ def inspect(repo: Path, paths: list[str], *, cached: bool = False,
     problems: list[str] = []
     index = cached_blobs(repo, paths) if cached else {}
     modes = modes or {}
+    path_set = set(paths)
+
+    def blob(rel: str) -> bytes | None:
+        return index.get(rel) if cached else worktree_blob(repo, rel)
+
+    manifest: dict[str, str] = {}
+    if BINARY_MANIFEST in path_set:
+        manifest_raw = blob(BINARY_MANIFEST)
+        if manifest_raw is None:
+            problems.append(f"{BINARY_MANIFEST}: tracked manifest is unreadable")
+        else:
+            manifest, manifest_problems = parse_binary_manifest(manifest_raw)
+            problems.extend(manifest_problems)
     for rel in paths:
         if rel.startswith(FORBIDDEN_ROOTS):
             problems.append(f"{rel}: installation-local root is tracked")
@@ -135,14 +162,21 @@ def inspect(repo: Path, paths: list[str], *, cached: bool = False,
         if mode is not None and mode not in REGULAR_MODES:
             problems.append(f"{rel}: tracked mode {mode} is not a regular file")
             continue
-        raw = index.get(rel) if cached else worktree_blob(repo, rel)
+        if not cached and (repo / rel).is_symlink():
+            problems.append(f"{rel}: worktree path is a symlink")
+            continue
+        raw = blob(rel)
         if raw is None:
             continue
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
-            if not allowed_binary(rel):
-                problems.append(f"{rel}: unexpected non-text tracked blob")
+            actual = hashlib.sha256(raw).hexdigest()
+            expected = manifest.get(rel)
+            if expected is None:
+                problems.append(f"{rel}: non-text blob is absent from reviewed manifest")
+            elif expected != actual:
+                problems.append(f"{rel}: non-text blob changed without manifest review")
             continue
 
         boundary_impl = rel == "tools/public_boundary.py"
@@ -182,6 +216,23 @@ def inspect(repo: Path, paths: list[str], *, cached: bool = False,
                 problems.append(f"{rel}: public seed contains installation relationships")
             if (seed.get("mrh") or {}).get("in_scope"):
                 problems.append(f"{rel}: public seed contains installation scope")
+
+    for rel, expected in manifest.items():
+        if rel not in path_set:
+            problems.append(f"{BINARY_MANIFEST}: untracked or missing asset {rel}")
+            continue
+        raw = blob(rel)
+        if raw is None:
+            problems.append(f"{BINARY_MANIFEST}: unreadable asset {rel}")
+            continue
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        else:
+            problems.append(f"{BINARY_MANIFEST}: listed asset is text {rel}")
+        if hashlib.sha256(raw).hexdigest() != expected:
+            problems.append(f"{rel}: non-text blob changed without manifest review")
 
     return sorted(set(problems))
 
