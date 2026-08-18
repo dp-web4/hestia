@@ -10530,6 +10530,100 @@ mod tests {
         );
     }
 
+
+    /// The poll now carries the verdict beside the field that cannot see it (2026-08-18,
+    /// kimi-code, taking up claude-code's remedy from forum reply 3442+3443). Measured live
+    /// by both seats the same day: `permits_write: true` served continuously on permits the
+    /// claim path had already refused — one of them reported to the operator as "~40 min
+    /// left" while already consumed. The store's explicit-`now` API constructs the exact
+    /// instant the two-conjunct field is blind to; the assertions are on the WIRE answer,
+    /// not the store predicate, because the defect was a reporting defect.
+    #[tokio::test]
+    async fn poll_says_not_claimable_where_permits_write_still_says_true() {
+        use crate::server::gate_escalation::{now_secs, Channel};
+
+        let (_dir, shared) = make_shared_state();
+        let (dead_id, live_id) = {
+            let mut s = shared.lock().await;
+            let now = now_secs();
+            let mut open_and_approve = |opened_at: u64| {
+                let e = s
+                    .gate_escalations
+                    .open(
+                        "kimi-code",
+                        "role:constellation:member",
+                        "Edit",
+                        "law_inject.py",
+                        None,
+                        None,
+                        opened_at,
+                        3600,
+                    )
+                    .expect("open");
+                s.gate_escalations
+                    .decide(
+                        &e.id,
+                        true,
+                        "dp",
+                        "role:constellation:sovereign",
+                        Channel::LocalCli,
+                        None,
+                        Some("ok"),
+                        opened_at,
+                    )
+                    .expect("decide");
+                e.id
+            };
+            // Horizon = grant + 600: dead by 100s, while `expires_at` still has 2900s —
+            // the exact divergence the stale-true field hid.
+            let dead = open_and_approve(now - 700);
+            let live = open_and_approve(now);
+            (dead, live)
+        };
+
+        let dead = tool_gate_escalation_poll(&shared, &json!({ "escalation_id": dead_id }))
+            .await
+            .unwrap();
+        assert_eq!(
+            dead["permits_write"],
+            json!(true),
+            "the two-conjunct field still reads true past the horizon (kept, additive): {dead}"
+        );
+        assert_eq!(
+            dead["claimable"],
+            json!(false),
+            "the verdict must agree with what `claim` will enforce: {dead}"
+        );
+        assert_eq!(
+            dead["claim_window_secs_remaining"],
+            json!(0),
+            "no clock may be advertised on a closed window: {dead}"
+        );
+
+        // Positive control: inside the window the two fields agree, so a false reading is
+        // the horizon and not a pinned constant.
+        let live = tool_gate_escalation_poll(&shared, &json!({ "escalation_id": live_id }))
+            .await
+            .unwrap();
+        assert_eq!(live["claimable"], json!(true), "{live}");
+        let window = live["claim_window_secs_remaining"].as_u64().unwrap();
+        assert!(
+            (590..=600).contains(&window),
+            "a fresh grant advertises its real window, not the open-anchored TTL: {live}"
+        );
+
+        // Fail-closed on an unknown id: the same answer as an expired one, on purpose.
+        let unknown = tool_gate_escalation_poll(&shared, &json!({ "escalation_id": "nope" }))
+            .await
+            .unwrap();
+        assert_eq!(unknown["claimable"], json!(false), "{unknown}");
+        assert_eq!(
+            unknown["claim_window_secs_remaining"],
+            json!(0),
+            "{unknown}"
+        );
+    }
+
     /// A session that disagrees with the asserted `plugin_id` is a forgery, and the claim door
     /// must refuse it BEFORE spending anything — a claimed approval cannot be un-claimed.
     #[tokio::test]
@@ -14577,6 +14671,18 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         // sufficient. (dp 2026-07-30 + claude-code: the record must carry the bar, not just
         // the evidence and the verdict.)
         "permits_write": status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false),
+        // `permits_write` is TWO of `is_claimable`'s FOUR conjuncts: it drops
+        // `consumed_at.is_none()` and `now < decided_horizon()` — exactly the two that
+        // change AFTER the decision — so it reads true on spent and horizon-dead approvals
+        // and never demotes (permanent, not stale: `status_at` clocks only Pending).
+        // Documented in tools/claimable.py (2026-08-15), re-derived twice since, measured
+        // live by two seats 2026-08-18. The verdict belongs where the wrong field already
+        // is: read `claimable` before spending, never `permits_write`. Additive; the hooks
+        // gate on the CLAIM response, not this poll, so this changes no enforcement.
+        "claimable": esc.map(|e| e.is_claimable(now)).unwrap_or(false),
+        "claim_window_secs_remaining": esc
+            .map(|e| e.decided_horizon().saturating_sub(now))
+            .unwrap_or(0),
         "bar": esc.map(|e| e.bar),
         "bar_met": esc.map(|e| e.bar_met()),
         "factors_present": esc.map(|e| e.factors.clone()),

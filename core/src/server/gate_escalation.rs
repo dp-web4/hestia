@@ -606,7 +606,11 @@ impl Escalation {
     /// `re_anchoring_the_claim_window_can_only_shorten_it` (the monotonicity, incl. the
     /// replay input). `the_claim_window_stays_tight_even_though_the_decision_window_grew`
     /// pins the constant and passes under any anchor — it is not a check on this.
-    fn decided_horizon(&self) -> u64 {
+    ///
+    /// `pub` since 2026-08-18 so the poll can publish the horizon it reports against
+    /// (`claim_window_secs_remaining`) instead of leaving every caller to re-derive it —
+    /// three mesh exchanges re-derived this from source while the field beside it lied.
+    pub fn decided_horizon(&self) -> u64 {
         let one_window_after_grant = self
             .decided_at
             .unwrap_or(self.opened_at)
