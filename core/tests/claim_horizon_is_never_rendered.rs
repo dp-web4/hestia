@@ -41,8 +41,10 @@
 //! `decided_horizon()` — the only function that knows when a grant dies — is private, and
 //! `grep` finds it at exactly five sites: its own definition, `is_claimable`, and three
 //! assertions in its own test module. It reaches no surface. `is_claimable` itself has ONE
-//! production caller in the crate, `claim_for`, so the only instrument that answers "is this
-//! permit still alive" answers by spending it.
+//! production caller in the crate — `EscalationStore::claim` (gate_escalation.rs:1151, inside
+//! the candidate filter) — so the only instrument that answers "is this permit still alive"
+//! answers by spending it. (Named `claim_for` in the first draft of this file; corrected on
+//! GPT's not-same review, verified by grep at the head under review.)
 //!
 //! The consequence is observable outside this repo. On 2026-08-15 the operator approved two
 //! twin escalations at 22:07:19Z; the deadline reached the asker as a hand-computed string
@@ -273,10 +275,15 @@ fn the_over_report_grows_as_the_decision_gets_faster() {
 /// PIN 3 — the grant surface carries no deadline at all, and the countdown it *does* expose
 /// for a decided row is the wrong clock.
 ///
-/// `decision_reply()` is what a member reads back from BOTH deciding surfaces (`poll` and
-/// `arbitrate`, per the doc comment at its definition: "the answer moves here and both
-/// callers read it"). Its `note` tells the asker, in the approved branch, to go and re-issue
-/// the write. That is the single moment in the lifecycle where a member is instructed to
+/// `decision_reply()` is what the DECIDER surfaces answer with — `tool_gate_arbitrate_escalation`
+/// (the MCP arbiter) and `operator_gate_escalation` (the operator's HTTP door). Its own doc
+/// comment's "both callers read it" means those two, not the asker's poll: verified at the
+/// reviewed head, `tool_gate_escalation_poll` builds its own `json!` and never calls this.
+/// That distinction is the seam between this pin and PIN 4 and the first draft blurred it —
+/// corrected on GPT's not-same review. PIN 3 is the DECIDER's reply omitting the horizon;
+/// PIN 4 is the ASKER's poll actively contradicting the enforcement.
+///
+/// Its `note` tells the asker, in the approved branch, to go and re-issue the write. That is the single moment in the lifecycle where a member is instructed to
 /// act inside a window — and the reply names no window, no deadline, and no anchor.
 ///
 /// Meanwhile `secs_remaining()` still answers, and still answers about `expires_at`, so a
@@ -360,16 +367,28 @@ fn the_grant_surface_renders_no_claim_deadline() {
 /// Five fields, and the one that asserts authority is the `note`. `is_claimable(now)` was
 /// false at that instant by both of its ceilings' minimum, and the poll handler calls it
 /// nowhere: `grep is_claimable core/src` finds ONE production site in the whole crate —
-/// `EscalationStore::claim_for` (gate_escalation.rs) — so the predicate that decides is
+/// `EscalationStore::claim` (gate_escalation.rs:1151) — so the predicate that decides is
 /// reachable only by spending. The single instrument that answers "is this permit alive"
 /// destroys the permit as the price of the answer, which is why no reviewer can check the
 /// thing they are being asked to certify.
 ///
-/// This is the field-level twin of PIN 3. PIN 3 says the grant reply carries no deadline;
-/// PIN 4 says the fields it *does* carry actively contradict the enforcement, and keep
-/// contradicting it for as long as the record survives — `status_at` only ever converts
-/// `Pending` into `Expired`, so `Approved` is terminal and `permits_write()` is
-/// `matches!(self, Status::Approved)` with no clock in it at all.
+/// This is the ASKER's surface, and PIN 3 is the DECIDER's. PIN 3 says the decision reply
+/// omits the horizon; PIN 4 says the fields the asker's poll *does* carry actively
+/// contradict the enforcement, and keep contradicting it for as long as the record survives.
+///
+/// WHAT WOULD CLOSE THIS PIN, stated so the fix is not mistaken for its opposite. The defect
+/// is the SURFACE IMPLICATION, never the historical verdict:
+///
+///   * `permits_write` in the poll reply must stop being derived from
+///     `Status::permits_write()`, which is `matches!(self, Status::Approved)` with no clock
+///     in it at all, and must instead reflect `is_claimable(now)`;
+///   * the reply must EXPOSE the claim horizon — a deadline or a remaining-seconds figure
+///     computed from `decided_horizon()`, not the record TTL that `secs_remaining()` reports;
+///   * `status` may keep saying `Approved`, because it is true. See the invariant in (b).
+///
+/// A "fix" that ages a decided row into `Expired` satisfies the letter of the old failure
+/// messages and breaks two things: it rewrites a historical fact, and it starts refusing
+/// corroboration, which keys on `status_at(now) == Status::Expired`.
 #[test]
 fn past_the_horizon_every_rendered_field_still_reads_live() {
     let granted_at = T0 + 209; // the live specimen's open→decide lag, to the second
@@ -391,13 +410,34 @@ fn past_the_horizon_every_rendered_field_still_reads_live() {
         "fixture is not past the horizon — the rest of this pin would measure nothing"
     );
 
-    // (b) The renderings, each pinned separately: a fix that repairs one and leaves the
-    // others is a partial fix, and a single combined assertion would report it as complete.
+    // (b) THE CONTRAST, and it is an INVARIANT rather than an open defect.
+    //
+    // `Approved` is a truthful historical fact and must stay one forever: the operator DID
+    // approve this escalation, and no clock retracts that. What expired is the ability to
+    // SPEND the approval. The first draft of this pin had the failure message declare the
+    // intended end state to be "a decided row now expires on the claim clock as well as the
+    // record clock" — i.e. it asked for the historical verdict to be rewritten into
+    // `Expired`. GPT's not-same review caught that, and it is right on two grounds:
+    //
+    //   * DECISION OUTCOME and CURRENT AUTHORITY are different facts, and this fleet has
+    //     repeatedly paid to keep them apart. Collapsing them here would undo that.
+    //   * It would perturb post-decision participation. `corroborate` refuses on
+    //     `status_at(now) == Status::Expired` (gate_escalation.rs:1271), so aging a decided
+    //     row into `Expired` would silently start refusing corroboration on rows that were
+    //     legitimately decided.
+    //
+    // So this assertion is the SPECIMEN, not the complaint: `Approved` is true at the same
+    // instant `is_claimable` is false, and that pair IS the defect — two answers about one
+    // permit, one of which the surfaces render and the other of which the gate enforces.
+    // If this row ever goes red, someone rewrote history; that is a regression, not the fix.
     assert_eq!(
         esc.status_at(dead),
         Status::Approved,
-        "OPEN-DEFECT PIN 4(a) has gone RED, which is the intended end state: a decided row \
-         now expires on the claim clock as well as the record clock."
+        "INVARIANT BROKEN, not a defect closed: the historical verdict has been rewritten. \
+         `Approved` records that the operator approved this escalation and must remain true \
+         for as long as the record exists — the claim horizon governs whether the approval \
+         can still be SPENT, never whether it was given. Check that nothing now ages a \
+         decided row into `Expired`; `corroborate` refuses on exactly that value."
     );
     assert!(
         esc.status_at(dead).permits_write(),
