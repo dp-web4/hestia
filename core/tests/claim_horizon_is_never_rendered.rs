@@ -24,13 +24,25 @@
 //!   dashboard.rs:1206   secs_remaining  — rows filtered `status == pending`  → CORRECT
 //!   dashboard.rs:1232   secs_remaining  — rows filtered `g.is_live(now)`     → CORRECT
 //!   governance_ledger.rs:488 secs_remaining — guarded `status == Open`       → CORRECT
+//!   handler.rs:14242    secs_remaining  — the PENDING-escalation queue       → CORRECT
+//!   handler.rs:13870    secs_remaining  — `poll`, gated to NOTHING           → the hole
 //!   handler.rs:13589    retry_within_secs — emitted on the OPEN path         → a supremum
 //!
-//! Every countdown this crate renders is anchored to `expires_at`, and every one of them is
-//! correct, because every one of them is gated to a row that is still OPEN. Not one is
-//! rendered for a DECIDED row. `decided_horizon()` — the only function that knows when a
-//! grant dies — is private, and `grep` finds it at exactly five sites: its own definition,
-//! `is_claimable`, and three assertions in its own test module. It reaches no surface.
+//! CORRECTED 2026-08-18 (claude-code, from the asker's seat). The 08-15 enumeration above
+//! ran to five rows and concluded "every countdown is gated to a row that is still OPEN;
+//! not one is rendered for a DECIDED row". It was 5/7, and one of the two it missed —
+//! `handler.rs:13870`, the `poll` handler — is the direct counter-example to the sentence it
+//! was supporting: `poll` takes any id, renders `secs_remaining` unconditionally, and a
+//! DECIDED row is exactly what a member polls, because a `disposition` notice is what sends
+//! them there. A completeness claim standing behind an incomplete recount, which is the
+//! failure `fb_recount_set_behind_completeness` names, committed in the file that pins it.
+//! The conclusion survives the correction and PIN 4 is what the missed row earned.
+//!
+//! `decided_horizon()` — the only function that knows when a grant dies — is private, and
+//! `grep` finds it at exactly five sites: its own definition, `is_claimable`, and three
+//! assertions in its own test module. It reaches no surface. `is_claimable` itself has ONE
+//! production caller in the crate, `claim_for`, so the only instrument that answers "is this
+//! permit still alive" answers by spending it.
 //!
 //! The consequence is observable outside this repo. On 2026-08-15 the operator approved two
 //! twin escalations at 22:07:19Z; the deadline reached the asker as a hand-computed string
@@ -38,7 +50,7 @@
 //! (kimi-code notice 2632). A peer had to compute the enforcing horizon by hand and deliver
 //! it out-of-band, because no surface of the system that enforces it will say it.
 //!
-//! WHAT THIS FILE IS. Three OPEN-DEFECT PINS, in the hole-J shape: each asserts the
+//! WHAT THIS FILE IS. Four OPEN-DEFECT PINS, in the hole-J shape: each asserts the
 //! CURRENT WRONG BEHAVIOUR, so each is green while the defect stands and goes RED the moment
 //! it is fixed. A red here is the intended end state, and the failure message says so.
 
@@ -328,5 +340,95 @@ fn the_grant_surface_renders_no_claim_deadline() {
         (ttl_remainder, true_remaining),
         (3_596, 600),
         "the magnitudes, pinned so a change of anchor cannot pass as a change of clock"
+    );
+}
+
+/// PIN 4 — past the horizon, every field the asker reads still says the permit is live.
+///
+/// MEASURED BEFORE IT WAS PINNED, from the asker's seat, on 2026-08-18. Escalation
+/// `0ba3d769dffe4964` (marker `pre_tool_use.py`, bar `sovereign_plus_peer`) opened 06:57:53Z,
+/// was approved by the operator at 07:01:22Z, and therefore stopped being claimable at
+/// 07:11:22Z. Polled at 07:11:43Z — 21 seconds dead — `hestia_gate_escalation_poll` answered:
+///
+///   status          "approved"
+///   permits_write   true
+///   bar_met         true
+///   secs_remaining  2770
+///   note            "authoritative as of now; only `approved` WITH the stated bar met
+///                    permits the write"
+///
+/// Five fields, and the one that asserts authority is the `note`. `is_claimable(now)` was
+/// false at that instant by both of its ceilings' minimum, and the poll handler calls it
+/// nowhere: `grep is_claimable core/src` finds ONE production site in the whole crate —
+/// `EscalationStore::claim_for` (gate_escalation.rs) — so the predicate that decides is
+/// reachable only by spending. The single instrument that answers "is this permit alive"
+/// destroys the permit as the price of the answer, which is why no reviewer can check the
+/// thing they are being asked to certify.
+///
+/// This is the field-level twin of PIN 3. PIN 3 says the grant reply carries no deadline;
+/// PIN 4 says the fields it *does* carry actively contradict the enforcement, and keep
+/// contradicting it for as long as the record survives — `status_at` only ever converts
+/// `Pending` into `Expired`, so `Approved` is terminal and `permits_write()` is
+/// `matches!(self, Status::Approved)` with no clock in it at all.
+#[test]
+fn past_the_horizon_every_rendered_field_still_reads_live() {
+    let granted_at = T0 + 209; // the live specimen's open→decide lag, to the second
+    let (mut s, id) = opened(DEFAULT_TTL_SECS);
+    approve_at(&mut s, &id, granted_at);
+    let esc = s.get(&id).expect("get").clone();
+
+    let dead = granted_at + APPROVAL_CLAIM_WINDOW_SECS + 21; // the live specimen's overshoot
+    assert!(
+        dead < T0 + DEFAULT_TTL_SECS,
+        "the fixture must be past the CLAIM horizon and inside the RECORD ttl, or it pins the \
+         uninteresting case where both clocks agree"
+    );
+
+    // (a) The enforcement. Not asserted through `claim`, because claiming is the act this
+    // whole file exists to say a reviewer cannot perform in order to find out.
+    assert!(
+        !esc.is_claimable(dead),
+        "fixture is not past the horizon — the rest of this pin would measure nothing"
+    );
+
+    // (b) The renderings, each pinned separately: a fix that repairs one and leaves the
+    // others is a partial fix, and a single combined assertion would report it as complete.
+    assert_eq!(
+        esc.status_at(dead),
+        Status::Approved,
+        "OPEN-DEFECT PIN 4(a) has gone RED, which is the intended end state: a decided row \
+         now expires on the claim clock as well as the record clock."
+    );
+    assert!(
+        esc.status_at(dead).permits_write(),
+        "OPEN-DEFECT PIN 4(b) has gone RED: the status a dead permit reports no longer claims \
+         to permit a write."
+    );
+    let ticking = esc.secs_remaining(dead);
+    assert!(
+        ticking > 0,
+        "OPEN-DEFECT PIN 4(c) has gone RED: the countdown on a dead permit has stopped."
+    );
+    assert_eq!(
+        ticking, 2_770,
+        "the live specimen's number, reproduced in-process from its own timings — pinned so a \
+         change of anchor cannot pass as a change of clock"
+    );
+
+    // (c) The structural cause, checked at the surface rather than inferred: the handler the
+    // asker reads composes its answer from `status` and `bar_met`, and never consults the
+    // predicate that enforces. Checked on the PRODUCTION body, comments stripped, so the
+    // prose above cannot satisfy it.
+    let poll = production_body("server/handler.rs", "tool_gate_escalation_poll");
+    assert!(
+        poll.contains(r#""permits_write": status.permits_write() && esc.map(|e| e.bar_met())"#),
+        "the producer expression this pin is about has moved; re-read the handler before \
+         trusting any assertion in this test"
+    );
+    assert!(
+        !poll.contains("is_claimable"),
+        "OPEN-DEFECT PIN 4(d) has gone RED, which is the intended end state. The poll surface \
+         now consults the enforcing predicate — the hole this file pins is closed at the one \
+         surface that matters. Delete this pin and keep the call."
     );
 }
