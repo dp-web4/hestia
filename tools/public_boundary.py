@@ -8,6 +8,8 @@ separate release process because deleting a current file does not erase a blob.
 """
 from __future__ import annotations
 
+import argparse
+import io
 import json
 import re
 import subprocess
@@ -46,20 +48,54 @@ def is_test(path: str) -> bool:
             or name.endswith(("_test.py", "_test.sh")))
 
 
-def inspect(repo: Path, paths: list[str]) -> list[str]:
+def cached_texts(repo: Path, paths: list[str]) -> dict[str, str]:
+    """Read index blobs in one Git process rather than one process per path."""
+    request = "".join(f":{rel}\n" for rel in paths).encode()
+    proc = subprocess.run(
+        ["git", "cat-file", "--batch"], cwd=repo, input=request,
+        capture_output=True, check=True,
+    )
+    stream = io.BytesIO(proc.stdout)
+    result: dict[str, str] = {}
+    for rel in paths:
+        header = stream.readline().rstrip(b"\n")
+        if header.endswith(b" missing"):
+            continue
+        fields = header.split()
+        if len(fields) != 3 or fields[1] != b"blob":
+            raise RuntimeError(f"unexpected git cat-file header for {rel}: {header!r}")
+        size = int(fields[2])
+        raw = stream.read(size)
+        if stream.read(1) != b"\n":
+            raise RuntimeError(f"missing git cat-file delimiter after {rel}")
+        try:
+            result[rel] = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+    return result
+
+
+def worktree_text(repo: Path, rel: str) -> str | None:
+    full = repo / rel
+    if not full.is_file():
+        return None
+    try:
+        return full.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return None
+
+
+def inspect(repo: Path, paths: list[str], *, cached: bool = False) -> list[str]:
     problems: list[str] = []
+    index = cached_texts(repo, paths) if cached else {}
     for rel in paths:
         if rel.startswith(FORBIDDEN_ROOTS):
             problems.append(f"{rel}: installation-local root is tracked")
             continue
         if LOCAL_PROBE.match(rel):
             problems.append(f"{rel}: seat-prefixed research probe is tracked")
-        full = repo / rel
-        if not full.is_file():
-            continue
-        try:
-            text = full.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
+        text = index.get(rel) if cached else worktree_text(repo, rel)
+        if text is None:
             continue
 
         boundary_impl = rel == "tools/public_boundary.py"
@@ -104,8 +140,14 @@ def inspect(repo: Path, paths: list[str]) -> list[str]:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--cached", action="store_true",
+        help="inspect the staged index exactly (for a composable pre-commit check)",
+    )
+    args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
-    problems = inspect(repo, tracked_paths(repo))
+    problems = inspect(repo, tracked_paths(repo), cached=args.cached)
     if problems:
         print("PUBLIC BOUNDARY: FAIL")
         for problem in problems:

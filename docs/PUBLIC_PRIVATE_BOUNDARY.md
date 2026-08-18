@@ -35,14 +35,25 @@ Installers accept explicit paths or render them from verified installation state
 not search for a maintainer's private repositories, enumerate familiar workspace layouts, or treat
 a public example as a live configuration.
 
+Diagnostics and support exports redact resolved absolute paths by default. Revealing a resolved
+path requires an explicit local operator action; adding an exporter does not silently weaken this
+boundary.
+
 ## Enforcement
 
-`python3 tools/public_boundary.py` checks the tracked tree. CI runs its sabotage-tested companion,
-`tools/public_boundary_test.py`, and fails if installation-local roots, seat-prefixed probes,
-credential-shaped values, real host paths, non-generic identity seeds, or scope-writing continuity
-hooks return.
+`python3 tools/public_boundary.py` checks the tracked working tree. Before committing,
+`python3 tools/public_boundary.py --cached` checks the exact staged snapshot; it is deliberately a
+composable command rather than a hook installer, because replacing an operator's existing Git hook
+chain can remove controls. CI runs the sabotage-tested companion, `tools/public_boundary_test.py`,
+and fails if installation-local roots, seat-prefixed probes, credential-shaped values, real host
+paths, non-generic identity seeds, or scope-writing continuity hooks return.
 
 The check covers the current tree. Release review separately scans reachable Git history for actual
 credentials because ordinary deletion does not erase old blobs. A history rewrite is warranted only
 when the audit finds an exploitable secret or capability, not merely local context that has been
 cleaned up and retained privately.
+
+Cleaning the default branch also does not clean other public refs. Before release, maintainers
+inventory branch ownership, preserve unique work, and delete only inactive refs whose local context
+has already been retained. Preservation precedes branch deletion; branch deletion precedes any
+separate decision about rewriting history.

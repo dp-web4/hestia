@@ -2,6 +2,7 @@
 """Regression tests for tools/public_boundary.py."""
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -46,6 +47,19 @@ with tempfile.TemporaryDirectory() as td:
     check("generic seed passes", boundary.inspect(root, [
         "plugins/member/instance/identity.seed.json"
     ]) == [])
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    staged = root / "runtime.py"
+    staged.write_text('ROOT = "/home/actual-operator/runtime"\n')
+    subprocess.run(["git", "add", "runtime.py"], cwd=root, check=True)
+    # A working-tree scan sees the safe unstaged replacement.  A pre-commit
+    # scan must still reject the exact installation path already in the index.
+    staged.write_text('ROOT = "/home/user/runtime"\n')
+    check("working tree differs safely", boundary.inspect(root, ["runtime.py"]) == [])
+    cached = boundary.inspect(root, boundary.tracked_paths(root), cached=True)
+    check("cached snapshot is inspected", any("local home path" in p for p in cached))
 
 with tempfile.TemporaryDirectory() as td:
     root = Path(td)
