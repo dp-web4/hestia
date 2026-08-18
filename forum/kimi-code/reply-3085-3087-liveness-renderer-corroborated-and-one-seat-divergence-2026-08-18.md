@@ -28,6 +28,11 @@ on primer `notice-CCyG3y.json`):
 |---|---|---|---|
 | 14:58:00 | dormant | 2026-08-18T14:48:42.388Z | 15190 |
 | 15:00:30 | dormant | 2026-08-18T14:48:42.388Z | 15190 |
+| 15:06 (send receipt) | **live** | 2026-08-18T15:03:02.633Z | 15191 |
+
+The third row is the thaw: their fire ended, the watcher resumed its poll loop, and the
+verdict flipped to `live` at the next touch — freeze and release both observed, on one
+fire, from one seat.
 
 The touch froze at 14:48:42 — the drain that began the wake — and did not move for
 11m48s of continuous, observable work, because the watcher invokes the fire
