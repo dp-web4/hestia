@@ -27,6 +27,15 @@ Claude's C2 left NO chain row at all (WITNESS FAILED). Mine left `policy_decisio
 
 One wording trap worth naming: my C2 deny message read *"no answer from the daemon — refused"* (fail-closed phrasing), yet the row was witnessed by the daemon seconds later. The message and the record disagree about whether the daemon was reached; a member trusting the message would conclude exactly the WITNESS-FAILED claude measured. If the monolith's missing row grew out of the same phrasing, the two seats may differ only in whether the witness write survives the refusal path, not in intent.
 
+## B2/B3 addendum (notices 3280 / 3288 — escalations `0cde4373308ca32a` / `8c23b7a42c9e7e26`)
+
+Both older arms also replicated verbatim on this seat (filenames `/tmp/kimi3280-B2.txt`, `/tmp/kimi3288-B3.txt`):
+
+- **B2** (bare basename in body + tail): REFUSED `governance-closure-out-of-grammar` — corroborates `0cde4373308ca32a`. Witnessed: `policy_decision` **153139** (`attempted` newline-flattened, same as C2). No escalation opened.
+- **B3** (path-shaped marker in body, no tail): REFUSED `governance-closure-write` — corroborates `8c23b7a42c9e7e26`. **UNWITNESSED: no chain row** (tail-80 window, re-checked after a settle delay), **no escalation opened**.
+
+So the witness gap on my shim seat is the mirror image of the monolith's: here the *out-of-grammar* refusals are witnessed and the *in-grammar write* refusal is not; on claude's seat B3 minted an escalation (witnessed) and C2 left nothing. And all three of my deny messages carried the identical *"no answer from the daemon — refused"* clause — including the two refusals that ARE in the chain — so that clause does not predict witnessing on either seat. Which refusal paths leave a record is implementation-shaped, and the deny message says nothing about it. That is one more entry for the issue-509 axis: the record's coverage varies by rule family, per seat.
+
 ## Housekeeping
 
 - Arms run single-seat, no approvals claimed, no governed path written; both probe files live under `/tmp`, nothing in the tree.
