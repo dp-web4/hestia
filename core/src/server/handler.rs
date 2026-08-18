@@ -10680,13 +10680,17 @@ mod tests {
         );
     }
 
-    /// OPEN-DEFECT PIN, hole-J shape (CBP 2026-08-18): the assertions below record the
-    /// CURRENT WRONG behaviour, so this test is green exactly while the defect stands and
-    /// goes RED the moment it is fixed. **A red here is the intended end state** — read the
-    /// failure messages, not the polarity.
+    /// PIN FLIPPED (CBP 2026-08-18): filed as an open-defect pin whose assertions recorded the
+    /// CURRENT WRONG behaviour, and turned over in the same commit that fixes it — so the fix
+    /// is measured by the sign of a pin written before it, not by a new test authored to agree
+    /// with it. Cell by cell: `mailbox_reader` true -> false and `invited_without_reader`
+    /// 0 -> 1 are outright sign flips; `absent` stays 1 and changes WHICH seat it counts,
+    /// which is why a second seat — `kimi-code`, mailbox read seconds ago — is added here as a
+    /// positive control. Without it every assertion below is also satisfied by a predicate
+    /// that answers "no reader" to everyone, and a blanket `false` would read as a fix.
     ///
-    /// `invited_without_reader` catches "never seen" and misses "not seen since July", so a
-    /// dead mailbox is scored as a peer that declined.
+    /// Before: `invited_without_reader` caught "never seen" and missed "not seen since July",
+    /// so a dead mailbox was scored as a peer that declined.
     ///
     /// `has_mailbox_reader` is `inbox_touch(id).is_some()` — row exists, all time, no window.
     /// The daemon already computes the windowed reading of the SAME row on the notify path:
@@ -10718,26 +10722,31 @@ mod tests {
     /// a boundary drawn for the queueing question and then reused for the conduct one. Its
     /// 172-of-272 is a floor on the defect, not a measure of it.
     ///
-    /// The fix is a WINDOW on an existing read, not a filter: `invited_without_reader` should
-    /// hold a seat whose `last_touch` predates the escalation's own TTL. Still not a gate —
+    /// The fix is a WINDOW on an existing read, not a filter: `invited_without_reader` holds
+    /// a seat whose `last_touch` predates the escalation's own TTL. Still not a gate —
     /// the seat stays invited and may corroborate late, which `corroborate` expressly allows.
     /// It changes only whether silence from an unreachable mailbox is published as a decision.
     #[tokio::test]
-    async fn a_stale_mailbox_row_is_still_counted_as_a_peer_that_declined() {
+    async fn a_stale_mailbox_row_is_not_counted_as_a_peer_that_declined() {
         let (_dir, shared) = make_shared_state();
         let mut session_of = std::collections::HashMap::new();
-        for id in ["claude-code", "codex-cli"] {
+        for id in ["claude-code", "codex-cli", "kimi-code"] {
             let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
                 .await
                 .unwrap();
             session_of.insert(id.to_string(), r["sessionId"].as_str().unwrap().to_string());
         }
-        // A reader existed once: the only production path that writes the row is a drain.
-        // Then rewind it to the measured vintage of the live `codex-cli` row — 23 days, or
-        // 552 times the 3600s TTL the escalation below will carry.
+        // TWO seats, differing in ONE property: when the mailbox was last read. `kimi-code`
+        // is the POSITIVE CONTROL and it is the reason a blanket `false` cannot pass this
+        // test — a predicate that answers "no reader" for everyone satisfies every stale-seat
+        // assertion below and fails on this one. Both rows are written by the same production
+        // path (a drain); only the vintage differs.
         {
             let s = shared.lock().await;
             s.inbox_store.drain_member("codex-cli").unwrap();
+            s.inbox_store.drain_member("kimi-code").unwrap();
+            // Rewind ONE of them to the measured vintage of the live `codex-cli` row —
+            // 23 days, or 552 times the 3600s TTL the escalation below will carry.
             s.inbox_store
                 .backdate_inbox_touch("codex-cli", Utc::now() - chrono::Duration::days(23))
                 .unwrap();
@@ -10773,8 +10782,9 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert!(
-            invited.contains(&"codex-cli".to_string()),
-            "precondition: the stale seat is invited (over-issuing is deliberate): {invited:?}"
+            invited.contains(&"codex-cli".to_string()) && invited.contains(&"kimi-code".to_string()),
+            "precondition: BOTH seats are invited — the window changes what is RECORDED about \
+             an invitee, never who is invited (over-issuing is deliberate): {invited:?}"
         );
 
         let s = shared.lock().await;
@@ -10788,20 +10798,31 @@ mod tests {
             json!(3600),
             "the deadline the conduct question is asked against"
         );
-        let reader_flag = opened.event_data["invitation_evidence"]
-            .as_array()
-            .expect("per-peer invitation evidence")
-            .iter()
-            .find(|r| r["peer"] == json!("codex-cli"))
-            .expect("the stale seat has an evidence row")["mailbox_reader"]
-            .clone();
+        let reader_bit = |peer: &str| {
+            opened.event_data["invitation_evidence"]
+                .as_array()
+                .expect("per-peer invitation evidence")
+                .iter()
+                .find(|r| r["peer"] == json!(peer))
+                .unwrap_or_else(|| panic!("{peer} has an evidence row"))["mailbox_reader"]
+                .clone()
+        };
+        let reader_flag = reader_bit("codex-cli");
+        // POSITIVE CONTROL, asserted BEFORE the defect cell so a blanket-`false` predicate is
+        // reported as what it is rather than as a passing fix.
+        assert_eq!(
+            reader_bit("kimi-code"),
+            json!(true),
+            "a mailbox read seconds ago IS a reader for this ask — the fix is a window on an \
+             existing read, not a filter that answers `false` to everyone"
+        );
         assert_eq!(
             reader_flag,
-            json!(true),
-            "PIN OF THE DEFECT, and a red here means it was FIXED — delete this assertion, \
-             not the fix. A mailbox last read 23 days before a 3600s escalation has no reader \
-             FOR THIS ASK, yet `has_mailbox_reader` reports one off a row with no window. \
-             That bit is what carries the seat past `invited_without_reader` and into `absent`."
+            json!(false),
+            "the RECORDED bit is now the windowed one: a mailbox last read 23 days before a \
+             3600s escalation has no reader FOR THIS ASK. This cell asserted `true` while the \
+             defect stood; it is the bit that carried the seat past `invited_without_reader` \
+             and into `absent`."
         );
 
         let esc_id = claimed["escalation_id"].as_str().unwrap();
@@ -10810,19 +10831,21 @@ mod tests {
             .get(esc_id)
             .expect("the escalation this call opened")
             .peer_participation();
-        // The registry here is exactly {claude-code (asker, excluded), codex-cli}, so the
-        // whole invited set is the one stale seat and the two counts have no room to hide
-        // in each other.
-        assert_eq!(invited.len(), 1, "the invited set is the stale seat alone: {invited:?}");
+        // The registry here is exactly {claude-code (asker, excluded), codex-cli (stale),
+        // kimi-code (fresh)}, so every count below is pinned on both sides at once: the two
+        // seats must land in DIFFERENT buckets, and neither count has room to hide in the
+        // other.
+        assert_eq!(invited.len(), 2, "the invited set is both seats: {invited:?}");
         assert_eq!(
-            pp.invited_without_reader, 0,
-            "PIN OF THE DEFECT (red here = fixed): the one seat that is unreachable for this \
-             ask is NOT held by the field built to hold exactly it: {pp:?}"
+            pp.invited_without_reader, 1,
+            "exactly the one seat unreachable for THIS ask is held by the field built to hold \
+             exactly it (this cell asserted 0 while the defect stood): {pp:?}"
         );
         assert_eq!(
             pp.absent, 1,
-            "PIN OF THE DEFECT (red here = fixed): and so it is published as a peer that saw \
-             the ask and stayed silent — a decline manufactured out of a dead mailbox: {pp:?}"
+            "and exactly the reachable seat that stayed silent is `absent` — the decline \
+             manufactured out of a DEAD mailbox is gone, the real silence is still counted \
+             (this cell asserted 1 for the wrong seat while the defect stood): {pp:?}"
         );
     }
 
@@ -14154,6 +14177,37 @@ fn has_mailbox_reader(store: &crate::storage::SqliteInboxStore, plugin_id: &str)
     !matches!(store.inbox_touch(plugin_id), Ok(None))
 }
 
+/// The same row, read for the CONDUCT question instead of the queueing one.
+///
+/// `has_mailbox_reader` asks "did a watcher EVER read this mailbox" — presence, all time, no
+/// window. That is the right answer to "is this worth queueing?": a dormant seat's notice
+/// waits, its watcher starts tomorrow, nothing is lost. It is the WRONG answer to "did this
+/// seat see the ask and decline?", because that question has a deadline — the escalation's own
+/// `ttl_secs` — and a mailbox last read weeks ago cannot be read inside the hour.
+///
+/// Measured (CBP 2026-08-18): `codex-cli` carried `mailbox_reader: true` on two 3600s
+/// escalations while the daemon's own `recipient_liveness` read the SAME row as `dormant`
+/// (`last_inbox_touch` 23 days earlier, `mailbox_reads: 1`). `peer_participation` therefore
+/// counted it in `absent` — published as a peer that saw the ask and stayed silent.
+///
+/// SAME DIRECTIONS as its unwindowed sibling: never-seen is `false`, and an unreadable store
+/// is `true` — a lookup that failed must not become a specific finding about a peer.
+fn has_mailbox_reader_within(
+    store: &crate::storage::SqliteInboxStore,
+    plugin_id: &str,
+    window_secs: u64,
+    now: u64,
+) -> bool {
+    match store.inbox_touch(plugin_id) {
+        Ok(None) => false,
+        Ok(Some(t)) => {
+            let last = t.last_touch.timestamp().max(0) as u64;
+            last.saturating_add(window_secs) >= now
+        }
+        Err(_) => true,
+    }
+}
+
 /// Resolve who this escalation invites, and record it on the escalation.
 ///
 /// NOT A GATE. Nothing here can refuse the open, delay it, or change `bar_met`. An invitation
@@ -14182,7 +14236,15 @@ fn resolve_invitation(
         // router so both routing receipts on this daemon are cut from the same depth of
         // evidence.
         let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
-        let mut pool: Vec<(String, crate::arbiter::Liveness, bool)> = s
+        // TWO readings of one row, because two different questions are asked of it. `reachable`
+        // (ever seen) orders the pool — a queueing preference, where dormant still deserves a
+        // slot. `reader_for_this_ask` (seen within THIS escalation's own TTL) is what gets
+        // RECORDED — a conduct fact, where a mailbox nobody has read since July cannot have
+        // read an ask that dies in an hour. Conflating them published dormant seats as peers
+        // that declined; see `has_mailbox_reader_within`.
+        let ttl_secs = esc.expires_at.saturating_sub(esc.opened_at);
+        let now = crate::server::gate_escalation::now_secs();
+        let mut pool: Vec<(String, crate::arbiter::Liveness, bool, bool)> = s
             .member_registry
             .iter_sorted()
             .into_iter()
@@ -14194,8 +14256,10 @@ fn resolve_invitation(
             })
             .map(|id| {
                 let l = actor_liveness(&window, &id);
-                let reader = has_mailbox_reader(&s.inbox_store, &id);
-                (id, l, reader)
+                let reachable = has_mailbox_reader(&s.inbox_store, &id);
+                let reader_for_this_ask =
+                    has_mailbox_reader_within(&s.inbox_store, &id, ttl_secs, now);
+                (id, l, reachable, reader_for_this_ask)
             })
             .collect();
         // Live first, then dormant, then unknown; then — under all of it — whether any
@@ -14208,7 +14272,7 @@ fn resolve_invitation(
         // it decides only between candidates the acts cannot tell apart, which is exactly the
         // `Unknown` tier where an alphabetical tie-break was handing slots to probe residue
         // ahead of a live peer.
-        pool.sort_by_key(|(id, l, reader)| {
+        pool.sort_by_key(|(id, l, reader, _)| {
             (
                 match l {
                     crate::arbiter::Liveness::Live => 0u8,
@@ -14224,11 +14288,11 @@ fn resolve_invitation(
         // derives `absent` from this list, and an id no watcher reads must not be counted as
         // a peer that read the ask and declined. Recording it at INVITE time is the only
         // moment the fact is true of the invitation rather than of the reader's later state.
-        let ev = |(id, l, reader): &(String, crate::arbiter::Liveness, bool)| {
+        let ev = |(id, l, _, reader): &(String, crate::arbiter::Liveness, bool, bool)| {
             json!({"peer": id, "liveness_at_invite": l, "mailbox_reader": reader})
         };
         (
-            pool.iter().map(|(id, _, _)| id.clone()).collect::<Vec<String>>(),
+            pool.iter().map(|(id, _, _, _)| id.clone()).collect::<Vec<String>>(),
             pool.iter().map(ev).collect::<Vec<Value>>(),
             over.iter().map(ev).collect::<Vec<Value>>(),
         )
