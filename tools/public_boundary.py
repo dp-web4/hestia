@@ -34,6 +34,24 @@ TOKEN_SHAPES = (
     re.compile(r"\bgh[opusr]_[A-Za-z0-9]{20,}"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
 )
+# Vendor-published example credentials: reviewed VALUES, not an exempted class.
+#
+# A test that pins "this field is never scrubbed" has to contain a token of the shape a
+# scrub would mangle, or it measures nothing.  The two ways to let it are not equivalent.
+# Exempting `is_test` paths — the carve-out the private-key rule below already takes —
+# would admit ANY credential shape into ANY test file, and fixtures are exactly where a
+# captured payload gets pasted.  Naming the value instead keeps the shape rule live
+# everywhere: a different AKIA in the same test file is still caught, and so is this one
+# sitting next to a real token.
+#
+# Same idiom as BINARY_MANIFEST below: enumerate reviewed exceptions rather than exempt a
+# class.  Each entry costs a reviewed line, which is the point.
+PUBLISHED_EXAMPLE_TOKENS = frozenset({
+    # AWS documentation example access key id; published by the vendor, identifies nothing.
+    # Written whole, not split across adjacent literals: this file is already exempt from
+    # its own shape rule, and a value that has to be reviewed has to be greppable.
+    "AKIAIOSFODNN7EXAMPLE",
+})
 RUNTIME_SUFFIXES = {".py", ".sh", ".json", ".toml", ".service", ".yaml", ".yml"}
 REGULAR_MODES = {"100644", "100755"}
 BINARY_MANIFEST = "tools/public_binary_assets.sha256"
@@ -182,7 +200,11 @@ def inspect(repo: Path, paths: list[str], *, cached: bool = False,
         boundary_impl = rel == "tools/public_boundary.py"
         if not boundary_impl:
             for token_re in TOKEN_SHAPES:
-                if token_re.search(text):
+                # Drop reviewed example values, then judge what is LEFT.  Filtering the
+                # matches rather than skipping the file is what keeps a published example
+                # from covering for a real token that shares the line.
+                if any(m.group(0) not in PUBLISHED_EXAMPLE_TOKENS
+                       for m in token_re.finditer(text)):
                     problems.append(f"{rel}: credential-shaped token")
                     break
         if "-----BEGIN PRIVATE KEY-----" in text and not is_test(rel) and not boundary_impl:
