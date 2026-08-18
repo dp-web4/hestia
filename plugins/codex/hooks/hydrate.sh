@@ -62,12 +62,13 @@ json.dump(ident, open(ident_p, "w", encoding="utf-8"), indent=2)
 
 # rewrite the dynamic state block in the deployed AGENTS.md (markers required; absent -> skip)
 B, E = "<!-- HESTIA:STATE:BEGIN -->", "<!-- HESTIA:STATE:END -->"
+identity_display = os.path.abspath(ident_p)
 state = f"""{B}
 ## Your footprint here (auto-updated at each session end — this IS your continuity)
 - **Sessions in this role:** {ident['session_count']} (first {ident['first_session']}, last ended {ident['last_session']})
 - **Phase:** {ident['phase']}  ·  **Role:** {ident['role']}  ·  acts observed last session: {acts}
-- **Live identity file:** `~/.codex/hestia-instance/identity.json` — read it to recall your history; milestones and session records are there.
-- **Facts your trained self-model gets wrong:** (1) you HAVE a native hook system (Claude-Code-lineage: PreToolUse/PostToolUse/SessionStart/SessionEnd/Stop/... — enabled via `[features] codex_hooks = true`). This scaffold runs on it. (2) Your `PreToolUse` gate covers the SHELL tool ONLY; the filesystem boundary for out-of-scope repos is the sandbox (`sandbox_mode = "workspace-write"`), not the hook. Don't re-derive these errors.
+- **Live identity file:** `{identity_display}` — read it to recall your history; milestones and session records are there.
+- **Facts your trained self-model gets wrong:** (1) you HAVE a native hook system (Claude-Code-lineage: PreToolUse/PostToolUse/SessionStart/SessionEnd/Stop/... — enabled via `[features] codex_hooks = true`). This scaffold runs on it. (2) `PreToolUse` dispatches the Hestia gate for shell commands, `apply_patch` edits, and MCP Function-payload calls; the filesystem sandbox is a separate structural boundary. Don't re-derive these errors.
 {E}"""
 try:
     s = open(agents_p, encoding="utf-8").read()

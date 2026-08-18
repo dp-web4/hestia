@@ -19,6 +19,56 @@ def check(label, condition):
         raise AssertionError(label)
 
 
+def exercise_hydrate(member, home_var, instance_var, agents_var, plugin_var):
+    """Run the real continuity hook and prove it cannot become authority."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        instance = root / "configured-instance"
+        instance.mkdir()
+        identity_path = instance / "identity.json"
+        identity = {
+            "session_count": 4,
+            "first_session": "2026-01-01T00:00:00+00:00",
+            "last_session": "2026-01-02T00:00:00+00:00",
+            "phase": "test",
+            "role": "role:test",
+            "sessions": [],
+            "relationships": {"peer": {"trust": "local-test"}},
+            "mrh": {"in_scope": ["repo:must-survive"]},
+        }
+        identity_path.write_text(json.dumps(identity))
+        agents = root / "AGENTS.md"
+        agents.write_text(
+            "before\n<!-- HESTIA:STATE:BEGIN -->\nold\n"
+            "<!-- HESTIA:STATE:END -->\nafter\n"
+        )
+        observe = root / "observe"
+        observe.mkdir()
+        env = dict(os.environ)
+        env.update({
+            home_var: str(root / "unused-default-home"),
+            instance_var: str(instance),
+            agents_var: str(agents),
+            plugin_var: str(REPO / "plugins" / member),
+            "HESTIA_OBSERVE_DIR": str(observe),
+        })
+        script = REPO / "plugins" / member / "hooks" / "hydrate.sh"
+        subprocess.run(
+            [str(script)], input='{"session_id":"boundary-test"}\n', text=True,
+            env=env, check=True,
+        )
+        hydrated = json.loads(identity_path.read_text())
+        check(f"{member} relationships unchanged",
+              hydrated["relationships"] == identity["relationships"])
+        check(f"{member} scope unchanged", hydrated["mrh"] == identity["mrh"])
+        rendered = agents.read_text()
+        check(f"{member} configured identity path rendered",
+              str(identity_path.resolve()) in rendered)
+        default_identity = {"codex": "~/.codex/", "kimi": "~/.kimi-code/"}[member]
+        check(f"{member} default identity path absent", default_identity not in rendered)
+        return rendered
+
+
 with tempfile.TemporaryDirectory() as td:
     root = Path(td)
     (root / "forum").mkdir()
@@ -48,6 +98,19 @@ with tempfile.TemporaryDirectory() as td:
         "plugins/member/instance/identity.seed.json"
     ]) == [])
 
+codex_state = exercise_hydrate(
+    "codex", "CODEX_HOME", "HESTIA_CODEX_INSTANCE_DIR",
+    "HESTIA_CODEX_AGENTS_MD", "CODEX_PLUGIN_ROOT",
+)
+check("Codex state names edit coverage", "apply_patch" in codex_state)
+check("Codex state names MCP coverage", "MCP Function-payload" in codex_state)
+check("Codex stale shell-only claim absent", "SHELL tool ONLY" not in codex_state)
+
+exercise_hydrate(
+    "kimi", "KIMI_CODE_HOME", "HESTIA_KIMI_INSTANCE_DIR",
+    "HESTIA_KIMI_AGENTS_MD", "KIMI_PLUGIN_ROOT",
+)
+
 with tempfile.TemporaryDirectory() as td:
     root = Path(td)
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
@@ -68,6 +131,30 @@ with tempfile.TemporaryDirectory() as td:
     subprocess.run(["git", "add", "odd\nruntime.py"], cwd=root, check=True)
     cached = boundary.inspect(root, boundary.tracked_paths(root), cached=True)
     check("newline path stays framed", any("odd\nruntime.py" in p for p in cached))
+
+    link = root / "innocent-link"
+    link.symlink_to("relative-product-path")
+    subprocess.run(["git", "add", "innocent-link"], cwd=root, check=True)
+    unexpected = root / "notes.bin"
+    unexpected.write_bytes(b"\xff\x00installation-local")
+    subprocess.run(["git", "add", "notes.bin"], cwd=root, check=True)
+    paths = boundary.tracked_paths(root)
+    modes = boundary.tracked_modes(root)
+    cached = boundary.inspect(root, paths, cached=True, modes=modes)
+    check("staged symlink rejected", any("innocent-link" in p and "not a regular" in p
+                                         for p in cached))
+    check("unexpected binary rejected", any("notes.bin" in p and "non-text" in p
+                                             for p in cached))
+
+    icon = root / "app" / "src-tauri" / "icons" / "icon.png"
+    icon.parent.mkdir(parents=True)
+    icon.write_bytes(b"\x89PNG\r\n\x1a\n\xff")
+    subprocess.run(["git", "add", "app/src-tauri/icons/icon.png"], cwd=root, check=True)
+    icon_rel = "app/src-tauri/icons/icon.png"
+    allowed = boundary.inspect(
+        root, [icon_rel], cached=True, modes=boundary.tracked_modes(root),
+    )
+    check("reviewed product binary allowed", allowed == [])
 
 with tempfile.TemporaryDirectory() as td:
     root = Path(td)
@@ -95,7 +182,7 @@ with tempfile.TemporaryDirectory() as td:
         else:
             os.environ["HESTIA_WORKSPACE"] = old_ws
 
-live = boundary.inspect(REPO, boundary.tracked_paths(REPO))
+live = boundary.inspect(REPO, boundary.tracked_paths(REPO), modes=boundary.tracked_modes(REPO))
 if live:
     raise AssertionError("public tree violates boundary:\n  " + "\n  ".join(live))
 

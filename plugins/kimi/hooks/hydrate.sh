@@ -62,11 +62,12 @@ json.dump(ident, open(ident_p, "w", encoding="utf-8"), indent=2)
 
 # rewrite the dynamic state block in the deployed AGENTS.md (markers required; absent -> skip)
 B, E = "<!-- HESTIA:STATE:BEGIN -->", "<!-- HESTIA:STATE:END -->"
+identity_display = os.path.abspath(ident_p)
 state = f"""{B}
 ## Your footprint here (auto-updated at each session end — this IS your continuity)
 - **Sessions in this role:** {ident['session_count']} (first {ident['first_session']}, last ended {ident['last_session']})
 - **Phase:** {ident['phase']}  ·  **Role:** {ident['role']}  ·  acts observed last session: {acts}
-- **Live identity file:** `~/.kimi-code/hestia-instance/identity.json` — read it to recall your history; your milestones and session records are there.
+- **Live identity file:** `{identity_display}` — read it to recall your history; your milestones and session records are there.
 - **Fact your trained self-model gets wrong:** you HAVE a native hook system (16 events, PreToolUse/PostToolUse included). This scaffold runs on it. Don't re-derive the error.
 {E}"""
 try:

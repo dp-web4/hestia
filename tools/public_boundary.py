@@ -34,11 +34,33 @@ TOKEN_SHAPES = (
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
 )
 RUNTIME_SUFFIXES = {".py", ".sh", ".json", ".toml", ".service", ".yaml", ".yml"}
+REGULAR_MODES = {"100644", "100755"}
+ALLOWED_BINARY_ROOTS = (
+    "app/public/brand/",
+    "app/src-tauri/gen/android/app/src/main/res/",
+    "app/src-tauri/icons/",
+    "docs/screenshots/",
+)
+ALLOWED_BINARY_SUFFIXES = {".png", ".icns", ".ico"}
+ALLOWED_BINARY_FILES = {"app/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.jar"}
 
 
 def tracked_paths(repo: Path) -> list[str]:
     raw = subprocess.check_output(["git", "ls-files", "-z"], cwd=repo)
     return [p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p]
+
+
+def tracked_modes(repo: Path) -> dict[str, str]:
+    raw = subprocess.check_output(["git", "ls-files", "-s", "-z"], cwd=repo)
+    modes: dict[str, str] = {}
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        metadata, path = record.split(b"\t", 1)
+        mode, _object_id, stage = metadata.split()
+        rel = path.decode("utf-8", "surrogateescape")
+        modes[rel] = mode.decode() if stage == b"0" else f"unmerged-stage-{stage.decode()}"
+    return modes
 
 
 def is_test(path: str) -> bool:
@@ -48,7 +70,7 @@ def is_test(path: str) -> bool:
             or name.endswith(("_test.py", "_test.sh")))
 
 
-def cached_texts(repo: Path, paths: list[str]) -> dict[str, str]:
+def cached_blobs(repo: Path, paths: list[str]) -> dict[str, bytes]:
     """Read index blobs in one Git process rather than one process per path."""
     request = b"".join(
         b":" + rel.encode("utf-8", "surrogateescape") + b"\0" for rel in paths
@@ -58,7 +80,7 @@ def cached_texts(repo: Path, paths: list[str]) -> dict[str, str]:
         capture_output=True, check=True,
     )
     stream = io.BytesIO(proc.stdout)
-    result: dict[str, str] = {}
+    result: dict[str, bytes] = {}
     for rel in paths:
         header_bytes = bytearray()
         while True:
@@ -72,40 +94,55 @@ def cached_texts(repo: Path, paths: list[str]) -> dict[str, str]:
         if header.endswith(b" missing"):
             continue
         fields = header.split()
-        if len(fields) != 3 or fields[1] != b"blob":
+        if len(fields) != 3:
             raise RuntimeError(f"unexpected git cat-file header for {rel}: {header!r}")
         size = int(fields[2])
         raw = stream.read(size)
         if stream.read(1) != b"\0":
             raise RuntimeError(f"missing git cat-file delimiter after {rel}")
-        try:
-            result[rel] = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            pass
+        result[rel] = raw
     return result
 
 
-def worktree_text(repo: Path, rel: str) -> str | None:
+def worktree_blob(repo: Path, rel: str) -> bytes | None:
     full = repo / rel
     if not full.is_file():
         return None
     try:
-        return full.read_text(encoding="utf-8")
-    except (UnicodeDecodeError, OSError):
+        return full.read_bytes()
+    except OSError:
         return None
 
 
-def inspect(repo: Path, paths: list[str], *, cached: bool = False) -> list[str]:
+def allowed_binary(rel: str) -> bool:
+    return (rel in ALLOWED_BINARY_FILES or
+            (Path(rel).suffix.lower() in ALLOWED_BINARY_SUFFIXES and
+             rel.startswith(ALLOWED_BINARY_ROOTS)))
+
+
+def inspect(repo: Path, paths: list[str], *, cached: bool = False,
+            modes: dict[str, str] | None = None) -> list[str]:
     problems: list[str] = []
-    index = cached_texts(repo, paths) if cached else {}
+    index = cached_blobs(repo, paths) if cached else {}
+    modes = modes or {}
     for rel in paths:
         if rel.startswith(FORBIDDEN_ROOTS):
             problems.append(f"{rel}: installation-local root is tracked")
             continue
         if LOCAL_PROBE.match(rel):
             problems.append(f"{rel}: seat-prefixed research probe is tracked")
-        text = index.get(rel) if cached else worktree_text(repo, rel)
-        if text is None:
+        mode = modes.get(rel)
+        if mode is not None and mode not in REGULAR_MODES:
+            problems.append(f"{rel}: tracked mode {mode} is not a regular file")
+            continue
+        raw = index.get(rel) if cached else worktree_blob(repo, rel)
+        if raw is None:
+            continue
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            if not allowed_binary(rel):
+                problems.append(f"{rel}: unexpected non-text tracked blob")
             continue
 
         boundary_impl = rel == "tools/public_boundary.py"
@@ -157,7 +194,9 @@ def main() -> int:
     )
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
-    problems = inspect(repo, tracked_paths(repo), cached=args.cached)
+    problems = inspect(
+        repo, tracked_paths(repo), cached=args.cached, modes=tracked_modes(repo),
+    )
     if problems:
         print("PUBLIC BOUNDARY: FAIL")
         for problem in problems:

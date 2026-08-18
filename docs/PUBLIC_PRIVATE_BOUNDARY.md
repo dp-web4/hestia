@@ -46,7 +46,9 @@ boundary.
 composable command rather than a hook installer, because replacing an operator's existing Git hook
 chain can remove controls. CI runs the sabotage-tested companion, `tools/public_boundary_test.py`,
 and fails if installation-local roots, seat-prefixed probes, credential-shaped values, real host
-paths, non-generic identity seeds, or scope-writing continuity hooks return.
+paths, non-generic identity seeds, or scope-writing continuity hooks return. The scanner also
+rejects non-regular Git modes and unexpected non-text blobs; binary product assets are confined to
+reviewed application-icon, brand, screenshot and build-wrapper locations.
 
 The check covers the current tree. Release review separately scans reachable Git history for actual
 credentials because ordinary deletion does not erase old blobs. A history rewrite is warranted only
