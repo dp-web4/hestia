@@ -10530,6 +10530,152 @@ mod tests {
         );
     }
 
+    /// OPEN-DEFECT PIN, hole-J shape (CBP 2026-08-18): the assertions below record the
+    /// CURRENT WRONG behaviour, so this test is green exactly while the defect stands and
+    /// goes RED the moment it is fixed. **A red here is the intended end state** — read the
+    /// failure messages, not the polarity.
+    ///
+    /// `invited_without_reader` catches "never seen" and misses "not seen since July", so a
+    /// dead mailbox is scored as a peer that declined.
+    ///
+    /// `has_mailbox_reader` is `inbox_touch(id).is_some()` — row exists, all time, no window.
+    /// The daemon already computes the windowed reading of the SAME row on the notify path:
+    /// `recipient_liveness` splits it three ways (`live` inside
+    /// [`MEMBER_LIVE_WITHIN_SECS`], `dormant`, `unknown`) and ships `last_inbox_touch` as
+    /// evidence. The invitation path calls the same `inbox_touch` and keeps one bit of it.
+    ///
+    /// That bit decides an EVIDENTIARY question, not a queueing one. `dormant` is the right
+    /// answer to "is this worth queueing?" — the notice waits, the watcher starts tomorrow,
+    /// nothing is lost. It is the wrong answer to "did this seat read the ask and decline?",
+    /// because that question has a deadline: `ttl_secs`, 3600 on every `sovereign_plus_peer`
+    /// escalation this daemon has opened. A seat whose mailbox was last read weeks ago cannot
+    /// read one inside the hour, and `peer_participation` counts it in `absent` anyway —
+    /// the exact reading `invited_without_reader` was added to prevent.
+    ///
+    /// MEASURED, not hypothesised. Escalations `5725d296b05cbc4c` (claude-code, 17:11:21Z)
+    /// and `18705bb00dd24903` (kimi-code, 17:13:48Z), both `ttl_secs: 3600`, invited 8 and
+    /// flagged 5 readerless. `codex-cli` was in the unflagged 3 on both, carrying
+    /// `mailbox_reader: true` with `liveness_at_invite: unknown` — and the daemon's own
+    /// liveness readout on that same row, minted 17:43Z the same day, is
+    /// `{first_seen: 2026-07-26T05:54:39Z, last_inbox_touch: 2026-07-26T05:54:39Z,
+    /// mailbox_reads: 1}`. One read, twenty-three days earlier, never an act on the chain:
+    /// dead by both instruments the daemon owns, and scored as a peer that declined by the
+    /// field built to stop exactly that.
+    ///
+    /// `tools/invitation_deadletter_census.py` could not see this class. It defines the
+    /// dead-letter population as ids "with no `member_inbox_touch` row at all", inheriting
+    /// `recipient_liveness`'s "`unknown` ... is the dead-letter class, and *only* this" —
+    /// a boundary drawn for the queueing question and then reused for the conduct one. Its
+    /// 172-of-272 is a floor on the defect, not a measure of it.
+    ///
+    /// The fix is a WINDOW on an existing read, not a filter: `invited_without_reader` should
+    /// hold a seat whose `last_touch` predates the escalation's own TTL. Still not a gate —
+    /// the seat stays invited and may corroborate late, which `corroborate` expressly allows.
+    /// It changes only whether silence from an unreachable mailbox is published as a decision.
+    #[tokio::test]
+    async fn a_stale_mailbox_row_is_still_counted_as_a_peer_that_declined() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "codex-cli"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id.to_string(), r["sessionId"].as_str().unwrap().to_string());
+        }
+        // A reader existed once: the only production path that writes the row is a drain.
+        // Then rewind it to the measured vintage of the live `codex-cli` row — 23 days, or
+        // 552 times the 3600s TTL the escalation below will carry.
+        {
+            let s = shared.lock().await;
+            s.inbox_store.drain_member("codex-cli").unwrap();
+            s.inbox_store
+                .backdate_inbox_touch("codex-cli", Utc::now() - chrono::Duration::days(23))
+                .unwrap();
+        }
+
+        // CONTROL, and it is the reason this test cannot pass by accident: the SAME row, read
+        // by the daemon's other consumer, already answers the question correctly.
+        {
+            let s = shared.lock().await;
+            let (verdict, evidence) = recipient_liveness(&s.inbox_store, "codex-cli");
+            assert_eq!(
+                verdict, "dormant",
+                "the notify path reads this row as stale: {evidence}"
+            );
+        }
+
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": session_of["claude-code"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "reason": "Edit -> a governance file",
+            }),
+        )
+        .await
+        .unwrap();
+        let invited: Vec<String> = claimed["invited_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            invited.contains(&"codex-cli".to_string()),
+            "precondition: the stale seat is invited (over-issuing is deliberate): {invited:?}"
+        );
+
+        let s = shared.lock().await;
+        let opened = s
+            .recent_chain(40)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened")
+            .expect("the open must be witnessed");
+        assert_eq!(
+            opened.event_data["ttl_secs"],
+            json!(3600),
+            "the deadline the conduct question is asked against"
+        );
+        let reader_flag = opened.event_data["invitation_evidence"]
+            .as_array()
+            .expect("per-peer invitation evidence")
+            .iter()
+            .find(|r| r["peer"] == json!("codex-cli"))
+            .expect("the stale seat has an evidence row")["mailbox_reader"]
+            .clone();
+        assert_eq!(
+            reader_flag,
+            json!(true),
+            "PIN OF THE DEFECT, and a red here means it was FIXED — delete this assertion, \
+             not the fix. A mailbox last read 23 days before a 3600s escalation has no reader \
+             FOR THIS ASK, yet `has_mailbox_reader` reports one off a row with no window. \
+             That bit is what carries the seat past `invited_without_reader` and into `absent`."
+        );
+
+        let esc_id = claimed["escalation_id"].as_str().unwrap();
+        let pp = s
+            .gate_escalations
+            .get(esc_id)
+            .expect("the escalation this call opened")
+            .peer_participation();
+        // The registry here is exactly {claude-code (asker, excluded), codex-cli}, so the
+        // whole invited set is the one stale seat and the two counts have no room to hide
+        // in each other.
+        assert_eq!(invited.len(), 1, "the invited set is the stale seat alone: {invited:?}");
+        assert_eq!(
+            pp.invited_without_reader, 0,
+            "PIN OF THE DEFECT (red here = fixed): the one seat that is unreachable for this \
+             ask is NOT held by the field built to hold exactly it: {pp:?}"
+        );
+        assert_eq!(
+            pp.absent, 1,
+            "PIN OF THE DEFECT (red here = fixed): and so it is published as a peer that saw \
+             the ask and stayed silent — a decline manufactured out of a dead mailbox: {pp:?}"
+        );
+    }
+
     /// A session that disagrees with the asserted `plugin_id` is a forgery, and the claim door
     /// must refuse it BEFORE spending anything — a claimed approval cannot be un-claimed.
     #[tokio::test]
