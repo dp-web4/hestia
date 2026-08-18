@@ -351,14 +351,24 @@ def test_hub_deploy_closure_is_write():
 # ; & | ;; && || ) tokenizes as one punct token and erases the boundary the same way.
 # A pin asserting a single spelling would certify the class as closed under the most
 # likely fix — enumerating `");"` into _SEPARATORS — while six spellings stay open
-# (fb_fix_class_not_instance_hold, from the guard side). So the pins assert the CLASS:
-# green only while ALL SEVEN hide the write; red names the closed subset, and a subset
-# means an instance-grain fix landed and the class is STILL OPEN — do not retire.
+# (fb_fix_class_not_instance_hold, from the guard side). So the pins asserted the CLASS:
+# green only while ALL SEVEN hid the write; red naming a SUBSET would have meant an
+# instance-grain fix and the class STILL OPEN.
 #
 # Both defects replicated independently by kimi-code (forum reply 2625), same rows, exact.
 #
-# WHEN ONE OF THESE FAILS: the fix landed. Delete the pin and enable the `# FIXED:` line
-# beneath it — do not just flip the expectation, the twin is the real contract.
+# BOTH PINS ARE RETIRED, 2026-08-18 (#496), and they went red the way they demanded:
+# 7/7 spellings at once, both halves, with the two controls still green. What closed them
+# is NOT the enumeration the header named as the likely wrong fix, and not the new
+# punct-flush arm the second pin was written to police either — `_tokenize` now re-splits
+# shlex's fused punctuation runs into bash's own operators, so `);` reaches the classifier
+# as `)` then `;` and the EXISTING separator arm handles both. The second pin's warning
+# (a new arm must reset `stdin_src` too, or it re-creates the divergence at state grain)
+# is answered by there being no new arm to fall out of parity.
+#
+# The retired bodies are directly below, converted to their `# FIXED:` twins as the
+# protocol requires. The paragraph above is kept because a pin that predicted the WRONG
+# remedy and still caught the right moment to retire is the part worth carrying forward.
 _MARK = "hestia_governance" + "_closure.py"  # assembled: a literal here trips the scan
 _GATE = os.path.expanduser("~/.claude/_shared/") + _MARK
 _FUSED_TRAILINGS = (";", "&", "|", ";;", "&&", "||", ")")
@@ -372,39 +382,47 @@ def _targets_or_exc(command):
         return type(exc).__name__
 
 
-def test_PIN_fused_paren_hides_write_onto_gate_STILL_OPEN():
+def test_fused_paren_no_longer_hides_write_onto_gate():
+    """RETIRED PIN, per the protocol above: ALL seven spellings closed, so this is the
+    `# FIXED:` twin the pin carried. Closed at CLASS grain by `_tokenize` re-splitting
+    shlex's fused runs (#496) — not by adding `);` to `_SEPARATORS`, which would have
+    closed one spelling and left the other six.
+
+    The two controls stay, because they are what tells a real fix from a fix that simply
+    refuses everything containing a paren.
+    """
     k = g._bash_write_targets("f () ( cp /tmp/evil " + _GATE + " )")
     check("K_lone_paren_sees_write", _GATE in k, f"positive control broke: {k}")
     s = g._bash_write_targets("f() ( cp /tmp/evil " + _GATE + " ) ; f")
     check("J_separated_sees_write", _GATE in s, f"separated control broke: {s}")
-    closed = [t for t in _FUSED_TRAILINGS
-              if _GATE in g._bash_write_targets("f() ( cp /tmp/evil " + _GATE + " )" + t + " f")]
-    check("J_fused_class_STILL_hides_write", closed == [],
-          f"closed spellings: {closed}/{len(_FUSED_TRAILINGS)} — ALL closed means the class "
-          f"fix landed, retire this pin; a SUBSET means instance-grain fix, class STILL OPEN")
-    # FIXED: for t in _FUSED_TRAILINGS:
-    #            check(f"J_fused_sees_write:{t}",
-    #                  _GATE in g._bash_write_targets(
-    #                      "f() ( cp /tmp/evil " + _GATE + " )" + t + " f"), t)
+    for t in _FUSED_TRAILINGS:
+        check(f"J_fused_sees_write:{t}",
+              _GATE in g._bash_write_targets(
+                  "f() ( cp /tmp/evil " + _GATE + " )" + t + " f"), t)
 
 
-def test_PIN_fused_paren_leaks_stdin_src_past_boundary_STILL_OPEN():
-    # The worse half: the fused token does not merely move a write target, it removes the
-    # `< file` preimage the fail-closed branch keys on. An arm modelled on another arm must
-    # reset ALL of that arm's state; partial parity re-creates the divergence at state grain.
+def test_fused_paren_no_longer_leaks_stdin_src_past_boundary():
+    """RETIRED PIN — the worse half of the same class, also closed 7/7.
+
+    The fused token did not merely move a write target, it carried the `< file` preimage
+    that the unconditional `_OpaqueWriter` fail-close keys on ACROSS a boundary, so
+    `( cat < /tmp/f.patch ) ; git apply` failed closed and its fused twin did not.
+
+    Worth recording HOW it closed, because the pin predicted a different remedy. The pin
+    was written expecting a NEW punct-flush arm, and warned that such an arm must reset
+    `stdin_src` as well as `cur` or it would re-create this divergence at state grain.
+    Re-splitting needs no new arm at all: the fused token becomes `)` then `;`, both of
+    which the EXISTING separator arm already handles, and that arm has always reset both.
+    A remedy that adds no second arm cannot fall out of parity with the first.
+    """
     for verb in ("git apply", "patch"):
         sep = _targets_or_exc("( cat < /tmp/f.patch ) ; " + verb)
         check(f"separated_fails_closed:{verb}", sep == "_OpaqueWriter",
               f"positive control broke: {sep}")
-        closed = [t for t in _FUSED_TRAILINGS
-                  if _targets_or_exc("( cat < /tmp/f.patch )" + t + " " + verb) != []]
-        check(f"fused_class_STILL_leaks_preimage:{verb}", closed == [],
-              f"closed spellings: {closed}/{len(_FUSED_TRAILINGS)} — ALL closed means the new "
-              f"arm resets stdin_src, retire this pin; a SUBSET means class STILL OPEN")
-        # FIXED: for t in _FUSED_TRAILINGS:
-        #            check(f"fused_fails_closed:{verb}:{t}",
-        #                  _targets_or_exc("( cat < /tmp/f.patch )" + t + " " + verb)
-        #                  == "_OpaqueWriter", t)
+        for t in _FUSED_TRAILINGS:
+            check(f"fused_fails_closed:{verb}:{t}",
+                  _targets_or_exc("( cat < /tmp/f.patch )" + t + " " + verb)
+                  == "_OpaqueWriter", t)
 
 
 # Explicit list — NOT a globals() comprehension — so every test name is a static reference
@@ -497,9 +515,99 @@ def test_463_pins_do_not_refuse_benign_forms():
         f"{quoted.classification!r}")
 
 
+def test_operator_table_covers_the_tokenizer_alphabet_496():
+    """The closure that makes `_split_operator_run`'s raise unreachable, pinned.
+
+    The splitter advances by matching an operator at each offset. That terminates only
+    because every single character the tokenizer may fuse is ITSELF a 1-character
+    operator. Nothing in the module enforces that: someone widening `_PUNCT` and not
+    `_OPERATORS` would turn a silent assumption into a runtime raise on real commands.
+
+    This is #463's own defect shape read the other way round — there, a set held a value
+    its producer never emitted, so the branch was dead and read as covered. Here the
+    producer's alphabet must stay inside the consumer's table. Either way the join is the
+    claim, and the join is what gets pinned.
+    """
+    singles = {op for op in g._OPERATORS if len(op) == 1}
+    missing = sorted(c for c in g._PUNCT_CHARS if c not in singles)
+    check("every_punct_char_is_an_operator", missing == [],
+          f"chars shlex can fuse with no 1-char operator: {missing!r}")
+    check("newline_is_in_the_alphabet", "\n" in g._PUNCT_CHARS, repr(g._PUNCT_CHARS))
+    check("operators_are_longest_first",
+          [len(o) for o in g._OPERATORS] == sorted((len(o) for o in g._OPERATORS), reverse=True),
+          f"maximal munch needs longest-first: {g._OPERATORS!r}")
+    # The munch itself, on the spellings that matter: an fd-dup must survive whole.
+    check("fd_dup_not_split", g._split_operator_run(">&") == [">&"],
+          repr(g._split_operator_run(">&")))
+    check("append_not_split", g._split_operator_run(">>") == [">>"],
+          repr(g._split_operator_run(">>")))
+    check("paren_semi_split", g._split_operator_run(");") == [")", ";"],
+          repr(g._split_operator_run(");")))
+    check("newline_run_split", g._split_operator_run("\n\n") == ["\n", "\n"],
+          repr(g._split_operator_run("\n\n")))
+
+
+def test_fused_operator_runs_do_not_hide_a_write_496():
+    """#496: #463's invariant one token wider.
+
+    Closing the newline hole put "\n" into shlex's punctuation set, and shlex fuses
+    adjacent punctuation into ONE token. So `printf hi\n\ncp /tmp/evil <closure>` produced
+    the single token `"\n\n"`, which is not in `_SEPARATORS`, and the `cp` was carried as
+    arguments to `printf` exactly as before the fix. One blank line put the hole back.
+
+    Every row here was ALLOWED on the first #463 fix (measured 2026-08-18 against that
+    head) and every one of them is the same write as the positive control.
+    """
+    tgt = _closure_target()
+    control = cls("Bash", {"command": f"cp /tmp/evil {tgt}"})
+    check("positive_control_refuses", control.classification == "write",
+          f"got {control.classification}")
+    for label, cmd in (
+        ("blank_line",      f"printf hi\n\ncp /tmp/evil {tgt}"),
+        ("three_newlines",  f"printf hi\n\n\ncp /tmp/evil {tgt}"),
+        ("semi_newline",    f"printf hi;\ncp /tmp/evil {tgt}"),
+        ("newline_semi",    f"printf hi\n;cp /tmp/evil {tgt}"),
+        ("newline_andand",  f"printf hi\n&& cp /tmp/evil {tgt}"),
+        ("newline_oror",    f"printf hi\n|| cp /tmp/evil {tgt}"),
+        ("newline_pipe",    f"printf hi\n| cp /tmp/evil {tgt}"),
+        ("newline_amp",     f"printf hi\n& cp /tmp/evil {tgt}"),
+        # Not in the review; found while measuring. The fused run carries a REDIRECT char,
+        # so a `">" in t` test reaches it before any separator test could — a flush arm
+        # ordered after the redirect arm would still have missed this one.
+        ("newline_redirect", f"printf hi\n> /tmp/x cp /tmp/evil {tgt}"),
+        ("newline_subshell", f"printf hi\n(cp /tmp/evil {tgt})"),
+    ):
+        v = cls("Bash", {"command": cmd})
+        check(f"fused_run_sees_write:{label}", v.classification == "write",
+              f"{label}: got {v.classification!r} for {cmd!r}")
+
+
+def test_496_pins_do_not_refuse_benign_forms():
+    """The negative half: a fix that refused anything with a blank line would pass every
+    row above and make the gate unusable. Measured cost of the split over the WHOLE fused
+    space (all 584 runs of length 1-3 over the 8-char alphabet, harness `cat <closure>
+    <RUN> <tail>`) was ZERO classification changes for any non-keyword tail.
+    """
+    tgt = _closure_target()
+    for label, cmd, want in (
+        ("quoted_newline_stays_data", f"printf 'a\nb' {tgt}", "read"),
+        ("benign_read",               f"cat {tgt}", "read"),
+        ("fd_dup_survives_split",     f"cat {tgt} 2>&1", "read"),
+        ("append_elsewhere",          f"cat {tgt} >> /tmp/log", "read"),
+        ("blank_line_unrelated",      "printf hi\n\ncp /tmp/a /tmp/b", "none"),
+        ("subshell_unrelated",        "( echo a ); echo b", "none"),
+    ):
+        v = cls("Bash", {"command": cmd})
+        check(f"benign:{label}", v.classification == want,
+              f"{label}: want {want}, got {v.classification!r} for {cmd!r}")
+
+
 ALL = [
-    test_PIN_fused_paren_hides_write_onto_gate_STILL_OPEN,
-    test_PIN_fused_paren_leaks_stdin_src_past_boundary_STILL_OPEN,
+    test_fused_paren_no_longer_hides_write_onto_gate,
+    test_fused_paren_no_longer_leaks_stdin_src_past_boundary,
+    test_operator_table_covers_the_tokenizer_alphabet_496,
+    test_fused_operator_runs_do_not_hide_a_write_496,
+    test_496_pins_do_not_refuse_benign_forms,
     test_readonly_find_naming_hook_is_read,
     test_chained_benign_rm_not_write_unless_target_in_closure,
     test_edit_write_parity,
