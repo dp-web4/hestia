@@ -667,6 +667,59 @@ verify_service_macos() {
   fi
 }
 
+step_workspace_marker() {
+  c_hdr "workspace marker"
+  # WHY THIS EXISTS. The gate resolves its scope root from, in order: $HESTIA_WORKSPACE in
+  # the HOOK PROCESS env, a `.hestia-workspace` marker walked up from cwd, else cwd itself.
+  # As of be944a9 those are the only two non-degenerate branches — and MEASURED on
+  # 2026-08-18, neither had a producer anywhere in the tree:
+  #
+  #   * the env branch needs the variable in the harness hook command. No installer writes
+  #     that command; `step_claude_hooks` below prints instructions and returns. The hook
+  #     lines on every seat are hand-wired, so there is nothing for an installer to set.
+  #   * the marker branch had exactly one writer on main, and it was a test fixture
+  #     (tools/public_boundary_test.py). No installed seat has ever had the file.
+  #
+  # So the gate fell through to cwd on every seat: a session launched inside a repo resolved
+  # its workspace to that repo, and sibling-repository grants went inert. That is the
+  # documented fail-narrow intent, but it was the ONLY reachable state rather than a
+  # fallback. This step gives the portable branch its producer.
+  #
+  # The marker, not the env var, on purpose: it is per-workspace rather than per-hook, so it
+  # covers every harness and every seat at once, it survives a hand-edited settings.json, and
+  # it needs no gate edit. Content is documentation only — the gate tests presence.
+  if [ -z "${HESTIA_WORKSPACE:-}" ]; then
+    c_warn "no workspace root detected — skipping .hestia-workspace marker"
+    c_warn "  the gate will resolve its scope root to each session's cwd (fail narrow)"
+    c_warn "  re-run with: HESTIA_WORKSPACE=/path/to/workspace $0"
+    return
+  fi
+  local marker="$HESTIA_WORKSPACE/.hestia-workspace"
+  if [ -f "$marker" ]; then
+    c_ok "marker present: $marker"
+    return
+  fi
+  if [ ! -d "$HESTIA_WORKSPACE" ]; then
+    c_warn "workspace root does not exist: $HESTIA_WORKSPACE — marker not written"
+    return
+  fi
+  # Written, then READ BACK. `printf` exiting 0 is not evidence the bytes landed on a
+  # filesystem this fleet actually runs on (WSL over NTFS has surprised this repo before).
+  printf '%s\n' \
+    "# hestia workspace root marker." \
+    "# Read by the gate's workspace resolution: presence of this file marks the directory" \
+    "# as the gate's scope root. Content is ignored." \
+    "# Written by deploy/fleet/install.sh. Safe to commit, safe to delete (deleting it" \
+    "# narrows scope resolution to each session's cwd, it does not widen anything)." \
+    > "$marker"
+  if [ -f "$marker" ]; then
+    c_ok "marker written: $marker"
+  else
+    c_err "marker write reported success but the file is absent: $marker"
+    return 1
+  fi
+}
+
 step_claude_hooks() {
   if [ -n "${HESTIA_SKIP_HOOK:-}" ]; then
     c_dim "claude-code hooks skipped (HESTIA_SKIP_HOOK set)"
@@ -729,6 +782,7 @@ main() {
     Darwin) step_service_macos ;;
     *) c_err "unsupported OS"; exit 1 ;;
   esac
+  step_workspace_marker
   step_claude_hooks
   step_smoketest
   c_hdr "done"
