@@ -296,6 +296,63 @@ if [ "$any_installed" = "0" ]; then
   exit 0
 fi
 
+# --- THE SHARED ENGINE IS AN INSTALL ARTIFACT TOO. ----------------------------------------
+# Every hook entrypoint installed above imports its decision engine from plugins/_shared/ —
+# and until now the ledger bound the entrypoints and ZERO bytes of the engine they call
+# (#481: current-build.json binds hook entrypoints but 0 bytes of _shared; the hooks digested
+# to installed paths while the engine executed from the mutable workspace checkout). An audit
+# that digests the hook but not the engine the hook imports proves the shape of the gate, not
+# its decisions. So the engine installs by the same invariants as any member file: back up
+# before overwrite (2), verify after writing (3), recorded in the authority file that is
+# written last and only on full success (4) — a failed engine verify dies BEFORE the ledger
+# write, so the ledger never claims an engine that did not land.
+#
+# The destination is FIXED — $HESTIA_HOME/shared/, deliberately no per-build versioning: the
+# ledger's sha256s ARE the versioning, and a fixed path is what a later verify-then-import
+# stage can resolve against. The glob is every `*.py`, test files included: a filter for
+# "which files are engine" is a rule that drifts; installing the directory whole cannot.
+#
+# What is deliberately NOT here: plugins/lib/path_scope.py (gemini's installed lib) is copied
+# by plugins/gemini/install.sh, a different installer with its own discipline. Folding it in
+# would mean this script deriving gemini's ext4 layout — the one-off shape this script exists
+# to end. Recording gemini's lib belongs to gemini's installer gaining ledger discipline, not
+# to this section reaching sideways.
+log "SHARED ENGINE (plugins/_shared)"
+shared_dir="$HESTIA_HOME/shared"
+shopt -s nullglob
+shared_srcs=( "$REPO_ROOT"/plugins/_shared/*.py )
+shopt -u nullglob
+# A checkout that ships no engine files must not ledger an empty engine as a deployment.
+[ "${#shared_srcs[@]}" -gt 0 ] || die "plugins/_shared holds no .py files — refusing to record an empty engine"
+shared_engine_json="["
+first_shared=1
+for src in "${shared_srcs[@]}"; do
+  base="$(basename "$src")"
+  target="$shared_dir/$base"
+  src_hash="$(sha256sum "$src" | cut -d' ' -f1)"
+  if [ -f "$target" ] && [ "$(sha256sum "$target" | cut -d' ' -f1)" = "$src_hash" ]; then
+    log "  ok    $base (already current) -> $shared_dir"
+  elif [ "$DRY_RUN" = "1" ]; then
+    log "  would $base -> $shared_dir"
+  else
+    mkdir -p "$shared_dir"
+    # INVARIANT 2: preserve what is currently enforcing before replacing it.
+    [ -f "$target" ] && cp -p "$target" "$target.pre-install.bak"
+    # Imported, not executed: 0644, not the entrypoints' 0755.
+    install -m 0644 "$src" "$target"
+    # INVARIANT 3: prove the bytes landed. cp exiting 0 is not evidence.
+    got="$(sha256sum "$target" | cut -d' ' -f1)"
+    [ "$got" = "$src_hash" ] || die "_shared/$base verify FAILED (src $src_hash != installed $got)"
+    log "  wrote $base -> $shared_dir"
+  fi
+  # Same record shape as the member files above, so one audit reads both sections.
+  [ $first_shared -eq 1 ] || shared_engine_json="$shared_engine_json,"
+  first_shared=0
+  shared_engine_json="$shared_engine_json{\"file\":\"$base\",\"path\":\"$target\",\"sha256\":\"$src_hash\"}"
+done
+shared_engine_json="$shared_engine_json]"
+log ""
+
 if [ "$DRY_RUN" = "1" ]; then
   log "DRY RUN complete; authority file NOT written"
   exit 0
@@ -304,15 +361,19 @@ fi
 # INVARIANT 4: written last, only after every file verified.
 mkdir -p "$HESTIA_HOME"
 tmp="$AUTHORITY.$$.tmp"
-python3 - "$tmp" "$build_id" "$head_sha" "$installed_json" <<'PY'
+python3 - "$tmp" "$build_id" "$head_sha" "$installed_json" "$shared_engine_json" <<'PY'
 import json, sys, time
-tmp, build_id, head_sha, installed = sys.argv[1:5]
+tmp, build_id, head_sha, installed, shared_engine = sys.argv[1:6]
 json.dump({
     "build_id": build_id,
     "head_sha": head_sha,
     "installed_at": int(time.time()),
     "installed_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     "members": json.loads(installed),
+    # Additive (#481 stage 1): the only shipped consumer reads `build_id` alone
+    # (core/src/server/dashboard.rs's deployment_health), so nothing existing
+    # can be broken by a key it never looks up.
+    "shared_engine": json.loads(shared_engine),
 }, open(tmp, "w"), indent=2, sort_keys=True)
 PY
 mv "$tmp" "$AUTHORITY"

@@ -53,11 +53,16 @@ def build(tmp, *, expects, registration=None, reg_name=None, files=("hook.py",))
     home = os.path.join(tmp, "home")
     os.makedirs(os.path.join(root, "deploy"))
     os.makedirs(os.path.join(root, "plugins", "m", "hooks"))
+    os.makedirs(os.path.join(root, "plugins", "_shared"))
     os.makedirs(home)
     shutil.copy(SCRIPT, os.path.join(root, "deploy", "install-members.sh"))
     for f in files:
         with open(os.path.join(root, "plugins", "m", "hooks", f), "w") as fh:
             fh.write("# fake hook\n")
+    # Since #481 stage 1 the installer also deploys the shared engine, and dies rather
+    # than ledger an empty one — so a fake repo root must ship a fake engine.
+    with open(os.path.join(root, "plugins", "_shared", "engine.py"), "w") as fh:
+        fh.write("# fake engine\n")
     with open(os.path.join(root, "plugins", "m", "expects.json"), "w") as fh:
         json.dump({"install": expects}, fh)
     if registration is not None:
