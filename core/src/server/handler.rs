@@ -10127,6 +10127,114 @@ mod tests {
         );
     }
 
+    /// THE MISSING DIRECTION.
+    ///
+    /// `governance_ledger::tests::every_declared_governance_event_is_actually_projected` walks
+    /// `GOVERNANCE_EVENTS` and checks each name projects to a row. Nothing walked the other way,
+    /// so an event a producer actually EMITS could go undeclared forever with that test green —
+    /// and it did, for both terminal escalation events, while 18 such rows sat on the live chain
+    /// (codex, reviewing #499, over 151,172 entries). A set-membership test can only be as
+    /// complete as the set; it can never notice what was never added.
+    ///
+    /// This asserts the direction no list can, and it is deliberately NOT a second spelling list
+    /// (codex's implementation constraint on #499): it runs the REAL producers and reads each
+    /// event type off the chain entry they actually wrote. No expected name appears below, so
+    /// renaming an event cannot silently retire the check, and a NEW terminal producer added
+    /// later is caught by the same assertion without anyone remembering to extend anything.
+    ///
+    /// Scope, stated rather than implied: this bounds the events carrying an `escalation_id`.
+    /// It does not bound producers on other surfaces — the honest guarantee is "no escalation
+    /// lifecycle event escapes declaration", not "no event anywhere does". A typed lifecycle
+    /// registry is the stronger route and is not what this is.
+    #[tokio::test]
+    async fn every_escalation_event_a_producer_emits_is_a_declared_governance_event() {
+        let (_dir, shared) = make_shared_state();
+        let mut sid = String::new();
+        for id in ["claude-code", "kimi-code"] {
+            let out = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            if id == "claude-code" {
+                sid = out["sessionId"].as_str().expect("a session to rule from").to_string();
+            }
+        }
+        let open_one = |marker: &'static str| {
+            let shared = shared.clone();
+            let sid = sid.clone();
+            async move {
+                let c = tool_gate_escalation_claim(
+                    &shared,
+                    &json!({
+                        "plugin_id": "claude-code",
+                        "tool_name": "Edit",
+                        "marker": marker,
+                        "reason": "Edit -> a governance file",
+                        "session_id": sid,
+                    }),
+                )
+                .await
+                .unwrap();
+                c["escalation_id"].as_str().expect("an id to rule on").to_string()
+            }
+        };
+
+        // PRODUCER 1 — the asker withdraws. Emits the terminal event that is not a verdict.
+        let withdrawn = open_one("witness.py").await;
+        tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({ "escalation_id": &withdrawn, "approve": false, "session_id": sid }),
+        )
+        .await
+        .expect("a member must be able to retire its own ask");
+
+        // PRODUCER 2 — the clock wins. `record_newly_lapsed` is the real lapse recorder, driven
+        // here at a `now` past the horizon rather than by waiting out the TTL.
+        let lapsed = open_one("pre_tool_use.py").await;
+        let recorded = {
+            let mut s = shared.lock().await;
+            let expires_at = s
+                .gate_escalations
+                .get(&lapsed)
+                .expect("the escalation just opened")
+                .expires_at;
+            record_newly_lapsed(&mut s, expires_at + 1)
+        };
+        assert_eq!(recorded, 1, "the lapse producer must have written exactly one row");
+
+        // THE ASSERTION. Every chain event these producers wrote that names an escalation is an
+        // admin act, so the ledger must be able to read it. Read the types off the chain — never
+        // compare against a name written here.
+        let s = shared.lock().await;
+        let emitted: Vec<String> = s
+            .recent_chain(200)
+            .into_iter()
+            .filter(|e| e.event_data.get("escalation_id").is_some())
+            .map(|e| e.event_type.clone())
+            .collect();
+        let undeclared: Vec<&String> = emitted
+            .iter()
+            .filter(|t| !crate::server::governance_ledger::is_governance_event(t))
+            .collect();
+        assert!(
+            undeclared.is_empty(),
+            "these escalation events are PRODUCED but declared in GOVERNANCE_EVENTS by nothing, \
+             so the operator ledger filters them out and the projector never sees them: \
+             {undeclared:?} (all emitted: {emitted:?})"
+        );
+
+        // The premise, guarded: an assertion over an empty list passes for the wrong reason, and
+        // a zero-iteration loop reading as "all clear" is this repo's recurring shape.
+        assert!(
+            emitted.iter().any(|t| t.ends_with("_withdrawn")),
+            "the withdrawal producer emitted nothing — the test proved a vacuous truth: \
+             {emitted:?}"
+        );
+        assert!(
+            emitted.iter().any(|t| t.ends_with("_expired")),
+            "the lapse producer emitted nothing — the test proved a vacuous truth: {emitted:?}"
+        );
+    }
+
     /// THE ASKER MAY DROP ITS OWN ASK — AND STILL MAY NOT GRANT IT.
     ///
     /// `tool_gate_arbitrate_escalation` parsed `approve` and then decided eligibility without
