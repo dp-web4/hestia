@@ -58,13 +58,8 @@ SHAPES = [
 ]
 
 
-def _default_workspace() -> str:
-    """The fleet workspace root, found by CONTENT rather than by depth.
-
-    `<repo>/../..` is wrong whenever this file is read from a git worktree — the parent of
-    `.wt/<name>/` is `.wt/`, whose children are worktrees, and the tool would then report the
-    scope surface of a directory that is not the workspace. Walk up for the first ancestor
-    holding the two directories every seat is expected to see."""
+def _default_workspace() -> str | None:
+    """Use explicit installation scope or a portable marker; never familiar repo names."""
     env = os.environ.get("HESTIA_WORKSPACE")
     if env and os.path.isdir(env):
         return env
@@ -73,18 +68,21 @@ def _default_workspace() -> str:
         d = os.path.dirname(d)
         if not d or d == "/":
             break
-        if all(os.path.isdir(os.path.join(d, x)) for x in ("hestia", "shared-context")):
+        if os.path.isfile(os.path.join(d, ".hestia-workspace")):
             return d
-    return os.path.abspath(os.path.join(_HERE, "..", ".."))
+    return None
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--workspace", default=_default_workspace())
-    ap.add_argument("--scopes", default="hestia,shared-context")
+    ap.add_argument("--scopes", required=True,
+                    help="comma-separated granted repository names")
     ap.add_argument("--cwd", default=None,
                     help="event cwd (default: both the workspace root and <ws>/<first scope>)")
     args = ap.parse_args()
+    if not args.workspace:
+        ap.error("--workspace is required unless HESTIA_WORKSPACE or .hestia-workspace is present")
 
     ws = args.workspace.replace("\\", "/").rstrip("/")
     scopes = [s for s in args.scopes.split(",") if s]

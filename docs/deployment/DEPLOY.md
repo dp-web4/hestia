@@ -48,27 +48,21 @@ routinely on another member's branch with uncommitted work — verified on 2026-
 refused to fast-forward because a peer had an unpushed commit checked out there.
 
 ```bash
-git worktree add -f --detach .wt/deploy-main origin/main
+git worktree add -f --detach ../hestia-deploy-main origin/main
 ```
 
-> **Why `.wt/` and not `/tmp`.** `core/` has sibling-repo path dependencies —
+> **Why an adjacent worktree and not `/tmp` or a nested `.wt/`.** `core/` has sibling-repo path dependencies —
 > `hub-plugin = { path = "../../web4/hub/hub-plugin" }`, and the same shape for `web4-core`,
 > `web4-trust-core`, `web4-policy`. Those resolve relative to `core/`, so a worktree anywhere
 > outside the tree that holds the `web4` checkout cannot build.
->
-> **`hestia/.wt/<name>` is one level deeper than the repo root, so it does not inherit the
-> sibling either.** From `.wt/deploy-main/core`, `../../web4` is `hestia/.wt/web4` — not the
-> checkout next to `hestia/`. The repo therefore tracks **`.wt/web4 → ../../web4`**, a relative
-> symlink that lands on the sibling `web4` from inside `.wt/`. It is committed rather than left
-> to each seat because the runbook did not build as written without it (HUB, 2026-08-10, deploying
-> `786-g56e52f6`), and a hand-made symlink reads as stray to the next person in the tree.
-> `.gitignore` ignores `/.wt/*` and un-ignores that one entry, so worktrees stay untracked.
-> A dangling `.wt/web4` means there is no sibling `web4` checkout on this box — clone it there.
+> An adjacent `hestia-deploy-main` worktree preserves that relationship without tracking an
+> installation-specific symlink. If the sibling dependency is absent, stop and obtain it through
+> the installation's documented source mechanism rather than fabricating a repository-local link.
 
 ### 1. Daemon binary
 
 ```bash
-cd .wt/deploy-main/core
+cd ../hestia-deploy-main/core
 CARGO_TARGET_DIR=<shared-target> cargo build --release
 ```
 
@@ -133,7 +127,7 @@ indication the config is stale rather than the state.
 
 ```bash
 DRY_RUN=1 deploy/install-members.sh        # every member should report "already current"
-/home/dp/.local/bin/hestia --version       # matches origin/main
+$HOME/.local/bin/hestia --version          # matches origin/main
 cat "$HESTIA_HOME/current-build.json"      # build id AND per-file hashes
 systemctl --user is-active hestia hestia-watch-claude hestia-watch-codex hestia-watch-kimi
 ```

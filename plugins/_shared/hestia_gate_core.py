@@ -325,7 +325,7 @@ class AgentPolicy:
     **"STALE IS NARROWER" WAS FALSE, AND IT WAS THE PREMISE THIS DESIGN RESTED ON.** (codex/gpt
     open-PR audit, 2026-08-04.) I argued a replica can only ever be staler, and staler-standing
     is narrower, so honouring it fails safe. That holds for grants ADDED since the copy. It
-    fails for grants **REVOKED** since the copy: if the vault revoked `repo:private-context`, a
+    fails for grants **REVOKED** since the copy: if the vault revoked `repo:restricted-project`, a
     replica still carrying it is **WIDER** than current policy. Revocation and expiry are
     precisely the operations a policy authority most needs to work, and precisely the ones the
     fallback silently defeated.
@@ -467,24 +467,25 @@ ALLOW = Verdict("allow")
 
 # ── Workspace + scope resolution ─────────────────────────────────────────────────────────
 def detect_workspace(profile: HarnessProfile) -> str:
-    """Survives a wrong or absent env. 2026-07-23, live: a session launched before
-    HESTIA_WORKSPACE landed in its hook config ran against the default ~/ai-workspace — every
-    real path then read as 'outside the workspace' (deny-everything) and the society-gate
-    script resolved to a nonexistent file. **A gate's own config must not be able to poison
-    its verdicts.**"""
+    """Resolve explicit install scope and otherwise fail narrow.
+
+    A public gate cannot infer an operator's repository names or home layout. Installers
+    should always set ``HESTIA_WORKSPACE``. A ``.hestia-workspace`` marker is the portable
+    fallback; absent either signal, cwd is returned and sibling-repository grants remain
+    inert rather than widening from a guess.
+    """
     env = os.environ.get(profile.workspace_env)
     if env and os.path.isdir(env):
         return env
-    markers = ("hestia", "shared-context", "web4", "private-context")
     d = os.getcwd()
     for _ in range(8):
-        if sum(os.path.isdir(os.path.join(d, m)) for m in markers) >= 2:
+        if os.path.isfile(os.path.join(d, ".hestia-workspace")):
             return d
         parent = os.path.dirname(d)
         if parent == d:
             break
         d = parent
-    return os.path.expanduser("~/ai-workspace")
+    return os.getcwd()
 
 
 #: Prefixes an `in_scope` entry may carry. Recognised DELIBERATELY rather than stripped by a
@@ -836,7 +837,7 @@ def _elide(path: str, keep: int = 72) -> str:
 def _offending_segment(path: str, workspace: str, cwd: Optional[str] = None) -> Optional[str]:
     """The workspace-relative first segment that was not granted, or None if the path simply
     lies outside the workspace entirely (a different fact, and worth saying differently —
-    `/mnt/c/exe/dpx/` was outside `HESTIA_WORKSPACE` altogether, and telling kimi it was 'not
+    `/outside/workspace/` was outside `HESTIA_WORKSPACE` altogether, and saying it was 'not
     granted' would have implied a grant could fix it).
 
     Normalises on the same rule as `path_in_scope`, and must: judged lexically, the deny for

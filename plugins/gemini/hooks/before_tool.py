@@ -80,7 +80,7 @@ BeforeModel events; those are complementary (this gate is the BeforeTool scope+s
 not reinvented here.
 
 Config (all env-overridable; defaults suit a generic install):
-  HESTIA_WORKSPACE         root that contains the granted repos       (default: ~/ai-workspace)
+  HESTIA_WORKSPACE         root that contains the granted repos       (set explicitly at install)
   HESTIA_SOCIETY_GATE      path to the society-safety gate caller      (default: $WORKSPACE/hestia/plugins/claude-code/hooks/pre_tool_use.py)
   HESTIA_GEMINI_IDENTITY   the member's live identity.json             (default: ~/.gemini/hestia-instance/identity.json)
   HESTIA_GEMINI_GATE_MODE  warn | enforce   (default: enforce - deny-tight, relax as trust accrues)
@@ -109,7 +109,7 @@ with contextlib.redirect_stdout(sys.stderr):
     except Exception:
         _shared_check_paths = None
 
-WORKSPACE = os.environ.get("HESTIA_WORKSPACE", os.path.expanduser("~/ai-workspace"))
+WORKSPACE = os.environ.get("HESTIA_WORKSPACE") or os.getcwd()
 IDENTITY = os.path.expanduser(
     os.environ.get("HESTIA_GEMINI_IDENTITY", "~/.gemini/hestia-instance/identity.json"))
 CLAUDE_PRE = os.environ.get(
@@ -134,15 +134,14 @@ GEMINI_HOME = os.path.expanduser("~/.gemini")
 
 
 def load_in_scope():
-    """Gemini's granted MRH (repos it may touch), read from its identity - per-entity, role-sourced."""
-    try:
-        mrh = json.load(open(IDENTITY, encoding="utf-8")).get("mrh", {})
-        scope = mrh.get("in_scope")
-        if isinstance(scope, list) and scope:
-            return [s.split(":", 1)[-1] for s in scope]  # "repo:web4" -> "web4"
-    except Exception:
-        pass
-    return ["web4"]
+    """Return no standing grants from the continuity replica.
+
+    identity.json is member-writable continuity, not authorization. The shared daemon
+    policy is authoritative; until this reference adapter consumes that snapshot directly,
+    standing scope remains deny-tight. The explicit launch directory remains a per-session
+    operator choice rather than a public-source grant.
+    """
+    return []
 
 
 def launch_cwd_repo():
@@ -167,7 +166,7 @@ def path_targets(tool_input):
                 out.append(v)
         # read_many_files takes `include`/`exclude` GLOBS, not `paths` (SOURCE-VERIFIED:
         # tools/definitions/base-declarations.ts). Scanning only paths/file_paths skipped Gate-1b
-        # for this tool entirely - an out-of-scope `include:["../private-context/**"]` was ALLOWED.
+        # for this tool entirely - an out-of-scope `include:["../restricted-project/**"]` was ALLOWED.
         # `paths`/`file_paths` stay as a defensive superset (other/future tools, harmless if absent).
         for k in ("paths", "file_paths", "include", "exclude"):
             v = tool_input.get(k)

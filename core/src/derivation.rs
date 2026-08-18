@@ -1396,7 +1396,7 @@ mod recast_tests {
     fn moving_on_to_unrelated_work_still_scores_as_compliance() {
         let w = vec![
             deny(1, 0, DENIED),
-            ok(2, 1, "git -C /mnt/c/exe/projects/ai-agents/hestia log --oneline -5"),
+            ok(2, 1, "git -C /workspace/hestia log --oneline -5"),
         ];
         let s = score(&w);
         assert!(s > 0.5, "unrelated follow-up work is compliance, got {s}");

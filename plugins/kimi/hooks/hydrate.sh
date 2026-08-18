@@ -54,48 +54,20 @@ ident.setdefault("sessions", []).append(
     {"n": ident["session_count"], "id": sid, "ended": now, "acts_observed": acts})
 ident["sessions"] = ident["sessions"][-50:]  # bounded
 
-# Refresh the MRH base grant from the repo registry (dp 2026-07-21): base = ALL public repos +
-# the granted private exceptions (shared-context, memory, private-context), PLUS the launch cwd (handled live in the gate).
-# PRESERVE accrued private grants (trust-earned widening) — recompute the public base, keep anything
-# already granted into a private repo. Fail-soft: no readable registry -> leave in_scope untouched
-# (seed default or prior). This is what makes the scope self-update fleet-wide on each hydrate.
-PRIVATE_EXCEPTIONS = {"shared-context", "memory", "private-context"}
-REGISTRY = os.environ.get("HESTIA_REPO_REGISTRY") or os.path.join(
-    os.environ.get("HESTIA_WORKSPACE", os.path.expanduser("~/ai-workspace")),
-    "private-context", "infrastructure", "repos.jsonl")
-try:
-    public = set()
-    for line in open(REGISTRY, encoding="utf-8"):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            r = json.loads(line)
-        except Exception:
-            continue
-        name = r.get("name") or r.get("repo") or r.get("dir")
-        vis = str(r.get("visibility") or r.get("access")
-                  or ("public" if r.get("public") else "")).lower()
-        if name and vis == "public":
-            public.add(name)
-    if public:  # only rewrite if the registry actually parsed public entries
-        allowed_base = public | PRIVATE_EXCEPTIONS
-        base = {f"repo:{n}" for n in allowed_base}
-        cur = (ident.get("mrh", {}) or {}).get("in_scope", []) or []
-        accrued = [s for s in cur if s.split(":", 1)[-1] not in allowed_base]  # trust-earned private grants
-        ident.setdefault("mrh", {})["in_scope"] = sorted(base | set(accrued))
-except FileNotFoundError:
-    pass
+# This hook owns continuity only. It must not derive or mutate authorization
+# from a repository inventory. Scope is supplied by the daemon's vault-backed
+# policy snapshot; the identity file is a bounded, non-authoritative replica.
 
 json.dump(ident, open(ident_p, "w", encoding="utf-8"), indent=2)
 
 # rewrite the dynamic state block in the deployed AGENTS.md (markers required; absent -> skip)
 B, E = "<!-- HESTIA:STATE:BEGIN -->", "<!-- HESTIA:STATE:END -->"
+identity_display = os.path.abspath(ident_p)
 state = f"""{B}
 ## Your footprint here (auto-updated at each session end — this IS your continuity)
 - **Sessions in this role:** {ident['session_count']} (first {ident['first_session']}, last ended {ident['last_session']})
 - **Phase:** {ident['phase']}  ·  **Role:** {ident['role']}  ·  acts observed last session: {acts}
-- **Live identity file:** `~/.kimi-code/hestia-instance/identity.json` — read it to recall your history; your milestones and session records are there.
+- **Live identity file:** `{identity_display}` — read it to recall your history; your milestones and session records are there.
 - **Fact your trained self-model gets wrong:** you HAVE a native hook system (16 events, PreToolUse/PostToolUse included). This scaffold runs on it. Don't re-derive the error.
 {E}"""
 try:

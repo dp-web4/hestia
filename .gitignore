@@ -46,12 +46,17 @@ app/src-tauri/gen/android/app/build/
 app/src-tauri/gen/android/buildSrc/build/
 app/src-tauri/gen/android/local.properties
 
-# Hardbound private key (never commit)
-.hardbound/signing.key
+# Installation-local evidence, discussion, and worktrees. These belong in a
+# private operator repository or runtime state, never in the public source tree.
+/.hardbound/
+/forum/
+/.wt/
+/.local-research/
+/.local-deployment/
 
-.hardbound/actors/claude/signing.key
-
-# Build worktrees (DEPLOY.md §0). The `web4` symlink beside them is tracked on
-# purpose — see docs/deployment/DEPLOY.md §0.
-/.wt/*
-!/.wt/web4
+# One-off fleet probes are local research artifacts. Product tools use generic
+# names and live under tools/.
+/tools/cbp_*
+/tools/claude_*
+/tools/codex_*
+/tools/kimi_*

@@ -230,6 +230,7 @@ named*. It stops being legitimate the moment anything here is described as produ
 - A control with no test holds at A0.
 - When an audit or review contradicts this document, the document is what changes.
 
-*Known open items are tracked as issues and in [`GATE_BYPASS_CATALOG.md`](GATE_BYPASS_CATALOG.md).
-Findings from external review are kept verbatim in `forum/` alongside their disposition, so
-the finding and the response remain separable.*
+*Known open items are tracked as public issues and in
+[`GATE_BYPASS_CATALOG.md`](GATE_BYPASS_CATALOG.md). Installation-specific review transcripts
+and their dispositions belong in the operator's private context; durable generic conclusions
+must be promoted into public issues, decisions, tests, or this catalog.*

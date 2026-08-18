@@ -3,11 +3,9 @@
 #
 # dp, 2026-07-28: "do it. make sure this is integrated as a hestia role not a standalone."
 #
-# LINEAGE. Adapted from private-context/supervisor/scripts/autonomous-legion-reviewer.sh,
-# which was well built and is still running. Kept from it: fresh context per session (-p),
-# worktree isolation with the shared-checkout hazard spelled out, schedule offset from the
-# workers, separate account routing. Changed: the repo list is DISCOVERED rather than
-# hardcoded, and the session is a governed hestia role rather than a standalone script.
+# The role keeps fresh context per session, worktree isolation, and independent
+# account routing. The repo list is discovered rather than hardcoded, and the
+# session is governed as a Hestia role rather than run as an anonymous script.
 #
 # WHY THE REPO LIST HAD TO CHANGE. Measured 2026-07-28: the hardcoded trio (4-life,
 # hardbound, web4) held ZERO open PRs while 17 sat unreviewed across six repos the reviewer
@@ -24,7 +22,8 @@ HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="${HESTIA_WORKSPACE:-$(cd "$HERE_DIR/../../.." && pwd)}"
 MEMBER="${REVIEWER_MEMBER:-claude-code}"
 SESSION_ID="$(date +%Y%m%d-%H%M%S)"
-LOG_DIR="${REVIEWER_LOG_DIR:-$WORKSPACE/private-context/autonomous-sessions}"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+LOG_DIR="${REVIEWER_LOG_DIR:-$STATE_HOME/hestia/reviewer-sessions}"
 LOG_FILE="$LOG_DIR/reviewer-$MEMBER-$SESSION_ID.log"
 mkdir -p "$LOG_DIR"
 

@@ -49,15 +49,12 @@ the `/mnt/c` 9p mount (cold reads can outlast a hook timeout, and these hooks fa
 `install.sh` wires **every trigger this platform can carry** — all three on Linux — and
 writes the resolved workspace into each of them.
 It has to: a systemd unit's `Environment=` is not the shell's environment and not the
-hook's, so the first cut — which set `HESTIA_WORKSPACE` on the timer only — left the
-other two triggers falling back to the compiled-in CBP default. Measured on Thor
-(2026-07-26): the hourly timer read the right workspace while both the terminal and the
-SessionStart hook answered `UNKNOWN | agent-atlas registry not readable at
-/mnt/c/exe/projects/ai-agents/…`. Honest, per rule 4 — and inert, on every machine that
-is not CBP. **Scope has to travel in the command, not in one trigger's environment.**
+hook's. A value wired into only one trigger makes the other triggers silently inspect a
+different scope. **Scope has to travel in the command, not in one trigger's environment.**
 
-Resolution order is `--workspace` → `$HESTIA_WORKSPACE` → compiled-in default, and which
-one answered is reported as `scope.workspace_source`.
+Resolution order is `--workspace` → `$HESTIA_WORKSPACE` → checkout inference → an
+explicitly unverified current-directory fallback, and which one answered is reported as
+`scope.workspace_source`. There is no compiled-in installation path.
 
 **And the workspace `install.sh` writes must not depend on where `install.sh` was run
 from.** It was `$SRC_DIR/../../..`, which is correct from the primary checkout and silently
@@ -96,7 +93,7 @@ looked" as "where it is"** — and every one of them failed in the *reassuring* 
 | `$HOME/.claude` | project + local scope too | on both machines the enforcement half lives *entirely* in the last two |
 | the working tree | `origin/main` | a feature-branch checkout flips the remedy from `install.sh` to "build an adapter" |
 | depth-1 children of the workspace | repos nest | a third dead `PreToolUse` gate, in `synchronism/manuscripts/`, was simply out of reach of the glob |
-| a compiled-in default path | `$HESTIA_WORKSPACE` | correct on CBP, `UNKNOWN` everywhere else |
+| a compiled-in default path | `$HESTIA_WORKSPACE` or checkout inference | a public build never assumes an operator's layout |
 | the substring `hestia` | real gates never say it | deleting codex's live gate still reported `OK` |
 | `$PATH` | `~/.nvm`, `~/.pyenv`, … | `1 installed` from a hook, `3 installed` from a shell, same machine, same minute |
 
@@ -498,7 +495,7 @@ the deletion rather than checking that the branch exists.
 **The two queued nits, taken by whoever touched the file next.** The provenance line was a
 real wrong output — `${HESTIA_WORKSPACE:+from HESTIA_WORKSPACE}${HESTIA_WORKSPACE:-…}`
 prints the label *and then the value*, so a set `HESTIA_WORKSPACE` read `from
-HESTIA_WORKSPACE/mnt/c/exe/projects/ai-agents`; now `from HESTIA_WORKSPACE`. The bare
+HESTIA_WORKSPACE/workspace/path`; now `from HESTIA_WORKSPACE`. The bare
 `python3` in step 3 is **hygiene, not a defect**, and that is the honest size of it:
 `install.sh` never modifies `PATH` and `PYTHON` is `command -v python3` from the same
 process, so the two always resolved to the same file, and the xcrun-stub case cannot bite
@@ -762,70 +759,3 @@ act is the thing this file exists to find.
    read as clean manufactures exactly the confidence it exists to withhold. See
    *Scope is the finding* above. This is rule 3 (`empty is not clean`) generalised from
    the registry to every dimension the check reads.
-
-## Status on CBP (2026-07-26)
-
-**`MISWIRED`** — 4 installed (claude, codex, gemini, kimi_code_cli), 6 plugins available,
-3 governed, 0 unknown. `claude` is miswired: three enabled `PreToolUse` gates resolve to
-nothing.
-
-```
-private-context/.claude/settings.local.json  PreToolUse -> web4/claude-code-plugin/hooks/pre_tool_use.py  (gone)
-Synchronism/.claude/settings.local.json      PreToolUse -> web4/claude-code-plugin/hooks/pre_tool_use.py  (gone)
-ruvector/.claude/settings.json               PreToolUse -> /workspaces/ruvector/...  (devcontainer path)
-                                             [VOID 2026-07-27 — see below]
-```
-
-The first two are the same defect Thor reported on Thor, on the machine that wrote the
-check. CBP's **user**-scope gate is live and enforcing — verified incidentally during this
-work, when a daemon deny refused an `rm -rf` from this session — but it is **fail-open**:
-`HESTIA_PRE_FAIL_CLOSED` is unset, and on 2026-07-26 the legacy fallback engine decided 73
-recorded calls (74 attempted; one record destroyed by a torn write in `~/.web4/r6/`). The
-dead ones are one scope down, which is precisely why the first cut could not see them.
-
-Prior reading at `209e154`, same machine, same hour: `OK — 1 installed, 1 governed`.
-Every difference is a blind spot, not a change on disk.
-
-### Later the same day: `UNKNOWN` — 4 installed, 4 governed
-
-**Superseded 2026-07-27 — the earlier account of these three was wrong in both directions.**
-
-- **`ruvector`** — VOID, not fixed. The `$CLAUDE_PROJECT_DIR` rewrite was **reverted**: the
-  repo is a fork of `ruvnet/RuVector` (external work), and rewriting a third party's
-  devcontainer config to make our dashboard read clean was the wrong act. The local clone
-  has since been deleted entirely, so the finding no longer has a subject. Attributing the
-  fix to "a sibling session" was also wrong — it was this tool's own author.
-- **The two `settings.local.json` gates** — NOT gone. They returned, and a third turned up
-  at `Synchronism/manuscripts/.claude/` once the project scan got deeper (#47/#48).
-
-Because the root cause was never the configs. It is
-`claude-code/plugins/web4-governance/settings.template.json`, which still points every
-project it installs at `web4/claude-code-plugin/hooks/` — a tombstone holding only a
-README, since the plugin moved to `claude-code/plugins/web4-governance/hooks/`. Those dead
-gates were not stale leftovers being cleaned up; they were being **manufactured**, which is
-why they kept reappearing after each fix.
-
-The lesson this section is now an example of: **a governance tool's own documentation is
-state, and it goes stale like any other.** Two of the three claims above were false by the
-time anyone read them, in the README of the check whose entire purpose is reporting
-accurate state. Findings need an expiry discipline, or they become the thing they warn
-about.
-
-
-
-Two things worth keeping, because both cut against the change that shipped here:
-
-- **Running the old code against the current filesystem gives the identical line.** The
-  split is a no-op on this machine today. Its evidence is `test_inventory.py`, not the
-  live report — and the reason that test file exists is that the live state was edited by
-  another member mid-change. A verdict this load-bearing cannot be checked by "run it and
-  look at today's machine."
-- **The proposal's premise was too strong.** It argued the remedy "lives in a repo we do
-  not own" — and then the repo turned out to be ownable and the config simply wrong
-  upstream, where fixing it helps every clone rather than just this box. *Fix the
-  stranger's config* is a third remedy neither member named, and it is the better one when
-  it is available. The split is still right for the case where it genuinely is not; it is
-  no longer justified by the example that motivated it.
-
-`UNKNOWN`, not `OK`, because `HESTIA_WORKSPACE` is unset in this shell — rule 4 working
-as intended.

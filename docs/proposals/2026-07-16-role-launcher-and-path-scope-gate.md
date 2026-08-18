@@ -11,7 +11,7 @@
 
 ```
 act: author + commit a hestia design proposal; hand to Legion+HUB for comment
-mrh: hestia (public repo) + shared-context forum
+mrh: product repo + an operator-provided coordination context
 basis: grant clause 1 (document) + clause 2 (coordinate); it's a proposal, not an implementation
 stakes: low / fully reversible (a doc; no code, no gate change)
 verdict: PROCEED
@@ -35,7 +35,7 @@ a role's law to a concrete invocation, and a **path-scope dimension** in the gat
 connects those.
 
 Kimi onboarding is the worked example: a Kimi agent should reach **only** (a) public-repo directories,
-(b) `shared-context`, and (c) the project cwd it's launched in — and any `../`, `/mnt`, absolute-escape,
+(b) a configured coordination repository, and (c) the project cwd it's launched in — and any `../`, absolute-escape,
 or out-of-scope access is **denied with an explanation**.
 
 ## 2. What we're proposing (three connected pieces)
@@ -51,7 +51,7 @@ scope:
   allowed_roots:            # the MRH, made literal
     - <cwd>                 # the project the agent is launched in (always granted)
     - <all public repos>    # enumerated from a maintained manifest, not guessed
-    - shared-context
+    - coordination-context
   deny_patterns:            # monitored + denied with reason
     - "../"                 # any parent-traversal in a tool arg
     - "/mnt"                # absolute host paths
@@ -68,14 +68,14 @@ same posture applied to a new predicate.)
 **Deny = steering, with explanation** (extends the existing kimi contract — a deny already carries a
 stderr reason):
 ```
-DENY: path '/mnt/c/exe/projects/ai-agents/private-context/x' is outside your granted scope.
-  Your roots: <cwd>, <public repos>, shared-context.
+DENY: path '/workspace/restricted-project/x' is outside your granted scope.
+  Your roots: <cwd>, <operator-granted repos>.
   Why: /mnt absolute paths and ../ traversal are denied for foreign-agent roles.
   If you need this, it's out of MRH — ask the launching human to widen the role, don't route around it.
 ```
 
 **Public-repo manifest:** the allowed-roots "all public repos" entry resolves from a **single
-maintained list**, not a heuristic. Proposal: `shared-context/coordination/public-repos.json` (fleet
+maintained list**, not a heuristic. Historical proposal: an operator-owned public-repository manifest
 source of truth, already the home of coordination manifests), regenerated from the same
 `gh repo list --visibility public` sweep used in the 2026-07-15 topic pass. The gate reads it; the
 launcher shows it. One list, both consumers — no drift.
@@ -138,7 +138,7 @@ accountability, it *runs on it* to start its own workers.
                                                        hestia ledger
 ```
 
-Public-repo manifest (`shared-context/coordination/public-repos.json`) feeds both the gate's
+An operator-owned public-repo manifest was proposed to feed both the gate's
 allowed-roots and the launcher's display. Single source, no drift.
 
 ## 4. Phasing (each phase independently shippable + reversible)
@@ -164,7 +164,7 @@ Phases 0–2 deliver the **security value** (scoped Kimi) without the UI; 3–5 
    in the **daemon** (one implementation, all orchestrators, but adds a daemon round-trip to every path
    arg)? Legion's read on the fail-open/fail-closed joint matters here — the hook is the membrane, but
    a daemon-side check is harder to bypass.
-3. **Manifest authority:** is `shared-context/coordination/public-repos.json` the right home, and who
+3. **Manifest authority:** what component owns the public-repository manifest, and who
    regenerates it (supervisor, on the same cadence as topic maintenance)?
 4. **Orchestrator profiles:** do we trust the OQ1 traces as current, or re-verify Kimi/Codex/Cursor
    fail-open semantics before encoding them as data? (Discovery by measurement, never by asking — the

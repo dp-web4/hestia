@@ -542,7 +542,7 @@ def _workspace_root() -> str:
         return detect_workspace(HarnessProfile(member_id="", identity_path=""))
     except Exception:
         env = os.environ.get("HESTIA_WORKSPACE")
-        return env if env else os.path.expanduser("~/ai-workspace")
+        return env if env and os.path.isdir(env) else os.getcwd()
 
 
 def _scope_entry_for_grant(path: str) -> str:

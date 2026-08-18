@@ -46,5 +46,5 @@ When a design question comes up, ask: *"Is this adding to what users already lov
 
 ## References
 
-- Original positioning ambiguity: see [strategy doc](https://github.com/dp-web4/private-context) prior to 2026-05-15
+- Original positioning ambiguity: retained in the maintainers' private strategy archive (pre-2026-05-15)
 - The framing fix: dp's directive on 2026-05-15

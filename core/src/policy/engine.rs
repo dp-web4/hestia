@@ -447,14 +447,14 @@ mod tests {
         let read_key = PolicyAction {
             tool_name: "Read",
             category: "file_read",
-            target: Some("/home/dp/.ssh/id_ed25519"),
+            target: Some("/home/member/.ssh/id_ed25519"),
             full_command: None,
         };
         assert_eq!(e.evaluate(&read_key).decision, PolicyDecision::Deny);
         let read_passphrase = PolicyAction {
             tool_name: "Read",
             category: "file_read",
-            target: Some("/home/dp/.hestia/.passphrase"),
+            target: Some("/home/member/.hestia/.passphrase"),
             full_command: None,
         };
         assert_eq!(e.evaluate(&read_passphrase).decision, PolicyDecision::Deny);
@@ -462,7 +462,7 @@ mod tests {
         let read_normal = PolicyAction {
             tool_name: "Read",
             category: "file_read",
-            target: Some("/home/dp/project/src/main.rs"),
+            target: Some("/home/member/project/src/main.rs"),
             full_command: None,
         };
         assert_eq!(e.evaluate(&read_normal).decision, PolicyDecision::Allow);
@@ -470,7 +470,7 @@ mod tests {
         let bash_mention = PolicyAction {
             tool_name: "Bash",
             category: "command",
-            target: Some("/home/dp/.ssh/id_ed25519"),
+            target: Some("/home/member/.ssh/id_ed25519"),
             full_command: None,
         };
         assert_eq!(e.evaluate(&bash_mention).decision, PolicyDecision::Allow);

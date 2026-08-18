@@ -3,17 +3,11 @@
 
 dp, 2026-07-28: *"make sure this is integrated as a hestia role not a standalone."*
 
-WHAT THIS REPLACES. `private-context/supervisor/scripts/autonomous-legion-reviewer.sh` is a
-good script and most of it should survive — fresh context per session, worktree isolation,
-schedule offset from the workers, separate account routing. Its one structural flaw is a
-**hardcoded three-repo array** from an earlier sprint. Measured 2026-07-28: those three
-(`4-life`, `hardbound`, `web4`) held **zero** open PRs, while **17** sat unreviewed across six
-repos the reviewer could not see. HUB's census counts 1,528 PRs across 72 repos and **one**
-approved review ever — but that number measures a STRUCTURAL CONSTRAINT, not review
-behaviour: every PR in this org is opened by the one shared account, and GitHub will not let
-an account approve or request-changes on its own PR. Reviews here can only ever be comments.
-Read as "nobody reviews", it is wrong; read as "no review in this org can land in the field
-selection would read", it is the argument for this file.
+This replaces the common fixed-repository reviewer pattern. A hardcoded list silently
+becomes incomplete as an installation grows, so discovery is part of the correctness
+contract. GitHub account ownership is also not treated as member identity: installations
+may use a shared transport account, and platform approval rules then measure the account
+layout rather than whether an independent role actually reviewed the work.
 
 So the reviewer worked. It was aimed at an empty room.
 

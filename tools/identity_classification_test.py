@@ -67,10 +67,8 @@ THE INVARIANT (four properties, plus two guards and a self-test)
                   field with one meaning; it is two fields with one name, and a
                   hash over it compares objects with different producers.
                   The product decision behind it (dp, 2026-08-04): a core field
-                  has ONE semantic producer -- for `mrh.in_scope`, the public
-                  repository inventory plus explicit per-install or earned
-                  grants. A frozen seed is bootstrap input, not an alternate
-                  permanent authority.
+                  has ONE semantic producer. A frozen seed is bootstrap input,
+                  not an alternate permanent authority.
 
   E  WALK SELF-TEST   Synthetic fixtures with known-correct answers run through
                   the walk every invocation. All of A-D trust the walk; if it
@@ -79,25 +77,20 @@ THE INVARIANT (four properties, plus two guards and a self-test)
 
 WHY D IS NOT AN AESTHETIC POINT
 
-The divergence that killed the supervisor proposal -- one member missing 24
-scope entries -- arrived through no write at all. Its cause is property D
-failing: `plugins/codex/hooks/hydrate.sh` recomputes `mrh.in_scope` from the
-repo registry at every session end; the corresponding gemini hook copies the
-seed once and returns, with a comment saying the rewrite is "kept minimal here
-pending a live-run verification."
+The divergence that motivated D -- one member missing 24 scope entries --
+arrived through no write at all. At the time, one member derived
+`mrh.in_scope` from a repository inventory while another kept a frozen seed.
+Both files were internally consistent, and a hash over either member's own
+copy matched; the under-derived member never wrote, so it never submitted a
+hash either. An absent record read as an agreeing one.
 
-So the two members' `mrh.in_scope` are different KINDS of object. On one it is
-a derivation output, refreshed each session against a source of truth; on the
-other it is a literal that has not moved since the seed was written. Both files
-are internally consistent, and a hash taken over either one, by its own writer,
-at its own write time, matches. The under-derived member is the one that never
-writes -- so it never submits a hash either, and an absent record reads as an
-agreeing one.
-
-That is why this checks the WRITERS and not just the files. A hash whose
-referent is the file as written can only catch mutation of that copy after the
-fact. The comparison that catches the case the thread actually measured is
-core-versus-derivation, and its precondition is that a derivation exists.
+The public/private boundary cleanup removed that split from the authority
+model. Public seeds now ship no grants, hydration only updates continuity, and
+the Hestia daemon plus certified runtime snapshots hold scope authority.
+`mrh.in_scope` in a public seed is therefore descriptive bootstrap metadata,
+not a core decision input. D remains because the failure class is generic: a
+future core field derived on one member and frozen on another would recreate
+the same false agreement. The self-test below plants exactly that split.
 
 HOW THE READERS AND WRITERS ARE FOUND
 
@@ -169,11 +162,10 @@ REPO = pathlib.Path(
 # --------------------------------------------------------------------------
 
 CORE = {
-    # The two fields a decider actually consumes (property B proves it, and the
+    # The field a decider actually consumes (property B proves it, and the
     # walk is the evidence, not the assertion). Classification ratified by dp
     # 2026-08-04, adopting the codex review's table on PR #157: core means a
     # decider reads it; policy-shaped prose with no enforcer is meta.
-    "mrh.in_scope": "it is what the gate permits",
     "role":         "instructive -- the gates key scope decisions on it",
 }
 
@@ -206,9 +198,8 @@ META = {
     # authority. If a decider ever consumes one, property C goes red -- that is
     # the classification working, not breaking.
     "mrh.scope_policy":            "policy-shaped prose; no enforcer",
+    "mrh.in_scope":                "public-seed placeholder; runtime authority lives in Hestia",
     "mrh.out_of_scope_note":       "policy-shaped prose; no enforcer",
-    "mrh.sandbox_note":            "policy-shaped prose; no enforcer",
-    "mrh.server_side_tools_note":  "policy-shaped prose; no enforcer",
 }
 
 # Keys beginning with `_` are prose the JSON format has no other home for
@@ -532,11 +523,10 @@ def prop_d_provenance(per_member, artifacts):
     Renamed from UNIFORM PROVENANCE (codex review, PR #157): the walk sees
     writer SHAPES, not semantic producers, and the name must claim what the
     measurement delivers. The product decision behind it (dp, 2026-08-04,
-    ratifying the codex review): a core field has ONE semantic producer -- for
-    `mrh.in_scope`, the public repository inventory plus explicit per-install
-    or earned grants. A frozen seed is bootstrap input, not an alternate
-    permanent authority. Under that decision a shape split IS a defect: the
-    frozen carrier's field is a different object with the same name.
+    ratifying the codex review): a core field has ONE semantic producer. A
+    frozen seed is bootstrap input, not an alternate permanent authority.
+    Under that decision a shape split IS a defect: the frozen carrier's field
+    is a different object with the same name.
     """
     carriers = {}
     for rel, obj in artifacts.items():
@@ -601,20 +591,20 @@ def prop_e_selftest():
         failures.append("E3: a planted meta-reading decider did not trip C (C is muted)")
 
     # E4: a producer-shape split must trip property D.
-    fake_members = {"deriver": {"reads": set(), "writes": {"mrh.in_scope"}, "files": []},
+    fake_members = {"deriver": {"reads": set(), "writes": {"role"}, "files": []},
                     "freezer": {"reads": set(), "writes": set(), "files": []}}
     fake_artifacts = {
-        "plugins/deriver/instance/identity.seed.json": {"mrh": {"in_scope": ["repo:a"]}, "role": "r"},
-        "plugins/freezer/instance/identity.seed.json": {"mrh": {"in_scope": ["repo:a"]}, "role": "r"},
+        "plugins/deriver/instance/identity.seed.json": {"role": "r"},
+        "plugins/freezer/instance/identity.seed.json": {"role": "r"},
     }
     split = prop_d_provenance(fake_members, fake_artifacts)
-    got = split.get("mrh.in_scope")
+    got = split.get("role")
     if not got or got[0] != ["deriver"] or got[1] != ["freezer"]:
         failures.append(f"E4: planted derive/freeze split not detected by D (got {got})")
 
     # E5: a core field with NO carrier must not pass D vacuously.
-    split = prop_d_provenance({}, {"plugins/a/instance/identity.seed.json": {"role": "r"}})
-    if "mrh.in_scope" not in split:
+    split = prop_d_provenance({}, {"plugins/a/instance/identity.seed.json": {"entity": "a"}})
+    if "role" not in split:
         failures.append("E5: D passes vacuously when a core field has no carrier")
 
     return failures

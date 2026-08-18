@@ -18,7 +18,7 @@ convert a visible gap into a silent misattribution.
 And the gap was real, not hypothetical. On CBP the `claude-code` plugin ships no
 `instance/identity.seed.json` and no `hooks/hydrate.sh` (codex, gemini and kimi all
 ship both), so nothing in the tree ever wrote `~/.claude/hestia-instance/
-identity.json`. `/home/dp/.claude/hestia-instance/` does not exist; this session's
+identity.json`. `/home/member/.claude/hestia-instance/` does not exist; this session's
 environment carries `HESTIA_MESH_PLUGIN` and `HESTIA_MESH_HOST_AGENT` but no
 `HESTIA_ROLE`. The resolution branch has never once fired for claude-code, and
 every mesh-fired session on that box was recorded as `interactive-dev`.

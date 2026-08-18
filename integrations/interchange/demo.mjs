@@ -15,7 +15,7 @@ import {
 } from "./hestia-vault.mjs";
 
 const NAME = "intx-path-a-demo";
-const REAL_SECRET = "sk-live-DEMO-ONLY-9f2c1a7b-not-a-real-key";
+const REAL_SECRET = "demo-secret-roundtrip-value";
 
 const vault = createHestiaVault();
 

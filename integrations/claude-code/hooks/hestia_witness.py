@@ -30,9 +30,11 @@ import sys
 import time
 from pathlib import Path
 
-# ---- Path so we can import the SDK without pip-installing -----------------
-SDK_PATH = "/mnt/c/exe/projects/ai-agents/hestia/plugin-sdk/python"
-if SDK_PATH not in sys.path:
+# ---- Path so a checkout install can import the SDK without pip-installing --
+# Packaged installs should put hestia_plugin_sdk on sys.path. Checkout installs
+# may set HESTIA_PYTHON_SDK; this public hook never assumes a host layout.
+SDK_PATH = os.environ.get("HESTIA_PYTHON_SDK")
+if SDK_PATH and SDK_PATH not in sys.path:
     sys.path.insert(0, SDK_PATH)
 
 from hestia_plugin_sdk import (  # type: ignore

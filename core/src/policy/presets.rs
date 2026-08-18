@@ -474,7 +474,7 @@ mod tests {
         for cmd in [
             // the three shapes measured as ALLOW on both seats
             "dd if=/dev/zero of=/dev/sda",
-            "shred -uz /home/dp/secret.key",
+            "shred -uz /home/member/secret.key",
             "cat /dev/zero > /dev/sda",
             // same act, other spellings of the same write position
             "sudo dd if=/dev/urandom of=/dev/nvme0n1 bs=1M",
@@ -576,7 +576,7 @@ mod tests {
             "mkfs.ext4 /dev/sda",
             // "plus `shred`" — shred is destructive with or without a flag
             "shred /dev/sda",
-            "shred -uz /home/dp/secret.key",
+            "shred -uz /home/member/secret.key",
             // a write position whose only marker is "last argument"
             "cp ubuntu.img /dev/sda",
             "mv ubuntu.img /dev/nvme0n1",

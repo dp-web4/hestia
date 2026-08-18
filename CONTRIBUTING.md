@@ -34,7 +34,7 @@ python3 --version      # 3.10+
 
 ## How decisions get made
 
-Hestia is part of the [Web4 project family](https://github.com/dp-web4/web4). Significant decisions are documented as ADRs in `docs/DESIGN_DECISIONS/`. The high-level strategy and PRD live in [`dp-web4/private-context/plans/`](https://github.com/dp-web4/private-context) (visible to maintainers; summaries surface here as ADRs).
+Hestia is part of the [Web4 project family](https://github.com/dp-web4/web4). Significant decisions are documented as ADRs in `docs/DESIGN_DECISIONS/`; public PRDs live under `docs/`. Installation-local discussion and evidence stay outside this repository under the [public/private boundary](docs/PUBLIC_PRIVATE_BOUNDARY.md), with durable conclusions promoted here as issues, decisions, tests, or documentation.
 
 Cross-model review is part of how we calibrate. Major design changes get reviewed by:
 - The maintainers (humans + Claude instances on the dp-web4 fleet)
@@ -48,7 +48,15 @@ If you want to propose a major change, frame it so a cold reader can evaluate it
 - **TypeScript:** `prettier` defaults. `tsc --noEmit` clean. ESLint configured per-package.
 - **Python:** `ruff` format + check.
 
-Pre-commit hooks will be added in Phase 0.
+Before committing, run the public/private boundary check against the exact staged snapshot:
+
+```bash
+python3 tools/public_boundary.py --cached
+```
+
+The command is hook-manager agnostic so it can be composed into an existing pre-commit chain
+without replacing security or governance hooks. CI runs the same scanner through its regression
+suite. Other formatting hooks will be added during Phase 0.
 
 ## Licensing of contributions
 

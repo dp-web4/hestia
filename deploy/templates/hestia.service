@@ -28,7 +28,7 @@ Documentation=https://github.com/dp-web4/hestia
 # (-qx on tokenised lines, not a bare grep: `grep -q hestia.service` also
 # matches a unit merely *named* like it, e.g. myhestia.service.)
 # Packaged as install.sh:verify_service_linux — run it fleet-wide, and let it,
-# not deploy/fleet/ROSTER.md, define which machines are affected.
+# not a source-controlled operator roster, define which installations are affected.
 # Credit: pub (three-node model + detector), nomad (charge/detonator framing),
 # sprout (initial confirm).
 
@@ -82,9 +82,10 @@ Environment=HESTIA_HOME=%h/.hestia
 # from the build actually running.
 Environment=HESTIA_CURRENT_BUILD_FILE=%h/.hestia/current-build.json
 Environment=RUST_LOG=warn
-# Workspace handed to agent-inventory for the dashboard read list. Unset => the
-# inventory guesses, notices it guessed, and degrades the report to UNKNOWN.
-Environment=HESTIA_WORKSPACE=/mnt/c/exe/projects/ai-agents
+# Optional workspace handed to agent-inventory for the dashboard read list.
+# Installers should render this from explicit operator configuration. Unset or
+# empty means the inventory must report inference/unknown rather than guess.
+Environment=HESTIA_WORKSPACE=
 
 # Sandboxing
 NoNewPrivileges=true

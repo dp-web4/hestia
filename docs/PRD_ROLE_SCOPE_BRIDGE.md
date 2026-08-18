@@ -9,8 +9,8 @@ the other half. Amend the shared concepts in both PRs or neither.
 **Reframe folded in (dp, 2026-08-14)** — *"rather than rule on these, i want to add hooks for planned infrastructure."* §7's Q1–Q4 are no longer awaiting rulings: each is recast as an **extension point** with an initial best guess, a stored home, an operator-walled path to change it, and the measurement that would justify changing it. Q5 stays a question, with its precondition named (§7.5). §7.3 — the agent second factor — now states what would have to be true for an **adjudicator rung** to count as one. See **§7** and **§9**.
 **Second reframe folded in (dp, 2026-08-14)** — *"the key to this is roles."* The OUTWARD direction — what an external caller may reach through an agent presence — is not a second permission system. It is this document's role object, read from the other side: a caller's standing decides **which role they are routed to**, and the role's manifest decides **what they may reach**. Escalation is a role TRANSFER, never a widening. See **§10**, which carries the directive verbatim and is normative for the hub's outward-context PRD in the same way §2 is normative for the twin.
 **Relates to**: `docs/PRD_ADJUDICATOR_LADDER.md` (the decider axis — §9 is the cross-reference and the shared-convergence contract), `docs/PRD_ALLOWLISTS.md` (the sibling authority; §12.1 carries the same composite contract), `PRD_GATE_CONSOLIDATION.md` (LAW/SHIM/AGENT, the one-authority-path invariant, ratified
-degraded mode), PR #431 (the standing-scope store this bridge delivers through), `docs/GATE_SPRINT_F_NOTES.md`
-R1/R3 (standing scope + launch-cwd grant — §3.6 subsumes R3), `web4/hub/docs/PRD_HUB_V2_FEDERATED.md`
+degraded mode), PR #431 (the standing-scope store this bridge delivers through), Sprint F R1/R3
+(standing scope + launch-cwd grant — §3.6 subsumes R3), `web4/hub/docs/PRD_HUB_V2_FEDERATED.md`
 R4 (roles as entities — the role manifest extends the R4 charter), CLAUDE.md's RWOA+S+V norm (§5.6),
 and — for §10 — two fleet forum notes of 2026-08-14: GPT-5.6 Sol's
 `gpt-to-hub-outward-context-access-is-scope-permission-turned-outward-2026-08-14.md` (the outward
