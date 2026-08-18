@@ -99,6 +99,44 @@ with tempfile.TemporaryDirectory() as td:
         "plugins/member/instance/identity.seed.json"
     ]) == [])
 
+# The credential-shape rule had no arms at all before this block, and it cannot get one
+# written the obvious way: a literal counterexample in THIS file would be flagged in the
+# real tree, because the shape rule takes no `is_test` exemption.  So the two tokens below
+# are assembled at call time.  That is an input to the scanner, not a hiding place — and
+# the arms are built so the exemption cannot be mistaken for a path-wide carve-out.
+check("the reviewed-example allowlist is non-empty",
+      bool(boundary.PUBLISHED_EXAMPLE_TOKENS))
+REVIEWED_EXAMPLE = next(iter(boundary.PUBLISHED_EXAMPLE_TOKENS))
+UNREVIEWED_SIBLING = "AKIA" + "7QY2NBWKZ4XJDT9F"   # same shape, value nobody reviewed
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    (root / "core" / "tests").mkdir(parents=True)
+    (root / "tools").mkdir()
+
+    pin = root / "core" / "tests" / "unscrubbed_pin.rs"
+    pin.write_text(f'const SHAPED: &str = "{REVIEWED_EXAMPLE}";\n')
+    check("reviewed example passes",
+          boundary.inspect(root, ["core/tests/unscrubbed_pin.rs"]) == [])
+
+    # Value-scoped, not path-scoped: the sibling sits on a test path too, and the ONLY
+    # thing that differs between this arm and the one above is whether the value was
+    # reviewed.  A carve-out for `is_test` paths would green both and prove nothing.
+    sibling = root / "core" / "tests" / "pasted_fixture.rs"
+    sibling.write_text(f'const CAPTURED: &str = "{UNREVIEWED_SIBLING}";\n')
+    check("unreviewed sibling on a test path is still caught",
+          any("credential-shaped token" in p
+              for p in boundary.inspect(root, ["core/tests/pasted_fixture.rs"])))
+
+    # And the exemption must not cover for its neighbour.  A `search`-then-skip
+    # implementation greens this file: the reviewed example matches first and the real
+    # token never gets looked at.  Filtering the matches is what fails it.
+    both = root / "tools" / "runtime_notes.py"
+    both.write_text(f'EXAMPLE = "{REVIEWED_EXAMPLE}"\nREAL = "{UNREVIEWED_SIBLING}"\n')
+    check("a reviewed example does not shield a token beside it",
+          any("credential-shaped token" in p
+              for p in boundary.inspect(root, ["tools/runtime_notes.py"])))
+
 codex_state = exercise_hydrate(
     "codex", "CODEX_HOME", "HESTIA_CODEX_INSTANCE_DIR",
     "HESTIA_CODEX_AGENTS_MD", "CODEX_PLUGIN_ROOT",
