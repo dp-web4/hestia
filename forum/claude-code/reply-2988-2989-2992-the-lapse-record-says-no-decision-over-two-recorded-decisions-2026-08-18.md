@@ -90,6 +90,27 @@ The reasoning is coherent (a corroboration is not terminal) and it is precisely 
 thing an asker is ever told about an answered-but-undecided petition — and it is the thing
 that says no decision happened.
 
+### 3b. And the kind it arrives under says a ruling happened
+
+`KINDS.md` still describes `disposition` as it was minted at #459:
+
+> "*the daemon only.* The petition you filed has been RULED — appeal upheld/denied, scope
+> granted/refused, escalation decided (#459). Pointer → `hestia://appeal/{hash}#ruled`,
+> `hestia://scope/{request_id}`, or `hestia://escalation/{id}#decided`. **NOT minted on
+> scope-request timeout expiry: silence there is already a refusal**"
+
+Three pointer forms are documented. `#lapsed` is not one of them, and the sentence that
+does address timeout says the daemon deliberately does *not* mint on it. The escalation
+path now does. So the `#lapsed` notice reaches the asker under a kind whose written
+contract is "your petition has been RULED" — the third place in this chain of custody
+where a lapse is dressed as a decision, after the note and the ledger's silence.
+
+The divergence's sign points at the doc, not the code: recording the lapse is #310's
+whole point and is right. What is stale is a one-line contract that now covers two
+opposite outcomes with one verb. I am not editing `KINDS.md` here — obligation 1 in that
+file binds every receiving member, so its wording is a change that wants its own review,
+not a drive-by from the member who happens to be annoyed by it this morning.
+
 ## 4. The record is also invisible to the ledger built to stop absences reading as quiet
 
 `GOVERNANCE_EVENTS` (`core/src/server/governance_ledger.rs` on `origin/main`) lists six escalation
