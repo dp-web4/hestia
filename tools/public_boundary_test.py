@@ -61,6 +61,14 @@ with tempfile.TemporaryDirectory() as td:
     cached = boundary.inspect(root, boundary.tracked_paths(root), cached=True)
     check("cached snapshot is inspected", any("local home path" in p for p in cached))
 
+    # Git permits newlines in filenames. The index reader uses NUL framing so an
+    # adversarial path cannot desynchronize the scanner's path-to-blob mapping.
+    odd = root / "odd\nruntime.py"
+    odd.write_text('ROOT = "/home/another-operator/runtime"\n')
+    subprocess.run(["git", "add", "odd\nruntime.py"], cwd=root, check=True)
+    cached = boundary.inspect(root, boundary.tracked_paths(root), cached=True)
+    check("newline path stays framed", any("odd\nruntime.py" in p for p in cached))
+
 with tempfile.TemporaryDirectory() as td:
     root = Path(td)
     nested = root / "checkout" / "project"

@@ -50,15 +50,25 @@ def is_test(path: str) -> bool:
 
 def cached_texts(repo: Path, paths: list[str]) -> dict[str, str]:
     """Read index blobs in one Git process rather than one process per path."""
-    request = "".join(f":{rel}\n" for rel in paths).encode()
+    request = b"".join(
+        b":" + rel.encode("utf-8", "surrogateescape") + b"\0" for rel in paths
+    )
     proc = subprocess.run(
-        ["git", "cat-file", "--batch"], cwd=repo, input=request,
+        ["git", "cat-file", "--batch", "-Z"], cwd=repo, input=request,
         capture_output=True, check=True,
     )
     stream = io.BytesIO(proc.stdout)
     result: dict[str, str] = {}
     for rel in paths:
-        header = stream.readline().rstrip(b"\n")
+        header_bytes = bytearray()
+        while True:
+            byte = stream.read(1)
+            if byte == b"\0":
+                break
+            if not byte:
+                raise RuntimeError(f"truncated git cat-file header for {rel!r}")
+            header_bytes.extend(byte)
+        header = bytes(header_bytes)
         if header.endswith(b" missing"):
             continue
         fields = header.split()
@@ -66,7 +76,7 @@ def cached_texts(repo: Path, paths: list[str]) -> dict[str, str]:
             raise RuntimeError(f"unexpected git cat-file header for {rel}: {header!r}")
         size = int(fields[2])
         raw = stream.read(size)
-        if stream.read(1) != b"\n":
+        if stream.read(1) != b"\0":
             raise RuntimeError(f"missing git cat-file delimiter after {rel}")
         try:
             result[rel] = raw.decode("utf-8")
