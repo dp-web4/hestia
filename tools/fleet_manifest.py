@@ -54,6 +54,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -237,7 +238,28 @@ def collect_findings(rows):
 
 def daemon_facts(probe_base):
     row = {"component": "daemon", "states": {}}
-    exe = os.path.join(HOME, ".local", "bin", "hestia")
+    # Resolve the binary from the RUNNING PROCESS first, then PATH, then the
+    # historical default. This tool's thesis is "what is actually running", and a
+    # hardcoded path breaks that on two counts: on any host whose daemon lives
+    # elsewhere (macOS/Homebrew puts it at /opt/homebrew/bin) the sha/version/
+    # build_commit either read MISSING/UNKNOWN or — worse — describe a DIFFERENT
+    # file than the live process, confidently. Fallback-safe: if the process scan
+    # yields nothing, behaviour is exactly as before.
+    exe = None
+    try:
+        _ps = subprocess.run(["ps", "-eo", "command"], capture_output=True, text=True).stdout
+        for _l in _ps.splitlines():
+            if "hestia serve" in _l and "grep" not in _l:
+                _c = _l.strip().split()[0]
+                if os.path.isabs(_c) and os.path.exists(_c):
+                    exe = _c
+                    break
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if not exe:
+        exe = shutil.which("hestia")
+    if not exe:
+        exe = os.path.join(HOME, ".local", "bin", "hestia")
     row["binary"] = os.path.relpath(exe, HOME) if exe.startswith(HOME) else exe
     row["binary_sha256"] = sha256_or(exe) if os.path.exists(exe) else "MISSING"
 
@@ -271,7 +293,11 @@ def daemon_facts(probe_base):
         row["states"]["source"] = "unverifiable"
 
     # Process: start time, RSS, and whether it predates the latest source change.
-    ps = subprocess.run(["ps", "-eo", "pid,lstart,rss,cmd"], capture_output=True, text=True).stdout
+    # POSIX "command", not procps-only "cmd": BSD/macOS ps REJECTS "cmd", writes
+    # "ps: cmd: keyword not found" to stderr, emits a listing with no command
+    # column, and still EXITS 0 — so nothing matches and the daemon reads
+    # "NOT RUNNING" while the tool has actually failed to look. Fail-open.
+    ps = subprocess.run(["ps", "-eo", "pid,lstart,rss,command"], capture_output=True, text=True).stdout
     # ALL of them, not first-match-wins: two daemons are exactly the surprise
     # this tool exists to catch, and first-match would report them as one
     # (PR #199 review, minor finding). Multiplicity is a finding, not a tiebreak.
@@ -326,7 +352,8 @@ def checkout_facts():
 
 def watcher_facts():
     rows = []
-    ps = subprocess.run(["ps", "-eo", "pid,lstart,cmd"], capture_output=True, text=True).stdout
+    # "command" not "cmd" — same BSD/macOS portability trap as the daemon row above.
+    ps = subprocess.run(["ps", "-eo", "pid,lstart,command"], capture_output=True, text=True).stdout
     seen_procs = []
     for line in ps.splitlines():
         if "hestia-watch-member.sh" in line and "grep" not in line:
