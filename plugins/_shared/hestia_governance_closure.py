@@ -391,7 +391,18 @@ def default_closure() -> Closure:
 # Reads are unaffected: a `>` inside a QUOTED argument or a heredoc body is never a write
 # position, so it never creates a write target (it may still classify "read", which is allowed).
 _PUNCT = "();<>|&"
-_SEPARATORS = frozenset({";", "&&", "||", "|", "|&", "&", "(", ")", ";;"})
+# "\n" IS A SEPARATOR AND IT IS EMITTED AS ONE (#463). It was listed here before and
+# matched NOTHING, because the tokenizer let shlex treat a newline as whitespace and shlex
+# never emits whitespace as a token. Every line after the first therefore arrived as
+# ARGUMENTS to line one's head, so a benign head hid every write behind it:
+#
+#     cp /tmp/evil <closure>/x.py            -> DENY   (positive control)
+#     printf hi\ncp /tmp/evil <closure>/x.py -> ALLOW  (#463: same write, invisible)
+#
+# A silent write to the code that decides writes is the one class worse than a false
+# refusal. `_tokenize` now removes "\n" from shlex's whitespace set and adds it to the
+# punctuation set, so it arrives here as its own token and this entry finally matches.
+_SEPARATORS = frozenset({";", "&&", "||", "|", "|&", "&", "(", ")", ";;", "\n"})
 _WRAPPERS = frozenset({"sudo", "doas", "env", "command", "exec", "nohup", "nice", "time",
                        "stdbuf"})
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -487,8 +498,46 @@ def _vocab_tokens(command: str) -> list:
 
 
 def _tokenize(cmd: str) -> list:
-    lex = shlex.shlex(cmd, posix=True, punctuation_chars=_PUNCT)
+    """Tokenize a command, with NEWLINES and COMMENT MARKERS visible to the caller.
+
+    TWO HOLES, ONE CAUSE, CLOSED HERE (#463, measured 2026-08-18):
+
+      `printf hi\ncp /tmp/evil <closure>/x.py`   was permitted — shlex counts a newline as
+      whitespace, so the second line became arguments to `printf` and the `cp` was never a
+      head. The 2026-08-10 fix for this lived in the caller's own text splitter; the
+      2026-08-13 consolidation moved classification here and left the splitter behind, so
+      the hole reopened in the module that replaced it.
+
+      `echo a#b; cp /tmp/evil <closure>/x.py`    was permitted — shlex's `commenters` eats
+      from `#` to end of LINE, and the `;` sits on that line, so the comment swallowed the
+      separator and the write with it. No newline was needed for that one.
+
+    ONE QUOTE MODEL, DELIBERATELY. The obvious repair is to pre-split the raw text on
+    unquoted newlines, and the caller's `_command_lines` does exactly that — correctly, with
+    its own hand-written quote walk. Porting that walk here would put TWO quote models in one
+    classifier, and the day they disagree about where a quote ends is the day the disagreement
+    is a bypass (that is #485's class, and the caller's own docstring warns of it in those
+    words). So the newline is handed to shlex instead: removed from `whitespace`, added to
+    `punctuation_chars`. shlex keeps deciding what is quoted, and a QUOTED newline stays data
+    inside its token exactly as before — verified, not assumed.
+
+    COMMENTS ARE NOT STRIPPED, and that is a considered fail-closed trade. Dropping tokens
+    from a `#` to the next newline would be the faithful bash rule, but after tokenization a
+    token beginning with `#` cannot be distinguished from a QUOTED one (`echo "#x"`), and
+    dropping on that guess would make everything after a quoted `#` invisible — trading a
+    false refusal for a silent write, which is the wrong direction for this module. Left in,
+    a comment's words become an ordinary simple command whose head is `#`: harmless, and the
+    following line is still seen. The residual cost is a comment containing a redirect
+    (`# write with > here`) raising a phantom write target and refusing a benign command.
+    That is a false POSITIVE, it fails closed, and it is the direction this module prefers.
+    `a#b` is unaffected: shlex keeps a mid-word `#` attached, so it never opens anything.
+    """
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=_PUNCT + "\n")
     lex.whitespace_split = True
+    # Newline must not be whitespace, or it is consumed before it can be punctuation.
+    lex.whitespace = " \t\r\f\v"
+    # shlex's comment rule eats the separator with the comment; see the docstring.
+    lex.commenters = ""
     return list(lex)
 
 

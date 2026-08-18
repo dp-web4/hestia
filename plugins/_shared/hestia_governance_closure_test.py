@@ -412,6 +412,91 @@ def test_PIN_fused_paren_leaks_stdin_src_past_boundary_STILL_OPEN():
 # statically; a dynamic sweep leaves each name un-referenced and reads as inert).
 # The two PINs are listed here as well: functions defined above but absent from ALL run
 # under pytest only and are silently skipped by the house runner (kimi, reply 2625 §3).
+def _closure_target() -> str:
+    """A path inside the governance closure, built from the module under test.
+
+    Derived rather than hardcoded so this file carries no absolute installation path
+    (docs/PUBLIC_PRIVATE_BOUNDARY.md) and so a relocation of the closure cannot leave these
+    pins asserting against a path nothing reaches.
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "hestia_governance_closure.py")
+
+
+def test_newline_separates_commands_463():
+    """#463: a write to the closure behind one benign line must NOT be invisible.
+
+    THE REGRESSION THIS PINS. `_SEPARATORS` has listed "\\n" since it was written and matched
+    NOTHING, because the tokenizer handed newlines to shlex, which counts them as whitespace
+    and never emits them as tokens. Every line after the first arrived as ARGUMENTS to line
+    one's head, so classification was decided by `printf` and the `cp` behind it was never a
+    head. The hole was found 2026-08-08, closed 2026-08-10 in the CALLER's own text splitter,
+    and reopened 2026-08-13 when classification consolidated into this module and left the
+    splitter behind.
+
+    It is pinned HERE, at the layer that now decides, because that is precisely the layer the
+    previous fix did not cover — a fix pinned only in the caller is a fix that a consolidation
+    can route around without any test going red.
+    """
+    tgt = _closure_target()
+    control = cls("Bash", {"command": f"cp /tmp/evil {tgt}"})
+    assert control.classification == "write", \
+        f"positive control must refuse; got {control.classification}"
+
+    for cmd in (
+        f"printf hi\ncp /tmp/evil {tgt}",
+        f"printf hi\nfor f in {tgt}\ndo\ncp /tmp/evil $f\ndone",
+    ):
+        v = cls("Bash", {"command": cmd})
+        assert v.classification == "write", (
+            "a write to the governance closure behind a newline must classify as a write "
+            f"(#463); got {v.classification!r} for {cmd!r}")
+
+
+def test_comment_does_not_eat_the_separator_463():
+    """A `#` must not swallow the separator AND the write that follows it.
+
+    shlex's `commenters` consumes from `#` to end of LINE, and a `;` sits on that line — so
+    `echo a#b; cp evil <closure>` was permitted with the `cp` entirely unseen while bash ran
+    it. No newline was required for this one, which is why closing the newline hole alone
+    would have left it standing.
+
+    The mid-word case is pinned as the PAIR: `a#b` is a literal to bash, not a comment, so a
+    fix that simply refuses anything containing `#` would pass the row above and be wrong
+    here. Only the pair says which happened.
+    """
+    tgt = _closure_target()
+    v = cls("Bash", {"command": f"echo a#b; cp /tmp/evil {tgt}"})
+    assert v.classification == "write", (
+        "a comment must not hide the write after the separator; got "
+        f"{v.classification!r}")
+
+
+def test_463_pins_do_not_refuse_benign_forms():
+    """The negative control for the two pins above — they must not buy safety with FPs.
+
+    A fix that refuses anything multi-line, or anything containing `#`, would satisfy both
+    tests above and make the gate unusable. These rows fail if that is how it was done.
+    """
+    tgt = _closure_target()
+    read = cls("Bash", {"command": f"cat {tgt}"})
+    assert read.classification == "read", \
+        f"reading the closure stays permitted; got {read.classification!r}"
+
+    unrelated = cls("Bash", {"command": "printf hi\ncp /tmp/a /tmp/b"})
+    assert unrelated.classification == "none", (
+        "a multi-line command naming nothing in the closure must not be refused; got "
+        f"{unrelated.classification!r}")
+
+    # A QUOTED newline is DATA, not a separator. This is the row that fails if the newline is
+    # ever split out of the raw TEXT instead of being handed to shlex — a blind text split
+    # cuts this pattern in half and leaves an unbalanced quote.
+    quoted = cls("Bash", {"command": f"grep -c 'a\nb' {tgt}"})
+    assert quoted.classification == "read", (
+        "a quoted newline is data and the command stays a read; got "
+        f"{quoted.classification!r}")
+
+
 ALL = [
     test_PIN_fused_paren_hides_write_onto_gate_STILL_OPEN,
     test_PIN_fused_paren_leaks_stdin_src_past_boundary_STILL_OPEN,
@@ -442,6 +527,9 @@ ALL = [
     test_attest_vault_reader_failure_reports_unknown_never_ok,
     test_new_file_into_shared_dir_is_write,
     test_hub_deploy_closure_is_write,
+    test_newline_separates_commands_463,
+    test_comment_does_not_eat_the_separator_463,
+    test_463_pins_do_not_refuse_benign_forms,
 ]
 
 if __name__ == "__main__":
