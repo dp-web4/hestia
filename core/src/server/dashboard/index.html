@@ -771,6 +771,9 @@
   /* Expired gets the WARNING colour, not the denied grey. Nobody ruled — that is a failure of
      the process, not an outcome of it, and it must not read as a decision. */
   .ledger-row.st-expired { border-left-color: var(--warning); }
+  /* Withdrawn is NOT expired and must not borrow its warning colour: the asker retired its own
+     ask, so nothing failed and nobody is owed a ruling. Neutral, like `recorded`. */
+  .ledger-row.st-withdrawn { border-left-color: var(--fg-dim); }
   .ledger-row.st-recorded { border-left-color: var(--border); }
   .ledger-head { display: flex; align-items: baseline; gap: 0.45rem; flex-wrap: wrap; }
   .ledger-badge { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.06em;
@@ -1144,6 +1147,7 @@
             <button class="ledger-tab" data-status="approved" aria-selected="false">approved<span class="lt-n" data-n="approved"></span></button>
             <button class="ledger-tab" data-status="denied" aria-selected="false">denied<span class="lt-n" data-n="denied"></span></button>
             <button class="ledger-tab" data-status="expired" aria-selected="false">expired<span class="lt-n" data-n="expired"></span></button>
+            <button class="ledger-tab" data-status="withdrawn" aria-selected="false">withdrawn<span class="lt-n" data-n="withdrawn"></span></button>
             <button class="ledger-tab" data-status="recorded" aria-selected="false">recorded<span class="lt-n" data-n="recorded"></span></button>
             <select id="ledger-range" aria-label="Ledger time range" style="margin-left:auto;font-size:0.72rem;">
               <option value="day">last day</option>
@@ -3199,7 +3203,9 @@
     const verdict = r.decided_by
       ? `${r.status} by ${escapeHtml(r.decided_by)}${r.decided_via ? ` (${escapeHtml(r.decided_via)})` : ''}${
           r.decision_reason ? ` — ${escapeHtml(r.decision_reason)}` : ''}`
-      : (r.status === 'expired' ? 'no ruling before the window closed' : '');
+      : (r.status === 'expired' ? 'no ruling before the window closed'
+        : r.status === 'withdrawn' ? 'the asker retired it — nobody ruled, and nobody was asked to'
+        : '');
     return `
       <div class="ledger-row st-${escapeHtml(r.status)}" data-id="${escapeHtml(r.id)}" data-kind="${escapeHtml(r.kind)}">
         <div class="ledger-head">

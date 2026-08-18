@@ -66,6 +66,15 @@ pub const GOVERNANCE_EVENTS: &[&str] = &[
     "gate_escalation_corroborated",
     "gate_escalation_refused",
     "gate_escalation_arbiter_refused",
+    // The two TERMINAL states that are not decisions. Both were produced by `handler.rs` and
+    // declared here by nothing, for as long as each has existed — found by codex reviewing #499,
+    // reproduced against 151,172 chain entries. The cost was not bookkeeping: with neither
+    // declared, an escalation that LAPSED and one the asker WITHDREW both fell through to the
+    // clock-derived branch at the bottom of `project` and rendered as `Expired`, so the operator
+    // ledger could not tell "nobody answered" from "the asker took it back". That is the same
+    // lossy-finality defect #499 records at the chain layer, one surface up.
+    "gate_escalation_expired",
+    "gate_escalation_withdrawn",
     // Scope requests — also decidable, same operator, different surface.
     "scope_requested",
     // A DURABLE grant that was attempted. Listed so a grant that failed its vault write is
@@ -143,6 +152,10 @@ pub enum LedgerStatus {
     Approved,
     Denied,
     Expired,
+    /// The asker took its own ask back. A terminal state that is NOT a verdict — nobody ruled,
+    /// and nobody failed to. Its own variant rather than folding into `Expired`, because those
+    /// two are exactly the pair the ledger used to render identically.
+    Withdrawn,
     Recorded,
 }
 
@@ -155,6 +168,7 @@ impl LedgerStatus {
             "approved" => *self == LedgerStatus::Approved,
             "denied" => *self == LedgerStatus::Denied,
             "expired" => *self == LedgerStatus::Expired,
+            "withdrawn" => *self == LedgerStatus::Withdrawn,
             "recorded" => *self == LedgerStatus::Recorded,
             // An unrecognised filter matches NOTHING rather than everything. A typo that silently
             // widened to "all" would show an operator more than they asked to see and call it a
@@ -248,6 +262,7 @@ pub struct LedgerCounts {
     pub approved: usize,
     pub denied: usize,
     pub expired: usize,
+    pub withdrawn: usize,
     pub recorded: usize,
 }
 
@@ -259,6 +274,7 @@ impl LedgerCounts {
             LedgerStatus::Approved => self.approved += 1,
             LedgerStatus::Denied => self.denied += 1,
             LedgerStatus::Expired => self.expired += 1,
+            LedgerStatus::Withdrawn => self.withdrawn += 1,
             LedgerStatus::Recorded => self.recorded += 1,
         }
     }
@@ -437,6 +453,48 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                             .unwrap_or_else(|| "unknown".into());
                         row.corroborations.push(who);
                     }
+                }
+            }
+            // The two terminal-but-not-decided ends of an ask. Same JOIN as `decided` — they land
+            // ON the open row rather than beside it — but they set no `decided_by`, because
+            // nobody decided: one is the clock winning, the other is the asker leaving.
+            //
+            // Reaching a RECORDED terminal here is the point. The clock-derived fallback below
+            // still answers for rows whose terminal event is not in the window, but where the
+            // event exists it now wins, and `withdrawn` stops being spelled `expired`.
+            "gate_escalation_expired" | "gate_escalation_withdrawn" => {
+                let Some(id) = s(d, "escalation_id") else { continue };
+                let status = if e.event_type == "gate_escalation_expired" {
+                    LedgerStatus::Expired
+                } else {
+                    LedgerStatus::Withdrawn
+                };
+                if let Some(row) = keyed.get_mut(&id) {
+                    row.status = status;
+                    row.decided_at = Some(ts);
+                    row.decided_hash = Some(e.hash.clone());
+                    // `Some(0)` reads as "the clock ran out", which is true of a lapse and false
+                    // of a withdrawal — the countdown was still running when the asker left.
+                    // Same distinction this arm exists to make, one field down.
+                    if status == LedgerStatus::Expired {
+                        row.secs_remaining = Some(0);
+                    }
+                } else {
+                    // Terminal fact whose `opened` row scrolled out of the window. Kept for the
+                    // same reason the `decided` arm keeps its orphans: dropping it would be the
+                    // silent truncation this module refuses, and a lapse nobody can see is the
+                    // defect #499 exists to close.
+                    let mut row = one_shot(e, LedgerKind::Escalation, status, s(d, "marker"));
+                    row.id = id;
+                    row.plugin_id = s(d, "plugin_id");
+                    row.tool_name = s(d, "tool_name");
+                    row.expires_at = u(d, "expires_at");
+                    row.decided_at = Some(ts);
+                    row.decided_hash = Some(e.hash.clone());
+                    if status == LedgerStatus::Expired {
+                        row.secs_remaining = Some(0);
+                    }
+                    order.push(Row::OneShot(row));
                 }
             }
             // A refusal to OPEN — quota, flood, or an arbiter that would not rule. Not a decision
@@ -753,6 +811,78 @@ mod tests {
         let law = rows.iter().find(|r| r.kind == LedgerKind::LawEdit).expect("law edit row");
         assert_eq!(law.subject.as_deref(), Some("set_preset: safety"));
         assert!(rows.iter().any(|r| r.kind == LedgerKind::Permission));
+    }
+
+    /// A LAPSE AND A WITHDRAWAL ARE NOT THE SAME END, and until these two events were declared
+    /// the ledger rendered them identically.
+    ///
+    /// Both fell through to the clock-derived branch at the bottom of `project`, which turns any
+    /// still-`Open` row past its horizon into `Expired`. So "nobody answered" and "the asker took
+    /// it back" arrived at the operator as one word. That is #499's lossy-finality defect on the
+    /// operator surface rather than the chain.
+    ///
+    /// The `now` here is the control, and it is the whole test: it sits BEFORE both horizons, so
+    /// the clock branch would call each of these rows `Open`. Any `Expired` or `Withdrawn` below
+    /// can therefore only have come from the RECORDED terminal event. Read with a `now` past the
+    /// horizon this test would pass on the old code for the expiry arm and prove nothing.
+    #[test]
+    fn a_withdrawal_and_a_lapse_are_distinguishable_and_read_from_the_record_not_the_clock() {
+        let rows = project(
+            &[
+                opened(1, "lapsed", 0),
+                entry(2, 10, "gate_escalation_expired",
+                      serde_json::json!({"escalation_id": "lapsed", "plugin_id": "claude-code"})),
+                opened(3, "taken-back", 0),
+                entry(4, 10, "gate_escalation_withdrawn",
+                      serde_json::json!({"escalation_id": "taken-back", "plugin_id": "claude-code"})),
+            ],
+            // Both `opened` rows expire at T0+3600. Well inside it: the clock says Open.
+            T0 + 20,
+        );
+        assert_eq!(rows.len(), 2, "each terminal event lands ON its open row, not beside it");
+        let lapsed = rows.iter().find(|r| r.id == "lapsed").expect("the lapsed row");
+        let taken_back = rows.iter().find(|r| r.id == "taken-back").expect("the withdrawn row");
+        assert_eq!(
+            lapsed.status,
+            LedgerStatus::Expired,
+            "a recorded lapse must terminate the row even though the clock still calls it open"
+        );
+        assert_eq!(
+            taken_back.status,
+            LedgerStatus::Withdrawn,
+            "a withdrawal read as anything else is the defect: nobody ruled, and nobody failed to"
+        );
+        assert_ne!(
+            lapsed.status, taken_back.status,
+            "the two ends this test exists to separate came back as one status"
+        );
+        // Nobody decided either of these. A `decided_by` here would manufacture a ruler.
+        assert!(lapsed.decided_by.is_none() && taken_back.decided_by.is_none());
+        // But both are terminal, so both carry WHEN and the hash that says so.
+        assert!(lapsed.decided_at.is_some() && lapsed.decided_hash.is_some());
+        assert!(taken_back.decided_at.is_some() && taken_back.decided_hash.is_some());
+        // And the countdown says which end it was. `0s left` is true of the lapse and a small
+        // lie about the withdrawal — its window was still open when the asker retired it.
+        assert_eq!(lapsed.secs_remaining, Some(0), "a lapse is the clock running out");
+        assert_eq!(
+            taken_back.secs_remaining, None,
+            "a withdrawal did not run out of time, and must not report that it did"
+        );
+    }
+
+    /// The orphan direction: a terminal event whose `opened` row scrolled out of the window is
+    /// still a fact, and dropping it would be the silent truncation this module refuses.
+    #[test]
+    fn a_terminal_escalation_event_survives_losing_its_open_row() {
+        let rows = project(
+            &[entry(1, 0, "gate_escalation_withdrawn",
+                    serde_json::json!({"escalation_id": "orphan", "plugin_id": "claude-code",
+                                       "marker": "pre_tool_use.py"}))],
+            T0 + 100,
+        );
+        assert_eq!(rows.len(), 1, "an orphaned terminal event must still produce a row");
+        assert_eq!(rows[0].id, "orphan", "the row must key on the escalation, not the hash");
+        assert_eq!(rows[0].status, LedgerStatus::Withdrawn);
     }
 
     /// Non-governance traffic must not leak into the admin ledger — that is the whole point of a
