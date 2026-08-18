@@ -813,7 +813,17 @@ impl EscalationStore {
                             //
                             // Absent key restores empty, which is honest for every escalation
                             // opened before this writer existed (all 317 of them) and for
-                            // every `SingleApprover` open, whose bar asks for no peer.
+                            // every open whose invitation genuinely dispatched nothing.
+                            //
+                            // It used to say "and for every `SingleApprover` open, whose bar
+                            // asks for no peer". That invariant is retired by this commit —
+                            // `SingleApprover` is cleared by ONE not-same peer, so it now
+                            // invites, and its rows carry a real `invited_peers` to restore.
+                            // The code beside this comment was always correct (it restores
+                            // whatever was serialized); only the sentence was pinned to the
+                            // old polarity. Flagged by codex in review of PR #498, and it is
+                            // the same shape as #499: a sentence that outlived its semantics
+                            // in a place nothing re-derives.
                             invited_peers: d
                                 .get("invited_peers")
                                 .and_then(|v| {
