@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use axum::{
+    Extension,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Json},
@@ -15,14 +16,17 @@ use axum::{
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use web4_core::oid4vc::{CredentialIssuerMetadata, CredentialRequest, verify_holder_proof};
 use web4_core::sd_jwt_vc::SdJwtVc;
 
+use super::dashboard::{DashboardChainProjection, DashboardSnapshot};
 use super::handler::HestiaServer;
 use super::state::SharedState;
 use crate::callback::{CallbackState, callback_router};
@@ -30,6 +34,128 @@ use crate::callback::{CallbackState, callback_router};
 pub const DEFAULT_BIND: &str = "127.0.0.1:7711";
 
 const DASHBOARD_HTML: &str = include_str!("dashboard/index.html");
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum DashboardRange {
+    Hour,
+    Day,
+    Week,
+    All,
+}
+
+impl DashboardRange {
+    fn from_query(range: Option<&str>) -> Self {
+        match range {
+            Some("day") => Self::Day,
+            Some("week") => Self::Week,
+            Some("all") => Self::All,
+            _ => Self::Hour,
+        }
+    }
+
+    fn projection(self) -> (Option<chrono::DateTime<chrono::Utc>>, u64, &'static str) {
+        let now = chrono::Utc::now();
+        match self {
+            Self::Hour => (Some(now - chrono::Duration::hours(1)), 2_000, "hour"),
+            Self::Day => (Some(now - chrono::Duration::days(1)), 5_000, "day"),
+            Self::Week => (Some(now - chrono::Duration::weeks(1)), 10_000, "week"),
+            Self::All => (None, 10_000, "all"),
+        }
+    }
+}
+
+/// Immutable, display-only snapshots served without touching authoritative state.
+///
+/// The tiny locks here protect only an ephemeral cache and its single-flight set;
+/// no governance state or chain connection sits behind them. A slow projection can
+/// therefore delay a newer dashboard picture, but it cannot delay a gate verdict.
+#[derive(Clone)]
+struct DashboardReadModel {
+    snapshots: Arc<RwLock<HashMap<DashboardRange, Arc<DashboardSnapshot>>>>,
+    queued: Arc<StdMutex<HashSet<DashboardRange>>>,
+    refresh_tx: mpsc::Sender<DashboardRange>,
+}
+
+impl DashboardReadModel {
+    fn new() -> (Self, mpsc::Receiver<DashboardRange>) {
+        let (refresh_tx, refresh_rx) = mpsc::channel(4);
+        (
+            Self {
+                snapshots: Arc::new(RwLock::new(HashMap::new())),
+                queued: Arc::new(StdMutex::new(HashSet::new())),
+                refresh_tx,
+            },
+            refresh_rx,
+        )
+    }
+
+    fn get(&self, range: DashboardRange) -> Option<Arc<DashboardSnapshot>> {
+        self.snapshots.read().ok()?.get(&range).cloned()
+    }
+
+    fn request_refresh(&self, range: DashboardRange) {
+        let newly_queued = self
+            .queued
+            .lock()
+            .map(|mut q| q.insert(range))
+            .unwrap_or(false);
+        if newly_queued && self.refresh_tx.try_send(range).is_err() {
+            if let Ok(mut q) = self.queued.lock() {
+                q.remove(&range);
+            }
+        }
+    }
+
+    fn publish(&self, range: DashboardRange, snapshot: DashboardSnapshot) {
+        if let Ok(mut snapshots) = self.snapshots.write() {
+            snapshots.insert(range, Arc::new(snapshot));
+        }
+        if let Ok(mut q) = self.queued.lock() {
+            q.remove(&range);
+        }
+    }
+
+    fn failed(&self, range: DashboardRange) {
+        if let Ok(mut q) = self.queued.lock() {
+            q.remove(&range);
+        }
+    }
+}
+
+async fn dashboard_read_model_worker(
+    state: SharedState,
+    model: DashboardReadModel,
+    mut refresh_rx: mpsc::Receiver<DashboardRange>,
+) {
+    while let Some(range) = refresh_rx.recv().await {
+        let (cutoff, cap, label) = range.projection();
+        // Clone the store handle under the authoritative lock; perform every
+        // SQLCipher read after releasing it. The store serializes its own
+        // connection and the blocking pool keeps SQLite off Tokio's workers.
+        let chain_store = { state.lock().await.chain_store.clone() };
+        let projection = tokio::task::spawn_blocking(move || {
+            DashboardChainProjection::read(&chain_store, cap, cutoff)
+        })
+        .await;
+        let projection = match projection {
+            Ok(projection) => projection,
+            Err(error) => {
+                tracing::warn!("dashboard projection worker failed: {error}");
+                model.failed(range);
+                continue;
+            }
+        };
+
+        // This remaining lock covers only the in-memory presentation fold. It
+        // never covers chain I/O; the immutable result is then published into
+        // the read model used by every GET.
+        let snapshot = {
+            let s = state.lock().await;
+            s.dashboard_snapshot_from_projection(projection, cutoff, label)
+        };
+        model.publish(range, snapshot);
+    }
+}
 
 // ---- Operator-surface authentication (RWOA clauses W + O) -------------------
 // The operator proves presence by SIGNING a server-issued challenge with their
@@ -370,6 +496,17 @@ pub async fn serve_with_callback(
         config,
     );
 
+    // One producer, any number of browser/TUI readers. Seed the default view
+    // before the listener accepts traffic; callers receive an honest 503 while
+    // the first projection warms rather than falling back to a synchronous read.
+    let (dashboard_model, dashboard_refresh_rx) = DashboardReadModel::new();
+    dashboard_model.request_refresh(DashboardRange::Hour);
+    tokio::spawn(dashboard_read_model_worker(
+        state.clone(),
+        dashboard_model.clone(),
+        dashboard_refresh_rx,
+    ));
+
     // The OPERATOR DATA surface (/api/*): every route behind the operator_gate
     // preflight (RWOA O). route_layer applies only to these routes, not fallbacks.
     // NB: the dashboard HTML shell `GET /` is served UNAUTHENTICATED below — it
@@ -480,7 +617,8 @@ pub async fn serve_with_callback(
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             operator_gate,
-        ));
+        ))
+        .layer(Extension(dashboard_model));
 
     // The disposition worker (#459; reshaped to the revised #480 review): the
     // daemon's only periodic task. Two halves per tick:
@@ -1010,21 +1148,22 @@ async fn trust_graph_turtle(
 }
 
 async fn dashboard_json(
-    State(state): State<SharedState>,
+    Extension(model): Extension<DashboardReadModel>,
     Query(q): Query<DashboardQuery>,
 ) -> impl IntoResponse {
-    let now = chrono::Utc::now();
-    // Caps are transport safety only; the range does the filtering.
-    let (cutoff, cap, label) = match q.range.as_deref() {
-        Some("day") => (Some(now - chrono::Duration::days(1)), 5_000, "day"),
-        Some("week") => (Some(now - chrono::Duration::weeks(1)), 10_000, "week"),
-        Some("all") => (None, 10_000, "all"),
-        _ => (Some(now - chrono::Duration::hours(1)), 2_000, "hour"),
-    };
-    let s = state.lock().await;
-    let snapshot = s.dashboard_snapshot_window(cap, cutoff, label);
-    drop(s);
-    Json(snapshot)
+    let range = DashboardRange::from_query(q.range.as_deref());
+    model.request_refresh(range);
+    match model.get(range) {
+        Some(snapshot) => Json(snapshot.as_ref().clone()).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "dashboard read model is warming",
+                "retry": true,
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn failures_json(State(state): State<SharedState>) -> impl IntoResponse {
@@ -3792,6 +3931,64 @@ mod tests {
         let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
         let state = ServerState::open(vault, dir.path(), "p").unwrap();
         (dir, Arc::new(tokio::sync::Mutex::new(state)))
+    }
+
+    /// Issue #423: a GET must consume only the immutable read model. Holding
+    /// the authoritative state lock simulates a governance write in progress;
+    /// the cached dashboard remains immediately readable and cannot join that
+    /// write's critical section.
+    #[tokio::test]
+    async fn dashboard_get_does_not_touch_authoritative_state() {
+        let (_dir, state) = make_shared_state();
+        let snapshot = { state.lock().await.dashboard_snapshot(1) };
+        let (model, _refresh_rx) = DashboardReadModel::new();
+        model.publish(DashboardRange::Hour, snapshot);
+
+        let _authoritative_write = state.lock().await;
+        let response = tokio::time::timeout(
+            Duration::from_millis(100),
+            dashboard_json(
+                Extension(model),
+                Query(DashboardQuery {
+                    range: Some("hour".into()),
+                }),
+            ),
+        )
+        .await
+        .expect("a cached display read must not wait for authoritative state")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn dashboard_refresh_is_single_flight_and_failure_keeps_last_good_snapshot() {
+        let (_dir, state) = make_shared_state();
+        let snapshot = state
+            .try_lock()
+            .expect("fresh test state")
+            .dashboard_snapshot(1);
+        let expected = snapshot.generated_at;
+        let (model, mut refresh_rx) = DashboardReadModel::new();
+        model.publish(DashboardRange::Hour, snapshot);
+
+        for _ in 0..8 {
+            model.request_refresh(DashboardRange::Hour);
+        }
+        assert_eq!(refresh_rx.try_recv(), Ok(DashboardRange::Hour));
+        assert!(refresh_rx.try_recv().is_err(), "one range queues only once");
+
+        model.failed(DashboardRange::Hour);
+        assert_eq!(
+            model.get(DashboardRange::Hour).map(|s| s.generated_at),
+            Some(expected),
+            "a failed refresh must retain the last honest snapshot"
+        );
+        model.request_refresh(DashboardRange::Hour);
+        assert_eq!(
+            refresh_rx.try_recv(),
+            Ok(DashboardRange::Hour),
+            "failure releases the single-flight slot for retry"
+        );
     }
 
     /// Issue #482 regression probe: a governance-ledger read must NOT hold the

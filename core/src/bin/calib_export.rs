@@ -79,15 +79,16 @@ fn main() -> Result<()> {
     // Derive the storage key from the REAL home (salt lives at <home>/.store-salt).
     let key = storage_key(&home, &passphrase).context("deriving storage key")?;
 
-    // Copy the sealed DB to avoid lock contention with the live daemon
-    // (SQLCipher/SQLite is single-writer). The copy is the encrypted bytes;
-    // the key never leaves this process, plaintext never hits disk.
+    // Take an online sealed snapshot to avoid lock contention with the live
+    // daemon. A raw copy of `witness.db` alone is incomplete in WAL mode: recent
+    // committed frames may live in `witness.db-wal`. SQLite's backup API folds a
+    // consistent view into another encrypted DB; plaintext never hits disk.
     let src_db = home.join("witness.db");
     let tmp_dir = std::env::temp_dir().join(format!("hestia-calib-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).context("creating temp copy dir")?;
     let copy_db = tmp_dir.join("witness.db");
-    std::fs::copy(&src_db, &copy_db)
-        .with_context(|| format!("copying sealed chain {}", src_db.display()))?;
+    SqliteChainStore::backup_encrypted(&src_db, &copy_db, key)
+        .with_context(|| format!("snapshotting sealed chain {}", src_db.display()))?;
 
     let store = SqliteChainStore::open(&copy_db, key)
         .context("opening sealed chain copy (wrong passphrase => AEAD/open error)")?;

@@ -517,7 +517,7 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     // flow it gates is which read-only rows appear, and under which harness name, in the trust
     // box. No allow/deny, no chain attribution, no NOT-SAME independence check. Naming, not
     // Predicate; no comparison pinned.
-    ("server/dashboard.rs::dashboard_snapshot_window", &[
+    ("server/dashboard.rs::dashboard_snapshot_from_projection", &[
         "if let Some(lct) = self.member_lct(orch.id) {",
     ], SiteClass::Naming),
 ];
@@ -591,7 +591,7 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("lct_publish.rs::collect_publish_set", &[
         "for (plugin_id, lct) in members.iter_sorted() {",
     ]),
-    ("server/dashboard.rs::dashboard_snapshot_window", &[
+    ("server/dashboard.rs::dashboard_snapshot_from_projection", &[
         "member_entities: self.member_registry.len(),",
     ]),
     // Added 2026-08-17 (codex, PR #490 NOT-SAME pass). READING, answering the question

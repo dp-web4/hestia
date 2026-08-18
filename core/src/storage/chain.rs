@@ -59,7 +59,14 @@ impl ChainRowRef<'_> {
 /// Witness chain persisted to SQLite. Locking is internal so the store
 /// is `Send + Sync` from the caller's perspective.
 pub struct SqliteChainStore {
+    /// Authoritative append connection. Reads that can be long-running belong
+    /// on `read_conn` so a display projection never waits on this process-local
+    /// mutex before a witness write can begin.
     conn: Mutex<Connection>,
+    /// Dedicated query-only connection. WAL mode lets its snapshot coexist
+    /// with an append transaction; the mutex serializes display/read
+    /// projections with each other, never with the writer.
+    read_conn: Mutex<Connection>,
     path: PathBuf,
     /// Cached entry count, so `len()` is O(1) instead of an O(n) `COUNT(*)`.
     ///
@@ -129,6 +136,66 @@ fn migrate_plaintext_to_encrypted(path: &Path, key_hex: &str) -> Result<()> {
 }
 
 impl SqliteChainStore {
+    /// Copy one consistent encrypted chain snapshot while its live daemon may
+    /// continue appending in WAL mode.
+    ///
+    /// A raw copy of only `witness.db` is not a snapshot once committed frames
+    /// may still live in `witness.db-wal`. SQLite's online backup API reads one
+    /// transactionally consistent view across both and re-encrypts it through a
+    /// separately keyed destination connection. The destination is replaced,
+    /// matching `std::fs::copy` semantics used by the callers this supersedes.
+    pub fn backup_encrypted(
+        source_path: impl AsRef<Path>,
+        destination_path: impl AsRef<Path>,
+        key: [u8; 32],
+    ) -> Result<()> {
+        let source_path = source_path.as_ref();
+        let destination_path = destination_path.as_ref();
+        anyhow::ensure!(
+            source_path != destination_path,
+            "chain snapshot destination must differ from its source"
+        );
+        if let Some(parent) = destination_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("creating chain snapshot dir {}", parent.display())
+            })?;
+        }
+        if destination_path.exists() {
+            std::fs::remove_file(destination_path).with_context(|| {
+                format!(
+                    "removing prior chain snapshot {}",
+                    destination_path.display()
+                )
+            })?;
+        }
+
+        let key_hex = hex::encode(key);
+        let source = Connection::open(source_path)
+            .with_context(|| format!("opening chain snapshot source {}", source_path.display()))?;
+        source
+            .pragma_update(None, "key", &key_hex)
+            .with_context(|| "keying chain snapshot source")?;
+        source
+            .pragma_update(None, "query_only", true)
+            .with_context(|| "making chain snapshot source query-only")?;
+
+        let mut destination = Connection::open(destination_path).with_context(|| {
+            format!(
+                "opening chain snapshot destination {}",
+                destination_path.display()
+            )
+        })?;
+        destination
+            .pragma_update(None, "key", &key_hex)
+            .with_context(|| "keying chain snapshot destination")?;
+        let backup = rusqlite::backup::Backup::new(&source, &mut destination)
+            .with_context(|| "starting encrypted chain snapshot")?;
+        backup
+            .run_to_completion(256, std::time::Duration::from_millis(10), None)
+            .with_context(|| "copying encrypted chain snapshot")?;
+        Ok(())
+    }
+
     /// Open or create the SQLCipher-encrypted witness chain. `key` is the stable
     /// storage key (see [`crate::storage::storage_key`]); it's applied as the
     /// SQLCipher key (hex), so the DB is encrypted at rest. A legacy plaintext
@@ -153,6 +220,14 @@ impl SqliteChainStore {
         // SQLCipher: key the connection before any other access.
         conn.pragma_update(None, "key", &key_hex)
             .with_context(|| "applying SQLCipher key to witness chain")?;
+        // Dashboard and ledger projections must never stand between a
+        // governance act and its witness append. One connection mutex cannot
+        // provide that property: moving a read outside ServerState would still
+        // make append() wait on the store's inner mutex. WAL gives the writer
+        // and a stable reader snapshot independent file-level progress. The WAL
+        // is encrypted by SQLCipher under the same database key.
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .with_context(|| "enabling WAL mode for concurrent chain reads")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chain_entries (
                 chain_position INTEGER PRIMARY KEY,
@@ -166,10 +241,23 @@ impl SqliteChainStore {
              CREATE INDEX IF NOT EXISTS idx_chain_event_type ON chain_entries(event_type);
              CREATE INDEX IF NOT EXISTS idx_chain_timestamp  ON chain_entries(timestamp);",
         )?;
+        let read_conn = Connection::open(&path).with_context(|| {
+            format!(
+                "opening witness-chain read connection at {}",
+                path.display()
+            )
+        })?;
+        read_conn
+            .pragma_update(None, "key", &key_hex)
+            .with_context(|| "applying SQLCipher key to witness-chain read connection")?;
+        read_conn
+            .pragma_update(None, "query_only", true)
+            .with_context(|| "making witness-chain read connection query-only")?;
         // Pay the O(n) count exactly once, at open, then track it incrementally.
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM chain_entries", [], |row| row.get(0))?;
         Ok(Self {
             conn: Mutex::new(conn),
+            read_conn: Mutex::new(read_conn),
             path,
             len: AtomicU64::new(n as u64),
         })
@@ -194,7 +282,7 @@ impl SqliteChainStore {
 
     /// Most recent entry's hash, or the genesis sentinel if empty.
     pub fn tail_hash(&self) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn.lock().unwrap();
         let h: Option<String> = conn
             .query_row(
                 "SELECT hash FROM chain_entries ORDER BY chain_position DESC LIMIT 1",
@@ -423,7 +511,7 @@ impl SqliteChainStore {
         if matches!(event_types, Some(t) if t.is_empty()) {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn.lock().unwrap();
         let mut where_parts: Vec<String> = Vec::new();
         if let Some(types) = event_types {
             where_parts.push(format!("event_type IN ({})", vec!["?"; types.len()].join(",")));
@@ -922,6 +1010,98 @@ mod tests {
 
         // An empty type list asks for nothing — same rule as read_recent_by_types.
         assert!(store.scan_recent(None, Some(&[]), 10, |_| Some(())).unwrap().is_empty());
+    }
+
+    /// A dashboard projection is allowed to be slow; it is not allowed to
+    /// become part of governance-write finality. Hold a live SELECT snapshot
+    /// open inside the projection callback and prove an append commits before
+    /// that reader is released. A second connection without WAL fails this
+    /// control at commit; one shared connection mutex fails before the write can
+    /// begin.
+    #[test]
+    fn scan_recent_snapshot_does_not_block_append() {
+        let dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(
+            SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap(),
+        );
+        let signer = "lct:web4:hestia:sovereign:test";
+        store
+            .append("seed", json!({"n": 1}), signer)
+            .unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let reader_store = store.clone();
+        let reader = std::thread::spawn(move || {
+            reader_store
+                .scan_recent(None, None, 1, |row| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Some(row.chain_position)
+                })
+                .unwrap()
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("reader reached a live SQLite row");
+
+        let (appended_tx, appended_rx) = std::sync::mpsc::sync_channel(0);
+        let writer_store = store.clone();
+        let writer = std::thread::spawn(move || {
+            let result = writer_store.append("concurrent", json!({"n": 2}), signer);
+            appended_tx.send(result).unwrap();
+        });
+        let append_while_reader_is_live =
+            appended_rx.recv_timeout(std::time::Duration::from_secs(2));
+
+        // Always release and join before asserting, so a broken implementation
+        // fails rather than leaving a permanently blocked test thread behind.
+        release_tx.send(()).unwrap();
+        assert_eq!(reader.join().unwrap(), vec![0]);
+        writer.join().unwrap();
+        append_while_reader_is_live
+            .expect("a display snapshot must not delay a witness append")
+            .expect("concurrent witness append succeeds");
+        assert_eq!(store.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn online_backup_includes_wal_frames_and_stays_encrypted() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("live.db");
+        let snapshot_path = dir.path().join("snapshot.db");
+        let store = SqliteChainStore::open(&source_path, TEST_KEY).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        }
+        store
+            .append(
+                "committed-in-wal",
+                json!({"visible": true}),
+                "lct:web4:hestia:sovereign:test",
+            )
+            .unwrap();
+        let wal_path = source_path.with_extension("db-wal");
+        assert!(
+            wal_path.metadata().map(|m| m.len() > 0).unwrap_or(false),
+            "negative-control precondition: committed WAL frames exist"
+        );
+
+        SqliteChainStore::backup_encrypted(&source_path, &snapshot_path, TEST_KEY).unwrap();
+        assert!(
+            !is_plaintext_sqlite(&snapshot_path),
+            "snapshot bytes remain encrypted at rest"
+        );
+        let snapshot = SqliteChainStore::open(&snapshot_path, TEST_KEY).unwrap();
+        let rows = snapshot.read_recent(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_type, "committed-in-wal");
+        drop(snapshot);
+        assert!(
+            SqliteChainStore::open(&snapshot_path, [9u8; 32]).is_err(),
+            "snapshot must require the original key"
+        );
     }
 
     #[test]

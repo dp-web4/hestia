@@ -225,8 +225,8 @@ fn main() -> Result<()> {
     let tmp_dir = std::env::temp_dir().join(format!("hestia-appeal-floor-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).context("creating temp copy dir")?;
     let copy_db = tmp_dir.join("witness.db");
-    std::fs::copy(&src_db, &copy_db)
-        .with_context(|| format!("copying sealed chain {}", src_db.display()))?;
+    SqliteChainStore::backup_encrypted(&src_db, &copy_db, key)
+        .with_context(|| format!("snapshotting sealed chain {}", src_db.display()))?;
 
     let store = SqliteChainStore::open(&copy_db, key)
         .context("opening sealed chain copy (wrong passphrase => AEAD/open error)")?;
