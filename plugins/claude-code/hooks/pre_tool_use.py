@@ -2668,7 +2668,21 @@ def main() -> int:
         home_markers=("~/.claude",),
         workspace_env="HESTIA_WORKSPACE",
     )
-    _WS = os.environ.get("HESTIA_WORKSPACE") or "/mnt/c/exe/projects/ai-agents"
+    # THE SHARED DISCOVERY, never a baked path. The first draft of this cutover fell back to
+    # a literal absolute workspace root — one maintainer's mount, compiled into a public
+    # gate — and `tools/public_boundary.py` failed it on exactly that line ("runtime
+    # mechanism bakes a mounted-host path"). It then failed a SECOND time when the fix's own
+    # comment quoted the offending path in order to explain itself: the rule is about leaking
+    # a real installation layout, and prose leaks it as well as code does. The control caught
+    # the author of the code it protects against, twice, which is the useful direction.
+    #
+    # `detect_workspace` is the one resolver every harness shares: HESTIA_WORKSPACE if the
+    # installer set it, else a `.hestia-workspace` marker walked up from cwd, else cwd — and
+    # its docstring states the reason a fallback must never be a guessed layout: "A public
+    # gate cannot infer an operator's repository names or home layout." A baked default does
+    # not just leak a path, it silently WIDENS scope on any machine whose layout happens to
+    # match, and stays inert-but-wrong on every machine that does not.
+    _WS = _core.detect_workspace(_CORE_PROFILE)
 
     # The event, normalised the way the core expects. Paths and command come from the same
     # tool_input the closure classifier already read — one extraction, not a second opinion.
