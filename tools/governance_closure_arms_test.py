@@ -51,7 +51,12 @@ Measured 2026-08-19 against three closures, same probe, neutral cwd, LITERAL_FLO
     #534's in-branch fd-skip unreachable, because #538 pops the digit earlier. These arms
     exist so that claim is a test rather than a paragraph.
 
-  OPEN DEFECT PIN — green on ALL THREE closures, including the fix
+  OPEN DEFECT PINS — green on ALL THREE closures, including the fix. TWO independent
+    out-of-grammar over-refusal classes, neither closed by #538. Both share a shape: once
+    ANYTHING throws the command out of grammar, the ENTIRE token vocabulary is matched
+    under the broader rules, and a quoted heredoc body stops being inert. The body is
+    never the trigger — with the trigger removed, the identical body is a read.
+
     FP12  a control-flow keyword anywhere in the command flips it out of grammar, so a
           plain READ of the closure is refused as a write. Not fixed by #538. Pinned at
           the CURRENT (wrong) verdict so the suite is green; a RED here means someone
@@ -62,6 +67,13 @@ Measured 2026-08-19 against three closures, same probe, neutral cwd, LITERAL_FLO
           not the keyword alone. NOTE the near-miss: the `$VAR` assignment is NOT the
           cause — rows for `ASSIGN=$VAR/<dir>` and `ASSIGN=/literal/<dir>` are both
           "read". Blaming the assignment would have mis-filed this as FP13.
+
+    OOG   a substitution in a WRITE POSITION (`cat > $V/a.md`) does the same, and this one
+          has a price on record: it refused a note ABOUT the gate whose destination path
+          was built from a variable, and opened escalation 28b6bc2af908e148 for an
+          operator to decide. Paired control run 5 minutes apart at the time: identical
+          body, literal destination, allowed. A variable in an assignment VALUE or in a
+          READ position is also allowed — it is the write position specifically.
 
 Arms I, J and K carry BENIGN TWINS in the same assertion. Without them each would be
 satisfied by a classifier that answers "write" to anything naming a marker — which the
@@ -278,6 +290,54 @@ def test_pin_a_control_flow_keyword_refuses_a_plain_read():
     check("FP12_assignment_is_not_the_cause", literal == "read",
           "a literal-valued assignment naming the closure is also a read — the $VAR is "
           f"not what triggers FP12; got {literal}")
+
+
+def test_pin_a_variable_in_a_write_position_sweeps_in_a_quoted_body():
+    """OPEN DEFECT, pinned at the WRONG verdict. Second out-of-grammar class, distinct
+    from FP12 and also unfixed by #538.
+
+    A substitution in a WRITE POSITION raises _OutOfGrammar in _flush_simple_command;
+    classify() then matches the command's FULL token vocabulary under the broader rules.
+    A quoted heredoc body — inert while the command is in grammar — becomes write-position
+    vocabulary the moment the redirect target contains a $VAR.
+
+    The heredoc is NOT the trigger and neither is the variable: with a literal destination
+    the identical body is a read (arm A), and a variable in an ASSIGNMENT VALUE or a READ
+    position is also a read. It is specifically a variable in a write position, and the
+    body is only the payload that gets swept in.
+
+    Recorded because it has a price: this exact shape — a note ABOUT the gate, written to
+    a $VAR-built path — refused a documentation write and opened escalation
+    28b6bc2af908e148, which an operator then had to decide.
+
+    A RED here means someone repaired it. Invert the arm; do not weaken it.
+    """
+    body_mark = "\nthe marker is " + MARK + "\nEOF"
+    body_none = "\nnothing to see here\nEOF"
+
+    got = verdict("cat > $V/a.md <<'EOF'" + body_mark)
+    check("OOG_var_dest_sweeps_quoted_body", got[0] == "write",
+          "THE WRITE-POSITION-VARIABLE OVER-REFUSAL APPEARS FIXED — a quoted body under a "
+          f"$VAR destination now classifies {got[0]!r}. Invert this pin to assert 'read'.")
+    check("OOG_reason_is_out_of_grammar", got[1] == g.RULE_OUT_OF_GRAMMAR,
+          f"the over-refusal should still be the grammar rule; got {got[1]}")
+
+    literal_dest = cls("cat > /tmp/a.md <<'EOF'" + body_mark)
+    check("OOG_literal_dest_is_a_read", literal_dest == "read",
+          f"the PAIRED CONTROL: identical body, literal destination, allowed; got {literal_dest}")
+
+    no_vocab = cls("cat > $V/a.md <<'EOF'" + body_none)
+    check("OOG_benign_twin", no_vocab == "none",
+          f"out-of-grammar alone must not refuse; it needs closure vocabulary; got {no_vocab}")
+
+    argv_mention = cls("echo " + MARK + " > $V/a.md")
+    check("OOG_not_heredoc_specific", argv_mention == "write",
+          "the same sweep happens with the marker in plain argv and no heredoc at all — "
+          f"the heredoc is the payload, not the trigger; got {argv_mention}")
+
+    read_position = cls("cp $V/" + MARK + " /tmp/a.py")
+    check("OOG_variable_in_read_position_is_a_read", read_position == "read",
+          f"a variable in a READ position does not throw the command out of grammar; got {read_position}")
 
 
 def _cases():
