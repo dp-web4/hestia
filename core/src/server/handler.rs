@@ -4929,13 +4929,27 @@ pub(crate) fn project_dispositions(
 /// input: open rows are few and reaped, so this never scans history).
 ///
 /// `status_at` derives Expired from the clock alone, so a petition nobody ruled
-/// used to leave no chain event and no return edge — and on the
-/// sovereign_plus_peer bar that is the modal terminal outcome. Each crossing
-/// gets its `gate_escalation_expired` record (witness FIRST — an unwitnessed
-/// lapse notice would be a claim about a record that does not exist), the
-/// store marks it so the append never repeats, and the expiry hash flows into
-/// the same obligation the other rulings use: the synchronous ensure here is
-/// the fast path, the cursor projector the guarantee.
+/// used to leave no chain event and no return edge. Each crossing gets its
+/// `gate_escalation_expired` record (witness FIRST — an unwitnessed lapse
+/// notice would be a claim about a record that does not exist), the store
+/// marks it so the append never repeats, and the expiry hash flows into the
+/// same obligation the other rulings use: the synchronous ensure here is the
+/// fast path, the cursor projector the guarantee.
+///
+/// This comment used to end its first sentence with "— and on the
+/// sovereign_plus_peer bar that is the modal terminal outcome", and the payload
+/// literal below carried the same clause one word over ("that" -> "it"). It was
+/// the RATIONALE FOR CREATING the event, pasted into the READING the event
+/// produces. It was almost certainly true when written: under #219's earlier
+/// semantics a `sovereign_plus_peer` escalation was "0 of 66 bar-met, lifetime",
+/// so lapse genuinely was its modal end. #219 changed that and the literal could
+/// not follow — measured over the whole chain at 151,052 entries (issue #499),
+/// `sovereign_plus_peer` is 47 `decided:approved` vs 2 expired, and 14 of the 16
+/// rows carrying the sentence are `single_approver`, a bar it does not describe.
+///
+/// The general rule this is an instance of: **an append-only payload must not
+/// assert a quantity that varies after it is written**, because nothing
+/// re-derives it and no pin fails when it drifts. Facts about THIS row only.
 ///
 /// The accepted gap, stated rather than hidden: a lapse that crosses while the
 /// daemon is DOWN is never recorded (`rehydrate` skips expired opens), per item
@@ -4956,10 +4970,38 @@ pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -
                 "opened_at": esc.opened_at,
                 "expires_at": esc.expires_at,
                 "lapsed_at": now,
-                "note": "the deadline passed with no decision. Until this record existed \
-                         the outcome was derived from the clock at read time and left no \
-                         trace of its own — and on the sovereign_plus_peer bar it is the \
-                         modal terminal outcome",
+                // The criterion this row died under. The `opened` event has always
+                // recorded it; the expiry did not, so answering "which bar lapses?"
+                // required joining every expiry back to its open — which is how the
+                // retired sentence above went 14/16 rows unchallenged, describing a
+                // bar most of its own rows were not on.
+                "bar": esc.bar,
+                // WHAT WAS PRESENT WHEN THE CLOCK WON. "No decision" is true and
+                // lossy: it reads identically over a petition nobody answered and
+                // one where peers looked, argued, and simply never met the bar.
+                // codex's dissent (#499) is the one that named this — a dissent is
+                // an answer and not a decision — and a record that cannot tell the
+                // two apart is the reason a lapse looks like society-wide silence.
+                //
+                // Counts, not the factors themselves: `Factor::argument` is a peer's
+                // verbatim prose and belongs in the escalation, not copied into a
+                // second append-only store where no retention rule reaches it.
+                "factors_present": esc.factors.len(),
+                "factors_concurring": esc.factors.iter().filter(|f| !f.dissent).count(),
+                "factors_dissenting": esc.factors.iter().filter(|f| f.dissent).count(),
+                "factors_by": esc.factors.iter().map(|f| &f.by).collect::<Vec<_>>(),
+                // Who was asked, and which of them no watcher had ever read for at
+                // invite time. Without these, an unanswered petition cannot be
+                // scored: uninvited silence is a routing defect, invited silence
+                // from a live seat is conduct, and invited silence from a seat with
+                // no reader is neither.
+                "invited_peers": esc.invited_peers,
+                "invited_without_reader": esc.invited_without_reader,
+                // Facts about this row, no clause that can rot. The evidence fields
+                // above carry what the retired prose was gesturing at, in a form a
+                // reader can recompute instead of trust.
+                "note": "the deadline passed with no decision; see factors_present \
+                         for what was on the record when it did",
             }),
         );
         match entry {
@@ -16219,9 +16261,10 @@ mod disposition_durability_tests {
     //!    positions a pass, idempotent on the ruling hash, restart-safe, and never
     //!    under the outer `SharedState` lock.
     //! 3. An escalation that ran out its clock gets a `gate_escalation_expired`
-    //!    record from the bounded live store, and a `#lapsed` disposition — the
-    //!    modal terminal outcome on the sovereign_plus_peer bar used to leave
-    //!    neither.
+    //!    record from the bounded live store, and a `#lapsed` disposition — a
+    //!    petition nobody ruled used to leave neither. The record carries its
+    //!    BAR and the EVIDENCE present at the crossing, so "no decision" cannot
+    //!    be read as "nobody answered" (#499).
     //! 4. An OPEN escalation's pointer carries what the invited peer is woken to
     //!    weigh: stated_reason, bar, factors_present, invited_peers, asker_basis.
     use super::*;
@@ -16826,6 +16869,102 @@ mod disposition_durability_tests {
                 record_newly_lapsed(&mut s, real_now),
                 0,
                 "the store marker dedups the append within a daemon lifetime"
+            );
+        }
+    }
+
+    /// #499: the expiry row must carry its BAR and the EVIDENCE present when the
+    /// clock won, and must not carry a claim that varies after it is written.
+    ///
+    /// Both arms in one test on purpose — a counter that is always 0 and a counter
+    /// that counts are indistinguishable from a single row. The dissent arm is the
+    /// one that matters: "the deadline passed with no decision" is TRUE over a
+    /// petition a peer looked at, argued against, and left short of its bar, and a
+    /// reader that cannot see the factor scores that as society-wide silence.
+    #[tokio::test]
+    async fn the_expiry_row_records_the_bar_and_the_evidence_that_was_present() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let real_now = now_secs();
+        let mut s = state.lock().await;
+
+        // Arm A: a peer looked and DISSENTED, then the window closed.
+        let answered = witness_open(&mut s, "kimi-code", None, real_now - 100, 200);
+        s.gate_escalations
+            .corroborate(
+                &answered,
+                "codex",
+                "role:constellation:member",
+                None,
+                true,
+                Some("the marker is not load-bearing here"),
+                real_now - 50,
+            )
+            .expect("a peer may answer a pending escalation");
+
+        // Arm B: nobody was ever asked, same window.
+        let unanswered = witness_open(&mut s, "claude-code", None, real_now - 100, 200);
+
+        let lapse_now = real_now + 300;
+        assert_eq!(record_newly_lapsed(&mut s, lapse_now), 2);
+
+        let rows: Vec<_> = s
+            .recent_chain(40)
+            .into_iter()
+            .filter(|e| e.event_type == "gate_escalation_expired")
+            .collect();
+        let row = |id: &str| {
+            rows.iter()
+                .find(|e| e.event_data.get("escalation_id").and_then(Value::as_str) == Some(id))
+                .unwrap_or_else(|| panic!("no expiry row for {id}"))
+                .event_data
+                .clone()
+        };
+        let a = row(&answered);
+        let b = row(&unanswered);
+
+        // The criterion the row died under — absent before #499, which is what
+        // made "which bar lapses?" a join instead of a read.
+        assert_eq!(
+            a.get("bar").and_then(Value::as_str),
+            Some("single_approver"),
+            "the expiry row states its own bar: {a}"
+        );
+
+        // The discriminating pair. If either side of this ever matches the other,
+        // the field has stopped measuring anything.
+        assert_eq!(a.get("factors_present").and_then(Value::as_u64), Some(1));
+        assert_eq!(a.get("factors_dissenting").and_then(Value::as_u64), Some(1));
+        assert_eq!(a.get("factors_concurring").and_then(Value::as_u64), Some(0));
+        assert_eq!(
+            a.get("factors_by").and_then(Value::as_array),
+            Some(&vec![Value::from("codex")]),
+            "the answering peer is named, so invited silence and an unmet bar differ"
+        );
+        assert_eq!(b.get("factors_present").and_then(Value::as_u64), Some(0));
+        assert_eq!(b.get("factors_dissenting").and_then(Value::as_u64), Some(0));
+        assert_ne!(
+            a.get("factors_present"),
+            b.get("factors_present"),
+            "a counter that cannot differ between an answered and an unasked lapse              is not evidence — it is a constant with a plausible name"
+        );
+
+        for (label, row) in [("answered", &a), ("unanswered", &b)] {
+            assert!(
+                row.get("invited_peers").and_then(Value::as_array).is_some(),
+                "{label}: the invitation is part of the terminal record"
+            );
+            assert!(row
+                .get("invited_without_reader")
+                .and_then(Value::as_array)
+                .is_some());
+
+            // The retired clause, pinned by its subject rather than its spelling:
+            // the payload's free text must not name a bar it cannot re-derive.
+            let note = row.get("note").and_then(Value::as_str).unwrap_or_default();
+            assert!(
+                !note.contains("sovereign_plus_peer") && !note.contains("modal"),
+                "{label}: an append-only note must not assert a quantity that varies                  after it is written (#499): {note}"
             );
         }
     }
