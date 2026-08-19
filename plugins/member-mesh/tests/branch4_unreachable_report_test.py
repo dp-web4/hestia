@@ -294,19 +294,37 @@ def main():
     # Sabotage case first: the classifier must NOT be a constant. `why=unknown`
     # for every input would satisfy any test that only checks the field exists —
     # so the assertions below require the branches to DISAGREE with each other.
+    # EVERY VENDOR'S SPELLING, VERBATIM. The plants below were authored, not
+    # captured, and all carried CODEX's `out of credits` — so the out-of-credits
+    # class was green while it could not fire for kimi at all, whose 403 says
+    # `usage limit` / `billing cycle` instead (2026-08-18). A positive control
+    # that only ever contains the sibling it already matches proves nothing about
+    # the members it does not contain. Each string below is copied from a real
+    # log named in the comment; adding a member means adding ITS capture here.
     seen = {}
-    for label, planted in [
-        ("out-of-credits", "starting\nERROR: Your workspace is out of credits.\nbye\n"),
-        ("egress-blocked", "starting\nurllib.error.URLError: <EPERM Operation not permitted>\n"),
-        ("timeout", "starting\nthe request timed out after 600s\n"),
-        ("unknown", "starting\nsomething nobody has a pattern for yet\n"),
+    for name, label, planted in [
+        # codex-20260818-170033.log:98
+        ("credits/codex", "out-of-credits",
+         "starting\nERROR: Your workspace is out of credits. Ask your workspace"
+         " owner to refill in order to continue.\n"),
+        # kimi-20260818-181807.log:2
+        ("credits/kimi", "out-of-credits",
+         "kimi version 0.36.1\nerror: failed to run prompt: provider.auth_error:"
+         " 403 You've reached your usage limit for this billing cycle. Your quota"
+         " will be refreshed in the next cycle. To continue now, purchase extra"
+         " usage or upgrade your plan: https://www.kimi.com/code/#pricing\n"),
+        ("egress", "egress-blocked",
+         "starting\nurllib.error.URLError: <EPERM Operation not permitted>\n"),
+        ("timeout", "timeout", "starting\nthe request timed out after 600s\n"),
+        ("unknown", "unknown",
+         "starting\nsomething nobody has a pattern for yet\n"),
     ]:
         d, o, _, _ = run_watcher([dict(NOTICE_A)], plant_fire_log=planted)
         rp = list(d.notify_calls)
-        seen[label] = rp[0].get("pointer_uri", "") if rp else ""
-        check(f"H: fire log naming {label} is classified as why={label}",
-              f";why={label};" in seen[label],
-              f"ptr={seen[label]!r}\n{o}")
+        seen[name] = rp[0].get("pointer_uri", "") if rp else ""
+        check(f"H: fire log naming {name} is classified as why={label}",
+              f";why={label};" in seen[name],
+              f"ptr={seen[name]!r}\n{o}")
 
     check("H: the classifier is not a constant (the four inputs give >1 verdict)",
           len({v.split(";why=")[-1].split(";")[0] for v in seen.values() if v}) > 1,
