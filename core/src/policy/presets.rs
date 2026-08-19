@@ -139,8 +139,36 @@ fn safety_rules() -> Vec<PolicyRule> {
                 // text that named them ("as does mkfs", "plus `shred`"): both
                 // required punctuation the text never mentioned, so `mkfs -t
                 // ext4` and a bare `shred` evaluated ALLOW. Widened to the token.
+                // The left `\b` on the delete verb is load-bearing and was missing
+                // until 2026-08-19 (#533). Without it the pattern is a bare
+                // SUBSTRING: any word ENDING in those two letters, followed by a
+                // space and a dash, convicts. Measured live on the claude-code
+                // seat, 06:36:31Z — a 4,775-char memory-index edit was DENIED on a
+                // single match, the tail of the English word "arm" inside the
+                // markdown heading `mention_vs_perform: remedy refuted + fd arm ---`.
+                // No delete verb anywhere in the command: not mention-read-as-
+                // performance, no mention at all. Replicated from the kimi-code seat
+                // (notice 3897) and hit a fourth time the same day, on two seats.
+                //
+                // Its siblings in this same Vec already carry the boundary
+                // (`\bmkfs\b`, `\bshred\b`, `\bof=`, `\btee`, `\b(cp|mv|install)`);
+                // this pattern alone did not.
+                //
+                // NOT the head anchor `(^|[;&|]\s*)`. That reads as the tighter
+                // repair and is a BYPASS, and its blast radius is wider than the
+                // `-exec`/`xargs` forms that first suggested it. Substituting the
+                // anchor here and re-running the KEEP arm, the FIRST row to
+                // evaluate ALLOW is `sudo rm -rf /var/data`: any privilege prefix,
+                // any absolute spelling (`/bin/rm …`), `-exec` and both `xargs`
+                // shapes put a SPACE before the verb rather than a command
+                // separator. The anchor would have scored ZERO false positives and
+                // opened the most ordinary destructive invocation there is.
+                //
+                // That asymmetry is why the test below carries a KEEP arm at all.
+                // An FP-only suite is a one-way gradient: every loosening scores
+                // green, so it cannot tell a fix from a hole.
                 target_patterns: Some(vec![
-                    r"rm\s+-".into(),
+                    r"\brm\s+-".into(),
                     r"\bmkfs\b".into(),
                     r"\bshred\b".into(),
                     format!(r"\bof={BLOCK_DEVICE}"),
@@ -167,7 +195,16 @@ fn safety_rules() -> Vec<PolicyRule> {
             r#match: PolicyMatch {
                 tools: Some(vec!["Bash".into(), "Shell".into()]),
                 // Matches "rm file" (no flags). Flag variants caught by deny rule above.
-                target_patterns: Some(vec![r"rm\s+[^-]".into()]),
+                //
+                // Second instance of the #533 defect, found by kimi-code one screen
+                // below the first (notice 3897): unanchored on the left, so
+                // `form of government`, `arm of the chair` and `alarm on` all HIT.
+                // Same class, same one-character repair, and the stakes are named by
+                // this rule's own comment below — a warn that cries wolf trains
+                // members to ignore warns. Fixing one line and not the other would
+                // leave the file carrying a live instance of the defect it just
+                // fixed.
+                target_patterns: Some(vec![r"\brm\s+[^-]".into()]),
                 target_patterns_are_regex: true,
                 // Same reasoning as the deny above: a warn that fires on the word rather
                 // than the act trains members to ignore warns, which is worse than silence.
@@ -607,6 +644,148 @@ mod tests {
                 v.decision,
                 PolicyDecision::Deny,
                 "`{cmd}` should not be denied (matched {:?})",
+                v.rule_id
+            );
+        }
+    }
+
+    /// #533: the delete verb's left word boundary, both arms.
+    ///
+    /// This test exists because the fix that removes a false positive can only
+    /// be trusted against the true positives it might also remove. An FP-only
+    /// suite is a ONE-WAY gradient: every loosening scores green, including a
+    /// loosening that opens a door. So the KEEP arm is not decoration here, it
+    /// is the half that can fail.
+    ///
+    /// The rejected alternative is why: the head anchor `(^|[;&|]\s*)` looks
+    /// like the tighter repair and is a bypass. In `-exec` and `xargs` forms a
+    /// SPACE precedes the verb, not a command separator, so the anchor would
+    /// evaluate those rows ALLOW while still scoring 0 false positives.
+    #[test]
+    fn delete_verb_boundary_keeps_true_positives() {
+        use crate::policy::{PolicyAction, PolicyEngine};
+
+        let e = PolicyEngine::new(get_preset("safety").unwrap().config);
+        let judge = |cmd: &str| {
+            e.evaluate(&PolicyAction {
+                tool_name: "Bash",
+                category: "command",
+                target: Some(cmd),
+                full_command: Some(cmd),
+            })
+        };
+
+        // KEEP arm. Ten shapes, measured 10/10 hit under `\brm\s+-` from the
+        // kimi-code seat (notice 3897) by regex and re-measured 10/10 here
+        // through the engine, projection included. Under the head anchor
+        // everything from row 3 down evaluates ALLOW — not just the `-exec`
+        // and `xargs` rows that first suggested the objection.
+        for cmd in [
+            "rm -rf /home/user/data",
+            "rm -f /var/lib/app/state.db",
+            "sudo rm -rf /var/data",
+            "/bin/rm -rf /var/data",
+            "echo starting; rm -rf /var/data",
+            "echo starting;rm -rf /var/data",
+            "cd /var && rm -rf data",
+            "(rm -rf /var/data)",
+            "find /var -name '*.log' -exec rm -rf {} +",
+            "find /var -print0 | xargs -0 rm -rf",
+        ] {
+            let v = judge(cmd);
+            assert_eq!(
+                v.decision,
+                PolicyDecision::Deny,
+                "`{cmd}` is a true positive the boundary must keep, got {:?} from {:?}",
+                v.decision,
+                v.rule_id
+            );
+        }
+
+        // DROP arm. Every row here was a live or replicated false positive of
+        // the unanchored pattern: a word ENDING in the two letters, followed by
+        // a space and a dash. No delete verb appears in any of them.
+        //
+        // The first row is verbatim the fragment that convicted a 4,775-char
+        // memory-index edit on the claude-code seat at 06:36:31Z on 2026-08-19
+        // — one match in the whole command, at the tail of the word "arm".
+        for cmd in [
+            "mention_vs_perform: remedy refuted + fd arm ---",
+            "alarm -v",
+            "confirm -x",
+            "swarm -n 4",
+        ] {
+            let v = judge(cmd);
+            assert_ne!(
+                v.decision,
+                PolicyDecision::Deny,
+                "`{cmd}` contains no delete verb and must not be denied (matched {:?})",
+                v.rule_id
+            );
+        }
+    }
+
+    /// The same defect one screen down, found by kimi-code (notice 3897) while
+    /// corroborating the first: `warn-file-delete` carried `rm\s+[^-]`, also
+    /// unanchored on the left.
+    ///
+    /// Lower stakes than the deny — nothing is blocked — but the rule's own
+    /// comment names the cost: a warn that fires on the word rather than the
+    /// act trains members to ignore warns, which is worse than silence. A
+    /// warning that fires on the phrase "form of government" is exactly that.
+    #[test]
+    fn warn_file_delete_fires_on_the_act_not_the_word() {
+        use crate::policy::{PolicyAction, PolicyEngine};
+
+        let e = PolicyEngine::new(get_preset("safety").unwrap().config);
+        let judge = |cmd: &str| {
+            e.evaluate(&PolicyAction {
+                tool_name: "Bash",
+                category: "command",
+                target: Some(cmd),
+                full_command: Some(cmd),
+            })
+        };
+
+        // KEEP arm: flagless deletion is what this rule is for.
+        for cmd in ["rm data.bin", "/bin/rm /var/lib/app/state.db"] {
+            let v = judge(cmd);
+            assert_eq!(
+                v.decision,
+                PolicyDecision::Warn,
+                "`{cmd}` is a flagless deletion and must still warn, got {:?} from {:?}",
+                v.decision,
+                v.rule_id
+            );
+        }
+
+        // DROP arm: ordinary English in an EXECUTABLE position, each row
+        // measured as a live Warn against the unanchored pattern through this
+        // same engine.
+        //
+        // The quoted spellings (`echo 'form of government'`) are NOT here, and
+        // the reason is the whole point of keeping this arm honest: they
+        // evaluate Allow with the boundary AND without it, because
+        // `MatchScope::ExecutablePositions` drops a quoted argument under an
+        // inert head before the pattern is ever consulted. A DROP arm built
+        // from them passes for a reason that has nothing to do with the fix —
+        // a control that cannot fail. Measured: with the boundary reverted,
+        // the quoted rows still passed while every row below flipped to Warn.
+        //
+        // The third row is why this is worth fixing rather than tolerating: it
+        // is a real command doing real work, warned at for the English in its
+        // trailing comment.
+        for cmd in [
+            "form of government",
+            "arm of the chair",
+            "git status # form of government",
+            "alarm on",
+        ] {
+            let v = judge(cmd);
+            assert_ne!(
+                v.decision,
+                PolicyDecision::Warn,
+                "`{cmd}` names no deletion and must not warn (matched {:?})",
                 v.rule_id
             );
         }
