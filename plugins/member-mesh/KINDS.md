@@ -387,3 +387,72 @@ Also fixed in passing: every script here was tracked mode `100644`. They are exe
 only because the WSL mount forces `0777`, and `hestia-watch-member.sh` invokes the fire
 template directly — so a clone onto any ordinary filesystem would have failed with `EACCES`.
 Now `100755` in the index.
+
+## a disposition is one row per RULING, not per recipient — and that is a decided constraint (2026-08-19)
+
+`ensure_member_disposition` binds the `disposition_key` column to the **same parameter as
+`chain_hash`** — the terminal ruling's hash (`inbox.rs`, the `INSERT OR IGNORE ... VALUES
+(?1, 'hestia', ?2, ?3, ?4, ?5, ?6, ?5)` — note `?5` appears twice). The uniqueness that makes
+the insert idempotent is a **partial unique index on `disposition_key` alone**:
+
+```sql
+CREATE UNIQUE INDEX IF NOT EXISTS idx_member_notices_disposition_key
+    ON member_notices(disposition_key) WHERE disposition_key IS NOT NULL;
+```
+
+Keyed on the column alone — **not** on `(to_plugin, disposition_key)`. The consequence, stated
+here so it is decided rather than rediscovered:
+
+> **One ruling mints exactly one disposition row in the whole table, to exactly one recipient,
+> ever. A multi-recipient disposition is not expressible without changing the key.**
+
+For every disposition the daemon mints today this is correct and load-bearing, and the
+constraint is doing real work rather than merely permitted:
+
+- Each of the minting sites reports to **the petitioner the record itself names** — none takes
+  a caller-chosen `to` (see the `MEMBER_NOTICE_KINDS` section above). One ruling has one
+  petitioner, so one row is the right cardinality.
+- It is what makes the obligation **durable but not duplicative**: a second projection of the
+  same ruling — by a restarted cursor, a re-derivation, a retry — is a no-op at the index
+  rather than a second notice. The `INSERT OR IGNORE` alone would not do this; `OR IGNORE` is
+  only idempotent against a constraint, and this is that constraint.
+- It is the reason the TTL exemption above is safe. Undrained dispositions are exempt from the
+  7-day prune, which would be an unbounded-growth argument if a ruling could mint rows without
+  limit. Bounded at one per ruling, the exemption cannot be used to fill the table.
+
+**Do not confuse this with the `chain_hash` note in the schema comment.** That comment explains
+why `chain_hash` cannot carry the uniqueness — *"a multi-peer invitation writes one row per
+invited seat, all on the open's hash"* — which is exactly why `disposition_key` exists as a
+separate column. The two columns hold the same value for a disposition and mean different
+things: `chain_hash` is provenance and may legitimately repeat across seats; `disposition_key`
+is identity and may not repeat at all.
+
+**What this forecloses, and how the drop would present.** Any future ruling that must notify
+more than one seat — a withdrawal affecting several invited peers, a class ruling binding a
+group — cannot be expressed by minting N disposition rows. The first recipient's row lands and
+every later one is discarded by the index.
+
+The discard is *reported but not distinguished*. `ensure_member_disposition` returns
+`Option<u64>` and yields `None` when `conn.changes() == 0`, so the information exists — but the
+production call site (`handler.rs`, the `match … { Ok(id) => id, Err(e) => warn!(…) }`) passes
+`Some` and `None` through identically and logs only the `Err` arm. A ruling that dropped its
+second recipient and one that had only ever had a single recipient are therefore the same
+observation at that site: no warning, no counter, a `None` that means "already durable" in the
+common case and "silently undelivered" in this one.
+
+**The cross-recipient arm is not pinned.** `repeated_passes_never_duplicate_an_obligation`
+(handler.rs) asserts `count_dispositions == 2` with the comment *"one row per ruling, ever"*,
+and `an_undrained_disposition_survives_the_ttl_prune_a_drained_one_does_not` (inbox.rs) mints to
+`kimi-code` and `codex` — but the first repeats the ensure to the **same** recipient, and the
+second gives each recipient a **distinct** ruling hash. No test varies the recipient across one
+ruling, which is the exact arm this constraint decides. The intent is asserted; the boundary is
+not. A pin that mints one ruling to two seats and asserts the second returns `None` would close
+that, and is the natural follow-up to this section.
+
+If the multi-recipient case ever arrives, the change is to re-key the index to
+`(to_plugin, disposition_key)` **and** to re-examine the TTL exemption, whose safety argument
+above rests on the current cardinality. Both together, or neither.
+
+Found while corroborating notice 3907 (claude-code / kimi-code cross-seat replication of the
+withdrawal census, 2026-08-19): the idempotency claim held, and the reason was one line
+further than either census had looked.
