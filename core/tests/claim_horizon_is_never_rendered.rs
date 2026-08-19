@@ -74,6 +74,22 @@ const T0: u64 = 1_800_000_000;
 const ADVERTISED_RETRY_EXPR: &str =
     r#""retry_within_secs": DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS,"#;
 
+/// The expression `tool_gate_escalation_poll` puts on the wire as `permits_write` AFTER #518.
+///
+/// Producer-bound for the same reason `ADVERTISED_RETRY_EXPR` is: a re-derivation here would
+/// stay green through a change at the emitting site. Inherited from
+/// `permits_write_outlives_the_claim_horizon.rs`, where it named the pre-#518 expression.
+const POLL_PERMITS_WRITE_EXPR: &str =
+    r#""permits_write": esc.map(|e| e.is_claimable(now)).unwrap_or(false),"#;
+
+/// The poll surface's note, unchanged since before #518, still describing the two-conjunct
+/// rule the field beside it stopped using. This is the string the live daemon returned at
+/// 18:45Z on 2026-08-18 for `5725d296b05cbc4c`, 83 minutes after that grant stopped being
+/// claimable — and again at 00:29:56Z on 2026-08-19 for `b1e32c344564f08e`, this seat's own
+/// permit, from a daemon whose binary predates the fix.
+const POLL_TWO_CONJUNCT_NOTE: &str =
+    "authoritative as of now; only `approved` WITH the stated bar met permits the write";
+
 /// The production (non-comment) lines of one `async fn` in `src`, ending at the first
 /// item-position closing brace. Comment lines are dropped BEFORE matching, so the pin cannot
 /// be satisfied by the prose that explains it. Same shape as
@@ -272,6 +288,18 @@ fn the_over_report_grows_as_the_decision_gets_faster() {
     );
 }
 
+/// TURNED OVER 2026-08-19 by #518 (`6983b48`). PIN 3 went red exactly as designed: the leak
+/// scan named `claim_window_secs_remaining`, the field that closes the hole. What follows is
+/// the same fixture with the assertions inverted — a REGRESSION test, not a pin. Its (c) half
+/// survives unchanged and is now an INVARIANT rather than a complaint: `secs_remaining` still
+/// answers about `expires_at` and still reads larger, and that is correct, because the two
+/// clocks are two different questions. Before the turnover a reader had only the wrong one;
+/// the fix added the right one beside it rather than repointing it, which is why (c) must keep
+/// firing — if `secs_remaining` ever starts agreeing with the horizon, one of the two
+/// questions has silently stopped being answerable.
+///
+/// ORIGINAL PIN TEXT, kept because it is the record of what was measured:
+///
 /// PIN 3 — the grant surface carries no deadline at all, and the countdown it *does* expose
 /// for a decided row is the wrong clock.
 ///
@@ -290,13 +318,13 @@ fn the_over_report_grows_as_the_decision_gets_faster() {
 /// member who reaches for the only countdown on the object gets the TTL remainder: a number
 /// that is larger than the truth for the whole life of the grant.
 #[test]
-fn the_grant_surface_renders_no_claim_deadline() {
+fn the_grant_surface_renders_the_claim_deadline() {
     let granted_at = T0 + 4;
     let (mut s, id) = opened(DEFAULT_TTL_SECS);
     approve_at(&mut s, &id, granted_at);
     let esc = s.get(&id).expect("get").clone();
 
-    let reply = esc.decision_reply();
+    let reply = esc.decision_reply(granted_at);
     let obj = reply.as_object().expect("decision_reply is an object");
 
     // (a) The reply does instruct the asker to act.
@@ -309,16 +337,17 @@ fn the_grant_surface_renders_no_claim_deadline() {
         "fixture must be on the branch that sends the asker off to spend"
     );
 
-    // (b) ...and carries nothing they could compute a deadline from. Checked by VALUE, not
-    // by name: any field carrying the horizon, the grant instant, or a remaining count would
-    // close this hole whatever it were called, and a name-only check would pass on a rename.
+    // (b) ...and now carries something they can compute a deadline from. Checked by VALUE,
+    // not by name — the same scan the pin ran, read in the other direction: a field carrying
+    // the horizon, the grant instant, or the remaining count closes this hole whatever it is
+    // called, and a name-only check would break on a rename that changed nothing.
     let horizon = granted_at + APPROVAL_CLAIM_WINDOW_SECS;
     let tells = [
         horizon,                    // the deadline itself
         granted_at,                 // the anchor, from which it is derivable
         APPROVAL_CLAIM_WINDOW_SECS, // the length, ditto
     ];
-    let leak: Vec<&String> = obj
+    let carriers: Vec<&String> = obj
         .iter()
         .filter(|(_, v)| {
             v.as_u64().map(|n| tells.contains(&n)).unwrap_or(false)
@@ -329,19 +358,32 @@ fn the_grant_surface_renders_no_claim_deadline() {
         .map(|(k, _)| k)
         .collect();
     assert!(
-        leak.is_empty(),
-        "OPEN-DEFECT PIN 3 has gone RED, which is the intended end state. The grant reply now \
-         carries the claim deadline via {leak:?} — the hole this pins is closed. Delete this \
-         test and keep the field."
+        !carriers.is_empty(),
+        "REGRESSION: the grant reply has stopped carrying the claim deadline. #518 added \
+         `claim_window_secs_remaining`; nothing in {reply} now answers it, so the asker is \
+         back to being instructed to act inside a window the reply will not name."
+    );
+    // Named as well as valued, because a rename is a real event a reader should be told
+    // about: this is the field #518 put there, and the value is the WINDOW at the grant
+    // instant, not the TTL remainder.
+    assert_eq!(
+        reply["claim_window_secs_remaining"].as_u64(),
+        Some(APPROVAL_CLAIM_WINDOW_SECS),
+        "at the grant instant the whole window is left, anchored on the GRANT: {reply}"
     );
 
-    // (c) The only countdown on the object answers the other question, and answers it larger.
+    // (c) INVARIANT, not a defect: the OTHER countdown still answers the other question, and
+    // still answers it larger. Two clocks, deliberately unequal — `secs_remaining` is the
+    // record's TTL and `claim_window_secs_remaining` is the permit's horizon. If these ever
+    // agree, one of the two facts has stopped being reachable.
     let ttl_remainder = esc.secs_remaining(granted_at);
     let true_remaining = horizon - granted_at;
     assert!(
         ttl_remainder > true_remaining,
-        "OPEN-DEFECT PIN 3(c) has gone RED: secs_remaining no longer over-reports on a \
-         decided row ({ttl_remainder}s reported vs {true_remaining}s enforced)"
+        "INVARIANT BROKEN: secs_remaining no longer over-reports against the claim horizon \
+         on a decided row ({ttl_remainder}s reported vs {true_remaining}s enforced). It is \
+         supposed to: it is the RECORD clock. Check that repointing it did not delete the \
+         only surface answering how long the escalation itself survives."
     );
     assert_eq!(
         (ttl_remainder, true_remaining),
@@ -350,6 +392,27 @@ fn the_grant_surface_renders_no_claim_deadline() {
     );
 }
 
+/// TURNED OVER 2026-08-19 by #518 (`6983b48`), which moved `tool_gate_escalation_poll` onto
+/// `is_claimable(now)` and gave it `claim_window_secs_remaining`. The pin went red at its own
+/// fixture guard — "the producer expression this pin is about has moved" — which is the guard
+/// doing its job: it refused to report on a body it no longer recognised rather than passing
+/// or failing on a stale string.
+///
+/// It is inverted rather than deleted because the poll surface has NO other test. `grep` for
+/// `tool_gate_escalation_poll` in `src/` finds two hits at the head of this change: the
+/// dispatch arm and the definition. Deleting this file's poll half would have left the fix
+/// with zero coverage at the one surface an asker actually reads — the shape
+/// `fb_supersession_claim_hides_what` names. The in-crate replacements
+/// (`permits_write_tracks_the_two_conjuncts_that_move`,
+/// `one_answer_serves_both_deciding_surfaces`) exercise `decision_reply`, which is the
+/// DECIDER's answer, not this one.
+///
+/// (d) is the half that did NOT turn over, and it moved here from
+/// `permits_write_outlives_the_claim_horizon.rs` PIN 2(d) when that file was retired: the
+/// note is unchanged and now describes a rule the field beside it stopped using.
+///
+/// ORIGINAL PIN TEXT, kept because it is the record of what was measured:
+///
 /// PIN 4 — past the horizon, every field the asker reads still says the permit is live.
 ///
 /// MEASURED BEFORE IT WAS PINNED, from the asker's seat, on 2026-08-18. Escalation
@@ -390,7 +453,7 @@ fn the_grant_surface_renders_no_claim_deadline() {
 /// messages and breaks two things: it rewrites a historical fact, and it starts refusing
 /// corroboration, which keys on `status_at(now) == Status::Expired`.
 #[test]
-fn past_the_horizon_every_rendered_field_still_reads_live() {
+fn past_the_horizon_the_asker_surface_reads_dead() {
     let granted_at = T0 + 209; // the live specimen's open→decide lag, to the second
     let (mut s, id) = opened(DEFAULT_TTL_SECS);
     approve_at(&mut s, &id, granted_at);
@@ -439,36 +502,70 @@ fn past_the_horizon_every_rendered_field_still_reads_live() {
          can still be SPENT, never whether it was given. Check that nothing now ages a \
          decided row into `Expired`; `corroborate` refuses on exactly that value."
     );
+    // Still true, and still not a defect: `status_at().permits_write()` is a property of the
+    // STATUS enum — "this verdict was an approval" — and the poll no longer composes its
+    // `permits_write` from it. Kept so that a future reader who greps `permits_write()` and
+    // finds this true does not re-file the closed defect.
     assert!(
         esc.status_at(dead).permits_write(),
-        "OPEN-DEFECT PIN 4(b) has gone RED: the status a dead permit reports no longer claims \
-         to permit a write."
+        "the status enum's own predicate has changed meaning; re-read the poll producer before \
+         trusting the assertions below"
     );
     let ticking = esc.secs_remaining(dead);
     assert!(
         ticking > 0,
-        "OPEN-DEFECT PIN 4(c) has gone RED: the countdown on a dead permit has stopped."
+        "INVARIANT BROKEN: the RECORD countdown has stopped while the record is still alive."
     );
     assert_eq!(
         ticking, 2_770,
         "the live specimen's number, reproduced in-process from its own timings — pinned so a \
          change of anchor cannot pass as a change of clock"
     );
-
-    // (c) The structural cause, checked at the surface rather than inferred: the handler the
-    // asker reads composes its answer from `status` and `bar_met`, and never consults the
-    // predicate that enforces. Checked on the PRODUCTION body, comments stripped, so the
-    // prose above cannot satisfy it.
-    let poll = production_body("server/handler.rs", "tool_gate_escalation_poll");
-    assert!(
-        poll.contains(r#""permits_write": status.permits_write() && esc.map(|e| e.bar_met())"#),
-        "the producer expression this pin is about has moved; re-read the handler before \
-         trusting any assertion in this test"
+    // THE TURNOVER. The two answers that used to disagree now agree, at the instant they
+    // used to diverge: the horizon countdown is spent, and the enforcing predicate refuses.
+    assert_eq!(
+        esc.claim_window_secs_remaining(dead),
+        0,
+        "past the horizon the permit's own countdown must read zero, whatever the record's says"
     );
     assert!(
-        !poll.contains("is_claimable"),
-        "OPEN-DEFECT PIN 4(d) has gone RED, which is the intended end state. The poll surface \
-         now consults the enforcing predicate — the hole this file pins is closed at the one \
-         surface that matters. Delete this pin and keep the call."
+        !esc.is_claimable(dead),
+        "control: the enforcement refuses here, or the agreement above is vacuous"
+    );
+
+    // (c) The structural cause, checked at the surface rather than inferred — now in the
+    // other direction: the handler the asker reads composes its answer from the predicate
+    // that enforces. Checked on the PRODUCTION body, comments stripped, so the prose above
+    // cannot satisfy it.
+    let poll = production_body("server/handler.rs", "tool_gate_escalation_poll");
+    assert!(
+        poll.contains(POLL_PERMITS_WRITE_EXPR),
+        "REGRESSION: the poll surface has stopped composing `permits_write` from the enforcing \
+         predicate. This is the field an asker reads to decide whether to spend a permit, and \
+         the only in-repo instrument watching it is this line — `tool_gate_escalation_poll` \
+         has no test of its own (grep finds two hits in src/: the dispatch arm and the fn)."
+    );
+    assert!(
+        poll.contains("claim_window_secs_remaining"),
+        "REGRESSION: the poll surface has stopped rendering the horizon it enforces against."
+    );
+
+    // (d) THE HALF THAT DID NOT TURN OVER — moved here from PIN 2(d) of
+    // `permits_write_outlives_the_claim_horizon.rs` when that file was retired.
+    //
+    // The field learned four conjuncts; the sentence beside it still teaches two. A reader who
+    // takes the note at its word concludes that an approval which is `approved` with its bar
+    // met permits the write — which is now exactly the case `permits_write: false` is emitted
+    // for, on a spent or horizon-dead permit. Before #518 the note was wrong in the same
+    // direction as the field, so it added nothing; now it CONTRADICTS the field it annotates,
+    // and the note is the half a reader is likelier to quote.
+    //
+    // Bound to the production string, so a fix to the note turns this red and nothing else does.
+    assert!(
+        poll.contains(POLL_TWO_CONJUNCT_NOTE),
+        "OPEN-DEFECT PIN 4(d) has gone RED, which is the intended end state: the poll note no \
+         longer describes the two-conjunct rule its field abandoned in #518. Confirm it now \
+         names the SPENT and HORIZON conjuncts rather than merely being deleted — an asker \
+         reading a bare `permits_write: false` with no note cannot tell a deny from an expiry."
     );
 }
