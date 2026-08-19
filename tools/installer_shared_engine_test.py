@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""`deploy/install-members.sh` must install the shared decision engine
-(`plugins/_shared/*.py`) as a digested install artifact, and must record every
-installed engine file in the authority file's `shared_engine` section.
+"""`deploy/install-members.sh` must install the shared decision engine as a
+digested install artifact whose ACTIVE set is exactly the RECORDED set, and
+must record every installed engine file in the authority file's
+`shared_engine` section.
 
-WHY THIS EXISTS (#481, stage 1). Until this change the ledger bound each
-member's hook entrypoints and ZERO bytes of the engine those entrypoints
-import: the hooks digested to installed paths while `hestia_gate_core.py` and
-its siblings executed from the mutable workspace checkout, digested nowhere.
-An audit that digests the hook but not the engine the hook imports proves the
-shape of the gate, not its decisions. The failure direction worth pinning is
-the quiet one — an installed engine file that DRIFTS (tampered, hand-edited,
-stale) while the ledger still claims the original bytes — so the assertions
-below check not just that the section exists but that a tampered byte is
-detectable against it, and that a re-run neither churns the ledger nor leaves
-drift in place.
+WHY THIS EXISTS (#481, stage 1; #525 review). Until this change the ledger
+bound each member's hook entrypoints and ZERO bytes of the engine those
+entrypoints import. The first cut of the fix still failed the invariant one
+level down: a per-file overwrite loop leaves a deleted or renamed module live
+on disk while the ledger stops naming it — bytes executable that no deployment
+truth represents. So the engine now installs as ONE content-addressed build:
+stage the declared set into a fresh directory, verify every digest there, then
+flip the `shared` symlink to it with a single atomic rename. The tests below
+pin the failure directions in order: drift on disk must read as drift against
+the ledger; a file removed from the source must leave the active set; a re-run
+must neither churn the ledger nor rebuild what already verifies.
+
+WHAT IS INSTALLED IS WHAT THE MANIFEST DECLARES (the #525 "option B" ruling):
+`plugins/_shared/RUNTIME_MANIFEST.txt`, one filename per line. `_shared` holds
+the tests beside the engine, so the engine set is a declaration, not a glob —
+and the last test below pins the declaration against what the hooks actually
+import, in both directions.
 
 The section is ADDITIVE: the authority file's only shipped consumer
 (core/src/server/dashboard.rs's deployment_health) reads `build_id` alone, so
@@ -27,9 +34,11 @@ touched — the env carries no session markers, so no ACK is ever needed.
 Run:  python3 tools/installer_shared_engine_test.py
 """
 
+import glob
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -40,6 +49,9 @@ SCRIPT = os.path.join(REPO, "deploy", "install-members.sh")
 
 ENGINE_FILES = ("hestia_gate_core.py", "hestia_gate_mechanism.py",
                 "hestia_governance_closure.py")
+# Lives in the fake _shared but NOT in the fake manifest: the installed set
+# must be the DECLARED set, so this must never reach the active directory.
+DECOY_TEST = "sprintZ_test.py"
 
 FAILS = []
 
@@ -54,12 +66,18 @@ def sha256(path):
         return hashlib.sha256(fh.read()).hexdigest()
 
 
+def write_manifest(root, names):
+    with open(os.path.join(root, "plugins", "_shared", "RUNTIME_MANIFEST.txt"),
+              "w") as fh:
+        fh.write("# fake manifest\n" + "\n".join(names) + "\n")
+
+
 def build(tmp):
     """A fake repo root (member `m` with one registered hook, plus a _shared
-    engine dir) and a fake HOME holding the harness registration. Returns
-    (repo_root, home, hestia_home, env) with env already sandboxed: DRY_RUN
-    off, HESTIA_HOME under tmp, and no session markers — so the refusal rail
-    is legitimately uninvolved rather than overridden."""
+    engine dir with a manifest and a decoy test file) and a fake HOME holding
+    the harness registration. Returns (repo_root, home, hestia_home, env) with
+    env already sandboxed: DRY_RUN off, HESTIA_HOME under tmp, and no session
+    markers — so the refusal rail is legitimately uninvolved, not overridden."""
     root = os.path.join(tmp, "repo")
     home = os.path.join(tmp, "home")
     hestia_home = os.path.join(tmp, "hestia-home")
@@ -71,9 +89,10 @@ def build(tmp):
     shutil.copy(SCRIPT, os.path.join(root, "deploy", "install-members.sh"))
     with open(os.path.join(root, "plugins", "m", "hooks", "hook.py"), "w") as fh:
         fh.write("# fake hook\n")
-    for f in ENGINE_FILES:
+    for f in ENGINE_FILES + (DECOY_TEST,):
         with open(os.path.join(shared, f), "w") as fh:
             fh.write(f"# fake engine: {f}\n")
+    write_manifest(root, ENGINE_FILES)
     with open(os.path.join(root, "plugins", "m", "expects.json"), "w") as fh:
         json.dump({"install": {
             "dest": "~/.harness/hooks",
@@ -121,6 +140,10 @@ def audit_engine(ledger):
     return bad
 
 
+def active_dir(hestia_home):
+    return os.path.join(hestia_home, "shared")
+
+
 def test_shared_engine_is_installed_and_digested():
     with tempfile.TemporaryDirectory() as tmp:
         root, _home, hestia_home, env = build(tmp)
@@ -132,17 +155,31 @@ def test_shared_engine_is_installed_and_digested():
         check(set(recorded) == set(ENGINE_FILES),
               f"shared_engine records {sorted(recorded)}, expected {sorted(ENGINE_FILES)}")
         for f in ENGINE_FILES:
-            installed = os.path.join(hestia_home, "shared", f)
-            check(os.path.isfile(installed), f"{f} was not installed to HESTIA_HOME/shared")
+            installed = os.path.join(active_dir(hestia_home), f)
+            check(os.path.isfile(installed), f"{f} is not in the active engine directory")
             entry = recorded.get(f, {})
             check(entry.get("path") == installed,
-                  f"{f}: ledger path {entry.get('path')!r} is not the installed location")
+                  f"{f}: ledger path {entry.get('path')!r} is not the stable active path")
             check(entry.get("sha256") == sha256(installed),
                   f"{f}: ledger digest does not match the installed copy")
             src = os.path.join(root, "plugins", "_shared", f)
             check(sha256(installed) == sha256(src),
                   f"{f}: installed bytes differ from the checkout")
         check(not audit_engine(ledger), "fresh install failed its own audit")
+
+        # The active set is EXACTLY the declared set — the decoy test file that
+        # lives beside the engine in _shared must never be installed.
+        active_set = set(os.listdir(active_dir(hestia_home)))
+        check(active_set == set(ENGINE_FILES),
+              f"active set {sorted(active_set)} is not exactly the manifest set")
+        check(DECOY_TEST not in active_set,
+              "a file absent from the manifest was installed anyway (the glob defect)")
+        # The mechanism the exactness rests on: `shared` is a symlink to one
+        # content-addressed build, so the swap is atomic and interruption-safe.
+        check(os.path.islink(active_dir(hestia_home)),
+              "shared is not a symlink — the install is not the atomic-flip design")
+        check(os.path.basename(os.path.realpath(active_dir(hestia_home))) in out,
+              "the activated build digest was not reported in the output")
 
         # The pre-existing contract must be untouched by the additive key.
         check(isinstance(ledger.get("build_id"), str) and ledger["build_id"],
@@ -153,14 +190,14 @@ def test_shared_engine_is_installed_and_digested():
 
 
 def test_tampered_installed_engine_file_is_detectable():
-    """The whole point of the section: drift on disk must read as drift
-    against the ledger, and a re-run must put the recorded bytes back."""
+    """The whole point of the section: drift on disk must read as drift against
+    the ledger, and a re-run must put the recorded bytes back."""
     with tempfile.TemporaryDirectory() as tmp:
         root, _home, hestia_home, env = build(tmp)
         rc, out = run(root, env)
         check(rc == 0, f"install exited {rc}: {out}")
 
-        victim = os.path.join(hestia_home, "shared", "hestia_gate_core.py")
+        victim = os.path.join(active_dir(hestia_home), "hestia_gate_core.py")
         with open(victim, "a") as fh:
             fh.write("# a hand-edit the ledger never approved\n")
         bad = audit_engine(load_ledger(hestia_home))
@@ -171,8 +208,37 @@ def test_tampered_installed_engine_file_is_detectable():
         check(rc == 0, f"re-run exited {rc}: {out}")
         check(not audit_engine(load_ledger(hestia_home)),
               "re-run did not restore the recorded bytes")
-        check("wrote hestia_gate_core.py" in out,
-              "re-run did not report rewriting the tampered file")
+        check("FAILED re-verification" in out,
+              "a build whose bytes no longer match their address was reused silently")
+
+
+def test_removed_source_file_leaves_the_active_set():
+    """The #525 blocker's counterexample, pinned: install {A,B,C}, remove B
+    from the source tree and the manifest, reinstall. B must be gone from the
+    ACTIVE set, and the ledger's set must equal the active set exactly."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root, _home, hestia_home, env = build(tmp)
+        rc, out = run(root, env)
+        check(rc == 0, f"install exited {rc}: {out}")
+        check(set(os.listdir(active_dir(hestia_home))) == set(ENGINE_FILES),
+              "initial install did not activate the full manifest set")
+
+        removed = "hestia_gate_mechanism.py"
+        os.remove(os.path.join(root, "plugins", "_shared", removed))
+        write_manifest(root, [f for f in ENGINE_FILES if f != removed])
+        rc, out = run(root, env)
+        check(rc == 0, f"reinstall after removal exited {rc}: {out}")
+
+        active_set = set(os.listdir(active_dir(hestia_home)))
+        check(removed not in active_set,
+              "a file deleted from the source is still loadable in the active engine set")
+        check(active_set == {"hestia_gate_core.py", "hestia_governance_closure.py"},
+              f"active set after removal is {sorted(active_set)}")
+        recorded = {e["file"] for e in load_ledger(hestia_home)["shared_engine"]}
+        check(recorded == active_set,
+              f"ledger set {sorted(recorded)} != active set {sorted(active_set)}")
+        check(not audit_engine(load_ledger(hestia_home)),
+              "post-removal install failed its own audit")
 
 
 def test_rerun_is_idempotent_except_timestamps():
@@ -191,10 +257,10 @@ def test_rerun_is_idempotent_except_timestamps():
             second.pop(stamp, None)
         check(first == second,
               "re-run changed the ledger beyond its timestamps")
-        check("ok    hestia_gate_core.py (already current)" in out,
+        check("(already current)" in out,
               "second run did not report the engine as already current")
-        check("wrote hestia_gate_" not in out,
-              "second run rewrote engine files that were already current")
+        check("wrote build" not in out,
+              "second run rebuilt an engine build that already verified")
 
 
 def test_dry_run_reports_the_engine_but_writes_nothing():
@@ -204,10 +270,51 @@ def test_dry_run_reports_the_engine_but_writes_nothing():
         check(rc == 0, f"dry run exited {rc}: {out}")
         for f in ENGINE_FILES:
             check(f"would {f}" in out, f"dry run did not report it would install {f}")
-        check(not os.path.exists(os.path.join(hestia_home, "shared")),
-              "dry run created the shared engine directory")
+        check(not os.path.exists(active_dir(hestia_home)),
+              "dry run created the active engine path")
+        check(not os.path.exists(os.path.join(hestia_home, "shared.builds")),
+              "dry run created the builds directory")
         check(not os.path.exists(os.path.join(hestia_home, "current-build.json")),
               "dry run wrote the authority file")
+
+
+def test_manifest_declares_exactly_what_the_runtime_imports():
+    """The drift guard for option B, in both directions: every manifest entry
+    must exist and be a runtime module (never a test), and every _shared module
+    any hook — or any declared engine module — imports must be declared. A
+    static import scan is deliberately sufficient: this is a drift alarm, not
+    a proof of non-import."""
+    shared = os.path.join(REPO, "plugins", "_shared")
+    manifest_path = os.path.join(shared, "RUNTIME_MANIFEST.txt")
+    check(os.path.isfile(manifest_path), "plugins/_shared/RUNTIME_MANIFEST.txt is missing")
+    with open(manifest_path, encoding="utf-8") as fh:
+        manifest = [ln.strip() for ln in fh
+                    if ln.strip() and not ln.startswith("#")]
+    check(manifest, "RUNTIME_MANIFEST.txt declares no files")
+    present = set(os.listdir(shared)) if os.path.isdir(shared) else set()
+    for f in manifest:
+        check(f in present, f"manifest declares {f}, which does not exist in _shared")
+        check(f.endswith(".py") and not f.endswith("_test.py")
+              and not f.startswith("test_"),
+              f"manifest entry {f} is not a runtime-module shape (tests are not engine)")
+
+    scan = [os.path.join(shared, f) for f in manifest]
+    for hooks_dir in glob.glob(os.path.join(REPO, "plugins", "*", "hooks")):
+        scan.extend(glob.glob(os.path.join(hooks_dir, "*.py")))
+    imported = set()
+    for path in scan:
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for m in re.finditer(r"^\s*(?:from|import)\s+([A-Za-z_]\w*)",
+                                 fh.read(), re.M):
+                mod = m.group(1) + ".py"
+                if mod in present:
+                    imported.add(mod)
+    undeclared = imported - set(manifest)
+    check(not undeclared,
+          f"_shared modules imported at runtime but absent from RUNTIME_MANIFEST.txt: "
+          f"{sorted(undeclared)}")
 
 
 def teardown_module(_module=None):
@@ -220,8 +327,10 @@ def teardown_module(_module=None):
 if __name__ == "__main__":
     test_shared_engine_is_installed_and_digested()
     test_tampered_installed_engine_file_is_detectable()
+    test_removed_source_file_leaves_the_active_set()
     test_rerun_is_idempotent_except_timestamps()
     test_dry_run_reports_the_engine_but_writes_nothing()
+    test_manifest_declares_exactly_what_the_runtime_imports()
     for f in FAILS:
         print("FAIL", f)
     print(f"{'FAILED' if FAILS else 'ok'}: {len(FAILS)} failure(s)")

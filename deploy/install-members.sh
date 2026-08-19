@@ -302,15 +302,29 @@ fi
 # (#481: current-build.json binds hook entrypoints but 0 bytes of _shared; the hooks digested
 # to installed paths while the engine executed from the mutable workspace checkout). An audit
 # that digests the hook but not the engine the hook imports proves the shape of the gate, not
-# its decisions. So the engine installs by the same invariants as any member file: back up
-# before overwrite (2), verify after writing (3), recorded in the authority file that is
-# written last and only on full success (4) — a failed engine verify dies BEFORE the ledger
-# write, so the ledger never claims an engine that did not land.
+# its decisions.
 #
-# The destination is FIXED — $HESTIA_HOME/shared/, deliberately no per-build versioning: the
-# ledger's sha256s ARE the versioning, and a fixed path is what a later verify-then-import
-# stage can resolve against. The glob is every `*.py`, test files included: a filter for
-# "which files are engine" is a rule that drifts; installing the directory whole cannot.
+# WHAT IS INSTALLED IS WHAT THE MANIFEST DECLARES (#525 review, the "option B" ruling). The
+# runtime set is plugins/_shared/RUNTIME_MANIFEST.txt, one filename per line — NOT a glob of
+# the directory, because _shared holds the tests beside the engine, and "which files are
+# engine" as an implicit rule is exactly the rule that drifts. The manifest declares; this
+# script deploys precisely that set; the test suite pins the declaration against what the
+# hooks actually import, in both directions.
+#
+# THE ACTIVE SET IS EXACTLY THE RECORDED SET. A per-file overwrite loop leaves a deleted or
+# renamed module live on disk while the ledger stops naming it — bytes executable that no
+# deployment truth represents, the failure the #525 review blocked on. So the engine installs
+# as ONE content-addressed build: stage every declared file into a fresh directory, verify
+# each digest THERE, and only then point $HESTIA_HOME/shared — a symlink — at the verified
+# build with a single atomic rename. Three consequences, each load-bearing:
+#   * a source file deleted in build N+1 is absent from build N+1's directory, so it leaves
+#     the ACTIVE set the moment the symlink flips — ledger and executable set cannot disagree;
+#   * an interrupted install never flips, so the running engine is never a half-written mix
+#     of two builds;
+#   * old builds stay, content-addressed and inert — they ARE the backup invariant 2 asks
+#     for, and a build whose bytes no longer match its address is quarantined, never reused.
+# The ledger still records the stable active paths ($HESTIA_HOME/shared/<file>) and is still
+# written last, only on full success — a failed stage or verify dies BEFORE any flip.
 #
 # What is deliberately NOT here: plugins/lib/path_scope.py (gemini's installed lib) is copied
 # by plugins/gemini/install.sh, a different installer with its own discipline. Folding it in
@@ -318,39 +332,99 @@ fi
 # to end. Recording gemini's lib belongs to gemini's installer gaining ledger discipline, not
 # to this section reaching sideways.
 log "SHARED ENGINE (plugins/_shared)"
-shared_dir="$HESTIA_HOME/shared"
-shopt -s nullglob
-shared_srcs=( "$REPO_ROOT"/plugins/_shared/*.py )
-shopt -u nullglob
-# A checkout that ships no engine files must not ledger an empty engine as a deployment.
-[ "${#shared_srcs[@]}" -gt 0 ] || die "plugins/_shared holds no .py files — refusing to record an empty engine"
-shared_engine_json="["
-first_shared=1
-for src in "${shared_srcs[@]}"; do
-  base="$(basename "$src")"
-  target="$shared_dir/$base"
+engine_manifest="$REPO_ROOT/plugins/_shared/RUNTIME_MANIFEST.txt"
+[ -f "$engine_manifest" ] || die "plugins/_shared/RUNTIME_MANIFEST.txt is missing — the engine set is a declaration, not a glob"
+mapfile -t engine_names < <(grep -vE '^[[:space:]]*(#|$)' "$engine_manifest")
+[ "${#engine_names[@]}" -gt 0 ] || die "RUNTIME_MANIFEST.txt declares no files — refusing to record an empty engine"
+
+engine_hashes=()
+set_fingerprint=""
+for base in "${engine_names[@]}"; do
+  src="$REPO_ROOT/plugins/_shared/$base"
+  [ -f "$src" ] || die "RUNTIME_MANIFEST.txt declares '$base' but $src does not exist"
   src_hash="$(sha256sum "$src" | cut -d' ' -f1)"
-  if [ -f "$target" ] && [ "$(sha256sum "$target" | cut -d' ' -f1)" = "$src_hash" ]; then
-    log "  ok    $base (already current) -> $shared_dir"
-  elif [ "$DRY_RUN" = "1" ]; then
-    log "  would $base -> $shared_dir"
-  else
-    mkdir -p "$shared_dir"
-    # INVARIANT 2: preserve what is currently enforcing before replacing it.
-    [ -f "$target" ] && cp -p "$target" "$target.pre-install.bak"
-    # Imported, not executed: 0644, not the entrypoints' 0755.
-    install -m 0644 "$src" "$target"
-    # INVARIANT 3: prove the bytes landed. cp exiting 0 is not evidence.
-    got="$(sha256sum "$target" | cut -d' ' -f1)"
-    [ "$got" = "$src_hash" ] || die "_shared/$base verify FAILED (src $src_hash != installed $got)"
-    log "  wrote $base -> $shared_dir"
-  fi
-  # Same record shape as the member files above, so one audit reads both sections.
-  [ $first_shared -eq 1 ] || shared_engine_json="$shared_engine_json,"
-  first_shared=0
-  shared_engine_json="$shared_engine_json{\"file\":\"$base\",\"path\":\"$target\",\"sha256\":\"$src_hash\"}"
+  engine_hashes+=("$src_hash")
+  set_fingerprint="$set_fingerprint$src_hash  $base
+"
+done
+# One address for the whole set: the build directory's name IS the digests of its contents.
+build_digest="$(printf '%s' "$set_fingerprint" | sha256sum | cut -c1-16)"
+builds_dir="$HESTIA_HOME/shared.builds"
+build_dir="$builds_dir/$build_digest"
+shared_link="$HESTIA_HOME/shared"
+
+# Every declared file present in $1, each hashing to its declared digest. Applied to the
+# STAGED set before it may become active, and to an existing build before it may be reused.
+engine_build_ok() {
+  local i
+  for i in "${!engine_names[@]}"; do
+    [ -f "$1/${engine_names[$i]}" ] || return 1
+    [ "$(sha256sum "$1/${engine_names[$i]}" | cut -d' ' -f1)" = "${engine_hashes[$i]}" ] || return 1
+  done
+}
+
+shared_engine_json="["
+for i in "${!engine_names[@]}"; do
+  [ "$i" -eq 0 ] || shared_engine_json="$shared_engine_json,"
+  # Same record shape as the member files above, so one audit reads both sections. The path
+  # is the stable ACTIVE path, not the build directory: the symlink is the contract.
+  shared_engine_json="$shared_engine_json{\"file\":\"${engine_names[$i]}\",\"path\":\"$shared_link/${engine_names[$i]}\",\"sha256\":\"${engine_hashes[$i]}\"}"
 done
 shared_engine_json="$shared_engine_json]"
+
+if [ "$DRY_RUN" = "1" ]; then
+  for base in "${engine_names[@]}"; do
+    log "  would $base -> $shared_link (build $build_digest)"
+  done
+else
+  mkdir -p "$builds_dir"
+  # Staging dirs from an interrupted run are inert — nothing points at them. Sweep them.
+  for stale in "$builds_dir"/.staging.*; do
+    [ -e "$stale" ] && rm -rf "$stale"
+  done
+
+  if [ -d "$build_dir" ]; then
+    if engine_build_ok "$build_dir"; then
+      log "  ok    build $build_digest (already staged, re-verified)"
+    else
+      # A content-addressed directory whose bytes no longer match their address: an installed
+      # engine file was rewritten after deploy. Quarantine loudly; never silently reuse. The
+      # symlink dangles until the rebuild below lands — the honest direction for a tampered
+      # engine is to fail, not to coast on bytes the ledger no longer recognizes.
+      warn "build $build_digest FAILED re-verification — quarantining as $build_dir.corrupt.$$ and rebuilding"
+      mv "$build_dir" "$build_dir.corrupt.$$"
+    fi
+  fi
+  if [ ! -d "$build_dir" ]; then
+    staging="$builds_dir/.staging.$$"
+    mkdir -p "$staging"
+    for i in "${!engine_names[@]}"; do
+      # Imported, not executed: 0644, not the entrypoints' 0755.
+      install -m 0644 "$REPO_ROOT/plugins/_shared/${engine_names[$i]}" "$staging/${engine_names[$i]}"
+    done
+    # INVARIANT 3: prove the bytes landed — the WHOLE staged set, before it can become active.
+    engine_build_ok "$staging" || die "engine build $build_digest verify FAILED in staging; nothing was activated"
+    mv "$staging" "$build_dir"
+    log "  wrote build $build_digest (${#engine_names[@]} files, staged and verified)"
+  fi
+
+  # THE FLIP: one atomic rename of a symlink. Before it, the active engine is untouched;
+  # after it, it is exactly the verified build. There is no between.
+  if [ -e "$shared_link" ] && [ ! -L "$shared_link" ]; then
+    # A pre-symlink install left shared/ as a real directory. INVARIANT 2: preserve, then move.
+    warn "migrating legacy shared/ directory aside to $shared_link.pre-flip.bak"
+    mv "$shared_link" "$shared_link.pre-flip.bak"
+  fi
+  current_target="$(readlink "$shared_link" 2>/dev/null || true)"
+  if [ "$current_target" = "shared.builds/$build_digest" ]; then
+    log "  ok    shared -> $current_target (already current)"
+  else
+    flip="$HESTIA_HOME/.shared.flip.$$"
+    ln -s "shared.builds/$build_digest" "$flip"
+    python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$flip" "$shared_link"
+    log "  wrote shared -> shared.builds/$build_digest"
+  fi
+fi
 log ""
 
 if [ "$DRY_RUN" = "1" ]; then
