@@ -1,0 +1,56 @@
+# AC-E1 (PRD_R6_R7_ENVELOPES §8): every file:line citation in §2, with the
+# construct it was made about. GENERATED ONCE from the authorities below and
+# committed — that is the point: if a pin bump moves a construct, the recorded
+# anchor no longer sits at the cited line and tools/prd_r6_r7_citation_test.py
+# goes red. Regenerate ONLY together with re-reading the row it changes.
+# web4 rows read at web4.pin 5513af9780b53aab7dfef15b0dbc1dae820a122a ; hestia rows at origin/main.
+# repo	path	start	end	anchor
+hestia	core/src/reputation.rs	98	98	class
+web4	r6.rs	9	10	R6 is for low-consequence actions (cheap). R
+web4	r6.rs	15	15	bounds
+web4	r6.rs	16	16	isolation
+web4	r6.rs	34	34	law_hash
+web4	r6.rs	36	36	society
+web4	r6.rs	38	38	constraints
+web4	r6.rs	42	42	prohibitions
+web4	r6.rs	46	52	has_permission
+web4	r6.rs	47	49	if self.prohibitions.iter().any(|p| p == act
+web4	r6.rs	55	63	Constraint
+web4	r6.rs	57	57	Constraint type (e.g., "rate_limit", "min_at
+web4	r6.rs	66	66	Reputation is ROLE-CONTEXTUALIZED, never glo
+web4	r6.rs	67	75	ActionRole
+web4	r6.rs	71	71	Role LCT ID (in what capacity — domain-speci
+web4	r6.rs	79	85	Request
+web4	r6.rs	85	85	parameters
+web4	r6.rs	92	92	deadline
+web4	r6.rs	98	98	proof_of_agency
+web4	r6.rs	102	112	ProofOfAgency
+web4	r6.rs	115	125	Reference
+web4	r6.rs	118	118	precedents
+web4	r6.rs	120	120	mrh_depth
+web4	r6.rs	122	122	relevant_entities
+web4	r6.rs	124	124	witnesses
+web4	r6.rs	128	136	Precedent
+web4	r6.rs	139	149	WitnessAttestation
+web4	r6.rs	144	144	attestation
+web4	r6.rs	155	155	required_atp
+web4	r6.rs	194	194	error
+web4	r6.rs	196	196	atp_consumed
+web4	r6.rs	217	222	ContributingFactor
+web4	r6.rs	235	243	SovereignStrength
+web4	r6.rs	262	270	DeltaClass
+web4	r6.rs	272	277	default
+web4	r6.rs	283	320	ReputationDelta
+web4	r6.rs	293	293	sovereign_strength
+web4	r6.rs	307	307	rule_triggered
+web4	r6.rs	315	315	contributing_factors
+web4	r6.rs	341	341	Governing rules (law reference + constraints
+web4	r6.rs	360	360	prev_action_hash
+web4	r6.rs	397	397	is_r7
+web4	r6.rs	422	440	met
+web4	r6.rs	423	423	if constraint.hard && constraint.constraint_
+web4	r6.rs	423	430	if constraint.hard && constraint.constraint_
+web4	r6.rs	431	431	if constraint.constraint_type == "witness_qu
+web4	r6.rs	431	439	met
+web4	r6.rs	432	432	if (self.reference.witnesses.len() as f64) <
+web4	r6.rs	494	494	for dim in &["talent", "training", "temperam
