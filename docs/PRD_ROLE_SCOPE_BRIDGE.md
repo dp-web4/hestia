@@ -3,9 +3,12 @@
 **Status**: proposed — dp-directed 2026-08-14; design PRD, not started; bridges hub<->hestia; builds
 on #431's standing-scope surface.
 **Author**: claude-code (CBP), 2026-08-14.
-**Twin**: `web4/hub/docs/PRD_ROLE_SCOPE_BRIDGE.md` — the hub side of the same bridge. §2 (concepts)
-is normative for BOTH documents; each side details only its own mechanics and defers to the twin for
-the other half. Amend the shared concepts in both PRs or neither.
+**Twin**: `web4/hub/docs/PRD_ROLE_SCOPE_BRIDGE.md` — the hub side of the same bridge. Each side
+details only its own mechanics and defers to the twin for the other half. **§2 (concepts) is the
+NORMATIVE HOME for both documents** — it is not mirrored, and the hub carries a non-normative
+summary that cites this section's `concepts_generation`. Amend §2 here and bump the generation; the
+hub's citation then reads stale until it is re-pointed. (Superseded convention, 2026-08-18: "amend
+the shared concepts in both PRs or neither" — see §2.0 for why it was replaced.)
 **Reframe folded in (dp, 2026-08-14)** — *"rather than rule on these, i want to add hooks for planned infrastructure."* §7's Q1–Q4 are no longer awaiting rulings: each is recast as an **extension point** with an initial best guess, a stored home, an operator-walled path to change it, and the measurement that would justify changing it. Q5 stays a question, with its precondition named (§7.5). §7.3 — the agent second factor — now states what would have to be true for an **adjudicator rung** to count as one. See **§7** and **§9**.
 **Second reframe folded in (dp, 2026-08-14)** — *"the key to this is roles."* The OUTWARD direction — what an external caller may reach through an agent presence — is not a second permission system. It is this document's role object, read from the other side: a caller's standing decides **which role they are routed to**, and the role's manifest decides **what they may reach**. Escalation is a role TRANSFER, never a widening. See **§10**, which carries the directive verbatim and is normative for the hub's outward-context PRD in the same way §2 is normative for the twin.
 **Relates to**: `docs/PRD_ADJUDICATOR_LADDER.md` (the decider axis — §9 is the cross-reference and the shared-convergence contract), `docs/PRD_ALLOWLISTS.md` (the sibling authority; §12.1 carries the same composite contract), `PRD_GATE_CONSOLIDATION.md` (LAW/SHIM/AGENT, the one-authority-path invariant, ratified
@@ -48,7 +51,41 @@ role*; and a member-level class approval (a clearance) bounds what any role can 
 member. One operator ceremony at the **class** grain; mechanical, witnessed, self-revoking flow at
 the **item** grain.
 
-## 2. Concepts (normative for both PRDs)
+## 2. Concepts — NORMATIVE HOME (`concepts_generation: 1`)
+
+### 2.0 The normative-home contract (replaces "amend both or neither", 2026-08-18)
+
+**This section is the single normative source for the bridge's concepts.** The hub twin does not
+mirror it; the twin's §2 is an explicitly non-normative summary that cites a generation. Where the
+two ever differ in substance, **this text governs and the summary is the defect**.
+
+`concepts_generation` is monotonic and bumps on every substantive amendment to §2. The hub cites the
+generation it was written against. **The check is an integer comparison, not a diff**: a hub citing
+a generation older than the one here is stale by construction, and that is the finding. Editorial
+changes that alter no requirement do not bump it — and if it is unclear whether an edit is
+substantive, bump: a false stale-flag costs one re-read, a missed one costs a divergence.
+
+**Why the previous convention was replaced.** From 2026-08-14 to 2026-08-18 both documents declared
+§2 "normative for BOTH — amend in both PRs or neither," and the hub's correspondence table made
+"a row whose two cells no longer say the same thing" the detection rule. The cells were never the
+same: this section ran 42 lines including the T0/T1/T2 proof-tier table and *"a high-tier grant at
+rest confers nothing"*, while the hub's ran 16 summary lines carrying neither. **A diff-based check
+over two texts that were never intended to match cannot fire** — it was a guard that could only ever
+report the difference it was built to tolerate. Worse, the loss was asymmetric in the direction that
+matters: the hub is the side that *records* an item's proof tier (§3.1), and the hub's document
+defined no tiers, reasoning about T1/T2 in its §10 against definitions present only here.
+
+This is §9.1's argument one level up. §9.1 refuses to let three PRDs each mint a generation, digest
+and TTL because *"three certification semantics agree until the first time they do not."* Two copies
+of normative prose fail the same way, on a slower clock and with no runtime surface on which the
+disagreement becomes visible. One home has one answer.
+
+**Amending this section**: bump `concepts_generation`, state the bump in the commit message, and
+re-point the hub's citation in the same change-set where possible — or, when the sides land
+separately, accept that the hub reads stale in the interval, which is the intended and *visible*
+failure mode rather than the silent one.
+
+---
 
 **Permission CLASS.** A named, operator-approved capability category a MEMBER holds — the analog of
 a security clearance or a signing authority. Examples (illustrative, not the taxonomy — §7 Q1):
