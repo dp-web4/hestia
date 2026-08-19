@@ -340,23 +340,50 @@ def test_pin_a_variable_in_a_write_position_sweeps_in_a_quoted_body():
           f"a variable in a READ position does not throw the command out of grammar; got {read_position}")
 
 
-def _cases():
-    return [(n, f) for n, f in sorted(globals().items())
-            if n.startswith("test_") and callable(f)]
+def test_every_case_in_this_file_is_in_ALL():
+    """An explicit ALL satisfies tools/ci_selfexec_test.py, which refuses a `def test_*`
+    that no Name node references — reflection over globals() is invisible to a static
+    check, so a file collected that way reads as inert. Conforming to the house
+    convention is right, but a hand-written list drifts the day someone adds a case and
+    forgets, and then it is inert for real. This arm closes that: the list is the runner,
+    and this compares the list against the module.
+    """
+    declared = {fn.__name__ for fn in ALL}
+    defined = {n for n, o in globals().items() if n.startswith("test_") and callable(o)}
+    missing = sorted(defined - declared)
+    check("ALL_is_complete", not missing,
+          f"defined but not in ALL, so never run: {missing}")
+    stale = sorted(declared - defined)
+    check("ALL_has_no_ghosts", not stale, f"in ALL but not defined: {stale}")
+
+
+ALL = [
+    test_prose_body_naming_the_marker_is_read,
+    test_shell_keyword_in_body_does_not_flip_out_of_grammar,
+    test_redirect_quoted_in_body_is_a_mention_not_a_write,
+    test_write_on_the_operator_line_stays_visible,
+    test_write_after_the_terminator_stays_visible,
+    test_fd_digit_does_not_displace_the_copy_destination,
+    test_fd_digit_does_not_manufacture_a_write,
+    test_fd_redirect_at_the_marker_is_a_write,
+    test_patch_writer_verdicts_are_decided_by_the_patch_not_the_fd,
+    test_pin_a_control_flow_keyword_refuses_a_plain_read,
+    test_pin_a_variable_in_a_write_position_sweeps_in_a_quoted_body,
+    test_every_case_in_this_file_is_in_ALL,
+]
 
 
 if __name__ == "__main__":
-    cases = _cases()
-    if not cases:
+    if not ALL:
         print("NO CASES COLLECTED — a zero-case run is a failure, not a pass")
         sys.exit(1)
     failed = []
-    for name, fn in cases:
+    for fn in ALL:
         try:
             fn()
-            print(f"ok    {name}")
+            print(f"ok    {fn.__name__}")
         except AssertionError as e:
-            failed.append(name)
-            print(f"FAIL  {name}: {e}")
-    print(f"\n{len(cases) - len(failed)}/{len(cases)} passed")
+            failed.append(fn.__name__)
+            print(f"FAIL  {fn.__name__}: {e}")
+    print(f"\n{len(ALL) - len(failed)}/{len(ALL)} passed")
     sys.exit(1 if failed else 0)
