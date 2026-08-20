@@ -305,7 +305,7 @@ citing `ref_mesh_undelivered_echo`. `DeltaClass{Conduct, Infra, Unclassified}` (
 exactly that distinction on the reputation axis, with a fail-closed default of `Unclassified`
 (`r6.rs:272-277`) that is *held, never applied*. Its doc comment names the measured failure it
 prevents: *"hestia PR #357 class: infrastructure fail-closed denies scored as member conduct."*
-hestia's `RepContext.class` (`core/src/reputation.rs:79`) already carries it from the caller and
+hestia's `RepContext.class` (`core/src/reputation.rs:98`) already carries it from the caller and
 refuses to infer it. **This row is the proof the frame is not aspirational** — the one place the two
 codebases already meet is the one place the semantics are right.
 
