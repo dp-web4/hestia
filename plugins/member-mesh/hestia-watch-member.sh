@@ -726,6 +726,33 @@ for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me
 # stops ending with a line this anchor matches. When the anchors are absent from
 # a log that DID echo a prompt, the failure mode is a shorter window and more
 # `unknown` — evidence lost, never evidence invented.
+# THE CLASS WAS A VENDOR-SPELLING BET (2026-08-18). `out of credits` is CODEX's
+# wording. kimi spells the identical billing state
+# `403 You've reached your usage limit for this billing cycle ... purchase extra
+# usage or upgrade your plan`, which matched none of the three patterns, so kimi
+# could never be classified out-of-credits — it fell through to `unknown` and the
+# report said `why=unknown` about a cause sitting verbatim in the log. Measured on
+# the live corpus: real kimi log -> `unknown`, real codex log -> `out-of-credits`,
+# same state, two verdicts. 40 kimi logs across three outages (08-08, 08-17, 08-18)
+# were mis-reported this way. This is the codex-notice-160 ambiguity the function
+# was written to END, reappearing one vendor over: the taxonomy was fine, its
+# vocabulary was one vendor wide.
+#
+# The test could not catch it because its "REAL planted log" was an AUTHORED
+# string carrying codex's spelling on BOTH sides of the check — a positive control
+# that contains only the sibling it already matches. The plants below are now
+# verbatim captures from each vendor's logs.
+#
+# Widening was checked for theft over all 1449 logs on disk: 42 verdicts move, all
+# `unknown -> out-of-credits`, ZERO taken from egress-blocked or timeout.
+# KNOWN FALSE POSITIVE, latent not live: claude's log has NEITHER anchor (its CLI
+# echoes no prompt), so its window is the member's OWN PROSE — and prose ABOUT an
+# outage now matches. Two such logs exist already (claude-20260810-155415,
+# claude-20260818-073521), both from SUCCEEDED fires, which this function never
+# reads. Reaching it needs a claude fire failing with rc not 0 and not 124 (124
+# short-circuits above) whose tail discusses credits. Cost is bounded by design —
+# nothing downstream branches on the hint — but the structural fix is an anchor in
+# claude's log, i.e. a window that is not member prose. Unfixed, deliberately.
 classify_fire_failure() {
   local RC="$1" PREFIX LOG TAIL START
   [ "$RC" = "124" ] && { echo timeout; return 0; }
@@ -741,7 +768,7 @@ classify_fire_failure() {
   else
     TAIL=$(tail -n 200 "$LOG" 2>/dev/null) || TAIL=""
   fi
-  if printf '%s' "$TAIL" | grep -qi 'out of credits\|insufficient credit\|quota exceeded'; then
+  if printf '%s' "$TAIL" | grep -qi 'out of credits\|insufficient credit\|quota exceeded\|usage limit\|billing cycle\|purchase extra usage\|upgrade your plan'; then
     echo out-of-credits
   elif printf '%s' "$TAIL" | grep -qi 'EPERM\|operation not permitted\|network is unreachable\|connection refused\|urllib\.error'; then
     echo egress-blocked
