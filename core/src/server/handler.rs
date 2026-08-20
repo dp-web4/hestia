@@ -10884,19 +10884,36 @@ mod tests {
     /// `true` passes in its place — claude-code fired exactly that sabotage against this PR
     /// (#558) on 2026-08-20 and it was INERT. This test is the arm that makes the stamp a
     /// reading rather than a constant.
+    ///
+    /// It carries BOTH poles itself. The never-drained seat kills a blanket `true`;
+    /// `fresh-drain` kills a blanket `false`. The alternative considered and rejected was a
+    /// comment in each test naming the other as holder of the opposite polarity — that is the
+    /// inert-warrant shape (`gate_escalation.rs` "safe because
+    /// `reaping_can_never_change_an_answer` proves...", green under BOTH sabotage arms, #544):
+    /// a citation does not go red when the test it cites is deleted. An assertion does.
     #[tokio::test]
     async fn a_never_drained_seat_stamps_false_on_both_readings() {
         let (_dir, shared) = make_shared_state();
         let mut session_of = std::collections::HashMap::new();
         // `egress-drain` is named for the fleet condition being reproduced: a member the
         // mesh has NEVER SEEN read a mailbox — no inbox row exists, on any timescale.
-        for id in ["claude-code", "egress-drain"] {
+        for id in ["claude-code", "egress-drain", "fresh-drain"] {
             let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
                 .await
                 .unwrap();
             session_of.insert(id.to_string(), r["sessionId"].as_str().unwrap().to_string());
         }
         // Deliberately NO drain for egress-drain: the row is absent, not stale.
+        // `fresh-drain` is the OPPOSITE POLE, and it is the whole reason this test is not a
+        // one-way gradient. Every assertion about `egress-drain` below expects `false`, so a
+        // blanket `false` stamp satisfies all of them; this seat is the one cell a blanket
+        // `false` cannot satisfy. Without it the two constants are killed by two DIFFERENT
+        // tests and deleting either silently unpins one direction — which is a coupling a
+        // cross-reference comment can document but cannot enforce.
+        {
+            let s = shared.lock().await;
+            s.inbox_store.drain_member("fresh-drain").unwrap();
+        }
 
         let claimed = tool_gate_escalation_claim(
             &shared,
@@ -10945,6 +10962,30 @@ mod tests {
             "the cell that distinguishes a reading from a constant: no row on ANY timescale. \
              A literal `true` in place of the stamp fails HERE — both bits false is 'never \
              seen', and it is what makes 'dead mailbox' (the bits diverge) tellable apart: {row}"
+        );
+
+        // POSITIVE CONTROL, and the arm that makes this test kill BOTH constants by itself.
+        // Same production path (a drain), same pass, opposite expected value.
+        let fresh = opened.event_data["invitation_evidence"]
+            .as_array()
+            .expect("per-peer invitation evidence")
+            .iter()
+            .find(|r| r["peer"] == json!("fresh-drain"))
+            .expect("fresh-drain has an evidence row")
+            .clone();
+        assert_eq!(
+            fresh["mailbox_reader_all_time"],
+            json!(true),
+            "a mailbox drained seconds ago has a row on every timescale. A literal `false` in \
+             place of the stamp fails HERE, and it passes every `egress-drain` cell above — \
+             this is the assertion that stops the never-drained fixture from being a one-way \
+             gradient: {fresh}"
+        );
+        assert_eq!(
+            fresh["mailbox_reader"],
+            json!(true),
+            "and the windowed reading agrees for a fresh row — the two bits diverge only for \
+             a STALE mailbox, which is the third case the sibling test holds: {fresh}"
         );
     }
 
