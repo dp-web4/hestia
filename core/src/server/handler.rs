@@ -10825,6 +10825,34 @@ mod tests {
              and into `absent`."
         );
 
+        // THE STAMP, pinned cell by cell: both readings of the ONE row ride in the evidence,
+        // so a later reader can tell "dead mailbox" (the two diverge) from "never seen"
+        // (both false) and can tell every post-change row from the pre-change population
+        // (no `mailbox_reader_all_time` key at all). claude-code, 2026-08-20: the all-time
+        // reading was computed here and discarded one identifier away from the row it
+        // stamped; emitting it is what keeps the two meanings of `mailbox_reader` separable
+        // in an append-only chain.
+        let all_time_bit = |peer: &str| {
+            opened.event_data["invitation_evidence"]
+                .as_array()
+                .expect("per-peer invitation evidence")
+                .iter()
+                .find(|r| r["peer"] == json!(peer))
+                .unwrap_or_else(|| panic!("{peer} has an evidence row"))["mailbox_reader_all_time"]
+                .clone()
+        };
+        assert_eq!(
+            all_time_bit("codex-cli"),
+            json!(true),
+            "the all-time reading of the SAME row is still true — the row exists — and the \
+             stamp is what makes `mailbox_reader: false` read as 'stale', not 'absent'"
+        );
+        assert_eq!(
+            all_time_bit("kimi-code"),
+            json!(true),
+            "positive control: a live reader is a reader on BOTH readings"
+        );
+
         let esc_id = claimed["escalation_id"].as_str().unwrap();
         let pp = s
             .gate_escalations
@@ -14288,8 +14316,15 @@ fn resolve_invitation(
         // derives `absent` from this list, and an id no watcher reads must not be counted as
         // a peer that read the ask and declined. Recording it at INVITE time is the only
         // moment the fact is true of the invitation rather than of the reader's later state.
-        let ev = |(id, l, _, reader): &(String, crate::arbiter::Liveness, bool, bool)| {
-            json!({"peer": id, "liveness_at_invite": l, "mailbox_reader": reader})
+        // `mailbox_reader_all_time` stamps the derivation basis beside it: the all-time
+        // presence reading this branch replaced as the recorded bit. Rows written BEFORE this
+        // change carry no such key, and absence is the discriminator — a row with no
+        // `mailbox_reader_all_time` is a pre-change, all-time-presence row, not a new row
+        // whose field was dropped. The stamp is a second measurement by the same pass, not a
+        // version constant: a constant can drift out of sync with the code, a reading cannot.
+        let ev = |(id, l, reachable, reader): &(String, crate::arbiter::Liveness, bool, bool)| {
+            json!({"peer": id, "liveness_at_invite": l, "mailbox_reader": reader,
+                   "mailbox_reader_all_time": reachable})
         };
         (
             pool.iter().map(|(id, _, _, _)| id.clone()).collect::<Vec<String>>(),
