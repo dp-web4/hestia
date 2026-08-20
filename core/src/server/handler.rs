@@ -10877,6 +10877,77 @@ mod tests {
         );
     }
 
+    /// The stamp's third case, and the cell the two-seat fixture above cannot supply: an
+    /// invited seat with NO inbox row at all must read `false` on BOTH bits — "never seen",
+    /// separable from "dead mailbox" (where the two diverge). Without this cell every invited
+    /// seat has a row, `mailbox_reader_all_time` is `true` everywhere, and the literal
+    /// `true` passes in its place — claude-code fired exactly that sabotage against this PR
+    /// (#558) on 2026-08-20 and it was INERT. This test is the arm that makes the stamp a
+    /// reading rather than a constant.
+    #[tokio::test]
+    async fn a_never_drained_seat_stamps_false_on_both_readings() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        // `egress-drain` is named for the fleet condition being reproduced: a member the
+        // mesh has NEVER SEEN read a mailbox — no inbox row exists, on any timescale.
+        for id in ["claude-code", "egress-drain"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id.to_string(), r["sessionId"].as_str().unwrap().to_string());
+        }
+        // Deliberately NO drain for egress-drain: the row is absent, not stale.
+
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": session_of["claude-code"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "reason": "Edit -> a governance file",
+            }),
+        )
+        .await
+        .unwrap();
+        let invited: Vec<String> = claimed["invited_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            invited.contains(&"egress-drain".to_string()),
+            "precondition: the never-drained seat IS invited: {invited:?}"
+        );
+
+        let s = shared.lock().await;
+        let opened = s
+            .recent_chain(40)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened")
+            .expect("the open must be witnessed");
+        let row = opened.event_data["invitation_evidence"]
+            .as_array()
+            .expect("per-peer invitation evidence")
+            .iter()
+            .find(|r| r["peer"] == json!("egress-drain"))
+            .expect("egress-drain has an evidence row")
+            .clone();
+        assert_eq!(
+            row["mailbox_reader"],
+            json!(false),
+            "no row, so no reader for THIS ask: {row}"
+        );
+        assert_eq!(
+            row["mailbox_reader_all_time"],
+            json!(false),
+            "the cell that distinguishes a reading from a constant: no row on ANY timescale. \
+             A literal `true` in place of the stamp fails HERE — both bits false is 'never \
+             seen', and it is what makes 'dead mailbox' (the bits diverge) tellable apart: {row}"
+        );
+    }
+
     /// A session that disagrees with the asserted `plugin_id` is a forgery, and the claim door
     /// must refuse it BEFORE spending anything — a claimed approval cannot be un-claimed.
     #[tokio::test]
