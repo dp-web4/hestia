@@ -4799,14 +4799,28 @@ pub(crate) struct DispositionProjection {
 /// The covered set is the petition surfaces' terminal facts: an appeal's
 /// `adjudication` (only the appeal kind — operator REPUTATION adjudications
 /// carry no `about_deny_hash` and are skipped), an escalation's
-/// `gate_escalation_decided` and its lapse (`gate_escalation_expired`, recorded
-/// by `record_newly_lapsed`), and a scope request's `scope_granted` /
-/// `scope_refused`. `scope_granted` with a NULL `request_id` is the
-/// operator-ORIGINATED grant (`/api/scope/grant`) — not a petition, no
+/// `gate_escalation_decided`, its lapse (`gate_escalation_expired`, recorded
+/// by `record_newly_lapsed`), AND ITS WITHDRAWAL, and a scope request's
+/// `scope_granted` / `scope_refused`. `scope_granted` with a NULL `request_id`
+/// is the operator-ORIGINATED grant (`/api/scope/grant`) — not a petition, no
 /// petitioner, deliberately skipped (#480 review change 5). A ruling row too
 /// thin to derive a recipient from is warned about and skipped — unprojectable
 /// is a real state, and the cursor advancing past it is safe because no later
 /// pass could do better.
+///
+/// THE WITHDRAWAL ARM, and the rule it ratifies (#545, split from #503): the
+/// disposition row is the durable keyed representation of a TERMINAL STATE, not
+/// a wake. "The withdrawer already knows" is a rendering concern — it may argue
+/// for how the notice is displayed, never for the row's absence: the covered
+/// set answers "which terminal states are on record as told", and a withdrawal
+/// is as terminal as a decision or a lapse. Withdrawing was previously QUIETER
+/// than lapsing — the wanted conduct (#503: the asker refuses its own request)
+/// had zero return-edge producers while the process failure had two. The arm
+/// lands forward-only by construction: the historical self-withdrawals (three,
+/// petitioner == withdrawer) stay without rows — they remain representable via
+/// the live `hestia://escalation/<id>` resolver, and minting notices for them
+/// now would manufacture exactly the noise the no-arm position was protecting
+/// against.
 fn disposition_obligation(e: &crate::storage::chain::ChainEntry) -> Option<(String, String)> {
     let get = |k: &str| e.event_data.get(k).and_then(Value::as_str);
     let thin = |what: &str| {
@@ -4836,6 +4850,15 @@ fn disposition_obligation(e: &crate::storage::chain::ChainEntry) -> Option<(Stri
             let id = get("escalation_id")?;
             match get("plugin_id") {
                 Some(to) => Some((to.to_string(), format!("hestia://escalation/{id}#lapsed"))),
+                None => thin("plugin_id"),
+            }
+        }
+        // The withdrawal — terminal like the two arms above (#545: the row is the
+        // record of a terminal state, not a wake; see the doc comment).
+        "gate_escalation_withdrawn" => {
+            let id = get("escalation_id")?;
+            match get("plugin_id") {
+                Some(to) => Some((to.to_string(), format!("hestia://escalation/{id}#withdrawn"))),
                 None => thin("plugin_id"),
             }
         }
@@ -15469,22 +15492,28 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
             };
             // #459: the decision's RETURN EDGE, minted HERE — the layer holding
             // SharedState — because `EscalationStore::decide` has no inbox access.
-            // Skipped for a withdrawal: that is the asker's own act and the asker
-            // was there for it; waking a member to tell it what it just did is
-            // noise wearing the return edge's clothes. Revised #480 contract: the
-            // decision entry IS the witness, so the obligation anchors to its
-            // hash; a failed ensure warns and is retried by the cursor projector,
-            // it is not the decider's error.
-            let disposition_notice_id = if withdrawn {
-                None
+            // Revised #480 contract: the terminal entry IS the witness, so the
+            // obligation anchors to its hash; a failed ensure warns and is retried
+            // by the cursor projector, it is not the decider's error.
+            //
+            // Withdrawals included, since #545: the disposition row is the durable
+            // representation of a TERMINAL STATE, not a wake, so "the withdrawer
+            // already knows" is a rendering concern, not a record concern. The
+            // earlier skip ("the asker was there for its own act") made withdrawing
+            // QUIETER than lapsing — the wanted conduct with no return edge while
+            // the process failure had two. Pointer: #withdrawn, matching the
+            // projector's arm.
+            let pointer = if withdrawn {
+                format!("hestia://escalation/{}#withdrawn", decided.id)
             } else {
-                ensure_disposition(
-                    &s,
-                    &decided.plugin_id,
-                    &format!("hestia://escalation/{}#decided", decided.id),
-                    &entry.hash,
-                )
+                format!("hestia://escalation/{}#decided", decided.id)
             };
+            let disposition_notice_id = ensure_disposition(
+                &s,
+                &decided.plugin_id,
+                &pointer,
+                &entry.hash,
+            );
             // The bar and whether this decision met it go to the DECIDER, not only to the
             // chain. They were recorded above and withheld here, and the asymmetry had a
             // measured cost: across the whole chain, 66 `sovereign_plus_peer` escalations
@@ -17124,5 +17153,158 @@ mod disposition_durability_tests {
             .expect("the evidence comes along, shape-parity with the live arm: {body}");
         assert_eq!(factors[0]["by"], "operator");
         assert_eq!(factors[0]["dissent"], json!(false));
+    }
+
+    /// #545: the covered set of `disposition_obligation`, pinned in BOTH directions —
+    /// the next silent enumeration-out (a kind added to the terminal vocabulary and
+    /// forgotten here, or a kind dropped without a stated reason) is a red test.
+    #[test]
+    fn the_disposition_covered_set_is_pinned_in_both_directions() {
+        fn entry(event_type: &str, data: Value) -> crate::storage::chain::ChainEntry {
+            crate::storage::chain::ChainEntry {
+                chain_position: 0,
+                hash: String::new(),
+                prev_hash: String::new(),
+                event_type: event_type.to_string(),
+                event_data: data,
+                signer_lct: "test".into(),
+                timestamp: chrono::Utc::now(),
+            }
+        }
+        let to = "kimi-code";
+        let cases: Vec<(crate::storage::chain::ChainEntry, Option<(String, String)>)> = vec![
+            // The covered set, each with its pointer.
+            (
+                entry("adjudication", json!({"about_deny_hash": "deadbeef", "subject_plugin_id": to})),
+                Some((to.into(), "hestia://appeal/deadbeef#ruled".into())),
+            ),
+            (
+                entry("gate_escalation_decided", json!({"escalation_id": "esc1", "plugin_id": to})),
+                Some((to.into(), "hestia://escalation/esc1#decided".into())),
+            ),
+            (
+                entry("gate_escalation_expired", json!({"escalation_id": "esc2", "plugin_id": to})),
+                Some((to.into(), "hestia://escalation/esc2#lapsed".into())),
+            ),
+            // #545: the withdrawal JOINS — the row is the record of a terminal
+            // state, not a wake; "the withdrawer already knows" is a rendering
+            // concern, not a record concern.
+            (
+                entry("gate_escalation_withdrawn", json!({"escalation_id": "esc3", "plugin_id": to})),
+                Some((to.into(), "hestia://escalation/esc3#withdrawn".into())),
+            ),
+            (
+                entry("scope_granted", json!({"request_id": "r1", "plugin_id": to})),
+                Some((to.into(), "hestia://scope/r1".into())),
+            ),
+            (
+                entry("scope_refused", json!({"request_id": "r2", "plugin_id": to})),
+                Some((to.into(), "hestia://scope/r2".into())),
+            ),
+            // The negative direction.
+            (
+                entry("gate_escalation_opened", json!({"escalation_id": "esc9", "plugin_id": to})),
+                None, // not terminal
+            ),
+            (
+                entry("scope_granted", json!({"request_id": Value::Null, "plugin_id": to,
+                                              "origin": "operator_initiated"})),
+                None, // operator-originated: no petitioner
+            ),
+            (
+                entry("adjudication", json!({"subject_plugin_id": to, "axis": "validity"})),
+                None, // operator REPUTATION adjudication — no about_deny_hash, not an appeal ruling
+            ),
+            (entry("outcome", json!({"escalation_id": "esc1"})), None),
+        ];
+        for (e, want) in cases {
+            assert_eq!(
+                disposition_obligation(&e),
+                want,
+                "covered-set mismatch for {} {}",
+                e.event_type,
+                e.event_data
+            );
+        }
+    }
+
+    /// The projector path for a withdrawal: the terminal entry was witnessed but
+    /// the daemon died before the ensure — the cursor projector mints from the
+    /// record, pointer `#withdrawn`. Same guarantee the decided and lapsed kinds
+    /// already had; the withdrawal had neither producer before #545.
+    #[tokio::test]
+    async fn the_projector_mints_a_withdrawn_disposition_from_the_terminal_record() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox) = {
+            let mut s = state.lock().await;
+            let handles = (s.chain_store.clone(), s.inbox_store.clone());
+            project_dispositions(&handles.0, &handles.1).unwrap();
+            s.append_chain(
+                "gate_escalation_withdrawn",
+                json!({"escalation_id": "esc-wd-p", "plugin_id": "kimi-code",
+                       "tool_name": "policy_edit", "status": "denied",
+                       "decided_by": "kimi-code", "decided_via": "self_withdrawn"}),
+            )
+            .unwrap();
+            handles
+        };
+        assert_eq!(project_dispositions(&chain, &inbox).unwrap().projected, 1);
+        let s = state.lock().await;
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        assert_eq!(
+            mail.iter()
+                .find(|n| n.kind == "disposition")
+                .and_then(|n| n.pointer_uri.as_deref()),
+            Some("hestia://escalation/esc-wd-p#withdrawn")
+        );
+    }
+
+    /// The synchronous fast path (#545): the withdrawal's OWN ruling site mints
+    /// immediately, anchored to the `gate_escalation_withdrawn` entry's hash —
+    /// withdrawing is no longer quieter than being decided.
+    #[tokio::test]
+    async fn a_withdrawal_reports_its_disposition_to_the_withdrawer() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let sid = super::appeal_tests::seat(&state, "kimi-code").await;
+        let opened = tool_gate_escalation_open(&state, &json!({
+            "plugin_id": "kimi-code", "tool_name": "policy_edit", "marker": "policy.json",
+            "reason": "turns out the rule already covers it",
+            "session_id": sid.to_string(),
+        })).await.unwrap();
+        let esc_id = opened["escalation_id"].as_str().expect("the open returns its id").to_string();
+
+        let ruled = tool_gate_arbitrate_escalation(&state, &json!({
+            "escalation_id": esc_id, "approve": false, "session_id": sid.to_string(),
+        })).await.unwrap();
+        assert!(
+            ruled.get("_hestia_error").is_none(),
+            "a member must be able to retire its own ask: {ruled}"
+        );
+        assert!(
+            ruled["disposition_notice_id"].is_number(),
+            "the withdrawal's return edge is minted at the ruling site, not only by the              projector: {ruled}"
+        );
+
+        let s = state.lock().await;
+        let withdrawn_entry = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_withdrawn")
+            .expect("the withdrawal itself must be witnessed");
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        let note = mail
+            .iter()
+            .find(|n| n.kind == "disposition")
+            .expect("the withdrawer holds the terminal record: {mail:?}");
+        assert_eq!(
+            note.pointer_uri.as_deref(),
+            Some(format!("hestia://escalation/{esc_id}#withdrawn")).as_deref()
+        );
+        assert_eq!(
+            note.chain_hash, withdrawn_entry.hash,
+            "the obligation anchors to the terminal entry, not to a notice-side entry"
+        );
     }
 }
