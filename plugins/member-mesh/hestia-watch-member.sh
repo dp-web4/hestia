@@ -44,6 +44,10 @@ flock -n 9 || { echo "[hestia-watch] another watcher holds $STATE/watch-$PLUGIN.
 # HEAD or main. Bash does not expose its parsed buffer, so this is explicitly a source
 # snapshot rather than a claim that every byte had already been parsed.
 WATCH_SOURCE="${BASH_SOURCE[0]}"
+# Resolved once, from the same source path the drift snapshot above hashes, so a
+# helper is loaded from the copy that is actually running rather than from a cwd
+# that is nobody's guarantee.
+WATCH_DIR="$(cd "$(dirname "$WATCH_SOURCE")" && pwd)"
 watch_source_hash() {
   python3 - "$WATCH_SOURCE" <<'PY'
 import hashlib, sys
@@ -597,6 +601,24 @@ unanswered() { mesh_rpc hestia_member_unanswered "{\"older_than_secs\": $STALE_A
 # the daemon's real parameter name (any other spelling is discarded into a success).
 unanswered_now() { mesh_rpc hestia_member_unanswered '{"older_than_secs": 0}'; }
 
+# THE PETITIONS YOU HOLD. `hestia_member_unanswered` asks "what have you not
+# answered"; nothing ever asked the mirror question — "what have you ASKED that
+# is still open" — and the member is the only party that can retire the moot
+# ones. An auto-minted escalation is opened FOR the member by the gate on a
+# refused write, so a member routinely holds petitions it never chose to file
+# and has no surface that names them: `hestia_gate_escalation_poll` needs an id
+# you already know, and the id is printed once, into a refusal, in a wake that
+# has usually ended. Measured on CBP 2026-08-19: 30 of 30 lapses were
+# gate-auto-minted and `gate_escalation_withdrawn` had fired twice, ever.
+#
+# Unattributed by design (`session_id` optional, no scope wall), but `mesh_rpc`
+# passes it, which is what populates `you_may_rule` — always false on your own
+# rows. That is the point: the move on your own open petition is not to rule it,
+# it is `hestia_gate_arbitrate_escalation approve:false`, which files it as
+# `self_withdrawn` with no independence claimed. Costs one read per drain and
+# never causes a fire on its own.
+open_petitions() { mesh_rpc hestia_gate_pending_escalations '{}'; }
+
 # The startup stale-primer pass. Deferred to here only because it needs `mesh_rpc`;
 # it still runs before the first poll, and before the unanswered journal announce.
 retry_stale_primers
@@ -855,13 +877,25 @@ while true; do
     # the question is asked where an answer is possible — inside the wake that
     # is happening anyway. Costs one read; never causes a fire on its own.
     UN=$(unanswered 2>/dev/null || echo '{}')
-    printf '%s' "$OUT" | UN="$UN" FOR_PLUGIN="$PLUGIN" python3 -c '
+    # The mirror of the debt fold: petitions THIS member has open. Filtered
+    # here, by `asked_by`, because the tool answers for the whole society and
+    # another member's rows are not this member's work — the same reason the
+    # primer directory is per-member. The filter and its renderer live in one
+    # file (`open-petitions.py`) so one suite covers both; an unparseable or
+    # failed read yields `asked:false`, which the renderer says out loud rather
+    # than rendering as "you hold none".
+    PET=$(open_petitions 2>/dev/null \
+          | timeout 5 python3 "$WATCH_DIR/open-petitions.py" fold "$PLUGIN" \
+          2>/dev/null || echo '{"asked":false,"mine":[]}')
+    printf '%s' "$OUT" | UN="$UN" PET="$PET" FOR_PLUGIN="$PLUGIN" python3 -c '
 import json,os,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
 try: u=json.loads(os.environ.get("UN") or "{}")
 except Exception: u={}
 d["unanswered"]={k:u.get(k,[]) for k in ("i_owe","owed_to_me")}
+try: d["open_petitions"]=json.loads(os.environ.get("PET") or "")
+except Exception: d["open_petitions"]={"asked":False,"mine":[]}
 # WHO THIS IS FOR — the one fact the primer never stated. It recorded from_plugin on
 # every notice and the recipient nowhere, so a misdelivered work list was
 # indistinguishable from a correct one by reading it, and the four days between notice
