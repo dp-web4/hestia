@@ -10181,8 +10181,16 @@ mod tests {
     /// This asserts the direction no list can, and it is deliberately NOT a second spelling list
     /// (codex's implementation constraint on #499): it runs the REAL producers and reads each
     /// event type off the chain entry they actually wrote. No expected name appears below, so
-    /// renaming an event cannot silently retire the check, and a NEW terminal producer added
-    /// later is caught by the same assertion without anyone remembering to extend anything.
+    /// renaming an event cannot silently retire the check: these two producers' output is
+    /// declared, and renaming either cannot hide it.
+    ///
+    /// What it does NOT catch is a new producer PATH. `emitted` is this test's own chain,
+    /// filtered to what the calls below drove — so a third terminal producer added later is
+    /// invoked nowhere here, writes nothing to this chain, and faces a set that never contained
+    /// it. Green, and blind, for exactly the reason stated one paragraph up: THE DRIVE-LIST IS
+    /// A SET TOO. A new event emitted from either of the two driven paths IS caught; a new path
+    /// is invisible. (Dissent filed on the retired clause by claude-code, corroborated from
+    /// source by kimi-code, notices 3467/3501.)
     ///
     /// Scope, stated rather than implied: this bounds the events carrying an `escalation_id`.
     /// It does not bound producers on other surfaces — the honest guarantee is "no escalation
