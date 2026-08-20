@@ -14361,21 +14361,35 @@ fn has_mailbox_reader(store: &crate::storage::SqliteInboxStore, plugin_id: &str)
 /// (`last_inbox_touch` 23 days earlier, `mailbox_reads: 1`). `peer_participation` therefore
 /// counted it in `absent` — published as a peer that saw the ask and stayed silent.
 ///
-/// SAME DIRECTIONS as its unwindowed sibling: never-seen is `false`, and an unreadable store
-/// is `true` — a lookup that failed must not become a specific finding about a peer.
+/// TRI-STATE, and the third state is the point (GPT review, 2026-08-20).
+///
+/// Its unwindowed sibling answers a QUEUEING question, where failing toward `true` is right:
+/// queue it, nothing is lost. This one answers a CONDUCT question, and there `true` is not a
+/// safe default — it is affirmative evidence that the seat's mailbox was being read when the
+/// ask went out, which is precisely what puts an unanswering peer into `absent`, i.e. into
+/// "saw the ask and stayed silent."
+///
+/// So the previous `Err(_) => true` inverted its own stated intent. The comment read "a lookup
+/// that failed must not become a specific finding about a peer" while the encoding made the
+/// failed lookup INTO that finding: an unreadable store manufactured a conduct fact about a
+/// seat nobody could measure.
+///
+/// `None` is UNKNOWN and must contribute to neither population — not to `invited_without_reader`
+/// (which would excuse the peer) and not to `absent` (which would accuse it). A measurement
+/// that did not happen is not evidence in either direction.
 fn has_mailbox_reader_within(
     store: &crate::storage::SqliteInboxStore,
     plugin_id: &str,
     window_secs: u64,
     now: u64,
-) -> bool {
+) -> Option<bool> {
     match store.inbox_touch(plugin_id) {
-        Ok(None) => false,
+        Ok(None) => Some(false),
         Ok(Some(t)) => {
             let last = t.last_touch.timestamp().max(0) as u64;
-            last.saturating_add(window_secs) >= now
+            Some(last.saturating_add(window_secs) >= now)
         }
-        Err(_) => true,
+        Err(_) => None,
     }
 }
 
@@ -14415,7 +14429,7 @@ fn resolve_invitation(
         // that declined; see `has_mailbox_reader_within`.
         let ttl_secs = esc.expires_at.saturating_sub(esc.opened_at);
         let now = crate::server::gate_escalation::now_secs();
-        let mut pool: Vec<(String, crate::arbiter::Liveness, bool, bool)> = s
+        let mut pool: Vec<(String, crate::arbiter::Liveness, bool, Option<bool>)> = s
             .member_registry
             .iter_sorted()
             .into_iter()
@@ -14465,7 +14479,12 @@ fn resolve_invitation(
         // `mailbox_reader_all_time` is a pre-change, all-time-presence row, not a new row
         // whose field was dropped. The stamp is a second measurement by the same pass, not a
         // version constant: a constant can drift out of sync with the code, a reading cannot.
-        let ev = |(id, l, reachable, reader): &(String, crate::arbiter::Liveness, bool, bool)| {
+        // `mailbox_reader` is now true / false / null. `null` is UNKNOWN — the store could not
+        // be read for this seat — and serde renders `Option::None` as JSON null, so the wire
+        // carries the third state rather than collapsing it into one of the other two. Readers
+        // that match on `== false` are unaffected; readers that treated "not false" as "true"
+        // were the defect this closes.
+        let ev = |(id, l, reachable, reader): &(String, crate::arbiter::Liveness, bool, Option<bool>)| {
             json!({"peer": id, "liveness_at_invite": l, "mailbox_reader": reader,
                    "mailbox_reader_all_time": reachable})
         };

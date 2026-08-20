@@ -298,6 +298,14 @@ pub struct Escalation {
     /// under-claims this finding rather than over-claiming it.
     #[serde(default)]
     pub invited_without_reader: Vec<String>,
+    /// Invited seats whose mailbox could not be READ at invite time — the store errored, so
+    /// no measurement exists. Distinct from `invited_without_reader`, which is a measurement
+    /// that came back negative. Held out of BOTH populations by `peer_participation`: an
+    /// unavailable reading must not excuse a peer and must not accuse one (GPT review,
+    /// 2026-08-20). Restored empty for escalations opened before the field existed, which
+    /// reads as "every reading succeeded" — the direction that under-claims this finding.
+    #[serde(default)]
+    pub invited_reader_unknown: Vec<String>,
     /// The member asking. Recorded as claimed — `plugin_id` is caller-asserted (HST-005), and
     /// this field inherits that weakness rather than laundering it.
     pub plugin_id: String,
@@ -522,10 +530,19 @@ impl Escalation {
             .filter(|f| f.channel == Channel::PeerMember)
             .map(|f| f.by.as_str())
             .collect();
+        // Three exclusions, not two. A seat whose reading FAILED is not silent-after-seeing:
+        // nobody knows whether it saw. Counting it in `absent` is the defect this closes —
+        // an unreadable store became affirmative conduct evidence about a peer.
+        let reader_unknown = self
+            .invited_peers
+            .iter()
+            .filter(|p| self.invited_reader_unknown.contains(p))
+            .count();
         let absent = self
             .invited_peers
             .iter()
             .filter(|p| !self.invited_without_reader.contains(p))
+            .filter(|p| !self.invited_reader_unknown.contains(p))
             .filter(|p| !answered.contains(p.as_str()))
             .count();
         PeerParticipation {
@@ -538,6 +555,7 @@ impl Escalation {
             // can fall after a decision — which is the mechanism working, not drift.
             absent,
             invited_without_reader: no_reader,
+            invited_reader_unknown: reader_unknown,
         }
     }
 
@@ -738,6 +756,10 @@ pub struct PeerParticipation {
     /// still asked: a reader must be able to see that the invitation went somewhere nobody
     /// listens, which is a finding about the ROUTE, not about the seat.
     pub invited_without_reader: usize,
+    /// Invited seats whose mailbox reading FAILED at invite time. Reported beside the other
+    /// two because it is a finding about the INSTRUMENT — the store could not answer — and a
+    /// number that silently joined `absent` would have been a finding about the seat.
+    pub invited_reader_unknown: usize,
 }
 
 #[derive(Default)]
@@ -862,6 +884,18 @@ impl EscalationStore {
                             // `invitation_evidence`, so a restart rebuilds the split from the
                             // evidence the decision was issued on, not from today's mailboxes
                             // — which is the whole reason it is captured at invite time.
+                            invited_reader_unknown: d
+                                .get("invitation_evidence")
+                                .and_then(|v| v.as_array())
+                                .map(|rows| {
+                                    rows.iter()
+                                        .filter(|r| r.get("mailbox_reader") == Some(&serde_json::Value::Null))
+                                        .filter_map(|r| {
+                                            r.get("peer").and_then(|p| p.as_str()).map(str::to_string)
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
                             invited_without_reader: d
                                 .get("invitation_evidence")
                                 .and_then(|v| v.as_array())
@@ -1023,6 +1057,7 @@ impl EscalationStore {
             id: id.clone(),
             invited_peers: Vec::new(),
             invited_without_reader: Vec::new(),
+            invited_reader_unknown: Vec::new(),
             plugin_id: plugin_id.to_string(),
             // Fail closed: every `open` caller is unproven until the handler records
             // otherwise via `record_asker_basis`. An asserted-by-default asker can be
@@ -1726,6 +1761,55 @@ mod tests {
         assert_eq!(p.concurred, 0);
         assert_eq!(p.dissented, 0);
         assert_eq!(p.absent, 0, "nobody was invited, so nobody is absent — absent is DERIVED");
+    }
+
+    /// An UNREADABLE mailbox is not a silent peer (GPT review, 2026-08-20).
+    ///
+    /// `has_mailbox_reader_within` used to answer `true` when the store errored, with the
+    /// stated intent that "a lookup that failed must not become a specific finding about a
+    /// peer." The encoding inverted the intent: for the CONDUCT question, `true` says the
+    /// mailbox WAS being read when the ask went out, and an invited seat that then does not
+    /// answer lands in `absent` — published as one that saw the ask and stayed silent. A
+    /// failed measurement became affirmative evidence against a seat nobody could measure.
+    ///
+    /// Three populations, and the third must claim nothing in either direction: a null
+    /// reading excuses no peer (`invited_without_reader`) and accuses none (`absent`).
+    ///
+    /// This test FAILS on the old semantics: with `Err => true`, `unreadable` carried
+    /// `mailbox_reader: true`, sat in neither held-out set, and counted as absent.
+    #[test]
+    fn an_unreadable_mailbox_is_neither_absent_nor_readerless() {
+        let mut s = EscalationStore::default();
+        let e = s
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        let mut e = s.get(&e.id).unwrap().clone();
+        e.invited_peers = vec![
+            "readable".to_string(),
+            "readerless".to_string(),
+            "unreadable".to_string(),
+        ];
+        // The two MEASURED outcomes, as the open writer records them.
+        e.invited_without_reader = vec!["readerless".to_string()];
+        // The third: the store could not answer for this seat.
+        e.invited_reader_unknown = vec!["unreadable".to_string()];
+
+        let p = e.peer_participation();
+
+        assert_eq!(p.invited.len(), 3);
+        assert_eq!(
+            p.invited_without_reader, 1,
+            "a measurement that came back negative"
+        );
+        assert_eq!(
+            p.invited_reader_unknown, 1,
+            "a measurement that did not happen — reported as a fact about the INSTRUMENT"
+        );
+        assert_eq!(
+            p.absent, 1,
+            "only the seat whose mailbox was READ and did not answer is absent; \
+             the unreadable one is held out, which is the whole fix"
+        );
     }
 
     /// One peer's answer must not cancel a DIFFERENT peer's silence.
