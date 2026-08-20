@@ -730,8 +730,55 @@ classify_fire_failure() {
   fi
 }
 
+# rc=124 IS NOT A DELIVERY VERDICT — IT IS THE ONE RC THAT PROVES DELIVERY.
+# `timeout -k 30 1800` in every fire-*.sh wraps the member's CLI with the primer path
+# already in its argv, so an rc of 124 says the launcher STARTED that CLI and later cut
+# it short. The work list reached the member. What was interrupted is the wake, and
+# retention plus `retry_stale_primers` is the mechanism that owns an interrupted wake.
+#
+# The evidence was already written down, one function away, and acted on only half.
+# `stale_primer_discharged_test.py` opens with it: "This mesh has filed nine
+# non-delivery reports on rc=124 and all nine were false." That measurement bought the
+# `primer_spent` guard on the RE-FIRE path (a discharged list is retired, not re-fired)
+# and nothing at all on the REPORT path, which runs FIRST and every time — so the wake
+# amplification stopped and the false reports did not.
+#
+# Instance ten and eleven, CBP 2026-08-20, the case that found this. claude-code sent
+# kimi-code notices 4121 (`review_done`, PR #525) and 4127 (`review_done`, PR #549).
+# Both were delivered: kimi's wake `kimi-20260820-011755` opens by enumerating them by
+# id and kind, argues them for 3700 lines, and its successor lands the fixes citing
+# "#525 re-review — invariant 1" and "claude asked for a test with a member holding a
+# live scope grant". That wake then ran past `timeout -k 30 1800` at 08:46:56Z. rc=124,
+# primer retained, and this function mailed claude-code two `kind=reply` notices saying
+# the notices kimi had just spent thirty minutes answering were undelivered. `reply` is
+# in MEMBER_KINDS_AWAIT_RESPONSE, so each one also became a row in the SENDER's `i_owe`
+# and woke a session to read it.
+#
+# That is an amplifier pointed the wrong way: the longer and more thorough a member's
+# wake, the likelier it is cut short by the bound, and the more of its peers are told
+# they were not heard. Failure reports generated in proportion to work done.
+#
+# WHY NOT THE SYMMETRIC FIX. The tempting move is to reuse `primer_spent` here — same
+# primer, same rc, ask the daemon the same question. It is wrong, and one-sidedly so:
+# `i_owe` only ever holds MEMBER_KINDS_AWAIT_RESPONSE, so a `review_done`, a
+# `disposition` or a `coordination` is absent from the fold whether it was answered or
+# never seen. Gating the report on `i_owe` would therefore suppress the report for
+# exactly the kinds where the report is the ONLY trace a notice ever existed — and it
+# would do so on the genuinely-dead fires (out-of-credits, egress-blocked) too, which
+# are the fires that need reporting most. So the guard is keyed to the ONE rc that
+# carries mechanical information about whether the CLI ran, and to nothing else.
+#
+# Not `why=timeout` either: `classify_fire_failure` also returns `timeout` from log
+# TEXT under any rc, and a log that merely says "timed out" is a guess about a fire
+# that may never have started. The integer is the fact; the classifier is the lead.
+# Every other rc reports exactly as before — 75 (lock refusal, the CLI never ran), 1
+# (out-of-credits, egress-blocked, usage error), 69, 70 — all unchanged.
 report_unreachable() {
-  local PRIMER_FILE="$1" WHY="$2" ROWS ARGS OUT LIVE
+  local PRIMER_FILE="$1" WHY="$2" RC="${3:-}" ROWS ARGS OUT LIVE
+  if [ "$RC" = "124" ]; then
+    echo "[hestia-watch] fire hit the launcher bound (rc=124) — the member's CLI ran with this primer, so it is RETAINED for retry and NOT reported unreachable: $PRIMER_FILE"
+    return 0
+  fi
   ROWS=$(python3 - "$PRIMER_FILE" "$WHY" "watch-$PLUGIN" <<'PY'
 import json,sys
 try: d=json.load(open(sys.argv[1]))
@@ -835,7 +882,7 @@ json.dump(d,sys.stdout)
         RC=$?
         WHY=$(classify_fire_failure "$RC")
         echo "[hestia-watch] fire command failed rc=$RC why=$WHY (notices preserved in $PRIMER)"
-        report_unreachable "$PRIMER" "fire-rc=$RC;why=$WHY"
+        report_unreachable "$PRIMER" "fire-rc=$RC;why=$WHY" "$RC"
       fi
     else
       python3 -c "import json;d=json.load(open('$PRIMER'));[print(f\"  {n['kind']} from {n['from_plugin']}: {n.get('pointer_uri','')}\") for n in d['notices']]"
