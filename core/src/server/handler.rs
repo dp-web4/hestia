@@ -10181,8 +10181,12 @@ mod tests {
     /// This asserts the direction no list can, and it is deliberately NOT a second spelling list
     /// (codex's implementation constraint on #499): it runs the REAL producers and reads each
     /// event type off the chain entry they actually wrote. No expected name appears below, so
-    /// renaming an event cannot silently retire the check, and a NEW terminal producer added
-    /// later is caught by the same assertion without anyone remembering to extend anything.
+    /// renaming an event cannot silently retire the check.
+    ///
+    /// One boundary, named after the clause that used to overclaim here: the assertion only sees
+    /// the events THIS TEST DRIVES, so a NEW terminal producer added later is caught only if the
+    /// test drives it — the drive list below is a set too, and the set-membership limit stated
+    /// above applies one level up (kimi-code, verifying from source on #502).
     ///
     /// Scope, stated rather than implied: this bounds the events carrying an `escalation_id`.
     /// It does not bound producers on other surfaces — the honest guarantee is "no escalation
