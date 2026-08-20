@@ -10856,6 +10856,34 @@ mod tests {
              and into `absent`."
         );
 
+        // THE STAMP, pinned cell by cell: both readings of the ONE row ride in the evidence,
+        // so a later reader can tell "dead mailbox" (the two diverge) from "never seen"
+        // (both false) and can tell every post-change row from the pre-change population
+        // (no `mailbox_reader_all_time` key at all). claude-code, 2026-08-20: the all-time
+        // reading was computed here and discarded one identifier away from the row it
+        // stamped; emitting it is what keeps the two meanings of `mailbox_reader` separable
+        // in an append-only chain.
+        let all_time_bit = |peer: &str| {
+            opened.event_data["invitation_evidence"]
+                .as_array()
+                .expect("per-peer invitation evidence")
+                .iter()
+                .find(|r| r["peer"] == json!(peer))
+                .unwrap_or_else(|| panic!("{peer} has an evidence row"))["mailbox_reader_all_time"]
+                .clone()
+        };
+        assert_eq!(
+            all_time_bit("codex-cli"),
+            json!(true),
+            "the all-time reading of the SAME row is still true — the row exists — and the \
+             stamp is what makes `mailbox_reader: false` read as 'stale', not 'absent'"
+        );
+        assert_eq!(
+            all_time_bit("kimi-code"),
+            json!(true),
+            "positive control: a live reader is a reader on BOTH readings"
+        );
+
         let esc_id = claimed["escalation_id"].as_str().unwrap();
         let pp = s
             .gate_escalations
@@ -10877,6 +10905,118 @@ mod tests {
             "and exactly the reachable seat that stayed silent is `absent` — the decline \
              manufactured out of a DEAD mailbox is gone, the real silence is still counted \
              (this cell asserted 1 for the wrong seat while the defect stood): {pp:?}"
+        );
+    }
+
+    /// The stamp's third case, and the cell the two-seat fixture above cannot supply: an
+    /// invited seat with NO inbox row at all must read `false` on BOTH bits — "never seen",
+    /// separable from "dead mailbox" (where the two diverge). Without this cell every invited
+    /// seat has a row, `mailbox_reader_all_time` is `true` everywhere, and the literal
+    /// `true` passes in its place — claude-code fired exactly that sabotage against this PR
+    /// (#558) on 2026-08-20 and it was INERT. This test is the arm that makes the stamp a
+    /// reading rather than a constant.
+    ///
+    /// It carries BOTH poles itself. The never-drained seat kills a blanket `true`;
+    /// `fresh-drain` kills a blanket `false`. The alternative considered and rejected was a
+    /// comment in each test naming the other as holder of the opposite polarity — that is the
+    /// inert-warrant shape (`gate_escalation.rs` "safe because
+    /// `reaping_can_never_change_an_answer` proves...", green under BOTH sabotage arms, #544):
+    /// a citation does not go red when the test it cites is deleted. An assertion does.
+    #[tokio::test]
+    async fn a_never_drained_seat_stamps_false_on_both_readings() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        // `egress-drain` is named for the fleet condition being reproduced: a member the
+        // mesh has NEVER SEEN read a mailbox — no inbox row exists, on any timescale.
+        for id in ["claude-code", "egress-drain", "fresh-drain"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id.to_string(), r["sessionId"].as_str().unwrap().to_string());
+        }
+        // Deliberately NO drain for egress-drain: the row is absent, not stale.
+        // `fresh-drain` is the OPPOSITE POLE, and it is the whole reason this test is not a
+        // one-way gradient. Every assertion about `egress-drain` below expects `false`, so a
+        // blanket `false` stamp satisfies all of them; this seat is the one cell a blanket
+        // `false` cannot satisfy. Without it the two constants are killed by two DIFFERENT
+        // tests and deleting either silently unpins one direction — which is a coupling a
+        // cross-reference comment can document but cannot enforce.
+        {
+            let s = shared.lock().await;
+            s.inbox_store.drain_member("fresh-drain").unwrap();
+        }
+
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": session_of["claude-code"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "reason": "Edit -> a governance file",
+            }),
+        )
+        .await
+        .unwrap();
+        let invited: Vec<String> = claimed["invited_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            invited.contains(&"egress-drain".to_string()),
+            "precondition: the never-drained seat IS invited: {invited:?}"
+        );
+
+        let s = shared.lock().await;
+        let opened = s
+            .recent_chain(40)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened")
+            .expect("the open must be witnessed");
+        let row = opened.event_data["invitation_evidence"]
+            .as_array()
+            .expect("per-peer invitation evidence")
+            .iter()
+            .find(|r| r["peer"] == json!("egress-drain"))
+            .expect("egress-drain has an evidence row")
+            .clone();
+        assert_eq!(
+            row["mailbox_reader"],
+            json!(false),
+            "no row, so no reader for THIS ask: {row}"
+        );
+        assert_eq!(
+            row["mailbox_reader_all_time"],
+            json!(false),
+            "the cell that distinguishes a reading from a constant: no row on ANY timescale. \
+             A literal `true` in place of the stamp fails HERE — both bits false is 'never \
+             seen', and it is what makes 'dead mailbox' (the bits diverge) tellable apart: {row}"
+        );
+
+        // POSITIVE CONTROL, and the arm that makes this test kill BOTH constants by itself.
+        // Same production path (a drain), same pass, opposite expected value.
+        let fresh = opened.event_data["invitation_evidence"]
+            .as_array()
+            .expect("per-peer invitation evidence")
+            .iter()
+            .find(|r| r["peer"] == json!("fresh-drain"))
+            .expect("fresh-drain has an evidence row")
+            .clone();
+        assert_eq!(
+            fresh["mailbox_reader_all_time"],
+            json!(true),
+            "a mailbox drained seconds ago has a row on every timescale. A literal `false` in \
+             place of the stamp fails HERE, and it passes every `egress-drain` cell above — \
+             this is the assertion that stops the never-drained fixture from being a one-way \
+             gradient: {fresh}"
+        );
+        assert_eq!(
+            fresh["mailbox_reader"],
+            json!(true),
+            "and the windowed reading agrees for a fresh row — the two bits diverge only for \
+             a STALE mailbox, which is the third case the sibling test holds: {fresh}"
         );
     }
 
@@ -14319,8 +14459,15 @@ fn resolve_invitation(
         // derives `absent` from this list, and an id no watcher reads must not be counted as
         // a peer that read the ask and declined. Recording it at INVITE time is the only
         // moment the fact is true of the invitation rather than of the reader's later state.
-        let ev = |(id, l, _, reader): &(String, crate::arbiter::Liveness, bool, bool)| {
-            json!({"peer": id, "liveness_at_invite": l, "mailbox_reader": reader})
+        // `mailbox_reader_all_time` stamps the derivation basis beside it: the all-time
+        // presence reading this branch replaced as the recorded bit. Rows written BEFORE this
+        // change carry no such key, and absence is the discriminator — a row with no
+        // `mailbox_reader_all_time` is a pre-change, all-time-presence row, not a new row
+        // whose field was dropped. The stamp is a second measurement by the same pass, not a
+        // version constant: a constant can drift out of sync with the code, a reading cannot.
+        let ev = |(id, l, reachable, reader): &(String, crate::arbiter::Liveness, bool, bool)| {
+            json!({"peer": id, "liveness_at_invite": l, "mailbox_reader": reader,
+                   "mailbox_reader_all_time": reachable})
         };
         (
             pool.iter().map(|(id, _, _, _)| id.clone()).collect::<Vec<String>>(),
