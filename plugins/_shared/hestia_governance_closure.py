@@ -751,9 +751,40 @@ def _command_write_targets(words: list, stdin_src=None) -> list:
                 pfiles = [stdin_src]
             if not pfiles:
                 raise _OpaqueWriter()
-            out = []
+            out, resolved = [], False
             for pf in pfiles:
-                out.extend(_patch_write_targets(pf))
+                try:
+                    out.extend(_patch_write_targets(pf))
+                except _OpaqueWriter:
+                    # A BARE DIGIT THAT CANNOT BE OPENED IS A FILE DESCRIPTOR, not a patch
+                    # file. `_tokenize` runs shlex with `punctuation_chars`, which splits
+                    # `2>&1` into `2`, `>&`, `1` and keeps NO adjacency — so the fd lands in
+                    # the simple command's word list exactly like an argument, and this
+                    # branch collected it as a second patch file. `_patch_write_targets`
+                    # then failed to open it and raised _OpaqueWriter("2"): an UNCONDITIONAL
+                    # fail-close naming a file descriptor as the governance resource, on a
+                    # command whose real patch had already been read and named nothing in
+                    # the closure. Measured on CBP 2026-08-18 and appealed (a3534df3),
+                    # upheld cross-vendor by kimi-code, which reproduced it byte-exact.
+                    #
+                    # The skip is deliberately conditioned on the READ FAILING, not on the
+                    # shape alone: a patch file that really is named `2` still opens, still
+                    # parses, and still contributes its targets. Dropping every bare digit
+                    # unread would have opened a hole exactly the width of `git apply 2`.
+                    #
+                    # The `>&` branch in `_bash_write_targets` already skips the RIGHT side
+                    # of the same operator (`nxt.isdigit()` after a punct containing `&`).
+                    # It ran one token too late to catch the left side; this is that shape,
+                    # caught where the damage was.
+                    if pf.isdigit():
+                        continue
+                    raise
+                resolved = True
+            if not resolved:
+                # Every operand was an fd, so no patch source was named at all — the content
+                # is arriving on a pipe this classifier cannot read. Same posture as the
+                # `not pfiles` case above, and the same reason.
+                raise _OpaqueWriter()
             return out
         if sub == "checkout":
             # Only explicit pathspec overwrite (`checkout [-|tree-ish] -- paths`); a branch
