@@ -10877,6 +10877,123 @@ mod tests {
         );
     }
 
+    /// The stamp's whole claim is that `mailbox_reader: false` carries TWO different meanings and
+    /// the sibling bit separates them. `a_stale_mailbox_row_is_not_counted_as_a_peer_that_declined`
+    /// pins the STALE half — `false` / `true`, a row that exists and is old. This is the other
+    /// half: a seat that has never been read at all, `false` / `false`.
+    ///
+    /// It is also the arm that makes the stamp a READING rather than a constant. Every
+    /// `mailbox_reader_all_time` cell pinned on #558 expects `true`, because both seats in that
+    /// fixture have an inbox row; a closure hardcoding `"mailbox_reader_all_time": true` satisfies
+    /// them and the comment above `ev` — "a second measurement by the same pass, not a version
+    /// constant" — would be an unpinned claim. Here the column takes BOTH values inside ONE
+    /// event, so a constant of either polarity fails: `true` fails the never-read seat below,
+    /// `false` fails the live positive control beside it.
+    ///
+    /// Separate fixture rather than a third seat on the #558 test, deliberately: that test pins
+    /// `invited.len()` and every `peer_participation` bucket against a registry of exactly three
+    /// on the stated ground that "neither count has room to hide in the other". A third invitee
+    /// moves two of those counts and dilutes the "exactly the one seat" reasoning they encode.
+    #[tokio::test]
+    async fn a_never_read_mailbox_and_a_live_one_are_different_rows_in_the_same_evidence() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "codex-cli", "kimi-code"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id.to_string(), r["sessionId"].as_str().unwrap().to_string());
+        }
+        // TWO seats differing in ONE property: whether a watcher has EVER read the mailbox.
+        // `kimi-code` drains (a row exists, minted now); `codex-cli` is registered and never
+        // drained, so it has no `member_inbox_touch` row at all — the dead-letter class
+        // `recipient_liveness` calls `unknown`. No backdating here: the axis under test is
+        // existence, not vintage, and the #558 test already varies vintage.
+        {
+            let s = shared.lock().await;
+            s.inbox_store.drain_member("kimi-code").unwrap();
+        }
+
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": session_of["claude-code"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "reason": "Edit -> a governance file",
+            }),
+        )
+        .await
+        .unwrap();
+        let invited: Vec<String> = claimed["invited_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            invited.contains(&"codex-cli".to_string()) && invited.contains(&"kimi-code".to_string()),
+            "precondition: a never-read seat is still INVITED — over-issuing is deliberate, and \
+             the stamp is about what is RECORDED of an invitee, never about who is invited: \
+             {invited:?}"
+        );
+
+        let s = shared.lock().await;
+        let opened = s
+            .recent_chain(40)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened")
+            .expect("the open must be witnessed");
+        let cell = |peer: &str, key: &str| {
+            opened.event_data["invitation_evidence"]
+                .as_array()
+                .expect("per-peer invitation evidence")
+                .iter()
+                .find(|r| r["peer"] == json!(peer))
+                .unwrap_or_else(|| panic!("{peer} has an evidence row"))[key]
+                .clone()
+        };
+
+        // POSITIVE CONTROL first, so a closure hardcoding `false` is reported as what it is
+        // rather than as a passing test: a mailbox read seconds ago is a reader on BOTH
+        // readings.
+        assert_eq!(
+            (cell("kimi-code", "mailbox_reader"), cell("kimi-code", "mailbox_reader_all_time")),
+            (json!(true), json!(true)),
+            "live seat: both readings agree, and this is the cell a blanket `false` fails"
+        );
+
+        // THE MISSING CELL. `mailbox_reader` here is `false` — the same value the STALE seat
+        // carries on the #558 test — and the stamp is the only thing in the row that says which
+        // of the two this is.
+        assert_eq!(
+            (cell("codex-cli", "mailbox_reader"), cell("codex-cli", "mailbox_reader_all_time")),
+            (json!(false), json!(false)),
+            "never-read seat: BOTH readings are false. A stale seat reads `false`/`true` and a \
+             never-read seat reads `false`/`false`; without the second bit the append-only row \
+             cannot tell 'dead mailbox' from 'never seen', which is the whole reason the stamp \
+             was added"
+        );
+
+        // And the two bits are not the same bit wearing two names: across this ONE event the
+        // recorded reading agrees on `kimi-code` and the all-time reading DISAGREES with the
+        // stale case pinned on #558. Stated as a set so the assertion fails loudly if a future
+        // cleanup collapses the column to a constant.
+        let all_time: std::collections::BTreeSet<bool> = opened.event_data["invitation_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["mailbox_reader_all_time"].as_bool().expect("the stamp is a bool"))
+            .collect();
+        assert_eq!(
+            all_time,
+            [false, true].into_iter().collect(),
+            "the stamp column takes BOTH values in one event — it is a measurement, not the \
+             constant the #558 fixture alone cannot distinguish it from"
+        );
+    }
+
     /// A session that disagrees with the asserted `plugin_id` is a forgery, and the claim door
     /// must refuse it BEFORE spending anything — a claimed approval cannot be un-claimed.
     #[tokio::test]
