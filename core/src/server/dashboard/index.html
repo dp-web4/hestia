@@ -121,6 +121,15 @@
   .govern-chip:hover { color: var(--fg); background: var(--bg-elev); }
   .govern-chip.selected { background: var(--accent-dim); color: var(--accent); }
   .govern-pane[hidden] { display: none; }
+  /* THE SCROLLER IS BOUNDED EVERYWHERE, not only inside the pinned shell below (§6.4).
+     Until this rule existed, `.govern-scroll` was declared ONLY inside the desktop media
+     query, so under 1100px `overflow-y` computed to `visible` and the ledger rendered at
+     full content height: measured 27,192px of list turning the WINDOW into the scrollbar,
+     with the pane's own controls pushed off the top. A containment strategy that exists
+     only above a breakpoint is not a containment strategy; it is a desktop-only one, and
+     the half nobody develops at is the half that ships broken. `dvh` rather than `vh`
+     because mobile browsers shrink the visual viewport as their chrome retracts. */
+  .govern-scroll { max-height: 70dvh; overflow-y: auto; }
   .govern-pane-head { display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.5rem; }
   .govern-pane-head h2 { margin: 0; font-size: 0.95rem; }
   .policy-state { font-size: 0.72rem; color: var(--fg-dim); margin-left: auto; }
@@ -343,7 +352,21 @@
        like the fix was applied. Each view names ONE growing, scrolling region. */
     .govern-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
     .govern-pane:not([hidden]) { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
-    .govern-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+    /* Inside the pinned shell the flex chain decides this element's height, so the base
+       cap must yield — leaving it would clamp the scroller to 70dvh inside a shell that
+       already bounds it, and the pane would end short of the viewport it was pinned to. */
+    .govern-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; max-height: none; }
+    /* PIN THE FURNITURE. The chain above says which region GROWS; nothing said which
+       regions must not SHRINK, and flex items default to `flex-shrink: 1`. So when the
+       ledger overflowed, the browser recovered the difference from every sibling it was
+       allowed to — including the sub-nav, which has `overflow: hidden` for its pill
+       radius and therefore collapsed to a 2.6px bordered line with its chips clipped to
+       9.6px: still in the DOM, still focusable, visually a hairline and unclickable.
+       That is the same defect class as the `min-height: 0` note above, in the opposite
+       direction: there, a region that had to shrink could not; here, regions that must
+       not shrink did. Naming the grower is only half the contract. */
+    .govern-nav { flex: 0 0 auto; }
+    .govern-pane:not([hidden]) > :not(.govern-scroll) { flex: 0 0 auto; }
     .live-grid { flex: 1 1 auto; min-height: 0; }
     .live-grid > .card {
       display: flex; flex-direction: column; min-height: 0; max-height: 100%;
