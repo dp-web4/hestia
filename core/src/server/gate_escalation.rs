@@ -740,6 +740,23 @@ impl std::fmt::Display for OpenError {
                 "{n} escalations already pending (max {MAX_PENDING}) — refusing rather than \
                  evicting, because evicting the oldest lets a flood erase a pending decision"
             ),
+            // `act` is required for a DIFFERENT reason than the attribution fields, and the
+            // member reads this string to decide what to do next, so it does not get to
+            // inherit their sentence. An escalation that names no act is attributable and
+            // perfectly actionable by the operator — it is *unspendable afterwards*, which is
+            // the strictly worse failure: the approval is granted and then matches nothing
+            // (`None == None` is not a match in `claim`), and claim-or-open mints a fresh
+            // escalation on every retry. legion's review of #565 measured 200 approve →
+            // fail → reopen cycles with no refusal. Refusing here costs the member one error;
+            // accepting costs an operator ruling that can never be spent (#565 arm 3).
+            OpenError::MissingField("act") => write!(
+                f,
+                "'act' is required — an escalation that names no act binds no digest, so the \
+                 approval it earns can never be claimed and each retry opens another one. \
+                 Pass the act string EXACTLY as the deny text printed it; it is derived \
+                 (tool-name prefixed, truncated, possibly redacted) and cannot be \
+                 reconstructed from your own command"
+            ),
             OpenError::MissingField(name) => {
                 write!(f, "'{name}' is required — an unattributable escalation is not actionable")
             }
@@ -1035,6 +1052,37 @@ impl EscalationStore {
         }
         if marker.is_empty() {
             return Err(OpenError::MissingField("marker"));
+        }
+        // ARM 3 (legion's review of #565, 2026-08-21): REFUSE rather than mint an
+        // unspendable row. Binding the act to its own field fixed the *mismatched* digest;
+        // it left the *absent* digest open, and legion measured that the absent case
+        // reproduces the same loop this PR exists to close — approve → claim fails →
+        // claim-or-open mints a fresh escalation → repeat, 200 cycles with no refusal.
+        //
+        // WHY MAX_PENDING DOES NOT BACKSTOP IT: the quota above counts `Status::Pending`,
+        // and these rows are *Approved*. The obvious cap misses this by construction.
+        //
+        // WHY HERE AND NOT IN THE MEMBER-DOOR HANDLER, which is where the arm was found.
+        // The invariant that has to hold is "no `None`-digest row is mintable", and this is
+        // the only function that mints. `a_replayed_row_with_no_act_digest_is_unspendable`
+        // prices legacy `None` rows as acceptable *because* "the legacy population drains
+        // within one TTL" — a premise that holds only while nothing can create new ones. A
+        // check on one door leaves the premise resting on an enumeration of doors; a check
+        // here makes it structural. `rehydrate` inserts into `by_id` directly and does not
+        // route through `open`, so restoring the legacy population still works — which is
+        // the behaviour that stance actually needs.
+        //
+        // The gate-hook door is unaffected in practice: it falls back to `reason`, which has
+        // always carried the act string there. It trips only if a hook presents NEITHER, and
+        // that escalation would have been unspendable anyway.
+        //
+        // NOT the #128 stance on `session_id`, and the difference is the whole argument.
+        // `session_id` is optional because the refusal channel still WORKS without it — an
+        // unproven asker can still get an operator ruling. Here the channel is already dark:
+        // no path spends this approval. So refusing forfeits no capability, and trades a
+        // silent strand for a fact the member can act on.
+        if stated_act.map(str::trim).filter(|v| !v.is_empty()).is_none() {
+            return Err(OpenError::MissingField("act"));
         }
 
         // Count what is ACTUALLY pending as of now, not what is stored as Pending — otherwise
@@ -1968,12 +2016,45 @@ mod tests {
     }
 
     /// An approval that named no act authorises none (#539).
+    ///
+    /// REBUILT ON `rehydrate` (#565 arm 3, legion 2026-08-21). This test used to reach its
+    /// subject through `open(.., None, ..)`, which `open` now REFUSES — so as written it was
+    /// asserting a property of rows that no longer exist. That is the good outcome, but it
+    /// leaves the property itself still worth pinning, because `rehydrate` is the one path
+    /// that can still produce a `None`-digest row: entries written to the chain before
+    /// `act_digest` existed. Those are exactly the legacy population
+    /// `a_replayed_row_with_no_act_digest_is_unspendable` prices as an acceptable, draining
+    /// cost — and the price is only right if they are genuinely unspendable, which is what
+    /// this now measures. Reaching the subject the way production reaches it also means a
+    /// guard that ever leaked into the replay path would show up here as a vanished subject
+    /// rather than as a silent pass.
     #[test]
     fn an_approval_naming_no_act_cannot_be_spent() {
         let mut s = EscalationStore::default();
-        let e = s
-            .open("claude-code", "r", "Edit", "pre_tool_use.py", None, None, None, T0, DEFAULT_TTL_SECS)
-            .unwrap();
+        assert!(
+            matches!(
+                s.open("claude-code", "r", "Edit", "pre_tool_use.py", None, None, None, T0,
+                       DEFAULT_TTL_SECS),
+                Err(OpenError::MissingField("act"))
+            ),
+            "no-act rows must not be MINTABLE — that is arm 3, and it is what makes the \
+             legacy population below a draining cost rather than a standing one"
+        );
+        let restored = s.rehydrate(
+            &[chain_entry(
+                "gate_escalation_opened",
+                serde_json::json!({
+                    "escalation_id": "legacy-noact", "plugin_id": "claude-code",
+                    "role": "r", "tool_name": "Edit", "marker": "pre_tool_use.py",
+                    "opened_at": T0, "expires_at": T0 + DEFAULT_TTL_SECS,
+                    // No `act_digest` key: the pre-#539 shape.
+                }),
+            )],
+            T0 + 1,
+        );
+        assert_eq!(restored, 1, "the legacy row must restore, or there is nothing to measure");
+        let e = s.get("legacy-noact").expect("restored").clone();
+        assert!(e.act_digest.is_none(), "the subject of this test is a digest-less row");
         s.decide(&e.id, true, "operator", "role:constellation:sovereign",
                  Channel::OperatorSession, None, Some("approved"), T0 + 5)
             .unwrap();
@@ -2462,7 +2543,7 @@ mod tests {
     fn a_flood_is_refused_and_expired_entries_do_not_hold_the_quota() {
         let mut s = EscalationStore::default();
         for i in 0..MAX_PENDING {
-            s.open("claude-code", "r", "Edit", &format!("f{i}.py"), None, None, None, T0, 120)
+            s.open("claude-code", "r", "Edit", &format!("f{i}.py"), None, None, Some(TEST_ACT), T0, 120)
                 .expect("under the cap");
         }
         assert_eq!(
@@ -2713,7 +2794,7 @@ mod tests {
     fn open_reaps_so_terminal_entries_cannot_accumulate_without_bound() {
         let mut s = EscalationStore::default();
         for i in 0..10 {
-            s.open("claude-code", "r", "Edit", &format!("f{i}.py"), None, None, None, T0, 120).unwrap();
+            s.open("claude-code", "r", "Edit", &format!("f{i}.py"), None, None, Some(TEST_ACT), T0, 120).unwrap();
         }
         assert_eq!(s.len(), 10);
         // Long after they lapsed, one more open sweeps them.
@@ -2745,7 +2826,7 @@ mod bar_factor_tests {
     fn open_with(marker: &str) -> (EscalationStore, String) {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "role:constellation:member", "Edit", marker, None, None, None, T0, 120)
+            .open("claude-code", "role:constellation:member", "Edit", marker, None, None, Some(TEST_ACT), T0, 120)
             .expect("open");
         (s, e.id)
     }

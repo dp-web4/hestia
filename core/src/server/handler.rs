@@ -323,7 +323,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_gate_escalation_open",
-            "Ask a HUMAN to approve a write to the governance surface (gate, witness, law_inject, the registration). Stage 2 of dp's 2026-07-29 ruling: the gate refuses these writes, and this is the channel that un-refuses a legitimate one. Returns an escalation_id and a deadline; NO DECISION WITHIN THE WINDOW IS A DENY, not a retry. Witnessed on open. Assurance A1: the operator shares this UID, so approval is tamper-EVIDENT, not tamper-proof. PASS answers_deny = the chain hash of the deny you are escalating (hestia_witness_decision returns it as witnessEntryHash): without it the escalation is witnessed but UNLINKED, and unlinked escalations cannot be credited as conduct — escalating instead of routing around is the top of the Temperament scale (1.0 on approval), and the link is what makes it readable. It is never inferred from timing",
+            "Ask a HUMAN to approve a write to the governance surface (gate, witness, law_inject, the registration). Stage 2 of dp's 2026-07-29 ruling: the gate refuses these writes, and this is the channel that un-refuses a legitimate one. Returns an escalation_id and a deadline; NO DECISION WITHIN THE WINDOW IS A DENY, not a retry. Witnessed on open. Assurance A1: the operator shares this UID, so approval is tamper-EVIDENT, not tamper-proof. PASS answers_deny = the chain hash of the deny you are escalating (hestia_witness_decision returns it as witnessEntryHash): without it the escalation is witnessed but UNLINKED, and unlinked escalations cannot be credited as conduct — escalating instead of routing around is the top of the Temperament scale (1.0 on approval), and the link is what makes it readable. It is never inferred from timing. PASS act = the act string EXACTLY as the deny text printed it (#539): the approval is bound to that one act and is spendable by nothing else, so an escalation naming no act is REFUSED here rather than granted and then stranded. Do not retype it from your own command — it is derived (tool-name prefixed, truncated at 140/220 chars, may carry a redaction hash) and only the deny text has the bytes. `reason` is your rationale and is NOT a substitute; binding the two together is the defect this separation exists to close",
         ),
         t(
             "hestia_gate_pending_escalations",
@@ -10145,6 +10145,8 @@ mod tests {
                 "plugin_id": "codex",
                 "tool_name": "Edit",
                 "marker": "pre_tool_use.py",
+                // #565 arm 3: the act the approval binds to; required now.
+                "act": "Edit -> pre_tool_use.py",
             }),
         )
         .await
@@ -11514,6 +11516,8 @@ mod tests {
                 "role": "role:constellation:member",
                 "tool_name": "Edit",
                 "marker": "pre_tool_use.py",
+                // #565 arm 3: the act the approval binds to; required now.
+                "act": "Edit -> pre_tool_use.py",
             }),
         )
         .await
@@ -11555,6 +11559,8 @@ mod tests {
                 "session_id": session_of["codex"],
                 "tool_name": "Edit",
                 "marker": "pre_tool_use.py",
+                // #565 arm 3: the act the approval binds to; required now.
+                "act": "Edit -> pre_tool_use.py",
             }),
         )
         .await
@@ -11657,6 +11663,8 @@ mod tests {
                 "plugin_id": "codex",
                 "tool_name": "Edit",
                 "marker": "pre_tool_use.py",
+                // #565 arm 3: the act the approval binds to; required now.
+                "act": "Edit -> pre_tool_use.py",
             }),
         )
         .await
@@ -11760,6 +11768,8 @@ mod tests {
                 "session_id": session_of["codex"],
                 "tool_name": "Edit",
                 "marker": "pre_tool_use.py",
+                // #565 arm 3: the act the approval binds to; required now.
+                "act": "Edit -> pre_tool_use.py",
             }),
         )
         .await
@@ -11804,6 +11814,8 @@ mod tests {
                 "session_id": session_of["claude-code"],
                 "tool_name": "Bash",
                 "marker": "witness.py",
+                // #565 arm 3: the act the approval binds to; required now.
+                "act": "Bash -> witness.py",
             }),
         )
         .await
@@ -13512,6 +13524,8 @@ mod appeal_tests {
         let peer_sid = seat(&state, "codex").await;
         let opened = tool_gate_escalation_open(&state, &json!({
             "plugin_id": "claude-code", "tool_name": "policy_edit", "marker": "policy.json",
+            // #565 arm 3: the act the approval binds to; required now.
+            "act": "policy_edit -> policy.json",
             "reason": "the deny blocks a legitimate rule addition",
             "session_id": asker_sid.to_string(),
         })).await.unwrap();
@@ -13891,6 +13905,8 @@ mod appeal_tests {
         let peer_sid = seat(&state, "codex").await;
         let opened = tool_gate_escalation_open(&state, &json!({
             "plugin_id": "claude-code", "tool_name": "policy_edit", "marker": "policy.json",
+            // #565 arm 3: the act the approval binds to; required now.
+            "act": "policy_edit -> policy.json",
             "reason": "the deny blocks a legitimate rule addition",
             "session_id": asker_sid.to_string(),
         })).await.unwrap();
@@ -14738,9 +14754,16 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // RATIONALE by documentation, so binding the digest to it made every member-opened
     // escalation unspendable by the gate hook, which claims with an act string (#565,
     // legion's review). No fallback to `reason` here: falling back would restore exactly
-    // the conflation this separates. An escalation that states no act binds no digest and
-    // therefore authorises no specific write — `None == None` is not a match — which is the
-    // honest outcome and is now REPORTED to the opener rather than discovered at claim time.
+    // the conflation this separates.
+    //
+    // ABSENT is refused, in `EscalationStore::open`, and is NOT the same decision as
+    // no-fallback — legion's arm 3. This comment previously claimed the absent case was
+    // "REPORTED to the opener rather than discovered at claim time"; that overstated it.
+    // The only report was `"act_digest": null` in the open response — a field, not a
+    // warning, and one whose meaning ("this approval can never be spent") a member would
+    // have to already know to read. Measured, the absent case reproduced the same loop as
+    // the mismatched case. So the row is refused at open instead, and the refusal is
+    // witnessed as `gate_escalation_refused` by the `Err` arm below.
     let stated_act = optional_string(args, "act");
     // #128 (release blocker per #224, closed "superseded for coordination" rather than fixed):
     // this surface has always taken its asker as a bare string and accepted no session at all,
@@ -16493,6 +16516,12 @@ mod disposition_durability_tests {
     //!    be read as "nobody answered" (#499).
     //! 4. An OPEN escalation's pointer carries what the invited peer is woken to
     //!    weigh: stated_reason, bar, factors_present, invited_peers, asker_basis.
+    /// What the gate-hook door would send as the act for the surface these tests
+    /// exercise. Its VALUE is irrelevant here — none of these pins measure the binding;
+    /// they measure the disposition path, which cannot be reached at all unless an
+    /// escalation opens (#565 arm 3 refuses an act-less one).
+    const HOOK_DOOR_ACT: &str = "policy_edit -> policy.json";
+
     use super::*;
     use crate::server::gate_escalation::{now_secs, REAP_KEEP_SECS};
     use crate::server::state::ServerState;
@@ -16524,8 +16553,13 @@ mod disposition_durability_tests {
                 "policy.json",
                 stated_reason,
                 None,
-                // This helper stands in for the gate-hook door, where `reason` IS the act.
-                stated_reason,
+                // This helper stands in for the gate-hook door, where `reason` IS the act —
+                // INCLUDING its fallback. That door sends `act` and reaches for `reason` only
+                // when the hook sent none; callers here pass `None` for the reason whenever
+                // the reason is not what they are measuring, and since #565 arm 3 an act-less
+                // open is refused. So the stand-in has to fall back the same way the real door
+                // does, or it stops standing in for it.
+                stated_reason.or(Some(HOOK_DOOR_ACT)),
                 opened_at,
                 ttl_secs,
             )
@@ -17241,7 +17275,8 @@ mod disposition_durability_tests {
             let opened_at = real_now - 3 * 3600;
             let esc = s
                 .gate_escalations
-                .open("kimi-code", "", "policy_edit", "policy.json", None, None, None, opened_at, 3600)
+                .open("kimi-code", "", "policy_edit", "policy.json", None, None,
+                      Some(HOOK_DOOR_ACT), opened_at, 3600)
                 .unwrap();
             let id = esc.id.clone();
             s.gate_escalations
@@ -17561,6 +17596,8 @@ mod disposition_durability_tests {
         let sid = super::appeal_tests::seat(&state, "kimi-code").await;
         let opened = tool_gate_escalation_open(&state, &json!({
             "plugin_id": "kimi-code", "tool_name": "policy_edit", "marker": "policy.json",
+            // #565 arm 3: the act the approval binds to; required now.
+            "act": "policy_edit -> policy.json",
             "reason": "turns out the rule already covers it",
             "session_id": sid.to_string(),
         })).await.unwrap();

@@ -1967,12 +1967,24 @@ def deny_self_access(marker: str, tool_name: str, resource: Optional[str] = None
     # refused claim opens a fresh escalation. Telling the member the exact string is what
     # makes the member-initiated door usable at all: pass it back as `act` and the digest
     # the operator approved is the digest the retry presents.
-    if attempted:
-        sys.stderr.write(
-            f"hestia: if you escalate this yourself, pass act={attempted!r} to "
-            f"hestia_gate_escalation_open VERBATIM — the approval is bound to that exact "
-            f"string, and an escalation that states no act authorises no write.\n"
-        )
+    #
+    # PRINTED UNCONDITIONALLY, with the SAME fallback the wire uses (#565 arm 3, legion
+    # 2026-08-21). This was `if attempted:`, which was survivable while an act-less
+    # escalation merely bound nothing: the member filed one, and it was accepted. The daemon
+    # now REFUSES an escalation that names no act — so on a deny where `attempted` came back
+    # empty, a silent branch here would leave the member facing a door that requires a field
+    # this text declined to give it, and no way to find the string. The auto-open below
+    # already falls back to `f"{tool_name} -> {resource or marker}"`; the member-facing
+    # instruction has to fall back to the same bytes, or the two doors go back to disagreeing
+    # about what the act is, which is the whole defect this thread has been closing.
+    act_string = attempted or f"{tool_name} -> {resource or marker}"
+    sys.stderr.write(
+        f"hestia: if you escalate this yourself, pass act={act_string!r} to "
+        f"hestia_gate_escalation_open VERBATIM — the approval is bound to that exact "
+        f"string, an escalation that states no act is REFUSED, and retyping it from your "
+        f"own command produces different bytes that will never match. `reason` is your "
+        f"rationale and is not a substitute.\n"
+    )
     debug_log(f"gate-self-access deny: {tool_name} -> {resource or marker} "
               f"(marker {marker}) witnessed={witnessed}")
     return 2

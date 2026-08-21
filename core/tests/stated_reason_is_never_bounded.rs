@@ -111,6 +111,11 @@ fn the_store_keeps_an_overlong_credential_shaped_reason_verbatim() {
             "stated_reason_bound_probe",
             Some(&reason),
             Some(&detail),
+            // #539/#565 arm 3: `open` refuses an absent act, so this pin has to name one to
+            // reach the fields it measures. Deliberately SHORT and clean — the whole finding
+            // is that `reason`/`detail` are stored unbounded and unscrubbed, and an act
+            // carrying the same payload would confound which field survived.
+            Some("Bash -> stated_reason_bound_probe"),
             T0,
             3600,
         )

@@ -64,6 +64,11 @@ use std::path::Path;
 
 const T0: u64 = 1_800_000_000;
 
+/// The one act every escalation in this file is opened for and claimed with. Its VALUE is
+/// irrelevant to what is being measured — it only has to be the same on both ends, so the
+/// act binding is satisfied and the horizon is the only thing left that can refuse a claim.
+const ACT: &str = "Edit -> law_inject.py";
+
 /// The value `handler.rs` puts on the wire as `retry_within_secs`.
 ///
 /// Deliberately NOT `DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS` written out here. The
@@ -133,6 +138,12 @@ fn opened(ttl: u64) -> (EscalationStore, String) {
             "law_inject.py",
             None,
             None,
+            // #539/#565: the digest is bound at open from the ACT, and `claim` matches on it
+            // — `None == None` is explicitly not a match, and as of legion's arm 3 an absent
+            // act is refused at open outright. This file measures the claim HORIZON, so it
+            // has to get past the binding to say anything about time: open and claim both
+            // name the same act, and every assertion below is then purely about `now`.
+            Some(ACT),
             T0,
             ttl,
         )
@@ -190,7 +201,7 @@ fn the_advertised_retry_deadline_is_attainable_in_no_history() {
         // grant + window, so claim must succeed at grant+window-1 and fail at grant+window.
         let last_ok = T0 + grant_offset + APPROVAL_CLAIM_WINDOW_SECS - 1;
         assert!(
-            s.claim("claude-code", "law_inject.py", last_ok).is_some(),
+            s.claim("claude-code", "law_inject.py", Some(ACT), last_ok).is_some(),
             "grant at +{grant_offset}: the window did not run its full length"
         );
         best_horizon = best_horizon.max(last_ok + 1 - T0);
@@ -261,7 +272,7 @@ fn the_over_report_grows_as_the_decision_gets_faster() {
 
         // The asker who believed the advertised deadline and returned inside it is refused.
         assert!(
-            s.claim("claude-code", "law_inject.py", T0 + advertised_retry_secs - 1)
+            s.claim("claude-code", "law_inject.py", Some(ACT), T0 + advertised_retry_secs - 1)
                 .is_none(),
             "grant at +{grant_offset}: a claim at the advertised deadline was honoured"
         );

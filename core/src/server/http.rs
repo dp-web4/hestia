@@ -3522,7 +3522,10 @@ mod disposition_tests {
             let mut s = state.lock().await;
             let now = crate::server::gate_escalation::now_secs();
             s.gate_escalations
-                .open("kimi-code", "", "policy_edit", "policy.json", None, None, None, now, 3600)
+                .open("kimi-code", "", "policy_edit", "policy.json", None, None,
+                      // #565 arm 3: an act-less open is refused; these tests measure the
+                      // DISPOSITION path, so the act only has to be present and consistent.
+                      Some("policy_edit -> policy.json"), now, 3600)
                 .unwrap()
                 .id
         };
@@ -3561,7 +3564,10 @@ mod disposition_tests {
             let mut s = state.lock().await;
             let now = crate::server::gate_escalation::now_secs();
             s.gate_escalations
-                .open("kimi-code", "", "policy_edit", "policy.json", None, None, None, now, 3600)
+                .open("kimi-code", "", "policy_edit", "policy.json", None, None,
+                      // #565 arm 3: an act-less open is refused; these tests measure the
+                      // DISPOSITION path, so the act only has to be present and consistent.
+                      Some("policy_edit -> policy.json"), now, 3600)
                 .unwrap()
                 .id
         };
