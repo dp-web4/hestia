@@ -1640,7 +1640,24 @@
           + '<h3 style="margin:0 0 8px">Operator sign-in</h3>'
           + '<p style="margin:0 0 12px;color:#9aa7b4">Signed locally; the key never leaves this page.</p>'
           + savedBlock
-          + '<input type="file" id="op-cred-file" accept=".key,.json,application/json" style="margin-bottom:10px">'
+          + '<input type="file" id="op-cred-file" accept=".key,.json,application/json" style="margin-bottom:6px">'
+          // The default key lives at ~/.hestia/operator.key — inside a DOTFILE directory.
+          // An <input type="file"> hands off to the OS dialog, which hides dot-directories
+          // by default and which a page cannot configure; there is also no way for a page
+          // to accept a typed path (the browser will not read an arbitrary local path).
+          // So the picker alone cannot reach the file it exists to select. Say the two
+          // keystrokes that do, and offer a paste box for everyone they do not help.
+          + '<div style="color:#9aa7b4;font-size:12px;margin-bottom:10px">'
+          + 'Default location is <code style="color:#c9d5e1">~/.hestia/operator.key</code> — a hidden folder. '
+          + 'In the file dialog press <b>Ctrl+H</b> to show hidden files, or <b>Ctrl+L</b> to type the path.'
+          + ' &nbsp;·&nbsp; <a href="#" id="op-cred-paste-toggle" style="color:#2d6cdf">paste it instead</a></div>'
+          // Same data, same client-side handling as the file read below (f.text()), so the
+          // "never leaves this page" property is unchanged. Deliberately NOT a path box that
+          // asks the daemon to read a file off disk: that would move the credential onto a
+          // consequential server-side surface to fix a file-dialog affordance.
+          + '<textarea id="op-cred-paste" placeholder="…or paste the contents of operator.key here" '
+          + 'style="display:none;width:100%;box-sizing:border-box;height:74px;margin-bottom:10px;background:#0d1117;'
+          + 'color:#e6edf3;border:1px solid #2b3440;border-radius:6px;padding:8px;font:12px ui-monospace,monospace"></textarea>'
           + '<label style="display:block;color:#9aa7b4;font-size:12px;margin-bottom:8px">'
           + '<input type="checkbox" id="op-cred-remember" checked> remember on this device (one-click next time)</label>'
           + '<button id="op-cred-go" style="padding:8px 16px;background:#2d6cdf;color:#fff;border:0;border-radius:6px;cursor:pointer">Sign in</button>'
@@ -1671,11 +1688,23 @@
             err('saved key forgotten');
           };
         }
+        // Reveal the paste box on demand. It stays hidden by default so the file picker
+        // remains the primary path for anyone it already works for.
+        const pasteToggle = o.querySelector('#op-cred-paste-toggle');
+        if (pasteToggle) pasteToggle.onclick = ev => {
+          ev.preventDefault();
+          const ta = o.querySelector('#op-cred-paste');
+          ta.style.display = 'block'; ta.focus();
+          pasteToggle.style.display = 'none';
+        };
         o.querySelector('#op-cred-go').onclick = async () => {
           try {
+            // File first, pasted text as the fallback — whichever the operator actually
+            // supplied. Both end up as the same string on the same client-side path.
             const f = o.querySelector('#op-cred-file').files[0];
-            if (!f) return err('choose your operator.key file');
-            const text = await f.text();
+            const pasted = (o.querySelector('#op-cred-paste').value || '').trim();
+            if (!f && !pasted) return err('choose your operator.key file, or paste its contents');
+            const text = f ? await f.text() : pasted;
             await loadCredential(text);
             await signIn();
             if (o.querySelector('#op-cred-remember').checked) {
