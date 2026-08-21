@@ -14734,6 +14734,14 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // the operator ruled on an id, an asker and a path fragment (dp, 2026-08-02).
     let stated_reason = optional_string(args, "reason");
     let stated_detail = optional_string(args, "detail");
+    // THE ACT, and NOT `reason` — see `EscalationStore::open`. On this door `reason` is a
+    // RATIONALE by documentation, so binding the digest to it made every member-opened
+    // escalation unspendable by the gate hook, which claims with an act string (#565,
+    // legion's review). No fallback to `reason` here: falling back would restore exactly
+    // the conflation this separates. An escalation that states no act binds no digest and
+    // therefore authorises no specific write — `None == None` is not a match — which is the
+    // honest outcome and is now REPORTED to the opener rather than discovered at claim time.
+    let stated_act = optional_string(args, "act");
     // #128 (release blocker per #224, closed "superseded for coordination" rather than fixed):
     // this surface has always taken its asker as a bare string and accepted no session at all,
     // so `arbiter::eligibility` compares an ASSERTION (`appellant: &esc.plugin_id`) against an
@@ -14774,7 +14782,8 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     let esc = match s
         .gate_escalations
         .open(&plugin_id, &role, &tool_name, &marker,
-              stated_reason.as_deref(), stated_detail.as_deref(), now, DEFAULT_TTL_SECS)
+              stated_reason.as_deref(), stated_detail.as_deref(), stated_act.as_deref(),
+              now, DEFAULT_TTL_SECS)
     {
         Ok(e) => e,
         // A refusal to OPEN is itself a deny of the write, so it is witnessed rather than
@@ -15219,6 +15228,13 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // the operator ruled on an id, an asker and a path fragment (dp, 2026-08-02).
     let stated_reason = optional_string(args, "reason");
     let stated_detail = optional_string(args, "detail");
+    // THE ACT this write would perform, as the gate rendered it. The hook sends it as `act`;
+    // older hooks send it ONLY as `reason`, because on this door `reason` has always carried
+    // the attempted act rather than a rationale (the hook's own comment says so). The
+    // fallback is what makes the daemon and the hook deployable independently — without it,
+    // a daemon rolled out ahead of the hooks would bind `None` on every auto-open and strand
+    // every claim in flight, which is the same unspendable state #565 exists to remove.
+    let stated_act = optional_string(args, "act").or_else(|| stated_reason.clone());
     // The durable per-wake key the daemon's own outcome rows carry — the value that joins a
     // spent approval to the act that consumed it. ACCEPTED HERE ONLY TO BE CHECKED, NEVER TO
     // BE BELIEVED: the row written below carries the value DERIVED from the caller's proven
@@ -15325,7 +15341,8 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // is about to perform — the same field the opener stated and the operator was shown — so
     // a permit granted for one write can no longer be spent on another. A caller that states
     // nothing cannot claim: an unnamed act matches no approval.
-    if let Some(esc) = s.gate_escalations.claim(&plugin_id, &marker, stated_reason.as_deref(), now) {
+    // Compared against the digest bound at open — from the SAME field on both doors now.
+    if let Some(esc) = s.gate_escalations.claim(&plugin_id, &marker, stated_act.as_deref(), now) {
         // Spending an approval is an ACT and is witnessed. The approval itself was already
         // recorded when it was decided; this entry is what ties it to the write it authorised,
         // without which the record would show a permission granted and never show it used.
@@ -15410,7 +15427,8 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     match s
         .gate_escalations
         .open(&plugin_id, &role, &tool_name, &marker,
-              stated_reason.as_deref(), stated_detail.as_deref(), now, DEFAULT_TTL_SECS)
+              stated_reason.as_deref(), stated_detail.as_deref(), stated_act.as_deref(),
+              now, DEFAULT_TTL_SECS)
     {
         Ok(esc) => {
             // THE SAME WRITER THE OTHER DOOR USES. This fallback had its own hand-rolled
@@ -16506,6 +16524,8 @@ mod disposition_durability_tests {
                 "policy.json",
                 stated_reason,
                 None,
+                // This helper stands in for the gate-hook door, where `reason` IS the act.
+                stated_reason,
                 opened_at,
                 ttl_secs,
             )
@@ -17221,7 +17241,7 @@ mod disposition_durability_tests {
             let opened_at = real_now - 3 * 3600;
             let esc = s
                 .gate_escalations
-                .open("kimi-code", "", "policy_edit", "policy.json", None, None, opened_at, 3600)
+                .open("kimi-code", "", "policy_edit", "policy.json", None, None, None, opened_at, 3600)
                 .unwrap();
             let id = esc.id.clone();
             s.gate_escalations

@@ -49,6 +49,7 @@ ENV
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -1927,7 +1928,8 @@ def _describe_hit(marker: str, resource: Optional[str], key: Optional[str],
 
 
 def deny_self_access(marker: str, tool_name: str, resource: Optional[str] = None,
-                     key: Optional[str] = None, dest: Optional[str] = None) -> int:
+                     key: Optional[str] = None, dest: Optional[str] = None,
+                     attempted: str = "") -> int:
     """Refuse, loudly, and try to witness it as its own event class.
 
     Deliberately NOT an ordinary deny: an ordinary deny is a boundary met in the
@@ -1956,6 +1958,21 @@ def deny_self_access(marker: str, tool_name: str, resource: Optional[str] = None
         f"need changed and why. Do not work around this by another route: doing so is the "
         f"behaviour this rule exists to make visible.\n"
     )
+    # THE ACT STRING, verbatim, because an approval is now bound to it (#539/#565).
+    #
+    # A member that files its own `hestia_gate_escalation_open` states a rationale in
+    # `reason`; the retried write is claimed by THIS hook with the act string below. Those
+    # are different bytes, so an escalation opened without the act binds a digest that can
+    # never be matched — the approval is granted and then permanently unspendable, and each
+    # refused claim opens a fresh escalation. Telling the member the exact string is what
+    # makes the member-initiated door usable at all: pass it back as `act` and the digest
+    # the operator approved is the digest the retry presents.
+    if attempted:
+        sys.stderr.write(
+            f"hestia: if you escalate this yourself, pass act={attempted!r} to "
+            f"hestia_gate_escalation_open VERBATIM — the approval is bound to that exact "
+            f"string, and an escalation that states no act authorises no write.\n"
+        )
     debug_log(f"gate-self-access deny: {tool_name} -> {resource or marker} "
               f"(marker {marker}) witnessed={witnessed}")
     return 2
@@ -1977,6 +1994,30 @@ def deny_self_access(marker: str, tool_name: str, resource: Optional[str] = None
 # and was shadowed by it for the constant's entire life -- 1.5 has always been the value
 # in force. Removed 2026-08-05; zero behaviour change.)
 ESCALATION_RPC_TIMEOUT_S = 1.5
+
+
+def _act_fingerprint(s: str) -> str:
+    """A short, non-reversible discriminator for text that must NOT be echoed.
+
+    The redaction branches of `_attempted_summary` withhold the payload, which is correct —
+    a refusal is not a licence to copy a secret into the witness chain. But #539 binds a
+    human's approval to the digest of the string this function's caller returns, and those
+    branches previously rendered a value keyed only on `tool_name` and `len(...)`. So ANY TWO
+    credential-shaped acts of the same length produced the same act string, therefore the same
+    digest, therefore ONE approval that either could spend. legion's review of PR #565
+    (2026-08-21) named this as the residual worth closing, because equal-length is nearly free
+    to collide deliberately.
+
+    A truncated SHA-256 distinguishes them without revealing them: an operator still sees no
+    payload, and two different secrets no longer share an approval. 16 hex chars because this
+    separates acts within one (member, marker) — it is not a security boundary on its own, and
+    the bytes it stands for never leave this process.
+
+    NOT a fix for the other two lossy branches (the 220-char prefix and the 140-char path
+    tail) — those still collide by design, and are named in `_attempted_summary`'s docstring
+    so steps 3-4 can scope them.
+    """
+    return hashlib.sha256(s.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def _attempted_summary(tool_name: str, tool_input: Any) -> str:
@@ -2013,6 +2054,23 @@ def _attempted_summary(tool_name: str, tool_input: Any) -> str:
     a licence to copy a payload into the witness chain: an egress deny is ABOUT a secret
     path, so verbatim echo would reproduce the protected thing inside a record that is
     deliberately easier to read than the file was.
+
+    THIS RENDERING IS LOSSY, AND #539 BINDS APPROVALS TO IT. The Rust layer trims only the
+    ends and is otherwise byte-exact, so "exact bytes of the stated act" is true THERE and
+    false here — the string that arrives has already been through this function. Two acts
+    that collide below share one digest and therefore one approval. Named, not fixed, so
+    #539 steps 3-4 can scope them (legion's review of PR #565, 2026-08-21):
+
+    - **220-char command prefix** — `s[:220]`. Two commands sharing a 220-char prefix are
+      one act. The likeliest real collision: long, similar commands differing at the tail.
+    - **140-char path tail** — `v[-140:]`. Two paths sharing a 140-char tail are one act.
+    - ~~equal-length credential-shaped commands~~ — CLOSED. That branch was keyed on
+      `len(s)` alone, making any two equal-length secrets interchangeable; it now carries
+      `_act_fingerprint`, which separates them without echoing either.
+
+    The binding remains a large net improvement — 33 act shapes under one `(plugin_id,
+    marker)` key, down to prefix collisions — but a reader deciding what an approval covers
+    should know the residual is prefix-shaped, not zero.
     """
     if not isinstance(tool_input, dict):
         return f"{tool_name} (no inspectable input)"
@@ -2027,13 +2085,15 @@ def _attempted_summary(tool_name: str, tool_input: Any) -> str:
                 # Confirmed leaking before this existed.
                 if _credential_shaped(v):
                     return (f"{tool_name} [REDACTED — the target is a credential-shaped path; "
-                            f"{len(v)} chars withheld rather than copied into the record]")
+                            f"{len(v)} chars withheld rather than copied into the record] "
+                            f"#{_act_fingerprint(v)}")
                 return f"{tool_name} -> {v[-140:]}"
         return f"{tool_name} (no command or path in input)"
     s = " ".join(raw.split())
     if _credential_shaped(s):
         return (f"{tool_name} [REDACTED — names a credential-shaped token; "
-                f"{len(s)} chars withheld rather than copied into the record]")
+                f"{len(s)} chars withheld rather than copied into the record] "
+                f"#{_act_fingerprint(s)}")
     return f"{tool_name}: {s[:220]}" + (" …" if len(s) > 220 else "")
 
 
@@ -2175,6 +2235,13 @@ def request_self_write(marker: str, tool_name: str, attempted: str = "",
             # because it would look like the member had explained itself. A member that
             # wants to state a why calls `hestia_gate_escalation_open` and supplies one.
             "reason": attempted or f"{tool_name} -> {resource or marker}",
+            # THE SAME BYTES, in the field the daemon binds the act digest to (#539/#565).
+            # `reason` keeps carrying the act on THIS door for the rendering reason above,
+            # but the daemon must not have to guess which door a `reason` came from: on
+            # `hestia_gate_escalation_open` the same key is a member's rationale, and binding
+            # a digest to it made every member-opened approval unspendable by this call.
+            # Sent as a separate key so both doors bind and compare the same thing.
+            "act": attempted or f"{tool_name} -> {resource or marker}",
             "detail": (
                 "Auto-opened by the gate on a refused write; the member stated no rationale "
                 "because it did not choose to escalate. Approving authorises this one write."
@@ -2523,7 +2590,8 @@ def _fallback_self_protection(tool_name: str, tool_input: Any,
             if verdict != "approved":
                 debug_log(f"gate-self-write {verdict}: {detail}")
                 return deny_self_access(_self_marker, tool_name, resource=_self_resource,
-                                        key=_self_key, dest=_self_dest)
+                                        key=_self_key, dest=_self_dest,
+                                        attempted=_attempted_summary(tool_name, tool_input))
             # APPROVED -- the self-protection is lifted for THIS call only, and the call
             # continues to the ordinary policy check below. Approving a gate edit is not
             # approving everything else the same command might do.
@@ -2600,7 +2668,8 @@ def main() -> int:
             if verdict != "approved":
                 debug_log(f"gate-self-write {verdict}: {detail}")
                 return deny_self_access(_cv.marker or _cv.rule, tool_name,
-                                        resource=_cv.resource, key=_cv.rule)
+                                        resource=_cv.resource, key=_cv.rule,
+                                        attempted=_attempted_summary(tool_name, tool_input))
             # APPROVED -- the self-protection is lifted for THIS call only, and the call
             # continues to the ordinary policy check below. Approving a gate edit is not
             # approving everything else the same command might do.
