@@ -41,10 +41,24 @@ THE REPAIR is not a better guess. It is to print what the daemon measured — `q
      `fire_sender_allowlist_test.py`): the busy-member row and the dead-name row must
      be DISTINGUISHABLE, the never-seen misroute hint must survive, and an unparseable
      stamp must degrade to "quiet unknown" rather than killing the subshell — a crash
-     there empties the whole debt block silently.
+     there empties the whole debt block silently. B6/B7 assert the legend where it is
+     READ, not where it is written: A3 pins it in the SOURCE, and the source is not
+     what the member sees.
+
+WHAT A3 COULD NOT SEE (2026-08-21). The legend shipped as markdown — `quiet Xm`,
+`reads=N`, `NEVER SEEN` — inside `DEBT_BLOCK="..."`, a double-quoted shell assignment
+in which a backtick is command substitution. Bash ran all three: `quiet Xm` and
+`NEVER SEEN` as commands, `reads=N` as an assignment, and substituted each with its
+empty output. Every wake on every seat for three days read "Recipient liveness is
+EVIDENCE, not a diagnosis:  is how long since that recipient last READ its mailbox,
+ its lifetime read count." A3 passed throughout, because both of its substrings sit
+in the untouched half of the sentence. Only two of the three failures reach stderr,
+so the journal undercounts the holes — B7 pins the noise, B6 pins the loss.
 
 RED ARM: point `MESH_DIR` at a pre-fix checkout
 (`git worktree add /tmp/prefix 08317d9`) and A1/A2/A3 and B1/B2/B5 must fail.
+For B6/B7 the red arm is `origin/main` at fce6044 or any earlier commit back to
+531b1a0: A0-B5 all pass there and B6/B7 fail, which is the whole point of them.
 
 Usage: ./liveness_evidence_rendered_test.py     (runtime ~3s, no daemon, no network)
 """
@@ -225,6 +239,31 @@ for script, stub, peer in CASES:
               broken and "quiet unknown" in broken and "reads=7" in broken,
               f"row={broken!r} — the renderer is a subshell; an exception there drops the "
               f"ENTIRE unanswered block with no error the member can see")
+
+        # B6/B7 close the gap A3 leaves open. A3 asks whether the legend is in the
+        # SOURCE; it is — as markdown `quiet Xm`, inside a double-quoted shell
+        # assignment, where a backtick is command substitution, not punctuation.
+        # The three terms are therefore present in the file and ABSENT from the
+        # prompt, so every static check passes while every reader gets a sentence
+        # with three holes in it. The legend has to be asserted where it is READ.
+        legend = next((l for l in prompt.splitlines()
+                       if "Recipient liveness is EVIDENCE" in l), "")
+        lost = [t for t in ("quiet Xm", "reads=N", "NEVER SEEN") if t not in legend]
+        check(f"B6. {script}: the legend survives expansion into the prompt",
+              bool(legend) and not lost,
+              f"lost={lost} legend={legend!r} — the terms are in the script and gone from "
+              f"the prompt; a legend that defines `quiet Xm` and then renders '' teaches "
+              f"the reader nothing about the very field it exists to explain")
+
+        # And the tell that undercounts it. Of the three substitutions, only two are
+        # command position (`quiet Xm`, `NEVER SEEN`); `reads=N` is a valid assignment
+        # and dies SILENTLY. So the journal shows 2 errors for 3 holes, and anyone
+        # debugging from stderr alone fixes two and ships the third.
+        noise = [l for l in (r.stderr or "").splitlines() if "command not found" in l]
+        check(f"B7. {script}: firing the template executes nothing from its own prose",
+              not noise,
+              f"stderr={noise} — prose evaluated as shell; note stderr undercounts the "
+              f"damage, silent assignments leave a hole with no error at all")
 
 print()
 if failures:
