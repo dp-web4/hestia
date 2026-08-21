@@ -72,6 +72,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+/// The act every claiming test states at BOTH ends (#539). Before act binding, the claim
+/// compared nothing to the act — so these fixtures opened with no act at all and still spent
+/// the permit. That the tests needed changing at all is the defect, visible in the fixtures.
+#[cfg(test)]
+const TEST_ACT: &str = "Edit -> /repo/core/src/example_target.rs";
+
 /// How long a pending escalation stays decidable.
 ///
 /// It was 120s, from dp's original instruction: *"deny on timeout of a couple minutes."* That
@@ -298,6 +304,32 @@ pub struct Escalation {
     /// under-claims this finding rather than over-claiming it.
     #[serde(default)]
     pub invited_without_reader: Vec<String>,
+    /// Digest of the EXACT act text this approval was rendered from (#539).
+    ///
+    /// The claim join was `(plugin_id, marker, claimable)` and compared nothing to the act
+    /// the operator saw. Measured on a 21,000-entry chain walk and replicated by a second
+    /// seat: **23 of 40 claims (58%) were spent on a different act than the one approved**.
+    /// One approval to edit a file was spent on `systemctl --user restart hestia` 99 seconds
+    /// later — an approval for a file edit, spent restarting the daemon that enforces
+    /// approvals. Nothing flagged it, because the join could not see it.
+    ///
+    /// `marker` does not scope this: it names the RULE that refused, not the request. The
+    /// same walk found 33 distinct act shapes under one `(plugin_id, marker)` key, none
+    /// holding more than a quarter of them.
+    ///
+    /// NOT canonicalised, deliberately. A canonical form is a rendering nobody was shown,
+    /// and with 33 shapes under one key there is no safe normalisation. Exact bytes of the
+    /// stated act, so a near-miss — the same act with one path absolute and one relative,
+    /// which several of the 23 were — requires a fresh ask. That is what all three seat
+    /// gate-scripts already promise the operator, in those words: "Approving authorises
+    /// this one write."
+    ///
+    /// `None` when the opener stated no act, and such a row is NOT claimable: an approval
+    /// naming no act cannot authorise a specific one. Legacy rows opened before this field
+    /// deserialize to `None` and are therefore unspendable — the population drains within
+    /// one TTL, and failing closed for that hour is the safe direction for a permit.
+    #[serde(default)]
+    pub act_digest: Option<String>,
     /// The member asking. Recorded as claimed — `plugin_id` is caller-asserted (HST-005), and
     /// this field inherits that weakness rather than laundering it.
     pub plugin_id: String,
@@ -890,6 +922,9 @@ impl EscalationStore {
                             // Recomputed from the marker rather than read from the entry: the
                             // claim path's `opened` event does not carry `bar`, and a default
                             // would silently lower the criterion an escalation is judged against.
+                            // Restored from the entry, so a restart keeps the binding.
+                            // Absent on legacy rows opened before #539 -> None -> unspendable.
+                            act_digest: s(d, "act_digest"),
                             stated_reason: s(d, "stated_reason"),
                             stated_detail: s(d, "stated_detail"),
                             bar: bar_for(&marker),
@@ -1023,6 +1058,11 @@ impl EscalationStore {
             id: id.clone(),
             invited_peers: Vec::new(),
             invited_without_reader: Vec::new(),
+            // Bound at OPEN, from the same text every decision surface renders (#539).
+            act_digest: stated_reason
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(Self::act_digest_of),
             plugin_id: plugin_id.to_string(),
             // Fail closed: every `open` caller is unproven until the handler records
             // otherwise via `record_asker_basis`. An asserted-by-default asker can be
@@ -1166,7 +1206,33 @@ impl EscalationStore {
         Some(known.contains(marker.trim()))
     }
 
-    pub fn claim(&mut self, plugin_id: &str, marker: &str, now: u64) -> Option<Escalation> {
+    /// The act digest (#539). Exact bytes of the stated act, trimmed only at the ends.
+    ///
+    /// Trimming is the ONE normalisation, and it is here because leading/trailing whitespace
+    /// is invisible on every surface that renders the act — an operator cannot approve a
+    /// trailing space differently from its absence, so treating them as different acts would
+    /// refuse a re-issue the operator would call identical. Nothing else is normalised: case,
+    /// separators, path spelling and argument order are all part of the act, because they are
+    /// all part of what was shown.
+    pub fn act_digest_of(act: &str) -> String {
+        let mut h = Sha256::new();
+        h.update(act.trim().as_bytes());
+        format!("{:x}", h.finalize())
+    }
+
+    /// Spend an approval — now keyed on the ACT, not merely on the rule that refused it.
+    ///
+    /// `attempted_act` is the caller's statement of what it is about to do, at claim time.
+    /// It is digested and compared against the digest bound at open. A caller that states
+    /// nothing, or states a different act, gets `None` and must ask again — which is the
+    /// behaviour the operator was already promised.
+    pub fn claim(
+        &mut self,
+        plugin_id: &str,
+        marker: &str,
+        attempted_act: Option<&str>,
+        now: u64,
+    ) -> Option<Escalation> {
         let plugin_id = plugin_id.trim();
         let marker = marker.trim();
         if plugin_id.is_empty() || marker.is_empty() {
@@ -1182,10 +1248,25 @@ impl EscalationStore {
             .insert(marker.to_string());
         // Oldest claimable first, so a member that somehow holds two approvals spends the one
         // closest to expiring rather than stranding it.
+        let want_digest = attempted_act
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(Self::act_digest_of);
         let mut ids: Vec<(u64, String)> = self
             .by_id
             .values()
-            .filter(|e| e.plugin_id == plugin_id && e.marker == marker && e.is_claimable(now))
+            .filter(|e| {
+                // (plugin_id, marker, ACT DIGEST, claimable) — #539. Both sides must carry a
+                // digest and they must be equal: `None == None` is NOT a match, because an
+                // approval that named no act cannot authorise this one.
+                e.plugin_id == plugin_id
+                    && e.marker == marker
+                    && match (&e.act_digest, &want_digest) {
+                        (Some(bound), Some(asked)) => bound == asked,
+                        _ => false,
+                    }
+                    && e.is_claimable(now)
+            })
             .map(|e| (e.opened_at, e.id.clone()))
             .collect();
         ids.sort();
@@ -1413,6 +1494,10 @@ mod tests {
                     "escalation_id": id, "plugin_id": "kimi-code", "role": "role:constellation:member",
                     "tool_name": "Bash", "marker": "law_inject.py",
                     "opened_at": T0, "expires_at": T0 + 3600,
+                    // #539: the binding must survive replay. Without this the restored row
+                    // carries no digest and is unspendable — which is exactly the LEGACY
+                    // behaviour, pinned separately below.
+                    "act_digest": EscalationStore::act_digest_of(TEST_ACT),
                 }),
             )
         };
@@ -1436,7 +1521,7 @@ mod tests {
         let mut s = EscalationStore::default();
         assert_eq!(s.rehydrate(&[opened("aaa1"), decided("aaa1", "approved")], T0 + 20), 1);
         assert_eq!(s.status_of("aaa1", T0 + 20), Status::Approved);
-        assert!(s.claim("kimi-code", "law_inject.py", T0 + 20).is_some());
+        assert!(s.claim("kimi-code", "law_inject.py", Some(TEST_ACT), T0 + 20).is_some());
 
         // Approved then CLAIMED -> restored as spent, and unclaimable.
         let mut s2 = EscalationStore::default();
@@ -1449,7 +1534,7 @@ mod tests {
             T0 + 20,
         );
         assert!(
-            s2.claim("kimi-code", "law_inject.py", T0 + 20).is_none(),
+            s2.claim("kimi-code", "law_inject.py", Some(TEST_ACT), T0 + 20).is_none(),
             "a restart re-armed an approval the chain shows was already spent — crashing the \
              daemon must not be a way to reuse a human's yes"
         );
@@ -1555,7 +1640,7 @@ mod tests {
 
         // And the live path: `open` defaults to Asserted until the handler records the proof.
         let mut s3 = EscalationStore::default();
-        let e = s3.open("codex", "r", "Edit", "pre_tool_use.py", None, None, T0, 120).unwrap();
+        let e = s3.open("codex", "r", "Edit", "pre_tool_use.py", Some(TEST_ACT), None, T0, 120).unwrap();
         assert_eq!(e.asker_basis, crate::arbiter::AskerBasis::Asserted);
         assert!(s3.record_asker_basis(&e.id, crate::arbiter::AskerBasis::Session));
         assert_eq!(s3.get(&e.id).map(|e| e.asker_basis), Some(crate::arbiter::AskerBasis::Session));
@@ -1671,7 +1756,7 @@ mod tests {
     fn store_with_one_simple_marker() -> (EscalationStore, String) {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "role:constellation:member", "Edit", "law_inject.py", None, None, T0, 120)
+            .open("claude-code", "role:constellation:member", "Edit", "law_inject.py", Some(TEST_ACT), None, T0, 120)
             .expect("open");
         (s, e.id)
     }
@@ -1679,7 +1764,7 @@ mod tests {
     fn store_with_one() -> (EscalationStore, String) {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "role:constellation:member", "Edit", "pre_tool_use.py", None, None, T0, 120)
+            .open("claude-code", "role:constellation:member", "Edit", "pre_tool_use.py", Some(TEST_ACT), None, T0, 120)
             .expect("open");
         (s, e.id)
     }
@@ -1694,6 +1779,104 @@ mod tests {
         }
     }
 
+    /// A permit granted for one act cannot be spent on another (#539).
+    ///
+    /// Measured before this binding existed, on a 21,000-entry chain walk replicated by a
+    /// second seat: 23 of 40 claims (58%) were spent on a different act than the one
+    /// approved. The worst single case was an approval to EDIT A FILE spent on a daemon
+    /// restart 99 seconds after decision — an approval for a file edit, spent restarting the
+    /// daemon that enforces approvals. Nothing refused it, because the join was
+    /// `(plugin_id, marker, claimable)` and compared nothing to the act.
+    ///
+    /// `marker` cannot stand in for the act: it names the RULE that refused, not the
+    /// request. That walk found 33 distinct act shapes under one `(plugin_id, marker)` key.
+    /// This test uses that exact pair — same seat, same marker, same claimable window — so
+    /// the ONLY thing that can refuse the substitution is the act digest.
+    /// A row restored WITHOUT an act digest cannot be spent (#539).
+    ///
+    /// Escalations opened before act binding carry no `act_digest` on the chain, so replay
+    /// gives them `None` — and `None` matches no act. They are therefore unspendable, and a
+    /// member holding one must ask again.
+    ///
+    /// This is the deliberate migration stance and the safe direction: the alternative is a
+    /// permit that predates binding retaining the fungibility binding exists to remove. The
+    /// legacy population drains within one TTL, so the cost is bounded by the hour after
+    /// deploy; the cost of the other choice is unbounded and invisible.
+    #[test]
+    fn a_replayed_row_with_no_act_digest_is_unspendable() {
+        let opened = chain_entry(
+            "gate_escalation_opened",
+            serde_json::json!({
+                "escalation_id": "legacy1", "plugin_id": "kimi-code",
+                "role": "role:constellation:member", "tool_name": "Bash",
+                "marker": "law_inject.py", "opened_at": T0, "expires_at": T0 + 3600,
+                // no `act_digest` — this is what every pre-#539 row looks like
+            }),
+        );
+        let decided = chain_entry(
+            "gate_escalation_decided",
+            serde_json::json!({
+                "escalation_id": "legacy1", "plugin_id": "kimi-code", "status": "approved",
+                "decided_by": "operator", "decided_role": "role:constellation:sovereign",
+                "decided_via": "operator_session", "decided_at": T0 + 5,
+            }),
+        );
+        let mut s = EscalationStore::default();
+        s.rehydrate(&[opened, decided], T0 + 10);
+        assert!(
+            s.claim("kimi-code", "law_inject.py", Some(TEST_ACT), T0 + 10).is_none(),
+            "a permit that predates act binding names no act, so it authorises none"
+        );
+    }
+
+    #[test]
+    fn an_approval_for_one_act_cannot_be_spent_on_another() {
+        const APPROVED: &str = "Edit -> /repo/core/src/example_target.rs";
+        const SUBSTITUTE: &str = "Bash -> restart the daemon";
+
+        let mut s = EscalationStore::default();
+        let e = s
+            .open("claude-code", "r", "Edit", "pre_tool_use.py", Some(APPROVED), None,
+                  T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        s.decide(&e.id, true, "operator", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("approved"), T0 + 5)
+            .unwrap();
+
+        assert!(
+            s.claim("claude-code", "pre_tool_use.py", Some(SUBSTITUTE), T0 + 10).is_none(),
+            "a permit granted for a file edit must not be spendable on a daemon restart"
+        );
+        assert!(
+            s.claim("claude-code", "pre_tool_use.py", Some(APPROVED), T0 + 11).is_some(),
+            "the act it was granted for still claims it"
+        );
+        assert!(
+            s.claim("claude-code", "pre_tool_use.py", Some(APPROVED), T0 + 12).is_none(),
+            "and only once"
+        );
+    }
+
+    /// An approval that named no act authorises none (#539).
+    #[test]
+    fn an_approval_naming_no_act_cannot_be_spent() {
+        let mut s = EscalationStore::default();
+        let e = s
+            .open("claude-code", "r", "Edit", "pre_tool_use.py", None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        s.decide(&e.id, true, "operator", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("approved"), T0 + 5)
+            .unwrap();
+        assert!(
+            s.claim("claude-code", "pre_tool_use.py", Some("Edit -> anything"), T0 + 10).is_none(),
+            "an unnamed approval matches no act"
+        );
+        assert!(
+            s.claim("claude-code", "pre_tool_use.py", None, T0 + 10).is_none(),
+            "and stating nothing at claim time matches nothing either"
+        );
+    }
+
     #[test]
     fn a_sovereign_may_rule_a_two_bar_alone_and_the_absent_peer_is_recorded() {
         // dp, decision of record 2026-08-06: "On sovereign decisions, two-bar is an
@@ -1705,7 +1888,7 @@ mod tests {
         // This test is the arithmetic of that ruling: it FAILS on the old semantics.
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let id = e.id.clone();
         assert_eq!(s.get(&id).unwrap().bar, Bar::SovereignPlusPeer);
@@ -1746,7 +1929,7 @@ mod tests {
     fn a_late_readers_answer_cannot_hide_a_readable_peers_absence() {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let id = e.id.clone();
         s.invite(&id, vec!["late-reader".into(), "readable-but-absent".into()]);
@@ -1809,7 +1992,7 @@ mod tests {
     fn one_answer_serves_both_deciding_surfaces() {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let id = e.id.clone();
         let decided = s
@@ -1856,7 +2039,7 @@ mod tests {
     fn permits_write_tracks_the_two_conjuncts_that_move() {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let id = e.id.clone();
         let decided = s
@@ -1898,7 +2081,7 @@ mod tests {
         // one that produced the false publication on 2026-08-18: a permit already claimed,
         // polled back as live.
         let claimed = s
-            .claim("claude-code", "pre_tool_use.py", T0 + 10)
+            .claim("claude-code", "pre_tool_use.py", Some(TEST_ACT), T0 + 10)
             .expect("the approval is claimable at T0+10, so the claim must find it");
         assert_eq!(claimed.consumed_at, Some(T0 + 10), "and the claim spends it");
         let spent = s.get(&id).unwrap().decision_reply(T0 + 11);
@@ -1939,7 +2122,7 @@ mod tests {
     fn an_approval_that_meets_no_bar_reports_that_it_permits_nothing() {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let id = e.id.clone();
         s.decide(&id, true, "operator", "role:constellation:sovereign",
@@ -1979,7 +2162,7 @@ mod tests {
     fn an_uninvited_peer_reads_as_uninvited_not_as_agreement() {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         assert!(
             e.invited_peers.is_empty(),
@@ -2054,7 +2237,7 @@ mod tests {
         // blocker again by the back door.
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let id = e.id.clone();
         s.decide(&id, true, "operator", "role:constellation:sovereign",
@@ -2160,7 +2343,7 @@ mod tests {
             OpenError::MissingField("tool_name")
         );
         assert_eq!(
-            s.open("claude-code", "r", "Edit", "   ", None, None, T0, 120).unwrap_err(),
+            s.open("claude-code", "r", "Edit", "   ", Some(TEST_ACT), None, T0, 120).unwrap_err(),
             OpenError::MissingField("marker")
         );
     }
@@ -2173,21 +2356,21 @@ mod tests {
                 .expect("under the cap");
         }
         assert_eq!(
-            s.open("claude-code", "r", "Edit", "one-too-many.py", None, None, T0, 120)
+            s.open("claude-code", "r", "Edit", "one-too-many.py", Some(TEST_ACT), None, T0, 120)
                 .unwrap_err(),
             OpenError::TooManyPending(MAX_PENDING)
         );
         // Once they lapse, the quota frees — otherwise a member's own timeouts would lock it out
         // of ever escalating again, which is a deny with no decision behind it.
-        s.open("claude-code", "r", "Edit", "later.py", None, None, T0 + 121, 120)
+        s.open("claude-code", "r", "Edit", "later.py", Some(TEST_ACT), None, T0 + 121, 120)
             .expect("expired entries must not hold the quota");
     }
 
     #[test]
     fn ids_are_distinct_within_the_same_second() {
         let mut s = EscalationStore::default();
-        let a = s.open("claude-code", "r", "Edit", "gate.py", None, None, T0, 120).unwrap();
-        let b = s.open("claude-code", "r", "Edit", "gate.py", None, None, T0, 120).unwrap();
+        let a = s.open("claude-code", "r", "Edit", "gate.py", Some(TEST_ACT), None, T0, 120).unwrap();
+        let b = s.open("claude-code", "r", "Edit", "gate.py", Some(TEST_ACT), None, T0, 120).unwrap();
         assert_ne!(a.id, b.id, "same member, same file, same second must still differ");
     }
 
@@ -2230,9 +2413,9 @@ mod tests {
         s.decide(&id, true, "kimi-code", "role:constellation:reviewer",
                  Channel::PeerMember, Some(Independence::CrossVendor), Some("ok"), T0 + 2)
             .unwrap();
-        assert!(s.claim("claude-code", "law_inject.py", T0 + 3).is_some());
+        assert!(s.claim("claude-code", "law_inject.py", Some(TEST_ACT), T0 + 3).is_some());
         assert!(
-            s.claim("claude-code", "law_inject.py", T0 + 4).is_none(),
+            s.claim("claude-code", "law_inject.py", Some(TEST_ACT), T0 + 4).is_none(),
             "a peer-granted approval must be spent like any other"
         );
     }
@@ -2256,10 +2439,10 @@ mod tests {
         // daemon restarts, which is not what anybody approved.
         let (mut s, id) = store_with_one_simple_marker();
         s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 5).unwrap();
-        let first = s.claim("claude-code", "law_inject.py", T0 + 6);
+        let first = s.claim("claude-code", "law_inject.py", Some(TEST_ACT), T0 + 6);
         assert!(first.is_some(), "the approval it was granted for must be claimable");
         assert_eq!(first.unwrap().consumed_at, Some(T0 + 6));
-        let second = s.claim("claude-code", "law_inject.py", T0 + 7);
+        let second = s.claim("claude-code", "law_inject.py", Some(TEST_ACT), T0 + 7);
         assert!(second.is_none(), "a spent approval must not authorise a second write");
     }
 
@@ -2269,14 +2452,14 @@ mod tests {
             let (mut s, id) = store_with_one();
             s.decide(&id, approve, "dp", "role:constellation:sovereign", Channel::LocalCli, None, None, T0 + 1).unwrap();
             assert!(
-                s.claim("claude-code", "pre_tool_use.py", T0 + 2).is_none(),
+                s.claim("claude-code", "pre_tool_use.py", Some(TEST_ACT), T0 + 2).is_none(),
                 "{label} must not be claimable"
             );
         }
         // Undecided, and lapsed-undecided, likewise.
         let (mut s, _) = store_with_one();
-        assert!(s.claim("claude-code", "pre_tool_use.py", T0 + 2).is_none(), "pending");
-        assert!(s.claim("claude-code", "pre_tool_use.py", T0 + 500).is_none(), "expired");
+        assert!(s.claim("claude-code", "pre_tool_use.py", Some(TEST_ACT), T0 + 2).is_none(), "pending");
+        assert!(s.claim("claude-code", "pre_tool_use.py", Some(TEST_ACT), T0 + 500).is_none(), "expired");
     }
 
     #[test]
@@ -2299,7 +2482,7 @@ mod tests {
         let (mut s, id) = store_with_one_simple_marker();
         s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), granted_at).unwrap();
         assert!(
-            s.claim("claude-code", "law_inject.py", granted_at + APPROVAL_CLAIM_WINDOW_SECS - 1).is_some(),
+            s.claim("claude-code", "law_inject.py", Some(TEST_ACT), granted_at + APPROVAL_CLAIM_WINDOW_SECS - 1).is_some(),
             "an approval must stay claimable through grant + window - 1"
         );
 
@@ -2307,7 +2490,7 @@ mod tests {
         s2.decide(&id2, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), granted_at).unwrap();
         for t in [granted_at + APPROVAL_CLAIM_WINDOW_SECS, T0 + 4_199, T0 + 86_400] {
             assert!(
-                s2.claim("claude-code", "law_inject.py", t).is_none(),
+                s2.claim("claude-code", "law_inject.py", Some(TEST_ACT), t).is_none(),
                 "grant + window has closed; nothing at {t} may still ride it"
             );
         }
@@ -2325,7 +2508,7 @@ mod tests {
         let old_ceiling = T0 + DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS;
         for grant in [T0, T0 + 1, T0 + 90, T0 + 119] {
             let mut s = EscalationStore::default();
-            let e = s.open("claude-code", "r", "Edit", "gate.py", None, None, T0, ttl).unwrap();
+            let e = s.open("claude-code", "r", "Edit", "gate.py", Some(TEST_ACT), None, T0, ttl).unwrap();
             s.decide(&e.id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), grant).unwrap();
             let esc = s.get(&e.id).unwrap();
             assert!(
@@ -2341,7 +2524,7 @@ mod tests {
         // The synthesised grant, directly: bounded by the record, not by the timestamp
         // the replay invented.
         let mut s = EscalationStore::default();
-        let e = s.open("claude-code", "r", "Edit", "gate.py", None, None, T0, ttl).unwrap();
+        let e = s.open("claude-code", "r", "Edit", "gate.py", Some(TEST_ACT), None, T0, ttl).unwrap();
         s.decide(&e.id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 1).unwrap();
         let mut esc = s.get(&e.id).unwrap().clone();
         esc.decided_at = Some(T0 + 1_000_000);
@@ -2362,11 +2545,11 @@ mod tests {
         // nor let a different member spend someone else's approval.
         let (mut s, id) = store_with_one_simple_marker();
         s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 1).unwrap();
-        assert!(s.claim("claude-code", "witness.py", T0 + 2).is_none(), "wrong file");
-        assert!(s.claim("kimi-code", "law_inject.py", T0 + 2).is_none(), "wrong member");
-        assert!(s.claim("", "law_inject.py", T0 + 2).is_none(), "empty member");
-        assert!(s.claim("claude-code", "", T0 + 2).is_none(), "empty file");
-        assert!(s.claim("claude-code", "law_inject.py", T0 + 2).is_some(), "the exact pair");
+        assert!(s.claim("claude-code", "witness.py", Some(TEST_ACT), T0 + 2).is_none(), "wrong file");
+        assert!(s.claim("kimi-code", "law_inject.py", Some(TEST_ACT), T0 + 2).is_none(), "wrong member");
+        assert!(s.claim("", "law_inject.py", Some(TEST_ACT), T0 + 2).is_none(), "empty member");
+        assert!(s.claim("claude-code", "", Some(TEST_ACT), T0 + 2).is_none(), "empty file");
+        assert!(s.claim("claude-code", "law_inject.py", Some(TEST_ACT), T0 + 2).is_some(), "the exact pair");
     }
 
     #[test]
@@ -2397,7 +2580,7 @@ mod tests {
         );
 
         let now = T0 + 120;
-        let claimed = s.claim("claude-code", "law_inject.py", now).expect("claim");
+        let claimed = s.claim("claude-code", "law_inject.py", Some(TEST_ACT), now).expect("claim");
         let from_decision = now - claimed.decided_at.expect("a claimed approval was decided");
         let from_open = now - claimed.opened_at;
         assert_eq!(from_decision, 1, "decision -> use");
@@ -2424,7 +2607,7 @@ mod tests {
         }
         assert_eq!(s.len(), 10);
         // Long after they lapsed, one more open sweeps them.
-        s.open("claude-code", "r", "Edit", "later.py", None, None, T0 + DEFAULT_TTL_SECS + REAP_KEEP_SECS + 1, 120)
+        s.open("claude-code", "r", "Edit", "later.py", Some(TEST_ACT), None, T0 + DEFAULT_TTL_SECS + REAP_KEEP_SECS + 1, 120)
             .unwrap();
         assert_eq!(s.len(), 1, "reap must run on open, not only in its own test");
     }
@@ -2432,8 +2615,8 @@ mod tests {
     #[test]
     fn pending_lists_oldest_first_and_hides_the_expired() {
         let mut s = EscalationStore::default();
-        let old = s.open("claude-code", "r", "Edit", "a.py", None, None, T0, 120).unwrap();
-        let new = s.open("kimi-code", "r", "Write", "b.py", None, None, T0 + 30, 120).unwrap();
+        let old = s.open("claude-code", "r", "Edit", "a.py", Some(TEST_ACT), None, T0, 120).unwrap();
+        let new = s.open("kimi-code", "r", "Write", "b.py", Some(TEST_ACT), None, T0 + 30, 120).unwrap();
         let ids: Vec<&str> = s.pending(T0 + 31).iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, vec![old.id.as_str(), new.id.as_str()]);
         // `old` lapses first; the list must stop offering it as decidable.
@@ -2490,7 +2673,7 @@ mod bar_factor_tests {
         assert_eq!(s.marker_is_recognised("m", readable), None);
 
         // A gate claims (finding nothing) and in doing so teaches its authoritative spelling.
-        assert!(s.claim("m", gate_marker, T0).is_none());
+        assert!(s.claim("m", gate_marker, Some(TEST_ACT), T0).is_none());
         assert_eq!(s.known_gate_markers("m"), vec![gate_marker.to_string()]);
         assert_eq!(s.marker_is_recognised("m", gate_marker), Some(true));
         assert_eq!(
@@ -2513,7 +2696,7 @@ mod bar_factor_tests {
         assert!(decided.bar_met(), "the approval is real and meets its bar");
         assert!(decided.is_claimable(T0 + 6), "and it is claimable — under ITS marker");
         assert!(
-            s.claim("m", gate_marker, T0 + 6).is_none(),
+            s.claim("m", gate_marker, Some(TEST_ACT), T0 + 6).is_none(),
             "APPROVED AND UNREACHABLE: the gate joins on its own spelling, so a genuine \
              operator approval buys nothing and the member cannot tell why"
         );
@@ -2630,7 +2813,7 @@ mod ttl_tests {
         // a mesh notice, on its own schedule, can still rule when it gets there. Two minutes
         // could not, and that is how escalation 8bb08a85 expired unruled on 2026-07-30.
         let mut s = EscalationStore::default();
-        let e = s.open("claude-code", "r", "Edit", "gate.py", None, None, T0, DEFAULT_TTL_SECS).unwrap();
+        let e = s.open("claude-code", "r", "Edit", "gate.py", Some(TEST_ACT), None, T0, DEFAULT_TTL_SECS).unwrap();
         let ten_minutes_later = T0 + 600;
         assert_eq!(
             s.status_of(&e.id, ten_minutes_later),
@@ -2650,11 +2833,11 @@ mod ttl_tests {
         // time buys a chance of an answer and grants nothing in the meantime. If this ever
         // fails, the generosity became a hole.
         let mut s = EscalationStore::default();
-        let e = s.open("claude-code", "r", "Edit", "gate.py", None, None, T0, DEFAULT_TTL_SECS).unwrap();
+        let e = s.open("claude-code", "r", "Edit", "gate.py", Some(TEST_ACT), None, T0, DEFAULT_TTL_SECS).unwrap();
         for t in [T0 + 1, T0 + 600, T0 + 3599] {
             assert_eq!(s.status_of(&e.id, t), Status::Pending);
             assert!(!s.status_of(&e.id, t).permits_write(), "pending permitted a write at {t}");
-            assert!(s.claim("claude-code", "gate.py", t).is_none(), "claimable while pending");
+            assert!(s.claim("claude-code", "gate.py", Some(TEST_ACT), t).is_none(), "claimable while pending");
         }
     }
 
@@ -2675,7 +2858,7 @@ mod ttl_tests {
         // Generous is not unbounded. An ask nobody ever answers must still go stale, or the
         // store accumulates open grants forever and 'pending' stops meaning anything.
         let mut s = EscalationStore::default();
-        let e = s.open("claude-code", "r", "Edit", "gate.py", None, None, T0, DEFAULT_TTL_SECS).unwrap();
+        let e = s.open("claude-code", "r", "Edit", "gate.py", Some(TEST_ACT), None, T0, DEFAULT_TTL_SECS).unwrap();
         assert_eq!(s.status_of(&e.id, T0 + DEFAULT_TTL_SECS), Status::Expired);
         assert!(s
             .decide(&e.id, true, "kimi-code", "r", Channel::PeerMember, None, Some("late"),

@@ -11178,7 +11178,10 @@ mod tests {
                 "session_id": session,
                 "tool_name": "Edit",
                 "marker": "<gate-hook>",
-                "reason": "Edit -> <gate-hook> (re-issued, claiming the approval)",
+                // #539: the RE-ISSUE states the SAME act the approval was granted for. Before act
+                // binding these fixtures re-issued a DIFFERENT string and the permit was spent
+                // anyway — the defect, encoded in the test suite.
+                "reason": "Edit -> <gate-hook>",
                 "host_session_id": "host-wake-37aa0412",
             }),
         )
@@ -11188,7 +11191,7 @@ mod tests {
 
         let d = claimed_row(&shared, "<gate-hook>").await;
         assert_eq!(
-            d["stated_attempted_act"], "Edit -> <gate-hook> (re-issued, claiming the approval)",
+            d["stated_attempted_act"], "Edit -> <gate-hook>",
             "WHAT the caller SAYS the authorised write is — the value that already arrived on \
              this call and was dropped until now. Testimony, not proof (#318): {d}"
         );
@@ -11219,12 +11222,44 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(sparse["claimed"], true, "{sparse}");
+        // #539 CHANGES THIS ARM, and the change is the point.
+        //
+        // This half used to assert that a claim stating NO act still spends the permit, and
+        // that the row records `stated_attempted_act` as explicit null. Under act binding
+        // that path no longer exists: the approval is bound to the act the operator was
+        // shown, and a claim that names nothing matches nothing. An unnamed claim is now a
+        // REFUSAL, which is what "Approving authorises this one write" always promised.
+        assert_eq!(
+            sparse["claimed"], false,
+            "a claim that states no act cannot spend an act-bound approval: {sparse}"
+        );
+
+        // The explicit-null discipline this test exists to guard is still guarded, on the
+        // field that can legitimately be absent: a caller may prove no host session. Claim
+        // again, naming the act, with no host session sent.
+        let named = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": bare_session,
+                "tool_name": "Edit",
+                "marker": "KINDS.md",
+                "reason": "Edit -> KINDS.md",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(named["claimed"], true, "naming the act spends it: {named}");
         let d = claimed_row(&shared, "KINDS.md").await;
-        for k in ["stated_attempted_act", "host_session_id"] {
-            assert!(d.get(k).is_some(), "key `{k}` must be WRITTEN, not omitted: {d}");
-            assert!(d[k].is_null(), "and explicitly null when not sent: {d}");
-        }
+        assert!(
+            d.get("host_session_id").is_some(),
+            "key `host_session_id` must be WRITTEN, not omitted: {d}"
+        );
+        assert!(d["host_session_id"].is_null(), "and explicitly null when not proven: {d}");
+        assert_eq!(
+            d["stated_attempted_act"], "Edit -> KINDS.md",
+            "and the act it was spent on is recorded: {d}"
+        );
     }
 
     /// THE DERIVATION, with nothing on the wire to derive from.
@@ -11257,7 +11292,10 @@ mod tests {
                 "session_id": session,
                 "tool_name": "Edit",
                 "marker": "<gate-hook>",
-                "reason": "Edit -> <gate-hook> (claiming, sending no host session at all)",
+                // #539: the RE-ISSUE states the SAME act the approval was granted for. Before act
+                // binding these fixtures re-issued a DIFFERENT string and the permit was spent
+                // anyway — the defect, encoded in the test suite.
+                "reason": "Edit -> <gate-hook>",
                 // deliberately absent: `host_session_id`
             }),
         )
@@ -11346,7 +11384,10 @@ mod tests {
                 "session_id": session,
                 "tool_name": "Edit",
                 "marker": "<gate-hook>",
-                "reason": "Edit -> <gate-hook> (corrected)",
+                // #539: the RE-ISSUE states the SAME act the approval was granted for. Before act
+                // binding these fixtures re-issued a DIFFERENT string and the permit was spent
+                // anyway — the defect, encoded in the test suite.
+                "reason": "Edit -> <gate-hook>",
             }),
         )
         .await
@@ -13884,7 +13925,7 @@ mod appeal_tests {
                 "the decision was rolled back — finality requires its witness"
             );
             assert!(
-                s.gate_escalations.claim("claude-code", "policy.json", now).is_none(),
+                s.gate_escalations.claim("claude-code", "policy.json", Some("Edit -> policy.json"), now).is_none(),
                 "claimable state is unchanged: nothing was authorised"
             );
         }
@@ -14563,6 +14604,12 @@ fn opened_payload(
         "escalation_id": esc.id,
         "plugin_id": esc.plugin_id,
         "subject_instance_lct": s.member_lct(&esc.plugin_id),
+        // #539: the digest of the exact act this approval is being asked for. On the chain
+        // because the binding must survive a restart — an escalation restored without it
+        // would be unspendable, and one restored with a DIFFERENT digest would be worse.
+        // Explicit null when the opener stated no act, so a census can count that class
+        // rather than confuse it with a row that predates the field.
+        "act_digest": esc.act_digest,
         // WHICH DOOR. See the doc comment: the key-set accident that used to answer this is
         // gone as of this change, deliberately.
         "opened_via": opened_via,
@@ -15273,7 +15320,12 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
         }
     }
 
-    if let Some(esc) = s.gate_escalations.claim(&plugin_id, &marker, now) {
+    // #539: the claim is now keyed on the ACT the approval was rendered from, not only on
+    // the rule that refused it. `stated_reason` here is the caller's statement of the act it
+    // is about to perform — the same field the opener stated and the operator was shown — so
+    // a permit granted for one write can no longer be spent on another. A caller that states
+    // nothing cannot claim: an unnamed act matches no approval.
+    if let Some(esc) = s.gate_escalations.claim(&plugin_id, &marker, stated_reason.as_deref(), now) {
         // Spending an approval is an ACT and is witnessed. The approval itself was already
         // recorded when it was decided; this entry is what ties it to the write it authorised,
         // without which the record would show a permission granted and never show it used.
