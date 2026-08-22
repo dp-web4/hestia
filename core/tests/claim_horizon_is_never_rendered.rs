@@ -62,6 +62,10 @@ use hestia::server::gate_escalation::{
 use std::fs;
 use std::path::Path;
 
+/// The act every open and every claim in this suite states (#539). Shared on purpose: this
+/// file measures the CLAIM HORIZON, so the act must never be what refuses a claim here.
+const HORIZON_ACT: &str = "Edit -> law_inject.py";
+
 const T0: u64 = 1_800_000_000;
 
 /// The value `handler.rs` puts on the wire as `retry_within_secs`.
@@ -131,6 +135,11 @@ fn opened(ttl: u64) -> (EscalationStore, String) {
             "role:constellation:member",
             "Edit",
             "law_inject.py",
+            // #539: the act is bound at open and must be re-stated at claim. This suite is
+            // about the HORIZON, so both ends name the same act deliberately — otherwise the
+            // act mismatch would refuse the claim and the horizon would stop being the thing
+            // under test. One shared constant keeps the horizon the only variable.
+            Some(HORIZON_ACT),
             None,
             None,
             T0,
@@ -190,7 +199,7 @@ fn the_advertised_retry_deadline_is_attainable_in_no_history() {
         // grant + window, so claim must succeed at grant+window-1 and fail at grant+window.
         let last_ok = T0 + grant_offset + APPROVAL_CLAIM_WINDOW_SECS - 1;
         assert!(
-            s.claim("claude-code", "law_inject.py", last_ok).is_some(),
+            s.claim("claude-code", "law_inject.py", Some(HORIZON_ACT), last_ok).is_some(),
             "grant at +{grant_offset}: the window did not run its full length"
         );
         best_horizon = best_horizon.max(last_ok + 1 - T0);
@@ -261,7 +270,7 @@ fn the_over_report_grows_as_the_decision_gets_faster() {
 
         // The asker who believed the advertised deadline and returned inside it is refused.
         assert!(
-            s.claim("claude-code", "law_inject.py", T0 + advertised_retry_secs - 1)
+            s.claim("claude-code", "law_inject.py", Some(HORIZON_ACT), T0 + advertised_retry_secs - 1)
                 .is_none(),
             "grant at +{grant_offset}: a claim at the advertised deadline was honoured"
         );
