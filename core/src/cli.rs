@@ -787,6 +787,22 @@ pub fn run() -> AnyResult<()> {
             WitnessCmd::Onboard { plugin_id, target } => {
                 cmd_witness_onboard(&home, &plugin_id, &target)
             }
+            WitnessCmd::Confer {
+                subject_lct_id,
+                role,
+                attestations,
+                witness_lcts,
+                context,
+                dry_run,
+            } => cmd_witness_confer(
+                &home,
+                &subject_lct_id,
+                &role,
+                &attestations,
+                &witness_lcts,
+                context.as_deref(),
+                dry_run,
+            ),
         },
         Command::Lct(l) => match l {
             LctCmd::Publish { dry_run: _, send } => cmd_lct_publish(&home, send),
@@ -1284,6 +1300,34 @@ enum WitnessCmd {
         #[arg(long, default_value = "")]
         target: String,
     },
+    /// Confer citizenship: assemble collected Existence attestations into a birth
+    /// certificate and record it in THIS society's ledger. **Fail-closed** — no
+    /// ledger write unless >=3 DISTINCT witnesses resolve and verify.
+    ///
+    /// Witness keys resolve OFFLINE from the supplied witness LCT documents: a
+    /// canonical LCT id is derived from its binding key, so a document
+    /// authenticates itself and no registry round-trip is trusted. Fetch them
+    /// with `curl <hub>/v1/hubs/<hub_id>/lcts/<witness_lct_id>` (a registry entry
+    /// or a bare LCT document are both accepted).
+    Confer {
+        /// Canonical LCT id of the subject being born (lct:web4:...).
+        subject_lct_id: String,
+        /// Canonical LCT id of the citizen role the subject inhabits.
+        #[arg(long)]
+        role: String,
+        /// An attestation JSON file (repeat once per witness; >=3 required).
+        #[arg(long = "attestation", required = true)]
+        attestations: Vec<String>,
+        /// A witness LCT document/registry entry JSON file (repeat per witness).
+        #[arg(long = "witness-lct", required = true)]
+        witness_lcts: Vec<String>,
+        /// Society-type classification recorded on the certificate.
+        #[arg(long, value_parser = ["nation", "platform", "network", "organization", "ecosystem"])]
+        context: Option<String>,
+        /// Assess the quorum and report, WITHOUT writing to the ledger.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn cmd_witness_attest(
@@ -1326,7 +1370,7 @@ fn cmd_witness_attest(
             let reg = hestia::member_registry::load_members(&vault);
             let lct = reg.get(pid).ok_or_else(|| anyhow::anyhow!(
                 "no member '{pid}' — mint it (a connect) then `hestia witness onboard {pid}`"))?;
-            if lct.operational_key_for("witnessing").map(|k| k != keypair.verifying_key()).unwrap_or(true) {
+            if lct.operational_key_for(hestia::witness::WITNESS_KEY_PURPOSE).map(|k| k != keypair.verifying_key()).unwrap_or(true) {
                 eprintln!("[witness] WARNING: '{pid}' has no vouched witnessing key matching this signer \
                            — run `hestia witness onboard {pid}` first, or the attestation won't resolve");
             }
@@ -1348,6 +1392,144 @@ fn cmd_witness_attest(
         None => println!("{json}"),
     }
     Ok(())
+}
+
+/// Read a witness LCT from a file that is EITHER a bare LCT document or a hub
+/// registry entry (`{"lct_id":…,"document":{…}}`) — the natural way to obtain one
+/// is `curl <hub>/v1/hubs/<id>/lcts/<witness>`, which returns the latter.
+fn read_witness_lct(path: &str) -> AnyResult<web4_core::Lct> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading witness LCT {path}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {path} as JSON"))?;
+    let doc = value.get("document").cloned().unwrap_or(value);
+    serde_json::from_value(doc)
+        .with_context(|| format!("{path} is neither an LCT document nor a registry entry"))
+}
+
+/// Confer citizenship — the caller `confer_citizenship` never had.
+///
+/// The society's ledger write is the consequential act, and it is guarded twice:
+/// `build_birth_certificate` returns `None` before any side effect unless the
+/// quorum holds, and this command computes a [`QuorumReport`] first so a refusal
+/// says WHY. `--dry-run` stops after the report.
+///
+/// ```text
+/// surface: hestia witness confer   act: confer citizenship (birth) — append an
+///          irreversible `citizenship.conferred` record to this society's ledger
+/// S: high/irreversible [construct: append_chain in ServerState::confer_citizenship]
+/// R: n/a [construct: local CLI; reachability is not the basis — the vault
+///    passphrase plus the witness quorum are]
+/// W: pass [construct: WitnessSet::from_documents — each witness id derives from
+///    its binding key, binding_proof verified, operational vouch checked against
+///    that binding key; authority = the canon >=3-distinct rule in quorum_reached]
+/// O: pass [construct: QuorumReport::assess and build_birth_certificate both
+///    precede the single append_chain; a refusal leaves the chain bit-identical]
+/// A: pass [construct: the recorded event carries the certificate AND its backing
+///    attestations — evidence, not a bare verdict]
+/// V: present [construct: --dry-run assesses without writing; vault-attended, so a
+///    human is in the loop for every birth]
+/// verdict: PASS
+/// ```
+#[allow(clippy::too_many_arguments)]
+fn cmd_witness_confer(
+    home: &std::path::Path,
+    subject_lct_id: &str,
+    citizen_role: &str,
+    attestation_paths: &[String],
+    witness_lct_paths: &[String],
+    context: Option<&str>,
+    dry_run: bool,
+) -> AnyResult<()> {
+    let birth_context: Option<web4_core::BirthContext> = match context {
+        Some(c) => Some(
+            serde_json::from_value(serde_json::Value::String(c.to_string()))
+                .with_context(|| format!("unknown birth context {c}"))?,
+        ),
+        None => None,
+    };
+
+    let mut attestations = Vec::new();
+    for path in attestation_paths {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading attestation {path}"))?;
+        attestations.push(
+            serde_json::from_str::<web4_core::Attestation>(&text)
+                .with_context(|| format!("parsing attestation {path}"))?,
+        );
+    }
+
+    let mut documents = Vec::new();
+    for path in witness_lct_paths {
+        documents.push((path.clone(), read_witness_lct(path)?));
+    }
+    let witnesses = hestia::witness::WitnessSet::from_documents(documents);
+    for (who, why) in &witnesses.rejected {
+        eprintln!("[confer] witness NOT admitted: {who}\n          {why}");
+    }
+    println!(
+        "Admitted {} witness key(s): {}",
+        witnesses.admitted().len(),
+        witnesses.admitted().join(", ")
+    );
+
+    // Assess BEFORE opening the sealed state — a refusal should not require a
+    // passphrase, and nothing about a failed quorum needs the ledger.
+    let report = hestia::witness::QuorumReport::assess(
+        subject_lct_id,
+        &attestations,
+        witnesses.resolver(),
+    );
+    println!("{}", report.explain());
+    if !report.quorum_met() {
+        anyhow::bail!(
+            "quorum not met — no birth (fail-closed). {} of {} distinct witnesses",
+            report.distinct_valid.len(),
+            web4_core::BIRTH_WITNESS_QUORUM
+        );
+    }
+    if dry_run {
+        println!("--dry-run: quorum HOLDS; nothing written.");
+        return Ok(());
+    }
+
+    let passphrase = prompt_passphrase("Vault passphrase: ")?;
+    let path = vault_path(home);
+    if !path.exists() {
+        anyhow::bail!("no vault at {} — run `hestia init` first", path.display());
+    }
+    let vault = Vault::open(path, passphrase.clone())?;
+    let state = hestia::server::ServerState::open(vault, home, &passphrase)?;
+
+    match state.confer_citizenship(
+        subject_lct_id,
+        citizen_role,
+        birth_context,
+        &attestations,
+        witnesses.resolver(),
+    )? {
+        Some(cref) => {
+            println!("Citizenship conferred.");
+            println!("  subject:         {subject_lct_id}");
+            println!("  issuing society: {}", cref.issuing_society);
+            println!("  ledger entry:    {}", cref.entry_id);
+            println!("  record hash:     {}", cref.entry_hash);
+            println!(
+                "\nHang this reference on the subject LCT's `citizenships`, then publish.\n\
+                 NOTE: publishing that LCT to the HUB registry as provenance=society_conferred\n\
+                 is still refused by hub ingest check 5 until the Phase-2 gate is replaced with a\n\
+                 CitizenshipRecord verification. The birth in THIS ledger is unaffected."
+            );
+            Ok(())
+        }
+        // Unreachable via this path (the report above already established the
+        // quorum against the same resolver), but `confer_citizenship` is the
+        // authority on its own refusal — never report a birth it did not make.
+        None => anyhow::bail!(
+            "confer_citizenship refused despite a passing pre-check — \
+             report this: the diagnostic and the authority disagree"
+        ),
+    }
 }
 
 fn cmd_witness_onboard(home: &std::path::Path, plugin_id: &str, target: &str) -> AnyResult<()> {
@@ -3550,6 +3732,53 @@ fn cmd_policy_test(
         println!("  - {c}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod witness_confer_tests {
+    use super::read_witness_lct;
+
+    /// `read_witness_lct` must accept BOTH shapes, because the natural way to
+    /// obtain a witness document is `curl <hub>/v1/hubs/<id>/lcts/<witness>`,
+    /// which returns a registry ENTRY wrapping the document — while
+    /// `hestia lct publish` and hand-assembled bundles carry the bare document.
+    /// Requiring one shape would make the obvious command produce a confusing
+    /// parse error.
+    fn write(dir: &std::path::Path, name: &str, body: &str) -> String {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn accepts_a_bare_document_and_a_registry_entry_identically() {
+        let (mut lct, kp) = web4_core::Lct::new(web4_core::EntityType::AiSoftware, None);
+        lct.sign_binding(&kp);
+        let dir = tempfile::tempdir().unwrap();
+
+        let bare = serde_json::to_string(&lct).unwrap();
+        let entry = serde_json::json!({
+            "lct_id": lct.lct_id(),
+            "document": &lct,
+            "provenance": "self_issued",
+            "version": 1
+        })
+        .to_string();
+
+        let a = read_witness_lct(&write(dir.path(), "bare.json", &bare)).unwrap();
+        let b = read_witness_lct(&write(dir.path(), "entry.json", &entry)).unwrap();
+        assert_eq!(a.lct_id(), lct.lct_id());
+        assert_eq!(b.lct_id(), lct.lct_id());
+        assert!(a.verify_binding() && b.verify_binding());
+    }
+
+    #[test]
+    fn a_file_that_is_neither_shape_fails_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "junk.json", r#"{"hello":"world"}"#);
+        let err = read_witness_lct(&p).unwrap_err().to_string();
+        assert!(err.contains("junk.json"), "the refusal names the file: {err}");
+    }
 }
 
 #[cfg(test)]
