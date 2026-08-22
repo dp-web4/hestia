@@ -162,7 +162,7 @@ pub fn vouch_witnessing_key(
         return false;
     }
     p.lct
-        .authorize_operational_key("witnessing", operational_pubkey, &binding_kp);
+        .authorize_operational_key(web4_core::WITNESS_PURPOSE, operational_pubkey, &binding_kp);
     if let Some(lct) = registry.members.get_mut(plugin_id) {
         *lct = p.lct.clone();
     }
@@ -385,7 +385,7 @@ mod tests {
         // resolvable from the member LCT, no roster
         let lct = reg.get("legion-witness").unwrap();
         assert_eq!(
-            lct.operational_key_for("witnessing"),
+            lct.operational_key_for(web4_core::WITNESS_PURPOSE),
             Some(operational.verifying_key())
         );
         // persisted: a reload still resolves it
@@ -394,7 +394,7 @@ mod tests {
             reloaded
                 .get("legion-witness")
                 .unwrap()
-                .operational_key_for("witnessing"),
+                .operational_key_for(web4_core::WITNESS_PURPOSE),
             Some(operational.verifying_key())
         );
         // unknown member → false, no panic

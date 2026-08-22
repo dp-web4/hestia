@@ -1326,7 +1326,7 @@ fn cmd_witness_attest(
             let reg = hestia::member_registry::load_members(&vault);
             let lct = reg.get(pid).ok_or_else(|| anyhow::anyhow!(
                 "no member '{pid}' — mint it (a connect) then `hestia witness onboard {pid}`"))?;
-            if lct.operational_key_for("witnessing").map(|k| k != keypair.verifying_key()).unwrap_or(true) {
+            if lct.operational_key_for(web4_core::WITNESS_PURPOSE).map(|k| k != keypair.verifying_key()).unwrap_or(true) {
                 eprintln!("[witness] WARNING: '{pid}' has no vouched witnessing key matching this signer \
                            — run `hestia witness onboard {pid}` first, or the attestation won't resolve");
             }
