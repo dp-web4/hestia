@@ -46,12 +46,39 @@ import time
 FRESH_DAYS_DEFAULT = 14
 
 
+# One fact, one precedence, in the order the rest of the fleet resolves it.
+#
+# This tool read only FLEET_ROOT, a THIRD spelling of the workspace root — the others being
+# HESTIA_WORKSPACE, which this daemon's own service unit carries (docs/ENVIRONMENT.md), and
+# AI_WORKSPACE, which operator tooling around a multi-repo checkout conventionally sets.
+# A second name for one fact is what a deployment silently disagrees over: nothing is
+# broken, but an operator who has configured a workspace root has still not configured
+# THIS, so the tool measures a different tree than the scripts beside it.
+#
+# FLEET_ROOT keeps working — it may be set on seats and in units nobody has audited, and
+# breaking it to tidy a name would trade a real outage for a cosmetic one. It is last, and
+# documented as legacy.
+WORKSPACE_ENV_VARS = ("AI_WORKSPACE", "HESTIA_WORKSPACE", "FLEET_ROOT")
+
+
 def workspace_root():
     """The directory holding the sibling repos. Derived, never hardcoded — the fleet spans
-    three filesystem conventions and `tools/public_boundary.py` bans baked paths."""
-    env = os.environ.get("FLEET_ROOT")
-    if env:
-        return env
+    three filesystem conventions and `tools/public_boundary.py` bans baked paths.
+
+    Precedence: AI_WORKSPACE, then HESTIA_WORKSPACE, then FLEET_ROOT (legacy), then derived
+    from this file's location. A set-but-missing value is reported and REFUSED rather than
+    silently skipped — ignoring what an operator configured is its own class of surprise,
+    and a reaper that quietly measures a different tree than the one you named is worse
+    than one that stops."""
+    for var in WORKSPACE_ENV_VARS:
+        env = os.environ.get(var)
+        if not env:
+            continue
+        if os.path.isdir(env):
+            return env
+        sys.exit("%s is set to %s, which is not a directory. Fix it or unset it; "
+                 "this tool will not fall back to a guess when you have named a root."
+                 % (var, env))
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # <root>/hestia
     return os.path.dirname(here)
 
