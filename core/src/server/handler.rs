@@ -14686,14 +14686,10 @@ fn resolve_invitation(
     // The doorbell half of the same write. Ordered AFTER `invite` because
     // `record_invitee_readers` keeps only ids that were actually invited — a flag on a seat
     // nobody asked must not be able to reduce `absent`.
-    s.gate_escalations.record_invitee_readers(
-        &esc.id,
-        evidence
-            .iter()
-            .filter(|r| r.get("mailbox_reader") == Some(&Value::Bool(false)))
-            .filter_map(|r| r.get("peer").and_then(Value::as_str).map(str::to_string))
-            .collect(),
-    );
+    // The evidence array WHOLE, not a pre-split (legion review, 2026-08-21). Splitting here
+    // is what left `invited_reader_unknown` unwritten on the live path — the store now derives
+    // both tiers from this one value, the same one `rehydrate` reads.
+    s.gate_escalations.record_invitee_readers(&esc.id, &evidence);
     // The basis the whole record already carries on the chain entry must also live ON the
     // escalation itself: `arbiter::eligibility` clause 0 reads it from here at decide and
     // corroborate time, and a basis that exists only on the chain is one the peer path

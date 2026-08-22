@@ -1133,13 +1133,41 @@ impl EscalationStore {
     /// ignores ids that were not invited: a flag on a seat nobody asked is not a fact about
     /// this escalation, and letting it through would let `absent` be reduced by a name that
     /// never appeared in the invitation.
-    pub fn record_invitee_readers(&mut self, id: &str, without_reader: Vec<String>) -> bool {
+    /// TAKES THE EVIDENCE ARRAY WHOLE, and derives BOTH splits here (legion review,
+    /// 2026-08-21). The caller used to pre-split, passing only `without_reader` computed from
+    /// `mailbox_reader == false`. That left the tri-state's third tier written NOWHERE on the
+    /// live path: `invited_reader_unknown` was rebuilt only by `rehydrate`, so the exclusion
+    /// worked *after a restart* and not inside the escalation's own TTL — which is exactly
+    /// when it is decided and when `peer_participation` is published. An unreadable seat was
+    /// still published as one that saw the ask and stayed silent for the whole live window.
+    ///
+    /// Reproduced by legion over ONE evidence array, both paths:
+    ///
+    /// ```text
+    ///   LIVE      absent: 2   invited_without_reader: 1   invited_reader_unknown: 0
+    ///   REPLAYED  absent: 1   invited_without_reader: 1   invited_reader_unknown: 1
+    /// ```
+    ///
+    /// Two code paths deriving the same thing, one of them wrong. So the split moves here and
+    /// happens ONCE, from the same input `rehydrate` reads — live and replay can no longer
+    /// disagree, because there is only one derivation left.
+    pub fn record_invitee_readers(&mut self, id: &str, evidence: &[serde_json::Value]) -> bool {
         match self.by_id.get_mut(id) {
             Some(e) => {
-                e.invited_without_reader = without_reader
-                    .into_iter()
-                    .filter(|p| e.invited_peers.contains(p))
-                    .collect();
+                let pick = |want: &serde_json::Value| -> Vec<String> {
+                    evidence
+                        .iter()
+                        .filter(|r| r.get("mailbox_reader") == Some(want))
+                        .filter_map(|r| {
+                            r.get("peer").and_then(serde_json::Value::as_str).map(str::to_string)
+                        })
+                        // Keep only ids actually invited — a flag on a seat nobody asked must
+                        // not be able to reduce `absent`.
+                        .filter(|p| e.invited_peers.contains(p))
+                        .collect()
+                };
+                e.invited_without_reader = pick(&serde_json::Value::Bool(false));
+                e.invited_reader_unknown = pick(&serde_json::Value::Null);
                 true
             }
             None => false,
@@ -1777,6 +1805,77 @@ mod tests {
     ///
     /// This test FAILS on the old semantics: with `Err => true`, `unreadable` carried
     /// `mailbox_reader: true`, sat in neither held-out set, and counted as absent.
+    /// LIVE AND REPLAY MUST AGREE ABOUT AN UNREADABLE MAILBOX (legion review, 2026-08-21).
+    ///
+    /// The tri-state fix shipped half-wired: `invited_reader_unknown` was rebuilt by
+    /// `rehydrate` and written NOWHERE on the live path, because the caller pre-split the
+    /// evidence on `mailbox_reader == false` and a null row reached neither set. So the
+    /// exclusion worked only after a restart, and inside the escalation's own TTL — when it
+    /// is decided and when `peer_participation` is published — the defect was fully intact.
+    ///
+    /// legion's numbers, over ONE evidence array:
+    ///
+    /// ```text
+    ///   LIVE      absent: 2   invited_without_reader: 1   invited_reader_unknown: 0
+    ///   REPLAYED  absent: 1   invited_without_reader: 1   invited_reader_unknown: 1
+    /// ```
+    ///
+    /// WHY MY OWN SABOTAGE ARM MISSED IT, recorded because the lesson outlives the bug: it
+    /// hand-populated `e.invited_reader_unknown = vec![...]` — a state the live path never
+    /// produces. A guard that constructs the value it checks tests the consumer and never the
+    /// producer, and this one would have looked correct indefinitely, because it only fires
+    /// when a storage read actually fails.
+    ///
+    /// So this pin compares the TWO DERIVATIONS against each other rather than either against
+    /// a literal. It fails if they ever diverge again, whichever one is wrong.
+    #[test]
+    fn the_live_path_and_the_replay_path_agree_about_an_unreadable_mailbox() {
+        // One evidence array: a readable seat, a measured-false seat, an unreadable seat.
+        let evidence = vec![
+            serde_json::json!({"peer": "readable",   "mailbox_reader": true}),
+            serde_json::json!({"peer": "readerless", "mailbox_reader": false}),
+            serde_json::json!({"peer": "unreadable", "mailbox_reader": null}),
+        ];
+        let invited: Vec<String> =
+            ["readable", "readerless", "unreadable"].iter().map(|s| s.to_string()).collect();
+
+        // LIVE: open, invite, record — exactly what `open_escalation` does.
+        let mut live = EscalationStore::default();
+        let e = live
+            .open("claude-code", "r", "Edit", "m.py", Some("Edit -> m.py"), None, T0, 3600)
+            .unwrap();
+        live.invite(&e.id, invited.clone());
+        assert!(live.record_invitee_readers(&e.id, &evidence));
+        let l = live.get(&e.id).unwrap().peer_participation();
+
+        // REPLAY: the same evidence, restored from a chain entry.
+        let mut replayed = EscalationStore::default();
+        let opened = chain_entry(
+            "gate_escalation_opened",
+            serde_json::json!({
+                "escalation_id": e.id, "plugin_id": "claude-code",
+                "role": "role:constellation:member", "tool_name": "Edit", "marker": "m.py",
+                "opened_at": T0, "expires_at": T0 + 3600,
+                "act_digest": null,
+                "invited_peers": invited,
+                "invitation_evidence": evidence,
+            }),
+        );
+        replayed.rehydrate(&[opened], T0 + 10);
+        let r = replayed.get(&e.id).unwrap().peer_participation();
+
+        assert_eq!(
+            (l.absent, l.invited_without_reader, l.invited_reader_unknown),
+            (r.absent, r.invited_without_reader, r.invited_reader_unknown),
+            "live and replay must derive the same three numbers from the same evidence — \
+             live={:?} replayed={:?}",
+            (l.absent, l.invited_without_reader, l.invited_reader_unknown),
+            (r.absent, r.invited_without_reader, r.invited_reader_unknown),
+        );
+        assert_eq!(l.invited_reader_unknown, 1, "the unreadable seat is held out on BOTH paths");
+        assert_eq!(l.absent, 1, "only the seat that was READ and did not answer is absent");
+    }
+
     #[test]
     fn an_unreadable_mailbox_is_neither_absent_nor_readerless() {
         let mut s = EscalationStore::default();
@@ -1834,7 +1933,12 @@ mod tests {
             .unwrap();
         let id = e.id.clone();
         s.invite(&id, vec!["late-reader".into(), "readable-but-absent".into()]);
-        s.record_invitee_readers(&id, vec!["late-reader".into()]);
+        // Evidence form (the signature now takes the array whole): "late-reader" is the
+        // seat whose mailbox measured FALSE at invite time.
+        s.record_invitee_readers(
+            &id,
+            &[serde_json::json!({"peer": "late-reader", "mailbox_reader": false})],
+        );
 
         // Nothing has landed yet: one flagged, one genuinely awaited.
         let p = s.get(&id).unwrap().peer_participation();
