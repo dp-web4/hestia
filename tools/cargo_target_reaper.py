@@ -21,9 +21,11 @@ absolute /tmp paths, so a reaper built on `rm` would be a reaper that has to be 
 or routed around every single time — which is how a protocol stops being followed.
 
 POLICY, stated so it can be argued with rather than inferred from behaviour:
-  - PROTECTED, never reaped: the shared `CARGO_TARGET_DIR`; any target inside a git
-    worktree with uncommitted changes (a dirty tree may be mid-experiment, and rebuilding
-    is cheap but re-deriving what someone was doing is not).
+  - PROTECTED, never reaped: the shared `CARGO_TARGET_DIR`; any target whose OWN CRATE
+    DIRECTORY has uncommitted changes (mid-experiment: rebuilding is cheap but re-deriving
+    what someone was doing is not). Scoped to the crate, not the repository — a repo whose
+    dirt lives in an unrelated subtree (daemon-written instance state, for instance) is not
+    evidence that this crate's target is warm. See `tree_is_dirty`.
   - FRESH: touched within --fresh-days (default 14). Reported, not reaped, because a warm
     target for something in active use is worth more than the space.
   - STALE: everything else. Reaped only with --reap.
@@ -103,7 +105,21 @@ def newest_mtime(path, cap=4000):
 
 def tree_is_dirty(crate_dir):
     try:
-        r = subprocess.run(["git", "-C", crate_dir, "status", "--porcelain"],
+        # `-- .` is load-bearing. `git status` reports the WHOLE repository regardless
+        # of `-C`, so without a pathspec this asks "is any file in this repo dirty?" while
+        # being named `crate_dir` and read as "is this crate dirty?".
+        #
+        # Measured on a fleet host 2026-08-21: SAGE/sage-rs classified PROTECTED(dirty)
+        # holding 324MB, while the crate itself was clean — the six dirty entries were
+        # sage-daemon instance state under sage/instances/, rewritten every couple of
+        # minutes. On that host the repo is dirty ~100% of the time by construction, so
+        # the protection was permanently ON for that crate, and a signal that is always on
+        # carries no information: it exempted a crate rather than protecting an experiment.
+        #
+        # Scoping to the crate keeps the rule's INTENT — do not reap the warm target of
+        # something someone is actively working on — and drops only the case where the
+        # dirt is in an unrelated subtree.
+        r = subprocess.run(["git", "-C", crate_dir, "status", "--porcelain", "--", "."],
                            capture_output=True, text=True, timeout=300)
         return bool(r.stdout.strip()) if r.returncode == 0 else False
     except Exception:
