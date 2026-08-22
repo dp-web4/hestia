@@ -1294,6 +1294,14 @@ fn cmd_witness_attest(
     out: Option<String>,
 ) -> AnyResult<()> {
     use hestia::hub::MemberKeySource;
+    // R6 preflight, BEFORE the vault: the subject id is inside the signed bytes,
+    // so a subject the registry cannot resolve yields an attestation that is
+    // well-formed, correctly signed, and permanently unverifiable — reported at
+    // the far end as the generic "quorum not met". Checking it first also means
+    // an UNATTENDED session can validate a subject id and get the reason, rather
+    // than dying on the tty-only passphrase prompt before reaching the check.
+    let subject_lct_id = hestia::witness::canonical_subject_id(subject_lct_id)
+        .map_err(|e| anyhow::anyhow!("refusing to attest: {e}"))?;
     let vault = open_vault(home)?;
     let store = HubStore::load(&vault)?;
     // Resolve which connection's pinned key witnesses (the operational key the
@@ -1333,12 +1341,29 @@ fn cmd_witness_attest(
             lct.lct_id()
         }
         None => {
-            eprintln!("[witness] note: legacy witness-id form; ruling (B) uses `--as <plugin_id>` \
-                       for the canonical, registry-resolvable id");
+            // Not "less resolvable" — UNRESOLVABLE. The hub's registry keys on
+            // `lct:web4:mb32:…` (`HubState::registry`), so the only bridge from
+            // an attestation's `witness` string to a pinned key starts with
+            // `registry.get(witness)`; a `lct:web4:member:{uuid}` string misses
+            // it and the witness is dropped as unresolvable (Sprout, forum
+            // 2026-08-21: "one resolver, one answer"). The attestation is
+            // well-formed and correctly signed and can never count toward a
+            // quorum — the exact silent failure R6 refuses on the SUBJECT one
+            // field over. Said loudly because the signing step is vault-attended
+            // and expensive to repeat.
+            eprintln!("[witness] WARNING: no --as, so the witness id is the legacy \
+                       `lct:web4:member:{{uuid}}` form. The hub's registry keys on \
+                       `lct:web4:mb32:…`, so this attestation will NOT resolve to a key \
+                       and will NOT count toward a quorum — it will be reported at \
+                       conferral as the generic \"quorum not met\". Re-run with \
+                       `--as <plugin_id>` (ruling B) for the registry-resolvable id.");
             format!("lct:web4:member:{}", conn.our_lct_id)
         }
     };
-    let att = hestia::witness::attest(subject_lct_id, &witness_lct_id, chrono::Utc::now(), &keypair);
+    // Already canonical (checked above, pre-vault); `attest` re-checks anyway —
+    // the guard belongs to the producer, not to this one caller.
+    let att = hestia::witness::attest(subject_lct_id, &witness_lct_id, chrono::Utc::now(), &keypair)
+        .map_err(|e| anyhow::anyhow!("refusing to attest: {e}"))?;
     let json = serde_json::to_string_pretty(&att)?;
     match out {
         Some(path) => {

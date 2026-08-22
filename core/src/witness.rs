@@ -11,10 +11,16 @@
 //!   the vault-sealed identity — W1's autonomy constraint: a witness can only
 //!   attest autonomously if the registry-resolvable key is operationally
 //!   available to it).
+//!   [`attest`] refuses a subject id that is not the canonical key-derived form
+//!   (R6) and signs whole-second timestamps (R4) — both because the subject and
+//!   the `ts` are inside the signed bytes, so getting either wrong produces an
+//!   attestation that is well-formed and permanently unverifiable.
 //! - **Assess** ([`valid_distinct_existence`], [`quorum_reached`]): given a
 //!   subject's collected attestations and a witness-pubkey resolver (the registry
 //!   is that resolver on the hub side), compute the verified quorum. Fail-closed,
-//!   reusing the web4-core `Attestation::verify` + the ≥3-DISTINCT-witness rule.
+//!   reusing the web4-core `Attestation::verify` + the ≥3-DISTINCT-witness rule,
+//!   where distinct means distinct in the witness id AND in the key that id
+//!   resolves to (R1 — three spellings of one key are one witness).
 //!
 //! - **Confer** ([`build_birth_certificate`] + [`crate::server::state::ServerState::confer_citizenship`]):
 //!   for entities born into THIS society (its members and roles), hestia records
@@ -37,34 +43,207 @@ use web4_core::{
     Attestation, AttestationType, BIRTH_WITNESS_QUORUM, BirthCertificate, BirthContext, PublicKey,
 };
 
+/// The canonical, key-derived LCT id prefix ([`web4_core::lct::derive_lct_id`],
+/// canon §2.3): `lct:web4:mb32:` plus the `b` multibase tag for RFC 4648
+/// base32-lowercase-no-pad.
+pub const CANONICAL_LCT_ID_PREFIX: &str = "lct:web4:mb32:b";
+
+/// The base32 body length of a derived id: SHA-256 is 32 bytes = 256 bits, and
+/// `ceil(256 / 5) = 52` characters with no padding.
+pub const CANONICAL_LCT_ID_BODY_LEN: usize = 52;
+
+/// The only two characters a derived id can end with. The derivation, so the
+/// next reader inherits it instead of re-deriving it: 52 characters × 5 bits =
+/// 260; SHA-256 supplies 256; the 4 residual bits are padding and are always
+/// zero — leaving alphabet index 0 (`a`) or 16 (`q`), and nothing else.
+///
+/// **This is an identity, not a sample.** The last character depends on nothing
+/// but the low bit of the final digest byte (31 bytes = 248 bits; 49 characters
+/// consume 245; the 32nd byte arrives with 3 bits buffered, emits two more
+/// characters and leaves exactly one bit), so it is checkable over all 256
+/// possible final bytes rather than sampled over digests. Checked exhaustively
+/// against [`web4_core::lct::derive_lct_id`]'s encoder: `'a'` ⟺ final byte even,
+/// `'q'` ⟺ final byte odd, independent of the other 31 bytes.
+///
+/// **What the clause is for: decode-completeness, not transcription.** Prefix +
+/// length + alphabet accept 32^52 = 2^260 strings, while a 256-bit digest has
+/// 2^256 encodings — so without this clause the predicate admits 2^260 − 2^256
+/// strings that are the encoding of *no digest at all*. Adding it leaves exactly
+/// 32^51 × 2 = 2^256: the clause **is** a decode round-trip, and it is what makes
+/// "canonical" mean canonical rather than plausible. (Measured: over 20 000 ids
+/// with this position perturbed to every alphabet value, tail-clause and
+/// decode-round-trip disagree 0 times.)
+///
+/// It is NOT the clause that catches a transcribed id, and a caller must not be
+/// told it is. It only sees position 52 of 52: measured over 200 000 single-
+/// character substitutions at uniform position, it catches **1.86%** of them
+/// (analytic `(1/52)(30/31)` = 1.861%). A slip in any of the other 51 positions
+/// is indistinguishable from a different valid id, by this or by anything else
+/// syntactic. (HUB's correction to the R6 headline, forum 2026-08-21.)
+const CANONICAL_LCT_ID_TAIL: [char; 2] = ['a', 'q'];
+
+/// Why a subject id is not the canonical, key-derived form [`attest`] will sign.
+///
+/// Each variant names what to hand it instead, because every one of these is
+/// otherwise indistinguishable at the far end: an attestation over a
+/// non-canonical subject is well-formed, correctly signed, and structurally
+/// incapable of ever verifying — and the verifier reports it as the generic
+/// "quorum not met".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubjectIdError {
+    /// `lct:web4:member:{uuid}` — a real id in the *membership* space. The hub
+    /// keys membership on `Uuid` and the registry keys on the derived id; the
+    /// two are linked only by pubkey equality, and nothing checks it.
+    MembershipIdSpace(String),
+    /// Not the `lct:web4:mb32:` space at all.
+    WrongSpace(String),
+    /// Right space, wrong body length.
+    BodyLength { got: usize },
+    /// A character outside the base32-lowercase-no-pad alphabet (`a-z2-7`).
+    Alphabet { ch: char },
+    /// 52 well-formed base32 characters whose final character carries non-zero
+    /// padding bits — so it is not the encoding of any 32-byte digest.
+    PaddingBits { last: char },
+}
+
+impl std::fmt::Display for SubjectIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MembershipIdSpace(id) => write!(
+                f,
+                "subject '{id}' is a membership id, not a published LCT id — attestations are \
+                 signed over the registry's key-derived `{CANONICAL_LCT_ID_PREFIX}…` id. Look the \
+                 member up in the registry and pass its published `lct_id`."
+            ),
+            Self::WrongSpace(id) => write!(
+                f,
+                "subject '{id}' is not a key-derived LCT id (expected the \
+                 `{CANONICAL_LCT_ID_PREFIX}…` form)"
+            ),
+            Self::BodyLength { got } => write!(
+                f,
+                "subject id body is {got} characters, expected {CANONICAL_LCT_ID_BODY_LEN} \
+                 (a truncated or elongated id)"
+            ),
+            Self::Alphabet { ch } => write!(
+                f,
+                "subject id contains '{ch}', which is outside base32-lowercase-no-pad (a-z2-7)"
+            ),
+            Self::PaddingBits { last } => write!(
+                f,
+                "subject id ends in '{last}': a 32-byte digest leaves four zero padding bits, so \
+                 the last character is always 'a' or 'q'. This id cannot encode any digest."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SubjectIdError {}
+
+/// **R6.** Accept `subject_lct_id` only if it is the canonical, key-derived form
+/// [`web4_core::lct::derive_lct_id`] produces; otherwise say precisely why.
+///
+/// This is a **refusal, not a translation**, and it cannot be a translation:
+/// there is no mapping from `lct:web4:member:{uuid}` back to the key-derived id
+/// without the key, and inventing one would be exactly the id-forgery the
+/// derived form exists to prevent. The check is *syntactic* — it cannot prove an
+/// id IS someone's derived id (that needs the pubkey), only refuse ids that
+/// provably are not anyone's.
+///
+/// Four clauses: the `lct:web4:mb32:b` prefix, a 52-character body, the
+/// base32-lowercase-no-pad alphabet, and the two-value tail
+/// ([`CANONICAL_LCT_ID_TAIL`]) that falls out of encoding exactly 256 bits.
+pub fn canonical_subject_id(subject_lct_id: &str) -> Result<&str, SubjectIdError> {
+    let Some(body) = subject_lct_id.strip_prefix(CANONICAL_LCT_ID_PREFIX) else {
+        return Err(if subject_lct_id.starts_with("lct:web4:member:") {
+            SubjectIdError::MembershipIdSpace(subject_lct_id.to_string())
+        } else {
+            SubjectIdError::WrongSpace(subject_lct_id.to_string())
+        });
+    };
+    if body.chars().count() != CANONICAL_LCT_ID_BODY_LEN {
+        return Err(SubjectIdError::BodyLength { got: body.chars().count() });
+    }
+    if let Some(ch) = body.chars().find(|c| !matches!(c, 'a'..='z' | '2'..='7')) {
+        return Err(SubjectIdError::Alphabet { ch });
+    }
+    let last = body.chars().next_back().expect("52 characters, checked above");
+    if !CANONICAL_LCT_ID_TAIL.contains(&last) {
+        return Err(SubjectIdError::PaddingBits { last });
+    }
+    Ok(subject_lct_id)
+}
+
+/// `true` iff `id` passes [`canonical_subject_id`]. The predicate HUB's witness
+/// roster keys on — one mapping, not two (HUB's R6 note, 2026-08-21).
+pub fn is_canonical_lct_id(id: &str) -> bool {
+    canonical_subject_id(id).is_ok()
+}
+
 /// Sign an `Existence` attestation over `subject_lct_id` as `witness_lct_id`,
 /// using this member's OPERATIONAL keypair (the channel key the registry
 /// resolves — W1). `ts` is the observation time (the CLI passes `Utc::now`;
 /// tests pass a fixed instant for determinism).
+///
+/// Two guards live here because both failure modes are silent at the far end:
+///
+/// - **R6 — the subject must be canonical.** The subject id is inside the signed
+///   bytes, so an attestation over the wrong id space can never verify no matter
+///   what the registry later says. Refused up front, with a reason
+///   ([`SubjectIdError`]) rather than at conferral as "quorum not met".
+/// - **R4 — `ts` is truncated to whole seconds before signing.** The canonical
+///   message renders `ts` with `SecondsFormat::AutoSi`, so the digit count
+///   follows the value: a `Utc::now()` attestation signs nine fractional digits,
+///   and any hop that normalises to milliseconds (a JSON store, a JS client, a
+///   `TIMESTAMP(3)` column) voids the signature. Truncating first makes that
+///   normalisation a no-op. The *rendering* is untouched, so this needs no
+///   `v1`→`v2` bump — only the value changes.
 pub fn attest(
     subject_lct_id: &str,
     witness_lct_id: &str,
     ts: chrono::DateTime<chrono::Utc>,
     operational_keypair: &web4_core::crypto::KeyPair,
-) -> Attestation {
-    Attestation::sign(
+) -> Result<Attestation, SubjectIdError> {
+    let subject_lct_id = canonical_subject_id(subject_lct_id)?;
+    let ts = chrono::SubsecRound::trunc_subsecs(ts, 0);
+    Ok(Attestation::sign(
         subject_lct_id,
         witness_lct_id,
         AttestationType::Existence,
         ts,
         operational_keypair,
-    )
+    ))
 }
 
 /// Filter `attestations` to the ones that genuinely count toward a birth quorum
 /// for `subject_lct_id`: **Existence** type, **signature-valid** against the
-/// witness's resolved pubkey, and **one per distinct witness** (the first valid
-/// attestation from each witness; later ones from the same witness do not add to
-/// the quorum — three signatures from one witness are not three witnesses).
+/// witness's resolved pubkey, and **one per distinct witness** — where
+/// "distinct" means distinct in BOTH the witness id and the key that id
+/// resolves to (**R1**).
+///
+/// The key half is the one that matters and the one that was missing.
+/// `hestia witness onboard <plugin_id>` vouches
+/// `member_signing_keypair(vault, &conn.member_key_source)` — a function of the
+/// hub CONNECTION, not of `plugin_id` — so onboarding three members of one
+/// constellation against one connection vouches ONE key onto three LCTs. Under
+/// id-only distinctness those three sign a passing quorum: the canon's "three
+/// entries that are one witness are not a quorum" held at the id layer while the
+/// independence it protects lives at the key layer, where nothing looked.
+///
+/// Dedup order is input order, and it is load-bearing only in the degenerate
+/// case: when two ids share a key, the FIRST is kept and the second dropped, so
+/// a certificate is never built naming both. It is dropped rather than refused
+/// because a shared key is not evidence of bad faith — it is the ordinary result
+/// of one seat onboarding several of its own members.
 ///
 /// `resolve_witness_pubkey` maps a witness LCT id → its bound key. A witness
 /// whose key does not resolve is dropped (cannot verify ⇒ does not count) — the
 /// same fail-closed posture as the web4-core birth-certificate validator.
+///
+/// Pairs with HUB's **R2** on the verifier side (web4#758), which counts the ≥3
+/// floor over distinct resolved keys. The two use the same predicate on purpose:
+/// distinct-keys ≥ 3 implies distinct-ids ≥ 3, so the key set is strictly
+/// stricter and the id set is the membership index, not a second gate.
 pub fn valid_distinct_existence<'a, F>(
     subject_lct_id: &str,
     attestations: &'a [Attestation],
@@ -73,16 +252,28 @@ pub fn valid_distinct_existence<'a, F>(
 where
     F: Fn(&str) -> Option<PublicKey>,
 {
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen_ids = std::collections::BTreeSet::new();
+    let mut seen_keys = std::collections::BTreeSet::new();
     attestations
         .iter()
         .filter(|a| a.attestation_type == AttestationType::Existence)
         .filter(|a| {
-            // distinct witness: keep only the first valid one per witness id
-            resolve_witness_pubkey(&a.witness)
-                .map(|pk| a.verify(subject_lct_id, &pk))
-                .unwrap_or(false)
-                && seen.insert(a.witness.clone())
+            let Some(pk) = resolve_witness_pubkey(&a.witness) else {
+                return false; // unresolvable ⇒ cannot verify ⇒ does not count
+            };
+            if !a.verify(subject_lct_id, &pk) {
+                return false;
+            }
+            // R1: distinct in the id AND in the key behind it. Tested before
+            // inserting so a dropped attestation never seeds either set — the
+            // two stay in agreement about exactly which attestations were kept.
+            let key_hex = pk.to_hex();
+            if seen_ids.contains(a.witness.as_str()) || seen_keys.contains(key_hex.as_str()) {
+                return false;
+            }
+            seen_ids.insert(a.witness.clone());
+            seen_keys.insert(key_hex);
+            true
         })
         .collect()
 }
@@ -140,25 +331,99 @@ mod tests {
         chrono::DateTime::UNIX_EPOCH.into()
     }
 
+    /// A real key-derived subject id. Before R6 these tests used the readable
+    /// stand-in `"lct:web4:mb32:bsubject"` — which R6 refuses, correctly: it is
+    /// 7 body characters where a derived id has 52, so no registry could ever
+    /// resolve it. hestia's own test corpus was signing over subjects that could
+    /// not verify against a real registry; that is the defect R6 names, and the
+    /// tests were carrying it.
+    fn subject_id() -> String {
+        web4_core::derive_lct_id(&KeyPair::generate().verifying_key())
+    }
+
+    /// The tail clause is an IDENTITY over all 256 possible final digest bytes,
+    /// not a distribution measured over some number of digests — so assert it
+    /// exhaustively rather than sampling. `'a'` ⟺ final byte even, `'q'` ⟺ odd,
+    /// independent of the other 31 bytes. If `derive_lct_id`'s digest ever stops
+    /// being 32 bytes, `CANONICAL_LCT_ID_TAIL` goes stale — and this test plus
+    /// `CANONICAL_LCT_ID_BODY_LEN` are the two places that say so loudly. (The
+    /// staleness direction is safe either way: a stale tail set can only ever
+    /// over-reject, never admit a non-canonical id.)
+    #[test]
+    fn the_tail_clause_holds_over_every_possible_final_digest_byte() {
+        // Drive `derive_lct_id`'s real encoder by choosing keys, then read the
+        // final digest byte back out of the digest we recompute the same way.
+        // Sweeping keys until all 256 final-byte values are seen is the honest
+        // exhaustive check: nothing here reimplements base32.
+        let mut seen = [false; 256];
+        let mut remaining = 256usize;
+        let mut tried = 0u32;
+        while remaining > 0 {
+            tried += 1;
+            assert!(tried < 100_000, "gave up sweeping final digest bytes");
+            let pk = KeyPair::generate().verifying_key();
+            let digest = web4_core::crypto::sha256(&pk.to_bytes());
+            let last_byte = *digest.last().expect("sha256 is 32 bytes") as usize;
+            if seen[last_byte] {
+                continue;
+            }
+            seen[last_byte] = true;
+            remaining -= 1;
+
+            let id = web4_core::derive_lct_id(&pk);
+            let last_char = id.chars().next_back().expect("non-empty id");
+            let expected = if last_byte % 2 == 0 { 'a' } else { 'q' };
+            assert_eq!(
+                last_char, expected,
+                "final digest byte {last_byte} should encode to '{expected}', got '{last_char}'"
+            );
+            assert!(CANONICAL_LCT_ID_TAIL.contains(&last_char));
+            assert!(is_canonical_lct_id(&id), "a real derived id is canonical");
+        }
+        assert_eq!(remaining, 0, "all 256 final-byte values exercised");
+    }
+
+    /// The other half of decode-completeness: perturbing the tail to any of the
+    /// 30 non-`{a,q}` characters makes an otherwise well-formed id the encoding
+    /// of no digest, and the predicate must say exactly that — not "quorum not
+    /// met", and not a bare `false`.
+    #[test]
+    fn a_perturbed_tail_is_refused_with_the_padding_bits_reason() {
+        let id = subject_id();
+        let head = &id[..id.len() - 1];
+        for ch in "abcdefghijklmnopqrstuvwxyz234567".chars() {
+            let perturbed = format!("{head}{ch}");
+            match canonical_subject_id(&perturbed) {
+                Ok(_) => assert!(
+                    CANONICAL_LCT_ID_TAIL.contains(&ch),
+                    "'{ch}' accepted but is not a canonical tail"
+                ),
+                Err(SubjectIdError::PaddingBits { last }) => {
+                    assert_eq!(last, ch);
+                    assert!(!CANONICAL_LCT_ID_TAIL.contains(&ch));
+                }
+                Err(other) => panic!("unexpected refusal for '{ch}': {other}"),
+            }
+        }
+    }
+
     #[test]
     fn attest_produces_a_verifiable_existence_attestation() {
         let kp = KeyPair::generate();
-        let a = attest(
-            "lct:web4:mb32:bsubject",
-            "lct:web4:member:legion",
-            now(),
-            &kp,
-        );
+        let subject = subject_id();
+        let other = subject_id();
+        let a = attest(&subject, "lct:web4:member:legion", now(), &kp).unwrap();
         assert_eq!(a.attestation_type, AttestationType::Existence);
         assert_eq!(a.witness, "lct:web4:member:legion");
-        assert!(a.verify("lct:web4:mb32:bsubject", &kp.verifying_key()));
+        assert!(a.verify(&subject, &kp.verifying_key()));
         // bound to THIS subject — a different subject's id does not verify
-        assert!(!a.verify("lct:web4:mb32:bother", &kp.verifying_key()));
+        assert!(!a.verify(&other, &kp.verifying_key()));
     }
 
     #[test]
     fn quorum_counts_distinct_valid_witnesses_only() {
-        let subject = "lct:web4:mb32:bsubject";
+        let subject = &subject_id();
+        let subject = subject.as_str();
         let w: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
         let wid: Vec<String> = (0..3).map(|i| format!("lct:web4:member:w{i}")).collect();
         let resolver = {
@@ -169,21 +434,16 @@ mod tests {
 
         // Two distinct witnesses + a DUPLICATE from w0 → still only 2 distinct.
         let mut atts = vec![
-            attest(subject, &wid[0], now(), &w[0]),
-            attest(subject, &wid[1], now(), &w[1]),
-            attest(
-                subject,
-                &wid[0],
-                now() + chrono::Duration::seconds(5),
-                &w[0],
-            ),
+            attest(subject, &wid[0], now(), &w[0]).unwrap(),
+            attest(subject, &wid[1], now(), &w[1]).unwrap(),
+            attest(subject, &wid[0], now() + chrono::Duration::seconds(5), &w[0]).unwrap(),
         ];
         let vd = valid_distinct_existence(subject, &atts, &resolver);
         assert_eq!(vd.len(), 2, "duplicate witness does not add to the quorum");
         assert!(!quorum_reached(&vd));
 
         // Add the third distinct witness → quorum reached.
-        atts.push(attest(subject, &wid[2], now(), &w[2]));
+        atts.push(attest(subject, &wid[2], now(), &w[2]).unwrap());
         let vd = valid_distinct_existence(subject, &atts, &resolver);
         assert_eq!(vd.len(), 3);
         assert!(quorum_reached(&vd));
@@ -191,7 +451,8 @@ mod tests {
 
     #[test]
     fn build_birth_certificate_is_quorum_gated() {
-        let subject = "lct:web4:mb32:bsubject";
+        let subject = &subject_id();
+        let subject = subject.as_str();
         let w: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
         let wid: Vec<String> = (0..3).map(|i| format!("lct:web4:member:w{i}")).collect();
         let resolver = {
@@ -201,8 +462,8 @@ mod tests {
         };
         // Two witnesses → below quorum → None (no birth on < 3 witnesses).
         let two = vec![
-            attest(subject, &wid[0], now(), &w[0]),
-            attest(subject, &wid[1], now(), &w[1]),
+            attest(subject, &wid[0], now(), &w[0]).unwrap(),
+            attest(subject, &wid[1], now(), &w[1]).unwrap(),
         ];
         assert!(
             build_birth_certificate(
@@ -218,7 +479,7 @@ mod tests {
         );
         // Three distinct → Some(cert) naming exactly those witnesses.
         let three: Vec<_> = (0..3)
-            .map(|i| attest(subject, &wid[i], now(), &w[i]))
+            .map(|i| attest(subject, &wid[i], now(), &w[i]).unwrap())
             .collect();
         let (cert, evidence) = build_birth_certificate(
             subject,
@@ -243,12 +504,13 @@ mod tests {
 
     #[test]
     fn invalid_and_unresolvable_witnesses_do_not_count() {
-        let subject = "lct:web4:mb32:bsubject";
+        let subject = &subject_id();
+        let subject = subject.as_str();
         let good = KeyPair::generate();
         let forger = KeyPair::generate();
         // one valid, and one whose recorded witness id resolves to a DIFFERENT key
         let atts = vec![
-            attest(subject, "lct:web4:member:good", now(), &good),
+            attest(subject, "lct:web4:member:good", now(), &good).unwrap(),
             // "forged": claims to be :good but signed by a different key
             Attestation::sign(
                 subject,

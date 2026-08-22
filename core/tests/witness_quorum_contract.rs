@@ -16,6 +16,26 @@
 //!   3. the signature must verify over `(subject_lct_id, type, ts)`
 //!   4. ≥3 **distinct** witnesses — distinct by the `witness` STRING (C1 below)
 //!   5. every DECLARED birth witness must be currently verifiable (C2 below)
+//!
+//! ## Status after the R2/R3/R5 ruling (HUB, 2026-08-21; web4#758)
+//!
+//! Three of these have moved from "measured wrong" to "fixed on the producer
+//! side", and the assertions below moved with them — which is the entire point
+//! of having written them first:
+//!
+//! - **C1 → R1.** `valid_distinct_existence` now dedups on the resolved KEY as
+//!   well as the id, so the three-spellings-of-one-key certificate is no longer
+//!   built. HUB's R2 makes the verifier count the same way (web4-core, theirs).
+//! - **C3 → R4.** `witness::attest` truncates `ts` to whole seconds before
+//!   signing, so a millisecond hop is a no-op.
+//! - **C5 → R6.** `witness::attest` refuses a subject id that is not the
+//!   canonical key-derived form, with a reason.
+//!
+//! **C2 and C4 are unchanged and still measure today's behaviour**, because both
+//! land in web4-core and neither is hestia's to fix: C2 is R3′ (HUB's ruling
+//! adopted the intent and revised the spelling; the canon call is dp's) and C4
+//! is R5 (`WITNESS_KEY_PURPOSE`, HUB's to export). They stay red-in-prose on
+//! purpose — when those ship, these two assertions are the ones that flip.
 
 use chrono::{TimeZone, Utc};
 use web4_core::crypto::KeyPair;
@@ -65,19 +85,83 @@ fn resolver(registry: &[Lct]) -> impl Fn(&str) -> Option<PublicKey> + '_ {
 /// not a quorum" holds at the id layer and not at the key layer, where the
 /// independence it is protecting actually lives.
 ///
-/// Should move to: dedup on the RESOLVED KEY as well as the id — in the
-/// producer (`valid_distinct_existence`) so a certificate like this is never
-/// built, and in the verifier's stated contract so an existing one is caught.
+/// **FIXED — R1** (this commit). `valid_distinct_existence` keeps two sets, an
+/// id set and a resolved-key set, and drops an attestation whose key has already
+/// counted. The producer no longer builds this certificate at all: the assertion
+/// below is now that `build_birth_certificate` returns `None`. HUB's R2
+/// (web4#758) makes the verifier count the ≥3 floor over distinct keys, so an
+/// already-issued certificate of this shape is caught too.
+///
+/// There is no installed base to invalidate — 1 of 23 registry LCTs carries a
+/// vouched witnessing key and the quorum needs 3, so zero conferred records
+/// exist. The hazard converts from "verifies as theatre" to "fails at conferral".
 #[test]
-fn c1_three_witness_ids_backed_by_one_key_currently_pass() {
+fn c1_three_witness_ids_backed_by_one_key_are_no_longer_a_quorum() {
     let sid = subject();
     let ts = fixed_ts();
     let shared_op = KeyPair::generate();
     let registry: Vec<Lct> = (0..3).map(|_| onboarded(&shared_op).0).collect();
     let atts: Vec<Attestation> = registry
         .iter()
-        .map(|m| hestia::witness::attest(&sid, &m.lct_id(), ts, &shared_op))
+        .map(|m| hestia::witness::attest(&sid, &m.lct_id(), ts, &shared_op).unwrap())
         .collect();
+
+    // Each attestation is individually valid: right type, resolvable witness,
+    // signature verifies. Only their independence is fictional.
+    let distinct_ids: std::collections::BTreeSet<&str> =
+        atts.iter().map(|a| a.witness.as_str()).collect();
+    let distinct_keys: std::collections::BTreeSet<String> = atts
+        .iter()
+        .filter_map(|a| resolver(&registry)(&a.witness).map(|k| k.to_hex()))
+        .collect();
+    assert_eq!(distinct_ids.len(), 3, "three distinct witness ids");
+    assert_eq!(distinct_keys.len(), 1, "backed by exactly one signing key");
+    assert!(
+        atts.iter().all(|a| resolver(&registry)(&a.witness)
+            .map(|k| a.verify(&sid, &k))
+            .unwrap_or(false)),
+        "every attestation verifies on its own"
+    );
+
+    let counted = hestia::witness::valid_distinct_existence(&sid, &atts, resolver(&registry));
+    assert_eq!(counted.len(), 1, "R1: one key counts once, whatever it is called");
+
+    assert!(
+        hestia::witness::build_birth_certificate(
+            &sid,
+            "lct:web4:role:citizen",
+            "lct:web4:society:test",
+            None,
+            &atts,
+            ts,
+            resolver(&registry),
+        )
+        .is_none(),
+        "R1: the producer refuses to birth a citizen on three spellings of one key"
+    );
+}
+
+/// **R1, the non-degenerate half.** The fix must not cost a real quorum. Three
+/// genuinely independent witnesses still confer, and a fourth attestation that
+/// duplicates one of their KEYS under a fresh id is the only thing dropped.
+#[test]
+fn r1_independent_witnesses_still_confer_and_only_the_twin_is_dropped() {
+    let sid = subject();
+    let ts = fixed_ts();
+    let ops: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
+    let mut registry: Vec<Lct> = ops.iter().map(|op| onboarded(op).0).collect();
+    let mut atts: Vec<Attestation> = registry
+        .iter()
+        .zip(&ops)
+        .map(|(m, op)| hestia::witness::attest(&sid, &m.lct_id(), ts, op).unwrap())
+        .collect();
+
+    // A fourth member of the same seat as ops[0] — a second `witness onboard`
+    // against one hub connection vouches the SAME key onto a new LCT.
+    let twin = onboarded(&ops[0]).0;
+    let twin_id = twin.lct_id();
+    registry.push(twin);
+    atts.push(hestia::witness::attest(&sid, &twin_id, ts, &ops[0]).unwrap());
 
     let (certificate, attestations) = hestia::witness::build_birth_certificate(
         &sid,
@@ -88,20 +172,17 @@ fn c1_three_witness_ids_backed_by_one_key_currently_pass() {
         ts,
         resolver(&registry),
     )
-    .expect("the producer builds this certificate today");
+    .expect("three independent witnesses are still a quorum");
+
+    assert_eq!(certificate.birth_witnesses.len(), 3, "the twin did not inflate the count");
+    assert!(
+        !certificate.birth_witnesses.contains(&twin_id),
+        "the twin is dropped, and the first id holding that key is the one kept"
+    );
     let record = CitizenshipRecord { certificate, attestations };
-
-    let distinct_keys: std::collections::BTreeSet<String> = record
-        .attestations
-        .iter()
-        .filter_map(|a| resolver(&registry)(&a.witness).map(|k| k.to_hex()))
-        .collect();
-
-    assert_eq!(record.certificate.birth_witnesses.len(), 3, "three declared witnesses");
-    assert_eq!(distinct_keys.len(), 1, "backed by exactly one signing key");
     assert!(
         record.verify_quorum(&sid, resolver(&registry)),
-        "MEASURED (to be fixed): the quorum passes on three spellings of one key"
+        "and it still verifies under today's verifier, before R2 lands"
     );
 }
 
@@ -134,7 +215,7 @@ fn c2_one_witness_rotating_voids_a_four_witness_certificate() {
     let atts: Vec<Attestation> = registry
         .iter()
         .zip(&ops)
-        .map(|(m, op)| hestia::witness::attest(&sid, &m.lct_id(), ts, op))
+        .map(|(m, op)| hestia::witness::attest(&sid, &m.lct_id(), ts, op).unwrap())
         .collect();
 
     let (certificate, attestations) = hestia::witness::build_birth_certificate(
@@ -195,38 +276,50 @@ fn c2_one_witness_rotating_voids_a_four_witness_certificate() {
 /// JSON store, a JS client, a `TIMESTAMP(3)` column — silently invalidates the
 /// signature, and the verifier reports the generic "quorum not met".
 ///
-/// Should move to: the producer truncates to whole seconds before signing.
-/// Measured below: a second-precision attestation survives both a JSON
-/// round-trip and a millisecond normalisation, because truncating it is a no-op.
+/// **FIXED — R4** (this commit). `witness::attest` truncates `ts` to whole
+/// seconds before signing, so the lossy hop is a no-op. The caller no longer has
+/// to know: passing `Utc::now()` — which is what the CLI does — now produces a
+/// second-precision attestation. Per HUB, this needs no `v1`→`v2` bump: the
+/// rendering is untouched, only the value changes.
+///
+/// The raw-`Attestation::sign` arm below is kept deliberately, to show the
+/// hazard still exists one layer down for anyone who bypasses the producer.
 #[test]
-fn c3_second_precision_is_the_only_ts_that_survives_a_lossy_hop() {
+fn c3_attest_now_signs_whole_seconds_so_a_lossy_hop_is_a_no_op() {
     let sid = subject();
     let op = KeyPair::generate();
     let now = Utc::now();
+    assert_ne!(now.timestamp_subsec_nanos(), 0, "Utc::now() carries sub-second precision");
 
-    let as_signed = hestia::witness::attest(&sid, "lct:web4:mb32:btest", now, &op);
-    assert!(as_signed.verify(&sid, &op.verifying_key()), "verifies as signed");
+    let att = hestia::witness::attest(&sid, "lct:web4:mb32:btest", now, &op).unwrap();
+    assert_eq!(att.ts.timestamp_subsec_nanos(), 0, "R4: truncated before signing");
+    assert_eq!(att.ts.timestamp(), now.timestamp(), "and truncated, not rounded");
+    assert!(att.verify(&sid, &op.verifying_key()), "verifies as signed");
 
-    let mut lossy = as_signed.clone();
-    lossy.ts = Utc.timestamp_millis_opt(now.timestamp_millis()).unwrap();
-    assert!(
-        !lossy.verify(&sid, &op.verifying_key()),
-        "MEASURED: a millisecond hop breaks a nanosecond-precision attestation"
-    );
-
-    let truncated = hestia::witness::attest(
-        &sid,
-        "lct:web4:mb32:btest",
-        Utc.timestamp_opt(now.timestamp(), 0).unwrap(),
-        &op,
-    );
     let mut round: Attestation =
-        serde_json::from_str(&serde_json::to_string(&truncated).unwrap()).unwrap();
+        serde_json::from_str(&serde_json::to_string(&att).unwrap()).unwrap();
     assert!(round.verify(&sid, &op.verifying_key()), "survives a JSON round-trip");
     round.ts = Utc.timestamp_millis_opt(round.ts.timestamp_millis()).unwrap();
     assert!(
         round.verify(&sid, &op.verifying_key()),
-        "and survives a millisecond hop, because truncation is a no-op"
+        "R4: and survives a millisecond hop, because truncation is a no-op"
+    );
+
+    // One layer down, unchanged: the signing primitive still honours whatever
+    // precision it is handed. R4 is a producer-side discipline, not a format change.
+    let raw = web4_core::Attestation::sign(
+        &sid,
+        "lct:web4:mb32:btest",
+        web4_core::AttestationType::Existence,
+        now,
+        &op,
+    );
+    let mut lossy = raw.clone();
+    lossy.ts = Utc.timestamp_millis_opt(now.timestamp_millis()).unwrap();
+    assert!(raw.verify(&sid, &op.verifying_key()));
+    assert!(
+        !lossy.verify(&sid, &op.verifying_key()),
+        "MEASURED: bypassing the producer still lets a millisecond hop void a signature"
     );
 }
 
@@ -259,19 +352,66 @@ fn c4_the_other_purpose_spelling_resolves_to_nothing() {
 /// spelling is, to the signature, a different subject — so an attestation can be
 /// well-formed, correctly signed, and structurally incapable of ever verifying.
 ///
-/// Should move to: `witness attest` canonicalises the subject id (or refuses a
-/// form it cannot canonicalise) rather than signing whatever it was handed.
+/// **FIXED — R6** (this commit). `witness::attest` refuses a subject that is not
+/// the canonical key-derived form, and names which id space it got instead. It
+/// is a refusal and not a translation, necessarily: there is no mapping from
+/// `lct:web4:member:{uuid}` back to the derived id without the key, and
+/// inventing one would be the id-forgery the derived form exists to prevent.
+///
+/// The predicate, for the witness roster to key on (HUB's R6 note — one mapping,
+/// not two): `lct:web4:mb32:b` + 52 characters of `[a-z2-7]`, final character
+/// `a` or `q`. That last clause is not cosmetic: 52 base32 characters hold 260
+/// bits and a SHA-256 digest supplies 256, so the final character's low four
+/// bits are padding and always zero — alphabet index 0 or 16. Measured over
+/// 20 000 random digests: exactly those two, ~50/50. It rejects 30 of every 32
+/// otherwise-well-formed hand-typed ids.
 #[test]
-fn c5_an_attestation_over_the_other_id_space_can_never_verify() {
+fn c5_attest_refuses_a_subject_from_the_other_id_space() {
+    use hestia::witness::{attest, canonical_subject_id, is_canonical_lct_id, SubjectIdError};
     let (subject_lct, _) = Lct::new(EntityType::AiSoftware, None);
     let mb32 = subject_lct.lct_id();
     let legacy = format!("lct:web4:member:{}", uuid::Uuid::nil());
     let op = KeyPair::generate();
 
-    let att = hestia::witness::attest(&legacy, "lct:web4:mb32:btest", fixed_ts(), &op);
-    assert!(att.verify(&legacy, &op.verifying_key()), "well-formed under the id it signed");
-    assert!(
-        !att.verify(&mb32, &op.verifying_key()),
-        "MEASURED: and worthless under the id the registry knows"
+    assert!(is_canonical_lct_id(&mb32), "a real derived id passes");
+    assert_eq!(
+        attest(&legacy, "lct:web4:mb32:btest", fixed_ts(), &op).unwrap_err(),
+        SubjectIdError::MembershipIdSpace(legacy.clone()),
+        "R6: the membership id space is refused BY NAME, not signed"
     );
+    // and the refusal explains itself rather than becoming "quorum not met"
+    let msg = attest(&legacy, "lct:web4:mb32:btest", fixed_ts(), &op)
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("membership id"), "names the id space: {msg}");
+    assert!(msg.contains("lct:web4:mb32:b"), "names the form it wants: {msg}");
+
+    // The full clause set, each refused for its own reason.
+    assert!(matches!(
+        canonical_subject_id("lct:web4:role:citizen"),
+        Err(SubjectIdError::WrongSpace(_))
+    ));
+    assert!(matches!(
+        canonical_subject_id("lct:web4:mb32:bsubject"),
+        Err(SubjectIdError::BodyLength { got: 7 })
+    ), "the readable stand-in hestia's own tests used before R6");
+    let mut bad_alpha: String = mb32.clone();
+    bad_alpha.replace_range(bad_alpha.len() - 1.., "1");
+    assert!(matches!(
+        canonical_subject_id(&bad_alpha),
+        Err(SubjectIdError::Alphabet { ch: '1' })
+    ));
+    // Same length, same alphabet, right prefix — and still impossible.
+    let mut bad_tail: String = mb32.clone();
+    bad_tail.replace_range(bad_tail.len() - 1.., "b");
+    assert_eq!(bad_tail.len(), mb32.len());
+    assert!(matches!(
+        canonical_subject_id(&bad_tail),
+        Err(SubjectIdError::PaddingBits { last: 'b' })
+    ), "the clause that catches a transcribed id: {bad_tail}");
+
+    // The real subject signs and verifies, under its own id and no other.
+    let good = attest(&mb32, "lct:web4:mb32:btest", fixed_ts(), &op).unwrap();
+    assert!(good.verify(&mb32, &op.verifying_key()));
+    assert!(!good.verify(&legacy, &op.verifying_key()));
 }
