@@ -323,7 +323,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_gate_escalation_open",
-            "Ask a HUMAN to approve a write to the governance surface (gate, witness, law_inject, the registration). Stage 2 of dp's 2026-07-29 ruling: the gate refuses these writes, and this is the channel that un-refuses a legitimate one. Returns an escalation_id and a deadline; NO DECISION WITHIN THE WINDOW IS A DENY, not a retry. Witnessed on open. Assurance A1: the operator shares this UID, so approval is tamper-EVIDENT, not tamper-proof. PASS answers_deny = the chain hash of the deny you are escalating (hestia_witness_decision returns it as witnessEntryHash): without it the escalation is witnessed but UNLINKED, and unlinked escalations cannot be credited as conduct — escalating instead of routing around is the top of the Temperament scale (1.0 on approval), and the link is what makes it readable. It is never inferred from timing",
+            "Ask a HUMAN to approve a write to the governance surface (gate, witness, law_inject, the registration). Stage 2 of dp's 2026-07-29 ruling: the gate refuses these writes, and this is the channel that un-refuses a legitimate one. Returns an escalation_id and a deadline; NO DECISION WITHIN THE WINDOW IS A DENY, not a retry. Witnessed on open. Assurance A1: the operator shares this UID, so approval is tamper-EVIDENT, not tamper-proof. PASS answers_deny = the chain hash of the deny you are escalating (hestia_witness_decision returns it as witnessEntryHash): without it the escalation is witnessed but UNLINKED, and unlinked escalations cannot be credited as conduct — escalating instead of routing around is the top of the Temperament scale (1.0 on approval), and the link is what makes it readable. It is never inferred from timing. PASS act = the exact write you intend to perform, e.g. 'Edit -> plugins/<seat>/hooks/<file>'. REQUIRED: the approval is bound to this string (#539), and you must re-issue the SAME string to claim it. `reason` is your rationale and is NOT the act — an approval bound to a rationale can never be claimed, so an open without `act` is refused rather than granted-and-unspendable",
         ),
         t(
             "hestia_gate_pending_escalations",
@@ -10145,6 +10145,7 @@ mod tests {
                 "plugin_id": "codex",
                 "tool_name": "Edit",
                 "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
             }),
         )
         .await
@@ -11471,6 +11472,7 @@ mod tests {
                 "role": "role:constellation:member",
                 "tool_name": "Edit",
                 "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
             }),
         )
         .await
@@ -11514,6 +11516,7 @@ mod tests {
                 "role": "role:constellation:member",
                 "tool_name": "Edit",
                 "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
             }),
         )
         .await
@@ -11555,6 +11558,7 @@ mod tests {
                 "session_id": session_of["codex"],
                 "tool_name": "Edit",
                 "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
             }),
         )
         .await
@@ -11620,6 +11624,7 @@ mod tests {
                 "session_id": mine,
                 "tool_name": "Edit",
                 "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
             }),
         )
         .await;
@@ -11657,6 +11662,7 @@ mod tests {
                 "plugin_id": "codex",
                 "tool_name": "Edit",
                 "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
             }),
         )
         .await
@@ -11760,6 +11766,7 @@ mod tests {
                 "session_id": session_of["codex"],
                 "tool_name": "Edit",
                 "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
             }),
         )
         .await
@@ -11804,6 +11811,7 @@ mod tests {
                 "session_id": session_of["claude-code"],
                 "tool_name": "Bash",
                 "marker": "witness.py",
+                "act": "Bash -> witness.py",
             }),
         )
         .await
@@ -13512,6 +13520,7 @@ mod appeal_tests {
         let peer_sid = seat(&state, "codex").await;
         let opened = tool_gate_escalation_open(&state, &json!({
             "plugin_id": "claude-code", "tool_name": "policy_edit", "marker": "policy.json",
+            "act": "policy_edit -> policy.json",
             "reason": "the deny blocks a legitimate rule addition",
             "session_id": asker_sid.to_string(),
         })).await.unwrap();
@@ -13891,6 +13900,7 @@ mod appeal_tests {
         let peer_sid = seat(&state, "codex").await;
         let opened = tool_gate_escalation_open(&state, &json!({
             "plugin_id": "claude-code", "tool_name": "policy_edit", "marker": "policy.json",
+            "act": "policy_edit -> policy.json",
             "reason": "the deny blocks a legitimate rule addition",
             "session_id": asker_sid.to_string(),
         })).await.unwrap();
@@ -14734,6 +14744,12 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // the operator ruled on an id, an asker and a path fragment (dp, 2026-08-02).
     let stated_reason = optional_string(args, "reason");
     let stated_detail = optional_string(args, "detail");
+    // THE ACT, and deliberately NOT `reason` on this door (legion review, 2026-08-21).
+    // `reason` here is a rationale by its own documentation; binding the digest to it would
+    // make every approval on this door unspendable and loop. No fallback: a member that
+    // states only a why gets `MissingField("act")` from the mint site and a message saying
+    // which field to add, rather than an approval that can never be claimed.
+    let act = optional_string(args, "act");
     // #128 (release blocker per #224, closed "superseded for coordination" rather than fixed):
     // this surface has always taken its asker as a bare string and accepted no session at all,
     // so `arbiter::eligibility` compares an ASSERTION (`appellant: &esc.plugin_id`) against an
@@ -14774,6 +14790,8 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     let esc = match s
         .gate_escalations
         .open(&plugin_id, &role, &tool_name, &marker,
+              // The act, from its own field. No fallback to `reason` on this door.
+              act.as_deref(),
               stated_reason.as_deref(), stated_detail.as_deref(), now, DEFAULT_TTL_SECS)
     {
         Ok(e) => e,
@@ -15218,6 +15236,9 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // "say what you need changed and why"; until now there was no field to say it in, so
     // the operator ruled on an id, an asker and a path fragment (dp, 2026-08-02).
     let stated_reason = optional_string(args, "reason");
+    // Optional here: the gate hook has always sent the act as `reason`, so the call
+    // site below falls back to it. A caller that sends both gets `act`.
+    let act = optional_string(args, "act");
     let stated_detail = optional_string(args, "detail");
     // The durable per-wake key the daemon's own outcome rows carry — the value that joins a
     // spent approval to the act that consumed it. ACCEPTED HERE ONLY TO BE CHECKED, NEVER TO
@@ -15410,6 +15431,9 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     match s
         .gate_escalations
         .open(&plugin_id, &role, &tool_name, &marker,
+              // The gate hook composes `reason` AS the act, and has always done so, so it is
+              // the act here. `act` still wins if a caller sends both.
+              act.as_deref().or(stated_reason.as_deref()),
               stated_reason.as_deref(), stated_detail.as_deref(), now, DEFAULT_TTL_SECS)
     {
         Ok(esc) => {
@@ -16504,6 +16528,9 @@ mod disposition_durability_tests {
                 "",
                 "policy_edit",
                 "policy.json",
+                // #539: the act is its own field. This synthetic opener names the act it is
+                // about to perform; `stated_reason` stays the rationale.
+                Some("policy_edit -> policy.json"),
                 stated_reason,
                 None,
                 opened_at,
@@ -17221,7 +17248,7 @@ mod disposition_durability_tests {
             let opened_at = real_now - 3 * 3600;
             let esc = s
                 .gate_escalations
-                .open("kimi-code", "", "policy_edit", "policy.json", None, None, opened_at, 3600)
+                .open("kimi-code", "", "policy_edit", "policy.json", Some("Edit -> act"), None, None, opened_at, 3600)
                 .unwrap();
             let id = esc.id.clone();
             s.gate_escalations
@@ -17541,6 +17568,7 @@ mod disposition_durability_tests {
         let sid = super::appeal_tests::seat(&state, "kimi-code").await;
         let opened = tool_gate_escalation_open(&state, &json!({
             "plugin_id": "kimi-code", "tool_name": "policy_edit", "marker": "policy.json",
+            "act": "policy_edit -> policy.json",
             "reason": "turns out the rule already covers it",
             "session_id": sid.to_string(),
         })).await.unwrap();
