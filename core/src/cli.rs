@@ -1294,6 +1294,14 @@ fn cmd_witness_attest(
     out: Option<String>,
 ) -> AnyResult<()> {
     use hestia::hub::MemberKeySource;
+    // R6 preflight, BEFORE the vault: the subject id is inside the signed bytes,
+    // so a subject the registry cannot resolve yields an attestation that is
+    // well-formed, correctly signed, and permanently unverifiable — reported at
+    // the far end as the generic "quorum not met". Checking it first also means
+    // an UNATTENDED session can validate a subject id and get the reason, rather
+    // than dying on the tty-only passphrase prompt before reaching the check.
+    let subject_lct_id = hestia::witness::canonical_subject_id(subject_lct_id)
+        .map_err(|e| anyhow::anyhow!("refusing to attest: {e}"))?;
     let vault = open_vault(home)?;
     let store = HubStore::load(&vault)?;
     // Resolve which connection's pinned key witnesses (the operational key the
@@ -1338,7 +1346,10 @@ fn cmd_witness_attest(
             format!("lct:web4:member:{}", conn.our_lct_id)
         }
     };
-    let att = hestia::witness::attest(subject_lct_id, &witness_lct_id, chrono::Utc::now(), &keypair);
+    // Already canonical (checked above, pre-vault); `attest` re-checks anyway —
+    // the guard belongs to the producer, not to this one caller.
+    let att = hestia::witness::attest(subject_lct_id, &witness_lct_id, chrono::Utc::now(), &keypair)
+        .map_err(|e| anyhow::anyhow!("refusing to attest: {e}"))?;
     let json = serde_json::to_string_pretty(&att)?;
     match out {
         Some(path) => {
