@@ -95,6 +95,76 @@ pub fn self_check(payload: &LctPublishPayload) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse a **foreign** `lct_publish` document — one minted by another
+/// constellation and handed over for relay — and re-attribute it to this
+/// relayer (M-CIT-1a).
+///
+/// [`collect_publish_set`] can only emit what this vault already holds, so
+/// there was no path to publish a document we did not mint. The registry seam
+/// has always allowed `subject != publisher` (the hub binds `published_by` to
+/// the envelope signer and never relates it to `document`), but no producer
+/// could express it. This is that producer.
+///
+/// **Nothing in the file is trusted except the subject.** `lct_id` and
+/// `provenance` are taken *verbatim from the file* precisely so that
+/// [`self_check`]'s checks 3 and 5 stay real checks against what the minter
+/// claimed — re-deriving `lct_id` here instead would make check 3 vacuous, and
+/// a relay that cannot fail is not a check.
+///
+/// **Attribution is never read from the file.** `published_by`/`published_at`
+/// are supplied by the caller, because the hub binds `published_by` to the
+/// envelope signer (hard 403 on mismatch) — a relayer that honoured a
+/// file-supplied publisher would emit a payload that cannot be sent. A file
+/// carrying a *parseable* publisher that is not us is refused rather than
+/// silently overwritten: that document was addressed to a different relayer,
+/// and quietly re-addressing it would be a forged handoff.
+pub fn relay_payload(
+    file: &serde_json::Value,
+    published_by: Uuid,
+    published_at: DateTime<Utc>,
+) -> Result<LctPublishPayload, String> {
+    if let Some(action) = file.get("action").and_then(|v| v.as_str()) {
+        if action != "lct_publish" {
+            return Err(format!("expected action=lct_publish, got {action}"));
+        }
+    }
+    // A parseable-but-different publisher means this handoff names someone
+    // else. A placeholder string (the handoff convention) parses as nothing
+    // and is simply replaced.
+    if let Some(named) = file
+        .get("published_by")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        if named != published_by {
+            return Err(format!(
+                "document names relayer {named}, but we would sign as {published_by} — \
+                 the hub binds published_by to the envelope signer, so this handoff \
+                 is addressed to someone else"
+            ));
+        }
+    }
+    let lct_id = file
+        .get("lct_id")
+        .and_then(|v| v.as_str())
+        .ok_or("relay file has no lct_id (string)")?
+        .to_string();
+    let provenance: LctProvenance = file
+        .get("provenance")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| format!("relay file provenance is not a known provenance: {e}"))?
+        .ok_or("relay file has no provenance")?;
+    let document_value = file.get("document").cloned().ok_or("relay file has no document")?;
+    let document: Lct = serde_json::from_value(document_value)
+        .map_err(|e| format!("relay file document is not an Lct: {e}"))?;
+
+    let payload = LctPublishPayload { lct_id, document, published_by, provenance, published_at };
+    self_check(&payload)?;
+    Ok(payload)
+}
+
 /// Collect the constellation's publishable set, **sovereign first** (so role
 /// `bound` edges resolve on arrival), then roles in stable label order. Every
 /// payload has passed [`self_check`]; anything that fails is returned in
@@ -179,6 +249,117 @@ mod tests {
             "anchor",
         );
         (sovereign, registry, members, dir)
+    }
+
+    /// A foreign handoff, built the way Sprout builds one: mint elsewhere,
+    /// hand over a file whose attribution fields are placeholders.
+    fn foreign_handoff() -> (serde_json::Value, Lct) {
+        let (mut lct, kp) = Lct::new(EntityType::AiEmbodied, None);
+        lct.sign_binding(&kp);
+        let file = serde_json::json!({
+            "action": "lct_publish",
+            "lct_id": lct.lct_id(),
+            "document": lct,
+            "provenance": "self_issued",
+            "published_by": "<relayer: MUST equal the envelope signer's member uuid>",
+            "published_at": "<relayer: set at send time>",
+        });
+        (file, lct)
+    }
+
+    #[test]
+    fn relay_attributes_a_foreign_document_to_the_relayer() {
+        let (file, lct) = foreign_handoff();
+        let me = Uuid::new_v4();
+        let at = Utc::now();
+        let payload = relay_payload(&file, me, at).expect("a well-formed handoff relays");
+        assert_eq!(payload.lct_id, lct.lct_id());
+        // The subject is the foreign document; the attribution is ours. This is
+        // the whole point of the surface — `collect_publish_set` cannot say it.
+        assert_eq!(payload.document.public_key, lct.public_key);
+        assert_eq!(payload.published_by, me, "placeholder replaced, not honoured");
+        assert_eq!(payload.published_at, at);
+    }
+
+    #[test]
+    fn relay_refuses_a_handoff_addressed_to_a_different_relayer() {
+        let (mut file, _) = foreign_handoff();
+        let someone_else = Uuid::new_v4();
+        file["published_by"] = serde_json::json!(someone_else);
+        let err = relay_payload(&file, Uuid::new_v4(), Utc::now()).unwrap_err();
+        assert!(
+            err.contains("addressed to someone else"),
+            "silently re-addressing another seat's handoff would forge it: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_refuses_a_relabelled_document() {
+        // The attack a relay uniquely enables: the relayer did not mint this
+        // document, so a hostile (or mistaken) handoff can point a *valid,
+        // correctly-signed* document at someone else's registry id and
+        // overwrite it in place. Check 3 is what stands in the way, so it has
+        // to be a real check — which is why `relay_payload` takes `lct_id`
+        // from the file instead of re-deriving it.
+        let (mut file, _) = foreign_handoff();
+        let (victim, vkp) = {
+            let (mut l, k) = Lct::new(EntityType::AiSoftware, None);
+            l.sign_binding(&k);
+            (l, k)
+        };
+        let _ = vkp;
+        file["lct_id"] = serde_json::json!(victim.lct_id());
+        let err = relay_payload(&file, Uuid::new_v4(), Utc::now()).unwrap_err();
+        assert!(err.contains("check 3"), "named check in the refusal: {err}");
+    }
+
+    #[test]
+    fn relay_refuses_conferred_provenance_and_a_broken_binding() {
+        let (mut file, _) = foreign_handoff();
+        file["provenance"] = serde_json::json!("society_conferred");
+        assert!(relay_payload(&file, Uuid::new_v4(), Utc::now())
+            .unwrap_err()
+            .contains("check 5"));
+
+        // check 2, via the failure mode that actually happens in transit: a
+        // relay hop that renders `created_at` at millisecond precision. The
+        // binding message signs the timestamp's *wire form*, so truncation
+        // voids a signature that was never tampered with.
+        let (mut file, _) = foreign_handoff();
+        file["document"]["created_at"] = serde_json::json!("2026-08-22T02:55:53.284Z");
+        let err = relay_payload(&file, Uuid::new_v4(), Utc::now()).unwrap_err();
+        assert!(err.contains("check 2"), "named check in the refusal: {err}");
+    }
+
+    #[test]
+    fn relay_round_trip_preserves_sub_millisecond_created_at() {
+        // The guard for the above: our own parse must not be the hop that
+        // truncates. A nanosecond-precision handoff has to survive
+        // JSON -> Lct -> JSON with its binding intact, or the relayer becomes
+        // the thing that breaks documents it is only supposed to carry.
+        let (file, _) = foreign_handoff();
+        let signed_at = file["document"]["created_at"].as_str().unwrap().to_string();
+        let payload = relay_payload(&file, Uuid::new_v4(), Utc::now()).unwrap();
+        let rendered = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            rendered["document"]["created_at"].as_str().unwrap(),
+            signed_at,
+            "the relayer re-serialized the timestamp it was handed"
+        );
+        assert!(payload.document.verify_binding(), "binding survives the round trip");
+    }
+
+    #[test]
+    fn relay_refuses_a_file_that_is_not_a_publish() {
+        let (mut file, _) = foreign_handoff();
+        file["action"] = serde_json::json!("member_join_request");
+        assert!(relay_payload(&file, Uuid::new_v4(), Utc::now())
+            .unwrap_err()
+            .contains("expected action=lct_publish"));
+        let missing = serde_json::json!({"action": "lct_publish"});
+        assert!(relay_payload(&missing, Uuid::new_v4(), Utc::now())
+            .unwrap_err()
+            .contains("no lct_id"));
     }
 
     #[test]
