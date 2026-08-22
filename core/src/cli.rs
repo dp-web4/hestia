@@ -1341,8 +1341,22 @@ fn cmd_witness_attest(
             lct.lct_id()
         }
         None => {
-            eprintln!("[witness] note: legacy witness-id form; ruling (B) uses `--as <plugin_id>` \
-                       for the canonical, registry-resolvable id");
+            // Not "less resolvable" — UNRESOLVABLE. The hub's registry keys on
+            // `lct:web4:mb32:…` (`HubState::registry`), so the only bridge from
+            // an attestation's `witness` string to a pinned key starts with
+            // `registry.get(witness)`; a `lct:web4:member:{uuid}` string misses
+            // it and the witness is dropped as unresolvable (Sprout, forum
+            // 2026-08-21: "one resolver, one answer"). The attestation is
+            // well-formed and correctly signed and can never count toward a
+            // quorum — the exact silent failure R6 refuses on the SUBJECT one
+            // field over. Said loudly because the signing step is vault-attended
+            // and expensive to repeat.
+            eprintln!("[witness] WARNING: no --as, so the witness id is the legacy \
+                       `lct:web4:member:{{uuid}}` form. The hub's registry keys on \
+                       `lct:web4:mb32:…`, so this attestation will NOT resolve to a key \
+                       and will NOT count toward a quorum — it will be reported at \
+                       conferral as the generic \"quorum not met\". Re-run with \
+                       `--as <plugin_id>` (ruling B) for the registry-resolvable id.");
             format!("lct:web4:member:{}", conn.our_lct_id)
         }
     };

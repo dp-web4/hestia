@@ -52,12 +52,34 @@ pub const CANONICAL_LCT_ID_PREFIX: &str = "lct:web4:mb32:b";
 /// `ceil(256 / 5) = 52` characters with no padding.
 pub const CANONICAL_LCT_ID_BODY_LEN: usize = 52;
 
-/// The only two characters a derived id can end with. 52 base32 characters hold
-/// 260 bits; a 256-bit digest supplies 256, so the final character's low **four
-/// bits are padding and are always zero** — leaving alphabet index 0 (`a`) or 16
-/// (`q`). Measured over 20 000 random digests: exactly these two, ~50/50. This
-/// is the clause that rejects a hand-typed, truncated or transcribed id that
-/// already passed prefix, length and alphabet.
+/// The only two characters a derived id can end with. The derivation, so the
+/// next reader inherits it instead of re-deriving it: 52 characters × 5 bits =
+/// 260; SHA-256 supplies 256; the 4 residual bits are padding and are always
+/// zero — leaving alphabet index 0 (`a`) or 16 (`q`), and nothing else.
+///
+/// **This is an identity, not a sample.** The last character depends on nothing
+/// but the low bit of the final digest byte (31 bytes = 248 bits; 49 characters
+/// consume 245; the 32nd byte arrives with 3 bits buffered, emits two more
+/// characters and leaves exactly one bit), so it is checkable over all 256
+/// possible final bytes rather than sampled over digests. Checked exhaustively
+/// against [`web4_core::lct::derive_lct_id`]'s encoder: `'a'` ⟺ final byte even,
+/// `'q'` ⟺ final byte odd, independent of the other 31 bytes.
+///
+/// **What the clause is for: decode-completeness, not transcription.** Prefix +
+/// length + alphabet accept 32^52 = 2^260 strings, while a 256-bit digest has
+/// 2^256 encodings — so without this clause the predicate admits 2^260 − 2^256
+/// strings that are the encoding of *no digest at all*. Adding it leaves exactly
+/// 32^51 × 2 = 2^256: the clause **is** a decode round-trip, and it is what makes
+/// "canonical" mean canonical rather than plausible. (Measured: over 20 000 ids
+/// with this position perturbed to every alphabet value, tail-clause and
+/// decode-round-trip disagree 0 times.)
+///
+/// It is NOT the clause that catches a transcribed id, and a caller must not be
+/// told it is. It only sees position 52 of 52: measured over 200 000 single-
+/// character substitutions at uniform position, it catches **1.86%** of them
+/// (analytic `(1/52)(30/31)` = 1.861%). A slip in any of the other 51 positions
+/// is indistinguishable from a different valid id, by this or by anything else
+/// syntactic. (HUB's correction to the R6 headline, forum 2026-08-21.)
 const CANONICAL_LCT_ID_TAIL: [char; 2] = ['a', 'q'];
 
 /// Why a subject id is not the canonical, key-derived form [`attest`] will sign.
@@ -317,6 +339,72 @@ mod tests {
     /// tests were carrying it.
     fn subject_id() -> String {
         web4_core::derive_lct_id(&KeyPair::generate().verifying_key())
+    }
+
+    /// The tail clause is an IDENTITY over all 256 possible final digest bytes,
+    /// not a distribution measured over some number of digests — so assert it
+    /// exhaustively rather than sampling. `'a'` ⟺ final byte even, `'q'` ⟺ odd,
+    /// independent of the other 31 bytes. If `derive_lct_id`'s digest ever stops
+    /// being 32 bytes, `CANONICAL_LCT_ID_TAIL` goes stale — and this test plus
+    /// `CANONICAL_LCT_ID_BODY_LEN` are the two places that say so loudly. (The
+    /// staleness direction is safe either way: a stale tail set can only ever
+    /// over-reject, never admit a non-canonical id.)
+    #[test]
+    fn the_tail_clause_holds_over_every_possible_final_digest_byte() {
+        // Drive `derive_lct_id`'s real encoder by choosing keys, then read the
+        // final digest byte back out of the digest we recompute the same way.
+        // Sweeping keys until all 256 final-byte values are seen is the honest
+        // exhaustive check: nothing here reimplements base32.
+        let mut seen = [false; 256];
+        let mut remaining = 256usize;
+        let mut tried = 0u32;
+        while remaining > 0 {
+            tried += 1;
+            assert!(tried < 100_000, "gave up sweeping final digest bytes");
+            let pk = KeyPair::generate().verifying_key();
+            let digest = web4_core::crypto::sha256(&pk.to_bytes());
+            let last_byte = *digest.last().expect("sha256 is 32 bytes") as usize;
+            if seen[last_byte] {
+                continue;
+            }
+            seen[last_byte] = true;
+            remaining -= 1;
+
+            let id = web4_core::derive_lct_id(&pk);
+            let last_char = id.chars().next_back().expect("non-empty id");
+            let expected = if last_byte % 2 == 0 { 'a' } else { 'q' };
+            assert_eq!(
+                last_char, expected,
+                "final digest byte {last_byte} should encode to '{expected}', got '{last_char}'"
+            );
+            assert!(CANONICAL_LCT_ID_TAIL.contains(&last_char));
+            assert!(is_canonical_lct_id(&id), "a real derived id is canonical");
+        }
+        assert_eq!(remaining, 0, "all 256 final-byte values exercised");
+    }
+
+    /// The other half of decode-completeness: perturbing the tail to any of the
+    /// 30 non-`{a,q}` characters makes an otherwise well-formed id the encoding
+    /// of no digest, and the predicate must say exactly that — not "quorum not
+    /// met", and not a bare `false`.
+    #[test]
+    fn a_perturbed_tail_is_refused_with_the_padding_bits_reason() {
+        let id = subject_id();
+        let head = &id[..id.len() - 1];
+        for ch in "abcdefghijklmnopqrstuvwxyz234567".chars() {
+            let perturbed = format!("{head}{ch}");
+            match canonical_subject_id(&perturbed) {
+                Ok(_) => assert!(
+                    CANONICAL_LCT_ID_TAIL.contains(&ch),
+                    "'{ch}' accepted but is not a canonical tail"
+                ),
+                Err(SubjectIdError::PaddingBits { last }) => {
+                    assert_eq!(last, ch);
+                    assert!(!CANONICAL_LCT_ID_TAIL.contains(&ch));
+                }
+                Err(other) => panic!("unexpected refusal for '{ch}': {other}"),
+            }
+        }
     }
 
     #[test]
