@@ -80,6 +80,16 @@ pub const DERIVATION_VERSION: &str = "v3-derived-v1";
 // 60k and 70k is not.
 pub const BASELINE_FLOOR_ACTS: u64 = 1_000;
 
+/// Below this, volume is not evidence of anything and must not produce a VERDICT.
+///
+/// dp specified "low under 1K acts", and that is right for a member with a modest but
+/// real record. It is wrong for a member with two. `low` is a negative finding on the
+/// same scale as `high`; asserting it from 2 actions manufactures a bad verdict out of
+/// near-zero evidence — the identical null-state conflation this whole file exists to
+/// prevent, just pointing the other way. Measured 2026-08-23: codex/interactive-dev
+/// carries exactly 2 actions and would otherwise have rendered `low`.
+pub const BASELINE_MIN_ACTS: u64 = 100;
+
 /// The act count at which volume evidence saturates.
 ///
 /// Deliberately ITS OWN constant and not `DERIVATION_GOVERNANCE_SCAN`, though they may
@@ -109,7 +119,7 @@ pub struct WitnessedVolume {
 
 /// Volume as evidence, gated on governed coverage. `None` = volume proves nothing here.
 pub fn baseline_score(total_acts: u64, governed_acts: u64) -> Option<f64> {
-    if governed_acts == 0 || total_acts == 0 {
+    if governed_acts == 0 || total_acts < BASELINE_MIN_ACTS {
         return None;
     }
     let floor = (BASELINE_FLOOR_ACTS as f64).log10();
@@ -1103,6 +1113,16 @@ mod tests {
         );
         assert!(baseline_score(50_000, 1).is_some(), "one governed act is coverage");
         assert_eq!(baseline_score(0, 10), None, "no acts, nothing to scale");
+        assert_eq!(
+            baseline_score(2, 2),
+            None,
+            "2 actions is not evidence of `low` — it is evidence of nothing, and `low` is \
+             a negative verdict on the same scale as `high`"
+        );
+        assert!(
+            baseline_score(BASELINE_MIN_ACTS, 2).is_some(),
+            "at the minimum, volume starts to speak"
+        );
     }
 
     /// The curve dp specified: low under 1K, high over 10K, monotone in between.
