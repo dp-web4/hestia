@@ -103,6 +103,21 @@ pub const BASELINE_SATURATION_ACTS: u64 = 10_000;
 const BASELINE_MIN: f64 = 0.35;
 const BASELINE_MAX: f64 = 0.75;
 
+/// How many observations a grain needs before a confident level may be asserted from
+/// conduct ALONE, when that grain's own activity is below `BASELINE_MIN_ACTS`.
+///
+/// dp, 2026-08-23: "codex interactive-dev reads high on 2 actions." Two causes met there.
+/// The EMA opens at 0.5 and two observations of 0.85 land at 0.754, clearing the 0.70
+/// `high` threshold — a confident number with two data points behind it. And the
+/// observations were not even the grain's own: a role-less adjudication credits every
+/// grain the member has (`a_role_less_adjudication_credits_every_grain`).
+///
+/// This gate is deliberately NARROW. It applies only when volume is known AND below the
+/// floor, so `derive()` without volume — every pre-existing test, and any caller that
+/// does not pass totals — behaves exactly as before. A grain with a real record is never
+/// silenced by it; a grain with two actions cannot wear a badge borrowed from elsewhere.
+const LEVEL_MIN_OBSERVATIONS: u64 = 5;
+
 /// The governed:total ratio at which governance conduct fully determines the level.
 /// Below it, conduct and volume blend in proportion to how much of the member's record
 /// was actually adjudicated — the significance ratio dp specified.
@@ -1075,6 +1090,20 @@ pub fn derive_with_volume(
         }
     }
 
+    // A grain whose OWN activity is below the volume floor must not assert a level from a
+    // handful of observations — least of all ones that may have leaked in from a sibling
+    // role. Narrow by construction: with no volume passed, nothing here changes.
+    let observations: u64 = [&temperament, &validity, &veracity, &valuation]
+        .iter()
+        .map(|d| d.observations)
+        .sum();
+    let thin_grain = volume.is_some_and(|v| v.total_acts < BASELINE_MIN_ACTS);
+    let conduct = if thin_grain && observations < LEVEL_MIN_OBSERVATIONS {
+        None
+    } else {
+        conduct
+    };
+
     let baseline = volume.and_then(|v| baseline_score(v.total_acts, governed_acts));
     let level_basis = match (conduct.is_some(), baseline.is_some()) {
         (false, false) => "none",
@@ -1118,6 +1147,96 @@ pub fn derive_with_volume(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// dp, 2026-08-23: "codex interactive-dev reads high on 2 actions."
+    ///
+    /// DIFFERENTIAL: the identical window and the identical evidence, changing only the
+    /// grain's own witnessed volume. Two actions must not carry a badge; a real record
+    /// must still get one, or this gate would be silencing evidence rather than thin air.
+    #[test]
+    fn two_actions_cannot_wear_a_confident_badge() {
+        let role = "role:constellation:interactive-dev";
+        let w = vec![entry(
+            1,
+            0,
+            "adjudication",
+            json!({"subject_plugin_id": "codex", "axis": "validity", "score": 0.9}),
+        )];
+
+        // Arm A — the grain codex/interactive-dev actually is: 2 acts, one thin
+        // observation (which is not even its own — see the role-less pin above).
+        let thin = derive_with_volume(
+            "codex",
+            role,
+            &w,
+            Some(WitnessedVolume { total_acts: 2, success_acts: 2 }),
+        );
+        assert_eq!(
+            thin.level, "unmeasured",
+            "2 actions and a single borrowed observation is not a HIGH — it is not \
+             anything, and saying so is the honest answer"
+        );
+
+        // Arm B — same evidence, a grain with a real record behind it. If this went
+        // unmeasured too, the gate would be suppressing evidence, not thin air.
+        let real = derive_with_volume(
+            "codex",
+            role,
+            &w,
+            Some(WitnessedVolume { total_acts: 5_000, success_acts: 4_900 }),
+        );
+        assert_ne!(
+            real.level, "unmeasured",
+            "CONTROL: a grain with 5,000 witnessed acts must still be levelled — the gate \
+             is narrow by design"
+        );
+
+        // And with no volume passed at all, nothing changes: every pre-existing caller
+        // and test keeps the behaviour it was written against.
+        assert_eq!(derive("codex", role, &w).level, thin_unchanged_level(&w, role));
+    }
+
+    fn thin_unchanged_level(w: &[ChainEntry], role: &str) -> String {
+        derive_with_volume("codex", role, w, None).level
+    }
+
+    /// A ROLE-LESS ADJUDICATION CREDITS EVERY GRAIN THE MEMBER HAS.
+    ///
+    /// `subject_role` is matched with `map_or(true, ...)`, so an adjudication that omits
+    /// it counts for each role separately. Surfaced 2026-08-23 when the window fix brought
+    /// codex's 2026-07-27 adjudications back into reach: `codex/interactive-dev` — 2
+    /// actions, no adjudications of its own — rendered HIGH on evidence belonging to
+    /// `member` and `reviewer`.
+    ///
+    /// Pinned as an OPEN DEFECT, not fixed here: making the match strict would drop real
+    /// evidence for grains whose adjudications legitimately carry no role, and which error
+    /// to prefer is dp's call, not mine. This goes red the moment the semantics change.
+    #[test]
+    fn a_role_less_adjudication_credits_every_grain() {
+        let mk = |role: &str| {
+            let w = vec![entry(
+                1,
+                0,
+                "adjudication",
+                json!({
+                    "subject_plugin_id": "codex",
+                    "axis": "validity",
+                    "score": 0.9,
+                    "adjudicator": "dp"
+                    // NOTE: no `subject_role`
+                }),
+            )];
+            derive("codex", role, &w).validity.observations
+        };
+        let a = mk("role:constellation:interactive-dev");
+        let b = mk("role:constellation:member");
+        assert_eq!(a, b, "same role-less adjudication counted for both grains");
+        assert!(
+            a > 0,
+            "OPEN-DEFECT PIN has gone RED, which is the intended end state: a role-less \
+             adjudication no longer credits an arbitrary grain. Close the finding."
+        );
+    }
 
     /// VOLUME NEVER SCORES WITHOUT GOVERNED COVERAGE — the safety property.
     ///
