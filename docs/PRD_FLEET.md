@@ -277,6 +277,9 @@ Carried honestly, each with its owner:
 8. **Multi-daemon co-residency** — `HESTIA_HOME` supports N identities per host (being + seat); do two daemons share a port, a chain, neither? Current answer: one daemon, N members (the being is a member of the seat's daemon); a second daemon per being is rejected until a concrete need appears. Owner: F2.
 
 9. **Provider subscription policy verification** — §13.5's posture-1 claim (vendor CLI headless under the owner's login = supported) reflects fleet practice and author knowledge; the external-research track on current provider terms did not complete. Before F4's subscription flag ships, verify each provider's current position in writing and record it beside the flag. Owner: F4, re-verified on every provider-policy change.
+10. **Slack/channel ToS + AI-disclosure-law verification** — §13.8's two go/no-go items (Slack's no-persistent-index clause; EU AI Act Art. 50 live since 2026-08-02) are carried from a peer-research pass and must be re-confirmed against current primary ToS/statute text before F5 is specified. This can *descope Slack entirely*; it is a phase-gate, not a footnote. Owner: F5 pre-spec.
+11. **hestia as its own STS (RFC 8693 + attenuated tokens)** — §16 rule 1: should the vault issue minute-scale, audience-bound, monotone-narrowing derived credentials to agents (AAT/`draft-niyikiza` shape, offline-verifiable) rather than ever handing over an upstream token? Highest-leverage borrow identified; maps onto the gate + witness chain. Owner: F0 (identity) design, informs F4/F5.
+
 ## 13. The external landscape — protocols, competitors, and the auth question
 
 From a dedicated research pass (2026-08-23; confidence-tagged in the study; load-bearing items verified against primary sources). Four findings change the PRD's posture; none change its architecture.
@@ -347,6 +350,23 @@ hestia's native loop is deliberately thin on exactly the absorbable functions (c
 
 Ingress/egress adapters per §6 use the boring, proven shapes: platform bot identities (bot token = a vault credential bound to the adapter's harness LCT), webhook ingress with signature verification where offered, OAuth account-linking ceremonies for address binding (§6.2's operator-walled `channel_bound` act), and plain SMTP/IMAP for mail. Agent-identity standards worth watching rather than adopting now: A2A signed AgentCards and the LF AI Catalog **Trust Manifest** (§13.2) — if the Trust Manifest matures, a member's public channel surface becomes a signed, discoverable artifact, and hestia should project it from the LCT rather than mint a parallel format. Named trigger to revisit: the manifest spec publishing field-level detail.
 
+### 13.8 Channel viability is a legal/ToS question before it is a technical one
+
+*(Evidence class: peer-research pass, 2026-08-23, confidence-tagged in source; the two go/no-go items below verified as load-bearing and carried as design constraints, not yet re-confirmed against primary ToS text by this author — §12.10.)*
+
+Two findings gate the channels phase (F5) independently of any code:
+
+- **Slack's API ToS (effective 2025-10-10) prohibits the obvious architecture.** Verbatim prohibitions: *"use API Data to train a large language model"*, *"create persistent copies, archives, indexes, or long-term data stores of other organizations' API Data"*, cross-org data use. Only *"limited and temporary"* handling essential to immediate operation, with prompt deletion; **no self-hosting carve-out.** So the Slack adapter is either (a) an ephemeral, single-org, no-LLM-ingestion relay with no message cache/vector index, or (b) out of scope. **A Slack-message memory or index built for a member is not a mitigation problem; it is a scoping decision, and it must be made before the adapter is specified.** This is the single highest-order design input for channels.
+- **EU AI Act Art. 50 transparency is enforceable *now* (since 2026-08-02) and was deliberately excluded from the Digital Omnibus deferral.** A member agent posting into a channel on a human's behalf must disclose it is AI **perceivably in the interaction itself** — a ToS line or an "assistant" label does not satisfy it. This is a product requirement in the egress path (a per-channel disclosure the adapter enforces), interacting directly with §6 and with the Telegram-Business "reply as the owner" primitive (the most powerful and most dangerous channel act — a governance-gate candidate by itself). US analogues: CA SB 1001 (bot disclosure) and SB 243 (in force 2026-01-01, private right of action).
+
+Platform-fit ranking, for phase-1 adapter selection (all peer-researched, tags in source):
+- **Telegram / Discord — cheapest NAT fit.** Telegram: OIDC account-linking now exists, `getUpdates` long-poll needs zero inbound reachability, native `sendRichMessageDraft` streams AI replies; **one poller per bot token** is a vault invariant. Discord: **interactions are delivered over the Gateway** (a NAT'd daemon gets full slash-command support, no public HTTPS), and privileged intents are self-serve under 10k users (obsoleted the old 100-server rule, 2026-06-10). Both bind on the platform's stable subject id, never email.
+- **Matrix — the only medium where hestia is the *authority*, not a guest** (appservice API = one virtual identity per agent, unrate-limited) — but only if the homeserver is local; otherwise it PUSHes to you and it's an architecture fork, not a config flag. `matrix-sdk-crypto` is a no-network state machine, a clean fit for vault-owned keys. Note **it is 0.x — pin exactly.**
+- **Email — good inbound, poor self-hosted outbound** (Gmail/Outlook require SPF+DKIM+DMARC+PTR; residential MX is dead; always relay via 587/465). Gmail auth: **Workspace + Internal consent screen = no CASA assessment, no 7-day refresh expiry**; personal Gmail = IMAP + app password. **Never a per-agent Google token scheme** (100 refresh tokens per account per client_id, silent eviction of the oldest).
+- **SMS — outbound-only alerting or out of scope** (US 10DLC registration mandatory with no hobbyist exemption; inbound is webhook-only, the one channel with no NAT-friendly receive).
+
+The structural pattern worth stating: **chat platforms in 2026 reward being small and private (Slack 50/min undistributed vs 1/min; Discord self-serve intents under 10k; Google's personal-use verification exemption); telecom punishes it.** A local-first fleet is on the right side of every chat platform's incentive and the wrong side of every telecom's — which is itself an argument for the channel set the PRD picks.
+
 ## 14. Acceptance criteria
 
 Each falsifiable, most with a named negative control (the corpus's own discipline):
@@ -380,6 +400,12 @@ Each falsifiable, most with a named negative control (the corpus's own disciplin
 - An inbound channel message can never mint authority: the receptionist projection retrieves nothing from private context (AGENT_CONTEXT_ACCESS §2.2's separation, tested at the retrieval predicate, not post-filter).
 - Escalation transfers role with no transcript carryover — assert the escalated-to context contains provenance only.
 
+**Security (§16)**
+- The daemon binds loopback/unix-socket only; a bind to `0.0.0.0` is a red test, and a same-host reverse proxy cannot reach an operator verb without a challenge-signed session. *This is the OpenClaw differentiator, tested.*
+- No agent ever receives an upstream provider/channel token: every credential handed to a session is a short-lived, audience-bound derived token. *Control: grep the vault-issue path for any raw upstream token reaching a session context → zero.*
+- The mass-revoke path is exercised in a test (Discord grant-wide vs Slack per-token both covered) before any channel adapter ships.
+- An agent posting to a channel emits the Art. 50 AI-disclosure in the interaction; an egress without it is refused. *Control: a channel.send with disclosure suppressed denies.*
+
 **Honesty**
 - Every dashboard assurance/deployment claim is derived (registry → profile; signed projection → fleet state), never asserted prose. The always-on-signal audit (#577) applies to every new indicator: each must have an observed transition or a designed dark state.
 
@@ -394,3 +420,20 @@ A: pass [construct: this document carries its evidence basis — four named stud
 V: present [construct: subscription mode architecturally optional + flag-gated; outward enforcement gated on rate-governor calibration; A2 claims derived, never asserted]
 verdict: PASS as a proposal — ratification is dp's, and implementation only through the phase gates
 ```
+
+## 16. Security threat model — hestia is in the OpenClaw/Drift family, and must say so
+
+*(Evidence class: peer-research pass, 2026-08-23; incident facts confidence-tagged in source. This section is the honest self-placement PRD_GOVERNANCE §2.4's adversary discipline requires for a credential-holding gateway.)*
+
+A daemon that holds provider credentials and social-channel tokens and drives agents is architecturally the same shape as two named 2026 disasters, and the PRD must answer both by name:
+
+- **OpenClaw (Jan–Feb 2026) — the cautionary twin.** A local-first agent daemon that bound `0.0.0.0:18789` and auto-trusted localhost (so any same-host reverse proxy bypassed auth); researchers pulled Anthropic keys, Telegram/Slack tokens, and months of chat history; ~63% of ~30k+ exposed instances had *no auth at all*. **What hestia does differently, by construction:** loopback/unix-socket bind with a required auth token, never `0.0.0.0`, never "localhost is trusted" (the operator gate already enforces challenge-signed sessions; reachability is not authority — the document's spine). This must be an acceptance criterion, not a default.
+- **Salesloft Drift (Aug 2025) — the exact failure chain, minus one hop.** source repo → cloud env → OAuth token store → **700+ customers' third-party accounts**; the stolen OAuth tokens **defeated MFA everywhere downstream** (an OAuth token *is* the MFA bypass); the actor grepped exfiltrated support tickets for `AKIA`/`secret`/`key`. hestia's chain is repo → vault → N members' credentials. **The one artifact the Drift attacker never touched was the audit log** — which is precisely hestia's differentiator.
+
+Three design rules fall out, and they are the honest differentiators against agentgateway/LiteLLM/Auth0-Token-Vault (§13.3), stated as requirements:
+
+1. **The vault never hands an upstream token to an agent.** It is its own STS: issues short-lived, audience-bound, *attenuated* derived credentials (the MCP token-passthrough prohibition as protocol law; the AAT monotone-narrowing algebra — *"authority can stay the same or narrow, but never widen"* — offline-verifiable from a root key, which maps almost exactly onto a governance gate + witness chain). This is the single highest-leverage borrow available and is added as open question §12.11.
+2. **Encryption at rest is worth nothing against local code execution while the daemon is unlocked** (CircleCI 2023: the attacker *"extracted encryption keys from a running process"*; CHAINDROP 2026 actively enumerates agent config files). So: per-subject encryption keys (a single vault DEK is the Drift architecture), an explicit per-credential-class choice between unattended operation and user-present unlock, and systemd encrypted credentials (TPM2-sealed, tmpfs-only, **do not propagate down the process tree** — the property env vars lack) as the storage primitive. TPM sealing defends disk theft, not the live-process threat — stated, not hidden.
+3. **Every token hestia holds is a pure bearer credential** — DPoP/mTLS sender-constraining is unavailable at Slack/Discord/Google-consumer/GitHub/Telegram. Blast radius is managed by the four things Drift lacked: short lifetime, minimal scope, per-subject keys, and a **pre-built, tested mass-revoke** (remembering the asymmetry: Discord revokes grant-wide, Slack per-token). And the Telegram bot token — scopeless, expiryless, unrevocable except by global rotation — is the one object that breaks the vault's attenuation promise: it is a distinguished credential class or it is not held (§12.7-adjacent).
+
+Legal placement, briefly: an operator choosing platforms, agent behavior, and retention is a **data controller, not a processor** (EDPB 07/2020; the household exemption fails the moment another data subject's comms are involved). The precedent that matters: **Irish DPC €91M against Meta (2024) for storing passwords in plaintext, never externally exposed** — insecure credential storage is itself the violation; "we were never breached" is not a defense. This is the legal weight behind the vault being the product's core, not a feature.
