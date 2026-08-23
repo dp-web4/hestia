@@ -1084,18 +1084,10 @@ async fn trust_derivation_json(
     let role = q
         .role
         .unwrap_or_else(|| "role:constellation:interactive-dev".to_string());
-    let window = s
-        .chain_store
-        // Fetch what the model DECLARES it reads, projected — not the whole window.
-        // `DERIVATION_EVENT_TYPES` filters in SQL (indexed) and `project_row` retains
-        // only `DERIVATION_KEYS`, so this stops materialising documents nobody folds.
-        .scan_recent(
-            None,
-            Some(crate::derivation::DERIVATION_EVENT_TYPES),
-            crate::derivation::DERIVATION_SCAN,
-            crate::derivation::project_row,
-        )
-        .unwrap_or_default();
+    // One shared window for every derivation surface: split budgets, so sparse
+    // governance evidence is not crowded out by routine outcomes. See
+    // `derivation::scan_window` for why the three call sites must not diverge.
+    let window = crate::derivation::scan_window(&s.chain_store);
     let derived = crate::derivation::derive(&q.plugin_id, &role, &window);
     drop(s);
     Json(serde_json::to_value(derived).unwrap_or_default())
@@ -1117,18 +1109,10 @@ async fn trust_graph_turtle(
     let role = q
         .role
         .unwrap_or_else(|| "role:constellation:interactive-dev".to_string());
-    let window = s
-        .chain_store
-        // Fetch what the model DECLARES it reads, projected — not the whole window.
-        // `DERIVATION_EVENT_TYPES` filters in SQL (indexed) and `project_row` retains
-        // only `DERIVATION_KEYS`, so this stops materialising documents nobody folds.
-        .scan_recent(
-            None,
-            Some(crate::derivation::DERIVATION_EVENT_TYPES),
-            crate::derivation::DERIVATION_SCAN,
-            crate::derivation::project_row,
-        )
-        .unwrap_or_default();
+    // One shared window for every derivation surface: split budgets, so sparse
+    // governance evidence is not crowded out by routine outcomes. See
+    // `derivation::scan_window` for why the three call sites must not diverge.
+    let window = crate::derivation::scan_window(&s.chain_store);
     let derived = crate::derivation::derive(&q.plugin_id, &role, &window);
     // The DURABLE member LCT, never the caller-supplied plugin_id — emitting the label here
     // would encode the attribution gap into the graph this projection exists to close.

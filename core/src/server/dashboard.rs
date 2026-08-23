@@ -41,18 +41,11 @@ impl DashboardChainProjection {
         // so the UI renders unavailable rather than fabricating a quiet fleet.
         // Each scan projects only what its consumer declares: derivation gets
         // its pruned ChainEntry, while stats/feed keep RecentEntry scalars.
-        let deriv_window = match chain_store.scan_recent(
-            None,
-            Some(crate::derivation::DERIVATION_EVENT_TYPES),
-            STATS_WINDOW,
-            crate::derivation::project_row,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("dashboard derivation chain read failed: {e}");
-                Vec::new()
-            }
-        };
+        // The dashboard read its derivation window with STATS_WINDOW (2,000) while the
+        // API used 10,000 — the surface a human looks at reached back FIVE TIMES less far
+        // than the API answering for it, and the comment below claimed the opposite.
+        // Both now share `derivation::scan_window`.
+        let deriv_window = crate::derivation::scan_window(chain_store);
         let (stats_window, stats_read_error) =
             match chain_store.scan_recent(None, None, STATS_WINDOW, |r| Some(flatten_row(r))) {
                 Ok(v) => (v, None),
@@ -917,10 +910,11 @@ impl ServerState {
         // (kimi-code) falls out of it entirely though its grain is intact. Seed the active set
         // from the trust store for every registry harness so it shows its most recent standing.
         // Insert-if-absent: a harness active in the window keeps its window entry untouched.
-        // The derived LEVEL still comes from `deriv_window` (the last N DERIVATION-type rows —
-        // a far sparser stream that reaches back much further), so an idle member shows its
-        // real last-derived level, never a fabricated one; if even that has aged out, the row
-        // is `unmeasured` but still carries the grain's action_count and days_since_last.
+        // The derived LEVEL comes from `deriv_window` — `derivation::scan_window`, whose
+        // governance budget is deep precisely so a member idle for days still shows the
+        // standing it earned. When this comment last claimed the window "reaches back much
+        // further", the dashboard was in fact passing STATS_WINDOW (~17 hours of chain) and
+        // kimi-code/codex rendered `unmeasured` beside 24k and 8k actions.
         if let Ok(all_keys) = self.trust_store.list() {
             // Reverse map: a grain key's instance prefix -> the human plugin_id, for the
             // harnesses we know. Both the mapped `lct:web4:member:…` form and the legacy

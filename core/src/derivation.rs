@@ -60,8 +60,27 @@ use crate::storage::chain::ChainEntry;
 
 pub const DERIVATION_VERSION: &str = "v3-derived-v1";
 const RETRY_WINDOW_MINUTES: i64 = 10;
-/// How much chain the derivation scans (same cap as the dashboard stats scan).
-pub const DERIVATION_SCAN: u64 = 10_000;
+/// How much chain the derivation scans — SPLIT BUDGETS.
+///
+/// One global cap starved the evidence trust is EARNED from. Until 2026-08-23 a single
+/// 10,000-row cap covered every type in `DERIVATION_EVENT_TYPES`, and `outcome` is ~92%
+/// of chain volume. Measured on this fleet: ~2,760 derivation-type rows/day, so the
+/// window reached back ~3.6 days — and the dashboard passed its own `STATS_WINDOW`
+/// (2,000), reaching back ~17 HOURS. kimi-code and codex each carried witnessed
+/// adjudications (10 and 5) plus hundreds of gate decisions, all dated 2026-07-27 and
+/// sitting ~84,000 rows deep. Both rendered `unmeasured` beside 24k and 8k actions.
+///
+/// That is not honest-unmeasured. The evidence existed and the READER dropped it, then
+/// reported the loss in the vocabulary of absence — indistinguishable, to anyone
+/// reading the screen, from "this agent has earned no trust".
+///
+/// The two classes have opposite lifetimes, so they get opposite budgets. `outcome` is
+/// read at exactly ONE site — pairing a successful recast within `RETRY_WINDOW_MINUTES`
+/// of a deny — so it needs recency, never reach. Governance evidence is sparse and
+/// matters indefinitely. Excluding `outcome` from the deep scan makes that scan cheaper
+/// than the old single window, because outcomes were most of what it materialised.
+pub const DERIVATION_HOT_SCAN: u64 = 10_000;
+pub const DERIVATION_GOVERNANCE_SCAN: u64 = 100_000;
 
 /// One piece of evidence backing a derived dimension.
 #[derive(Debug, Clone, Serialize)]
@@ -146,6 +165,63 @@ pub const DERIVATION_EVENT_TYPES: &[&str] = &[
     "gate_escalation_opened", "outcome", "policy_decision", "scope_attestation",
     IDENTITY_ALIAS_EVENT,
 ];
+
+/// The high-volume half: routine outcomes, read only within `RETRY_WINDOW_MINUTES` of a
+/// deny (`"outcome"` is folded at exactly one site).
+pub const DERIVATION_HOT_EVENT_TYPES: &[&str] = &["outcome"];
+
+/// The sparse half: everything a member's standing is actually earned from. These must
+/// not be crowded out of the window by another member's routine traffic — a trust level
+/// that depends on how busy your peers are is not a trust level.
+pub const DERIVATION_GOVERNANCE_EVENT_TYPES: &[&str] = &[
+    "adjudication", "amnesty", "appeal", "exoneration", "gate_escalation_decided",
+    "gate_escalation_opened", "policy_decision", "scope_attestation",
+    IDENTITY_ALIAS_EVENT,
+];
+
+/// The window EVERY derivation surface reads.
+///
+/// Shared deliberately: this was open-coded at three call sites with three different
+/// budgets — two API routes at 10,000 and the dashboard at `STATS_WINDOW` (2,000) — so
+/// the surface a human looked at reached back five times less far than the API that
+/// answered for it, while the comment above the dashboard call claimed the reverse.
+/// One helper means the three cannot silently disagree again.
+///
+/// Newest-first (`chain_position` DESC) is load-bearing: `ema_fold` weights the head of
+/// the slice most, so the merge re-sorts rather than concatenating two ordered runs.
+pub fn scan_window(chain_store: &crate::storage::chain::SqliteChainStore) -> Vec<ChainEntry> {
+    scan_window_with(chain_store, DERIVATION_HOT_SCAN, DERIVATION_GOVERNANCE_SCAN)
+}
+
+/// [`scan_window`] with explicit budgets, so a test can exercise the REAL path — the SQL
+/// type filter, the projection, and the merge — at a size that runs in milliseconds
+/// instead of writing ten thousand fixture rows. Setting both budgets equal and pointing
+/// them at the union reproduces the pre-2026-08-23 single-window behaviour, which is what
+/// makes the differential in `governance_evidence_survives_a_flood_of_outcomes` real
+/// rather than a claim about a constant.
+pub fn scan_window_with(
+    chain_store: &crate::storage::chain::SqliteChainStore,
+    hot_scan: u64,
+    governance_scan: u64,
+) -> Vec<ChainEntry> {
+    let scan = |types: &[&str], limit: u64, label: &str| -> Vec<ChainEntry> {
+        match chain_store.scan_recent(None, Some(types), limit, project_row) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("derivation {label} chain read failed: {e}");
+                Vec::new()
+            }
+        }
+    };
+    let mut out = scan(
+        DERIVATION_GOVERNANCE_EVENT_TYPES,
+        governance_scan,
+        "governance",
+    );
+    out.extend(scan(DERIVATION_HOT_EVENT_TYPES, hot_scan, "outcome"));
+    out.sort_by(|a, b| b.chain_position.cmp(&a.chain_position));
+    out
+}
 
 /// Build a `ChainEntry` carrying ONLY the keys in [`DERIVATION_KEYS`].
 ///
@@ -904,6 +980,65 @@ pub fn derive(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// THE WINDOW FIX, MEASURED — a differential, not an assertion about a constant.
+    ///
+    /// Routine outcomes must not push governance evidence out of the window a member's
+    /// standing is derived from. Measured 2026-08-22: kimi-code and codex each carried
+    /// witnessed adjudications dated 2026-07-27 sitting ~84,000 rows deep, and both
+    /// rendered `unmeasured` beside 24k and 8k actions — the evidence existed and the
+    /// reader dropped it.
+    ///
+    /// ARM A reproduces the pre-fix read (one budget over the union, smaller than the
+    /// flood) and must LOSE the adjudication — asserted, so a fixture that stops burying
+    /// it fails loudly instead of making arm B look meaningful. ARM B is the shipped
+    /// split and must KEEP it.
+    #[test]
+    fn governance_evidence_survives_a_flood_of_outcomes() {
+        use crate::storage::chain::SqliteChainStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), [7u8; 32]).unwrap();
+        let signer = "lct:web4:hestia:sovereign:test";
+
+        // Scarce evidence lands FIRST, then routine traffic buries it.
+        store
+            .append("adjudication", json!({"plugin_id": "kimi-code"}), signer)
+            .unwrap();
+        for i in 0..40 {
+            store
+                .append(
+                    "outcome",
+                    json!({"plugin_id": "kimi-code", "success": true, "n": i}),
+                    signer,
+                )
+                .unwrap();
+        }
+
+        let has_adj = |w: &[ChainEntry]| w.iter().any(|e| e.event_type == "adjudication");
+
+        let old = store
+            .scan_recent(None, Some(DERIVATION_EVENT_TYPES), 10, project_row)
+            .unwrap();
+        assert!(
+            !has_adj(&old),
+            "CONTROL IS INERT: the fixture no longer buries the adjudication, so arm B \
+             proves nothing. Add more outcomes than arm A's budget."
+        );
+
+        let new = scan_window_with(&store, 10, 10_000);
+        assert!(
+            has_adj(&new),
+            "REGRESSION: split budgets no longer protect governance evidence. A member's \
+             adjudications are being crowded out by routine outcomes again — which is what \
+             renders as `unmeasured` beside a large action_count."
+        );
+
+        // Newest-first is load-bearing: `ema_fold` weights the head of the slice most.
+        let positions: Vec<u64> = new.iter().map(|e| e.chain_position).collect();
+        let mut desc = positions.clone();
+        desc.sort_by(|a, b| b.cmp(a));
+        assert_eq!(positions, desc, "merged window must stay chain_position DESC");
+    }
 
     fn entry(pos: u64, ts_offset_min: i64, event_type: &str, data: Value) -> ChainEntry {
         ChainEntry {
