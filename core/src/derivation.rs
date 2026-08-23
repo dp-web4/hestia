@@ -1208,9 +1208,10 @@ mod tests {
     /// actions, no adjudications of its own — rendered HIGH on evidence belonging to
     /// `member` and `reviewer`.
     ///
-    /// Pinned as an OPEN DEFECT, not fixed here: making the match strict would drop real
-    /// evidence for grains whose adjudications legitimately carry no role, and which error
-    /// to prefer is dp's call, not mine. This goes red the moment the semantics change.
+    /// Pinned as an OPEN DEFECT (hestia#580), not fixed here: making the match strict
+    /// would drop real evidence for grains whose adjudications legitimately carry no role,
+    /// and which error to prefer is a governance decision about what a role-less
+    /// adjudication MEANS. This goes red the moment the semantics change.
     #[test]
     fn a_role_less_adjudication_credits_every_grain() {
         let mk = |role: &str| {
