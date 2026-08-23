@@ -1088,7 +1088,16 @@ async fn trust_derivation_json(
     // governance evidence is not crowded out by routine outcomes. See
     // `derivation::scan_window` for why the three call sites must not diverge.
     let window = crate::derivation::scan_window(&s.chain_store);
-    let derived = crate::derivation::derive(&q.plugin_id, &role, &window);
+    let vol = s.trust_for_role(&q.plugin_id, &role);
+    let derived = crate::derivation::derive_with_volume(
+        &q.plugin_id,
+        &role,
+        &window,
+        Some(crate::derivation::WitnessedVolume {
+            total_acts: vol.action_count,
+            success_acts: vol.success_count,
+        }),
+    );
     drop(s);
     Json(serde_json::to_value(derived).unwrap_or_default())
 }
@@ -1113,7 +1122,16 @@ async fn trust_graph_turtle(
     // governance evidence is not crowded out by routine outcomes. See
     // `derivation::scan_window` for why the three call sites must not diverge.
     let window = crate::derivation::scan_window(&s.chain_store);
-    let derived = crate::derivation::derive(&q.plugin_id, &role, &window);
+    let vol = s.trust_for_role(&q.plugin_id, &role);
+    let derived = crate::derivation::derive_with_volume(
+        &q.plugin_id,
+        &role,
+        &window,
+        Some(crate::derivation::WitnessedVolume {
+            total_acts: vol.action_count,
+            success_acts: vol.success_count,
+        }),
+    );
     // The DURABLE member LCT, never the caller-supplied plugin_id — emitting the label here
     // would encode the attribution gap into the graph this projection exists to close.
     // Unmappable (synthetic / malformed) grains get an explicit urn rather than a guess.

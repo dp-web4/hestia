@@ -985,7 +985,18 @@ impl ServerState {
                 // v3-derived-v1: the DISPLAYED level comes from derived
                 // evidence (adjudications + governance conduct) — never from
                 // the self-report scalar. Unmeasured renders as unmeasured.
-                let derived = crate::derivation::derive(pid, _role, &deriv_window);
+                // Lifetime totals come from the PERSISTED grain, never the window: the
+                // whole point is that routine governed work does not evaporate when a
+                // member goes idle for three days.
+                let derived = crate::derivation::derive_with_volume(
+                    pid,
+                    _role,
+                    &deriv_window,
+                    Some(crate::derivation::WitnessedVolume {
+                        total_acts: t.action_count,
+                        success_acts: t.success_count,
+                    }),
+                );
                 TrustView {
                     plugin_id: pid.clone(),
                     entity_id: t.entity_id.clone(),
