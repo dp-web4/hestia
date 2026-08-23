@@ -199,6 +199,18 @@ pub struct DerivedTrust {
     /// "unmeasured" until any dimension has evidence; then low/medium/high by
     /// the mean of measured dimension scores (<0.4 / <0.7 / >=0.7).
     pub level: String,
+    /// WHY `level` reads the way it does: "conduct", "volume", "conduct+volume", "none".
+    ///
+    /// Exposed because the level and the row's explanatory text are computed from
+    /// different things, and a row that renders a MEDIUM badge beside "unmeasured — no
+    /// adjudicated evidence yet" is a fresh version of the contradiction this change
+    /// exists to remove. A reader must be able to see which evidence produced the badge.
+    pub level_basis: String,
+    /// The lifetime witnessed acts the volume baseline was taken from (0 when unused).
+    pub baseline_acts: u64,
+    /// Governed acts counted for this grain in the window — the coverage that licenses
+    /// the volume baseline at all, and the numerator of the significance ratio.
+    pub governed_acts: u64,
 }
 
 /// The canonical fold used for derived observations — the same EMA the
@@ -1064,6 +1076,13 @@ pub fn derive_with_volume(
     }
 
     let baseline = volume.and_then(|v| baseline_score(v.total_acts, governed_acts));
+    let level_basis = match (conduct.is_some(), baseline.is_some()) {
+        (false, false) => "none",
+        (true, false) => "conduct",
+        (false, true) => "volume",
+        (true, true) => "conduct+volume",
+    }
+    .to_string();
     let level = match (conduct, baseline) {
         // Nothing to say, and saying nothing is correct.
         (None, None) => "unmeasured".to_string(),
@@ -1089,6 +1108,9 @@ pub fn derive_with_volume(
         veracity,
         valuation,
         level,
+        level_basis,
+        baseline_acts: volume.map_or(0, |v| v.total_acts),
+        governed_acts,
     }
 }
 

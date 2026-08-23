@@ -517,6 +517,10 @@ pub struct TrustView {
     pub legacy_level: String,
     /// Derived temperament (v3-derived-v1: governance-response conduct).
     #[serde(default)]
+    /// Why `level` reads the way it does, so the badge and the row text cannot disagree.
+    pub derived_level_basis: String,
+    pub derived_baseline_acts: u64,
+    pub derived_governed_acts: u64,
     pub derived_temperament: Option<f64>,
     #[serde(default)]
     pub derived_temperament_n: u64,
@@ -1002,6 +1006,9 @@ impl ServerState {
                     entity_id: t.entity_id.clone(),
                     level: derived.level.clone(),
                     legacy_level: t.trust_level().as_str().to_string(),
+                    derived_level_basis: derived.level_basis.clone(),
+                    derived_baseline_acts: derived.baseline_acts,
+                    derived_governed_acts: derived.governed_acts,
                     derived_temperament: derived.temperament.score,
                     derived_temperament_n: derived.temperament.observations,
                     t3_talent: dim(t.talent(), t3c[0]),
