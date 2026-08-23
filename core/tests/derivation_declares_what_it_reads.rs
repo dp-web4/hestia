@@ -191,14 +191,26 @@ fn every_declared_event_type_is_actually_read() {
 /// call sites with different windows would score the same member differently depending on
 /// which endpoint you asked, and neither would be wrong on its own terms.
 ///
-/// GRAIN, stated because it bounds what a green here means: this scan is FILE-grained, not
-/// call-site-grained. It asserts that every file which folds trust also names
-/// `DERIVATION_EVENT_TYPES` somewhere in its production region. Today that is exact —
-/// dashboard.rs has one fold and one mention, http.rs has two of each. But a file that
-/// grew a second, unprefiltered fold beside a prefiltered one would still pass. Closing
-/// that needs the call-site's actual argument, which needs a parser, not a substring; the
-/// weaker assertion is here because it catches the whole-file case (a new endpoint, a new
-/// module) that is how a divergent fold has actually arrived so far.
+/// THIS TEST CAUGHT EXACTLY THAT, and then caught its own repair. Measured 2026-08-23:
+/// dashboard.rs passed `STATS_WINDOW` (2,000 rows ≈ 17 hours) while the two http.rs routes
+/// passed `DERIVATION_SCAN` (10,000) — the surface a human looked at reached back five
+/// times less far than the API answering for it, and both named `DERIVATION_EVENT_TYPES`,
+/// so the FILE-grained assertion below went green through the whole divergence. The
+/// mention was never the invariant; the ARGUMENT was.
+///
+/// The repair removed the ambiguity rather than parsing it: all three sites now take their
+/// window from `derivation::scan_window`, one function, split budgets inside it. So the
+/// assertion is no longer "names the declared list somewhere" — it is "gets its window
+/// from the ONE place that applies the declared prefilters". That is strictly stronger
+/// than what this test asserted before, and it needs no parser: a second, unprefiltered
+/// fold beside a prefiltered one now fails, because the check is that a folding file
+/// obtains windows ONLY through `scan_window`.
+///
+/// GRAIN, stated because it bounds what a green here means: still FILE-grained. A file
+/// that calls `scan_window` and ALSO hand-builds a second window still passes. Catching
+/// that needs the call's arguments, and this test has always declined to write a parser —
+/// bare `scan_recent` cannot stand in for it, because dashboard.rs legitimately reads a
+/// stats/feed window that way and it is not a fold at all.
 #[test]
 fn every_fold_call_site_applies_the_declared_prefilter() {
     let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -223,9 +235,21 @@ fn every_fold_call_site_applies_the_declared_prefilter() {
                 continue;
             }
             let prod = body.split("#[cfg(test)]").next().unwrap_or(&body);
-            if prod.contains("derivation::derive(") {
+            // Both fold entry points: `derive` and `derive_with_volume` (which carries the
+            // grain's persisted lifetime totals). Renaming a call site must not be able to
+            // empty this scan silently — the assertion below fails loudly if it does.
+            let folds = prod.contains("derivation::derive(")
+                || prod.contains("derivation::derive_with_volume(");
+            if folds {
                 checked.push(path.display().to_string());
-                if !prod.contains("DERIVATION_EVENT_TYPES") {
+                // The window must come from the ONE prefiltered path. A file that builds
+                // its own window with `scan_recent` is exactly the divergence that let the
+                // dashboard read 17 hours while the API read 3.6 days.
+                // NOT also flagging bare `scan_recent` in the file: dashboard.rs reads a
+                // stats/feed window that way and it is not a derivation fold. Separating
+                // those needs the call's ARGUMENTS, which is the parser this test has
+                // always declined to write.
+                if !prod.contains("derivation::scan_window(") {
                     offenders.push(path.display().to_string());
                 }
             }
@@ -234,14 +258,18 @@ fn every_fold_call_site_applies_the_declared_prefilter() {
 
     assert!(
         !checked.is_empty(),
-        "no file outside derivation.rs calls `derivation::derive(` — either the fold lost its \
-         callers or this scan stopped finding them. Either way the two tests above are \
-         guarding a list nothing reads, and that is worth knowing."
+        "no file outside derivation.rs calls `derivation::derive(` or \
+         `derivation::derive_with_volume(` — either the fold lost its callers or this scan \
+         stopped finding them. Either way the two tests above are guarding a list nothing \
+         reads, and that is worth knowing."
     );
     assert!(
         offenders.is_empty(),
-        "{offenders:?} fold trust without naming DERIVATION_EVENT_TYPES. A fold whose window \
-         came from a different prefilter scores the same member from a different population \
-         than /api/trust/derivation does, and the guard above cannot see it. Checked: {checked:?}"
+        "{offenders:?} fold trust without taking the window from `derivation::scan_window`, \
+         or build one by hand with `scan_recent` alongside it. A fold whose window came from \
+         a different prefilter or a different BUDGET scores the same member from a different \
+         population than /api/trust/derivation does — measured 2026-08-23, that was 17 hours \
+         of chain against 3.6 days, and both sites named the declared list. Checked: \
+         {checked:?}"
     );
 }

@@ -2173,6 +2173,18 @@
   function lawScore(t) {
     const measured = LAW_DIMS.map(([n, f]) => [n, f(t)]).filter(([, v]) => typeof v === 'number');
     if (!measured.length) {
+      // No ADJUDICATED evidence — but the daemon may still have levelled this grain from
+      // witnessed governed volume. Saying "unmeasured" beside a MEDIUM badge would be a
+      // fresh version of the contradiction this whole change exists to remove, so the
+      // row states which evidence produced the badge.
+      if (t.derived_level_basis === 'volume' && t.derived_baseline_acts) {
+        return {
+          score: null,
+          n: 0,
+          label: `baseline from ${fmt.int(t.derived_baseline_acts)} witnessed acts`
+               + ` · ${fmt.int(t.derived_governed_acts)} governed · no adjudicated conduct yet`,
+        };
+      }
       // Honest-unmeasured, matching the daemon: zero qualifying evidence is not zero
       // trust and is not the self-reported figure either. Say so; render no fill.
       return { score: null, label: 'unmeasured — no adjudicated evidence yet', n: 0 };
