@@ -11417,6 +11417,99 @@ mod tests {
         );
     }
 
+    /// The member door states the act and its rationale in DIFFERENT fields (#539).
+    ///
+    /// The first repair parsed `act` here and used it when opening, but the spend path still
+    /// hashed `reason`. That made a correctly approved member-door escalation unclaimable
+    /// whenever the member supplied the rationale the schema asks for. The existing fixtures
+    /// could not see it because every one used the gate-hook compatibility shape, where the
+    /// act lives in `reason` and no explicit `act` is sent.
+    #[tokio::test]
+    async fn an_explicit_act_wins_over_a_distinct_rationale_when_claimed() {
+        const ACT: &str = "Edit -> /repo/core/src/member_door_target.rs";
+        const WHY: &str = "repair the member-door authorization binding";
+        const MARKER: &str = "policy.json";
+
+        let (_dir, shared) = make_shared_state();
+        let connected = tool_connect(
+            &shared,
+            &json!({ "plugin_id": "kimi-code", "host_agent": "h" }),
+        )
+        .await
+        .unwrap();
+        let session = connected["sessionId"].as_str().unwrap().to_string();
+
+        // The documented member door: `act` is WHAT, `reason` is WHY. They are deliberately
+        // unequal so falling back to the compatibility field cannot pass accidentally.
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": session,
+                "tool_name": "Edit",
+                "marker": MARKER,
+                "act": ACT,
+                "reason": WHY,
+            }),
+        )
+        .await
+        .unwrap();
+        let escalation_id = opened["escalation_id"].as_str().unwrap().to_string();
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations
+                .decide(
+                    &escalation_id,
+                    true,
+                    "operator",
+                    "role:constellation:sovereign",
+                    crate::server::gate_escalation::Channel::OperatorSession,
+                    None,
+                    Some("approved for the stated act"),
+                    crate::server::gate_escalation::now_secs(),
+                )
+                .expect("the sovereign channel approves the member-door act");
+        }
+
+        let claim_args = json!({
+            "plugin_id": "kimi-code",
+            "session_id": session,
+            "tool_name": "Edit",
+            "marker": MARKER,
+            "act": ACT,
+            "reason": WHY,
+        });
+        let claimed = tool_gate_escalation_claim(&shared, &claim_args).await.unwrap();
+        assert_eq!(
+            claimed["claimed"], true,
+            "the explicit act must spend its approval: {claimed}"
+        );
+        assert_eq!(
+            claimed["escalation_id"], escalation_id,
+            "the approved row is the one spent"
+        );
+
+        let row = claimed_row(&shared, MARKER).await;
+        assert_eq!(
+            row["stated_attempted_act"], ACT,
+            "the chain must record the same explicit act whose digest admitted the spend, not \
+             the distinct rationale: {row}"
+        );
+
+        // Single use remains load-bearing: the same exact act cannot spend the approval twice.
+        // `claim` is claim-or-open, so the retry opens a fresh pending ask rather than reusing
+        // the approved id; both halves are asserted to distinguish those states.
+        let retry = tool_gate_escalation_claim(&shared, &claim_args).await.unwrap();
+        assert_eq!(
+            retry["claimed"], false,
+            "the approval was already spent: {retry}"
+        );
+        assert_ne!(
+            retry["escalation_id"], escalation_id,
+            "a spent approval must never re-arm"
+        );
+    }
+
     /// THE DERIVATION, with nothing on the wire to derive from.
     ///
     /// The first draft of this change wrote the caller's `host_session_id` argument straight
@@ -15408,6 +15501,12 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // Optional here: the gate hook has always sent the act as `reason`, so the call
     // site below falls back to it. A caller that sends both gets `act`.
     let act = optional_string(args, "act");
+    // One value for all three uses below: the digest join, the claimed-chain row, and the
+    // claim-or-open fallback. Keeping those as separate expressions is how the explicit
+    // `act` was parsed and then discarded on the spend path: the open bound `act`, while
+    // the claim hashed and recorded `reason`. An approval could therefore be correct in the
+    // store and permanently unspendable by the member-door caller that created it.
+    let attempted_act = act.clone().or_else(|| stated_reason.clone());
     let stated_detail = optional_string(args, "detail");
     // The durable per-wake key the daemon's own outcome rows carry — the value that joins a
     // spent approval to the act that consumed it. ACCEPTED HERE ONLY TO BE CHECKED, NEVER TO
@@ -15511,11 +15610,14 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     }
 
     // #539: the claim is now keyed on the ACT the approval was rendered from, not only on
-    // the rule that refused it. `stated_reason` here is the caller's statement of the act it
-    // is about to perform — the same field the opener stated and the operator was shown — so
-    // a permit granted for one write can no longer be spent on another. A caller that states
-    // nothing cannot claim: an unnamed act matches no approval.
-    if let Some(esc) = s.gate_escalations.claim(&plugin_id, &marker, stated_reason.as_deref(), now) {
+    // the rule that refused it. The gate-hook compatibility path still carries that act in
+    // `reason`; the member door carries an explicit `act` plus a distinct rationale. The
+    // explicit field wins when both are present, exactly as it does on the open fallback.
+    // A caller that states neither cannot claim: an unnamed act matches no approval.
+    if let Some(esc) =
+        s.gate_escalations
+            .claim(&plugin_id, &marker, attempted_act.as_deref(), now)
+    {
         // Spending an approval is an ACT and is witnessed. The approval itself was already
         // recorded when it was decided; this entry is what ties it to the write it authorised,
         // without which the record would show a permission granted and never show it used.
@@ -15565,8 +15667,10 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                 "decided_via": esc.decided_via,
                 "reason": esc.reason,
                 // WHAT the caller SAYS the authorised write is, in its own words at claim
-                // time. Testimony, not proof — see the note above and #318.
-                "stated_attempted_act": stated_reason,
+                // time. Testimony, not proof — see the note above and #318. This is the SAME
+                // value used for the digest join: recording `reason` here after `act` won the
+                // join would make the witness row misdescribe the act that spent the permit.
+                "stated_attempted_act": attempted_act,
                 // The per-wake key that joins this spend to its consuming act's outcomes.
                 // DERIVED from the proven session, never from the arguments.
                 "host_session_id": proven_host_session_id,
@@ -15602,7 +15706,7 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
         .open(&plugin_id, &role, &tool_name, &marker,
               // The gate hook composes `reason` AS the act, and has always done so, so it is
               // the act here. `act` still wins if a caller sends both.
-              act.as_deref().or(stated_reason.as_deref()),
+              attempted_act.as_deref(),
               stated_reason.as_deref(), stated_detail.as_deref(), now, DEFAULT_TTL_SECS)
     {
         Ok(esc) => {
