@@ -206,7 +206,7 @@ PY
 DEBT_BLOCK=""
 [ -n "$DEBT" ] && DEBT_BLOCK="
 Unanswered (no notice binds a response to these — responsiveness only):
-Recipient liveness is EVIDENCE, not a diagnosis: `quiet Xm` is how long since that recipient last READ its mailbox, `reads=N` its lifetime read count. A member drains once at the top of a wake and then works, so a BUSY member reads quiet for most of it — quiet is not down (#506). `NEVER SEEN` means no liveness record exists at all.
+Recipient liveness is EVIDENCE, not a diagnosis: \`quiet Xm\` is how long since that recipient last READ its mailbox, \`reads=N\` its lifetime read count. A member drains once at the top of a wake and then works, so a BUSY member reads quiet for most of it — quiet is not down (#506). \`NEVER SEEN\` means no liveness record exists at all.
 $DEBT"
 
 # LAST WORDS — the reporting-void repair (decision of record, dp 2026-08-04:

@@ -790,6 +790,9 @@ pub fn run() -> AnyResult<()> {
         },
         Command::Lct(l) => match l {
             LctCmd::Publish { dry_run: _, send } => cmd_lct_publish(&home, send),
+            LctCmd::Relay { file, as_member, dry_run: _, send } => {
+                cmd_lct_relay(&home, &file, as_member, send)
+            }
         },
         Command::Hub(h) => match h {
             HubCmd::Connect { url } => cmd_hub_connect(&home, &url),
@@ -1399,6 +1402,144 @@ enum LctCmd {
         #[arg(long)]
         send: bool,
     },
+    /// Relay a FOREIGN `lct_publish` document — one minted by another
+    /// constellation and handed to this seat for publication (M-CIT-1a).
+    ///
+    /// `publish` can only emit what this vault holds; the registry seam has
+    /// always allowed `subject != publisher`, but nothing could express it.
+    /// The dry-run runs the full producer-side ingest mirror and **never
+    /// opens the vault**, so an unattended session can verify a handoff it
+    /// cannot send; `--send` is the attended half.
+    Relay {
+        /// Path to the handed-over `lct_publish` JSON document.
+        file: std::path::PathBuf,
+        /// The relaying member uuid to attribute the publish to. Optional on
+        /// the dry-run (shown as nil when omitted); on `--send` it is resolved
+        /// from the vault and must agree with this if both are present.
+        #[arg(long = "as", value_name = "MEMBER_UUID")]
+        as_member: Option<uuid::Uuid>,
+        /// Verify and print without sending (the default).
+        #[arg(long, default_value_t = true, conflicts_with = "send")]
+        dry_run: bool,
+        /// Sign and POST to the connected hub's registry.
+        #[arg(long)]
+        send: bool,
+    },
+}
+
+/// Relay a foreign `lct_publish` document (M-CIT-1a).
+///
+/// Accountability self-audit (hestia CLAUDE.md), for the `--send` half:
+/// ```text
+/// surface: `hestia lct relay`   act: publish a foreign LCT to the live hub registry
+/// S: med/irreversible-in-practice [construct: republish overwrites in place and bumps
+///    `version`; the ledger entry is append-only, so the ACT cannot be unmade]
+/// R: n/a [construct: no reachability factor is consulted — authority is the signing key]
+/// W: pass [construct: `member_signing_keypair` + hub-side `published_by ==
+///    envelope.signer_lct_id`; the relayer signs as itself and can attribute to no one else]
+/// O: pass [construct: `relay_payload` -> `self_check` runs before `open_vault`, and the
+///    resolved-identity disagreement check precedes `publish_lct`; a refusal sends nothing]
+/// A: pass [construct: the hub commits `HubEvent::LctPublished` with `published_by` bound
+///    to the verified signer; the read-back prints the accepted entry_index + hash]
+/// V: present [construct: dry-run is the default, `--send` is opt-in and vault-attended —
+///    an unattended session cannot reach the act]
+/// verdict: PASS
+/// ```
+fn cmd_lct_relay(
+    home: &std::path::Path,
+    file: &std::path::Path,
+    as_member: Option<uuid::Uuid>,
+    send: bool,
+) -> AnyResult<()> {
+    let raw = std::fs::read_to_string(file)
+        .with_context(|| format!("reading relay document {}", file.display()))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("{} is not JSON", file.display()))?;
+
+    // The dry-run is deliberately vault-free: checks 2-5 are properties of the
+    // document alone, so verifying a handoff must not require the passphrase
+    // prompt that only an attended seat can answer. Only the send needs a key.
+    if !send {
+        let published_by = as_member.unwrap_or_else(uuid::Uuid::nil);
+        if as_member.is_none() {
+            eprintln!(
+                "[lct relay] note: no --as <uuid> — published_by shown as nil for this dry-run \
+                 (the hub binds it to the envelope signer at send time)"
+            );
+        }
+        let payload = hestia::lct_publish::relay_payload(&value, published_by, chrono::Utc::now())
+            .map_err(|e| anyhow::anyhow!("relay refused: {e}"))?;
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        eprintln!(
+            "[lct relay] {} passes the producer-side ingest mirror (checks 2-5) \
+             (dry-run — pass --send to publish)",
+            payload.lct_id
+        );
+        return Ok(());
+    }
+
+    let mut vault = open_vault(home)?;
+    let mut hubs = hestia::hub::HubStore::load(&vault).unwrap_or_default();
+    let vault_identity: Option<uuid::Uuid> =
+        vault.get("ai_identity_lct_id").and_then(|e| e.secret.parse().ok());
+    let conn = hubs
+        .connections
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("not connected to a hub — run `hestia hub connect <url>`"))?;
+    let (published_by, needs_repair) = hestia::hub::resolve_publish_identity(
+        conn.our_lct_id,
+        &conn.member_key_source,
+        vault_identity,
+    )?;
+    if needs_repair {
+        eprintln!(
+            "[lct relay] REPAIR hubs store our_lct_id for {}: {} → {} \
+             (stale cache; vault ai_identity_lct_id is authoritative)",
+            conn.url, conn.our_lct_id, published_by
+        );
+        hubs.connections[0].our_lct_id = published_by;
+        hubs.save(&mut vault)?;
+    }
+    // An explicit --as that disagrees with the key we would actually sign with
+    // is a mistake worth stopping for: the hub would 403, but finding that out
+    // from the operator's own stated intent is cheaper than from the hub.
+    if let Some(claimed) = as_member {
+        if claimed != published_by {
+            anyhow::bail!(
+                "--as {claimed} disagrees with the identity this seat signs as ({published_by}); \
+                 the hub binds published_by to the envelope signer"
+            );
+        }
+    }
+
+    let payload = hestia::lct_publish::relay_payload(&value, published_by, chrono::Utc::now())
+        .map_err(|e| anyhow::anyhow!("relay refused: {e}"))?;
+    let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let hub_id = conn.hub_lct_id;
+    println!(
+        "Relaying {} to {} (hub {hub_id}) as {published_by} ...",
+        payload.lct_id, conn.url
+    );
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let client = HubClient::new();
+    let accepted = rt
+        .block_on(client.publish_lct(&rest, hub_id, published_by, &keypair, &payload))
+        .with_context(|| format!("relaying {}", payload.lct_id))?;
+    println!(
+        "  ✓ {} v{} ledger#{} ({})",
+        accepted.lct_id, accepted.version, accepted.entry_index, accepted.entry_hash
+    );
+    // Read back what the registry now serves — verification, not trust.
+    match rt.block_on(client.list_lcts(&rest, hub_id)) {
+        Ok(list) => {
+            let n = list.as_array().map(|a| a.len()).unwrap_or(0);
+            println!("Registry now lists {n} entr{}.", if n == 1 { "y" } else { "ies" });
+        }
+        Err(e) => eprintln!("[lct relay] published, but registry read-back failed: {e:#}"),
+    }
+    Ok(())
 }
 
 fn cmd_lct_publish(home: &std::path::Path, send: bool) -> AnyResult<()> {

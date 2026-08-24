@@ -41,18 +41,11 @@ impl DashboardChainProjection {
         // so the UI renders unavailable rather than fabricating a quiet fleet.
         // Each scan projects only what its consumer declares: derivation gets
         // its pruned ChainEntry, while stats/feed keep RecentEntry scalars.
-        let deriv_window = match chain_store.scan_recent(
-            None,
-            Some(crate::derivation::DERIVATION_EVENT_TYPES),
-            STATS_WINDOW,
-            crate::derivation::project_row,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("dashboard derivation chain read failed: {e}");
-                Vec::new()
-            }
-        };
+        // The dashboard read its derivation window with STATS_WINDOW (2,000) while the
+        // API used 10,000 — the surface a human looks at reached back FIVE TIMES less far
+        // than the API answering for it, and the comment below claimed the opposite.
+        // Both now share `derivation::scan_window`.
+        let deriv_window = crate::derivation::scan_window(chain_store);
         let (stats_window, stats_read_error) =
             match chain_store.scan_recent(None, None, STATS_WINDOW, |r| Some(flatten_row(r))) {
                 Ok(v) => (v, None),
@@ -524,6 +517,10 @@ pub struct TrustView {
     pub legacy_level: String,
     /// Derived temperament (v3-derived-v1: governance-response conduct).
     #[serde(default)]
+    /// Why `level` reads the way it does, so the badge and the row text cannot disagree.
+    pub derived_level_basis: String,
+    pub derived_baseline_acts: u64,
+    pub derived_governed_acts: u64,
     pub derived_temperament: Option<f64>,
     #[serde(default)]
     pub derived_temperament_n: u64,
@@ -917,10 +914,11 @@ impl ServerState {
         // (kimi-code) falls out of it entirely though its grain is intact. Seed the active set
         // from the trust store for every registry harness so it shows its most recent standing.
         // Insert-if-absent: a harness active in the window keeps its window entry untouched.
-        // The derived LEVEL still comes from `deriv_window` (the last N DERIVATION-type rows —
-        // a far sparser stream that reaches back much further), so an idle member shows its
-        // real last-derived level, never a fabricated one; if even that has aged out, the row
-        // is `unmeasured` but still carries the grain's action_count and days_since_last.
+        // The derived LEVEL comes from `deriv_window` — `derivation::scan_window`, whose
+        // governance budget is deep precisely so a member idle for days still shows the
+        // standing it earned. When this comment last claimed the window "reaches back much
+        // further", the dashboard was in fact passing STATS_WINDOW (~17 hours of chain) and
+        // kimi-code/codex rendered `unmeasured` beside 24k and 8k actions.
         if let Ok(all_keys) = self.trust_store.list() {
             // Reverse map: a grain key's instance prefix -> the human plugin_id, for the
             // harnesses we know. Both the mapped `lct:web4:member:…` form and the legacy
@@ -991,12 +989,26 @@ impl ServerState {
                 // v3-derived-v1: the DISPLAYED level comes from derived
                 // evidence (adjudications + governance conduct) — never from
                 // the self-report scalar. Unmeasured renders as unmeasured.
-                let derived = crate::derivation::derive(pid, _role, &deriv_window);
+                // Lifetime totals come from the PERSISTED grain, never the window: the
+                // whole point is that routine governed work does not evaporate when a
+                // member goes idle for three days.
+                let derived = crate::derivation::derive_with_volume(
+                    pid,
+                    _role,
+                    &deriv_window,
+                    Some(crate::derivation::WitnessedVolume {
+                        total_acts: t.action_count,
+                        success_acts: t.success_count,
+                    }),
+                );
                 TrustView {
                     plugin_id: pid.clone(),
                     entity_id: t.entity_id.clone(),
                     level: derived.level.clone(),
                     legacy_level: t.trust_level().as_str().to_string(),
+                    derived_level_basis: derived.level_basis.clone(),
+                    derived_baseline_acts: derived.baseline_acts,
+                    derived_governed_acts: derived.governed_acts,
                     derived_temperament: derived.temperament.score,
                     derived_temperament_n: derived.temperament.observations,
                     t3_talent: dim(t.talent(), t3c[0]),
