@@ -3524,7 +3524,7 @@ mod disposition_tests {
             let mut s = state.lock().await;
             let now = crate::server::gate_escalation::now_secs();
             s.gate_escalations
-                .open("kimi-code", "", "policy_edit", "policy.json", None, None, now, 3600)
+                .open("kimi-code", "", "policy_edit", "policy.json", Some("policy_edit -> policy.json"), None, None, now, 3600)
                 .unwrap()
                 .id
         };
@@ -3563,7 +3563,7 @@ mod disposition_tests {
             let mut s = state.lock().await;
             let now = crate::server::gate_escalation::now_secs();
             s.gate_escalations
-                .open("kimi-code", "", "policy_edit", "policy.json", None, None, now, 3600)
+                .open("kimi-code", "", "policy_edit", "policy.json", Some("policy_edit -> policy.json"), None, None, now, 3600)
                 .unwrap()
                 .id
         };
