@@ -14950,6 +14950,12 @@ fn opened_payload(
                 json!({
                     "escalation_id": c.id,
                     "marker": c.marker,
+                    // WHICH ACT this approval authorises. Since #539, `claim()` matches on
+                    // the act digest and treats a missing one as no match — so "you hold an
+                    // approval" is only actionable alongside "for this act". Without it a
+                    // member re-issues a different write, is refused, and reads the refusal
+                    // as the approval having lapsed.
+                    "act_digest": c.act_digest,
                     // The CLAIM clock, never the record clock: measured 2026-08-08, three
                     // permits reported ~1500s of record life while ~24 minutes past their
                     // grant horizon — that is how a spent permit publishes as live.
