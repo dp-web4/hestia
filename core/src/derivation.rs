@@ -1992,3 +1992,182 @@ mod recast_tests {
         assert!(score(&w) > 0.5, "no attempted => not assessable as a recast");
     }
 }
+
+/// THE APPEAL DOOR AND THE APPEAL LADDER ACCEPT DIFFERENT EVENT CLASSES.
+///
+/// `APPEALABLE_EVENT_TYPES` (server/handler.rs) is `["policy_decision", "gate_self_access"]`
+/// — widened to admit the second class on 2026-08-18, and the door's own refusal text
+/// advertises both. The ladder in this module that PAYS for appealing lives inside
+/// `for deny in &denies`, and `denies` admits one class. So the conduct the law asks every
+/// member to perform — *"appeal it rather than rephrasing around it… an appeal is recorded
+/// conduct that can change the law"* — is unscorable for the class of refusal that
+/// governance work actually generates.
+///
+/// SPECIMEN, chain-verified: deny `352ce89c…` (`gate_self_access`, chain 172123,
+/// claude-code), appealed, **RULED UPHELD `cross_vendor` by codex** at 172174
+/// (`35a53ac2…`, rationale: "the disclosed act has no governance write-position target").
+/// Textbook accountable disagreement, ruled in the appellant's favour by a
+/// structurally-independent arbiter, and no trust dimension scores it.
+///
+/// BOUNDED, so nobody has to re-derive the limit: the ruling is VISIBLE, just unscored.
+/// `server/governance_ledger.rs:563` renders `appeal | adjudication | reversal` as an
+/// `Adjudication` row keyed off `deny_hash`, class-agnostic, and both classes are declared
+/// in `GOVERNANCE_EVENTS`; `bin/appeal_floor.rs` (unruled-appeal monitor) is class-agnostic
+/// too. So an operator can read it. What cannot read it is the arithmetic that turns
+/// conduct into trust — which is the half the law's promise is about.
+///
+/// THREE FILTERS IN SERIES, and this is why the pin is three assertions rather than one:
+/// each one ALONE makes a fix to either of the others inert, so a single-line repair ships
+/// a green zero.
+///   1. `DERIVATION_EVENT_TYPES` omits `gate_self_access` — the row never leaves SQL, so
+///      `derive` is never handed it no matter what `derive` does with it.
+///   2. `denies` requires `event_type == "policy_decision"` — the row is not a deny.
+///   3. `entry_str` is FLAT-only, and `gate_self_access` nests its fields under `data`
+///      behind a `requested_by` envelope. So `is_grain` cannot even read the row's
+///      `plugin_id`: fix 1 and 2 and the row still folds onto nobody.
+/// (3) is independently witnessed in this repo — `tools/chain_walk.py` documents it as
+/// trap 3, noting that "the two event types specifically about the gate are exactly the
+/// ones a flat reader silently drops."
+///
+/// THIS IS A PIN, NOT A FIX. The repair has a real fork that should be argued, not decided
+/// by whoever writes the patch: admitting `gate_self_access` to `denies` makes every
+/// un-appealed gate refusal a *scored* deny (0.85 comply / 0.0 retry / 0.35 recast), which
+/// on this seat's own history is a large volume of new penalty; crediting only the upheld
+/// appeal is one-sided and pays nothing for a refuted one. Both are defensible; they are
+/// not the same policy. Flip these assertions when that fork is decided.
+#[cfg(test)]
+mod appeal_ladder_class_reach {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use serde_json::{json, Value};
+
+    fn entry(pos: u64, ts_offset_min: i64, event_type: &str, data: Value) -> ChainEntry {
+        ChainEntry {
+            chain_position: pos,
+            hash: format!("hash-{pos}"),
+            prev_hash: String::new(),
+            event_type: event_type.to_string(),
+            event_data: data,
+            signer_lct: "test".into(),
+            timestamp: Utc::now() + Duration::minutes(ts_offset_min),
+        }
+    }
+
+    const ME: &str = "claude-code";
+    const ROLE: &str = "role:constellation:mesh-worker";
+
+    /// The appeal + upheld-adjudication pair, spelled once. Only the deny differs between
+    /// the two arms, so a reader can see that the conduct is identical and the CLASS of the
+    /// thing complained about is the entire independent variable.
+    fn appeal_and_upheld_ruling(deny_hash: &str) -> Vec<ChainEntry> {
+        vec![
+            entry(2, 1, "appeal", json!({
+                "plugin_id": ME, "role_lct": ROLE,
+                "deny_hash": deny_hash, "reason": "false positive: a READ classified as a WRITE"})),
+            entry(3, 2, "adjudication", json!({
+                "subject_plugin_id": ME, "subject_role": ROLE,
+                "about_deny_hash": deny_hash, "upheld": true,
+                "adjudicator": "codex", "independence": "cross_vendor"})),
+        ]
+    }
+
+    /// ARM A / ARM B differential. Same appellant, same grain, same arbiter, same verdict —
+    /// only the event class of the refusal changes.
+    #[test]
+    fn an_upheld_appeal_pays_on_one_deny_class_and_vanishes_on_the_other() {
+        // ---- ARM A: POSITIVE CONTROL. The class the ladder was written for. ----
+        // This arm exists so a zero in Arm B cannot be read as "the ladder is broken" or
+        // "the fixture is malformed". The ladder works; it is out of reach.
+        let mut arm_a = vec![entry(1, 0, "policy_decision", json!({
+            "decision": "deny", "enforced": true, "plugin_id": ME, "role_lct": ROLE,
+            "session_id": "s1", "tool_name": "Bash", "payload_sha256": "abc", "target": "t"}))];
+        arm_a.extend(appeal_and_upheld_ruling("hash-1"));
+        let a = derive(ME, ROLE, &arm_a);
+        assert_eq!(
+            a.temperament.observations, 1,
+            "POSITIVE CONTROL: a policy_decision deny, appealed and upheld, must fold"
+        );
+        assert!(
+            a.temperament.evidence[0].contribution.starts_with("appeal-upheld"),
+            "POSITIVE CONTROL: must reach the TOP rung, not comply-after-deny; got {:?}",
+            a.temperament.evidence[0].contribution
+        );
+
+        // ---- ARM B: THE HOLE. Byte-identical conduct against a gate_self_access deny. ----
+        // Shaped as the chain really writes this class: fields nested under `data`, behind
+        // a `requested_by` envelope. The gate_path/marker values are placeholders — nothing
+        // in this module reads them, and a test asserting a governance defect should not
+        // need to quote the governance surface's own strings to do it.
+        let mut arm_b = vec![entry(1, 0, "gate_self_access", json!({
+            "data": {"gate_path": "<gate>", "marker": "<marker>", "plugin_id": ME,
+                     "severity": "escalate", "tool_name": "Bash"},
+            "requested_by": {"plugin_id": ME, "role_lct": ROLE, "session_id": "s1"}}))];
+        arm_b.extend(appeal_and_upheld_ruling("hash-1"));
+        let b = derive(ME, ROLE, &arm_b);
+
+        assert_eq!(
+            b.temperament.observations, 0,
+            "PINNED HOLE: an upheld cross-vendor appeal on a gate_self_access deny scores \
+             NOTHING. If this is now 1, the fork in this module's header was decided \
+             — check that filters 1 and 3 moved too (see the two pins below), or the \
+             endpoint still returns zero while this test reads green"
+        );
+        assert!(
+            b.temperament.score.is_none(),
+            "PINNED HOLE: no temperament observation at all, so no score"
+        );
+        assert_eq!(
+            b.validity.observations, 0,
+            "PINNED HOLE, second surface: the V3 axes are the other place an adjudication \
+             could land, and an APPEAL RULING carries `upheld` with no `axis`/`score`, so \
+             the axis fold right-censors it. Zero of four dimensions see this ruling"
+        );
+        assert_eq!(
+            b.level, "unmeasured",
+            "PINNED HOLE: the whole grain stays unmeasured on conduct that is, by the \
+             ladder's own header, the TOP of the temperament scale"
+        );
+    }
+
+    /// FILTER 1, pinned separately because `derive` is handed a window directly in these
+    /// tests and therefore CANNOT see this filter. Repair filter 2 alone and the test above
+    /// flips green while `/api/trust/derivation` keeps returning zero, because the row is
+    /// dropped in SQL before `derive` is called (`server/http.rs` passes
+    /// `DERIVATION_EVENT_TYPES` to `scan_recent`).
+    #[test]
+    fn filter_one_the_sql_prefilter_never_loads_the_row() {
+        assert!(
+            !DERIVATION_EVENT_TYPES.contains(&"gate_self_access"),
+            "if gate_self_access is now declared, filter 1 moved — good, but the \
+             differential above must move with it or the two disagree"
+        );
+        assert!(
+            DERIVATION_EVENT_TYPES.contains(&"appeal")
+                && DERIVATION_EVENT_TYPES.contains(&"adjudication"),
+            "CONTROL for filter 1: the appeal and the ruling DO load. The missing row is \
+             specifically the refusal they are about — which is why the ruling arrives \
+             with nothing to attach to, rather than not arriving"
+        );
+    }
+
+    /// FILTER 3, pinned separately for the same reason: it is a property of the row SHAPE,
+    /// not of any predicate, so neither of the other two repairs touches it.
+    #[test]
+    fn filter_three_a_flat_reader_cannot_see_a_nested_grain() {
+        let nested = entry(1, 0, "gate_self_access", json!({
+            "data": {"plugin_id": ME, "tool_name": "Bash"},
+            "requested_by": {"plugin_id": ME, "role_lct": ROLE}}));
+        assert_eq!(
+            entry_str(&nested, "plugin_id"), None,
+            "derivation's field reader is flat-only, so the grain id of a gate_self_access \
+             row is unreachable — admit the class to `denies` and every such row folds \
+             onto nobody, silently"
+        );
+        let flat = entry(2, 0, "policy_decision", json!({"plugin_id": ME}));
+        assert_eq!(
+            entry_str(&flat, "plugin_id"), Some(ME),
+            "CONTROL for filter 3: the same reader on a flat row works. The defect is the \
+             shape of this one class, not the reader being broken"
+        );
+    }
+}
