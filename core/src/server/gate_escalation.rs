@@ -2305,7 +2305,8 @@ mod tests {
         let mut s = EscalationStore::default();
 
         let a = s
-            .open("claude-code", "r", "Bash", "marker-a", None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "marker-a",
+                  Some("Bash -> marker-a"), None, None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let aid = a.id.clone();
         s.decide(&aid, true, "operator", "role:constellation:sovereign",
@@ -2313,11 +2314,13 @@ mod tests {
             .unwrap();
 
         let b = s
-            .open("claude-code", "r", "Bash", "marker-b", None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "marker-b",
+                  Some("Bash -> marker-b"), None, None, T0, DEFAULT_TTL_SECS)
             .unwrap();
 
         let c = s
-            .open("kimi-code", "r", "Bash", "marker-c", None, None, T0, DEFAULT_TTL_SECS)
+            .open("kimi-code", "r", "Bash", "marker-c",
+                  Some("Bash -> marker-c"), None, None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let cid = c.id.clone();
         s.decide(&cid, true, "operator", "role:constellation:sovereign",
