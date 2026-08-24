@@ -44,6 +44,14 @@ absent, check this variable before looking for a bug.
 Set it when you want those features, and set it **explicitly**. Installers render
 it from operator-supplied configuration; they must never derive it by probing.
 
+**Tooling that resolves a workspace root** (currently `tools/cargo_target_reaper.py`)
+accepts, in order: `AI_WORKSPACE`, then `HESTIA_WORKSPACE`, then **`FLEET_ROOT` (legacy)**,
+then a value derived from the tool's own location. One fact, one precedence — `FLEET_ROOT`
+predates the others and keeps working because it may be set in units nobody has audited,
+but it should not be used in anything new. A variable that is set but names a directory
+that does not exist is **refused**, not skipped: quietly measuring a different tree than
+the one you named is worse than stopping.
+
 ### Members (gate hooks)
 
 Set in each member harness's hook environment, not globally.
