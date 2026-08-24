@@ -82,6 +82,22 @@ Environment=HESTIA_HOME=%h/.hestia
 # from the build actually running.
 Environment=HESTIA_CURRENT_BUILD_FILE=%h/.hestia/current-build.json
 Environment=RUST_LOG=warn
+# ARENA CAP (#354). glibc allocates one 64 MB arena per thread up to 8 x cores — on an
+# 8-core host that is a 4 GB ceiling of pure fragmentation surface. An arena only returns
+# memory by trimming its TOP, so one live allocation above a freed block pins the whole
+# region, and every heavy read permanently claims arena space in whichever worker ran it.
+#
+# Measured on CBP 2026-08-24 at ~20h uptime: 21 arenas of exactly 64.0 MB, RSS 1,767 MB
+# against an all-time peak of 1,777 MB — essentially nothing ever returned. That RSS floor
+# is what makes the box swap, which makes the daemon slow under its single global lock,
+# which makes gate calls exceed their budget and DENY writes fleet-wide. Daemon memory is a
+# governance-availability parameter, not hygiene.
+#
+# 2 rather than 1: a single arena serialises every allocation across ~12 tokio threads.
+# This workload is I/O-bound on SQLCipher, so the contention is cheap and the fragmentation
+# surface drops by ~30x. Paired with the malloc_trim(0) on the maintenance tick, which
+# releases what the cap does not prevent.
+Environment=MALLOC_ARENA_MAX=2
 # Optional workspace handed to agent-inventory for the dashboard read list.
 # Installers should render this from explicit operator configuration. Unset or
 # empty means the inventory must report inference/unknown rather than guess.

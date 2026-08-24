@@ -31,6 +31,102 @@ use super::handler::HestiaServer;
 use super::state::SharedState;
 use crate::callback::{CallbackState, callback_router};
 
+// ---- Allocator arena retention (#354) ------------------------------------------------
+//
+// THE DAEMON'S MEMORY IS A GOVERNANCE-AVAILABILITY PARAMETER, not hygiene. The chain,
+// measured end-to-end on CBP 2026-08-23: arena retention -> RSS floor climbs -> the box
+// swaps -> the daemon is slow under its single global lock -> gate calls exceed their
+// budget -> the ratified degraded mode DENIES writes for every member. 377 gate-unavailable
+// events that day, peaking at 65/hour against a 64/DAY baseline.
+//
+// IT IS NOT A LEAK. Rust frees the memory; glibc keeps it. Measured 2026-08-24 at ~20h
+// uptime: RSS 1,767 MB against VmHWM 1,777 MB — within 10 MB of the all-time peak, so
+// essentially nothing had ever been returned. 1,750 MB of that was anonymous private-dirty
+// with only 14 MB file-backed, which rules out the SQLCipher page cache. And 21 mappings of
+// EXACTLY 64.0 MB — `HEAP_MAX_SIZE`, the per-thread arena size. An arena only releases by
+// trimming its TOP, so one live allocation above a freed block pins the whole 64 MB region.
+// Every heavy read permanently claims arena space in whichever worker thread ran it.
+//
+// That is the signature already recorded above `project_row`: "flat at idle and stepping on
+// every heavy read". `project_row` shrank each spike; it could not make the allocator hand
+// back what it already held. It is also why RESTART has been the only known fix — restart
+// does not repair a leak, it discards the arenas.
+//
+// Growth rate measured here: 1,767 MB / ~1200 min = ~1.47 MB/min, against the ~1.5 MB/min
+// recorded independently on #354 months earlier on a different build. A rate that stable is
+// proportional to WORK DONE, not to any structure that grows with the chain.
+
+/// Resident set size in kB, or `None` where the kernel does not publish it.
+///
+/// Read rather than estimated: this is the number the trim below has to move, and a fix for
+/// a memory problem that cannot show its own effect is a claim, not a remedy.
+fn rss_kb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse().ok())
+}
+
+/// Ask glibc to return free arena pages to the kernel. `true` if it released memory.
+///
+/// Declared as an extern rather than pulling in `libc`: the call is glibc-only by nature, so
+/// it needs the cfg guard either way, and a new dependency for one symbol would churn the
+/// lockfile that `--locked` CI and `web4.pin` reproducibility both rest on.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_allocator_arenas() -> bool {
+    extern "C" {
+        fn malloc_trim(pad: usize) -> std::os::raw::c_int;
+    }
+    // SAFETY: no arguments borrowed, no Rust invariants involved — glibc walks its own free
+    // lists and madvises pages away. Safe to call at any time from any thread.
+    unsafe { malloc_trim(0) == 1 }
+}
+
+/// Non-glibc targets (macOS on McNugget, musl): nothing to trim, and saying so beats a
+/// silent no-op that reads as "the remedy is deployed here".
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_allocator_arenas() -> bool {
+    false
+}
+
+#[cfg(test)]
+mod arena_tests {
+    use super::*;
+
+    /// THE INSTRUMENT MUST WORK, or the remedy cannot be checked in production.
+    ///
+    /// `malloc_trim` returning 1 says glibc released *something*, not how much — the only
+    /// number that answers "did this help" is RSS before vs after, and #354's whole history
+    /// is of a memory problem diagnosed by restart-and-see. If `rss_kb()` silently returned
+    /// `None` the trim would still run, the log line would never fire, and the fix would be
+    /// indistinguishable from a no-op.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rss_is_readable_so_the_trim_can_be_measured() {
+        let rss = rss_kb().expect("VmRSS is published by this kernel");
+        assert!(
+            rss > 1024,
+            "a live test process reporting {rss} kB is not a plausible RSS — the parse is \
+             reading the wrong field, and every freed_mb figure downstream would be wrong"
+        );
+    }
+
+    /// Calling it must be safe and total on every target the fleet runs — glibc hosts trim,
+    /// macOS and musl report false rather than pretending the remedy is in force there.
+    #[test]
+    fn trimming_is_safe_to_call_and_reports_whether_it_applies() {
+        let applied = trim_allocator_arenas();
+        if cfg!(all(target_os = "linux", target_env = "gnu")) {
+            let _ = applied; // glibc decides; either answer is legitimate
+        } else {
+            assert!(!applied, "a non-glibc target must not report a trim it cannot perform");
+        }
+    }
+}
+
+
 pub const DEFAULT_BIND: &str = "127.0.0.1:7711";
 
 const DASHBOARD_HTML: &str = include_str!("dashboard/index.html");
@@ -633,6 +729,7 @@ pub async fn serve_with_callback(
     //    global lock every pass, the gate-starving shape #488/#482 flagged; this
     //    is the work-queue shape the review asked for instead.
     //
+
     // Spawned before `app` below moves `state`.
     let (chain_handle, inbox_handle) = {
         let s = state.lock().await;
@@ -661,6 +758,24 @@ pub async fn serve_with_callback(
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!("disposition projector: {e}"),
+            }
+            // Ride the maintenance tick rather than adding a timer: the heavy reads that
+            // claim arena space are the same work this loop follows, so trimming here is
+            // trimming right after the allocations that caused it.
+            let before = rss_kb();
+            let released = trim_allocator_arenas();
+            if let (Some(b), Some(a)) = (before, rss_kb()) {
+                let freed = b.saturating_sub(a);
+                // Only worth a line when it actually moved: a log that fires every tick
+                // regardless of effect is how a no-op remedy reads as a working one.
+                if freed >= 8 * 1024 {
+                    tracing::info!(
+                        freed_mb = freed / 1024,
+                        rss_mb = a / 1024,
+                        released,
+                        "allocator arenas trimmed (#354)"
+                    );
+                }
             }
         }
     });
