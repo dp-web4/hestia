@@ -27,7 +27,9 @@ codebase keeps finding in itself: a check that reports success while measuring n
 > current source, but the public daemon and Android releases are older and there is no public
 > desktop app artifact. Hub, constellation, messaging, and credential-issuance source paths exist;
 > newcomer, second-device, wallet, and current-release-pair evidence remains incomplete. See
-> [Honest Status](#honest-status) and the [2026-08-08 audit](docs/STATUS_AUDIT_2026-08-08.md).
+> [Honest Status](#honest-status). The [2026-08-08 audit](docs/STATUS_AUDIT_2026-08-08.md) remains
+> the baseline artifact; gate-consolidation status below was refreshed on 2026-08-23 against the
+> subsequently merged work and keeps repo state separate from live-install evidence.
 
 > ### ⚠️ The gate stops accidents, not adversaries
 >
@@ -119,10 +121,12 @@ have one yet.
 
 ## Honest status
 
-*Reconciled against source, the current reference daemon, public artifacts, and open issues on
-2026-08-08 — method and evidence in
-[`docs/STATUS_AUDIT_2026-08-08.md`](docs/STATUS_AUDIT_2026-08-08.md). Three tiers, kept
-apart on purpose:*
+*Baseline reconciliation against source, the reference daemon, public artifacts, and open issues was
+performed on 2026-08-08 — method and evidence in
+[`docs/STATUS_AUDIT_2026-08-08.md`](docs/STATUS_AUDIT_2026-08-08.md). Gate-consolidation status was
+refreshed on 2026-08-23 against subsequently merged repository work. **Repository convergence is not
+live-install proof**: where an installed seat or executed artifact has not been re-measured, that gap
+is stated rather than inferred away. Three tiers remain kept apart on purpose:*
 
 - **Measured** — exercised on a live system, with chain entries or a live probe behind it.
 - **Plumbed** — code and tests exist, the path has not been driven end to end in anger.
@@ -135,7 +139,7 @@ This is the part that runs every day and has the scars to prove it.
 
 | Component | Status | Evidence |
 |-----------|--------|----------|
-| **Policy gate, multi-vendor** | Measured, divergent | Six vendor surfaces operate under the same intended law, but the shared decision core is **not wired** and harnesses retain independent classifiers. Fail-closed behavior and recovery affordances are not yet parity-tested (#225). |
+| **Policy gate, multi-vendor** | Measured; shared core consolidated in repo, install evidence incomplete | The gate-consolidation Sprints A–G and shared decision path are merged in the repository; #517 also merged the claude-code seat cutover. That does **not** prove every installed seat is executing the attested common artifact. Live-install / decision-path verification remains separate, and #586 currently shows why: the installer can attest `$HESTIA_HOME/shared/*` while member shims still resolve `_shared/*` unless stage-2 verify-then-import wiring lands. Treat repo convergence as shipped code, not as proof of enforcement on every seat. |
 | **Witness chain** | Measured | Hash-linked SQLCipher and live event production. Infrastructure failures require the separate Plane-E path because the normal chain may be unavailable. |
 | **Human escalation** | Measured | A refused governance write is offered to a human: dashboard notice, `hestia gate approve/deny`, or an operator-authenticated HTTP decision. Single-use, expiring, witnessed both ends. Store is **rehydrated from the chain**, so a deploy no longer destroys a ruling. |
 | **Peer arbitration** | Built, manually exercised | A NOT-SAME peer can rule an escalation and eligibility is checked server-side. No autonomous driver should ship until appeals bind to one recorded act and NOT-BENEFICIARY is enforced. |

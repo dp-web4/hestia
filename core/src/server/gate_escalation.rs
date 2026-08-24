@@ -1215,6 +1215,37 @@ impl EscalationStore {
     /// Two code paths deriving the same thing, one of them wrong. So the split moves here and
     /// happens ONCE, from the same input `rehydrate` reads — live and replay can no longer
     /// disagree, because there is only one derivation left.
+    /// Every approval THIS member could spend right now, newest decision first.
+    ///
+    /// WHY A MEMBER MUST BE ABLE TO ASK THIS (#366). The sanctioned path is deny-now →
+    /// decide-out-of-band → re-issue, and the re-issue only happens if the member LEARNS the
+    /// decision landed. A woken seat learns it from its mailbox. A LIVE seat is never woken —
+    /// it is already running — so the notice waits for a wake that never comes and
+    /// `APPROVAL_CLAIM_WINDOW_SECS` (600) expires against a member that was online the whole
+    /// time and would have re-issued instantly.
+    ///
+    /// Measured 2026-08-23/24 on CBP: four escalations opened, all four approved by the
+    /// operator, ZERO notifications received. Exactly one was claimed — because dp mentioned
+    /// the approval in conversation while the window happened to still be open, and
+    /// re-issuing then produced only hashes, which is what proved the refused act had been a
+    /// read. The other three were approved and never claimed. Population: #536.
+    ///
+    /// `is_claimable` is the SAME predicate `claim()` spends against, so a listing here can
+    /// never promise a claim that would fail — including the case this struct's own doc
+    /// records, where an approval was `permits_write=true` and permanently unclaimable
+    /// because the marker never matched.
+    pub fn claimable_for(&self, plugin_id: &str, now: u64) -> Vec<&Escalation> {
+        let mut out: Vec<&Escalation> = self
+            .by_id
+            .values()
+            .filter(|e| e.plugin_id == plugin_id && e.is_claimable(now))
+            .collect();
+        // Newest decision first: with a 600s window the freshest grant is the one a member
+        // can still act on. Ties fall back to id so the order is total, not incidental.
+        out.sort_by(|a, b| b.decided_at.cmp(&a.decided_at).then_with(|| a.id.cmp(&b.id)));
+        out
+    }
+
     pub fn record_invitee_readers(&mut self, id: &str, evidence: &[serde_json::Value]) -> bool {
         match self.by_id.get_mut(id) {
             Some(e) => {
@@ -2264,6 +2295,52 @@ mod tests {
     /// proves the shared answer is correct, not that the route calls it —
     /// `the_operator_route_still_reads_the_shared_answer` covers that half, differently and
     /// more weakly.
+    #[test]
+    /// A LIVE MEMBER SEES ONLY WHAT IT COULD ACTUALLY SPEND (#366).
+    ///
+    /// The control arm is the point: past the claim horizon the listing must go EMPTY.
+    /// Advertising a dead grant would send a member to re-issue a write `claim()` refuses —
+    /// the same failure this closes, wearing the opposite mask.
+    fn a_live_member_sees_only_the_approvals_it_could_actually_spend() {
+        let mut s = EscalationStore::default();
+
+        let a = s
+            .open("claude-code", "r", "Bash", "marker-a", None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        let aid = a.id.clone();
+        s.decide(&aid, true, "operator", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("proceed"), T0 + 5)
+            .unwrap();
+
+        let b = s
+            .open("claude-code", "r", "Bash", "marker-b", None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+
+        let c = s
+            .open("kimi-code", "r", "Bash", "marker-c", None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        let cid = c.id.clone();
+        s.decide(&cid, true, "operator", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("proceed"), T0 + 5)
+            .unwrap();
+
+        let mine: Vec<String> = s
+            .claimable_for("claude-code", T0 + 10)
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(mine, vec![aid], "only my own DECIDED approval");
+        assert!(!mine.contains(&b.id), "a PENDING escalation is not spendable");
+        assert!(!mine.contains(&cid), "a peer's approval is not mine to spend");
+
+        let past = T0 + 5 + APPROVAL_CLAIM_WINDOW_SECS + 1;
+        assert!(
+            s.claimable_for("claude-code", past).is_empty(),
+            "past the claim horizon this must go empty — advertising a dead grant sends the \
+             member to re-issue a write that claim() will refuse"
+        );
+    }
+
     #[test]
     fn one_answer_serves_both_deciding_surfaces() {
         let mut s = EscalationStore::default();
