@@ -1605,7 +1605,11 @@ mod tests {
     #[test]
     fn confer_citizenship_records_a_birth_cert_in_the_ledger_only_on_quorum() {
         let (_dir, state) = make_state();
-        let subject = "lct:web4:mb32:bsubjectcitizen";
+        // A real key-derived id: `witness::attest` refuses anything else (R6).
+        let subject = &web4_core::derive_lct_id(
+            &web4_core::crypto::KeyPair::generate().verifying_key(),
+        );
+        let subject = subject.as_str();
         let w: Vec<web4_core::crypto::KeyPair> = (0..3)
             .map(|_| web4_core::crypto::KeyPair::generate())
             .collect();
@@ -1620,7 +1624,7 @@ mod tests {
 
         // Below quorum → None, and NOTHING written to the ledger (fail-closed).
         let two: Vec<_> = (0..2)
-            .map(|i| crate::witness::attest(subject, &wid[i], ts, &w[i]))
+            .map(|i| crate::witness::attest(subject, &wid[i], ts, &w[i]).unwrap())
             .collect();
         assert!(
             state
@@ -1636,7 +1640,7 @@ mod tests {
 
         // Quorum → the birth cert is recorded in this society's ledger.
         let three: Vec<_> = (0..3)
-            .map(|i| crate::witness::attest(subject, &wid[i], ts, &w[i]))
+            .map(|i| crate::witness::attest(subject, &wid[i], ts, &w[i]).unwrap())
             .collect();
         let cref = state
             .confer_citizenship(subject, "lct:web4:role:citizen", None, &three, &resolver)
