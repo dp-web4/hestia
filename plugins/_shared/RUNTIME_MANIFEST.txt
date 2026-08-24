@@ -1,0 +1,22 @@
+# The runtime engine set — the files deploy/install-members.sh installs to
+# $HESTIA_HOME/shared and the ledger's shared_engine section digests.
+#
+# WHY THIS EXISTS (#481 stage 1, #525 review — the "manifest, option B" ruling):
+# this directory holds the decision engine AND its tests side by side, so
+# "which files are the engine" cannot be a glob over *.py: an implicit rule is
+# exactly the rule that drifts (a stray helper, a test with a creative name,
+# a future package subtree). The installed artifact set is therefore a
+# DECLARATION, one filename per line, and the installer deploys precisely
+# this set — no more (tests are never installed), no less (a missing entry
+# dies the install, it does not shrink the engine).
+#
+# The guard runs in both directions in
+# tools/installer_shared_engine_test.py: every entry here must exist and not
+# be a test, and every module under _shared that any hook imports must be
+# declared here. Adding a runtime module without listing it fails that test;
+# listing a file that does not exist fails the install.
+#
+# One filename per line. Blank lines and #-comments are ignored.
+hestia_gate_core.py
+hestia_gate_mechanism.py
+hestia_governance_closure.py

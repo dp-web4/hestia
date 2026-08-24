@@ -59,9 +59,122 @@ use serde_json::Value;
 use crate::storage::chain::ChainEntry;
 
 pub const DERIVATION_VERSION: &str = "v3-derived-v1";
+
+// ---- Witnessed-volume baseline -------------------------------------------------------
+//
+// dp, 2026-08-23: "routine actions establish a 'medium' trust as a baseline. governed
+// actions modify it. if something has 27K witnessed actions, its trust cannot be
+// 'unmeasured'. it earned trust by never doing anything wrong, among 27K acts."
+//
+// THE REFINEMENT THE DATA FORCED. A spotless record is the WEAK version of that argument,
+// because it is indistinguishable from a gate that was never installed — a documented
+// failure mode on this fleet, where a seat can run ungoverned and look flawless. So volume
+// alone never scores: `baseline_score` returns None unless the grain also carries governed
+// acts, i.e. evidence that something could have caught the member and did not. Measured
+// 2026-08-22, that condition holds and the record is stronger than "clean": kimi-code ran
+// 720 denies against 53 warns, codex 648 against 7 — heavily tested and compliant, which
+// is better evidence than never having been tested.
+//
+// Below the floor volume says nothing; at saturation it says all it can. The scale is
+// LOG, because the difference between 1k and 10k acts is real and the difference between
+// 60k and 70k is not.
+pub const BASELINE_FLOOR_ACTS: u64 = 1_000;
+
+/// Below this, volume is not evidence of anything and must not produce a VERDICT.
+///
+/// dp specified "low under 1K acts", and that is right for a member with a modest but
+/// real record. It is wrong for a member with two. `low` is a negative finding on the
+/// same scale as `high`; asserting it from 2 actions manufactures a bad verdict out of
+/// near-zero evidence — the identical null-state conflation this whole file exists to
+/// prevent, just pointing the other way. Measured 2026-08-23: codex/interactive-dev
+/// carries exactly 2 actions and would otherwise have rendered `low`.
+pub const BASELINE_MIN_ACTS: u64 = 100;
+
+/// The act count at which volume evidence saturates.
+///
+/// Deliberately ITS OWN constant and not `DERIVATION_GOVERNANCE_SCAN`, though they may
+/// hold the same number: if the denominator were the scan budget, retuning a MEMORY knob
+/// would silently re-level every member's trust fleet-wide. A performance dial must not
+/// be able to move a trust verdict.
+pub const BASELINE_SATURATION_ACTS: u64 = 10_000;
+
+/// Volume maps onto the bottom of `medium` at the floor and into `high` at saturation,
+/// on the same scale the conduct mean uses (<0.4 low, <0.7 medium, else high).
+const BASELINE_MIN: f64 = 0.35;
+const BASELINE_MAX: f64 = 0.75;
+
+/// How many observations a grain needs before a confident level may be asserted from
+/// conduct ALONE, when that grain's own activity is below `BASELINE_MIN_ACTS`.
+///
+/// dp, 2026-08-23: "codex interactive-dev reads high on 2 actions." Two causes met there.
+/// The EMA opens at 0.5 and two observations of 0.85 land at 0.754, clearing the 0.70
+/// `high` threshold — a confident number with two data points behind it. And the
+/// observations were not even the grain's own: a role-less adjudication credits every
+/// grain the member has (`a_role_less_adjudication_credits_every_grain`).
+///
+/// This gate is deliberately NARROW. It applies only when volume is known AND below the
+/// floor, so `derive()` without volume — every pre-existing test, and any caller that
+/// does not pass totals — behaves exactly as before. A grain with a real record is never
+/// silenced by it; a grain with two actions cannot wear a badge borrowed from elsewhere.
+const LEVEL_MIN_OBSERVATIONS: u64 = 5;
+
+/// The governed:total ratio at which governance conduct fully determines the level.
+/// Below it, conduct and volume blend in proportion to how much of the member's record
+/// was actually adjudicated — the significance ratio dp specified.
+const SIGNIFICANCE_REFERENCE_RATIO: f64 = 0.10;
+
+/// A grain's lifetime witnessed totals, read from the persisted trust store rather than
+/// the window — the whole point is that this number does NOT decay when a member goes
+/// idle, which is what made an idle member read `unmeasured`.
+#[derive(Debug, Clone, Copy)]
+pub struct WitnessedVolume {
+    pub total_acts: u64,
+    pub success_acts: u64,
+}
+
+/// Volume as evidence, gated on governed coverage. `None` = volume proves nothing here.
+pub fn baseline_score(total_acts: u64, governed_acts: u64) -> Option<f64> {
+    if governed_acts == 0 || total_acts < BASELINE_MIN_ACTS {
+        return None;
+    }
+    let floor = (BASELINE_FLOOR_ACTS as f64).log10();
+    let sat = (BASELINE_SATURATION_ACTS as f64).log10();
+    let t = (((total_acts as f64).log10() - floor) / (sat - floor)).clamp(0.0, 1.0);
+    Some(BASELINE_MIN + t * (BASELINE_MAX - BASELINE_MIN))
+}
+
+fn level_of(mean: f64) -> String {
+    (if mean < 0.4 {
+        "low"
+    } else if mean < 0.7 {
+        "medium"
+    } else {
+        "high"
+    })
+    .to_string()
+}
 const RETRY_WINDOW_MINUTES: i64 = 10;
-/// How much chain the derivation scans (same cap as the dashboard stats scan).
-pub const DERIVATION_SCAN: u64 = 10_000;
+/// How much chain the derivation scans — SPLIT BUDGETS.
+///
+/// One global cap starved the evidence trust is EARNED from. Until 2026-08-23 a single
+/// 10,000-row cap covered every type in `DERIVATION_EVENT_TYPES`, and `outcome` is ~92%
+/// of chain volume. Measured on this fleet: ~2,760 derivation-type rows/day, so the
+/// window reached back ~3.6 days — and the dashboard passed its own `STATS_WINDOW`
+/// (2,000), reaching back ~17 HOURS. kimi-code and codex each carried witnessed
+/// adjudications (10 and 5) plus hundreds of gate decisions, all dated 2026-07-27 and
+/// sitting ~84,000 rows deep. Both rendered `unmeasured` beside 24k and 8k actions.
+///
+/// That is not honest-unmeasured. The evidence existed and the READER dropped it, then
+/// reported the loss in the vocabulary of absence — indistinguishable, to anyone
+/// reading the screen, from "this agent has earned no trust".
+///
+/// The two classes have opposite lifetimes, so they get opposite budgets. `outcome` is
+/// read at exactly ONE site — pairing a successful recast within `RETRY_WINDOW_MINUTES`
+/// of a deny — so it needs recency, never reach. Governance evidence is sparse and
+/// matters indefinitely. Excluding `outcome` from the deep scan makes that scan cheaper
+/// than the old single window, because outcomes were most of what it materialised.
+pub const DERIVATION_HOT_SCAN: u64 = 10_000;
+pub const DERIVATION_GOVERNANCE_SCAN: u64 = 100_000;
 
 /// One piece of evidence backing a derived dimension.
 #[derive(Debug, Clone, Serialize)]
@@ -101,6 +214,18 @@ pub struct DerivedTrust {
     /// "unmeasured" until any dimension has evidence; then low/medium/high by
     /// the mean of measured dimension scores (<0.4 / <0.7 / >=0.7).
     pub level: String,
+    /// WHY `level` reads the way it does: "conduct", "volume", "conduct+volume", "none".
+    ///
+    /// Exposed because the level and the row's explanatory text are computed from
+    /// different things, and a row that renders a MEDIUM badge beside "unmeasured — no
+    /// adjudicated evidence yet" is a fresh version of the contradiction this change
+    /// exists to remove. A reader must be able to see which evidence produced the badge.
+    pub level_basis: String,
+    /// The lifetime witnessed acts the volume baseline was taken from (0 when unused).
+    pub baseline_acts: u64,
+    /// Governed acts counted for this grain in the window — the coverage that licenses
+    /// the volume baseline at all, and the numerator of the significance ratio.
+    pub governed_acts: u64,
 }
 
 /// The canonical fold used for derived observations — the same EMA the
@@ -146,6 +271,63 @@ pub const DERIVATION_EVENT_TYPES: &[&str] = &[
     "gate_escalation_opened", "outcome", "policy_decision", "scope_attestation",
     IDENTITY_ALIAS_EVENT,
 ];
+
+/// The high-volume half: routine outcomes, read only within `RETRY_WINDOW_MINUTES` of a
+/// deny (`"outcome"` is folded at exactly one site).
+pub const DERIVATION_HOT_EVENT_TYPES: &[&str] = &["outcome"];
+
+/// The sparse half: everything a member's standing is actually earned from. These must
+/// not be crowded out of the window by another member's routine traffic — a trust level
+/// that depends on how busy your peers are is not a trust level.
+pub const DERIVATION_GOVERNANCE_EVENT_TYPES: &[&str] = &[
+    "adjudication", "amnesty", "appeal", "exoneration", "gate_escalation_decided",
+    "gate_escalation_opened", "policy_decision", "scope_attestation",
+    IDENTITY_ALIAS_EVENT,
+];
+
+/// The window EVERY derivation surface reads.
+///
+/// Shared deliberately: this was open-coded at three call sites with three different
+/// budgets — two API routes at 10,000 and the dashboard at `STATS_WINDOW` (2,000) — so
+/// the surface a human looked at reached back five times less far than the API that
+/// answered for it, while the comment above the dashboard call claimed the reverse.
+/// One helper means the three cannot silently disagree again.
+///
+/// Newest-first (`chain_position` DESC) is load-bearing: `ema_fold` weights the head of
+/// the slice most, so the merge re-sorts rather than concatenating two ordered runs.
+pub fn scan_window(chain_store: &crate::storage::chain::SqliteChainStore) -> Vec<ChainEntry> {
+    scan_window_with(chain_store, DERIVATION_HOT_SCAN, DERIVATION_GOVERNANCE_SCAN)
+}
+
+/// [`scan_window`] with explicit budgets, so a test can exercise the REAL path — the SQL
+/// type filter, the projection, and the merge — at a size that runs in milliseconds
+/// instead of writing ten thousand fixture rows. Setting both budgets equal and pointing
+/// them at the union reproduces the pre-2026-08-23 single-window behaviour, which is what
+/// makes the differential in `governance_evidence_survives_a_flood_of_outcomes` real
+/// rather than a claim about a constant.
+pub fn scan_window_with(
+    chain_store: &crate::storage::chain::SqliteChainStore,
+    hot_scan: u64,
+    governance_scan: u64,
+) -> Vec<ChainEntry> {
+    let scan = |types: &[&str], limit: u64, label: &str| -> Vec<ChainEntry> {
+        match chain_store.scan_recent(None, Some(types), limit, project_row) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("derivation {label} chain read failed: {e}");
+                Vec::new()
+            }
+        }
+    };
+    let mut out = scan(
+        DERIVATION_GOVERNANCE_EVENT_TYPES,
+        governance_scan,
+        "governance",
+    );
+    out.extend(scan(DERIVATION_HOT_EVENT_TYPES, hot_scan, "outcome"));
+    out.sort_by(|a, b| b.chain_position.cmp(&a.chain_position));
+    out
+}
 
 /// Build a `ChainEntry` carrying ONLY the keys in [`DERIVATION_KEYS`].
 ///
@@ -258,6 +440,18 @@ pub fn derive(
     plugin_id: &str,
     role_lct: &str,
     window: &[ChainEntry],
+) -> DerivedTrust {
+    derive_with_volume(plugin_id, role_lct, window, None)
+}
+
+/// [`derive`] with the grain's persisted lifetime totals, so routine governed work can
+/// establish a baseline the chain window cannot erase. `None` reproduces the pre-2026-08-23
+/// behaviour exactly, which is what keeps every existing derivation test meaningful.
+pub fn derive_with_volume(
+    plugin_id: &str,
+    role_lct: &str,
+    window: &[ChainEntry],
+    volume: Option<WitnessedVolume>,
 ) -> DerivedTrust {
     let mut entries: Vec<&ChainEntry> = window.iter().collect();
     entries.sort_by_key(|e| e.chain_position);
@@ -880,11 +1074,57 @@ pub fn derive(
         .iter()
         .filter_map(|d| d.score)
         .collect();
-    let level = if measured.is_empty() {
-        "unmeasured".to_string()
+    let conduct = if measured.is_empty() {
+        None
     } else {
-        let mean = measured.iter().sum::<f64>() / measured.len() as f64;
-        (if mean < 0.4 { "low" } else if mean < 0.7 { "medium" } else { "high" }).to_string()
+        Some(measured.iter().sum::<f64>() / measured.len() as f64)
+    };
+
+    // Governed coverage, counted from the window. The governance budget is deep (100,000)
+    // against ~8,000 governance events on this chain, so this count is complete in
+    // practice — unlike `outcome`, which is capped for recency on purpose.
+    let mut governed_acts: u64 = 0;
+    for e in entries.iter().copied() {
+        if e.event_type == "policy_decision" && is_grain(e) {
+            governed_acts += 1;
+        }
+    }
+
+    // A grain whose OWN activity is below the volume floor must not assert a level from a
+    // handful of observations — least of all ones that may have leaked in from a sibling
+    // role. Narrow by construction: with no volume passed, nothing here changes.
+    let observations: u64 = [&temperament, &validity, &veracity, &valuation]
+        .iter()
+        .map(|d| d.observations)
+        .sum();
+    let thin_grain = volume.is_some_and(|v| v.total_acts < BASELINE_MIN_ACTS);
+    let conduct = if thin_grain && observations < LEVEL_MIN_OBSERVATIONS {
+        None
+    } else {
+        conduct
+    };
+
+    let baseline = volume.and_then(|v| baseline_score(v.total_acts, governed_acts));
+    let level_basis = match (conduct.is_some(), baseline.is_some()) {
+        (false, false) => "none",
+        (true, false) => "conduct",
+        (false, true) => "volume",
+        (true, true) => "conduct+volume",
+    }
+    .to_string();
+    let level = match (conduct, baseline) {
+        // Nothing to say, and saying nothing is correct.
+        (None, None) => "unmeasured".to_string(),
+        (Some(m), None) => level_of(m),
+        (None, Some(b)) => level_of(b),
+        // Both: the significance ratio decides how much the adjudicated record moves the
+        // volume baseline. A member whose acts were mostly ungoverned floats on volume; one
+        // whose record was heavily adjudicated is judged on that record.
+        (Some(m), Some(b)) => {
+            let total = volume.map_or(1, |v| v.total_acts).max(1) as f64;
+            let w = ((governed_acts as f64 / total) / SIGNIFICANCE_REFERENCE_RATIO).clamp(0.0, 1.0);
+            level_of(b * (1.0 - w) + m * w)
+        }
     };
 
     DerivedTrust {
@@ -897,6 +1137,9 @@ pub fn derive(
         veracity,
         valuation,
         level,
+        level_basis,
+        baseline_acts: volume.map_or(0, |v| v.total_acts),
+        governed_acts,
     }
 }
 
@@ -904,6 +1147,237 @@ pub fn derive(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// dp, 2026-08-23: "codex interactive-dev reads high on 2 actions."
+    ///
+    /// DIFFERENTIAL: the identical window and the identical evidence, changing only the
+    /// grain's own witnessed volume. Two actions must not carry a badge; a real record
+    /// must still get one, or this gate would be silencing evidence rather than thin air.
+    #[test]
+    fn two_actions_cannot_wear_a_confident_badge() {
+        let role = "role:constellation:interactive-dev";
+        let w = vec![entry(
+            1,
+            0,
+            "adjudication",
+            json!({"subject_plugin_id": "codex", "axis": "validity", "score": 0.9}),
+        )];
+
+        // Arm A — the grain codex/interactive-dev actually is: 2 acts, one thin
+        // observation (which is not even its own — see the role-less pin above).
+        let thin = derive_with_volume(
+            "codex",
+            role,
+            &w,
+            Some(WitnessedVolume { total_acts: 2, success_acts: 2 }),
+        );
+        assert_eq!(
+            thin.level, "unmeasured",
+            "2 actions and a single borrowed observation is not a HIGH — it is not \
+             anything, and saying so is the honest answer"
+        );
+
+        // Arm B — same evidence, a grain with a real record behind it. If this went
+        // unmeasured too, the gate would be suppressing evidence, not thin air.
+        let real = derive_with_volume(
+            "codex",
+            role,
+            &w,
+            Some(WitnessedVolume { total_acts: 5_000, success_acts: 4_900 }),
+        );
+        assert_ne!(
+            real.level, "unmeasured",
+            "CONTROL: a grain with 5,000 witnessed acts must still be levelled — the gate \
+             is narrow by design"
+        );
+
+        // And with no volume passed at all, nothing changes: every pre-existing caller
+        // and test keeps the behaviour it was written against.
+        assert_eq!(derive("codex", role, &w).level, thin_unchanged_level(&w, role));
+    }
+
+    fn thin_unchanged_level(w: &[ChainEntry], role: &str) -> String {
+        derive_with_volume("codex", role, w, None).level
+    }
+
+    /// A ROLE-LESS ADJUDICATION CREDITS EVERY GRAIN THE MEMBER HAS.
+    ///
+    /// `subject_role` is matched with `map_or(true, ...)`, so an adjudication that omits
+    /// it counts for each role separately. Surfaced 2026-08-23 when the window fix brought
+    /// codex's 2026-07-27 adjudications back into reach: `codex/interactive-dev` — 2
+    /// actions, no adjudications of its own — rendered HIGH on evidence belonging to
+    /// `member` and `reviewer`.
+    ///
+    /// Pinned as an OPEN DEFECT (hestia#580), not fixed here: making the match strict
+    /// would drop real evidence for grains whose adjudications legitimately carry no role,
+    /// and which error to prefer is a governance decision about what a role-less
+    /// adjudication MEANS. This goes red the moment the semantics change.
+    #[test]
+    fn a_role_less_adjudication_credits_every_grain() {
+        let mk = |role: &str| {
+            let w = vec![entry(
+                1,
+                0,
+                "adjudication",
+                json!({
+                    "subject_plugin_id": "codex",
+                    "axis": "validity",
+                    "score": 0.9,
+                    "adjudicator": "dp"
+                    // NOTE: no `subject_role`
+                }),
+            )];
+            derive("codex", role, &w).validity.observations
+        };
+        let a = mk("role:constellation:interactive-dev");
+        let b = mk("role:constellation:member");
+        assert_eq!(a, b, "same role-less adjudication counted for both grains");
+        assert!(
+            a > 0,
+            "OPEN-DEFECT PIN has gone RED, which is the intended end state: a role-less \
+             adjudication no longer credits an arbitrary grain. Close the finding."
+        );
+    }
+
+    /// VOLUME NEVER SCORES WITHOUT GOVERNED COVERAGE — the safety property.
+    ///
+    /// A spotless record is indistinguishable from a gate that was never installed, and
+    /// this fleet has shipped seats whose gate resolved onto nothing. If volume alone
+    /// could lift a grain, an ungoverned member would look like a well-behaved one, and
+    /// the number would be worse than the silence it replaced.
+    #[test]
+    fn volume_alone_never_scores_without_governed_coverage() {
+        assert_eq!(
+            baseline_score(50_000, 0),
+            None,
+            "50k acts with NOTHING governing them must stay unmeasured — otherwise an \
+             ungoverned seat farms trust by being busy"
+        );
+        assert!(baseline_score(50_000, 1).is_some(), "one governed act is coverage");
+        assert_eq!(baseline_score(0, 10), None, "no acts, nothing to scale");
+        assert_eq!(
+            baseline_score(2, 2),
+            None,
+            "2 actions is not evidence of `low` — it is evidence of nothing, and `low` is \
+             a negative verdict on the same scale as `high`"
+        );
+        assert!(
+            baseline_score(BASELINE_MIN_ACTS, 2).is_some(),
+            "at the minimum, volume starts to speak"
+        );
+    }
+
+    /// The curve dp specified: low under 1K, high over 10K, monotone in between.
+    #[test]
+    fn the_volume_curve_runs_low_under_1k_and_high_over_10k() {
+        let lo = baseline_score(500, 5).unwrap();
+        let hi = baseline_score(BASELINE_SATURATION_ACTS, 5).unwrap();
+        assert_eq!(level_of(lo), "low", "under the floor volume says little");
+        assert_eq!(level_of(hi), "high", "at saturation volume says all it can");
+        // Monotone and saturating — 60k must not outrank 10k by drifting upward forever.
+        assert!(baseline_score(3_000, 5).unwrap() > lo);
+        assert!(baseline_score(3_000, 5).unwrap() < hi);
+        assert_eq!(baseline_score(60_000, 5), baseline_score(10_000, 5), "saturates");
+    }
+
+    /// dp, 2026-08-23: "if something has 27K witnessed actions, its trust cannot be
+    /// 'unmeasured'." A DIFFERENTIAL: the same window with no volume must still read
+    /// unmeasured, or this test is measuring nothing.
+    #[test]
+    fn a_member_with_witnessed_governed_volume_is_never_unmeasured() {
+        let role = "role:constellation:interactive-dev";
+        // `allow` decisions: governed coverage that scores no conduct, so the level below
+        // can only be coming from volume.
+        let w: Vec<ChainEntry> = (1..=3)
+            .map(|i| {
+                entry(
+                    i,
+                    0,
+                    "policy_decision",
+                    json!({"plugin_id": "kimi-code", "role_lct": role, "decision": "allow"}),
+                )
+            })
+            .collect();
+
+        let without = derive("kimi-code", role, &w);
+        assert_eq!(
+            without.level, "unmeasured",
+            "CONTROL IS INERT: this window already scores on its own, so the volume arm \
+             below proves nothing"
+        );
+
+        let with = derive_with_volume(
+            "kimi-code",
+            role,
+            &w,
+            Some(WitnessedVolume { total_acts: 27_000, success_acts: 26_900 }),
+        );
+        assert_ne!(
+            with.level, "unmeasured",
+            "27,000 witnessed acts under a live gate is evidence; rendering it as absence \
+             is what cost hestia its credibility in a screenshot"
+        );
+        assert_eq!(with.level, "high", "saturated volume, no adverse conduct");
+    }
+
+    /// THE WINDOW FIX, MEASURED — a differential, not an assertion about a constant.
+    ///
+    /// Routine outcomes must not push governance evidence out of the window a member's
+    /// standing is derived from. Measured 2026-08-22: kimi-code and codex each carried
+    /// witnessed adjudications dated 2026-07-27 sitting ~84,000 rows deep, and both
+    /// rendered `unmeasured` beside 24k and 8k actions — the evidence existed and the
+    /// reader dropped it.
+    ///
+    /// ARM A reproduces the pre-fix read (one budget over the union, smaller than the
+    /// flood) and must LOSE the adjudication — asserted, so a fixture that stops burying
+    /// it fails loudly instead of making arm B look meaningful. ARM B is the shipped
+    /// split and must KEEP it.
+    #[test]
+    fn governance_evidence_survives_a_flood_of_outcomes() {
+        use crate::storage::chain::SqliteChainStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), [7u8; 32]).unwrap();
+        let signer = "lct:web4:hestia:sovereign:test";
+
+        // Scarce evidence lands FIRST, then routine traffic buries it.
+        store
+            .append("adjudication", json!({"plugin_id": "kimi-code"}), signer)
+            .unwrap();
+        for i in 0..40 {
+            store
+                .append(
+                    "outcome",
+                    json!({"plugin_id": "kimi-code", "success": true, "n": i}),
+                    signer,
+                )
+                .unwrap();
+        }
+
+        let has_adj = |w: &[ChainEntry]| w.iter().any(|e| e.event_type == "adjudication");
+
+        let old = store
+            .scan_recent(None, Some(DERIVATION_EVENT_TYPES), 10, project_row)
+            .unwrap();
+        assert!(
+            !has_adj(&old),
+            "CONTROL IS INERT: the fixture no longer buries the adjudication, so arm B \
+             proves nothing. Add more outcomes than arm A's budget."
+        );
+
+        let new = scan_window_with(&store, 10, 10_000);
+        assert!(
+            has_adj(&new),
+            "REGRESSION: split budgets no longer protect governance evidence. A member's \
+             adjudications are being crowded out by routine outcomes again — which is what \
+             renders as `unmeasured` beside a large action_count."
+        );
+
+        // Newest-first is load-bearing: `ema_fold` weights the head of the slice most.
+        let positions: Vec<u64> = new.iter().map(|e| e.chain_position).collect();
+        let mut desc = positions.clone();
+        desc.sort_by(|a, b| b.cmp(a));
+        assert_eq!(positions, desc, "merged window must stay chain_position DESC");
+    }
 
     fn entry(pos: u64, ts_offset_min: i64, event_type: &str, data: Value) -> ChainEntry {
         ChainEntry {

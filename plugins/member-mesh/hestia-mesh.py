@@ -8,6 +8,7 @@ Usage:
   hestia-mesh.py unanswered [older_than_secs]            # what has no bound response
 
 Env: HESTIA_ENDPOINT (default http://127.0.0.1:7711/mcp),
+     HESTIA_MESH_TIMEOUT (seconds, default 30 — the daemon serializes all members),
      HESTIA_MESH_PLUGIN (REQUIRED — no default; see below), HESTIA_MESH_HOST_AGENT
      (defaults to <plugin>-cli, derived rather than pinned to one member),
      HESTIA_ROLE — constellation role declared on hestia_connect. Absent → omitted →
@@ -20,10 +21,21 @@ Kinds: coordination|review_request|review_done|reply|handoff|forum-note|ack (ack
 Discipline: forum post = record, mesh notice = wake; content lives at the pointer.
 Bind your dispositions: pass the id of the notice you are answering as the 4th
 arg to `send` (reply/ack/review_done), or it stays "unanswered" forever.
+Exit codes: 0 ok | 1 never got there (refused/DNS) | 2 usage | 3 daemon answered and
+declined | 4 UNDETERMINED — no answer in time, the write MAY have landed; do not
+blind-retry a `send` on 4 (issue #523).
 """
 import json, os, sys, time, urllib.error, urllib.request
 
 EP = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+
+# The daemon holds ONE global lock and its latency is linear in concurrent members, so
+# the response tail is not a fixed distance below any ceiling we pick. Measured
+# 2026-08-18 against a healthy daemon in one wake: bare `initialize` took 6.944s while
+# three seats, three watchers and a cargo run were live, and 0.001s minutes later. The
+# old hard-coded 5s sat INSIDE that tail. Raising it shrinks the failure window; only
+# the Undetermined split below makes the report sound at any value.
+TIMEOUT = float(os.environ.get("HESTIA_MESH_TIMEOUT", "30"))
 
 # IDENTITY HAS NO DEFAULT, and this is the one field that must not.
 #
@@ -63,7 +75,31 @@ if not PLUGIN:
 HOST = os.environ.get("HESTIA_MESH_HOST_AGENT", f"{PLUGIN}-cli")
 
 class Unreachable(Exception):
-    """No answer at all: connection refused, DNS, timeout. rc=1 — "I never got there"."""
+    """No answer at all: connection refused, DNS. rc=1 — "I never got there".
+
+    A TIMEOUT used to be in this list and is not a member of it. See Undetermined.
+    """
+
+
+class Undetermined(Exception):
+    """The request went out and no answer came back in time. rc=4 — "I do not know".
+
+    `urlopen(timeout=)` bounds the WHOLE exchange, including reading the response. A
+    POST the daemon received, processed and COMMITTED — but answered slowly — raises
+    the same OSError as connection-refused. Collapsing the two makes the CLI report a
+    landed write as `rc=1 "I never got there"`.
+
+    Measured 2026-08-18 (issue #523): a `send` binding a reply to notice 3049 exited
+    rc=1 "timed out", and 3049 was discharged from `unanswered` immediately after. The
+    reply had landed.
+
+    This matters because rc decides what the CALLER does next. rc=1 invites a retry;
+    `send` has no idempotency key, so a retry after a committed write duplicates the
+    notice. rc=4 means: it may have landed, and a blind retry is not safe.
+
+    Deliberately NOT rc=1 and NOT rc=3. rc=3 is DaemonRefusal — "something answered and
+    declined", which is a decision. This is the absence of one.
+    """
 
 
 class DaemonRefusal(Exception):
@@ -104,7 +140,7 @@ def post(payload, hdrs={}):
         headers={"Content-Type": "application/json",
                  "Accept": "application/json, text/event-stream", **hdrs})
     try:
-        r = urllib.request.urlopen(req, timeout=5)
+        r = urllib.request.urlopen(req, timeout=TIMEOUT)
         return r.read().decode(), r.headers.get("mcp-session-id")
     except urllib.error.HTTPError as e:
         # The daemon answered — with a non-2xx. urlopen raises here, and an uncaught
@@ -118,8 +154,16 @@ def post(payload, hdrs={}):
             "code": "hestia_mesh.http_error",
             "message": f"daemon answered HTTP {e.code} ({e.reason})",
             "data": {"status": e.code, "body_excerpt": excerpt(e.read())}}}) from None
-    except OSError as e:  # URLError (connection refused, DNS) and socket timeouts.
-        raise Unreachable(getattr(e, "reason", None) or e) from None
+    except TimeoutError as e:
+        # Bare socket timeout: the read deadline expired. Undetermined, not unreachable.
+        raise Undetermined(f"no answer within {TIMEOUT:g}s ({e or 'read timed out'})") from None
+    except OSError as e:  # URLError (connection refused, DNS) and wrapped timeouts.
+        # urllib wraps a CONNECT-phase timeout in URLError; unwrap before classifying,
+        # because the string "timed out" on the outside of a URLError is the same event.
+        reason = getattr(e, "reason", None)
+        if isinstance(reason, TimeoutError) or isinstance(e, TimeoutError):
+            raise Undetermined(f"no answer within {TIMEOUT:g}s ({reason or e})") from None
+        raise Unreachable(reason or e) from None
 
 
 def rpc(h, name, args):
@@ -264,6 +308,14 @@ def main():
         print(json.dumps(r.payload, indent=1))
         summarize(r.payload)
         sys.exit(3)
+    except Undetermined as u:
+        # NOT rc=1. The caller must be able to tell "never left" from "may have landed",
+        # because only the first one is safe to retry blind.
+        print(f"hestia-mesh: UNDETERMINED — {EP} did not answer in time: {u}\n"
+              f"  The request may have been COMMITTED. `send` has no idempotency key,\n"
+              f"  so retrying may duplicate it. Check `unanswered` (or `peek`) first.",
+              file=sys.stderr)
+        sys.exit(4)
     except Unreachable as u:
         # The one case that is genuinely rc=1. stderr, because there is no payload to
         # parse — saying so beats a traceback that a caller has to regex.

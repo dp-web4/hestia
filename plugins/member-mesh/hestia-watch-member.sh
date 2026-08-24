@@ -44,6 +44,10 @@ flock -n 9 || { echo "[hestia-watch] another watcher holds $STATE/watch-$PLUGIN.
 # HEAD or main. Bash does not expose its parsed buffer, so this is explicitly a source
 # snapshot rather than a claim that every byte had already been parsed.
 WATCH_SOURCE="${BASH_SOURCE[0]}"
+# Resolved once, from the same source path the drift snapshot above hashes, so a
+# helper is loaded from the copy that is actually running rather than from a cwd
+# that is nobody's guarantee.
+WATCH_DIR="$(cd "$(dirname "$WATCH_SOURCE")" && pwd)"
 watch_source_hash() {
   python3 - "$WATCH_SOURCE" <<'PY'
 import hashlib, sys
@@ -597,6 +601,24 @@ unanswered() { mesh_rpc hestia_member_unanswered "{\"older_than_secs\": $STALE_A
 # the daemon's real parameter name (any other spelling is discarded into a success).
 unanswered_now() { mesh_rpc hestia_member_unanswered '{"older_than_secs": 0}'; }
 
+# THE PETITIONS YOU HOLD. `hestia_member_unanswered` asks "what have you not
+# answered"; nothing ever asked the mirror question — "what have you ASKED that
+# is still open" — and the member is the only party that can retire the moot
+# ones. An auto-minted escalation is opened FOR the member by the gate on a
+# refused write, so a member routinely holds petitions it never chose to file
+# and has no surface that names them: `hestia_gate_escalation_poll` needs an id
+# you already know, and the id is printed once, into a refusal, in a wake that
+# has usually ended. Measured on CBP 2026-08-19: 30 of 30 lapses were
+# gate-auto-minted and `gate_escalation_withdrawn` had fired twice, ever.
+#
+# Unattributed by design (`session_id` optional, no scope wall), but `mesh_rpc`
+# passes it, which is what populates `you_may_rule` — always false on your own
+# rows. That is the point: the move on your own open petition is not to rule it,
+# it is `hestia_gate_arbitrate_escalation approve:false`, which files it as
+# `self_withdrawn` with no independence claimed. Costs one read per drain and
+# never causes a fire on its own.
+open_petitions() { mesh_rpc hestia_gate_pending_escalations '{}'; }
+
 # The startup stale-primer pass. Deferred to here only because it needs `mesh_rpc`;
 # it still runs before the first poll, and before the unanswered journal announce.
 retry_stale_primers
@@ -704,6 +726,33 @@ for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me
 # stops ending with a line this anchor matches. When the anchors are absent from
 # a log that DID echo a prompt, the failure mode is a shorter window and more
 # `unknown` — evidence lost, never evidence invented.
+# THE CLASS WAS A VENDOR-SPELLING BET (2026-08-18). `out of credits` is CODEX's
+# wording. kimi spells the identical billing state
+# `403 You've reached your usage limit for this billing cycle ... purchase extra
+# usage or upgrade your plan`, which matched none of the three patterns, so kimi
+# could never be classified out-of-credits — it fell through to `unknown` and the
+# report said `why=unknown` about a cause sitting verbatim in the log. Measured on
+# the live corpus: real kimi log -> `unknown`, real codex log -> `out-of-credits`,
+# same state, two verdicts. 40 kimi logs across three outages (08-08, 08-17, 08-18)
+# were mis-reported this way. This is the codex-notice-160 ambiguity the function
+# was written to END, reappearing one vendor over: the taxonomy was fine, its
+# vocabulary was one vendor wide.
+#
+# The test could not catch it because its "REAL planted log" was an AUTHORED
+# string carrying codex's spelling on BOTH sides of the check — a positive control
+# that contains only the sibling it already matches. The plants below are now
+# verbatim captures from each vendor's logs.
+#
+# Widening was checked for theft over all 1449 logs on disk: 42 verdicts move, all
+# `unknown -> out-of-credits`, ZERO taken from egress-blocked or timeout.
+# KNOWN FALSE POSITIVE, latent not live: claude's log has NEITHER anchor (its CLI
+# echoes no prompt), so its window is the member's OWN PROSE — and prose ABOUT an
+# outage now matches. Two such logs exist already (claude-20260810-155415,
+# claude-20260818-073521), both from SUCCEEDED fires, which this function never
+# reads. Reaching it needs a claude fire failing with rc not 0 and not 124 (124
+# short-circuits above) whose tail discusses credits. Cost is bounded by design —
+# nothing downstream branches on the hint — but the structural fix is an anchor in
+# claude's log, i.e. a window that is not member prose. Unfixed, deliberately.
 classify_fire_failure() {
   local RC="$1" PREFIX LOG TAIL START
   [ "$RC" = "124" ] && { echo timeout; return 0; }
@@ -719,7 +768,7 @@ classify_fire_failure() {
   else
     TAIL=$(tail -n 200 "$LOG" 2>/dev/null) || TAIL=""
   fi
-  if printf '%s' "$TAIL" | grep -qi 'out of credits\|insufficient credit\|quota exceeded'; then
+  if printf '%s' "$TAIL" | grep -qi 'out of credits\|insufficient credit\|quota exceeded\|usage limit\|billing cycle\|purchase extra usage\|upgrade your plan'; then
     echo out-of-credits
   elif printf '%s' "$TAIL" | grep -qi 'EPERM\|operation not permitted\|network is unreachable\|connection refused\|urllib\.error'; then
     echo egress-blocked
@@ -730,8 +779,55 @@ classify_fire_failure() {
   fi
 }
 
+# rc=124 IS NOT A DELIVERY VERDICT — IT IS THE ONE RC THAT PROVES DELIVERY.
+# `timeout -k 30 1800` in every fire-*.sh wraps the member's CLI with the primer path
+# already in its argv, so an rc of 124 says the launcher STARTED that CLI and later cut
+# it short. The work list reached the member. What was interrupted is the wake, and
+# retention plus `retry_stale_primers` is the mechanism that owns an interrupted wake.
+#
+# The evidence was already written down, one function away, and acted on only half.
+# `stale_primer_discharged_test.py` opens with it: "This mesh has filed nine
+# non-delivery reports on rc=124 and all nine were false." That measurement bought the
+# `primer_spent` guard on the RE-FIRE path (a discharged list is retired, not re-fired)
+# and nothing at all on the REPORT path, which runs FIRST and every time — so the wake
+# amplification stopped and the false reports did not.
+#
+# Instance ten and eleven, CBP 2026-08-20, the case that found this. claude-code sent
+# kimi-code notices 4121 (`review_done`, PR #525) and 4127 (`review_done`, PR #549).
+# Both were delivered: kimi's wake `kimi-20260820-011755` opens by enumerating them by
+# id and kind, argues them for 3700 lines, and its successor lands the fixes citing
+# "#525 re-review — invariant 1" and "claude asked for a test with a member holding a
+# live scope grant". That wake then ran past `timeout -k 30 1800` at 08:46:56Z. rc=124,
+# primer retained, and this function mailed claude-code two `kind=reply` notices saying
+# the notices kimi had just spent thirty minutes answering were undelivered. `reply` is
+# in MEMBER_KINDS_AWAIT_RESPONSE, so each one also became a row in the SENDER's `i_owe`
+# and woke a session to read it.
+#
+# That is an amplifier pointed the wrong way: the longer and more thorough a member's
+# wake, the likelier it is cut short by the bound, and the more of its peers are told
+# they were not heard. Failure reports generated in proportion to work done.
+#
+# WHY NOT THE SYMMETRIC FIX. The tempting move is to reuse `primer_spent` here — same
+# primer, same rc, ask the daemon the same question. It is wrong, and one-sidedly so:
+# `i_owe` only ever holds MEMBER_KINDS_AWAIT_RESPONSE, so a `review_done`, a
+# `disposition` or a `coordination` is absent from the fold whether it was answered or
+# never seen. Gating the report on `i_owe` would therefore suppress the report for
+# exactly the kinds where the report is the ONLY trace a notice ever existed — and it
+# would do so on the genuinely-dead fires (out-of-credits, egress-blocked) too, which
+# are the fires that need reporting most. So the guard is keyed to the ONE rc that
+# carries mechanical information about whether the CLI ran, and to nothing else.
+#
+# Not `why=timeout` either: `classify_fire_failure` also returns `timeout` from log
+# TEXT under any rc, and a log that merely says "timed out" is a guess about a fire
+# that may never have started. The integer is the fact; the classifier is the lead.
+# Every other rc reports exactly as before — 75 (lock refusal, the CLI never ran), 1
+# (out-of-credits, egress-blocked, usage error), 69, 70 — all unchanged.
 report_unreachable() {
-  local PRIMER_FILE="$1" WHY="$2" ROWS ARGS OUT LIVE
+  local PRIMER_FILE="$1" WHY="$2" RC="${3:-}" ROWS ARGS OUT LIVE
+  if [ "$RC" = "124" ]; then
+    echo "[hestia-watch] fire hit the launcher bound (rc=124) — the member's CLI ran with this primer, so it is RETAINED for retry and NOT reported unreachable: $PRIMER_FILE"
+    return 0
+  fi
   ROWS=$(python3 - "$PRIMER_FILE" "$WHY" "watch-$PLUGIN" <<'PY'
 import json,sys
 try: d=json.load(open(sys.argv[1]))
@@ -808,13 +904,25 @@ while true; do
     # the question is asked where an answer is possible — inside the wake that
     # is happening anyway. Costs one read; never causes a fire on its own.
     UN=$(unanswered 2>/dev/null || echo '{}')
-    printf '%s' "$OUT" | UN="$UN" FOR_PLUGIN="$PLUGIN" python3 -c '
+    # The mirror of the debt fold: petitions THIS member has open. Filtered
+    # here, by `asked_by`, because the tool answers for the whole society and
+    # another member's rows are not this member's work — the same reason the
+    # primer directory is per-member. The filter and its renderer live in one
+    # file (`open-petitions.py`) so one suite covers both; an unparseable or
+    # failed read yields `asked:false`, which the renderer says out loud rather
+    # than rendering as "you hold none".
+    PET=$(open_petitions 2>/dev/null \
+          | timeout 5 python3 "$WATCH_DIR/open-petitions.py" fold "$PLUGIN" \
+          2>/dev/null || echo '{"asked":false,"mine":[]}')
+    printf '%s' "$OUT" | UN="$UN" PET="$PET" FOR_PLUGIN="$PLUGIN" python3 -c '
 import json,os,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
 try: u=json.loads(os.environ.get("UN") or "{}")
 except Exception: u={}
 d["unanswered"]={k:u.get(k,[]) for k in ("i_owe","owed_to_me")}
+try: d["open_petitions"]=json.loads(os.environ.get("PET") or "")
+except Exception: d["open_petitions"]={"asked":False,"mine":[]}
 # WHO THIS IS FOR — the one fact the primer never stated. It recorded from_plugin on
 # every notice and the recipient nowhere, so a misdelivered work list was
 # indistinguishable from a correct one by reading it, and the four days between notice
@@ -835,7 +943,7 @@ json.dump(d,sys.stdout)
         RC=$?
         WHY=$(classify_fire_failure "$RC")
         echo "[hestia-watch] fire command failed rc=$RC why=$WHY (notices preserved in $PRIMER)"
-        report_unreachable "$PRIMER" "fire-rc=$RC;why=$WHY"
+        report_unreachable "$PRIMER" "fire-rc=$RC;why=$WHY" "$RC"
       fi
     else
       python3 -c "import json;d=json.load(open('$PRIMER'));[print(f\"  {n['kind']} from {n['from_plugin']}: {n.get('pointer_uri','')}\") for n in d['notices']]"

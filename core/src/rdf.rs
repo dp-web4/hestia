@@ -292,6 +292,9 @@ mod tests {
             veracity: dim(None, vec![]),
             valuation: dim(None, vec![]),
             level: "high".into(),
+            level_basis: "conduct".into(),
+            baseline_acts: 0,
+            governed_acts: 0,
         }
     }
 

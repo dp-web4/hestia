@@ -4799,14 +4799,28 @@ pub(crate) struct DispositionProjection {
 /// The covered set is the petition surfaces' terminal facts: an appeal's
 /// `adjudication` (only the appeal kind — operator REPUTATION adjudications
 /// carry no `about_deny_hash` and are skipped), an escalation's
-/// `gate_escalation_decided` and its lapse (`gate_escalation_expired`, recorded
-/// by `record_newly_lapsed`), and a scope request's `scope_granted` /
-/// `scope_refused`. `scope_granted` with a NULL `request_id` is the
-/// operator-ORIGINATED grant (`/api/scope/grant`) — not a petition, no
+/// `gate_escalation_decided`, its lapse (`gate_escalation_expired`, recorded
+/// by `record_newly_lapsed`), AND ITS WITHDRAWAL, and a scope request's
+/// `scope_granted` / `scope_refused`. `scope_granted` with a NULL `request_id`
+/// is the operator-ORIGINATED grant (`/api/scope/grant`) — not a petition, no
 /// petitioner, deliberately skipped (#480 review change 5). A ruling row too
 /// thin to derive a recipient from is warned about and skipped — unprojectable
 /// is a real state, and the cursor advancing past it is safe because no later
 /// pass could do better.
+///
+/// THE WITHDRAWAL ARM, and the rule it ratifies (#545, split from #503): the
+/// disposition row is the durable keyed representation of a TERMINAL STATE, not
+/// a wake. "The withdrawer already knows" is a rendering concern — it may argue
+/// for how the notice is displayed, never for the row's absence: the covered
+/// set answers "which terminal states are on record as told", and a withdrawal
+/// is as terminal as a decision or a lapse. Withdrawing was previously QUIETER
+/// than lapsing — the wanted conduct (#503: the asker refuses its own request)
+/// had zero return-edge producers while the process failure had two. The arm
+/// lands forward-only by construction: the historical self-withdrawals (three,
+/// petitioner == withdrawer) stay without rows — they remain representable via
+/// the live `hestia://escalation/<id>` resolver, and minting notices for them
+/// now would manufacture exactly the noise the no-arm position was protecting
+/// against.
 fn disposition_obligation(e: &crate::storage::chain::ChainEntry) -> Option<(String, String)> {
     let get = |k: &str| e.event_data.get(k).and_then(Value::as_str);
     let thin = |what: &str| {
@@ -4836,6 +4850,15 @@ fn disposition_obligation(e: &crate::storage::chain::ChainEntry) -> Option<(Stri
             let id = get("escalation_id")?;
             match get("plugin_id") {
                 Some(to) => Some((to.to_string(), format!("hestia://escalation/{id}#lapsed"))),
+                None => thin("plugin_id"),
+            }
+        }
+        // The withdrawal — terminal like the two arms above (#545: the row is the
+        // record of a terminal state, not a wake; see the doc comment).
+        "gate_escalation_withdrawn" => {
+            let id = get("escalation_id")?;
+            match get("plugin_id") {
+                Some(to) => Some((to.to_string(), format!("hestia://escalation/{id}#withdrawn"))),
                 None => thin("plugin_id"),
             }
         }
@@ -10181,8 +10204,16 @@ mod tests {
     /// This asserts the direction no list can, and it is deliberately NOT a second spelling list
     /// (codex's implementation constraint on #499): it runs the REAL producers and reads each
     /// event type off the chain entry they actually wrote. No expected name appears below, so
-    /// renaming an event cannot silently retire the check, and a NEW terminal producer added
-    /// later is caught by the same assertion without anyone remembering to extend anything.
+    /// renaming an event cannot silently retire the check: these two producers' output is
+    /// declared, and renaming either cannot hide it.
+    ///
+    /// What it does NOT catch is a new producer PATH. `emitted` is this test's own chain,
+    /// filtered to what the calls below drove — so a third terminal producer added later is
+    /// invoked nowhere here, writes nothing to this chain, and faces a set that never contained
+    /// it. Green, and blind, for exactly the reason stated one paragraph up: THE DRIVE-LIST IS
+    /// A SET TOO. A new event emitted from either of the two driven paths IS caught; a new path
+    /// is invisible. (Dissent filed on the retired clause by claude-code, corroborated from
+    /// source by kimi-code, notices 3467/3501.)
     ///
     /// Scope, stated rather than implied: this bounds the events carrying an `escalation_id`.
     /// It does not bound producers on other surfaces — the honest guarantee is "no escalation
@@ -10757,13 +10788,17 @@ mod tests {
         );
     }
 
-    /// OPEN-DEFECT PIN, hole-J shape (CBP 2026-08-18): the assertions below record the
-    /// CURRENT WRONG behaviour, so this test is green exactly while the defect stands and
-    /// goes RED the moment it is fixed. **A red here is the intended end state** — read the
-    /// failure messages, not the polarity.
+    /// PIN FLIPPED (CBP 2026-08-18): filed as an open-defect pin whose assertions recorded the
+    /// CURRENT WRONG behaviour, and turned over in the same commit that fixes it — so the fix
+    /// is measured by the sign of a pin written before it, not by a new test authored to agree
+    /// with it. Cell by cell: `mailbox_reader` true -> false and `invited_without_reader`
+    /// 0 -> 1 are outright sign flips; `absent` stays 1 and changes WHICH seat it counts,
+    /// which is why a second seat — `kimi-code`, mailbox read seconds ago — is added here as a
+    /// positive control. Without it every assertion below is also satisfied by a predicate
+    /// that answers "no reader" to everyone, and a blanket `false` would read as a fix.
     ///
-    /// `invited_without_reader` catches "never seen" and misses "not seen since July", so a
-    /// dead mailbox is scored as a peer that declined.
+    /// Before: `invited_without_reader` caught "never seen" and missed "not seen since July",
+    /// so a dead mailbox was scored as a peer that declined.
     ///
     /// `has_mailbox_reader` is `inbox_touch(id).is_some()` — row exists, all time, no window.
     /// The daemon already computes the windowed reading of the SAME row on the notify path:
@@ -10795,26 +10830,31 @@ mod tests {
     /// a boundary drawn for the queueing question and then reused for the conduct one. Its
     /// 172-of-272 is a floor on the defect, not a measure of it.
     ///
-    /// The fix is a WINDOW on an existing read, not a filter: `invited_without_reader` should
-    /// hold a seat whose `last_touch` predates the escalation's own TTL. Still not a gate —
+    /// The fix is a WINDOW on an existing read, not a filter: `invited_without_reader` holds
+    /// a seat whose `last_touch` predates the escalation's own TTL. Still not a gate —
     /// the seat stays invited and may corroborate late, which `corroborate` expressly allows.
     /// It changes only whether silence from an unreachable mailbox is published as a decision.
     #[tokio::test]
-    async fn a_stale_mailbox_row_is_still_counted_as_a_peer_that_declined() {
+    async fn a_stale_mailbox_row_is_not_counted_as_a_peer_that_declined() {
         let (_dir, shared) = make_shared_state();
         let mut session_of = std::collections::HashMap::new();
-        for id in ["claude-code", "codex-cli"] {
+        for id in ["claude-code", "codex-cli", "kimi-code"] {
             let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
                 .await
                 .unwrap();
             session_of.insert(id.to_string(), r["sessionId"].as_str().unwrap().to_string());
         }
-        // A reader existed once: the only production path that writes the row is a drain.
-        // Then rewind it to the measured vintage of the live `codex-cli` row — 23 days, or
-        // 552 times the 3600s TTL the escalation below will carry.
+        // TWO seats, differing in ONE property: when the mailbox was last read. `kimi-code`
+        // is the POSITIVE CONTROL and it is the reason a blanket `false` cannot pass this
+        // test — a predicate that answers "no reader" for everyone satisfies every stale-seat
+        // assertion below and fails on this one. Both rows are written by the same production
+        // path (a drain); only the vintage differs.
         {
             let s = shared.lock().await;
             s.inbox_store.drain_member("codex-cli").unwrap();
+            s.inbox_store.drain_member("kimi-code").unwrap();
+            // Rewind ONE of them to the measured vintage of the live `codex-cli` row —
+            // 23 days, or 552 times the 3600s TTL the escalation below will carry.
             s.inbox_store
                 .backdate_inbox_touch("codex-cli", Utc::now() - chrono::Duration::days(23))
                 .unwrap();
@@ -10850,8 +10890,9 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert!(
-            invited.contains(&"codex-cli".to_string()),
-            "precondition: the stale seat is invited (over-issuing is deliberate): {invited:?}"
+            invited.contains(&"codex-cli".to_string()) && invited.contains(&"kimi-code".to_string()),
+            "precondition: BOTH seats are invited — the window changes what is RECORDED about \
+             an invitee, never who is invited (over-issuing is deliberate): {invited:?}"
         );
 
         let s = shared.lock().await;
@@ -10865,20 +10906,59 @@ mod tests {
             json!(3600),
             "the deadline the conduct question is asked against"
         );
-        let reader_flag = opened.event_data["invitation_evidence"]
-            .as_array()
-            .expect("per-peer invitation evidence")
-            .iter()
-            .find(|r| r["peer"] == json!("codex-cli"))
-            .expect("the stale seat has an evidence row")["mailbox_reader"]
-            .clone();
+        let reader_bit = |peer: &str| {
+            opened.event_data["invitation_evidence"]
+                .as_array()
+                .expect("per-peer invitation evidence")
+                .iter()
+                .find(|r| r["peer"] == json!(peer))
+                .unwrap_or_else(|| panic!("{peer} has an evidence row"))["mailbox_reader"]
+                .clone()
+        };
+        let reader_flag = reader_bit("codex-cli");
+        // POSITIVE CONTROL, asserted BEFORE the defect cell so a blanket-`false` predicate is
+        // reported as what it is rather than as a passing fix.
+        assert_eq!(
+            reader_bit("kimi-code"),
+            json!(true),
+            "a mailbox read seconds ago IS a reader for this ask — the fix is a window on an \
+             existing read, not a filter that answers `false` to everyone"
+        );
         assert_eq!(
             reader_flag,
+            json!(false),
+            "the RECORDED bit is now the windowed one: a mailbox last read 23 days before a \
+             3600s escalation has no reader FOR THIS ASK. This cell asserted `true` while the \
+             defect stood; it is the bit that carried the seat past `invited_without_reader` \
+             and into `absent`."
+        );
+
+        // THE STAMP, pinned cell by cell: both readings of the ONE row ride in the evidence,
+        // so a later reader can tell "dead mailbox" (the two diverge) from "never seen"
+        // (both false) and can tell every post-change row from the pre-change population
+        // (no `mailbox_reader_all_time` key at all). claude-code, 2026-08-20: the all-time
+        // reading was computed here and discarded one identifier away from the row it
+        // stamped; emitting it is what keeps the two meanings of `mailbox_reader` separable
+        // in an append-only chain.
+        let all_time_bit = |peer: &str| {
+            opened.event_data["invitation_evidence"]
+                .as_array()
+                .expect("per-peer invitation evidence")
+                .iter()
+                .find(|r| r["peer"] == json!(peer))
+                .unwrap_or_else(|| panic!("{peer} has an evidence row"))["mailbox_reader_all_time"]
+                .clone()
+        };
+        assert_eq!(
+            all_time_bit("codex-cli"),
             json!(true),
-            "PIN OF THE DEFECT, and a red here means it was FIXED — delete this assertion, \
-             not the fix. A mailbox last read 23 days before a 3600s escalation has no reader \
-             FOR THIS ASK, yet `has_mailbox_reader` reports one off a row with no window. \
-             That bit is what carries the seat past `invited_without_reader` and into `absent`."
+            "the all-time reading of the SAME row is still true — the row exists — and the \
+             stamp is what makes `mailbox_reader: false` read as 'stale', not 'absent'"
+        );
+        assert_eq!(
+            all_time_bit("kimi-code"),
+            json!(true),
+            "positive control: a live reader is a reader on BOTH readings"
         );
 
         let esc_id = claimed["escalation_id"].as_str().unwrap();
@@ -10887,19 +10967,133 @@ mod tests {
             .get(esc_id)
             .expect("the escalation this call opened")
             .peer_participation();
-        // The registry here is exactly {claude-code (asker, excluded), codex-cli}, so the
-        // whole invited set is the one stale seat and the two counts have no room to hide
-        // in each other.
-        assert_eq!(invited.len(), 1, "the invited set is the stale seat alone: {invited:?}");
+        // The registry here is exactly {claude-code (asker, excluded), codex-cli (stale),
+        // kimi-code (fresh)}, so every count below is pinned on both sides at once: the two
+        // seats must land in DIFFERENT buckets, and neither count has room to hide in the
+        // other.
+        assert_eq!(invited.len(), 2, "the invited set is both seats: {invited:?}");
         assert_eq!(
-            pp.invited_without_reader, 0,
-            "PIN OF THE DEFECT (red here = fixed): the one seat that is unreachable for this \
-             ask is NOT held by the field built to hold exactly it: {pp:?}"
+            pp.invited_without_reader, 1,
+            "exactly the one seat unreachable for THIS ask is held by the field built to hold \
+             exactly it (this cell asserted 0 while the defect stood): {pp:?}"
         );
         assert_eq!(
             pp.absent, 1,
-            "PIN OF THE DEFECT (red here = fixed): and so it is published as a peer that saw \
-             the ask and stayed silent — a decline manufactured out of a dead mailbox: {pp:?}"
+            "and exactly the reachable seat that stayed silent is `absent` — the decline \
+             manufactured out of a DEAD mailbox is gone, the real silence is still counted \
+             (this cell asserted 1 for the wrong seat while the defect stood): {pp:?}"
+        );
+    }
+
+    /// The stamp's third case, and the cell the two-seat fixture above cannot supply: an
+    /// invited seat with NO inbox row at all must read `false` on BOTH bits — "never seen",
+    /// separable from "dead mailbox" (where the two diverge). Without this cell every invited
+    /// seat has a row, `mailbox_reader_all_time` is `true` everywhere, and the literal
+    /// `true` passes in its place — claude-code fired exactly that sabotage against this PR
+    /// (#558) on 2026-08-20 and it was INERT. This test is the arm that makes the stamp a
+    /// reading rather than a constant.
+    ///
+    /// It carries BOTH poles itself. The never-drained seat kills a blanket `true`;
+    /// `fresh-drain` kills a blanket `false`. The alternative considered and rejected was a
+    /// comment in each test naming the other as holder of the opposite polarity — that is the
+    /// inert-warrant shape (`gate_escalation.rs` "safe because
+    /// `reaping_can_never_change_an_answer` proves...", green under BOTH sabotage arms, #544):
+    /// a citation does not go red when the test it cites is deleted. An assertion does.
+    #[tokio::test]
+    async fn a_never_drained_seat_stamps_false_on_both_readings() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        // `egress-drain` is named for the fleet condition being reproduced: a member the
+        // mesh has NEVER SEEN read a mailbox — no inbox row exists, on any timescale.
+        for id in ["claude-code", "egress-drain", "fresh-drain"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id.to_string(), r["sessionId"].as_str().unwrap().to_string());
+        }
+        // Deliberately NO drain for egress-drain: the row is absent, not stale.
+        // `fresh-drain` is the OPPOSITE POLE, and it is the whole reason this test is not a
+        // one-way gradient. Every assertion about `egress-drain` below expects `false`, so a
+        // blanket `false` stamp satisfies all of them; this seat is the one cell a blanket
+        // `false` cannot satisfy. Without it the two constants are killed by two DIFFERENT
+        // tests and deleting either silently unpins one direction — which is a coupling a
+        // cross-reference comment can document but cannot enforce.
+        {
+            let s = shared.lock().await;
+            s.inbox_store.drain_member("fresh-drain").unwrap();
+        }
+
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": session_of["claude-code"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "reason": "Edit -> a governance file",
+            }),
+        )
+        .await
+        .unwrap();
+        let invited: Vec<String> = claimed["invited_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            invited.contains(&"egress-drain".to_string()),
+            "precondition: the never-drained seat IS invited: {invited:?}"
+        );
+
+        let s = shared.lock().await;
+        let opened = s
+            .recent_chain(40)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened")
+            .expect("the open must be witnessed");
+        let row = opened.event_data["invitation_evidence"]
+            .as_array()
+            .expect("per-peer invitation evidence")
+            .iter()
+            .find(|r| r["peer"] == json!("egress-drain"))
+            .expect("egress-drain has an evidence row")
+            .clone();
+        assert_eq!(
+            row["mailbox_reader"],
+            json!(false),
+            "no row, so no reader for THIS ask: {row}"
+        );
+        assert_eq!(
+            row["mailbox_reader_all_time"],
+            json!(false),
+            "the cell that distinguishes a reading from a constant: no row on ANY timescale. \
+             A literal `true` in place of the stamp fails HERE — both bits false is 'never \
+             seen', and it is what makes 'dead mailbox' (the bits diverge) tellable apart: {row}"
+        );
+
+        // POSITIVE CONTROL, and the arm that makes this test kill BOTH constants by itself.
+        // Same production path (a drain), same pass, opposite expected value.
+        let fresh = opened.event_data["invitation_evidence"]
+            .as_array()
+            .expect("per-peer invitation evidence")
+            .iter()
+            .find(|r| r["peer"] == json!("fresh-drain"))
+            .expect("fresh-drain has an evidence row")
+            .clone();
+        assert_eq!(
+            fresh["mailbox_reader_all_time"],
+            json!(true),
+            "a mailbox drained seconds ago has a row on every timescale. A literal `false` in \
+             place of the stamp fails HERE, and it passes every `egress-drain` cell above — \
+             this is the assertion that stops the never-drained fixture from being a one-way \
+             gradient: {fresh}"
+        );
+        assert_eq!(
+            fresh["mailbox_reader"],
+            json!(true),
+            "and the windowed reading agrees for a fresh row — the two bits diverge only for \
+             a STALE mailbox, which is the third case the sibling test holds: {fresh}"
         );
     }
 
@@ -11030,6 +11224,160 @@ mod tests {
     /// redaction convention (see `tool_gate_escalation_claim`, which explains why): the
     /// literal is what the two production spends carried, and writing the literal here
     /// refuses this edit for the reason documented there.
+    /// RESCUED FROM PR #561 (kimi-code), which is being closed rather than merged.
+    ///
+    /// The fix this pins — `has_mailbox_reader_within` wired into `resolve_invitation` —
+    /// reached main by another carrier (#527/#558). The TEST did not, so main enforced the
+    /// windowing with nothing asserting it. Re-derived here rather than reviving the branch:
+    /// the branch's remaining diff was a stale copy of a function main already has, and the
+    /// only live thing on it was this pin.
+    ///
+    /// Kept intact, including its control — `recipient_liveness` reading the SAME row as
+    /// `dormant` is what stops this passing by accident.
+    ///
+    /// FIXED-DEFECT PIN, hole-J shape (CBP 2026-08-18, fixed 2026-08-19): the assertions
+    /// below recorded the defect while it stood (a red was the intended end state); with
+    /// `has_mailbox_reader_within` wired into `resolve_invitation` they assert the fixed
+    /// behaviour, and a red now means regression.
+    ///
+    /// `invited_without_reader` catches "never seen" and misses "not seen since July", so a
+    /// dead mailbox is scored as a peer that declined.
+    ///
+    /// `has_mailbox_reader` is `inbox_touch(id).is_some()` — row exists, all time, no window.
+    /// The daemon already computes the windowed reading of the SAME row on the notify path:
+    /// `recipient_liveness` splits it three ways (`live` inside
+    /// [`MEMBER_LIVE_WITHIN_SECS`], `dormant`, `unknown`) and ships `last_inbox_touch` as
+    /// evidence. The invitation path calls the same `inbox_touch` and keeps one bit of it.
+    ///
+    /// That bit decides an EVIDENTIARY question, not a queueing one. `dormant` is the right
+    /// answer to "is this worth queueing?" — the notice waits, the watcher starts tomorrow,
+    /// nothing is lost. It is the wrong answer to "did this seat read the ask and decline?",
+    /// because that question has a deadline: `ttl_secs`, 3600 on every `sovereign_plus_peer`
+    /// escalation this daemon has opened. A seat whose mailbox was last read weeks ago cannot
+    /// read one inside the hour, and `peer_participation` counts it in `absent` anyway —
+    /// the exact reading `invited_without_reader` was added to prevent.
+    ///
+    /// MEASURED, not hypothesised. Escalations `5725d296b05cbc4c` (claude-code, 17:11:21Z)
+    /// and `18705bb00dd24903` (kimi-code, 17:13:48Z), both `ttl_secs: 3600`, invited 8 and
+    /// flagged 5 readerless. `codex-cli` was in the unflagged 3 on both, carrying
+    /// `mailbox_reader: true` with `liveness_at_invite: unknown` — and the daemon's own
+    /// liveness readout on that same row, minted 17:43Z the same day, is
+    /// `{first_seen: 2026-07-26T05:54:39Z, last_inbox_touch: 2026-07-26T05:54:39Z,
+    /// mailbox_reads: 1}`. One read, twenty-three days earlier, never an act on the chain:
+    /// dead by both instruments the daemon owns, and scored as a peer that declined by the
+    /// field built to stop exactly that.
+    ///
+    /// `tools/invitation_deadletter_census.py` could not see this class. It defines the
+    /// dead-letter population as ids "with no `member_inbox_touch` row at all", inheriting
+    /// `recipient_liveness`'s "`unknown` ... is the dead-letter class, and *only* this" —
+    /// a boundary drawn for the queueing question and then reused for the conduct one. Its
+    /// 172-of-272 is a floor on the defect, not a measure of it.
+    ///
+    /// The fix is a WINDOW on an existing read, not a filter: `invited_without_reader` should
+    /// hold a seat whose `last_touch` predates the escalation's own TTL. Still not a gate —
+    /// the seat stays invited and may corroborate late, which `corroborate` expressly allows.
+    /// It changes only whether silence from an unreachable mailbox is published as a decision.
+    #[tokio::test]
+    async fn a_stale_mailbox_row_scores_unreachable_for_this_ask_not_a_decline() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "codex-cli"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id.to_string(), r["sessionId"].as_str().unwrap().to_string());
+        }
+        // A reader existed once: the only production path that writes the row is a drain.
+        // Then rewind it to the measured vintage of the live `codex-cli` row — 23 days, or
+        // 552 times the 3600s TTL the escalation below will carry.
+        {
+            let s = shared.lock().await;
+            s.inbox_store.drain_member("codex-cli").unwrap();
+            s.inbox_store
+                .backdate_inbox_touch("codex-cli", Utc::now() - chrono::Duration::days(23))
+                .unwrap();
+        }
+
+        // CONTROL, and it is the reason this test cannot pass by accident: the SAME row, read
+        // by the daemon's other consumer, already answers the question correctly.
+        {
+            let s = shared.lock().await;
+            let (verdict, evidence) = recipient_liveness(&s.inbox_store, "codex-cli");
+            assert_eq!(
+                verdict, "dormant",
+                "the notify path reads this row as stale: {evidence}"
+            );
+        }
+
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": session_of["claude-code"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "reason": "Edit -> a governance file",
+            }),
+        )
+        .await
+        .unwrap();
+        let invited: Vec<String> = claimed["invited_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            invited.contains(&"codex-cli".to_string()),
+            "precondition: the stale seat is invited (over-issuing is deliberate): {invited:?}"
+        );
+
+        let s = shared.lock().await;
+        let opened = s
+            .recent_chain(40)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened")
+            .expect("the open must be witnessed");
+        assert_eq!(
+            opened.event_data["ttl_secs"],
+            json!(3600),
+            "the deadline the conduct question is asked against"
+        );
+        let reader_flag = opened.event_data["invitation_evidence"]
+            .as_array()
+            .expect("per-peer invitation evidence")
+            .iter()
+            .find(|r| r["peer"] == json!("codex-cli"))
+            .expect("the stale seat has an evidence row")["mailbox_reader"]
+            .clone();
+        assert_eq!(
+            reader_flag,
+            json!(false),
+            "a mailbox last read 23 days before a 3600s escalation has no reader FOR THIS ASK; \
+             recording `mailbox_reader: true` off a row with no window is what puts it in \
+             `absent`"
+        );
+
+        let esc_id = claimed["escalation_id"].as_str().unwrap();
+        let pp = s
+            .gate_escalations
+            .get(esc_id)
+            .expect("the escalation this call opened")
+            .peer_participation();
+        // The registry here is exactly {claude-code (asker, excluded), codex-cli}, so the
+        // whole invited set is the one stale seat and the two counts have no room to hide
+        // in each other.
+        assert_eq!(invited.len(), 1, "the invited set is the stale seat alone: {invited:?}");
+        assert_eq!(
+            pp.invited_without_reader, 1,
+            "unreachable-for-this-ask belongs in `invited_without_reader`: {pp:?}"
+        );
+        assert_eq!(
+            pp.absent, 0,
+            "and must NOT be published as a peer that saw the ask and stayed silent: {pp:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_claimed_row_carries_the_stated_attempted_act_and_the_derived_join_key() {
         let (_dir, shared) = make_shared_state();
@@ -14231,6 +14579,51 @@ fn has_mailbox_reader(store: &crate::storage::SqliteInboxStore, plugin_id: &str)
     !matches!(store.inbox_touch(plugin_id), Ok(None))
 }
 
+/// The same row, read for the CONDUCT question instead of the queueing one.
+///
+/// `has_mailbox_reader` asks "did a watcher EVER read this mailbox" — presence, all time, no
+/// window. That is the right answer to "is this worth queueing?": a dormant seat's notice
+/// waits, its watcher starts tomorrow, nothing is lost. It is the WRONG answer to "did this
+/// seat see the ask and decline?", because that question has a deadline — the escalation's own
+/// `ttl_secs` — and a mailbox last read weeks ago cannot be read inside the hour.
+///
+/// Measured (CBP 2026-08-18): `codex-cli` carried `mailbox_reader: true` on two 3600s
+/// escalations while the daemon's own `recipient_liveness` read the SAME row as `dormant`
+/// (`last_inbox_touch` 23 days earlier, `mailbox_reads: 1`). `peer_participation` therefore
+/// counted it in `absent` — published as a peer that saw the ask and stayed silent.
+///
+/// TRI-STATE, and the third state is the point (GPT review, 2026-08-20).
+///
+/// Its unwindowed sibling answers a QUEUEING question, where failing toward `true` is right:
+/// queue it, nothing is lost. This one answers a CONDUCT question, and there `true` is not a
+/// safe default — it is affirmative evidence that the seat's mailbox was being read when the
+/// ask went out, which is precisely what puts an unanswering peer into `absent`, i.e. into
+/// "saw the ask and stayed silent."
+///
+/// So the previous `Err(_) => true` inverted its own stated intent. The comment read "a lookup
+/// that failed must not become a specific finding about a peer" while the encoding made the
+/// failed lookup INTO that finding: an unreadable store manufactured a conduct fact about a
+/// seat nobody could measure.
+///
+/// `None` is UNKNOWN and must contribute to neither population — not to `invited_without_reader`
+/// (which would excuse the peer) and not to `absent` (which would accuse it). A measurement
+/// that did not happen is not evidence in either direction.
+fn has_mailbox_reader_within(
+    store: &crate::storage::SqliteInboxStore,
+    plugin_id: &str,
+    window_secs: u64,
+    now: u64,
+) -> Option<bool> {
+    match store.inbox_touch(plugin_id) {
+        Ok(None) => Some(false),
+        Ok(Some(t)) => {
+            let last = t.last_touch.timestamp().max(0) as u64;
+            Some(last.saturating_add(window_secs) >= now)
+        }
+        Err(_) => None,
+    }
+}
+
 /// Resolve who this escalation invites, and record it on the escalation.
 ///
 /// NOT A GATE. Nothing here can refuse the open, delay it, or change `bar_met`. An invitation
@@ -14275,7 +14668,15 @@ fn resolve_invitation(
         // router so both routing receipts on this daemon are cut from the same depth of
         // evidence.
         let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
-        let mut pool: Vec<(String, crate::arbiter::Liveness, bool)> = s
+        // TWO readings of one row, because two different questions are asked of it. `reachable`
+        // (ever seen) orders the pool — a queueing preference, where dormant still deserves a
+        // slot. `reader_for_this_ask` (seen within THIS escalation's own TTL) is what gets
+        // RECORDED — a conduct fact, where a mailbox nobody has read since July cannot have
+        // read an ask that dies in an hour. Conflating them published dormant seats as peers
+        // that declined; see `has_mailbox_reader_within`.
+        let ttl_secs = esc.expires_at.saturating_sub(esc.opened_at);
+        let now = crate::server::gate_escalation::now_secs();
+        let mut pool: Vec<(String, crate::arbiter::Liveness, bool, Option<bool>)> = s
             .member_registry
             .iter_sorted()
             .into_iter()
@@ -14287,8 +14688,10 @@ fn resolve_invitation(
             })
             .map(|id| {
                 let l = actor_liveness(&window, &id);
-                let reader = has_mailbox_reader(&s.inbox_store, &id);
-                (id, l, reader)
+                let reachable = has_mailbox_reader(&s.inbox_store, &id);
+                let reader_for_this_ask =
+                    has_mailbox_reader_within(&s.inbox_store, &id, ttl_secs, now);
+                (id, l, reachable, reader_for_this_ask)
             })
             .collect();
         // Live first, then dormant, then unknown; then — under all of it — whether any
@@ -14301,7 +14704,7 @@ fn resolve_invitation(
         // it decides only between candidates the acts cannot tell apart, which is exactly the
         // `Unknown` tier where an alphabetical tie-break was handing slots to probe residue
         // ahead of a live peer.
-        pool.sort_by_key(|(id, l, reader)| {
+        pool.sort_by_key(|(id, l, reader, _)| {
             (
                 match l {
                     crate::arbiter::Liveness::Live => 0u8,
@@ -14317,11 +14720,23 @@ fn resolve_invitation(
         // derives `absent` from this list, and an id no watcher reads must not be counted as
         // a peer that read the ask and declined. Recording it at INVITE time is the only
         // moment the fact is true of the invitation rather than of the reader's later state.
-        let ev = |(id, l, reader): &(String, crate::arbiter::Liveness, bool)| {
-            json!({"peer": id, "liveness_at_invite": l, "mailbox_reader": reader})
+        // `mailbox_reader_all_time` stamps the derivation basis beside it: the all-time
+        // presence reading this branch replaced as the recorded bit. Rows written BEFORE this
+        // change carry no such key, and absence is the discriminator — a row with no
+        // `mailbox_reader_all_time` is a pre-change, all-time-presence row, not a new row
+        // whose field was dropped. The stamp is a second measurement by the same pass, not a
+        // version constant: a constant can drift out of sync with the code, a reading cannot.
+        // `mailbox_reader` is now true / false / null. `null` is UNKNOWN — the store could not
+        // be read for this seat — and serde renders `Option::None` as JSON null, so the wire
+        // carries the third state rather than collapsing it into one of the other two. Readers
+        // that match on `== false` are unaffected; readers that treated "not false" as "true"
+        // were the defect this closes.
+        let ev = |(id, l, reachable, reader): &(String, crate::arbiter::Liveness, bool, Option<bool>)| {
+            json!({"peer": id, "liveness_at_invite": l, "mailbox_reader": reader,
+                   "mailbox_reader_all_time": reachable})
         };
         (
-            pool.iter().map(|(id, _, _)| id.clone()).collect::<Vec<String>>(),
+            pool.iter().map(|(id, _, _, _)| id.clone()).collect::<Vec<String>>(),
             pool.iter().map(ev).collect::<Vec<Value>>(),
             over.iter().map(ev).collect::<Vec<Value>>(),
         )
@@ -14362,14 +14777,10 @@ fn resolve_invitation(
     // The doorbell half of the same write. Ordered AFTER `invite` because
     // `record_invitee_readers` keeps only ids that were actually invited — a flag on a seat
     // nobody asked must not be able to reduce `absent`.
-    s.gate_escalations.record_invitee_readers(
-        &esc.id,
-        evidence
-            .iter()
-            .filter(|r| r.get("mailbox_reader") == Some(&Value::Bool(false)))
-            .filter_map(|r| r.get("peer").and_then(Value::as_str).map(str::to_string))
-            .collect(),
-    );
+    // The evidence array WHOLE, not a pre-split (legion review, 2026-08-21). Splitting here
+    // is what left `invited_reader_unknown` unwritten on the live path — the store now derives
+    // both tiers from this one value, the same one `rehydrate` reads.
+    s.gate_escalations.record_invitee_readers(&esc.id, &evidence);
     // The basis the whole record already carries on the chain entry must also live ON the
     // escalation itself: `arbiter::eligibility` clause 0 reads it from here at decide and
     // corroborate time, and a basis that exists only on the chain is one the peer path
@@ -15561,22 +15972,28 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
             };
             // #459: the decision's RETURN EDGE, minted HERE — the layer holding
             // SharedState — because `EscalationStore::decide` has no inbox access.
-            // Skipped for a withdrawal: that is the asker's own act and the asker
-            // was there for it; waking a member to tell it what it just did is
-            // noise wearing the return edge's clothes. Revised #480 contract: the
-            // decision entry IS the witness, so the obligation anchors to its
-            // hash; a failed ensure warns and is retried by the cursor projector,
-            // it is not the decider's error.
-            let disposition_notice_id = if withdrawn {
-                None
+            // Revised #480 contract: the terminal entry IS the witness, so the
+            // obligation anchors to its hash; a failed ensure warns and is retried
+            // by the cursor projector, it is not the decider's error.
+            //
+            // Withdrawals included, since #545: the disposition row is the durable
+            // representation of a TERMINAL STATE, not a wake, so "the withdrawer
+            // already knows" is a rendering concern, not a record concern. The
+            // earlier skip ("the asker was there for its own act") made withdrawing
+            // QUIETER than lapsing — the wanted conduct with no return edge while
+            // the process failure had two. Pointer: #withdrawn, matching the
+            // projector's arm.
+            let pointer = if withdrawn {
+                format!("hestia://escalation/{}#withdrawn", decided.id)
             } else {
-                ensure_disposition(
-                    &s,
-                    &decided.plugin_id,
-                    &format!("hestia://escalation/{}#decided", decided.id),
-                    &entry.hash,
-                )
+                format!("hestia://escalation/{}#decided", decided.id)
             };
+            let disposition_notice_id = ensure_disposition(
+                &s,
+                &decided.plugin_id,
+                &pointer,
+                &entry.hash,
+            );
             // The bar and whether this decision met it go to the DECIDER, not only to the
             // chain. They were recorded above and withheld here, and the asymmetry had a
             // measured cost: across the whole chain, 66 `sovereign_plus_peer` escalations
@@ -17216,5 +17633,158 @@ mod disposition_durability_tests {
             .expect("the evidence comes along, shape-parity with the live arm: {body}");
         assert_eq!(factors[0]["by"], "operator");
         assert_eq!(factors[0]["dissent"], json!(false));
+    }
+
+    /// #545: the covered set of `disposition_obligation`, pinned in BOTH directions —
+    /// the next silent enumeration-out (a kind added to the terminal vocabulary and
+    /// forgotten here, or a kind dropped without a stated reason) is a red test.
+    #[test]
+    fn the_disposition_covered_set_is_pinned_in_both_directions() {
+        fn entry(event_type: &str, data: Value) -> crate::storage::chain::ChainEntry {
+            crate::storage::chain::ChainEntry {
+                chain_position: 0,
+                hash: String::new(),
+                prev_hash: String::new(),
+                event_type: event_type.to_string(),
+                event_data: data,
+                signer_lct: "test".into(),
+                timestamp: chrono::Utc::now(),
+            }
+        }
+        let to = "kimi-code";
+        let cases: Vec<(crate::storage::chain::ChainEntry, Option<(String, String)>)> = vec![
+            // The covered set, each with its pointer.
+            (
+                entry("adjudication", json!({"about_deny_hash": "deadbeef", "subject_plugin_id": to})),
+                Some((to.into(), "hestia://appeal/deadbeef#ruled".into())),
+            ),
+            (
+                entry("gate_escalation_decided", json!({"escalation_id": "esc1", "plugin_id": to})),
+                Some((to.into(), "hestia://escalation/esc1#decided".into())),
+            ),
+            (
+                entry("gate_escalation_expired", json!({"escalation_id": "esc2", "plugin_id": to})),
+                Some((to.into(), "hestia://escalation/esc2#lapsed".into())),
+            ),
+            // #545: the withdrawal JOINS — the row is the record of a terminal
+            // state, not a wake; "the withdrawer already knows" is a rendering
+            // concern, not a record concern.
+            (
+                entry("gate_escalation_withdrawn", json!({"escalation_id": "esc3", "plugin_id": to})),
+                Some((to.into(), "hestia://escalation/esc3#withdrawn".into())),
+            ),
+            (
+                entry("scope_granted", json!({"request_id": "r1", "plugin_id": to})),
+                Some((to.into(), "hestia://scope/r1".into())),
+            ),
+            (
+                entry("scope_refused", json!({"request_id": "r2", "plugin_id": to})),
+                Some((to.into(), "hestia://scope/r2".into())),
+            ),
+            // The negative direction.
+            (
+                entry("gate_escalation_opened", json!({"escalation_id": "esc9", "plugin_id": to})),
+                None, // not terminal
+            ),
+            (
+                entry("scope_granted", json!({"request_id": Value::Null, "plugin_id": to,
+                                              "origin": "operator_initiated"})),
+                None, // operator-originated: no petitioner
+            ),
+            (
+                entry("adjudication", json!({"subject_plugin_id": to, "axis": "validity"})),
+                None, // operator REPUTATION adjudication — no about_deny_hash, not an appeal ruling
+            ),
+            (entry("outcome", json!({"escalation_id": "esc1"})), None),
+        ];
+        for (e, want) in cases {
+            assert_eq!(
+                disposition_obligation(&e),
+                want,
+                "covered-set mismatch for {} {}",
+                e.event_type,
+                e.event_data
+            );
+        }
+    }
+
+    /// The projector path for a withdrawal: the terminal entry was witnessed but
+    /// the daemon died before the ensure — the cursor projector mints from the
+    /// record, pointer `#withdrawn`. Same guarantee the decided and lapsed kinds
+    /// already had; the withdrawal had neither producer before #545.
+    #[tokio::test]
+    async fn the_projector_mints_a_withdrawn_disposition_from_the_terminal_record() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox) = {
+            let mut s = state.lock().await;
+            let handles = (s.chain_store.clone(), s.inbox_store.clone());
+            project_dispositions(&handles.0, &handles.1).unwrap();
+            s.append_chain(
+                "gate_escalation_withdrawn",
+                json!({"escalation_id": "esc-wd-p", "plugin_id": "kimi-code",
+                       "tool_name": "policy_edit", "status": "denied",
+                       "decided_by": "kimi-code", "decided_via": "self_withdrawn"}),
+            )
+            .unwrap();
+            handles
+        };
+        assert_eq!(project_dispositions(&chain, &inbox).unwrap().projected, 1);
+        let s = state.lock().await;
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        assert_eq!(
+            mail.iter()
+                .find(|n| n.kind == "disposition")
+                .and_then(|n| n.pointer_uri.as_deref()),
+            Some("hestia://escalation/esc-wd-p#withdrawn")
+        );
+    }
+
+    /// The synchronous fast path (#545): the withdrawal's OWN ruling site mints
+    /// immediately, anchored to the `gate_escalation_withdrawn` entry's hash —
+    /// withdrawing is no longer quieter than being decided.
+    #[tokio::test]
+    async fn a_withdrawal_reports_its_disposition_to_the_withdrawer() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let sid = super::appeal_tests::seat(&state, "kimi-code").await;
+        let opened = tool_gate_escalation_open(&state, &json!({
+            "plugin_id": "kimi-code", "tool_name": "policy_edit", "marker": "policy.json",
+            "reason": "turns out the rule already covers it",
+            "session_id": sid.to_string(),
+        })).await.unwrap();
+        let esc_id = opened["escalation_id"].as_str().expect("the open returns its id").to_string();
+
+        let ruled = tool_gate_arbitrate_escalation(&state, &json!({
+            "escalation_id": esc_id, "approve": false, "session_id": sid.to_string(),
+        })).await.unwrap();
+        assert!(
+            ruled.get("_hestia_error").is_none(),
+            "a member must be able to retire its own ask: {ruled}"
+        );
+        assert!(
+            ruled["disposition_notice_id"].is_number(),
+            "the withdrawal's return edge is minted at the ruling site, not only by the              projector: {ruled}"
+        );
+
+        let s = state.lock().await;
+        let withdrawn_entry = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_withdrawn")
+            .expect("the withdrawal itself must be witnessed");
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        let note = mail
+            .iter()
+            .find(|n| n.kind == "disposition")
+            .expect("the withdrawer holds the terminal record: {mail:?}");
+        assert_eq!(
+            note.pointer_uri.as_deref(),
+            Some(format!("hestia://escalation/{esc_id}#withdrawn")).as_deref()
+        );
+        assert_eq!(
+            note.chain_hash, withdrawn_entry.hash,
+            "the obligation anchors to the terminal entry, not to a notice-side entry"
+        );
     }
 }

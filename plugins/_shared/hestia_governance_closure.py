@@ -751,9 +751,40 @@ def _command_write_targets(words: list, stdin_src=None) -> list:
                 pfiles = [stdin_src]
             if not pfiles:
                 raise _OpaqueWriter()
-            out = []
+            out, resolved = [], False
             for pf in pfiles:
-                out.extend(_patch_write_targets(pf))
+                try:
+                    out.extend(_patch_write_targets(pf))
+                except _OpaqueWriter:
+                    # A BARE DIGIT THAT CANNOT BE OPENED IS A FILE DESCRIPTOR, not a patch
+                    # file. `_tokenize` runs shlex with `punctuation_chars`, which splits
+                    # `2>&1` into `2`, `>&`, `1` and keeps NO adjacency — so the fd lands in
+                    # the simple command's word list exactly like an argument, and this
+                    # branch collected it as a second patch file. `_patch_write_targets`
+                    # then failed to open it and raised _OpaqueWriter("2"): an UNCONDITIONAL
+                    # fail-close naming a file descriptor as the governance resource, on a
+                    # command whose real patch had already been read and named nothing in
+                    # the closure. Measured on CBP 2026-08-18 and appealed (a3534df3),
+                    # upheld cross-vendor by kimi-code, which reproduced it byte-exact.
+                    #
+                    # The skip is deliberately conditioned on the READ FAILING, not on the
+                    # shape alone: a patch file that really is named `2` still opens, still
+                    # parses, and still contributes its targets. Dropping every bare digit
+                    # unread would have opened a hole exactly the width of `git apply 2`.
+                    #
+                    # The `>&` branch in `_bash_write_targets` already skips the RIGHT side
+                    # of the same operator (`nxt.isdigit()` after a punct containing `&`).
+                    # It ran one token too late to catch the left side; this is that shape,
+                    # caught where the damage was.
+                    if pf.isdigit():
+                        continue
+                    raise
+                resolved = True
+            if not resolved:
+                # Every operand was an fd, so no patch source was named at all — the content
+                # is arriving on a pipe this classifier cannot read. Same posture as the
+                # `not pfiles` case above, and the same reason.
+                raise _OpaqueWriter()
             return out
         if sub == "checkout":
             # Only explicit pathspec overwrite (`checkout [-|tree-ish] -- paths`); a branch
@@ -804,12 +835,36 @@ def _flush_simple_command(words: list, eff: str, targets: list, stdin_src=None) 
     return eff
 
 
+
+_HEREDOC_OP = re.compile(r"<<-?(?!<)\s*([\'\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _strip_heredoc_bodies(command: str) -> str:
+    """Remove heredoc BODIES (a line-delimited construct) before tokenizing, keeping the
+    operator line itself -- bash executes the rest of that line. Terminator match is
+    deliberately loose (stripped compare): terminating early retains body lines as code
+    (a false positive), never drops executable code (a bypass)."""
+    lines = command.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        delims = [m.group(2) for m in _HEREDOC_OP.finditer(line)]
+        i += 1
+        for d in delims:
+            while i < len(lines) and lines[i].strip() != d:
+                i += 1
+            if i < len(lines):
+                i += 1  # consume the terminator line
+    return "\n".join(out)
+
+
 def _bash_write_targets(command: str) -> list:
     """All write-position arguments across a compound command: redirect targets plus each
     simple command's write positions, each resolved against the cd-tracked effective cwd.
     Raises on tokenizer failure (caller -> unparseable posture) and raises _OutOfGrammar on
     any out-of-grammar construct (caller -> out-of-grammar posture)."""
-    toks = _tokenize(command)
+    toks = _tokenize(_strip_heredoc_bodies(command))
     targets, cur = [], []
     stdin_src = None  # `< file` source for the current simple command (patch input)
     eff = ""  # relative cwd accumulator; cd within this command line adjusts it
@@ -824,6 +879,8 @@ def _bash_write_targets(command: str) -> list:
             i += 1
             continue
         if _is_punct(t):
+            if (">" in t or "<" in t) and cur and cur[-1].isdigit():
+                cur.pop()  # leading fd number belongs to the redirect, not to argv
             if ">" in t:
                 nxt = toks[i + 1] if i + 1 < len(toks) else None
                 if nxt is not None and "&" in t and nxt.isdigit():

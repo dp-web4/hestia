@@ -66,6 +66,23 @@ jobs:
           repository: dp-web4/web4
           path: web4
 
+      # AC-E1 (PRD_R6_R7_ENVELOPES §8) verifies §2's file:line citations AT web4.pin,
+      # not at web4 main — the anchors were recorded against the pin, so main would
+      # report drift that is not drift. The checkout above is `main` at fetch-depth 1,
+      # so the pin object is absent and the check would skip. Fetch exactly that one
+      # commit: `--depth 1 <sha>` costs one object graph, not web4's whole history,
+      # which is why this is a targeted fetch rather than `fetch-depth: 0` above.
+      # If the pin is unreachable the check SKIPS loudly rather than reddening — so a
+      # failure here is a real fetch problem, not a citation problem.
+      - name: Fetch the web4.pin object (for the PRD citation check)
+        run: |
+          rev="$(grep -oiE '[0-9a-f]{40}' hestia/web4.pin | head -1)"
+          git -C web4 fetch --depth 1 origin "$rev"
+
+      - name: PRD R6/R7 §2 citations resolve at the pin (AC-E1, AC-E2)
+        working-directory: hestia
+        run: python3 tools/prd_r6_r7_citation_test.py
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
