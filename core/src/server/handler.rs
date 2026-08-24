@@ -14781,6 +14781,33 @@ fn opened_payload(
         // Recorded so a reader is never left inferring it from silence.
         "assurance": "A1 — cooperative gate, same-UID operator. This escalation is \
                       tamper-EVIDENT, not tamper-proof.",
+        // CLOSING THE LOOP FOR A LIVE SEAT (#366). The push half exists — the disposition
+        // projector mints a mesh notice on decision — but delivery is a WAKE, and a live
+        // seat is never woken, so the notice waits while the 600s claim window expires
+        // against a member that was online the entire time.
+        //
+        // A refused member is BY DEFINITION talking to this daemon right now, so the refusal
+        // answers the question it just provoked: what of mine can I already spend? Same
+        // predicate `claim()` spends against, so this cannot advertise a claim that would
+        // fail. The escalation just opened is excluded — pending by construction, and
+        // listing it would read as "already approved".
+        "decided_awaiting_claim": s
+            .gate_escalations
+            .claimable_for(&esc.plugin_id, crate::server::gate_escalation::now_secs())
+            .iter()
+            .filter(|c| c.id != esc.id)
+            .map(|c| {
+                json!({
+                    "escalation_id": c.id,
+                    "marker": c.marker,
+                    // The CLAIM clock, never the record clock: measured 2026-08-08, three
+                    // permits reported ~1500s of record life while ~24 minutes past their
+                    // grant horizon — that is how a spent permit publishes as live.
+                    "claim_window_secs_remaining": c.claim_window_secs_remaining(
+                        crate::server::gate_escalation::now_secs()),
+                })
+            })
+            .collect::<Vec<_>>(),
     })
 }
 
