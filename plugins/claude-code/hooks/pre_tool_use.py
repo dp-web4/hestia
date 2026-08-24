@@ -283,8 +283,28 @@ _GOVERNANCE_FILES = (
 # (_fallback_self_protection, before main()): on an import failure the closure
 # protection must not silently vanish — the core's "mirrored, not imported" reasoning,
 # pointed the other way.
-_SHARED_DIR = os.environ.get("HESTIA_SHARED_DIR") or os.path.join(
-    os.path.dirname(os.path.dirname(_SELF_DIR)), "_shared")
+# FLEET-CANONICAL SHARED ENGINE (dp, 2026-08-23): "the read should be from fleet generic
+# ./hestia not ./claude".
+#
+# The default used to be derived from THIS hook's own location — `~/.claude/_shared` for
+# claude-code. Measured 2026-08-23, that produced one shared engine per vendor and no
+# agreement between them: claude-code read `~/.claude/_shared` (3 modules, 2026-08-14),
+# kimi read the repo WORKING TREE (whatever branch the checkout sat on — 62 commits behind
+# main at the time), codex had `~/.codex/_shared` holding a single module, gemini had none.
+# Meanwhile `deploy/install-members.sh` wrote to `~/.hestia/shared`, which no member read
+# and which did not exist. Installing would have stamped the deployment ledger CURRENT
+# while every seat kept running a nine-day-old closure (#583).
+#
+# One fact, one name. `$HESTIA_HOME/shared` is the fleet path the installer already uses.
+_HESTIA_HOME = os.environ.get("HESTIA_HOME") or os.path.join(
+    os.path.expanduser("~"), ".hestia")
+_SHARED_DIR = os.environ.get("HESTIA_SHARED_DIR") or os.path.join(_HESTIA_HOME, "shared")
+# Fallback, deliberately one-directional: if the canonical path is not populated yet, keep
+# using the legacy per-vendor directory rather than losing the closure entirely. A host
+# mid-rollout stays governed; a host that has cut over never silently reverts.
+_LEGACY_SHARED_DIR = os.path.join(os.path.dirname(os.path.dirname(_SELF_DIR)), "_shared")
+if not os.path.isdir(_SHARED_DIR) and os.path.isdir(_LEGACY_SHARED_DIR):
+    _SHARED_DIR = _LEGACY_SHARED_DIR
 if os.path.isdir(_SHARED_DIR) and _SHARED_DIR not in sys.path:
     sys.path.insert(0, _SHARED_DIR)
 try:

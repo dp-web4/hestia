@@ -85,7 +85,25 @@ CLAUDE_PRE = os.environ.get(
 # below for the measured class), so a missing/broken core must surface as an explicit
 # fail-closed deny inside main() — the `_core is None` check there — never as a
 # module-level crash.
-_SHARED_DIR = os.path.join(WORKSPACE, "hestia", "plugins", "_shared")
+# FLEET-CANONICAL SHARED ENGINE (dp, 2026-08-23): "the read should be from fleet generic
+# ./hestia not ./claude".
+#
+# This resolved into the repo WORKING TREE, which means kimi's enforcing gate was whatever
+# the checkout happened to be on — measured 2026-08-23, that checkout sat on a branch
+# deleted from origin, 62 commits behind main. A gate whose version is decided by someone
+# else's `git checkout` is not deployed, it is coincidental. Codex corroborated the same
+# shape from its own live registration on 2026-08-24.
+#
+# `$HESTIA_HOME/shared` is the same path the installer writes and claude-code now reads.
+_HESTIA_HOME = os.environ.get("HESTIA_HOME") or os.path.join(
+    os.path.expanduser("~"), ".hestia")
+_SHARED_DIR = os.environ.get("HESTIA_SHARED_DIR") or os.path.join(_HESTIA_HOME, "shared")
+# One-directional fallback: an un-cut-over host keeps its working-tree engine rather than
+# losing the closure. On this engine an import failure IS a fail-open (see above), so the
+# fallback is the conservative branch, not a convenience.
+_LEGACY_SHARED_DIR = os.path.join(WORKSPACE, "hestia", "plugins", "_shared")
+if not os.path.isdir(_SHARED_DIR) and os.path.isdir(_LEGACY_SHARED_DIR):
+    _SHARED_DIR = _LEGACY_SHARED_DIR
 if _SHARED_DIR not in sys.path:
     sys.path.insert(0, _SHARED_DIR)
 try:
