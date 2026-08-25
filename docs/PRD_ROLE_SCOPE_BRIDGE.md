@@ -51,7 +51,7 @@ role*; and a member-level class approval (a clearance) bounds what any role can 
 member. One operator ceremony at the **class** grain; mechanical, witnessed, self-revoking flow at
 the **item** grain.
 
-## 2. Concepts — NORMATIVE HOME (`concepts_generation: 1`)
+## 2. Concepts — NORMATIVE HOME (`concepts_generation: 2`)
 
 ### 2.0 The normative-home contract (replaces "amend both or neither", 2026-08-18)
 
@@ -126,6 +126,45 @@ contextual preponderance of evidence, not a boolean):
 A high-tier grant **at rest confers nothing**: holding a T2 item means the gate will *entertain*
 the act and demand the second factor then and there — multifactor is per-act evidence, never a
 property of the grant. (What counts as a member's second factor is open — §7 Q3.)
+
+**ROLE SKILLS (dp, 2026-08-21).** A role confers not only *reach* but *capability*: the skills
+its occupant should have loaded while filling it. Same shape as the scope manifest and for the
+same reason — a role that says "release manager" should carry the release runbook, the
+deploy checklist and the rollback procedure, and an occupant who rotates out should stop
+carrying them.
+
+Skills are manifest items like any other: **each tagged with exactly one permission class**,
+so the flow rule governs them unchanged. That is the load-bearing half. A skill is not inert
+documentation — it is instruction that shapes what an agent does, so a skill that arrives
+outside the clearance system is an unclearanced capability delivered under a role's name. The
+intersection rule applies verbatim: a role may name a skill the occupant is not cleared for,
+and the occupant does not receive it (withheld and disclosed, never silently absorbed).
+
+Two properties follow from putting skills in the manifest rather than beside it:
+
+- **Rotation carries them.** Occupancy ends, the attestation stops verifying, and the skills
+  go with the scope. A skill that outlived its role would be exactly the residue this bridge
+  exists to prevent.
+- **Amendment strands them.** Bumping `manifest_generation` re-passes the flow rule for skills
+  as for paths, so a role cannot silently widen what its occupants *know how to do* any more
+  than it can silently widen what they can reach.
+
+**ROLE MEMBOTS (dp, 2026-08-21, marked SPECULATIVE by the directive and kept that way).** A
+role may also confer a *memory cartridge* — the recall context appropriate to the job, rather
+than only the instructions. This is a strictly larger claim than skills and it is recorded
+here as an open question, not a decided concept:
+
+- a skill is instruction the occupant reads; a membot is **retrieval the occupant queries**,
+  and what it returns is not fixed at conferral time. Its contents can change under an
+  occupant who never re-passed the flow rule.
+- so the class tag would have to govern the *cartridge*, while the thing that actually reaches
+  the occupant is a *query result*. Whether a class can bound that is unresolved, and it is
+  the same shape as §7's extension points rather than a settled rule.
+- the honest v0 position: **skills yes, membots not yet** — carried as an extension point so
+  the question has a home, not so it ships.
+
+`PRD_R6_R7_ENVELOPES.md` is the natural carrier for how any of these three (paths, skills,
+cartridges) ride one envelope; this section only says they are the same kind of item.
 
 ## 3. Mechanics — the hestia side
 
