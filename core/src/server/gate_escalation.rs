@@ -1238,7 +1238,27 @@ impl EscalationStore {
         let mut out: Vec<&Escalation> = self
             .by_id
             .values()
-            .filter(|e| e.plugin_id == plugin_id && e.is_claimable(now))
+            .filter(|e| {
+                // `is_claimable` is necessary and — since #539 landed act binding — NO LONGER
+                // SUFFICIENT. `claim()` matches on (plugin_id, marker, ACT DIGEST, claimable),
+                // and its digest arm reads:
+                //
+                //     (Some(bound), Some(asked)) => bound == asked,
+                //     _ => false,          // None == None is NOT a match
+                //
+                // so an approval carrying no digest can never be spent, by any act, ever. This
+                // listing exists to tell a live member what it can spend; including a
+                // permanently unclaimable row would reproduce the exact defect this store's own
+                // doc records — `permits_write=true`, unclaimable, "indistinguishable from not
+                // approved yet" — on the surface built to end that confusion.
+                //
+                // #591 and #539 merged 64 minutes apart on 2026-08-24 (a233e27, then 577fbfc).
+                // Neither broke alone; the pair did, in the direction where the newer, stricter
+                // rule made the older promise false. Which act each approval is bound to is
+                // rendered by the caller, so a member can tell WHICH write it authorises rather
+                // than assuming any write qualifies.
+                e.plugin_id == plugin_id && e.act_digest.is_some() && e.is_claimable(now)
+            })
             .collect();
         // Newest decision first: with a 600s window the freshest grant is the one a member
         // can still act on. Ties fall back to id so the order is total, not incidental.
@@ -2295,6 +2315,53 @@ mod tests {
     /// proves the shared answer is correct, not that the route calls it —
     /// `the_operator_route_still_reads_the_shared_answer` covers that half, differently and
     /// more weakly.
+    #[test]
+    /// AN APPROVAL BOUND TO NO ACT CAN NEVER BE SPENT, so it must not be advertised.
+    ///
+    /// #539's `claim()` digest arm is `(Some(bound), Some(asked)) => bound == asked, _ =>
+    /// false` — `None == None` is explicitly NOT a match. `is_claimable` does not know that;
+    /// it answers four other conjuncts. So after #539 the listing had to stop using
+    /// `is_claimable` alone, or it would advertise rows that are permanently unspendable —
+    /// the exact "permits_write=true and unclaimable" confusion this surface exists to end.
+    ///
+    /// The control arm is the pair: same store, same member, same window, differing ONLY in
+    /// whether an act was named. If both appeared, the filter would be inert.
+    fn an_approval_bound_to_no_act_is_never_advertised() {
+        let mut s = EscalationStore::default();
+
+        // Bound to an act — spendable, so it belongs in the listing.
+        let bound = s
+            .open("claude-code", "r", "Bash", "m-bound", Some("Bash -> probe"), None, None,
+                  T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        let bound_id = bound.id.clone();
+        s.decide(&bound_id, true, "operator", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("proceed"), T0 + 5)
+            .unwrap();
+
+        let listed: Vec<String> = s
+            .claimable_for("claude-code", T0 + 10)
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(listed, vec![bound_id.clone()], "an act-bound approval is spendable");
+
+        // CONTROL: strip the digest from that same approval. Every other conjunct is
+        // untouched, so `is_claimable` still says yes — and the listing must still say no.
+        s.by_id.get_mut(&bound_id).unwrap().act_digest = None;
+        assert!(
+            s.by_id[&bound_id].is_claimable(T0 + 10),
+            "control precondition: is_claimable must STILL be true, or this test proves \
+             nothing about the act filter"
+        );
+        assert!(
+            s.claimable_for("claude-code", T0 + 10).is_empty(),
+            "an approval carrying no act digest can never be claimed by any act, so \
+             advertising it tells a member to re-issue a write that claim() will refuse"
+        );
+    }
+
+
     #[test]
     /// A LIVE MEMBER SEES ONLY WHAT IT COULD ACTUALLY SPEND (#366).
     ///
