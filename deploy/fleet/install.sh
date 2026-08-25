@@ -203,6 +203,30 @@ Type=simple
 ExecStart=/bin/sh -c 'HESTIA_PASSPHRASE="\$(cat %h/.hestia/.passphrase)" exec %h/.local/bin/hestia serve --bind ${HESTIA_BIND}'
 Environment=HESTIA_HOME=%h/.hestia
 Environment=RUST_LOG=warn
+# THE GAUGE'S ONLY INPUT. \`deployment_health\` reads this env var and has NO fallback:
+# unset means \`deployment_health_from_path(None)\` -> state "unknown". It was present in
+# deploy/templates/hestia.service and MISSING here, and this heredoc is what actually
+# installs — so running this script would have rewritten the live unit without it and taken
+# the deployment badge from "stale" (a signal) to "unknown" (no signal), silently. The tool
+# you reach for to deploy would have disabled the instrument that tells you whether the
+# deploy landed. Found 2026-08-24 while answering "what are the obstacles to deployment".
+Environment=HESTIA_CURRENT_BUILD_FILE=%h/.hestia/current-build.json
+# ARENA CAP (#354). glibc allocates one 64 MB arena per thread up to 8 x cores — a 4 GB
+# fragmentation ceiling on an 8-core host. An arena only returns memory by trimming its
+# TOP, so one live allocation above a freed block pins the whole region and every heavy
+# read permanently claims arena space. Measured on CBP 2026-08-24 at ~20h uptime: 21 arenas
+# of exactly 64.0 MB, RSS 1,767 MB against an all-time peak of 1,777 MB — essentially
+# nothing ever returned.
+#
+# That RSS floor is what makes the box swap, which makes the daemon slow under its single
+# global lock, which makes gate calls exceed budget and DENY writes fleet-wide (377
+# gate-unavailable events on 2026-08-23, peaking at 65/hour against a 64/DAY baseline).
+# Daemon memory is a governance-availability parameter.
+#
+# 2 rather than 1: a single arena serialises allocation across ~12 tokio threads. This
+# workload is I/O-bound on SQLCipher, so the contention is cheap and the fragmentation
+# surface drops ~30x. Paired with malloc_trim(0) on the daemon's maintenance tick.
+Environment=MALLOC_ARENA_MAX=2
 # The workspace the daemon hands to agent-inventory when the dashboard asks for the
 # read list. Without it the inventory falls back to a compiled-in default that is only
 # correct on the machine it was written on, and — correctly — degrades its whole report
