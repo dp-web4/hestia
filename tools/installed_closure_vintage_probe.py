@@ -1,193 +1,115 @@
 #!/usr/bin/env python3
-"""Report which engine file this seat's registered hook actually loads, and how old it is.
+"""Report which engine this seat's registered hook actually loads, and whether it matches.
 
 Host-state reporting only: reads, hashes, prints. Mutates nothing.
 
-The thing worth measuring is not the hook. Every seat's hook is a thin shim that
-resolves a sibling module two directory levels up and imports it; the imported
-module is what decides. A seat can carry a current shim over a months-old engine
-and every surface that inspects "the hook" will report it healthy.
+The thing worth measuring is not the shim. Every seat's shim is thin; the engine it
+imports is what decides. A seat can carry a current shim over a months-old engine and
+every surface that inspects "the hook" reports it healthy. Measured on CBP 2026-08-25:
+the shims were current while the engine in use was dated 2026-08-14 and 10.6 KB smaller
+than the tracked copy.
 
-So this resolves the sibling the way the shim does -- from the shim's own
-location at runtime, never from a literal spelled here -- hashes what it finds,
-and compares that to the tracked copy and to the tracked copy's upstream tip.
+WHY THIS FILE WAS REWRITTEN (2026-08-25). The previous version's own docstring claimed it
+resolved locations "from the shim's own location at runtime, never from a literal spelled
+here" -- and then spelled three: a parents[2] sibling walk (the pre-#590 per-vendor
+topology), a codex path carrying a segment the real shim does not have, and a kimi seat
+directory under the wrong name. After #590 moved the fleet to one engine under
+$HESTIA_HOME, all three were stale, and the two seat paths had never been right.
+
+gpt caught it blocking a branch-rescue that would have reinstated this file verbatim. A
+measurement instrument that reports confidently from locations nothing uses is worse than
+an absent one, because its "not found" reads as a finding.
+
+The repair is to stop guessing. The member installer writes an authoritative record of
+what it installed and where -- every shim path and every engine path, each with a sha256.
+This reads THAT. It cannot drift from the installed topology because it holds no opinion
+about the topology: if a future layout change moves everything again, this file needs no
+edit and cannot silently measure the wrong place.
 
 Exit status is a verdict, not an error:
-  0  installed engine matches the tracked upstream tip
-  1  installed engine differs (stale or forked) -- read the report
-  2  could not determine (shim or engine not found)
+  0  every recorded file matches what the ledger recorded
+  1  something differs -- read the report
+  2  could not determine (no ledger, or nothing recorded in it)
 """
 
 from __future__ import annotations
 
 import hashlib
-import os
-import subprocess
+import json
 import sys
+from os import environ
 from pathlib import Path
 
-ENGINE_STEM = "hestia_governance_closure"
-SIBLING_DIRNAME = "_shared"
-PARENTS_UP = 2  # the shim's own resolution: parents[2] / _shared
+
+def ledger_path() -> Path:
+    """The install record. Same resolution the daemon uses."""
+    explicit = environ.get("HESTIA_CURRENT_BUILD_FILE")
+    if explicit:
+        return Path(explicit)
+    home = environ.get("HESTIA_HOME") or str(Path.home() / ".hestia")
+    return Path(home) / "current-build.json"
 
 
-def sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 16), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def find_shim() -> Path | None:
-    """Locate the registered PreToolUse shim on this seat.
-
-    Deliberately does NOT read the settings file: on a governed seat that read is
-    itself gate-classified, and a probe that needs an approval to run is a probe
-    nobody runs. The shim lives at a stable location per engine; check the ones
-    that exist and take the first hit.
-    """
-    home = Path(os.path.expanduser("~"))
-    candidates = [
-        home / ".claude" / "hooks" / "hestia" / "pre_tool_use.py",
-        home / ".codex" / "hooks" / "hestia" / "pre_tool_use.py",
-        home / ".kimi" / "hooks" / "hestia" / "pre_tool_use.py",
-    ]
-    env = os.environ.get("HESTIA_SHIM_PATH")
-    if env:
-        candidates.insert(0, Path(env))
-    for c in candidates:
-        if c.is_file():
-            return c.resolve()
-    return None
-
-
-def resolve_engine(shim: Path) -> Path | None:
-    """Resolve the engine exactly as the shim does, including the env override that
-    takes precedence over the relative walk."""
-    override = os.environ.get("HESTIA_SHARED_DIR")
-    shared = Path(override) if override else shim.parents[PARENTS_UP] / SIBLING_DIRNAME
-    engine = shared / (ENGINE_STEM + ".py")
-    return engine if engine.is_file() else None
-
-
-def git(repo: Path, *args: str) -> str | None:
+def digest(path: Path):
     try:
-        out = subprocess.run(
-            ["git", "-C", str(repo), *args],
-            capture_output=True, text=True, timeout=30,
-        )
-    except Exception:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
         return None
-    return out.stdout.strip() if out.returncode == 0 else None
 
 
-def tracked_copy(repo: Path) -> Path | None:
-    hits = list(repo.glob("**/" + SIBLING_DIRNAME + "/" + ENGINE_STEM + ".py"))
-    return hits[0] if hits else None
+def check(entries, label: str):
+    """Report one recorded group. Returns (checked, mismatched)."""
+    checked = mismatched = 0
+    for e in entries:
+        p = Path(e["path"])
+        checked += 1
+        actual = digest(p)
+        if actual is None:
+            print(f"  {label:<8} {e['file']:<34} MISSING on disk  {p}")
+            mismatched += 1
+        elif actual != e.get("sha256"):
+            print(f"  {label:<8} {e['file']:<34} DIFFERS from the ledger")
+            print(f"           recorded {str(e.get('sha256'))[:16]}  actual {actual[:16]}")
+            mismatched += 1
+        else:
+            print(f"  {label:<8} {e['file']:<34} matches")
+    return checked, mismatched
 
 
 def main() -> int:
-    repo = Path(__file__).resolve().parents[1]
-
-    shim = find_shim()
-    if shim is None:
-        print("UNDETERMINED: no registered shim found on this seat")
-        return 2
-    engine = resolve_engine(shim)
-    if engine is None:
-        print("UNDETERMINED: shim at %s resolves no engine" % shim)
-        print("  (the shim's Tier-2 fallback matcher is what would be enforcing)")
+    lp = ledger_path()
+    try:
+        ledger = json.loads(lp.read_text())
+    except Exception as exc:  # noqa: BLE001 - any unreadable ledger is the same verdict
+        print(f"cannot determine: no usable install ledger at {lp} ({exc})", file=sys.stderr)
         return 2
 
-    installed_sha = sha256(engine)
-    print("shim      %s" % shim)
-    print("engine    %s" % engine)
-    print("installed %s  mtime=%s" % (
-        installed_sha[:8],
-        subprocess.run(["date", "-u", "-r", str(engine), "+%Y-%m-%dT%H:%M:%SZ"],
-                       capture_output=True, text=True).stdout.strip() or "?",
-    ))
+    print(f"install ledger : {lp}")
+    print(f"  build_id     : {ledger.get('build_id')}")
+    print(f"  installed at : {ledger.get('installed_at_iso')}")
+    print()
 
-    local = tracked_copy(repo)
-    if local is None:
-        print("UNDETERMINED: no tracked copy under %s" % repo)
-        return 2
-    local_sha = sha256(local)
-    rel = local.relative_to(repo)
-    print("tracked   %s  %s" % (local_sha[:8], rel))
+    total = bad = 0
+    # The engine first: it is the thing that decides, and the thing that was stale.
+    engine = ledger.get("shared_engine") or []
+    if engine:
+        c, m = check(engine, "engine")
+        total += c
+        bad += m
+    else:
+        print("  engine   (not recorded by this ledger -- pre-#583 installer)")
 
-    upstream_sha = None
-    blob = git(repo, "rev-parse", "origin/main:%s" % rel)
-    if blob:
-        raw = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", blob],
-                             capture_output=True, timeout=30)
-        if raw.returncode == 0:
-            upstream_sha = hashlib.sha256(raw.stdout).hexdigest()
-            print("upstream  %s  origin/main:%s" % (upstream_sha[:8], rel))
-    if upstream_sha is None:
-        print("upstream  UNKNOWN (no origin/main copy readable)")
-
-    reference = upstream_sha or local_sha
-    label = "origin/main" if upstream_sha else "local tracked copy"
-
-    if installed_sha == reference:
-        print()
-        print("VERDICT: installed engine MATCHES %s" % label)
-        return 0
+    for member in ledger.get("members", []):
+        c, m = check(member.get("files", []), str(member.get("member", "?"))[:8])
+        total += c
+        bad += m
 
     print()
-    print("VERDICT: installed engine DIFFERS from %s" % label)
-    # Direction matters: if the installed bytes exist anywhere in this repo's
-    # history the seat is merely behind (a fast-forward fixes it). If they exist
-    # nowhere, the installed engine is off-history and copying over it would
-    # discard whatever produced it.
-    #
-    # The search key must be a GIT OBJECT ID, not the content sha256 printed
-    # above -- git names a blob by sha1 over "blob <len>\0<content>", so handing
-    # --find-object a sha256 matches nothing, always, and the probe would report
-    # FORKED for every seat including a perfectly healthy one. Ask git for the
-    # id it would use.
-    blob_id = git(repo, "hash-object", "--", str(engine))
-    if not blob_id:
-        print("  DIRECTION: undetermined (could not hash installed engine as a blob)")
-        return 1
-
-    # Enumerate every blob this PATH has ever carried, across all refs, and ask
-    # whether the installed bytes are one of them.
-    #
-    # The obvious instrument -- `git log --find-object` -- is wrong here twice
-    # over, and both ways it fails SILENTLY toward "not in history":
-    #   1. it matches the blob at ANY path, so an unrelated file that once held
-    #      identical bytes reads as a hit for this one;
-    #   2. it does not diff merge commits by default, so a blob introduced by a
-    #      merge is invisible to it.
-    # Defect 2 is not hypothetical: run it against origin/main's own CURRENT
-    # blob and it reports absent. That is the control below -- if the reference
-    # blob is missing from the enumerated set, the set is not trustworthy and
-    # this refuses to render a direction rather than guessing.
-    history = set()
-    for commit in (git(repo, "rev-list", "--all", "--", str(rel)) or "").split():
-        b = git(repo, "rev-parse", "-q", "--verify", "%s:%s" % (commit, rel))
-        if b:
-            history.add(b)
-
-    upstream_blob = git(repo, "rev-parse", "origin/main:%s" % rel)
-    if upstream_blob and upstream_blob not in history:
-        print("  DIRECTION: undetermined -- the path-history enumeration failed its"
-              " own control (origin/main's live blob is absent from it), so any"
-              " verdict from it would be an artifact")
-    elif blob_id in history:
-        print("  DIRECTION: installed bytes are a past version of THIS path"
-              " (%d versions on record) -- seat is BEHIND, fast-forward is safe"
-              % len(history))
-    else:
-        print("  DIRECTION: installed bytes match NO version this path has ever"
-              " had -- FORKED; copying over it discards an unarchived engine")
-    print("  This engine is what refuses and permits on this seat. The tracked")
-    print("  copy is not consulted at runtime and its test results do not")
-    print("  describe what is enforcing here.")
-    return 1
+    if not total:
+        print("cannot determine: the ledger records no files", file=sys.stderr)
+        return 2
+    print(f"{total} recorded file(s), {bad} not matching what was installed")
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":
