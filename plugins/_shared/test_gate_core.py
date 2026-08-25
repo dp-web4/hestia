@@ -528,7 +528,8 @@ def test_path_syntax_is_never_a_scope_name():
     check("prefixed_dot_entry_dropped", G._parse_scope_entries(["path:.."]) == ())
     # It must drop path syntax WITHOUT eating the two things that look adjacent:
     check("real_name_survives", G._parse_scope_entries(["repo:hestia"]) == ("hestia",))
-    check("dotfile_name_survives", G._parse_scope_entries(["path:.git-inbox"]) == (".git-inbox",))
+    check("dotfile_path_survives_with_type",
+          G._parse_scope_entries(["path:.git-inbox"]) == ("path:.git-inbox",))
     check("unscoped_survives", G._parse_scope_entries(["*"]) == (G.AgentPolicy.UNSCOPED,))
 
     # End to end: a policy carrying only path syntax grants nothing, rather than everything.
@@ -768,7 +769,8 @@ def test_an_unknown_prefix_is_dropped_and_could_previously_grant():
 
     # The spellings that must survive: the drop is narrow, not a blanket colon ban on grants.
     check("known_prefixes_still_parse",
-          G._parse_scope_entries(["repo:web4", "path:.git-inbox"]) == ("web4", ".git-inbox"))
+          G._parse_scope_entries(["repo:web4", "path:.git-inbox"])
+          == ("web4", "path:.git-inbox"))
     check("legacy_bare_name_still_parses", G._parse_scope_entries(["web4"]) == ("web4",))
     check("bare_wildcard_still_unscoped", G._parse_scope_entries(["*"]) == ("*",))
     check("prefixed_wildcard_still_collapses_to_nothing",
@@ -799,7 +801,7 @@ def test_prefixed_wildcard_is_not_unscoped():
     check("path_wildcard_is_not_unscoped", "*" not in G._parse_scope_entries(["path:*"]))
     check("normal_entries_still_parse",
           G._parse_scope_entries(["repo:web4", "path:.git-inbox", "legacy"])
-          == ("web4", ".git-inbox", "legacy"))
+          == ("web4", "path:.git-inbox", "legacy"))
 
 
 def test_policy_resolution_names_its_source_and_fails_closed():
