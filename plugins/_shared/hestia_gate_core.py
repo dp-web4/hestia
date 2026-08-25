@@ -503,7 +503,11 @@ def now_secs() -> int:
 
 
 def _parse_scope_entries(entries) -> tuple:
-    """`["repo:web4", "path:.git-inbox"]` -> `("web4", ".git-inbox")`.
+    """`["repo:web4", "path:.git-inbox"]` -> `("web4", "path:.git-inbox")`.
+
+    Repo grants become segment names; path grants retain their type. Collapsing both to
+    bare strings made an absolute path grant permanently unmatchable by the segment-keyed
+    repo rule (#596): ``/workspace`` can never equal the first segment ``repo``.
 
     Raises on a non-string element so the caller can fail closed rather than let an
     AttributeError escape the gate. Only a BARE `"*"` yields the unscoped marker; a prefixed
@@ -517,13 +521,13 @@ def _parse_scope_entries(entries) -> tuple:
         if e == AgentPolicy.UNSCOPED:
             out.append(AgentPolicy.UNSCOPED)
             continue
-        for p in _SCOPE_PREFIXES:
-            if e.startswith(p):
-                rest = e[len(p):]
+        for prefix in _SCOPE_PREFIXES:
+            if e.startswith(prefix):
+                rest = e[len(prefix):]
                 # A prefixed wildcard is NOT unscoped. Dropped, loudly-by-absence: the operator
                 # who meant "everything" writes a bare "*", which is auditable as such.
-                if rest and rest != AgentPolicy.UNSCOPED:
-                    out.append(rest)
+                if rest and rest != AgentPolicy.UNSCOPED and rest.strip("."):
+                    out.append(("path:" + rest) if prefix == "path:" else rest)
                 break
         else:
             # An UNRECOGNISED prefix is dropped, not kept (kimi #937, finding C, sharpened by
@@ -545,6 +549,40 @@ def _parse_scope_entries(entries) -> tuple:
     # `ssh:/etc` was inert, `ssh:etc` granted). Dropped here too, so the guarantee does not
     # depend on the caller of the day. No live policy carries one; all are bare repo names.
     return tuple(s for s in out if s.strip("."))
+
+
+def _scope_parts(scopes, workspace: str) -> tuple:
+    """Return ``(repo_names, resolved_path_roots)`` without conflating their semantics.
+
+    Relative path grants are rooted at the configured workspace. Both grants and candidates
+    use ``realpath`` so a symlink below an allowed directory cannot turn a lexical descendant
+    into an ungranted read elsewhere. Containment is tested at the separator by the caller.
+    """
+    repos = []
+    roots = []
+    ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
+    for scope in scopes:
+        if not isinstance(scope, str):
+            continue
+        if scope.startswith("path:"):
+            raw = os.path.expanduser(scope[len("path:"):]).replace("\\", "/")
+            if not raw:
+                continue
+            if not raw.startswith("/"):
+                raw = os.path.join(ws, raw)
+            root = os.path.realpath(os.path.normpath(raw)).replace("\\", "/").rstrip("/")
+            if root:
+                roots.append(root)
+        else:
+            repos.append(scope)
+    return tuple(repos), tuple(roots)
+
+
+def _within_path_grant(path: str, scopes, workspace: str) -> bool:
+    """Whether ``path`` is exactly a granted path root or descends from one."""
+    candidate = os.path.realpath(os.path.normpath(path)).replace("\\", "/").rstrip("/")
+    _, roots = _scope_parts(scopes, workspace)
+    return any(candidate == root or candidate.startswith(root + "/") for root in roots)
 
 
 def resolve_agent_policy(profile: HarnessProfile,
@@ -726,12 +764,15 @@ def path_in_scope(path: str, scopes, workspace: str, profile: HarnessProfile,
                 return True
     if _under_temp_root(p):
         return True
+    if _within_path_grant(p, scopes, workspace):
+        return True
     ws = workspace.replace("\\", "/").rstrip("/")
     if ws and (p == ws or p.startswith(ws + "/")):
         seg = p[len(ws):].lstrip("/").split("/", 1)[0]
         if seg == "":
             return False          # bare workspace root — the glob-the-root antipattern
-        return seg in scopes
+        repo_scopes, _ = _scope_parts(scopes, workspace)
+        return seg in repo_scopes
     return False                  # absolute, outside the workspace, not home/tmp
 
 
@@ -747,6 +788,7 @@ def command_in_scope(cmd: str, scopes, workspace: str, cwd: Optional[str] = None
     Residual, documented and accepted: relative traversal that never names a path (`grep -r .`)
     escapes string parsing entirely — the engine sandbox, not this check, is the fs boundary."""
     ws = workspace.rstrip("/")
+    repo_scopes, _ = _scope_parts(scopes, workspace)
     for after in cmd.split(workspace)[1:]:
         # Resolve the whole token before reading a segment off it (kimi #940 B7). Taking the
         # head lexically let `cat <ws>/repo-a/../repo-b/secret` pass on `repo-a` while
@@ -757,7 +799,7 @@ def command_in_scope(cmd: str, scopes, workspace: str, cwd: Optional[str] = None
         if resolved != ws and not resolved.startswith(ws + "/"):
             return False, (tok or "<workspace root>")   # traversed out of the workspace
         seg = resolved[len(ws):].lstrip("/").split("/", 1)[0]
-        if seg not in scopes:
+        if seg not in repo_scopes and not _within_path_grant(resolved, scopes, workspace):
             return False, (seg or "<workspace root>")
 
     # Pass 2 — relative tokens. The event cwd is NOT reliable: the engine may run each command
@@ -768,8 +810,8 @@ def command_in_scope(cmd: str, scopes, workspace: str, cwd: Optional[str] = None
     # out-of-scope one with no in-scope alternative denies; a token that exists nowhere is not
     # a reach.
     cwd = (cwd or os.getcwd()).replace("\\", "/")
-    bases = [cwd] + [f"{ws}/{s}" for s in scopes]
-    oos_names = {r for r in _all_repos(workspace) if r not in scopes}
+    bases = [cwd] + [f"{ws}/{s}" for s in repo_scopes]
+    oos_names = {r for r in _all_repos(workspace) if r not in repo_scopes}
     probes = 0
     for raw in re.split(r"""[\s;|&<>()'"`]+""", cmd):
         for tok in raw.split("="):
@@ -799,10 +841,13 @@ def command_in_scope(cmd: str, scopes, workspace: str, cwd: Optional[str] = None
                     continue
                 if cand.startswith(ws + "/"):
                     seg = cand[len(ws) + 1:].split("/", 1)[0]
-                    if seg in scopes:
+                    if seg in repo_scopes or _within_path_grant(cand, scopes, workspace):
                         in_scope_vote = True
                         break
                     oos_vote = seg
+                elif _within_path_grant(cand, scopes, workspace):
+                    in_scope_vote = True
+                    break
             if not in_scope_vote and oos_vote:
                 return False, oos_vote
     return True, None

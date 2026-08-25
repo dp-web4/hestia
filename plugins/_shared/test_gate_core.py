@@ -329,6 +329,52 @@ def test_path_grant_reaches_a_sibling_of_the_repos():
           G.evaluate(ev, with_grant, ws).decision == "allow")
 
 
+def test_path_grants_keep_their_type_and_match_resolved_boundaries():
+    """#596. A daemon grant is an absolute PATH, while the legacy MRH is a set of repo
+    NAMES. Collapsing both into one tuple made every workspace-root and deep-directory grant
+    inert: the parser stripped ``path:``, then the matcher compared the resulting absolute
+    string with a first repo segment.
+
+    Pin the two properties the operator actually granted: a path reaches itself and its
+    descendants, and never a sibling that merely shares its textual prefix. Exercise both
+    explicit path tools and the shell's absolute-path pass; fixing only one leaves the seat
+    disabled on its next Bash call.
+    """
+    ws = _workspace()
+    repo = os.path.join(ws, "repo")
+    deep = os.path.join(repo, "subdir")
+    sibling = os.path.join(repo, "subdir-evil")
+    os.makedirs(deep, exist_ok=True)
+    os.makedirs(sibling, exist_ok=True)
+
+    root_entry = "path:" + ws
+    check("path_type_survives_policy_parse",
+          G._parse_scope_entries([root_entry]) == (root_entry,),
+          repr(G._parse_scope_entries([root_entry])))
+    root = _profile(ws, [root_entry])
+
+    ev = G.NormalizedEvent(tool="Read", paths=[os.path.join(deep, "note.md")], cwd=ws)
+    check("workspace_root_grant_admits_descendant",
+          G.evaluate(ev, root, ws).decision == "allow")
+    ev = G.NormalizedEvent(tool="Bash", command=f"cat {deep}/note.md", cwd=ws)
+    check("workspace_root_grant_admits_absolute_shell_path",
+          G.evaluate(ev, root, ws).decision == "allow")
+
+    deep_entry = "path:" + deep
+    narrow = _profile(_workspace(), [deep_entry])
+    ev = G.NormalizedEvent(tool="Read", paths=[os.path.join(deep, "child.txt")], cwd=ws)
+    check("deep_directory_grant_admits_child",
+          G.evaluate(ev, narrow, ws).decision == "allow")
+    ev = G.NormalizedEvent(tool="Bash", command=f"cat {deep}/child.txt", cwd=ws)
+    check("deep_directory_grant_admits_shell_child",
+          G.evaluate(ev, narrow, ws).decision == "allow")
+
+    ev = G.NormalizedEvent(tool="Read", paths=[os.path.join(sibling, "loot")], cwd=ws)
+    check("path_prefix_sibling_is_not_a_descendant", G.evaluate(ev, narrow, ws).blocks)
+    ev = G.NormalizedEvent(tool="Bash", command=f"cat {sibling}/loot", cwd=ws)
+    check("shell_path_prefix_sibling_is_not_a_descendant", G.evaluate(ev, narrow, ws).blocks)
+
+
 def test_temp_root_is_a_path_boundary_not_a_prefix():
     """codex #169 finding 2. `startswith("/tmp")` admits `/tmp-other` — a SIBLING of the temp
     root, and a directory anyone can create. That would hand a member unconditional reach by
@@ -482,7 +528,8 @@ def test_path_syntax_is_never_a_scope_name():
     check("prefixed_dot_entry_dropped", G._parse_scope_entries(["path:.."]) == ())
     # It must drop path syntax WITHOUT eating the two things that look adjacent:
     check("real_name_survives", G._parse_scope_entries(["repo:hestia"]) == ("hestia",))
-    check("dotfile_name_survives", G._parse_scope_entries(["path:.git-inbox"]) == (".git-inbox",))
+    check("dotfile_path_survives_with_type",
+          G._parse_scope_entries(["path:.git-inbox"]) == ("path:.git-inbox",))
     check("unscoped_survives", G._parse_scope_entries(["*"]) == (G.AgentPolicy.UNSCOPED,))
 
     # End to end: a policy carrying only path syntax grants nothing, rather than everything.
@@ -722,7 +769,8 @@ def test_an_unknown_prefix_is_dropped_and_could_previously_grant():
 
     # The spellings that must survive: the drop is narrow, not a blanket colon ban on grants.
     check("known_prefixes_still_parse",
-          G._parse_scope_entries(["repo:web4", "path:.git-inbox"]) == ("web4", ".git-inbox"))
+          G._parse_scope_entries(["repo:web4", "path:.git-inbox"])
+          == ("web4", "path:.git-inbox"))
     check("legacy_bare_name_still_parses", G._parse_scope_entries(["web4"]) == ("web4",))
     check("bare_wildcard_still_unscoped", G._parse_scope_entries(["*"]) == ("*",))
     check("prefixed_wildcard_still_collapses_to_nothing",
@@ -753,7 +801,7 @@ def test_prefixed_wildcard_is_not_unscoped():
     check("path_wildcard_is_not_unscoped", "*" not in G._parse_scope_entries(["path:*"]))
     check("normal_entries_still_parse",
           G._parse_scope_entries(["repo:web4", "path:.git-inbox", "legacy"])
-          == ("web4", ".git-inbox", "legacy"))
+          == ("web4", "path:.git-inbox", "legacy"))
 
 
 def test_policy_resolution_names_its_source_and_fails_closed():
@@ -900,6 +948,7 @@ ALL_TESTS = [
     "test_scope_remedy_distinguishes_itself_from_appeal",
     "test_path_and_command_scope",
     "test_path_grant_reaches_a_sibling_of_the_repos",
+    "test_path_grants_keep_their_type_and_match_resolved_boundaries",
     "test_temp_root_is_a_path_boundary_not_a_prefix",
     "test_shims_contain_no_policy",
     "test_unscoped_must_be_declared_never_inferred",
@@ -976,6 +1025,7 @@ if __name__ == "__main__":
     test_scope_remedy_distinguishes_itself_from_appeal()
     test_path_and_command_scope()
     test_path_grant_reaches_a_sibling_of_the_repos()
+    test_path_grants_keep_their_type_and_match_resolved_boundaries()
     test_temp_root_is_a_path_boundary_not_a_prefix()
     test_shims_contain_no_policy()
     test_unscoped_must_be_declared_never_inferred()
