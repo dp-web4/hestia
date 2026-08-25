@@ -52,6 +52,10 @@ CODEX_HOOK = os.path.join(TREE, "plugins", "codex", "hooks", HOOK)
 DEAD = "http://127.0.0.1:9/mcp"        # port 9 (discard) is closed by convention
 
 SHIMS = {
+    "claude": {"hook": os.path.join(TREE, "plugins", "claude-code", "hooks", HOOK),
+               "plugin_id": "claude-code", "bash_tool": "Bash",
+               "identity_env": "HESTIA_CLAUDE_IDENTITY",
+               "mode_env": "HESTIA_PRE_FAIL_CLOSED", "mode_value": "1"},
     "kimi": {"hook": KIMI_HOOK, "plugin_id": "kimi-code", "bash_tool": "Bash",
              "identity_env": "HESTIA_KIMI_IDENTITY", "mode_env": "HESTIA_KIMI_GATE_MODE"},
     "codex": {"hook": CODEX_HOOK, "plugin_id": "codex", "bash_tool": "bash",
@@ -191,7 +195,9 @@ def run_hook(shim, ws, event, endpoint, home=None, cwd=None):
     env.update({"HESTIA_WORKSPACE": ws,
                 cfg["identity_env"]: os.path.join(ws, "identity.json"),
                 "HESTIA_OBSERVE_DIR": os.path.join(ws, "observe-" + shim),
-                cfg["mode_env"]: "enforce",
+                cfg["mode_env"]: cfg.get("mode_value", "enforce"),
+                # Exercise the tree under test, never an installed or per-vendor copy.
+                "HESTIA_SHARED_DIR": SHARED,
                 "HESTIA_ENDPOINT": endpoint})
     if home:
         env["HESTIA_HOME"] = home
@@ -328,6 +334,37 @@ def test_ordinary_in_scope_write_allowed_with_live_snapshot():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_claude_workspace_root_standing_grant_admits_absolute_bash_path():
+    """#596 / post-#517 regression. Drive Claude's actual shim as a subprocess.
+
+    A workspace-root standing grant is faithfully represented as ``path:<absolute>``.
+    Before #596 the parser erased that type and the segment-keyed matcher denied the very
+    next Bash call, so the seat could neither work nor pull its own repair. Requiring the
+    downstream policy call distinguishes a genuine scope allow from an early hook exit.
+    """
+    tmp, ws = make_workspace()
+    stub = StubDaemon(scope_status={
+        "plugin_id": "claude-code", "requests": [], "live_grants": [],
+        "standing_grants": [{"path": ws, "granted_by": "operator",
+                              "reason": "workspace root", "expires_at": None}],
+        "generation": 1,
+    })
+    srv = Server(stub)
+    try:
+        target = os.path.join(ws, "granted", "ok.md")
+        rc, err = run_hook("claude", ws,
+                           _event("Bash", {"command": f"cat {target}"}),
+                           srv.endpoint)
+        check("claude-root-grant-allows", rc == 0, f"rc={rc} stderr={err}")
+        check("claude-continued-to-policy", "hestia_begin_action" in stub.names(),
+              stub.names())
+        check("claude-fetched-standing-scope", "hestia_scope_status" in stub.names(),
+              stub.names())
+    finally:
+        srv.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ---- the fetch itself: composition, thin daemon, unreachable daemon ----
 def _load_mechanism_module():
     import importlib.util
@@ -405,6 +442,7 @@ ALL = [
     test_degraded_denies_are_recorded,
     test_differential_inputs_converge,
     test_ordinary_in_scope_write_allowed_with_live_snapshot,
+    test_claude_workspace_root_standing_grant_admits_absolute_bash_path,
     test_fetch_policy_snapshot_composes_from_daemon_surfaces,
     test_fetch_policy_snapshot_thin_daemon_is_not_degraded_trigger,
     test_fetch_policy_snapshot_unreachable_is_none,
