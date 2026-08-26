@@ -24,13 +24,18 @@ arg to `send` (reply/ack/review_done), or it stays "unanswered" forever.
 Exit codes: 0 ok | 1 never got there (refused/DNS) | 2 usage | 3 daemon answered and
 declined | 4 UNDETERMINED — no answer in time, the write MAY have landed; do not
 blind-retry a `send` on 4 (issue #523) | 5 REFUSED LOCALLY — this seat already queued a
-byte-identical notice inside the resend window; nothing was sent. Override with
-HESTIA_MESH_RESEND=1, or widen/narrow with HESTIA_MESH_RESEND_WINDOW (seconds, default
-900; 0 disables the guard; an unparseable value warns and falls back to 900 rather than
-blocking the send). The identity is (seat, endpoint, recipient, kind, pointer_uri,
-in_reply_to) — a notice aimed at a different HESTIA_ENDPOINT is a different act.
+byte-identical notice inside the resend window; nothing was sent, and NO SESSION WAS
+OPENED — the guard runs before connect(), so a local refusal costs the daemon nothing.
+Override with HESTIA_MESH_RESEND=1, or widen/narrow with HESTIA_MESH_RESEND_WINDOW
+(seconds, default 900; 0 disables the guard; a value that is not a FINITE number — that
+includes NaN and Infinity, which float() accepts without raising — warns and falls back
+to 900 rather than blocking the send or silently switching the guard off). The identity
+is (seat, endpoint, recipient, kind, pointer_uri, in_reply_to) — a notice aimed at a
+different HESTIA_ENDPOINT is a different act; scheme and host fold by case, the path
+does not.
 """
-import hashlib, json, os, sys, time, urllib.error, urllib.request
+import hashlib, json, math, os, sys, time, urllib.error, urllib.parse
+import urllib.request
 
 EP = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
 
@@ -311,11 +316,29 @@ def resend_endpoint():
 
     HESTIA_ENDPOINT is configurable but the ledger is one file per seat, so without this
     the same tuple sent to a DIFFERENT mesh would read as a repeat and be refused (codex,
-    PR #649). Normalization is deliberately shallow (case, trailing slash): two spellings
-    of one host read as two endpoints and PERMIT the send, which is the fail-open
-    direction. The reverse — collapsing two real endpoints — would block one of them.
+    PR #649). Normalization is deliberately shallow: two spellings of one host read as two
+    endpoints and PERMIT the send, which is the fail-open direction. The reverse —
+    collapsing two real endpoints — blocks one of them, and the first cut of this function
+    DID that: it lowercased the WHOLE url, so `http://h/MCP` and `http://h/mcp` shared a
+    key and the second mesh's first send was refused as a duplicate (codex again, same
+    review). Only scheme and host are case-insensitive (RFC 3986 §6.2.2.1); path, query
+    and userinfo are not, and are left alone. An unparseable value keeps its raw spelling
+    rather than guessing — two spellings that we cannot compare must not collapse.
     """
-    return (EP or "").strip().rstrip("/").lower()
+    raw = (EP or "").strip().rstrip("/")
+    try:
+        u = urllib.parse.urlsplit(raw)
+        if not u.scheme or not u.netloc:
+            return raw
+        host = (u.hostname or "").lower()
+        if u.port is not None:
+            host = f"{host}:{u.port}"
+        if "@" in u.netloc:                       # preserve userinfo case verbatim
+            host = u.netloc.rsplit("@", 1)[0] + "@" + host
+        return urllib.parse.urlunsplit(
+            (u.scheme.lower(), host, u.path, u.query, u.fragment))
+    except ValueError:
+        return raw
 
 
 def resend_key(args):
@@ -339,19 +362,30 @@ def resend_window():
     A malformed value falls back to the default rather than disabling the guard: the
     thing that must not happen is a BLOCKED send, and the default window blocks nothing
     except a byte-identical repeat. To actually turn the guard off, set it to 0.
+
+    NON-FINITE IS MALFORMED, and it is the case a try/except cannot see. `float("nan")`
+    and `float("inf")` do not raise — they return, and the poison shows up two lines
+    later in a comparison that has no exception to catch. `WINDOW=NaN` made every age
+    comparison False and silently switched the guard OFF while still growing a ledger
+    nobody consults; `WINDOW=Infinity` made every matching row a duplicate FOREVER, in
+    the blocking direction. Both were live on 7e3da00, the commit that fixed the
+    raising arms of this same contract (codex's automated review, PR #649).
     """
     raw = os.environ.get("HESTIA_MESH_RESEND_WINDOW")
     if raw is None:
         return RESEND_WINDOW_DEFAULT
     try:
-        return float(raw)
+        v = float(raw)
     except (TypeError, ValueError):
-        if raw not in _RESEND_WINDOW_WARNED:
-            _RESEND_WINDOW_WARNED.add(raw)
-            print(f"hestia-mesh: WARNING: HESTIA_MESH_RESEND_WINDOW={raw!r} is not a "
-                  f"number - using the {RESEND_WINDOW_DEFAULT:g}s default. Set it to 0 "
-                  f"to disable the duplicate guard.", file=sys.stderr)
-        return RESEND_WINDOW_DEFAULT
+        v = math.nan
+    if math.isfinite(v):
+        return v
+    if raw not in _RESEND_WINDOW_WARNED:
+        _RESEND_WINDOW_WARNED.add(raw)
+        print(f"hestia-mesh: WARNING: HESTIA_MESH_RESEND_WINDOW={raw!r} is not a finite "
+              f"number - using the {RESEND_WINDOW_DEFAULT:g}s default. Set it to 0 "
+              f"to disable the duplicate guard.", file=sys.stderr)
+    return RESEND_WINDOW_DEFAULT
 
 
 def resend_ledger_path():
@@ -376,13 +410,29 @@ def already_sent(args, now=None):
     invocation is not asking the same question the first one answered.
 
     So the fix has to be on the WRITE, not on the report. This is a local, best-effort
-    ledger keyed on (plugin, to, kind, pointer, in_reply_to) — the whole tuple, so a
-    genuine second disposition on the same pointer, or the same pointer bound to a
+    ledger keyed on (plugin, ENDPOINT, to, kind, pointer, in_reply_to) — the whole tuple,
+    so a genuine second disposition on the same pointer, or the same pointer bound to a
     different notice, is NOT refused. Only the byte-identical repeat is.
 
     Deliberately NOT an idempotency key on the daemon: that is the right fix and needs a
     protocol field (`hestia_member_notify` has none). This closes the measured hole from
     the caller side today and does not preclude it.
+
+    TWO NON-PROPERTIES, named so nobody has to rediscover them.
+
+    (a) NOT ATOMIC. Two byte-identical `send` processes that overlap can both finish this
+    check before either reaches record_sent(), and both will queue (codex, PR #649). No
+    interprocess lock is taken, deliberately: the measured failure mode is a caller
+    RE-RUNNING a script sequentially, where the race cannot occur, and the ledger is one
+    file for the whole seat — so a lock held across a notify would serialize UNRELATED
+    sends behind an RPC measured at 15-17s when the daemon drags, and a stale lock file
+    would become one more way for this guard to block the mesh. That is the failure
+    direction this function exists to avoid. The concurrent case wants the daemon-side
+    idempotency key above, not a local mutex.
+
+    (b) APPEND-ONLY, never pruned, and re-read in full on every send. O(rows) per send at
+    a measured few hundred notices/seat/month, i.e. nothing; but it grows without bound
+    and nobody rotates it.
 
     Fail-open by construction, like keep_a_copy(): a guard that blocks the mesh because
     its own state file is corrupt would be worse than the duplicate it prevents. Any
@@ -417,13 +467,29 @@ def already_sent(args, now=None):
         try:
             at = float(row.get("at", 0))
         except (TypeError, ValueError):
+            at = math.nan
+        if not math.isfinite(at):
             # A matching row we cannot date is a warning-plus-permit, never an
-            # exception: half-written state must not be able to stop a send.
+            # exception: half-written state must not be able to stop a send. `at` is
+            # non-finite as well as unparseable here, because float("Infinity") does
+            # NOT raise: it passed this guard, satisfied the comparison below, and then
+            # act()'s int(now - inf) raised OverflowError and exited rc=1 BEFORE notify
+            # — the fail-open contract broken a fourth time, by a value that no except
+            # clause could have caught (codex, PR #649).
             print(f"hestia-mesh: WARNING: the resend ledger row for this notice has a "
                   f"malformed timestamp ({row.get('at')!r}) — the duplicate guard "
                   f"is OFF for this call.", file=sys.stderr)
             return None
-        if now - at <= window:
+        age = now - at
+        if age < 0:
+            # Dated in the future: this seat's clock moved, so the row cannot say
+            # anything about a window. Skip it rather than refuse — a row we cannot
+            # place in time must not be able to block a send until the clock catches up.
+            print(f"hestia-mesh: WARNING: a resend ledger row for this notice is dated "
+                  f"{-age:.0f}s in the FUTURE — ignoring it (clock moved?).",
+                  file=sys.stderr)
+            continue
+        if age <= window:
             return row
     return None
 
@@ -478,6 +544,27 @@ def main():
 
 
 def act(cmd):
+    # The duplicate check runs BEFORE connect(), not inside the send branch below.
+    # KINDS.md promises that "a refused send leaves the chain and the recipient's inbox
+    # bit-identical"; connecting first spent three POSTs (initialize/initialized/connect)
+    # and a session on a call this seat was never going to make (kimi-code, PR #649).
+    # The key holds no session_id, so there is nothing to wait for the daemon to tell us.
+    if cmd == "send":
+        if len(sys.argv) < 5:
+            print("usage: hestia-mesh.py send <to_plugin_id> <kind> <pointer_uri> [re_notice_id]")
+            sys.exit(2)
+        sendargs = {"to_plugin_id": sys.argv[2], "kind": sys.argv[3],
+                    "pointer_uri": sys.argv[4]}
+        if len(sys.argv) > 5:
+            sendargs["in_reply_to"] = int(sys.argv[5])
+        dup = already_sent(sendargs)
+        if dup is not None:
+            age = int(time.time() - float(dup.get("at", 0)))
+            print(f"hestia-mesh: REFUSED LOCALLY — this seat queued a byte-identical "
+                  f"notice {age}s ago (queued_id={dup.get('queued_id')}). NOTHING WAS "
+                  f"SENT, and no session was opened. If you meant to send it twice: "
+                  f"HESTIA_MESH_RESEND=1 {' '.join(sys.argv)}", file=sys.stderr)
+            sys.exit(5)
     h, s = connect()
     if cmd in ("peek", "drain"):
         out = rpc(h, "hestia_member_inbox", {"session_id": s, "peek": cmd == "peek"})
@@ -489,21 +576,9 @@ def act(cmd):
             args["older_than_secs"] = int(sys.argv[2])
         out = rpc(h, "hestia_member_unanswered", args)
     else:
-        if len(sys.argv) < 5:
-            print("usage: hestia-mesh.py send <to_plugin_id> <kind> <pointer_uri> [re_notice_id]")
-            sys.exit(2)
-        args = {"to_plugin_id": sys.argv[2], "kind": sys.argv[3],
-                "pointer_uri": sys.argv[4], "session_id": s}
-        if len(sys.argv) > 5:
-            args["in_reply_to"] = int(sys.argv[5])
-        dup = already_sent(args)
-        if dup is not None:
-            age = int(time.time() - float(dup.get("at", 0)))
-            print(f"hestia-mesh: REFUSED LOCALLY — this seat queued a byte-identical "
-                  f"notice {age}s ago (queued_id={dup.get('queued_id')}). NOTHING WAS "
-                  f"SENT. If you meant to send it twice: HESTIA_MESH_RESEND=1 "
-                  f"{' '.join(sys.argv[:1] + sys.argv[1:])}", file=sys.stderr)
-            sys.exit(5)
+        # already_sent() ran above, before connect(). session_id is added here and is
+        # deliberately NOT part of resend_key(): a fresh session is not a new act.
+        args = dict(sendargs, session_id=s)
         out = rpc(h, "hestia_member_notify", args)
         if not failed(out):
             record_sent(args, out)

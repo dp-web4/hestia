@@ -31,7 +31,7 @@ bound to a different notice, differs in the tuple and passes. And it is not load
 every failure path fails OPEN, because a guard that blocks the mesh on its own corrupt
 state is worse than the duplicate it prevents.
 
-Seven properties, against the real module and a real filesystem — no seam, no mocks:
+Properties, against the real module and a real filesystem — no seam, no mocks:
 
   1. A byte-identical repeat inside the window is REFUSED, and a first send is not.
   2. Each field of the tuple is load-bearing: change any ONE of to/kind/pointer/
@@ -53,6 +53,16 @@ Seven properties, against the real module and a real filesystem — no seam, no 
      test run must never be able to append to the operator's real ledger.
   7. The mesh ENDPOINT is part of the identity: one ledger per seat spans every daemon
      that seat talks to, so without it the first send to a second mesh reads as a repeat.
+     Scheme and host fold by case (RFC 3986); the PATH does not — lowercasing the whole
+     url collapsed two meshes mounted at /MCP and /mcp into one key.
+  8. NON-FINITE IS MALFORMED, on both sides. This is property 5's class one level down
+     and it is the one no `except` clause can reach: float("nan") and float("inf") do
+     not raise, they RETURN, and the poison surfaces in a comparison. NaN silently
+     switched the guard off; Infinity refused forever; a ledger row with at=Infinity was
+     returned as a duplicate and then killed the caller with OverflowError on int(-inf),
+     rc=1 before notify. All three were live on the commit that fixed 5b-5d.
+  9. A local refusal costs the daemon NOTHING: the guard runs before connect(), so a
+     duplicate aimed at a dead port still exits 5 rather than 1.
 
 Plus one doc pin: rc=5 must appear in the module's exit-code table. A guard whose exit
 code is undocumented is a new silent failure for every caller that branches on rc.
@@ -232,6 +242,100 @@ def main():
     check("8c. a trailing slash is the same endpoint, not a second one",
           m3.already_sent(b) is not None,
           "normalization did not collapse a trailing slash")
+    # 8d/8e: which parts of a URL are case-insensitive is not a matter of taste. Scheme
+    # and host are (RFC 3986 6.2.2.1); PATH IS NOT. The first cut lowercased the whole
+    # string, so two meshes mounted at /MCP and /mcp shared one key and the second one's
+    # first send was refused as a duplicate — the exact collapse resend_endpoint()'s
+    # docstring says must not happen (codex, PR #649).
+    m4 = load(tmp8, endpoint="http://127.0.0.1:7711/MCP")
+    check("8d. two case-distinct endpoint PATHS are two endpoints (permit)",
+          m4.already_sent(b) is None,
+          f"path case-folded into one key: {m4.resend_endpoint()!r}")
+    m5 = load(tmp8, endpoint="http://127.0.0.1:7711/mcp")
+    m5.record_sent(b, {"queued_id": 9002})
+    m6 = load(tmp8, endpoint="HTTP://127.0.0.1:7711/mcp")
+    check("8e. scheme/host case is still ONE endpoint (refuse)",
+          m6.already_sent(b) is not None,
+          f"host case read as a second endpoint: {m6.resend_endpoint()!r}")
+
+    # ---- 9. NON-FINITE IS MALFORMED — the escape no `except` clause can catch.
+    # 5b pinned the RAISING arm (float("invalid") -> ValueError). float("nan") and
+    # float("inf") do not raise: they return, pass every guard written to catch an
+    # exception, and poison a comparison two lines later. Both were live on 7e3da00,
+    # the commit that closed the raising arms of this same contract, and they fail in
+    # OPPOSITE directions — NaN silently switched the guard off, Infinity refused
+    # forever (codex's automated review, PR #649).
+    tmp9 = tempfile.mkdtemp(prefix="resend-nonfinite-")
+    m9 = load(tmp9)
+    c = notice()
+    m9.record_sent(c, {"queued_id": 9101})
+    for raw in ("NaN", "Infinity", "-Infinity"):
+        os.environ["HESTIA_MESH_RESEND_WINDOW"] = raw
+        try:
+            check(f"9a. WINDOW={raw} falls back to the 900s default",
+                  m9.resend_window() == 900.0, repr(m9.resend_window()))
+            check(f"9b. WINDOW={raw} still REFUSES a real duplicate (guard not disabled)",
+                  m9.already_sent(c) is not None, "the guard was silently switched off")
+            check(f"9c. WINDOW={raw} does not refuse a 31-year-old row (not forever)",
+                  m9.already_sent(c, now=time.time() + 10 ** 9) is None,
+                  "an infinite window makes every matching row a permanent duplicate")
+        finally:
+            os.environ.pop("HESTIA_MESH_RESEND_WINDOW", None)
+
+    # ---- 10. THE SAME CLASS ON THE LEDGER SIDE: a row `at` that parses but is not a
+    # usable time. at="Infinity" satisfied `now - at <= window`, was returned as a
+    # duplicate, and act() then raised OverflowError on int(-inf) — rc=1 BEFORE notify,
+    # a traceback, nothing sent. A future-dated row (clock moved) refused every
+    # identical send until the clock caught up.
+    def permits(label, row):
+        with open(m9.resend_ledger_path(), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+        try:
+            got = m9.already_sent(c)
+            check(label, got is None, f"refused instead: {json.dumps(got)[:200]}")
+            if got is not None:   # ...and then act() has to render that refusal
+                age = int(time.time() - float(got.get("at", 0)))
+                check(label + " [render]", True, str(age))
+        except Exception as e:
+            check(label + " [render]", False,
+                  f"raised {type(e).__name__}: {e} (rc=1, nothing sent)")
+
+    permits("10a. a matching row with at=Infinity permits (warn, not OverflowError)",
+            {"key": m9.resend_key(c), "at": "Infinity"})
+    permits("10b. a matching row with at=NaN permits",
+            {"key": m9.resend_key(c), "at": "NaN"})
+    permits("10c. a matching row dated in the FUTURE permits (clock moved)",
+            {"key": m9.resend_key(c), "at": time.time() + 10 ** 6})
+
+    # ---- 11. A LOCAL REFUSAL LEAVES NO TRACE ON THE DAEMON. KINDS.md promises a
+    # refused send leaves the chain and the recipient's inbox bit-identical; the guard
+    # used to run AFTER connect(), spending three POSTs and a session on a call that
+    # was never going to be made (kimi-code, PR #649). Pinned without a stub daemon:
+    # aim a known duplicate at a DEAD port. If the guard runs first the answer is rc=5;
+    # if it connects first there is nothing there and the answer is rc=1.
+    import socket
+    import subprocess
+    s11 = socket.socket()
+    s11.bind(("127.0.0.1", 0))
+    dead = f"http://127.0.0.1:{s11.getsockname()[1]}/mcp"
+    s11.close()
+    tmp11 = tempfile.mkdtemp(prefix="resend-noconnect-")
+    m11 = load(tmp11, endpoint=dead)
+    d = notice(to="codex", kind="reply", pointer="hestia://e/dead#x", re_id=6147)
+    m11.record_sent(d, {"queued_id": 9201})
+    env11 = dict(os.environ, HESTIA_ENDPOINT=dead, HESTIA_MESH_STATE=tmp11,
+                 HESTIA_MESH_PLUGIN="claude-code", HESTIA_MESH_TIMEOUT="5")
+    env11.pop("HESTIA_ROLE", None)
+    env11.pop("HESTIA_MESH_RESEND", None)
+    env11.pop("HESTIA_MESH_RESEND_WINDOW", None)
+    p11 = subprocess.run(
+        [sys.executable, CLI, "send", "codex", "reply", "hestia://e/dead#x", "6147"],
+        capture_output=True, text=True, env=env11, timeout=30)
+    check("11a. a duplicate is refused BEFORE connect (rc=5 at a dead endpoint, not 1)",
+          p11.returncode == 5, f"rc={p11.returncode} stderr={p11.stderr.strip()[-160:]!r}")
+    check("11b. and it says no session was opened",
+          "no session was opened" in p11.stderr, p11.stderr.strip()[-160:])
+
     load(tmp, endpoint=None)  # restore the module under test for the doc pin below
 
     # ---- doc pin: the exit code has to be findable by a caller that branches on rc.
