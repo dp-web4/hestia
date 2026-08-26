@@ -662,9 +662,19 @@ impl Escalation {
             // The invitation half of the bar, reported as a RECORD (#226). Under blocker
             // semantics an absent peer showed up as `bar_met: false`; now that the sovereign
             // conjunct decides alone, nothing on any surface would say whether a peer was ever
-            // asked. `invited` is empty on every escalation this daemon has ever opened —
-            // `open()` sets `Vec::new()` and no production path writes it — so this currently
-            // reports, truthfully, that no invitation was issued. That is the point: it must
+            // asked.
+            //
+            // `invited` WAS empty on every escalation this daemon had opened — `open()` and
+            // `rehydrate()` both set `Vec::new()` and nothing else wrote it — and this comment
+            // went on saying so in the PRESENT tense after the production writer landed
+            // (`invite()`, called from `resolve_invitation` at the open door). MEASURED on this
+            // deployment 2026-08-25: escalations 5859494c6fa156da (18:52Z) and 81d748d5ff19354b
+            // (19:04Z) each recorded 8 `invited_peers`, with 7 further candidates under
+            // `invitation_passed_over`. The stale sentence is not cosmetic: it tells a reader
+            // this field is a constant empty, which licenses skipping the audit of `absent` —
+            // the one number the invitation record exists to make auditable.
+            //
+            // The guard direction is unchanged and still the point: an empty `invited` must
             // read as "nobody was asked", never as "asked and they agreed".
             "peer_participation": self.peer_participation(),
             "note": if permits_write {
@@ -2599,15 +2609,18 @@ mod tests {
     ///
     /// #226 retained the peer conjunct as evidence via `peer_participation()`, on the
     /// reasoning that the bar "still shapes WHO IS ASKED and what is recorded". Neither half
-    /// is true yet: `invited_peers` has no production writer (`open` and `rehydrate` both set
-    /// `Vec::new()`), and before this change `peer_participation()` had no production reader
-    /// at all. Censused over 111,620 chain entries: NO key on any `gate_escalation_opened` or
-    /// `_decided` payload names an invited peer, across 317 opens.
+    /// was true when this test was written: `invited_peers` had no production writer (`open`
+    /// and `rehydrate` both set `Vec::new()`), and `peer_participation()` had no production
+    /// reader at all. Censused over 111,620 chain entries: NO key on any
+    /// `gate_escalation_opened` or `_decided` payload named an invited peer, across 317 opens.
     ///
-    /// So this asserts the honest current state and guards the direction of the lie. An empty
-    /// `invited` with `absent: 0` reads "nobody was asked". The failure to guard against is a
-    /// future writer populating `invited` from a roster WITHOUT sending anything — that would
-    /// make the record assert an invitation that was never issued.
+    /// BOTH halves have since landed, and this doc kept asserting the gap in the present tense
+    /// while the body below already called `invite()` and named it "the production writer".
+    /// What the test still pins is the SHAPE, not the absence: a freshly `open`ed escalation
+    /// invites nobody, so an empty `invited` with `absent: 0` reads "nobody was asked". The
+    /// failure to guard against is a future writer populating `invited` from a roster WITHOUT
+    /// sending anything — that would make the record assert an invitation that was never
+    /// issued.
     #[test]
     fn an_uninvited_peer_reads_as_uninvited_not_as_agreement() {
         let mut s = EscalationStore::default();
