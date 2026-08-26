@@ -64,16 +64,58 @@ def short(sec):
     return f"{sec}s"
 
 
+# The remedy the not-measured arms used to omit. Both arms named a DIAGNOSIS
+# (which producer wrote this primer, why the read failed) and no ANSWER, so a
+# member that wanted the number was left with "restart your watcher" — the one
+# action a woken member structurally cannot take, because restarting its own
+# watcher kills the wake that is reading the sentence. The read is one RPC and
+# the fold is in this file; a member on any watcher vintage can answer the
+# question for itself. Measured on CBP 2026-08-26 from a wake whose primer
+# carried no key at all: count 0, `{"asked": true, "mine": []}`.
+SELF_SERVE = ("You can answer it yourself without a restart: call "
+              "`hestia_gate_pending_escalations` (session_id from `hestia_connect`) "
+              "and pipe the response through `open-petitions.py fold <your plugin_id>` "
+              "— `asked:true` with an empty `mine` is a MEASURED zero, which this "
+              "line is not.")
+
+
 def render(f):
     """The prompt block. Empty string when the member holds nothing."""
     if not isinstance(f, dict):
         return ""
     if not f.get("asked"):
-        # The read failed, or the daemon predates this fold. Say so: "you hold
+        # The read failed, or the WATCHER predates this fold. Say so: "you hold
         # none" is a claim and this is not evidence for it — the same
         # absence-read-as-pass the primer's own ownership stamp exists to stop.
+        #
+        # And say WHICH, because the two want opposite responses and the primer
+        # asserted the first for both. Measured on CBP 2026-08-26: the claude and
+        # kimi watchers were executing a8dccda (2026-08-06), which has no fold at
+        # all, so every wake read "the pending-escalations read failed" about a
+        # read that was never attempted — a false cause, stated flatly, in the one
+        # surface a woken member is guaranteed to read. The discriminator is on
+        # disk and costs nothing: a watcher too old to fold writes NO
+        # `open_petitions` key, while a failed read writes `asked:false`.
+        # See tools/process_vintage.py for why the watcher's vintage is not
+        # something you can read off /proc.
+        if f.get("_absent"):
+            # Say what the ARTIFACT shows and stop. Key-absence dates THIS PRIMER's
+            # producer, not the watcher now running, and codex named two live
+            # counterexamples on PR #634: a retained primer written by the old watcher
+            # is retried AFTER a restart, so a fully current watcher can launch a
+            # keyless one; and the current watcher's own composition fallback
+            # (`... || echo "$OUT" > "$PRIMER"`) emits a keyless primer when the final
+            # step fails. Both make "your watcher predates the fold" a cause the
+            # artifact does not entail — the same overclaim-from-absence this branch
+            # exists to stop, committed by the branch itself.
+            return ("Open petitions: NOT MEASURED this wake — this primer carries no "
+                    "`open_petitions` key, so the read was never attempted for it. "
+                    "That dates the primer's PRODUCER (a watcher without the fold, or "
+                    "a composition fallback), not necessarily the watcher running now; "
+                    "`tools/process_vintage.py units` is what tells them apart. This "
+                    "is not evidence that you hold none. " + SELF_SERVE)
         return ("Open petitions: NOT MEASURED this wake (the pending-escalations "
-                "read failed) — this is not evidence that you hold none.")
+                "read failed) — this is not evidence that you hold none. " + SELF_SERVE)
     mine = f.get("mine") or []
     if not mine:
         return ""
@@ -123,7 +165,14 @@ def main(argv):
         return 0
     if len(argv) >= 3 and argv[1] == "render":
         try:
-            f = json.load(open(argv[2])).get("open_petitions") or {}
+            d = json.load(open(argv[2]))
+            f = d.get("open_petitions") or {}
+            # Key-ABSENT and asked:false are different facts about different
+            # components — the watcher never folded, versus the daemon refused the
+            # read — and only this line can still tell them apart. `render` gets a
+            # dict either way, so the discriminator has to be carried, not inferred.
+            if "open_petitions" not in d:
+                f = dict(f, _absent=True)
         except Exception:
             return 0
         block = render(f)
