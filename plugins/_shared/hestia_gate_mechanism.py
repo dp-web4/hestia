@@ -552,8 +552,9 @@ def _scope_entry_for_grant(path: str) -> str:
 
     A grant naming a REPO ROOT directly under the workspace maps to the bare repo NAME —
     the only form evaluate()'s segment-keyed scope model admits. Anything deeper keeps
-    the faithful "path:" form: a FILE grant must not front for its whole repo (Sprint F
-    R2's conservatism, still binding). Lexical + realpath, no stat: the daemon records
+    the faithful "path:" form, which the core matches only at that resolved boundary and
+    below: a FILE grant must not front for its whole repo (Sprint F R2's conservatism,
+    still binding). Lexical + realpath, no stat: the daemon records
     grants while this gate enforces them, and the two must agree on what a path names
     even when the object does not exist yet."""
     p = os.path.realpath(os.path.expanduser(path.strip()))
@@ -710,9 +711,9 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
                         # ONE mapping for both grant channels (GPT #431 blocker 4;
                         # subsumes #430's inline fix): a live grant naming a repo root
                         # under the core-discovered workspace admits as the repo NAME;
-                        # anything deeper keeps the faithful "path:" form, inert against
-                        # the segment-keyed model (R2) — a file grant must not front for
-                        # its whole repo.
+                        # anything deeper keeps the faithful typed "path:" form; the core
+                        # admits only that resolved boundary and descendants (R2) — a file
+                        # grant must not front for its whole repo.
                         snap["in_scope"].append(_scope_entry_for_grant(p))
             # STANDING grants (Sprint F R1) — the durable, operator-promoted list the
             # daemon persists in its vault. Additive beside live_grants; absent on an
@@ -747,7 +748,7 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             #
             # Mapped through the SAME `_scope_entry_for_grant` the two grant channels use, so
             # a floor path admits by exactly the rule a granted path does — a repo root as a
-            # repo-name grant, anything deeper as an inert `path:` entry. A second mapping
+            # repo-name grant, anything deeper as a boundary-scoped `path:` entry. A second mapping
             # here would be a second law for the same question, which is the drift this list
             # exists to prevent.
             #
