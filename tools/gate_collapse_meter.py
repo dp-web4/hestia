@@ -120,7 +120,16 @@ def shared_symbols(shared_dir: Path):
             continue
         files.append(f)
         tree = ast.parse(f.read_text(encoding="utf-8", errors="replace"), filename=str(f))
-        for node in ast.walk(tree):
+        # TOP LEVEL ONLY, and this is a correction rather than a tightening. `ast.walk`
+        # collected NESTED functions too, so a private closure inside a shared function
+        # became "a name the engine owns" -- and any unrelated local helper in a seat that
+        # happened to share the name read as a second implementation of it. Caught when the
+        # first real collapse slice moved `emit_attestation` in, whose internal `post` helper
+        # instantly "forked" the unrelated `post` closures in codex and kimi and pushed the
+        # ratchet from 4 to 6. The instrument would have gone red at the exact moment the
+        # work it measures succeeded. A closure is not API; only what a seat could actually
+        # import can be forked.
+        for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 names.add(node.name)
     return names, files
@@ -153,6 +162,7 @@ def module_functions(path: Path):
     tree = ast.parse(src, filename=str(path))
     lines = src.splitlines()
     out = []
+    top = {id(n) for n in tree.body}
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             end = getattr(node, "end_lineno", node.lineno)
@@ -161,6 +171,7 @@ def module_functions(path: Path):
                 "name": node.name,
                 "sloc": end - node.lineno + 1,
                 "line": node.lineno,
+                "top_level": id(node) in top,
                 "delegates": delegates(node),
                 "law_bearing": any(v in body or v in node.name.lower() for v in LAW_VOCABULARY),
             })
@@ -211,7 +222,7 @@ def main() -> int:
     rows = []
     for seat, path in gates:
         fns, filelines = module_functions(path)
-        same = [f for f in fns if f["name"] in names]
+        same = [f for f in fns if f["name"] in names and f["top_level"]]
         fork = [f for f in same if not f["delegates"]]
         adapt = [f for f in same if f["delegates"]]
         law = [f for f in fns if f["law_bearing"]]

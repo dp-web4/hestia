@@ -770,3 +770,90 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
         _snapshot_unavailable(
             plugin_id, f"{type(e).__name__}:{getattr(e, 'errno', '')}:{str(e)[:120]}")
         return None
+
+
+# ── COLLAPSED FROM THE SEATS (2026-08-25) ─────────────────────────────────────────────────
+# `emit_attestation` lived as a byte-identical copy in BOTH the codex
+# and kimi gates: 19/19 and 62/62 lines, matching line for line. Nothing flagged them,
+# because the collapse ratchet can only see a seat overriding a name the engine ALREADY owns,
+# and the engine never owned these. Two seats answering the same question with two bodies is
+# the shape every drift incident so far has come out of; the copies were identical today only
+# because nobody had edited one yet.
+#
+# THE SHIM BOUNDARY, stated once here because every later slice inherits it: the ENGINE owns
+# the logic, the SEAT supplies its identity. Neither function is seat-specific — what was
+# seat-specific was `HESTIA_PLUGIN_ID` and `_role_bridge()` closed over from module scope,
+# which is exactly why the code could not be shared without being parameterised first. They
+# are arguments now, and a seat that forgets to pass them gets a TypeError at the call rather
+# than a plausible default attributing its acts to somebody else.
+
+
+def emit_attestation(allows, denies, *, plugin_id, role_lct, endpoint=None):
+    """Attest this gate's effective scope to the daemon, best effort.
+
+    `plugin_id` and `role_lct` are REQUIRED and keyword-only. In the seat-local copies both
+    were read from module scope, so the identity a record carried was decided by which file
+    the function happened to live in. Making them arguments is what let one body serve every
+    seat; keyword-only is what stops the two ever being passed in the wrong order, since they
+    are both strings and a silent swap would attribute the attestation to a role.
+    """
+    endpoint = endpoint or os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+
+    def post(payload, timeout, hdrs=None):
+        req = urllib.request.Request(
+            endpoint, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream", **(hdrs or {})})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read(), r.headers.get("mcp-session-id")
+
+    _, sid = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                   "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                              "clientInfo": {"name": "hestia-gate-attest", "version": "1"}}}, 1.0)
+    h = {"mcp-session-id": sid} if sid else {}
+    post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, 0.4, h)
+    # `hestia_request_witness` is an ATTRIBUTED append: it refuses an unconnected caller,
+    # because what lands on the chain must carry a proven WHO and not only caller-supplied
+    # data. Connect first and pass the session, or the attestation is silently refused —
+    # which is exactly how the first cut of this failed.
+    raw, _ = post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                   "params": {"name": "hestia_connect",
+                              "arguments": {"plugin_id": plugin_id,
+                                            "host_agent": plugin_id,
+                                            # DECLARE THE ROLE ON CONNECT (dp, 2026-07-28:
+                                            # "kimi's member alias still shows unmeasured
+                                            # with over 3k actions"). This gate has always
+                                            # KNOWN its role — it writes the role bridge
+                                            # into the attestation payload below — and never
+                                            # told the daemon on connect, so the session
+                                            # defaulted to role:constellation:member and the
+                                            # attestation landed on a grain the member does
+                                            # not act under. Acts on one grain, the decisions
+                                            # governing them on another, and NEITHER can score
+                                            # conduct. The capability to declare arrived with
+                                            # the connect-echoes-role work; this is the caller
+                                            # that never started using it.
+                                            "role": role_lct,
+                                            "instance_name": "gate-attest"}}}, 1.5, h)
+    sess = None
+    for line in raw.decode("utf-8", "replace").splitlines():
+        if line.startswith("data: {"):
+            try:
+                pl = json.loads(line[6:])
+                if "result" in pl:
+                    sess = json.loads(pl["result"]["content"][0]["text"]).get("sessionId")
+            except Exception:
+                pass
+    if not sess:
+        return
+    post({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+          "params": {"name": "hestia_request_witness",
+                     "arguments": {"session_id": sess,
+                                   "event_type": "scope_attestation",
+                                   "event_data": {
+                                       "plugin_id": plugin_id,
+                                       "role_lct": role_lct,
+                                       "allows": allows,
+                                       "denies": denies,
+                                       "attested_by": "plugin-gate:" + plugin_id,
+                                   }}}}, 1.5, h)
