@@ -12498,6 +12498,173 @@ mod tests {
             "post-decision, the argument is preserved"
         );
     }
+
+    /// THE SEAT KEYS (#542). Until this change every question of the form "which seat /
+    /// which wake opened this escalation" was unanswerable from the opened row — field
+    /// census 0/173 for `gate_path`, `session_id`, `host_session_id` in any spelling,
+    /// while `asker_basis: "session"` named a session the row did not carry. These
+    /// assert on the CHAIN ENTRY, for the same reason the claim-door invitation test
+    /// does: the census that found the absence reads payload keys.
+    ///
+    /// The two session keys are DERIVED from the proven session, never the arguments:
+    /// the test passes NO `host_session_id` argument to the claim, only to the connect,
+    /// so a populated key can only have come from the proven session record.
+    #[tokio::test]
+    async fn the_claim_door_records_the_seat_keys_from_the_proven_session() {
+        let (_dir, shared) = make_shared_state();
+        let conn = tool_connect(&shared, &json!({
+            "plugin_id": "kimi-code", "host_agent": "h", "host_session_id": "wake-542"
+        }))
+        .await
+        .unwrap();
+        let sid = conn["sessionId"].as_str().unwrap().to_string();
+
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": sid,
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "reason": "Edit -> a governance file",
+                "gate_path": "hooks/kimi/pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed["claimed"], false, "precondition: the open fallback: {claimed}");
+
+        let s = shared.lock().await;
+        let opened = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened")
+            .expect("the refusal must be witnessed");
+        let d = &opened.event_data;
+        assert_eq!(
+            d["gate_path"], "hooks/kimi/pre_tool_use.py",
+            "the caller-asserted gate is recorded, as exactly that: {d}"
+        );
+        assert_eq!(
+            d["host_session_id"], "wake-542",
+            "the per-wake key is DERIVED from the proven session — the claim call never              carried it as an argument: {d}"
+        );
+        assert_eq!(
+            d["session_id"], sid.as_str(),
+            "the MCP session the refusal row already recorded on requested_by now lands              on the opened row too: {d}"
+        );
+        assert_eq!(d["asker_basis"], "session", "the basis finally names a present field: {d}");
+    }
+
+    /// The member door writes the same three keys (#542) — a field added only to the
+    /// claim door is a field the documented entry point never sees, which is how the
+    /// invitation writer shipped onto the wrong surface once already.
+    #[tokio::test]
+    async fn the_open_door_records_the_seat_keys_too() {
+        let (_dir, shared) = make_shared_state();
+        let conn = tool_connect(&shared, &json!({
+            "plugin_id": "kimi-code", "host_agent": "h", "host_session_id": "wake-542b"
+        }))
+        .await
+        .unwrap();
+        let sid = conn["sessionId"].as_str().unwrap().to_string();
+
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": sid,
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "act": "Edit -> a governance file",
+                "reason": "the deny blocks a legitimate rule addition",
+                "gate_path": "hooks/kimi/pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(opened.get("escalation_id").is_some(), "the open must land: {opened}");
+
+        let s = shared.lock().await;
+        let entry = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened")
+            .expect("the open must be witnessed");
+        let d = &entry.event_data;
+        assert_eq!(d["gate_path"], "hooks/kimi/pre_tool_use.py", "{d}");
+        assert_eq!(d["host_session_id"], "wake-542b", "{d}");
+        assert_eq!(d["session_id"], sid.as_str(), "{d}");
+    }
+
+    /// Absence is RECORDED, not fabricated (#542): an unproven open (no session, no
+    /// gate_path) writes all three keys as explicit null — the one-shape doctrine, so a
+    /// census reading payload KEYS can never mistake "no shape for the field" for "the
+    /// field had no value". And a PROVEN session that itself carries no host_session_id
+    /// yields a populated `session_id` beside a null `host_session_id`: derived, never
+    /// the caller's assertion.
+    #[tokio::test]
+    async fn an_unproven_open_records_explicit_null_seat_keys() {
+        let (_dir, shared) = make_shared_state();
+        // Arm 1: nothing proven at all.
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "act": "Edit -> a governance file",
+                "reason": "the deny blocks a legitimate rule addition",
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(opened.get("escalation_id").is_some(), "{opened}");
+
+        // Arm 2: a proven session that never carried a host_session_id.
+        let conn = tool_connect(&shared, &json!({ "plugin_id": "codex", "host_agent": "h" }))
+            .await
+            .unwrap();
+        let sid2 = conn["sessionId"].as_str().unwrap().to_string();
+        let opened2 = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "session_id": sid2,
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "act": "Edit -> another governance file",
+                "reason": "a second legitimate rule addition",
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(opened2.get("escalation_id").is_some(), "{opened2}");
+
+        let s = shared.lock().await;
+        let mut opened_entries = s
+            .recent_chain(20)
+            .into_iter()
+            .filter(|e| e.event_type == "gate_escalation_opened");
+        let second = opened_entries.next().expect("the second open is witnessed");
+        let first = opened_entries.next().expect("the first open is witnessed");
+
+        let d1 = &first.event_data;
+        for key in ["gate_path", "host_session_id", "session_id"] {
+            assert!(
+                d1.get(key).is_some_and(Value::is_null),
+                "arm 1: '{key}' must be an EXPLICIT null, not a missing key and never a                  fabricated value: {d1}"
+            );
+        }
+
+        let d2 = &second.event_data;
+        assert_eq!(d2["session_id"], sid2.as_str(), "arm 2: the proven session lands: {d2}");
+        assert!(
+            d2["host_session_id"].is_null(),
+            "arm 2: the proven session carried none, so null is the honest record — the              caller's unverifiable assertion would have been worse than the missing key: {d2}"
+        );
+        assert!(d2["gate_path"].is_null(), "arm 2: no gate named itself: {d2}");
+    }
 }
 
 #[cfg(test)]
@@ -15018,6 +15185,19 @@ fn opened_payload(
         // bounded invitation that reads as an exhaustive one makes "nobody looked"
         // unfalsifiable.
         "invitation_passed_over": inv.passed_over,
+        // THE SEAT KEYS (#542). Until these three, every question of the form "which
+        // seat / which wake opened this escalation" was unanswerable from the row —
+        // field census 0/173 for any of them in any spelling, while `asker_basis:
+        // "session"` named a session the row did not carry. All three are emitted on
+        // EVERY open (the one-shape doctrine above): a null is the explicit record
+        // of absence, never a missing key a census can mistake for an unwritten
+        // shape. `gate_path` is caller-asserted (A1 — the hook self-reports; nothing
+        // here can check it). The two session keys are DERIVED from the proven live
+        // session or null — never the caller's assertion; see the struct fields'
+        // docs and the claimed row's host_session_id doctrine they mirror.
+        "gate_path": esc.gate_path,
+        "host_session_id": esc.host_session_id,
+        "session_id": esc.session_id,
         "expires_at": esc.expires_at,
         "ttl_secs": ttl_secs,
         // Recorded so a reader is never left inferring it from silence.
@@ -15153,6 +15333,11 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // #128 remedy — basis recorded on the escalation, and `eligibility` refusing to peer-clear
     // an asker nobody proved — is its own change against a reopened #128.
     let session_id_arg = optional_session_id(args);
+    // WHICH HOOK FIRED, when the opener says so (#542). CALLER-ASSERTED like every
+    // other unproven field on this surface — recorded, never trusted (see the
+    // struct field's doc). A member-initiated open through a plain session usually
+    // supplies nothing, and null is the explicit record of that.
+    let gate_path = optional_string(args, "gate_path");
     let now = now_secs();
 
     let mut s = state.lock().await;
@@ -15174,6 +15359,7 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         }
     }
     let asker_is_proven = proven_asker.is_some();
+    let proven_session_uuid = proven_asker.as_ref().and_then(|who| who.session_uuid);
     let esc = match s
         .gate_escalations
         .open(&plugin_id, &role, &tool_name, &marker,
@@ -15197,6 +15383,28 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
             return Err(anyhow::anyhow!("{e}"));
         }
     };
+    // THE SEAT KEYS (#542), recorded before the witness so the entry records what
+    // exists rather than what this call intends (the `invite` ordering rule, one
+    // field group over). The two session keys are DERIVED from the proven session
+    // — never the caller's assertion; `gate_path` is the caller's self-report and
+    // is recorded as exactly that.
+    let proven_host_session_id = proven_session_uuid
+        .and_then(|uuid| s.sessions.get(&uuid))
+        .and_then(|sess| sess.host_session_id.clone());
+    let proven_session_id = proven_session_uuid.map(|uuid| uuid.to_string());
+    s.gate_escalations.record_seat_keys(
+        &esc.id,
+        gate_path.as_deref(),
+        proven_host_session_id.as_deref(),
+        proven_session_id.as_deref(),
+    );
+    // Re-read AFTER the recording: `open` returned a clone taken before it, and
+    // the payload below is built from the struct — the store is the record.
+    let esc = s
+        .gate_escalations
+        .get(&esc.id)
+        .cloned()
+        .expect("just opened; the row exists");
 
     // ---- THE INVITATION HALF ----------------------------------------------------------
     //
@@ -15647,6 +15855,10 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // launder, and a join key is exactly the field an auditor would rely on to say WHICH
     // acts a spent approval covered.
     let stated_host_session_id = optional_string(args, "host_session_id");
+    // WHICH HOOK FIRED, when the gate says so (#542) — caller-asserted and recorded
+    // as exactly that (the struct field's doc carries the caveat). The hook passes
+    // its own realpath; an old hook passes nothing, and null is the explicit record.
+    let gate_path = optional_string(args, "gate_path");
     // WHO is asking, provable. Accepted here for the same reason `tool_gate_escalation_open`
     // accepts it (#128: `eligibility` otherwise compares an ASSERTION against an IDENTITY),
     // and because the invitation half cannot issue without it — an invitation is an outward
@@ -15835,6 +16047,28 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
               stated_reason.as_deref(), stated_detail.as_deref(), now, DEFAULT_TTL_SECS)
     {
         Ok(esc) => {
+            // THE SEAT KEYS (#542), same write as the member door: the two session
+            // keys DERIVED from the proven session (never the arguments — the
+            // doctrine the claimed row's host_session_id follows, ten lines up),
+            // `gate_path` the caller's self-report and recorded as exactly that.
+            // Recorded before the witness, same ordering rule as `invite`.
+            s.gate_escalations.record_seat_keys(
+                &esc.id,
+                gate_path.as_deref(),
+                proven_host_session_id.as_deref(),
+                proven_asker
+                    .as_ref()
+                    .and_then(|who| who.session_uuid)
+                    .map(|uuid| uuid.to_string())
+                    .as_deref(),
+            );
+            // Re-read AFTER the recording, same reason as the member door: `open`
+            // returned a pre-recording clone and the payload is built from it.
+            let esc = s
+                .gate_escalations
+                .get(&esc.id)
+                .cloned()
+                .expect("just opened; the row exists");
             // THE SAME WRITER THE OTHER DOOR USES. This fallback had its own hand-rolled
             // payload — no `bar`, no `invited_peers`, no `asker_basis`, no `invitation_*` —
             // and since this is the door the gate hook actually calls, that shape is what the
