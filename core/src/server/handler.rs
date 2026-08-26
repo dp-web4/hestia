@@ -5118,6 +5118,17 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
 ///    Both sentences ship in the response so a reader cannot take the first
 ///    for the second.
 ///
+/// 3. Every row carries its own `in_reply_to`, because that is the only field
+///    that separates distinct dispositions sharing one `pointer_uri`. Measured
+///    on CBP 2026-08-26: 37 `i_owe` rows, 25 distinct pointers, six pointers
+///    arriving three times each byte-identical and ~0.3s apart — which reads as
+///    twelve duplicates until you look at the bindings, where all twelve are
+///    distinct (one per fork of a batched act, anchored at one section on
+///    purpose). A reader grouping by what the report SHOWED would have
+///    mass-acked twelve live claims. Unansweredness is defined by what binds to
+///    `n.id`; a report that hides the binding makes its own definition
+///    unverifiable from the outside.
+///
 /// Read-only and self-scoped: a caller sees only notices it sent or received.
 async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult {
     let session_id_arg = optional_session_id(args);
@@ -5179,7 +5190,10 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
         // Notices I sent that nobody answered: did my wake land?
         "owed_to_me": theirs,
         "scope": "unanswered = no notice binds in_reply_to to it; \
-                  drained_at:null additionally means it was never picked up",
+                  drained_at:null additionally means it was never picked up; \
+                  each row carries its OWN in_reply_to - group by that, not by \
+                  pointer_uri, or distinct dispositions anchored at one section \
+                  read as duplicates",
         "recipient_liveness_scope": "liveness measures the DELIVERY PATH (did that member \
                                      read its mailbox), not the member's ability to act — a \
                                      watcher polling for a broken CLI reads as live. \
@@ -8966,6 +8980,103 @@ mod member_mesh_tests {
         // Liveness is about the delivery path, not about acting — say so in
         // the payload, where a reader cannot skip past it.
         assert!(rows["recipient_liveness_scope"].is_string(), "{rows}");
+    }
+
+    /// Two dispositions, one pointer, different bindings. The report must show what
+    /// tells them apart, or the reader groups by the proxy and acks a live claim.
+    ///
+    /// This is the CBP 2026-08-26 case reduced to two rows. There, six pointers each
+    /// arrived three times, byte-identical (225ch, matching sha256) and ~0.3s apart,
+    /// from one sender: every visible field said "duplicate". They were twelve distinct
+    /// dispositions, one per fork of a batched act, deliberately anchored at the same
+    /// section of one forum file, and the only field that said so was `in_reply_to` —
+    /// which the row did not project. The query has always READ that column (the
+    /// `NOT EXISTS` clause is what makes a row unanswered at all); it just never showed
+    /// it.
+    #[tokio::test]
+    async fn unanswered_rows_carry_the_binding_that_separates_a_shared_pointer() {
+        let (_dir, state) = test_state().await;
+        let kimi = connect(&state, "kimi-code").await;
+        let claude = connect(&state, "claude-code").await;
+
+        // Two asks FROM claude TO kimi. A member may only bind to mail addressed to it,
+        // so these are what kimi is allowed to answer — and they are the shape the real
+        // case had: my notices to kimi, kimi's dispositions coming back.
+        let mut originals = Vec::new();
+        for i in 0..2 {
+            let out = tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                        "pointer_uri": format!("pr/{i}"), "session_id": claude}),
+            )
+            .await
+            .unwrap();
+            originals.push(out["queued_id"].as_u64().expect("queued_id"));
+        }
+        tool_member_inbox(&state, &json!({"session_id": kimi})).await.unwrap();
+
+        // Now the shape under test: kimi answers BOTH with the same anchor. Same
+        // recipient, same kind, byte-identical pointer; only the binding differs.
+        const SHARED: &str = "forum/kimi-code/batch.md#one-factor-per-digest";
+        for re in &originals {
+            tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": "claude-code", "kind": "reply",
+                        "pointer_uri": SHARED, "in_reply_to": re, "session_id": kimi}),
+            )
+            .await
+            .unwrap();
+        }
+
+        let rows = tool_member_unanswered(
+            &state,
+            &json!({"session_id": claude, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let mine = rows["i_owe"].as_array().unwrap();
+        let shared: Vec<&Value> = mine
+            .iter()
+            .filter(|r| r["pointer_uri"] == json!(SHARED))
+            .collect();
+        assert_eq!(shared.len(), 2, "both dispositions are owed: {rows}");
+
+        // The defect, stated as the assertion that would have caught it: grouping by
+        // every OTHER rendered field collapses these two into one.
+        let proxy: std::collections::HashSet<String> = shared
+            .iter()
+            .map(|r| format!("{}|{}|{}", r["from_plugin"], r["kind"], r["pointer_uri"]))
+            .collect();
+        assert_eq!(proxy.len(), 1, "the proxy key cannot tell them apart: {rows}");
+
+        let bound: std::collections::HashSet<u64> = shared
+            .iter()
+            .map(|r| {
+                r["in_reply_to"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("row has no in_reply_to: {r}"))
+            })
+            .collect();
+        assert_eq!(
+            bound.len(),
+            2,
+            "in_reply_to must separate what the pointer cannot: {rows}"
+        );
+        assert_eq!(
+            bound,
+            originals.iter().copied().collect(),
+            "and it must name the notices actually answered: {rows}"
+        );
+
+        // Say it where the reader is, not only in the row: the fire primer renders
+        // `scope`, and "group by the binding" is the instruction that prevents the
+        // mass-ack this row shape invites.
+        let scope = rows["scope"].as_str().unwrap_or_default();
+        assert!(scope.contains("in_reply_to"), "{rows}");
+        assert!(
+            scope.contains("group by"),
+            "scope must tell the reader HOW to group: {scope}"
+        );
     }
 
     /// Kimi review Finding 3: a pointer NAMES a location. Multi-line /

@@ -1168,7 +1168,8 @@ impl SqliteInboxStore {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at
+            "SELECT id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at,
+                    in_reply_to
              FROM member_notices n
              WHERE (n.to_plugin = ?1 OR n.from_plugin = ?1)
                AND n.dest_peer IS NULL
@@ -1194,13 +1195,16 @@ impl SqliteInboxStore {
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at) = row?;
+            let (id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at, re) =
+                row?;
             out.push(UnansweredNotice {
                 id: id as u64,
+                in_reply_to: re.map(|r| r as u64),
                 to_plugin,
                 from_plugin,
                 kind,
@@ -1478,6 +1482,23 @@ pub struct UnansweredNotice {
     pub pointer_uri: Option<String>,
     pub queued_at: DateTime<Utc>,
     pub drained_at: Option<DateTime<Utc>>,
+    /// What this notice is itself an answer to — projected because it is the ONLY
+    /// field that separates distinct dispositions sharing one pointer.
+    ///
+    /// Measured on CBP, 2026-08-26: a reader's 37 `i_owe` rows resolved to 25 distinct
+    /// `pointer_uri` values, six of them arriving three times each, byte-identical
+    /// (same length, same sha256) and ~0.3s apart. Read from the rendered row that is
+    /// twelve duplicate notices and a mass-ack discharges twelve debts at once. It was
+    /// not: every one carried a DIFFERENT `in_reply_to` (5603, 5611, 5619, 5627, ...) —
+    /// twelve distinct dispositions, one per fork of a batched act, deliberately
+    /// anchored at the same section of one forum file. The report projected the field
+    /// that does not discriminate and dropped the field that does.
+    ///
+    /// The query already reads this column in its `NOT EXISTS` clause: unansweredness
+    /// is DEFINED by what binds to `n.id`, so a report that never shows the binding
+    /// forces the reader to group by a proxy. Whether a debt is a duplicate is a
+    /// question about bindings, and the reader could not see them.
+    pub in_reply_to: Option<u64>,
 }
 
 /// One notice awaiting hand-off to the fleet mesh (r6-routing branch 2).
