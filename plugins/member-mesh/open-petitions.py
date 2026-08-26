@@ -69,9 +69,25 @@ def render(f):
     if not isinstance(f, dict):
         return ""
     if not f.get("asked"):
-        # The read failed, or the daemon predates this fold. Say so: "you hold
+        # The read failed, or the WATCHER predates this fold. Say so: "you hold
         # none" is a claim and this is not evidence for it — the same
         # absence-read-as-pass the primer's own ownership stamp exists to stop.
+        #
+        # And say WHICH, because the two want opposite responses and the primer
+        # asserted the first for both. Measured on CBP 2026-08-26: the claude and
+        # kimi watchers were executing a8dccda (2026-08-06), which has no fold at
+        # all, so every wake read "the pending-escalations read failed" about a
+        # read that was never attempted — a false cause, stated flatly, in the one
+        # surface a woken member is guaranteed to read. The discriminator is on
+        # disk and costs nothing: a watcher too old to fold writes NO
+        # `open_petitions` key, while a failed read writes `asked:false`.
+        # See tools/process_vintage.py for why the watcher's vintage is not
+        # something you can read off /proc.
+        if f.get("_absent"):
+            return ("Open petitions: NOT MEASURED this wake — your WATCHER predates "
+                    "the fold (no `open_petitions` key in the primer), so the read "
+                    "was never attempted. Restarting the watcher is what fixes this; "
+                    "this is not evidence that you hold none.")
         return ("Open petitions: NOT MEASURED this wake (the pending-escalations "
                 "read failed) — this is not evidence that you hold none.")
     mine = f.get("mine") or []
@@ -123,7 +139,14 @@ def main(argv):
         return 0
     if len(argv) >= 3 and argv[1] == "render":
         try:
-            f = json.load(open(argv[2])).get("open_petitions") or {}
+            d = json.load(open(argv[2]))
+            f = d.get("open_petitions") or {}
+            # Key-ABSENT and asked:false are different facts about different
+            # components — the watcher never folded, versus the daemon refused the
+            # read — and only this line can still tell them apart. `render` gets a
+            # dict either way, so the discriminator has to be carried, not inferred.
+            if "open_petitions" not in d:
+                f = dict(f, _absent=True)
         except Exception:
             return 0
         block = render(f)

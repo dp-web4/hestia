@@ -152,6 +152,30 @@ with tempfile.TemporaryDirectory() as tmp:
     check("B1 unmeasured fold says so", "NOT MEASURED" in out, repr(out))
     check("B1 and refuses the inference explicitly",
           "not evidence that you hold none" in out, repr(out))
+    check("B1 a failed READ is attributed to the read",
+          "read failed" in out and "WATCHER predates" not in out, repr(out))
+
+    # B1b: the OTHER cause of asked:false, and the reason it needed separating.
+    # A watcher too old to fold writes no `open_petitions` key at all, and until
+    # 2026-08-26 that rendered as "the pending-escalations read failed" — a flat
+    # assertion about a read nobody attempted. Measured that day: the claude and
+    # kimi watchers were running a8dccda (2026-08-06), which has no fold, so both
+    # seats read a false cause every wake. The two want opposite responses (chase
+    # the daemon vs restart the watcher), so the renderer must not merge them.
+    p = os.path.join(tmp, "primer-no-key.json")
+    with open(p, "w") as fh:
+        json.dump({"notices": []}, fh)          # NO open_petitions key
+    out_absent = subprocess.run([sys.executable, HELPER, "render", p],
+                                capture_output=True, text=True).stdout
+    check("B1b key-absent still says NOT MEASURED", "NOT MEASURED" in out_absent,
+          repr(out_absent))
+    check("B1b key-absent blames the WATCHER, not the read",
+          "WATCHER predates" in out_absent and "read failed" not in out_absent,
+          repr(out_absent))
+    check("B1b key-absent names the move that fixes it",
+          "estarting the watcher" in out_absent, repr(out_absent))
+    check("B1b key-absent still refuses the inference",
+          "not evidence that you hold none" in out_absent, repr(out_absent))
 
     # B2: measured-and-empty is silence. A block that fires every wake stops
     # being read, and holding nothing is the common case.

@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Date the source a RUNNING process is executing — and refuse the witnesses that lie.
+
+WHY THIS EXISTS. `tools/vintage_from_wire.py` (PR #614) dates a deployment from the
+CHAIN, and its docstring concedes the case it cannot reach: "that is true of the mesh
+fire scripts, which the watchers exec by argv path out of a shared dev tree". The
+premise there is that a long-running process's vintage is unmeasurable — you can only
+infer it from restart time and branch archaeology.
+
+That premise is FALSE, and this file is the counterexample. Measured on CBP 2026-08-26
+against the three member-mesh watchers, FOUR witnesses were available and THREE of them
+disagreed. Only cross-checking caught it:
+
+    witness                          said                        verdict
+    cat /proc/PID/fd/255             current (54340B, 08-25)     FALSE
+    stat -L /proc/PID/fd/255         48681B, mtime 08-18 18:27   FALSE for execution
+    WATCH_STARTUP_SHA256 (journal)   489c0076 = a8dccda, 08-06   TRUE
+    primer key census / behaviour    predates 08-19 and 08-20    TRUE, independent
+
+WHY EACH FALSE WITNESS IS FALSE — both failure modes are silent and both read as "fine":
+
+  1. `cat /proc/PID/fd/255` RE-OPENS BY PATH on a DrvFs/9p mount (WSL `/mnt/c`), so it
+     hands back the CURRENT file even when the fd's own inode is a different, deleted
+     one. It reports every stale process as up to date. `stat -L` on the SAME fd said
+     48681 bytes while `cat` on it returned 54340 — one fd, two answers. If the two
+     agree you have learned nothing; only the DISAGREEMENT is informative.
+
+  2. `stat -L /proc/PID/fd/255` reads the held inode honestly, but the held inode is not
+     what is executing. Bash parses a `while` loop — one compound command — ONCE, in
+     full, at startup. An in-place rewrite afterwards (a `>` redirect, which truncates
+     and grows the SAME inode) changes the bytes the fd sees and changes NOTHING about
+     the semantics already parsed into memory. So fd-stat dates the inode's later life,
+     not the parse.
+
+WHAT IS TRUE. The vintage of a long-running interpreter is fixed at PARSE TIME, so the
+only sound witness is one captured AT STARTUP by the process itself, or a downstream
+artifact whose SHAPE the running code determines:
+
+  * a startup self-hash the process prints (member-mesh: `WATCH_STARTUP_SHA256`, emitted
+    hourly on the `[hestia-watch] ARTIFACT ...` level line);
+  * a KEY CENSUS of an artifact the process writes — a key a known commit added is
+    absent below that commit and present above it, exactly the partition
+    `vintage_from_wire.py` uses on chain payloads, applied to a file instead;
+  * a BEHAVIOURAL probe — a branch a known commit added either runs or does not.
+
+A startup self-hash is a claim by the subject about itself, which is why it is not
+enough alone: #567's guard pinned SOURCE and printed "all checks passed" while the
+RENDER was broken. Confirm it with a census or a probe, which are properties of output
+and cannot be self-reported wrong.
+
+WHAT THIS FOUND. claude-code and kimi-code watchers were executing a8dccda
+(2026-08-06); codex was current. FIVE commits to that file had merged to main in
+between, including `ebc3719` ("rc=124 proves the primer was delivered — stop reporting
+it undelivered"). The fleetwide "undelivered" epidemic was that lag, on two seats,
+announced hourly into a journal nobody read.
+
+Usage:
+    process_vintage.py units                 # every member-mesh watcher, resolved
+    process_vintage.py fd <pid> <path>       # the two-witness fd contradiction check
+"""
+import hashlib
+import os
+import re
+import subprocess
+import sys
+
+# `[hestia-watch] ARTIFACT plugin=X state=Y reason=Z startup_sha256=... disk_sha256=...`
+# The LEVEL line, not the edge alarm. The edge fires once and is gone with the journal's
+# retention window; a process older than that window has no edge left to read, which is
+# how a 20-day drift stayed invisible while being correctly detected the whole time.
+ARTIFACT_RE = re.compile(
+    r"ARTIFACT\s+plugin=(?P<plugin>\S+)\s+state=(?P<state>\S+)\s+"
+    r"reason=(?P<reason>\S+)\s+startup_sha256=(?P<startup>\S+)\s+"
+    r"disk_sha256=(?P<disk>\S+)")
+
+WATCHER_UNITS = ("hestia-watch-claude", "hestia-watch-codex", "hestia-watch-kimi")
+WATCH_PATH = "plugins/member-mesh/hestia-watch-member.sh"
+
+
+def parse_artifact(line):
+    """Pull the startup/disk pair out of one ARTIFACT level line. None if not one.
+
+    Returns the raw strings; validation is `classify`'s job, because "this field is not
+    a sha" is a state the watcher reports deliberately (`unverifiable`) and collapsing
+    it into a parse failure would hide it.
+    """
+    m = ARTIFACT_RE.search(line or "")
+    return m.groupdict() if m else None
+
+
+def classify(startup, disk):
+    """drift / ok / unverifiable, from the pair alone.
+
+    Mirrors `check_artifact_drift` in the watcher so a reader can check the tool against
+    the shell without running either. `unverifiable` is NOT `ok`: an absent baseline
+    means the question was never answerable, and reporting that as agreement is the
+    absence-read-as-pass this whole corpus keeps re-finding.
+    """
+    hexish = lambda s: bool(re.fullmatch(r"[0-9a-f]{64}", s or ""))
+    if not hexish(startup):
+        return "unverifiable", "startup-baseline-unavailable"
+    if not hexish(disk):
+        return "unverifiable", "disk-hash-unavailable"
+    if startup != disk:
+        return "drift", "differs-from-startup"
+    return "ok", "matches-startup"
+
+
+def fd_witnesses(fd_size, fd_readback_sha, disk_size, disk_sha):
+    """Name which fd witness is lying, from the four numbers.
+
+    The point of returning a VERDICT rather than a boolean: when `cat` and `stat`
+    agree, that is not corroboration — on a filesystem where `cat` re-opens by path,
+    agreement is exactly what an up-to-date process AND a stale one both produce. Only
+    disagreement carries information, so `agree` is reported as UNINFORMATIVE.
+    """
+    readback_is_disk = (fd_readback_sha == disk_sha)
+    stat_is_disk = (fd_size == disk_size)
+    if readback_is_disk and not stat_is_disk:
+        return ("cat-lies",
+                "cat re-opened by path (DrvFs/9p): it returned the CURRENT file while "
+                "stat on the same fd reports a different inode. Trust neither for "
+                "execution vintage; use the startup self-hash.")
+    if not readback_is_disk and not stat_is_disk:
+        return ("fd-holds-old-inode",
+                "the fd genuinely holds a superseded inode — but that still dates the "
+                "INODE, not the parse. Confirm with a startup hash or key census.")
+    return ("agree-uninformative",
+            "both fd witnesses match the on-disk file. This does NOT show the process "
+            "is current: it is also what a stale process looks like when cat re-opens "
+            "by path. Uninformative either way.")
+
+
+def sha256_bytes(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def _run(args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=60).stdout
+    except Exception:
+        return ""
+
+
+def git_versions(repo, path):
+    """sha256 -> (commit, iso date, subject) for every committed version of `path`.
+
+    Keyed on the CONTENT hash, never on size: measured 2026-08-26, a 48681-byte inode
+    matched a 48681-byte blob at `8af9a76` whose sha256 was entirely different. Size is
+    a collision-rich key that produces a confident wrong commit id.
+    """
+    out = {}
+    revs = _run(["git", "-C", repo, "rev-list", "--all", "--", path]).split()
+    for c in revs:
+        blob = _run(["git", "-C", repo, "rev-parse", f"{c}:{path}"]).strip()
+        if not blob:
+            continue
+        raw = subprocess.run(["git", "-C", repo, "cat-file", "-p", blob],
+                             capture_output=True, timeout=60).stdout
+        h = sha256_bytes(raw)
+        if h not in out:
+            meta = _run(["git", "-C", repo, "log", "-1", "--format=%cI\t%s", c]).strip()
+            date, _, subj = meta.partition("\t")
+            out[h] = (c[:7], date, subj)
+    return out
+
+
+def cmd_units(repo):
+    versions = git_versions(repo, WATCH_PATH)
+    print(f"{len(versions)} distinct committed versions of {WATCH_PATH}\n")
+    for unit in WATCHER_UNITS:
+        log = _run(["journalctl", "--user", "-u", unit, "--no-pager"])
+        art = None
+        for line in log.splitlines():
+            p = parse_artifact(line)
+            if p:
+                art = p            # keep the LAST — the level line, hourly
+        if not art:
+            print(f"{unit}: no ARTIFACT level line in the journal window — "
+                  f"vintage NOT MEASURED (not 'current')")
+            continue
+        state, reason = classify(art["startup"], art["disk"])
+        got = versions.get(art["startup"])
+        where = (f"{got[0]}  {got[1]}  {got[2][:58]}" if got
+                 else "matches NO commit — an uncommitted working-tree state")
+        print(f"{unit}  [{state}: {reason}]")
+        print(f"    in force: {where}")
+        if state == "drift":
+            since = _run(["git", "-C", repo, "log", "--oneline",
+                          f"{got[0]}..origin/main", "--", WATCH_PATH]) if got else ""
+            n = len([x for x in since.splitlines() if x.strip()])
+            print(f"    {n} commit(s) to this file merged to main since — NOT in force:")
+            for line in since.splitlines():
+                print(f"      {line}")
+        print()
+
+
+def cmd_fd(pid, path):
+    disk = open(path, "rb").read()
+    fd = f"/proc/{pid}/fd/255"
+    st = os.stat(fd)                       # follows to the held inode
+    readback = open(fd, "rb").read()
+    verdict, why = fd_witnesses(st.st_size, sha256_bytes(readback),
+                                len(disk), sha256_bytes(disk))
+    print(f"pid {pid} fd 255 -> {path}")
+    print(f"  stat -L size : {st.st_size}   (on disk: {len(disk)})")
+    print(f"  cat readback : {sha256_bytes(readback)[:16]}   "
+          f"(on disk: {sha256_bytes(disk)[:16]})")
+    print(f"  VERDICT: {verdict} — {why}")
+
+
+def main(argv):
+    repo = os.environ.get("HESTIA_REPO") or os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))
+    if len(argv) >= 2 and argv[1] == "units":
+        cmd_units(repo)
+        return 0
+    if len(argv) >= 4 and argv[1] == "fd":
+        cmd_fd(argv[2], argv[3])
+        return 0
+    print(__doc__.strip().splitlines()[0], file=sys.stderr)
+    print("usage: process_vintage.py units | fd <pid> <path>", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
