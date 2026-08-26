@@ -169,13 +169,33 @@ with tempfile.TemporaryDirectory() as tmp:
                                 capture_output=True, text=True).stdout
     check("B1b key-absent still says NOT MEASURED", "NOT MEASURED" in out_absent,
           repr(out_absent))
-    check("B1b key-absent blames the WATCHER, not the read",
-          "WATCHER predates" in out_absent and "read failed" not in out_absent,
-          repr(out_absent))
-    check("B1b key-absent names the move that fixes it",
-          "estarting the watcher" in out_absent, repr(out_absent))
+    check("B1b key-absent is still separated from the failed read",
+          "read failed" not in out_absent, repr(out_absent))
     check("B1b key-absent still refuses the inference",
           "not evidence that you hold none" in out_absent, repr(out_absent))
+
+    # B1c: the FALSIFIER B1b did not have. Absence dates the primer's PRODUCER,
+    # and that is not the same fact as the vintage of the watcher running now.
+    # Codex gave two live counterexamples on PR #634 in which a fully current
+    # watcher launches a keyless primer: a retained primer written before the
+    # restart is retried after it, and the current watcher's own composition
+    # fallback (`... || echo "$OUT" > "$PRIMER"`) emits a keyless primer when the
+    # final step fails. So the first version of this branch — "your WATCHER
+    # predates the fold ... restarting the watcher is what fixes this" — asserted
+    # a cause and prescribed a remedy the artifact does not entail. That is the
+    # same overclaim-from-absence the branch exists to stop, committed by the
+    # branch itself, which is why the wording is pinned and not just spot-checked.
+    check("B1c key-absent does NOT claim the RUNNING watcher predates the fold",
+          "WATCHER predates" not in out_absent, repr(out_absent))
+    check("B1c key-absent does NOT prescribe a restart as the entailed remedy",
+          "estarting the watcher is what fixes" not in out_absent, repr(out_absent))
+    check("B1c key-absent attributes the absence to the PRODUCER of this primer",
+          "PRODUCER" in out_absent and "primer" in out_absent, repr(out_absent))
+    check("B1c key-absent names BOTH admissible producers",
+          "without the fold" in out_absent and "composition fallback" in out_absent,
+          repr(out_absent))
+    check("B1c key-absent points at the tool that DOES discriminate them",
+          "process_vintage.py units" in out_absent, repr(out_absent))
 
     # B2: measured-and-empty is silence. A block that fires every wake stops
     # being read, and holding nothing is the common case.

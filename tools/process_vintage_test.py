@@ -19,6 +19,7 @@ than no answer. `git_versions` is keyed on sha256 and this pins that.
 Run: python3 tools/process_vintage_test.py   (or via pytest)
 """
 import importlib.util
+import io
 import os
 import sys
 
@@ -109,6 +110,157 @@ def test_size_is_not_a_key():
           "a size-keyed lookup would map both to one commit")
 
 
+# ---------------------------------------------------------------------------
+# The invocation-binding arms. `cmd_units` shells out for everything, so `_run`
+# and `git_versions` are the only two seams — stub both and the whole decision
+# surface is reachable without a systemd host.
+# ---------------------------------------------------------------------------
+
+STARTUP = pv.parse_artifact(REAL_LINE)["startup"]
+VERSIONS = {STARTUP: ("a8dccda", "2026-08-06T14:30:59-07:00", "the stale watcher body")}
+
+
+class FakeShell:
+    """Stand in for systemctl and journalctl, and RECORD what was asked.
+
+    Recording matters as much as answering: two of the arms below are about a
+    query that must NOT be made (the journal of a dead process) or must be made
+    in one particular form (bound to the invocation). A stub that only returns
+    output can be satisfied by code that asks the wrong question and ignores it.
+    """
+
+    def __init__(self, units):
+        self.units = units
+        self.calls = []
+
+    def __call__(self, args):
+        args = list(args)
+        self.calls.append(args)
+        if args[:3] == ["systemctl", "--user", "show"]:
+            spec = self.units.get(args[3], {})
+            return (f"ActiveState={spec.get('state', 'active')}\n"
+                    f"MainPID={spec.get('pid', '4242')}\n"
+                    f"InvocationID={spec.get('invocation', '')}\n")
+        if args and args[0] == "journalctl":
+            for spec in self.units.values():
+                inv = spec.get("invocation")
+                if inv and f"_SYSTEMD_INVOCATION_ID={inv}" in args:
+                    return spec.get("inv_log", "")
+            if "-u" in args:
+                return self.units.get(args[args.index("-u") + 1], {}).get("unit_log", "")
+        return ""
+
+
+def run_units(units):
+    """cmd_units against a fake host. Returns (stdout, the calls it made)."""
+    import contextlib
+    shell = FakeShell(units)
+    real_run, real_versions, real_units = pv._run, pv.git_versions, pv.WATCHER_UNITS
+    buf = io.StringIO()
+    try:
+        pv._run = shell
+        pv.git_versions = lambda repo, path: VERSIONS
+        # Only the units under test — otherwise the two unstubbed real watcher names
+        # answer from FakeShell's defaults and every per-call assertion below counts
+        # queries the test never asked for.
+        pv.WATCHER_UNITS = tuple(units)
+        with contextlib.redirect_stdout(buf):
+            pv.cmd_units("/repo")
+    finally:
+        pv._run, pv.git_versions, pv.WATCHER_UNITS = (
+            real_run, real_versions, real_units)
+    return buf.getvalue(), shell.calls
+
+
+def test_a_stopped_unit_is_not_measured_and_its_journal_is_not_even_read():
+    """A dead process has no vintage. Its last ARTIFACT line dates the process that
+    EXITED — an artifact outliving its producer, which is this tool's own subject."""
+    out, calls = run_units({"hestia-watch-claude": {
+        "state": "inactive", "unit_log": REAL_LINE}})
+    check("refuses", "NOT MEASURED" in out, out)
+    check("says why", "Nothing is executing" in out, out)
+    check("no commit claimed", "a8dccda" not in out, out)
+    check("did not consult the journal at all",
+          not any(c and c[0] == "journalctl" for c in calls), calls)
+
+
+def test_a_restart_with_no_fresh_level_line_refuses_instead_of_the_previous_one():
+    """The load-bearing arm. Measured on CBP 2026-08-26 the journal retained 1h46m
+    while the ARTIFACT level line is HOURLY, so for up to an hour after a restart the
+    unit-wide query still returns the PREVIOUS invocation's startup hash. That is the
+    exact minute someone runs this tool to check the restart took, and the unbound
+    version told them it had not."""
+    out, _ = run_units({"hestia-watch-claude": {
+        "state": "active", "invocation": "NEWINV", "inv_log": "",
+        "unit_log": REAL_LINE}})
+    check("refuses", "NOT MEASURED" in out, out)
+    check("does NOT report the dead invocation's commit", "a8dccda" not in out, out)
+    check("does NOT report a vintage at all", "in force" not in out, out)
+    check("names the inference it is refusing",
+          "NOT evidence the restart failed to take" in out, out)
+
+
+def test_the_journal_query_is_bound_to_the_invocation_not_the_unit():
+    """Pins the mechanism, not just the message: a unit-wide query spans every
+    invocation still inside the retention window."""
+    _, calls = run_units({"hestia-watch-claude": {
+        "state": "active", "invocation": "NEWINV", "inv_log": REAL_LINE}})
+    journal = [c for c in calls if c and c[0] == "journalctl"]
+    check("asked the journal once", len(journal) == 1, journal)
+    check("bound to the invocation",
+          "_SYSTEMD_INVOCATION_ID=NEWINV" in journal[0], journal[0])
+    check("never asked unit-wide", "-u" not in journal[0], journal[0])
+
+
+def test_an_unbindable_unit_is_labelled_rather_than_silently_unit_wide():
+    """No InvocationID (not systemd, or systemd not answering) is a degraded answer,
+    not an equal one. Report it, do not launder it."""
+    out, calls = run_units({"hestia-watch-claude": {
+        "state": "active", "invocation": "", "unit_log": REAL_LINE}})
+    check("fell back to unit-wide",
+          any(c and c[0] == "journalctl" and "-u" in c for c in calls), calls)
+    check("and said so", "may belong to a previous invocation" in out, out)
+
+
+def test_an_active_unit_with_a_fresh_level_line_still_reports_its_vintage():
+    """POSITIVE CONTROL for the three refusals above. Without it, a `cmd_units` that
+    refused every input would pass this file — the refusals would be measuring
+    nothing, which is the failure mode the corpus keeps re-finding."""
+    out, _ = run_units({"hestia-watch-claude": {
+        "state": "active", "invocation": "NEWINV", "inv_log": REAL_LINE}})
+    check("measured", "NOT MEASURED" not in out, out)
+    check("names the commit in force", "a8dccda" in out, out)
+    check("and its verdict", "drift" in out, out)
+
+
+def test_same_size_different_content_is_not_agreement():
+    """codex and kimi-code named this independently on PR #634. The readback hash
+    differs from disk while the sizes collide — a same-size rewrite or a mid-write
+    race — and the first version fell through to the agreement arm, whose message
+    asserts "both fd witnesses match the on-disk file" about a readback that
+    provably does not."""
+    v, why = pv.fd_witnesses(fd_size=100, fd_readback_sha=A, disk_size=100, disk_sha=B)
+    check("not agreement", v != "agree-uninformative", v)
+    check("verdict", v == "fd-content-differs-size-collides", v)
+    check("the message does not claim a match",
+          "both fd witnesses match" not in why, why)
+    check("names the collision", "collision" in why, why)
+
+
+def test_every_fd_input_combination_has_its_own_verdict():
+    """Exhaustive over the 2x2. A truth table with four inputs and three names has a
+    fallthrough, and a fallthrough carries the message of whichever arm it lands in."""
+    got = {(rb, sz): pv.fd_witnesses(
+        fd_size=(100 if sz else 200), fd_readback_sha=(A if rb else B),
+        disk_size=100, disk_sha=A)[0]
+        for rb in (True, False) for sz in (True, False)}
+    check("four inputs", len(got) == 4, got)
+    check("four distinct verdicts", len(set(got.values())) == 4, got)
+    check("only true/true is agreement",
+          [k for k, v in got.items() if v == "agree-uninformative"] == [(True, True)],
+          got)
+
+
 TESTS = [
     test_parses_the_real_journal_line,
     test_a_non_artifact_line_is_not_half_parsed,
@@ -118,6 +270,13 @@ TESTS = [
     test_cat_lying_is_detected_by_the_size_disagreement,
     test_a_genuinely_held_old_inode_still_does_not_date_the_parse,
     test_size_is_not_a_key,
+    test_same_size_different_content_is_not_agreement,
+    test_every_fd_input_combination_has_its_own_verdict,
+    test_a_stopped_unit_is_not_measured_and_its_journal_is_not_even_read,
+    test_a_restart_with_no_fresh_level_line_refuses_instead_of_the_previous_one,
+    test_the_journal_query_is_bound_to_the_invocation_not_the_unit,
+    test_an_unbindable_unit_is_labelled_rather_than_silently_unit_wide,
+    test_an_active_unit_with_a_fresh_level_line_still_reports_its_vintage,
 ]
 
 

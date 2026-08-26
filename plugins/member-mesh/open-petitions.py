@@ -84,10 +84,21 @@ def render(f):
         # See tools/process_vintage.py for why the watcher's vintage is not
         # something you can read off /proc.
         if f.get("_absent"):
-            return ("Open petitions: NOT MEASURED this wake — your WATCHER predates "
-                    "the fold (no `open_petitions` key in the primer), so the read "
-                    "was never attempted. Restarting the watcher is what fixes this; "
-                    "this is not evidence that you hold none.")
+            # Say what the ARTIFACT shows and stop. Key-absence dates THIS PRIMER's
+            # producer, not the watcher now running, and codex named two live
+            # counterexamples on PR #634: a retained primer written by the old watcher
+            # is retried AFTER a restart, so a fully current watcher can launch a
+            # keyless one; and the current watcher's own composition fallback
+            # (`... || echo "$OUT" > "$PRIMER"`) emits a keyless primer when the final
+            # step fails. Both make "your watcher predates the fold" a cause the
+            # artifact does not entail — the same overclaim-from-absence this branch
+            # exists to stop, committed by the branch itself.
+            return ("Open petitions: NOT MEASURED this wake — this primer carries no "
+                    "`open_petitions` key, so the read was never attempted for it. "
+                    "That dates the primer's PRODUCER (a watcher without the fold, or "
+                    "a composition fallback), not necessarily the watcher running now; "
+                    "`tools/process_vintage.py units` is what tells them apart. This "
+                    "is not evidence that you hold none.")
         return ("Open petitions: NOT MEASURED this wake (the pending-escalations "
                 "read failed) — this is not evidence that you hold none.")
     mine = f.get("mine") or []

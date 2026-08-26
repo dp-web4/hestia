@@ -54,6 +54,14 @@ between, including `ebc3719` ("rc=124 proves the primer was delivered — stop r
 it undelivered"). The fleetwide "undelivered" epidemic was that lag, on two seats,
 announced hourly into a journal nobody read.
 
+A startup self-hash also has to be BOUND TO THE RUNNING INVOCATION to mean anything.
+`journalctl -u <unit>` spans every invocation still inside the retention window, so its
+last ARTIFACT line can be the exit statement of a process that is gone. `cmd_units`
+therefore reads `_SYSTEMD_INVOCATION_ID` for the current run, refuses outright on a unit
+that is not active, and refuses again when the current invocation has not yet emitted a
+level line — the last case being exactly the hour after a restart, when someone is
+checking whether the restart took.
+
 Usage:
     process_vintage.py units                 # every member-mesh watcher, resolved
     process_vintage.py fd <pid> <path>       # the two-witness fd contradiction check
@@ -107,12 +115,20 @@ def classify(startup, disk):
 
 
 def fd_witnesses(fd_size, fd_readback_sha, disk_size, disk_sha):
-    """Name which fd witness is lying, from the four numbers.
+    """Name which fd witness is lying, across ALL FOUR input combinations.
 
     The point of returning a VERDICT rather than a boolean: when `cat` and `stat`
     agree, that is not corroboration — on a filesystem where `cat` re-opens by path,
     agreement is exactly what an up-to-date process AND a stale one both produce. Only
     disagreement carries information, so `agree` is reported as UNINFORMATIVE.
+
+    CONTENT DECIDES, SIZE NEVER DOES. `git_versions` below already refuses size as a
+    key because a 48681-byte inode collided with an unrelated 48681-byte blob. The
+    first version of this function applied that doctrine to the commit lookup and NOT
+    to the fd two lines above it: `(readback != disk, size == disk)` fell through to
+    the agreement arm and printed "both fd witnesses match the on-disk file" about a
+    readback that provably did not. Named by codex and kimi-code independently on
+    PR #634. Every arm below now branches on the readback first.
     """
     readback_is_disk = (fd_readback_sha == disk_sha)
     stat_is_disk = (fd_size == disk_size)
@@ -125,6 +141,12 @@ def fd_witnesses(fd_size, fd_readback_sha, disk_size, disk_sha):
         return ("fd-holds-old-inode",
                 "the fd genuinely holds a superseded inode — but that still dates the "
                 "INODE, not the parse. Confirm with a startup hash or key census.")
+    if not readback_is_disk and stat_is_disk:
+        return ("fd-content-differs-size-collides",
+                "the fd's CONTENT differs from disk while the sizes happen to match — "
+                "a same-size rewrite, or a read caught mid-write. The size agreement "
+                "is a collision and carries nothing; this is the old-content case. "
+                "It still dates the INODE, not the parse: use the startup self-hash.")
     return ("agree-uninformative",
             "both fd witnesses match the on-disk file. This does NOT show the process "
             "is current: it is also what a stale process looks like when cat re-opens "
@@ -165,20 +187,74 @@ def git_versions(repo, path):
     return out
 
 
+def unit_state(unit):
+    """ActiveState / MainPID / InvocationID for ONE unit. Empty dict if systemd is not
+    answering — an empty dict is a refusal downstream, never a default.
+
+    Queried one unit at a time on purpose: `systemctl show a b c` emits unlabelled
+    property blocks in argument order, so a batched call is positional and one missing
+    unit silently shifts every later answer onto the wrong name.
+    """
+    out = {}
+    for line in _run(["systemctl", "--user", "show", unit,
+                      "-p", "ActiveState", "-p", "MainPID",
+                      "-p", "InvocationID"]).splitlines():
+        k, _, v = line.partition("=")
+        if k:
+            out[k] = v.strip()
+    return out
+
+
+def invocation_log(unit, invocation_id):
+    """The journal for the CURRENT run of `unit`, and whether it is actually bound.
+
+    `journalctl -u <unit>` spans EVERY invocation still inside the retention window,
+    so the last ARTIFACT line in it can belong to a process that no longer exists.
+    Measured on CBP 2026-08-26: retention held 1h46m while the ARTIFACT level line is
+    emitted HOURLY — so for up to an hour after a restart, the unit-wide query returns
+    the PREVIOUS invocation's startup hash. That is precisely the minute someone runs
+    this tool to check whether their restart took, and the unbound version would have
+    told them it did not. Bind to `_SYSTEMD_INVOCATION_ID` or say you did not.
+    """
+    if invocation_id:
+        return _run(["journalctl", "--user",
+                     f"_SYSTEMD_INVOCATION_ID={invocation_id}", "--no-pager"]), True
+    return _run(["journalctl", "--user", "-u", unit, "--no-pager"]), False
+
+
 def cmd_units(repo):
     versions = git_versions(repo, WATCH_PATH)
     print(f"{len(versions)} distinct committed versions of {WATCH_PATH}\n")
     for unit in WATCHER_UNITS:
-        log = _run(["journalctl", "--user", "-u", unit, "--no-pager"])
+        st = unit_state(unit)
+        active = st.get("ActiveState")
+        if active != "active":
+            # A stopped unit has no vintage. Its last journal line dates the process
+            # that EXITED, and reporting that as "in force" is the same shape as the
+            # bug this whole file is about: an artifact outliving its producer.
+            print(f"{unit}: unit is {active or 'not reported by systemd'} — vintage "
+                  f"NOT MEASURED. Nothing is executing; the last journal line dates "
+                  f"the process that exited, not one in force.\n")
+            continue
+        log, bound = invocation_log(unit, st.get("InvocationID"))
         art = None
         for line in log.splitlines():
-            p = parse_artifact(line)
-            if p:
-                art = p            # keep the LAST — the level line, hourly
+            parsed = parse_artifact(line)
+            if parsed:
+                art = parsed       # keep the LAST — the level line, hourly
         if not art:
-            print(f"{unit}: no ARTIFACT level line in the journal window — "
-                  f"vintage NOT MEASURED (not 'current')")
+            if bound:
+                print(f"{unit}: active as pid {st.get('MainPID') or '?'} but THIS "
+                      f"invocation has emitted no ARTIFACT level line yet (it is "
+                      f"hourly) — vintage NOT MEASURED. This is NOT evidence the "
+                      f"restart failed to take; wait for the next level line.\n")
+            else:
+                print(f"{unit}: no ARTIFACT level line in the journal window — "
+                      f"vintage NOT MEASURED (not 'current')\n")
             continue
+        if not bound:
+            print(f"{unit}: WARNING — systemd gave no InvocationID, so the line below "
+                  f"is unit-wide and may belong to a previous invocation.")
         state, reason = classify(art["startup"], art["disk"])
         got = versions.get(art["startup"])
         where = (f"{got[0]}  {got[1]}  {got[2][:58]}" if got
