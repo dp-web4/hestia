@@ -55,6 +55,24 @@
 //! WHAT THIS FILE IS. Four OPEN-DEFECT PINS, in the hole-J shape: each asserts the
 //! CURRENT WRONG BEHAVIOUR, so each is green while the defect stands and goes RED the moment
 //! it is fixed. A red here is the intended end state, and the failure message says so.
+//!
+//! TURNOVER LEDGER, so a reader can tell a pin that is still WAITING from one that has been
+//! PAID. A turned-over pin keeps its history in place and inverts its assertion; none are
+//! deleted, because the specimen is the durable part.
+//!
+//!   PIN 1        — OPEN.        `retry_within_secs` still emits the supremum at open time.
+//!   PIN 2        — OPEN.        the emitting site still has no decided-anchored deadline.
+//!   PIN 4(a)-(c) — TURNED OVER #518/#528. `permits_write` reads `is_claimable(now)` and
+//!                                the poll renders `claim_window_secs_remaining`.
+//!   PIN 4(d)     — TURNED OVER #611, 2026-08-26. The note is produced by
+//!                                `Escalation::claim_note(now)` and names WHICH of the two
+//!                                causes of `permits_write: false` a payload carries.
+//!
+//! The last of those is the one worth restating, because the pin's own failure message
+//! anticipated the wrong fix: deleting the false sentence would have turned it red without
+//! closing anything. `permits_write: false` has two causes — SPENT and LAPSED — and every
+//! other field the poll renders is identical between them. Prose that says nothing and prose
+//! that says the wrong thing fail an asker in the same place.
 
 use hestia::server::gate_escalation::{
     Channel, EscalationStore, Status, APPROVAL_CLAIM_WINDOW_SECS, DEFAULT_TTL_SECS,
@@ -86,11 +104,17 @@ const ADVERTISED_RETRY_EXPR: &str =
 const POLL_PERMITS_WRITE_EXPR: &str =
     r#""permits_write": esc.map(|e| e.is_claimable(now)).unwrap_or(false),"#;
 
-/// The poll surface's note, unchanged since before #518, still describing the two-conjunct
-/// rule the field beside it stopped using. This is the string the live daemon returned at
-/// 18:45Z on 2026-08-18 for `5725d296b05cbc4c`, 83 minutes after that grant stopped being
-/// claimable — and again at 00:29:56Z on 2026-08-19 for `b1e32c344564f08e`, this seat's own
-/// permit, from a daemon whose binary predates the fix.
+/// The RETIRED poll note — the two-conjunct rule the `permits_write` field stopped using at
+/// #518 and the sentence beside it kept teaching for six days after.
+///
+/// This is the string the live daemon returned at 18:45Z on 2026-08-18 for
+/// `5725d296b05cbc4c`, 83 minutes after that grant stopped being claimable; again at
+/// 00:29:56Z on 2026-08-19 for `b1e32c344564f08e`, this seat's own permit, from a daemon
+/// whose binary predates the fix; and last at 20:24Z on 2026-08-24 for `27a25b66e7fe22d0`,
+/// beside `approved` + `bar_met: true` + `permits_write: false` on a permit claimed 41s
+/// after its grant — the payload that finally motivated #611.
+///
+/// Kept as a NEGATIVE constant: PIN 4(d) below now asserts this appears in no producer.
 const POLL_TWO_CONJUNCT_NOTE: &str =
     "authoritative as of now; only `approved` WITH the stated bar met permits the write";
 
@@ -123,6 +147,16 @@ fn production_body(rel: &str, want_fn: &str) -> String {
     assert!(in_fn, "fn `{want_fn}` not found in {rel} — this pin is measuring nothing");
     assert!(!out.is_empty(), "fn `{want_fn}` body read as empty in {rel}");
     out.join("\n")
+}
+
+/// The WHOLE text of one file in `src`, comments included.
+///
+/// Deliberately un-stripped, unlike `production_body`: its one use below is a NEGATIVE
+/// assertion — a retired string must appear nowhere — and for that, prose is not an escape
+/// hatch but a place the literal can hide and be copied back out of.
+fn production_text(rel: &str) -> String {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    fs::read_to_string(src.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
 /// Open one escalation on a `SingleApprover` marker, so a lone sovereign approval meets the
@@ -559,22 +593,88 @@ fn past_the_horizon_the_asker_surface_reads_dead() {
         "REGRESSION: the poll surface has stopped rendering the horizon it enforces against."
     );
 
-    // (d) THE HALF THAT DID NOT TURN OVER — moved here from PIN 2(d) of
-    // `permits_write_outlives_the_claim_horizon.rs` when that file was retired.
+    // (d) TURNED OVER, 2026-08-26 (#611). Was: THE HALF THAT DID NOT TURN OVER — moved here
+    // from PIN 2(d) of `permits_write_outlives_the_claim_horizon.rs` when that file was
+    // retired, and the last of this file's four pins still asserting a wrong behaviour.
     //
-    // The field learned four conjuncts; the sentence beside it still teaches two. A reader who
-    // takes the note at its word concludes that an approval which is `approved` with its bar
-    // met permits the write — which is now exactly the case `permits_write: false` is emitted
-    // for, on a spent or horizon-dead permit. Before #518 the note was wrong in the same
-    // direction as the field, so it added nothing; now it CONTRADICTS the field it annotates,
-    // and the note is the half a reader is likelier to quote.
+    // WHAT IT PINNED. The field learned four conjuncts at #518; the sentence beside it kept
+    // teaching two. A reader who took the note at its word concluded that an approval which
+    // is `approved` with its bar met permits the write — which is exactly the case
+    // `permits_write: false` is emitted for, on a spent or horizon-dead permit. Before #518
+    // the note was wrong in the same direction as the field, so it added nothing; after
+    // #518 it CONTRADICTED the field it annotates, and the note is the half a reader is
+    // likelier to quote.
     //
-    // Bound to the production string, so a fix to the note turns this red and nothing else does.
+    // WHAT CLOSED IT, and why the assertions below are shaped this way. The pin's failure
+    // message did not ask for the false sentence to be DELETED — a bare `permits_write:
+    // false` with no note leaves an asker unable to tell a deny from an expiry, which is a
+    // different defect at the same surface. It asked that the replacement NAME THE SPENT AND
+    // HORIZON CONJUNCTS. So the turnover checks the naming on BEHAVIOUR, against two
+    // specimens that differ in nothing else, and checks on source only the two things
+    // behaviour cannot see: that one producer feeds the surface, and that the retired
+    // sentence is gone from every file that could copy it back.
+    for rel in ["server/handler.rs", "server/gate_escalation.rs"] {
+        assert!(
+            !production_text(rel).contains(POLL_TWO_CONJUNCT_NOTE),
+            "REGRESSION: the retired two-conjunct note is back in {rel}. It states the \
+             pre-#518 rule that `permits_write` stopped using, so it reads as a GRANT on \
+             every payload where the permit is spent or past its horizon — the exact \
+             payloads a poll is issued to check."
+        );
+    }
     assert!(
-        poll.contains(POLL_TWO_CONJUNCT_NOTE),
-        "OPEN-DEFECT PIN 4(d) has gone RED, which is the intended end state: the poll note no \
-         longer describes the two-conjunct rule its field abandoned in #518. Confirm it now \
-         names the SPENT and HORIZON conjuncts rather than merely being deleted — an asker \
-         reading a bare `permits_write: false` with no note cannot tell a deny from an expiry."
+        poll.contains("e.claim_note(now)"),
+        "REGRESSION: the poll surface has stopped taking its note from the single producer. \
+         A second sentence written at this call site is how the first one drifted: the field \
+         was repaired at one site and the prose explaining it at another, and nothing \
+         compiles a string literal."
+    );
+
+    // THE DISCRIMINATION, on behaviour. Two permits that render IDENTICALLY in every other
+    // field the poll carries — `approved`, `bar_met: true`, `granted: true`,
+    // `permits_write: false`, `claim_window_secs_remaining: 0` — separated only by cause:
+    // this one LAPSED, the next was SPENT. Measured live as one shape on CBP 2026-08-26
+    // 03:10Z (`c5e2cab3c68874c4` lapsed, `365289a4402c4f13` spent).
+    let lapsed_note = esc.claim_note(dead);
+    assert!(
+        lapsed_note.contains("CLAIM WINDOW HAS CLOSED"),
+        "the HORIZON conjunct is unnamed: an asker past the horizon is told the write is \
+         refused and not that its own clock is what refused it, got {lapsed_note:?}"
+    );
+    assert_eq!(
+        esc.consumed_at, None,
+        "the lapsed specimen must be unspent, or it is not the state this arm names"
+    );
+
+    let (mut spent_store, spent_id) = opened(DEFAULT_TTL_SECS);
+    approve_at(&mut spent_store, &spent_id, granted_at);
+    assert!(
+        spent_store
+            .claim("claude-code", "law_inject.py", Some(HORIZON_ACT), granted_at + 1)
+            .is_some(),
+        "the spent arm is only in-domain if the claim actually lands"
+    );
+    let spent = spent_store.get(&spent_id).expect("get").clone();
+    let spent_note = spent.claim_note(dead);
+    assert!(
+        spent_note.contains("ALREADY BEEN CLAIMED"),
+        "the SPENT conjunct is unnamed, got {spent_note:?}"
+    );
+    assert!(
+        spent.consumed_at.is_some(),
+        "`consumed_at` is the machine-readable half of this same distinction, and #611 put it \
+         on the poll: the note is for a human, this field is for the peer auditing which of \
+         N approvals on a shared marker was the one actually spent"
+    );
+    assert_ne!(
+        lapsed_note, spent_note,
+        "SPENT and LAPSED render the SAME sentence, so the note discriminates nothing and the \
+         deletion-shaped fix has happened instead of the naming-shaped one"
+    );
+    assert!(
+        !esc.is_claimable(dead) && !spent.is_claimable(dead),
+        "control: both specimens must be refused at this instant, or the two notes above \
+         describe states that never co-occur with `permits_write: false` and this arm is \
+         vacuous"
     );
 }
