@@ -8,8 +8,10 @@ three mesh commits ahead -- one of them ebc3719, the fix that stops this very sc
 reporting a DELIVERED primer as undelivered. Cost, counted in ONE member's primer that
 morning: 41 non-delivery labels on rc=124 (the one rc that PROVES delivery), 40 of them
 filed by the two stale-vintage watchers. The 41st was codex's, queued 18:37:02Z on
-08-25, 4h35m BEFORE codex restarted into the current bytes at 23:12:38Z. Since the fix
-went in force on the one seat that has it, that seat has filed none.
+08-25, 4h35m BEFORE codex restarted into the current bytes at 23:12:38Z. That
+denominator is ONE member's primer: codex counted seven such rows of its own, and the
+18:37:02Z batch filed four notices, of which one reached the primer counted here.
+Post-restart, on either denominator, that seat has filed none.
 
 Nobody applied the remedy by hand because there is no moment to apply it in: the
 session reading the alarm is a descendant of its own watcher's cgroup, and the other
@@ -36,13 +38,19 @@ Five properties, behavioural against the real watcher in a real scratch repo, no
 
   1. MERGED BYTES DEPLOY, and the successor is really running them (a second startup
      ARTIFACT line whose startup_sha256 is the new file's hash, state=ok), and the
-     process survives -- `exec`, not death.
+     process survives -- `exec`, not death. 1d reads the successor's argv out of /proc
+     and requires it to name the private verified snapshot: the log line is the claim,
+     argv is the fact, and a pathname re-opened at exec time is not what was checked.
   2. EDITED BYTES DO NOT. Drifted, stable, parses, one byte off origin/main -> held.
   3. CRLF BYTES DO NOT, though their blob id is identical to origin/main's (3b).
   4. THE FIRST SIGHTING NEVER DEPLOYS. The drift edge alarm precedes any deploy, which
      is the observable form of "the same new hash on two consecutive passes".
   5. NO DRIFT, NO DEPLOY. The control: a watcher whose disk matches its startup never
      emits a deploy line however long it runs.
+  6. GIT CANNOT ANSWER -> held verdict AND THE WATCHER LIVES. 6c is the one that
+     matters: the first draft exited rc=128 here, under a Restart=always unit.
+  7. UNREADABLE origin/main + AN EMPTY DISK FILE -> held. The fail-open the first draft
+     had, where a discarded rc=128 left sha256("") matching an empty disk file.
 
 HOW MUCH EACH ARM IS WORTH. Against origin/main (no deploy path at all) 1a, 1b, 2b and
 4a go RED and the rest stay green -- correctly, and vacuously: 2a, 3a and 5a assert that
@@ -70,6 +78,10 @@ PLUGIN = "claude-code"
 REL = "plugins/member-mesh/hestia-watch-member.sh"
 
 failures = []
+# What the last run_watcher() left behind: the live process's argv and its state dir.
+# Both are needed to say WHICH FILE the successor is executing, which is the whole
+# same-object claim and cannot be read off the log line.
+LAST_RUN = {}
 
 
 def check(label, ok, detail=""):
@@ -137,8 +149,19 @@ def start_stub():
     return srv, f"http://127.0.0.1:{srv.server_address[1]}/mcp"
 
 
-def git(repo, *args):
-    return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+def git(repo, *args, stdin=""):
+    return subprocess.run(["git", "-C", repo, *args], input=stdin,
+                          capture_output=True, text=True)
+
+
+def swap(path, data):
+    """Replace by rename. Truncating the inode bash is reading makes it observe EOF and
+    exit, which would report a watcher healthy by killing it."""
+    tmp = path + ".swap"
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, path)
 
 
 def build_repo(tmp, label):
@@ -175,6 +198,7 @@ def run_watcher(tmp, repo, label, mutate_after, settle=14):
                          env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     lines = []
     stop = threading.Event()
+    LAST_RUN.clear()
 
     def pump():
         for line in p.stdout:
@@ -193,6 +217,13 @@ def run_watcher(tmp, repo, label, mutate_after, settle=14):
         mutate_after(path)
     time.sleep(settle)
     alive = p.poll() is None
+    if alive:
+        try:
+            with open(f"/proc/{p.pid}/cmdline", "rb") as fh:
+                LAST_RUN["argv"] = [a.decode() for a in fh.read().split(b"\0") if a]
+        except OSError:
+            pass
+    LAST_RUN["state"] = state
     stop.set()
     p.kill()
     p.wait()
@@ -232,6 +263,21 @@ def main():
           f"merged_sha={merged_sha}\nstart lines:\n" + "\n".join(starts[-4:]))
     check("1c. and the process survived — exec replaced it, nothing killed it",
           alive, out[-1200:])
+    # SAME OBJECT, MEASURED ON THE LIVE PROCESS. Hashing a pathname and then exec'ing
+    # that pathname binds nothing in a tree with concurrent writers -- the replacement
+    # that lands in between is what runs. Codex review of #636, blocking 1. The fix
+    # execs a private snapshot placed by rename, so the argv of the SUCCESSOR names a
+    # file under $STATE that no other writer can reach, and that file's bytes are the
+    # ones the digest and `bash -n` were computed over. Reading /proc rather than the
+    # log line: the log is the claim, argv is the fact.
+    snap = os.path.join(LAST_RUN.get("state", ""), "self-deploy", f"watch-{PLUGIN}.sh")
+    argv = LAST_RUN.get("argv") or []
+    snap_ok = os.path.exists(snap) and sha256_bytes(open(snap, "rb").read()) == merged_sha
+    check("1d. the successor's argv names the PRIVATE VERIFIED SNAPSHOT, not the "
+          "repo pathname — the bytes hashed and parsed are the bytes exec opened",
+          len(argv) >= 2 and os.path.realpath(argv[1]) == os.path.realpath(snap)
+          and snap_ok,
+          f"argv={argv}\nsnap={snap} exists+matches={snap_ok}")
 
     # ---- 2. EDITED BYTES DO NOT DEPLOY.
     repo = build_repo(tmp, "edited")
@@ -249,9 +295,15 @@ def main():
     # ---- 3. CRLF BYTES DO NOT DEPLOY, THOUGH THEIR BLOB ID IS IDENTICAL.
     repo = build_repo(tmp, "crlf")
     boot_stale(repo)
-    crlf = merged.replace(b"\n", b"\r\n")
-    lines, alive = run_watcher(tmp, repo, "crlf",
-                               lambda path: open(path, "wb").write(crlf))
+    # MIXED EOL, NOT WHOLESALE. Converting every LF to CRLF does give an equal blob id,
+    # but `bash -n` REJECTS it (rc=2 at the first `f() {` followed by CR) -- so a
+    # whole-file fixture is refused by the parse conjunct before the byte conjunct is
+    # reached, and cannot witness the claim that BOTH rejected guards would have waved
+    # it through. Codex found this in review of #636. CRLF on the shebang line alone is
+    # a comment to bash: same cleaned blob, different raw bytes, and it PARSES.
+    crlf = merged.replace(b"#!/usr/bin/env bash\n", b"#!/usr/bin/env bash\r\n", 1)
+    assert crlf != merged, "could not construct a mixed-EOL variant"
+    lines, alive = run_watcher(tmp, repo, "crlf", lambda path: swap(path, crlf))
     out = "\n".join(lines)
     check("3a. CRLF-mangled bytes are HELD",
           not any("ARTIFACT DEPLOY" in l for l in lines), out[-2000:])
@@ -260,6 +312,13 @@ def main():
     check("3b. NOT VACUOUS: the blob ids ARE equal, so the `git hash-object` spelling "
           "would have deployed bytes that are not the merged bytes",
           disk_blob and disk_blob == main_blob, f"disk={disk_blob} main={main_blob}")
+    parse = subprocess.run(["bash", "-n", os.path.join(repo, REL)],
+                           capture_output=True, text=True)
+    check("3c. NOT VACUOUS EITHER: `bash -n` ACCEPTS the same fixture, so the parse "
+          "conjunct did not do this work — raw byte identity is what refused it",
+          parse.returncode == 0, f"rc={parse.returncode} {parse.stderr.strip()[:200]}")
+    check("3d. and the raw bytes really do differ from the merged bytes",
+          sha256_bytes(crlf) != merged_sha)
 
     # ---- 4. THE FIRST SIGHTING NEVER DEPLOYS.
     repo = build_repo(tmp, "twice")
@@ -279,6 +338,52 @@ def main():
     check("5a. a watcher whose disk matches its startup never deploys",
           not any("ARTIFACT DEPLOY" in l for l in lines), "\n".join(lines[-20:]))
     check("5b. and it is still running, having done nothing", alive)
+
+    # ---- 6. GIT CANNOT ANSWER -> HELD VERDICT, AND THE WATCHER LIVES.
+    # The regression that turned #636's CI red. `REL="$(git ... | head -1)"` under
+    # `set -euo pipefail` made a failing git exit the whole watcher with rc=128 before
+    # the held verdict could print -- fail-closed on the deploy, but fail-DEAD on the
+    # process, under a unit that would then restart it into the same stale bytes.
+    repo = build_repo(tmp, "nogit")
+    boot_stale(repo)
+
+    def merged_and_hide_git(path, _repo=repo):
+        swap(path, merged)
+        os.rename(os.path.join(_repo, ".git"), os.path.join(_repo, ".git-hidden"))
+
+    lines, alive = run_watcher(tmp, repo, "nogit", merged_and_hide_git)
+    out = "\n".join(lines)
+    check("6a. an unanswerable git holds the deploy",
+          not any("ARTIFACT DEPLOY" in l for l in lines), out[-2000:])
+    check("6b. and says so",
+          any("cannot ask git" in l or "not tracked in a git repo" in l for l in lines),
+          out[-2000:])
+    check("6c. AND THE WATCHER IS STILL RUNNING — a held conjunct is not an exit",
+          alive, out[-2000:])
+
+    # ---- 7. UNREADABLE origin/main + EMPTY DISK -> HELD. The fail-OPEN that was here.
+    # `MAIN_SHA="$(git show ... | sha256_stdin || true)"` discarded rc=128 and kept the
+    # hasher's stdout, which for an unreadable path is sha256 of EMPTY INPUT. An empty
+    # file on disk hashes to the same constant, `bash -n` accepts empty, and the watcher
+    # would have exec'd an empty script under Restart=always -- on the exact conjunct
+    # the function advertises as fail-closed.
+    repo = build_repo(tmp, "noref")
+    boot_stale(repo)
+    empty_tree = git(repo, "mktree", stdin="").stdout.strip()
+    orphan = git(repo, "commit-tree", empty_tree, "-m", "an origin/main without us").stdout.strip()
+    assert orphan, "could not build an origin/main lacking the watcher"
+    git(repo, "update-ref", "refs/remotes/origin/main", orphan)
+    lines, alive = run_watcher(tmp, repo, "noref", lambda path: swap(path, b""))
+    out = "\n".join(lines)
+    empty_sha = sha256_bytes(b"")
+    check("7a. NOT VACUOUS: the disk file really is empty, and its hash is the same "
+          "constant an unreadable `git show` used to yield",
+          any(f"disk_sha256={empty_sha}" in l for l in lines), out[-1500:])
+    check("7b. an unreadable origin/main holds the deploy",
+          not any("ARTIFACT DEPLOY" in l for l in lines), out[-2000:])
+    check("7c. and names the conjunct that refused",
+          any("cannot read origin/main" in l for l in lines), out[-2000:])
+    check("7d. and the watcher is still running", alive, out[-2000:])
 
     srv.shutdown()
     print()

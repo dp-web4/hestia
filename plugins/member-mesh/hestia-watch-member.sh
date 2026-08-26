@@ -43,13 +43,17 @@ flock -n 9 || { echo "[hestia-watch] another watcher holds $STATE/watch-$PLUGIN.
 # repository commit: an installed copy or dirty worktree can honestly differ from either
 # HEAD or main. Bash does not expose its parsed buffer, so this is explicitly a source
 # snapshot rather than a claim that every byte had already been parsed.
-WATCH_SOURCE="${BASH_SOURCE[0]}"
+# HANDED DOWN BY A DEPLOYING PREDECESSOR (see maybe_self_deploy). After a self-deploy
+# this process is executing a private snapshot under $STATE, but the file the fleet
+# DEPLOYS is still the canonical repo path -- so the predecessor passes it, and drift is
+# measured against the file operators actually update rather than against our own copy.
+WATCH_SOURCE="${HESTIA_WATCH_SOURCE:-${BASH_SOURCE[0]}}"
 # Resolved once, from the same source path the drift snapshot above hashes, so a
 # helper is loaded from the copy that is actually running rather than from a cwd
 # that is nobody's guarantee.
 WATCH_DIR="$(cd "$(dirname "$WATCH_SOURCE")" && pwd)"
-watch_source_hash() {
-  python3 - "$WATCH_SOURCE" <<'PY'
+sha256_file() {
+  python3 - "$1" <<'PY'
 import hashlib, sys
 h = hashlib.sha256()
 with open(sys.argv[1], "rb") as fh:
@@ -58,8 +62,19 @@ with open(sys.argv[1], "rb") as fh:
 print(h.hexdigest())
 PY
 }
-WATCH_STARTUP_SHA256="$(watch_source_hash 2>/dev/null || true)"
+watch_source_hash() { sha256_file "$WATCH_SOURCE"; }
+# A predecessor that deployed us already hashed the exact bytes it handed over, and
+# they are the bytes this process is executing. Re-deriving the baseline by reading the
+# canonical path here would instead capture whatever is on disk NOW -- which, if the path
+# moved again in the microseconds since, is a baseline for a file we never ran.
+WATCH_STARTUP_SHA256="${HESTIA_WATCH_STARTUP_SHA256:-}"
+[[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
+  WATCH_STARTUP_SHA256="$(watch_source_hash 2>/dev/null || true)"
 [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]] || WATCH_STARTUP_SHA256="unavailable"
+# Consumed. Not inherited by the fired CLI, and not inherited by a successor that did
+# not get it from us -- these two say "your predecessor verified this", and only a
+# predecessor is entitled to say it.
+unset HESTIA_WATCH_SOURCE HESTIA_WATCH_STARTUP_SHA256
 WATCH_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 WATCH_CURRENT_SHA256="$WATCH_STARTUP_SHA256"
 if [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
@@ -83,16 +98,6 @@ WATCH_ARGV=("$@")
 # whatever session is awake in it -- and a file caught mid-write hashes to bytes nobody
 # ever committed. One sample is not a version; it is a race.
 WATCH_DRIFT_SEEN_SHA256=""
-
-# sha256 of stdin, the same digest `watch_source_hash` computes over the file, so the
-# merged bytes and the disk bytes are compared with one function and no filter.
-sha256_stdin() {
-  python3 -c 'import hashlib,sys
-h=hashlib.sha256()
-for chunk in iter(lambda: sys.stdin.buffer.read(1024*1024), b""):
-    h.update(chunk)
-print(h.hexdigest())'
-}
 
 # DAEMON DRIFT (2026-08-03, mesh-vocabulary thread: "landed is three steps short").
 # The watcher refuses to run stale bytes of ITSELF (check_artifact_drift above), but
@@ -340,8 +345,12 @@ check_artifact_drift() {
 # In one member's primer that morning: 41 non-delivery labels on rc=124 -- the one rc
 # that proves delivery -- of which 40 were filed by the two stale-vintage watchers.
 # The 41st was codex's, queued 2026-08-25T18:37:02Z, 4h35m BEFORE codex restarted into
-# the current bytes at 23:12:38Z. Since the fix went in force on the one seat that has
-# it, that seat has filed zero. The fix works. It was merged. It was not in force.
+# the current bytes at 23:12:38Z. THE DENOMINATOR IS ONE MEMBER'S PRIMER, not the
+# fleet: codex, reviewing this PR from its own retained snapshots, counted seven unique
+# rc=124 rows attributed via watch-codex, and the 18:37:02Z batch filed four notices --
+# only one of which reached the primer counted here. Post-restart, on either
+# denominator, that seat has filed zero. The fix works. It was merged. It was not in
+# force.
 #
 # WHY NOBODY APPLIED IT BY HAND. There is no moment to apply it in. The session that
 # reads the alarm is a descendant of its own watcher's cgroup, so `systemctl restart`
@@ -379,6 +388,13 @@ check_artifact_drift() {
 #                     against the same sha256 the startup snapshot already computes puts
 #                     no filter anywhere in the path, and costs one hash.
 #
+#   SAME OBJECT    -- the hash, the parse and the `exec` all name ONE private file
+#                     under $STATE holding the `git show` output, placed by rename.
+#                     Checking a PATHNAME and then exec'ing that pathname binds
+#                     nothing in a tree with concurrent writers: the replacement that
+#                     lands in between is what runs. Rehashing just before exec
+#                     narrows that window and does not close it.
+#
 #   parses         -- `bash -n`. Unreachable unless origin/main itself carries a syntax
 #                     error, and kept for exactly that case: the unit is Restart=always,
 #                     so exec'ing into a file that does not parse is a fleet-wide crash
@@ -414,31 +430,79 @@ maybe_self_deploy() {
     return 0
   fi
 
-  local REL MAIN_SHA
-  REL="$(git -C "$WATCH_DIR" ls-files --full-name -- "$WATCH_SOURCE" 2>/dev/null | head -1)"
+  local REL SNAP SNAP_NEW SNAP_SHA
+
+  # A FAILING COMMAND MUST PRODUCE A HELD VERDICT, NOT AN EXIT. Codex review of #636,
+  # blocking 2, and it was not hypothetical: under `set -euo pipefail` the previous
+  # spelling `REL="$(git ... | head -1)"` made a non-repo working directory kill the
+  # WHOLE WATCHER with rc=128 before the "not tracked" branch below could ever print.
+  # CI reproduced it -- watch_artifact_identity_test.py runs this script from a bare
+  # temp dir, and the watcher died mid-test. `if !` puts the status in a condition
+  # (where errexit is suspended), and the first line is taken with an expansion rather
+  # than a pipe, so nothing but git's own status decides the verdict.
+  if ! REL="$(git -C "$WATCH_DIR" ls-files --full-name -- "$WATCH_SOURCE" 2>/dev/null)"; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — cannot ask git whether the source is tracked; deploy declined"
+    return 0
+  fi
+  REL="${REL%%$'\n'*}"
   if [ -z "$REL" ]; then
     echo "[hestia-watch] ARTIFACT DRIFT held — source is not tracked in a git repo; deploy declined"
     return 0
   fi
-  MAIN_SHA="$(git -C "$WATCH_DIR" show "origin/main:$REL" 2>/dev/null | sha256_stdin 2>/dev/null || true)"
-  if [[ ! "$MAIN_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+
+  # THE BYTES CHECKED MUST BE THE BYTES `exec` OPENS. Codex review of #636, blocking 1.
+  # Hashing and parsing a PATHNAME and then exec'ing that same pathname binds nothing:
+  # this tree has concurrent writers, and a replacement landing between the last check
+  # and the open is precisely what gets executed. Re-hashing just before exec narrows
+  # the window; it does not close it.
+  #
+  # So `git show` is materialised into a private file under $STATE (0700, one per
+  # plugin, and the flock above guarantees a single watcher per plugin writes it), and
+  # the hash, the `bash -n` and the `exec` all name THAT file. The final `mv` is a
+  # rename, so the inode verified is the inode executed, and a predecessor still
+  # running from the old snapshot keeps its own open inode rather than being truncated
+  # underneath itself.
+  #
+  # What the successor loses by running from $STATE -- the canonical path it should
+  # keep watching, and the hash of what it is really executing -- is handed to it
+  # explicitly on the exec line.
+  SNAP="$STATE/self-deploy/watch-$PLUGIN.sh"
+  SNAP_NEW="$SNAP.new"
+  mkdir -p "$STATE/self-deploy" && chmod 700 "$STATE/self-deploy"
+  # Branching on git's status, NOT on the digest. The previous spelling ended in
+  # `|| true`, which threw away rc=128 for an unreadable origin/main and kept the
+  # hasher's stdout: sha256 of EMPTY INPUT, e3b0c442... If the drifted disk file were
+  # also empty the two would match, `bash -n` would accept it, and the watcher would
+  # deploy an empty script under Restart=always -- fail-OPEN on the exact conjunct this
+  # function advertises as fail-closed.
+  if ! git -C "$WATCH_DIR" show "origin/main:$REL" > "$SNAP_NEW" 2>/dev/null; then
     echo "[hestia-watch] ARTIFACT DRIFT held — cannot read origin/main:$REL; deploy declined"
     return 0
   fi
-  if [ "$MAIN_SHA" != "$WATCH_CURRENT_SHA256" ]; then
-    echo "[hestia-watch] ARTIFACT DRIFT held — disk bytes are not origin/main:$REL (disk=$WATCH_CURRENT_SHA256 main=$MAIN_SHA); merged bytes deploy, edited bytes do not"
+  SNAP_SHA="$(sha256_file "$SNAP_NEW" 2>/dev/null || true)"
+  if [[ ! "$SNAP_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — cannot hash origin/main:$REL; deploy declined"
     return 0
   fi
-  if ! "${BASH:-bash}" -n "$WATCH_SOURCE" 2>/dev/null; then
+  if [ "$SNAP_SHA" != "$WATCH_CURRENT_SHA256" ]; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — disk bytes are not origin/main:$REL (disk=$WATCH_CURRENT_SHA256 main=$SNAP_SHA); merged bytes deploy, edited bytes do not"
+    return 0
+  fi
+  if ! "${BASH:-bash}" -n "$SNAP_NEW" 2>/dev/null; then
     echo "[hestia-watch] ARTIFACT DRIFT held — origin/main:$REL does not parse; deploy declined"
     return 0
   fi
+  if ! mv -f "$SNAP_NEW" "$SNAP"; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — cannot place the verified snapshot at $SNAP; deploy declined"
+    return 0
+  fi
 
-  echo "[hestia-watch] ARTIFACT DEPLOY plugin=$PLUGIN — exec into merged bytes; was=$WATCH_STARTUP_SHA256 now=$WATCH_CURRENT_SHA256 ref=origin/main:$REL"
+  echo "[hestia-watch] ARTIFACT DEPLOY plugin=$PLUGIN — exec into merged bytes; was=$WATCH_STARTUP_SHA256 now=$WATCH_CURRENT_SHA256 ref=origin/main:$REL snapshot=$SNAP_SHA"
   # `exec bash "$path"` and not `exec "$path"`: the executable bit does not survive on
   # the Windows mount this tree lives on, which is why the unit invokes the script
   # through bash to begin with.
-  exec "${BASH:-bash}" "$WATCH_SOURCE" "${WATCH_ARGV[@]}"
+  HESTIA_WATCH_SOURCE="$WATCH_SOURCE" HESTIA_WATCH_STARTUP_SHA256="$SNAP_SHA" \
+    exec "${BASH:-bash}" "$SNAP" "${WATCH_ARGV[@]}"
 }
 
 announce_artifact
