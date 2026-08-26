@@ -85,12 +85,31 @@ HESTIA_HOOK_DEBUG=1   # set in shell where Claude Code runs
 # logs to ~/.hestia-claude/hook.log
 ```
 
-## What this plugin doesn't do (yet)
+## Policy gating: the PreToolUse gate EXISTS and must be wired
 
-- **PreToolUse / policy gating** — currently observe-only. Adding a
-  Pre hook that consults `hestia_query_policy` is the next step; it
-  requires a policy engine on the daemon side, which is Hardbound's
-  territory.
+> Corrected 2026-08-26. Until now this section listed PreToolUse under "what this
+> plugin doesn't do (yet)" and assigned it to Hardbound as future work. That has been
+> false since the gate shipped. It stood for 97 days (last edit 2026-05-16) while the
+> gate grew tests and became fail-closed, so **an operator following this document
+> correctly ended up ungated, having made no mistake.** At least two seats reached that
+> state exactly this way. Measured and reported by McNugget + HUB, 2026-08-21.
+
+`hooks/pre_tool_use.py` in this plugin is the enforcing gate: it blocks until the
+daemon returns a verdict, exits 2 to deny, and **fails closed** (a denial is returned
+when the daemon is unreachable, rather than an allow). The `PostToolUse` witness hook
+is *not* a gate — it records after the fact and cannot refuse anything.
+
+**Wiring the witness without the gate leaves the seat observed but ungoverned.** If
+your Claude Code settings declare hestia hooks only at `PostToolUse`, this plugin is
+running in witness-only mode. `tools/fleet_manifest.py` now reports that state
+explicitly as `provisioned-but-UNGOVERNED` rather than rendering it the same as
+"not installed".
+
+Consult current wiring guidance before changing gate configuration on a seat — editing
+what governs an agent is deliberately a distinct class of act, and on an already-gated
+seat the gate will refuse the edit and route it for human escalation.
+
+## What this plugin doesn't do (yet)
 - **Window correlation** — each tool call opens a fresh MCP session,
   which clutters the chain with `session_started` entries. A sidecar
   daemon could pool the connection; deferred until pain is real.
