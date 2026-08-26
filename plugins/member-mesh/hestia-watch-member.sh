@@ -74,6 +74,25 @@ else
   WATCH_ARTIFACT_REASON="startup-baseline-unavailable"
 fi
 WATCH_LAST_ALARM_KEY=""
+# The argv this process was started with, captured at TOP LEVEL. Inside a function
+# `"$@"` is that function's own arguments, which is precisely how a re-exec loses the
+# plugin id and the fire command and comes back up watching nothing.
+WATCH_ARGV=("$@")
+# Last drifted disk hash seen, so a deploy needs the SAME new bytes on two consecutive
+# passes. The tree this mesh executes from has concurrent writers -- three watchers and
+# whatever session is awake in it -- and a file caught mid-write hashes to bytes nobody
+# ever committed. One sample is not a version; it is a race.
+WATCH_DRIFT_SEEN_SHA256=""
+
+# sha256 of stdin, the same digest `watch_source_hash` computes over the file, so the
+# merged bytes and the disk bytes are compared with one function and no filter.
+sha256_stdin() {
+  python3 -c 'import hashlib,sys
+h=hashlib.sha256()
+for chunk in iter(lambda: sys.stdin.buffer.read(1024*1024), b""):
+    h.update(chunk)
+print(h.hexdigest())'
+}
 
 # DAEMON DRIFT (2026-08-03, mesh-vocabulary thread: "landed is three steps short").
 # The watcher refuses to run stale bytes of ITSELF (check_artifact_drift above), but
@@ -304,6 +323,122 @@ check_artifact_drift() {
     fi
     WATCH_LAST_ALARM_KEY="$STATE:$REASON"
   fi
+}
+
+# THE ALARM THAT HAD NO RECOVERY.
+#
+# `check_artifact_drift` above has been correct, level-triggered and hourly for twenty
+# days, and it changed nothing -- because the only sentence it can say is "restart
+# required" and it says it to a log no member reads, on behalf of a process no member
+# can restart. This file already names that defect, one function down, about a
+# different alarm: "The alarm existed and the recovery did not, which is this corpus's
+# recurring defect wearing recovery's clothes." The drift alarm is the next instance.
+#
+# MEASURED, CBP 2026-08-26. The claude-code and kimi-code watchers were executing
+# a8dccda (2026-08-06) while origin/main was three mesh commits ahead. One of the three
+# is ebc3719, which stops this script reporting a DELIVERED primer as undelivered.
+# In one member's primer that morning: 41 non-delivery labels on rc=124 -- the one rc
+# that proves delivery -- of which 40 were filed by the two stale-vintage watchers.
+# The 41st was codex's, queued 2026-08-25T18:37:02Z, 4h35m BEFORE codex restarted into
+# the current bytes at 23:12:38Z. Since the fix went in force on the one seat that has
+# it, that seat has filed zero. The fix works. It was merged. It was not in force.
+#
+# WHY NOBODY APPLIED IT BY HAND. There is no moment to apply it in. The session that
+# reads the alarm is a descendant of its own watcher's cgroup, so `systemctl restart`
+# is suicide; the other stale seat was mid-wake behind a foreground `timeout -k 30
+# 1800`. Three members waking each other makes "idle at the instant a human looks"
+# close to a null set. A remedy only a human can apply, to a machine that is never
+# idle when the human is there, is not a remedy.
+#
+# FOUR CONJUNCTS. Each one removes a way this could be worse than the staleness it
+# fixes; none of them is decoration.
+#
+#   drift          -- nothing to deploy otherwise.
+#
+#   stable twice   -- the same NEW hash on two consecutive passes, not one sighting.
+#                     Concurrent writers; a half-written file is not a version.
+#
+#   MERGED, BYTE   -- the disk bytes must be byte-identical to `origin/main:<path>`.
+#     FOR BYTE        This is the conjunct that carries the design. Deploying
+#                     "whatever changed" would make the fleet's in-force vintage a
+#                     function of whoever last hit save in a shared worktree, which is
+#                     strictly WORSE than being stale: stale is at least stable and
+#                     nameable, and this file's whole vintage story depends on that.
+#                     Deploying "what was merged" closes the last link of
+#                     committed -> routed -> merged -> IN FORCE, and refuses to close
+#                     it for bytes that skipped the earlier ones.
+#
+#                     NOT `git hash-object` against `rev-parse origin/main:<path>`,
+#                     which is the obvious spelling and is WRONG HERE. This tree lives
+#                     on a Windows mount with `core.autocrlf=input`, so the clean
+#                     filter normalises CRLF on the way in: a CRLF-mangled working copy
+#                     has the SAME blob id as the clean merged file. Measured on this
+#                     box -- identical blob, and `bash -n` accepts the mangled file too,
+#                     so the parse conjunct does not catch it either. Both guards would
+#                     have waved it through. Comparing the RAW BYTES of `git show`
+#                     against the same sha256 the startup snapshot already computes puts
+#                     no filter anywhere in the path, and costs one hash.
+#
+#   parses         -- `bash -n`. Unreachable unless origin/main itself carries a syntax
+#                     error, and kept for exactly that case: the unit is Restart=always,
+#                     so exec'ing into a file that does not parse is a fleet-wide crash
+#                     loop rather than a deploy. Cheap insurance against the one input
+#                     the merged-bytes conjunct cannot vet.
+#
+# FAIL CLOSED. Any conjunct that cannot be answered -- source not tracked, no
+# origin/main, git absent, hash unavailable -- declines to deploy and says which one,
+# leaving today's behaviour exactly as it is. The polarity is deliberate: an
+# auto-deployer that fires when it cannot verify is the bug it is here to fix.
+#
+# WHERE IT RUNS is the safety argument, and it is structural rather than a heuristic.
+# The fire is FOREGROUND (`if "$FIRE" "$PRIMER"; then`), so the top of the loop is the
+# one point in this script where this watcher provably has no wake in flight. A deploy
+# that can only happen where there is no wake can never cut one short.
+#
+# `exec` and not `systemctl restart`: same pid, the unit never goes inactive, MainPID
+# does not move, nothing else in the cgroup is signalled -- and the successor reads the
+# file from byte zero, which is the entire point, since a long-running bash executes
+# the buffer it began with and can otherwise resume at a stale byte offset.
+#
+# BOOTSTRAP, SAID OUT LOUD: this function cannot deploy itself. The seats that predate
+# it need exactly one manual restart, ever, and then never another one.
+maybe_self_deploy() {
+  if [ "$WATCH_ARTIFACT_STATE" != "drift" ]; then
+    WATCH_DRIFT_SEEN_SHA256=""
+    return 0
+  fi
+  [[ "$WATCH_CURRENT_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 0
+
+  if [ "$WATCH_CURRENT_SHA256" != "$WATCH_DRIFT_SEEN_SHA256" ]; then
+    WATCH_DRIFT_SEEN_SHA256="$WATCH_CURRENT_SHA256"
+    return 0
+  fi
+
+  local REL MAIN_SHA
+  REL="$(git -C "$WATCH_DIR" ls-files --full-name -- "$WATCH_SOURCE" 2>/dev/null | head -1)"
+  if [ -z "$REL" ]; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — source is not tracked in a git repo; deploy declined"
+    return 0
+  fi
+  MAIN_SHA="$(git -C "$WATCH_DIR" show "origin/main:$REL" 2>/dev/null | sha256_stdin 2>/dev/null || true)"
+  if [[ ! "$MAIN_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — cannot read origin/main:$REL; deploy declined"
+    return 0
+  fi
+  if [ "$MAIN_SHA" != "$WATCH_CURRENT_SHA256" ]; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — disk bytes are not origin/main:$REL (disk=$WATCH_CURRENT_SHA256 main=$MAIN_SHA); merged bytes deploy, edited bytes do not"
+    return 0
+  fi
+  if ! "${BASH:-bash}" -n "$WATCH_SOURCE" 2>/dev/null; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — origin/main:$REL does not parse; deploy declined"
+    return 0
+  fi
+
+  echo "[hestia-watch] ARTIFACT DEPLOY plugin=$PLUGIN — exec into merged bytes; was=$WATCH_STARTUP_SHA256 now=$WATCH_CURRENT_SHA256 ref=origin/main:$REL"
+  # `exec bash "$path"` and not `exec "$path"`: the executable bit does not survive on
+  # the Windows mount this tree lives on, which is why the unit invokes the script
+  # through bash to begin with.
+  exec "${BASH:-bash}" "$WATCH_SOURCE" "${WATCH_ARGV[@]}"
 }
 
 announce_artifact
@@ -888,6 +1023,7 @@ LAST_ANNOUNCE=$(date +%s)
 
 while true; do
   check_artifact_drift
+  maybe_self_deploy
   check_daemon_drift
   NOW=$(date +%s)
   if [ $((NOW - LAST_ANNOUNCE)) -ge "$UNANSWERED_EVERY" ]; then
