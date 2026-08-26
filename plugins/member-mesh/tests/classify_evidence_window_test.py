@@ -71,13 +71,29 @@ def extract_function():
 FUNC = extract_function()
 
 
-def classify(log_text, rc="1", prefix="codex"):
+def decoys(logs, prefix, n):
+    """N sibling logs beside the one under test, all stamped strictly OLDER.
+
+    Production log directories hold hundreds — CBP 2026-08-26: codex 474, claude 748,
+    kimi 764 — and the size of that directory is what decides whether the function's
+    `ls -t` lookup survives (see section C). A fixture with one log is the single case
+    in which that line cannot fail, which is why it never has here.
+    """
+    for i in range(n):
+        d = os.path.join(logs, f"{prefix}-20251231-{i:06d}.log")
+        with open(d, "w", encoding="utf-8") as fh:
+            fh.write("decoy\n")
+        os.utime(d, (1_600_000_000, 1_600_000_000))
+
+
+def classify(log_text, rc="1", prefix="codex", siblings=0):
     """Run the extracted function against a synthetic log for `prefix`."""
     with tempfile.TemporaryDirectory() as state:
         logs = os.path.join(state, "logs")
         os.makedirs(logs)
         with open(os.path.join(logs, f"{prefix}-20260101-000000.log"), "w", encoding="utf-8") as fh:
             fh.write(log_text)
+        decoys(logs, prefix, siblings)
         script = (
             "set -euo pipefail\n"
             f'STATE="{state}"\n'
@@ -237,6 +253,69 @@ for t in templates:
           len(hits) == 1 and hits[0].rstrip().endswith('"'),
           "the anchor must be the PROMPT's final line — if the wording moves, the "
           "classifier's window silently widens back over the echoed primer")
+
+print()
+print("=== C. THE LOOKUP AT PRODUCTION SCALE ===")
+
+# Every A case above runs against a directory holding ONE log. That is not a small
+# simplification, it is the only directory size at which the function's very first
+# action succeeds.
+#
+#   LOG=$(ls -t "$STATE/logs/$PREFIX"-*.log 2>/dev/null | head -1) || LOG=""
+#
+# `set -euo pipefail` is in force. `head` exits after the first line while `ls` is
+# still writing, so `ls` takes SIGPIPE, the PIPELINE reports 141 — failure, on a
+# lookup that succeeded — and `|| LOG=""` blanks the filename. The `[ -n "$LOG" ]`
+# guard then returns `unknown` without opening anything, and every pattern in the
+# function is unreachable. Measured on CBP 2026-08-26 over sibling counts: 0/10
+# SIGPIPE at <=128, 2/10 at 256, 9/10 at 384, 10/10 at 474 and above. All three live
+# corpora were past 474, and the dates they crossed 384 — kimi 08-07, claude 08-08,
+# codex 08-25 — sit BEFORE the two vendor-spelling widenings that section A8 pins.
+# Both widenings measured their target logs as `unknown` and read that as a missing
+# pattern; both measured it through this file, at one log. They are still needed and
+# were never sufficient, and their own evidence could not tell the two causes apart.
+C_SIBLINGS = 900  # ~2x the smallest live corpus (codex, 474) on the day this was written
+
+# C1 is a POSITIVE CONTROL on the FIXTURE, not a check of the watcher. C2 below can go
+# green two ways — because the lookup is correct, or because the race did not fire this
+# run — and a one-log fixture has been passing the second way since 2026-08-01. So
+# reproduce the raw pattern here and say out loud whether the pin was live. On a machine
+# fast enough that `ls` finishes before `head` exits, C2 is vacuous and C3 is the pin.
+with tempfile.TemporaryDirectory() as _ctl:
+    _logs = os.path.join(_ctl, "logs")
+    os.makedirs(_logs)
+    decoys(_logs, "codex", C_SIBLINGS)
+    _raw = f'set -o pipefail; ls -t "{_logs}"/codex-*.log 2>/dev/null | head -1 >/dev/null'
+    _rcs = [subprocess.run(["bash", "-c", _raw], capture_output=True).returncode
+            for _ in range(5)]
+_fired = _rcs.count(141)
+print(f"C1: control — `ls -t <{C_SIBLINGS} logs> | head -1` under pipefail returned "
+      f"{_rcs} ({_fired}/5 SIGPIPE). "
+      + ("C2 is a live pin on this machine."
+         if _fired else
+         "The race did NOT reproduce here, so C2 is VACUOUS this run — C3 is the pin."))
+
+# C2 — the invariant the fix has to hold: the verdict must not depend on how many other
+# logs the member happens to have. Same text, same vendor, 0 siblings vs C_SIBLINGS.
+_alone = classify(BILLING_SPECIMENS["codex"] + "\n", prefix="codex", siblings=0)
+_crowd = classify(BILLING_SPECIMENS["codex"] + "\n", prefix="codex", siblings=C_SIBLINGS)
+check("C2a: the billing state still classifies with a production-sized log directory",
+      _crowd == "out-of-credits",
+      f"got {_crowd!r} beside {C_SIBLINGS} siblings, {_alone!r} alone — the lookup "
+      f"dropped the filename, so the classifier never opened a log")
+check("C2b: the verdict does not depend on the directory's size",
+      _alone == _crowd, f"alone={_alone!r} crowded={_crowd!r}")
+
+# C3 — deterministic, so the pin survives a machine that wins the race. The lookup must
+# not put `ls` on the writing end of a pipe under pipefail. Static by necessity: the
+# behaviour it guards is the one C2 can only observe when the timing cooperates.
+_lookup = [ln for ln in watcher_src.splitlines()
+           if "ls -t" in ln and "$PREFIX" in ln]
+check("C3a: the log lookup was found", len(_lookup) == 1, f"found {_lookup}")
+check("C3b: the log lookup does not pipe `ls` into `head`",
+      bool(_lookup) and "head" not in _lookup[0],
+      f"{_lookup[0].strip() if _lookup else ''!r} — under pipefail this reports 141 on "
+      f"success and the `|| LOG=\"\"` beside it blanks the filename")
 
 print()
 if failures:
