@@ -40,37 +40,66 @@ hops", never "always present". Same for the other end.
 Usage:
     python3 tools/vintage_from_wire.py <eventType> <field> [--hops N] [--json]
 """
-import argparse, json, sys
+import argparse
+import json
+import os
+import sys
 
-sys.path.insert(0, "/mnt/c/exe/projects/ai-agents/private-context/hestia-local/probes")
-import chainwalk  # noqa: E402  — the ONE wrapped chain cursor; do not hand-roll a sixth
+# The PUBLIC walker, vendored from this same repository (codex review of #614, finding 3).
+# The first draft imported a host-specific private checkout by absolute path, which made
+# both the tool and its tests unrunnable in any public checkout — the same defect codex
+# raised against #615. `tools/` is on the path because this file lives in it.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from chain_walk import ChainWalker, payload  # noqa: E402
 
 
-def partition(event_type, field, hops=9000, progress=3000):
-    """Walk the chain, split `event_type` rows on presence of `field`."""
-    c = chainwalk.Chain()
-    with_f, without_f = [], []
+def partition(event_type, field, hops=9000, walker=None):
+    """Walk the chain, split `event_type` rows on PRESENCE of `field`.
+
+    PRESENCE, NOT TRUTHINESS (codex review of #614, finding 1). The first draft tested
+    `p.get(field) is not None`, which classifies an explicitly-null value as absent. A
+    schema that emits the key with a null — exactly what a partially-deployed writer
+    does — would then manufacture a deployment boundary that never happened. `field in p`
+    is the presence test; null-valued rows are counted SEPARATELY and reported, because
+    they are evidence about the writer rather than about the cutover.
+
+    ORDER IS `chainPosition`, NOT A TRUNCATED TIMESTAMP (finding 2). The first draft
+    sorted and compared on `timestamp[:19]`, discarding subsecond precision, and compared
+    with a strict `>`. A present row followed in the SAME SECOND by an absent row then
+    scored zero interleaving and printed CLEAN PARTITION over a contradiction. The chain
+    position is the chain's own total order and has no such collision.
+    """
+    c = walker or ChainWalker()
+    with_f, without_f, null_valued = [], [], []
     walked = 0
-    for e in c.walk(max_hops=hops, progress=progress):
+    for e in c.walk(max_entries=hops):
         walked += 1
-        if e["eventType"] != event_type:
+        if e.get("eventType") != event_type:
             continue
-        p = chainwalk.payload(e)
-        row = {"ts": e["timestamp"][:19], "pos": e["chainPosition"],
+        p = payload(e)
+        row = {"ts": e.get("timestamp"), "pos": e.get("chainPosition"),
                "plugin": p.get("plugin_id")}
-        (with_f if p.get(field) is not None else without_f).append(row)
-    with_f.sort(key=lambda r: r["ts"])
-    without_f.sort(key=lambda r: r["ts"])
-    # Interleaving: any row lacking the field that is NEWER than the oldest row carrying
-    # it. One cutover means zero such rows.
+        if field in p:
+            with_f.append(row)
+            if p[field] is None:
+                null_valued.append(row)
+        else:
+            without_f.append(row)
+
+    key = lambda r: (r["pos"] if r["pos"] is not None else -1, r["ts"] or "")
+    with_f.sort(key=key)
+    without_f.sort(key=key)
+    # One cutover means: no row LACKING the field sits above the oldest row CARRYING it,
+    # in chain order. `>=` rather than `>` so a same-position tie cannot hide a conflict.
     inter = []
     if with_f and without_f:
-        first_with = with_f[0]["ts"]
-        inter = [r for r in without_f if r["ts"] > first_with]
+        first = key(with_f[0])
+        inter = [r for r in without_f if key(r) >= first]
     return {
         "event_type": event_type, "field": field, "hops_walked": walked,
         "rows": len(with_f) + len(without_f),
         "with": with_f, "without": without_f, "interleaved": inter,
+        "null_valued": null_valued,
     }
 
 
@@ -79,7 +108,8 @@ def report(r):
     if n == 0:
         return f"no {r['event_type']} rows in {r['hops_walked']} hops — widen --hops"
     w, wo = r["with"], r["without"]
-    span = f"{(wo + w)[0]['ts']} -> {sorted(wo + w, key=lambda x: x['ts'])[-1]['ts']}"
+    allrows = sorted(w + wo, key=lambda x: (x["pos"] if x["pos"] is not None else -1))
+    span = f"{allrows[0]['ts']} -> {allrows[-1]['ts']}"
     out = [f"{r['event_type']}: {n} rows over {span}",
            f"  without {r['field']!r}: {len(wo):<4} (newest {wo[-1]['ts'] if wo else '-'})",
            f"  with    {r['field']!r}: {len(w):<4} (oldest {w[0]['ts'] if w else '-'})",
@@ -87,6 +117,10 @@ def report(r):
            + ("  -> CLEAN PARTITION" if not r["interleaved"] else
               "  -> NOT A DEPLOYMENT BOUNDARY (multiple writers, a conditional field, "
               "or the wrong commit)")]
+    if r["null_valued"]:
+        out.append(f"  {len(r['null_valued'])} rows carry {r['field']!r} as an explicit "
+                   f"NULL — the key is present, so these do NOT date a cutover; they say "
+                   f"the writer emits the field without a value")
     if not wo:
         out.append(f"  field present on the OLDEST row reached — cutover is below "
                    f"{r['hops_walked']} hops, not 'always present'")
