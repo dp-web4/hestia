@@ -149,12 +149,26 @@ def main() -> int:
     # CONTROLS, BOTH POLARITIES, BEFORE ANY RATE IS PRINTED. A predicate that fired on
     # everything and a predicate that fired on nothing would each produce a clean-looking
     # census, so the census does not get to run until the discriminating cases are checked.
-    pos = cred("cat /home/dp/.ssh/id_rsa")
+    # POSITIVE CONTROL DERIVED FROM THE PREDICATE'S OWN VOCABULARY, not one hand-picked
+    # sample. A single example pins ONE shape and silently stops covering the rest the moment
+    # the list grows -- which is the failure mode this census exists to catch elsewhere. Built
+    # from `shapes`, the control tracks the predicate instead of going stale beside it.
+    #
+    # DISCLOSED: it also leaves this file with no key-material literal in it, which is what
+    # the public-boundary check flagged (a baked local home path) and what the running gate
+    # refuses outright. That is a consequence of the redesign, not its justification -- the
+    # justification is coverage, and the redesign is strictly stronger than what it replaces.
+    misses = [s for s in shapes if not cred("cat /home/user/x" + s)]
     neg = cred("grep -n foo core/src/handler.rs")
-    topic = cred("grep -rn 'the secret sauce' README.md")
-    print(f"controls: material fires={pos}  plain-read fires={neg}  bare-topic-word fires={topic}")
-    if not pos or neg:
-        raise SystemExit("CONTROL FAILED - the predicate does not discriminate; census aborted")
+    # OVER-BREADTH, REPORTED NOT ASSERTED. Shapes that are ordinary words fire on prose, and
+    # that false-positive supply is the thing this census is measuring the cost of.
+    prose = [s for s in shapes if s.replace("_", "").isalpha() and len(s) > 3]
+    print(f"controls: shapes={len(shapes)}  all fire={not misses}  "
+          f"plain-read fires={neg}  bare-word shapes={len(prose)}")
+    if misses or neg:
+        raise SystemExit(
+            f"CONTROL FAILED - the predicate does not discriminate "
+            f"(unmatched shapes={misses}, plain-read fires={neg}); census aborted")
     print()
 
     cmds, nfiles = collect_commands(root)
