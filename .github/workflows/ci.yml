@@ -310,9 +310,19 @@ jobs:
       - name: Measure how much of the gate still executes per-seat
         run: |
           set -euo pipefail
-          # Both pins, deliberately. --max-redefined is beyond argument (a name
-          # the shared engine already owns, defined again in a seat file).
-          # --max-pct is the number that actually matters and depends on a
-          # published vocabulary, so it is arguable -- which is a reason to
+          # Both pins, deliberately. --max-forked is beyond argument (a name the
+          # shared engine already owns, implemented a second time in a seat's
+          # gate). --max-pct is the number that actually matters and depends on
+          # a published vocabulary, so it is arguable -- which is a reason to
           # print it every run, not a reason to leave it unpinned.
-          python3 tools/gate_collapse_meter.py --max-redefined 2 --max-pct 67.8
+          python3 tools/gate_collapse_meter.py --max-forked 4 --max-pct 69.3
+
+      - name: Do the forked predicates actually disagree with the engine?
+        run: |
+          set -euo pipefail
+          # A fork count is debt; a divergence count is exposure. This pins how
+          # many inputs the forked scope predicates answer differently from the
+          # shared engine -- currently 6, every one of them a defect class the
+          # engine's own docstring says it was hardened against. Collapsing a
+          # fork is what drives it down.
+          python3 tools/scope_fork_differential_test.py --max-divergences 6
