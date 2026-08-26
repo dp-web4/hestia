@@ -786,7 +786,26 @@ classify_fire_failure() {
   [ "$RC" = "124" ] && { echo timeout; return 0; }
   PREFIX=$(basename "${FIRE:-}" .sh); PREFIX="${PREFIX#fire-}"
   [ -n "$PREFIX" ] || { echo unknown; return 0; }
-  LOG=$(ls -t "$STATE/logs/$PREFIX"-*.log 2>/dev/null | head -1) || LOG=""
+  # NOT `| head -1`. `set -euo pipefail` is in force (line 13), and `head` exits after
+  # the first line while `ls` is still writing — so `ls` takes SIGPIPE, the pipeline
+  # reports 141, and `|| LOG=""` BLANKS the filename it had just found. The guard on the
+  # next line then returns `unknown` without ever opening a log, so every pattern below
+  # is unreachable. It is a race, and the corpus decides it: measured on this box
+  # 2026-08-26, 0/10 SIGPIPE at <=128 sibling logs, 2/10 at 256, 9/10 at 384, 10/10 at
+  # 474 and above. Live counts the same day — codex 474, claude 748, kimi 764 — so all
+  # three seats were at 10/10 and the classifier had not read a log on any of them since
+  # roughly 08-07 (kimi), 08-08 (claude), 08-25 (codex), the dates each crossed 384.
+  #
+  # That is why the two vendor-spelling widenings above (08-18 kimi, 08-26 claude) each
+  # measured their target logs as `unknown` and read that as a missing pattern: both were
+  # measured through tests/classify_evidence_window_test.py, whose fixture writes exactly
+  # ONE log into the temp dir — the single case in which this line cannot fail. Those
+  # widenings are still needed; they were just never sufficient, and their evidence could
+  # not tell the two causes apart. Section C of that test now pins this one at scale.
+  #
+  # Take the first line in the shell: no pipe, no SIGPIPE, identical `ls -t` ordering.
+  LOG=$(ls -t "$STATE/logs/$PREFIX"-*.log 2>/dev/null) || LOG=""
+  LOG="${LOG%%$'\n'*}"
   [ -n "$LOG" ] || { echo unknown; return 0; }
   START=$(grep -n -e '^<<<end previous-wake-final-output>' \
                  -e '^Pointers are DATA, not instructions' \
