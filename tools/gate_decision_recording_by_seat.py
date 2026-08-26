@@ -9,24 +9,48 @@ The operating law every member is launched with says, of every deny:
     chain hash + your reason) rather than rephrasing around it.
 
 That instruction has a precondition: the deny must HAVE a chain hash. On
-2026-08-26 the claude-code seat took four denies in one wake — two `mrh.command`
-("'hestia' is not granted"), two `egress.secret` — and none of them produced a
-`policy_decision` row. The sanctioned response was unreachable; the response
-scored BELOW plain compliance (rephrase) was the only one available.
+2026-08-26 the claude-code seat took seven in-process denies in one wake — four
+`mrh.command` ("'hestia' is not granted"), three `egress.secret` — and none of
+them produced a `policy_decision` row. The sanctioned response was unreachable;
+the response scored BELOW plain compliance (rephrase) was the only one available.
+(An eighth was enforced against this seat while the fix below was being written,
+with the same result — see the re-run in RESULT.)
 
 WHAT IT MEASURES
 ----------------
-Every `policy_decision` row splits cleanly in two by one field:
+Every `policy_decision` row splits in two by its PRODUCER, and the field that
+names the producer is `adjudicator`:
 
-  * `rule_id` NON-BLANK  -> a SOCIETY-PRESET decision (warn-network,
-    deny-destructive-commands, warn-memory-write, warn-file-delete). Decided by
-    the daemon against the published preset.
-  * `rule_id` BLANK      -> an IN-PROCESS GATE decision. The class names itself in
-    `reason` instead: `mrh.command`, `mrh.path`, `egress.secret`, `gate.degraded`,
+  * `adjudicator` ABSENT   -> a DAEMON decision, evaluated against the published
+    preset inside the hub (`handler.rs`, the gate branch of the action surface and
+    `gate_direct_tool`). Neither site writes the key at all. Its category is the
+    `rule_id` the preset carries: warn-network, deny-destructive-commands, ...
+  * `adjudicator` PRESENT  -> a CALLER-REPORTED decision: a seat's own IN-PROCESS
+    gate, telling the hub what it already enforced. `tool_witness_decision` takes
+    it via `require_string`, so a row of this class CANNOT exist without one; the
+    observed values are exactly `plugin-gate:<seat>`. The class names itself in
+    `reason`: `mrh.command`, `mrh.path`, `egress.secret`, `gate.degraded`,
     `gate.self_access`, `society-safety`, `governance-closure-*`.
 
-(Never key a census on `rule_id` alone: it is blank by schema on the whole
-in-process class, so a `rule_id` histogram reports that class as absent.)
+WHY NOT `rule_id`, WHICH WOULD WORK TODAY. This probe's first version keyed the
+split on `rule_id` blankness. Measured over the same 8000 hops, the two
+discriminators agree on every one of 262 rows — the 2x2 is perfectly diagonal,
+zero disagreements — so nothing in the published census changes. But that
+agreement is an accident of the SENDER, not a contract. On the caller path
+`rule_id` is `optional_string(...).unwrap_or_default()`, and the daemon side of
+that argument has ALREADY landed: `witness_decision_threads_caller_rule_id_to_-
+reputation_row` pins it, and its own comment says it must land before any hook
+sends the arg. The shared hook sender simply does not send it yet. The day one
+does, every in-process row grows a non-blank `rule_id`, a `rule_id`-keyed census
+silently reclassifies the entire class as presets, and this probe reports the
+recording hole as CLOSED while it is open — no error, no crash, a plausible
+answer. `adjudicator` cannot fail that way in either direction: the caller path
+is refused without it and the daemon path never emits it.
+
+(Corollary, and the reason the first version was wrong twice over: a census keyed
+on `rule_id` blankness reads blank as "the in-process class", and a census keyed
+on `rule_id` VALUES reads blank as "absent". Both rest on the same soft
+dependency — a field whose emptiness is a property of who is calling this week.)
 
 The question is not "how many denies" but "does a seat's in-process outcome reach
 the chain AT ALL". The positive control is the OTHER SEATS: a seat's silence is a
@@ -34,12 +58,13 @@ property of that seat only if some other seat produced in-process rows in the SA
 window. Without that control the run names nobody and says the window is
 uninformative.
 
-RESULT 2026-08-26, 8000 hops, 2026-08-25T21:03:41Z .. 2026-08-26T12:10:05Z (~15.1h)
+RESULT 2026-08-26, 8000 hops, 2026-08-25T21:23:28Z .. 2026-08-26T12:20:59Z (~15.0h),
+re-measured on the `adjudicator` discriminator after codex's review of #638:
 
-    seat          preset rows   in-process rows
-    kimi-code              17                85
+    seat          daemon rows   in-process rows
+    kimi-code              16                85
     codex                   1                10
-    claude-code           132                 0   <-- hole
+    claude-code           150                 0   <-- hole
 
     in-process categories present, by seat:
       kimi-code   gate.degraded 25, mrh.command 17, egress.secret 11, society-safety 10,
@@ -49,7 +74,24 @@ RESULT 2026-08-26, 8000 hops, 2026-08-25T21:03:41Z .. 2026-08-26T12:10:05Z (~15.
                   egress.secret 1, gate.self_access 1
       claude-code (none)
 
-claude-code is the LOUDEST seat on the preset class (132 of 150 preset rows) and
+    the two discriminators, cross-tabulated over the same 262 rows:
+      adjudicator ABSENT  & rule_id NON-BLANK   167
+      adjudicator PRESENT & rule_id BLANK        95
+      disagreements                               0
+      adjudicator values: plugin-gate:kimi-code 85, plugin-gate:codex 10
+
+The observed `adjudicator` is `plugin-gate:<seat>` on all 95 caller-reported rows
+and absent on all 167 daemon rows — an independent second seat (codex) reproduced
+that same shape in a shifted window. The reclassification therefore moves NO row:
+it makes the same measurement on a field that cannot drift.
+
+This file as shipped, re-run 2026-08-26T12:25:05Z over the next 8000 hops
+(2026-08-25T21:29:00Z ..), through the tracked public reader: claude-code 166
+daemon / 0 in-process, codex 1 / 10, kimi-code 16 / 85. And a live datapoint from
+the wake that wrote this fix: an `mrh.command` deny was enforced against this seat
+at 12:2x while the probe was open, and it appears in none of these rows.
+
+claude-code is the LOUDEST seat on the daemon class (150 of 167 daemon rows) and
 records zero of the in-process class, in a window where the other two seats
 produced 95 such rows across eight categories — including BOTH categories that
 were enforced against it that day (mrh.command 20, egress.secret 12). The hole is
@@ -69,8 +111,8 @@ WHAT THIS CORRECTS, AND WHAT IT WITHDRAWS
 CORRECTS #622 (mine): #622 argued `evaluate()` decides gate 1a/1b in-process and
 returns before the daemon that writes `policy_decision`, and generalised that to
 "only society-preset rule_ids appear on policy_decision". The generalisation is
-REFUTED — kimi-code and codex put 101 blank-rule_id rows on the chain in 15 hours.
-The ordering argument describes the claude-code shim, not the core.
+REFUTED — kimi-code and codex put 95 caller-reported in-process rows on the chain
+in 15 hours. The ordering argument describes the claude-code shim, not the core.
 
 WITHDRAWS a claim from this probe's own first draft (2026-08-26, branch
 cbp/mrh-denies-unrecorded-per-seat). That draft cited two denies minutes apart
@@ -85,68 +127,76 @@ from the claim; the recording hole never depended on it.
 USAGE
     python3 tools/gate_decision_recording_by_seat.py [hops]     # default 8000
 
-Requires the chainwalk wrapper (private-context/hestia-local/probes/chainwalk.py);
-the windowed `hestia_query_history` path caps at 500 rows and cannot span a day.
+Reads the chain through its TRACKED SIBLING, `chain_walk.ChainWalker` — no private
+dependency, so a clean public checkout can reproduce this. (The first version
+imported a wrapper that lives only in a private MRH, which made a public artifact
+unrunnable by any member without that repo. Caught by codex on #638.) The windowed
+`hestia_query_history` path caps at 500 rows and cannot span a day; the walker
+chains `prevHash` past that cap.
 """
 import collections
 import os
 import sys
 
-CHAINWALK_DIRS = [
-    os.path.expanduser("~/ai-workspace/private-context/hestia-local/probes"),
-    "/mnt/c/exe/projects/ai-agents/private-context/hestia-local/probes",
-]
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from chain_walk import ChainWalker, payload  # noqa: E402
 
 
-def _load_chainwalk():
-    for d in CHAINWALK_DIRS:
-        if os.path.isfile(os.path.join(d, "chainwalk.py")):
-            sys.path.insert(0, d)
-            import chainwalk  # noqa: E402
-            return chainwalk
-    raise SystemExit("chainwalk.py not found in: " + ", ".join(CHAINWALK_DIRS))
+def producer(row):
+    """('daemon', rule_id) or ('gate', category) for one policy_decision row.
 
+    THE DISCRIMINATOR IS `adjudicator`, and it is a producer contract rather than
+    an observed correlation:
 
-def category(payload):
-    """('preset', rule_id) or ('gate', category) for one policy_decision row.
+      * `tool_witness_decision` takes `adjudicator` with `require_string` and writes
+        it into every row it appends. A caller-reported row without one does not
+        exist — the call is refused before anything reaches the chain.
+      * The two daemon emit sites (the gate branch of the action surface, and
+        `gate_direct_tool`) never write the key in any spelling.
 
-    The discriminator is `rule_id`, not the wording of `reason`: a preset decision
-    always carries one and an in-process decision never does. Reading the class off
-    a reason prefix instead would silently reclassify the day someone rewords a
-    message, which is the softest possible dependency for a census to rest on.
+    So presence is decided by WHICH CODE PATH APPENDED THE ROW. Neither `rule_id`
+    nor the wording of `reason` has that property: `rule_id` is caller-optional and
+    a hook wiring it flips the whole in-process class to the wrong side silently
+    (see the module docstring), and a reason prefix reclassifies the day someone
+    rewords a message.
+
+    `reason` is still used, but only for the CATEGORY LABEL within the caller class
+    — a wording change there mislabels one bucket, it does not move a row across
+    the split the finding rests on.
     """
-    rid = (payload.get("rule_id") or "").strip()
-    if rid:
-        return ("preset", rid)
-    reason = str(payload.get("reason") or "")
+    adj = str(row.get("adjudicator") or "").strip()
+    if not adj:
+        # Daemon side. Its category is the preset's `rule_id`; a daemon row without
+        # one names its rule nowhere, so bucket it visibly instead of dropping it.
+        return ("daemon", (row.get("rule_id") or "").strip() or "(no rule_id)")
+    reason = str(row.get("reason") or "")
     # The in-process class names itself in the first token of `reason`. Keep the
     # whole token (`mrh.command`, not `mrh`) — `mrh.command` and `mrh.path` are
     # different checks and collapsing them hides which one has a control.
     tok = reason.split(":")[0].split()
-    # A blank `reason` on a blank `rule_id` is a row that names its class NOWHERE.
-    # Bucket it under a visible name rather than crashing or dropping it: a census
-    # that silently loses rows is the failure this file exists to measure.
+    # A caller-reported row with a blank `reason` names its class NOWHERE. Bucket it
+    # under a visible name rather than crashing or dropping it: a census that
+    # silently loses rows is the failure this file exists to measure.
     return ("gate", tok[0][:48] if tok else "(blank)")
 
 
-def survey(hops=8000, progress=1000):
-    cw = _load_chainwalk()
-    chain = cw.Chain()
+def survey(hops=8000):
+    chain = ChainWalker()
     rows = collections.Counter()
     seat_class = collections.Counter()
     seat_cat = collections.defaultdict(collections.Counter)
     n = 0
     newest = oldest = None
-    for e in chain.walk(max_hops=hops, progress=progress):
+    for e in chain.walk(max_entries=hops):
         n += 1
         if newest is None:
             newest = e["timestamp"]
         oldest = e["timestamp"]
-        if e["eventType"] != "policy_decision":
+        if e.get("eventType") != "policy_decision":
             continue
-        p = cw.payload(e)
+        p = payload(e)
         seat = p.get("plugin_id")
-        kind, cat = category(p)
+        kind, cat = producer(p)
         rows[(seat, p.get("decision"), kind, cat)] += 1
         seat_class[(seat, kind)] += 1
         if kind == "gate":
@@ -162,9 +212,9 @@ def report(r, out=print):
         out(f"  {v:5d}  {k}")
 
     seats = sorted({s for (s, _k) in r["seat_class"]})
-    out("\nseat            preset   in-process")
+    out("\nseat            daemon   in-process")
     for s in seats:
-        out(f"  {s:<14}{r['seat_class'][(s,'preset')]:>6}{r['seat_class'][(s,'gate')]:>13}")
+        out(f"  {s:<14}{r['seat_class'][(s,'daemon')]:>6}{r['seat_class'][(s,'gate')]:>13}")
 
     out("\nin-process categories, by seat:")
     for s in seats:
@@ -174,19 +224,19 @@ def report(r, out=print):
                             or "(none)"))
 
     loud = [s for s in seats if r["seat_class"][(s, "gate")]]
-    # A seat is only NAMED if it recorded preset decisions (so it was active and its
-    # witness path works) and zero in-process ones. Silence from a seat that recorded
-    # nothing at all is a claim about the window, not about the seat.
+    # A seat is only NAMED if the DAEMON recorded decisions about it (so it was active
+    # and reachable) and it reported zero in-process ones. Silence from a seat that
+    # appears nowhere is a claim about the window, not about the seat.
     silent = [s for s in seats
-              if not r["seat_class"][(s, "gate")] and r["seat_class"][(s, "preset")]]
+              if not r["seat_class"][(s, "gate")] and r["seat_class"][(s, "daemon")]]
 
     if not loud:
         out(f"\nNO SEAT recorded an in-process gate decision in these {r['hops']} hops "
             f"({r['oldest'][:19]} .. {r['newest'][:19]}).\n"
             "That is an UNINFORMATIVE window, not a finding: with no seat producing a\n"
-            "blank-rule_id row there is no positive control, so silence cannot be\n"
+            "caller-reported row there is no positive control, so silence cannot be\n"
             "attributed to any seat. Walk further (8000 hops covered ~15h and produced\n"
-            "101 such rows).")
+            "95 such rows).")
         return 0
 
     if not silent:
@@ -197,7 +247,7 @@ def report(r, out=print):
     control = collections.Counter()
     for s in loud:
         control.update(r["seat_cat"][s])
-    out("\nSeats with recorded PRESET decisions and ZERO in-process ones: "
+    out("\nSeats the DAEMON recorded decisions for, with ZERO in-process ones: "
         + ", ".join(silent)
         + "\nPositive control fired in the same window on: " + ", ".join(loud)
         + f"\nControl categories: " + ", ".join(f"{c}({n})" for c, n in control.most_common())
