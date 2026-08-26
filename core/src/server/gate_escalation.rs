@@ -677,7 +677,6 @@ impl Escalation {
         // who wants the decision fact reads those.
         let granted = self.stored_status() == Status::Approved && bar_met;
         let permits_write = self.is_claimable(now);
-        let spent = self.consumed_at.is_some();
         serde_json::json!({
             "escalation_id": self.id,
             "status": self.stored_status(),
@@ -711,24 +710,66 @@ impl Escalation {
             // The guard direction is unchanged and still the point: an empty `invited` must
             // read as "nobody was asked", never as "asked and they agreed".
             "peer_participation": self.peer_participation(),
-            "note": if permits_write {
-                "the asker must RE-ISSUE the write to claim this; approvals are single use"
-            } else if granted && spent {
-                "this approval has ALREADY BEEN CLAIMED. Approvals are single use: re-issuing \
-                 the write will be refused, and a new escalation must be opened."
-            } else if granted {
-                "this approval was granted and its CLAIM WINDOW HAS CLOSED. It is recorded as \
-                 approved and it authorises nothing: re-issuing the write will be refused, \
-                 and a new escalation must be opened."
-            } else if bar_met {
-                "this decision does not permit the write: it is a DENY, recorded as one"
-            } else {
-                "this decision does NOT permit the write: the stated bar is UNMET. It is \
-                 recorded, and re-issuing the write will still be refused. Decisions are \
-                 single-shot, so this escalation can no longer accumulate the missing \
-                 factor — a new one must be opened."
-            },
+            "note": self.claim_note(now),
         })
+    }
+
+    /// The PROSE half of "may this write proceed?" — one answer, for every surface that
+    /// answers it.
+    ///
+    /// `decision_reply` exists because "two places deciding what 'permits the write' means is
+    /// how they come to disagree", and the header above records that they disagreed anyway,
+    /// one layer up. This is the same defect one FIELD down, and it was live on CBP on
+    /// 2026-08-24: escalation `27a25b66e7fe22d0` polled back
+    /// `status: approved, bar_met: true, permits_write: false` — already claimed 41s after
+    /// its grant — beside the note *"only `approved` WITH the stated bar met permits the
+    /// write"*. Both of that sentence's conditions held. The write was not permitted. A
+    /// reader who trusts the prose reads the exact negation of the field beside it, and the
+    /// prose is the half written for humans.
+    ///
+    /// The `permits_write` FIELD in the poll was repaired on 2026-08-18 (two conjuncts to
+    /// `is_claimable`'s four) after a seat published a spent permit to the operator as live.
+    /// The note directly under it kept the two-conjunct rule, because a string is not a
+    /// predicate and nothing compiles it. So the repair landed on the value and left the
+    /// SENTENCE THAT MOTIVATED THE REPAIR stating the pre-repair law — which is why this is a
+    /// method and not a literal at each call site, the same reasoning `decision_reply` was
+    /// extracted under and the same one that put `is_claimable` on the poll path instead of
+    /// leaving the correct reader in `tools/claimable.py` with zero call sites.
+    ///
+    /// Two branches exist here that `decision_reply` could never reach, and they are the
+    /// reason this could not just be a copy of that literal: the poll answers for UNDECIDED
+    /// and EXPIRED-UNDECIDED escalations too, and both would have fallen into the trailing
+    /// `bar is UNMET ... decisions are single-shot` arm — telling the asker of a live,
+    /// pending escalation that it had already been ruled against.
+    pub fn claim_note(&self, now: u64) -> &'static str {
+        let bar_met = self.bar_met();
+        let granted = self.stored_status() == Status::Approved && bar_met;
+        let spent = self.consumed_at.is_some();
+        if self.is_claimable(now) {
+            "the asker must RE-ISSUE the write to claim this; approvals are single use"
+        } else if self.status_at(now) == Status::Pending {
+            "this escalation is UNDECIDED: nobody has ruled, nothing is granted, and the \
+             write stays refused. A pending escalation permits nothing."
+        } else if self.status_at(now) == Status::Expired && self.stored_status() == Status::Pending
+        {
+            "this escalation EXPIRED UNDECIDED: the window closed with nobody ruling, which \
+             is a deny. Re-issuing the write will be refused, and a new escalation must be \
+             opened."
+        } else if granted && spent {
+            "this approval has ALREADY BEEN CLAIMED. Approvals are single use: re-issuing \
+             the write will be refused, and a new escalation must be opened."
+        } else if granted {
+            "this approval was granted and its CLAIM WINDOW HAS CLOSED. It is recorded as \
+             approved and it authorises nothing: re-issuing the write will be refused, \
+             and a new escalation must be opened."
+        } else if bar_met {
+            "this decision does not permit the write: it is a DENY, recorded as one"
+        } else {
+            "this decision does NOT permit the write: the stated bar is UNMET. It is \
+             recorded, and re-issuing the write will still be refused. Decisions are \
+             single-shot, so this escalation can no longer accumulate the missing \
+             factor — a new one must be opened."
+        }
     }
 
     /// The instant after which an approval stops being claimable.
@@ -2081,6 +2122,100 @@ mod tests {
             .open("claude-code", "role:constellation:member", "Edit", "pre_tool_use.py", Some(TEST_ACT), None, None, T0, 120)
             .expect("open");
         (s, e.id)
+    }
+
+    /// EVERY BRANCH OF `claim_note` FIRES HERE, AND THE NOTE IS A BICONDITIONAL WITH
+    /// `is_claimable`.
+    ///
+    /// The defect this pins is not a wrong value, it is a wrong SENTENCE: the poll published
+    /// "only `approved` WITH the stated bar met permits the write" beside
+    /// `permits_write: false` on a payload where both of those conditions held (live CBP
+    /// escalation `27a25b66e7fe22d0`, 2026-08-24). A note is prose, so nothing compiles it and
+    /// no type check notices when the rule it states stops being the rule enforced.
+    ///
+    /// So the assertion is an EQUIVALENCE, checked on every state a poll can reach: the note
+    /// says "spend it" exactly when `is_claimable` says it may be spent. One arm of an
+    /// equivalence can be satisfied by a constant; both arms cannot. Two of these states —
+    /// UNDECIDED and EXPIRED-UNDECIDED — are reachable only through the poll, never through
+    /// `decision_reply`, and before this method existed they fell through to the trailing
+    /// "the stated bar is UNMET ... decisions are single-shot" arm, which told the asker of a
+    /// live pending escalation that it had already been ruled against.
+    #[test]
+    fn the_note_says_spend_it_exactly_when_the_permit_is_claimable() {
+        const PERMIT: &str = "the asker must RE-ISSUE the write to claim this; approvals are \
+                              single use";
+
+        fn approved_at(when: u64) -> (EscalationStore, String) {
+            let (mut s, id) = store_with_one_simple_marker();
+            s.decide(&id, true, "operator", "role:constellation:sovereign",
+                     Channel::OperatorSession, None, Some("k"), when)
+                .expect("approve");
+            (s, id)
+        }
+
+        // (label, store, id, the clock to read at, the substring the note must carry)
+        let mut cases: Vec<(&str, EscalationStore, String, u64, &str)> = Vec::new();
+
+        let (s, id) = store_with_one_simple_marker();
+        cases.push(("undecided", s, id, T0 + 10, "UNDECIDED"));
+
+        // ttl is 120 in this fixture, so T0+200 is past the deadline with nobody having ruled.
+        let (s, id) = store_with_one_simple_marker();
+        cases.push(("expired undecided", s, id, T0 + 200, "EXPIRED UNDECIDED"));
+
+        let (s, id) = approved_at(T0 + 10);
+        cases.push(("granted, unspent", s, id, T0 + 20, "RE-ISSUE"));
+
+        let (mut s, id) = approved_at(T0 + 10);
+        assert!(
+            s.claim("claude-code", "law_inject.py", Some(TEST_ACT), T0 + 20).is_some(),
+            "the spent arm is only in-domain if the claim actually lands"
+        );
+        cases.push(("granted, spent", s, id, T0 + 30, "ALREADY BEEN CLAIMED"));
+
+        // decided_horizon = min(decided + 600, expires_at + 600) = min(T0+610, T0+720).
+        let (s, id) = approved_at(T0 + 10);
+        cases.push(("granted, window closed", s, id, T0 + 700, "CLAIM WINDOW HAS CLOSED"));
+
+        let (mut s, id) = store_with_one_simple_marker();
+        s.decide(&id, false, "operator", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("no"), T0 + 10)
+            .expect("deny");
+        cases.push(("denied", s, id, T0 + 20, "it is a DENY"));
+
+        let mut saw_permitting = 0;
+        let mut saw_refusing = 0;
+        for (label, store, id, now, must_say) in cases {
+            let esc = store.get(&id).expect("fixture escalation exists");
+            let note = esc.claim_note(now);
+            let claimable = esc.is_claimable(now);
+            assert!(
+                note.contains(must_say),
+                "{label}: note must name its own state, got {note:?}"
+            );
+            assert_eq!(
+                claimable,
+                note == PERMIT,
+                "{label}: the note and `is_claimable` disagree — note {note:?}, claimable \
+                 {claimable}. This is the defect: prose stating a rule the field denies."
+            );
+            // AND THE DISCRIMINATOR ITSELF, over the same six states. `consumed_at` is what
+            // the poll now publishes so a peer can separate SPENT from LAPSED without
+            // parsing the sentence above — the two states whose every other field agrees.
+            // Asserted as an equivalence for the same reason the note is: one arm of it can
+            // be satisfied by a constant `None`, both arms cannot.
+            assert_eq!(
+                esc.consumed_at.is_some(),
+                label == "granted, spent",
+                "{label}: `consumed_at` must be set for exactly the state that spent a \
+                 permit — it is the only field that separates spent from window-closed"
+            );
+            if claimable { saw_permitting += 1 } else { saw_refusing += 1 }
+        }
+        // Without this the equivalence could hold vacuously on a one-sided fixture set — the
+        // failure mode where a guard passes because nothing ever entered its domain.
+        assert_eq!(saw_permitting, 1, "exactly one fixture may spend");
+        assert_eq!(saw_refusing, 5, "and five must not, each for a DIFFERENT reason");
     }
 
     #[test]
