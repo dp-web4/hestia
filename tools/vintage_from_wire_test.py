@@ -82,9 +82,34 @@ def test_no_rows_says_widen_the_window():
     assert "widen --hops" in out, out
 
 
+
+# Listed by name rather than swept out of `globals()`. The sweep DOES run every test --
+# measured, four arms, 2026-08-26 -- but `tools/ci_selfexec_test.py` decides "is this test
+# wired up?" by walking `ast.Name` for a reference to each name, and a `globals()` dispatch
+# is invisible to it. This is the third PR to pay for that: #171 (test_gate_core.py),
+# #468 (claimable_test.py, a week red), and this one. The explicit list is the idiom the
+# corpus settled on; the staleness check below is what keeps it from becoming the very
+# defect the guard exists to catch.
+TESTS = [
+    test_clean_partition_names_the_gap,
+    test_interleaving_refuses_to_name_a_date,
+    test_all_present_is_not_always_present,
+    test_all_absent_says_not_deployed_not_never,
+    test_equal_second_interleave_is_still_interleave,
+    test_explicit_null_is_present_not_absent,
+    test_no_rows_says_widen_the_window,
+]
+
+
 if __name__ == "__main__":
-    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    for f in fns:
+    defined = {k for k in globals() if k.startswith("test_")}
+    listed = {t.__name__ for t in TESTS}
+    if defined != listed:
+        # An explicit list can go stale. Make that RED, not a silently smaller run.
+        print(f"FAIL TESTS is stale: defined-not-listed={sorted(defined - listed)} "
+              f"listed-not-defined={sorted(listed - defined)}")
+        raise SystemExit(1)
+    for f in TESTS:
         f()
         print("ok", f.__name__)
-    print(f"{len(fns)} passed")
+    print(f"{len(TESTS)} passed")
