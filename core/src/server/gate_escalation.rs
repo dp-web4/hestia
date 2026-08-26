@@ -497,8 +497,19 @@ impl Escalation {
     /// `secs_remaining ~1500` while ~24 minutes past their grant-anchored horizon. Reporting
     /// the record clock where a holder reads for the claim clock is how a spent permit gets
     /// published as live.
-    pub fn claim_window_secs_remaining(&self, now: u64) -> u64 {
-        self.decided_horizon().saturating_sub(now)
+    /// `None` while the escalation is still PENDING, because an undecided petition has no
+    /// claim clock yet. `decided_horizon()` falls back to `opened_at` (see there for why it
+    /// must), so ten minutes after the open this reported `0` on a record with up to fifty
+    /// MORE minutes of decision life. Measured live 2026-08-26 22:18:45Z (#651): `a0dc8225`
+    /// polled `0` holding 1203s of decision life, `bc37287c` `0` holding 2460s.
+    ///
+    /// `0` is the answer for a window that SHUT. A window that has not OPENED yet is a
+    /// different fact, and a reader that cannot separate them reads a live petition as a
+    /// spent one. This is the same lesson as `secs_remaining` vs the claim clock, one state
+    /// earlier: two distinct facts were sharing one integer.
+    pub fn claim_window_secs_remaining(&self, now: u64) -> Option<u64> {
+        self.decided_at
+            .map(|_| self.decided_horizon().saturating_sub(now))
     }
 
     /// May this approval still authorise the write it was granted for?
@@ -795,6 +806,17 @@ impl Escalation {
     /// `re_anchoring_the_claim_window_can_only_shorten_it` (the monotonicity, incl. the
     /// replay input). `the_claim_window_stays_tight_even_though_the_decision_window_grew`
     /// pins the constant and passes under any anchor — it is not a check on this.
+    /// The `unwrap_or(self.opened_at)` below is DELIBERATE and must stay, even though it is
+    /// the arithmetic that made `claim_window_secs_remaining` lie (#651). Its only other
+    /// caller is `is_claimable`, where an undecided record must fail CLOSED: anchoring an
+    /// absent decision at the open yields the shortest possible horizon, so the worst this
+    /// fallback can do is refuse a claim early. Returning `None`/unbounded here instead
+    /// would turn an `Approved`-without-`decided_at` record into a standing permit. That
+    /// record is currently unreachable — `decide()` sets `status` and `decided_at` in the
+    /// same breath, and the restore path forces `decided_at = replay time` via
+    /// `or(Some(now))` — but "unreachable today" is exactly the kind of absence that has
+    /// been load-bearing here before. The fix went to the REPORTING field, which has no
+    /// enforcement duty, and left the enforcing one conservative.
     fn decided_horizon(&self) -> u64 {
         let one_window_after_grant = self
             .decided_at

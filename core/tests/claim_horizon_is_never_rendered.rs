@@ -568,7 +568,7 @@ fn past_the_horizon_the_asker_surface_reads_dead() {
     // used to diverge: the horizon countdown is spent, and the enforcing predicate refuses.
     assert_eq!(
         esc.claim_window_secs_remaining(dead),
-        0,
+        Some(0),
         "past the horizon the permit's own countdown must read zero, whatever the record's says"
     );
     assert!(
@@ -676,5 +676,143 @@ fn past_the_horizon_the_asker_surface_reads_dead() {
         "control: both specimens must be refused at this instant, or the two notes above \
          describe states that never co-occur with `permits_write: false` and this arm is \
          vacuous"
+    );
+}
+
+/// PIN 5 — a petition that has not been decided is published as one whose window has SHUT.
+///
+/// `claim_window_secs_remaining` was `decided_horizon().saturating_sub(now)`, and
+/// `decided_horizon` anchors an absent decision at `opened_at` (`decided_at.unwrap_or`).
+/// So `APPROVAL_CLAIM_WINDOW_SECS` after the OPEN — ten minutes, against a one-hour TTL —
+/// a still-pending petition began reporting `0`, the same integer a spent permit reports,
+/// for the remaining fifty minutes of its decidable life.
+///
+/// MEASURED LIVE, 2026-08-26 22:18:45Z (#651), and independently reproduced by kimi-code:
+/// `a0dc8225` polled `claim_window_secs_remaining: 0` while holding 1203s of decision life;
+/// `bc37287c` the same with 2460s. Both were decidable at the instant they published as
+/// spent.
+///
+/// WHY IT SURVIVED. Every pre-existing test in this file and in the crate builds its
+/// specimen by calling `approve_at` first, so `decided_at` is always `Some` and the
+/// `unwrap_or` branch is DEAD under the whole suite. The behaviour was not defended by a
+/// contract; it was held up by the absence of a fixture. This pin is that fixture.
+///
+/// The two specimens are evaluated at the SAME INSTANT on purpose. The defect is not that
+/// pending reported a wrong number — it is that pending and lapsed reported the SAME number,
+/// so no reader could separate "not open yet" from "already shut".
+#[test]
+fn a_pending_petition_does_not_report_a_spent_claim_window() {
+    // The instant PIN 4 uses for its lapsed specimen, reused so both arms below are read off
+    // one clock: past a T0-anchored claim horizon, and well inside the record TTL.
+    let now = T0 + 209 + APPROVAL_CLAIM_WINDOW_SECS + 21;
+    assert!(
+        now > T0 + APPROVAL_CLAIM_WINDOW_SECS && now < T0 + DEFAULT_TTL_SECS,
+        "fixture must sit past the OPEN-anchored claim horizon and inside the record TTL, or \
+         it cannot reach the arithmetic under test"
+    );
+
+    // ---- specimen A: still PENDING ----
+    let (pending_store, pending_id) = opened(DEFAULT_TTL_SECS);
+    let pending = pending_store.get(&pending_id).expect("get").clone();
+
+    // CONTROL, and the whole reason `0` is a lie here: this record is not merely alive, it is
+    // DECIDABLE at this instant. Asserted by performing the decision on a clone of the store,
+    // because "the operator could still approve this" is the exact fact the published `0`
+    // denies, and inferring it from `status` would be re-deriving rather than demonstrating.
+    assert_eq!(
+        pending.status_at(now),
+        Status::Pending,
+        "specimen A must still be pending here or this pin measures the decided path again"
+    );
+    let decision_life = pending.secs_remaining(now);
+    assert!(
+        decision_life > 0,
+        "control: specimen A must have decision life left, or `0` would be honest"
+    );
+    assert_eq!(
+        decision_life, 2_770,
+        "the live specimens' shape, pinned: ~46 minutes of decision life behind a field \
+         reporting the window had shut"
+    );
+    // An independently opened twin, decided AT THIS INSTANT. Not a clone of specimen A —
+    // `EscalationStore` is deliberately not `Clone` — and the independent build is the
+    // stronger demonstration anyway, since nothing of specimen A's state carries over.
+    let (mut twin_store, twin_id) = opened(DEFAULT_TTL_SECS);
+    approve_at(&mut twin_store, &twin_id, now);
+    assert!(
+        twin_store.get(&twin_id).expect("get").is_claimable(now),
+        "CONTROL FAILED: a petition opened at T0 could not actually be decided-and-claimed at \
+         this instant, so the claim below — that `0` was published against a still-live \
+         petition — is not established and this whole pin is vacuous"
+    );
+
+    // THE DEFECT. Was `0`; must not be an integer that reads as a shut window.
+    assert_eq!(
+        pending.claim_window_secs_remaining(now),
+        None,
+        "REGRESSION (#651): an UNDECIDED petition is reporting a claim countdown. It has no \
+         claim clock — the approval it would be spent against does not exist yet. Reporting \
+         `0` here is not merely imprecise, it is the exact value that means `spent or \
+         lapsed`, published against a petition the operator can still approve right now. If \
+         this went red because `decided_horizon`'s `unwrap_or(opened_at)` came back, read the \
+         comment on that function first: the fallback is correct THERE, for `is_claimable`, \
+         and wrong on a reporting field."
+    );
+
+    // ---- specimen B: DECIDED, and genuinely lapsed, at the same instant ----
+    let (mut lapsed_store, lapsed_id) = opened(DEFAULT_TTL_SECS);
+    approve_at(&mut lapsed_store, &lapsed_id, T0 + 209);
+    let lapsed = lapsed_store.get(&lapsed_id).expect("get").clone();
+    assert!(
+        !lapsed.is_claimable(now),
+        "control: specimen B must be past its claim horizon here"
+    );
+
+    // POSITIVE CONTROL. `0` must still be reachable and still mean what it always meant —
+    // otherwise the fix is the deletion-shaped one, where the field stops saying anything and
+    // the pin above passes vacuously.
+    assert_eq!(
+        lapsed.claim_window_secs_remaining(now),
+        Some(0),
+        "the SHUT window must still report `0`. If this is `None`, the field no longer \
+         distinguishes a lapsed permit from an undecided one — the collision has been moved, \
+         not closed"
+    );
+
+    // THE SEPARATION, stated as the thing a reader actually needs.
+    assert_ne!(
+        pending.claim_window_secs_remaining(now),
+        lapsed.claim_window_secs_remaining(now),
+        "PENDING and LAPSED render the same value, so this field discriminates nothing: a \
+         live petition and a spent permit are one shape on the wire, which is the defect \
+         #651 opened"
+    );
+
+    // (e) THE ARM THAT MUST NOT BE "CLEANED UP". Checked on the PRODUCTION body, comments
+    // stripped, because the tempting simplification of this fix — `esc.and_then(..)` — is
+    // one keystroke away, reads better, and is WRONG: it would carry the pending repair into
+    // the unknown-id case, which this payload deliberately answers `0`. That policy is stated
+    // on the `note` field two lines below the expression: an id this daemon has never seen is
+    // treated as EXPIRED, because the caller's only safe reading of "I do not know" is "no".
+    // Pending has no such safe-downgrade argument — nothing is permitted by "not decided yet".
+    let poll = production_body("server/handler.rs", "tool_gate_escalation_poll");
+    let unknown_stays_zero = concat!(
+        "\"claim_window_secs_remaining\": match esc {\n",
+        "None => Some(0),\n",
+        "Some(e) => e.claim_window_secs_remaining(now),",
+    );
+    assert!(
+        poll.contains(unknown_stays_zero),
+        "REGRESSION: the poll no longer distinguishes UNKNOWN-ID from PENDING on \
+         `claim_window_secs_remaining`. An unknown id must keep rendering `0` (documented \
+         fail-closed policy, see the `note` field); only a known-but-undecided record renders \
+         `null`. If this went red because the match was folded into `and_then`, that fold is \
+         the bug: it makes an id the daemon has never heard of read as `null` — 'no claim \
+         information' — where the contract says it must read as 'no'."
+    );
+    assert!(
+        !poll.contains("esc.and_then(|e| e.claim_window_secs_remaining"),
+        "REGRESSION: the unknown-id case has been folded into the pending case. See above — \
+         these are opposite situations and only one of them is safe to answer `null`."
     );
 }

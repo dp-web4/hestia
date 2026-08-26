@@ -15950,7 +15950,24 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         // the wrong field already was.
         "permits_write": esc.map(|e| e.is_claimable(now)).unwrap_or(false),
         "granted": status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false),
-        "claim_window_secs_remaining": esc.map(|e| e.claim_window_secs_remaining(now)).unwrap_or(0),
+        // THREE causes for `0`, one shape (#651) — and the fix is NOT to collapse all three
+        // to `null`, because the two causes are not the same kind of thing.
+        //
+        // UNKNOWN ID stays `0`. That is the deliberate policy stated on `note` below: an id
+        // this daemon has never seen is treated as EXPIRED, and the caller's only safe
+        // reading of "I do not know" is "no". An `and_then` here would have quietly widened
+        // the #651 repair into that contract and turned a fail-closed answer into `null`.
+        //
+        // PENDING becomes `null`, because it is the opposite situation: a KNOWN record whose
+        // claim clock has not started. `0` there is not a safe "no", it is a false "your
+        // window shut" published against a petition the operator can still approve — measured
+        // live 2026-08-26 22:18:45Z on `a0dc8225` (1203s of decision life) and `bc37287c`
+        // (2460s). The safe-downgrade argument does not reach it: nothing is being permitted
+        // by saying "not decided yet", so there is no failure to close toward.
+        "claim_window_secs_remaining": match esc {
+            None => Some(0),
+            Some(e) => e.claim_window_secs_remaining(now),
+        },
         // THE DISCRIMINATOR, AS A FIELD AND NOT ONLY AS PROSE. `permits_write: false` has two
         // causes — the permit was SPENT, or its window LAPSED — and every other field on this
         // payload is identical between them. Measured live on CBP 2026-08-26 03:10Z:
