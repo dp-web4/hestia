@@ -31,7 +31,7 @@ bound to a different notice, differs in the tuple and passes. And it is not load
 every failure path fails OPEN, because a guard that blocks the mesh on its own corrupt
 state is worse than the duplicate it prevents.
 
-Six properties, against the real module and a real filesystem — no seam, no mocks:
+Seven properties, against the real module and a real filesystem — no seam, no mocks:
 
   1. A byte-identical repeat inside the window is REFUSED, and a first send is not.
   2. Each field of the tuple is load-bearing: change any ONE of to/kind/pointer/
@@ -41,11 +41,18 @@ Six properties, against the real module and a real filesystem — no seam, no mo
   3. The window is real: the same tuple outside it is permitted again.
   4. HESTIA_MESH_RESEND=1 forces through, and RESEND_WINDOW=0 disables the guard
      entirely — an operator who wants the duplicate can always have it.
-  5. FAIL-OPEN: a corrupt ledger permits the send and says so on stderr. Also: the
-     recorded row carries `queued_id`, so the refusal message can name the notice the
-     caller already has.
+  5. FAIL-OPEN, on EVERY path, not just the remembered one: a corrupt ledger, a
+     malformed HESTIA_MESH_RESEND_WINDOW, a matching row with an undateable `at`, and a
+     row that is valid JSON but not an object all permit the send and say so on stderr.
+     The last three raised past the fail-open try and exited rc=1 before notify until
+     codex's review of PR #649 — the contract only covered the read someone thought
+     of. The fallback is the DEFAULT window, not a disabled guard (5e): failing open
+     means "do not block a send", not "stop noticing duplicates". Also: the recorded row
+     carries `queued_id`, so the refusal message can name the notice the caller has.
   6. The ledger lives under `HESTIA_MESH_STATE` and is named for the sending seat — a
      test run must never be able to append to the operator's real ledger.
+  7. The mesh ENDPOINT is part of the identity: one ledger per seat spans every daemon
+     that seat talks to, so without it the first send to a second mesh reads as a repeat.
 
 Plus one doc pin: rc=5 must appear in the module's exit-code table. A guard whose exit
 code is undocumented is a new silent failure for every caller that branches on rc.
@@ -71,11 +78,16 @@ def check(name, ok, detail=""):
         failures.append(name)
 
 
-def load(state_dir, plugin="claude-code"):
+def load(state_dir, plugin="claude-code", endpoint=None):
     os.environ["HESTIA_MESH_PLUGIN"] = plugin
     os.environ["HESTIA_MESH_STATE"] = state_dir
     os.environ.pop("HESTIA_MESH_RESEND", None)
     os.environ.pop("HESTIA_MESH_RESEND_WINDOW", None)
+    # EP is read at import time, so a second endpoint means a second module object.
+    if endpoint is None:
+        os.environ.pop("HESTIA_ENDPOINT", None)
+    else:
+        os.environ["HESTIA_ENDPOINT"] = endpoint
     spec = importlib.util.spec_from_file_location("hestia_mesh_under_test", CLI)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -135,6 +147,61 @@ def main():
     check("5a. a corrupt ledger PERMITS the send (fail-open)",
           m.already_sent(a) is None)
 
+    # 5b-5d are codex's dissent on PR #649, reproduced. The docstring said "any error
+    # reading the ledger warns and permits", but three reads sat OUTSIDE the try that
+    # made that true, and each one exits rc=1 BEFORE notify. A fail-open contract that
+    # only covers the paths someone remembered is not a contract; these pin the escapes.
+    # Note what a passing 5a could not tell us: it exercises the ONE path inside the
+    # guard. The defect lived in the arithmetic on either side of it.
+    def permits_without_raising(label, prepare, env=None):
+        prepare()
+        if env is not None:
+            os.environ["HESTIA_MESH_RESEND_WINDOW"] = env
+        try:
+            got = m.already_sent(a)
+            check(label, got is None, f"refused instead: {json.dumps(got)[:200]}")
+        except Exception as e:
+            check(label, False, f"raised {type(e).__name__}: {e} (rc=1, nothing sent)")
+        finally:
+            os.environ.pop("HESTIA_MESH_RESEND_WINDOW", None)
+
+    def write_rows(*lines):
+        def go():
+            with open(m.resend_ledger_path(), "w", encoding="utf-8") as fh:
+                fh.write("".join(l + "\n" for l in lines))
+        return go
+
+    permits_without_raising(
+        "5b. a malformed HESTIA_MESH_RESEND_WINDOW does not block the send",
+        write_rows(), env="invalid")
+    permits_without_raising(
+        "5c. a matching row with an undateable `at` permits (warn, not raise)",
+        write_rows(json.dumps({"key": m.resend_key(a), "at": "not-a-time"})))
+    permits_without_raising(
+        "5d. a row that is valid JSON but not an object permits (warn, not raise)",
+        write_rows("42", '"a string row"'))
+
+    # ...and the fallback is the DEFAULT window, not a disabled guard: a typo in the
+    # env var must not silently turn the duplicate refusal off.
+    write_rows()()
+    m.record_sent(a, {"queued_id": 6153})
+    os.environ["HESTIA_MESH_RESEND_WINDOW"] = "invalid"
+    check("5e. the malformed-window fallback still REFUSES a real duplicate",
+          m.already_sent(a) is not None,
+          "a bad env value silently disabled the guard")
+    check("5f. and the fallback window is the documented 900s default",
+          m.resend_window() == 900.0, repr(m.resend_window()))
+    os.environ.pop("HESTIA_MESH_RESEND_WINDOW")
+
+    # 5g: the reader treated window<=0 as OFF but the writer string-compared to "0", so
+    # "0.0" and "-1" grew a ledger nobody consults. One predicate, both sides.
+    os.environ["HESTIA_MESH_RESEND_WINDOW"] = "0.0"
+    before = open(m.resend_ledger_path(), encoding="utf-8").read()
+    m.record_sent(notice(to="nobody"), {"queued_id": 1})
+    check("5g. a disabled guard does not keep writing rows ('0.0', not just '0')",
+          open(m.resend_ledger_path(), encoding="utf-8").read() == before)
+    os.environ.pop("HESTIA_MESH_RESEND_WINDOW")
+
     # ---- 6. THE LEDGER LIVES UNDER HESTIA_MESH_STATE, AND NOWHERE ELSE.
     # CI found this the expensive way: mesh_send_confirm_line_test.py never set the
     # state dir, so a test run would have appended to the OPERATOR'S REAL ledger. A
@@ -147,6 +214,25 @@ def main():
     check("6b. the ledger is named for the sending seat, not shared across seats",
           os.path.basename(m.resend_ledger_path()) == "claude-code.jsonl",
           m.resend_ledger_path())
+
+    # ---- 8. THE ENDPOINT IS PART OF THE IDENTITY (codex's tuple follow-up on #649).
+    # HESTIA_ENDPOINT is configurable and the ledger is one file per seat, so the same
+    # semantic notice aimed at a SECOND mesh looked like a repeat of the first and was
+    # refused. That is the fan-out failure again, one axis over.
+    tmp8 = tempfile.mkdtemp(prefix="resend-endpoint-")
+    m1 = load(tmp8, endpoint="http://127.0.0.1:7711/mcp")
+    b = notice()
+    m1.record_sent(b, {"queued_id": 9001})
+    check("8a. the same endpoint still refuses the repeat", m1.already_sent(b) is not None)
+    m2 = load(tmp8, endpoint="http://127.0.0.1:7799/mcp")
+    check("8b. the same tuple to a DIFFERENT endpoint is permitted",
+          m2.already_sent(b) is None,
+          f"wrongly refused: {json.dumps(m2.already_sent(b))[:200]}")
+    m3 = load(tmp8, endpoint="http://127.0.0.1:7711/mcp/")
+    check("8c. a trailing slash is the same endpoint, not a second one",
+          m3.already_sent(b) is not None,
+          "normalization did not collapse a trailing slash")
+    load(tmp, endpoint=None)  # restore the module under test for the doc pin below
 
     # ---- doc pin: the exit code has to be findable by a caller that branches on rc.
     doc = open(CLI, encoding="utf-8").read()

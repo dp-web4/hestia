@@ -26,7 +26,9 @@ declined | 4 UNDETERMINED — no answer in time, the write MAY have landed; do n
 blind-retry a `send` on 4 (issue #523) | 5 REFUSED LOCALLY — this seat already queued a
 byte-identical notice inside the resend window; nothing was sent. Override with
 HESTIA_MESH_RESEND=1, or widen/narrow with HESTIA_MESH_RESEND_WINDOW (seconds, default
-900; 0 disables the guard).
+900; 0 disables the guard; an unparseable value warns and falls back to 900 rather than
+blocking the send). The identity is (seat, endpoint, recipient, kind, pointer_uri,
+in_reply_to) — a notice aimed at a different HESTIA_ENDPOINT is a different act.
 """
 import hashlib, json, os, sys, time, urllib.error, urllib.request
 
@@ -300,12 +302,56 @@ def keep_a_copy(payload):
         print(json.dumps(payload, indent=1), file=sys.stderr)
 
 
+RESEND_WINDOW_DEFAULT = 900.0
+_RESEND_WINDOW_WARNED = set()
+
+
+def resend_endpoint():
+    """The daemon this seat is talking to, normalized — part of the dedupe identity.
+
+    HESTIA_ENDPOINT is configurable but the ledger is one file per seat, so without this
+    the same tuple sent to a DIFFERENT mesh would read as a repeat and be refused (codex,
+    PR #649). Normalization is deliberately shallow (case, trailing slash): two spellings
+    of one host read as two endpoints and PERMIT the send, which is the fail-open
+    direction. The reverse — collapsing two real endpoints — would block one of them.
+    """
+    return (EP or "").strip().rstrip("/").lower()
+
+
 def resend_key(args):
     """The identity of a notice for dedupe purposes: who/what/where/answering-what."""
     return hashlib.sha256("\u0000".join([
-        PLUGIN or "?", str(args.get("to_plugin_id")), str(args.get("kind")),
-        str(args.get("pointer_uri")), str(args.get("in_reply_to")),
+        PLUGIN or "?", resend_endpoint(), str(args.get("to_plugin_id")),
+        str(args.get("kind")), str(args.get("pointer_uri")),
+        str(args.get("in_reply_to")),
     ]).encode("utf-8")).hexdigest()
+
+
+def resend_window():
+    """The configured window in seconds; an unparseable value falls back to the default.
+
+    Parsed here rather than at the use site because the use site sits inside a fail-open
+    contract that this call was outside of: `float(os.environ[...])` on a malformed value
+    raised an uncaught ValueError and exited rc=1 BEFORE notify, so a typo in an env var
+    could block the mesh — precisely what the guard promises cannot happen (codex found
+    and reproduced this on PR #649).
+
+    A malformed value falls back to the default rather than disabling the guard: the
+    thing that must not happen is a BLOCKED send, and the default window blocks nothing
+    except a byte-identical repeat. To actually turn the guard off, set it to 0.
+    """
+    raw = os.environ.get("HESTIA_MESH_RESEND_WINDOW")
+    if raw is None:
+        return RESEND_WINDOW_DEFAULT
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        if raw not in _RESEND_WINDOW_WARNED:
+            _RESEND_WINDOW_WARNED.add(raw)
+            print(f"hestia-mesh: WARNING: HESTIA_MESH_RESEND_WINDOW={raw!r} is not a "
+                  f"number - using the {RESEND_WINDOW_DEFAULT:g}s default. Set it to 0 "
+                  f"to disable the duplicate guard.", file=sys.stderr)
+        return RESEND_WINDOW_DEFAULT
 
 
 def resend_ledger_path():
@@ -340,19 +386,25 @@ def already_sent(args, now=None):
 
     Fail-open by construction, like keep_a_copy(): a guard that blocks the mesh because
     its own state file is corrupt would be worse than the duplicate it prevents. Any
-    error reading the ledger warns on stderr and permits the send.
+    error reading the ledger warns on stderr and permits the send — including a
+    malformed window (see resend_window()) and a matching row with an undateable `at`,
+    both of which used to raise past this contract and exit rc=1.
 
     Not recorded on rc=4 (UNDETERMINED) — see record_sent(). Blocking the retry of a
     send that MAY not have landed is the one case where a duplicate beats a silence.
     """
-    window = float(os.environ.get("HESTIA_MESH_RESEND_WINDOW", "900"))
+    window = resend_window()
     if window <= 0 or os.environ.get("HESTIA_MESH_RESEND") == "1":
         return None
     now = time.time() if now is None else now
     key = resend_key(args)
     try:
         with open(resend_ledger_path(), encoding="utf-8") as f:
-            rows = [json.loads(l) for l in f if l.strip()]
+            # Non-object rows are dropped, not raised on: a bare JSON scalar parses fine
+            # and then row.get() would AttributeError outside this try - same class of
+            # escape as the window parse was.
+            rows = [r for r in (json.loads(l) for l in f if l.strip())
+                    if isinstance(r, dict)]
     except FileNotFoundError:
         return None
     except Exception as e:
@@ -360,14 +412,27 @@ def already_sent(args, now=None):
               f"the duplicate guard is OFF for this call.", file=sys.stderr)
         return None
     for row in reversed(rows):
-        if row.get("key") == key and now - float(row.get("at", 0)) <= window:
+        if row.get("key") != key:
+            continue
+        try:
+            at = float(row.get("at", 0))
+        except (TypeError, ValueError):
+            # A matching row we cannot date is a warning-plus-permit, never an
+            # exception: half-written state must not be able to stop a send.
+            print(f"hestia-mesh: WARNING: the resend ledger row for this notice has a "
+                  f"malformed timestamp ({row.get('at')!r}) — the duplicate guard "
+                  f"is OFF for this call.", file=sys.stderr)
+            return None
+        if now - at <= window:
             return row
     return None
 
 
 def record_sent(args, out):
     """Append one ledger row for a send the daemon confirmed. Best effort, never fatal."""
-    if os.environ.get("HESTIA_MESH_RESEND_WINDOW") == "0":
+    # Same predicate the reader uses, not a string compare against "0": WINDOW="0.0"
+    # or "-1" disabled the read while still growing a ledger nobody consults.
+    if resend_window() <= 0:
         return
     path = resend_ledger_path()
     row = {"at": time.time(), "key": resend_key(args),
