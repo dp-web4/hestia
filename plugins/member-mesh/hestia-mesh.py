@@ -23,9 +23,12 @@ Bind your dispositions: pass the id of the notice you are answering as the 4th
 arg to `send` (reply/ack/review_done), or it stays "unanswered" forever.
 Exit codes: 0 ok | 1 never got there (refused/DNS) | 2 usage | 3 daemon answered and
 declined | 4 UNDETERMINED — no answer in time, the write MAY have landed; do not
-blind-retry a `send` on 4 (issue #523).
+blind-retry a `send` on 4 (issue #523) | 5 REFUSED LOCALLY — this seat already queued a
+byte-identical notice inside the resend window; nothing was sent. Override with
+HESTIA_MESH_RESEND=1, or widen/narrow with HESTIA_MESH_RESEND_WINDOW (seconds, default
+900; 0 disables the guard).
 """
-import json, os, sys, time, urllib.error, urllib.request
+import hashlib, json, os, sys, time, urllib.error, urllib.request
 
 EP = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
 
@@ -297,6 +300,92 @@ def keep_a_copy(payload):
         print(json.dumps(payload, indent=1), file=sys.stderr)
 
 
+def resend_key(args):
+    """The identity of a notice for dedupe purposes: who/what/where/answering-what."""
+    return hashlib.sha256("\u0000".join([
+        PLUGIN or "?", str(args.get("to_plugin_id")), str(args.get("kind")),
+        str(args.get("pointer_uri")), str(args.get("in_reply_to")),
+    ]).encode("utf-8")).hexdigest()
+
+
+def resend_ledger_path():
+    state = os.environ.get("HESTIA_MESH_STATE") or os.path.join(
+        os.path.expanduser("~"), ".local", "state", "hestia-mesh")
+    return os.path.join(state, "sent", f"{PLUGIN or 'unknown'}.jsonl")
+
+
+def already_sent(args, now=None):
+    """Has this seat already queued a byte-identical notice inside the window?
+
+    #135 gave a successful `send` a loud stderr line because two identical notices
+    (743/744, 2026-08-03, claude-code -> kimi-code) were queued 5.6s apart: the first
+    send SUCCEEDED and was read through `| tail -5`, which showed the closing brace of
+    the liveness blob and nothing that said it worked. confirm() fixed the legibility.
+
+    It did not fix the duplicate. Measured again 2026-08-26, same seat: EIGHT bound
+    dispositions were sent rc=0, the caller piped the run through `tail -40`, lost its
+    own per-send summary lines, and RE-RAN THE SCRIPT TO SEE THEM. Every peer got the
+    notice twice. The re-run was not a retry — the sender never doubted delivery; it
+    wanted the output. A louder confirmation cannot prevent that, because the second
+    invocation is not asking the same question the first one answered.
+
+    So the fix has to be on the WRITE, not on the report. This is a local, best-effort
+    ledger keyed on (plugin, to, kind, pointer, in_reply_to) — the whole tuple, so a
+    genuine second disposition on the same pointer, or the same pointer bound to a
+    different notice, is NOT refused. Only the byte-identical repeat is.
+
+    Deliberately NOT an idempotency key on the daemon: that is the right fix and needs a
+    protocol field (`hestia_member_notify` has none). This closes the measured hole from
+    the caller side today and does not preclude it.
+
+    Fail-open by construction, like keep_a_copy(): a guard that blocks the mesh because
+    its own state file is corrupt would be worse than the duplicate it prevents. Any
+    error reading the ledger warns on stderr and permits the send.
+
+    Not recorded on rc=4 (UNDETERMINED) — see record_sent(). Blocking the retry of a
+    send that MAY not have landed is the one case where a duplicate beats a silence.
+    """
+    window = float(os.environ.get("HESTIA_MESH_RESEND_WINDOW", "900"))
+    if window <= 0 or os.environ.get("HESTIA_MESH_RESEND") == "1":
+        return None
+    now = time.time() if now is None else now
+    key = resend_key(args)
+    try:
+        with open(resend_ledger_path(), encoding="utf-8") as f:
+            rows = [json.loads(l) for l in f if l.strip()]
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"hestia-mesh: WARNING: resend ledger unreadable ({e}) — "
+              f"the duplicate guard is OFF for this call.", file=sys.stderr)
+        return None
+    for row in reversed(rows):
+        if row.get("key") == key and now - float(row.get("at", 0)) <= window:
+            return row
+    return None
+
+
+def record_sent(args, out):
+    """Append one ledger row for a send the daemon confirmed. Best effort, never fatal."""
+    if os.environ.get("HESTIA_MESH_RESEND_WINDOW") == "0":
+        return
+    path = resend_ledger_path()
+    row = {"at": time.time(), "key": resend_key(args),
+           "to": args.get("to_plugin_id"), "kind": args.get("kind"),
+           "in_reply_to": args.get("in_reply_to"),
+           "pointer_uri": args.get("pointer_uri"),
+           "queued_id": (out or {}).get("queued_id")}
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.chmod(os.path.dirname(path), 0o700)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+        os.chmod(path, 0o600)
+    except Exception as e:
+        print(f"hestia-mesh: WARNING: could not record the send in the resend ledger "
+              f"({e}) — a byte-identical resend will NOT be caught.", file=sys.stderr)
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in ("peek", "drain", "send", "unanswered"):
         print(__doc__); sys.exit(2)
@@ -342,7 +431,17 @@ def act(cmd):
                 "pointer_uri": sys.argv[4], "session_id": s}
         if len(sys.argv) > 5:
             args["in_reply_to"] = int(sys.argv[5])
+        dup = already_sent(args)
+        if dup is not None:
+            age = int(time.time() - float(dup.get("at", 0)))
+            print(f"hestia-mesh: REFUSED LOCALLY — this seat queued a byte-identical "
+                  f"notice {age}s ago (queued_id={dup.get('queued_id')}). NOTHING WAS "
+                  f"SENT. If you meant to send it twice: HESTIA_MESH_RESEND=1 "
+                  f"{' '.join(sys.argv[:1] + sys.argv[1:])}", file=sys.stderr)
+            sys.exit(5)
         out = rpc(h, "hestia_member_notify", args)
+        if not failed(out):
+            record_sent(args, out)
     # stdout keeps carrying the full payload either way — callers parse it as JSON and
     # the error body is the diagnostic. Only the exit code changes: 3 = the daemon
     # answered and refused, distinct from 2 (usage/identity) and 1 (connect failed), so

@@ -44,6 +44,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -129,6 +130,9 @@ class Stub(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
+STATE_DIR = tempfile.mkdtemp(prefix="mesh-confirm-state-")
+
+
 def run(args, mode="ok", combine=False):
     """combine=True reproduces `2>&1` — one stream, real interleaving, real ordering.
 
@@ -137,7 +141,15 @@ def run(args, mode="ok", combine=False):
     unbuffered stderr) is answered honestly rather than assumed.
     """
     MODE["tool"] = mode
-    env = dict(os.environ, HESTIA_ENDPOINT=EP, HESTIA_MESH_PLUGIN="test-member")
+    # HESTIA_MESH_STATE: this test repeats the IDENTICAL send six times, which is what
+    # a duplicate looks like to already_sent(). Two things follow and both are the
+    # test's job, not the guard's. Point the state dir at a tempdir so a test run can
+    # never append to the operator's real ledger (it would have, before this line),
+    # and disable the resend window so the repeats are permitted -- this file is
+    # pinning confirm(), and an opt-out that is visible in the env beats a guard that
+    # quietly does not apply.
+    env = dict(os.environ, HESTIA_ENDPOINT=EP, HESTIA_MESH_PLUGIN="test-member",
+               HESTIA_MESH_STATE=STATE_DIR, HESTIA_MESH_RESEND_WINDOW="0")
     env.pop("HESTIA_ROLE", None)
     # Explicit stdout=PIPE rather than capture_output=True: the two cannot be combined
     # with an explicit stderr=, and capture_output is what makes `2>&1` unrepresentable.

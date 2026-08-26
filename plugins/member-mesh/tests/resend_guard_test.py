@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""A louder success line does not stop a duplicate send. The write has to refuse.
+
+WHAT HAPPENED, TWICE, SAME SEAT, 23 DAYS APART.
+
+  2026-08-03, notices 743/744 (claude-code -> kimi-code). The same pointer queued twice,
+  5.6s apart. The first send SUCCEEDED; the caller read it through `| tail -5` and saw
+  the tail of `recipient_liveness_evidence` and a closing brace — nothing that said it
+  worked. #135 fixed that by adding confirm(): one loud stderr line naming `queued_id`,
+  flushed last so it survives `2>&1 | tail -N`. That docstring is still in the file.
+
+  2026-08-26, eight notices (claude-code -> codex, kimi-code, hestia). A script sent all
+  eight, rc=0 on every one, confirm() printing correctly. The caller piped the RUN
+  through `tail -40`, lost its own per-send summary lines, and RE-RAN THE SCRIPT TO SEE
+  THEM. Every peer received the notice twice, each bound to the same `in_reply_to`.
+
+The second occurrence is not a regression of the first fix — it is proof the fix was
+aimed one layer off. confirm() answers "did it work?"; the re-run was never asking that.
+The sender did not doubt delivery, it wanted the output, and re-running a send script is
+how you get output from a surface with no dry-run and no read-back. A report cannot
+defend against a caller who is not reading it as a report.
+
+So the guard belongs on the WRITE. `already_sent()` keeps a local jsonl ledger keyed on
+the whole tuple (plugin, to, kind, pointer_uri, in_reply_to) and refuses a byte-identical
+repeat inside HESTIA_MESH_RESEND_WINDOW (default 900s) with rc=5, NOTHING SENT.
+
+WHAT IT DELIBERATELY DOES NOT DO. It is not an idempotency key on the daemon — that is
+the correct fix and needs a protocol field `hestia_member_notify` does not have. It is
+not a rate limit: a genuine second disposition on the same pointer, or the same pointer
+bound to a different notice, differs in the tuple and passes. And it is not load-bearing:
+every failure path fails OPEN, because a guard that blocks the mesh on its own corrupt
+state is worse than the duplicate it prevents.
+
+Six properties, against the real module and a real filesystem — no seam, no mocks:
+
+  1. A byte-identical repeat inside the window is REFUSED, and a first send is not.
+  2. Each field of the tuple is load-bearing: change any ONE of to/kind/pointer/
+     in_reply_to and the send is permitted. (Red if the guard keys on the pointer alone,
+     which would eat the fan-out case: five debts sharing one file, five distinct
+     anchors.)
+  3. The window is real: the same tuple outside it is permitted again.
+  4. HESTIA_MESH_RESEND=1 forces through, and RESEND_WINDOW=0 disables the guard
+     entirely — an operator who wants the duplicate can always have it.
+  5. FAIL-OPEN: a corrupt ledger permits the send and says so on stderr. Also: the
+     recorded row carries `queued_id`, so the refusal message can name the notice the
+     caller already has.
+  6. The ledger lives under `HESTIA_MESH_STATE` and is named for the sending seat — a
+     test run must never be able to append to the operator's real ledger.
+
+Plus one doc pin: rc=5 must appear in the module's exit-code table. A guard whose exit
+code is undocumented is a new silent failure for every caller that branches on rc.
+"""
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CLI = os.path.join(os.path.dirname(HERE), "hestia-mesh.py")
+
+failures = []
+
+
+def check(name, ok, detail=""):
+    print(("  ok   " if ok else "  FAIL ") + name)
+    if not ok:
+        if detail:
+            print("       " + detail.replace("\n", "\n       ")[:900])
+        failures.append(name)
+
+
+def load(state_dir, plugin="claude-code"):
+    os.environ["HESTIA_MESH_PLUGIN"] = plugin
+    os.environ["HESTIA_MESH_STATE"] = state_dir
+    os.environ.pop("HESTIA_MESH_RESEND", None)
+    os.environ.pop("HESTIA_MESH_RESEND_WINDOW", None)
+    spec = importlib.util.spec_from_file_location("hestia_mesh_under_test", CLI)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def notice(to="codex", kind="reply", pointer="hestia://escalation/abc#x", re_id=6147):
+    return {"to_plugin_id": to, "kind": kind, "pointer_uri": pointer,
+            "in_reply_to": re_id, "session_id": "sess"}
+
+
+def main():
+    tmp = tempfile.mkdtemp(prefix="resend-guard-")
+    m = load(tmp)
+
+    # ---- 1. THE MEASURED CASE: send, then send the identical thing again.
+    a = notice()
+    check("1a. a first send is permitted (no ledger yet)", m.already_sent(a) is None)
+    m.record_sent(a, {"queued_id": 6153})
+    dup = m.already_sent(a)
+    check("1b. a byte-identical repeat inside the window is REFUSED",
+          dup is not None, f"already_sent returned {dup!r}")
+    check("1c. the refusal names the notice the caller already has",
+          (dup or {}).get("queued_id") == 6153, f"row={json.dumps(dup)[:300]}")
+
+    # ---- 2. EVERY FIELD OF THE TUPLE IS LOAD-BEARING.
+    # The fan-out case is why: five debts sharing one forum file had five DISTINCT
+    # anchors and were five claims, not duplicates. A pointer-only key would eat four.
+    for label, other in (
+            ("a different recipient", notice(to="kimi-code")),
+            ("a different kind", notice(kind="ack")),
+            ("a different pointer (same thread, different anchor)",
+             notice(pointer="hestia://escalation/abc#y")),
+            ("the same pointer bound to a DIFFERENT notice", notice(re_id=6152)),
+    ):
+        check(f"2. {label} is permitted", m.already_sent(other) is None,
+              f"wrongly refused: {json.dumps(m.already_sent(other))[:300]}")
+
+    # ---- 3. THE WINDOW IS REAL.
+    check("3a. inside a 900s window the repeat is refused",
+          m.already_sent(a, now=time.time() + 899) is not None)
+    check("3b. outside it the same tuple is permitted again",
+          m.already_sent(a, now=time.time() + 901) is None)
+
+    # ---- 4. THE OPERATOR CAN ALWAYS HAVE THE DUPLICATE.
+    os.environ["HESTIA_MESH_RESEND"] = "1"
+    check("4a. HESTIA_MESH_RESEND=1 forces through", m.already_sent(a) is None)
+    os.environ.pop("HESTIA_MESH_RESEND")
+    os.environ["HESTIA_MESH_RESEND_WINDOW"] = "0"
+    check("4b. HESTIA_MESH_RESEND_WINDOW=0 disables the guard", m.already_sent(a) is None)
+    os.environ.pop("HESTIA_MESH_RESEND_WINDOW")
+
+    # ---- 5. FAIL-OPEN. A guard that blocks the mesh on its own broken state is worse
+    # than the duplicate it prevents — same contract as keep_a_copy().
+    with open(m.resend_ledger_path(), "w", encoding="utf-8") as f:
+        f.write("{not json at all\n")
+    check("5a. a corrupt ledger PERMITS the send (fail-open)",
+          m.already_sent(a) is None)
+
+    # ---- 6. THE LEDGER LIVES UNDER HESTIA_MESH_STATE, AND NOWHERE ELSE.
+    # CI found this the expensive way: mesh_send_confirm_line_test.py never set the
+    # state dir, so a test run would have appended to the OPERATOR'S REAL ledger. A
+    # test that mutates live member state is a worse bug than the duplicate the guard
+    # prevents, and nothing in the suite would have said so. Pinned here so the next
+    # person who moves the path has to move this line too.
+    check("6a. the ledger path is inside HESTIA_MESH_STATE",
+          os.path.abspath(m.resend_ledger_path()).startswith(os.path.abspath(tmp)),
+          f"ledger at {m.resend_ledger_path()} but state dir is {tmp}")
+    check("6b. the ledger is named for the sending seat, not shared across seats",
+          os.path.basename(m.resend_ledger_path()) == "claude-code.jsonl",
+          m.resend_ledger_path())
+
+    # ---- doc pin: the exit code has to be findable by a caller that branches on rc.
+    doc = open(CLI, encoding="utf-8").read()
+    check("7a. rc=5 is documented in the module's exit-code table",
+          "| 5 " in doc and "REFUSED LOCALLY" in doc,
+          "exit-code table does not mention 5 / REFUSED LOCALLY")
+    check("7b. the override is documented where the rc is",
+          "HESTIA_MESH_RESEND=1" in doc)
+
+    print()
+    if failures:
+        print(f"FAILED {len(failures)}: " + "; ".join(failures))
+        return 1
+    print("all properties hold")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
