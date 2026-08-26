@@ -395,6 +395,40 @@ pub struct Escalation {
     /// one of the two is stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stated_detail: Option<String>,
+    /// WHICH HOOK FIRED, when the opener says so — the gate's own file path
+    /// (`gate_path`, #542). The one seat key that discriminates seats perfectly
+    /// where it is recorded (`gate_self_read`/`gate_self_access`: zero
+    /// cross-firing censused), added because every other question of the form
+    /// "which seat opened this escalation" was unanswerable from the row.
+    /// CALLER-ASSERTED (A1, HST-005): the hook self-reports it, the daemon has
+    /// nothing to check it against, and the row says so only by carrying the
+    /// value. `None` when the opener did not supply one — member-initiated
+    /// opens through `tool_gate_escalation_open` (a session, not a gate),
+    /// hooks that predate the argument, and every row minted before #542.
+    /// An absent value therefore under-claims nothing and proves nothing; it
+    /// reads as "no gate named itself", never as "no gate was involved".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_path: Option<String>,
+    /// The per-wake key of the session that opened this escalation — DERIVED
+    /// from the caller's PROVEN live session (`state::Session::host_session_id`),
+    /// never from the arguments, exactly the doctrine the claimed row's
+    /// `host_session_id` follows: an attribution key a caller can assert is an
+    /// attribution key a caller can launder. `None` when the asker was unproven
+    /// (`asker_basis: asserted`) or the proven session itself carried none —
+    /// and, on rows restored from before #542, always. A null here is the
+    /// honest record of "no proven wake", not a censored one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_session_id: Option<String>,
+    /// The MCP session (its uuid) that opened this escalation, when the asker
+    /// was proven — the same key the refusal row's `requested_by.session_id`
+    /// already carried, which is what made the absence from THIS row a defect
+    /// (#542: `asker_basis: "session"` named a field the row did not have).
+    /// `None` when unproven, and on every pre-#542 row. Note the namespace:
+    /// this is the per-CONNECTION MCP session, not the per-act `session_id` of
+    /// outcome rows — joining on it is the documented misuse
+    /// (`session_prefix` is not a session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub opened_at: u64,
     pub expires_at: u64,
     status: Status,
@@ -998,6 +1032,13 @@ impl EscalationStore {
                             act_digest: s(d, "act_digest"),
                             stated_reason: s(d, "stated_reason"),
                             stated_detail: s(d, "stated_detail"),
+                            // The seat keys (#542), restored from the entry when present.
+                            // Absent restores None — rows minted before #542 carry no key,
+                            // and a null here under-claims nothing: it reads "no gate or
+                            // proven session was recorded", never "none was involved".
+                            gate_path: s(d, "gate_path"),
+                            host_session_id: s(d, "host_session_id"),
+                            session_id: s(d, "session_id"),
                             bar: bar_for(&marker),
                             marker,
                             opened_at: u(d, "opened_at").unwrap_or(now),
@@ -1169,6 +1210,12 @@ impl EscalationStore {
             marker: marker.to_string(),
             stated_reason: stated_reason.map(str::to_string).filter(|v| !v.trim().is_empty()),
             stated_detail: stated_detail.map(str::to_string).filter(|v| !v.trim().is_empty()),
+            // Seat keys are recorded by `record_seat_keys` after the handler
+            // resolves them — `open` is pure over the store and takes no view of
+            // the session (same separation as `record_asker_basis`).
+            gate_path: None,
+            host_session_id: None,
+            session_id: None,
             opened_at: now,
             expires_at: now.saturating_add(ttl_secs.max(1)),
             status: Status::Pending,
@@ -1335,6 +1382,36 @@ impl EscalationStore {
         match self.by_id.get_mut(id) {
             Some(e) => {
                 e.asker_basis = basis;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record the seat keys of the session that opened this escalation — `gate_path`,
+    /// `host_session_id`, `session_id` (#542). Separate from `open` for the same
+    /// reason `record_asker_basis` is: `open` is pure over the store, and resolving
+    /// which values are PROVEN (the two session keys) versus merely asserted
+    /// (`gate_path`) is the handler layer's knowledge, not this store's.
+    ///
+    /// Written by the same call that witnesses the open, never by a later sweep —
+    /// a background writer could disagree with the chain about which session an
+    /// escalation came from, and these fields exist so a reader can ask exactly
+    /// that. Returns false for an unknown id rather than synthesising a shell
+    /// (`invite` / `record_asker_basis` discipline).
+    pub fn record_seat_keys(
+        &mut self,
+        id: &str,
+        gate_path: Option<&str>,
+        host_session_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> bool {
+        match self.by_id.get_mut(id) {
+            Some(e) => {
+                e.gate_path = gate_path.map(str::to_string).filter(|v| !v.trim().is_empty());
+                e.host_session_id =
+                    host_session_id.map(str::to_string).filter(|v| !v.trim().is_empty());
+                e.session_id = session_id.map(str::to_string).filter(|v| !v.trim().is_empty());
                 true
             }
             None => false,
@@ -1840,6 +1917,47 @@ mod tests {
         assert_eq!(e.asker_basis, crate::arbiter::AskerBasis::Asserted);
         assert!(s3.record_asker_basis(&e.id, crate::arbiter::AskerBasis::Session));
         assert_eq!(s3.get(&e.id).map(|e| e.asker_basis), Some(crate::arbiter::AskerBasis::Session));
+    }
+
+    /// The seat keys (#542) survive the same restart every other opened-row field does —
+    /// and a legacy row without them restores None, which under-claims nothing: it reads
+    /// "no gate or proven session was recorded", never "none was involved".
+    #[test]
+    fn replay_restores_the_seat_keys_and_legacy_rows_restore_none() {
+        let mut s = EscalationStore::default();
+        let with_keys = chain_entry(
+            "gate_escalation_opened",
+            serde_json::json!({
+                "escalation_id": "f0a1", "plugin_id": "kimi-code", "role": "r",
+                "tool_name": "Edit", "marker": "pre_tool_use.py",
+                "opened_at": T0, "expires_at": T0 + 3600,
+                "gate_path": "hooks/kimi/pre_tool_use.py",
+                "host_session_id": "wake-542",
+                "session_id": "11111111-2222-3333-4444-555555555555",
+            }),
+        );
+        let legacy = chain_entry(
+            "gate_escalation_opened",
+            serde_json::json!({
+                "escalation_id": "f0a2", "plugin_id": "codex", "role": "r",
+                "tool_name": "Edit", "marker": "pre_tool_use.py",
+                "opened_at": T0, "expires_at": T0 + 3600,
+            }),
+        );
+        assert_eq!(s.rehydrate(&[with_keys, legacy], T0 + 20), 2);
+
+        let e = s.get("f0a1").expect("restored");
+        assert_eq!(e.gate_path.as_deref(), Some("hooks/kimi/pre_tool_use.py"));
+        assert_eq!(e.host_session_id.as_deref(), Some("wake-542"));
+        assert_eq!(
+            e.session_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+
+        let e = s.get("f0a2").expect("restored");
+        assert_eq!(e.gate_path, None, "legacy rows carry no key and restore none");
+        assert_eq!(e.host_session_id, None);
+        assert_eq!(e.session_id, None);
     }
 
     /// A restart must not erase WHO WAS ASKED.
