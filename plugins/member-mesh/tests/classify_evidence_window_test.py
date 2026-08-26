@@ -172,6 +172,52 @@ check("A7: no post-prompt output yields unknown, not the quoted block's verdict"
       got == "unknown", f"got {got!r}")
 
 print()
+print("=== A8. THE BILLING STATE, ONE SPECIMEN PER VENDOR THE MESH FIRES ===")
+# The vendor-spelling bet, third occurrence (2026-08-26). The 08-18 pass widened
+# codex's vocabulary to cover kimi's and stopped; claude spells the identical state
+# two more ways and 60 of 60 claude logs carrying one classified `unknown`, across
+# five outages. A list with one entry per vendor is the shape that makes "one vendor
+# wide" visible — adding a fourth fire template without adding its spelling here is
+# meant to look like the omission it is.
+#
+# Every string below is a VERBATIM capture from a real log on CBP, not authored. An
+# authored plant is what let the kimi gap survive its own test: the plant carried
+# codex's spelling on both sides of the check, so the control contained only the
+# sibling it already matched.
+BILLING_SPECIMENS = {
+    # codex-20260804-225003.log
+    "codex": "ERROR: Your workspace is out of credits. Add credits to continue.",
+    # kimi logs, 08-08 / 08-17 / 08-18 outages
+    "kimi": "403 You've reached your usage limit for this billing cycle. "
+            "Please purchase extra usage or upgrade your plan.",
+    # claude-20260826-064548.log — session bound
+    "claude-session": "You've hit your session limit · resets 7am (America/Los_Angeles)",
+    # claude-20260824-201955.log — weekly bound
+    "claude-weekly": "You've hit your weekly limit · resets 11pm (America/Los_Angeles)",
+    # claude-20260816-050152.log — weekly bound, dated reset variant
+    "claude-weekly-dated": "You've hit your weekly limit · resets Aug 17, 11pm "
+                           "(America/Los_Angeles)",
+}
+for name, specimen in BILLING_SPECIMENS.items():
+    # claude and kimi echo no prompt, so their real logs have no anchor and the whole
+    # tail is the window — reproduce that rather than wrapping every vendor in codex's
+    # log shape, which would test a log none of them writes.
+    got = classify(specimen + "\n", prefix="claude" if name.startswith("claude") else name)
+    check(f"A8/{name}: the billing state classifies as out-of-credits",
+          got == "out-of-credits",
+          f"got {got!r} — this vendor's spelling is not in the pattern list")
+
+# A9 — the widening must not have bought its coverage by stealing verdicts. Checked
+# over all 1960 logs on disk when it landed (60 move, all unknown -> out-of-credits,
+# zero from egress-blocked or timeout); pinned here on the two it could plausibly take.
+got = classify(EPERM + "\n", prefix="claude")
+check("A9a: the widening did not steal egress-blocked",
+      got == "egress-blocked", f"got {got!r}")
+got = classify("the request timed out after 30s\n", prefix="claude")
+check("A9b: the widening did not steal timeout",
+      got == "timeout", f"got {got!r}")
+
+print()
 print("=== B. ADOPTION ===")
 
 watcher_src = open(WATCHER, encoding="utf-8").read()
