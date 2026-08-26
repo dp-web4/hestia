@@ -21,9 +21,15 @@ Everything below is construction detail for that paragraph. Where this document 
 
 ## 1. Why now — measured, not theorised
 
-Three facts from **2026-08-14**, all readable in the live witness chain
-(`hestia_query_history {"filter": {"event_type": "policy_decision"}}`) with the standing-scope
-store empty:
+Three facts from **2026-08-14**, all readable in the live witness chain with the
+standing-scope store empty. This document used to print the reproduction as
+`hestia_query_history {"filter": {"event_type": "policy_decision"}}`; that shape never
+worked. `event_type` is not a key the chain can select on, it was silently DROPPED, and
+the command returned an unfiltered window over the tail wearing a filtered window's
+shape — so a reader who ran it got a plausible answer to a different question. It is now
+refused outright (`hestia.query_filter_unknown_key`). Read a window and select
+client-side: `hestia_query_history {"filter": {"limit": 500}}`, then keep the entries
+whose `eventType` is `policy_decision`.
 
 | ts (UTC) | member | rule | tool | target |
 |---|---|---|---|---|

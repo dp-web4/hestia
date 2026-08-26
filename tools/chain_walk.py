@@ -11,8 +11,12 @@ plausible, well-formed, WRONG answer rather than an error.
      true` with zero declared properties, so an unknown key nested inside `filter` is
      accepted and SILENTLY IGNORED: `{"filter":{"event_type":"appeal"}}` returns
      undifferentiated `outcome` rows, which reads exactly like "no appeal events exist."
-     (Note the asymmetry: a `limit` at the TOP level is refused loudly, with a good
-     message. One call shape, two opposite unknown-input policies.)
+     (The asymmetry that allowed this — a `limit` at the TOP level refused loudly, an
+     unknown key INSIDE `filter` dropped in silence — is closed as of #648: the daemon
+     now answers `hestia.query_filter_unknown_key`. That is a SERVER fix, and a server
+     fix binds only once the daemon is rebuilt AND restarted, so the client-side refusal
+     in `window()` below stays: it is what protects a member talking to a daemon that
+     has not been cycled yet, which on this fleet is the common case.)
   2. The window path answers under `entries` (plural). The `filter.hash` cursor answers
      under **`entry` (SINGULAR)**. A walker keyed on `entries` gets an empty list out of
      a SUCCESSFUL lookup and concludes the cursor is dead. That mistake was published to
