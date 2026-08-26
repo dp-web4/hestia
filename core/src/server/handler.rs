@@ -11587,6 +11587,168 @@ mod tests {
         );
     }
 
+    /// THE POLL'S PROSE MUST NOT STATE A RULE ITS OWN `permits_write` FIELD DENIES.
+    ///
+    /// Reproduced from a live payload, not imagined. CBP, 2026-08-24 20:24Z, escalation
+    /// `27a25b66e7fe22d0`: an operator approval granted at +16s and CLAIMED at +41s polled
+    /// back `status: approved`, `bar_met: true`, `granted: true`, `permits_write: false`,
+    /// with `note: "authoritative as of now; only \`approved\` WITH the stated bar met
+    /// permits the write"`. Both conditions that sentence names were true in that same
+    /// payload and the write was not permitted — the note asserted the negation of the field
+    /// printed four lines above it.
+    ///
+    /// The FIELD had been repaired on 2026-08-18 (two conjuncts -> `is_claimable`'s four)
+    /// after a seat published a spent permit to the operator as live. The sentence
+    /// explaining the field kept the pre-repair law, because nothing type-checks a string
+    /// literal. So this asserts the two halves of one answer against each other.
+    ///
+    /// BOTH ARMS MOVE, deliberately: the same escalation is polled while undecided, while
+    /// the permit is live, and after it is spent, and the note must differ across them. A
+    /// note that is CONSTANT — which is exactly what the retired literal was — fails no
+    /// matter which sentence it is frozen at, and a `permits_write` frozen either way fails
+    /// one of the three arms. Sabotage arm: restore the literal at the poll's `note` and
+    /// this test reds on the undecided arm and again on the spent arm.
+    ///
+    /// FIXTURE HYGIENE, learned the hard way while writing this test: the first draft named
+    /// a real gate path as its `act`, and the seat's own gate refused the edit — a content
+    /// matcher cannot tell a Rust string literal in a test from a write target, and the file
+    /// being written (this one) is not a governance surface at all. Fixtures here name
+    /// surfaces that are markers WITHOUT being live hook paths, the same convention the test
+    /// directly above already follows.
+    #[tokio::test]
+    async fn the_poll_note_never_states_a_rule_permits_write_denies() {
+        const ACT: &str = "Edit -> /repo/core/src/escalation_note_target.rs";
+        const MARKER: &str = "policy.json";
+
+        let (_dir, shared) = make_shared_state();
+        let connected = tool_connect(
+            &shared,
+            &json!({ "plugin_id": "claude-code", "host_agent": "h" }),
+        )
+        .await
+        .unwrap();
+        let session = connected["sessionId"].as_str().unwrap().to_string();
+
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": session,
+                "tool_name": "Bash",
+                "marker": MARKER,
+                "act": ACT,
+                "reason": ACT,
+            }),
+        )
+        .await
+        .unwrap();
+        let escalation_id = opened["escalation_id"].as_str().unwrap().to_string();
+        let poll_args = json!({ "escalation_id": escalation_id });
+
+        // ARM 0 — UNDECIDED. The retired literal had no branch for this at all: an asker
+        // polling a live pending escalation was told the rule under which it would be
+        // permitted, as if a decision had already happened.
+        let pending = tool_gate_escalation_poll(&shared, &poll_args).await.unwrap();
+        assert_eq!(pending["permits_write"], false, "pending permits nothing: {pending}");
+        let pending_note = pending["note"].as_str().unwrap().to_string();
+        assert!(
+            pending_note.contains("UNDECIDED"),
+            "an undecided escalation must say so, not recite the grant rule: {pending}"
+        );
+        assert_eq!(
+            pending["consumed_at"],
+            Value::Null,
+            "nothing has been spent yet: {pending}"
+        );
+
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations
+                .decide(
+                    &escalation_id,
+                    true,
+                    "operator",
+                    "role:constellation:sovereign",
+                    crate::server::gate_escalation::Channel::OperatorSession,
+                    None,
+                    Some("k"),
+                    crate::server::gate_escalation::now_secs(),
+                )
+                .expect("the sovereign channel approves");
+        }
+
+        // ARM 1 — GRANTED AND UNSPENT. `permits_write` is true here, so the note may say so.
+        let live = tool_gate_escalation_poll(&shared, &poll_args).await.unwrap();
+        assert_eq!(live["status"], "approved", "{live}");
+        assert_eq!(live["bar_met"], true, "{live}");
+        assert_eq!(live["permits_write"], true, "an unspent grant is claimable: {live}");
+        let live_note = live["note"].as_str().unwrap().to_string();
+        assert!(
+            live_note.contains("RE-ISSUE"),
+            "a live permit must tell the holder how to spend it: {live}"
+        );
+        assert_eq!(
+            live["consumed_at"],
+            Value::Null,
+            "a grant nobody has claimed carries no spend instant: {live}"
+        );
+
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": session,
+                "tool_name": "Bash",
+                "marker": MARKER,
+                "act": ACT,
+                "reason": ACT,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed["claimed"], true, "the approval is spent here: {claimed}");
+
+        // ARM 2 — THE LIVE PAYLOAD. Approved, bar met, granted, already claimed.
+        let spent = tool_gate_escalation_poll(&shared, &poll_args).await.unwrap();
+        assert_eq!(spent["status"], "approved", "the RECORD is still approved: {spent}");
+        assert_eq!(spent["bar_met"], true, "and the bar is still met: {spent}");
+        assert_eq!(spent["granted"], true, "and it was genuinely granted: {spent}");
+        assert_eq!(
+            spent["permits_write"], false,
+            "but a spent approval is single-use and permits nothing: {spent}"
+        );
+        let spent_note = spent["note"].as_str().unwrap().to_string();
+        assert!(
+            spent_note.contains("ALREADY BEEN CLAIMED"),
+            "the note must name the spend that made `permits_write` false: {spent}"
+        );
+        assert_ne!(
+            spent_note, live_note,
+            "the note has to MOVE with the permission; a constant sentence is the defect"
+        );
+        assert!(
+            !spent_note.contains("only `approved` WITH the stated bar met permits the write"),
+            "the retired two-conjunct rule is FALSE of this very payload, whose `status` and \
+             `bar_met` both hold while the write is refused: {spent}"
+        );
+        // THE MACHINE-READABLE HALF. Everything else on this payload is byte-identical to a
+        // permit that merely LAPSED — measured live on two CBP escalations, 2026-08-26. A
+        // peer asking "which of these approvals was actually spent?" must be able to answer
+        // it without substring-matching English.
+        assert!(
+            spent["consumed_at"].is_u64(),
+            "the spend instant is the one field that separates spent from lapsed: {spent}"
+        );
+        assert_eq!(
+            spent["status"], live["status"],
+            "the whole point: status cannot tell these apart"
+        );
+        assert_eq!(
+            spent["permits_write"], false,
+            "and neither can permits_write, which is false for BOTH causes"
+        );
+    }
+
     /// THE DERIVATION, with nothing on the wire to derive from.
     ///
     /// The first draft of this change wrote the caller's `host_session_id` argument straight
@@ -15581,6 +15743,20 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         "permits_write": esc.map(|e| e.is_claimable(now)).unwrap_or(false),
         "granted": status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false),
         "claim_window_secs_remaining": esc.map(|e| e.claim_window_secs_remaining(now)).unwrap_or(0),
+        // THE DISCRIMINATOR, AS A FIELD AND NOT ONLY AS PROSE. `permits_write: false` has two
+        // causes — the permit was SPENT, or its window LAPSED — and every other field on this
+        // payload is identical between them. Measured live on CBP 2026-08-26 03:10Z:
+        // `c5e2cab3c68874c4` and `365289a4402c4f13` both polled back `status: approved`,
+        // `bar_met: true`, `granted: true`, `permits_write: false`,
+        // `claim_window_secs_remaining: 0` — one of each cause, one shape.
+        //
+        // `claim_note` below now says which, and that is the half a human reads. This is the
+        // half a program reads, because the lesson this whole surface keeps re-teaching is
+        // that a string is not a predicate: `tools/claimable.py` was the correct reader with
+        // zero call sites, and the note stated the two-conjunct rule for six days after the
+        // field it explains was moved to four. A peer auditing "which of these N approvals on
+        // a shared marker was the one actually spent?" must not have to substring-match prose.
+        "consumed_at": esc.and_then(|e| e.consumed_at),
         "bar": esc.map(|e| e.bar),
         "bar_met": esc.map(|e| e.bar_met()),
         "factors_present": esc.map(|e| e.factors.clone()),
@@ -15590,11 +15766,19 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         "reason": esc.and_then(|e| e.reason.clone()),
         // An id this daemon has never seen and an id whose window closed are the SAME answer on
         // purpose. The caller's only safe reading of "I do not know" is "no".
-        "note": if esc.is_none() {
-            "unknown escalation_id — treated as expired (a restart drops the store, and an \
-             in-flight escalation must then read as denied)"
-        } else {
-            "authoritative as of now; only `approved` WITH the stated bar met permits the write"
+        //
+        // THE NOTE IS THE FIELD'S PROSE AND MUST TRACK THE SAME FOUR CONJUNCTS. It used to
+        // read "authoritative as of now; only `approved` WITH the stated bar met permits the
+        // write" — the TWO-conjunct rule that the `permits_write` repair immediately above
+        // replaced. Live on CBP 2026-08-24: `27a25b66e7fe22d0` polled `approved` + `bar_met`
+        // + `permits_write: false` (claimed 41s after grant) beside a sentence saying those
+        // two facts permit the write. The value was fixed and the sentence explaining the
+        // value was not, because nothing compiles a string. It now comes from
+        // `Escalation::claim_note`, the single answer `decision_reply` already reads.
+        "note": match esc {
+            None => "unknown escalation_id — treated as expired (a restart drops the store, and \
+                     an in-flight escalation must then read as denied)",
+            Some(e) => e.claim_note(now),
         },
     }))
 }
