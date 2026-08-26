@@ -64,6 +64,21 @@ def short(sec):
     return f"{sec}s"
 
 
+# The remedy the not-measured arms used to omit. Both arms named a DIAGNOSIS
+# (which producer wrote this primer, why the read failed) and no ANSWER, so a
+# member that wanted the number was left with "restart your watcher" — the one
+# action a woken member structurally cannot take, because restarting its own
+# watcher kills the wake that is reading the sentence. The read is one RPC and
+# the fold is in this file; a member on any watcher vintage can answer the
+# question for itself. Measured on CBP 2026-08-26 from a wake whose primer
+# carried no key at all: count 0, `{"asked": true, "mine": []}`.
+SELF_SERVE = ("You can answer it yourself without a restart: call "
+              "`hestia_gate_pending_escalations` (session_id from `hestia_connect`) "
+              "and pipe the response through `open-petitions.py fold <your plugin_id>` "
+              "— `asked:true` with an empty `mine` is a MEASURED zero, which this "
+              "line is not.")
+
+
 def render(f):
     """The prompt block. Empty string when the member holds nothing."""
     if not isinstance(f, dict):
@@ -98,9 +113,9 @@ def render(f):
                     "That dates the primer's PRODUCER (a watcher without the fold, or "
                     "a composition fallback), not necessarily the watcher running now; "
                     "`tools/process_vintage.py units` is what tells them apart. This "
-                    "is not evidence that you hold none.")
+                    "is not evidence that you hold none. " + SELF_SERVE)
         return ("Open petitions: NOT MEASURED this wake (the pending-escalations "
-                "read failed) — this is not evidence that you hold none.")
+                "read failed) — this is not evidence that you hold none. " + SELF_SERVE)
     mine = f.get("mine") or []
     if not mine:
         return ""

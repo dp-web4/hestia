@@ -197,6 +197,25 @@ with tempfile.TemporaryDirectory() as tmp:
     check("B1c key-absent points at the tool that DOES discriminate them",
           "process_vintage.py units" in out_absent, repr(out_absent))
 
+    # B1d: a diagnosis is not a remedy. Both not-measured arms named the CAUSE
+    # and stopped, and the only action either ever named was a watcher restart —
+    # which is the one action a woken member structurally cannot take, because
+    # restarting its own watcher kills the wake that is reading the sentence.
+    # The read is one RPC and the fold is in this file, so a member on ANY
+    # watcher vintage can answer the question for itself. Both arms, not just
+    # the key-absent one: a failed read is equally self-servable, and a remedy
+    # wired into one arm fixes one cause rather than the class — the same
+    # single-seat mistake arm C exists to stop, one level down.
+    for label, block in (("key-absent", out_absent), ("failed-read", out)):
+        check(f"B1d {label} names the RPC that answers it",
+              "hestia_gate_pending_escalations" in block, repr(block))
+        check(f"B1d {label} names the fold that filters it to this member",
+              "open-petitions.py fold" in block, repr(block))
+        check(f"B1d {label} says the route needs no restart",
+              "without a restart" in block, repr(block))
+        check(f"B1d {label} says what a MEASURED zero looks like",
+              "asked:true" in block and "mine" in block, repr(block))
+
     # B2: measured-and-empty is silence. A block that fires every wake stops
     # being read, and holding nothing is the common case.
     check("B2 measured-and-empty renders nothing",
