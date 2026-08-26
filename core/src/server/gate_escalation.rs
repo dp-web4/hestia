@@ -294,7 +294,24 @@ pub struct Escalation {
     /// a list can tell those apart.
     #[serde(default)]
     pub invited_peers: Vec<String>,
-    /// The subset of `invited_peers` no watcher has ever read a mailbox for, AT INVITE TIME.
+    /// The subset of `invited_peers` whose mailbox no watcher read INSIDE THIS ESCALATION'S
+    /// OWN TTL, evaluated at invite time.
+    ///
+    /// NOT "never read", and the difference is the whole point of the field. `resolve_invitation`
+    /// fills this from `has_mailbox_reader_within(.., ttl_secs, now)`, which is false for a seat
+    /// with no `member_inbox_touch` row at all AND for one whose last touch predates the window.
+    /// The all-time reading is still computed beside it (`has_mailbox_reader`) but feeds only the
+    /// reachability SORT, never this list — a queueing preference, where dormant still deserves a
+    /// slot, versus a conduct fact, where a mailbox nobody has read since July cannot have read an
+    /// ask that dies in an hour.
+    ///
+    /// So an evidence row carries BOTH bits, and they DISAGREE on exactly the class the window was
+    /// added for: `mailbox_reader: false` with `mailbox_reader_all_time: true` is the fix working,
+    /// not a contradiction. Corroborated first-hand on a live row by kimi-code (#516).
+    ///
+    /// `mailbox_reader` is three-state on purpose. A store error yields `None`, and the derivation
+    /// keys on `== Some(false)`, so an unreadable store leaves the seat UNFLAGGED: not being able
+    /// to check a mailbox is not evidence that its owner declined.
     ///
     /// Kept as a subset rather than removed from the invitation: they WERE invited, the
     /// notice IS queued, and a member whose watcher starts tomorrow will read it. What this
