@@ -17,7 +17,7 @@ WHAT COUNTS AS ATTESTABLE. `stated_reason` matching `^<Tool>: ` carries a comman
 so it is computed from the stored string rather than from `tool_name` -- a seat whose hook
 someday sends a real Edit summary must show up as attestable without this script changing.
 
-STORE, NAMED. `/home/dp/.hestia/witness.db` on CBP, read over the daemon at
+STORE, NAMED. `~/.hestia/witness.db` on the seat host, read over the daemon at
 $HESTIA_ENDPOINT (default 127.0.0.1:7711). The .db is ENCRYPTED at rest -- `sqlite3` says
 "file is not a database" -- so there is no cheap local scan and the hash-chain walk at
 ~1 hop per HTTP round trip is the only route. Hop cost is the reason for `--max-hops`.
@@ -36,9 +36,8 @@ import os
 import re
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "..", "..", "private-context", "hestia-local", "probes"))
-import chainwalk  # noqa: E402  -- located above; see ref_chainwalk_wrapper_exists
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from chain_walk import ChainWalker, payload  # noqa: E402
 
 OPENED = "gate_escalation_opened"
 
@@ -83,10 +82,10 @@ def main(argv=None):
 
     expected = {e.strip() for e in args.expect.split(",") if e.strip()}
 
-    chain = chainwalk.Chain()
+    chain = ChainWalker()
     rows, hops, seen_ids = [], 0, set()
     span_new = span_old = None
-    for entry in chain.walk(max_hops=args.max_hops, progress=2000):
+    for entry in chain.walk(max_entries=args.max_hops):
         hops += 1
         ts = entry.get("timestamp")
         if ts:
@@ -94,7 +93,7 @@ def main(argv=None):
             span_old = ts
         if entry.get("eventType") != OPENED:
             continue
-        p = chainwalk.payload(entry)
+        p = payload(entry)
         eid = p.get("escalation_id") or p.get("id")
         if eid:
             seen_ids.add(eid)

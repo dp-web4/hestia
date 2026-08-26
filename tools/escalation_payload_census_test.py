@@ -18,8 +18,6 @@ so any test that only exercises this seat's spelling passes on a broken discrimi
 import os
 import sys
 
-import pytest
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from escalation_payload_census import classify  # noqa: E402
 
@@ -83,10 +81,16 @@ def test_redacted_is_its_own_class():
         "than copied into the record]") == "redacted"
 
 
-@pytest.mark.parametrize("value", [None, "", "   "])
-def test_missing_reason_is_absent(value):
-    """Observed twice: bb120cbc3cdee1cf (Bash) and 301cefe885d1ec8d (Write) carry null."""
-    assert classify(value) == "absent"
+def test_missing_reason_is_absent():
+    """Observed twice: bb120cbc3cdee1cf (Bash) and 301cefe885d1ec8d (Write) carry null.
+
+    Was a parametrize mark over the three values. Under bare `python3` -- which is how CI
+    runs this glob -- the mark does NOTHING: the function is called once with `value`
+    unbound and dies on TypeError, or is never called at all. The loop is the same three
+    cases with the same coverage and no runner to be wrong about.
+    """
+    for value in (None, "", "   "):
+        assert classify(value) == "absent", repr(value)
 
 
 def test_path_with_trailing_space_is_still_destination_only():
@@ -110,5 +114,34 @@ def test_no_edit_or_write_shape_survives_as_attestable():
         assert classify(shape) == "destination-only", shape
 
 
+# Listed by name rather than handed to a runner. `tools/ci_selfexec_test.py` answers
+# "is this test wired up?" by walking `ast.Name`, so dispatch through a runner -- like a
+# `globals()` sweep -- is invisible to it and the whole file reads as inert. Third PR to
+# pay for that: #171, #468 (a week red), and this one. The staleness check below is what
+# stops the explicit list from becoming the very defect the guard exists to catch.
+TESTS = [
+    test_claude_edit_fallback_is_destination_only,
+    test_kimi_edit_fallback_is_destination_only,
+    test_write_fallback_is_destination_only,
+    test_claude_bash_prefixed_command_is_attestable,
+    test_kimi_bare_command_is_attestable,
+    test_codex_apply_patch_is_attestable,
+    test_command_that_merely_starts_with_a_path_is_attestable,
+    test_redacted_is_its_own_class,
+    test_missing_reason_is_absent,
+    test_path_with_trailing_space_is_still_destination_only,
+    test_no_edit_or_write_shape_survives_as_attestable,
+]
+
+
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-q"]))
+    defined = {k for k in globals() if k.startswith("test_")}
+    listed = {t.__name__ for t in TESTS}
+    if defined != listed:
+        print(f"FAIL TESTS is stale: defined-not-listed={sorted(defined - listed)} "
+              f"listed-not-defined={sorted(listed - defined)}")
+        sys.exit(1)
+    for f in TESTS:
+        f()
+        print("ok", f.__name__)
+    print(f"{len(TESTS)} passed")
