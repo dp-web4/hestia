@@ -745,6 +745,34 @@ for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me
 #
 # Widening was checked for theft over all 1449 logs on disk: 42 verdicts move, all
 # `unknown -> out-of-credits`, ZERO taken from egress-blocked or timeout.
+#
+# AND IT HAPPENED A THIRD TIME, SAME SHAPE, THE VENDOR THIS BLOCK IS ABOUT
+# (2026-08-26). The 08-18 pass widened codex's vocabulary to cover kimi's and stopped
+# there. claude's CLI spells the identical state two more ways —
+# `You've hit your session limit · resets 7am (America/Los_Angeles)` and
+# `You've hit your weekly limit · resets 11pm (America/Los_Angeles)` — and neither
+# carries `usage limit`, `credits`, or any other pattern above. Measured over all 740
+# claude logs on disk: 60 carry a claude limit spelling and **60 of 60 classified
+# `unknown`**, across five separate outages (08-03, 08-16, 08-17, 08-24, 08-26). Not
+# one was ever classified correctly. That is a larger corpus than the 40 kimi logs
+# that motivated the previous widening, and it sat under a comment that had already
+# named the failure mode in general terms — "the taxonomy was fine, its vocabulary was
+# one vendor wide" — while the vocabulary was still one vendor short.
+#
+# The lesson the 08-18 pass recorded but did not act on: a vendor-spelling bet is not
+# fixed by adding the one sibling that bit you. Enumerate every vendor the mesh fires,
+# from that vendor's own logs, or the next outage re-files the same report. Three
+# vendors fire here; all three spellings are now present, from verbatim captures.
+#
+# Theft re-checked over all 1960 logs now on disk: 60 verdicts move, all
+# `unknown -> out-of-credits`, ZERO taken from egress-blocked or timeout.
+#
+# This widening makes the claude FALSE POSITIVE below slightly more reachable, and
+# that is an accepted trade, stated rather than hidden: the FP needs a claude fire
+# failing rc not-0 and not-124 whose own prose discusses limits, costs a wrong `why=`
+# hint that nothing downstream branches on, and has occurred twice in 740 logs. The FN
+# it removes is 60 for 60, live, and each one publishes `why=unknown` about a cause
+# sitting verbatim on line 1 of the log it just read.
 # KNOWN FALSE POSITIVE, latent not live: claude's log has NEITHER anchor (its CLI
 # echoes no prompt), so its window is the member's OWN PROSE — and prose ABOUT an
 # outage now matches. Two such logs exist already (claude-20260810-155415,
@@ -768,7 +796,7 @@ classify_fire_failure() {
   else
     TAIL=$(tail -n 200 "$LOG" 2>/dev/null) || TAIL=""
   fi
-  if printf '%s' "$TAIL" | grep -qi 'out of credits\|insufficient credit\|quota exceeded\|usage limit\|billing cycle\|purchase extra usage\|upgrade your plan'; then
+  if printf '%s' "$TAIL" | grep -qi 'out of credits\|insufficient credit\|quota exceeded\|usage limit\|billing cycle\|purchase extra usage\|upgrade your plan\|hit your session limit\|hit your weekly limit\|hit your usage limit'; then
     echo out-of-credits
   elif printf '%s' "$TAIL" | grep -qi 'EPERM\|operation not permitted\|network is unreachable\|connection refused\|urllib\.error'; then
     echo egress-blocked
