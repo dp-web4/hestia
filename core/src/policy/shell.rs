@@ -678,6 +678,53 @@ mod tests {
         assert!(still_visible("echo $(rm -rf /tmp/x && ls)"));
     }
 
+    /// The gap kimi-code named on #617, now pinned.
+    ///
+    /// All three blanking sites — single-quoted spans, non-expanding double-quoted
+    /// spans, and quoted heredoc bodies — are guarded by `subst_depth == 0`, so quoted
+    /// DATA inside `$( … )` stays visible even under an inert head.
+    /// `command_substitution_keeps_its_teeth` above pins the CODE case; nothing pinned
+    /// the data case, so the restriction was enforced by no test and could have been
+    /// widened or narrowed in a refactor with the whole suite green.
+    ///
+    /// It is defensible conservatism — text inside a substitution is re-read by the
+    /// shell, and this module's discipline is "unknown means scanned". The defect kimi
+    /// reported is that the published law names the quoting CONSTRUCT and never names
+    /// substitution depth, so a member reading it cannot predict the verdict. That half
+    /// is fixed in `presets.rs`; this half makes the behaviour the text now promises
+    /// impossible to change silently.
+    ///
+    /// Each arm carries its own outermost CONTROL. Without one, a fixture that never had
+    /// the token, or a head that was never inert, reads as a pass.
+    #[test]
+    fn quoted_data_inside_a_substitution_is_not_inert() {
+        // single-quoted span
+        assert!(!still_visible("grep 'rm -rf /' f"), "control: inert head at depth 0");
+        assert!(still_visible("echo $(grep 'rm -rf /' f)"));
+
+        // non-expanding double-quoted span
+        assert!(!still_visible("grep \"rm -rf /\" f"), "control: inert head at depth 0");
+        assert!(still_visible("echo $(grep \"rm -rf /\" f)"));
+
+        // quoted heredoc body — the shape kimi reproduced live against this parser
+        assert!(!still_visible("cat <<'X'\nrm -rf /\nX"), "control: inert head at depth 0");
+        assert!(still_visible("echo $(cat <<'X'\nrm -rf /\nX\n)"));
+
+        // Depth, not a latch: once the substitution closes, the same span blanks again
+        // in the SAME command. A `bool` refactor would pass every arm above and fail here.
+        assert!(!still_visible("echo $(true); grep 'rm -rf /' f"));
+
+        // Every negative arm above is only evidence if the token was there to lose.
+        for c in [
+            "grep 'rm -rf /' f",
+            "grep \"rm -rf /\" f",
+            "cat <<'X'\nrm -rf /\nX",
+            "echo $(true); grep 'rm -rf /' f",
+        ] {
+            assert!(still_visible_raw(c), "fixture lost its token: {c}");
+        }
+    }
+
     #[test]
     fn an_inert_head_piped_into_a_shell_is_not_inert() {
         // The bypass this design exists to refuse: `cat` governs the heredoc, but `sh`
