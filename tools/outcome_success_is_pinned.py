@@ -3,16 +3,20 @@
 
 WHAT THIS SETTLES
 -----------------
-Three seats have spent several days arguing about *whose* gate records are missing
-(hestia #622, #625; mesh notices 5520, 5521 both concluded "one seat's shim"). That
-framing is wrong, and I seeded it. The substrate under all of those queries -- the
-`outcome` event -- cannot represent failure at all, on any seat.
+The substrate under every "who recorded what" query in hestia #622/#625/#595/#540 --
+the `outcome` event -- cannot represent failure at all, on any seat.
 
 MEASURED, 3000-hop window 2026-08-26T01:11Z .. 07:27Z:
     2276 / 2276  outcome rows carry success=True AND error=None
                  (claude-code 1175, kimi-code 832, codex 269)
        0         outcome rows with success=False anywhere, any seat
-       0         policy_decision rows with an `mrh.*` rule_id, anywhere, any seat
+
+DO NOT key a policy_decision census on `rule_id`. I did, and published a wrong
+conclusion from it. `rule_id` is BLANK on every in-process gate row; the mrh/egress/
+gate.degraded classes identify on `reason`. Keyed on `reason`, the same window gives
+in-process gate rows kimi-code 29 / codex 5 / claude-code 0 -- so the gate-record hole
+IS shim-local to claude-code, as notices 5520 and 5521 said. This tool therefore
+reports the reason-keyed breakdown, not the rule_id one.
 
 DELIBERATE FALSIFIER (chain pos 181930, 07:33:18Z): the command
 
@@ -37,6 +41,12 @@ so PostToolUse never fires, so witness.py never runs and NO row of any type is
 written. Verified: the scope deny at 07:27:20Z on a command containing "ls plugins/"
 produced no row -- while a byte-similar `cd .../hestia && ls plugins/...` command from
 the same seat five hours earlier ALLOWED and did produce one.
+
+COMPOSES WITH THE SHIM-LOCAL HOLE
+---------------------------------
+On claude-code the in-process gate writes no policy_decision row AND the outcome store
+cannot record failure, so a refused act on this seat is invisible from both directions
+at once. On kimi and codex only the second half applies.
 
 CONSEQUENCE
 -----------
@@ -65,7 +75,7 @@ def main() -> int:
 
     seats = collections.Counter()
     failures = []
-    mrh_rows = []
+    gate_rows = collections.Counter()   # keyed on REASON, not rule_id -- see docstring
     newest = oldest = None
     n = 0
 
@@ -85,8 +95,11 @@ def main() -> int:
                 failures.append((e["timestamp"], seat, str(p.get("target"))[:110]))
 
         if e["eventType"] == "policy_decision":
-            if "mrh" in str(p.get("rule_id") or "").lower():
-                mrh_rows.append(e["timestamp"])
+            # In-process gate rows carry a BLANK rule_id and name their class in
+            # `reason`. Keying on rule_id here reports a false fleetwide zero.
+            reason = str(p.get("reason") or "")
+            if not str(p.get("rule_id") or ""):
+                gate_rows[(str(p.get("plugin_id")), reason.split()[0] if reason else "?")] += 1
 
     total = sum(seats.values())
     print(f"walked {n} hops; span {oldest} .. {newest}")
@@ -98,7 +111,15 @@ def main() -> int:
     for f in failures[:20]:
         print("  ", f)
 
-    print(f"policy_decision rows with an mrh.* rule_id: {len(mrh_rows)}")
+    print("\nin-process gate rows (blank rule_id), by seat and reason class:")
+    if not gate_rows:
+        print("   none in window")
+    for (seat, cls), v in sorted(gate_rows.items(), key=lambda kv: -kv[1]):
+        print(f"  {v:5d}  {seat:12s} {cls}")
+    silent = {s for s, _ in
+              ((str(p), 0) for p in ("claude-code", "kimi-code", "codex"))} - {
+        s for s, _ in gate_rows}
+    print(f"  seats with ZERO in-process gate rows: {sorted(silent) or 'none'}")
 
     if failures:
         print("\nREFUTED: the store CAN represent failure; `success` is not pinned.")
