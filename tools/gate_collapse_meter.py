@@ -237,6 +237,40 @@ def main() -> int:
           f"{'':>6}{tot_law:>7}{tot_local:>8}")
     print()
 
+    # THE UNSHARED FORK SURFACE, and it is the one that names the WORK.
+    #
+    # FORKED above can only count names the shared engine ALREADY owns -- a seat overriding
+    # something that was successfully shared once. That set is small here (4) precisely
+    # because the sharing mostly never happened: you cannot override a name nobody shared.
+    #
+    # This counts the other direction: a name defined in TWO OR MORE gates that no shared
+    # module owns at all. Nobody is overriding anything, so nothing flags -- and yet two
+    # seats are answering the same question with two bodies, each seat's tests pass from its
+    # own directory, and CI compares them never. That is the fork surface that produced
+    # every drift incident to date, and every name in this list is a candidate to MOVE into
+    # the shared engine rather than to delete.
+    by_name = {}
+    for seat, path in gates:
+        fns, _ = module_functions(path)
+        for f in fns:
+            if f["name"] in names:
+                continue  # shared owns it: that is the FORKED/ADAPTER axis, counted above
+            by_name.setdefault(f["name"], []).append((seat, f))
+    unshared = {n: v for n, v in by_name.items() if len({s for s, _ in v}) > 1}
+    law_unshared = {n: v for n, v in unshared.items() if any(f["law_bearing"] for _, f in v)}
+    unshared_sloc = sum(f["sloc"] for v in law_unshared.values() for _, f in v)
+
+    print(f"UNSHARED FORK SURFACE: {len(unshared)} name(s) live in 2+ gates and are owned by "
+          f"NO shared module; {len(law_unshared)} law-bearing, {unshared_sloc} sloc.")
+    print("These are candidates to MOVE into the engine. Nothing flags them today.")
+    if not args.quiet and law_unshared:
+        for n, v in sorted(law_unshared.items(),
+                           key=lambda kv: -sum(f["sloc"] for _, f in kv[1])):
+            spread = sum(f["sloc"] for _, f in v)
+            where = "  ".join(f"{s}:{f['sloc']}" for s, f in sorted(v))
+            print(f"    {spread:>5} sloc  {n:<36} {where}")
+    print()
+
     if not args.quiet:
         for seat, _, fork, adapt, _, _, _, _ in rows:
             if fork:
