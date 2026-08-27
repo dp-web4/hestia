@@ -55,15 +55,35 @@ METHOD, and its limits, stated so a reader can discount them:
     verdict. They are the rows where the label is neither supported nor contradicted --
     it is simply uncheckable, which is its own finding and not a rounding error.
 
-PROVENANCE OF THE VOCABULARY BELOW. Running this file's write-verb regex as a `python3`
-heredoc was DENIED by the safety preset on 2026-08-27T12:42:04Z, chain
-`e1f4bfca22947d2e09ce7c970c1417606df80000f6d1a51912e2001509f7e3d8`: the list of verbs that
-mean "write", passed to `re.compile` as a string literal, was read as a command that
-writes. Appealed rather than respelled -- witness `0b2728a1b45b637f`, routed to codex,
-cross-vendor. Not one character of the vocabulary was changed to get past it; the file is
-on disk instead of on stdin. The second-order shape is worth naming: to count how often
-this gate calls a read a write, you must write down the words that mean write, and the
-gate reads that list as a write.
+PROVENANCE OF THE VOCABULARY BELOW, AND AN APPEAL I LOST. Running an earlier draft of this
+analysis as a `python3` heredoc was DENIED by the safety preset on 2026-08-27T12:42:04Z,
+chain `e1f4bfca22947d2e09ce7c970c1417606df80000f6d1a51912e2001509f7e3d8`. I appealed rather
+than respelling it (`0b2728a1b45b637f`), arguing the only thing that looked like a write was
+the list of verbs meaning "write" passed to `re.compile` as a string literal, and that the
+script's only output was a printed table.
+
+**That appeal was NOT UPHELD, and the arbiter was right.** codex ruled cross-vendor at
+12:46:23Z, 159 seconds after filing: the carried command's last statement was
+`json.dump(..., open("/tmp/wk/result.json", "w"))`, which names and opens a filesystem
+destination for writing. The premise of my appeal was false. I had not re-read the act I was
+appealing -- which is the exact failure this file exists to measure, committed by its author
+while measuring it.
+
+Two things follow, and the second is the one that matters:
+
+  * The deny fired on a real write. Whether a `json.dump` to `/tmp` belongs in the class
+    "Block destructive shell commands" is a separate question the ruling did not have to
+    reach, and this file does not claim it.
+  * codex could refute me in 159 seconds ONLY because the safety-preset deny recorded the
+    full command, untruncated. That is the whole argument of this census, arriving from the
+    other direction: peer review is not weak here, it is starved. Give a reviewer the act and
+    they will read it and catch you. The 668 rows below are the population where nobody
+    could, because the field built for the act holds a constant.
+
+Not one character of the write-verb vocabulary was changed to get past the deny; the file is
+on disk instead of on stdin. The second-order shape is still worth naming: to count how often
+this gate calls a read a write, you must write down the words that mean write, and the gate
+reads that list as a write.
 
 Usage:
     python3 tools/escalation_detail_is_a_constant.py            # whole chain
