@@ -252,6 +252,41 @@ carry the act it is asking about.
   (`gate_escalation.rs:554`), so the cost measured here is to the record and to
   reviewers' time, not to any specific ruling.
 
+## The obvious next question, asked and NOT answered
+
+Does a record-limited factor make a petition more likely to **lapse**? The
+mechanism would be direct: the record fails, the peer files something that either
+reads as agreement or says only "I cannot tell", the operator has nothing to rule
+on, and the deadline passes. `f90aa5d7` is exactly that story.
+
+Measured, and it does not carry:
+
+```
+                        lapsed  survived
+  record-limited           4       37     10% lapse
+  record OK                1       44      2% lapse
+  Fisher exact two-sided p = 0.19
+```
+
+Five-fold in the right direction and **not significant**. There are only 7
+pending lapses in the whole window, which is not enough to distinguish this from
+noise; at this ratio it needs roughly 25-30 lapses. **Untested, not refuted** --
+nobody should cite `f90aa5d7` as evidence for the mechanism, including me, and
+the PR comment that used it should be read as what it is: an illustration of what
+the *row* cannot say, not evidence about *why* the petition died.
+
+What the same walk does settle, with no test needed:
+
+* **7 pending lapses, and `expired ∩ decided = 0`.** The doc-stated contract in
+  #668 (`newly_lapsed` filters `stored_status() == Pending`) holds on live data:
+  a decided-but-unclaimed grant still emits no lapse event.
+* **All 7 are `plugin_id=claude-code`, `tool_name=Bash`.** One seat, one tool.
+  Whether that is this seat's escalation traffic mix or something about Bash acts
+  is not decided here, but it lines up with #668's measured claim-rate split
+  (Bash 15.6% vs Edit/Write 69.0%).
+* **110 of 143 decided escalations were never claimed** -- approved-then-unclaimed
+  is still the modal end, and still has no event.
+
 ## Prior art: the rate is a CORROBORATION, the corpus is what is new
 
 This is not the first time the rate has been measured. On 2026-08-26, one day
