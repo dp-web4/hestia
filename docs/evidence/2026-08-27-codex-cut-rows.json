@@ -1,0 +1,208 @@
+{
+ "artifact": "codex-cut-rows-manifest",
+ "claim_under_test": "codex's hook still truncates stated_reason at 400 chars; 10 opened escalations in 2026-08-24..2026-08-27 carry the cut.",
+ "walk": {
+  "hops": 40000,
+  "span": [
+   "2026-08-18T18:35:23.434030520+00:00",
+   "2026-08-27T14:40:53.443933588+00:00"
+  ],
+  "opened_rows_total": 224,
+  "driver": "tools/escalation_payload_census.py --max-hops 40000 --expect 13674a4dde3475ce --json",
+  "driver_ref": "origin/claude/truncated-is-not-attestable"
+ },
+ "note": "The ids below are the POPULATION, not the program. Do not re-run the driver to check this -- fetch each id by any route you like, take len() of its stated_reason in CHARACTERS and sha256 of its UTF-8 bytes, and compare. A re-run of my driver certifies its determinism, not its claim.",
+ "hash_definition": "sha256(stated_reason.encode('utf-8')) over the field EXACTLY as the chain payload returns it -- no strip(), no normalisation. chars = Python len() on the str; bytes = len of the UTF-8 encoding. The two differ because the marker is non-ASCII.",
+ "codex_rows_all": [
+  {
+   "escalation_id": "7a0c3d97c9fff6c7",
+   "at": "2026-08-24T01:40:23.971230431+00:00",
+   "tool_name": "Bash",
+   "class": "truncated",
+   "chars": 412,
+   "bytes": 414,
+   "sha256_utf8": "6d025c7b234b29f5494558c5863b5f9cb7f136f883413bb78f3bf6bd9256dd75",
+   "ends_with_marker": "…[truncated]"
+  },
+  {
+   "escalation_id": "8f1b4d2b1375f050",
+   "at": "2026-08-24T18:47:24.304667625+00:00",
+   "tool_name": "Bash",
+   "class": "truncated",
+   "chars": 412,
+   "bytes": 414,
+   "sha256_utf8": "c7d36969ca7a6437a9b0a100281ce8985d1c2465a7a194cb0cda910337f55209",
+   "ends_with_marker": "…[truncated]"
+  },
+  {
+   "escalation_id": "d7aca7b0301300fb",
+   "at": "2026-08-24T18:51:41.773110956+00:00",
+   "tool_name": "Bash",
+   "class": "truncated",
+   "chars": 412,
+   "bytes": 414,
+   "sha256_utf8": "2c8e6579284bb6da453a2af4c705043ed2ed3b519d108645c6504998489b0d6a",
+   "ends_with_marker": "…[truncated]"
+  },
+  {
+   "escalation_id": "a34486229f036f18",
+   "at": "2026-08-25T03:08:42.982145574+00:00",
+   "tool_name": "mcp__codex_apps__github__fetch_file",
+   "class": "attestable",
+   "chars": 35,
+   "bytes": 35,
+   "sha256_utf8": "ef66a7fe22c8b8a3f0c23248ff713be041a899227fb7751223f56c26142c529b",
+   "ends_with_marker": null
+  },
+  {
+   "escalation_id": "1fb7b2e1e404fa82",
+   "at": "2026-08-25T03:36:14.936618552+00:00",
+   "tool_name": "apply_patch",
+   "class": "truncated",
+   "chars": 412,
+   "bytes": 414,
+   "sha256_utf8": "0793b6bfe0c84dab1f9e3dcbf1ddf83e369255c1aae94f8686ab02e6397ad434",
+   "ends_with_marker": "…[truncated]"
+  },
+  {
+   "escalation_id": "bca326dac25a1e55",
+   "at": "2026-08-25T04:30:37.074330556+00:00",
+   "tool_name": "apply_patch",
+   "class": "truncated",
+   "chars": 412,
+   "bytes": 414,
+   "sha256_utf8": "c67c973a7d68d75651de446bd2e261195c6eca16f7ebd677092f5aca037007df",
+   "ends_with_marker": "…[truncated]"
+  },
+  {
+   "escalation_id": "975732971316e135",
+   "at": "2026-08-25T04:34:07.126228780+00:00",
+   "tool_name": "apply_patch",
+   "class": "truncated",
+   "chars": 412,
+   "bytes": 414,
+   "sha256_utf8": "e55ff00289e76bf041c4d75e9243e7a68672ac956a9e786b6c54d71b8c8bfc01",
+   "ends_with_marker": "…[truncated]"
+  },
+  {
+   "escalation_id": "1eb27224742cf8d3",
+   "at": "2026-08-25T05:17:03.884227725+00:00",
+   "tool_name": "Bash",
+   "class": "attestable",
+   "chars": 318,
+   "bytes": 318,
+   "sha256_utf8": "9776cc215bba366aebda67ad8e2f131bbc3890197e96b49800f1138c33764311",
+   "ends_with_marker": null
+  },
+  {
+   "escalation_id": "250cdbcb0aca04be",
+   "at": "2026-08-25T18:41:13.263043318+00:00",
+   "tool_name": "Bash",
+   "class": "attestable",
+   "chars": 394,
+   "bytes": 394,
+   "sha256_utf8": "912e789913e2ed5df4c333faf42814b8ad7f6725481b7c62fc5c8f383b805281",
+   "ends_with_marker": null
+  },
+  {
+   "escalation_id": "04359f47c01e53e4",
+   "at": "2026-08-25T23:16:42.098005232+00:00",
+   "tool_name": "Bash",
+   "class": "truncated",
+   "chars": 412,
+   "bytes": 414,
+   "sha256_utf8": "64706b2817b1470b9b9bdea4764fb79d3467fb2f9089f21e65a5e65707c81dc2",
+   "ends_with_marker": "…[truncated]"
+  },
+  {
+   "escalation_id": "e1bc557f2f4940c0",
+   "at": "2026-08-27T00:12:49.148027655+00:00",
+   "tool_name": "Bash",
+   "class": "truncated",
+   "chars": 412,
+   "bytes": 414,
+   "sha256_utf8": "30d7988aa09fec39c5da55c33aea73eb1cc779684de1179e99f253c6f41be9f0",
+   "ends_with_marker": "…[truncated]"
+  },
+  {
+   "escalation_id": "8435c380056cbab7",
+   "at": "2026-08-27T00:25:28.395349512+00:00",
+   "tool_name": "Bash",
+   "class": "truncated",
+   "chars": 412,
+   "bytes": 414,
+   "sha256_utf8": "df485a116e12430c93b266661daca621bc327c29749ff88996c65bf5052608fd",
+   "ends_with_marker": "…[truncated]"
+  },
+  {
+   "escalation_id": "9a18bf661e88ec24",
+   "at": "2026-08-27T00:47:59.443733153+00:00",
+   "tool_name": "Bash",
+   "class": "attestable",
+   "chars": 54,
+   "bytes": 54,
+   "sha256_utf8": "d297ba46daecac1b385ece6c230e0ce3a7ee6768e5d353577856d4349c9c865c",
+   "ends_with_marker": null
+  },
+  {
+   "escalation_id": "aef13d056044c0a5",
+   "at": "2026-08-27T01:36:28.110086217+00:00",
+   "tool_name": "Bash",
+   "class": "attestable",
+   "chars": 287,
+   "bytes": 287,
+   "sha256_utf8": "dcd1367e9b959cf8c3329b00de79c378597a7bc095f5dfee7d4aaed70376e1d2",
+   "ends_with_marker": null
+  },
+  {
+   "escalation_id": "a17c28f66e10222a",
+   "at": "2026-08-27T07:09:57.927751317+00:00",
+   "tool_name": "Bash",
+   "class": "truncated",
+   "chars": 412,
+   "bytes": 414,
+   "sha256_utf8": "473911c9b3cf64f5a19f548af3d33b2eac9c5f36d7e1b172b1473d1e9fb22137",
+   "ends_with_marker": "…[truncated]"
+  },
+  {
+   "escalation_id": "22bb1c80ee42fec4",
+   "at": "2026-08-27T13:03:38.585940734+00:00",
+   "tool_name": "Bash",
+   "class": "attestable",
+   "chars": 249,
+   "bytes": 249,
+   "sha256_utf8": "cf5124105cf351fb259d4a5c7f78536109d2dd08f8998cf7548f29d76a1f483b",
+   "ends_with_marker": null
+  }
+ ],
+ "split": {
+  "truncated": 10,
+  "attestable": 6,
+  "total": 16
+ },
+ "producer": {
+  "executing_path": "/home/dp/.codex/hooks/pre_tool_use.py",
+  "wired_at": "/home/dp/.codex/config.toml:40",
+  "md5": "f4b8baf54c057bcaec6389a7f7e610e1",
+  "mtime": "2026-08-17T19:39",
+  "identical_to": "origin/main:plugins/codex/hooks/pre_tool_use.py (same md5)",
+  "site": "pre_tool_use.py:418 `def _attempted_summary(ev, limit=400)` -> :456 `return s[:limit] + (\"…[truncated]\" if len(s) > limit else \"\")`",
+  "reaches_the_chain_via": "pre_tool_use.py:686 and :911 pass it as witness_decision_unified(attempted_summary=...); _shared/hestia_gate_mechanism.py:456,:482 store it as `attempted`.",
+  "why_this_matters": "This file has not changed since 2026-08-17, which is BEFORE every row above. The 2026-08-14 date previously published as a codex 'producer cutover' cannot be a behavioural change of this site."
+ },
+ "cap_signature": {
+  "distinct_sha256_among_cut_rows": 10,
+  "distinct_char_lengths_among_cut_rows": [
+   412
+  ],
+  "byte_lengths_among_cut_rows": [
+   414
+  ],
+  "marker_chars": 12,
+  "arithmetic": "400 (limit) + 12 ('…[truncated]') = 412 chars; the ellipsis is 3 UTF-8 bytes so 414 bytes.",
+  "longest_UNCUT_codex_row_chars": 394,
+  "why_it_is_a_cap_and_not_a_retry": "10 DISTINCT acts (10 distinct sha256) sit at ONE length. A retried command piles ONE act at one length; a cap piles many. This is the same discriminator `_cap_suspects` uses, and it is why that guard counts distinct acts rather than rows.",
+  "cross_tool_check": "Bash rows and apply_patch rows both land at exactly 412, because codex caps the ASSEMBLED summary. (claude-code caps the command BEFORE prefixing, which is why its Bash render is 228 and its apply_patch render is 235 -- do not port that expectation across seats.)"
+ },
+ "redaction_note": "Act TEXT is deliberately absent. Every row carries its id, its length, and a sha256 of the exact field -- enough to check the claim to the byte, and not enough to republish a command the record already caps. The tail is reported only as WHICH marker, never as the characters before it."
+}
