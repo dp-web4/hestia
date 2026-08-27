@@ -53,12 +53,41 @@ So a zero is no longer a scalar here. Every (surface, seat) cell carries a `stat
                             surface in this window. Emitted explicitly, because a seat
                             missing from a per-seat table reads as a seat that is fine.
 
-And every cell — at any n — carries its `ceiling`: the longest value observed, how many
-rows sit on exactly that length, and their share. That one number survives the floor. A
-hard cap is the one thing nothing can exceed, so it piles rows onto the ceiling: 16/16 at
-240 is share 1.0 and screams at n=16, where the spike test is structurally deaf. An
-uncapped surface puts one row on its ceiling. `ceiling.flags_cap` is reported as a
-SUSPICION with its threshold named, never folded into `cut_rate`.
+And every MEASURED cell carries `min_detectable_rate` = MIN_SPIKE_ROWS/n — what the floor
+costs THAT cell. The floor is absolute in rows, so it buys blindness in inverse proportion
+to traffic: 44% on a 45-row seat, 0.04% on a 45,000-row one. Live, full chain, the sharpest
+specimen: seat `unattributed` on the escalation surface has 19 of its 29 rows at exactly 228
+chars ENDING IN A CUT MARKER, and the cell printed `cut=0 (0.0%)` — one row under the floor.
+Its true rate (>=65.5%) sits below its own sensitivity (69.0%), which is what makes that
+zero forced rather than found. A measured zero that does not print this number is still the
+sentence this file exists to abolish, one indirection further out.
+
+And every cell — at any n — carries its `concentrations`: every length holding at least
+CONCENTRATION_MIN_SHARE of the seat. That survives the floor, because a cap piles rows onto
+one length no matter how thin the denominator: 16/16 at 240 is share 1.0 and screams at
+n=16, where the spike test is structurally deaf. Reported as a SUSPICION with its thresholds
+named, never folded into `cut_rate`. `ceiling` is kept as the descriptive special case (the
+concentration at max_len), not as the test — see `concentrations()` for why the maximum is
+the wrong thing to key on.
+
+WHAT THE LENGTH-MODE TEST GETS WRONG, AND THE COLUMN THAT FIXES IT. A spelling-blind test
+has exactly one false-positive class: a probe or watcher that emits ONE FIXED STRING on
+every act piles it onto a single length in an empty neighbourhood, which is arithmetically
+indistinguishable from a cap and reports a 100% cut rate for a seat that truncates nothing.
+Both live instances (`gate-handshake-probe` n=50 at len 32, `gate-lock-probe` n=61 at len
+20) were found by kimi-code on the first full-chain run of this driver — the review caught
+the defect the design was always going to have. The discriminator needs no marker and was
+already in the walked data: DISTINCT VALUES at that length. Measured, full chain: the probes
+sit at 1 distinct value (ratio 0.02) and the live 240 cap at 5,710 over 6,127 rows (0.93).
+Two orders of magnitude apart, so `CONSTANT_MAX_DISTINCT_RATIO` is not a delicate number.
+
+A CAP IS A PROPERTY OF A SUB-POPULATION, NOT OF A SURFACE (kimi-code, PR #679). This seat's
+`extract_target` caps only its `command` branch at 240; the `file_path`/`url` branch returns
+the value UNCAPPED. So claude-code's `outcome.target` carries a max_len of 318 sitting ABOVE
+a 240 cap that cuts 30.7% of the surface. Any test built on "a cap has an empty right tail"
+— including the first draft of the ceiling test below — is therefore wrong on a mixed
+surface, and live surfaces are mixed. What survives is the SHARE, unbound from the maximum:
+`concentrations()` flags any length holding >=10% of a seat on >=2 rows, ceiling or not.
 
 Usage:
     python3 outcome_target_cap_census.py [--max N] [--min-spike F] [--out report.json]
@@ -82,8 +111,10 @@ SURFACES = (
     ("gate_escalation_opened", "stated_reason"),
 )
 
-# Known cut markers, for LABELLING spikes only — never for finding them. Longest first
-# so `…[truncated]` is not swallowed by the bare `…` test.
+# Known cut markers, for LABELLING spikes only — never for finding them, and (see
+# `demote_constants`) for REFUSING to call a repeated constant a cap. Order is immaterial:
+# `…[truncated]` ends in `]`, so the bare `…` test can never swallow it. It was written
+# "longest first" for a collision that does not exist; kept sorted only for reading.
 KNOWN_MARKERS = (
     ("trunc_bracket", "…[truncated]"),
     ("ellipsis_sp", " …"),
@@ -100,8 +131,19 @@ MIN_SPIKE_ROWS = 20
 # Below the floor the spike test is deaf, so the ceiling is what is left. A cap is the one
 # length nothing can exceed, so it piles rows onto max_len; an uncapped surface leaves one
 # row there. These two thresholds gate a SUSPICION only -- never a count, never a rate.
-CEILING_MIN_ROWS = 2
-CEILING_MIN_SHARE = 0.10
+CONCENTRATION_MIN_ROWS = 2
+CONCENTRATION_MIN_SHARE = 0.10
+# Back-compat aliases: the ceiling is one concentration (the one at max_len).
+CEILING_MIN_ROWS = CONCENTRATION_MIN_ROWS
+CEILING_MIN_SHARE = CONCENTRATION_MIN_SHARE
+
+# A hard cap piles hundreds of DISTINCT acts onto one length. A bot repeating one fixed
+# string piles one value there hundreds of times, and in a sparse neighbourhood that reads
+# as a spike of ratio infinity. Measured on the full chain (kimi-code, PR #679 review):
+# two probe seats spiked at 1 distinct value over 50 and 61 rows (ratio 0.02), while the
+# live 240 cap held 5,710 distinct values over 6,127 rows (0.93). Two orders of magnitude,
+# so the threshold is not delicate.
+CONSTANT_MAX_DISTINCT_RATIO = 0.05
 
 
 def marker_of(s: str) -> str:
@@ -111,12 +153,23 @@ def marker_of(s: str) -> str:
     return "UNKNOWN_MARKER"
 
 
-def find_spikes(lengths: Counter, factor: float) -> list:
+def find_spikes(lengths: Counter, factor: float, distinct: dict | None = None) -> list:
     """Lengths standing >= `factor` x the local background. Cap detection, spelling-blind.
 
     Background is the mean count over the 10 lengths on each side, excluding the
     candidate. A smooth distribution gives ratio ~1; a hard cap gives ratio in the
     hundreds. Nothing here knows what a cut looks like.
+
+    THE BACKGROUND WINDOW IS TWO-SIDED AND A CAP'S RIGHT SIDE IS STRUCTURALLY EMPTY (kimi
+    on PR #679): within a capped sub-population, lengths L+1..L+10 cannot exist, so `bg` is
+    roughly halved and `ratio` roughly doubled at exactly the spikes this test is hunting.
+    The direction favours detection, so nothing is hidden — but `--min-spike 20` is
+    therefore doing about 10x of work at a boundary, and any recalibration of that factor
+    must be done against a LEFT-ONLY window or it will silently move by 2x.
+
+    `distinct` (length -> set of value hashes) adds the column that separates a cap from a
+    bot repeating one fixed string; see `demote_constants`. It is optional so the histogram
+    tests can drive this function with no values at all.
     """
     spikes = []
     for L, n in lengths.items():
@@ -126,9 +179,86 @@ def find_spikes(lengths: Counter, factor: float) -> list:
         bg = sum(neigh) / len(neigh) if neigh else 0.0
         ratio = float("inf") if bg == 0 else n / bg
         if ratio >= factor:
+            vals = (distinct or {}).get(L)
+            k = len(vals) if vals is not None else None
             spikes.append({"length": L, "rows": n, "background": round(bg, 2),
-                           "ratio": None if bg == 0 else round(ratio, 1)})
+                           "ratio": None if bg == 0 else round(ratio, 1),
+                           "distinct": k,
+                           "distinct_ratio": None if k is None else round(k / n, 3)})
     return sorted(spikes, key=lambda d: -d["rows"])
+
+
+def demote_constants(spikes: list, markers_at: dict) -> tuple:
+    """Split candidate spikes into caps and repeated constants. Returns (caps, demoted).
+
+    The one false-positive class the length-mode test has: a probe or watcher emitting ONE
+    fixed string on every act piles that string onto a single length in an otherwise empty
+    neighbourhood — ratio infinity, rows over the floor, and a 100% "cut rate" for a seat
+    that truncates nothing. Both live instances (`gate-handshake-probe` n=50 at len 32,
+    `gate-lock-probe` n=61 at len 20) were found by kimi-code on the first full-chain run
+    of this driver, which is where a spelling-blind test was always going to be weakest.
+
+    The discriminator is already in the walked data and needs no marker: a cap collects
+    DISTINCT values, a constant collects one. Demotion additionally requires that no known
+    cut marker was read at that length. That marker read can only REFUSE a cap, never mint
+    one, so the file's spelling-blindness is intact in the direction that matters —
+    but it does mean a genuine cut CONSTANT (one long command, repeated, cut every time,
+    ending in a marker nobody has catalogued) is demoted. That row is printed under
+    `demoted_spikes` with its reason, never dropped.
+    """
+    caps, demoted = [], []
+    for sp in spikes:
+        dr = sp.get("distinct_ratio")
+        marks = markers_at.get(sp["length"], {})
+        known = [m for m in marks if m != "UNKNOWN_MARKER"]
+        if dr is not None and dr <= CONSTANT_MAX_DISTINCT_RATIO and not known:
+            demoted.append(dict(sp, demoted_because=(
+                f"distinct_ratio {dr} <= {CONSTANT_MAX_DISTINCT_RATIO} and no known cut "
+                f"marker at this length: a repeated constant, not a cap")))
+        else:
+            caps.append(sp)
+    return caps, demoted
+
+
+def _from(entries: list, source: str) -> list:
+    """Tag demoted rows with which detector proposed them, so one printed DEMOTED clause
+    can serve both and the reader still knows what was refused."""
+    return [dict(e, proposed_by=source) for e in entries]
+
+
+def concentrations(lengths: Counter, markers_at: dict, n: int,
+                   distinct: dict | None = None) -> list:
+    """Every length holding >= CONCENTRATION_MIN_SHARE of the seat on >= MIN_ROWS rows.
+
+    This is the signal that survives `MIN_SPIKE_ROWS`, and it is the CEILING TEST WITH THE
+    CEILING TAKEN OUT. The ceiling version — "a cap is the one length nothing can exceed,
+    so look at max_len" — is true only inside the capped sub-population, and kimi's own
+    correction on PR #679 shows live surfaces are MIXED: `extract_target` caps the
+    `command` branch at 240 and returns the `file_path`/`url` branch UNCAPPED, so
+    claude-code's `outcome.target` has a max_len of 318 sitting above a 240 cap that cuts
+    ~31% of the surface. On that seat the spike test still finds the cap, so nothing was
+    lost — but the ceiling test looks at 318 (3 rows, share ~0), flags nothing, and would
+    have been the ONLY instrument on a cell of the same shape below the row floor.
+
+    So the share test is unbound from max_len: a cap piles a large share onto ONE length
+    whether or not anything sits above it. A suspicion with its thresholds named, never a
+    count and never a rate.
+    """
+    if not lengths or not n:
+        return []
+    top = max(lengths)
+    out = []
+    for L, rows in lengths.items():
+        share = rows / n
+        if rows >= CONCENTRATION_MIN_ROWS and share >= CONCENTRATION_MIN_SHARE:
+            vals = (distinct or {}).get(L)
+            k = len(vals) if vals is not None else None
+            out.append({"length": L, "rows": rows, "share": round(share, 4),
+                        "markers": dict(markers_at.get(L, {})),
+                        "distinct": k,
+                        "distinct_ratio": None if k is None else round(k / rows, 3),
+                        "is_ceiling": L == top})
+    return sorted(out, key=lambda d: -d["rows"])
 
 
 def ceiling_of(lengths: Counter, markers_at: dict, n: int) -> dict | None:
@@ -156,16 +286,32 @@ def ceiling_of(lengths: Counter, markers_at: dict, n: int) -> dict | None:
     }
 
 
-def seat_report(lengths: Counter, markers_at: dict, n: int, factor: float) -> dict:
+def seat_report(lengths: Counter, markers_at: dict, n: int, factor: float,
+                distinct: dict | None = None) -> dict:
     """One (surface, seat) cell. Factored out of main() so the states are testable.
 
     The whole point of the split below: when a floor-clearing spike is IMPOSSIBLE, the
     count and the rate are `None`. `0` would be a claim about the surface; `None` is the
     truth about the instrument.
+
+    `min_detectable_rate` finishes that job for the cells that ARE measured. The floor is
+    absolute in rows, so on a seat of n rows no cap cutting less than MIN_SPIKE_ROWS/n of
+    it can be seen at all — 44% on a 45-row seat, 0.04% on a 45,000-row one. kimi-code's
+    escalation cell measured `0.0%` at n=45 while its true full-window rate was 24.8%: the
+    zero was structurally forced, not bad luck, and the report that printed it owed the
+    reader that number. It is the sensitivity of the instrument, printed beside its result.
     """
-    spikes = find_spikes(lengths, factor)
+    spikes = find_spikes(lengths, factor, distinct)
     for sp in spikes:
         sp["markers"] = dict(markers_at.get(sp["length"], {}))
+    spikes, demoted = demote_constants(spikes, markers_at)
+    # The same false-positive class reaches the share test, and harder: below the row floor
+    # the share test is the ONLY instrument, so an 11-row seat repeating one 12-char string
+    # is a 100%-share "SUSPECT ceiling" with nothing else to contradict it. Live on the full
+    # chain: three `conformance-runner*` seats. Both detectors get the same discriminator.
+    cons, cons_demoted = demote_constants(
+        concentrations(lengths, markers_at, n, distinct), markers_at)
+    demoted = _from(demoted, "spike") + _from(cons_demoted, "concentration")
 
     if n == 0:
         state = "no_rows"
@@ -183,8 +329,12 @@ def seat_report(lengths: Counter, markers_at: dict, n: int, factor: float) -> di
         "cut_rate": round(cut_rows / n, 4) if measured else None,
         "cut_rate_is_a_floor": True,
         "detection_floor_rows": MIN_SPIKE_ROWS,
+        # What the floor costs THIS cell, as a rate. `None` where no rate is expressible.
+        "min_detectable_rate": round(MIN_SPIKE_ROWS / n, 4) if measured else None,
         "max_len": max(lengths) if lengths else None,
         "candidate_caps": spikes,
+        "demoted_as_repeated_constants": demoted,
+        "concentrations": cons,
         "ceiling": ceiling_of(lengths, markers_at, n),
     }
 
@@ -202,17 +352,25 @@ def summary_line(surface: str, pid: str, s: dict) -> str:
     ) or "none"
     if s["state"] == "measured":
         cut = f"cut={s['rows_at_a_cap']:6d} ({100 * s['cut_rate']:.1f}%)"
+        # A measured zero must carry the sensitivity that produced it, or it reads as
+        # "this seat does not truncate" — the sentence this whole file exists to kill.
+        if not s["rows_at_a_cap"]:
+            caps += f" [floor: no cap under {100 * s['min_detectable_rate']:.1f}% is visible here]"
     else:
         cut = f"cut=   n/a [{s['state']}]"
-    ceil = s.get("ceiling")
-    suspect = ""
-    if ceil and ceil["flags_cap"] and not any(
-        c["length"] == ceil["length"] for c in s["candidate_caps"]
-    ):
-        suspect = (f"  SUSPECT ceiling {ceil['length']} "
-                   f"({ceil['rows']}/{s['rows']} rows = {100 * ceil['share']:.0f}%, "
-                   f"{'/'.join(ceil['markers']) or 'no marker'})")
-    return f"{surface:42s} {pid:12s} n={s['rows']:6d} {cut}  caps: {caps}{suspect}"
+    named = {c["length"] for c in s["candidate_caps"]}
+    suspect = "".join(
+        f"  SUSPECT {'ceiling' if c['is_ceiling'] else 'concentration'} {c['length']} "
+        f"({c['rows']}/{s['rows']} rows = {100 * c['share']:.0f}%, "
+        f"{'/'.join(c['markers']) or 'no marker'})"
+        for c in s.get("concentrations", []) if c["length"] not in named
+    )
+    dem = "".join(
+        f"  DEMOTED {c['length']} ({c['rows']} rows, {c['distinct']} distinct value"
+        f"{'' if c['distinct'] == 1 else 's'}: repeated constant, not a cap)"
+        for c in s.get("demoted_as_repeated_constants", [])
+    )
+    return f"{surface:42s} {pid:12s} n={s['rows']:6d} {cut}  caps: {caps}{suspect}{dem}"
 
 
 def main() -> int:
@@ -226,6 +384,11 @@ def main() -> int:
     lengths = defaultdict(lambda: defaultdict(Counter))
     # surface -> plugin -> length -> Counter(marker)
     markers = defaultdict(lambda: defaultdict(lambda: defaultdict(Counter)))
+    # surface -> plugin -> length -> set(value). The values THEMSELVES, not hashes: the
+    # count is what separates a cap from a repeated constant, and a 64-bit hash would make
+    # that count an estimate for no benefit worth arguing about. A set dedupes as it goes,
+    # so this is bounded by DISTINCT act text on the walked surfaces, not by rows.
+    distinct = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
     totals = defaultdict(Counter)
     want = {t: f for t, f in SURFACES}
     # Every plugin_id seen ANYWHERE in the walk. A seat that wrote nothing to a surface is
@@ -256,6 +419,7 @@ def main() -> int:
         totals[et][pid] += 1
         lengths[et][pid][len(val)] += 1
         markers[et][pid][len(val)][marker_of(val)] += 1
+        distinct[et][pid][len(val)].add(val)
 
     report = {
         "walked_entries": walked,
@@ -276,6 +440,7 @@ def main() -> int:
                 markers[et].get(pid, {}),
                 totals[et][pid],
                 args.min_spike,
+                distinct[et].get(pid, {}),
             )
         report["surfaces"][f"{et}.{field}"] = seats
 
@@ -288,7 +453,8 @@ def main() -> int:
     # Loud, human-readable summary — the numbers a notice would quote.
     print("\n=== candidate caps, spelling-blind ===", file=sys.stderr)
     print(f"(cut_rate is a FLOOR: a cap holding <{MIN_SPIKE_ROWS} rows in this window is "
-          f"below the spike test's sensitivity on a seat of ANY size)", file=sys.stderr)
+          f"below the spike test's sensitivity on a seat of ANY size. Every measured zero "
+          f"prints the rate that floor costs IT.)", file=sys.stderr)
     for surface, seats in report["surfaces"].items():
         for pid, s in sorted(seats.items()):
             print(summary_line(surface, pid, s), file=sys.stderr)

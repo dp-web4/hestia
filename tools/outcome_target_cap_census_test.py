@@ -27,15 +27,17 @@ from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from outcome_target_cap_census import (  # noqa: E402
-    MIN_SPIKE_ROWS, ceiling_of, find_spikes, marker_of, seat_report, summary_line,
+    MIN_SPIKE_ROWS, ceiling_of, concentrations, demote_constants, find_spikes, marker_of,
+    seat_report, summary_line,
 )
 
 
-def _cell(lengths: dict, markers: dict | None = None, factor: float = 20.0) -> dict:
+def _cell(lengths: dict, markers: dict | None = None, factor: float = 20.0,
+          distinct: dict | None = None) -> dict:
     """A (surface, seat) cell from a length histogram. `n` is derived, never passed in,
     so no fixture can accidentally disagree with its own denominator."""
     lc = Counter(lengths)
-    return seat_report(lc, markers or {}, sum(lc.values()), factor)
+    return seat_report(lc, markers or {}, sum(lc.values()), factor, distinct)
 
 
 # ---- THE REGRESSION: a thin denominator must not produce a measured zero ----
@@ -159,7 +161,144 @@ def test_ceiling_of_an_empty_seat_is_none_not_a_crash():
     assert ceiling_of(Counter(), {}, 0) is None
 
 
+# ---- the false-positive class a spelling-blind test was always going to have ----
+
+def test_a_probe_repeating_one_string_is_demoted_not_reported_as_a_cap():
+    """`gate-handshake-probe`: 50 acts, all the literal string `/tmp/gate-handshake-probe-
+    target`, in an empty neighbourhood. Ratio infinity, rows over the floor, and the
+    pre-fix driver called it a 100%-cut cap. Found by kimi-code on the first full-chain
+    run of this file. One distinct value cannot evidence a cap: a cap piles hundreds of
+    DIFFERENT acts onto one length."""
+    one = "/tmp/gate-handshake-probe-target"
+    c = _cell({len(one): 50}, {len(one): Counter({"UNKNOWN_MARKER": 50})},
+              distinct={len(one): {one}})
+    assert c["candidate_caps"] == [], c["candidate_caps"]
+    assert c["rows_at_a_cap"] == 0, c["rows_at_a_cap"]
+    # BOTH detectors proposed it (spike ratio infinity, share 100%) and both refuse it --
+    # the share test needs the discriminator more, since below the row floor it is alone.
+    dem = c["demoted_as_repeated_constants"]
+    assert sorted(d["proposed_by"] for d in dem) == ["concentration", "spike"], dem
+    assert c["concentrations"] == [], c["concentrations"]
+    d = [x for x in dem if x["proposed_by"] == "spike"][0]
+    assert d["distinct"] == 1 and d["distinct_ratio"] == 0.02, d
+    assert "repeated constant" in d["demoted_because"]
+    # Demoted, never dropped: it must still be visible on the line a notice quotes.
+    line = summary_line("outcome.target", "gate-handshake-probe", c)
+    assert "DEMOTED" in line and "SUSPECT" not in line, line
+
+
+def test_the_real_cap_is_not_demoted_because_its_values_are_distinct():
+    """The measured contrast, same test, same threshold: 5,710 distinct values over 6,127
+    rows at 240 on the live surface vs 1/50 for the probe. Two orders of magnitude."""
+    lengths = {L: 2 for L in range(200, 240)}
+    lengths[240] = 6127
+    c = _cell(lengths, {240: Counter({"dots3": 6118, "UNKNOWN_MARKER": 9})},
+              distinct={240: {"x" * 239 + str(i) for i in range(5710)}})
+    assert [s["length"] for s in c["candidate_caps"]] == [240]
+    assert c["candidate_caps"][0]["distinct"] == 5710
+    assert c["candidate_caps"][0]["distinct_ratio"] == 0.932
+    assert c["demoted_as_repeated_constants"] == []
+
+
+def test_a_cut_constant_is_kept_because_the_marker_refuses_the_demotion():
+    """The demotion's own failure mode, pinned so it stays narrow. One long command,
+    repeated 50 times, cut every time -- 1 distinct value, but the value ENDS IN A CUT
+    MARKER. The marker read may only refuse a cap, never mint one, so this stays a cap and
+    the file's spelling-blindness is untouched in the direction that finds things."""
+    v = "x" * 237 + "..."
+    c = _cell({240: 50}, {240: Counter({"dots3": 50})}, distinct={240: {v}})
+    assert [s["length"] for s in c["candidate_caps"]] == [240], c["candidate_caps"]
+    assert c["demoted_as_repeated_constants"] == []
+
+
+def test_demotion_needs_values_and_says_nothing_without_them():
+    """Driven from a bare histogram -- the histogram-only tests above, and any caller that
+    did not collect values -- the column is `None` and NOTHING is demoted. An absent
+    measurement must not read as a passed test."""
+    spikes = [{"length": 32, "rows": 50, "distinct": None, "distinct_ratio": None}]
+    caps, demoted = demote_constants(spikes, {32: Counter({"UNKNOWN_MARKER": 50})})
+    assert demoted == [] and len(caps) == 1
+
+
+# ---- a measured zero must carry its own sensitivity ----
+
+def test_a_measured_zero_prints_the_rate_it_could_not_have_seen():
+    """kimi-code's escalation cell: n=45, driver printed `cut=0 (0.0%) caps: none`, true
+    full-window rate 24.8%. The floor is ABSOLUTE in rows, so at n=45 nothing under
+    20/45 = 44% is expressible -- the zero was forced by arithmetic, and 24.8% sits under
+    it. The cell owes the reader that bound next to the result."""
+    c = _cell({L: 1 for L in range(400, 445)})
+    assert c["state"] == "measured" and c["cut_rate"] == 0.0
+    assert c["min_detectable_rate"] == round(MIN_SPIKE_ROWS / 45, 4)
+    line = summary_line("gate_escalation_opened.stated_reason", "kimi-code", c)
+    assert "floor: no cap under 44.4%" in line, line
+
+
+def test_the_live_cell_that_missed_the_floor_by_one_row():
+    """Not a hypothetical. Full chain, 2026-08-27, `gate_escalation_opened.stated_reason`,
+    seat `unattributed`: 29 rows, NINETEEN of them exactly 228 chars and ending in the
+    `ellipsis_sp` cut marker -- the same 220 cap claude-code cuts at. The floor is 20. The
+    driver printed `cut=0 (0.0%) caps: none`.
+
+    So the seat's true cut rate is >= 65.5% and the cell said zero, one row short. The
+    sensitivity bound makes that legible without anyone reading a marker: 20/29 = 69.0%
+    is ABOVE the true rate, which is exactly why the zero was forced rather than found."""
+    lengths = {228: 19}
+    lengths.update({L: 1 for L in range(200, 210)})
+    c = _cell(lengths, {228: Counter({"ellipsis_sp": 19})})
+    assert c["state"] == "measured", c["state"]
+    assert c["cut_rate"] == 0.0 and c["candidate_caps"] == []
+    assert c["min_detectable_rate"] == round(20 / 29, 4)
+    line = summary_line("gate_escalation_opened.stated_reason", "unattributed", c)
+    assert "floor: no cap under 69.0%" in line, line
+    # ...and the share test, which the floor does not bind, names the length anyway.
+    assert "SUSPECT ceiling 228" in line, line
+
+
+def test_min_detectable_rate_is_null_where_no_rate_is_expressible():
+    """Below the floor there is no sensitivity to quote -- printing 20/16 = 125% would be
+    a number pretending to be a bound. `insufficient_sample` already says it."""
+    assert _cell({240: 16})["min_detectable_rate"] is None
+    assert _cell({})["min_detectable_rate"] is None
+
+
+# ---- the ceiling test is blind on a MIXED surface; the share test is not ----
+
+def test_a_cap_under_an_uncapped_tail_is_missed_by_the_ceiling_and_caught_by_share():
+    """kimi's correction on PR #679: `extract_target` caps the `command` branch at 240 and
+    returns the `file_path`/`url` branch UNCAPPED, so a live surface can carry rows ABOVE
+    its own cap (claude-code: max_len 318 over a 240 cap cutting ~31%).
+
+    Put that mixture below the row floor, where the spike test is deaf and the ceiling is
+    the only instrument left, and the ceiling looks at 318 -- one uncapped row, share 6% --
+    and flags nothing. The cap is 16 of 18 rows. A cap piles a share onto ONE length
+    whether or not something sits above it, so the share test is unbound from max_len."""
+    c = _cell({240: 16, 318: 1, 300: 1}, {240: Counter({"dots3": 16})})
+    assert c["state"] == "insufficient_sample" and c["candidate_caps"] == []
+    assert c["ceiling"]["length"] == 318
+    assert c["ceiling"]["flags_cap"] is False, "the ceiling test sees the uncapped tail"
+    hits = [x for x in c["concentrations"] if x["length"] == 240]
+    assert hits and hits[0]["rows"] == 16 and hits[0]["is_ceiling"] is False, c["concentrations"]
+    line = summary_line("outcome.target", "claude-code", c)
+    assert "SUSPECT concentration 240" in line, line
+
+
+def test_share_test_still_refuses_a_smooth_surface():
+    """The generalisation must not have bought sensitivity by flagging everything: 60
+    lengths at 30 rows each is 1.7% per length, under the 10% share threshold."""
+    assert concentrations(Counter({L: 30 for L in range(200, 260)}), {}, 1800) == []
+
+
 TESTS = [
+    test_a_probe_repeating_one_string_is_demoted_not_reported_as_a_cap,
+    test_the_real_cap_is_not_demoted_because_its_values_are_distinct,
+    test_a_cut_constant_is_kept_because_the_marker_refuses_the_demotion,
+    test_demotion_needs_values_and_says_nothing_without_them,
+    test_a_measured_zero_prints_the_rate_it_could_not_have_seen,
+    test_the_live_cell_that_missed_the_floor_by_one_row,
+    test_min_detectable_rate_is_null_where_no_rate_is_expressible,
+    test_a_cap_under_an_uncapped_tail_is_missed_by_the_ceiling_and_caught_by_share,
+    test_share_test_still_refuses_a_smooth_surface,
     test_sixteen_rows_all_at_a_cap_is_not_a_measured_zero,
     test_that_cell_still_surfaces_the_cap_as_a_suspicion,
     test_the_summary_line_never_prints_a_zero_rate_it_did_not_measure,
