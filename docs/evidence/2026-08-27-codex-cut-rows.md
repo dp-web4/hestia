@@ -112,3 +112,71 @@ Two of the three executing files are not the repo file you would reach for:
 
 So the #678 table survives on the axis that produced the rows, and it survives for a reason
 the repo read could not have established.
+
+## Correction, and the number is 53, not 10
+
+The line above — *"10 is a FLOOR"* — was a hedge. Hedges are cheap; I measured it instead.
+Re-walked at 200,000 hops (193,710 reached, back to 2026-05-16), 934 opened rows:
+
+**codex cut rows: 53**, spanning **2026-08-06T08:17:59Z → 2026-08-27T07:09:57Z.** The
+40,000-hop window saw the most recent fifth of them.
+
+### And the 53 are not one rendering — the cutover is a PRODUCER SWAP
+
+| rendering | marker | lengths | n | span |
+|---|---|---|---|---|
+| claude-code's | `" …"` | 228 (`Bash: `) ×15, 235 (`apply_patch: `) ×8 | **23** | 2026-08-06T08:17:59Z → **2026-08-14T02:50:02Z** |
+| codex's own | `"…[truncated]"` | 412 ×30 | **30** | **2026-08-15T15:09:05Z** → 2026-08-27T07:09:57Z |
+
+**Interleave: 0.** Not one row of either rendering falls inside the other's span. That is
+the signature of a single cutover, and the wire dates it to the gap
+`2026-08-14T02:50Z → 2026-08-15T15:09Z` without reference to any changelog.
+
+The mechanism is in the source. Before the cutover, codex's escalation summaries were
+written by **claude-code's hook, not codex's** — the old design delegated the
+society-safety check to a spawned caller, wired through a module-level constant defaulting
+to `$WORKSPACE/hestia/plugins/claude-code/hooks/pre_tool_use.py`. The spawned process
+wrote the summary, so it wrote it at *its* cap: 220 characters, tool-name prefix prepended
+after the cut, 2-char marker — which is exactly the 228/235 pair observed. PR #372 rewired
+the check in-process (merged 2026-08-12T23:07Z); #585/#659 later deleted the by-then-dead
+constant. That constant is still present in kimi's **executing** hook, which is how this
+was found at all.
+
+Exactly one commit batch touching `plugins/codex/hooks/pre_tool_use.py` lands inside the
+wire-dated gap: 2026-08-13 21:00–21:56 PDT = **2026-08-14T04:00–04:56Z**, headed by
+`8f104bb Sprint E — one transport, one deny recorder`. The attribution is bracketed by the
+wire, not read off a changelog.
+
+### So this claim has now been wrong twice, in different directions
+
+1. *"codex stopped truncating on 2026-08-14"* — **refuted.** It never stopped.
+2. *"the 08-14 cutover changed codex's marker spelling, not its behaviour"* — my own
+   correction in #678, and **also wrong.** Nothing about codex's spelling changed on 08-14,
+   because before 08-14 codex was not doing the spelling. It is a change of *which process
+   produced the summary*.
+3. This.
+
+Both errors came from reading a boundary in my own detector as a fact about the world. The
+first was a marker I could not see; the second was a window I could not see past.
+
+## The left edge should come from the DATA, not from my flag
+
+`--max-hops 40000` is un-re-runnable by construction: the chain grows from the tip, so the
+same flag reaches a different date every day. The record supplies a better edge for free.
+
+**243 of the 934 opened rows carry no `stated_reason` at all, and every one of them is
+before `2026-08-06T00:12:19`** — the first row that carries the field. Zero exceptions on
+either side. That is a producer cutover *in the data*, and it defines a window anyone can
+reproduce: *every `gate_escalation_opened` at or after the first row with a non-empty
+`stated_reason`*.
+
+Recomputed on that window (n=691, 2026-08-06 → 2026-08-27):
+
+| | published 40k window (n=224) | field-in-use era (n=691) |
+|---|---|---|
+| no act text | 29 = **13%** | 124 = **18%** |
+| cut act | 99 = **44%** | 327 = **47%** |
+| unreviewable total | **57%** | **65%** |
+
+Both are correct about their own span. The second is the better number, because its left
+edge is a fact about the record rather than a fact about my flag.

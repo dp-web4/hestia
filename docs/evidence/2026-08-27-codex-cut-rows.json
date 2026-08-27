@@ -257,5 +257,78 @@
    }
   ],
   "what_this_upgrades": "The #678 table asserted three caps from three repo files. Two of the three executing files are NOT the repo file you would reach for: codex's happens to match origin/main, kimi's does not. The claim survives on the executing axis, which is the axis that produced the rows."
+ },
+ "deep_walk_2026_08_27": {
+  "why": "The 40,000-hop walk's left edge is a BUDGET, not a window, and it drifts. Re-walked at 200,000 hops (193,710 reached, back to 2026-05-16) to find out how far '10 is a floor' actually went.",
+  "hops": 193710,
+  "span": [
+   "2026-05-16T17:19:39Z",
+   "2026-08-27T14:46:56Z"
+  ],
+  "opened_rows": 934,
+  "codex_cut_rows": 53,
+  "codex_cut_span": [
+   "2026-08-06T08:17:59Z",
+   "2026-08-27T07:09:57Z"
+  ],
+  "correction_to_the_number": "10 -> 53. The 40k window saw the most recent fifth of them.",
+  "THE PRODUCER SWAP": {
+   "finding": "codex's 53 cut rows are NOT one rendering. 23 of them carry claude-code's marker at claude-code's lengths; 30 carry codex's own.",
+   "claude_rendered": {
+    "marker": " …",
+    "lengths": {
+     "228 (Bash: )": 15,
+     "235 (apply_patch: )": 8
+    },
+    "n": 23,
+    "span": [
+     "2026-08-06T08:17:59Z",
+     "2026-08-14T02:50:02Z"
+    ]
+   },
+   "codex_rendered": {
+    "marker": "…[truncated]",
+    "lengths": {
+     "412": 30
+    },
+    "n": 30,
+    "span": [
+     "2026-08-15T15:09:05Z",
+     "2026-08-27T07:09:57Z"
+    ]
+   },
+   "interleave": 0,
+   "what_interleave_0_means": "Zero rows of either rendering fall inside the other's span. That is the signature of ONE cutover, not a gradual rollout and not two coexisting producers. The wire dates it to the gap 2026-08-14T02:50Z -> 2026-08-15T15:09Z.",
+   "mechanism": "Before the cutover codex's escalation summaries were produced by CLAUDE-CODE's hook, not codex's. The delegation is named in the source: a module-level CLAUDE_PRE constant defaulting to $WORKSPACE/hestia/plugins/claude-code/hooks/pre_tool_use.py, documented as 'delegate the society-safety check to hestia's tested daemon caller'. That spawned process wrote the summary, so it wrote it at ITS cap: 220 characters, tool-name prefix prepended afterwards, 2-char marker. PR #372 rewired the check in-process (merged 2026-08-12T23:07Z); #585/#659 later deleted the by-then-dead constant. The knob is still present in kimi's EXECUTING hook, which is how it was found.",
+   "commit_inside_the_window": "Exactly one batch touching plugins/codex/hooks/pre_tool_use.py lands inside the wire-dated gap: 2026-08-13 21:00-21:56 PDT = 2026-08-14T04:00-04:56Z, headed by `8f104bb Sprint E - one transport, one deny recorder` and `a297b51 Sprint D - pure law centralized`. The attribution is to that batch, bracketed by the wire; it is not read off a changelog.",
+   "what_this_corrects": "THREE versions of this claim now. (1) 'codex stopped truncating on 08-14' — refuted; it never stopped. (2) my own #678 correction, 'the 08-14 cutover changed codex's marker SPELLING, not its behaviour' — also wrong. Nothing about codex's spelling changed on 08-14, because before 08-14 codex was not doing the spelling. The cutover is a change of WHICH PROCESS produced the summary. (3) this."
+  },
+  "the_left_edge_should_come_from_the_DATA": {
+   "problem": "#678's headline (13% no act text, 44% cut) was computed over a 40,000-hop budget. A budget is un-re-runnable: the chain grows from the tip, so the same flag reaches a different date every day.",
+   "the_data_has_its_own_edge": "243 of the 934 opened rows carry NO stated_reason at all, and ALL 243 are before 2026-08-06T00:12:19 — the first row that carries the field. Zero exceptions on either side. That is a producer cutover in the record, and it is a re-runnable window definition: 'every gate_escalation_opened at or after the first row with a non-empty stated_reason'.",
+   "recomputed_over_the_field_in_use_era": {
+    "span": [
+     "2026-08-06",
+     "2026-08-27"
+    ],
+    "rows": 691,
+    "no_act_text": "124/691 = 18%",
+    "cut": "327/691 = 47%",
+    "unreviewable_total": "65%",
+    "redacted": 24,
+    "attestable": 216
+   },
+   "versus_the_published_window": {
+    "span_40k_hops": [
+     "2026-08-18",
+     "2026-08-27"
+    ],
+    "rows": 224,
+    "no_act_text": "29/224 = 13%",
+    "cut": "99/224 = 44%",
+    "unreviewable_total": "57%"
+   },
+   "note": "Both are correct about their own span. The second is the better number because its left edge is a fact about the data rather than a fact about my flag."
+  }
  }
 }
