@@ -145,6 +145,9 @@ CEILING_MIN_SHARE = CONCENTRATION_MIN_SHARE
 # so the threshold is not delicate.
 CONSTANT_MAX_DISTINCT_RATIO = 0.05
 
+# How many flagged concentrations reach the human-readable line before it is truncated.
+MAX_SUSPECTS_ON_A_LINE = 3
+
 
 def marker_of(s: str) -> str:
     for name, mark in KNOWN_MARKERS:
@@ -208,10 +211,14 @@ def demote_constants(spikes: list, markers_at: dict) -> tuple:
     """
     caps, demoted = [], []
     for sp in spikes:
-        dr = sp.get("distinct_ratio")
+        k, dr = sp.get("distinct"), sp.get("distinct_ratio")
         marks = markers_at.get(sp["length"], {})
         known = [m for m in marks if m != "UNKNOWN_MARKER"]
-        if dr is not None and dr <= CONSTANT_MAX_DISTINCT_RATIO and not known:
+        # `k == 1` is the sharp form and the only one that reaches a THIN candidate: a ratio
+        # floor of 0.05 needs 20+ rows before one distinct value can clear it, and the share
+        # test proposes candidates with as few as 2. Live: `conformance-runner-rust`, 14 rows
+        # at length 12, ONE value -- ratio 0.07, over the floor, demoted only by `k == 1`.
+        if (k == 1 or (dr is not None and dr <= CONSTANT_MAX_DISTINCT_RATIO)) and not known:
             demoted.append(dict(sp, demoted_because=(
                 f"distinct_ratio {dr} <= {CONSTANT_MAX_DISTINCT_RATIO} and no known cut "
                 f"marker at this length: a repeated constant, not a cap")))
@@ -359,17 +366,27 @@ def summary_line(surface: str, pid: str, s: dict) -> str:
     else:
         cut = f"cut=   n/a [{s['state']}]"
     named = {c["length"] for c in s["candidate_caps"]}
+    shown = [c for c in s.get("concentrations", []) if c["length"] not in named]
     suspect = "".join(
         f"  SUSPECT {'ceiling' if c['is_ceiling'] else 'concentration'} {c['length']} "
         f"({c['rows']}/{s['rows']} rows = {100 * c['share']:.0f}%, "
         f"{'/'.join(c['markers']) or 'no marker'})"
-        for c in s.get("concentrations", []) if c["length"] not in named
+        for c in shown[:MAX_SUSPECTS_ON_A_LINE]
     )
-    dem = "".join(
-        f"  DEMOTED {c['length']} ({c['rows']} rows, {c['distinct']} distinct value"
-        f"{'' if c['distinct'] == 1 else 's'}: repeated constant, not a cap)"
-        for c in s.get("demoted_as_repeated_constants", [])
-    )
+    # A thin seat can put a dozen lengths over a 10% share, and a line nobody reads is the
+    # same as no line. Truncated LOUDLY -- the count is the whole point, and the JSON holds
+    # every row. (`concentrations` is sorted by rows, so the ones dropped are the smallest.)
+    if len(shown) > MAX_SUSPECTS_ON_A_LINE:
+        suspect += f"  (+{len(shown) - MAX_SUSPECTS_ON_A_LINE} more >={100 * CONCENTRATION_MIN_SHARE:.0f}% concentrations in the JSON)"
+    # Both detectors can propose the same length, and both refusals are recorded in the
+    # JSON. The line says it once.
+    dem_seen, dem = set(), ""
+    for c in s.get("demoted_as_repeated_constants", []):
+        if c["length"] in dem_seen:
+            continue
+        dem_seen.add(c["length"])
+        dem += (f"  DEMOTED {c['length']} ({c['rows']} rows, {c['distinct']} distinct value"
+                f"{'' if c['distinct'] == 1 else 's'}: repeated constant, not a cap)")
     return f"{surface:42s} {pid:12s} n={s['rows']:6d} {cut}  caps: {caps}{suspect}{dem}"
 
 

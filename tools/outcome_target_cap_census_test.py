@@ -27,8 +27,8 @@ from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from outcome_target_cap_census import (  # noqa: E402
-    MIN_SPIKE_ROWS, ceiling_of, concentrations, demote_constants, find_spikes, marker_of,
-    seat_report, summary_line,
+    MAX_SUSPECTS_ON_A_LINE, MIN_SPIKE_ROWS, ceiling_of, concentrations, demote_constants,
+    find_spikes, marker_of, seat_report, summary_line,
 )
 
 
@@ -220,6 +220,40 @@ def test_demotion_needs_values_and_says_nothing_without_them():
     assert demoted == [] and len(caps) == 1
 
 
+def test_a_thin_repeated_constant_is_demoted_by_count_not_by_ratio():
+    """Live: `conformance-runner-rust`, 14 rows of ONE 12-char value on `outcome.target`.
+    A ratio floor cannot reach it -- 1/14 = 0.07 is over 0.05, and no single value can
+    clear a 0.05 ratio below 20 rows at all, while the share test proposes candidates from
+    2 rows up. So the sharp form does the work on exactly the thin cells where the share
+    test is the only instrument, which is where a false SUSPECT costs the most."""
+    one = "hestia_status"[:12]
+    c = _cell({12: 14, 40: 1}, {12: Counter({"UNKNOWN_MARKER": 14})}, distinct={12: {one}})
+    assert c["state"] == "insufficient_sample"
+    assert c["concentrations"] == [], c["concentrations"]
+    d = c["demoted_as_repeated_constants"]
+    assert [x["proposed_by"] for x in d] == ["concentration"], d
+    assert d[0]["distinct"] == 1 and d[0]["distinct_ratio"] == 0.071, d[0]
+    line = summary_line("outcome.target", "conformance-runner-rust", c)
+    assert "SUSPECT" not in line and "DEMOTED 12" in line, line
+    # ...and it is said ONCE even when both detectors propose the same length.
+    assert line.count("DEMOTED") == 1, line
+
+
+def test_a_thin_seat_with_many_concentrations_truncates_the_line_out_loud():
+    """`cursor` puts four lengths over a 10% share on 18 rows, all with distinct values --
+    real suspicions the demotion must not eat. But a line carrying a dozen of them is a
+    line nobody reads, which is the same as no line. Bounded, and the bound is PRINTED:
+    a silent top-N reads as 'that was all of them'."""
+    lengths = {L: 3 for L in range(16, 16 + MAX_SUSPECTS_ON_A_LINE + 2)}
+    marks = {L: Counter({"UNKNOWN_MARKER": 3}) for L in lengths}
+    vals = {L: {f"{L}-{i}" for i in range(3)} for L in lengths}
+    c = _cell(lengths, marks, distinct=vals)
+    assert len(c["concentrations"]) == MAX_SUSPECTS_ON_A_LINE + 2
+    line = summary_line("outcome.target", "cursor", c)
+    assert line.count("SUSPECT") == MAX_SUSPECTS_ON_A_LINE, line
+    assert "(+2 more >=10% concentrations in the JSON)" in line, line
+
+
 # ---- a measured zero must carry its own sensitivity ----
 
 def test_a_measured_zero_prints_the_rate_it_could_not_have_seen():
@@ -294,6 +328,8 @@ TESTS = [
     test_the_real_cap_is_not_demoted_because_its_values_are_distinct,
     test_a_cut_constant_is_kept_because_the_marker_refuses_the_demotion,
     test_demotion_needs_values_and_says_nothing_without_them,
+    test_a_thin_repeated_constant_is_demoted_by_count_not_by_ratio,
+    test_a_thin_seat_with_many_concentrations_truncates_the_line_out_loud,
     test_a_measured_zero_prints_the_rate_it_could_not_have_seen,
     test_the_live_cell_that_missed_the_floor_by_one_row,
     test_min_detectable_rate_is_null_where_no_rate_is_expressible,
