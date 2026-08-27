@@ -326,3 +326,122 @@ survives a corpus 2.4x larger and differently selected, and (b) the structural
 half above: `dissent` is a bool with no cell for the modal case, `argument`
 disappears from the lapse row entirely, and the same state has already been
 filed under the opposite bool.
+
+---
+
+## The hand label was avoidable. Measured 2026-08-27, after a second-seat audit.
+
+kimi-code audited all 60 concur labels from a second seat (PR #671, comment
+5438782937) and disagreed on two, both `none` -> `record_recovered`, and said
+the single-hand read "erred *conservative*; 50% is, if anything, the floor."
+That audit is an inter-rater reliability measurement and nobody scored it as
+one. Two follow-ups, `tools/label_instrument_check.py` and
+`tools/record_carried_the_act.py`.
+
+### 1. The label is reliable — kappa 0.94, not 93%
+
+56 of 60 raw agreement sounds strong and mostly is not: 35 of 60 labels are
+`none`, so two raters who both guessed the majority class agree ~40% by luck.
+Scored properly (`label_instrument_check.py`):
+
+| | agree | p(observed) | p(chance) | **kappa** |
+|---|---|---|---|---|
+| firm disagreements only | 58/60 | 0.967 | 0.414 | **0.943** |
+| firm + the 2 borderline | 56/60 | 0.933 | 0.402 | **0.889** |
+
+Both "almost perfect" on Landis-Koch. The label survives being scored.
+
+### 2. But its errors are one-directional, and that is structural
+
+A crude keyword auto-labeller over the same 60 arguments flags 38 record-limited
+against the hand read's 25. The two disagreement sets are printed, and only one
+of them has anything in it:
+
+- **auto flags / hand said `none`: 13 rows** — candidate misses.
+- **hand flags / auto said `none`: 0 rows** — empty.
+
+The hand read is a strict subset. It cannot over-count this class, only
+under-count it, which is what kimi predicted from n=2 and what the sweep shows
+at n=60. Both of kimi's firm relabels appear in the 13, found independently.
+
+### 3. So stop asking the rater. Ask the record.
+
+Whether a peer **could** have reviewed the act from the escalation is a property
+of `gate_escalation_opened.stated_reason`, not of the peer's prose.
+`record_carried_the_act.py` classifies the field instead of the argument, over
+the 87 escalations that drew peer review:
+
+| what the record carries | n | % |
+|---|---|---|
+| FULL | 44 | 51% |
+| TRUNCATED (cut mid-act) | 27 | 31% |
+| MARKER (bare destination path, no act) | 11 | 13% |
+| REDACTED (act withheld, credential-shaped) | 5 | 6% |
+| ABSENT | 0 | 0% |
+
+**43 of 87 (49%) cannot be reviewed from the record alone**, by four distinct
+mechanisms, none of which requires reading a single peer's prose.
+
+**Every truncated record is exactly 228 characters. Zero variance across all
+27.** That is not an emergent number, it is arithmetic, from
+`pre_tool_use.py:2057`:
+
+```python
+return f"{tool_name}: {s[:220]}" + (" …" if len(s) > 220 else "")
+```
+
+`"Bash: "` (6) + 220 + `" …"` (2) = 228. All 27 are `Bash`. The fleet has been
+quoting "~220" — the slice constant — where the observable is 228. And the
+docstring says the cut is deliberate: *"Truncated hard, because an escalation
+body is read by a human under interruption."* **This is a contract, not a bug**,
+so "reissue the request with a complete inspectable act" is not something an
+asker can comply with: the hook truncates every Bash act over 220 chars
+regardless of who sent it.
+
+Two producers, and only one truncates. 38 of the 87 reasons carry no
+`tool_name:` prefix at all — the bare command up to 412 chars, or a bare path.
+A classifier that only looks for the ellipsis scores those FULL. The first cut
+of this tool did exactly that and reported 31% instead of 49%.
+
+### 4. Cross-tabbed against the hand label
+
+|  | FULL | TRUNCATED | MARKER | REDACTED |
+|---|---|---|---|---|
+| `none` | 23 | 6 | 5 | 1 |
+| `record_qualified` | 1 | 10 | 1 | 0 |
+| `record_recovered` | 6 | 3 | 3 | 0 |
+
+**12 factors labelled `none` sit on records that provably could not carry the
+act.** `none` is defined in this file as "the record carried the act," so all 12
+leave that cell. kimi's audit found 2 of the 12 by hand (plus 2 borderline, both
+also confirmed here as MARKER). The measurement finds all 12 without a rater.
+
+Adopting them: concur side 25 -> **37 of 60 (62%)**; whole-bool 62 -> **74 of
+125 (59%)**. The headline moves up again, in the direction the audit predicted.
+
+`record_recovered` x FULL = 6 is not an error in the other direction. A complete
+command string can still reference content the record does not hold — `a0dc8225`
+is `git apply --3way /tmp/qfilter.patch` where the patch was written by an
+earlier command in the same compound. FULL means *the command text was not cut*,
+never *the act was reviewable*. 49% is a floor for that reason too.
+
+### 5. Two factors have no argument at all
+
+`012a6924`/codex and `5344b783`/codex carry no `argument` key on the wire —
+absent, not empty. Both concur, both on records that carry no act (REDACTED and
+MARKER respectively). `Factor::argument` is optional, so a peer can concur with
+no prose on an escalation whose act was withheld, and it counts in
+`peer_participation()` exactly like a reviewed one. Every prose-reading method
+in this file — mine, kimi's, #648's regex — is blind to those two by
+construction, and silently labelled them `none`.
+
+### Limits
+
+- The window is a 25,000-hop budget, not a date range, and the chain grows from
+  the tip, so the left edge drifts between runs. This pass sees 127 unique
+  factors where the census above saw 125; that is drift, not a method change.
+  The driver is `--max`, and it is published, but a hop budget is not a window.
+- MARKER is `no whitespace, starts with /`. It matches the observed write-class
+  shape and nothing else in this corpus; a single-token non-path reason would be
+  scored FULL.
+- Two seats, one week, seats not randomly assigned. Unchanged from above.
