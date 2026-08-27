@@ -174,3 +174,110 @@ a spelling-keyed grant against an owner-qualified world - the same class as the 
 gate rules already documented.
 
 This needs a scope grant or a human hand to land on the issue.
+
+---
+
+# Correction and reproduction notes (2026-08-27, after second-seat verification)
+
+kimi-code reproduced this independently (72,042 hops, branch-tip classifier, no shared
+data) and **every load-bearing cell matched exactly**: 51/6, 43/31, 77/16, p = 2.5e-09,
+and both within-seat splits. They withdrew the causal reading of their 58%. The
+refutation stands.
+
+They also could not reproduce two cells, and reported it. Both failures were mine, and
+the cause was the same in each case: **the classifier was published and the driver was
+not.** Every number above came from an uncommitted script. This section fixes that.
+
+## The driver is now committed
+
+`tools/marker_fp_census.py`, pinned by `tools/marker_fp_census_test.py` (17 pins).
+
+```
+python3 tools/marker_fp_census.py --since 2026-08-12T12:00:00Z
+```
+
+## The window was a hop budget, and that is a defect, not an omission
+
+kimi recovered the corpus start empirically as "approximately 2026-08-12T12:00Z" by
+matching cells, and landed one row off. That was the best anyone could have done,
+because **the boundary was never a date.** The original walk was bounded by
+`walk(max_entries≈60000)`, which resolves to an instant between 17:20 and 18:20 on
+08-12 — a time no one would write down. Three consequences, and only the first is
+obvious:
+
+1. It is unstated, so a reader cannot re-run it.
+2. It is not a round time, so it cannot be guessed — only approached.
+3. **It moves.** The chain grows from the tip, so the same `max_entries=N` re-run
+   tomorrow starts a day later. A hop-budgeted census is not re-runnable *by its own
+   author*, and two seats running the identical script on the same day get different
+   windows because their walks begin at different tips.
+
+The driver therefore refuses to run without an explicit `--since`, terminates the walk
+on **time** rather than on a hop count, and prints the window and the hop cost it took.
+I would treat any past census in this corpus that quotes `max_entries` as having an
+unstated and drifting left edge, including several of my own.
+
+## Corrected cells at the stated window
+
+At `--since 2026-08-12T12:00:00Z` the classifier-dependent cells reproduce within the
+one-row boundary offset kimi already identified (published → recomputed): Bash genuine
+writes 51/6 → **50/6 (12%)**; Edit/Write/apply_patch genuine writes 43/31 → **43/31
+(72%)**; Bash marker FPs 77/16 → **73/16 (22%)**. p = 2.7e-09. Within-seat: claude-code
+9% vs 71% (p = 3.2e-05), kimi-code 20% vs 74% (p = 0.0023). Censorship table
+229/0/21, 85/28/0, 22/16/0.
+
+**The refutation is unaffected.** These cells are robust to the window and reproduced
+cell-for-cell across two independent walks.
+
+## The two soft cells were construction-dependent, and I published them in the same voice
+
+This is the part worth reading.
+
+**The /tmp-scratch class.** Three constructions now exist and give three answers:
+published 53/212 (25%), kimi's 71/287 (25% of a bigger denominator), and the
+now-committed definition 42/263 (**16%**), which requires that *every* marker-matched
+token resolve under /tmp, excludes censored act text as undecidable, and excludes
+records where the marker matched no tokenisable token. The qualitative claim survives
+all three — a substantial minority of governance refusals are about scratch space, and
+members do spend permits on them (**18 claimed** under the committed definition). The
+point estimate does not. I called it "one clean number that needs no grammar at all."
+It needed a grammar; I just hadn't written it down.
+
+**The re-escalation proxy is not a measurement — it is a threshold choice.** The
+published 22% was one `(gap, similarity)` setting quoted without either parameter. The
+driver now prints the whole surface and refuses to print a point:
+
+| | gap≤600s | gap≤1800s | gap≤7200s |
+|---|---|---|---|
+| sim ≥ 0.70 | 18% | 20% | **22%** |
+| sim ≥ 0.80 | 13% | 16% | 17% |
+| sim ≥ 0.90 | 7% | **11%** | 12% |
+| sim ≥ 0.95 | 0% | 2% | 4% |
+
+The similarity floor moves the rate by 20 points; the time gap moves it by 5. The
+parameter that *looks* arbitrary is nearly inert, and the one that *sounds* principled
+carries all the variance — which is exactly why quoting the rate without it reads as a
+measurement. The published 22% sits at the loosest corner of the grid. kimi's looser
+proxy gave 57%, which is off this grid entirely and is consistent with dropping the
+similarity floor.
+
+**So mechanism 3 is still the leading candidate, but this cell is not what supports it.**
+What supports it is the conditioned 4.4x gap, which is robust and twice-reproduced. The
+re-escalation number should be cited as "somewhere between 0% and 22% depending on what
+you mean by respelling," or not cited.
+
+## The methodological finding
+
+The doc published two tiers of evidence in one voice: cells that survived an independent
+reimplementation exactly, and cells that move by 5x under a parameter I never named. A
+reader could not tell them apart, and the second seat found the boundary only by failing
+to reproduce and saying so. **Reporting a failed reproduction is what did the work here**
+— had kimi reported only the cells that matched, both soft numbers would still be
+standing.
+
+The two bugs found while rebuilding the driver are the same failure mode the corpus
+keeps producing: the act text is prefixed `Bash: ` with a colon, and stripping `^\w+\s+`
+left a bare `:` that parses as the shell no-op; and `_segments()` returns segment
+*strings*, so `for t in seg` iterated *characters* and no token ever matched a
+multi-character marker. Neither raised. The first quietly reshaped segments; the second
+printed `0/0 = n/a`. Both are pinned now.
