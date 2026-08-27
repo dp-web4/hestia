@@ -16141,13 +16141,34 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
 
     let id = require_string(args, "escalation_id")?;
     let now = now_secs();
-    let s = state.lock().await;
+    let session_id_arg = optional_session_id(args);
+    let mut s = state.lock().await;
+
+    // OBSERVATION STARTS THE FUSE, and only a PROVEN asker's observation counts.
+    //
+    // The claim window used to burn from `decided_at`, which measured proximity to the
+    // operator rather than anything about the act: a member in live conversation claimed
+    // inside it while a member working asynchronously watched grants die unspent. Reading
+    // your own decision is how you learn it landed, so that is where the clock should start.
+    //
+    // The READ stays open to anyone — poll has never required a session and a status query is
+    // not an act. What requires proof is MOVING THE CLOCK: an asserted plugin_id here would
+    // let any caller extend (or, by racing, fix) another member's deadline. Unproven callers
+    // get exactly the answer they got before; nothing regresses for them.
+    let observed = match resolve_attributed_caller(&s, session_id_arg.as_deref()) {
+        Some(c) => s.gate_escalations.mark_observed(&id, &c.plugin_id, now),
+        None => false,
+    };
+
     let status = s.gate_escalations.status_of(&id, now);
     let esc = s.gate_escalations.get(&id);
 
     Ok(json!({
         "escalation_id": id,
         "status": status,
+        // Told, not inferred: if this poll is what started the claim fuse, the member should
+        // know its window is now measured from THIS moment and not from the ruling.
+        "observation_started_claim_window": observed,
         // The bar is part of the answer, always: an approval SHORT of the stated bar is
         // recorded but permits nothing. The mismatch is a visible state, never an implicit
         // sufficient. (dp 2026-07-30 + claude-code: the record must carry the bar, not just
@@ -16531,6 +16552,31 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                 "asker_basis": if asker_is_proven { "session" } else { "asserted" },
                 "how_to_decide": format!(
                     "hestia gate approve {id} --reason '...'   (or: hestia gate deny {id})",
+                    id = esc.id
+                ),
+                // TELL THE ASKER HOW TO WAIT, because the notice does not reach a live seat.
+                //
+                // dp, 2026-08-27: "the escalation instructions should include the suggestion
+                // that the asker set a monitor to wait on disposition. most harnesses have
+                // that function." They do — and for a decision, which resolves ONCE, the right
+                // harness primitive is a BACKGROUNDED COMMAND THAT EXITS, not a streaming
+                // monitor. A streaming monitor is for one-event-per-occurrence and stays armed
+                // after the event it was watching for has already fired.
+                //
+                // The waiter must cover EVERY terminal state. A watcher that matches only
+                // `approved` is silent through a denial, an expiry and a dead daemon, and
+                // silence is indistinguishable from "still waiting" — which is precisely how
+                // five approvals across two seats died unclaimed on 2026-08-26/27 while their
+                // askers sat online. `tools/await_escalation.py` exits 0 claimable, 3 approved
+                // -but-dead, 4 denied, 5 expired, 2 undeterminable, so the caller branches on
+                // an exit code rather than parsing prose.
+                //
+                // Passing your session makes the first detection YOUR OBSERVATION, which is
+                // what starts the claim window from that moment rather than from the ruling.
+                "how_to_wait": format!(
+                    "python3 tools/await_escalation.py {id} --session <your session_id>   \
+                     (run it in the BACKGROUND — it exits when decided; \
+                     0=claimable now, 3=approved-but-window-closed, 4=denied, 5=expired)",
                     id = esc.id
                 ),
                 "then": "RE-ISSUE the same write; it will claim the approval. The write is \
