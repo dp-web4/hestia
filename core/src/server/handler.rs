@@ -2004,6 +2004,49 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
     }
 
     let filter = args.get("filter").cloned().unwrap_or(Value::Null);
+
+    // The other half of the same wrong answer. The guard above catches a KNOWN key in the
+    // wrong PLACE; this one catches an unknown key in the right place, and both produce the
+    // identical failure — a default window whose JSON is shape-identical to an honoured
+    // answer. Measured on the live fleet (#648): `filter.escalation_id`, `filter.request_id`
+    // and `filter.plugin_id` each returned the same five newest hashes as no filter at all,
+    // and the entry actually being sought was 770 entries below the served window.
+    //
+    // This is not a hypothetical caller. Both bounded pointer resolvers end their not-found
+    // arm by sending the member here — "older history was NOT searched (hestia_query_history
+    // and hestia://chain/ pointers page deeper)" — and the only key that member holds is the
+    // `escalation_id` / `request_id` the lookup just failed on. Served silently, the advice
+    // converts a truthful "not searched" into a confident, unfiltered "not present".
+    if let Some(obj) = filter.as_object() {
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !QUERY_FILTER_KEYS.contains(k))
+            .collect();
+        if !unknown.is_empty() {
+            let named = unknown.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ");
+            return Ok(hestia_error_envelope(
+                "hestia.query_filter_unknown_key",
+                &format!(
+                    "{named} is not a filter this chain can honour: the chain is indexed by \
+                     hash and read newest-first, so there is nothing to select an \
+                     escalation_id, request_id or plugin_id on. Served as sent it would be \
+                     DROPPED and you would get an unfiltered window over the tail that looks \
+                     exactly like a filtered answer — so it is refused. To reach a record by \
+                     id use its pointer resource (hestia://escalation/<id>, hestia://scope/<id>, \
+                     hestia://appeal/<hash>), which scans for it; to reach one by chain hash \
+                     use filter.hash, which short-circuits the window."
+                ),
+                Some(json!({
+                    "unknownKeys": unknown,
+                    "honoured": QUERY_FILTER_KEYS,
+                    "byIdInstead": ["hestia://escalation/<id>", "hestia://scope/<id>",
+                                    "hestia://appeal/<deny_hash|appeal_entry_hash>"],
+                })),
+            ));
+        }
+    }
+
     let limit = filter
         .get("limit")
         .and_then(Value::as_u64)
@@ -14294,6 +14337,68 @@ mod appeal_tests {
         // The nested shape is untouched.
         let ok = tool_query_history(&state, &json!({"filter": {"limit": 3}})).await.unwrap();
         assert_eq!(ok["entries"].as_array().unwrap().len(), 3, "{ok}");
+    }
+
+    /// The sibling the guard above did not cover, found by walking the live chain (#648).
+    /// A guard is as strong as the DOMAIN it validates, not the exceptions it catches: the
+    /// misplaced-key check validates "known key, wrong place" and says nothing about
+    /// "unknown key, right place" — which lands on the identical wrong answer, an unfiltered
+    /// window wearing a filtered window's shape.
+    ///
+    /// The caller is not hypothetical. `resolve_escalation_pointer` and
+    /// `resolve_scope_pointer` both end their bounded not-found arm by naming this tool as
+    /// the way to page deeper, and the only key that member is holding is the id the scan
+    /// just failed on. If that id is silently dropped, a truthful "the newest 1000 entries
+    /// were searched" becomes a confident "no such record".
+    #[tokio::test]
+    async fn an_unknown_key_inside_filter_is_refused_not_silently_dropped() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let s = state.lock().await;
+            for i in 0..60 {
+                s.append_chain("outcome", json!({"filler": i})).unwrap();
+            }
+        }
+
+        let unfiltered = tool_query_history(&state, &json!({"filter": {"limit": 5}}))
+            .await
+            .unwrap();
+
+        for key in ["escalation_id", "request_id", "plugin_id", "event_type"] {
+            let served = tool_query_history(&state, &json!({"filter": {key: "x", "limit": 5}}))
+                .await
+                .unwrap();
+            let err = served.get("_hestia_error").unwrap_or_else(|| {
+                panic!("`filter.{key}` must be refused, not dropped: {served}")
+            });
+            assert_eq!(err["code"].as_str(), Some("hestia.query_filter_unknown_key"), "{served}");
+            assert!(
+                err["data"]["unknownKeys"].as_array().unwrap().iter().any(|k| k == key),
+                "the refusal must name the key it refused: {served}"
+            );
+            assert!(
+                err["message"].as_str().unwrap().contains("hestia://escalation/"),
+                "refusing without naming a route that works just moves the dead end: {served}"
+            );
+            assert!(served.get("entries").is_none(), "a refusal must not also serve data: {served}");
+            // The bug this pins: served, the answer was byte-identical to no filter at all.
+            assert_ne!(
+                served["entries"], unfiltered["entries"],
+                "an unknown filter key must not return the unfiltered window: {served}"
+            );
+        }
+
+        // The honoured keys keep working, alone and together.
+        let ok = tool_query_history(&state, &json!({"filter": {"limit": 3}})).await.unwrap();
+        assert_eq!(ok["entries"].as_array().unwrap().len(), 3, "{ok}");
+        let named = tool_query_history(&state, &json!({"filter": {"limit": 3, "tool_name": "z"}}))
+            .await
+            .unwrap();
+        assert!(named.get("_hestia_error").is_none(), "{named}");
+        // An empty filter object is not an unknown key.
+        let empty = tool_query_history(&state, &json!({"filter": {}})).await.unwrap();
+        assert!(empty.get("_hestia_error").is_none(), "{empty}");
     }
 
     /// The half the call-site lint did not reach. A misplaced `limit` costs depth; a misplaced
