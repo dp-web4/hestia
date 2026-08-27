@@ -181,8 +181,8 @@
   "total": 16
  },
  "producer": {
-  "executing_path": "/home/dp/.codex/hooks/pre_tool_use.py",
-  "wired_at": "/home/dp/.codex/config.toml:40",
+  "executing_path": "~/.codex/hooks/pre_tool_use.py",
+  "wired_at": "~/.codex/config.toml:40",
   "md5": "f4b8baf54c057bcaec6389a7f7e610e1",
   "mtime": "2026-08-17T19:39",
   "identical_to": "origin/main:plugins/codex/hooks/pre_tool_use.py (same md5)",
@@ -211,7 +211,7 @@
   "seats": [
    {
     "plugin_id": "claude-code",
-    "executing_path": "/home/dp/.claude/hooks/hestia/pre_tool_use.py",
+    "executing_path": "~/.claude/hooks/hestia/pre_tool_use.py",
     "md5": "0e237d8aec8c37205e402e3cb0380957",
     "mtime": "2026-08-25 11:08",
     "cap_site": "pre_tool_use.py:2057  return f\"{tool_name}: {s[:220]}\" + (\" …\" if len(s) > 220 else \"\")",
@@ -226,7 +226,7 @@
    },
    {
     "plugin_id": "codex",
-    "executing_path": "/home/dp/.codex/hooks/pre_tool_use.py",
+    "executing_path": "~/.codex/hooks/pre_tool_use.py",
     "md5": "f4b8baf54c057bcaec6389a7f7e610e1",
     "mtime": "2026-08-17 19:39",
     "cap_site": "pre_tool_use.py:418 def _attempted_summary(ev, limit=400) -> :456 return s[:limit] + (\"…[truncated]\" if len(s) > limit else \"\")",
@@ -241,7 +241,7 @@
    },
    {
     "plugin_id": "kimi-code",
-    "executing_path": "/home/dp/.kimi-code/hooks/pre_tool_use.py",
+    "executing_path": "~/.kimi-code/hooks/pre_tool_use.py",
     "md5": "619cb4c22f43d7231a39cbde4b2f612d",
     "mtime": "2026-08-25 11:08",
     "cap_site": "pre_tool_use.py:358 def _attempted_summary(ev, limit=400) -> :393 return s[:limit] + (\"…[truncated]\" if len(s) > limit else \"\")",
