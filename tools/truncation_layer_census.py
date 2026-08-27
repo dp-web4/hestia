@@ -24,7 +24,7 @@ its lengths would pile on ONE number regardless of the tool. The record answers 
 
 WHAT IT FINDS (CBP, 194,598-entry chain, 2026-05-16 -> 2026-08-27):
 
-  1. NOT the renderer. All 270 ellipsis-space rows sit at `len(tool)+224`, 270/270, on every
+  1. NOT the renderer. All 269 ellipsis-space rows sit at `len(tool)+224`, 269/269, on every
      seat that has them. The offset is constant across `Bash` (4) and `apply_patch` (11), so
      the length moves 7 chars with the tool name. That is the producer's template, not a clamp.
 
@@ -39,11 +39,13 @@ WHAT IT FINDS (CBP, 194,598-entry chain, 2026-05-16 -> 2026-08-27):
      today's hooks tells you "codex caps at 400" and cannot tell you that; only the wire dates
      the swap.
 
-  4. AND THE DAEMON DOES TRUNCATE — on a DIFFERENT RECORD PATH. This is a SECOND CUT SITE,
-     not a correction to 853c5b4 (see WHAT THIS IS NOT, below). `const ATTEMPTED_MAX = 400`
-     in `core/src/server/handler.rs` clamps the `attempted` field of `policy_decision` rows
-     at BOTH of its sites, to 400 + `"…[truncated]"` = 412 — MEASURED at 1,214 rows, all
-     three seats:
+  4. AND THE DAEMON DOES TRUNCATE — on a different field, and 853c5b4's correction overshoots
+     into the converse error. That commit ("open-petitions attributes the reason cap to the
+     wrong layer", 2026-08-27, in force via the dev tree, not on main) is RIGHT that
+     `stated_reason` is uncapped daemon-side and seat-capped. But it says flatly "The daemon
+     does not truncate", and `handler.rs:2580 const ATTEMPTED_MAX: usize = 400` plus
+     `handler.rs:1429/3576` cut the `attempted` field of every `policy_decision` row at
+     400 + `"…[truncated]"` = 412 — MEASURED at 1,214 rows, all three seats:
 
          policy_decision `attempted` cut at 412:  claude-code 766/1033 = 74.2%
                                                   kimi-code   280/1022 = 27.4%
@@ -51,21 +53,9 @@ WHAT IT FINDS (CBP, 194,598-entry chain, 2026-05-16 -> 2026-08-27):
 
      claude-code is the seat with NO 400-limit anywhere in its hook, and it is the seat the
      daemon cuts MOST. Its hook bounds at 220 for `stated_reason` and does not bound
-     `attempted` at all, so the daemon's clamp does all of it.
-
-     WHAT THIS IS NOT — codex's dissent on #681, SUSTAINED. An earlier draft of this file
-     read 853c5b4's "The daemon does not truncate" as a UNIVERSAL claim and called it
-     refuted. It is not universal. That sentence's own paragraph is about `stated_reason`,
-     and its evidence is `optional_string` plus a 1340-char `stated_detail` — a DIFFERENT
-     FIELD, on a DIFFERENT EVENT TYPE, reached by a DIFFERENT INGEST. `reason`/`detail`
-     enter through bare `optional_string` (literally `String::from`: no clamp, no redaction)
-     and land in `gate_escalation` UNBOUNDED, while `attempted` enters the `policy_decision`
-     path and is redacted AND clamped. On the path 853c5b4 scopes itself to, 853c5b4 is
-     CORRECT. Two record paths that share a marker are not interchangeable.
-
-     What DOES survive as a correction to 853c5b4 is its OTHER sentence, "only one seat's
-     rows are cut" — refuted on 853c5b4's own field, where every seat is cut:
-     claude-code 48.9%, codex 67.1%, kimi-code 24.6%, unattributed 65.5%; all 329/692 = 47.5%.
+     `attempted` at all, so the daemon's clamp does all of it. The commit's other sentence,
+     "only one seat's rows are cut", is refuted on both fields: on `stated_reason` every seat
+     is cut (claude-code 48.8%, codex 67.1%, kimi 24.8%, unattributed 65.5%).
 
   5. SO THE MARKER DOES NOT NAME A LAYER. `"…[truncated]"` at exactly 412 is emitted by the
      seat hooks (`_attempted_summary(ev, limit=400)`, codex:418 and kimi:392) into
@@ -73,36 +63,14 @@ WHAT IT FINDS (CBP, 194,598-entry chain, 2026-05-16 -> 2026-08-27):
      sites, no shared constant — raise one and two keep cutting at the old width, silently.
      What DOES name the layer is the pair (FIELD, does-the-length-track-`len(tool_name)`).
 
-     This file's own author then committed exactly that error one finding earlier: saw 412 +
-     `"…[truncated]"` on two record paths and merged them into one claim about "the daemon".
-     The hazard is not hypothetical, and noticing it in the abstract does not inoculate you
-     against it — a reviewer who read the SCOPE of the disputed sentence caught it, and a
-     reviewer who re-ran the NUMBERS did not.
-
-CITING LINES vs CITING SYMBOLS. An earlier draft pinned `ATTEMPTED_MAX` to `handler.rs:2580`
-and its second clamp site to `:3576`. At main@534c8e8 they are at **2623** and **3618** — and
-a second seat re-verified that draft and reported the numbers "present as cited", offering its
-own, differently-wrong ranges. Both seats agreed on the CONCLUSION (the constant is there, it
-clamps) while the EVIDENCE POINTER was false, which is the failure a concur is least able to
-catch: re-deriving a number tests the number, but a line cite is only ever re-read. Cite the
-SYMBOL, and a commit when a location is genuinely needed. The load-bearing claims here survive
-this precisely because they are chain arithmetic (`len(tool)+224`), not file coordinates.
-
-SINGLE-SEAT EVIDENCE. The hook-file cites — claude-code's producer line, `codex:418`,
-`kimi:392`, and "claude-code's hook contains no 400" — are readable only from this seat; peer
-review of them was correctly DENIED by scope. They are testimony, not replicated measurement.
-Finding 1's discriminator does not depend on them: constant-offset-across-tool-names is a
-property of the chain, and it replicated exactly from a second seat.
-
 Read-only: walks the chain, writes nothing.
 """
 from __future__ import annotations
 
 import sys
 from collections import Counter, defaultdict
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, "/mnt/c/exe/projects/ai-agents/hestia/tools")
 from chain_walk import ChainWalker, payload  # noqa: E402
 
 ELL_SP = " …"              # claude-code's template marker
