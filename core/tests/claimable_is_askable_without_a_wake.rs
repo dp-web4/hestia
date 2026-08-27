@@ -175,3 +175,56 @@ fn one_members_grant_is_not_another_members_listing() {
          scoping and not about an empty store"
     );
 }
+
+/// PIN C — the surface refuses an unproven caller instead of serving a named one.
+///
+/// GPT/Nova review of the first cut: the handler fell back to a caller-supplied `plugin_id`
+/// when the session did not resolve, labelled it `asker_basis: "asserted"`, and then listed
+/// that member's claimable approvals. An honest LABEL on a disclosure does not stop it being a
+/// disclosure -- an unauthenticated caller could enumerate any member's grants by naming them,
+/// while the tool advertised "what approvals YOU can spend". The doc's excuse ("discloses
+/// nothing a member could not learn by being refused") was false on its face: your own refusal
+/// never reports what a PEER holds.
+///
+/// Pinned from SOURCE because the defect was a fallback ARM, not a wrong value: a behavioural
+/// test that passes a session would never exercise it, which is exactly how it shipped.
+#[test]
+fn the_claimable_surface_has_no_asserted_plugin_id_fallback() {
+    let src = include_str!("../src/server/handler.rs");
+    let start = src
+        .find("async fn tool_gate_escalation_claimable")
+        .expect("claimable handler not found");
+    let end = src[start..]
+        .find("\nasync fn ")
+        .map(|o| start + o)
+        .unwrap_or(src.len());
+    // COMMENTS STRIPPED BEFORE MATCHING. The first run of this pin went red on the prose that
+    // explains the fix -- the comment block quotes `asker_basis: "asserted"` while describing
+    // why the arm was removed. A guard that a comment can satisfy (or break) is measuring the
+    // documentation, not the code.
+    let body: String = src[start..end]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = body.as_str();
+
+    assert!(
+        !body.contains("\"asserted\""),
+        "the asserted-identity arm is back in tool_gate_escalation_claimable: an unproven \
+         caller must be REFUSED, not served under a label. This surface reports the caller's \
+         OWN permissions and a caller-supplied plugin_id lets one member enumerate another's."
+    );
+    assert!(
+        !body.contains("args.get(\"plugin_id\")"),
+        "tool_gate_escalation_claimable reads a caller-supplied plugin_id again; identity here \
+         must come from resolve_attributed_caller and nowhere else"
+    );
+    // Positive control: the refusal path must still exist, or the two assertions above would
+    // also pass on a handler that had been deleted entirely.
+    assert!(
+        body.contains("resolve_attributed_caller") && body.contains("cannot determine who is asking"),
+        "positive control failed: the proven-identity path and its refusal message are gone, \
+         so the negative assertions above prove nothing"
+    );
+}

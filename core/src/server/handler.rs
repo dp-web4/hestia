@@ -332,7 +332,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_gate_escalation_claimable",
-            "What approvals YOU can spend RIGHT NOW, newest decision first. Ask this after any deny, and again whenever you suspect a decision landed: an approval dies APPROVAL_CLAIM_WINDOW_SECS (600) after the DECISION, not after the open, and a live seat is never woken, so the notice announcing your grant waits for a wake that never comes while the window closes against a member that was online the whole time. Each entry carries act_digest — the exact act the approval is bound to (#539), which you must re-issue verbatim — and claim_window_secs_remaining, the CLAIM clock rather than the record clock. Read-only, and the same predicate hestia_gate_escalation_claim spends against, so it can never advertise a claim that would fail. An empty list is a real answer: you hold nothing spendable",
+            "What approvals YOU can spend RIGHT NOW, newest decision first. REQUIRES a proven session_id from hestia_connect: this reports your OWN permissions, so a caller-supplied plugin_id is refused rather than trusted (it would let one member enumerate another's grants). Ask this after any deny, and again whenever you suspect a decision landed: an approval dies APPROVAL_CLAIM_WINDOW_SECS (600) after the DECISION, not after the open, and a live seat is never woken, so the notice announcing your grant waits for a wake that never comes while the window closes against a member that was online the whole time. Each entry carries act_digest — the exact act the approval is bound to (#539), which you must re-issue verbatim — and claim_window_secs_remaining, the CLAIM clock rather than the record clock. Read-only, and the same predicate hestia_gate_escalation_claim spends against, so it can never advertise a claim that would fail. An empty list is a real answer: you hold nothing spendable",
         ),
         t(
             "hestia_gate_arbitrate_escalation",
@@ -15958,8 +15958,9 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
 /// the moment it wants to know.
 ///
 /// Read-only and deliberately unwitnessed, for the same reason `hestia_scope_status` is:
-/// reading your own permissions is not an act. This lists ONLY what the caller may spend, so
-/// it discloses nothing a member could not already learn by being refused.
+/// reading your own permissions is not an act. It lists ONLY what the PROVEN caller may spend
+/// -- see the identity block below for why an earlier draft's `asserted` fallback made that
+/// sentence false, and why "the label was honest" was not a defence.
 async fn tool_gate_escalation_claimable(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
 
@@ -15972,22 +15973,35 @@ async fn tool_gate_escalation_claimable(state: &SharedState, args: &Value) -> To
     // than merely joining it, and the basis is reported. A member reading its own grants
     // under `asserted` should know that is what it did.
     let caller = resolve_attributed_caller(&s, session_id_arg.as_deref());
-    let (plugin_id, basis) = match caller.as_ref() {
-        Some(c) => (c.plugin_id.clone(), "session"),
-        None => match args.get("plugin_id").and_then(|v| v.as_str()) {
-            Some(p) if !p.is_empty() => (p.to_string(), "asserted"),
-            // Naming nobody is not the same as holding nothing, and answering `[]` here
-            // would be indistinguishable from a member that genuinely has no grant — the
-            // "null state reads as a verdict" failure. Refuse instead.
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "cannot determine who is asking: pass session_id (preferred, proven) or \
-                     plugin_id. An empty list would read as 'you hold nothing spendable', \
-                     which is a different answer from 'I do not know who you are'"
-                ))
-            }
-        },
+    // A PROVEN SESSION IS REQUIRED, and the first cut of this got it wrong (GPT/Nova review).
+    //
+    // That version fell back to a caller-supplied `plugin_id` when the session did not resolve
+    // and labelled the result `asker_basis: "asserted"`. The reasoning was that an honest label
+    // makes the evidence honest — and it does. What it does not do is make the SURFACE honest:
+    // the tool advertises "what approvals YOU can spend" and the doc claimed it "lists ONLY what
+    // the caller may spend", while the asserted arm let an unauthenticated caller ENUMERATE
+    // ANOTHER MEMBER'S claimable approvals by naming that member. Labelling a disclosure does
+    // not stop it being one, and the doc's excuse — "discloses nothing a member could not learn
+    // by being refused" — was simply false: your own refusal never tells you what a PEER holds.
+    //
+    // This surface exists precisely BECAUSE the member is already talking to this daemon, so
+    // requiring the live session costs it nothing and removes an identity-laundering seam.
+    // Same null-state discipline as before: unresolved identity is an ERROR, never an empty
+    // list, because "I do not know who you are" and "you hold nothing" are different answers.
+    let plugin_id = match caller.as_ref() {
+        Some(c) => c.plugin_id.clone(),
+        None => {
+            return Err(anyhow::anyhow!(
+                "cannot determine who is asking: this surface reports YOUR OWN claimable \
+                 approvals and therefore requires a PROVEN session_id (from hestia_connect). \
+                 A caller-supplied plugin_id is not accepted here: it would let one member \
+                 enumerate another's grants. Note that an empty list is a real answer and this \
+                 is not it — 'I do not know who you are' is a different fact from 'you hold \
+                 nothing spendable'"
+            ))
+        }
     };
+    let basis = "session";
 
     let items: Vec<Value> = s
         .gate_escalations
