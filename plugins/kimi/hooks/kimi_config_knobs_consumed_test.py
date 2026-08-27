@@ -95,6 +95,35 @@ def consumed_names(sources):
     return direct | {name for field, name in bindings.items() if field in field_reads}
 
 
+def _strip_doc(body):
+    """Blank a docstring in place: prose is not code, and a mention is not a read."""
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body[0].value.value = ""
+
+
+def _code_strings(src):
+    """String constants in executable position, docstrings excluded."""
+    tree = ast.parse(src)
+    _strip_doc(tree.body)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            _strip_doc(node.body)
+    return {n.value for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+
+
+def _claude_pre_assigned(src):
+    """A CLAUDE_PRE* assignment at ANY depth — the dead delegation variable returning."""
+    for node in ast.walk(ast.parse(src)):
+        targets = node.targets if isinstance(node, ast.Assign) else (
+            [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign)) else [])
+        if any(isinstance(t, ast.Name) and t.id.startswith("CLAUDE_PRE") for t in targets):
+            return True
+    return False
+
+
 def main() -> int:
     src = open(HOOK, encoding="utf-8").read()
     advertised = advertised_knobs(src)
@@ -114,10 +143,15 @@ def main() -> int:
         for f in failures:
             print("  " + f)
         return 1
-    # The removed knob must stay removed (the regression itself). Prose MENTIONS are fine
-    # (the removal note names it); what must not return is the env read or the assignment.
-    code = src.split('"""', 2)[2] + "\n" + "\n".join(sources[1:])
-    if re.search(r'os\.environ[.\[][^)]*HESTIA_SOCIETY_GATE', code) or re.search(r"^CLAUDE_PRE\s*=", code, re.M):
+    # The removed knob must stay removed (the regression itself). Tightened 2026-08-27 on
+    # claude-code's mutation probe (peer factor on 5344b7832489bc1e; staging escalations
+    # 61e282101e871eb9 / 3c7474bb8b1bd1e5): the regex arm this replaced could not see
+    # os.getenv("HESTIA_SOCIETY_GATE"), a from-import of environ, a variable-held name, or
+    # an indented CLAUDE_PRE — each resurrected the dead knob green. The census is now AST:
+    # the knob's NAME as a code string constant (docstrings stripped, so prose mentions
+    # stay fine) or a CLAUDE_PRE* assignment at any depth IS the regression.
+    bodies = [src.split('"""', 2)[2]] + sources[1:]
+    if any("HESTIA_SOCIETY_GATE" in _code_strings(b) or _claude_pre_assigned(b) for b in bodies):
         print("FAIL: HESTIA_SOCIETY_GATE / CLAUDE_PRE is being READ again — the #585 deletion regressed")
         return 1
     print(f"ok: {len(advertised)} advertised config knobs, all consumed; dead knob absent")
