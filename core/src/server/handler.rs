@@ -16141,13 +16141,34 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
 
     let id = require_string(args, "escalation_id")?;
     let now = now_secs();
-    let s = state.lock().await;
+    let session_id_arg = optional_session_id(args);
+    let mut s = state.lock().await;
+
+    // OBSERVATION STARTS THE FUSE, and only a PROVEN asker's observation counts.
+    //
+    // The claim window used to burn from `decided_at`, which measured proximity to the
+    // operator rather than anything about the act: a member in live conversation claimed
+    // inside it while a member working asynchronously watched grants die unspent. Reading
+    // your own decision is how you learn it landed, so that is where the clock should start.
+    //
+    // The READ stays open to anyone — poll has never required a session and a status query is
+    // not an act. What requires proof is MOVING THE CLOCK: an asserted plugin_id here would
+    // let any caller extend (or, by racing, fix) another member's deadline. Unproven callers
+    // get exactly the answer they got before; nothing regresses for them.
+    let observed = match resolve_attributed_caller(&s, session_id_arg.as_deref()) {
+        Some(c) => s.gate_escalations.mark_observed(&id, &c.plugin_id, now),
+        None => false,
+    };
+
     let status = s.gate_escalations.status_of(&id, now);
     let esc = s.gate_escalations.get(&id);
 
     Ok(json!({
         "escalation_id": id,
         "status": status,
+        // Told, not inferred: if this poll is what started the claim fuse, the member should
+        // know its window is now measured from THIS moment and not from the ruling.
+        "observation_started_claim_window": observed,
         // The bar is part of the answer, always: an approval SHORT of the stated bar is
         // recorded but permits nothing. The mismatch is a visible state, never an implicit
         // sufficient. (dp 2026-07-30 + claude-code: the record must carry the bar, not just
