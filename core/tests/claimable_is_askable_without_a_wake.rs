@@ -135,9 +135,12 @@ fn the_listing_expires_on_the_decision_clock_not_the_record_clock() {
          nothing satisfies the expiry half of this test trivially"
     );
     assert_eq!(live[0].id, id);
+    // `Some(1)`, not `1`: main changed this to `Option<u64>` so that "no decision yet" and
+    // "zero seconds left" stop being the same answer — a distinction this suite's whole
+    // subject matter depends on, and one a bare integer cannot carry.
     assert_eq!(
         live[0].claim_window_secs_remaining(horizon - 1),
-        1,
+        Some(1),
         "the remaining figure must count down to the CLAIM horizon"
     );
 
