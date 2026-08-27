@@ -23,9 +23,11 @@ adapter, so a gate-file write is classified as gate-self even when the daemon is
      (deny-writes-allow-reads, computed by the core; every degraded deny recorded with
      verdict_available=False) — never a silent policy=None / local-replica fallback
      (§7.1 criterion 5).
-  2. SOCIETY SAFETY (the governor): for write/exec-class tools, delegate to hestia's tested daemon
-     caller so the decision reaches the governor and is witnessed. Its deny (or fail-closed-on-
-     unreachable) is honored.
+  2. SOCIETY SAFETY (the governor): for write/exec-class tools, consulted IN-PROCESS via
+     hestia_gate_mechanism.query_society_safety (the §6.C consented pilot; the spawned-caller
+     delegation this line used to describe was rewired in-process by PR #372 and the dead
+     HESTIA_SOCIETY_GATE knob removed for #585). Its deny (or fail-closed-on-unreachable)
+     is honored.
 
 A deny is STEERING, not just a block: the stderr reason says why + what to do (adjust in-scope, or
 ask via hestia_request_scope). The remedy sentence is rendered from the core's REMEDIES table
@@ -35,7 +37,6 @@ Exit codes (Kimi engine contract): 2 = block (stderr = reason); 0 = allow. Defau
 
 Config (all env-overridable; defaults suit a generic install):
   HESTIA_WORKSPACE       root that contains the granted repos      (set explicitly at install)
-  HESTIA_SOCIETY_GATE    path to the society-safety gate caller     (default: $WORKSPACE/hestia/plugins/claude-code/hooks/pre_tool_use.py)
   HESTIA_KIMI_IDENTITY   the member's live identity.json            (default: ~/.kimi-code/hestia-instance/identity.json)
   HESTIA_KIMI_GATE_MODE  warn | enforce   (default: enforce — deny-tight, relax as trust accrues)
   HESTIA_FORBIDDEN_EXTRA comma-separated extra forbidden path tokens (e.g. your private repo names)
@@ -70,11 +71,9 @@ def _detect_workspace():
 WORKSPACE = _detect_workspace()
 IDENTITY = os.path.expanduser(
     os.environ.get("HESTIA_KIMI_IDENTITY", "~/.kimi-code/hestia-instance/identity.json"))
-# Delegate the society-safety check to hestia's tested daemon caller (the safety preset is global, so
-# plugin_id doesn't change its verdict — we set it anyway for when it's parametrized).
-CLAUDE_PRE = os.environ.get(
-    "HESTIA_SOCIETY_GATE",
-    os.path.join(WORKSPACE, "hestia/plugins/claude-code/hooks/pre_tool_use.py"))
+# (#585) The HESTIA_SOCIETY_GATE / CLAUDE_PRE delegation knob is REMOVED: it was assigned here
+# and never read — dead since the PR #372 in-process rewire made Gate 2 a direct
+# query_society_safety call. A documented knob that changes nothing is worse than an absent one.
 
 # ---- Shared gate core (gate-consolidation PRD §6.C — the consented pilot) -------------
 # The hardened scope predicates live ONCE, in the shared core module under
