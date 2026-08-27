@@ -32,7 +32,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The identity asserted when the operator does not name one. Deliberately not a member
 /// name: an unnamed caller should be visibly a CLI, not silently a peer. Note that an
@@ -260,16 +260,117 @@ pub fn pending(endpoint: &str, asserted_id: Option<String>, role: &str) -> Resul
     Ok(())
 }
 
-pub fn poll(endpoint: &str, id: &str, asserted_id: Option<String>, role: &str) -> Result<()> {
+/// How long to sleep between polls while `--wait` is counting down.
+///
+/// The claim window is 600s and a grant is single-use, so the cost of noticing a decision
+/// late is real: every second between the ruling and the re-issue is spent out of the
+/// window the asker has to use it. Two seconds against a loopback daemon is ~1800 requests
+/// across the longest permitted wait, which is nothing, and it bounds the notice lag at
+/// 0.3% of the window.
+const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The longest `--wait` this client accepts.
+///
+/// Not a clamp — an over-long value is REFUSED, loudly. A silent clamp would hand the
+/// caller a wait that ended for a reason they were never told, which is the same shape as
+/// every other defect this surface has had: a well-formed wrong answer instead of an error.
+/// The number is the default escalation TTL: a pending record cannot outlive it, so no
+/// wait beyond it can learn anything a wait of exactly it could not.
+const WAIT_MAX_SECS: u64 = 3600;
+
+/// Has this escalation left the PENDING state? — the whole predicate `--wait` waits on.
+///
+/// Split out and pure for the same reason `hollow_approval_warning` is: the daemon is not
+/// available to a unit test, and a wait condition that nothing exercises is a claim, not a
+/// guarantee. Every trap here is a way of continuing to wait forever on a record that will
+/// never move.
+///
+/// ONLY the literal `pending` continues the wait. Approved, denied and expired are all
+/// terminal, and so is an unknown id — which the daemon deliberately answers as `expired`,
+/// because "an id this daemon has never seen" and "an id whose window closed" are the same
+/// answer on purpose (#129). Waiting on a typo would otherwise burn the caller's entire
+/// budget and then report the same thing the first poll already knew.
+///
+/// A MISSING OR NON-STRING `status` ALSO ENDS THE WAIT. This is the same fail-closed rule
+/// `hollow_approval_warning` applies to an absent `permits_write`: a daemon too old to send
+/// the field, or a reply this client cannot parse, must not be able to buy an unbounded
+/// wait by staying silent. The caller gets the payload and can read it; what they do not
+/// get is a spinner against a daemon that was never going to answer the question.
+fn wait_is_over(r: &Value) -> bool {
+    !matches!(r.get("status").and_then(Value::as_str), Some("pending"))
+}
+
+/// Show one escalation's state, optionally BLOCKING until it is ruled on.
+///
+/// WHY THE WAIT EXISTS, measured on CBP 2026-08-27. Escalation `cdeeb14b74cd4ed0` was
+/// opened at 08:12:15, approved by the operator at 08:16:30, and claimed at 08:21:16 —
+/// 286 seconds after the grant, and 11 seconds after a human typed the word "approved"
+/// into the asker's session. The decision had been on the chain and in a queued disposition
+/// notice that whole time. Nothing was broken: the record was correct, the poll would have
+/// answered correctly, and the asker simply had no way to be waiting on it, because every
+/// route from "ruled" back to "the asker knows" was either a mesh notice that only lands at
+/// the next wake, or a busy-wait nobody writes by hand. So the cheapest way to learn the
+/// answer was to ask a person, and 286 of the 600 available seconds went to that.
+///
+/// That is a governance failure and not a latency one. A remedy whose fast path runs
+/// through a human is a remedy that will be skipped, and the alternative to a skipped
+/// remedy is not compliance — it is a rephrase. This makes waiting on the RECORD the
+/// cheapest thing the asker can do.
+///
+/// The session is opened ONCE and reused for the whole wait; a tool error mid-wait
+/// propagates rather than being retried, so a caller never mistakes a broken connection for
+/// a still-pending petition.
+pub fn poll(
+    endpoint: &str,
+    id: &str,
+    asserted_id: Option<String>,
+    role: &str,
+    wait_secs: Option<u64>,
+) -> Result<()> {
+    if let Some(w) = wait_secs {
+        if w > WAIT_MAX_SECS {
+            bail!(
+                "--wait {w} exceeds the {WAIT_MAX_SECS}s maximum: a pending escalation \
+                 cannot outlive its TTL, so a longer wait cannot learn anything this one \
+                 cannot. Re-run with a smaller value."
+            );
+        }
+    }
     let asserted = asserted_id.unwrap_or_else(|| DEFAULT_ASSERTED_ID.to_string());
     let mut m = Mcp::connect(endpoint)?;
     let (sid, who) = open_session(&mut m, &asserted, role)?;
     banner(&who);
-    let r = m.tool(
-        "hestia_gate_escalation_poll",
-        json!({"escalation_id": id, "session_id": sid}),
-    )?;
+
+    let budget = wait_secs.unwrap_or(0);
+    let started = Instant::now();
+    let mut timed_out = false;
+    let r = loop {
+        let r = m.tool(
+            "hestia_gate_escalation_poll",
+            json!({"escalation_id": id, "session_id": sid}),
+        )?;
+        if wait_is_over(&r) {
+            break r;
+        }
+        let spent = started.elapsed().as_secs();
+        if spent >= budget {
+            timed_out = wait_secs.is_some();
+            break r;
+        }
+        // Never sleep past the budget: the last nap of a wait is the remainder, so the
+        // reported elapsed time is the one the caller asked for.
+        let left = Duration::from_secs(budget - spent);
+        std::thread::sleep(WAIT_POLL_INTERVAL.min(left));
+    };
+
     println!("{}", serde_json::to_string_pretty(&r)?);
+    if timed_out {
+        eprintln!(
+            "\nwaited {budget}s and this escalation is STILL PENDING: nobody has ruled. \
+             That is not a deny — the record is live and the write stays refused until \
+             someone decides. Poll again, or wait again."
+        );
+    }
     // An unknown id and an expired id are the SAME answer by design (#129); the status
     // word alone cannot tell them apart, so do not let the exit code imply it can.
     let permits = r.get("permits_write").and_then(Value::as_bool).unwrap_or(false);
@@ -366,6 +467,75 @@ pub fn corroborate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--wait` MUST NOT SPIN ON A RECORD THAT WILL NEVER MOVE, and must not stop early
+    /// on the one state it exists to wait through.
+    ///
+    /// Both directions are failures and they are not symmetric. Stopping early on
+    /// `pending` gives the caller back the same answer they already had and sends them to
+    /// a human — the exact 286-second detour this flag was written to remove. Failing to
+    /// stop hangs a headless session against a typo'd id until its own wake times out,
+    /// with no output at all.
+    ///
+    /// The unknown-id arm is the real payload measured on CBP 2026-08-27 against
+    /// `deadbeefdeadbeef`, verbatim: the daemon answers `expired`, on purpose, because
+    /// "never seen" and "window closed" are the same answer (#129). A wait keyed on
+    /// "approved or denied" rather than "not pending" would sit on that for the full
+    /// budget and then report what the first poll already knew.
+    ///
+    /// Sabotage arm: change `wait_is_over` to `matches!(.., Some("approved") | Some("denied"))`
+    /// and the expired, unknown-id, absent and non-string arms all go red while the
+    /// pending and approved arms stay green — which is exactly the shape of wait bug that
+    /// would otherwise ship.
+    #[test]
+    fn only_a_pending_status_keeps_the_wait_going() {
+        assert!(
+            !wait_is_over(&json!({"status": "pending", "permits_write": false})),
+            "a live petition is the ONE state worth waiting through"
+        );
+
+        for terminal in ["approved", "denied", "expired"] {
+            assert!(
+                wait_is_over(&json!({"status": terminal})),
+                "{terminal} is a ruling or a death; there is nothing further to wait for"
+            );
+        }
+
+        // The unknown-id reply, measured live rather than imagined.
+        assert!(
+            wait_is_over(&json!({
+                "escalation_id": "deadbeefdeadbeef",
+                "status": "expired",
+                "permits_write": false,
+                "granted": false,
+                "claim_window_secs_remaining": 0,
+                "secs_remaining": 0,
+                "note": "unknown escalation_id — treated as expired (a restart drops the \
+                         store, and an in-flight escalation must then read as denied)"
+            })),
+            "an id this daemon never saw must not buy an unbounded wait"
+        );
+    }
+
+    /// A REPLY THIS CLIENT CANNOT READ ENDS THE WAIT — the same fail-closed rule
+    /// `a_missing_permits_write_field_is_not_taken_as_permission` applies one field over.
+    ///
+    /// An older daemon that does not send `status`, or any reply whose `status` is not a
+    /// string, must not be able to purchase a silent hour of spinning by omission. The
+    /// caller still gets the payload printed and can read it; what they must not get is a
+    /// client that treats "I could not parse this" as "not decided yet".
+    #[test]
+    fn an_unreadable_status_does_not_buy_an_unbounded_wait() {
+        assert!(wait_is_over(&json!({})), "absent status must end the wait");
+        assert!(
+            wait_is_over(&json!({"status": null})),
+            "a null status is not a pending petition"
+        );
+        assert!(
+            wait_is_over(&json!({"status": 0})),
+            "a non-string status must not read as pending"
+        );
+    }
 
     /// The daemon's stream opens with an EMPTY `data:` frame. A reader that takes the
     /// first `data:` blindly decodes "" and reports the daemon as unreachable. This input

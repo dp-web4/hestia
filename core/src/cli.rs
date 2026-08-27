@@ -157,6 +157,14 @@ enum GateCmd {
     Poll {
         /// Escalation id from the deny text
         escalation_id: String,
+        /// Block for up to N seconds until somebody rules, instead of answering once.
+        ///
+        /// Without this the only cheap way to learn that an escalation was approved is to
+        /// have a human say so — measured at 286s of a 600s claim window on CBP
+        /// 2026-08-27. Approved, denied and expired all end the wait; so does an unknown
+        /// id, which the daemon answers as expired on purpose.
+        #[arg(long, value_name = "SECS")]
+        wait: Option<u64>,
     },
 
     /// Approve a governance write. Requires --reason; a deny does not.
@@ -728,8 +736,8 @@ pub fn run() -> AnyResult<()> {
             use hestia::gate_cli;
             match cmd {
                 GateCmd::Pending => gate_cli::pending(&endpoint, asserted_id, &role),
-                GateCmd::Poll { escalation_id } => {
-                    gate_cli::poll(&endpoint, &escalation_id, asserted_id, &role)
+                GateCmd::Poll { escalation_id, wait } => {
+                    gate_cli::poll(&endpoint, &escalation_id, asserted_id, &role, wait)
                 }
                 GateCmd::Approve { escalation_id, reason } => gate_cli::arbitrate(
                     &endpoint, &escalation_id, true, Some(reason), asserted_id, &role,
