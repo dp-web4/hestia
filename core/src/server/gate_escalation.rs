@@ -1425,7 +1425,25 @@ impl EscalationStore {
     /// on the claimable surface: labelling an assertion does not make it an authentication.)
     pub fn mark_observed(&mut self, id: &str, plugin_id: &str, now: u64) -> bool {
         match self.by_id.get_mut(id) {
-            Some(e) if e.plugin_id == plugin_id && e.observed_at.is_none() => {
+            // THE RECORD MUST ALREADY BEAR AN APPROVAL. GPT/Nova blocking review of the
+            // first cut, and it was right in the worst way: `poll` marks before it reads
+            // status, so the ORDINARY flow — an asker polling while its petition is still
+            // PENDING — stamped `observed_at` at once. `decided_horizon()` then preferred
+            // that pre-decision timestamp over `decided_at`, and the fuse could burn out
+            // BEFORE the ruling existed. A change written to stop grants dying unclaimed
+            // made them die sooner, and every test I wrote observed AFTER a decision, so
+            // none of them could see it.
+            //
+            // Observation is only meaningful about something there is to observe. Approved
+            // and bar-met is exactly "this record could become claimable" minus the clock,
+            // which is the clause being computed — using `is_claimable` here would ask the
+            // horizon about itself.
+            Some(e)
+                if e.plugin_id == plugin_id
+                    && e.observed_at.is_none()
+                    && e.status == Status::Approved
+                    && e.bar_met() =>
+            {
                 e.observed_at = Some(now);
                 true
             }

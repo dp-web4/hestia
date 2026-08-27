@@ -21,7 +21,16 @@
 //!   2. observation moves the horizon, so the fix actually does something;
 //!   3. the `expires_at + WINDOW` ceiling still caps an observation made late;
 //!   4. observation is ONE-WAY, so a member cannot hold a grant open by polling in a loop;
-//!   5. a non-asker cannot move someone else's clock.
+//!   5. a non-asker cannot move someone else's clock;
+//!   6. a poll BEFORE the ruling starts nothing — the arm the first cut got wrong, and the
+//!      one PINS 1-5 could not see because every one of them observes AFTER a decision;
+//!   7. a DENIAL bears no approval to observe.
+//!
+//! Pins 6 and 7 exist because of a blocking review (GPT/Nova) of the first implementation:
+//! `poll` marked observation before reading status, so the ORDINARY flow — an asker polling
+//! while its petition is still pending — started the fuse against a ruling that did not yet
+//! exist. A change written to stop grants dying unclaimed made them die sooner. The fixture
+//! that felt natural to write was the single arm the defect did not live in.
 
 use hestia::server::gate_escalation::{
     Channel, EscalationStore, APPROVAL_CLAIM_WINDOW_SECS, DEFAULT_TTL_SECS,
@@ -122,4 +131,78 @@ fn a_peer_cannot_start_another_members_fuse() {
     // and not about an escalation that refuses every observation.
     assert!(s.mark_observed(&id, SEAT, T0 + 100),
         "positive control: the asker's own observation must still record");
+}
+
+/// PIN 6 — a poll BEFORE the ruling must not start the fuse.
+///
+/// GPT/Nova blocking review of the first cut, and the differential it specified. `poll` marks
+/// observation before it reads status, and the first `mark_observed` checked only asker
+/// identity — so the ORDINARY flow, an asker polling while its petition is still pending,
+/// stamped `observed_at` immediately. `decided_horizon()` then preferred that pre-decision
+/// timestamp over `decided_at`, and the claim fuse could burn out BEFORE the ruling existed.
+///
+/// A change written to stop grants dying unclaimed made them die sooner. PINS 1-5 could not
+/// see it because every one of them observes AFTER a decision: the fixture that felt natural
+/// to write was the one arm the defect does not live in.
+#[test]
+fn polling_a_pending_petition_does_not_start_the_fuse() {
+    let mut s = EscalationStore::default();
+    let e = s
+        .open(SEAT, "role:constellation:member", "Edit", "law_inject.py",
+              Some(ACT), None, None, T0, DEFAULT_TTL_SECS)
+        .expect("open");
+    let id = e.id.clone();
+
+    // The asker polls one second in, while nobody has ruled. This is the NORMAL thing to do
+    // and it must record nothing.
+    assert!(!s.mark_observed(&id, SEAT, T0 + 1),
+        "observation of a PENDING petition must not record: there is no grant to observe, \
+         and stamping here starts a fuse against a ruling that does not exist yet");
+
+    // The operator rules twenty minutes later — long past where the bogus fuse would have
+    // expired (T0 + 1 + 600 = T0 + 601).
+    s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli,
+             None, Some("ok"), T0 + 1200).expect("decide");
+
+    // Unobserved, so the horizon is the decision's: the grant is alive right after the ruling.
+    assert_eq!(s.claimable_for(SEAT, T0 + 1201).len(), 1,
+        "the grant must be live immediately after the ruling — if the pending poll had \
+         started the fuse, this is where it would already be dead");
+
+    // NOW the asker's poll counts, and a full window runs from THIS moment.
+    let learned = T0 + 1500;
+    assert!(s.mark_observed(&id, SEAT, learned),
+        "the first observation of an APPROVED record must record");
+    assert_eq!(s.claimable_for(SEAT, learned + APPROVAL_CLAIM_WINDOW_SECS - 1).len(), 1,
+        "a full window begins at the first proven poll after the decision");
+    assert!(s.claimable_for(SEAT, learned + APPROVAL_CLAIM_WINDOW_SECS).is_empty(),
+        "and it is a window, not an extension without end");
+}
+
+/// PIN 7 — a DENIED record cannot be observed either.
+///
+/// `mark_observed` gates on approved-and-bar-met rather than merely decided, because a denial
+/// is a decision too. Recording observation against one would be harmless today (a denied row
+/// is never claimable) and load-bearing the moment anything else reads `observed_at`.
+#[test]
+fn observing_a_denial_records_nothing() {
+    let mut s = EscalationStore::default();
+    let e = s
+        .open(SEAT, "role:constellation:member", "Edit", "law_inject.py",
+              Some(ACT), None, None, T0, DEFAULT_TTL_SECS)
+        .expect("open");
+    let id = e.id.clone();
+    s.decide(&id, false, "dp", "role:constellation:sovereign", Channel::LocalCli,
+             None, Some("no"), T0 + 10).expect("decide");
+
+    assert!(!s.mark_observed(&id, SEAT, T0 + 20),
+        "a refusal is a decision, but it bears no approval to observe");
+    // Positive control: the same fixture with a GRANT does record, so the assertion above is
+    // about the verdict and not about a store that refuses every observation.
+    let mut ok = EscalationStore::default();
+    let g = ok.open(SEAT, "role:constellation:member", "Edit", "law_inject.py",
+                    Some(ACT), None, None, T0, DEFAULT_TTL_SECS).expect("open");
+    ok.decide(&g.id, true, "dp", "role:constellation:sovereign", Channel::LocalCli,
+              None, Some("ok"), T0 + 10).expect("decide");
+    assert!(ok.mark_observed(&g.id, SEAT, T0 + 20), "positive control: an approval records");
 }
