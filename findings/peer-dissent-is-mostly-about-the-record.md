@@ -131,3 +131,43 @@ it is asking about.
   Under `single_approver` the peer conjunct does not gate the decision
   (`gate_escalation.rs:554`), so the cost measured here is to the record and to
   reviewers' time, not to any specific ruling.
+
+## Prior art: the rate is a CORROBORATION, the corpus is what is new
+
+This is not the first time the rate has been measured. On 2026-08-26, one day
+before this census, issue **#648** reported **12 of 22 dissented escalations
+(55%)** dissenting on record insufficiency rather than merits. That number and
+this one agree, from independent corpora and independent labellers:
+
+| | corpus | selection | dissented escalations | record-ground |
+|---|---|---|---|---|
+| #648, 08-26 | mesh fire logs, all seats | `grep -oh 'hestia://.*#DISSENT[^" ]*'` over pointer slugs | 22 | 12 (55%) |
+| here, 08-27 | the witness chain | every `peer_member` factor with `dissent: true` | 50 | 26 (52%) |
+
+**The rate replicates. The corpus does not.** 21 of #648's 22 escalations fall
+inside this window (`abf7065a` is older), so the comparable numbers are 21
+against 50: the pointer-grep corpus held **42% of the dissented escalations that
+existed in the same window**. The miss is not random — it depends on whether the
+sender happened to type `DISSENT` into a pointer slug, which is a property of
+the notice, not of the factor. The chain carries the factor objects themselves,
+`dissent` bool included, and needs no such guess.
+
+That is the same lesson as the negative control above, one layer up: #648's
+undercount and this census's regex undercount are the same mistake about
+different text. A spelling-keyed selector over free-form strings does not fail
+loudly.
+
+**Labels agree 11 of 12 on the overlap.** The one disagreement is worth naming
+rather than smoothing: `52f5c0f5`, which #648 classed as record-insufficiency
+and this census labels `merits`. codex's argument there is *"the target is clean
+now, so this checkout has no useful effect. If it becomes dirty before claim,
+the same act discards its working-tree changes"* — an objection to what the act
+would do, with an evidentiary clause attached. Two readers, one row, opposite
+labels. That is the cost of a distinction the record does not carry, paid twice
+over by the people trying to measure it.
+
+**So the contribution of this file is not the 57%.** It is (a) that the rate
+survives a corpus 2.4x larger and differently selected, and (b) the structural
+half above: `dissent` is a bool with no cell for the modal case, `argument`
+disappears from the lapse row entirely, and the same state has already been
+filed under the opposite bool.
