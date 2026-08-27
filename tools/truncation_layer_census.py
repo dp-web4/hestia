@@ -69,8 +69,18 @@ from __future__ import annotations
 
 import sys
 from collections import Counter, defaultdict
+from pathlib import Path
 
-sys.path.insert(0, "/mnt/c/exe/projects/ai-agents/hestia/tools")
+# `chain_walk` sits BESIDE this file, so resolve it from this file. The first cut spelled one
+# operator's absolute WSL mount, which public_boundary_test correctly refuses as a
+# "runtime mechanism bakes a mounted-host path" (the literal is deliberately NOT quoted here:
+# the guard matches text, so naming the offending string in the comment re-triggers it —
+# which is exactly what happened on the first attempt at this fix):
+# it breaks on every other machine in the fleet, and on this one the moment a worktree moves.
+# Same defect class as the SAGE unit spelling `sage-rs/target/release` while CARGO_TARGET_DIR
+# points elsewhere, and as the vintage probe's hardcoded PARENTS_UP. Derive the location, do
+# not spell it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from chain_walk import ChainWalker, payload  # noqa: E402
 
 ELL_SP = " …"              # claude-code's template marker
