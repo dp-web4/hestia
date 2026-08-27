@@ -235,9 +235,14 @@ def main() -> int:
     # then sliced to 140 chars with no escalation_id: a reader could neither read the act
     # nor look the row up, so the disagreement set was an assertion, not evidence. That is
     # the same defect this census measures, committed by the census. If a line below ends
-    # in "…", the CUT IS THE PRODUCER'S (220 chars + "Bash: " + " …" = 228, claude-code
-    # only) and no reader anywhere can recover the rest — which is the finding, not a
-    # formatting choice.
+    # in "…", the CUT IS THE PRODUCER'S and no reader anywhere can recover the rest —
+    # which is the finding, not a formatting choice. The cap is 220 characters OF ACT
+    # TEXT, not 228 and not seat-keyed: the producer slices to 220, then prepends
+    # "<tool_name>: ", so the visible length is 228 under "Bash: " and 235 under
+    # "apply_patch: ". Measured to genesis: claude-code 226 cut rows (all 228), codex 23
+    # (228 and 235), unattributed 19, kimi-code 0. Truncation only destroys a verdict
+    # when the tool is Bash — where the tool name settles nothing and the act text is the
+    # whole evidence — which is why claude-code holds 157 of the 183 B_trunc rows.
     print(f"\n  DISAGREEMENT SET ({len(dis)}) — every row addressable, act text uncut by this tool:")
     for p in dis:
         r = p.get("stated_reason") or ""
