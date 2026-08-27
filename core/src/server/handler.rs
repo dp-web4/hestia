@@ -16554,6 +16554,31 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                     "hestia gate approve {id} --reason '...'   (or: hestia gate deny {id})",
                     id = esc.id
                 ),
+                // TELL THE ASKER HOW TO WAIT, because the notice does not reach a live seat.
+                //
+                // dp, 2026-08-27: "the escalation instructions should include the suggestion
+                // that the asker set a monitor to wait on disposition. most harnesses have
+                // that function." They do — and for a decision, which resolves ONCE, the right
+                // harness primitive is a BACKGROUNDED COMMAND THAT EXITS, not a streaming
+                // monitor. A streaming monitor is for one-event-per-occurrence and stays armed
+                // after the event it was watching for has already fired.
+                //
+                // The waiter must cover EVERY terminal state. A watcher that matches only
+                // `approved` is silent through a denial, an expiry and a dead daemon, and
+                // silence is indistinguishable from "still waiting" — which is precisely how
+                // five approvals across two seats died unclaimed on 2026-08-26/27 while their
+                // askers sat online. `tools/await_escalation.py` exits 0 claimable, 3 approved
+                // -but-dead, 4 denied, 5 expired, 2 undeterminable, so the caller branches on
+                // an exit code rather than parsing prose.
+                //
+                // Passing your session makes the first detection YOUR OBSERVATION, which is
+                // what starts the claim window from that moment rather than from the ruling.
+                "how_to_wait": format!(
+                    "python3 tools/await_escalation.py {id} --session <your session_id>   \
+                     (run it in the BACKGROUND — it exits when decided; \
+                     0=claimable now, 3=approved-but-window-closed, 4=denied, 5=expired)",
+                    id = esc.id
+                ),
                 "then": "RE-ISSUE the same write; it will claim the approval. The write is \
                          refused right now, and stays refused until it is retried after a \
                          human approves.",
