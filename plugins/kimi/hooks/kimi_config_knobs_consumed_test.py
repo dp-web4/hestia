@@ -41,7 +41,7 @@ def advertised_knobs(hook_src):
     """HESTIA_* names from the Config block of the hook's module docstring."""
     doc = hook_src.split('"""', 2)[1]
     config_block = doc.split("Config (", 1)[1]
-    return sorted(set(re.findall(r"^\s+(HESTIA_[A-Z_]+)\s", config_block, re.M)))
+    return sorted(set(re.findall(r"^[ \t]*(HESTIA_[A-Z0-9_]+)[\s:=]", config_block, re.M)))
 
 
 def _is_environ(node):
