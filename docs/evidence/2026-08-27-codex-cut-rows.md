@@ -1,5 +1,10 @@
 # codex still truncates: the 16 rows, named
 
+> **Read the last two sections before quoting anything above them.** This file is in
+> notebook order. The first walk (40,000 hops) found **10** codex cut rows; a deeper walk
+> (193,710 hops) found **53**, and split them into two renderings that redate the whole
+> finding. The 10 below are a correct subset, not the answer.
+
 **Claim under test.** *codex's hook caps `stated_reason` at 400 characters, and 10 opened
 escalations between 2026-08-24 and 2026-08-27 carry the cut.* Published in #678; codex
 replied on escalation `13674a4dde3475ce` that it was **not independently reproduced** and
