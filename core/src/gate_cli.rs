@@ -203,12 +203,34 @@ fn banner(asserted: &str) {
     );
 }
 
-pub fn pending(endpoint: &str, asserted_id: Option<String>, role: &str) -> Result<()> {
+/// Serialize the pending response without changing its daemon-owned schema.
+///
+/// The wake primer routes this value to `open-petitions.py fold`. That consumer
+/// distinguishes an attempted empty read from a non-response by checking that
+/// `pending` is an array, so a CLI-specific wrapper or table parser would erase
+/// the distinction the fold exists to preserve (#675).
+fn pending_json(r: &Value) -> Result<String> {
+    serde_json::to_string(r).context("encoding pending escalations as JSON")
+}
+
+pub fn pending(
+    endpoint: &str,
+    asserted_id: Option<String>,
+    role: &str,
+    json_output: bool,
+) -> Result<()> {
     let asserted = asserted_id.unwrap_or_else(|| DEFAULT_ASSERTED_ID.to_string());
     let mut m = Mcp::connect(endpoint)?;
     let (sid, who) = open_session(&mut m, &asserted, role)?;
     banner(&who);
     let r = m.tool("hestia_gate_pending_escalations", json!({"session_id": sid}))?;
+
+    if json_output {
+        // `banner` is stderr. Keep stdout to one JSON value so the primer's
+        // `hestia gate pending --json | open-petitions.py fold …` works as written.
+        println!("{}", pending_json(&r)?);
+        return Ok(());
+    }
 
     let count = r.get("count").and_then(Value::as_u64).unwrap_or(0);
     if count == 0 {
@@ -446,6 +468,28 @@ mod tests {
         let resp = json!({"result": {"content": [{"text": json!({"count": 0}).to_string()}]}});
         let v = tool_payload("hestia_gate_pending_escalations", &resp).unwrap();
         assert_eq!(v.get("count"), Some(&json!(0)));
+    }
+
+    /// `--json` is a pipe contract, not a second rendering. The fold's `asked`
+    /// flag depends on seeing the daemon's `pending` array, including when it is
+    /// empty, so every field must survive untouched.
+    #[test]
+    fn pending_json_preserves_the_daemon_response_shape() {
+        let daemon = json!({
+            "pending": [{
+                "escalation_id": "abc123",
+                "asked_by": "member-a",
+                "you_may_rule": false,
+                "factors": [{"member": "member-b", "stance": "dissent"}],
+            }],
+            "count": 1,
+            "you": {"plugin_id": "member-c", "role": "role:constellation:member"},
+            "caveat": "a stated caveat",
+        });
+        let rendered = pending_json(&daemon).expect("pending response serializes");
+        let reparsed: Value = serde_json::from_str(&rendered).expect("JSON output reparses");
+        assert_eq!(reparsed, daemon, "the CLI must not reinterpret the daemon response");
+        assert!(reparsed["pending"].is_array(), "the fold requires a pending array");
     }
 
     /// Connect answers `sessionId`; the gate tools want `session_id`. Reading back the key
