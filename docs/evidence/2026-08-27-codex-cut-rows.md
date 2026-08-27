@@ -82,3 +82,33 @@ This file has not changed since 2026-08-17, which is BEFORE every row above. The
 - The span's left edge is a hop budget, not a date. `--max-hops 40000` reached
   `2026-08-18` on this run and will drift as the chain grows. Rows *before*
   that edge are unmeasured, so **10 is a floor**.
+
+## Upgrade: the same table, read off the EXECUTING closure
+
+#678's cap table was read from the repo. A repo read dates a *branch*, not a running
+process — and it is the running process that produced the rows above. Re-read on CBP,
+2026-08-27, at the path each seat's launcher actually wires:
+
+| seat | executing path | md5 | mtime | limit | marker | total |
+|---|---|---|---|---|---|---|
+| claude-code | `~/.claude/hooks/hestia/pre_tool_use.py` | `0e237d8a…` | 2026-08-25 11:08 | 220 | `" …"` (2) | **228** `Bash: ` / **235** `apply_patch: ` |
+| codex | `~/.codex/hooks/pre_tool_use.py` | `f4b8baf5…` | 2026-08-17 19:39 | 400 | `"…[truncated]"` (12) | **412** (any tool) |
+| kimi-code | `~/.kimi-code/hooks/pre_tool_use.py` | `619cb4c2…` | 2026-08-25 11:08 | 400 | `"…[truncated]"` (12) | **412** (any tool) |
+
+Why the totals differ in *kind*, not just in size: **claude-code caps `s` and prepends
+`f"{tool_name}: "` afterwards**, so its total is `len(prefix) + 220 + 2` and moves with the
+tool. codex and kimi cap the *assembled* string with no prefix, so every tool lands on the
+same number. This is why `228` is not a fleet constant and must never be matched on.
+
+Two of the three executing files are not the repo file you would reach for:
+
+- **codex** is byte-identical to `origin/main:plugins/codex/hooks/pre_tool_use.py`.
+- **kimi-code is NOT.** Its executing file is the pre-#659 blob (`bb58c545`); #659 landed on
+  main at 2026-08-27 00:05, two days after this file's mtime. The **entire** delta is 17
+  changed lines removing the **dead** `HESTIA_SOCIETY_GATE` / `CLAUDE_PRE` knob and its
+  docstring. Behavioural delta: **zero**; the cap site is byte-identical. That is staleness
+  *measured and bounded*, which is a different claim from "kimi's gate is stale" — and the
+  bounded version is the one that is true.
+
+So the #678 table survives on the axis that produced the rows, and it survives for a reason
+the repo read could not have established.

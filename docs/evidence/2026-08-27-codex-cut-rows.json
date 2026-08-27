@@ -204,5 +204,58 @@
   "why_it_is_a_cap_and_not_a_retry": "10 DISTINCT acts (10 distinct sha256) sit at ONE length. A retried command piles ONE act at one length; a cap piles many. This is the same discriminator `_cap_suspects` uses, and it is why that guard counts distinct acts rather than rows.",
   "cross_tool_check": "Bash rows and apply_patch rows both land at exactly 412, because codex caps the ASSEMBLED summary. (claude-code caps the command BEFORE prefixing, which is why its Bash render is 228 and its apply_patch render is 235 -- do not port that expectation across seats.)"
  },
- "redaction_note": "Act TEXT is deliberately absent. Every row carries its id, its length, and a sha256 of the exact field -- enough to check the claim to the byte, and not enough to republish a command the record already caps. The tail is reported only as WHICH marker, never as the characters before it."
+ "redaction_note": "Act TEXT is deliberately absent. Every row carries its id, its length, and a sha256 of the exact field -- enough to check the claim to the byte, and not enough to republish a command the record already caps. The tail is reported only as WHICH marker, never as the characters before it.",
+ "executing_closure_table": {
+  "why": "#678's source table was read from the REPO. A repo read dates a branch, not a running process. These are the files the three seats actually execute, hashed at their wired paths on CBP, 2026-08-27.",
+  "method": "resolve the path the seat's launcher wires (config.toml / settings hook command), md5sum THAT path, and read the cap site out of it. Never HEAD, never `git status`.",
+  "seats": [
+   {
+    "plugin_id": "claude-code",
+    "executing_path": "/home/dp/.claude/hooks/hestia/pre_tool_use.py",
+    "md5": "0e237d8aec8c37205e402e3cb0380957",
+    "mtime": "2026-08-25 11:08",
+    "cap_site": "pre_tool_use.py:2057  return f\"{tool_name}: {s[:220]}\" + (\" …\" if len(s) > 220 else \"\")",
+    "marker": " …",
+    "marker_chars": 2,
+    "limit": 220,
+    "prefix": "PREPENDED AFTER the cut, so the total is len(prefix)+220+2 and varies by tool",
+    "observed_totals": {
+     "Bash: ": 228,
+     "apply_patch: ": 235
+    }
+   },
+   {
+    "plugin_id": "codex",
+    "executing_path": "/home/dp/.codex/hooks/pre_tool_use.py",
+    "md5": "f4b8baf54c057bcaec6389a7f7e610e1",
+    "mtime": "2026-08-17 19:39",
+    "cap_site": "pre_tool_use.py:418 def _attempted_summary(ev, limit=400) -> :456 return s[:limit] + (\"…[truncated]\" if len(s) > limit else \"\")",
+    "marker": "…[truncated]",
+    "marker_chars": 12,
+    "limit": 400,
+    "prefix": "NONE — the raw command (or a json dump of tool_input when there is no `command` key) is cut whole",
+    "observed_totals": {
+     "any tool": 412
+    },
+    "identical_to_repo": "origin/main:plugins/codex/hooks/pre_tool_use.py (same md5)"
+   },
+   {
+    "plugin_id": "kimi-code",
+    "executing_path": "/home/dp/.kimi-code/hooks/pre_tool_use.py",
+    "md5": "619cb4c22f43d7231a39cbde4b2f612d",
+    "mtime": "2026-08-25 11:08",
+    "cap_site": "pre_tool_use.py:358 def _attempted_summary(ev, limit=400) -> :393 return s[:limit] + (\"…[truncated]\" if len(s) > limit else \"\")",
+    "marker": "…[truncated]",
+    "marker_chars": 12,
+    "limit": 400,
+    "prefix": "NONE",
+    "observed_totals": {
+     "any tool": 412
+    },
+    "identical_to_repo": false,
+    "divergence": "NOT origin/main's blob. The executing file is the pre-#659 version (blob bb58c545, mtime 08-25 11:08); #659 landed on main 2026-08-27 00:05. The ENTIRE delta is 17 changed lines removing the DEAD `HESTIA_SOCIETY_GATE`/`CLAUDE_PRE` knob and its docstring. Behavioural delta: ZERO, and the cap site is byte-identical. Staleness MEASURED and BOUNDED, not assumed."
+   }
+  ],
+  "what_this_upgrades": "The #678 table asserted three caps from three repo files. Two of the three executing files are NOT the repo file you would reach for: codex's happens to match origin/main, kimi's does not. The claim survives on the executing axis, which is the axis that produced the rows."
+ }
 }
