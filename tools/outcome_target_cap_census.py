@@ -35,6 +35,31 @@ the asymmetry between them is a finding: on 2026-08-27 the refused act carried t
 SHORTER cap (220) and had no second witness at all, while the executed act carried 240.
 Redundancy runs opposite to review need.
 
+WHAT THIS DRIVER CANNOT SEE, SAID OUT LOUD. The spike test carries an ABSOLUTE row
+floor (`MIN_SPIKE_ROWS`), and the first version of this file let that floor manufacture
+the very artefact the file exists to abolish: a seat with 16 rows, ALL 16 at a genuine
+240-char cap, reported `rows_at_a_cap: 0`, `cut_rate: 0.0`, `caps: none` — a clean zero,
+produced by arithmetic rather than by measurement, indistinguishable in the report from a
+seat that does not truncate. Found by codex on PR #679, not by the author.
+
+So a zero is no longer a scalar here. Every (surface, seat) cell carries a `state`:
+
+  * `measured`            — n >= MIN_SPIKE_ROWS. `cut_rate` is a real measurement, and a
+                            FLOOR: a cap catching fewer than MIN_SPIKE_ROWS rows in this
+                            window is below the detector's sensitivity and is not counted.
+  * `insufficient_sample` — n < MIN_SPIKE_ROWS. A floor-clearing spike is IMPOSSIBLE, so
+                            `rows_at_a_cap` and `cut_rate` are `null`, never `0`.
+  * `no_rows`             — the seat appears in the walked chain but wrote nothing to this
+                            surface in this window. Emitted explicitly, because a seat
+                            missing from a per-seat table reads as a seat that is fine.
+
+And every cell — at any n — carries its `ceiling`: the longest value observed, how many
+rows sit on exactly that length, and their share. That one number survives the floor. A
+hard cap is the one thing nothing can exceed, so it piles rows onto the ceiling: 16/16 at
+240 is share 1.0 and screams at n=16, where the spike test is structurally deaf. An
+uncapped surface puts one row on its ceiling. `ceiling.flags_cap` is reported as a
+SUSPICION with its threshold named, never folded into `cut_rate`.
+
 Usage:
     python3 outcome_target_cap_census.py [--max N] [--min-spike F] [--out report.json]
 Reads via chain_walk.ChainWalker (the one correct reader — see its docstring for the
@@ -67,7 +92,16 @@ KNOWN_MARKERS = (
 )
 
 # A spike must also clear this absolute count, so a 3-row seat cannot mint a "cap".
+# It is ABSOLUTE, not a share of n: its blind region therefore scales with nothing, and a
+# cap catching fewer than this many rows is invisible on a seat of ANY size. That bound is
+# published as `detection_floor_rows` rather than hidden inside a zero.
 MIN_SPIKE_ROWS = 20
+
+# Below the floor the spike test is deaf, so the ceiling is what is left. A cap is the one
+# length nothing can exceed, so it piles rows onto max_len; an uncapped surface leaves one
+# row there. These two thresholds gate a SUSPICION only -- never a count, never a rate.
+CEILING_MIN_ROWS = 2
+CEILING_MIN_SHARE = 0.10
 
 
 def marker_of(s: str) -> str:
@@ -97,6 +131,90 @@ def find_spikes(lengths: Counter, factor: float) -> list:
     return sorted(spikes, key=lambda d: -d["rows"])
 
 
+def ceiling_of(lengths: Counter, markers_at: dict, n: int) -> dict | None:
+    """The longest value seen, and how much of the seat piles onto exactly that length.
+
+    This is the signal that survives `MIN_SPIKE_ROWS`. It knows nothing about markers and
+    nothing about row counts in the absolute -- only that a hard cap is the one length
+    nothing can exceed, so it collects rows at max_len while a smooth distribution leaves
+    a singleton there. `flags_cap` names its own thresholds and is a suspicion, not a
+    measurement: it is never added to `rows_at_a_cap` and never moves `cut_rate`.
+    """
+    if not lengths or not n:
+        return None
+    L = max(lengths)
+    rows = lengths[L]
+    share = rows / n
+    return {
+        "length": L,
+        "rows": rows,
+        "share": round(share, 4),
+        "markers": dict(markers_at.get(L, {})),
+        "flags_cap": rows >= CEILING_MIN_ROWS and share >= CEILING_MIN_SHARE,
+        "flags_cap_thresholds": {"min_rows": CEILING_MIN_ROWS,
+                                 "min_share": CEILING_MIN_SHARE},
+    }
+
+
+def seat_report(lengths: Counter, markers_at: dict, n: int, factor: float) -> dict:
+    """One (surface, seat) cell. Factored out of main() so the states are testable.
+
+    The whole point of the split below: when a floor-clearing spike is IMPOSSIBLE, the
+    count and the rate are `None`. `0` would be a claim about the surface; `None` is the
+    truth about the instrument.
+    """
+    spikes = find_spikes(lengths, factor)
+    for sp in spikes:
+        sp["markers"] = dict(markers_at.get(sp["length"], {}))
+
+    if n == 0:
+        state = "no_rows"
+    elif n < MIN_SPIKE_ROWS:
+        state = "insufficient_sample"
+    else:
+        state = "measured"
+
+    measured = state == "measured"
+    cut_rows = sum(sp["rows"] for sp in spikes) if measured else None
+    return {
+        "state": state,
+        "rows": n,
+        "rows_at_a_cap": cut_rows,
+        "cut_rate": round(cut_rows / n, 4) if measured else None,
+        "cut_rate_is_a_floor": True,
+        "detection_floor_rows": MIN_SPIKE_ROWS,
+        "max_len": max(lengths) if lengths else None,
+        "candidate_caps": spikes,
+        "ceiling": ceiling_of(lengths, markers_at, n),
+    }
+
+
+def summary_line(surface: str, pid: str, s: dict) -> str:
+    """The one line a notice would quote. It must not be quotable as a zero.
+
+    `cut=` prints `n/a` in every state where the count is not a measurement, and the
+    ceiling is appended whenever it is flagged, so the 16/16-at-240 cell reads as a
+    suspected cap on a thin denominator instead of as `cut=0 (0.0%) caps: none`.
+    """
+    caps = ", ".join(
+        f"{c['length']}({c['rows']} rows, {'/'.join(c['markers'])})"
+        for c in s["candidate_caps"]
+    ) or "none"
+    if s["state"] == "measured":
+        cut = f"cut={s['rows_at_a_cap']:6d} ({100 * s['cut_rate']:.1f}%)"
+    else:
+        cut = f"cut=   n/a [{s['state']}]"
+    ceil = s.get("ceiling")
+    suspect = ""
+    if ceil and ceil["flags_cap"] and not any(
+        c["length"] == ceil["length"] for c in s["candidate_caps"]
+    ):
+        suspect = (f"  SUSPECT ceiling {ceil['length']} "
+                   f"({ceil['rows']}/{s['rows']} rows = {100 * ceil['share']:.0f}%, "
+                   f"{'/'.join(ceil['markers']) or 'no marker'})")
+    return f"{surface:42s} {pid:12s} n={s['rows']:6d} {cut}  caps: {caps}{suspect}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--max", type=int, default=200_000)
@@ -110,6 +228,11 @@ def main() -> int:
     markers = defaultdict(lambda: defaultdict(lambda: defaultdict(Counter)))
     totals = defaultdict(Counter)
     want = {t: f for t, f in SURFACES}
+    # Every plugin_id seen ANYWHERE in the walk. A seat that wrote nothing to a surface is
+    # absent from that surface's Counter, and a seat missing from a per-seat table reads
+    # as a seat that is fine -- the same absence-as-OK shape one level up from the floor.
+    # This set is what lets the report say `no_rows` out loud.
+    seen_plugins = set()
     first_ts = last_ts = None
     walked = 0
 
@@ -120,10 +243,12 @@ def main() -> int:
             if first_ts is None:
                 first_ts = ts
             last_ts = ts
+        d = payload(e)
+        if isinstance(d, dict) and isinstance(d.get("plugin_id"), str):
+            seen_plugins.add(d["plugin_id"])
         et = e.get("eventType")
         if et not in want:
             continue
-        d = payload(e)
         val = d.get(want[et])
         if not isinstance(val, str) or not val:
             continue
@@ -138,24 +263,20 @@ def main() -> int:
         "span_oldest": last_ts,
         "min_spike_factor": args.min_spike,
         "min_spike_rows": MIN_SPIKE_ROWS,
+        "plugins_seen_in_walk": sorted(seen_plugins),
         "surfaces": {},
     }
 
     for et, field in SURFACES:
         seats = {}
-        for pid, lc in lengths[et].items():
-            spikes = find_spikes(lc, args.min_spike)
-            for sp in spikes:
-                sp["markers"] = dict(markers[et][pid][sp["length"]])
-            cut_rows = sum(sp["rows"] for sp in spikes)
-            n = totals[et][pid]
-            seats[pid] = {
-                "rows": n,
-                "rows_at_a_cap": cut_rows,
-                "cut_rate": round(cut_rows / n, 4) if n else None,
-                "max_len": max(lc) if lc else None,
-                "candidate_caps": spikes,
-            }
+        # Union, not just the seats that wrote here: `no_rows` must be a printed state.
+        for pid in sorted(seen_plugins | set(lengths[et])):
+            seats[pid] = seat_report(
+                lengths[et].get(pid, Counter()),
+                markers[et].get(pid, {}),
+                totals[et][pid],
+                args.min_spike,
+            )
         report["surfaces"][f"{et}.{field}"] = seats
 
     print(json.dumps(report, indent=2, sort_keys=True))
@@ -166,15 +287,11 @@ def main() -> int:
 
     # Loud, human-readable summary — the numbers a notice would quote.
     print("\n=== candidate caps, spelling-blind ===", file=sys.stderr)
+    print(f"(cut_rate is a FLOOR: a cap holding <{MIN_SPIKE_ROWS} rows in this window is "
+          f"below the spike test's sensitivity on a seat of ANY size)", file=sys.stderr)
     for surface, seats in report["surfaces"].items():
         for pid, s in sorted(seats.items()):
-            caps = ", ".join(
-                f"{c['length']}({c['rows']} rows, {'/'.join(c['markers'])})"
-                for c in s["candidate_caps"]
-            ) or "none"
-            print(f"{surface:42s} {pid:12s} n={s['rows']:6d} "
-                  f"cut={s['rows_at_a_cap']:6d} ({100*(s['cut_rate'] or 0):.1f}%)  caps: {caps}",
-                  file=sys.stderr)
+            print(summary_line(surface, pid, s), file=sys.stderr)
     return 0
 
 
