@@ -25,10 +25,16 @@ import json
 import re
 import sys
 
-# What survives into the primer. `stated_reason` is the daemon's own truncation
-# of the refused command; `stated_detail` is kept only because its wording is the
-# one available discriminator between a gate-auto-minted petition and one the
-# member chose to file, and those two want different responses.
+# What survives into the primer. `stated_reason` is the SEAT HOOK's truncation of
+# the refused command, not the daemon's — the daemon stores whatever it is handed,
+# verbatim and uncapped (`optional_string`, handler.rs). The cap is `s[:220]` in
+# claude-code's `pre_tool_use.py` and `limit=400` in kimi's and codex's, so the
+# same act renders at three different lengths and only one seat's rows are cut.
+# Said wrongly here since this file was written, and it points a reader at the
+# wrong layer to fix: there is nothing to change in the daemon (#627).
+# `stated_detail` is kept only because its wording is the one available
+# discriminator between a gate-auto-minted petition and one the member chose to
+# file, and those two want different responses.
 KEEP = ("escalation_id", "secs_remaining", "marker", "tool_name", "opened_at",
         "stated_reason", "stated_detail", "peer_participation", "bar")
 
