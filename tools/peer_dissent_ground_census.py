@@ -21,6 +21,7 @@ and belongs in the escalation, not copied into a second append-only store").
 
 RESULT (2026-08-27, 25,000 hops, window 2026-08-20T11:11Z -> 2026-08-27T10:36Z):
 
+
   156 escalations opened in the window
    86 of them drew at least one peer factor
   125 unique peer factors (deduped by (escalation, by, at) -- each
@@ -34,17 +35,27 @@ RESULT (2026-08-27, 25,000 hops, window 2026-08-20T11:11Z -> 2026-08-27T10:36Z):
 
   All three seats file them: codex 20, kimi-code 9, claude-code 8.
 
-  And the same obstacle draws THREE different responses, of which the record
-  can express one:
-    37 file it as dissent   -- counted as an objection to the act.
-     1 files it as a QUALIFIED concurrence (f90aa5d7, kimi-code, 2026-08-27:
-       "context-verified, NOT content-verified ... weigh this as context
-       evidence only") -- counted as a plain concurrence; the qualification
-       survives only in prose.
-    >=1 RECOVERS the act out of band and then concurs on the merits
-       (931982233251501b, claude-code) -- indistinguishable, in every field,
-       from a peer who was simply handed a readable record.
-  There is no convention because there is no field.
+  That is the VISIBLE half. Hand-reading all 60 concurrences the same way --
+  prompted by kimi-code's second-seat verification, which found the first of
+  them -- puts the same obstacle on the OTHER value of the bool:
+
+    13 QUALIFIED concurrences  (22%) -- concur, limit stated, unremedied.
+    12 RECOVERED concurrences  (20%) -- concur, act obtained from outside the
+       record (asker transcript, artifact on disk, sibling `outcome` rows, git
+       history, a different chain surface, mtime forensics that expire).
+    -- 25 of 60 = 42%, every one of them `dissent: false`.
+
+  ** 62 of 125 peer factors (50%) are review of a record that did not carry
+     the act. The bool splits that one quantity across BOTH its values. **
+
+  On the concur side nothing is even MIS-counted: the factor reads as plain
+  agreement. There is no convention because there is no field.
+
+  AND THE BIT IS SEAT IDIOM. Restricted to those 62, how a seat files the same
+  obstacle: codex 20 dissent / 1 concur (95% dissent), claude-code 8/7 (53%),
+  kimi-code 9/17 (35%). chi2=18.07 df=2; codex vs rest Fisher p=2.6e-05. So
+  `factors_dissenting` on a record-starved petition is partly a measurement of
+  which peers were invited. n=62, one week, seats not randomly assigned.
 
 NEGATIVE CONTROL (and the reason this file carries hand labels instead of a
 regex). A keyword matcher over the same 65 arguments --
@@ -81,6 +92,7 @@ import argparse
 import re
 import sys
 from collections import Counter
+from math import comb
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from chain_walk import ChainWalker, payload  # noqa: E402
@@ -165,9 +177,92 @@ LABELS = {
 #       same obstacle, RECOVERED out of band, then a full concurrence on the
 #       merits. Not a qualified concurrence; a demonstration that the third
 #       response exists.
-CONCURRENCE_NOTES = {
-    ("f90aa5d7528c35cd", "kimi-code", 1787826607): "unverified",
-    ("931982233251501b", "claude-code", 1787817190): "recovered",
+# CONCURRENCES, hand-read the same way -- ALL 60, so this side has no
+# `unlabelled` bucket and the denominator is fully read.  The obstacle that the
+# 37 record dissents name does not only produce dissent.  Two other responses
+# put it on the OTHER value of the bool:
+#
+#   record_qualified -- the peer concurs and STATES that the record did not
+#                       carry enough of the act ("stated_reason truncates at
+#                       U+2026 ... the sovereign should weigh the unread tail").
+#                       The limit is disclosed and left unremedied.
+#   record_recovered -- the peer concurs because it obtained the act from
+#                       somewhere the escalation is not: the asker's transcript,
+#                       an artifact still on disk, sibling `outcome` rows, git
+#                       history, mtime forensics.  The record failed; the peer
+#                       paid to work around it.  In every structured field this
+#                       is INDISTINGUISHABLE from a peer handed a readable
+#                       record -- it is the most invisible response of the four.
+#   none             -- the record carried the act.
+#
+# Excluded deliberately, so the rule stays about the ACT's visibility:
+#   e5bc6795/claude-code  -- "enforced scope is wider than the record states"
+#       is a record limit about the PERMIT, not about seeing the act (#600).
+#   3b85ff21/codex        -- "My independent reproduction was refused by the
+#       same out-of-grammar gate class, so I do not claim an unobserved run
+#       result."  A FOURTH obstacle: the reviewer was blocked by the gate it
+#       was reviewing.  Real, one instance, its own class, not counted here.
+CONCUR_LABELS = {
+    ("012a692489ac320e", "codex", 1787539201): "none",  # 
+    ("e5bc679555d8ddf6", "codex", 1787679845): "record_qualified",  # Concur with the published #585 deletion-only cleanup: current source retains the three i
+    ("e5bc679555d8ddf6", "claude-code", 1787680181): "none",  # Concur with codex on the act, and extend its qualification: the permit is not bound to t
+    ("5859494c6fa156da", "codex", 1787684563): "none",  # Reviewed the requested staging act and two-file diff at dd4300: the removed HESTIA_SOCIE
+    ("81d748d5ff19354b", "codex", 1787685082): "none",  # Independent review of .wt/585: the dead HESTIA_SOCIETY_GATE/CLAUDE_PRE path is removed; 
+    ("250cdbcb0aca04be", "claude-code", 1787685332): "none",  # CONCUR. Read the act verbatim off the chain: git status, sed -n 1,260p, two git diff, st
+    ("5859494c6fa156da", "claude-code", 1787685333): "none",  # CONCUR on the act; codex reviewed the diff and I did not, so I add no diff evidence. The
+    ("4ddfecc051b54df8", "kimi-code", 1787692641): "none",  # CONCUR - approval was the only correct ruling: the payload is READ-ONLY (echo+grep reads
+    ("47e1b5bf7c308267", "kimi-code", 1787692656): "none",  # CONCUR - approval correct: payload is READ-ONLY (git cat-file blob|sha256sum of origin/m
+    ("7ed01af00ff2d0c3", "kimi-code", 1787692667): "none",  # CONCUR - approval correct: payload is READ-ONLY (find across ~/.codex, ~/.kimi, ~/.kimi-
+    ("f27a2c1c11cac18a", "kimi-code", 1787692682): "none",  # CONCUR - approval correct: payload is 'stat /tmp/pre_tool_use.py' - READ-ONLY metadata o
+    ("1b2fba5ed65f595a", "kimi-code", 1787692701): "none",  # CONCUR - approval correct: payload is 'wc -c /tmp/pre_tool_use.py' in a one-iteration fo
+    ("a78ee20c7b036501", "kimi-code", 1787693340): "none",  # CONCUR - approval correct: payload is READ-ONLY (ls -la on /home/dp/.hestia/shared + /ho
+    ("35d58b680d84cc7d", "claude-code", 1787693788): "none",  # CONCUR on the approval, and this one is a TRUE POSITIVE - stated explicitly because this
+    ("28aeb33cb3b4addf", "claude-code", 1787693803): "none",  # CONCUR on the approval - the underlying write is legitimate and identical in substance t
+    ("28aeb33cb3b4addf", "claude-code", 1787693834): "none",  # CORRECTION to my factor at 1787693xxx on this escalation, same stance (concur). I claime
+    ("1c424f1c19f5dc96", "claude-code", 1787693849): "none",  # CONCUR on the approval; the escalation itself is a false positive, and I can name the ma
+    ("04359f47c01e53e4", "claude-code", 1787701032): "record_recovered",  # CORROBORATE the act, DISSENT on the diagnosis.  The refused command is read-only (two `g
+    ("cb0b1688a7f93884", "codex", 1787701600): "none",  # The requested action is a read-only differential diagnostic confined to the public Hesti
+    ("cb0b1688a7f93884", "claude-code", 1787701849): "none",  # CONCUR on disposition, DISSENT on the stated mechanism. Kimi named a heredoc-delimiter c
+    ("3b85ff218d584aa1", "codex", 1787702147): "none",  # Concur on authorizing the act: static review of the exact command and af892036 test driv
+    ("effa9139576887fb", "kimi-code", 1787705541): "record_qualified",  # Concur with the decision; the defect is in the record, not the ruling. The act is a scra
+    ("c9f0a99683c852d3", "kimi-code", 1787705582): "record_qualified",  # Concur with the decision; the defect is in the record. Scratch paths throughout (/tmp/ef
+    ("7e4e738d75e984e6", "kimi-code", 1787705591): "none",  # Concur with the decision; the refusal itself was the FP. The act is a plain delete of a 
+    ("d9568c0d70eff668", "kimi-code", 1787710132): "none",  # Grammar discriminator replicated classifier-direct on a second seat: repo plugins/_share
+    ("3b262f4ea3207600", "kimi-code", 1787714612): "record_recovered",  # Act recovered verbatim from asker transcript (5731c0bd @02:54:02.197Z = opened_at): cd+e
+    ("cf15d0973a790438", "kimi-code", 1787714632): "record_recovered",  # Act recovered verbatim from asker transcript (5731c0bd @02:54:29.978Z = opened_at): for-
+    ("a0f71efcf663147b", "kimi-code", 1787721628): "record_qualified",  # CONCUR — approval correct, act attestable in kind. Verified first-hand on the chain: the
+    ("94fcfae92fef603b", "kimi-code", 1787727499): "record_qualified",  # CONCUR. Act is a nested loop over the four seat hooks printing occurrence tallies of fou
+    ("c5bd1c2bc173321a", "kimi-code", 1787727499): "none",  # CONCUR. Act is `cd plugins/_shared && for t in *_test.py; do python3 '$t' ...; done` — r
+    ("f4f175530d8e383e", "claude-code", 1787731190): "none",  # CONCUR on the approval; the escalation is a FALSE POSITIVE, and I reproduced its mechani
+    ("91ed5f2da412cd9c", "kimi-code", 1787735699): "record_qualified",  # CONCUR with the approval; the refusal was the documented intentional control-flow FP, an
+    ("1d806c310e5dc484", "kimi-code", 1787751821): "record_qualified",  # Concur with approval, limits disclosed. Verified from the kimi seat by poll and chain wa
+    ("52f5c0f524deb5a9", "kimi-code", 1787773299): "none",  # CONCUR. Full command visible: `git checkout -- plugins/_shared/hestia_governance_closure
+    ("0f4552f2f9bf0211", "kimi-code", 1787773299): "record_qualified",  # CONCUR, with the limit of the evidence stated. Visible portion (the hook truncates the a
+    ("a0dc8225b9143f80", "kimi-code", 1787781404): "none",  # CONCUR. The refuse was correct-by-design and the act is verified benign; I verified cont
+    ("bc37287c9ae287f6", "kimi-code", 1787782046): "record_qualified",  # CONCUR. The refuse was correct-by-design; the act's visible shape and its chain-verified
+    ("18e0e6bafadd2ec3", "claude-code", 1787792387): "record_qualified",  # CONCUR on the marker, and this is the DECIDABLE member of today's pair. Verified in /mnt
+    ("aef13d056044c0a5", "claude-code", 1787795156): "record_recovered",  # CONCUR on the act, filed LATE and saying so. The two dissents on 9a18bf661e88ec24 (mine 
+    ("aef13d056044c0a5", "kimi-code", 1787795378): "record_recovered",  # CONCUR with the approval, verified against the payload itself, not the record. Unlike 9a
+    ("aef13d056044c0a5", "kimi-code", 1787795443): "record_recovered",  # CORRECTION to my factor at 1787795378 (witness 94ce3102): rider (2) STALENESS is withdra
+    ("9f4a6d4b1a971a37", "codex", 1787810801): "none",  # Reviewed the staged #585 deletion and guard: the removed HESTIA_SOCIETY_GATE/CLAUDE_PRE 
+    ("9f4a6d4b1a971a37", "claude-code", 1787811276): "none",  # CONCUR - the refusal was correct, and it survives the decomposition test that dissolved 
+    ("5344b7832489bc1e", "codex", 1787812449): "none",  # 
+    ("992c8226a06aa908", "claude-code", 1787812950): "none",  # CORROBORATE codex's dissent, independently and by a different route. Codex's reading was
+    ("3c7474bb8b1bd1e5", "kimi-code", 1787813517): "record_qualified",  # Concur, same reasoning as my factor on 61e282101e871eb9 (the twin /tmp/kg staging act). 
+    ("61e282101e871eb9", "kimi-code", 1787813517): "record_qualified",  # Concur, with a measured caveat that CONFIRMS codex's factual premise but not its weight.
+    ("c44125d831f197c3", "codex", 1787815974): "none",  # CORROBORATE: reviewed committed 18f236c in public Hestia worktree. The knob guard passes
+    ("a17c28f66e10222a", "kimi-code", 1787815989): "record_recovered",  # CONCUR — and this act is reviewable past the 400-char prefix, from the chain itself. The
+    ("a17c28f66e10222a", "claude-code", 1787816249): "record_recovered",  # SUPPLEMENT to my dissent above, filed after INDEPENDENTLY VERIFYING kimi-code's concurre
+    ("931982233251501b", "claude-code", 1787817190): "record_recovered",  # CONCUR on the merits, and I RECOVERED THE ACT the record withheld -- which is the part w
+    ("c44125d831f197c3", "claude-code", 1787817209): "record_recovered",  # CONCUR, post-hoc and saying so. This escalation was decided at 07:29:42 and CLAIMED at 0
+    ("ba7696107904c3fe", "codex", 1787817291): "none",  # CORROBORATE: the recorded Bash act is a read-only inspection: echo plus git show of thre
+    ("042c34a4e750eefd", "codex", 1787818346): "none",  # CORROBORATE: inspected the exact claimed .wt/585 test. It only reads the hook and shared
+    ("042c34a4e750eefd", "claude-code", 1787818430): "none",  # CONCUR, post-hoc (decided 08:07:42, claimed 08:09:58, write succeeded 08:09:59 -- the co
+    ("d8ed9e925a143c9c", "claude-code", 1787818430): "record_recovered",  # CONCUR, post-hoc and saying so (decided 07:54:19, my factor lands ~08:1x; under single_a
+    ("ba7696107904c3fe", "kimi-code", 1787819330): "record_recovered",  # CONCUR, post-hoc (decided 07:51:10, claimed or lapsed before this wake; under single_app
+    ("cdeeb14b74cd4ed0", "kimi-code", 1787819356): "none",  # CONCUR with the ruling, post-hoc (decided 08:16:30, claimed 08:21:16, +286s; the refuse-
+    ("1be574adfc1e445b", "kimi-code", 1787820239): "none",  # Concur with evidence addressing codex's dissent, measured first-hand in the main tree at
+    ("f90aa5d7528c35cd", "kimi-code", 1787826607): "record_qualified",  # context-verified, NOT content-verified. The command text is withheld from the record (re
 }
 
 # The negative control: what a keyword matcher over the same prose would find.
@@ -176,6 +271,40 @@ HEDGE_RE = re.compile(
     r"unable to verify|redact|withheld|context only|context evidence",
     re.I,
 )
+
+
+
+def _chi2(tab):
+    """Pearson chi-square on the seat x bool table. Small, so no scipy."""
+    rows = list(tab.values())
+    tot_d = sum(d for d, _ in rows)
+    tot_c = sum(c for _, c in rows)
+    n = tot_d + tot_c
+    chi = 0.0
+    for d, c in rows:
+        m = d + c
+        for obs, exp in ((d, m * tot_d / n), (c, m * tot_c / n)):
+            if exp:
+                chi += (obs - exp) ** 2 / exp
+    return chi
+
+
+def _fisher_vs_rest(tab, seat):
+    """Two-sided Fisher exact, one seat against the pooled others."""
+    a, b = tab[seat]
+    c = sum(d for s, (d, _) in tab.items() if s != seat)
+    d = sum(x for s, (_, x) in tab.items() if s != seat)
+    n = a + b + c + d
+    obs = comb(a + b, a) * comb(c + d, c) / comb(n, a + c)
+    p = 0.0
+    for i in range(0, min(a + b, a + c) + 1):
+        k = a + c - i
+        if k < 0 or k > c + d:
+            continue
+        pr = comb(a + b, i) * comb(c + d, k) / comb(n, a + c)
+        if pr <= obs * (1 + 1e-9):
+            p += pr
+    return p
 
 
 def collect(max_entries: int):
@@ -257,20 +386,86 @@ def main() -> int:
           f" {100.0 * len(esc_rec) / len(esc_any):.0f}% of peer-reviewed)")
 
     print()
-    print("CONCURRENCES WHOSE PROSE SAYS THE ACT WAS NOT VERIFIED:")
-    for k, kind in CONCURRENCE_NOTES.items():
-        state = "present" if k in concurs else "NOT IN WINDOW"
-        print(f"  {k[0]} {k[1]}  {kind}  [{state}]")
-    print("  Same obstacle as the 37 record dissents; opposite bool. There is no")
-    print("  field, so there is no convention.")
+    print("CONCURRENCES THAT CARRY THE SAME OBSTACLE (hand-read, all"
+          f" {len(concurs)}):")
+    c_lab = {k: CONCUR_LABELS[k] for k in concurs if k in CONCUR_LABELS}
+    c_missing = [k for k in concurs if k not in CONCUR_LABELS]
+    c_stale = [k for k in CONCUR_LABELS if k not in concurs]
+    c_grounds = Counter(c_lab.values())
+    c_record = c_grounds["record_qualified"] + c_grounds["record_recovered"]
+    for ground, n in c_grounds.most_common():
+        pct = 100.0 * n / len(c_lab) if c_lab else 0.0
+        print(f"  {ground:<18} {n:>3}   {pct:.0f}% of concurrences")
+    print(f"  -> {c_record} of {len(c_lab)} concurrences"
+          f" ({100.0 * c_record / len(c_lab):.0f}%) say the record did not carry"
+          " the act,")
+    print("     and every one of them is `dissent: false`.")
+    if c_missing:
+        # Same discipline as the dissent side: never fold an unread row in.
+        print(f"  UNLABELLED {len(c_missing)} -- excluded from the rate above.")
+        for k in c_missing:
+            arg = (concurs[k].get("argument") or "")[:100].replace("\n", " ")
+            print(f"    {k[0]} {k[1]} {k[2]}  {arg}")
+    if c_stale:
+        # A label whose factor is no longer on the chain means the window moved
+        # under the table. Say so rather than quietly shrinking the denominator.
+        print(f"  STALE LABELS {len(c_stale)} -- in the table, not in the window:")
+        for k in c_stale:
+            print(f"    {k[0]} {k[1]} {k[2]}")
+    c_seat = Counter(k[1] for k, g in c_lab.items() if g != "none")
+    print(f"  record-limited concurrence by seat: {dict(c_seat)}")
+
+    print()
+    print("HOW EACH SEAT FILES THE SAME OBSTACLE (the 62 record-limited factors):")
+    seats = sorted({k[1] for k, g in labelled.items() if g == "record"} |
+                   {k[1] for k, g in c_lab.items() if g != "none"})
+    tab = {}
+    for st in seats:
+        d = sum(1 for k, g in labelled.items() if g == "record" and k[1] == st)
+        c = sum(1 for k, g in c_lab.items() if g != "none" and k[1] == st)
+        tab[st] = (d, c)
+        print(f"  {st:<12} dissent {d:>2}  concur {c:>2}"
+              f"   -> {100.0 * d / (d + c):.0f}% filed as DISSENT")
+    print(f"  chi2 = {_chi2(tab):.2f}, df = {len(tab) - 1}"
+          f"   |  codex vs rest, Fisher exact two-sided p = {_fisher_vs_rest(tab, 'codex'):.1e}")
+    print("  The value of the bit on a record failure is predicted by WHICH SEAT")
+    print("  reviewed. So `factors_dissenting` is partly a measure of the roster.")
+    print("  n=62, one week, seats not randomly assigned to escalations -- part of")
+    print("  this may be which escalations a seat drew, not how it filed them.")
+    print("  Separating those needs the enum, which is the point.")
+
+    print()
+    print("THE OBSTACLE ACROSS THE WHOLE BOOL:")
+    both = record + c_record
+    print(f"  {record:>3} record dissents   of {len(dissents)} dissents")
+    print(f"  {c_record:>3} record concurs    of {len(concurs)} concurrences")
+    print(f"  {both:>3} of {len(seen)} peer factors"
+          f" ({100.0 * both / len(seen):.0f}%) are review of a record that did"
+          " not carry the act.")
+    print("  The bool splits them across BOTH its values, so no count recovers")
+    print("  the quantity -- and on the concur side nothing is even mis-counted:")
+    print("  the factor reads as plain agreement.")
 
     print()
     hedged = [k for k in dissents
               if HEDGE_RE.search(dissents[k].get("argument") or "")]
+    c_hedged = [k for k in concurs
+                if HEDGE_RE.search(concurs[k].get("argument") or "")]
+    c_true = {k for k, g in c_lab.items() if g != "none"}
     print("NEGATIVE CONTROL -- keyword matcher over the same prose:")
-    print(f"  regex finds {len(hedged)} of the {record} hand-labelled record dissents"
-          f" ({record / len(hedged) if hedged else float('inf'):.1f}x undercount)")
+    print(f"  dissent side: regex finds {len(hedged)} of the {record} hand-labelled"
+          f" record dissents ({record / len(hedged) if hedged else float('inf'):.1f}x"
+          " undercount)")
+    print(f"  concur side:  regex finds {len(set(c_hedged) & c_true)} of the"
+          f" {c_record} ({c_record / len(set(c_hedged) & c_true) if set(c_hedged) & c_true else float('inf'):.1f}x"
+          f" undercount), and flags {len(set(c_hedged) - c_true)} that the hand"
+          " read cleared.")
     print("  A spelling-keyed search over free prose returns a clean wrong number.")
+    print("  Both directions, though: building the concur table, the regex caught")
+    print("  two factors the hand read had MISSED (a0f71efc, 94fcfae9 -- both bury")
+    print("  the truncation past the 400th character, under an opening sentence")
+    print("  that reads as unqualified concurrence). Neither method dominates.")
+    print("  That is an argument for the FIELD, not for a better matcher.")
     return 0
 
 
