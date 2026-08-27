@@ -405,11 +405,11 @@ of this tool did exactly that and reported 31% instead of 49%.
 
 ### 4. Cross-tabbed against the hand label
 
-|  | FULL | TRUNCATED | MARKER | REDACTED |
-|---|---|---|---|---|
-| `none` | 23 | 6 | 5 | 1 |
-| `record_qualified` | 1 | 10 | 1 | 0 |
-| `record_recovered` | 6 | 3 | 3 | 0 |
+|  | FULL | TRUNCATED | MARKER | REDACTED | total |
+|---|---|---|---|---|---|
+| `none` | 23 | 6 | 5 | 1 | 35 |
+| `record_qualified` | 1 | 10 | 1 | 1 | 13 |
+| `record_recovered` | 6 | 3 | 3 | 0 | 12 |
 
 **12 factors labelled `none` sit on records that provably could not carry the
 act.** `none` is defined in this file as "the record carried the act," so all 12

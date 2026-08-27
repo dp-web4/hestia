@@ -148,7 +148,7 @@ def main() -> int:
         if lab == "none" and kind != "FULL":
             misses.append((k, kind, f))
     labs = ["none", "record_qualified", "record_recovered"]
-    kindnames = ["FULL", "TRUNCATED", "MARKER", "ABSENT"]
+    kindnames = ["FULL", "TRUNCATED", "MARKER", "REDACTED", "ABSENT"]
     print(f"  {'':<18}" + "".join(f"{x:>10}" for x in kindnames))
     for lab in labs:
         print(f"  {lab:<18}" + "".join(f"{rows[(lab,x)]:>10}" for x in kindnames))
