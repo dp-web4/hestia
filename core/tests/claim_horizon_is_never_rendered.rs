@@ -55,6 +55,24 @@
 //! WHAT THIS FILE IS. Four OPEN-DEFECT PINS, in the hole-J shape: each asserts the
 //! CURRENT WRONG BEHAVIOUR, so each is green while the defect stands and goes RED the moment
 //! it is fixed. A red here is the intended end state, and the failure message says so.
+//!
+//! TURNOVER LEDGER, so a reader can tell a pin that is still WAITING from one that has been
+//! PAID. A turned-over pin keeps its history in place and inverts its assertion; none are
+//! deleted, because the specimen is the durable part.
+//!
+//!   PIN 1        — OPEN.        `retry_within_secs` still emits the supremum at open time.
+//!   PIN 2        — OPEN.        the emitting site still has no decided-anchored deadline.
+//!   PIN 4(a)-(c) — TURNED OVER #518/#528. `permits_write` reads `is_claimable(now)` and
+//!                                the poll renders `claim_window_secs_remaining`.
+//!   PIN 4(d)     — TURNED OVER #611, 2026-08-26. The note is produced by
+//!                                `Escalation::claim_note(now)` and names WHICH of the two
+//!                                causes of `permits_write: false` a payload carries.
+//!
+//! The last of those is the one worth restating, because the pin's own failure message
+//! anticipated the wrong fix: deleting the false sentence would have turned it red without
+//! closing anything. `permits_write: false` has two causes — SPENT and LAPSED — and every
+//! other field the poll renders is identical between them. Prose that says nothing and prose
+//! that says the wrong thing fail an asker in the same place.
 
 use hestia::server::gate_escalation::{
     Channel, EscalationStore, Status, APPROVAL_CLAIM_WINDOW_SECS, DEFAULT_TTL_SECS,
@@ -86,11 +104,17 @@ const ADVERTISED_RETRY_EXPR: &str =
 const POLL_PERMITS_WRITE_EXPR: &str =
     r#""permits_write": esc.map(|e| e.is_claimable(now)).unwrap_or(false),"#;
 
-/// The poll surface's note, unchanged since before #518, still describing the two-conjunct
-/// rule the field beside it stopped using. This is the string the live daemon returned at
-/// 18:45Z on 2026-08-18 for `5725d296b05cbc4c`, 83 minutes after that grant stopped being
-/// claimable — and again at 00:29:56Z on 2026-08-19 for `b1e32c344564f08e`, this seat's own
-/// permit, from a daemon whose binary predates the fix.
+/// The RETIRED poll note — the two-conjunct rule the `permits_write` field stopped using at
+/// #518 and the sentence beside it kept teaching for six days after.
+///
+/// This is the string the live daemon returned at 18:45Z on 2026-08-18 for
+/// `5725d296b05cbc4c`, 83 minutes after that grant stopped being claimable; again at
+/// 00:29:56Z on 2026-08-19 for `b1e32c344564f08e`, this seat's own permit, from a daemon
+/// whose binary predates the fix; and last at 20:24Z on 2026-08-24 for `27a25b66e7fe22d0`,
+/// beside `approved` + `bar_met: true` + `permits_write: false` on a permit claimed 41s
+/// after its grant — the payload that finally motivated #611.
+///
+/// Kept as a NEGATIVE constant: PIN 4(d) below now asserts this appears in no producer.
 const POLL_TWO_CONJUNCT_NOTE: &str =
     "authoritative as of now; only `approved` WITH the stated bar met permits the write";
 
@@ -123,6 +147,16 @@ fn production_body(rel: &str, want_fn: &str) -> String {
     assert!(in_fn, "fn `{want_fn}` not found in {rel} — this pin is measuring nothing");
     assert!(!out.is_empty(), "fn `{want_fn}` body read as empty in {rel}");
     out.join("\n")
+}
+
+/// The WHOLE text of one file in `src`, comments included.
+///
+/// Deliberately un-stripped, unlike `production_body`: its one use below is a NEGATIVE
+/// assertion — a retired string must appear nowhere — and for that, prose is not an escape
+/// hatch but a place the literal can hide and be copied back out of.
+fn production_text(rel: &str) -> String {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    fs::read_to_string(src.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
 /// Open one escalation on a `SingleApprover` marker, so a lone sovereign approval meets the
@@ -534,7 +568,7 @@ fn past_the_horizon_the_asker_surface_reads_dead() {
     // used to diverge: the horizon countdown is spent, and the enforcing predicate refuses.
     assert_eq!(
         esc.claim_window_secs_remaining(dead),
-        0,
+        Some(0),
         "past the horizon the permit's own countdown must read zero, whatever the record's says"
     );
     assert!(
@@ -559,22 +593,226 @@ fn past_the_horizon_the_asker_surface_reads_dead() {
         "REGRESSION: the poll surface has stopped rendering the horizon it enforces against."
     );
 
-    // (d) THE HALF THAT DID NOT TURN OVER — moved here from PIN 2(d) of
-    // `permits_write_outlives_the_claim_horizon.rs` when that file was retired.
+    // (d) TURNED OVER, 2026-08-26 (#611). Was: THE HALF THAT DID NOT TURN OVER — moved here
+    // from PIN 2(d) of `permits_write_outlives_the_claim_horizon.rs` when that file was
+    // retired, and the last of this file's four pins still asserting a wrong behaviour.
     //
-    // The field learned four conjuncts; the sentence beside it still teaches two. A reader who
-    // takes the note at its word concludes that an approval which is `approved` with its bar
-    // met permits the write — which is now exactly the case `permits_write: false` is emitted
-    // for, on a spent or horizon-dead permit. Before #518 the note was wrong in the same
-    // direction as the field, so it added nothing; now it CONTRADICTS the field it annotates,
-    // and the note is the half a reader is likelier to quote.
+    // WHAT IT PINNED. The field learned four conjuncts at #518; the sentence beside it kept
+    // teaching two. A reader who took the note at its word concluded that an approval which
+    // is `approved` with its bar met permits the write — which is exactly the case
+    // `permits_write: false` is emitted for, on a spent or horizon-dead permit. Before #518
+    // the note was wrong in the same direction as the field, so it added nothing; after
+    // #518 it CONTRADICTED the field it annotates, and the note is the half a reader is
+    // likelier to quote.
     //
-    // Bound to the production string, so a fix to the note turns this red and nothing else does.
+    // WHAT CLOSED IT, and why the assertions below are shaped this way. The pin's failure
+    // message did not ask for the false sentence to be DELETED — a bare `permits_write:
+    // false` with no note leaves an asker unable to tell a deny from an expiry, which is a
+    // different defect at the same surface. It asked that the replacement NAME THE SPENT AND
+    // HORIZON CONJUNCTS. So the turnover checks the naming on BEHAVIOUR, against two
+    // specimens that differ in nothing else, and checks on source only the two things
+    // behaviour cannot see: that one producer feeds the surface, and that the retired
+    // sentence is gone from every file that could copy it back.
+    for rel in ["server/handler.rs", "server/gate_escalation.rs"] {
+        assert!(
+            !production_text(rel).contains(POLL_TWO_CONJUNCT_NOTE),
+            "REGRESSION: the retired two-conjunct note is back in {rel}. It states the \
+             pre-#518 rule that `permits_write` stopped using, so it reads as a GRANT on \
+             every payload where the permit is spent or past its horizon — the exact \
+             payloads a poll is issued to check."
+        );
+    }
     assert!(
-        poll.contains(POLL_TWO_CONJUNCT_NOTE),
-        "OPEN-DEFECT PIN 4(d) has gone RED, which is the intended end state: the poll note no \
-         longer describes the two-conjunct rule its field abandoned in #518. Confirm it now \
-         names the SPENT and HORIZON conjuncts rather than merely being deleted — an asker \
-         reading a bare `permits_write: false` with no note cannot tell a deny from an expiry."
+        poll.contains("e.claim_note(now)"),
+        "REGRESSION: the poll surface has stopped taking its note from the single producer. \
+         A second sentence written at this call site is how the first one drifted: the field \
+         was repaired at one site and the prose explaining it at another, and nothing \
+         compiles a string literal."
+    );
+
+    // THE DISCRIMINATION, on behaviour. Two permits that render IDENTICALLY in every other
+    // field the poll carries — `approved`, `bar_met: true`, `granted: true`,
+    // `permits_write: false`, `claim_window_secs_remaining: 0` — separated only by cause:
+    // this one LAPSED, the next was SPENT. Measured live as one shape on CBP 2026-08-26
+    // 03:10Z (`c5e2cab3c68874c4` lapsed, `365289a4402c4f13` spent).
+    let lapsed_note = esc.claim_note(dead);
+    assert!(
+        lapsed_note.contains("CLAIM WINDOW HAS CLOSED"),
+        "the HORIZON conjunct is unnamed: an asker past the horizon is told the write is \
+         refused and not that its own clock is what refused it, got {lapsed_note:?}"
+    );
+    assert_eq!(
+        esc.consumed_at, None,
+        "the lapsed specimen must be unspent, or it is not the state this arm names"
+    );
+
+    let (mut spent_store, spent_id) = opened(DEFAULT_TTL_SECS);
+    approve_at(&mut spent_store, &spent_id, granted_at);
+    assert!(
+        spent_store
+            .claim("claude-code", "law_inject.py", Some(HORIZON_ACT), granted_at + 1)
+            .is_some(),
+        "the spent arm is only in-domain if the claim actually lands"
+    );
+    let spent = spent_store.get(&spent_id).expect("get").clone();
+    let spent_note = spent.claim_note(dead);
+    assert!(
+        spent_note.contains("ALREADY BEEN CLAIMED"),
+        "the SPENT conjunct is unnamed, got {spent_note:?}"
+    );
+    assert!(
+        spent.consumed_at.is_some(),
+        "`consumed_at` is the machine-readable half of this same distinction, and #611 put it \
+         on the poll: the note is for a human, this field is for the peer auditing which of \
+         N approvals on a shared marker was the one actually spent"
+    );
+    assert_ne!(
+        lapsed_note, spent_note,
+        "SPENT and LAPSED render the SAME sentence, so the note discriminates nothing and the \
+         deletion-shaped fix has happened instead of the naming-shaped one"
+    );
+    assert!(
+        !esc.is_claimable(dead) && !spent.is_claimable(dead),
+        "control: both specimens must be refused at this instant, or the two notes above \
+         describe states that never co-occur with `permits_write: false` and this arm is \
+         vacuous"
+    );
+}
+
+/// PIN 5 — a petition that has not been decided is published as one whose window has SHUT.
+///
+/// `claim_window_secs_remaining` was `decided_horizon().saturating_sub(now)`, and
+/// `decided_horizon` anchors an absent decision at `opened_at` (`decided_at.unwrap_or`).
+/// So `APPROVAL_CLAIM_WINDOW_SECS` after the OPEN — ten minutes, against a one-hour TTL —
+/// a still-pending petition began reporting `0`, the same integer a spent permit reports,
+/// for the remaining fifty minutes of its decidable life.
+///
+/// MEASURED LIVE, 2026-08-26 22:18:45Z (#651), and independently reproduced by kimi-code:
+/// `a0dc8225` polled `claim_window_secs_remaining: 0` while holding 1203s of decision life;
+/// `bc37287c` the same with 2460s. Both were decidable at the instant they published as
+/// spent.
+///
+/// WHY IT SURVIVED. Every pre-existing test in this file and in the crate builds its
+/// specimen by calling `approve_at` first, so `decided_at` is always `Some` and the
+/// `unwrap_or` branch is DEAD under the whole suite. The behaviour was not defended by a
+/// contract; it was held up by the absence of a fixture. This pin is that fixture.
+///
+/// The two specimens are evaluated at the SAME INSTANT on purpose. The defect is not that
+/// pending reported a wrong number — it is that pending and lapsed reported the SAME number,
+/// so no reader could separate "not open yet" from "already shut".
+#[test]
+fn a_pending_petition_does_not_report_a_spent_claim_window() {
+    // The instant PIN 4 uses for its lapsed specimen, reused so both arms below are read off
+    // one clock: past a T0-anchored claim horizon, and well inside the record TTL.
+    let now = T0 + 209 + APPROVAL_CLAIM_WINDOW_SECS + 21;
+    assert!(
+        now > T0 + APPROVAL_CLAIM_WINDOW_SECS && now < T0 + DEFAULT_TTL_SECS,
+        "fixture must sit past the OPEN-anchored claim horizon and inside the record TTL, or \
+         it cannot reach the arithmetic under test"
+    );
+
+    // ---- specimen A: still PENDING ----
+    let (pending_store, pending_id) = opened(DEFAULT_TTL_SECS);
+    let pending = pending_store.get(&pending_id).expect("get").clone();
+
+    // CONTROL, and the whole reason `0` is a lie here: this record is not merely alive, it is
+    // DECIDABLE at this instant. Asserted by performing the decision on a clone of the store,
+    // because "the operator could still approve this" is the exact fact the published `0`
+    // denies, and inferring it from `status` would be re-deriving rather than demonstrating.
+    assert_eq!(
+        pending.status_at(now),
+        Status::Pending,
+        "specimen A must still be pending here or this pin measures the decided path again"
+    );
+    let decision_life = pending.secs_remaining(now);
+    assert!(
+        decision_life > 0,
+        "control: specimen A must have decision life left, or `0` would be honest"
+    );
+    assert_eq!(
+        decision_life, 2_770,
+        "the live specimens' shape, pinned: ~46 minutes of decision life behind a field \
+         reporting the window had shut"
+    );
+    // An independently opened twin, decided AT THIS INSTANT. Not a clone of specimen A —
+    // `EscalationStore` is deliberately not `Clone` — and the independent build is the
+    // stronger demonstration anyway, since nothing of specimen A's state carries over.
+    let (mut twin_store, twin_id) = opened(DEFAULT_TTL_SECS);
+    approve_at(&mut twin_store, &twin_id, now);
+    assert!(
+        twin_store.get(&twin_id).expect("get").is_claimable(now),
+        "CONTROL FAILED: a petition opened at T0 could not actually be decided-and-claimed at \
+         this instant, so the claim below — that `0` was published against a still-live \
+         petition — is not established and this whole pin is vacuous"
+    );
+
+    // THE DEFECT. Was `0`; must not be an integer that reads as a shut window.
+    assert_eq!(
+        pending.claim_window_secs_remaining(now),
+        None,
+        "REGRESSION (#651): an UNDECIDED petition is reporting a claim countdown. It has no \
+         claim clock — the approval it would be spent against does not exist yet. Reporting \
+         `0` here is not merely imprecise, it is the exact value that means `spent or \
+         lapsed`, published against a petition the operator can still approve right now. If \
+         this went red because `decided_horizon`'s `unwrap_or(opened_at)` came back, read the \
+         comment on that function first: the fallback is correct THERE, for `is_claimable`, \
+         and wrong on a reporting field."
+    );
+
+    // ---- specimen B: DECIDED, and genuinely lapsed, at the same instant ----
+    let (mut lapsed_store, lapsed_id) = opened(DEFAULT_TTL_SECS);
+    approve_at(&mut lapsed_store, &lapsed_id, T0 + 209);
+    let lapsed = lapsed_store.get(&lapsed_id).expect("get").clone();
+    assert!(
+        !lapsed.is_claimable(now),
+        "control: specimen B must be past its claim horizon here"
+    );
+
+    // POSITIVE CONTROL. `0` must still be reachable and still mean what it always meant —
+    // otherwise the fix is the deletion-shaped one, where the field stops saying anything and
+    // the pin above passes vacuously.
+    assert_eq!(
+        lapsed.claim_window_secs_remaining(now),
+        Some(0),
+        "the SHUT window must still report `0`. If this is `None`, the field no longer \
+         distinguishes a lapsed permit from an undecided one — the collision has been moved, \
+         not closed"
+    );
+
+    // THE SEPARATION, stated as the thing a reader actually needs.
+    assert_ne!(
+        pending.claim_window_secs_remaining(now),
+        lapsed.claim_window_secs_remaining(now),
+        "PENDING and LAPSED render the same value, so this field discriminates nothing: a \
+         live petition and a spent permit are one shape on the wire, which is the defect \
+         #651 opened"
+    );
+
+    // (e) THE ARM THAT MUST NOT BE "CLEANED UP". Checked on the PRODUCTION body, comments
+    // stripped, because the tempting simplification of this fix — `esc.and_then(..)` — is
+    // one keystroke away, reads better, and is WRONG: it would carry the pending repair into
+    // the unknown-id case, which this payload deliberately answers `0`. That policy is stated
+    // on the `note` field two lines below the expression: an id this daemon has never seen is
+    // treated as EXPIRED, because the caller's only safe reading of "I do not know" is "no".
+    // Pending has no such safe-downgrade argument — nothing is permitted by "not decided yet".
+    let poll = production_body("server/handler.rs", "tool_gate_escalation_poll");
+    let unknown_stays_zero = concat!(
+        "\"claim_window_secs_remaining\": match esc {\n",
+        "None => Some(0),\n",
+        "Some(e) => e.claim_window_secs_remaining(now),",
+    );
+    assert!(
+        poll.contains(unknown_stays_zero),
+        "REGRESSION: the poll no longer distinguishes UNKNOWN-ID from PENDING on \
+         `claim_window_secs_remaining`. An unknown id must keep rendering `0` (documented \
+         fail-closed policy, see the `note` field); only a known-but-undecided record renders \
+         `null`. If this went red because the match was folded into `and_then`, that fold is \
+         the bug: it makes an id the daemon has never heard of read as `null` — 'no claim \
+         information' — where the contract says it must read as 'no'."
+    );
+    assert!(
+        !poll.contains("esc.and_then(|e| e.claim_window_secs_remaining"),
+        "REGRESSION: the unknown-id case has been folded into the pending case. See above — \
+         these are opposite situations and only one of them is safe to answer `null`."
     );
 }

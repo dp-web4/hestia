@@ -119,9 +119,24 @@ def test_no_inert_test_functions():
         check(f"no inert test functions: {rel}", not inert,
               f"defines {inert} but never calls them. CI runs this file with "
               "bare `python3`, so those functions NEVER EXECUTE and the file "
-              "reports green no matter what they assert. Either call them "
-              "(module scope or a __main__ block), or move the file out of "
-              "the bare-python globs and run it under pytest.")
+              "reports green no matter what they assert.\n"
+              "  WHAT SATISFIES THIS CHECK: each name written out, as a name. "
+              "This guard walks `ast.Name`, so a reference is what it can see.\n"
+              "  WHAT DOES NOT, though every test really does run: a "
+              "`globals()`/`vars()` sweep, or handing the file to a runner "
+              "(`pytest.main([__file__])`). Measured, four arms: the sweep "
+              "executes all of them and this guard still calls all of them "
+              "inert. That is the trap, and it has now cost PRs #171, #468 (a "
+              "week red) and #614/#615, each rediscovering it from scratch.\n"
+              "  THE IDIOM, copyable from `tools/claimable_test.py`: a "
+              "module-level `TESTS = [test_a, test_b, ...]`, plus a __main__ "
+              "block that compares it against `{k for k in globals() if "
+              "k.startswith(\'test_\')}` and exits 1 when they differ, so an "
+              "explicit list going stale is RED rather than a silently smaller "
+              "run. That check is why the explicit list is a fix and not a "
+              "suppression.\n"
+              "  Or move the file out of the bare-python globs and run it "
+              "under pytest.")
 
 
 def test_no_pytest_dependency():
@@ -514,6 +529,34 @@ def test_closure_reaches_through_helpers():
           "the pytest entry points and now flags the very remedy this PR applies")
 
 
+def test_remediation_text_names_the_working_idiom():
+    """The message must say what SATISFIES the check, not only what fails it.
+
+    For three PRs it said "call them (module scope or a __main__ block)" -- which is
+    exactly what #171, #468 and #614/#615 each did, via a `globals()` sweep or a runner.
+    Both really do execute every test; neither is visible to this guard. The remediation
+    named the trap as the cure, so the cure is pinned here.
+
+    Scoped to the failing check's own body via ast rather than searched for across the
+    file: this docstring mentions the same tokens, and a whole-file substring search would
+    pass on that alone -- a guard satisfied by the text of its own assertion.
+    """
+    src = pathlib.Path(__file__).read_text(encoding="utf-8")
+    found = [n for n in ast.parse(src).body
+             if isinstance(n, ast.FunctionDef) and n.name == "test_no_inert_test_functions"]
+    check("remediation check is still findable", len(found) == 1,
+          "test_no_inert_test_functions was renamed or moved; this pin now guards nothing")
+    if not found:
+        return
+    text = ast.unparse(found[0])
+    for token, why in (
+            ("claimable_test.py", "no copyable reference implementation is named"),
+            ("globals()", "does not warn that a sweep runs the tests yet still fails here"),
+            ("stale", "does not mention the staleness check that makes an explicit list a "
+                      "fix rather than a suppression")):
+        check(f"remediation names {token}", token in text, why)
+
+
 def teardown_module(module):
     """Deliver this file's accumulated failures to a harness that reads exceptions.
 
@@ -543,6 +586,7 @@ if __name__ == "__main__":
     test_no_pytest_blind_files()
     test_no_undelivered_accumulators()
     test_closure_reaches_through_helpers()
+    test_remediation_text_names_the_working_idiom()
     for f in FAILS:
         print("FAIL", f)
     n = len(bare_python_files())

@@ -152,6 +152,69 @@ with tempfile.TemporaryDirectory() as tmp:
     check("B1 unmeasured fold says so", "NOT MEASURED" in out, repr(out))
     check("B1 and refuses the inference explicitly",
           "not evidence that you hold none" in out, repr(out))
+    check("B1 a failed READ is attributed to the read",
+          "read failed" in out and "WATCHER predates" not in out, repr(out))
+
+    # B1b: the OTHER cause of asked:false, and the reason it needed separating.
+    # A watcher too old to fold writes no `open_petitions` key at all, and until
+    # 2026-08-26 that rendered as "the pending-escalations read failed" — a flat
+    # assertion about a read nobody attempted. Measured that day: the claude and
+    # kimi watchers were running a8dccda (2026-08-06), which has no fold, so both
+    # seats read a false cause every wake. The two want opposite responses (chase
+    # the daemon vs restart the watcher), so the renderer must not merge them.
+    p = os.path.join(tmp, "primer-no-key.json")
+    with open(p, "w") as fh:
+        json.dump({"notices": []}, fh)          # NO open_petitions key
+    out_absent = subprocess.run([sys.executable, HELPER, "render", p],
+                                capture_output=True, text=True).stdout
+    check("B1b key-absent still says NOT MEASURED", "NOT MEASURED" in out_absent,
+          repr(out_absent))
+    check("B1b key-absent is still separated from the failed read",
+          "read failed" not in out_absent, repr(out_absent))
+    check("B1b key-absent still refuses the inference",
+          "not evidence that you hold none" in out_absent, repr(out_absent))
+
+    # B1c: the FALSIFIER B1b did not have. Absence dates the primer's PRODUCER,
+    # and that is not the same fact as the vintage of the watcher running now.
+    # Codex gave two live counterexamples on PR #634 in which a fully current
+    # watcher launches a keyless primer: a retained primer written before the
+    # restart is retried after it, and the current watcher's own composition
+    # fallback (`... || echo "$OUT" > "$PRIMER"`) emits a keyless primer when the
+    # final step fails. So the first version of this branch — "your WATCHER
+    # predates the fold ... restarting the watcher is what fixes this" — asserted
+    # a cause and prescribed a remedy the artifact does not entail. That is the
+    # same overclaim-from-absence the branch exists to stop, committed by the
+    # branch itself, which is why the wording is pinned and not just spot-checked.
+    check("B1c key-absent does NOT claim the RUNNING watcher predates the fold",
+          "WATCHER predates" not in out_absent, repr(out_absent))
+    check("B1c key-absent does NOT prescribe a restart as the entailed remedy",
+          "estarting the watcher is what fixes" not in out_absent, repr(out_absent))
+    check("B1c key-absent attributes the absence to the PRODUCER of this primer",
+          "PRODUCER" in out_absent and "primer" in out_absent, repr(out_absent))
+    check("B1c key-absent names BOTH admissible producers",
+          "without the fold" in out_absent and "composition fallback" in out_absent,
+          repr(out_absent))
+    check("B1c key-absent points at the tool that DOES discriminate them",
+          "process_vintage.py units" in out_absent, repr(out_absent))
+
+    # B1d: a diagnosis is not a remedy. Both not-measured arms named the CAUSE
+    # and stopped, and the only action either ever named was a watcher restart —
+    # which is the one action a woken member structurally cannot take, because
+    # restarting its own watcher kills the wake that is reading the sentence.
+    # The read is one RPC and the fold is in this file, so a member on ANY
+    # watcher vintage can answer the question for itself. Both arms, not just
+    # the key-absent one: a failed read is equally self-servable, and a remedy
+    # wired into one arm fixes one cause rather than the class — the same
+    # single-seat mistake arm C exists to stop, one level down.
+    for label, block in (("key-absent", out_absent), ("failed-read", out)):
+        check(f"B1d {label} names the RPC that answers it",
+              "hestia_gate_pending_escalations" in block, repr(block))
+        check(f"B1d {label} names the fold that filters it to this member",
+              "open-petitions.py fold" in block, repr(block))
+        check(f"B1d {label} says the route needs no restart",
+              "without a restart" in block, repr(block))
+        check(f"B1d {label} says what a MEASURED zero looks like",
+              "asked:true" in block and "mine" in block, repr(block))
 
     # B2: measured-and-empty is silence. A block that fires every wake stops
     # being read, and holding nothing is the common case.

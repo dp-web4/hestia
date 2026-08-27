@@ -71,6 +71,102 @@ MEMBERS = {  # member -> (installed hooks dir under $HOME, plugins/ dir name)
     "codex":       (".codex/hooks",     "codex"),
     "gemini":      (".gemini/hooks",    "gemini"),
 }
+# Where each member ACTUALLY declares its hooks. The directory in MEMBERS is only one
+# install layout; wiring may instead name absolute paths from a config file, in which case a
+# directory-keyed survey reports a gated seat as ungated (HUB 2026-08-21, and this seat's own
+# ungoverned finding). These are read as FILES. Never build a shell command naming them: on a
+# properly-gated seat the gate classifies a command carrying that marker as a write to the thing
+# that governs the agent and refuses it — so the seats the survey most needs to classify are the
+# ones most likely to refuse the probe.
+MEMBER_CONFIG = {
+    "claude-code": ".claude/settings.json",
+    "codex":       ".codex/config.toml",
+    "gemini":      ".gemini/settings.json",
+    "kimi-code":   ".kimi-code/config.json",
+}
+GATE_EVENT = "PreToolUse"          # the enforcing hook; everything else is witness
+
+
+def _hestia_hook_commands(path):
+    """(events_with_hestia_hooks, resolved_paths) from a member config file, or None if unreadable."""
+    try:
+        raw = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+    events, paths = {}, []
+    if path.endswith((".json",)):
+        try:
+            doc = json.loads(raw)
+        except ValueError:
+            return None
+        for ev, entries in (doc.get("hooks") or {}).items():
+            for entry in (entries or []):
+                for hk in (entry.get("hooks") or []):
+                    cmd = str(hk.get("command", ""))
+                    if "hestia" not in cmd.lower():
+                        continue
+                    events.setdefault(ev, 0)
+                    events[ev] += 1
+                    for tok in cmd.split():
+                        if "/" in tok and "hestia" in tok.lower():
+                            paths.append(tok)
+    else:  # toml/ini-ish: line scan is enough to answer "is anything wired at all"
+        for line in raw.splitlines():
+            low = line.lower()
+            if "hestia" in low and any(k in low for k in ("hook", "notify", "command")):
+                events.setdefault("unparsed", 0)
+                events["unparsed"] += 1
+    return events, paths
+
+
+def gate_surface(member, inst_dir):
+    """Resolve a member's GATE from its real config surface.
+
+    Returns one of, and these are FOUR states plus a distinct undetermined:
+      gated-at-canonical-path | gated-from-a-working-tree |
+      provisioned-but-UNGOVERNED | not-provisioned | UNDETERMINED
+
+    UNDETERMINED must never collapse into a negative. A survey that falls back to the
+    directory check on an unreadable config reports a properly-gated seat as ungated —
+    the exact inversion HUB hit while probing its own seat.
+    """
+    cfg_rel = MEMBER_CONFIG.get(member)
+    cfg = os.path.join(HOME, cfg_rel) if cfg_rel else None
+    home_dir_present = os.path.isdir(os.path.join(HOME, "." + member.split("-")[0])) or os.path.isdir(inst_dir)
+
+    if cfg and os.path.exists(cfg):
+        parsed = _hestia_hook_commands(cfg)
+        if parsed is None:
+            return "UNDETERMINED", f"config present but unparseable: {cfg_rel}"
+        events, paths = parsed
+        if not events:
+            # Schema safety: my parser understands claude-code's hooks{} shape. Another
+            # member could wire a gate under a schema it does not walk, and reporting that
+            # as UNGOVERNED would be the false-negative-about-governance this whole change
+            # exists to remove. So distinguish by evidence that is schema-independent:
+            # if the file mentions hestia ANYWHERE, something is wired that I failed to
+            # parse -> UNDETERMINED. Only a file with no hestia reference at all is safely
+            # ungoverned.
+            try:
+                mentions = "hestia" in open(cfg, encoding="utf-8", errors="replace").read().lower()
+            except OSError:
+                return "UNDETERMINED", f"config unreadable: {cfg_rel}"
+            if mentions:
+                return ("UNDETERMINED",
+                        f"{cfg_rel} references hestia but not in a shape this parser walks")
+            return "provisioned-but-UNGOVERNED", f"{cfg_rel} declares no hestia hook"
+        if GATE_EVENT in events:
+            where = next((q for q in paths if REPO and os.path.abspath(q).startswith(os.path.abspath(REPO))), None)
+            if where:
+                return "gated-from-a-working-tree", f"{GATE_EVENT} -> {os.path.relpath(where, REPO)} (in checkout; only as current as its branch)"
+            return "gated-at-canonical-path", f"{GATE_EVENT} -> {paths[0] if paths else 'resolved'}"
+        return ("provisioned-but-UNGOVERNED",
+                f"hestia hooks at {sorted(events)} but NO {GATE_EVENT} — witness only, no gate")
+    if home_dir_present:
+        return "UNDETERMINED", "member dir present but no known config surface to read"
+    return "not-provisioned", "no config surface and no member dir"
+
+
 WATCH_GLOB = "plugins/member-mesh/hestia-watch-member.sh"
 FIRE_GLOB_PREFIX = "plugins/member-mesh/fire-"
 
@@ -217,6 +313,13 @@ def collect_findings(rows):
             if rst.startswith("STALE-CODE") or rst == "script not found":
                 findings.append(f"{comp}: {rst}")
         elif comp.startswith("hooks ("):
+            g = st.get("gate", "")
+            if g == "provisioned-but-UNGOVERNED":
+                findings.append(f"{comp}: PROVISIONED BUT UNGOVERNED — {r.get('gate_evidence','')}")
+            elif g == "gated-from-a-working-tree":
+                findings.append(f"{comp}: gated from a WORKING TREE — {r.get('gate_evidence','')}")
+            elif g == "UNDETERMINED":
+                findings.append(f"{comp}: gate UNDETERMINED (NOT a negative) — {r.get('gate_evidence','')}")
             n = st.get("_drift")
             if n is None:
                 # The row never reached per-file comparison (canonical index
@@ -225,7 +328,16 @@ def collect_findings(rows):
                 # must not fall through to silence (claude-code re-review,
                 # PR #199: an empty drift_summary reads as "nothing is
                 # wrong", never as "I could not look").
-                findings.append(f"{comp}: {st.get('installed')}")
+                #
+                # UNLESS the gate resolver reached a conclusive answer from the
+                # member's config surface. Then we are not blind — we looked
+                # somewhere strictly better, and the gate line above carries the
+                # verdict. Emitting both makes a correctly-classified seat report
+                # "PROVISIONED BUT UNGOVERNED" and "absent" in the same summary.
+                # PR #199's intent is preserved exactly: UNDETERMINED still
+                # reports here, so an unanswerable row can never read as clean.
+                if g == "UNDETERMINED" or not g:
+                    findings.append(f"{comp}: {st.get('installed')}")
             else:
                 if n:
                     findings.append(f"{comp}: {st.get('installed')}")
@@ -456,6 +568,11 @@ def hook_facts(member_overrides):
         row = {"component": f"hooks ({member})",
                "installed_dir": home_rel if not member_overrides.get(member) else inst_dir,
                "files": [], "states": {}}
+        # The GATE verdict comes from the member's config surface, not from the presence of a
+        # hooks/ directory. Four states + a distinct UNDETERMINED; see gate_surface().
+        _g, _why = gate_surface(member, inst_dir)
+        row["states"]["gate"] = _g
+        row["gate_evidence"] = _why
         if canon is None:
             row["states"]["installed"] = "unverifiable — canonical index failed (git ls-files)"
             rows.append(row)

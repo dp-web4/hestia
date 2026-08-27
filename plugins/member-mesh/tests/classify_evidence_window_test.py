@@ -71,13 +71,29 @@ def extract_function():
 FUNC = extract_function()
 
 
-def classify(log_text, rc="1", prefix="codex"):
+def decoys(logs, prefix, n):
+    """N sibling logs beside the one under test, all stamped strictly OLDER.
+
+    Production log directories hold hundreds — CBP 2026-08-26: codex 474, claude 748,
+    kimi 764 — and the size of that directory is what decides whether the function's
+    `ls -t` lookup survives (see section C). A fixture with one log is the single case
+    in which that line cannot fail, which is why it never has here.
+    """
+    for i in range(n):
+        d = os.path.join(logs, f"{prefix}-20251231-{i:06d}.log")
+        with open(d, "w", encoding="utf-8") as fh:
+            fh.write("decoy\n")
+        os.utime(d, (1_600_000_000, 1_600_000_000))
+
+
+def classify(log_text, rc="1", prefix="codex", siblings=0):
     """Run the extracted function against a synthetic log for `prefix`."""
     with tempfile.TemporaryDirectory() as state:
         logs = os.path.join(state, "logs")
         os.makedirs(logs)
         with open(os.path.join(logs, f"{prefix}-20260101-000000.log"), "w", encoding="utf-8") as fh:
             fh.write(log_text)
+        decoys(logs, prefix, siblings)
         script = (
             "set -euo pipefail\n"
             f'STATE="{state}"\n'
@@ -172,6 +188,52 @@ check("A7: no post-prompt output yields unknown, not the quoted block's verdict"
       got == "unknown", f"got {got!r}")
 
 print()
+print("=== A8. THE BILLING STATE, ONE SPECIMEN PER VENDOR THE MESH FIRES ===")
+# The vendor-spelling bet, third occurrence (2026-08-26). The 08-18 pass widened
+# codex's vocabulary to cover kimi's and stopped; claude spells the identical state
+# two more ways and 60 of 60 claude logs carrying one classified `unknown`, across
+# five outages. A list with one entry per vendor is the shape that makes "one vendor
+# wide" visible — adding a fourth fire template without adding its spelling here is
+# meant to look like the omission it is.
+#
+# Every string below is a VERBATIM capture from a real log on CBP, not authored. An
+# authored plant is what let the kimi gap survive its own test: the plant carried
+# codex's spelling on both sides of the check, so the control contained only the
+# sibling it already matched.
+BILLING_SPECIMENS = {
+    # codex-20260804-225003.log
+    "codex": "ERROR: Your workspace is out of credits. Add credits to continue.",
+    # kimi logs, 08-08 / 08-17 / 08-18 outages
+    "kimi": "403 You've reached your usage limit for this billing cycle. "
+            "Please purchase extra usage or upgrade your plan.",
+    # claude-20260826-064548.log — session bound
+    "claude-session": "You've hit your session limit · resets 7am (America/Los_Angeles)",
+    # claude-20260824-201955.log — weekly bound
+    "claude-weekly": "You've hit your weekly limit · resets 11pm (America/Los_Angeles)",
+    # claude-20260816-050152.log — weekly bound, dated reset variant
+    "claude-weekly-dated": "You've hit your weekly limit · resets Aug 17, 11pm "
+                           "(America/Los_Angeles)",
+}
+for name, specimen in BILLING_SPECIMENS.items():
+    # claude and kimi echo no prompt, so their real logs have no anchor and the whole
+    # tail is the window — reproduce that rather than wrapping every vendor in codex's
+    # log shape, which would test a log none of them writes.
+    got = classify(specimen + "\n", prefix="claude" if name.startswith("claude") else name)
+    check(f"A8/{name}: the billing state classifies as out-of-credits",
+          got == "out-of-credits",
+          f"got {got!r} — this vendor's spelling is not in the pattern list")
+
+# A9 — the widening must not have bought its coverage by stealing verdicts. Checked
+# over all 1960 logs on disk when it landed (60 move, all unknown -> out-of-credits,
+# zero from egress-blocked or timeout); pinned here on the two it could plausibly take.
+got = classify(EPERM + "\n", prefix="claude")
+check("A9a: the widening did not steal egress-blocked",
+      got == "egress-blocked", f"got {got!r}")
+got = classify("the request timed out after 30s\n", prefix="claude")
+check("A9b: the widening did not steal timeout",
+      got == "timeout", f"got {got!r}")
+
+print()
 print("=== B. ADOPTION ===")
 
 watcher_src = open(WATCHER, encoding="utf-8").read()
@@ -191,6 +253,69 @@ for t in templates:
           len(hits) == 1 and hits[0].rstrip().endswith('"'),
           "the anchor must be the PROMPT's final line — if the wording moves, the "
           "classifier's window silently widens back over the echoed primer")
+
+print()
+print("=== C. THE LOOKUP AT PRODUCTION SCALE ===")
+
+# Every A case above runs against a directory holding ONE log. That is not a small
+# simplification, it is the only directory size at which the function's very first
+# action succeeds.
+#
+#   LOG=$(ls -t "$STATE/logs/$PREFIX"-*.log 2>/dev/null | head -1) || LOG=""
+#
+# `set -euo pipefail` is in force. `head` exits after the first line while `ls` is
+# still writing, so `ls` takes SIGPIPE, the PIPELINE reports 141 — failure, on a
+# lookup that succeeded — and `|| LOG=""` blanks the filename. The `[ -n "$LOG" ]`
+# guard then returns `unknown` without opening anything, and every pattern in the
+# function is unreachable. Measured on CBP 2026-08-26 over sibling counts: 0/10
+# SIGPIPE at <=128, 2/10 at 256, 9/10 at 384, 10/10 at 474 and above. All three live
+# corpora were past 474, and the dates they crossed 384 — kimi 08-07, claude 08-08,
+# codex 08-25 — sit BEFORE the two vendor-spelling widenings that section A8 pins.
+# Both widenings measured their target logs as `unknown` and read that as a missing
+# pattern; both measured it through this file, at one log. They are still needed and
+# were never sufficient, and their own evidence could not tell the two causes apart.
+C_SIBLINGS = 900  # ~2x the smallest live corpus (codex, 474) on the day this was written
+
+# C1 is a POSITIVE CONTROL on the FIXTURE, not a check of the watcher. C2 below can go
+# green two ways — because the lookup is correct, or because the race did not fire this
+# run — and a one-log fixture has been passing the second way since 2026-08-01. So
+# reproduce the raw pattern here and say out loud whether the pin was live. On a machine
+# fast enough that `ls` finishes before `head` exits, C2 is vacuous and C3 is the pin.
+with tempfile.TemporaryDirectory() as _ctl:
+    _logs = os.path.join(_ctl, "logs")
+    os.makedirs(_logs)
+    decoys(_logs, "codex", C_SIBLINGS)
+    _raw = f'set -o pipefail; ls -t "{_logs}"/codex-*.log 2>/dev/null | head -1 >/dev/null'
+    _rcs = [subprocess.run(["bash", "-c", _raw], capture_output=True).returncode
+            for _ in range(5)]
+_fired = _rcs.count(141)
+print(f"C1: control — `ls -t <{C_SIBLINGS} logs> | head -1` under pipefail returned "
+      f"{_rcs} ({_fired}/5 SIGPIPE). "
+      + ("C2 is a live pin on this machine."
+         if _fired else
+         "The race did NOT reproduce here, so C2 is VACUOUS this run — C3 is the pin."))
+
+# C2 — the invariant the fix has to hold: the verdict must not depend on how many other
+# logs the member happens to have. Same text, same vendor, 0 siblings vs C_SIBLINGS.
+_alone = classify(BILLING_SPECIMENS["codex"] + "\n", prefix="codex", siblings=0)
+_crowd = classify(BILLING_SPECIMENS["codex"] + "\n", prefix="codex", siblings=C_SIBLINGS)
+check("C2a: the billing state still classifies with a production-sized log directory",
+      _crowd == "out-of-credits",
+      f"got {_crowd!r} beside {C_SIBLINGS} siblings, {_alone!r} alone — the lookup "
+      f"dropped the filename, so the classifier never opened a log")
+check("C2b: the verdict does not depend on the directory's size",
+      _alone == _crowd, f"alone={_alone!r} crowded={_crowd!r}")
+
+# C3 — deterministic, so the pin survives a machine that wins the race. The lookup must
+# not put `ls` on the writing end of a pipe under pipefail. Static by necessity: the
+# behaviour it guards is the one C2 can only observe when the timing cooperates.
+_lookup = [ln for ln in watcher_src.splitlines()
+           if "ls -t" in ln and "$PREFIX" in ln]
+check("C3a: the log lookup was found", len(_lookup) == 1, f"found {_lookup}")
+check("C3b: the log lookup does not pipe `ls` into `head`",
+      bool(_lookup) and "head" not in _lookup[0],
+      f"{_lookup[0].strip() if _lookup else ''!r} — under pipefail this reports 141 on "
+      f"success and the `|| LOG=\"\"` beside it blanks the filename")
 
 print()
 if failures:

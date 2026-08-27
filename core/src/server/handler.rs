@@ -2009,6 +2009,49 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
     }
 
     let filter = args.get("filter").cloned().unwrap_or(Value::Null);
+
+    // The other half of the same wrong answer. The guard above catches a KNOWN key in the
+    // wrong PLACE; this one catches an unknown key in the right place, and both produce the
+    // identical failure — a default window whose JSON is shape-identical to an honoured
+    // answer. Measured on the live fleet (#648): `filter.escalation_id`, `filter.request_id`
+    // and `filter.plugin_id` each returned the same five newest hashes as no filter at all,
+    // and the entry actually being sought was 770 entries below the served window.
+    //
+    // This is not a hypothetical caller. Both bounded pointer resolvers end their not-found
+    // arm by sending the member here — "older history was NOT searched (hestia_query_history
+    // and hestia://chain/ pointers page deeper)" — and the only key that member holds is the
+    // `escalation_id` / `request_id` the lookup just failed on. Served silently, the advice
+    // converts a truthful "not searched" into a confident, unfiltered "not present".
+    if let Some(obj) = filter.as_object() {
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !QUERY_FILTER_KEYS.contains(k))
+            .collect();
+        if !unknown.is_empty() {
+            let named = unknown.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ");
+            return Ok(hestia_error_envelope(
+                "hestia.query_filter_unknown_key",
+                &format!(
+                    "{named} is not a filter this chain can honour: the chain is indexed by \
+                     hash and read newest-first, so there is nothing to select an \
+                     escalation_id, request_id or plugin_id on. Served as sent it would be \
+                     DROPPED and you would get an unfiltered window over the tail that looks \
+                     exactly like a filtered answer — so it is refused. To reach a record by \
+                     id use its pointer resource (hestia://escalation/<id>, hestia://scope/<id>, \
+                     hestia://appeal/<hash>), which scans for it; to reach one by chain hash \
+                     use filter.hash, which short-circuits the window."
+                ),
+                Some(json!({
+                    "unknownKeys": unknown,
+                    "honoured": QUERY_FILTER_KEYS,
+                    "byIdInstead": ["hestia://escalation/<id>", "hestia://scope/<id>",
+                                    "hestia://appeal/<deny_hash|appeal_entry_hash>"],
+                })),
+            ));
+        }
+    }
+
     let limit = filter
         .get("limit")
         .and_then(Value::as_u64)
@@ -5123,6 +5166,17 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
 ///    Both sentences ship in the response so a reader cannot take the first
 ///    for the second.
 ///
+/// 3. Every row carries its own `in_reply_to`, because that is the only field
+///    that separates distinct dispositions sharing one `pointer_uri`. Measured
+///    on CBP 2026-08-26: 37 `i_owe` rows, 25 distinct pointers, six pointers
+///    arriving three times each byte-identical and ~0.3s apart — which reads as
+///    twelve duplicates until you look at the bindings, where all twelve are
+///    distinct (one per fork of a batched act, anchored at one section on
+///    purpose). A reader grouping by what the report SHOWED would have
+///    mass-acked twelve live claims. Unansweredness is defined by what binds to
+///    `n.id`; a report that hides the binding makes its own definition
+///    unverifiable from the outside.
+///
 /// Read-only and self-scoped: a caller sees only notices it sent or received.
 async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult {
     let session_id_arg = optional_session_id(args);
@@ -5184,7 +5238,10 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
         // Notices I sent that nobody answered: did my wake land?
         "owed_to_me": theirs,
         "scope": "unanswered = no notice binds in_reply_to to it; \
-                  drained_at:null additionally means it was never picked up",
+                  drained_at:null additionally means it was never picked up; \
+                  each row carries its OWN in_reply_to - group by that, not by \
+                  pointer_uri, or distinct dispositions anchored at one section \
+                  read as duplicates",
         "recipient_liveness_scope": "liveness measures the DELIVERY PATH (did that member \
                                      read its mailbox), not the member's ability to act — a \
                                      watcher polling for a broken CLI reads as live. \
@@ -8973,6 +9030,103 @@ mod member_mesh_tests {
         assert!(rows["recipient_liveness_scope"].is_string(), "{rows}");
     }
 
+    /// Two dispositions, one pointer, different bindings. The report must show what
+    /// tells them apart, or the reader groups by the proxy and acks a live claim.
+    ///
+    /// This is the CBP 2026-08-26 case reduced to two rows. There, six pointers each
+    /// arrived three times, byte-identical (225ch, matching sha256) and ~0.3s apart,
+    /// from one sender: every visible field said "duplicate". They were twelve distinct
+    /// dispositions, one per fork of a batched act, deliberately anchored at the same
+    /// section of one forum file, and the only field that said so was `in_reply_to` —
+    /// which the row did not project. The query has always READ that column (the
+    /// `NOT EXISTS` clause is what makes a row unanswered at all); it just never showed
+    /// it.
+    #[tokio::test]
+    async fn unanswered_rows_carry_the_binding_that_separates_a_shared_pointer() {
+        let (_dir, state) = test_state().await;
+        let kimi = connect(&state, "kimi-code").await;
+        let claude = connect(&state, "claude-code").await;
+
+        // Two asks FROM claude TO kimi. A member may only bind to mail addressed to it,
+        // so these are what kimi is allowed to answer — and they are the shape the real
+        // case had: my notices to kimi, kimi's dispositions coming back.
+        let mut originals = Vec::new();
+        for i in 0..2 {
+            let out = tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                        "pointer_uri": format!("pr/{i}"), "session_id": claude}),
+            )
+            .await
+            .unwrap();
+            originals.push(out["queued_id"].as_u64().expect("queued_id"));
+        }
+        tool_member_inbox(&state, &json!({"session_id": kimi})).await.unwrap();
+
+        // Now the shape under test: kimi answers BOTH with the same anchor. Same
+        // recipient, same kind, byte-identical pointer; only the binding differs.
+        const SHARED: &str = "forum/kimi-code/batch.md#one-factor-per-digest";
+        for re in &originals {
+            tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": "claude-code", "kind": "reply",
+                        "pointer_uri": SHARED, "in_reply_to": re, "session_id": kimi}),
+            )
+            .await
+            .unwrap();
+        }
+
+        let rows = tool_member_unanswered(
+            &state,
+            &json!({"session_id": claude, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let mine = rows["i_owe"].as_array().unwrap();
+        let shared: Vec<&Value> = mine
+            .iter()
+            .filter(|r| r["pointer_uri"] == json!(SHARED))
+            .collect();
+        assert_eq!(shared.len(), 2, "both dispositions are owed: {rows}");
+
+        // The defect, stated as the assertion that would have caught it: grouping by
+        // every OTHER rendered field collapses these two into one.
+        let proxy: std::collections::HashSet<String> = shared
+            .iter()
+            .map(|r| format!("{}|{}|{}", r["from_plugin"], r["kind"], r["pointer_uri"]))
+            .collect();
+        assert_eq!(proxy.len(), 1, "the proxy key cannot tell them apart: {rows}");
+
+        let bound: std::collections::HashSet<u64> = shared
+            .iter()
+            .map(|r| {
+                r["in_reply_to"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("row has no in_reply_to: {r}"))
+            })
+            .collect();
+        assert_eq!(
+            bound.len(),
+            2,
+            "in_reply_to must separate what the pointer cannot: {rows}"
+        );
+        assert_eq!(
+            bound,
+            originals.iter().copied().collect(),
+            "and it must name the notices actually answered: {rows}"
+        );
+
+        // Say it where the reader is, not only in the row: the fire primer renders
+        // `scope`, and "group by the binding" is the instruction that prevents the
+        // mass-ack this row shape invites.
+        let scope = rows["scope"].as_str().unwrap_or_default();
+        assert!(scope.contains("in_reply_to"), "{rows}");
+        assert!(
+            scope.contains("group by"),
+            "scope must tell the reader HOW to group: {scope}"
+        );
+    }
+
     /// Kimi review Finding 3: a pointer NAMES a location. Multi-line /
     /// control-character pointers are prompt-injection carriers (the fire
     /// templates render notices into an LLM prompt) and oversized ones are
@@ -11592,6 +11746,168 @@ mod tests {
         );
     }
 
+    /// THE POLL'S PROSE MUST NOT STATE A RULE ITS OWN `permits_write` FIELD DENIES.
+    ///
+    /// Reproduced from a live payload, not imagined. CBP, 2026-08-24 20:24Z, escalation
+    /// `27a25b66e7fe22d0`: an operator approval granted at +16s and CLAIMED at +41s polled
+    /// back `status: approved`, `bar_met: true`, `granted: true`, `permits_write: false`,
+    /// with `note: "authoritative as of now; only \`approved\` WITH the stated bar met
+    /// permits the write"`. Both conditions that sentence names were true in that same
+    /// payload and the write was not permitted — the note asserted the negation of the field
+    /// printed four lines above it.
+    ///
+    /// The FIELD had been repaired on 2026-08-18 (two conjuncts -> `is_claimable`'s four)
+    /// after a seat published a spent permit to the operator as live. The sentence
+    /// explaining the field kept the pre-repair law, because nothing type-checks a string
+    /// literal. So this asserts the two halves of one answer against each other.
+    ///
+    /// BOTH ARMS MOVE, deliberately: the same escalation is polled while undecided, while
+    /// the permit is live, and after it is spent, and the note must differ across them. A
+    /// note that is CONSTANT — which is exactly what the retired literal was — fails no
+    /// matter which sentence it is frozen at, and a `permits_write` frozen either way fails
+    /// one of the three arms. Sabotage arm: restore the literal at the poll's `note` and
+    /// this test reds on the undecided arm and again on the spent arm.
+    ///
+    /// FIXTURE HYGIENE, learned the hard way while writing this test: the first draft named
+    /// a real gate path as its `act`, and the seat's own gate refused the edit — a content
+    /// matcher cannot tell a Rust string literal in a test from a write target, and the file
+    /// being written (this one) is not a governance surface at all. Fixtures here name
+    /// surfaces that are markers WITHOUT being live hook paths, the same convention the test
+    /// directly above already follows.
+    #[tokio::test]
+    async fn the_poll_note_never_states_a_rule_permits_write_denies() {
+        const ACT: &str = "Edit -> /repo/core/src/escalation_note_target.rs";
+        const MARKER: &str = "policy.json";
+
+        let (_dir, shared) = make_shared_state();
+        let connected = tool_connect(
+            &shared,
+            &json!({ "plugin_id": "claude-code", "host_agent": "h" }),
+        )
+        .await
+        .unwrap();
+        let session = connected["sessionId"].as_str().unwrap().to_string();
+
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": session,
+                "tool_name": "Bash",
+                "marker": MARKER,
+                "act": ACT,
+                "reason": ACT,
+            }),
+        )
+        .await
+        .unwrap();
+        let escalation_id = opened["escalation_id"].as_str().unwrap().to_string();
+        let poll_args = json!({ "escalation_id": escalation_id });
+
+        // ARM 0 — UNDECIDED. The retired literal had no branch for this at all: an asker
+        // polling a live pending escalation was told the rule under which it would be
+        // permitted, as if a decision had already happened.
+        let pending = tool_gate_escalation_poll(&shared, &poll_args).await.unwrap();
+        assert_eq!(pending["permits_write"], false, "pending permits nothing: {pending}");
+        let pending_note = pending["note"].as_str().unwrap().to_string();
+        assert!(
+            pending_note.contains("UNDECIDED"),
+            "an undecided escalation must say so, not recite the grant rule: {pending}"
+        );
+        assert_eq!(
+            pending["consumed_at"],
+            Value::Null,
+            "nothing has been spent yet: {pending}"
+        );
+
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations
+                .decide(
+                    &escalation_id,
+                    true,
+                    "operator",
+                    "role:constellation:sovereign",
+                    crate::server::gate_escalation::Channel::OperatorSession,
+                    None,
+                    Some("k"),
+                    crate::server::gate_escalation::now_secs(),
+                )
+                .expect("the sovereign channel approves");
+        }
+
+        // ARM 1 — GRANTED AND UNSPENT. `permits_write` is true here, so the note may say so.
+        let live = tool_gate_escalation_poll(&shared, &poll_args).await.unwrap();
+        assert_eq!(live["status"], "approved", "{live}");
+        assert_eq!(live["bar_met"], true, "{live}");
+        assert_eq!(live["permits_write"], true, "an unspent grant is claimable: {live}");
+        let live_note = live["note"].as_str().unwrap().to_string();
+        assert!(
+            live_note.contains("RE-ISSUE"),
+            "a live permit must tell the holder how to spend it: {live}"
+        );
+        assert_eq!(
+            live["consumed_at"],
+            Value::Null,
+            "a grant nobody has claimed carries no spend instant: {live}"
+        );
+
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": session,
+                "tool_name": "Bash",
+                "marker": MARKER,
+                "act": ACT,
+                "reason": ACT,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed["claimed"], true, "the approval is spent here: {claimed}");
+
+        // ARM 2 — THE LIVE PAYLOAD. Approved, bar met, granted, already claimed.
+        let spent = tool_gate_escalation_poll(&shared, &poll_args).await.unwrap();
+        assert_eq!(spent["status"], "approved", "the RECORD is still approved: {spent}");
+        assert_eq!(spent["bar_met"], true, "and the bar is still met: {spent}");
+        assert_eq!(spent["granted"], true, "and it was genuinely granted: {spent}");
+        assert_eq!(
+            spent["permits_write"], false,
+            "but a spent approval is single-use and permits nothing: {spent}"
+        );
+        let spent_note = spent["note"].as_str().unwrap().to_string();
+        assert!(
+            spent_note.contains("ALREADY BEEN CLAIMED"),
+            "the note must name the spend that made `permits_write` false: {spent}"
+        );
+        assert_ne!(
+            spent_note, live_note,
+            "the note has to MOVE with the permission; a constant sentence is the defect"
+        );
+        assert!(
+            !spent_note.contains("only `approved` WITH the stated bar met permits the write"),
+            "the retired two-conjunct rule is FALSE of this very payload, whose `status` and \
+             `bar_met` both hold while the write is refused: {spent}"
+        );
+        // THE MACHINE-READABLE HALF. Everything else on this payload is byte-identical to a
+        // permit that merely LAPSED — measured live on two CBP escalations, 2026-08-26. A
+        // peer asking "which of these approvals was actually spent?" must be able to answer
+        // it without substring-matching English.
+        assert!(
+            spent["consumed_at"].is_u64(),
+            "the spend instant is the one field that separates spent from lapsed: {spent}"
+        );
+        assert_eq!(
+            spent["status"], live["status"],
+            "the whole point: status cannot tell these apart"
+        );
+        assert_eq!(
+            spent["permits_write"], false,
+            "and neither can permits_write, which is false for BOTH causes"
+        );
+    }
+
     /// THE DERIVATION, with nothing on the wire to derive from.
     ///
     /// The first draft of this change wrote the caller's `host_session_id` argument straight
@@ -12502,6 +12818,173 @@ mod tests {
             Some("claim key is (plugin, marker), not the exact act"),
             "post-decision, the argument is preserved"
         );
+    }
+
+    /// THE SEAT KEYS (#542). Until this change every question of the form "which seat /
+    /// which wake opened this escalation" was unanswerable from the opened row — field
+    /// census 0/173 for `gate_path`, `session_id`, `host_session_id` in any spelling,
+    /// while `asker_basis: "session"` named a session the row did not carry. These
+    /// assert on the CHAIN ENTRY, for the same reason the claim-door invitation test
+    /// does: the census that found the absence reads payload keys.
+    ///
+    /// The two session keys are DERIVED from the proven session, never the arguments:
+    /// the test passes NO `host_session_id` argument to the claim, only to the connect,
+    /// so a populated key can only have come from the proven session record.
+    #[tokio::test]
+    async fn the_claim_door_records_the_seat_keys_from_the_proven_session() {
+        let (_dir, shared) = make_shared_state();
+        let conn = tool_connect(&shared, &json!({
+            "plugin_id": "kimi-code", "host_agent": "h", "host_session_id": "wake-542"
+        }))
+        .await
+        .unwrap();
+        let sid = conn["sessionId"].as_str().unwrap().to_string();
+
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": sid,
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "reason": "Edit -> a governance file",
+                "gate_path": "hooks/kimi/pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed["claimed"], false, "precondition: the open fallback: {claimed}");
+
+        let s = shared.lock().await;
+        let opened = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened")
+            .expect("the refusal must be witnessed");
+        let d = &opened.event_data;
+        assert_eq!(
+            d["gate_path"], "hooks/kimi/pre_tool_use.py",
+            "the caller-asserted gate is recorded, as exactly that: {d}"
+        );
+        assert_eq!(
+            d["host_session_id"], "wake-542",
+            "the per-wake key is DERIVED from the proven session — the claim call never              carried it as an argument: {d}"
+        );
+        assert_eq!(
+            d["session_id"], sid.as_str(),
+            "the MCP session the refusal row already recorded on requested_by now lands              on the opened row too: {d}"
+        );
+        assert_eq!(d["asker_basis"], "session", "the basis finally names a present field: {d}");
+    }
+
+    /// The member door writes the same three keys (#542) — a field added only to the
+    /// claim door is a field the documented entry point never sees, which is how the
+    /// invitation writer shipped onto the wrong surface once already.
+    #[tokio::test]
+    async fn the_open_door_records_the_seat_keys_too() {
+        let (_dir, shared) = make_shared_state();
+        let conn = tool_connect(&shared, &json!({
+            "plugin_id": "kimi-code", "host_agent": "h", "host_session_id": "wake-542b"
+        }))
+        .await
+        .unwrap();
+        let sid = conn["sessionId"].as_str().unwrap().to_string();
+
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": sid,
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "act": "Edit -> a governance file",
+                "reason": "the deny blocks a legitimate rule addition",
+                "gate_path": "hooks/kimi/pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(opened.get("escalation_id").is_some(), "the open must land: {opened}");
+
+        let s = shared.lock().await;
+        let entry = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened")
+            .expect("the open must be witnessed");
+        let d = &entry.event_data;
+        assert_eq!(d["gate_path"], "hooks/kimi/pre_tool_use.py", "{d}");
+        assert_eq!(d["host_session_id"], "wake-542b", "{d}");
+        assert_eq!(d["session_id"], sid.as_str(), "{d}");
+    }
+
+    /// Absence is RECORDED, not fabricated (#542): an unproven open (no session, no
+    /// gate_path) writes all three keys as explicit null — the one-shape doctrine, so a
+    /// census reading payload KEYS can never mistake "no shape for the field" for "the
+    /// field had no value". And a PROVEN session that itself carries no host_session_id
+    /// yields a populated `session_id` beside a null `host_session_id`: derived, never
+    /// the caller's assertion.
+    #[tokio::test]
+    async fn an_unproven_open_records_explicit_null_seat_keys() {
+        let (_dir, shared) = make_shared_state();
+        // Arm 1: nothing proven at all.
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "act": "Edit -> a governance file",
+                "reason": "the deny blocks a legitimate rule addition",
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(opened.get("escalation_id").is_some(), "{opened}");
+
+        // Arm 2: a proven session that never carried a host_session_id.
+        let conn = tool_connect(&shared, &json!({ "plugin_id": "codex", "host_agent": "h" }))
+            .await
+            .unwrap();
+        let sid2 = conn["sessionId"].as_str().unwrap().to_string();
+        let opened2 = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "session_id": sid2,
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "act": "Edit -> another governance file",
+                "reason": "a second legitimate rule addition",
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(opened2.get("escalation_id").is_some(), "{opened2}");
+
+        let s = shared.lock().await;
+        let mut opened_entries = s
+            .recent_chain(20)
+            .into_iter()
+            .filter(|e| e.event_type == "gate_escalation_opened");
+        let second = opened_entries.next().expect("the second open is witnessed");
+        let first = opened_entries.next().expect("the first open is witnessed");
+
+        let d1 = &first.event_data;
+        for key in ["gate_path", "host_session_id", "session_id"] {
+            assert!(
+                d1.get(key).is_some_and(Value::is_null),
+                "arm 1: '{key}' must be an EXPLICIT null, not a missing key and never a                  fabricated value: {d1}"
+            );
+        }
+
+        let d2 = &second.event_data;
+        assert_eq!(d2["session_id"], sid2.as_str(), "arm 2: the proven session lands: {d2}");
+        assert!(
+            d2["host_session_id"].is_null(),
+            "arm 2: the proven session carried none, so null is the honest record — the              caller's unverifiable assertion would have been worse than the missing key: {d2}"
+        );
+        assert!(d2["gate_path"].is_null(), "arm 2: no gate named itself: {d2}");
     }
 }
 
@@ -13972,6 +14455,68 @@ mod appeal_tests {
         assert_eq!(ok["entries"].as_array().unwrap().len(), 3, "{ok}");
     }
 
+    /// The sibling the guard above did not cover, found by walking the live chain (#648).
+    /// A guard is as strong as the DOMAIN it validates, not the exceptions it catches: the
+    /// misplaced-key check validates "known key, wrong place" and says nothing about
+    /// "unknown key, right place" — which lands on the identical wrong answer, an unfiltered
+    /// window wearing a filtered window's shape.
+    ///
+    /// The caller is not hypothetical. `resolve_escalation_pointer` and
+    /// `resolve_scope_pointer` both end their bounded not-found arm by naming this tool as
+    /// the way to page deeper, and the only key that member is holding is the id the scan
+    /// just failed on. If that id is silently dropped, a truthful "the newest 1000 entries
+    /// were searched" becomes a confident "no such record".
+    #[tokio::test]
+    async fn an_unknown_key_inside_filter_is_refused_not_silently_dropped() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let s = state.lock().await;
+            for i in 0..60 {
+                s.append_chain("outcome", json!({"filler": i})).unwrap();
+            }
+        }
+
+        let unfiltered = tool_query_history(&state, &json!({"filter": {"limit": 5}}))
+            .await
+            .unwrap();
+
+        for key in ["escalation_id", "request_id", "plugin_id", "event_type"] {
+            let served = tool_query_history(&state, &json!({"filter": {key: "x", "limit": 5}}))
+                .await
+                .unwrap();
+            let err = served.get("_hestia_error").unwrap_or_else(|| {
+                panic!("`filter.{key}` must be refused, not dropped: {served}")
+            });
+            assert_eq!(err["code"].as_str(), Some("hestia.query_filter_unknown_key"), "{served}");
+            assert!(
+                err["data"]["unknownKeys"].as_array().unwrap().iter().any(|k| k == key),
+                "the refusal must name the key it refused: {served}"
+            );
+            assert!(
+                err["message"].as_str().unwrap().contains("hestia://escalation/"),
+                "refusing without naming a route that works just moves the dead end: {served}"
+            );
+            assert!(served.get("entries").is_none(), "a refusal must not also serve data: {served}");
+            // The bug this pins: served, the answer was byte-identical to no filter at all.
+            assert_ne!(
+                served["entries"], unfiltered["entries"],
+                "an unknown filter key must not return the unfiltered window: {served}"
+            );
+        }
+
+        // The honoured keys keep working, alone and together.
+        let ok = tool_query_history(&state, &json!({"filter": {"limit": 3}})).await.unwrap();
+        assert_eq!(ok["entries"].as_array().unwrap().len(), 3, "{ok}");
+        let named = tool_query_history(&state, &json!({"filter": {"limit": 3, "tool_name": "z"}}))
+            .await
+            .unwrap();
+        assert!(named.get("_hestia_error").is_none(), "{named}");
+        // An empty filter object is not an unknown key.
+        let empty = tool_query_history(&state, &json!({"filter": {}})).await.unwrap();
+        assert!(empty.get("_hestia_error").is_none(), "{empty}");
+    }
+
     /// The half the call-site lint did not reach. A misplaced `limit` costs depth; a misplaced
     /// `hash` costs the pointer entirely — `filter.hash` short-circuits the window precisely so
     /// an old entry does not read as absent, and the bare shape silently puts the window back.
@@ -15023,6 +15568,19 @@ fn opened_payload(
         // bounded invitation that reads as an exhaustive one makes "nobody looked"
         // unfalsifiable.
         "invitation_passed_over": inv.passed_over,
+        // THE SEAT KEYS (#542). Until these three, every question of the form "which
+        // seat / which wake opened this escalation" was unanswerable from the row —
+        // field census 0/173 for any of them in any spelling, while `asker_basis:
+        // "session"` named a session the row did not carry. All three are emitted on
+        // EVERY open (the one-shape doctrine above): a null is the explicit record
+        // of absence, never a missing key a census can mistake for an unwritten
+        // shape. `gate_path` is caller-asserted (A1 — the hook self-reports; nothing
+        // here can check it). The two session keys are DERIVED from the proven live
+        // session or null — never the caller's assertion; see the struct fields'
+        // docs and the claimed row's host_session_id doctrine they mirror.
+        "gate_path": esc.gate_path,
+        "host_session_id": esc.host_session_id,
+        "session_id": esc.session_id,
         "expires_at": esc.expires_at,
         "ttl_secs": ttl_secs,
         // Recorded so a reader is never left inferring it from silence.
@@ -15158,6 +15716,11 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // #128 remedy — basis recorded on the escalation, and `eligibility` refusing to peer-clear
     // an asker nobody proved — is its own change against a reopened #128.
     let session_id_arg = optional_session_id(args);
+    // WHICH HOOK FIRED, when the opener says so (#542). CALLER-ASSERTED like every
+    // other unproven field on this surface — recorded, never trusted (see the
+    // struct field's doc). A member-initiated open through a plain session usually
+    // supplies nothing, and null is the explicit record of that.
+    let gate_path = optional_string(args, "gate_path");
     let now = now_secs();
 
     let mut s = state.lock().await;
@@ -15179,6 +15742,7 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         }
     }
     let asker_is_proven = proven_asker.is_some();
+    let proven_session_uuid = proven_asker.as_ref().and_then(|who| who.session_uuid);
     let esc = match s
         .gate_escalations
         .open(&plugin_id, &role, &tool_name, &marker,
@@ -15202,6 +15766,28 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
             return Err(anyhow::anyhow!("{e}"));
         }
     };
+    // THE SEAT KEYS (#542), recorded before the witness so the entry records what
+    // exists rather than what this call intends (the `invite` ordering rule, one
+    // field group over). The two session keys are DERIVED from the proven session
+    // — never the caller's assertion; `gate_path` is the caller's self-report and
+    // is recorded as exactly that.
+    let proven_host_session_id = proven_session_uuid
+        .and_then(|uuid| s.sessions.get(&uuid))
+        .and_then(|sess| sess.host_session_id.clone());
+    let proven_session_id = proven_session_uuid.map(|uuid| uuid.to_string());
+    s.gate_escalations.record_seat_keys(
+        &esc.id,
+        gate_path.as_deref(),
+        proven_host_session_id.as_deref(),
+        proven_session_id.as_deref(),
+    );
+    // Re-read AFTER the recording: `open` returned a clone taken before it, and
+    // the payload below is built from the struct — the store is the record.
+    let esc = s
+        .gate_escalations
+        .get(&esc.id)
+        .cloned()
+        .expect("just opened; the row exists");
 
     // ---- THE INVITATION HALF ----------------------------------------------------------
     //
@@ -15585,7 +16171,38 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         // the wrong field already was.
         "permits_write": esc.map(|e| e.is_claimable(now)).unwrap_or(false),
         "granted": status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false),
-        "claim_window_secs_remaining": esc.map(|e| e.claim_window_secs_remaining(now)).unwrap_or(0),
+        // THREE causes for `0`, one shape (#651) — and the fix is NOT to collapse all three
+        // to `null`, because the two causes are not the same kind of thing.
+        //
+        // UNKNOWN ID stays `0`. That is the deliberate policy stated on `note` below: an id
+        // this daemon has never seen is treated as EXPIRED, and the caller's only safe
+        // reading of "I do not know" is "no". An `and_then` here would have quietly widened
+        // the #651 repair into that contract and turned a fail-closed answer into `null`.
+        //
+        // PENDING becomes `null`, because it is the opposite situation: a KNOWN record whose
+        // claim clock has not started. `0` there is not a safe "no", it is a false "your
+        // window shut" published against a petition the operator can still approve — measured
+        // live 2026-08-26 22:18:45Z on `a0dc8225` (1203s of decision life) and `bc37287c`
+        // (2460s). The safe-downgrade argument does not reach it: nothing is being permitted
+        // by saying "not decided yet", so there is no failure to close toward.
+        "claim_window_secs_remaining": match esc {
+            None => Some(0),
+            Some(e) => e.claim_window_secs_remaining(now),
+        },
+        // THE DISCRIMINATOR, AS A FIELD AND NOT ONLY AS PROSE. `permits_write: false` has two
+        // causes — the permit was SPENT, or its window LAPSED — and every other field on this
+        // payload is identical between them. Measured live on CBP 2026-08-26 03:10Z:
+        // `c5e2cab3c68874c4` and `365289a4402c4f13` both polled back `status: approved`,
+        // `bar_met: true`, `granted: true`, `permits_write: false`,
+        // `claim_window_secs_remaining: 0` — one of each cause, one shape.
+        //
+        // `claim_note` below now says which, and that is the half a human reads. This is the
+        // half a program reads, because the lesson this whole surface keeps re-teaching is
+        // that a string is not a predicate: `tools/claimable.py` was the correct reader with
+        // zero call sites, and the note stated the two-conjunct rule for six days after the
+        // field it explains was moved to four. A peer auditing "which of these N approvals on
+        // a shared marker was the one actually spent?" must not have to substring-match prose.
+        "consumed_at": esc.and_then(|e| e.consumed_at),
         "bar": esc.map(|e| e.bar),
         "bar_met": esc.map(|e| e.bar_met()),
         "factors_present": esc.map(|e| e.factors.clone()),
@@ -15595,11 +16212,19 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         "reason": esc.and_then(|e| e.reason.clone()),
         // An id this daemon has never seen and an id whose window closed are the SAME answer on
         // purpose. The caller's only safe reading of "I do not know" is "no".
-        "note": if esc.is_none() {
-            "unknown escalation_id — treated as expired (a restart drops the store, and an \
-             in-flight escalation must then read as denied)"
-        } else {
-            "authoritative as of now; only `approved` WITH the stated bar met permits the write"
+        //
+        // THE NOTE IS THE FIELD'S PROSE AND MUST TRACK THE SAME FOUR CONJUNCTS. It used to
+        // read "authoritative as of now; only `approved` WITH the stated bar met permits the
+        // write" — the TWO-conjunct rule that the `permits_write` repair immediately above
+        // replaced. Live on CBP 2026-08-24: `27a25b66e7fe22d0` polled `approved` + `bar_met`
+        // + `permits_write: false` (claimed 41s after grant) beside a sentence saying those
+        // two facts permit the write. The value was fixed and the sentence explaining the
+        // value was not, because nothing compiles a string. It now comes from
+        // `Escalation::claim_note`, the single answer `decision_reply` already reads.
+        "note": match esc {
+            None => "unknown escalation_id — treated as expired (a restart drops the store, and \
+                     an in-flight escalation must then read as denied)",
+            Some(e) => e.claim_note(now),
         },
     }))
 }
@@ -15652,6 +16277,10 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // launder, and a join key is exactly the field an auditor would rely on to say WHICH
     // acts a spent approval covered.
     let stated_host_session_id = optional_string(args, "host_session_id");
+    // WHICH HOOK FIRED, when the gate says so (#542) — caller-asserted and recorded
+    // as exactly that (the struct field's doc carries the caveat). The hook passes
+    // its own realpath; an old hook passes nothing, and null is the explicit record.
+    let gate_path = optional_string(args, "gate_path");
     // WHO is asking, provable. Accepted here for the same reason `tool_gate_escalation_open`
     // accepts it (#128: `eligibility` otherwise compares an ASSERTION against an IDENTITY),
     // and because the invitation half cannot issue without it — an invitation is an outward
@@ -15840,6 +16469,28 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
               stated_reason.as_deref(), stated_detail.as_deref(), now, DEFAULT_TTL_SECS)
     {
         Ok(esc) => {
+            // THE SEAT KEYS (#542), same write as the member door: the two session
+            // keys DERIVED from the proven session (never the arguments — the
+            // doctrine the claimed row's host_session_id follows, ten lines up),
+            // `gate_path` the caller's self-report and recorded as exactly that.
+            // Recorded before the witness, same ordering rule as `invite`.
+            s.gate_escalations.record_seat_keys(
+                &esc.id,
+                gate_path.as_deref(),
+                proven_host_session_id.as_deref(),
+                proven_asker
+                    .as_ref()
+                    .and_then(|who| who.session_uuid)
+                    .map(|uuid| uuid.to_string())
+                    .as_deref(),
+            );
+            // Re-read AFTER the recording, same reason as the member door: `open`
+            // returned a pre-recording clone and the payload is built from it.
+            let esc = s
+                .gate_escalations
+                .get(&esc.id)
+                .cloned()
+                .expect("just opened; the row exists");
             // THE SAME WRITER THE OTHER DOOR USES. This fallback had its own hand-rolled
             // payload — no `bar`, no `invited_peers`, no `asker_basis`, no `invitation_*` —
             // and since this is the door the gate hook actually calls, that shape is what the

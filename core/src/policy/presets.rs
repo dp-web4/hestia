@@ -102,7 +102,16 @@ fn safety_rules() -> Vec<PolicyRule> {
                  cat/tee, a non-expanding double-quoted string) does not trip it — but \
                  handing that same text to an interpreter (`sh -c`, `eval`, a pipe into a \
                  shell) does, and anything the parser cannot read confidently is matched in \
-                 full. If the act is legitimate, appeal it with `hestia_appeal` (this \
+                 full. THE DATA CARVE-OUT APPLIES AT THE OUTERMOST LEVEL ONLY: inside \
+                 `$( … )` or backticks nothing is treated as data, because a substitution \
+                 is re-read by the shell as commands — so `grep 'TOKEN' f` is allowed while \
+                 `echo $(grep 'TOKEN' f)` is not, and the same holds for a quoted heredoc \
+                 body under cat/tee once it is inside a substitution. Reported by kimi-code \
+                 (#617) with a live repro: the implementation scoped the carve-out to \
+                 substitution depth 0 and this text named only the quoting construct, so \
+                 the verdict was unpredictable from the published law. Pinned by \
+                 `policy::shell::tests::quoted_data_inside_a_substitution_is_not_inert`. \
+                 If the act is legitimate, appeal it with `hestia_appeal` (this \
                  decision's chain hash + your reason) rather than rephrasing — a rephrase \
                  that reaches the same resource scores 0.35, BELOW plain compliance, and \
                  teaches the society nothing. An appeal is recorded conduct that can change \
