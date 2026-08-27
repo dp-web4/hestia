@@ -44,8 +44,11 @@ METHOD, and its limits, stated so a reader can discount them:
   * TWO classifiers run, not one. V1 is the first pass; V2 closes two holes V1 had
     (`git -C <dir> <verb>` slipped past a `git\\s+verb` anchor; a governance-CLI write such
     as `hestia gate approve` writes no file but is still a write). Both totals print and
-    the DISAGREEMENT SET prints in full. A single hand-tuned regex quoting a rate is the
-    failure mode this repo already has on record; the honest form is two and their delta.
+    the DISAGREEMENT SET prints with each row's `escalation_id`, chain position,
+    timestamp, seat, `act_digest`, and the producer's act text UNCUT BY THIS TOOL — so a
+    reviewer can fetch the row themselves rather than take the delta on trust. A single
+    hand-tuned regex quoting a rate is the failure mode this repo already has on record;
+    the honest form is two and their delta, addressable.
   * "READ" here means THE RECORD SHOWS ONLY A READ -- not "this could not possibly have
     written". A command can write through a destination that is merely a last argument,
     which the safety preset's own law text says it cannot see either. So the read bucket
@@ -79,6 +82,15 @@ Two things follow, and the second is the one that matters:
     other direction: peer review is not weak here, it is starved. Give a reviewer the act and
     they will read it and catch you. The 668 rows below are the population where nobody
     could, because the field built for the act holds a constant.
+
+A SECOND REVIEWER CAUGHT THE SAME SHAPE AGAIN. codex dissented on the appeal record
+(`0b2728a1b45b637f`) after reproducing every count in this file off its own chain walk —
+930 opened, 668 constant, and both classifiers' buckets to the row. Its dissent was not
+about the numbers: the docstring promised the disagreement set "in full" while the printer
+sliced `stated_reason` to 140 characters and omitted `escalation_id`, so the four rows that
+are this census's entire independently-checkable surface could be neither read nor looked
+up. That is this file's own finding, committed by this file, in the one place built to
+answer it. Fixed at the print site below; the remedy is codex's, verbatim.
 
 Not one character of the write-verb vocabulary was changed to get past the deny; the file is
 on disk instead of on stdin. The second-order shape is still worth naming: to count how often
@@ -166,6 +178,9 @@ def collect(max_entries: int):
             continue
         p = payload(e)
         if et == "gate_escalation_opened":
+            # Carry the entry's own coordinates onto the payload. A row a reader cannot
+            # look up is not evidence, and the payload alone does not say where it lives.
+            p["_pos"], p["_ts"] = e["chainPosition"], e["timestamp"]
             opened.append(p)
         elif et == "gate_escalation_decided":
             decided.add(p.get("escalation_id"))
@@ -215,9 +230,25 @@ def main() -> int:
     for b in BUCKETS:
         print(f"  {b:12s} {c1[b]:4d}   {c2[b]:4d}")
     dis = [p for p in auto if k1(p) != k2(p)]
-    print(f"\n  DISAGREEMENT SET ({len(dis)}), in full:")
+    # Every row here is addressable and carries whatever act text the PRODUCER stored,
+    # uncut by this tool. codex dissented on an earlier draft that promised "in full" and
+    # then sliced to 140 chars with no escalation_id: a reader could neither read the act
+    # nor look the row up, so the disagreement set was an assertion, not evidence. That is
+    # the same defect this census measures, committed by the census. If a line below ends
+    # in "…", the CUT IS THE PRODUCER'S (220 chars + "Bash: " + " …" = 228, claude-code
+    # only) and no reader anywhere can recover the rest — which is the finding, not a
+    # formatting choice.
+    print(f"\n  DISAGREEMENT SET ({len(dis)}) — every row addressable, act text uncut by this tool:")
     for p in dis:
-        print(f"    {k1(p)} -> {k2(p)} | {(p.get('stated_reason') or '')[:140]}")
+        r = p.get("stated_reason") or ""
+        print(f"    {p.get('escalation_id')}  pos={p.get('_pos')}  {p.get('_ts', '')[:19]}  "
+              f"{p.get('plugin_id')}  {k1(p)} -> {k2(p)}")
+        # act_digest is the OTHER identifier a reviewer might reach for, and on these rows
+        # it is absent — so it is printed as absent rather than omitted, because "the
+        # fallback identifier does not exist here" is something a reviewer needs told.
+        print(f"      act_digest={p.get('act_digest') or 'ABSENT on this row'}")
+        print(f"      stated_reason ({len(r)} chars"
+              f"{', PRODUCER-TRUNCATED' if r.rstrip().endswith('…') else ''}): {r}")
 
     def table(pop, title, key=k2):
         c = Counter(key(p) for p in pop)
