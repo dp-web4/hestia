@@ -49,9 +49,12 @@ at the repo root) plus `cargo clean -p` on the affected crates once, and both of
 decisions a person should make with the reason in front of them.
 
 Exit status is a verdict:
-  0  every path-dependency crate has exactly one artifact set in the shared target
+  0  every external path-dep crate has exactly one artifact set in the shared target,
+     OR there is no shared target (CARGO_TARGET_DIR unset), in which case the defect is
+     impossible by construction and this says so. That is CI's situation on every run.
   1  at least one is split -- the report names the crate and the remedy
-  2  cannot determine (no shared target, no cargo, or discovery found no path deps)
+  2  cannot determine (CARGO_TARGET_DIR set but no fingerprint dir, cargo metadata failed,
+     or discovery found no external path deps)
 """
 
 from __future__ import annotations
@@ -138,10 +141,16 @@ def main() -> int:
     else:
         target = os.environ.get("CARGO_TARGET_DIR")
         if not target:
-            print("cannot determine: CARGO_TARGET_DIR is not set, so there is no SHARED "
-                  "target for two checkouts to disagree in. Per-checkout targets cannot "
-                  "have this defect.", file=sys.stderr)
-            return 2
+            # PASS BY CONSTRUCTION, and exit 0 -- not "cannot determine". The first version
+            # returned 2 here, and CI (which sets no CARGO_TARGET_DIR) counts any non-zero
+            # as a failed test: the guard went red on its first CI run for the one
+            # environment in which the defect is impossible. Its own docstring had said it
+            # "can never fail there", which was the untested claim. A per-checkout target
+            # has nothing for two checkouts to disagree in; say so and pass.
+            print("PASS  CARGO_TARGET_DIR is not set: per-checkout targets, so there is no "
+                  "shared target for two checkouts to disagree in and this defect cannot "
+                  "occur here")
+            return 0
         fp = Path(target) / "debug" / ".fingerprint"
     if not fp.is_dir():
         print(f"cannot determine: no fingerprint directory at {fp}", file=sys.stderr)
