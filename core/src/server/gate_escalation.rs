@@ -822,9 +822,11 @@ impl Escalation {
     ///    session and spent by another — fit inside the slack.
     /// 2. **One window after the record dies.** An approval must not outlive the escalation
     ///    it belongs to by more than a window. Needed independently of (1): the replay path
-    ///    restores a decided entry carrying no `decided_at` as `decided_at = replay time`
-    ///    (`or(Some(now))` below), and a grant anchor alone would hand a restarted daemon a
-    ///    fresh window an arbitrary distance after the open. This reads `expires_at` rather
+    ///    used to restore a decided entry carrying no `decided_at` as `decided_at = replay
+    ///    time` (`or(Some(now))`; since #710 it recovers the time from the decider's own
+    ///    factor or the entry, but this ceiling stays — monotonicity must not depend on
+    ///    what a payload happens to carry), and a grant anchor alone would hand a
+    ///    restarted daemon a fresh window an arbitrary distance after the open. This reads `expires_at` rather
     ///    than the DEFAULT ttl, which the hardcoded form got wrong for any escalation opened
     ///    with a shorter one.
     ///
@@ -839,8 +841,8 @@ impl Escalation {
     /// fallback can do is refuse a claim early. Returning `None`/unbounded here instead
     /// would turn an `Approved`-without-`decided_at` record into a standing permit. That
     /// record is currently unreachable — `decide()` sets `status` and `decided_at` in the
-    /// same breath, and the restore path forces `decided_at = replay time` via
-    /// `or(Some(now))` — but "unreachable today" is exactly the kind of absence that has
+    /// same breath, and the restore path always supplies one (the decider's factor, else
+    /// the entry's timestamp) — but "unreachable today" is exactly the kind of absence that has
     /// been load-bearing here before. The fix went to the REPORTING field, which has no
     /// enforcement duty, and left the enforcing one conservative.
     fn decided_horizon(&self) -> u64 {
@@ -1029,6 +1031,11 @@ impl EscalationStore {
         let u = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_u64());
         let mut restored = 0usize;
         for e in entries {
+            // The entry's own timestamp. Every append here happens in the same call as the
+            // mutation it records, so it is the true date of any field the payload omits —
+            // and the restart is never the answer (#700 for the open; #710 for the ruling
+            // and the claim).
+            let entry_ts = e.timestamp.timestamp().max(0) as u64;
             let d = &e.event_data;
             let Some(id) = s(d, "escalation_id") else { continue };
             match e.event_type.as_str() {
@@ -1171,7 +1178,31 @@ impl EscalationStore {
                             // replay cannot positively identify as a grant is not a grant.
                             _ => Status::Denied,
                         };
-                        esc.decided_at = u(d, "decided_at").or(Some(now));
+                        // WHEN it was decided. The emitter writes no `decided_at` — neither
+                        // `_decided` nor `_withdrawn` (handler.rs, one `json!` for both; 6/6
+                        // live rows on 2026-08-28) — so the old `.or(Some(now))` dated EVERY
+                        // restored ruling at the restart: #700's defect on the decision half,
+                        // and the fixture below was this key's only writer (kimi-code, review
+                        // 7236). The time is on the wire twice regardless: the decider's own
+                        // factor (`decide()` pushes it with the very `now` it stamps
+                        // `decided_at` from — equal to the entry's second on all 6 rows), and
+                        // the entry itself. Read them in that order. Both predate the restart,
+                        // so `decided_horizon` can only tighten; its `expires_at + window`
+                        // ceiling stays, because monotonicity must not depend on the payload.
+                        let decided_by = s(d, "decided_by");
+                        let from_own_factor = d
+                            .get("factors_present")
+                            .and_then(|v| v.as_array())
+                            .and_then(|fs| {
+                                // The decider's factor is pushed LAST by `decide()`; a peer
+                                // factor under the same name earlier must not win.
+                                fs.iter()
+                                    .rev()
+                                    .find(|f| f.get("by").and_then(|b| b.as_str()) == decided_by.as_deref())
+                                    .and_then(|f| f.get("at"))
+                                    .and_then(|a| a.as_u64())
+                            });
+                        esc.decided_at = u(d, "decided_at").or(from_own_factor).or(Some(entry_ts));
                         esc.decided_by = s(d, "decided_by");
                         esc.decided_role = s(d, "decided_role");
                         // The channel is what tells a restored `denied` apart from a
@@ -1216,7 +1247,10 @@ impl EscalationStore {
                     // restored copy must be spent too — otherwise a restart would RE-ARM every
                     // approval ever granted, turning a crash into a way to reuse a human's yes.
                     if let Some(esc) = self.by_id.get_mut(&id) {
-                        esc.consumed_at = u(d, "consumed_at").or(Some(now));
+                        // `_claimed` carries `decided_at` and `secs_from_decision_to_use`
+                        // but NOT `consumed_at` (live row 01ef18fa, 2026-08-28), so the
+                        // claim used to be re-dated at the restart as well. The entry is it.
+                        esc.consumed_at = u(d, "consumed_at").or(Some(entry_ts));
                     }
                 }
                 _ => {}
@@ -1985,7 +2019,9 @@ mod tests {
     /// A self-withdrawal is terminal. Before this arm existed the withdrawn event fell
     /// through replay, the row came back PENDING, and the operator approved it
     /// (`b8228e5250e87356`, 2026-08-28: withdrawn 07:10:07Z, restart 07:18:14Z, approved
-    /// 07:19:54Z). Pinned from the real payload shape, not a synthetic one.
+    /// 07:19:54Z). Pinned from the real payload shape, not a synthetic one — which means NO
+    /// `decided_at`: the emitter never writes it, and a fixture that supplied it was this
+    /// key's only writer (kimi-code, review 7236; #700's pattern on the decision half).
     #[test]
     fn replay_restores_a_withdrawal_as_terminal_not_pending() {
         let opened = chain_entry(
@@ -2003,7 +2039,7 @@ mod tests {
                 "escalation_id": "b8228e52", "plugin_id": "claude-code",
                 "status": "denied", "decided_by": "claude-code",
                 "decided_role": "role:constellation:member", "decided_via": "self_withdrawn",
-                "decided_at": T0 + 153, "reason": "self-withdraw: nothing to claim",
+                "reason": "self-withdraw: nothing to claim",
                 "bar": "single_approver", "bar_met": false, "independence": null,
                 "factors_present": [{
                     "channel": "self_withdrawn", "by": "claude-code",
@@ -2024,6 +2060,8 @@ mod tests {
         let row = s.by_id.get("b8228e52").expect("restored");
         assert_eq!(row.decided_via, Some(Channel::SelfWithdrawn));
         assert_eq!(row.decided_by.as_deref(), Some("claude-code"));
+        // WHEN: recovered from the withdrawer's own factor, not invented at the restart.
+        assert_eq!(row.decided_at, Some(T0 + 153), "a withdrawal was re-dated at the restart");
         assert_eq!(row.factors.len(), 1, "the withdrawer's own factor survives replay");
         assert_eq!(row.factors[0].channel, Channel::SelfWithdrawn);
 
@@ -2038,6 +2076,99 @@ mod tests {
         assert!(
             s.claim("claude-code", "plugins/_shared", Some(TEST_ACT), restart + 100).is_none(),
             "nothing to claim on a withdrawn ask"
+        );
+    }
+
+    /// The decision time is on the wire twice — the decider's factor `at` and the entry's
+    /// own timestamp — and never under `decided_at` (6/6 live `_decided`/`_withdrawn` rows,
+    /// 2026-08-28). Replay must read what is there rather than date every restored ruling
+    /// at the restart (#700's defect, decision half). Same class for `consumed_at`:
+    /// `_claimed` carries `decided_at` but not `consumed_at`, so the claim was re-dated too.
+    #[test]
+    fn replay_dates_a_ruling_and_a_claim_from_the_wire_not_from_the_restart() {
+        let restart = T0 + 3000;
+        let at = |mut e: crate::storage::chain::ChainEntry, ts: u64| {
+            e.timestamp = chrono::DateTime::<chrono::Utc>::from_timestamp(ts as i64, 0).expect("valid ts");
+            e
+        };
+        let opened = |id: &str| {
+            at(
+                chain_entry(
+                    "gate_escalation_opened",
+                    serde_json::json!({
+                        "escalation_id": id, "plugin_id": "claude-code",
+                        "role": "role:constellation:member", "tool_name": "Edit",
+                        "marker": "law_inject.py", "opened_at": T0, "expires_at": T0 + 3600,
+                        "act_digest": EscalationStore::act_digest_of(TEST_ACT),
+                    }),
+                ),
+                T0,
+            )
+        };
+        // A legacy ruling (pre-2026-07-30): no `decided_at`, no `factors_present`. Only the
+        // entry can date it.
+        let legacy = at(
+            chain_entry(
+                "gate_escalation_decided",
+                serde_json::json!({"escalation_id": "leg", "status": "approved", "decided_by": "operator"}),
+            ),
+            T0 + 40,
+        );
+        // A current ruling: still no `decided_at`; the decider's own factor carries the time.
+        // A peer factor lodged earlier under the same name must not win — the decider's is
+        // pushed last, and the entry lands a moment after it.
+        let current = at(
+            chain_entry(
+                "gate_escalation_decided",
+                serde_json::json!({
+                    "escalation_id": "cur", "status": "approved", "decided_by": "operator",
+                    "decided_via": "operator_session",
+                    "factors_present": [
+                        {"channel": "peer_member", "by": "operator", "role": null,
+                         "independence": null, "at": T0 + 20},
+                        {"channel": "operator_session", "by": "operator",
+                         "role": "role:constellation:sovereign", "independence": null, "at": T0 + 50},
+                    ],
+                }),
+            ),
+            T0 + 51,
+        );
+        // The real `_claimed` shape: `decided_at` present, `consumed_at` absent.
+        let claimed = at(
+            chain_entry(
+                "gate_escalation_claimed",
+                serde_json::json!({"escalation_id": "cur", "decided_at": T0 + 50, "marker": "law_inject.py"}),
+            ),
+            T0 + 70,
+        );
+        // Forward-compatible: a payload that DOES carry the key is believed over both.
+        let explicit = at(
+            chain_entry(
+                "gate_escalation_decided",
+                serde_json::json!({
+                    "escalation_id": "exp", "status": "denied", "decided_by": "operator",
+                    "decided_at": T0 + 30,
+                    "factors_present": [{"channel": "operator_session", "by": "operator",
+                                         "role": null, "independence": null, "at": T0 + 31}],
+                }),
+            ),
+            T0 + 32,
+        );
+
+        let mut s = EscalationStore::default();
+        s.rehydrate(&[opened("leg"), opened("cur"), opened("exp"), legacy, current, claimed, explicit], restart);
+        assert_eq!(s.by_id["leg"].decided_at, Some(T0 + 40), "a legacy ruling was dated at the restart");
+        assert_eq!(s.by_id["cur"].decided_at, Some(T0 + 50), "the decider's own factor was not read");
+        assert_eq!(s.by_id["cur"].consumed_at, Some(T0 + 70), "the claim was re-dated at the restart");
+        assert_eq!(s.by_id["exp"].decided_at, Some(T0 + 30), "an explicit decided_at was overridden");
+        for id in ["leg", "cur", "exp"] {
+            assert_ne!(s.by_id[id].decided_at, Some(restart), "{id}: dated at the restart");
+        }
+        // The recovered (earlier) time can only TIGHTEN the claim window: anchored at T0+40,
+        // `leg`'s horizon is one window after that, not one window after the restart.
+        assert!(
+            s.by_id["leg"].decided_horizon() <= T0 + 40 + APPROVAL_CLAIM_WINDOW_SECS,
+            "an earlier anchor widened the window"
         );
     }
 
@@ -3383,11 +3514,13 @@ mod tests {
     #[test]
     fn re_anchoring_the_claim_window_can_only_shorten_it() {
         // Re-anchoring is safe only if it tightens for EVERY input, including the ones
-        // nobody typed. The replay path restores a `gate_escalation_decided` entry that
-        // carries no `decided_at` as `decided_at = replay time` (`or(Some(now))`), so a
-        // grant anchor ALONE would hand a restarted daemon a brand-new window an
-        // arbitrary distance after the open. The record's own death is kept as a second
-        // ceiling for exactly that input, which is what makes the change monotone.
+        // nobody typed. The replay path USED to restore a `gate_escalation_decided` entry
+        // that carries no `decided_at` as `decided_at = replay time` (`or(Some(now))`) —
+        // and no real entry carries one (#710) — so a grant anchor ALONE would have handed
+        // a restarted daemon a brand-new window an arbitrary distance after the open.
+        // Replay now recovers the time from the wire, but the record's own death stays as
+        // a second ceiling for exactly that input: monotonicity must hold for ANY value a
+        // payload, or a future replay, might put here.
         let ttl = 120;
         let old_ceiling = T0 + DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS;
         for grant in [T0, T0 + 1, T0 + 90, T0 + 119] {
