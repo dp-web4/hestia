@@ -41,6 +41,7 @@ Config (all env-overridable; defaults suit a generic install):
   HESTIA_KIMI_GATE_MODE  warn | enforce   (default: enforce — deny-tight, relax as trust accrues)
   HESTIA_FORBIDDEN_EXTRA comma-separated extra forbidden path tokens (e.g. your private repo names)
 """
+import hashlib
 import json
 import os
 import re
@@ -354,6 +355,33 @@ def _emit_attestation(allows, denies):
                                    }}}}, 1.5, h)
 
 
+def _payload_digest(ti):
+    """Content fingerprint for a file-writing act (#601/#648).
+
+    The daemon binds an escalation approval to sha256 of the attempted-act string
+    (gate_escalation.claim, #539), and for Edit/Write that string was the PATH ALONE —
+    so an approval minted for one edit authorised ANY write to the same file re-issued
+    inside the claim window (measured: a full-file Write of witness.py claimed an
+    approval minted for a small Edit). Digest the payload that MAKES the act into the
+    act string: a byte-identical re-issue produces the same string and claims; a
+    modified payload produces a different one and cannot. Appended AFTER masking and
+    truncation, so the fingerprint always survives and never carries payload content —
+    12 hex chars; the preimage never leaves this process.
+    """
+    if not isinstance(ti, dict):
+        return None
+    parts = {k: ti[k] for k in ("old_string", "new_string", "replace_all",
+                                "content", "new_source", "old_source", "edits")
+             if k in ti}
+    if not parts:
+        return None
+    try:
+        blob = json.dumps(parts, sort_keys=True, default=str)
+    except Exception:
+        return None
+    return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[:12]
+
+
 def _attempted_summary(ev, limit=400):
     """The bounded, scrubbed command this gate refused — the WHAT behind the verdict.
 
@@ -389,7 +417,9 @@ def _attempted_summary(ev, limit=400):
         mask_next = low in KEYS
         out.append(tok)
     s = " ".join(out)
-    return s[:limit] + ("…[truncated]" if len(s) > limit else "")
+    s = s[:limit] + ("…[truncated]" if len(s) > limit else "")
+    d = _payload_digest(ti)
+    return f"{s} #payload:{d}" if d else s
 
 
 # ── REPAIR 4 (GPT fleet-review blocker 4): ONE deny recorder, literally. ──────────────

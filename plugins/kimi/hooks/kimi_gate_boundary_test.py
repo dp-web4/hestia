@@ -335,6 +335,45 @@ def test_gate_file_bash_write_refused_locally():
             srv.close()
 
 
+def test_claim_reason_binds_to_payload_digest():
+    """#601/#648: an approval binds to sha256 of the attempted-act string, so a path-ONLY
+    act string made any later write to the same gate file claimable inside the window
+    (measured: a full-file Write claimed an approval minted for a small Edit). The claim
+    reason must now fingerprint the payload: identical re-issue -> identical reason
+    (claims); modified payload -> different reason (cannot claim, daemon-side via #539)."""
+    import re as _re
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = make_workspace(tmp)
+        stub = StubDaemon()
+        srv = Server(stub)
+        try:
+            target = os.path.join(ws, "hestia", "plugins", "kimi", "hooks", "pre_tool_use.py")
+
+            def claim_reason(tool, tool_input):
+                stub.calls.clear()
+                rc, err = run_hook(ws, _event(tool, tool_input), srv.endpoint)
+                check("rc", rc == 2, f"rc={rc} stderr={err}")
+                claims = [a for n, a in stub.calls if n == "hestia_gate_escalation_claim"]
+                check("claim-made", len(claims) == 1, stub.names())
+                return claims[0].get("reason") or ""
+
+            r1 = claim_reason("Write", {"file_path": target, "content": "alpha"})
+            r2 = claim_reason("Write", {"file_path": target, "content": "alpha"})  # re-issue
+            r3 = claim_reason("Write", {"file_path": target, "content": "omega"})  # new payload
+            check("digest-present", _re.search(r"#payload:[0-9a-f]{12}$", r1), r1[-60:])
+            check("identical-reissue-matches", r1 == r2, f"{r1[-60:]} vs {r2[-60:]}")
+            check("modified-payload-differs", r1 != r3, r1[-60:])
+            # An Edit digests old+new, so content-binding holds for the patch form too.
+            r4 = claim_reason("Edit", {"file_path": target, "old_string": "a",
+                                       "new_string": "b"})
+            check("edit-digest-present", _re.search(r"#payload:[0-9a-f]{12}$", r4), r4[-60:])
+            # Bash already carries its full command text as the act — no digest appended.
+            rb = claim_reason("Bash", {"command": f"echo pwned > {target}"})
+            check("bash-unmodified", "#payload:" not in rb, rb[-60:])
+        finally:
+            srv.close()
+
+
 def main():
     # Explicit list, NOT a globals() sweep — tools/ci_selfexec_test.py requires each test to be a
     # static reference (a dynamic sweep leaves the names un-referenced and reads as inert).
@@ -348,6 +387,7 @@ def main():
         ("test_gate_file_read_allowed_and_witnessed", test_gate_file_read_allowed_and_witnessed),
         ("test_gate_write_refused_with_daemon_down", test_gate_write_refused_with_daemon_down),
         ("test_ordinary_write_daemon_down_fails_closed", test_ordinary_write_daemon_down_fails_closed),
+        ("test_claim_reason_binds_to_payload_digest", test_claim_reason_binds_to_payload_digest),
     ]
     failed = []
     for name, fn in tests:
