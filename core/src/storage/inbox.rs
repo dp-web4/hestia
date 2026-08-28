@@ -40,6 +40,25 @@ const MAX_INBOX_NOTICES: u64 = 1000;
 /// arbitrary.
 pub(crate) const MAX_EGRESS_QUEUE: u64 = 200;
 
+/// Per-peer share of the egress plane. The global bound above is necessary and not
+/// sufficient: it counts undrained forwards TOTAL, so one wedged link can occupy every
+/// slot and the refusal then lands on traffic to peers that are perfectly healthy.
+///
+/// MEASURED (S1, 2026-07-28, reproduced against main 2026-08-27 — the fix was written a
+/// month ago, superseded by an additive recompose that could not see it, and never landed):
+///
+///     200 forwards enqueued to peer "wedged"   -> all 200 ADMITTED
+///     1 forward to unrelated peer "healthy"    -> REFUSED
+///       "egress queue full (200/200 undrained forwards)"
+///
+/// One dead link, a fleet-wide coordination outage, and a refusal that reports a full plane
+/// while saying nothing about WHICH peer filled it — a disposition without its basis.
+///
+/// 50 against a global 200: four peers must each wedge before the global bound can be the
+/// binding one, so in the ordinary case the per-peer clause is what refuses and its message
+/// names the responsible link. The value is a judgment call and the only one in this change.
+pub(crate) const MAX_EGRESS_QUEUE_PER_PEER: u64 = 50;
+
 /// How many failed hand-offs an egress row survives before it is retired and its
 /// sender is told (r6-routing branch 4, at the egress seam).
 ///
@@ -619,6 +638,29 @@ impl SqliteInboxStore {
             anyhow::bail!(
                 "egress queue full ({queued}/{MAX_EGRESS_QUEUE} undrained forwards) — \
                  refusing admission rather than evicting a queued forward"
+            );
+        }
+        // PER-PEER, and the reason it is a SECOND clause rather than a replacement: the
+        // global bound protects the STORE (unbounded growth), this one protects the other
+        // PEERS (one wedged link starving every healthy one). Both are real and neither
+        // implies the other, so both are tested.
+        //
+        // Ordered after the global check so that when the plane is genuinely full the
+        // caller still gets the plane-full message; this clause speaks only when the plane
+        // has room and THIS destination does not, which is the case the old code answered
+        // with a message about the total.
+        let queued_peer: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM member_notices
+              WHERE dest_peer = ?1 AND drained_at IS NULL",
+            params![dest_peer],
+            |row| row.get(0),
+        )?;
+        if queued_peer as u64 >= MAX_EGRESS_QUEUE_PER_PEER {
+            anyhow::bail!(
+                "egress queue full for peer '{dest_peer}' \
+                 ({queued_peer}/{MAX_EGRESS_QUEUE_PER_PEER} undrained forwards to that peer; \
+                 plane holds {queued}/{MAX_EGRESS_QUEUE}) — refusing admission to this peer \
+                 while others still have room"
             );
         }
         conn.execute(
@@ -1530,6 +1572,90 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Enqueue `n` forwards to `peer`, asserting each is admitted. Returns nothing: a
+    /// helper that swallowed a refusal would make the starvation test pass for the wrong
+    /// reason (nothing queued -> nothing starved).
+    fn fill(store: &SqliteInboxStore, peer: &str, n: u64) {
+        for i in 0..n {
+            store
+                .enqueue_egress(peer, "to", "from", "role:constellation:member",
+                                "reply", None, &format!("hash-{peer}-{i}"))
+                .unwrap_or_else(|e| panic!("forward {i} to {peer} was refused: {e}"));
+        }
+    }
+
+    /// THE DEFECT, and the reason S1 exists. One wedged link must not refuse traffic to
+    /// a healthy one.
+    ///
+    /// Measured on main before this change: 200 forwards to "wedged" were all admitted,
+    /// and the very next forward to an unrelated peer was refused with a message about
+    /// the TOTAL. One dead link, a fleet-wide coordination outage, and a refusal whose
+    /// text named no peer.
+    #[test]
+    fn one_wedged_peer_does_not_starve_a_healthy_one() {
+        let (_tmp, store) = fresh();
+        fill(&store, "wedged", MAX_EGRESS_QUEUE_PER_PEER);
+
+        let err = store
+            .enqueue_egress("wedged", "to", "from", "role:constellation:member",
+                            "reply", None, "one-too-many")
+            .expect_err("the wedged peer is at its own bound and must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("wedged"),
+            "the refusal must NAME the peer that filled its share — a disposition \
+             without its basis is what the global-only message was: {msg}");
+
+        // The plane still has room, so a healthy destination must still be admitted.
+        store
+            .enqueue_egress("healthy", "to", "from", "role:constellation:member",
+                            "reply", None, "healthy-1")
+            .expect("a healthy peer must not inherit another peer's backlog");
+        assert_eq!(store.egress_queued_for("healthy").unwrap(), 1);
+        assert_eq!(store.egress_queued_for("wedged").unwrap(), MAX_EGRESS_QUEUE_PER_PEER);
+    }
+
+    /// The GLOBAL bound still binds. Without this, "make the per-peer bound generous"
+    /// would silently remove the store's own protection and this suite would not notice.
+    #[test]
+    fn the_global_bound_still_refuses_when_the_plane_is_actually_full() {
+        let (_tmp, store) = fresh();
+        // Spread across enough peers that no single one reaches its share first.
+        let peers = (MAX_EGRESS_QUEUE / MAX_EGRESS_QUEUE_PER_PEER) as usize;
+        assert!(peers >= 2, "fixture assumes the plane holds several peers' shares");
+        for p in 0..peers {
+            fill(&store, &format!("peer{p}"), MAX_EGRESS_QUEUE_PER_PEER);
+        }
+        assert_eq!(store.egress_queued().unwrap(), MAX_EGRESS_QUEUE);
+
+        let err = store
+            .enqueue_egress("fresh-peer", "to", "from", "role:constellation:member",
+                            "reply", None, "over-the-plane")
+            .expect_err("the plane is full; admission must be refused");
+        assert!(err.to_string().contains("egress queue full ("),
+            "when the PLANE is full the caller must get the plane-full message, not a \
+             per-peer one: {err}");
+    }
+
+    /// A drained row frees its peer's share. Otherwise the bound is a lifetime quota
+    /// rather than a depth bound, and a busy-but-healthy link would wedge itself.
+    #[test]
+    fn draining_releases_the_peers_share() {
+        let (_tmp, store) = fresh();
+        fill(&store, "busy", MAX_EGRESS_QUEUE_PER_PEER);
+        assert!(store
+            .enqueue_egress("busy", "to", "from", "role:constellation:member",
+                            "reply", None, "blocked")
+            .is_err());
+
+        let row = store.pending_egress(1).unwrap().into_iter().next().unwrap();
+        store.mark_egress_forwarded(row.id).unwrap();
+
+        store
+            .enqueue_egress("busy", "to", "from", "role:constellation:member",
+                            "reply", None, "after-drain")
+            .expect("draining one forward must free exactly one slot for that peer");
+    }
+
     fn fresh() -> (tempfile::TempDir, SqliteInboxStore) {
         let tmp = tempdir().unwrap();
         let store = SqliteInboxStore::open(tmp.path().join("inbox.db"), [7u8; 32]).unwrap();
@@ -2267,19 +2393,29 @@ mod tests {
     #[test]
     fn the_egress_plane_carries_its_own_bound_and_it_refuses_rather_than_evicts() {
         let (_tmp, store) = fresh();
+        // SPREAD ACROSS PEERS. This fill used one destination ("thor"), which stopped being
+        // able to reach the plane's bound when MAX_EGRESS_QUEUE_PER_PEER landed: a single
+        // peer is now refused at its own share long before the plane is full. That is the
+        // per-peer clause doing its job, not a regression here — this test is about the
+        // PLANE's bound and about refusing rather than evicting, and the single destination
+        // was incidental to both. Distributing keeps every assertion below unchanged.
+        let peer_of = |i: u64| format!("peer{}", i / MAX_EGRESS_QUEUE_PER_PEER);
         let first = store
-            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+            .enqueue_egress(&peer_of(0), "claude-code", "codex-cli", "role:r", "reply",
                             Some("forum/first.md#t"), "hash-first")
             .unwrap();
         for i in 1..MAX_EGRESS_QUEUE {
             store
-                .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+                .enqueue_egress(&peer_of(i), "claude-code", "codex-cli", "role:r", "reply",
                                 Some(&format!("forum/f{i}.md#t")), "hash-e")
                 .unwrap();
         }
         assert_eq!(store.egress_queued().unwrap(), MAX_EGRESS_QUEUE);
-        let refused = store.enqueue_egress("thor", "claude-code", "codex-cli", "role:r",
-                                           "reply", Some("forum/over.md#t"), "hash-o");
+        // A destination with NO backlog of its own: the only thing that can refuse it is
+        // the plane's bound, which is what this test is for.
+        let refused = store.enqueue_egress("unused-peer", "claude-code", "codex-cli",
+                                           "role:r", "reply", Some("forum/over.md#t"),
+                                           "hash-o");
         assert!(refused.is_err(), "the egress plane admitted past its cap");
         // The oldest forward is still queued: at the bound we tell the newest sender
         // no, we do not silently destroy the oldest sender's packet.
