@@ -8796,12 +8796,21 @@ mod member_mesh_tests {
 
         // Fill the egress plane to its bound directly — this test is about what the
         // refusal RECORDS, not about where the bound sits (that is pinned in inbox.rs).
+        //
+        // SPREAD ACROSS PEERS. This fill used one destination ("thor"), which stopped
+        // reaching the plane's bound when MAX_EGRESS_QUEUE_PER_PEER landed: a single peer
+        // is refused at its own share (50) long before the plane (200) is full, so the
+        // loop's unwrap panicked at i=50. That is the per-peer clause doing its job. The
+        // destination was always incidental here — what is under test is the refusal's
+        // chain record — so the fill is distributed and "thor", which holds nothing, is
+        // then refused by the GLOBAL bound, exactly as before.
         {
             let s = state.lock().await;
+            let per = crate::storage::inbox::MAX_EGRESS_QUEUE_PER_PEER;
             for i in 0..crate::storage::inbox::MAX_EGRESS_QUEUE {
                 s.inbox_store
-                    .enqueue_egress("thor", "claude-code", "codex-cli", "role:r",
-                                    "reply", Some("forum/x.md#thread=t"),
+                    .enqueue_egress(&format!("peer{}", i / per), "claude-code", "codex-cli",
+                                    "role:r", "reply", Some("forum/x.md#thread=t"),
                                     &format!("h{i}"))
                     .unwrap();
             }
