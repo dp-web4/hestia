@@ -109,7 +109,7 @@ def _hestia_hook_commands(path):
                     events[ev] += 1
                     for tok in cmd.split():
                         if "/" in tok and "hestia" in tok.lower():
-                            paths.append(tok)
+                            paths.append((ev, tok))
     else:  # toml/ini-ish: line scan is enough to answer "is anything wired at all"
         for line in raw.splitlines():
             low = line.lower()
@@ -156,10 +156,16 @@ def gate_surface(member, inst_dir):
                         f"{cfg_rel} references hestia but not in a shape this parser walks")
             return "provisioned-but-UNGOVERNED", f"{cfg_rel} declares no hestia hook"
         if GATE_EVENT in events:
-            where = next((q for q in paths if REPO and os.path.abspath(q).startswith(os.path.abspath(REPO))), None)
+            # Only paths declared under the GATE event describe the gate. Collecting them
+            # globally let the row name another event's file (a PostToolUse witness reported
+            # as the PreToolUse target) — a wrong answer to "which file is my gate?".
+            gate_paths = [q for ev_, q in paths if ev_ == GATE_EVENT]
+            where = next((q for q in gate_paths
+                          if REPO and os.path.abspath(q).startswith(os.path.abspath(REPO))), None)
             if where:
-                return "gated-from-a-working-tree", f"{GATE_EVENT} -> {os.path.relpath(where, REPO)} (in checkout; only as current as its branch)"
-            return "gated-at-canonical-path", f"{GATE_EVENT} -> {paths[0] if paths else 'resolved'}"
+                return ("gated-from-a-working-tree",
+                        f"{GATE_EVENT} -> {os.path.relpath(where, REPO)} (in checkout; only as current as its branch)")
+            return "gated-at-canonical-path", f"{GATE_EVENT} -> {gate_paths[0] if gate_paths else 'resolved'}"
         return ("provisioned-but-UNGOVERNED",
                 f"hestia hooks at {sorted(events)} but NO {GATE_EVENT} — witness only, no gate")
     if home_dir_present:

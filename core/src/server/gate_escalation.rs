@@ -454,6 +454,32 @@ pub struct Escalation {
     /// How different the decider was from the asker, when a peer decided. `None` for the
     /// sovereign channels, where the question does not arise.
     pub independence: Option<crate::arbiter::Independence>,
+    /// When the ASKER first SAW the decision. This is what the claim fuse burns from.
+    ///
+    /// WHY THE FUSE MOVED (measured four times, two seats, 2026-08-23..27). The window ran
+    /// from `decided_at`, so it measured PROXIMITY TO THE OPERATOR and nothing else. A member
+    /// in live conversation claimed inside it; a member working asynchronously watched five
+    /// grants die unspent. Same law, opposite outcomes, and the difference was who happened to
+    /// be standing next to the human when they decided. On 2026-08-27 the only delivery channel
+    /// that worked, four times running, was dp saying "approved" out loud.
+    ///
+    /// Lengthening the window does not fix that — it changes the odds, not the bias. The bias
+    /// is that the clock is keyed to the wrong event. A right that expires before its holder
+    /// can learn it exists is a lottery, however generous the timer.
+    ///
+    /// WHY THIS IS SAFE NOW, and would not have been before #539. GPT's standing objection to
+    /// wider claim windows is exact: a longer window enlarges the SUBSTITUTION POOL — more
+    /// live grants means more chances to spend one on a different act. Since #539/#565 a claim
+    /// matches on `act_digest` and a missing binding is explicitly NOT a match, so a grant can
+    /// only ever be spent on the act it was minted for. The pool cannot be substituted from.
+    /// The objection was right about the mechanism and is answered by the binding, not waived.
+    ///
+    /// BOUNDED, both ways. `None` reproduces the old behaviour exactly: an unobserved grant
+    /// still dies at `decided_at + APPROVAL_CLAIM_WINDOW_SECS`, so this widens nothing for a
+    /// member that never looked. And the `expires_at + WINDOW` ceiling still caps everything,
+    /// so observation cannot outlive the record. Only a member that has PROVABLY seen the
+    /// decision gets its window from that moment.
+    pub observed_at: Option<u64>,
     /// When the approval was spent. An approval is **single use**: it authorises the one write
     /// that was refused, not a standing permit on the governance surface. Without this, one
     /// approval would license every subsequent edit until the daemon restarted.
@@ -818,8 +844,12 @@ impl Escalation {
     /// been load-bearing here before. The fix went to the REPORTING field, which has no
     /// enforcement duty, and left the enforcing one conservative.
     fn decided_horizon(&self) -> u64 {
+        // OBSERVATION FIRST, decision second. See `observed_at`: the fuse burns from when the
+        // asker learned, not from when the operator ruled. `None` falls through to the old
+        // behaviour unchanged, so nothing widens for a grant nobody looked at.
         let one_window_after_grant = self
-            .decided_at
+            .observed_at
+            .or(self.decided_at)
             .unwrap_or(self.opened_at)
             .saturating_add(APPROVAL_CLAIM_WINDOW_SECS);
         let one_window_after_death = self.expires_at.saturating_add(APPROVAL_CLAIM_WINDOW_SECS);
@@ -1113,7 +1143,8 @@ impl EscalationStore {
                             decided_role: None,
                             reason: None,
                             independence: None,
-                            consumed_at: None,
+                            observed_at: None,
+            consumed_at: None,
                             factors: Vec::new(),
                         },
                     );
@@ -1288,6 +1319,7 @@ impl EscalationStore {
             reason: None,
             decided_role: None,
             independence: None,
+            observed_at: None,
             consumed_at: None,
             // The bar is stated AT OPEN and copied from policy, so the record carries the
             // criterion in force at the time — a later tightening of `bar_for` must not
@@ -1381,6 +1413,44 @@ impl EscalationStore {
     /// never promise a claim that would fail — including the case this struct's own doc
     /// records, where an approval was `permits_write=true` and permanently unclaimable
     /// because the marker never matched.
+    /// Record that the ASKER has now SEEN this decision, and start the claim fuse from here.
+    ///
+    /// Idempotent and one-way: the first observation wins, so a member cannot refresh its own
+    /// window by polling in a loop. Returns true only when this call is what set it.
+    ///
+    /// PROVEN ASKER ONLY. The caller must already have resolved to `plugin_id`; this method
+    /// does not authenticate, it records. An unproven caller must never reach it — the whole
+    /// point is that the clock now depends on an identity claim, and an identity claim that is
+    /// merely asserted would let anyone move anyone's deadline. (Same boundary GPT/Nova blocked
+    /// on the claimable surface: labelling an assertion does not make it an authentication.)
+    pub fn mark_observed(&mut self, id: &str, plugin_id: &str, now: u64) -> bool {
+        match self.by_id.get_mut(id) {
+            // THE RECORD MUST ALREADY BEAR AN APPROVAL. GPT/Nova blocking review of the
+            // first cut, and it was right in the worst way: `poll` marks before it reads
+            // status, so the ORDINARY flow — an asker polling while its petition is still
+            // PENDING — stamped `observed_at` at once. `decided_horizon()` then preferred
+            // that pre-decision timestamp over `decided_at`, and the fuse could burn out
+            // BEFORE the ruling existed. A change written to stop grants dying unclaimed
+            // made them die sooner, and every test I wrote observed AFTER a decision, so
+            // none of them could see it.
+            //
+            // Observation is only meaningful about something there is to observe. Approved
+            // and bar-met is exactly "this record could become claimable" minus the clock,
+            // which is the clause being computed — using `is_claimable` here would ask the
+            // horizon about itself.
+            Some(e)
+                if e.plugin_id == plugin_id
+                    && e.observed_at.is_none()
+                    && e.status == Status::Approved
+                    && e.bar_met() =>
+            {
+                e.observed_at = Some(now);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn claimable_for(&self, plugin_id: &str, now: u64) -> Vec<&Escalation> {
         let mut out: Vec<&Escalation> = self
             .by_id

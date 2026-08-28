@@ -151,7 +151,12 @@ enum Command {
 #[derive(Subcommand, Debug)]
 enum GateCmd {
     /// List escalations awaiting a decision
-    Pending,
+    Pending {
+        /// Emit the daemon's `{ "pending": [...] }` response as JSON on stdout.
+        /// Identity and caveats remain on stderr so this can be piped to a fold.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Show one escalation's current state (unknown and expired are the same answer)
     Poll {
@@ -735,7 +740,11 @@ pub fn run() -> AnyResult<()> {
         Command::Gate { cmd, endpoint, asserted_id, role } => {
             use hestia::gate_cli;
             match cmd {
-                GateCmd::Pending => gate_cli::pending(&endpoint, asserted_id, &role),
+                // Both sides kept: main added `--json` to pending (#684), this branch
+                // added `--wait` to poll. They are orthogonal flags on different verbs.
+                GateCmd::Pending { json } => {
+                    gate_cli::pending(&endpoint, asserted_id, &role, json)
+                }
                 GateCmd::Poll { escalation_id, wait } => {
                     gate_cli::poll(&endpoint, &escalation_id, asserted_id, &role, wait)
                 }
