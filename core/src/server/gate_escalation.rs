@@ -1150,7 +1150,19 @@ impl EscalationStore {
                     );
                     restored += 1;
                 }
-                "gate_escalation_decided" => {
+                // A WITHDRAWAL IS A RULING for replay purposes. `gate_escalation_withdrawn`
+                // carries the same payload shape as `_decided` (status `denied`,
+                // `decided_via: self_withdrawn`, the withdrawer's own factor) but it used to
+                // fall through to `_ => {}` below, so a restart restored the row as
+                // PENDING, dated at the restart (#700), and it re-entered the operator's
+                // queue as a live ask. Measured 2026-08-28 on CBP: `b8228e5250e87356` was
+                // self-withdrawn at 07:10:07Z (chain 197117), the daemon restarted at
+                // 07:18:14Z, and the operator approved the revived row at 07:19:54Z
+                // (chain 197226, `secs_into_window: 99`) — a single-use grant minted for an
+                // act its asker had already abandoned in writing, with the withdrawal
+                // erased from `factors_present`. The withdrawal was the wanted conduct;
+                // replay turned it into the one terminal state that comes back to life.
+                "gate_escalation_decided" | "gate_escalation_withdrawn" => {
                     if let Some(esc) = self.by_id.get_mut(&id) {
                         esc.status = match s(d, "status").as_deref() {
                             Some(x) if x.eq_ignore_ascii_case("approved") => Status::Approved,
@@ -1162,6 +1174,11 @@ impl EscalationStore {
                         esc.decided_at = u(d, "decided_at").or(Some(now));
                         esc.decided_by = s(d, "decided_by");
                         esc.decided_role = s(d, "decided_role");
+                        // The channel is what tells a restored `denied` apart from a
+                        // restored withdrawal on every read surface; both events emit it.
+                        esc.decided_via = d
+                            .get("decided_via")
+                            .and_then(|v| serde_json::from_value::<Channel>(v.clone()).ok());
                         esc.reason = s(d, "reason");
                         // RESTORE THE EVIDENCE, not just the verdict. `claim` re-checks
                         // `bar_met()`, which is evaluated against the factor SET — so an
@@ -1965,6 +1982,65 @@ mod tests {
     /// survive a restart. RED before the `gate_escalation_corroborated` replay arm existed:
     /// every pre-decision factor was erased, and erased in the flattering direction — a
     /// dissent lodged before the crash read afterwards as a peer who never looked.
+    /// A self-withdrawal is terminal. Before this arm existed the withdrawn event fell
+    /// through replay, the row came back PENDING, and the operator approved it
+    /// (`b8228e5250e87356`, 2026-08-28: withdrawn 07:10:07Z, restart 07:18:14Z, approved
+    /// 07:19:54Z). Pinned from the real payload shape, not a synthetic one.
+    #[test]
+    fn replay_restores_a_withdrawal_as_terminal_not_pending() {
+        let opened = chain_entry(
+            "gate_escalation_opened",
+            serde_json::json!({
+                "escalation_id": "b8228e52", "plugin_id": "claude-code",
+                "role": "role:constellation:member", "tool_name": "Bash",
+                "marker": "plugins/_shared", "opened_at": T0, "expires_at": T0 + 3600,
+                "act_digest": EscalationStore::act_digest_of(TEST_ACT),
+            }),
+        );
+        let withdrawn = chain_entry(
+            "gate_escalation_withdrawn",
+            serde_json::json!({
+                "escalation_id": "b8228e52", "plugin_id": "claude-code",
+                "status": "denied", "decided_by": "claude-code",
+                "decided_role": "role:constellation:member", "decided_via": "self_withdrawn",
+                "decided_at": T0 + 153, "reason": "self-withdraw: nothing to claim",
+                "bar": "single_approver", "bar_met": false, "independence": null,
+                "factors_present": [{
+                    "channel": "self_withdrawn", "by": "claude-code",
+                    "role": "role:constellation:member", "independence": null,
+                    "dissent": false, "at": T0 + 153,
+                }],
+            }),
+        );
+
+        let mut s = EscalationStore::default();
+        // The daemon restarts eight minutes later, well inside the ask's hour.
+        let restart = T0 + 640;
+        assert_eq!(s.rehydrate(&[opened, withdrawn], restart), 1);
+
+        // Terminal, not pending: not in the operator's queue ...
+        assert_eq!(s.status_of("b8228e52", restart), Status::Denied);
+        assert!(s.pending(restart).is_empty(), "a withdrawn ask re-entered the queue");
+        let row = s.by_id.get("b8228e52").expect("restored");
+        assert_eq!(row.decided_via, Some(Channel::SelfWithdrawn));
+        assert_eq!(row.decided_by.as_deref(), Some("claude-code"));
+        assert_eq!(row.factors.len(), 1, "the withdrawer's own factor survives replay");
+        assert_eq!(row.factors[0].channel, Channel::SelfWithdrawn);
+
+        // ... and the operator cannot mint a grant on top of it.
+        let err = s
+            .decide(
+                "b8228e52", true, "operator", "role:constellation:sovereign",
+                Channel::OperatorSession, None, Some("k"), restart + 100,
+            )
+            .expect_err("a withdrawn ask must not be approvable after a restart");
+        assert_eq!(err, DecideError::AlreadyDecided(Status::Denied));
+        assert!(
+            s.claim("claude-code", "plugins/_shared", Some(TEST_ACT), restart + 100).is_none(),
+            "nothing to claim on a withdrawn ask"
+        );
+    }
+
     #[test]
     fn replay_restores_pending_peer_factors_dissent_and_argument_included() {
         let mut s = EscalationStore::default();
