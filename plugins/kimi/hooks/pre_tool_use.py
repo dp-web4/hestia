@@ -650,7 +650,7 @@ def _gate_self_call(tool, args, host_session_id=None):
         args = dict(args)
         args.setdefault("session_id", sess)
         raw, _ = post({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                       "params": {"name": tool, "arguments": args}}, h, 0.9)
+                       "params": {"name": tool, "arguments": args}}, h, 2.0)
         return unwrap(raw)
     except Exception:
         return None
