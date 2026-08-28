@@ -1,0 +1,12 @@
+[Unit]
+Description=hestia deploy from origin/main (daemon + members' governance surface)
+Documentation=file://%h/.hestia/deploy/hestia/deploy/from-main/README.md
+After=hestia.service
+
+[Service]
+Type=oneshot
+Environment=HESTIA_HOME=%h/.hestia
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/hestia-deploy
+# A cold release build on this box is minutes, not hours.
+TimeoutStartSec=45min

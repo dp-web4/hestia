@@ -1,0 +1,14 @@
+[Unit]
+Description=hestia deploy from origin/main, every 4h at a fixed wall clock
+
+[Timer]
+# Fixed marks, no random delay: anyone running a daemon-dependent test on this box can read
+# the schedule (00:17, 04:17, 08:17, 12:17, 16:17, 20:17 local) instead of guessing it.
+# Touch ~/.hestia/deploy.hold to skip a cycle; it expires on its own.
+OnCalendar=*-*-* 00/4:17:00
+OnBootSec=10min
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
