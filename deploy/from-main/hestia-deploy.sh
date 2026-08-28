@@ -38,6 +38,9 @@
 #         --build-only  sync + build, no install, no restart
 #         --hooks-only  re-run the members' install against the deployed binary (recovery for
 #                       hooks=FAILED; refuses if main has moved since — see the block below)
+# Exit:   0 only when the cycle did everything it claims: CURRENT, SKIP (lock/hold), or DEPLOYED
+#         with hooks=ok (or hooks=skipped by explicit HESTIA_DEPLOY_HOOKS=0). DEPLOYED with any
+#         other hooks value exits 1 — the binary is live, the manifest is not (see the tail).
 #         anything else usage, exit 2, BEFORE the lock is taken (a typo'd flag from a shell
 #                       used to run a full cycle: Legion, 2026-08-27)
 #
@@ -327,3 +330,20 @@ ls -1t "$HESTIA_HOME"/hestia.prev-* 2>/dev/null | tail -n +"$(( KEEP_BACKUPS + 1
 done
 
 log "DEPLOYED ${running:-none} -> $newv (hestia $target_sha, web4 $web4_sha) hooks=$hooks in $(( $(date +%s) - T0 ))s"
+
+# A DEPLOYED line with hooks != ok is HALF a deploy: the binary is current, the manifest is not,
+# and the dashboard reads stale (or unknown) until someone runs --hooks-only. Until 2026-08-27
+# that half-deploy exited 0 — a line starting with the word DEPLOYED, a green unit, and the
+# README's "nothing else exits 0 without deploying" quietly false (mcnugget: "either the hooks
+# failure is fatal, or that sentence is not true"). It is fatal to the CYCLE, not to the binary:
+# a rollback here would trade a current daemon for a stale one to repair a manifest, and the
+# manifest is exactly what --hooks-only repairs. So the binary stays, the log line still says
+# DEPLOYED (it is true), and the cycle exits 1 so the unit reads failed and the tail names why.
+# The only hooks value that exits 0 without a manifest is the explicit opt-out
+# (HESTIA_DEPLOY_HOOKS=0 -> hooks=skipped); an absent installer or an absent bash>=4 is a
+# missing primitive, and a missing primitive does not read as a pass.
+case "$hooks" in
+  ok|skipped) exit 0 ;;
+  *) log "HALF-DEPLOYED $newv: binary current, manifest not written (hooks=$hooks); fix the cause, then hestia-deploy --hooks-only"
+     exit 1 ;;
+esac

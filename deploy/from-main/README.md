@@ -128,7 +128,14 @@ primitive that is not there must never be indistinguishable from a lock that is 
   executing, or the lock primitive is missing and the fallback cannot be taken, or the
   restart command fails — a failed restart rolls back to the saved binary first. A
   `SKIP` at exit 0 means exactly two things: another deploy holds the lock, or a hold
-  file is present. Nothing else exits 0 without deploying.
+  file is present. Nothing else exits 0 without deploying — and a **half** deploy does not
+  exit 0 either: `DEPLOYED … hooks=FAILED(rc=N)` or `hooks=skipped(no bash>=4)` /
+  `skipped(no installer)` leaves the binary current and the manifest unwritten, so the
+  cycle exits 1 (`HALF-DEPLOYED` is the last line), the unit reads failed, and the repair
+  is `--hooks-only` once the cause is fixed. The binary is not rolled back: a stale daemon
+  would be a worse state than a stale manifest, and the manifest is what `--hooks-only`
+  rewrites. The one `hooks=skipped` that exits 0 is the explicit opt-out,
+  `HESTIA_DEPLOY_HOOKS=0` (mcnugget asked which it was, 2026-08-27; this is the answer).
 - Every cycle appends one line to `~/.hestia/deploy.log`; a deploy appends
   `DEPLOYED <old> -> <new> (hestia <sha>, web4 <sha>) hooks=<ok|skipped|FAILED>`.
   `journalctl --user -u hestia-deploy` has the same lines plus cargo's tail; on macOS
