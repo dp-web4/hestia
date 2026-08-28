@@ -8,5 +8,10 @@ Type=oneshot
 Environment=HESTIA_HOME=%h/.hestia
 Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/.local/bin/hestia-deploy
+# A release build at normal priority pins the CPU and the daemon's /mcp gate round-trip times
+# out: every member on the box fail-closes (deploy/build-lock/README.md, #354/#358). The cargo
+# shim there is shadowed here because PATH puts ~/.cargo/bin first, so yield at the unit level.
+# Legion measured a cold build at nice 15 in 65s on 32 cores; the cost is the build's, not ours.
+Nice=15
 # A cold release build on this box is minutes, not hours.
 TimeoutStartSec=45min

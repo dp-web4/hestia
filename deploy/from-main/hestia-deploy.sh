@@ -36,6 +36,15 @@
 # Modes:  (none)        full cycle
 #         --check       sync + report currency, no build, no restart, exit 0 current / 3 stale
 #         --build-only  sync + build, no install, no restart
+#         anything else usage, exit 2, BEFORE the lock is taken (a typo'd flag from a shell
+#                       used to run a full cycle: Legion, 2026-08-27)
+#
+# PORTABILITY (mcnugget, 2026-08-27, measured on Darwin): flock(1) and `stat -c` are GNU/util-linux
+# and absent on macOS and slim images; `systemctl --user restart` is a systemd seat's restart.
+# Each has a portable path below, and the invariant that matters is that a MISSING primitive
+# fails loudly instead of looking like a healthy SKIP. Non-systemd seats set:
+#   HESTIA_BIN          the file the daemon actually execs (e.g. /opt/homebrew/bin/hestia)
+#   HESTIA_RESTART_CMD  e.g. "launchctl kickstart -k gui/$(id -u)/com.web4.hestia.daemon"
 set -euo pipefail
 
 DEPLOY_ROOT="${HESTIA_DEPLOY_ROOT:-$HOME/.hestia/deploy}"
@@ -45,12 +54,17 @@ BIN="${HESTIA_BIN:-$HOME/.local/bin/hestia}"
 SELF_INSTALL="$HOME/.local/bin/hestia-deploy"
 EP="${HESTIA_ENDPOINT:-http://127.0.0.1:7711/mcp}"
 UNIT="${HESTIA_UNIT:-hestia.service}"
+RESTART_CMD="${HESTIA_RESTART_CMD:-systemctl --user restart $UNIT}"
 LOG="$HESTIA_HOME/deploy.log"
 HOLD="$HESTIA_HOME/deploy.hold"
 HOLD_MAX_SECS="${HESTIA_DEPLOY_HOLD_MAX_SECS:-21600}"
 KEEP_BACKUPS="${HESTIA_DEPLOY_KEEP_BACKUPS:-5}"
 READY_SECS="${HESTIA_DEPLOY_READY_SECS:-120}"
 MODE="${1:-full}"
+case "$MODE" in
+  full|--check|--build-only) ;;
+  *) echo "usage: hestia-deploy [--check|--build-only]" >&2; exit 2 ;;
+esac
 
 export CARGO_TARGET_DIR="$DEPLOY_ROOT/target"
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -70,14 +84,58 @@ running_version() {
     2>/dev/null | tr -d '\r' | grep -o '"serverInfo":{[^}]*}' | describe_of || true
 }
 
+# mtime as epoch seconds: GNU `stat -c %Y`, BSD `stat -f %m`. Selected ONCE, GNU first: on GNU
+# `-f` means "file system status" and `%m` is read as a path, so probing the BSD form first is
+# not a clean failure (measured: it prints an fs block and exits 1, and BSD `stat -c` prints
+# nothing at all, which is how the hold expiry lost its operand on mcnugget).
+if stat -c %Y / >/dev/null 2>&1; then mtime_of() { stat -c %Y "$1"; }
+else                                   mtime_of() { stat -f %m "$1"; }; fi
+
+# Absolute path with symlinks resolved where the tools allow; else absolutised (pwd -P).
+canon() { readlink -f "$1" 2>/dev/null || (cd "$(dirname "$1")" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$(basename "$1")"); }
+
+# The file the daemon is actually executing, when the seat can tell us (systemd + /proc).
+# Empty when unknown; a non-systemd seat states it with HESTIA_BIN instead.
+daemon_exe() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local pid
+  pid="$(systemctl --user show "$UNIT" -p MainPID --value 2>/dev/null || true)"
+  [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null || return 0
+  readlink "/proc/$pid/exe" 2>/dev/null | sed 's/ (deleted)$//' || true
+}
+
+# ONE restart, used by the deploy AND the rollback (a port that fixes only the first leaves
+# rollback unable to bring the old binary back).
+restart_daemon() { log "restart: $RESTART_CMD"; eval "$RESTART_CMD"; }
+
 # ---- one at a time -----------------------------------------------------------------------
+# A lock primitive that is not there must never be indistinguishable from a lock that is held.
+# `flock -n 9 || exit 0` on a seat without flock turned rc=127 "command not found" into a SKIP
+# at rc=0 on every cycle, forever, with a log line that read like healthy mutual exclusion.
 mkdir -p "$HESTIA_HOME"
-exec 9>"$HESTIA_HOME/deploy.lock"
-flock -n 9 || { log "SKIP another deploy holds the lock"; exit 0; }
+LOCKD="$HESTIA_HOME/deploy.lock.d"
+take_lockd() {
+  mkdir "$LOCKD" 2>/dev/null || return 1
+  echo $$ >"$LOCKD/pid"
+  trap 'rm -f "$LOCKD/pid"; rmdir "$LOCKD" 2>/dev/null' EXIT
+}
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$HESTIA_HOME/deploy.lock"
+  flock -n 9 || { log "SKIP another deploy holds the lock ($HESTIA_HOME/deploy.lock)"; exit 0; }
+elif ! take_lockd; then
+  # mkdir is atomic everywhere; a holder killed without running its trap is reaped by pid.
+  holder="$(cat "$LOCKD/pid" 2>/dev/null || true)"
+  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+    log "SKIP another deploy holds the lock (pid $holder, $LOCKD)"; exit 0
+  fi
+  log "stale lock $LOCKD (holder '${holder:-unknown}' not running); reclaiming"
+  rm -f "$LOCKD/pid"; rmdir "$LOCKD" 2>/dev/null || true
+  take_lockd || { log "SKIP another deploy holds the lock ($LOCKD)"; exit 0; }
+fi
 
 # ---- operator hold -----------------------------------------------------------------------
 if [ -e "$HOLD" ]; then
-  age=$(( $(date +%s) - $(stat -c %Y "$HOLD") ))
+  age=$(( $(date +%s) - $(mtime_of "$HOLD") ))
   if [ "$age" -lt "$HOLD_MAX_SECS" ]; then
     log "SKIP hold present (${age}s old, expires at ${HOLD_MAX_SECS}s): $(head -c 200 "$HOLD" | tr '\n' ' ')"
     exit 0
@@ -101,6 +159,15 @@ web4_sha="$(git -C "$DEPLOY_ROOT/web4" rev-parse --short HEAD)"
 running="$(running_version)"
 ondisk="$("$BIN" --version 2>/dev/null | describe_of || true)"
 log "target=$target ($target_sha, web4 $web4_sha) running=${running:-none} ondisk=${ondisk:-none}"
+
+# BIN must be the file the daemon execs. Otherwise one cycle installs to a path nothing
+# launches, restarts the OLD binary, sees the old version, and "rolls back" a file nobody runs
+# (mcnugget: default ~/.local/bin/hestia vs a launchd plist exec'ing /opt/homebrew/bin/hestia).
+[ -f "$BIN" ] || die "no daemon binary at $BIN; set HESTIA_BIN to the file the daemon execs"
+exe="$(daemon_exe)"
+if [ -n "$exe" ] && [ "$(canon "$exe")" != "$(canon "$BIN")" ]; then
+  die "BIN=$BIN but the daemon ($UNIT) is executing $exe; set HESTIA_BIN to that path"
+fi
 
 # The script keeps itself current from the checkout it deploys (units run the installed copy).
 if [ -f "$DEPLOY_ROOT/hestia/deploy/from-main/hestia-deploy.sh" ] && \
@@ -135,7 +202,22 @@ prev="$HESTIA_HOME/hestia.prev-$(date +%Y%m%d-%H%M%S)"
 [ -f "$BIN" ] && cp -f "$BIN" "$prev"
 install -m 0755 "$new" "$BIN.new" && mv -f "$BIN.new" "$BIN" || die "install $BIN"
 log "installed $newv (previous saved as $(basename "$prev"))"
-systemctl --user restart "$UNIT" || die "systemctl restart $UNIT"
+
+# Restore the saved binary and restart on it. Reached from a failed restart as well as from a
+# daemon that came back on the wrong version; before, a failed restart died with the new file
+# already in place and nothing put the old one back.
+rollback() {
+  log "$1; rolling back"
+  if [ -f "$prev" ]; then
+    install -m 0755 "$prev" "$BIN.new" && mv -f "$BIN.new" "$BIN"
+    restart_daemon || true
+    log "rolled back to $(basename "$prev"): running=$(running_version)"
+  else
+    log "no previous binary to roll back to"
+  fi
+  die "deploy $newv"
+}
+restart_daemon || rollback "restart failed ($RESTART_CMD)"
 
 deadline=$(( $(date +%s) + READY_SECS ))
 got=""
@@ -144,15 +226,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   [ "$got" = "$newv" ] && break
   sleep 3
 done
-if [ "$got" != "$newv" ]; then
-  log "daemon did not answer as $newv within ${READY_SECS}s (got '${got:-none}'); rolling back"
-  if [ -f "$prev" ]; then
-    install -m 0755 "$prev" "$BIN.new" && mv -f "$BIN.new" "$BIN"
-    systemctl --user restart "$UNIT" || true
-    log "rolled back to $(basename "$prev"): running=$(running_version)"
-  fi
-  die "deploy $newv"
-fi
+[ "$got" = "$newv" ] || rollback "daemon did not answer as $newv within ${READY_SECS}s (got '${got:-none}')"
 log "daemon up on $newv after $(( $(date +%s) - T0 ))s"
 
 # ---- members' governance surface, from the SAME checkout -----------------------------------------
