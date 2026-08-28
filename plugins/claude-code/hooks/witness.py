@@ -12,6 +12,11 @@ DESIGN
 - Fail-open at every layer. Any error connecting to Hestia is logged
   (when `HESTIA_HOOK_DEBUG=1`) and swallowed. The hook MUST NOT block
   Claude Code's tool execution.
+- Fail-open means DEFER, not DESTROY (#696): on any transient failure the
+  full intent is spooled locally and replayed by a later run, with the
+  original `client_ts` preserved. A dropped row used to leave no trace
+  anywhere, so the ledger's loss rate was invisible by construction; the
+  spool's depth is now the daemon-health metric.
 - First-run UX: if the daemon is missing, write a single one-time
   "daemon not detected" hint to ~/.hestia-claude/last-warning so a
   user who never ran `hestia init` knows what's happening.
@@ -23,6 +28,7 @@ DESIGN
 DEBUG
   HESTIA_HOOK_DEBUG=1     log to ~/.hestia-claude/hook.log
   HESTIA_ENDPOINT=URL     override endpoint discovery
+  HESTIA_WITNESS_TIMEOUT_S  override the per-call budget (default 2.0; tests)
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -47,8 +54,8 @@ from typing import Any, Optional
 PLUGIN_ID = os.environ.get("HESTIA_PLUGIN_ID", "claude-code")
 HOST_AGENT = os.environ.get("HESTIA_HOST_AGENT", PLUGIN_ID)
 PROTOCOL_VERSION = "2024-11-05"
-TIMEOUT_S = 2.0
-HOOK_VERSION = "0.0.3"
+TIMEOUT_S = float(os.environ.get("HESTIA_WITNESS_TIMEOUT_S") or "2.0")
+HOOK_VERSION = "0.0.4"
 
 STATE_DIR = Path(
     os.environ.get("HESTIA_STATE_DIR")
@@ -98,6 +105,81 @@ def warn_once_daemon_missing() -> None:
         pass
 
 
+# ---- Spool: a slow referee must not DESTROY the record (#696) --------------
+#
+# Fail-open stays absolute — nothing here may block or fail the tool call.
+# But "fail open" used to mean "drop the row", and a dropped row leaves no
+# trace anywhere: measured 2026-08-28, a seat's dashboard showed 5 outcome
+# rows for an hour with ~36 tool calls, rows landing minutes late or never,
+# and no component recording the loss. The spool converts silent destruction
+# into a visible backlog: on transient failure the full intent becomes one
+# file; a later run replays up to SPOOL_DRAIN_PER_RUN entries with the
+# ORIGINAL client_ts, so append-lag stays measurable across the replay.
+SPOOL_DIR = STATE_DIR / "spool"
+SPOOL_MAX_ENTRIES = 500
+SPOOL_DRAIN_PER_RUN = 8
+
+
+def spool_save(intent: dict) -> None:
+    """Best-effort append. FIFO: the name sorts by act time. When full, drop
+    the NEWEST (this one) — the backlog is the alarm, so it is preserved."""
+    try:
+        SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+        if len(list(SPOOL_DIR.glob("*.json"))) >= SPOOL_MAX_ENTRIES:
+            debug_log(f"spool FULL ({SPOOL_MAX_ENTRIES}) — dropping newest row; backlog preserved")
+            return
+        (SPOOL_DIR / f"{intent['client_ts']:.3f}-{uuid.uuid4().hex}.json").write_text(
+            json.dumps(intent)
+        )
+    except (OSError, KeyError) as e:
+        debug_log(f"spool save failed: {e}")
+
+
+def spool_drain(client: "McpHttp", session_id: Optional[str]) -> None:
+    """Replay spooled intents, oldest first, bounded per run. Record-then-
+    unlink: a crash between the two replays the row, and a duplicate is
+    detectable (same client_ts) where a loss is invisible. flock serializes
+    concurrent children; on platforms without fcntl the race is accepted
+    (same direction: a duplicate, never a loss)."""
+    try:
+        files = sorted(SPOOL_DIR.glob("*.json"))[:SPOOL_DRAIN_PER_RUN]
+    except OSError:
+        return
+    if not files:
+        return
+    lock_file = None
+    fcntl = None
+    if os.name != "nt":
+        try:
+            import fcntl as _fcntl
+            fcntl = _fcntl
+            lock_file = open(SPOOL_DIR / ".lock", "w")
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+        except (OSError, ImportError):
+            lock_file = None
+    try:
+        for f in files:
+            try:
+                intent = json.loads(f.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            verdict = witness_one(client, session_id, intent)
+            if verdict == "transient":
+                continue  # referee still unreachable; the row stays
+            try:
+                f.unlink()
+            except OSError:
+                pass
+            debug_log(f"spool: {verdict} {f.name} (client_ts {intent.get('client_ts')})")
+    finally:
+        if lock_file is not None:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+                lock_file.close()
+            except OSError:
+                pass
+
+
 # ---- Magnitude / target heuristics ---------------------------------------
 
 def magnitude_for(tool_name: str) -> float:
@@ -123,7 +205,7 @@ def extract_target(tool_input: Any) -> Optional[str]:
     cmd = tool_input.get("command")
     if isinstance(cmd, str) and cmd.strip():
         # Send the full command (truncated for chain-entry hygiene).
-        # The policy gate already sees the untruncated command via the
+        # The policy gate already sees the untracked command via the
         # PreToolUse hook's `parameters.command`; this `target` is for
         # forensic readability in the chain feed.
         s = cmd.strip()
@@ -248,6 +330,62 @@ def unwrap_tool_result(rpc_response: dict[str, Any]) -> dict[str, Any]:
 
 # ---- Main flow -----------------------------------------------------------
 
+def witness_one(client: "McpHttp", session_id: Optional[str], intent: dict) -> str:
+    """Fire the begin+record pair for one intent.
+
+    Returns one of three verdicts, because the failure kind decides the
+    disposition: "recorded"; "transient" (network/timeout — the referee may
+    be reachable later, so the caller spools or keeps the row); "rejected"
+    (the daemon RULED on it — an error envelope or a malformed reply — and
+    replaying will never succeed, so the row is dropped, loudly in debug).
+    """
+    try:
+        begin_resp = client.call_tool(
+            "hestia_begin_action",
+            {
+                "tool_name": intent["tool_name"],
+                "target": intent.get("target"),
+                **({"session_id": session_id} if session_id else {}),
+                **({"host_session_id": intent["host_session_id"]} if intent.get("host_session_id") else {}),
+            },
+        )
+    except (urllib.error.URLError, OSError) as e:
+        debug_log(f"begin network: {e}")
+        return "transient"
+    begin = unwrap_tool_result(begin_resp)
+    if "_hestia_error" in begin:
+        debug_log(f"begin_action rejected: {begin['_hestia_error']}")
+        return "rejected"
+    action_id = begin.get("actionId")
+    if not action_id:
+        debug_log(f"begin_action missing actionId: {begin}")
+        return "rejected"
+
+    try:
+        outcome_resp = client.call_tool(
+            "hestia_record_outcome",
+            {
+                "action_id": action_id,
+                "success": intent["success"],
+                "magnitude": intent["magnitude"],
+                "error": intent.get("error"),
+                # The act's own clock (#696): append-lag = chain ts - client_ts
+                # is the measurement that makes a slow referee visible. Older
+                # daemons ignore the field; newer ones carry it onto the row.
+                "client_ts": intent["client_ts"],
+                **({"session_id": session_id} if session_id else {}),
+            },
+        )
+    except (urllib.error.URLError, OSError) as e:
+        debug_log(f"record network: {e}")
+        return "transient"
+    outcome = unwrap_tool_result(outcome_resp)
+    if "_hestia_error" in outcome:
+        debug_log(f"record_outcome rejected: {outcome['_hestia_error']}")
+        return "rejected"
+    return "recorded"
+
+
 def run() -> int:
     raw = sys.stdin.read()
     if not raw.strip():
@@ -267,21 +405,32 @@ def run() -> int:
     # Claude Code's own stable session id — the real per-session audit grain.
     host_session_id = event.get("session_id")
 
+    success, error = derive_success(tool_response)
+    intent: dict[str, Any] = {
+        "tool_name": tool_name,
+        "target": extract_target(tool_input),
+        "success": success,
+        "magnitude": magnitude_for(tool_name),
+        "error": error,
+        "host_session_id": host_session_id,
+        # Captured BEFORE any network work: this is the act's timestamp, and
+        # it survives a spool-replay unchanged.
+        "client_ts": time.time(),
+    }
+
     endpoint = discover_endpoint()
     if endpoint is None:
         warn_once_daemon_missing()
-        debug_log("no endpoint discovered; skipping")
+        debug_log("no endpoint discovered; spooling")
+        spool_save(intent)
         return 0
-
-    target = extract_target(tool_input)
-    magnitude = magnitude_for(tool_name)
-    success, error = derive_success(tool_response)
 
     client = McpHttp(endpoint)
     try:
         init_resp = client.initialize()
         if "result" not in init_resp:
             debug_log(f"initialize failed: {init_resp}")
+            spool_save(intent)
             return 0
         client.initialized()
 
@@ -310,52 +459,29 @@ def run() -> int:
         connect_resp = client.call_tool("hestia_connect", connect_args)
         connect = unwrap_tool_result(connect_resp)
         if "_hestia_error" in connect:
+            # A RULED-ON refusal, not an unreachable referee: replaying the
+            # intent will not heal it, so there is nothing to spool.
             debug_log(f"connect rejected: {connect['_hestia_error']}")
             return 0
         session_id = connect.get("sessionId")
 
-        begin_resp = client.call_tool(
-            "hestia_begin_action",
-            {
-                "tool_name": tool_name,
-                "target": target,
-                **({"session_id": session_id} if session_id else {}),
-                **({"host_session_id": host_session_id} if host_session_id else {}),
-            },
-        )
-        begin = unwrap_tool_result(begin_resp)
-        if "_hestia_error" in begin:
-            debug_log(f"begin_action rejected: {begin['_hestia_error']}")
-            return 0
-        action_id = begin.get("actionId")
-        if not action_id:
-            debug_log(f"begin_action missing actionId: {begin}")
-            return 0
+        # Replay the backlog first: older acts outrank this one.
+        spool_drain(client, session_id)
 
-        outcome_resp = client.call_tool(
-            "hestia_record_outcome",
-            {
-                "action_id": action_id,
-                "success": success,
-                "magnitude": magnitude,
-                "error": error,
-                **({"session_id": session_id} if session_id else {}),
-            },
-        )
-        outcome = unwrap_tool_result(outcome_resp)
-        if "_hestia_error" in outcome:
-            debug_log(f"record_outcome rejected: {outcome['_hestia_error']}")
-            return 0
-
-        debug_log(
-            f"post {tool_name} action={action_id[:8]} "
-            f"success={success} magnitude={magnitude}"
-        )
+        verdict = witness_one(client, session_id, intent)
+        if verdict == "transient":
+            spool_save(intent)
+        elif verdict == "recorded":
+            debug_log(
+                f"post {tool_name} success={success} magnitude={intent['magnitude']}"
+            )
     except urllib.error.URLError as e:
         debug_log(f"network: {e}")
         warn_once_daemon_missing()
+        spool_save(intent)
     except Exception as e:  # noqa: BLE001 — fail-open at top level
         debug_log(f"unexpected: {type(e).__name__}: {e}")
+        spool_save(intent)
     return 0
 
 

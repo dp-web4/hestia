@@ -838,9 +838,13 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
     // `role_lct` alone cannot carry that distinction.
     let instance_lct = s.member_lct(&plugin_id);
 
-    let entry = s.append_chain(
-        "outcome",
-        json!({
+    // The witness hook's own clock at act time (#696). append-lag =
+    // chain ts - client_ts turns "the referee was slow" from a reconstruction
+    // into a query. Older hooks omit it; absent stays absent (not null), so a
+    // missing field never masquerades as a measured one.
+    let client_ts = args.get("client_ts").and_then(Value::as_f64);
+
+    let mut outcome_payload = json!({
             "action_id": action_id,
             "tool_name": action.tool_name,
             "target": action.target,
@@ -856,8 +860,11 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
             "intent": action.intent,
             "closure_claims_schema": CLOSURE_CLAIMS_SCHEMA_V1,
             "closure_claims": closure_claims,
-        }),
-    )?;
+        });
+    if let Some(ts) = client_ts {
+        outcome_payload["client_ts"] = json!(ts);
+    }
+    let entry = s.append_chain("outcome", outcome_payload)?;
 
     let rep_action_id = action_id.to_string();
     let rep_ctx = crate::reputation::RepContext {
@@ -6538,6 +6545,60 @@ mod accountability_tests {
         assert!(
             outcome.event_data["intent"].is_null(),
             "unstated intent must be null"
+        );
+    }
+
+    /// #696: `client_ts` is the witness hook's own clock at act time, and the
+    /// chain must carry it — append-lag (chain ts - client_ts) is the
+    /// measurement that turns "the referee was slow" from a reconstruction
+    /// into a query. Both directions pinned: carried when sent, ABSENT (not
+    /// null) when not — a missing field must never masquerade as a measured
+    /// one, which is the trap null would set for a lag census.
+    #[tokio::test]
+    async fn outcome_carries_client_ts_when_sent_and_omits_it_when_not() {
+        let (_dir, state) = test_state().await;
+        let connected = tool_connect(&state, &json!({"plugin_id":"claude-code","host_agent":"test"}))
+            .await
+            .unwrap();
+        let sid = connected["sessionId"].as_str().unwrap().to_string();
+
+        let begin = tool_begin_action(&state, &json!({"tool_name":"Bash","session_id":sid}))
+            .await
+            .unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        tool_record_outcome(
+            &state,
+            &json!({"action_id":aid,"success":true,"client_ts":1788000000.25}),
+        )
+        .await
+        .unwrap();
+
+        let begin2 = tool_begin_action(&state, &json!({"tool_name":"Read","session_id":sid}))
+            .await
+            .unwrap();
+        let aid2 = begin2["actionId"].as_str().unwrap().to_string();
+        tool_record_outcome(&state, &json!({"action_id":aid2,"success":true}))
+            .await
+            .unwrap();
+
+        let s = state.lock().await;
+        let chain = s.recent_chain(20);
+        let with_ts = chain
+            .iter()
+            .find(|e| e.event_type == "outcome" && e.event_data["tool_name"] == "Bash")
+            .unwrap();
+        assert_eq!(
+            with_ts.event_data["client_ts"].as_f64(),
+            Some(1788000000.25),
+            "a sent client_ts must land on the row verbatim"
+        );
+        let without_ts = chain
+            .iter()
+            .find(|e| e.event_type == "outcome" && e.event_data["tool_name"] == "Read")
+            .unwrap();
+        assert!(
+            without_ts.event_data.get("client_ts").is_none(),
+            "an unsent client_ts must be ABSENT, not null — null reads as measured-zero"
         );
     }
 
