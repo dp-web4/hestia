@@ -15637,6 +15637,13 @@ fn opened_payload(
         "gate_path": esc.gate_path,
         "host_session_id": esc.host_session_id,
         "session_id": esc.session_id,
+        // WHEN IT OPENED. Never emitted before this change: replay had `expires_at` and
+        // `ttl_secs` but not the open, so `rehydrate` dated every restored row at RESTART
+        // time — a row opened at 05:09Z carried `opened_at` 05:43:47Z, one second after the
+        // daemon came back, with its own peer factors 31 minutes OLDER than its open
+        // (kimi-code, factor on d3f643cf). Every replay test supplied the field; production
+        // never did — the fixture was the only writer of it.
+        "opened_at": esc.opened_at,
         "expires_at": esc.expires_at,
         "ttl_secs": ttl_secs,
         // Recorded so a reader is never left inferring it from silence.

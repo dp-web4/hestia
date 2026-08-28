@@ -1134,7 +1134,16 @@ impl EscalationStore {
                             session_id: s(d, "session_id"),
                             bar: bar_for(&marker),
                             marker,
-                            opened_at: u(d, "opened_at").unwrap_or(now),
+                            // The open time is the ENTRY's time, not the restart's. The
+                            // payload carries it as of this change; rows written before
+                            // it never did, and for those the chain entry's own append
+                            // timestamp is the daemon's witness of the same instant.
+                            // `now` is the one value that is never right here: it dated
+                            // every restored row at restart, collapsed the pending
+                            // queue's open-order onto id-order, and published
+                            // `secs_from_open_to_use` measured from the wrong event.
+                            opened_at: u(d, "opened_at")
+                                .unwrap_or_else(|| e.timestamp.timestamp().max(0) as u64),
                             expires_at,
                             status: Status::Pending,
                             decided_at: None,
@@ -1884,6 +1893,65 @@ mod tests {
             signer_lct: "test".into(),
             timestamp: chrono::Utc::now(),
         }
+    }
+
+    /// A chain entry whose append time is `ts` — the shape `rehydrate` sees for a row the
+    /// daemon wrote earlier, as opposed to `chain_entry`, whose `Utc::now()` timestamp makes
+    /// "the entry's time" and "replay time" indistinguishable.
+    fn chain_entry_at(event_type: &str, data: serde_json::Value, ts: u64) -> crate::storage::chain::ChainEntry {
+        let mut e = chain_entry(event_type, data);
+        e.timestamp = chrono::DateTime::<chrono::Utc>::from_timestamp(ts as i64, 0).expect("valid ts");
+        e
+    }
+
+    /// A restart must not re-date the open. The production `gate_escalation_opened` payload
+    /// never carried `opened_at` (only `expires_at` and `ttl_secs`), and every replay test in
+    /// this module supplied it anyway — so `unwrap_or(now)` was exercised by NO test and by
+    /// EVERY live restore. Observed 2026-08-28: d3f643cf opened ~05:09Z, daemon restarted
+    /// 05:43:46Z, the restored row reported `opened_at` 05:43:47Z while its self-withdrawal
+    /// factor read 05:12:27Z — peers older than the petition they answered. This test replays
+    /// the payload in the shape the live writer emitted BEFORE this change and pins the open
+    /// to the entry's own time, not the restart's.
+    #[test]
+    fn replay_dates_the_open_from_the_entry_not_from_the_restart() {
+        let restart = T0 + 2040; // 34 minutes later, inside the 3600s TTL
+        let legacy_opened = chain_entry_at(
+            "gate_escalation_opened",
+            serde_json::json!({
+                "escalation_id": "legacy", "plugin_id": "claude-code",
+                "role": "role:constellation:member", "tool_name": "Bash",
+                "marker": "plugins/*/hooks", "act_digest": "d",
+                // exactly what the writer emitted: the death, the TTL, and no birth
+                "expires_at": T0 + 3600, "ttl_secs": 3600,
+            }),
+            T0,
+        );
+        // And the shape it emits NOW, which must win over the entry time when present.
+        let current_opened = chain_entry_at(
+            "gate_escalation_opened",
+            serde_json::json!({
+                "escalation_id": "current", "plugin_id": "claude-code",
+                "role": "role:constellation:member", "tool_name": "Bash",
+                "marker": "plugins/*/hooks", "act_digest": "d",
+                "opened_at": T0 + 5, "expires_at": T0 + 3605, "ttl_secs": 3600,
+            }),
+            T0 + 7,
+        );
+        let mut store = EscalationStore::default();
+        store.rehydrate(&[legacy_opened, current_opened], restart);
+        let legacy = store.by_id.get("legacy").expect("restored");
+        assert_ne!(
+            legacy.opened_at, restart,
+            "replay dated a legacy open at RESTART time: the payload omitted opened_at and \
+             the fallback was `now`, so a 34-minute-old petition was reborn at the restart"
+        );
+        assert_eq!(legacy.opened_at, T0, "legacy rows restore from the entry's own timestamp");
+        let current = store.by_id.get("current").expect("restored");
+        assert_eq!(current.opened_at, T0 + 5, "the emitted field wins over the entry time");
+        // The consumer that made this visible: pending order is open-order, and with every
+        // restored row dated at the restart it collapsed onto id-order.
+        let pending: Vec<&str> = store.pending(restart).iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(pending, vec!["legacy", "current"]);
     }
 
     /// Replay must restore a human's ruling AND must never re-arm one that was already spent.
