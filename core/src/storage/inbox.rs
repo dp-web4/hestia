@@ -47,9 +47,15 @@ pub(crate) const MAX_EGRESS_QUEUE: u64 = 200;
 /// MEASURED (S1, 2026-07-28, reproduced against main 2026-08-27 — the fix was written a
 /// month ago, superseded by an additive recompose that could not see it, and never landed):
 ///
-///     200 forwards enqueued to peer "wedged"   -> all 200 ADMITTED
-///     1 forward to unrelated peer "healthy"    -> REFUSED
-///       "egress queue full (200/200 undrained forwards)"
+/// ```text
+/// 200 forwards enqueued to peer "wedged"   -> all 200 ADMITTED
+/// 1 forward to unrelated peer "healthy"    -> REFUSED
+///   "egress queue full (200/200 undrained forwards)"
+/// ```
+///
+/// (Fenced as `text` on purpose: a four-space-indented block in a doc comment is a Rust
+/// DOCTEST, and this one failed CI with "expected item, found `200`". `cargo test --lib`
+/// never runs doctests, which is why it was green locally while `cargo test` was red.)
 ///
 /// One dead link, a fleet-wide coordination outage, and a refusal that reports a full plane
 /// while saying nothing about WHICH peer filled it — a disposition without its basis.
