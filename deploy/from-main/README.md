@@ -74,6 +74,16 @@ Mac therefore fails the members' half of every cycle with
 checks for a bash ≥ 4 *before* invoking the installer and logs the requirement by name
 rather than emitting that syntax error, so `hooks=skipped(no bash>=4)` is a diagnosis.
 
+`HESTIA_BASH` is a **pin**, like `HESTIA_RESTART_CMD`: set, it is used or the cycle says why
+it cannot be (`hooks=skipped(HESTIA_BASH not bash>=4)`) — it is never silently replaced by
+a different interpreter found on `PATH`. It was a hint until 2026-08-27, when mcnugget
+measured `HESTIA_BASH=/bin/bash` resolving to `/opt/homebrew/bin/bash` at rc=0, identical
+to not setting it: an operator pinning 3.2 on purpose, to reproduce a stock Mac's failure,
+got a different interpreter and no indication the pin was ignored. So this is also the
+reproduction recipe for the half-deploy arm on any seat: `HESTIA_BASH=/bin/sh` (or any
+non-bash-4) in the agent's environment on a cycle where main has moved ends
+`HALF-DEPLOYED … (hooks=skipped(HESTIA_BASH not bash>=4))`, rc=1, daemon on the new binary.
+
 This wants a fleet decision rather than local `brew install`s: either bash ≥ 4 is a
 declared prerequisite for a hestia member host, or `install-members.sh` goes 3.2-clean
 (two `mapfile` calls and one associative array). Measured consequence of leaving it:
@@ -117,32 +127,48 @@ primitive that is not there must never be indistinguishable from a lock that is 
   stale (exit 3) without building. `hestia-deploy --build-only` builds without
   installing, for a pre-flight before a hold. Any other argument is usage, exit 2,
   and does not take the lock — the default is refusal, not deployment.
-- `hestia-deploy --hooks-only` re-runs just the members' install, for the one case the
-  cycle cannot recover on its own: `hooks=FAILED` leaves the binary current and the
-  manifest stale, so the next cycle logs `CURRENT` and exits before reaching the
-  installer. It refuses unless the synced checkout still equals what is deployed —
-  otherwise it would write a `build_id` from a moved main over the running binary and
-  manufacture the very divergence the manifest exists to disprove (mcnugget measured
-  exactly that on the flag's first use, before the guard).
+- A half deploy heals on the **next timer cycle**: a full cycle that finds the binary
+  `CURRENT` but `current-build.json` behind it (or absent) re-runs the members' install
+  from the same synced checkout and logs `CURRENT <v> manifest-repair hooks=ok`. Until
+  2026-08-27 that cycle logged `CURRENT` and exited before the installer, so a half deploy
+  stayed half until someone ran `--hooks-only` by hand — and mcnugget measured that the
+  someone, when it is an agent session, cannot (below). The timer is the one caller that
+  is not a session, so its cycle is where the repair belongs. `--check` still only reports.
+- `hestia-deploy --hooks-only` re-runs just the members' install by hand, **from an
+  operator shell**: the installer refuses inside a governed session (`CLAUDECODE` /
+  `HESTIA_ROLE` set without the operator ack), and the cycle spells that
+  `hooks=refused(governed session)` — still rc=1, the manifest genuinely was not written,
+  but named apart from `FAILED(rc=N)` because it is the governance surface working, not an
+  install broken, and "fix the cause" is not the repair. mcnugget 2026-08-27: agent-run
+  `--hooks-only` on that seat produced `FAILED(rc=3)` twice and never a manifest, while the
+  launchd cycle (no `CLAUDECODE`) wrote it normally. `--hooks-only` refuses unless the
+  synced checkout still equals what is deployed — otherwise it would write a `build_id`
+  from a moved main over the running binary and manufacture the very divergence the
+  manifest exists to disprove (mcnugget measured exactly that on the flag's first use,
+  before the guard).
 - The script refuses (exit 1, `FAIL`) when `HESTIA_BIN` is not the file the daemon is
   executing, or the lock primitive is missing and the fallback cannot be taken, or the
   restart command fails — a failed restart rolls back to the saved binary first. A
   `SKIP` at exit 0 means exactly two things: another deploy holds the lock, or a hold
   file is present. Nothing else exits 0 without deploying — and a **half** deploy does not
-  exit 0 either: `DEPLOYED … hooks=FAILED(rc=N)` or `hooks=skipped(no bash>=4)` /
-  `skipped(no installer)` leaves the binary current and the manifest unwritten, so the
-  cycle exits 1 (`HALF-DEPLOYED` is the last line), the unit reads failed, and the repair
-  is `--hooks-only` once the cause is fixed. The binary is not rolled back: a stale daemon
-  would be a worse state than a stale manifest, and the manifest is what `--hooks-only`
-  rewrites. The one `hooks=skipped` that exits 0 is the explicit opt-out,
+  exit 0 either: `DEPLOYED … hooks=FAILED(rc=N)`, `hooks=refused(governed session)`,
+  `hooks=skipped(no bash>=4)` / `skipped(HESTIA_BASH not bash>=4)` / `skipped(no installer)`
+  leaves the binary current and the manifest unwritten, so the cycle exits 1
+  (`HALF-DEPLOYED` is the last line, and it names the repair for that value), the unit
+  reads failed, and the next timer cycle repairs the manifest. The binary is not rolled
+  back: a stale daemon would be a worse state than a stale manifest, and the manifest is
+  what the repair rewrites. The one `hooks=skipped` that exits 0 is the explicit opt-out,
   `HESTIA_DEPLOY_HOOKS=0` (mcnugget asked which it was, 2026-08-27; this is the answer).
+  Measured on Darwin by mcnugget (sandboxed home, real build, stub restart): rc=1, binary
+  current, manifest absent, `launchctl list` column 2 = 1.
 - Every cycle appends one line to `~/.hestia/deploy.log`; a deploy appends
   `DEPLOYED <old> -> <new> (hestia <sha>, web4 <sha>) hooks=<ok|skipped|FAILED>`.
   `journalctl --user -u hestia-deploy` has the same lines plus cargo's tail; on macOS
   that second copy is `~/Library/Logs/hestia/deploy-agent.log`.
 - The members' installer refuses to run from inside a governed session (it is the
-  gate installing the gate); it runs under the timer, which is not a member. Test the
-  whole cycle through the service manager, never by hand:
+  gate installing the gate; the cycle logs it as `hooks=refused(governed session)`); it
+  runs under the timer, which is not a member. Test the whole cycle through the service
+  manager, never by hand:
   `systemctl --user start hestia-deploy.service`, or on macOS
   `launchctl kickstart -k gui/$(id -u)/com.web4.hestia.deploy`.
 
