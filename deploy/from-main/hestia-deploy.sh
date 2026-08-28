@@ -45,7 +45,9 @@
 # Exit:   0 only when the cycle did everything it claims: CURRENT (manifest matching), SKIP
 #         (lock/hold), or DEPLOYED with hooks=ok (or hooks=skipped by explicit
 #         HESTIA_DEPLOY_HOOKS=0). DEPLOYED or CURRENT with any other hooks value exits 1 — the
-#         binary is live, the manifest is not (see the tail).
+#         binary is live, the manifest is not (see the tail). hooks=ok is a POST-CONDITION on
+#         the manifest file, not the installer's exit code: an installer that exits 0 without
+#         writing it (no member registered here; DRY_RUN=1) is hooks=FAILED(installer rc=0, …).
 #         anything else usage, exit 2, BEFORE the lock is taken (a typo'd flag from a shell
 #                       used to run a full cycle: Legion, 2026-08-27)
 #
@@ -198,6 +200,20 @@ install_hooks() {
   fi
   if HESTIA_HOME="$HESTIA_HOME" "$sh" "$DEPLOY_ROOT/hestia/deploy/install-members.sh" >>"$LOG" 2>&1; then
     hooks="ok"
+    # rc=0 from the installer is NOT evidence the manifest was written. It has two documented
+    # paths that write nothing and exit 0 on purpose (no member registered on this host;
+    # DRY_RUN=1), each correct in itself: "a box may legitimately host no member, but it must
+    # not silently write an authority file claiming a deployment that did not happen". Reading
+    # that rc=0 as "manifest now current" broke the promise one layer up: mcnugget, 2026-08-28,
+    # under a REAL launchd timer with no member registered in HOME — `manifest-repair hooks=ok`,
+    # rc=0, twice, and no current-build.json. Every 4h, forever, green. So the manifest gets the
+    # same post-condition the binary already has (`[ "$newv" = "$target" ] || die`): check the
+    # file this value is named for, not the exit code of the thing that was supposed to write it.
+    local after
+    after="$(manifest_build_id)"
+    if [ "$after" != "$target" ]; then
+      hooks="FAILED(installer rc=0, manifest '${after:-none}')"
+    fi
   else
     rc=$?
     # daemon is up; the manifest was not rewritten, so it now reads stale. rc=3 is the one exit
@@ -233,6 +249,7 @@ manifest_build_id() {
 hooks_repair_hint() {
   case "$hooks" in
     refused*) printf '%s' "the members' installer refuses inside a governed session (CLAUDECODE/HESTIA_ROLE set); the next timer cycle repairs it, or run hestia-deploy --hooks-only from an operator shell" ;;
+    "FAILED(installer rc=0"*) printf '%s' "the installer exited 0 without writing the manifest; its own lines above say why (no member registered on this host, or DRY_RUN=1). Register a member, then hestia-deploy --hooks-only from an operator shell, or let the next timer cycle repair it" ;;
     *)        printf '%s' "fix the cause, then hestia-deploy --hooks-only (from an operator shell, or let the next timer cycle repair it)" ;;
   esac
 }
@@ -276,7 +293,12 @@ fi
 # ---- sync the deploy checkout and its sibling --------------------------------------------
 [ -d "$DEPLOY_ROOT/hestia/.git" ] || die "no deploy checkout at $DEPLOY_ROOT/hestia (see README)"
 [ -d "$DEPLOY_ROOT/web4/.git" ]   || die "no web4 sibling at $DEPLOY_ROOT/web4 (see README)"
-git -C "$DEPLOY_ROOT/hestia" fetch -q --tags origin || die "fetch hestia"
+# --force: a moved tag is otherwise never updated in an existing clone, and every identity
+# this script reports (target, running, ondisk, build_id) is a `describe` string. Measured on
+# mcnugget 2026-08-28: two clones at the same HEAD read v0.0.4-485 and v0.0.4-492 because one
+# still held the pre-move v0.0.4. One rebuild the first time a seat catches up is the price of
+# every seat agreeing on what a commit is called.
+git -C "$DEPLOY_ROOT/hestia" fetch -q --tags --force origin || die "fetch hestia"
 git -C "$DEPLOY_ROOT/hestia" reset -q --hard "origin/$BRANCH" || die "reset hestia"
 git -C "$DEPLOY_ROOT/hestia" clean -qfd
 git -C "$DEPLOY_ROOT/web4" fetch -q origin || die "fetch web4"

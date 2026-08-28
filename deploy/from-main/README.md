@@ -157,7 +157,13 @@ primitive that is not there must never be indistinguishable from a lock that is 
   (`HALF-DEPLOYED` is the last line, and it names the repair for that value), the unit
   reads failed, and the next timer cycle repairs the manifest. The binary is not rolled
   back: a stale daemon would be a worse state than a stale manifest, and the manifest is
-  what the repair rewrites. The one `hooks=skipped` that exits 0 is the explicit opt-out,
+  what the repair rewrites. `hooks=ok` is checked against the **file**, not the installer's
+  exit code: the installer exits 0 without writing anything when no member is registered on
+  the host (and under `DRY_RUN=1`), and mcnugget measured the repair path reading that as
+  `manifest-repair hooks=ok`, rc=0, under a real launchd timer, twice, with no manifest on
+  disk — green every 4h, forever, on exactly the headless profile being onboarded next. It
+  is now `hooks=FAILED(installer rc=0, manifest 'none')`, rc=1, and the tail says to look at
+  the installer's own lines above. The one `hooks=skipped` that exits 0 is the explicit opt-out,
   `HESTIA_DEPLOY_HOOKS=0` (mcnugget asked which it was, 2026-08-27; this is the answer).
   Measured on Darwin by mcnugget (sandboxed home, real build, stub restart): rc=1, binary
   current, manifest absent, `launchctl list` column 2 = 1.
