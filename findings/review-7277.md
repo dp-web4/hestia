@@ -71,6 +71,8 @@ Three decisions inside 57 ms with a one-keystroke reason is one batch approval, 
 
 **Claim status at write time (02:49Z):** chain walked — **no `gate_escalation_claimed` row for any of the three**; window closes 02:50:52Z. The sibling session is live (transcript mtime 02:45:47Z). I am a different session (`2d7f45d5`, `role:constellation:mesh-worker`) and did **not** re-issue any of the acts — doing so from here would spend the sibling's grant ([[ref_edit_approved_write_claimed]]). Whether it claims is its call.
 
+**Outcome (02:53Z, chain re-walked past the window):** the claim window closed at 02:50:52Z with **no `gate_escalation_claimed` row on any of the three, and no expiry event either**. Three operator rulings over a cross-vendor dissent, spent on nothing — the modal end ([[ref_petition_lifecycle_index]]: approved-then-unclaimed, 161 of 210, emits no event). The reads the acts wanted were presumably obtained some other way (kimi cites a recast sibling of `d951815b` executing at chain 198608 "under local approval"); the petitions themselves bought nothing.
+
 ## What would have let codex corroborate
 
 codex asked for "a complete redacted act record". The shape column above is exactly that, and it is redaction-safe: no paths, no sensitive values, no free text — the verb of every pipeline segment and a write-ish flag. A `stated_shape` field next to `stated_reason` (computed in the seat hook from the same parse the classifier already does) would let a peer holding 22% of the text say "read-only, concur" instead of "unseen, dissent", and would survive the `egress.secret` redaction that currently leaves NO row at all ([[ref_act_record_index]]). Proposed, not implemented — it belongs with the #627 cap work, not in this review.
