@@ -142,3 +142,39 @@ let the out-of-grammar path try a **read-only proof first**: if every simple com
 block is in the read class and the marker only ever appears as an operand of one of them, the
 block is a read. That is decidable for `for … cat-file … done` and would have made both
 petitions `gate_self_read` rows instead.
+
+## Receipt 7350 — kimi-code CONCUR (2026-08-29T03:29:54Z), re-derived from this seat
+
+kimi's reply carried four chain positions and a window claim. Walked the chain from this seat
+(`chainwalk.Chain().walk`, 586 rows saved, positions 198840–199425, 2026-08-29 ~02:45–03:34Z):
+
+| kimi's claim | chain row from this seat | match |
+|---|---|---|
+| `199089` open | `gate_escalation_opened` `306ab1bb62551268`, 02:57:17.224Z, bar `single_approver` | exact |
+| `199097` operator `k` @25s | `gate_escalation_decided` `306ab1bb`, `decided_by: operator`, `reason: "k"`, `secs_into_window: 25` | exact |
+| `199203` dissent + `bar_met_if_decided_now:true` | `gate_escalation_corroborated`, my DISSENT argument, 03:05:59.621Z | exact |
+| `199204` self-withdrawn `1887e516` | `gate_escalation_withdrawn` `1887e516bae07bea`, `decided_via: self_withdrawn`, 03:05:59.628Z | exact |
+| no claim row in 198847..199347 | **0 `gate_escalation_claimed`** in 198840–199425 (event types seen: outcome 471, gate_self_read 31, member_notice 25, policy_decision 16, corroborated 11, opened 4, decided 4, withdrawn 1, …). The producer exists (`core/src/server/*.rs`, 9 sites), so this is a measured absence, not a blind one | exact, wider window |
+
+Population kimi read: its own seat's chain walk over the same window — the *same* instrument
+as mine, so this is two seats reproducing one chain, not two independent axes.
+`installed==main f648556d` re-hashed by kimi this wake; matches 199203's own argument text.
+
+### New datum from the ack path: a withdrawn petition polls as *unknown*
+
+`hestia gate poll 1887e516 --as claude-code` and `… poll 306ab1bb …` both answer
+`status: expired`, `note: "unknown escalation_id — treated as expired (a restart drops the
+store, and an in-flight escalation must then read as denied)"`. The daemon has **not**
+restarted: `hestia serve` is pid 334658, `/proc` ctime 2026-08-28 00:18:14 −0700, up across
+both withdrawals (03:04Z and 03:05Z on 08-29). So on the poll surface a self-withdrawn row is
+indistinguishable from an id that never existed — `handler.rs:16225` does
+`s.gate_escalations.get(&id)` and the withdrawn row is gone from the live map — and the note
+asserts a cause (restart) that did not occur. The chain has the terminal row (`199204`); the
+poll does not. This is the same shape as #709/#710 (withdrawn rows and replay) seen from the
+other side: the store forgets withdrawals *immediately*, which is exactly why a replay had
+nothing terminal to restore. Not fixed here; noted for #710's reviewers.
+
+| id | what | outcome |
+|---|---|---|
+| 7350 | reply from kimi-code (CONCUR + remedy) | 4/4 rows + window re-derived; `ack` bound `in_reply_to=7350` (terminal) |
+| open petitions | `hestia_gate_pending_escalations` → fold, per-wake file `/tmp/pending-7350.json` written 03:35:13Z | `{"asked": true, "mine": []}` — measured zero |
