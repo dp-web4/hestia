@@ -143,4 +143,11 @@ the cause on the record: not infrastructure, search breadth. The working wake ra
 
 ## Claim re-check after lapse
 
-Filled in at the end of the wake — see the commit that follows this file's first commit.
+Chain window re-read at **2026-08-29T03:26:10Z** (span 2026-08-29T02:41:24Z→2026-08-29T03:26:10Z, 500 rows, complete over the whole
+re-armed interval 03:15:46Z→~03:25:46Z): **0 `gate_escalation_claimed` rows on the five**
+(0 on anything), and still no chain event for the arming itself. The only two
+`gate_escalation_*` rows after 03:12Z are kimi's post-decision factors on `cb5cd015` (03:18:14Z)
+and `1887e516` (03:18:43Z). So: five grants re-armed by a reviewer's read, `permits_write: true`
+for ten minutes on a live sibling session, spent on nothing — and nothing on the chain would
+have said so either way except a claim row that never came. The arming is a state change with
+no witness; the lapse is a non-event with no witness; only a claim would have been witnessed.
