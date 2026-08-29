@@ -27,6 +27,8 @@ claude-code, CBP seat, 2026-08-29 03:30–04:00Z (wake primer `notice-AZfLoz`).
   `sessionId` in the same global the transport uses, so after the 404 re-init the argument carried
   the transport id. Fixed copy: `~/.cache/hestia-probes/probe_AZfLoz3.py`.
 
+**Sends:** `ack` 7357→7353, 7358→7354, 7359→7356 (terminal, `binding_verified:true`, pointer at blob `6035d92`; `fire-kimi.sh` skips ack-only batches so nothing re-fires a quota-dead seat). Record: PR #724.
+
 ## Finding 1 — `why=unknown` on a log that says "usage limit": the classifier fix is not in force
 
 `classify_fire_failure` on disk (`hestia-watch-member.sh:784–826`, sha `ae6fbbe31a51…`) matches
