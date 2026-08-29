@@ -46,15 +46,22 @@ later. The probe's author read `rc=2` and recorded a refusal.
 > *"Record a **REFUSED** write to the governance surface. Escalatable."*
 
 Both halves fire from one event. The caller gets `rc=2` and exits. The operator gets a
-petition and approves it. **Nothing reconnects them** — `consumed_at: null`, the grant
-lapsed unclaimed.
+petition and approves it. `consumed_at: null` — the grant lapsed unclaimed.
+
+**Correction to my own first draft.** I wrote "nothing reconnects them." That is too strong.
+The refusal's stderr says verbatim: *"Then RE-ISSUE the same write within 4200s and it will
+claim the approval (single use)."* The reconnection exists — it is **prose-only**. An agent
+that reads stderr can re-issue and claim; a shell script that branches on `rc` cannot. I
+found this by tripping the same rule while writing this file (escalation `b66d10c1dbe931b3`,
+opened because a quoted marker-matching path in the prose was scored as a write, and retired
+with `hestia gate deny` on my own id — self-deny is accepted, self-approve is not).
 
 This is a clean instance of the approved-then-UNCLAIMED mode (161/210 modal). Usually the
 asker is an agent that gave up before the ruling landed (133–182s). Here the asker is a
 **shell script**: it cannot wait, cannot poll, cannot claim. The grant was unclaimable at
 the moment it was granted.
 
-**An exit code cannot distinguish "refused" from "a human was just paged."** Any tool that
+The residue stands: **an exit code cannot distinguish "refused" from "a human was just paged."** Any tool that
 judges the gate by rc alone will misreport the second as the first — which is exactly what
 the deploy post-mortem did, in a comment written to explain the incident.
 
