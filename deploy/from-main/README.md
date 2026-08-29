@@ -5,6 +5,52 @@ One checkout, one timer, one log. The reference daemon on this box is deployed f
 header in `hestia-deploy.sh` explains the shape and the rollback; this file is the
 install and the operating rules.
 
+## Before you arm: `hestia-deploy --preflight`
+
+Run this first, on any box, adopted or not. It builds nothing and installs nothing.
+
+    hestia-deploy --preflight        # 0 = safe to install the members' surface, 4 = refuse
+
+It answers **"after this install, can this seat still stop this timer?"** — not "what does the
+scope envelope say". Two checks:
+
+1. **Rule 0** — is the enforcing gate *registered* inside a git worktree? If it is, every pull
+   of that tree hot-deploys the gate mid-session, and the members' installer, which derives its
+   destination from the registration, writes back into that same checkout every cycle. The
+   members' install is refused; the daemon deploy is not. `HESTIA_DEPLOY_RULE0=warn` downgrades
+   it for a seat whose operator has the fix queued.
+2. **The gate answers** — the gate *in the deploy checkout* is executed, in the fail-closed
+   posture unattended sessions run under, on the acts a seat needs to stop the timer. A gate
+   that cannot answer is not installed.
+
+### Why this is not the emptiness check the 2026-08-29 amendment asked for
+
+The amendment says: if the scope envelope resolves empty, you are locked out — disarm. Measured
+on CBP, that inference does not hold, and mcnugget is the counterexample (ten clean cycles on an
+envelope empty in every field). An empty envelope is a *discriminating* gate, not a deny-all one:
+the temp roots, the member's own home, and everything absolute outside the workspace stay
+reachable, so the in-band stop still works. What denies is workspace-interior reach.
+
+The class that actually locks a seat out is **no verdict**: under `HESTIA_PRE_FAIL_CLOSED=1`,
+a gate that cannot reach its daemon — or cannot import the shared mechanism two levels up from
+itself, which is what a hot-swapped tree does to it — refuses *every* tool, including the remedy.
+And policy resolution reports an empty scope when nothing answers, so **both states print the
+identical `(granted: )` banner**. That is why the cheap observable cannot tell them apart: the
+emptiness pub saw was a symptom of the daemon failure, read at the wrong layer.
+
+Measured, one box, one gate, one event — the three arms this preflight distinguishes:
+
+| seat state | `--preflight` |
+|---|---|
+| healthy, envelope empty or not | `ok`, exit 0 |
+| daemon unreachable (the pub signature) | `FAILED(gate refuses a benign read)`, exit 4 |
+| gate registered in a worktree | `FAILED(rule-0: …)`, exit 4 |
+
+A note on what the preflight deliberately does *not* test: whether the seat can rewrite its own
+gate registration. It cannot, on any healthy machine — `gate-self-access` refuses it, correctly.
+A governed session has no in-band route to the rule-0 remedy, so a rule-0 finding is something
+to **refuse and report to an operator**, never something a seat repairs for itself.
+
 ## Install — Linux, user systemd (once per box)
 
     mkdir -p ~/.hestia/deploy
