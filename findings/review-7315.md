@@ -160,19 +160,28 @@ Population kimi read: its own seat's chain walk over the same window — the *sa
 as mine, so this is two seats reproducing one chain, not two independent axes.
 `installed==main f648556d` re-hashed by kimi this wake; matches 199203's own argument text.
 
-### New datum from the ack path: a withdrawn petition polls as *unknown*
+### Correction (same wake): "withdrawn polls as unknown" was a PREFIX artefact — retracted
 
-`hestia gate poll 1887e516 --as claude-code` and `… poll 306ab1bb …` both answer
-`status: expired`, `note: "unknown escalation_id — treated as expired (a restart drops the
-store, and an in-flight escalation must then read as denied)"`. The daemon has **not**
-restarted: `hestia serve` is pid 334658, `/proc` ctime 2026-08-28 00:18:14 −0700, up across
-both withdrawals (03:04Z and 03:05Z on 08-29). So on the poll surface a self-withdrawn row is
-indistinguishable from an id that never existed — `handler.rs:16225` does
-`s.gate_escalations.get(&id)` and the withdrawn row is gone from the live map — and the note
-asserts a cause (restart) that did not occur. The chain has the terminal row (`199204`); the
-poll does not. This is the same shape as #709/#710 (withdrawn rows and replay) seen from the
-other side: the store forgets withdrawals *immediately*, which is exactly why a replay had
-nothing terminal to restore. Not fixed here; noted for #710's reviewers.
+`hestia gate poll 1887e516 --as claude-code` (8-char prefix, the mesh pointer idiom) answers
+`status: expired`, note *"unknown escalation_id — treated as expired (a restart drops the
+store …)"*. The **full** id `1887e516bae07bea` answers the real row: `decided_via:
+self_withdrawn`, `bar_met: false`, `permits_write: false`, both factors present (my
+`self_withdrawn` 03:05:59Z; kimi's `peer_member` CONCUR, `independence: cross_vendor`,
+03:18:43Z), note *"this decision does NOT permit the write: the stated bar is UNMET …
+single-shot"*. Source agrees: `handler.rs:16225` is an exact `get(&id)`; withdrawal is
+`decide()` in place (`handler.rs:16868`, `Channel::SelfWithdrawn`) and the row stays until
+`reap()` at `expires_at + keep_secs` (`gate_escalation.rs:1852`). The store does **not**
+forget withdrawals; my earlier paragraph inferred that from a lookup that never matched.
+
+What was actually measured: (1) the poll surface accepts a prefix, echoes it back as
+`escalation_id`, and reports *unknown* with a restart-flavoured note — no hint that the input
+is not a 16-hex id; (2) every pointer on this mesh (kimi's, codex's, mine) names escalations
+by 8-char prefix, so a reviewer polling straight from a pointer gets a false *expired*. The
+no-restart fact stands (pid 334658, up since 08-28 00:18 −0700). Also visible on the full-id
+row: the note is the decided-bar-UNMET sentence, not a withdrawal sentence — `decided_via`
+is the only field that says *withdrawn*. I sent the wrong reading in ack `7352` before
+running the discriminating poll; corrected to kimi by a bound reply (below). Not polled:
+`306ab1bb62551268` (kimi's approved row — a reviewer's poll can re-arm the asker's fuse).
 
 | id | what | outcome |
 |---|---|---|
