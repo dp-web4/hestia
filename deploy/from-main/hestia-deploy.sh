@@ -229,7 +229,7 @@ bash4() {
 # member's gate it exercises. The other members' gates share the mechanism it imports but not
 # the event shape; extending the probe needs their schema, not a wider glob. Sets $preflight.
 preflight_gate() {
-  local gate ev tmp rc r0
+  local gate ev tmp rc r0 r0_audit r0_out r0_rc _tr t2
   preflight="ok"
   [ "${HESTIA_DEPLOY_PREFLIGHT:-1}" = "1" ] || { preflight="skipped(opt-out)"; return 0; }
   command -v python3 >/dev/null 2>&1 || { preflight="skipped(no python3)"; return 0; }
@@ -242,10 +242,52 @@ preflight_gate() {
   # REGISTERED path"). Refusing the members' install is therefore the narrowest useful act: the
   # daemon still deploys, and the one step that would deepen the exposure does not run.
   # HESTIA_DEPLOY_RULE0=warn keeps a seat cycling while its operator has the fix queued.
-  r0="$(python3 "$DEPLOY_ROOT/hestia/deploy/from-main/rule0-audit.py" 2>/dev/null)" || r0=""
+  #
+  # ABSENCE IS ITS OWN ARM (mcnugget, 2026-08-29, finding 3 — measured, not theorised). The line
+  # here used to be
+  #     r0="$(python3 …/rule0-audit.py 2>/dev/null)" || r0=""
+  # which folds THREE states into one: missing file, crashed interpreter, and audited-clean all
+  # arrive as an empty $r0 and read as a pass. #698 is not in main, so a seat's $DEPLOY_ROOT has
+  # no deploy/from-main/ AT ALL — and mcnugget's arm 2 returned `ok` on a seat whose rule 0
+  # definitively fails. Third instance of the class this script has already named and fixed twice
+  # (flock-absent-reads-as-SKIP, installer-rc=0-reads-as-ok), and the block below argues the same
+  # point about --preflight dying in its own tee. The auditor's contract is what makes the three
+  # separable, and it is explicit about it: one line per finding, nothing when clean, and NEVER
+  # nonzero for a finding. So rc!=0 means the AUDITOR broke, and only an rc=0 run with empty
+  # output is evidence of clean. This matters most in the window that exists right now, where
+  # seats carry this script and a pre-#698 $DEPLOY_ROOT.
+  r0_audit="$DEPLOY_ROOT/hestia/deploy/from-main/rule0-audit.py"
+  if [ ! -f "$r0_audit" ]; then
+    r0="auditor missing at $r0_audit — a deploy checkout older than #698 has no deploy/from-main/, so rule 0 is UNMEASURED on this seat, not clean"
+  else
+    # stdout only: a DeprecationWarning on stderr must not read as a finding and refuse the
+    # members' install fleet-wide. The failure path re-runs to get the message — the auditor is
+    # read-only and cheap, and a diagnosis is worth one extra exec on the rare arm.
+    # `|| r0_rc=$?`, not `; r0_rc=$?` — this script runs under `set -e`, where an assignment
+    # whose command substitution exits nonzero terminates the shell BEFORE the next statement.
+    # Written the obvious way, a crashing auditor killed --preflight at that line: exit 1, no
+    # output, no PREFLIGHT verdict. That is the failure the mode's own header warns about — a
+    # check whose failure to RUN is indistinguishable from a check that ran and refused — and it
+    # went in while fixing a different instance of the same class. Measured on CBP.
+    r0_rc=0
+    r0_out="$(python3 "$r0_audit" 2>/dev/null)" || r0_rc=$?
+    if [ "$r0_rc" != 0 ]; then
+      # `|| true` inside the substitution: `set -o pipefail` is on, so this diagnostic pipeline
+      # inherits the auditor's nonzero rc, the ASSIGNMENT carries it, and `set -e` kills the
+      # script — the same exit-1-with-no-verdict as above, arriving a second time by a second
+      # route while capturing the very message that explains the first. Both traps were found by
+      # running the arm, not by reading it.
+      r0="auditor failed rc=$r0_rc: $(python3 "$r0_audit" 2>&1 >/dev/null | tr '\n' ' ' | cut -c1-200 || true)"
+    else
+      r0="$r0_out"
+    fi
+  fi
   if [ -n "$r0" ]; then
     if [ "${HESTIA_DEPLOY_RULE0:-refuse}" = "warn" ]; then
-      log "WARN rule-0: enforcing gate registered inside a git worktree — $r0 (HESTIA_DEPLOY_RULE0=warn, continuing; a pull of that tree hot-deploys the gate mid-session)"
+      # Wording is deliberately generic now: $r0 no longer means only "a registration was found",
+      # it also carries "the auditor is absent" and "the auditor broke". Asserting the worktree
+      # finding here would mis-report the two new arms as something they are not.
+      log "WARN rule-0: $r0 (HESTIA_DEPLOY_RULE0=warn, continuing; a gate registered in a worktree is hot-deployed mid-session by any pull of that tree)"
     else
       preflight="FAILED(rule-0: $r0)"
       return 0
@@ -256,7 +298,29 @@ preflight_gate() {
   # The point is to catch a gate that cannot answer BEFORE it becomes the one deciding.
   gate="$DEPLOY_ROOT/hestia/plugins/claude-code/hooks/pre_tool_use.py"
   [ -f "$gate" ] || { preflight="skipped(no claude-code gate in checkout)"; return 0; }
-  tmp="$(mktemp -d "${TMPDIR:-/tmp}/hestia-preflight.XXXXXX")" || { preflight="skipped(no tmpdir)"; return 0; }
+  # SCRATCH IN A ROOT THE GATE'S OWN DOMAIN RECOGNISES — deliberately NOT $TMPDIR (mcnugget,
+  # 2026-08-29, finding 1). This line was `mktemp -d "${TMPDIR:-/tmp}/…"`, and on darwin $TMPDIR
+  # is the per-uid /var/folders/<hash>/T, which is under neither entry of the gate's
+  #     hestia_gate_core.py:857   TEMP_ROOTS = ("/tmp", "/var/tmp")
+  # So the probe file landed outside every temp root, the benign read denied, and the preflight
+  # reported FAILED(gate refuses a benign read) — the pub LOCKOUT signature — on a healthy seat
+  # with ten clean cycles, minutes after that session had made dozens of passing gate calls. Four
+  # arms on mcnugget flipped the verdict on that one variable and nothing else. Shipped as-is it
+  # would have been WORSE than the emptiness rule this block replaced: the emptiness rule
+  # disarmed healthy seats loudly and REVERSIBLY, this failed them with the signature that reads
+  # "your seat is dead" — the reading most likely to trigger a disarm nobody re-examines.
+  #
+  # Pinning to the declared roots makes the PREFLIGHT portable. It does not fix TEMP_ROOTS, which
+  # is a live gate defect on every darwin seat and is tracked outside #698 — see the WARN probe
+  # below, which exists so that this pin REPORTS the defect instead of hiding it. Do not
+  # "modernise" this back to $TMPDIR.
+  tmp=""
+  for _tr in /tmp /var/tmp; do
+    [ -d "$_tr" ] && [ -w "$_tr" ] || continue
+    tmp="$(mktemp -d "$_tr/hestia-preflight.XXXXXX" 2>/dev/null)" && break
+    tmp=""
+  done
+  [ -n "$tmp" ] || { preflight="skipped(no writable temp root among /tmp /var/tmp)"; return 0; }
   : >"$tmp/probe"
 
   # Each probe is an act the seat MUST retain in order to undo this install. A gate that denies
@@ -273,6 +337,24 @@ preflight_gate() {
   ev='{"session_id":"hestia-deploy-preflight","tool_name":"Read","tool_input":{"file_path":"'"$tmp/probe"'"}}'
   _probe "read own scratch file" "$ev" || {
     preflight="FAILED(gate refuses a benign read)"; rm -rf "$tmp"; return 0; }
+
+  # REPORT THE DOMAIN DEFECT RATHER THAN HIDE IT. The pin above means this preflight no longer
+  # fails on darwin — but every member on that seat which scratches in $TMPDIR is still denied,
+  # and a pin that silently routes around a defect is exactly how the defect stops being visible.
+  # So probe $TMPDIR once, when it is not already a declared root, and name what it means. WARN
+  # and never FAILED: the seat's reversibility is intact — proved by the probes either side of
+  # this one — so this is not grounds to refuse the members' install.
+  case "${TMPDIR:-}" in
+    ""|/tmp|/tmp/|/var/tmp|/var/tmp/) ;;
+    *)
+      if [ -d "$TMPDIR" ] && t2="$(mktemp -d "${TMPDIR%/}/hestia-preflight.XXXXXX" 2>/dev/null)"; then
+        : >"$t2/probe"
+        ev='{"session_id":"hestia-deploy-preflight","tool_name":"Read","tool_input":{"file_path":"'"$t2/probe"'"}}'
+        _probe "read a \$TMPDIR scratch file" "$ev" || \
+          log "WARN gate does not recognise \$TMPDIR ($TMPDIR) as a temp root. TEMP_ROOTS is ('/tmp','/var/tmp') and _under_temp_root normpaths but never resolves symlinks, so darwin's per-uid /var/folders/<hash>/T denies — and so does /private/tmp, the realpath of /tmp, a LISTED root refused under its own canonical name. #169 fixed how the roots are compared (prefix -> boundary, correctly); neither the domain nor the normal form was fixed. NOT fatal to this preflight, which scratches in $tmp, and NOT grounds to refuse the install; it IS live for every member on this seat. Gate defect, tracked outside #698 — mcnugget 2026-08-29, findings 1-2."
+        rm -rf "$t2"
+      fi ;;
+  esac
 
   ev='{"session_id":"hestia-deploy-preflight","tool_name":"Bash","tool_input":{"command":"touch '"$HOLD"'"}}'
   _probe "touch the deploy hold (the in-band stop)" "$ev" || {
