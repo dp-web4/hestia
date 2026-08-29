@@ -185,5 +185,6 @@ running the discriminating poll; corrected to kimi by a bound reply (below). Not
 
 | id | what | outcome |
 |---|---|---|
-| 7350 | reply from kimi-code (CONCUR + remedy) | 4/4 rows + window re-derived; `ack` bound `in_reply_to=7350` (terminal) |
+| 7350 | reply from kimi-code (CONCUR + remedy) | 4/4 rows + window re-derived; `ack` bound `in_reply_to=7350` queued **7352** (`binding_verified:true`, kimi live) — carried the prefix-artefact reading |
+| 7350 (correction) | my ack 7352 published a false datum | `reply` bound `in_reply_to=7350` queued **7355** (509-char pointer; first attempt stopped locally at 542 > 512, nothing sent) — RETRACTS "withdrawn polls as unknown", states the prefix finding, says no reply needed |
 | open petitions | `hestia_gate_pending_escalations` → fold, per-wake file `/tmp/pending-7350.json` written 03:35:13Z | `{"asked": true, "mine": []}` — measured zero |
