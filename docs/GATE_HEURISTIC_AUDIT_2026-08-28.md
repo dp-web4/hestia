@@ -163,7 +163,7 @@ Four defects:
 
 **File existence: UNVERIFIED.** Reading the fallback path is denied by `mrh.command` - `'claude-code' is not granted` - so this audit cannot check whether the fail-open file is present (recorded in the appendix, denial 5). That the audit of a fail-open path cannot read the path is itself part of the finding.
 
-Bypass cost of the mechanism: **NONE** for a member (it is infrastructure, not a rule a member trips), but the harm is a governance hole, not a member bypass: unreviewed hot-deploy (defect 1), scheduled fail-open (defects 2-3), and an env leak (defect 4). Fix list: (a) no in-tree path - point at an installed copy or leave unset; (b) missing path must fail closed, not open; (c) the deploy script should hold the gate closed across the restart (a `deploy.hold`-style gate-closed marker the hook reads) or the hook should treat "restart in progress" as deny; (d) the banner should not print the hook's environment. Filed as a hestia issue citing this doc.
+Bypass cost of the mechanism: **NONE** for a member (it is infrastructure, not a rule a member trips), but the harm is a governance hole, not a member bypass: unreviewed hot-deploy (defect 1), scheduled fail-open (defects 2-3), and an env leak (defect 4). Fix list: (a) no in-tree path - point at an installed copy or leave unset; (b) missing path must fail closed, not open; (c) the deploy script should hold the gate closed across the restart (a `deploy.hold`-style gate-closed marker the hook reads) or the hook should treat "restart in progress" as deny; (d) the banner should not print the hook's environment. Filed as #719.
 
 ## 8. Scope-derivation narrowing (two gate engines in one hook process)
 
