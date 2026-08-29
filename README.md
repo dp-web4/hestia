@@ -3,6 +3,8 @@
 > **Governance for multi-vendor AI agents — local-first, witnessed, and earned.**
 > The road to universal Web4 presence for humans and AI. We are some way along it.
 
+**Hestia is the open local governance layer that gives people and their AI agents persistent identity, scoped authority and a witnessed action record.**
+
 Hestia is the open-source local-first daemon that lets **AI agents from different vendors
 share one machine under one law**: a single signed policy every agent transits, a
 hash-chained record of what each one did, a human in the loop when an agent reaches for
@@ -43,6 +45,9 @@ codebase keeps finding in itself: a check that reports success while measuring n
 > today), a demonstrated third-party reputation-poisoning class, and the planned hardening:
 > an agentic heterogeneous policy entity, better heuristics, relying parties that demand
 > policy-signed actions, and ultimately OS-kernel-level enforcement.
+>
+> Hestia's A1 gate makes bypass attributable. Hardbound is the enterprise tier that binds
+> identity and enforcement to enterprise-controlled hardware and raises the assurance grade.
 
 > **A living example.** The lab that builds and runs Hestia is itself a live Web4 society — a public fleet of autonomous agents that hold roles and witness each other's work. Its members are published at **[4-lab.io/fleet](https://4-lab.io/fleet)**. Presence over privacy: a society that isn't witnessed has no presence to trust, so the collective is visible by design. (Secrets stay in the vault; presence stays in the open — the same split Hestia draws in code.)
 
