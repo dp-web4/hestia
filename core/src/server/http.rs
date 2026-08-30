@@ -735,6 +735,52 @@ pub async fn serve_with_callback(
         let s = state.lock().await;
         (s.chain_store.clone(), s.inbox_store.clone())
     };
+    // PERIODIC AUTHORITY VERIFICATION (dp's ruling on #715/#596, 2026-08-29: "on a clock,
+    // compare vault truth to every published/runtime projection, report a freshness timestamp
+    // and exact divergence ... Silence is not health"). Reports; never repairs. Repair
+    // direction is a governed decision, and a verifier that quietly picked one would become
+    // the authority it exists to check.
+    let verify_state = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(
+            super::standing_scope::PROJECTION_VERIFY_INTERVAL_SECS,
+        ));
+        loop {
+            tick.tick().await;
+            let now = super::gate_escalation::now_secs();
+            let mut s = verify_state.lock().await;
+            match s.verify_standing_projection(now) {
+                Ok(audit) => {
+                    if !audit.matches {
+                        tracing::error!(
+                            runtime_generation = audit.runtime_generation,
+                            vault_generation = audit.vault_generation,
+                            divergence = ?audit.divergence,
+                            "standing-scope projection DIVERGED from the vault authority"
+                        );
+                    }
+                    s.standing_projection_audit = Some(audit);
+                }
+                // A vault that cannot be read is itself a finding, and leaving the previous
+                // audit in place would let a stale "matches: true" outlive the evidence for
+                // it. Record the failure as a non-match with the reason.
+                Err(e) => {
+                    tracing::error!("standing-scope projection unverifiable: {e}");
+                    s.standing_projection_audit =
+                        Some(super::standing_scope::ProjectionAudit {
+                            verified_at: now,
+                            matches: false,
+                            runtime_generation: s.standing_scope.generation,
+                            vault_generation: 0,
+                            runtime_digest: s.standing_scope.authority_digest(),
+                            vault_digest: String::new(),
+                            divergence: vec![format!("vault authority unreadable: {e}")],
+                        });
+                }
+            }
+        }
+    });
+
     let lapse_state = state.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(

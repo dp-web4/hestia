@@ -367,6 +367,14 @@ pub struct ServerState {
     /// decision. Mutated ONLY from the operator-gated HTTP surface; no MCP tool reaches it
     /// (`no_mcp_tool_can_mutate_standing_scope`). See `server::standing_scope`.
     pub standing_scope: crate::server::standing_scope::StandingScopeStore,
+    /// What was found where the standing authority should be, at launch. Set once during
+    /// construction and served beside the envelope so an unmigrated society is legible
+    /// rather than silently empty.
+    pub authority_status: crate::server::standing_scope::AuthorityStatus,
+    /// The most recent proof that the runtime projection still equals the vault. `None`
+    /// until the first verification runs, which is itself information: it means no
+    /// verification has happened yet, not that everything is fine.
+    pub standing_projection_audit: Option<crate::server::standing_scope::ProjectionAudit>,
     /// TRUE while the in-memory standing store is TIGHTER than the persisted vault copy —
     /// set when a revoke's vault write fails after the row was already removed from memory
     /// (memory keeps the tighter state on purpose). While set, the revoke surface accepts a
@@ -566,12 +574,33 @@ impl ServerState {
         // corrupt store to empty would silently drop operator-made durable grants, and a
         // ruling that vanishes without a trace is the exact failure the escalation-replay
         // block above refuses. An ABSENT document is a fresh install and empty is correct.
+        // ABSENT IS TWO STATES, AND ONLY ONE OF THEM IS "EMPTY IS CORRECT" (dp's ruling on
+        // #715/#596, 2026-08-29: "society exists but generation is 0 because the feature
+        // arrived later must not silently become deny-all"). A fresh install has no standing
+        // document and no history, and empty is right. A society that has been acting since
+        // before the standing-scope feature landed also has no document, and empty is a
+        // 24-hour outage wearing the same face. The chain tells them apart: it is this
+        // society's history, and a society that has acted has entries.
+        let standing_doc_present = vault.get_document("scope", "standing").is_some();
         let standing_scope: crate::server::standing_scope::StandingScopeStore = {
             use anyhow::Context;
             crate::vault::load_doc(&vault, "scope", "standing", "standing-scope.json").context(
                 "standing-scope store unreadable — failing closed instead of dropping \
                  operator-made durable grants",
             )?
+        };
+        let authority_status = if standing_doc_present {
+            crate::server::standing_scope::AuthorityStatus::Loaded
+        } else if chain_store.len().unwrap_or(0) > 0 {
+            tracing::warn!(
+                "standing-scope authority ABSENT on a society with history: the vault holds no \
+                 scope/standing document, so every member's envelope is empty. This is a \
+                 migration, not a fresh install. Grant scope or seed a floor through the \
+                 operator surface; the daemon serves the state rather than hiding it."
+            );
+            crate::server::standing_scope::AuthorityStatus::MigrationRequired
+        } else {
+            crate::server::standing_scope::AuthorityStatus::Fresh
         };
 
         let mut st = Self {
@@ -600,6 +629,11 @@ impl ServerState {
             // The deliberate exception (row 3): standing grants are durable and were just
             // loaded from the vault, so an operator's standing ruling survives the deploy.
             standing_scope,
+            authority_status,
+            // No verification has run yet. Deliberately not a synthetic "matches: true":
+            // construction agreeing with itself is not a proof, and claiming one here would
+            // make the freshness timestamp lie from the first second.
+            standing_projection_audit: None,
             // Memory was just loaded FROM the vault, so the two agree by construction.
             standing_scope_dirty: false,
             law_gate,
@@ -970,6 +1004,32 @@ impl ServerState {
         // committed mutation.
         self.standing_scope_dirty = false;
         Ok(())
+    }
+
+    /// Re-read the authority from the vault and prove the runtime projection still equals it.
+    ///
+    /// This is the "continuously proves the published projection matches it" half of dp's
+    /// 2026-08-29 ruling. It reads the vault fresh rather than trusting any cached copy,
+    /// because a verifier that compares memory to memory proves nothing.
+    ///
+    /// It reports and does not repair. Repair direction is a governed decision: a PHANTOM
+    /// grant should lose to the vault, but a LOST grant may mean the vault write failed and
+    /// the operator's intent is the one in memory. Choosing silently would make the verifier
+    /// an authority, which is exactly what the ruling says it must not be.
+    pub fn verify_standing_projection(&self, now: u64) -> Result<crate::server::standing_scope::ProjectionAudit> {
+        use crate::server::standing_scope::{ProjectionAudit, StandingScopeStore};
+        let vault_copy: StandingScopeStore =
+            crate::vault::load_doc(&self.vault, "scope", "standing", "standing-scope.json")?;
+        let divergence = self.standing_scope.divergence_from(&vault_copy);
+        Ok(ProjectionAudit {
+            verified_at: now,
+            matches: divergence.is_empty(),
+            runtime_generation: self.standing_scope.generation,
+            vault_generation: vault_copy.generation,
+            runtime_digest: self.standing_scope.authority_digest(),
+            vault_digest: vault_copy.authority_digest(),
+            divergence,
+        })
     }
 
     /// INTENT → COMMIT → SUCCESS. The one place the ordering of a durable scope widening is
